@@ -1,8 +1,8 @@
+pub mod memory;
 pub mod model;
 mod storage;
 
-use tauri::Manager;
-use tauri::{WebviewUrl, WebviewWindowBuilder};
+use tauri::{Manager, WebviewWindowBuilder, WindowEvent};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -13,10 +13,18 @@ pub fn run() {
             let storage = storage::StorageService::initialize(app.handle())
                 .map_err(|error| std::io::Error::other(error.message))?;
             app.manage(storage);
+            create_configured_windows(app)?;
+            configure_window_lifecycle(app)?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             model::chat_with_model,
+            memory::create_memory_candidate,
+            memory::list_memories,
+            memory::get_memory,
+            memory::update_memory_candidate,
+            memory::confirm_memory,
+            memory::delete_memory,
             open_settings_window,
             open_chat_window,
             close_settings_window,
@@ -35,102 +43,90 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
-struct SecondaryWindowDefinition {
-    label: &'static str,
-    title: &'static str,
-    width: f64,
-    height: f64,
-    min_width: f64,
-    min_height: f64,
-    production_page: &'static str,
-    dev_window_kind: &'static str,
+fn create_configured_windows(app: &mut tauri::App) -> Result<(), std::io::Error> {
+    let windows = app.config().app.windows.clone();
+    for config in windows.iter().filter(|window| !window.create) {
+        WebviewWindowBuilder::from_config(app.handle(), config)
+            .map_err(|error| std::io::Error::other(error.to_string()))?
+            .build()
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
 fn open_settings_window(app: tauri::AppHandle) -> Result<(), storage::StorageError> {
-    open_secondary_window(
-        &app,
-        SecondaryWindowDefinition {
-            label: "settings",
-            title: "Digital Life Settings",
-            width: 680.0,
-            height: 650.0,
-            min_width: 560.0,
-            min_height: 520.0,
-            production_page: "settings.html",
-            dev_window_kind: "settings",
-        },
-    )
+    show_secondary_window(&app, "settings")
 }
 
 #[tauri::command]
 fn open_chat_window(app: tauri::AppHandle) -> Result<(), storage::StorageError> {
-    open_secondary_window(
-        &app,
-        SecondaryWindowDefinition {
-            label: "chat",
-            title: "Digital Life Chat",
-            width: 680.0,
-            height: 720.0,
-            min_width: 560.0,
-            min_height: 520.0,
-            production_page: "chat.html",
-            dev_window_kind: "chat",
-        },
-    )
+    show_secondary_window(&app, "chat")
 }
 
-fn open_secondary_window(
-    app: &tauri::AppHandle,
-    definition: SecondaryWindowDefinition,
-) -> Result<(), storage::StorageError> {
-    if let Some(window) = app.get_webview_window(definition.label) {
-        window.unminimize().map_err(|error| {
+fn show_secondary_window(app: &tauri::AppHandle, label: &str) -> Result<(), storage::StorageError> {
+    let window = app.get_webview_window(label).ok_or_else(|| {
+        storage::StorageError::new(
+            "SECONDARY_WINDOW_NOT_CONFIGURED",
+            "The requested secondary window is not configured.",
+            false,
+        )
+    })?;
+    window
+        .unminimize()
+        .and_then(|_| window.set_always_on_top(true))
+        .and_then(|_| window.show())
+        .and_then(|_| window.set_focus())
+        .map_err(|error| {
             storage::StorageError::new("SECONDARY_WINDOW_ERROR", error.to_string(), true)
-        })?;
-        window.show().map_err(|error| {
-            storage::StorageError::new("SECONDARY_WINDOW_ERROR", error.to_string(), true)
-        })?;
-        window.set_focus().map_err(|error| {
-            storage::StorageError::new("SECONDARY_WINDOW_ERROR", error.to_string(), true)
-        })?;
-        return Ok(());
-    }
-
-    let uses_dev_server = app.config().build.dev_url.is_some();
-    let page = if uses_dev_server {
-        "index.html"
-    } else {
-        definition.production_page
-    };
-    let builder = WebviewWindowBuilder::new(app, definition.label, WebviewUrl::App(page.into()))
-        .title(definition.title)
-        .inner_size(definition.width, definition.height)
-        .min_inner_size(definition.min_width, definition.min_height)
-        .resizable(true)
-        .decorations(true)
-        .transparent(false);
-    let builder = if uses_dev_server {
-        builder.initialization_script(format!(
-            "window.__DIGITAL_LIFE_WINDOW_KIND__ = '{}';",
-            definition.dev_window_kind
-        ))
-    } else {
-        builder
-    };
-
-    builder.build().map(|_| ()).map_err(|error| {
-        storage::StorageError::new("SECONDARY_WINDOW_ERROR", error.to_string(), true)
-    })
+        })
 }
 
 #[tauri::command]
 fn close_settings_window(app: tauri::AppHandle) -> Result<(), storage::StorageError> {
-    if let Some(window) = app.get_webview_window("settings") {
-        window.close().map_err(|error| {
-            storage::StorageError::new("SETTINGS_WINDOW_ERROR", error.to_string(), true)
+    hide_secondary_window(&app, "settings")
+}
+
+fn hide_secondary_window(app: &tauri::AppHandle, label: &str) -> Result<(), storage::StorageError> {
+    let window = app.get_webview_window(label).ok_or_else(|| {
+        storage::StorageError::new(
+            "SECONDARY_WINDOW_NOT_CONFIGURED",
+            "The requested secondary window is not configured.",
+            false,
+        )
+    })?;
+    window
+        .set_always_on_top(false)
+        .and_then(|_| window.hide())
+        .map_err(|error| {
+            storage::StorageError::new("SECONDARY_WINDOW_ERROR", error.to_string(), true)
+        })
+}
+
+fn configure_window_lifecycle(app: &mut tauri::App) -> Result<(), std::io::Error> {
+    for label in ["chat", "settings"] {
+        let window = app.get_webview_window(label).ok_or_else(|| {
+            std::io::Error::other(format!("Configured window '{label}' is missing."))
         })?;
+        let window_to_hide = window.clone();
+        window.on_window_event(move |event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window_to_hide.set_always_on_top(false);
+                let _ = window_to_hide.hide();
+            }
+        });
     }
+
+    let main_window = app
+        .get_webview_window("main")
+        .ok_or_else(|| std::io::Error::other("Configured main window is missing."))?;
+    let app_handle = app.handle().clone();
+    main_window.on_window_event(move |event| {
+        if matches!(event, WindowEvent::CloseRequested { .. }) {
+            app_handle.exit(0);
+        }
+    });
 
     Ok(())
 }

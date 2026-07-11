@@ -1,20 +1,18 @@
 import { createApp } from "vue";
 import { createPinia } from "pinia";
 import App from "./App.vue";
-import ChatView from "./chat/ChatView.vue";
-import SettingsApp from "./settings/SettingsApp.vue";
 
-declare global {
-  interface Window {
-    __DIGITAL_LIFE_WINDOW_KIND__?: "settings" | "chat";
-  }
+function showMountFailure(): void {
+  document.documentElement.dataset.page = "error";
+  document.querySelector("#app")?.replaceChildren("Page initialization failed.");
 }
 
-const rootComponent =
-  window.__DIGITAL_LIFE_WINDOW_KIND__ === "settings"
-    ? SettingsApp
-    : window.__DIGITAL_LIFE_WINDOW_KIND__ === "chat"
-      ? ChatView
-      : App;
-
-createApp(rootComponent).use(createPinia()).mount("#app");
+try {
+  createApp(App).use(createPinia()).mount("#app");
+  document.documentElement.dataset.page = "main";
+  if (import.meta.env.DEV) {
+    console.info("[window:main] mounted");
+  }
+} catch {
+  showMountFailure();
+}

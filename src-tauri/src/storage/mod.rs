@@ -1,4 +1,5 @@
 mod location;
+mod memory;
 mod migration;
 
 use std::{
@@ -15,8 +16,14 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
 
 pub const DATABASE_FILE_NAME: &str = "digital-life.sqlite3";
-const MIGRATIONS: &[(i64, &str, &str)] =
-    &[(1, "001_initial", include_str!("migrations/001_initial.sql"))];
+const MIGRATIONS: &[(i64, &str, &str)] = &[
+    (1, "001_initial", include_str!("migrations/001_initial.sql")),
+    (
+        2,
+        "002_memory_core",
+        include_str!("migrations/002_memory_core.sql"),
+    ),
+];
 
 #[derive(Clone, Debug, Serialize)]
 pub struct StorageError {

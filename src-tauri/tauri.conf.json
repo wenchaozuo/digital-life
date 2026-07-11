@@ -12,6 +12,8 @@
   "app": {
     "windows": [
       {
+        "label": "main",
+        "create": false,
         "title": "Digital Life",
         "width": 420,
         "height": 640,
@@ -20,6 +22,36 @@
         "alwaysOnTop": true,
         "resizable": true,
         "shadow": false
+      },
+      {
+        "label": "chat",
+        "create": false,
+        "url": "chat.html",
+        "title": "Digital Life Chat",
+        "width": 680,
+        "height": 720,
+        "minWidth": 560,
+        "minHeight": 520,
+        "visible": false,
+        "transparent": false,
+        "decorations": true,
+        "resizable": true,
+        "alwaysOnTop": false
+      },
+      {
+        "label": "settings",
+        "create": false,
+        "url": "settings.html",
+        "title": "Digital Life Settings",
+        "width": 680,
+        "height": 650,
+        "minWidth": 560,
+        "minHeight": 520,
+        "visible": false,
+        "transparent": false,
+        "decorations": true,
+        "resizable": true,
+        "alwaysOnTop": false
       }
     ],
     "security": {

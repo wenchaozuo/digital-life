@@ -14,6 +14,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             storage::initialize_storage,
+            storage::get_storage_location,
+            storage::validate_storage_location,
+            storage::migrate_storage_location,
             storage::save_life_identity,
             storage::get_current_life_identity,
             storage::get_life_identity,

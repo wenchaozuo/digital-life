@@ -1,1 +1,7 @@
-export { StorageService, storageService } from "./storageService";
+export {
+  StorageService,
+  storageService,
+  type StorageLocationInfo,
+  type StorageLocationValidation,
+  type StorageMigrationResult,
+} from "./storageService";

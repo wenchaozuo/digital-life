@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { invoke } from "@tauri-apps/api/core";
 import { onMounted, onUnmounted, ref } from "vue";
 import { bodyStateMachine, defaultBodyProvider, type BodyState } from "./body";
 import { initializeDefaultLife, type LifeIdentity } from "./life";
@@ -9,7 +10,18 @@ const bodyState = ref<BodyState>("idle");
 const bodyResource = ref("");
 const lifeIdentity = ref<LifeIdentity>();
 const personaTemplate = ref<PersonaTemplate>();
+const settingsError = ref("");
 let unsubscribe: (() => void) | undefined;
+
+async function openSettings(): Promise<void> {
+  settingsError.value = "";
+
+  try {
+    await invoke("open_settings_window");
+  } catch (error: unknown) {
+    settingsError.value = error instanceof Error ? error.message : "Unable to open settings.";
+  }
+}
 
 onMounted(async () => {
   await storageService.initialize();
@@ -31,8 +43,18 @@ onUnmounted(() => unsubscribe?.());
 </script>
 
 <template>
-  <main class="desktop-body" data-tauri-drag-region>
+  <main class="desktop-body">
     <section class="body-card" aria-label="Digital Life desktop body">
+      <button
+        class="settings-button"
+        type="button"
+        aria-label="Open storage settings"
+        title="Settings"
+        @mousedown.stop
+        @click.stop="openSettings"
+      >
+        ⚙
+      </button>
       <img
         v-if="bodyResource"
         :src="bodyResource"
@@ -46,6 +68,7 @@ onUnmounted(() => unsubscribe?.());
         <span>Persona: {{ personaTemplate?.name }}</span>
         <span>Persona Version: {{ personaTemplate?.version }}</span>
         <span>State: {{ bodyState }}</span>
+        <span v-if="settingsError" class="settings-error">{{ settingsError }}</span>
       </div>
     </section>
   </main>
@@ -76,11 +99,33 @@ body,
 }
 
 .body-card {
+  position: relative;
   display: grid;
   justify-items: center;
   gap: 0.5rem;
   max-width: min(82vw, 340px);
   padding: 1rem;
+}
+
+.settings-button {
+  position: absolute;
+  z-index: 1;
+  top: 0.25rem;
+  right: 0.25rem;
+  width: 2rem;
+  height: 2rem;
+  border: 1px solid rgb(255 255 255 / 32%);
+  border-radius: 999px;
+  background: rgb(15 23 42 / 82%);
+  color: #e0f2fe;
+  cursor: pointer;
+  font-size: 1rem;
+  line-height: 1;
+}
+
+.settings-button:hover,
+.settings-button:focus-visible {
+  background: rgb(14 116 144 / 92%);
 }
 
 .body-image {
@@ -104,5 +149,9 @@ body,
 .status span {
   color: #b9f6ff;
   font-size: 0.875rem;
+}
+
+.status .settings-error {
+  color: #fecaca;
 }
 </style>

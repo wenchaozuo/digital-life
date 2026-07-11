@@ -1,3 +1,4 @@
+pub mod model;
 mod storage;
 
 use tauri::Manager;
@@ -15,6 +16,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            model::chat_with_model,
             open_settings_window,
             close_settings_window,
             storage::initialize_storage,

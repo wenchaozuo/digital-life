@@ -25,6 +25,7 @@ pub fn run() {
             memory::update_memory_candidate,
             memory::confirm_memory,
             memory::delete_memory,
+            memory::retrieval::retrieve_memories,
             open_settings_window,
             open_chat_window,
             close_settings_window,

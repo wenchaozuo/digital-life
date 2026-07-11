@@ -18,3 +18,4 @@ export {
   type MemoryStatus,
   type UpdateMemoryRequest,
 } from "./types";
+export * from "./retrieval";

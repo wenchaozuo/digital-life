@@ -6,7 +6,7 @@ export interface ModelConfig {
   modelName: string;
 }
 
-export type ModelMessageRole = "user" | "assistant";
+export type ModelMessageRole = "user" | "assistant" | "system";
 
 export interface ModelMessage {
   role: ModelMessageRole;

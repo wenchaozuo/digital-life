@@ -22,6 +22,7 @@ pub struct ModelConfig {
 pub enum ModelMessageRole {
     User,
     Assistant,
+    System,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

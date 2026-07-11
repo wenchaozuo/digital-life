@@ -126,6 +126,7 @@ impl OpenAICompatibleProvider {
             role: match message.role {
                 ModelMessageRole::User => "user",
                 ModelMessageRole::Assistant => "assistant",
+                ModelMessageRole::System => "system",
             },
             content: message.content,
         }));

@@ -1,36 +1,14 @@
 import { bodyStateMachine } from "../body";
 import { lifeIdentityManager, type LifeIdentity } from "../life";
-import {
-  modelService,
-  type ModelConfig,
-  type ModelRequest,
-  type ModelResponse,
-} from "../model";
+import { modelService, type ModelRequest } from "../model";
 import { personaManager, type PersonaTemplate } from "../persona";
-import { PromptCompiler, type PromptCompilerVersion } from "../prompt";
-
-export type ConversationMessageRole = "user" | "assistant";
-
-export interface ConversationMessage {
-  role: ConversationMessageRole;
-  content: string;
-}
-
-export interface ConversationRequest {
-  userInput: string;
-  modelConfig: ModelConfig;
-  temperature: number;
-  maxTokens: number;
-}
-
-export interface ConversationResponse {
-  lifeId: string;
-  personaId: string;
-  promptCompilerVersion: PromptCompilerVersion;
-  userMessage: ConversationMessage;
-  assistantMessage: ConversationMessage;
-  modelResponse: ModelResponse;
-}
+import { PromptCompiler } from "../prompt";
+import { ConversationSession } from "./session";
+import type {
+  ConversationMessage,
+  ConversationRequest,
+  ConversationResponse,
+} from "./types";
 
 export class ConversationError extends Error {
   constructor(
@@ -45,7 +23,16 @@ export class ConversationError extends Error {
 
 export class ConversationService {
   private readonly promptCompiler = new PromptCompiler();
+  private readonly session = new ConversationSession();
   private isSending = false;
+
+  getSession(): ConversationSession {
+    return this.session;
+  }
+
+  clearSession(): void {
+    this.session.clear();
+  }
 
   async send(request: ConversationRequest): Promise<ConversationResponse> {
     const userInput = request.userInput.trim();
@@ -72,9 +59,18 @@ export class ConversationService {
       const life = await this.requireCurrentLife();
       const persona = await this.requirePersona(life);
       const compilation = this.promptCompiler.compile(persona);
-      const userMessage: ConversationMessage = { role: "user", content: userInput };
+      const userMessage: ConversationMessage = {
+        role: "user",
+        content: userInput,
+        timestamp: new Date().toISOString(),
+      };
+      const history = this.session.getMessages();
+      this.session.addMessage(userMessage);
       const modelRequest: ModelRequest = {
-        messages: [userMessage],
+        messages: [...history, userMessage].map(({ role, content }) => ({
+          role,
+          content,
+        })),
         systemContext: compilation.systemContext,
         temperature: request.temperature,
         maxTokens: request.maxTokens,
@@ -83,10 +79,13 @@ export class ConversationService {
       const assistantMessage: ConversationMessage = {
         role: "assistant",
         content: modelResponse.text,
+        timestamp: new Date().toISOString(),
       };
+      this.session.addMessage(assistantMessage);
 
       bodyStateMachine.transition("speaking");
       return {
+        sessionId: this.session.sessionId,
         lifeId: life.id,
         personaId: persona.id,
         promptCompilerVersion: compilation.compilerVersion,

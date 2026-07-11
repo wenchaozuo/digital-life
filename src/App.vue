@@ -2,13 +2,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { onMounted, onUnmounted, ref } from "vue";
 import { bodyStateMachine, defaultBodyProvider, type BodyState } from "./body";
-import {
-  ConversationError,
-  conversationService,
-  type ConversationResponse,
-} from "./conversation";
 import { initializeDefaultLife, type LifeIdentity } from "./life";
-import type { ModelConfig } from "./model";
 import { personaManager, type PersonaTemplate } from "./persona";
 import { storageService } from "./storage";
 
@@ -17,13 +11,6 @@ const bodyResource = ref("");
 const lifeIdentity = ref<LifeIdentity>();
 const personaTemplate = ref<PersonaTemplate>();
 const settingsError = ref("");
-const testEndpoint = ref("");
-const testApiKey = ref("");
-const testModelName = ref("");
-const testInput = ref("");
-const conversationResponse = ref<ConversationResponse>();
-const conversationError = ref("");
-const isSending = ref(false);
 let unsubscribe: (() => void) | undefined;
 
 async function openSettings(): Promise<void> {
@@ -36,35 +23,12 @@ async function openSettings(): Promise<void> {
   }
 }
 
-async function sendConversationTest(): Promise<void> {
-  if (isSending.value) {
-    return;
-  }
-
-  isSending.value = true;
-  conversationResponse.value = undefined;
-  conversationError.value = "";
-
-  const modelConfig: ModelConfig = {
-    baseUrl: testEndpoint.value,
-    apiKey: testApiKey.value,
-    modelName: testModelName.value,
-  };
-
+async function openChat(): Promise<void> {
+  settingsError.value = "";
   try {
-    conversationResponse.value = await conversationService.send({
-      userInput: testInput.value,
-      modelConfig,
-      temperature: 0.7,
-      maxTokens: 512,
-    });
+    await invoke("open_chat_window");
   } catch (error) {
-    conversationError.value =
-      error instanceof ConversationError
-        ? `${error.code}: ${error.message}`
-        : "CONVERSATION_MODEL_FAILED: The model request could not be completed.";
-  } finally {
-    isSending.value = false;
+    settingsError.value = error instanceof Error ? error.message : "Unable to open chat.";
   }
 }
 
@@ -90,16 +54,26 @@ onUnmounted(() => unsubscribe?.());
 <template>
   <main class="desktop-body">
     <section class="body-card" aria-label="Digital Life desktop body">
-      <button
-        class="settings-button"
-        type="button"
-        aria-label="Open storage settings"
-        title="Settings"
-        @mousedown.stop
-        @click.stop="openSettings"
-      >
-        ⚙
-      </button>
+      <div class="window-actions">
+        <button
+          type="button"
+          aria-label="Open chat"
+          title="Chat"
+          @mousedown.stop
+          @click.stop="openChat"
+        >
+          Chat
+        </button>
+        <button
+          type="button"
+          aria-label="Open storage settings"
+          title="Settings"
+          @mousedown.stop
+          @click.stop="openSettings"
+        >
+          ⚙
+        </button>
+      </div>
       <img
         v-if="bodyResource"
         :src="bodyResource"
@@ -115,33 +89,6 @@ onUnmounted(() => unsubscribe?.());
         <span>State: {{ bodyState }}</span>
         <span v-if="settingsError" class="settings-error">{{ settingsError }}</span>
       </div>
-      <details class="conversation-test">
-        <summary>Conversation test</summary>
-        <label>
-          Endpoint
-          <input v-model="testEndpoint" autocomplete="off" placeholder="Runtime only" />
-        </label>
-        <label>
-          API key
-          <input v-model="testApiKey" type="password" autocomplete="off" placeholder="Runtime only" />
-        </label>
-        <label>
-          Model
-          <input v-model="testModelName" autocomplete="off" placeholder="Model name" />
-        </label>
-        <label>
-          Message
-          <input v-model="testInput" autocomplete="off" placeholder="Type a test message" />
-        </label>
-        <button type="button" :disabled="isSending" @click="sendConversationTest">
-          {{ isSending ? "Sending…" : "Send" }}
-        </button>
-        <p v-if="conversationResponse" class="conversation-result">
-          <strong>You:</strong> {{ conversationResponse.userMessage.content }}
-          <strong>Life:</strong> {{ conversationResponse.assistantMessage.content }}
-        </p>
-        <p v-if="conversationError" class="settings-error">{{ conversationError }}</p>
-      </details>
     </section>
   </main>
 </template>
@@ -179,12 +126,17 @@ body,
   padding: 1rem;
 }
 
-.settings-button {
+.window-actions {
   position: absolute;
   z-index: 1;
   top: 0.25rem;
   right: 0.25rem;
-  width: 2rem;
+  display: flex;
+  gap: 0.35rem;
+}
+
+.window-actions button {
+  min-width: 2rem;
   height: 2rem;
   border: 1px solid rgb(255 255 255 / 32%);
   border-radius: 999px;
@@ -195,8 +147,8 @@ body,
   line-height: 1;
 }
 
-.settings-button:hover,
-.settings-button:focus-visible {
+.window-actions button:hover,
+.window-actions button:focus-visible {
   background: rgb(14 116 144 / 92%);
 }
 
@@ -227,55 +179,4 @@ body,
   color: #fecaca;
 }
 
-.conversation-test {
-  display: grid;
-  width: min(82vw, 340px);
-  gap: 0.5rem;
-  color: #e0f2fe;
-  font-size: 0.8rem;
-}
-
-.conversation-test summary {
-  cursor: pointer;
-  text-align: center;
-}
-
-.conversation-test[open] {
-  padding: 0.65rem;
-  border: 1px solid rgb(255 255 255 / 22%);
-  border-radius: 0.75rem;
-  background: rgb(15 23 42 / 78%);
-}
-
-.conversation-test label {
-  display: grid;
-  gap: 0.2rem;
-}
-
-.conversation-test input,
-.conversation-test button {
-  box-sizing: border-box;
-  width: 100%;
-  border: 1px solid rgb(255 255 255 / 32%);
-  border-radius: 0.4rem;
-  background: rgb(15 23 42 / 88%);
-  color: #f8fafc;
-  padding: 0.35rem 0.45rem;
-}
-
-.conversation-test button {
-  cursor: pointer;
-}
-
-.conversation-test button:disabled {
-  cursor: not-allowed;
-  opacity: 0.6;
-}
-
-.conversation-result {
-  display: grid;
-  gap: 0.2rem;
-  margin: 0;
-  overflow-wrap: anywhere;
-}
 </style>

@@ -18,6 +18,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             model::chat_with_model,
             open_settings_window,
+            open_chat_window,
             close_settings_window,
             storage::initialize_storage,
             storage::get_storage_location,
@@ -34,17 +35,64 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
+struct SecondaryWindowDefinition {
+    label: &'static str,
+    title: &'static str,
+    width: f64,
+    height: f64,
+    min_width: f64,
+    min_height: f64,
+    production_page: &'static str,
+    dev_window_kind: &'static str,
+}
+
 #[tauri::command]
 fn open_settings_window(app: tauri::AppHandle) -> Result<(), storage::StorageError> {
-    if let Some(window) = app.get_webview_window("settings") {
+    open_secondary_window(
+        &app,
+        SecondaryWindowDefinition {
+            label: "settings",
+            title: "Digital Life Settings",
+            width: 680.0,
+            height: 650.0,
+            min_width: 560.0,
+            min_height: 520.0,
+            production_page: "settings.html",
+            dev_window_kind: "settings",
+        },
+    )
+}
+
+#[tauri::command]
+fn open_chat_window(app: tauri::AppHandle) -> Result<(), storage::StorageError> {
+    open_secondary_window(
+        &app,
+        SecondaryWindowDefinition {
+            label: "chat",
+            title: "Digital Life Chat",
+            width: 680.0,
+            height: 720.0,
+            min_width: 560.0,
+            min_height: 520.0,
+            production_page: "chat.html",
+            dev_window_kind: "chat",
+        },
+    )
+}
+
+fn open_secondary_window(
+    app: &tauri::AppHandle,
+    definition: SecondaryWindowDefinition,
+) -> Result<(), storage::StorageError> {
+    if let Some(window) = app.get_webview_window(definition.label) {
         window.unminimize().map_err(|error| {
-            storage::StorageError::new("SETTINGS_WINDOW_ERROR", error.to_string(), true)
+            storage::StorageError::new("SECONDARY_WINDOW_ERROR", error.to_string(), true)
         })?;
         window.show().map_err(|error| {
-            storage::StorageError::new("SETTINGS_WINDOW_ERROR", error.to_string(), true)
+            storage::StorageError::new("SECONDARY_WINDOW_ERROR", error.to_string(), true)
         })?;
         window.set_focus().map_err(|error| {
-            storage::StorageError::new("SETTINGS_WINDOW_ERROR", error.to_string(), true)
+            storage::StorageError::new("SECONDARY_WINDOW_ERROR", error.to_string(), true)
         })?;
         return Ok(());
     }
@@ -53,23 +101,26 @@ fn open_settings_window(app: tauri::AppHandle) -> Result<(), storage::StorageErr
     let page = if uses_dev_server {
         "index.html"
     } else {
-        "settings.html"
+        definition.production_page
     };
-    let builder = WebviewWindowBuilder::new(&app, "settings", WebviewUrl::App(page.into()))
-        .title("Digital Life Settings")
-        .inner_size(680.0, 650.0)
-        .min_inner_size(560.0, 520.0)
+    let builder = WebviewWindowBuilder::new(app, definition.label, WebviewUrl::App(page.into()))
+        .title(definition.title)
+        .inner_size(definition.width, definition.height)
+        .min_inner_size(definition.min_width, definition.min_height)
         .resizable(true)
         .decorations(true)
         .transparent(false);
     let builder = if uses_dev_server {
-        builder.initialization_script("window.__DIGITAL_LIFE_WINDOW_KIND__ = 'settings';")
+        builder.initialization_script(format!(
+            "window.__DIGITAL_LIFE_WINDOW_KIND__ = '{}';",
+            definition.dev_window_kind
+        ))
     } else {
         builder
     };
 
     builder.build().map(|_| ()).map_err(|error| {
-        storage::StorageError::new("SETTINGS_WINDOW_ERROR", error.to_string(), true)
+        storage::StorageError::new("SECONDARY_WINDOW_ERROR", error.to_string(), true)
     })
 }
 

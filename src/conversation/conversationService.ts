@@ -1,8 +1,13 @@
 import { bodyStateMachine } from "../body";
 import { lifeIdentityManager, type LifeIdentity } from "../life";
 import { modelService, type ModelRequest } from "../model";
+import { memoryRetrieverService } from "../memory";
 import { personaManager, type PersonaTemplate } from "../persona";
 import { PromptCompiler } from "../prompt";
+import {
+  combineConversationSystemContext,
+  prepareConversationMemoryContext,
+} from "./memoryContextIntegration";
 import { ConversationSession } from "./session";
 import type {
   ConversationMessage,
@@ -59,6 +64,15 @@ export class ConversationService {
       const life = await this.requireCurrentLife();
       const persona = await this.requirePersona(life);
       const compilation = this.promptCompiler.compile(persona);
+      const memoryPreparation = await prepareConversationMemoryContext(
+        life.id,
+        userInput,
+        memoryRetrieverService,
+      );
+      const systemContext = combineConversationSystemContext(
+        compilation.systemContext,
+        memoryPreparation.memoryContext,
+      );
       const userMessage: ConversationMessage = {
         role: "user",
         content: userInput,
@@ -71,7 +85,7 @@ export class ConversationService {
           role,
           content,
         })),
-        systemContext: compilation.systemContext,
+        systemContext,
         temperature: request.temperature,
         maxTokens: request.maxTokens,
       };
@@ -92,6 +106,12 @@ export class ConversationService {
         userMessage,
         assistantMessage,
         modelResponse,
+        retrievedMemoryCount:
+          memoryPreparation.memoryContext.retrievedCount,
+        usedMemoryCount: memoryPreparation.memoryContext.usedCount,
+        usedMemoryIds: memoryPreparation.memoryContext.usedMemoryIds,
+        memoryContextTruncated: memoryPreparation.memoryContext.truncated,
+        memoryWarning: memoryPreparation.warning,
       };
     } catch (error) {
       bodyStateMachine.transition("error");

@@ -7,15 +7,17 @@ type ConversationSessionListener = () => void;
 export class ConversationSession {
   readonly sessionId: string;
   readonly createdAt: string;
+  private readonly messageLimit: number;
   private messageHistory: ConversationMessage[] = [];
   private activityAt: string;
   private readonly listeners = new Set<ConversationSessionListener>();
 
   constructor(
-    private readonly messageLimit = DEFAULT_SESSION_MESSAGE_LIMIT,
+    messageLimit = DEFAULT_SESSION_MESSAGE_LIMIT,
     sessionId = crypto.randomUUID(),
     createdAt = new Date().toISOString(),
   ) {
+    this.messageLimit = messageLimit;
     this.sessionId = sessionId;
     this.createdAt = createdAt;
     this.activityAt = createdAt;

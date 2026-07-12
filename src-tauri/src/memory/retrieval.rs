@@ -6,8 +6,7 @@ use crate::{
     storage::StorageService,
 };
 
-const MAX_QUERY_LENGTH: usize = 512;
-const MAX_QUERY_TERMS: usize = 16;
+const MAX_QUERY_LENGTH: usize = 4000;
 const MAX_RESULT_LIMIT: u32 = 100;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -69,9 +68,6 @@ fn validate_query(query: &RetrievalQuery) -> Result<(), MemoryError> {
     }
     if query_text.chars().count() > MAX_QUERY_LENGTH {
         return Err(invalid_query("queryText is too long."));
-    }
-    if query_text.split_whitespace().count() > MAX_QUERY_TERMS {
-        return Err(invalid_query("queryText contains too many search terms."));
     }
     if query.limit == 0 || query.limit > MAX_RESULT_LIMIT {
         return Err(invalid_query("limit must be between 1 and 100."));

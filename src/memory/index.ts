@@ -19,3 +19,4 @@ export {
   type UpdateMemoryRequest,
 } from "./types";
 export * from "./retrieval";
+export * from "./context";

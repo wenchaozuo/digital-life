@@ -1,7 +1,12 @@
 import { bodyStateMachine } from "../body";
 import { lifeIdentityManager, type LifeIdentity } from "../life";
 import { modelService, type ModelRequest } from "../model";
-import { memoryRetrieverService } from "../memory";
+import {
+  MemorySourceTypes,
+  memoryExtractor,
+  memoryRetrieverService,
+  type MemoryExtractionResult,
+} from "../memory";
 import { personaManager, type PersonaTemplate } from "../persona";
 import { PromptCompiler } from "../prompt";
 import {
@@ -37,6 +42,15 @@ export class ConversationService {
 
   clearSession(): void {
     this.session.clear();
+  }
+
+  async extractMemoryCandidates(): Promise<MemoryExtractionResult> {
+    const life = await this.requireCurrentLife();
+    return memoryExtractor.extract({
+      lifeId: life.id,
+      messages: this.session.getMessages(),
+      sourceType: MemorySourceTypes.Conversation,
+    });
   }
 
   async send(request: ConversationRequest): Promise<ConversationResponse> {

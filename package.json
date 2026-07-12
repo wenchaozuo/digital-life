@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
-    "test": "node --test tests/memoryContextBuilder.test.ts tests/memoryContextIntegration.test.ts tests/memoryExtractor.test.ts",
+    "test": "node tests/checkNoExplicitAny.mjs && node --test tests/memoryContextBuilder.test.ts tests/memoryContextIntegration.test.ts tests/memoryExtractor.test.ts tests/memoryReview.test.ts",
     "preview": "vite preview",
     "tauri": "tauri"
   },

@@ -1,6 +1,7 @@
 pub mod embedding;
 pub mod memory;
 pub mod model;
+pub mod prompt;
 pub mod secrets;
 mod storage;
 pub mod vector_store;

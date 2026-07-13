@@ -168,8 +168,14 @@ struct JobEntry {
 #[derive(Default)]
 struct JobRegistry {
     jobs: HashMap<VectorIndexJobId, JobEntry>,
-    active_lives: HashMap<String, VectorIndexJobId>,
+    active_lives: HashMap<String, ActiveIndexOperation>,
     completed_order: VecDeque<VectorIndexJobId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ActiveIndexOperation {
+    Rebuild(VectorIndexJobId),
+    SyncWorker,
 }
 
 pub struct MemoryVectorIndexRuntimeCoordinator {
@@ -196,9 +202,10 @@ impl MemoryVectorIndexRuntimeCoordinator {
             ));
         }
         let job_id = generate_job_id(&self.sequence);
-        registry
-            .active_lives
-            .insert(life_id.clone(), job_id.clone());
+        registry.active_lives.insert(
+            life_id.clone(),
+            ActiveIndexOperation::Rebuild(job_id.clone()),
+        );
         registry.jobs.insert(
             job_id.clone(),
             JobEntry {
@@ -317,7 +324,11 @@ impl MemoryVectorIndexRuntimeCoordinator {
                 None
             };
             if let Some(life_id) = life_id {
-                registry.active_lives.remove(&life_id);
+                if registry.active_lives.get(&life_id)
+                    == Some(&ActiveIndexOperation::Rebuild(job_id.clone()))
+                {
+                    registry.active_lives.remove(&life_id);
+                }
                 registry.completed_order.push_back(job_id.clone());
                 while registry.completed_order.len() > MAX_COMPLETED_JOBS {
                     if let Some(oldest) = registry.completed_order.pop_front() {
@@ -339,9 +350,34 @@ impl MemoryVectorIndexRuntimeCoordinator {
     }
 
     fn is_running(&self, life_id: &str) -> bool {
-        self.registry
-            .lock()
-            .is_ok_and(|registry| registry.active_lives.contains_key(life_id))
+        self.registry.lock().is_ok_and(|registry| {
+            matches!(
+                registry.active_lives.get(life_id),
+                Some(ActiveIndexOperation::Rebuild(_))
+            )
+        })
+    }
+
+    pub(crate) fn begin_sync_worker(&self, life_id: &str) -> Result<(), VectorIndexRuntimeError> {
+        validate_life_id(life_id)?;
+        let mut registry = self.registry()?;
+        if registry.active_lives.contains_key(life_id) {
+            return Err(runtime_error(
+                VectorIndexRuntimeErrorCode::RebuildAlreadyRunning,
+            ));
+        }
+        registry
+            .active_lives
+            .insert(life_id.to_string(), ActiveIndexOperation::SyncWorker);
+        Ok(())
+    }
+
+    pub(crate) fn finish_sync_worker(&self, life_id: &str) {
+        if let Ok(mut registry) = self.registry.lock() {
+            if registry.active_lives.get(life_id) == Some(&ActiveIndexOperation::SyncWorker) {
+                registry.active_lives.remove(life_id);
+            }
+        }
     }
 
     fn registry(&self) -> Result<MutexGuard<'_, JobRegistry>, VectorIndexRuntimeError> {
@@ -994,6 +1030,30 @@ mod tests {
             Some(runtime_error(VectorIndexRuntimeErrorCode::RebuildCancelled)),
         );
         assert!(jobs.start_job("life-a".into()).is_ok());
+    }
+
+    #[test]
+    fn rebuild_and_sync_worker_share_the_same_life_operation_gate() {
+        let operations = MemoryVectorIndexRuntimeCoordinator::default();
+        operations.begin_sync_worker("life-a").unwrap();
+        assert_eq!(
+            operations.start_job("life-a".into()).unwrap_err().code,
+            VectorIndexRuntimeErrorCode::RebuildAlreadyRunning
+        );
+        assert!(operations.start_job("life-b".into()).is_ok());
+        operations.finish_sync_worker("life-a");
+        let rebuild = operations.start_job("life-a".into()).unwrap();
+        assert_eq!(
+            operations.begin_sync_worker("life-a").unwrap_err().code,
+            VectorIndexRuntimeErrorCode::RebuildAlreadyRunning
+        );
+        operations.finish(
+            &rebuild,
+            VectorIndexJobStatus::Cancelled,
+            None,
+            Some(runtime_error(VectorIndexRuntimeErrorCode::RebuildCancelled)),
+        );
+        operations.begin_sync_worker("life-a").unwrap();
     }
 
     #[test]

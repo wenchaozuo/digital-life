@@ -22,4 +22,10 @@ commands.allow = [
     "start_memory_vector_index_rebuild",
     "get_memory_vector_index_job",
     "cancel_memory_vector_index_job",
+    "get_memory_vector_sync_settings",
+    "set_memory_vector_sync_enabled",
+    "get_memory_vector_sync_status",
+    "start_memory_vector_sync",
+    "pause_memory_vector_sync",
+    "retry_memory_vector_sync_failures",
 ]

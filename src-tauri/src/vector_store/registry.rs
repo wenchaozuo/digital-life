@@ -108,6 +108,56 @@ impl LanceDbVectorStoreRegistry {
         Ok(Some(store))
     }
 
+    /// Opens the derived index for an explicitly authorized write operation.
+    /// Unlike `existing_store`, this is allowed to initialize the fixed
+    /// `<dataRoot>/vectors/lancedb` directory.
+    pub async fn store_for_write(
+        &self,
+        data_root: &Path,
+    ) -> Result<Arc<LanceDbVectorStore>, LanceDbVectorStoreRegistryError> {
+        let index_root = data_root.join("vectors").join("lancedb");
+        if index_root.exists() && !index_root.is_dir() {
+            return Err(error(LanceDbVectorStoreRegistryErrorCode::StoreUnavailable));
+        }
+        if index_root.is_dir() {
+            let canonical_root = std::fs::canonicalize(&index_root)
+                .map_err(|_| error(LanceDbVectorStoreRegistryErrorCode::StoreUnavailable))?;
+            if let Some(store) = self.lookup(&canonical_root)? {
+                return Ok(store);
+            }
+        }
+        let store = Arc::new(
+            LanceDbVectorStore::open(&index_root)
+                .await
+                .map_err(|_| error(LanceDbVectorStoreRegistryErrorCode::StoreUnavailable))?,
+        );
+        let canonical_root = std::fs::canonicalize(&index_root)
+            .map_err(|_| error(LanceDbVectorStoreRegistryErrorCode::StoreUnavailable))?;
+        let mut stores = self
+            .stores
+            .lock()
+            .map_err(|_| error(LanceDbVectorStoreRegistryErrorCode::StoreUnavailable))?;
+        if let Some(position) = stores
+            .iter()
+            .position(|entry| entry.canonical_root == canonical_root)
+        {
+            let entry = stores
+                .remove(position)
+                .expect("position was derived from deque");
+            let existing = Arc::clone(&entry.store);
+            stores.push_front(entry);
+            return Ok(existing);
+        }
+        stores.push_front(CachedStore {
+            canonical_root,
+            store: Arc::clone(&store),
+        });
+        while stores.len() > self.capacity {
+            stores.pop_back();
+        }
+        Ok(store)
+    }
+
     fn lookup(
         &self,
         canonical_root: &Path,

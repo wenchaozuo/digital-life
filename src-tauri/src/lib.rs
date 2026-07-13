@@ -25,6 +25,7 @@ pub fn run() {
             app.manage(
                 memory::vector_index_runtime::MemoryVectorIndexRuntimeCoordinator::default(),
             );
+            app.manage(memory::vector_sync_worker::MemoryVectorSyncWorkerCoordinator::default());
             create_configured_windows(app)?;
             configure_window_lifecycle(app)?;
             Ok(())
@@ -49,6 +50,12 @@ pub fn run() {
             memory::vector_index_runtime::start_memory_vector_index_rebuild,
             memory::vector_index_runtime::get_memory_vector_index_job,
             memory::vector_index_runtime::cancel_memory_vector_index_job,
+            memory::vector_sync_worker::get_memory_vector_sync_settings,
+            memory::vector_sync_worker::set_memory_vector_sync_enabled,
+            memory::vector_sync_worker::get_memory_vector_sync_status,
+            memory::vector_sync_worker::start_memory_vector_sync,
+            memory::vector_sync_worker::pause_memory_vector_sync,
+            memory::vector_sync_worker::retry_memory_vector_sync_failures,
             secrets::save_api_credential,
             secrets::has_api_credential,
             secrets::delete_api_credential,

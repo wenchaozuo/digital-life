@@ -12,7 +12,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    embedding::{EmbeddingProvider, EmbeddingPurpose, EmbeddingRequest, EmbeddingResponse},
+    embedding::{
+        EmbeddingError, EmbeddingErrorCode, EmbeddingProvider, EmbeddingPurpose, EmbeddingRequest,
+        EmbeddingResponse,
+    },
     vector_store::{VectorRecord, VectorSpace, VectorStore},
 };
 
@@ -92,6 +95,11 @@ pub enum MemoryIndexErrorCode {
     EmptyIndexText,
     RepositoryUnavailable,
     EmbeddingFailed,
+    AuthenticationFailed,
+    RateLimited,
+    NetworkUnavailable,
+    RequestTimeout,
+    InvalidProviderResponse,
     DimensionMismatch,
     VectorStoreFailed,
     PartialIndexFailure,
@@ -251,7 +259,7 @@ where
                 purpose: EmbeddingPurpose::Document,
             })
             .await
-            .map_err(|_| embedding_failed())?;
+            .map_err(map_embedding_error)?;
         validate_embedding_response(&response, 1, &self.vector_space)?;
         let vector = response
             .vectors
@@ -400,7 +408,7 @@ where
                     purpose: EmbeddingPurpose::Document,
                 })
                 .await
-                .map_err(|_| embedding_failed())?;
+                .map_err(map_embedding_error)?;
             validate_embedding_response(&response, batch.len(), &self.vector_space)?;
             for (payload, vector) in batch.iter().zip(response.vectors) {
                 records.push(VectorRecord {
@@ -671,6 +679,28 @@ fn embedding_failed() -> MemoryIndexError {
         MemoryIndexErrorCode::EmbeddingFailed,
         "Memory embedding generation failed.",
         true,
+    )
+}
+
+fn map_embedding_error(error: EmbeddingError) -> MemoryIndexError {
+    let code = match error.code {
+        EmbeddingErrorCode::AuthenticationFailed => MemoryIndexErrorCode::AuthenticationFailed,
+        EmbeddingErrorCode::RateLimited => MemoryIndexErrorCode::RateLimited,
+        EmbeddingErrorCode::NetworkError => MemoryIndexErrorCode::NetworkUnavailable,
+        EmbeddingErrorCode::RequestTimeout => MemoryIndexErrorCode::RequestTimeout,
+        EmbeddingErrorCode::InvalidProviderResponse => {
+            MemoryIndexErrorCode::InvalidProviderResponse
+        }
+        EmbeddingErrorCode::DimensionMismatch => MemoryIndexErrorCode::DimensionMismatch,
+        EmbeddingErrorCode::InvalidRequest
+        | EmbeddingErrorCode::EmptyText
+        | EmbeddingErrorCode::BatchLimitExceeded
+        | EmbeddingErrorCode::TextLimitExceeded => MemoryIndexErrorCode::EmbeddingFailed,
+    };
+    MemoryIndexError::new(
+        code,
+        "Memory embedding generation failed.",
+        error.recoverable,
     )
 }
 
@@ -1458,7 +1488,7 @@ mod tests {
                 })
                 .await
                 .unwrap_err();
-            assert_eq!(error.code, MemoryIndexErrorCode::EmbeddingFailed);
+            assert_eq!(error.code, MemoryIndexErrorCode::NetworkUnavailable);
             assert_eq!(store.count("life", Some(&test_space())).await.unwrap(), 1);
             assert_eq!(repository.count_rows("life"), 1);
         });

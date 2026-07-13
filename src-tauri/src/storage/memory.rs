@@ -476,7 +476,7 @@ mod tests {
             .connection
             .query_row("SELECT COUNT(*) FROM memory_record", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         assert_eq!(memory_count, 0);
     }
 

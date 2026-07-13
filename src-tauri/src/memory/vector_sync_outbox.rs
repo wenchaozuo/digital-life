@@ -87,6 +87,13 @@ pub struct ClaimMemoryVectorSyncRequest {
     pub lease_expires_at: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClaimMemoryVectorSyncLeaseRequest {
+    pub life_id: String,
+    pub lease_owner: String,
+    pub lease_seconds: u32,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum MemoryVectorSyncOutboxErrorCode {
@@ -148,12 +155,24 @@ pub trait MemoryVectorSyncOutboxRepository: Send + Sync {
         &self,
         request: ClaimMemoryVectorSyncRequest,
     ) -> Result<Option<MemoryVectorSyncJob>, MemoryVectorSyncOutboxError>;
+    fn claim_next_with_lease(
+        &self,
+        request: ClaimMemoryVectorSyncLeaseRequest,
+    ) -> Result<Option<MemoryVectorSyncJob>, MemoryVectorSyncOutboxError>;
     fn mark_retry(
         &self,
         life_id: &str,
         memory_id: &str,
         lease_owner: &str,
         next_attempt_at: &str,
+        error_code: &str,
+    ) -> Result<(), MemoryVectorSyncOutboxError>;
+    fn mark_retry_after(
+        &self,
+        life_id: &str,
+        memory_id: &str,
+        lease_owner: &str,
+        delay_seconds: u32,
         error_code: &str,
     ) -> Result<(), MemoryVectorSyncOutboxError>;
     fn mark_blocked(
@@ -183,4 +202,5 @@ pub trait MemoryVectorSyncOutboxRepository: Send + Sync {
         life_id: &str,
         state: MemoryVectorSyncState,
     ) -> Result<usize, MemoryVectorSyncOutboxError>;
+    fn retry_failures(&self, life_id: &str) -> Result<usize, MemoryVectorSyncOutboxError>;
 }

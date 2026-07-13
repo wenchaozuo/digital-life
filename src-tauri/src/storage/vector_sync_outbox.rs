@@ -1,9 +1,10 @@
-use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 
 use crate::memory::vector_sync_outbox::{
-    ClaimMemoryVectorSyncRequest, EnqueueMemoryVectorSyncRequest, MemoryVectorSyncAction,
-    MemoryVectorSyncJob, MemoryVectorSyncOutboxError, MemoryVectorSyncOutboxErrorCode,
-    MemoryVectorSyncOutboxRepository, MemoryVectorSyncState,
+    ClaimMemoryVectorSyncLeaseRequest, ClaimMemoryVectorSyncRequest,
+    EnqueueMemoryVectorSyncRequest, MemoryVectorSyncAction, MemoryVectorSyncJob,
+    MemoryVectorSyncOutboxError, MemoryVectorSyncOutboxErrorCode, MemoryVectorSyncOutboxRepository,
+    MemoryVectorSyncState,
 };
 
 use super::StorageService;
@@ -58,7 +59,10 @@ impl MemoryVectorSyncOutboxRepository for StorageService {
         request: EnqueueMemoryVectorSyncRequest,
     ) -> Result<MemoryVectorSyncJob, MemoryVectorSyncOutboxError> {
         let mut state = self.state().map_err(|_| outbox_error())?;
-        let transaction = state.connection.transaction().map_err(|_| outbox_error())?;
+        let transaction = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| outbox_error())?;
         enqueue_in_transaction(
             &transaction,
             &request.life_id,
@@ -80,7 +84,10 @@ impl MemoryVectorSyncOutboxRepository for StorageService {
             &request.lease_expires_at,
         )?;
         let mut state = self.state().map_err(|_| outbox_error())?;
-        let transaction = state.connection.transaction().map_err(|_| outbox_error())?;
+        let transaction = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| outbox_error())?;
         transaction.execute(
             "UPDATE memory_vector_sync_outbox SET state = 'pending', lease_owner = NULL, lease_expires_at = NULL,
              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
@@ -114,6 +121,49 @@ impl MemoryVectorSyncOutboxRepository for StorageService {
         Ok(Some(job))
     }
 
+    fn claim_next_with_lease(
+        &self,
+        request: ClaimMemoryVectorSyncLeaseRequest,
+    ) -> Result<Option<MemoryVectorSyncJob>, MemoryVectorSyncOutboxError> {
+        if request.lease_seconds == 0 || request.lease_seconds > 3_600 {
+            return Err(outbox_error());
+        }
+        validate_worker(&request.life_id, &request.lease_owner, "calculated")?;
+        let mut state = self.state().map_err(|_| outbox_error())?;
+        let transaction = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| outbox_error())?;
+        release_expired_in_transaction(&transaction, &request.life_id)?;
+        let Some(id) = next_eligible_id(&transaction, &request.life_id)? else {
+            transaction.commit().map_err(|_| outbox_error())?;
+            return Ok(None);
+        };
+        let changed = transaction
+            .execute(
+                "UPDATE memory_vector_sync_outbox SET state = 'processing',
+                 attempt_count = attempt_count + 1, lease_owner = ?2,
+                 lease_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', printf('+%d seconds', ?3)),
+                 next_attempt_at = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 WHERE id = ?1 AND life_id = ?4 AND state IN ('pending', 'retry_wait')",
+                params![
+                    id,
+                    request.lease_owner,
+                    request.lease_seconds,
+                    request.life_id
+                ],
+            )
+            .map_err(|_| outbox_error())?;
+        if changed != 1 {
+            return Err(MemoryVectorSyncOutboxError::new(
+                MemoryVectorSyncOutboxErrorCode::SyncJobLeaseConflict,
+            ));
+        }
+        let job = load_job_by_id(&transaction, &request.life_id, id)?;
+        transaction.commit().map_err(|_| outbox_error())?;
+        Ok(Some(job))
+    }
+
     fn mark_retry(
         &self,
         life_id: &str,
@@ -130,6 +180,39 @@ impl MemoryVectorSyncOutboxRepository for StorageService {
             Some(next_attempt_at),
             error_code,
         )
+    }
+
+    fn mark_retry_after(
+        &self,
+        life_id: &str,
+        memory_id: &str,
+        lease_owner: &str,
+        delay_seconds: u32,
+        error_code: &str,
+    ) -> Result<(), MemoryVectorSyncOutboxError> {
+        validate_ids(life_id, memory_id)?;
+        if delay_seconds == 0 || delay_seconds > 3_600 {
+            return Err(outbox_error());
+        }
+        let state = self.state().map_err(|_| outbox_error())?;
+        let changed = state
+            .connection
+            .execute(
+                "UPDATE memory_vector_sync_outbox SET state = 'retry_wait',
+                 next_attempt_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', printf('+%d seconds', ?4)),
+                 lease_owner = NULL, lease_expires_at = NULL, last_error_code = ?5,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 WHERE life_id = ?1 AND memory_id = ?2 AND state = 'processing' AND lease_owner = ?3",
+                params![
+                    life_id,
+                    memory_id,
+                    lease_owner,
+                    delay_seconds,
+                    safe_error_code(error_code)
+                ],
+            )
+            .map_err(|_| outbox_error())?;
+        claimed_change(changed)
     }
     fn mark_blocked(
         &self,
@@ -212,6 +295,23 @@ impl MemoryVectorSyncOutboxRepository for StorageService {
             )
             .map_err(|_| outbox_error())?;
         usize::try_from(count).map_err(|_| outbox_error())
+    }
+
+    fn retry_failures(&self, life_id: &str) -> Result<usize, MemoryVectorSyncOutboxError> {
+        if life_id.trim().is_empty() {
+            return Err(outbox_error());
+        }
+        let state = self.state().map_err(|_| outbox_error())?;
+        state
+            .connection
+            .execute(
+                "UPDATE memory_vector_sync_outbox SET state = 'pending', attempt_count = 0,
+                 next_attempt_at = NULL, lease_owner = NULL, lease_expires_at = NULL,
+                 last_error_code = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 WHERE life_id = ?1 AND state IN ('blocked', 'failed', 'retry_wait')",
+                params![life_id],
+            )
+            .map_err(|_| outbox_error())
     }
 }
 
@@ -308,6 +408,37 @@ fn load_job_by_id(
         })?
         .try_into()
 }
+fn release_expired_in_transaction(
+    transaction: &Transaction<'_>,
+    life_id: &str,
+) -> Result<(), MemoryVectorSyncOutboxError> {
+    transaction
+        .execute(
+            "UPDATE memory_vector_sync_outbox SET state = 'pending', lease_owner = NULL,
+             lease_expires_at = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE life_id = ?1 AND state = 'processing'
+               AND lease_expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+            params![life_id],
+        )
+        .map_err(|_| outbox_error())?;
+    Ok(())
+}
+fn next_eligible_id(
+    transaction: &Transaction<'_>,
+    life_id: &str,
+) -> Result<Option<i64>, MemoryVectorSyncOutboxError> {
+    transaction
+        .query_row(
+            "SELECT id FROM memory_vector_sync_outbox
+             WHERE life_id = ?1 AND (state = 'pending' OR
+               (state = 'retry_wait' AND next_attempt_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))
+             ORDER BY created_at ASC, id ASC LIMIT 1",
+            params![life_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| outbox_error())
+}
 fn validate_ids(life_id: &str, memory_id: &str) -> Result<(), MemoryVectorSyncOutboxError> {
     if life_id.trim().is_empty() || memory_id.trim().is_empty() {
         Err(outbox_error())
@@ -362,7 +493,12 @@ mod tests {
         },
         storage::{LifeIdentityRecord, PersonaTemplateRecord},
     };
-    use std::{fs, path::PathBuf};
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::{Arc, Barrier},
+        thread,
+    };
 
     struct TestRoot(PathBuf);
     impl TestRoot {
@@ -442,7 +578,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
     }
 
     #[test]
@@ -482,7 +618,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         drop(storage);
 
         let reopened = StorageService::initialize_with_roots(data_root, None).unwrap();
@@ -673,5 +809,38 @@ mod tests {
         );
         assert!(storage.list("life").unwrap().is_empty());
         assert!(storage.list("other-life").unwrap().is_empty());
+    }
+
+    #[test]
+    fn concurrent_claims_obtain_the_job_at_most_once() {
+        let (root, first_store) = storage();
+        let memory = candidate(&first_store, false);
+        first_store
+            .enqueue(EnqueueMemoryVectorSyncRequest {
+                life_id: "life".into(),
+                memory_id: memory.id,
+                desired_action: MemoryVectorSyncAction::Upsert,
+            })
+            .unwrap();
+        let second_store =
+            StorageService::initialize_with_roots(root.0.join("data"), None).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let claim = |store: StorageService, owner: &'static str, barrier: Arc<Barrier>| {
+            thread::spawn(move || {
+                barrier.wait();
+                store.claim_next(ClaimMemoryVectorSyncRequest {
+                    life_id: "life".into(),
+                    lease_owner: owner.into(),
+                    lease_expires_at: "2999-01-01T00:00:00.000Z".into(),
+                })
+            })
+        };
+        let first = claim(first_store, "worker-a", Arc::clone(&barrier));
+        let second = claim(second_store, "worker-b", barrier);
+        let obtained = [first.join().unwrap(), second.join().unwrap()]
+            .into_iter()
+            .filter(|result| matches!(result, Ok(Some(_))))
+            .count();
+        assert_eq!(obtained, 1);
     }
 }

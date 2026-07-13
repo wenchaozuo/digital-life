@@ -1,3 +1,4 @@
+pub mod embedding;
 pub mod memory;
 pub mod model;
 mod storage;

@@ -20,7 +20,12 @@ const filesToCheck = [
   'src/chat/ChatView.vue',
   'tests/modelSettings.test.ts',
   'tests/memoryVectorIndexSettings.test.ts',
-  'tests/conversationPersistence.test.ts'
+  'tests/conversationPersistence.test.ts',
+  'src/settings/memory/memoryCenterController.ts',
+  'src/settings/memory/MemoryCenterView.vue',
+  'src/settings/memory/MemoryListPanel.vue',
+  'src/settings/memory/MemoryDetailPanel.vue',
+  'tests/memoryCenterController.test.ts'
 ];
 
 let failed = false;

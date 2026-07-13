@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { computed, onMounted, ref } from "vue";
 import type { ModelPurpose } from "../model";
 import ModelProfilesView from "./model/ModelProfilesView.vue";
+import MemoryCenterView from "./memory/MemoryCenterView.vue";
 import {
   storageService,
   type StorageLocationInfo,
@@ -28,13 +29,14 @@ const migration = ref<StorageMigrationResult>();
 const phase = ref<StorageSettingsPhase>("unselected");
 const error = ref<StorageSettingsError>();
 const confirmationVisible = ref(false);
-type SettingsSection = "storage" | "chat" | "embedding";
-interface ModelProfilesViewHandle {
+type SettingsSection = "storage" | "chat" | "embedding" | "memory";
+interface SettingsViewHandle {
   clearSensitiveInputs(): void;
   requestLeave(): boolean;
 }
 const activeSection = ref<SettingsSection>("storage");
-const modelProfilesView = ref<ModelProfilesViewHandle>();
+const modelProfilesView = ref<SettingsViewHandle>();
+const memoryCenterView = ref<SettingsViewHandle>();
 const activeModelPurpose = computed<ModelPurpose>(() =>
   activeSection.value === "embedding" ? "embedding" : "chat",
 );
@@ -152,23 +154,38 @@ async function confirmMigration(): Promise<void> {
   }
 }
 
+function requestActiveViewLeave(): boolean {
+  if (activeSection.value === "storage") {
+    return true;
+  }
+  if (activeSection.value === "memory") {
+    return memoryCenterView.value?.requestLeave() ?? true;
+  }
+  return modelProfilesView.value?.requestLeave() ?? true;
+}
+
+function clearActiveViewSensitive(): void {
+  modelProfilesView.value?.clearSensitiveInputs();
+  memoryCenterView.value?.clearSensitiveInputs();
+}
+
 async function switchSection(section: SettingsSection): Promise<void> {
   if (section === activeSection.value || phase.value === "migrating") {
     return;
   }
-  if (activeSection.value !== "storage" && !modelProfilesView.value?.requestLeave()) {
+  if (!requestActiveViewLeave()) {
     return;
   }
-  modelProfilesView.value?.clearSensitiveInputs();
+  clearActiveViewSensitive();
   activeSection.value = section;
 }
 
 async function closeSettings(): Promise<void> {
   if (phase.value !== "migrating") {
-    if (activeSection.value !== "storage" && !modelProfilesView.value?.requestLeave()) {
+    if (!requestActiveViewLeave()) {
       return;
     }
-    modelProfilesView.value?.clearSensitiveInputs();
+    clearActiveViewSensitive();
     void invoke("close_settings_window");
   }
 }
@@ -195,6 +212,7 @@ onMounted(async () => {
         <button type="button" :class="{ selected: activeSection === 'storage' }" :disabled="phase === 'migrating'" @click="switchSection('storage')">Storage location</button>
         <button type="button" :class="{ selected: activeSection === 'chat' }" :disabled="phase === 'migrating'" @click="switchSection('chat')">Conversation models</button>
         <button type="button" :class="{ selected: activeSection === 'embedding' }" :disabled="phase === 'migrating'" @click="switchSection('embedding')">Embedding models</button>
+        <button type="button" :class="{ selected: activeSection === 'memory' }" :disabled="phase === 'migrating'" @click="switchSection('memory')">Memory Center</button>
       </nav>
 
       <section v-if="activeSection === 'storage'" class="settings-section" aria-label="Storage location settings">
@@ -273,6 +291,11 @@ onMounted(async () => {
       </section>
 
       </section>
+
+      <MemoryCenterView
+        v-else-if="activeSection === 'memory'"
+        ref="memoryCenterView"
+      />
 
       <ModelProfilesView
         v-else

@@ -3,6 +3,14 @@ export {
   memoryManagementService,
   type IMemoryManagementService,
 } from "./memoryManagementService.ts";
+export {
+  MemoryCenterController,
+  type MemoryCenterError,
+  type MemoryCenterOperation,
+  type MemoryCenterPhase,
+  type MemoryEditDraft,
+  type MemoryFilterState,
+} from "./memoryCenterController.ts";
 export type {
   DeleteMemoryRequest,
   DeleteMemoryResult,

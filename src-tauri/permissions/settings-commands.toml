@@ -1,6 +1,6 @@
 [[permission]]
 identifier = "settings-commands"
-description = "Storage, model-profile, connection-test, and credential management commands for Settings."
+description = "Storage, model-profile, credential, and manual vector-index management commands for Settings."
 commands.allow = [
     "close_settings_window",
     "get_storage_location",
@@ -17,4 +17,8 @@ commands.allow = [
     "save_api_credential",
     "has_api_credential",
     "delete_api_credential",
+    "get_memory_vector_index_status",
+    "start_memory_vector_index_rebuild",
+    "get_memory_vector_index_job",
+    "cancel_memory_vector_index_job",
 ]

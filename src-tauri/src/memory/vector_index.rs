@@ -96,6 +96,7 @@ pub enum MemoryIndexErrorCode {
     VectorStoreFailed,
     PartialIndexFailure,
     IndexOperationInProgress,
+    RebuildCancelled,
     InternalError,
 }
 
@@ -105,6 +106,44 @@ pub struct MemoryIndexError {
     pub code: MemoryIndexErrorCode,
     pub message: String,
     pub recoverable: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryRebuildPhase {
+    Scanning,
+    Embedding,
+    Writing,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryRebuildProgress {
+    pub phase: MemoryRebuildPhase,
+    pub scanned_count: usize,
+    pub eligible_count: usize,
+    pub embedded_count: usize,
+    pub indexed_count: usize,
+    pub skipped_candidate_count: usize,
+    pub skipped_sensitive_count: usize,
+    pub current_batch: usize,
+    pub total_batches: usize,
+}
+
+/// Runtime-owned cooperative cancellation and progress boundary. Implementors
+/// must never retain memory text or vectors from a callback.
+pub trait MemoryRebuildObserver: Send + Sync {
+    fn is_cancelled(&self) -> bool;
+    fn on_model_resolved(&self, _embedding_model: &str, _dimension: usize) {}
+    fn on_progress(&self, progress: MemoryRebuildProgress);
+}
+
+struct NoopRebuildObserver;
+
+impl MemoryRebuildObserver for NoopRebuildObserver {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+
+    fn on_progress(&self, _progress: MemoryRebuildProgress) {}
 }
 
 impl MemoryIndexError {
@@ -267,6 +306,15 @@ where
         &self,
         request: MemoryRebuildRequest,
     ) -> Result<MemoryRebuildReport, MemoryIndexError> {
+        self.rebuild_life_index_observed(request, &NoopRebuildObserver)
+            .await
+    }
+
+    pub async fn rebuild_life_index_observed(
+        &self,
+        request: MemoryRebuildRequest,
+        observer: &dyn MemoryRebuildObserver,
+    ) -> Result<MemoryRebuildReport, MemoryIndexError> {
         validate_life_id(&request.life_id)?;
         let _permit = self.acquire_operation(&request.life_id, &self.vector_space)?;
         let mut report = MemoryRebuildReport {
@@ -284,6 +332,7 @@ where
         let mut payloads = Vec::new();
         let mut offset = 0usize;
         loop {
+            ensure_not_cancelled(observer)?;
             let page = self
                 .repository
                 .list_page(&request.life_id, offset, REBUILD_PAGE_SIZE)
@@ -318,6 +367,13 @@ where
                     text,
                 });
             }
+            observer.on_progress(progress_from_report(
+                MemoryRebuildPhase::Scanning,
+                &report,
+                0,
+                0,
+                0,
+            ));
             offset = offset.saturating_add(page_len);
             if page_len < REBUILD_PAGE_SIZE {
                 break;
@@ -326,8 +382,17 @@ where
         report.eligible_count = payloads.len();
 
         let batch_size = self.embedding_provider.max_batch_size();
+        let total_batches = payloads.len().div_ceil(batch_size);
         let mut records = Vec::with_capacity(payloads.len());
-        for batch in payloads.chunks(batch_size) {
+        for (batch_index, batch) in payloads.chunks(batch_size).enumerate() {
+            ensure_not_cancelled(observer)?;
+            observer.on_progress(progress_from_report(
+                MemoryRebuildPhase::Embedding,
+                &report,
+                records.len(),
+                batch_index + 1,
+                total_batches,
+            ));
             let response = self
                 .embedding_provider
                 .embed(EmbeddingRequest {
@@ -347,12 +412,28 @@ where
                     content_hash: payload.content_hash.clone(),
                 });
             }
+            observer.on_progress(progress_from_report(
+                MemoryRebuildPhase::Embedding,
+                &report,
+                records.len(),
+                batch_index + 1,
+                total_batches,
+            ));
         }
 
+        ensure_not_cancelled(observer)?;
+        observer.on_progress(progress_from_report(
+            MemoryRebuildPhase::Writing,
+            &report,
+            records.len(),
+            total_batches,
+            total_batches,
+        ));
         self.vector_store
             .clear_space(&request.life_id, &self.vector_space)
             .await
             .map_err(|_| partial_index_failure())?;
+        ensure_not_cancelled(observer)?;
         if !records.is_empty() {
             self.vector_store
                 .upsert_batch(records)
@@ -361,6 +442,13 @@ where
         }
         report.indexed_count = payloads.len();
         report.completed = true;
+        observer.on_progress(progress_from_report(
+            MemoryRebuildPhase::Writing,
+            &report,
+            payloads.len(),
+            total_batches,
+            total_batches,
+        ));
         Ok(report)
     }
 
@@ -386,6 +474,37 @@ where
             operations: &self.active_operations,
             key,
         })
+    }
+}
+
+fn ensure_not_cancelled(observer: &dyn MemoryRebuildObserver) -> Result<(), MemoryIndexError> {
+    if observer.is_cancelled() {
+        return Err(MemoryIndexError::new(
+            MemoryIndexErrorCode::RebuildCancelled,
+            "The memory vector index rebuild was cancelled.",
+            true,
+        ));
+    }
+    Ok(())
+}
+
+fn progress_from_report(
+    phase: MemoryRebuildPhase,
+    report: &MemoryRebuildReport,
+    embedded_count: usize,
+    current_batch: usize,
+    total_batches: usize,
+) -> MemoryRebuildProgress {
+    MemoryRebuildProgress {
+        phase,
+        scanned_count: report.scanned_count,
+        eligible_count: report.eligible_count,
+        embedded_count,
+        indexed_count: report.indexed_count,
+        skipped_candidate_count: report.skipped_candidate_count,
+        skipped_sensitive_count: report.skipped_sensitive_count,
+        current_batch,
+        total_batches,
     }
 }
 
@@ -1498,6 +1617,74 @@ mod tests {
                 .unwrap();
             assert_eq!(store.count("life", Some(&test_space())).await.unwrap(), 0);
             assert_eq!(repository.count_rows("life"), 1);
+        });
+    }
+
+    #[test]
+    fn cancellation_before_scan_preserves_existing_index() {
+        struct Cancelled;
+
+        impl MemoryRebuildObserver for Cancelled {
+            fn is_cancelled(&self) -> bool {
+                true
+            }
+
+            fn on_progress(&self, _progress: MemoryRebuildProgress) {}
+        }
+
+        block_on(async {
+            let repository = TestSqliteRepository::new();
+            repository.put(
+                &memory(
+                    "memory-new",
+                    "life",
+                    MemoryStatus::Confirmed,
+                    false,
+                    "new text",
+                    None,
+                    MemoryKind::Fact,
+                ),
+                1,
+            );
+            let provider = RecordingEmbeddingProvider::new(3, 2);
+            let store = InMemoryVectorStore::new();
+            store
+                .upsert(VectorRecord {
+                    life_id: "life".into(),
+                    memory_id: "memory-old".into(),
+                    embedding_model: "test-model".into(),
+                    dimension: 3,
+                    vector: vec![1.0, 0.0, 0.0],
+                    content_hash: "old-hash".into(),
+                })
+                .await
+                .unwrap();
+            let service =
+                MemoryVectorIndexService::new(&repository, &provider, &store, test_space())
+                    .unwrap();
+            let error = service
+                .rebuild_life_index_observed(
+                    MemoryRebuildRequest {
+                        life_id: "life".into(),
+                    },
+                    &Cancelled,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, MemoryIndexErrorCode::RebuildCancelled);
+            assert_eq!(store.count("life", Some(&test_space())).await.unwrap(), 1);
+            assert!(store
+                .search(VectorSearchQuery {
+                    life_id: "life".into(),
+                    space: test_space(),
+                    vector: vec![1.0, 0.0, 0.0],
+                    limit: 10,
+                    min_score: None,
+                })
+                .await
+                .unwrap()
+                .iter()
+                .any(|hit| hit.memory_id == "memory-old"));
         });
     }
 }

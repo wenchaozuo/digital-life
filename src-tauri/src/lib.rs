@@ -18,6 +18,9 @@ pub fn run() {
             app.manage(storage);
             app.manage(secrets::WindowsCredentialSecretStore::new());
             app.manage(model::runtime::ModelRuntimeCoordinator::default());
+            app.manage(
+                memory::vector_index_runtime::MemoryVectorIndexRuntimeCoordinator::default(),
+            );
             create_configured_windows(app)?;
             configure_window_lifecycle(app)?;
             Ok(())
@@ -39,6 +42,10 @@ pub fn run() {
             memory::confirm_memory,
             memory::delete_memory,
             memory::retrieval::retrieve_memories,
+            memory::vector_index_runtime::get_memory_vector_index_status,
+            memory::vector_index_runtime::start_memory_vector_index_rebuild,
+            memory::vector_index_runtime::get_memory_vector_index_job,
+            memory::vector_index_runtime::cancel_memory_vector_index_job,
             secrets::save_api_credential,
             secrets::has_api_credential,
             secrets::delete_api_credential,

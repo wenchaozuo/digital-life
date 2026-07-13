@@ -11,6 +11,7 @@ use crate::storage::StorageService;
 pub mod retrieval;
 pub mod retrieval_router;
 pub mod vector_index;
+pub mod vector_index_runtime;
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]

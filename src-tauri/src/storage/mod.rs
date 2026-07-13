@@ -207,6 +207,12 @@ impl StorageService {
         })
     }
 
+    /// Internal authoritative data-root accessor. The path is never serialized
+    /// by vector-index runtime APIs.
+    pub(crate) fn active_data_root(&self) -> Result<PathBuf, StorageError> {
+        Ok(self.state()?.active_root.clone())
+    }
+
     pub fn validate_location(&self, candidate: &str) -> StorageLocationValidation {
         let current_root = match self.state() {
             Ok(state) => state.active_root.clone(),

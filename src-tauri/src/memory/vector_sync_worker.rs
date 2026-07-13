@@ -1075,6 +1075,7 @@ mod tests {
                         Err(error) => panic!("mock listener failed: {error}"),
                     })
                     .expect("mock embedding request was not received");
+                stream.set_nonblocking(false).unwrap();
                 read_request(&mut stream);
                 let reply = format!(
                     "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",

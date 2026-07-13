@@ -15,10 +15,12 @@ const filesToCheck = [
   'src/settings/model/MemoryVectorIndexPanel.vue',
   'src/model/modelService.ts',
   'src/conversation/conversationService.ts',
+  'src/conversation/conversationHistoryService.ts',
   'src/conversation/types.ts',
   'src/chat/ChatView.vue',
   'tests/modelSettings.test.ts',
-  'tests/memoryVectorIndexSettings.test.ts'
+  'tests/memoryVectorIndexSettings.test.ts',
+  'tests/conversationPersistence.test.ts'
 ];
 
 let failed = false;

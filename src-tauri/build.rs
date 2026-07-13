@@ -2,6 +2,11 @@ fn main() {
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
             "chat_with_governed_context",
+            "create_conversation",
+            "list_conversations",
+            "get_conversation_messages",
+            "rename_conversation",
+            "delete_conversation",
             "create_model_profile",
             "list_model_profiles",
             "get_model_profile",

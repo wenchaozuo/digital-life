@@ -18,6 +18,7 @@ const bodyState = ref<BodyState>(bodyStateMachine.getState());
 const messages = ref<readonly ConversationMessage[]>([]);
 const error = ref<{ code: string; message: string }>();
 const isSending = ref(false);
+const isRestoring = ref(true);
 const clearSignal = ref(0);
 const memoryNotice = ref<string>();
 const modelSetupErrorCodes = new Set([
@@ -32,6 +33,7 @@ const showModelSettingsAction = computed(() =>
   error.value ? modelSetupErrorCodes.has(error.value.code) : false,
 );
 const visibleMessages = computed(() => messages.value);
+const conversationTitle = ref<string>();
 
 const showMemoryPanel = ref(false);
 const showUnconfirmedHint = ref(false);
@@ -42,6 +44,20 @@ let unsubscribeBodyState: (() => void) | undefined;
 
 function refreshMessages(): void {
   messages.value = conversationService.getSession().getMessages();
+  conversationTitle.value = conversationService.getConversationTitle();
+}
+
+async function restoreConversation(): Promise<void> {
+  try {
+    await conversationService.initialize();
+    refreshMessages();
+  } catch (caught) {
+    error.value = caught instanceof ConversationError
+      ? { code: caught.code, message: caught.message }
+      : { code: "CONVERSATION_STORAGE_UNAVAILABLE", message: "Conversation history could not be restored." };
+  } finally {
+    isRestoring.value = false;
+  }
 }
 
 function memoryNoticeFor(codes: readonly string[], rebuildRecommended: boolean): string | undefined {
@@ -109,6 +125,7 @@ onMounted(() => {
   unsubscribeBodyState = bodyStateMachine.subscribe(({ current }) => {
     bodyState.value = current;
   });
+  void restoreConversation();
 });
 
 onUnmounted(() => {
@@ -123,6 +140,7 @@ onUnmounted(() => {
       <div>
         <p class="eyebrow">Digital Life</p>
         <h1>Chat</h1>
+        <p v-if="conversationTitle" class="conversation-title">{{ conversationTitle }}</p>
       </div>
       <span>Body state: {{ bodyState }}</span>
     </header>
@@ -157,7 +175,7 @@ onUnmounted(() => {
       </button>
     </section>
     <p v-if="memoryNotice" class="memory-notice" aria-live="polite">{{ memoryNotice }}</p>
-    <ChatInput :disabled="isSending" :clear-signal="clearSignal" @send="send" />
+    <ChatInput :disabled="isSending || isRestoring" :clear-signal="clearSignal" @send="send" />
   </main>
 
   <!-- Backdrop Overlay -->

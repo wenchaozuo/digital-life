@@ -4,6 +4,9 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use tauri::State;
+
+use crate::storage::StorageService;
 
 pub const MAX_CONVERSATION_TITLE_CHARACTERS: usize = 120;
 pub const MAX_CONVERSATION_MESSAGE_CHARACTERS: usize = 32_000;
@@ -111,6 +114,74 @@ pub struct AppendConversationTurnResult {
     pub assistant_message: ConversationMessageRecord,
     pub conversation_revision: i64,
     pub replayed: bool,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationSummary {
+    pub id: String,
+    pub title: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub last_message_at: String,
+}
+
+impl From<ConversationRecord> for ConversationSummary {
+    fn from(value: ConversationRecord) -> Self {
+        Self {
+            id: value.id,
+            title: value.title,
+            created_at: value.created_at,
+            updated_at: value.updated_at,
+            last_message_at: value.last_message_at,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreateConversationCommandRequest {
+    pub title: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConversationIdRequest {
+    pub conversation_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RenameConversationCommandRequest {
+    pub conversation_id: String,
+    pub title: String,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistedConversationMessage {
+    pub role: ConversationRole,
+    pub content: String,
+    pub sequence_no: i64,
+    pub created_at: String,
+}
+
+impl From<ConversationMessageRecord> for PersistedConversationMessage {
+    fn from(value: ConversationMessageRecord) -> Self {
+        Self {
+            role: value.role,
+            content: value.content,
+            sequence_no: value.sequence_no,
+            created_at: value.created_at,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteConversationResult {
+    pub conversation_id: String,
+    pub deleted: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -426,4 +497,81 @@ pub(crate) fn generate_id(prefix: &str) -> String {
         .unwrap_or_default();
     let sequence = ID_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     format!("{prefix}-{timestamp:032x}-{sequence:016x}")
+}
+
+fn current_life_id(storage: &StorageService) -> Result<String, ConversationHistoryError> {
+    storage
+        .get_current_life()
+        .map_err(|_| {
+            ConversationHistoryError::new(
+                ConversationHistoryErrorCode::ConversationStorageUnavailable,
+            )
+        })?
+        .map(|life| life.id)
+        .ok_or_else(|| {
+            ConversationHistoryError::new(ConversationHistoryErrorCode::ConversationNotFound)
+        })
+}
+
+#[tauri::command]
+pub fn create_conversation(
+    storage: State<'_, StorageService>,
+    request: CreateConversationCommandRequest,
+) -> Result<ConversationSummary, ConversationHistoryError> {
+    let life_id = current_life_id(storage.inner())?;
+    ConversationHistoryService::new(storage.inner())
+        .create(CreateConversationRequest {
+            life_id,
+            title: request.title,
+        })
+        .map(Into::into)
+}
+
+#[tauri::command]
+pub fn list_conversations(
+    storage: State<'_, StorageService>,
+) -> Result<Vec<ConversationSummary>, ConversationHistoryError> {
+    let life_id = current_life_id(storage.inner())?;
+    ConversationHistoryService::new(storage.inner())
+        .list(&life_id)
+        .map(|values| values.into_iter().map(Into::into).collect())
+}
+
+#[tauri::command]
+pub fn get_conversation_messages(
+    storage: State<'_, StorageService>,
+    request: ConversationIdRequest,
+) -> Result<Vec<PersistedConversationMessage>, ConversationHistoryError> {
+    let life_id = current_life_id(storage.inner())?;
+    ConversationHistoryService::new(storage.inner())
+        .recent_messages(&life_id, &request.conversation_id)
+        .map(|values| values.into_iter().map(Into::into).collect())
+}
+
+#[tauri::command]
+pub fn rename_conversation(
+    storage: State<'_, StorageService>,
+    request: RenameConversationCommandRequest,
+) -> Result<ConversationSummary, ConversationHistoryError> {
+    let life_id = current_life_id(storage.inner())?;
+    ConversationHistoryService::new(storage.inner())
+        .rename(RenameConversationRequest {
+            life_id,
+            conversation_id: request.conversation_id,
+            title: request.title,
+        })
+        .map(Into::into)
+}
+
+#[tauri::command]
+pub fn delete_conversation(
+    storage: State<'_, StorageService>,
+    request: ConversationIdRequest,
+) -> Result<DeleteConversationResult, ConversationHistoryError> {
+    let life_id = current_life_id(storage.inner())?;
+    ConversationHistoryService::new(storage.inner()).delete(&life_id, &request.conversation_id)?;
+    Ok(DeleteConversationResult {
+        conversation_id: request.conversation_id,
+        deleted: true,
+    })
 }

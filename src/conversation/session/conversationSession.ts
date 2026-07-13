@@ -1,4 +1,5 @@
 import type { ConversationMessage } from "../types";
+import type { PersistedConversationMessage } from "../../model";
 
 export const DEFAULT_SESSION_MESSAGE_LIMIT = 20;
 
@@ -31,25 +32,31 @@ export class ConversationSession {
     return this.activityAt;
   }
 
-  addMessage(message: ConversationMessage): void {
-    this.messageHistory.push({ ...message });
-    if (this.messageHistory.length > this.messageLimit) {
-      this.messageHistory.splice(0, this.messageHistory.length - this.messageLimit);
-    }
-    this.activityAt = message.timestamp;
+  replaceMessagesFromPersistence(messages: readonly PersistedConversationMessage[]): void {
+    this.messageHistory = messages
+      .map(toDisplayMessage)
+      .sort((left, right) => (left.sequenceNo ?? 0) - (right.sequenceNo ?? 0))
+      .slice(-this.messageLimit);
+    this.activityAt = this.messageHistory[this.messageHistory.length - 1]?.timestamp ?? new Date().toISOString();
     this.notifyListeners();
   }
 
-  /** Atomically commits a completed user/assistant turn. */
-  appendTurn(userMessage: ConversationMessage, assistantMessage: ConversationMessage): void {
-    if (userMessage.role !== "user" || assistantMessage.role !== "assistant") {
-      throw new Error("A conversation turn must contain one user and one assistant message.");
+  appendPersistedTurn(messages: readonly PersistedConversationMessage[]): void {
+    if (
+      messages.length !== 2
+      || messages[0].role !== "user"
+      || messages[1].role !== "assistant"
+      || messages[1].sequenceNo !== messages[0].sequenceNo + 1
+    ) {
+      throw new Error("A persisted conversation turn must contain one complete ordered turn.");
     }
-    this.messageHistory.push({ ...userMessage }, { ...assistantMessage });
-    if (this.messageHistory.length > this.messageLimit) {
-      this.messageHistory.splice(0, this.messageHistory.length - this.messageLimit);
-    }
-    this.activityAt = assistantMessage.timestamp;
+    const sequences = new Set(messages.map((message) => message.sequenceNo));
+    this.messageHistory = this.messageHistory
+      .filter((message) => message.sequenceNo === undefined || !sequences.has(message.sequenceNo))
+      .concat(messages.map(toDisplayMessage))
+      .sort((left, right) => (left.sequenceNo ?? 0) - (right.sequenceNo ?? 0))
+      .slice(-this.messageLimit);
+    this.activityAt = messages[1].createdAt;
     this.notifyListeners();
   }
 
@@ -57,7 +64,7 @@ export class ConversationSession {
     return this.messageHistory.map((message) => ({ ...message }));
   }
 
-  clear(): void {
+  clearForConversationSwitch(): void {
     this.messageHistory = [];
     this.activityAt = new Date().toISOString();
     this.notifyListeners();
@@ -71,4 +78,13 @@ export class ConversationSession {
   private notifyListeners(): void {
     this.listeners.forEach((listener) => listener());
   }
+}
+
+function toDisplayMessage(message: PersistedConversationMessage): ConversationMessage {
+  return {
+    role: message.role,
+    content: message.content,
+    timestamp: message.createdAt,
+    sequenceNo: message.sequenceNo,
+  };
 }

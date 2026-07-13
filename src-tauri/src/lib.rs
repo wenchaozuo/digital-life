@@ -32,6 +32,11 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             conversation::service::chat_with_governed_context,
+            conversation::history::create_conversation,
+            conversation::history::list_conversations,
+            conversation::history::get_conversation_messages,
+            conversation::history::rename_conversation,
+            conversation::history::delete_conversation,
             model::profile::create_model_profile,
             model::profile::list_model_profiles,
             model::profile::get_model_profile,

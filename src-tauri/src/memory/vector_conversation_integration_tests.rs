@@ -1191,10 +1191,10 @@ fn retrieval_failures_budget_injection_and_session_commit_contract_are_safe() {
             .find("const runtime = await this.dependencies.model.chatWithGovernedContext")
             .unwrap();
         let append_turn = frontend
-            .find("this.dependencies.session.appendTurn")
+            .find("this.dependencies.session.appendPersistedTurn")
             .unwrap();
         let catch_block = frontend.find("} catch (caught) {").unwrap();
         assert!(model_await < append_turn && append_turn < catch_block);
-        assert!(!frontend.contains("this.dependencies.session.addMessage(userMessage)"));
+        assert!(!frontend.contains("history: this.dependencies.session"));
     });
 }

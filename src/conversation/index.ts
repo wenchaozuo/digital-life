@@ -13,3 +13,10 @@ export {
   DEFAULT_SESSION_MESSAGE_LIMIT,
   ConversationSession,
 } from "./session";
+export {
+  ConversationHistoryService,
+  conversationHistoryService,
+  type ConversationHistoryPort,
+  type ConversationSummary,
+  type DeleteConversationResult,
+} from "./conversationHistoryService";

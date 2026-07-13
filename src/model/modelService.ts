@@ -1,14 +1,16 @@
 import { invoke } from "@tauri-apps/api/core";
 
-export interface GovernedConversationMessage {
+export interface PersistedConversationMessage {
   role: "user" | "assistant";
   content: string;
+  sequenceNo: number;
+  createdAt: string;
 }
 
 export interface GovernedConversationRequest {
   requestId: string;
-  userMessage: string;
-  history: GovernedConversationMessage[];
+  conversationId: string;
+  currentMessage: string;
 }
 
 export type ConversationDegradationCode =
@@ -36,11 +38,14 @@ export interface ConversationMemoryMetadata {
 
 export interface GovernedConversationResponse {
   requestId: string;
+  conversationId: string;
   assistantMessage: string;
-  profileDisplayName: string;
-  modelName: string;
+  persistedMessages: PersistedConversationMessage[];
+  profileDisplayName: string | null;
+  modelName: string | null;
   memory: ConversationMemoryMetadata;
   latencyMs: number;
+  replayed: boolean;
 }
 
 export class ModelService {

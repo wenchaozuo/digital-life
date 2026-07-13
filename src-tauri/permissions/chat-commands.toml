@@ -3,7 +3,11 @@ identifier = "chat-commands"
 description = "Safe conversation, life, persona, and governed memory commands for the chat window."
 commands.allow = [
     "chat_with_governed_context",
-    "chat_with_governed_context",
+    "create_conversation",
+    "list_conversations",
+    "get_conversation_messages",
+    "rename_conversation",
+    "delete_conversation",
     "open_settings_window",
     "get_current_life_identity",
     "get_persona_template",

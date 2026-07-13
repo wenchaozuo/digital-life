@@ -3,17 +3,20 @@
 pub mod history;
 pub mod service;
 
+#[cfg(test)]
+mod integration_tests;
+
 pub use history::{
     AppendConversationTurnRequest, AppendConversationTurnResult, ConversationHistoryError,
     ConversationHistoryErrorCode, ConversationHistoryService, ConversationMessagePage,
     ConversationMessageRecord, ConversationPageRequest, ConversationRecord, ConversationRepository,
-    ConversationRole as PersistedConversationRole, CreateConversationRequest,
-    RenameConversationRequest,
+    ConversationRole as PersistedConversationRole, ConversationSummary,
+    CreateConversationCommandRequest, CreateConversationRequest, DeleteConversationResult,
+    PersistedConversationMessage, RenameConversationCommandRequest, RenameConversationRequest,
 };
 
 pub use service::{
     chat_with_governed_context, ConversationCognitionCoordinator, ConversationCognitionError,
     ConversationCognitionErrorCode, ConversationDegradationCode, ConversationMemoryMetadata,
-    ConversationRole, GovernedConversationMessage, GovernedConversationRequest,
-    GovernedConversationResponse,
+    GovernedConversationRequest, GovernedConversationResponse,
 };

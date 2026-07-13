@@ -6,6 +6,7 @@ export interface ConversationMessage {
   role: ConversationMessageRole;
   content: string;
   timestamp: string;
+  sequenceNo?: number;
 }
 
 export interface ConversationRequest {

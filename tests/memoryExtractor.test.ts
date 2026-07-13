@@ -106,11 +106,12 @@ test("same request produces exactly the same result", () => {
 
 test("extracting session messages neither mutates the session nor persists data", () => {
   const session = new ConversationSession(20, "session-1", timestamp);
-  session.addMessage({
+  session.replaceMessagesFromPersistence([{
     role: "user",
     content: "我喜欢散步",
-    timestamp,
-  });
+    sequenceNo: 1,
+    createdAt: timestamp,
+  }]);
   const before = session.getMessages();
 
   new MemoryExtractor().extract({

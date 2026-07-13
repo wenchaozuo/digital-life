@@ -3,7 +3,7 @@ export {
   modelService,
   type ConversationDegradationCode,
   type ConversationMemoryMetadata,
-  type GovernedConversationMessage,
+  type PersistedConversationMessage,
   type GovernedConversationRequest,
   type GovernedConversationResponse,
 } from "./modelService";

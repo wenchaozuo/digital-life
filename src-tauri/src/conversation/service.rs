@@ -4,6 +4,11 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::{
+    conversation::history::{
+        AppendConversationTurnRequest, AppendConversationTurnResult, ConversationHistoryError,
+        ConversationHistoryErrorCode, ConversationHistoryService,
+        ConversationRole as PersistedConversationRole, PersistedConversationMessage,
+    },
     memory::{
         context_builder::{
             MemoryContextBuildRequest, MemoryContextBuilder, MemoryContextEntry,
@@ -26,45 +31,19 @@ use crate::{
         InitiativeLevel, PromptCommunicationStyle, PromptCompilationRequest, PromptCompiler,
         PromptLifeIdentity, PromptPersona, SafetyRulesVersion,
     },
-    secrets::WindowsCredentialSecretStore,
+    secrets::{SecretStore, WindowsCredentialSecretStore},
     storage::{LifeIdentityRecord, PersonaTemplateRecord, StorageService},
     vector_store::LanceDbVectorStoreRegistry,
 };
 
-const MAX_HISTORY_MESSAGES: usize = 20;
-const MAX_HISTORY_MESSAGE_CHARACTERS: usize = 4_000;
-const MAX_HISTORY_TOTAL_CHARACTERS: usize = 20_000;
-const MAX_USER_MESSAGE_CHARACTERS: usize = 4_000;
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum ConversationRole {
-    User,
-    Assistant,
-}
-
-impl ConversationRole {
-    fn model_role(self) -> ModelMessageRole {
-        match self {
-            Self::User => ModelMessageRole::User,
-            Self::Assistant => ModelMessageRole::Assistant,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct GovernedConversationMessage {
-    pub role: ConversationRole,
-    pub content: String,
-}
+const MAX_USER_MESSAGE_CHARACTERS: usize = 32_000;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GovernedConversationRequest {
     pub request_id: String,
-    pub user_message: String,
-    pub history: Vec<GovernedConversationMessage>,
+    pub conversation_id: String,
+    pub current_message: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
@@ -99,11 +78,14 @@ pub struct ConversationMemoryMetadata {
 #[serde(rename_all = "camelCase")]
 pub struct GovernedConversationResponse {
     pub request_id: String,
+    pub conversation_id: String,
     pub assistant_message: String,
-    pub profile_display_name: String,
-    pub model_name: String,
+    pub persisted_messages: Vec<PersistedConversationMessage>,
+    pub profile_display_name: Option<String>,
+    pub model_name: Option<String>,
     pub memory: ConversationMemoryMetadata,
     pub latency_ms: u64,
+    pub replayed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
@@ -115,6 +97,11 @@ pub enum ConversationCognitionErrorCode {
     InvalidConversationRequest,
     InvalidHistoryRole,
     ConversationInProgress,
+    ConversationNotFound,
+    ConversationLifeMismatch,
+    TurnIdConflict,
+    ConversationChangedDuringRequest,
+    ConversationStorageUnavailable,
     NoActiveProfile,
     CredentialNotFound,
     ProviderInitializationFailed,
@@ -155,27 +142,29 @@ impl ConversationCognitionCoordinator {
         &self,
         request_id: &str,
         life_id: &str,
+        conversation_id: &str,
     ) -> Result<ConversationPermit<'_>, ConversationCognitionError> {
         let mut active = self
             .active
             .lock()
             .map_err(|_| error(ConversationCognitionErrorCode::ConversationInProgress))?;
         let request_key = format!("request:{request_id}");
-        let life_key = format!("life:{life_id}");
+        let conversation_key = format!("conversation:{life_id}:{conversation_id}");
         if request_id.trim().is_empty()
+            || conversation_id.trim().is_empty()
             || active.contains(&request_key)
-            || active.contains(&life_key)
+            || active.contains(&conversation_key)
         {
             return Err(error(
                 ConversationCognitionErrorCode::ConversationInProgress,
             ));
         }
         active.insert(request_key.clone());
-        active.insert(life_key.clone());
+        active.insert(conversation_key.clone());
         Ok(ConversationPermit {
             coordinator: self,
             request_key,
-            life_key,
+            conversation_key,
         })
     }
 }
@@ -183,29 +172,35 @@ impl ConversationCognitionCoordinator {
 struct ConversationPermit<'a> {
     coordinator: &'a ConversationCognitionCoordinator,
     request_key: String,
-    life_key: String,
+    conversation_key: String,
 }
 impl Drop for ConversationPermit<'_> {
     fn drop(&mut self) {
         if let Ok(mut active) = self.coordinator.active.lock() {
             active.remove(&self.request_key);
-            active.remove(&self.life_key);
+            active.remove(&self.conversation_key);
         }
     }
 }
 
-pub struct ConversationCognitionService<'a> {
+pub struct ConversationCognitionService<'a, S>
+where
+    S: SecretStore + ?Sized,
+{
     storage: &'a StorageService,
-    secrets: &'a WindowsCredentialSecretStore,
+    secrets: &'a S,
     model_coordinator: &'a ModelRuntimeCoordinator,
     retrieval_registry: &'a LanceDbVectorStoreRegistry,
     coordinator: &'a ConversationCognitionCoordinator,
 }
 
-impl<'a> ConversationCognitionService<'a> {
+impl<'a, S> ConversationCognitionService<'a, S>
+where
+    S: SecretStore + ?Sized,
+{
     pub fn new(
         storage: &'a StorageService,
-        secrets: &'a WindowsCredentialSecretStore,
+        secrets: &'a S,
         model_coordinator: &'a ModelRuntimeCoordinator,
         retrieval_registry: &'a LanceDbVectorStoreRegistry,
         coordinator: &'a ConversationCognitionCoordinator,
@@ -229,14 +224,32 @@ impl<'a> ConversationCognitionService<'a> {
             .get_current_life()
             .map_err(|_| error(ConversationCognitionErrorCode::LifeIdentityNotFound))?
             .ok_or_else(|| error(ConversationCognitionErrorCode::LifeIdentityNotFound))?;
-        let _permit = self.coordinator.acquire(&request.request_id, &life.id)?;
+        let _permit =
+            self.coordinator
+                .acquire(&request.request_id, &life.id, &request.conversation_id)?;
+        let started = Instant::now();
+        let history = ConversationHistoryService::new(self.storage);
+        if let Some(existing) = history
+            .find_turn(&life.id, &request.conversation_id, &request.request_id)
+            .map_err(map_history_error)?
+        {
+            if existing.user_message.content != request.current_message {
+                return Err(error(ConversationCognitionErrorCode::TurnIdConflict));
+            }
+            return Ok(replayed_response(request, existing, started));
+        }
+        let conversation = history
+            .get(&life.id, &request.conversation_id)
+            .map_err(map_history_error)?;
+        let persisted_history = history
+            .recent_messages(&life.id, &request.conversation_id)
+            .map_err(map_history_error)?;
         let persona_record = self
             .storage
             .get_persona(&life.persona_id)
             .map_err(|_| error(ConversationCognitionErrorCode::PersonaNotFound))?
             .ok_or_else(|| error(ConversationCognitionErrorCode::PersonaNotFound))?;
         let persona = parse_persona(&life, &persona_record)?;
-        let started = Instant::now();
 
         let factory = ModelRuntimeEmbeddingProviderFactory::new(
             self.storage,
@@ -252,7 +265,7 @@ impl<'a> ConversationCognitionService<'a> {
         let retrieval_result = retrieval
             .retrieve(GovernedRetrievalRequest {
                 life_id: life.id.clone(),
-                query: request.user_message.clone(),
+                query: request.current_message.clone(),
                 memory_kind_filter: None,
             })
             .await
@@ -289,16 +302,18 @@ impl<'a> ConversationCognitionService<'a> {
                 memory_context: memory_context.context.clone(),
             })
             .map_err(|_| error(ConversationCognitionErrorCode::PersonaNotFound))?;
-        let messages = request
-            .history
-            .iter()
+        let messages = persisted_history
+            .into_iter()
             .map(|message| ModelMessage {
-                role: message.role.model_role(),
-                content: message.content.trim().to_string(),
+                role: match message.role {
+                    PersistedConversationRole::User => ModelMessageRole::User,
+                    PersistedConversationRole::Assistant => ModelMessageRole::Assistant,
+                },
+                content: message.content,
             })
             .chain(std::iter::once(ModelMessage {
                 role: ModelMessageRole::User,
-                content: request.user_message.trim().to_string(),
+                content: request.current_message.clone(),
             }))
             .collect();
         let runtime = ModelRuntimeService::new(self.storage, self.secrets, self.model_coordinator);
@@ -317,6 +332,16 @@ impl<'a> ConversationCognitionService<'a> {
             )
             .await
             .map_err(map_model_error)?;
+        let appended = history
+            .append_turn(AppendConversationTurnRequest {
+                life_id: life.id,
+                conversation_id: request.conversation_id.clone(),
+                turn_id: request.request_id.clone(),
+                user_content: request.current_message,
+                assistant_content: response.text,
+                expected_revision: Some(conversation.revision),
+            })
+            .map_err(map_history_error)?;
         let mut degradations = retrieval_result
             .degradation_codes
             .iter()
@@ -329,9 +354,11 @@ impl<'a> ConversationCognitionService<'a> {
         }
         Ok(GovernedConversationResponse {
             request_id: request.request_id,
-            assistant_message: response.text,
-            profile_display_name,
-            model_name,
+            conversation_id: request.conversation_id,
+            assistant_message: appended.assistant_message.content.clone(),
+            persisted_messages: persisted_messages(&appended),
+            profile_display_name: Some(profile_display_name),
+            model_name: Some(model_name),
             memory: ConversationMemoryMetadata {
                 retrieved_count: retrieval_result.retrieved_count,
                 used_count: memory_context.used_count,
@@ -341,6 +368,7 @@ impl<'a> ConversationCognitionService<'a> {
                 rebuild_recommended: retrieval_result.rebuild_recommended,
             },
             latency_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            replayed: false,
         })
     }
 }
@@ -441,31 +469,67 @@ fn validate_request(
     request: &GovernedConversationRequest,
 ) -> Result<(), ConversationCognitionError> {
     if request.request_id.trim().is_empty()
-        || request.user_message.trim().is_empty()
-        || request.user_message.chars().count() > MAX_USER_MESSAGE_CHARACTERS
-        || request.history.len() > MAX_HISTORY_MESSAGES
+        || request.conversation_id.trim().is_empty()
+        || request.current_message.trim().is_empty()
+        || request.current_message.chars().count() > MAX_USER_MESSAGE_CHARACTERS
     {
-        return Err(error(
-            ConversationCognitionErrorCode::InvalidConversationRequest,
-        ));
-    }
-    let mut total = 0usize;
-    for message in &request.history {
-        let text = message.content.trim();
-        if text.is_empty() || text.chars().count() > MAX_HISTORY_MESSAGE_CHARACTERS {
-            return Err(error(
-                ConversationCognitionErrorCode::InvalidConversationRequest,
-            ));
-        }
-        total += text.chars().count();
-    }
-    if total > MAX_HISTORY_TOTAL_CHARACTERS {
         return Err(error(
             ConversationCognitionErrorCode::InvalidConversationRequest,
         ));
     }
     Ok(())
 }
+
+fn persisted_messages(result: &AppendConversationTurnResult) -> Vec<PersistedConversationMessage> {
+    vec![
+        result.user_message.clone().into(),
+        result.assistant_message.clone().into(),
+    ]
+}
+
+fn replayed_response(
+    request: GovernedConversationRequest,
+    existing: AppendConversationTurnResult,
+    started: Instant,
+) -> GovernedConversationResponse {
+    GovernedConversationResponse {
+        request_id: request.request_id,
+        conversation_id: request.conversation_id,
+        assistant_message: existing.assistant_message.content.clone(),
+        persisted_messages: persisted_messages(&existing),
+        profile_display_name: None,
+        model_name: None,
+        memory: ConversationMemoryMetadata {
+            retrieved_count: 0,
+            used_count: 0,
+            truncated: false,
+            degradation_codes: Vec::new(),
+            vector_availability: RetrievalAvailability::NoMemory,
+            rebuild_recommended: false,
+        },
+        latency_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        replayed: true,
+    }
+}
+
+fn map_history_error(history_error: ConversationHistoryError) -> ConversationCognitionError {
+    error(match history_error.code {
+        ConversationHistoryErrorCode::ConversationNotFound => {
+            ConversationCognitionErrorCode::ConversationNotFound
+        }
+        ConversationHistoryErrorCode::ConversationLifeMismatch => {
+            ConversationCognitionErrorCode::ConversationLifeMismatch
+        }
+        ConversationHistoryErrorCode::TurnIdConflict => {
+            ConversationCognitionErrorCode::TurnIdConflict
+        }
+        ConversationHistoryErrorCode::ConversationChangedDuringRequest => {
+            ConversationCognitionErrorCode::ConversationChangedDuringRequest
+        }
+        _ => ConversationCognitionErrorCode::ConversationStorageUnavailable,
+    })
+}
+
 fn map_model_error(runtime_error: ModelRuntimeError) -> ConversationCognitionError {
     error(match runtime_error.code {
         ModelRuntimeErrorCode::NoActiveProfile => ConversationCognitionErrorCode::NoActiveProfile,
@@ -544,6 +608,24 @@ fn error(code: ConversationCognitionErrorCode) -> ConversationCognitionError {
         ConversationCognitionErrorCode::ConversationInProgress => {
             ("A conversation request is already in progress.", true)
         }
+        ConversationCognitionErrorCode::ConversationNotFound => {
+            ("The conversation was not found.", true)
+        }
+        ConversationCognitionErrorCode::ConversationLifeMismatch => (
+            "The conversation does not belong to the current life.",
+            false,
+        ),
+        ConversationCognitionErrorCode::TurnIdConflict => (
+            "The request identifier conflicts with committed history.",
+            false,
+        ),
+        ConversationCognitionErrorCode::ConversationChangedDuringRequest => (
+            "The conversation changed while the response was being generated.",
+            true,
+        ),
+        ConversationCognitionErrorCode::ConversationStorageUnavailable => {
+            ("Conversation history is unavailable.", true)
+        }
         ConversationCognitionErrorCode::NoActiveProfile => {
             ("No active chat model profile is configured.", true)
         }
@@ -577,18 +659,20 @@ mod tests {
     fn request_is_strict_and_bounded() {
         let request = GovernedConversationRequest {
             request_id: "r".into(),
-            user_message: "hello".into(),
-            history: vec![],
+            conversation_id: "conversation".into(),
+            current_message: "hello".into(),
         };
         assert!(validate_request(&request).is_ok());
-        let invalid = serde_json::json!({"requestId":"r","userMessage":"x","history":[{"role":"system","content":"no"}]});
+        let invalid = serde_json::json!({"requestId":"r","conversationId":"conversation","currentMessage":"x","history":[]});
         assert!(serde_json::from_value::<GovernedConversationRequest>(invalid).is_err());
     }
     #[test]
-    fn coordinator_rejects_duplicate_life_and_releases() {
+    fn coordinator_scopes_concurrency_to_conversation_and_request_id() {
         let coordinator = ConversationCognitionCoordinator::default();
-        let permit = coordinator.acquire("one", "life").unwrap();
-        let duplicate = match coordinator.acquire("two", "life") {
+        let permit = coordinator
+            .acquire("one", "life", "conversation-a")
+            .unwrap();
+        let duplicate = match coordinator.acquire("two", "life", "conversation-a") {
             Err(error) => error,
             Ok(_) => panic!("duplicate life requests must be rejected"),
         };
@@ -596,7 +680,19 @@ mod tests {
             duplicate.code,
             ConversationCognitionErrorCode::ConversationInProgress
         );
+        let duplicate_request = match coordinator.acquire("one", "life", "conversation-b") {
+            Err(error) => error,
+            Ok(_) => panic!("duplicate request ids must be rejected"),
+        };
+        assert_eq!(
+            duplicate_request.code,
+            ConversationCognitionErrorCode::ConversationInProgress
+        );
+        let independent = coordinator
+            .acquire("three", "life", "conversation-b")
+            .unwrap();
+        drop(independent);
         drop(permit);
-        assert!(coordinator.acquire("two", "life").is_ok());
+        assert!(coordinator.acquire("two", "life", "conversation-a").is_ok());
     }
 }

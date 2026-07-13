@@ -1,10 +1,5 @@
+use crate::memory::{MemoryError, MemoryKind};
 use serde::{Deserialize, Serialize};
-use tauri::State;
-
-use crate::{
-    memory::{MemoryError, MemoryKind},
-    storage::StorageService,
-};
 
 const MAX_QUERY_LENGTH: usize = 4000;
 const MAX_RESULT_LIMIT: u32 = 100;
@@ -78,14 +73,6 @@ fn validate_query(query: &RetrievalQuery) -> Result<(), MemoryError> {
 
 fn invalid_query(message: &str) -> MemoryError {
     MemoryError::new("INVALID_RETRIEVAL_QUERY", message, true)
-}
-
-#[tauri::command]
-pub fn retrieve_memories(
-    storage: State<'_, StorageService>,
-    query: RetrievalQuery,
-) -> Result<Vec<MemoryRetrievalResult>, MemoryError> {
-    MemoryRetriever::new(storage.inner()).retrieve(query)
 }
 
 #[cfg(test)]

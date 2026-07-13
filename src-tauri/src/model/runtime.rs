@@ -640,19 +640,6 @@ fn runtime_error(code: ModelRuntimeErrorCode) -> ModelRuntimeError {
 
 #[cfg(windows)]
 #[tauri::command]
-pub async fn chat_with_active_model(
-    storage: State<'_, StorageService>,
-    secrets: State<'_, WindowsCredentialSecretStore>,
-    coordinator: State<'_, ModelRuntimeCoordinator>,
-    request: ActiveModelChatRequest,
-) -> Result<super::ModelResponse, ModelRuntimeError> {
-    ModelRuntimeService::new(storage.inner(), secrets.inner(), coordinator.inner())
-        .chat_with_active_model(request)
-        .await
-}
-
-#[cfg(windows)]
-#[tauri::command]
 pub async fn test_model_profile_connection(
     storage: State<'_, StorageService>,
     secrets: State<'_, WindowsCredentialSecretStore>,
@@ -1333,7 +1320,8 @@ mod tests {
     #[test]
     fn command_surface_has_no_plaintext_credential_reader() {
         let source = include_str!("../lib.rs");
-        assert!(source.contains("model::runtime::chat_with_active_model"));
+        assert!(source.contains("conversation::service::chat_with_governed_context"));
+        assert!(!source.contains("model::runtime::chat_with_active_model"));
         assert!(source.contains("model::runtime::test_model_profile_connection"));
         assert!(!source.contains("model::chat_with_model"));
         assert!(!source.contains("get_api_key"));

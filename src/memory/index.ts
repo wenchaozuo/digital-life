@@ -18,6 +18,4 @@ export {
   type MemoryStatus,
   type UpdateMemoryRequest,
 } from "./types";
-export * from "./retrieval";
-export * from "./context";
 export * from "./extractor";

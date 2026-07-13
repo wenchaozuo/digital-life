@@ -47,12 +47,21 @@ test("ChatView has no plaintext runtime model settings and retains failures for 
   assert.doesNotMatch(input, /content\.value = "";\s*}\s*$/m);
 });
 
-test("chat capability adds governed chat while legacy permissions remain until cleanup", () => {
+test("chat capability exposes only governed chat and no legacy cognition command", () => {
   const rust = read("src-tauri/src/lib.rs");
   const permission = read("src-tauri/permissions/chat-commands.toml");
   assert.match(rust, /conversation::service::chat_with_governed_context/);
-  assert.match(rust, /model::runtime::chat_with_active_model/);
   assert.match(permission, /"chat_with_governed_context"/);
-  assert.match(permission, /"chat_with_active_model"/);
+  assert.doesNotMatch(rust, /model::runtime::chat_with_active_model|retrieval::retrieve_memories/);
+  assert.doesNotMatch(permission, /"chat_with_active_model"|"retrieve_memories"/);
   assert.doesNotMatch(permission, /api_credential|model_profile|start_memory_vector_index_rebuild/);
+});
+
+test("legacy frontend prompt and memory retrieval modules are absent", () => {
+  for (const pathName of [
+    "src/conversation/memoryContextIntegration.ts",
+    "src/memory/context/memoryContextBuilder.ts",
+    "src/memory/retrieval/memoryRetrieverService.ts",
+    "src/prompt/promptCompiler.ts",
+  ]) assert.equal(fs.existsSync(path.join(workspace, pathName)), false);
 });

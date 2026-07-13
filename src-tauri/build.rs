@@ -1,7 +1,7 @@
 fn main() {
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
-            "chat_with_active_model",
+            "chat_with_governed_context",
             "create_model_profile",
             "list_model_profiles",
             "get_model_profile",
@@ -16,7 +16,6 @@ fn main() {
             "update_memory_candidate",
             "confirm_memory",
             "delete_memory",
-            "retrieve_memories",
             "get_memory_vector_index_status",
             "start_memory_vector_index_rebuild",
             "get_memory_vector_index_job",

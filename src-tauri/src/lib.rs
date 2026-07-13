@@ -31,7 +31,6 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             conversation::service::chat_with_governed_context,
-            model::runtime::chat_with_active_model,
             model::profile::create_model_profile,
             model::profile::list_model_profiles,
             model::profile::get_model_profile,
@@ -46,7 +45,6 @@ pub fn run() {
             memory::update_memory_candidate,
             memory::confirm_memory,
             memory::delete_memory,
-            memory::retrieval::retrieve_memories,
             memory::vector_index_runtime::get_memory_vector_index_status,
             memory::vector_index_runtime::start_memory_vector_index_rebuild,
             memory::vector_index_runtime::get_memory_vector_index_job,

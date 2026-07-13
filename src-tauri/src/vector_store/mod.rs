@@ -6,10 +6,15 @@
 #[cfg(any(test, debug_assertions))]
 mod in_memory;
 mod lancedb;
+mod registry;
 
 #[cfg(any(test, debug_assertions))]
 pub use in_memory::InMemoryVectorStore;
 pub use lancedb::LanceDbVectorStore;
+pub use registry::{
+    LanceDbVectorStoreRegistry, LanceDbVectorStoreRegistryError,
+    LanceDbVectorStoreRegistryErrorCode, DEFAULT_MAX_CACHED_STORES,
+};
 
 use std::{future::Future, pin::Pin};
 

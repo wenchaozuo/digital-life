@@ -94,6 +94,12 @@ impl ResolvedEmbeddingProvider {
     pub fn provider(&self) -> &dyn EmbeddingProvider {
         &self.provider
     }
+
+    /// Transfers the short-lived provider into another Rust-internal
+    /// orchestrator without exposing its credential to IPC or serialization.
+    pub(crate) fn into_provider(self) -> OpenAICompatibleEmbeddingProvider {
+        self.provider
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]

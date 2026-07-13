@@ -11,6 +11,7 @@ use crate::storage::StorageService;
 pub mod context_builder;
 pub mod retrieval;
 pub mod retrieval_router;
+pub mod retrieval_runtime;
 pub mod vector_index;
 pub mod vector_index_runtime;
 

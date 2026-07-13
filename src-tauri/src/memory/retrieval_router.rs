@@ -17,6 +17,7 @@ use super::{
 
 pub const DEFAULT_HYBRID_LIMIT: usize = 10;
 pub const MAX_HYBRID_LIMIT: usize = 10;
+pub const MIN_FINAL_SCORE: f64 = 0.20;
 const MAX_QUERY_CHARACTERS: usize = 4000;
 const CANDIDATE_POOL_MULTIPLIER: usize = 4;
 // Relevance has equal fixed weight across both retrieval channels. Importance
@@ -75,6 +76,14 @@ pub enum VectorRetrievalStatus {
     VectorUnavailable,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum KeywordRetrievalStatus {
+    NotRequested,
+    Available,
+    KeywordUnavailable,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct RetrievalCandidate {
@@ -97,6 +106,7 @@ pub struct RetrievalTrace {
     pub keyword_candidate_count: usize,
     pub vector_candidate_count: usize,
     pub authoritative_candidate_count: usize,
+    pub keyword_status: KeywordRetrievalStatus,
     pub vector_status: VectorRetrievalStatus,
 }
 
@@ -104,6 +114,7 @@ pub struct RetrievalTrace {
 #[serde(rename_all = "camelCase")]
 pub struct HybridRetrievalResult {
     pub candidates: Vec<RetrievalCandidate>,
+    pub keyword_status: KeywordRetrievalStatus,
     pub vector_status: VectorRetrievalStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace: Option<RetrievalTrace>,
@@ -202,6 +213,7 @@ impl MemoryCandidateMerger {
             })
             .collect();
 
+        candidates.retain(|candidate| candidate.final_score >= MIN_FINAL_SCORE);
         candidates.sort_by(|left, right| {
             right
                 .final_score
@@ -295,27 +307,34 @@ where
             .saturating_mul(CANDIDATE_POOL_MULTIPLIER)
             .min(100);
         let mut keyword_scores = HashMap::new();
+        let mut keyword_status = KeywordRetrievalStatus::NotRequested;
         if request.strategy != RetrievalStrategy::VectorOnly {
-            let results = MemoryRetriever::new(self.repository)
-                .retrieve(RetrievalQuery {
-                    life_id: request.life_id.clone(),
-                    query_text: request.query.clone(),
-                    kinds: request.memory_kind_filter.clone(),
-                    limit: pool_limit as u32,
-                })
-                .map_err(|_| {
-                    MemoryRetrievalRouterError::new(
+            match MemoryRetriever::new(self.repository).retrieve(RetrievalQuery {
+                life_id: request.life_id.clone(),
+                query_text: request.query.clone(),
+                kinds: request.memory_kind_filter.clone(),
+                limit: pool_limit as u32,
+            }) {
+                Ok(results) => {
+                    keyword_status = KeywordRetrievalStatus::Available;
+                    for (rank, result) in results.into_iter().enumerate() {
+                        let score = 1.0 / (rank + 1) as f64;
+                        keyword_scores
+                            .entry(result.memory_id)
+                            .and_modify(|current: &mut f64| *current = current.max(score))
+                            .or_insert(score);
+                    }
+                }
+                Err(_) if request.strategy == RetrievalStrategy::Hybrid => {
+                    keyword_status = KeywordRetrievalStatus::KeywordUnavailable;
+                }
+                Err(_) => {
+                    return Err(MemoryRetrievalRouterError::new(
                         MemoryRetrievalRouterErrorCode::KeywordUnavailable,
                         "Keyword memory retrieval is unavailable.",
                         true,
-                    )
-                })?;
-            for (rank, result) in results.into_iter().enumerate() {
-                let score = 1.0 / (rank + 1) as f64;
-                keyword_scores
-                    .entry(result.memory_id)
-                    .and_modify(|current: &mut f64| *current = current.max(score))
-                    .or_insert(score);
+                    ));
+                }
             }
         }
 
@@ -365,10 +384,12 @@ where
             keyword_candidate_count: keyword_scores.len(),
             vector_candidate_count: vector_scores.len(),
             authoritative_candidate_count: authoritative_count,
+            keyword_status,
             vector_status,
         });
         Ok(HybridRetrievalResult {
             candidates,
+            keyword_status,
             vector_status,
             trace,
         })

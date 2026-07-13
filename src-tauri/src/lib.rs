@@ -1,6 +1,7 @@
 pub mod embedding;
 pub mod memory;
 pub mod model;
+pub mod secrets;
 mod storage;
 pub mod vector_store;
 
@@ -15,6 +16,7 @@ pub fn run() {
             let storage = storage::StorageService::initialize(app.handle())
                 .map_err(|error| std::io::Error::other(error.message))?;
             app.manage(storage);
+            app.manage(secrets::WindowsCredentialSecretStore::new());
             create_configured_windows(app)?;
             configure_window_lifecycle(app)?;
             Ok(())
@@ -28,6 +30,9 @@ pub fn run() {
             memory::confirm_memory,
             memory::delete_memory,
             memory::retrieval::retrieve_memories,
+            secrets::save_api_credential,
+            secrets::has_api_credential,
+            secrets::delete_api_credential,
             open_settings_window,
             open_chat_window,
             close_settings_window,

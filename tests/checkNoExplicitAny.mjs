@@ -4,7 +4,13 @@ import process from 'node:process';
 
 const filesToCheck = [
   'src/chat/memoryReviewController.ts',
-  'tests/memoryReview.test.ts'
+  'tests/memoryReview.test.ts',
+  'src/settings/model/credentialService.ts',
+  'src/settings/model/modelProfileController.ts',
+  'src/settings/model/ModelProfileForm.vue',
+  'src/settings/model/ModelProfileCard.vue',
+  'src/settings/model/ModelProfilesView.vue',
+  'tests/modelSettings.test.ts'
 ];
 
 let failed = false;

@@ -2,6 +2,8 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import { computed, onMounted, ref } from "vue";
+import type { ModelPurpose } from "../model";
+import ModelProfilesView from "./model/ModelProfilesView.vue";
 import {
   storageService,
   type StorageLocationInfo,
@@ -26,6 +28,16 @@ const migration = ref<StorageMigrationResult>();
 const phase = ref<StorageSettingsPhase>("unselected");
 const error = ref<StorageSettingsError>();
 const confirmationVisible = ref(false);
+type SettingsSection = "storage" | "chat" | "embedding";
+interface ModelProfilesViewHandle {
+  clearSensitiveInputs(): void;
+  requestLeave(): boolean;
+}
+const activeSection = ref<SettingsSection>("storage");
+const modelProfilesView = ref<ModelProfilesViewHandle>();
+const activeModelPurpose = computed<ModelPurpose>(() =>
+  activeSection.value === "embedding" ? "embedding" : "chat",
+);
 
 const canInteract = computed(() => canInteractWithLocation(phase.value));
 const canMigrate = computed(() =>
@@ -140,8 +152,23 @@ async function confirmMigration(): Promise<void> {
   }
 }
 
-function closeSettings(): void {
+async function switchSection(section: SettingsSection): Promise<void> {
+  if (section === activeSection.value || phase.value === "migrating") {
+    return;
+  }
+  if (activeSection.value !== "storage" && !modelProfilesView.value?.requestLeave()) {
+    return;
+  }
+  modelProfilesView.value?.clearSensitiveInputs();
+  activeSection.value = section;
+}
+
+async function closeSettings(): Promise<void> {
   if (phase.value !== "migrating") {
+    if (activeSection.value !== "storage" && !modelProfilesView.value?.requestLeave()) {
+      return;
+    }
+    modelProfilesView.value?.clearSensitiveInputs();
     void invoke("close_settings_window");
   }
 }
@@ -160,9 +187,17 @@ onMounted(async () => {
     <section class="settings-panel" aria-labelledby="settings-title">
       <header>
         <p class="eyebrow">Digital Life</p>
-        <h1 id="settings-title">Storage location</h1>
-        <p>Choose and safely migrate the local SQLite data root.</p>
+        <h1 id="settings-title">Settings</h1>
+        <p>Manage local storage and independently configured model profiles.</p>
       </header>
+
+      <nav class="settings-nav" aria-label="Settings sections">
+        <button type="button" :class="{ selected: activeSection === 'storage' }" :disabled="phase === 'migrating'" @click="switchSection('storage')">Storage location</button>
+        <button type="button" :class="{ selected: activeSection === 'chat' }" :disabled="phase === 'migrating'" @click="switchSection('chat')">Conversation models</button>
+        <button type="button" :class="{ selected: activeSection === 'embedding' }" :disabled="phase === 'migrating'" @click="switchSection('embedding')">Embedding models</button>
+      </nav>
+
+      <section v-if="activeSection === 'storage'" class="settings-section" aria-label="Storage location settings">
 
       <section class="location-summary" aria-label="Current storage location">
         <h2>Current data root</h2>
@@ -237,6 +272,15 @@ onMounted(async () => {
         <p>The original database remains available.</p>
       </section>
 
+      </section>
+
+      <ModelProfilesView
+        v-else
+        ref="modelProfilesView"
+        :key="activeSection"
+        :purpose="activeModelPurpose"
+      />
+
       <footer>
         <button type="button" :disabled="phase === 'migrating'" @click="closeSettings">
           Close settings
@@ -300,6 +344,10 @@ input:disabled {
   max-width: 760px;
   margin: 0 auto;
 }
+
+.settings-section { display: grid; gap: 1rem; }
+.settings-nav { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+.settings-nav .selected { border-color: #38bdf8; background: #075985; }
 
 h1,
 h2,

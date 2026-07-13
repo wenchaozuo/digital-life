@@ -23,9 +23,9 @@ export interface CreateModelProfileRequest {
   displayName: string;
   baseUrl: string;
   modelName: string;
-  temperature: number | null;
-  maxTokens: number | null;
-  embeddingDimension: number | null;
+  temperature?: number;
+  maxTokens?: number;
+  embeddingDimension?: number;
 }
 
 export interface UpdateModelProfileRequest

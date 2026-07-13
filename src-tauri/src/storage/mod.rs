@@ -1,6 +1,7 @@
 mod conversation;
 mod location;
 mod memory;
+mod memory_management;
 mod memory_retrieval;
 mod memory_revision;
 mod migration;

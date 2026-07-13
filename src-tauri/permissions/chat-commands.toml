@@ -12,8 +12,6 @@ commands.allow = [
     "get_current_life_identity",
     "get_persona_template",
     "create_memory_candidate",
-    "list_memories",
-    "get_memory",
     "update_memory_candidate",
     "confirm_memory",
     "delete_memory",

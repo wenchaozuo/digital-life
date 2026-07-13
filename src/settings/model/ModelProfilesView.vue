@@ -5,6 +5,8 @@ import ModelProfileCard from "./ModelProfileCard.vue";
 import ModelProfileForm from "./ModelProfileForm.vue";
 import MemoryVectorIndexPanel from "./MemoryVectorIndexPanel.vue";
 import MemoryVectorSyncPanel from "./MemoryVectorSyncPanel.vue";
+import type { MemoryVectorIndexStatus } from "./memoryVectorIndexService.ts";
+import type { MemoryVectorSyncWorkerStatus, MemoryVectorSyncSettings } from "./memoryVectorSyncService.ts";
 import {
   ModelProfileController,
   type ModelProfileDraft,
@@ -23,7 +25,7 @@ interface MemoryVectorIndexPanelHandle {
   notifyActiveEmbeddingProfileChanged(): void;
   deactivate(): void;
   isRebuildRunning: boolean;
-  status: any;
+  status: MemoryVectorIndexStatus | undefined;
 }
 const memoryVectorIndexPanel = ref<MemoryVectorIndexPanelHandle>();
 
@@ -31,8 +33,8 @@ interface MemoryVectorSyncPanelHandle {
   refreshStatus(): void;
   deactivate(): void;
   isSyncRunning: boolean;
-  status: any;
-  settings: any;
+  status: MemoryVectorSyncWorkerStatus | undefined;
+  settings: MemoryVectorSyncSettings | undefined;
 }
 const memoryVectorSyncPanel = ref<MemoryVectorSyncPanelHandle>();
 

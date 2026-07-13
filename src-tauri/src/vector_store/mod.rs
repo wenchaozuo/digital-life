@@ -5,9 +5,11 @@
 
 #[cfg(any(test, debug_assertions))]
 mod in_memory;
+mod lancedb;
 
 #[cfg(any(test, debug_assertions))]
 pub use in_memory::InMemoryVectorStore;
+pub use lancedb::LanceDbVectorStore;
 
 use std::{future::Future, pin::Pin};
 

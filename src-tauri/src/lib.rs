@@ -2,6 +2,7 @@ pub mod embedding;
 pub mod memory;
 pub mod model;
 mod storage;
+pub mod vector_store;
 
 use tauri::{Manager, WebviewWindowBuilder, WindowEvent};
 

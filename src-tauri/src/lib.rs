@@ -23,6 +23,13 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             model::chat_with_model,
+            model::profile::create_model_profile,
+            model::profile::list_model_profiles,
+            model::profile::get_model_profile,
+            model::profile::update_model_profile,
+            model::profile::delete_model_profile,
+            model::profile::set_active_model_profile,
+            model::profile::get_active_model_profile,
             memory::create_memory_candidate,
             memory::list_memories,
             memory::get_memory,

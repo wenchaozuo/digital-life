@@ -13,3 +13,16 @@ export {
   type ModelStreamEventKind,
   type ModelUsage,
 } from "./modelService";
+
+export {
+  ModelProfileService,
+  modelProfileService,
+  type ActiveModelProfile,
+  type CreateModelProfileRequest,
+  type DeleteModelProfileResult,
+  type ModelProfile,
+  type ModelProfileError,
+  type ModelProviderKind,
+  type ModelPurpose,
+  type UpdateModelProfileRequest,
+} from "./modelProfileService";

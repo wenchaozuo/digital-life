@@ -2,6 +2,7 @@ mod location;
 mod memory;
 mod memory_retrieval;
 mod migration;
+mod model_profile;
 
 use std::{
     fmt::Display,
@@ -23,6 +24,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         2,
         "002_memory_core",
         include_str!("migrations/002_memory_core.sql"),
+    ),
+    (
+        3,
+        "003_model_profiles",
+        include_str!("migrations/003_model_profiles.sql"),
     ),
 ];
 

@@ -1,4 +1,5 @@
 mod openai_compatible;
+pub mod profile;
 
 use std::{future::Future, pin::Pin};
 

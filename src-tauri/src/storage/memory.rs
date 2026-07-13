@@ -418,7 +418,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_002_upgrades_version_001_and_creates_no_default_memory() {
+    fn migrations_upgrade_version_001_and_create_no_default_memory() {
         let root = TestRoot::new("upgrade-v1");
         let data_root = root.0.join("data");
         fs::create_dir_all(&data_root).unwrap();
@@ -457,7 +457,7 @@ mod tests {
             .connection
             .query_row("SELECT COUNT(*) FROM memory_record", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         assert_eq!(memory_count, 0);
     }
 

@@ -1456,6 +1456,151 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_memory_reference_rejects_cross_life_insert_and_update() {
+        let root = TestRoot::new("confirmed-memory-life");
+        let service = seeded_service(&root);
+        insert_confirmed_memory(&service, "memory-a", "life-a");
+        insert_confirmed_memory(&service, "memory-b", "life-b");
+
+        let mut cross_life = pending("accepted", "life-a", "2026-07-14T10:00:00.000Z");
+        cross_life.status = CandidateMemoryStatus::Accepted;
+        cross_life.content = None;
+        cross_life.confirmed_memory_id = Some("memory-b".into());
+        assert_eq!(
+            <StorageService as CandidateMemoryRepository>::insert_candidate(&service, cross_life)
+                .unwrap_err()
+                .code,
+            "CANDIDATE_MEMORY_CONSTRAINT_VIOLATION"
+        );
+
+        let mut valid = pending("valid-accepted", "life-a", "2026-07-14T10:01:00.000Z");
+        valid.status = CandidateMemoryStatus::Accepted;
+        valid.content = None;
+        valid.confirmed_memory_id = Some("memory-a".into());
+        <StorageService as CandidateMemoryRepository>::insert_candidate(&service, valid).unwrap();
+        let state = service.state().unwrap();
+        assert!(state
+            .connection
+            .execute(
+                "UPDATE candidate_memory SET life_id = 'life-b' WHERE id = 'valid-accepted'",
+                [],
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn conflicting_memory_reference_rejects_cross_life_insert_and_update() {
+        let root = TestRoot::new("conflicting-memory-life");
+        let service = seeded_service(&root);
+        insert_confirmed_memory(&service, "memory-a", "life-a");
+        insert_confirmed_memory(&service, "memory-b", "life-b");
+
+        let mut cross_life = pending("cross-life", "life-a", "2026-07-14T10:00:00.000Z");
+        cross_life.conflicts_with_memory_id = Some("memory-b".into());
+        assert_eq!(
+            <StorageService as CandidateMemoryRepository>::insert_candidate(&service, cross_life)
+                .unwrap_err()
+                .code,
+            "CANDIDATE_MEMORY_CONSTRAINT_VIOLATION"
+        );
+
+        let mut valid = pending("valid", "life-a", "2026-07-14T10:01:00.000Z");
+        valid.conflicts_with_memory_id = Some("memory-a".into());
+        <StorageService as CandidateMemoryRepository>::insert_candidate(&service, valid).unwrap();
+        let state = service.state().unwrap();
+        assert!(state
+            .connection
+            .execute(
+                "UPDATE candidate_memory SET conflicts_with_memory_id = 'memory-b' WHERE id = 'valid'",
+                [],
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn evidence_rejects_cross_life_insert_and_update_at_database_boundary() {
+        let root = TestRoot::new("evidence-life-trigger");
+        let service = seeded_service(&root);
+        insert_candidate(
+            &service,
+            "candidate-a",
+            "life-a",
+            "2026-07-14T10:00:00.000Z",
+        );
+        let state = service.state().unwrap();
+        assert!(state
+            .connection
+            .execute(
+                "INSERT INTO candidate_memory_evidence (
+                    id, candidate_id, life_id, source_type, observed_at
+                 ) VALUES ('evidence-cross', 'candidate-a', 'life-b', 'manual', ?1)",
+                params!["2026-07-14T10:00:00.000Z"],
+            )
+            .is_err());
+        state
+            .connection
+            .execute(
+                "INSERT INTO candidate_memory_evidence (
+                    id, candidate_id, life_id, source_type, observed_at
+                 ) VALUES ('evidence-valid', 'candidate-a', 'life-a', 'manual', ?1)",
+                params!["2026-07-14T10:00:00.000Z"],
+            )
+            .unwrap();
+        assert!(state
+            .connection
+            .execute(
+                "UPDATE candidate_memory_evidence SET life_id = 'life-b'
+                 WHERE id = 'evidence-valid'",
+                [],
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn superseded_candidate_reference_rejects_cross_life_insert_and_update() {
+        let root = TestRoot::new("superseded-life-trigger");
+        let service = seeded_service(&root);
+        insert_candidate(
+            &service,
+            "replacement-a",
+            "life-a",
+            "2026-07-14T10:00:00.000Z",
+        );
+        insert_candidate(
+            &service,
+            "replacement-b",
+            "life-b",
+            "2026-07-14T10:01:00.000Z",
+        );
+
+        let mut cross_life = pending("superseded-cross", "life-a", "2026-07-14T10:02:00.000Z");
+        cross_life.status = CandidateMemoryStatus::Superseded;
+        cross_life.content = None;
+        cross_life.superseded_by_candidate_id = Some("replacement-b".into());
+        assert_eq!(
+            <StorageService as CandidateMemoryRepository>::insert_candidate(&service, cross_life)
+                .unwrap_err()
+                .code,
+            "CANDIDATE_MEMORY_CONSTRAINT_VIOLATION"
+        );
+
+        let mut valid = pending("superseded-valid", "life-a", "2026-07-14T10:03:00.000Z");
+        valid.status = CandidateMemoryStatus::Superseded;
+        valid.content = None;
+        valid.superseded_by_candidate_id = Some("replacement-a".into());
+        <StorageService as CandidateMemoryRepository>::insert_candidate(&service, valid).unwrap();
+        let state = service.state().unwrap();
+        assert!(state
+            .connection
+            .execute(
+                "UPDATE candidate_memory SET superseded_by_candidate_id = 'replacement-b'
+                 WHERE id = 'superseded-valid'",
+                [],
+            )
+            .is_err());
+    }
+
+    #[test]
     fn confirmed_memory_deletion_cascades_accepted_candidate_only() {
         let root = TestRoot::new("confirmed-cascade");
         let service = seeded_service(&root);

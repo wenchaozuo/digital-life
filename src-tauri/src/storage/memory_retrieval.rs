@@ -158,8 +158,7 @@ mod tests {
         memory::{
             retrieval::{MemoryRetriever, RetrievalQuery},
             revisions::{DeleteMemoryPermanentlyRequest, MemoryRevisionService},
-            ConfirmMemoryRequest, CreateMemoryCandidateRequest, MemoryKind, MemoryService,
-            MemorySourceType,
+            CreateMemoryCandidateRequest, MemoryKind, MemoryService, MemorySourceType,
         },
         storage::{unique_suffix, LifeIdentityRecord, PersonaTemplateRecord, StorageService},
     };
@@ -216,32 +215,33 @@ mod tests {
         importance: f64,
         confirmed: bool,
     ) -> crate::memory::MemoryRecord {
-        let candidate = MemoryService::new(service)
-            .create_candidate(CreateMemoryCandidateRequest {
-                life_id: life_id.into(),
-                kind,
-                content: content.into(),
-                summary: summary.map(str::to_string),
-                source_type: MemorySourceType::Manual,
-                source_ref: Some("retrieval-test".into()),
-                source_created_at: "2026-07-11T01:00:00.000Z".into(),
-                importance,
-                confidence: 0.8,
-                is_sensitive: false,
-            })
-            .unwrap();
-
         if confirmed {
+            super::super::test_support::insert_confirmed_memory_fixture(
+                service,
+                life_id,
+                kind.as_str(),
+                content,
+                summary,
+                importance,
+                0.8,
+                false,
+                false,
+            )
+        } else {
             MemoryService::new(service)
-                .confirm(ConfirmMemoryRequest {
+                .create_candidate(CreateMemoryCandidateRequest {
                     life_id: life_id.into(),
-                    memory_id: candidate.id,
-                    user_confirmed: true,
-                    sensitive_consent: false,
+                    kind,
+                    content: content.into(),
+                    summary: summary.map(str::to_string),
+                    source_type: MemorySourceType::Manual,
+                    source_ref: Some("retrieval-test".into()),
+                    source_created_at: "2026-07-11T01:00:00.000Z".into(),
+                    importance,
+                    confidence: 0.8,
+                    is_sensitive: false,
                 })
                 .unwrap()
-        } else {
-            candidate
         }
     }
 
@@ -308,28 +308,17 @@ mod tests {
     fn confirmed_sensitive_memory_is_not_retrieved() {
         let root = TestRoot::new("sensitive-filter");
         let service = seeded_service(&root);
-        let candidate = MemoryService::new(&service)
-            .create_candidate(CreateMemoryCandidateRequest {
-                life_id: "life-a".into(),
-                kind: MemoryKind::Fact,
-                content: "A sensitive lighthouse fact.".into(),
-                summary: None,
-                source_type: MemorySourceType::Manual,
-                source_ref: Some("retrieval-test".into()),
-                source_created_at: "2026-07-11T01:00:00.000Z".into(),
-                importance: 0.9,
-                confidence: 0.9,
-                is_sensitive: true,
-            })
-            .unwrap();
-        MemoryService::new(&service)
-            .confirm(ConfirmMemoryRequest {
-                life_id: "life-a".into(),
-                memory_id: candidate.id,
-                user_confirmed: true,
-                sensitive_consent: true,
-            })
-            .unwrap();
+        super::super::test_support::insert_confirmed_memory_fixture(
+            &service,
+            "life-a",
+            "fact",
+            "A sensitive lighthouse fact.",
+            None,
+            0.9,
+            0.9,
+            true,
+            false,
+        );
 
         assert!(MemoryRetriever::new(&service)
             .retrieve(query("life-a", "lighthouse"))

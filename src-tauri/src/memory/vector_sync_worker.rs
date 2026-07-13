@@ -1043,8 +1043,6 @@ mod tests {
         memory::{
             revisions::{DeleteMemoryPermanentlyRequest, MemoryRevisionService},
             vector_sync_outbox::EnqueueMemoryVectorSyncRequest,
-            ConfirmMemoryRequest, CreateMemoryCandidateRequest, MemoryKind, MemoryService,
-            MemorySourceType,
         },
         model::profile::{
             CreateModelProfileRequest, ModelProfileService, ModelProviderKind, ModelPurpose,
@@ -1164,33 +1162,18 @@ mod tests {
         (temp, storage)
     }
 
-    fn candidate(storage: &StorageService, sensitive: bool) -> super::super::MemoryRecord {
-        MemoryService::new(storage)
-            .create_candidate(CreateMemoryCandidateRequest {
-                life_id: "life".into(),
-                kind: MemoryKind::Fact,
-                content: "temporary worker fixture".into(),
-                summary: Some("worker summary".into()),
-                source_type: MemorySourceType::Manual,
-                source_ref: None,
-                source_created_at: "2026-01-01T00:00:00Z".into(),
-                importance: 0.5,
-                confidence: 0.8,
-                is_sensitive: sensitive,
-            })
-            .unwrap()
-    }
-
     fn confirmed(storage: &StorageService, sensitive: bool) -> super::super::MemoryRecord {
-        let memory = candidate(storage, sensitive);
-        MemoryService::new(storage)
-            .confirm(ConfirmMemoryRequest {
-                life_id: "life".into(),
-                memory_id: memory.id,
-                user_confirmed: true,
-                sensitive_consent: sensitive,
-            })
-            .unwrap()
+        crate::storage::test_support::insert_confirmed_memory_fixture(
+            storage,
+            "life",
+            "fact",
+            "temporary worker fixture",
+            Some("worker summary"),
+            0.5,
+            0.8,
+            sensitive,
+            !sensitive,
+        )
     }
 
     fn activate_profile(storage: &StorageService, base_url: &str) -> String {
@@ -1341,17 +1324,10 @@ mod tests {
     }
 
     #[test]
-    fn candidate_sensitive_and_delete_jobs_never_need_embedding() {
+    fn sensitive_and_delete_jobs_never_need_embedding() {
         let (temp, storage) = test_storage();
         storage.set_vector_sync_enabled("life", true).unwrap();
-        let candidate = candidate(&storage, false);
-        storage
-            .enqueue(EnqueueMemoryVectorSyncRequest {
-                life_id: "life".into(),
-                memory_id: candidate.id,
-                desired_action: MemoryVectorSyncAction::Upsert,
-            })
-            .unwrap();
+        // Sensitive confirmed — manually enqueue upsert (fixture skips outbox for sensitive).
         let sensitive = confirmed(&storage, true);
         storage
             .enqueue(EnqueueMemoryVectorSyncRequest {
@@ -1360,6 +1336,7 @@ mod tests {
                 desired_action: MemoryVectorSyncAction::Upsert,
             })
             .unwrap();
+        // Non-sensitive confirmed — delete creates outbox delete entry.
         let deleted = confirmed(&storage, false);
         MemoryRevisionService::new(&storage)
             .delete_permanently(DeleteMemoryPermanentlyRequest {
@@ -1381,7 +1358,7 @@ mod tests {
             || false,
         ))
         .unwrap();
-        assert_eq!(results.len(), 3);
+        assert_eq!(results.len(), 2);
         assert!(results
             .iter()
             .all(|result| { result.disposition == MemoryVectorSyncProcessDisposition::Completed }));

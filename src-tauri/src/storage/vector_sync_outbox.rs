@@ -556,6 +556,20 @@ mod tests {
             .unwrap()
     }
 
+    fn confirmed(storage: &StorageService, sensitive: bool) -> crate::memory::MemoryRecord {
+        super::super::test_support::insert_confirmed_memory_fixture(
+            storage,
+            "life",
+            "fact",
+            "fixture memory",
+            None,
+            0.5,
+            0.5,
+            sensitive,
+            !sensitive,
+        )
+    }
+
     #[test]
     fn migration_schema_is_safe_and_candidate_does_not_enqueue() {
         let (_root, storage) = storage();
@@ -637,17 +651,9 @@ mod tests {
     }
 
     #[test]
-    fn confirmation_enqueues_and_delete_preserves_folded_job() {
+    fn confirmed_fixture_enqueues_and_delete_preserves_folded_job() {
         let (_root, storage) = storage();
-        let record = candidate(&storage, false);
-        MemoryService::new(&storage)
-            .confirm(ConfirmMemoryRequest {
-                life_id: "life".into(),
-                memory_id: record.id.clone(),
-                user_confirmed: true,
-                sensitive_consent: false,
-            })
-            .unwrap();
+        let record = confirmed(&storage, false);
         let jobs = storage.list("life").unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].desired_action, MemoryVectorSyncAction::Upsert);
@@ -676,31 +682,25 @@ mod tests {
     }
 
     #[test]
-    fn sensitive_confirmation_never_enqueues_upsert() {
+    fn sensitive_confirmation_is_unavailable_and_never_enqueues_upsert() {
         let (_root, storage) = storage();
         let record = candidate(&storage, true);
-        MemoryService::new(&storage)
+        let error = MemoryService::new(&storage)
             .confirm(ConfirmMemoryRequest {
                 life_id: "life".into(),
                 memory_id: record.id,
                 user_confirmed: true,
                 sensitive_consent: true,
             })
-            .unwrap();
+            .unwrap_err();
+        assert_eq!(error.code, "CANDIDATE_CONFIRMATION_UNAVAILABLE");
         assert!(storage.list("life").unwrap().is_empty());
     }
 
     #[test]
-    fn outbox_failure_rolls_back_memory_confirmation() {
+    fn confirm_is_unavailable_and_does_not_modify_candidate() {
         let (_root, storage) = storage();
         let record = candidate(&storage, false);
-        storage
-            .state()
-            .unwrap()
-            .connection
-            .execute("DROP TABLE memory_vector_sync_outbox", [])
-            .unwrap();
-
         let error = MemoryService::new(&storage)
             .confirm(ConfirmMemoryRequest {
                 life_id: "life".into(),
@@ -709,18 +709,18 @@ mod tests {
                 sensitive_consent: false,
             })
             .unwrap_err();
-
-        assert_eq!(error.code, "DATABASE_ERROR");
+        assert_eq!(error.code, "CANDIDATE_CONFIRMATION_UNAVAILABLE");
         let authoritative =
             <StorageService as crate::memory::MemoryRepository>::get(&storage, "life", &record.id)
                 .unwrap();
         assert_eq!(authoritative.status, crate::memory::MemoryStatus::Candidate);
+        assert!(storage.list("life").unwrap().is_empty());
     }
 
     #[test]
     fn leases_are_exclusive_resettable_and_expired_leases_recover() {
         let (_root, storage) = storage();
-        let record = candidate(&storage, false);
+        let record = confirmed(&storage, false);
         storage
             .enqueue(EnqueueMemoryVectorSyncRequest {
                 life_id: "life".into(),
@@ -785,20 +785,17 @@ mod tests {
                 persona_version: 1,
             })
             .unwrap();
-        let other = MemoryService::new(&storage)
-            .create_candidate(CreateMemoryCandidateRequest {
-                life_id: "other-life".into(),
-                kind: MemoryKind::Fact,
-                content: "other fixture".into(),
-                summary: None,
-                source_type: MemorySourceType::Manual,
-                source_ref: None,
-                source_created_at: "2026-01-01T00:00:00Z".into(),
-                importance: 0.5,
-                confidence: 0.5,
-                is_sensitive: false,
-            })
-            .unwrap();
+        let other = super::super::test_support::insert_confirmed_memory_fixture(
+            &storage,
+            "other-life",
+            "fact",
+            "other fixture",
+            None,
+            0.5,
+            0.5,
+            false,
+            false,
+        );
 
         let error = storage
             .enqueue(EnqueueMemoryVectorSyncRequest {
@@ -819,14 +816,7 @@ mod tests {
     #[test]
     fn concurrent_claims_obtain_the_job_at_most_once() {
         let (root, first_store) = storage();
-        let memory = candidate(&first_store, false);
-        first_store
-            .enqueue(EnqueueMemoryVectorSyncRequest {
-                life_id: "life".into(),
-                memory_id: memory.id,
-                desired_action: MemoryVectorSyncAction::Upsert,
-            })
-            .unwrap();
+        let _memory = confirmed(&first_store, false);
         let second_store =
             StorageService::initialize_with_roots(root.0.join("data"), None).unwrap();
         let barrier = Arc::new(Barrier::new(2));

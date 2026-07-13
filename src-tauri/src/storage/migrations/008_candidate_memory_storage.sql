@@ -136,33 +136,99 @@ ON candidate_memory_audit (life_id, created_at);
 CREATE TRIGGER candidate_memory_confirmed_memory_insert
 BEFORE INSERT ON candidate_memory
 WHEN NEW.confirmed_memory_id IS NOT NULL
- AND COALESCE((SELECT status FROM memory_record WHERE id = NEW.confirmed_memory_id), '') <> 'confirmed'
+ AND NOT EXISTS (
+    SELECT 1 FROM memory_record
+    WHERE id = NEW.confirmed_memory_id
+      AND status = 'confirmed'
+      AND life_id = NEW.life_id
+ )
 BEGIN
-    SELECT RAISE(ABORT, 'candidate_memory confirmed_memory_id must reference confirmed memory');
+    SELECT RAISE(ABORT, 'candidate_memory confirmed_memory_id must reference confirmed memory in the same life');
 END;
 
 CREATE TRIGGER candidate_memory_confirmed_memory_update
-BEFORE UPDATE OF confirmed_memory_id ON candidate_memory
+BEFORE UPDATE OF life_id, confirmed_memory_id ON candidate_memory
 WHEN NEW.confirmed_memory_id IS NOT NULL
- AND COALESCE((SELECT status FROM memory_record WHERE id = NEW.confirmed_memory_id), '') <> 'confirmed'
+ AND NOT EXISTS (
+    SELECT 1 FROM memory_record
+    WHERE id = NEW.confirmed_memory_id
+      AND status = 'confirmed'
+      AND life_id = NEW.life_id
+ )
 BEGIN
-    SELECT RAISE(ABORT, 'candidate_memory confirmed_memory_id must reference confirmed memory');
+    SELECT RAISE(ABORT, 'candidate_memory confirmed_memory_id must reference confirmed memory in the same life');
 END;
 
 CREATE TRIGGER candidate_memory_conflict_memory_insert
 BEFORE INSERT ON candidate_memory
 WHEN NEW.conflicts_with_memory_id IS NOT NULL
- AND COALESCE((SELECT status FROM memory_record WHERE id = NEW.conflicts_with_memory_id), '') <> 'confirmed'
+ AND NOT EXISTS (
+    SELECT 1 FROM memory_record
+    WHERE id = NEW.conflicts_with_memory_id
+      AND status = 'confirmed'
+      AND life_id = NEW.life_id
+ )
 BEGIN
-    SELECT RAISE(ABORT, 'candidate_memory conflicts_with_memory_id must reference confirmed memory');
+    SELECT RAISE(ABORT, 'candidate_memory conflicts_with_memory_id must reference confirmed memory in the same life');
 END;
 
 CREATE TRIGGER candidate_memory_conflict_memory_update
-BEFORE UPDATE OF conflicts_with_memory_id ON candidate_memory
+BEFORE UPDATE OF life_id, conflicts_with_memory_id ON candidate_memory
 WHEN NEW.conflicts_with_memory_id IS NOT NULL
- AND COALESCE((SELECT status FROM memory_record WHERE id = NEW.conflicts_with_memory_id), '') <> 'confirmed'
+ AND NOT EXISTS (
+    SELECT 1 FROM memory_record
+    WHERE id = NEW.conflicts_with_memory_id
+      AND status = 'confirmed'
+      AND life_id = NEW.life_id
+ )
 BEGIN
-    SELECT RAISE(ABORT, 'candidate_memory conflicts_with_memory_id must reference confirmed memory');
+    SELECT RAISE(ABORT, 'candidate_memory conflicts_with_memory_id must reference confirmed memory in the same life');
+END;
+
+CREATE TRIGGER candidate_memory_superseded_candidate_insert
+BEFORE INSERT ON candidate_memory
+WHEN NEW.superseded_by_candidate_id IS NOT NULL
+ AND NOT EXISTS (
+    SELECT 1 FROM candidate_memory
+    WHERE id = NEW.superseded_by_candidate_id
+      AND life_id = NEW.life_id
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'candidate_memory superseded_by_candidate_id must reference candidate memory in the same life');
+END;
+
+CREATE TRIGGER candidate_memory_superseded_candidate_update
+BEFORE UPDATE OF life_id, superseded_by_candidate_id ON candidate_memory
+WHEN NEW.superseded_by_candidate_id IS NOT NULL
+ AND NOT EXISTS (
+    SELECT 1 FROM candidate_memory
+    WHERE id = NEW.superseded_by_candidate_id
+      AND life_id = NEW.life_id
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'candidate_memory superseded_by_candidate_id must reference candidate memory in the same life');
+END;
+
+CREATE TRIGGER candidate_memory_evidence_life_insert
+BEFORE INSERT ON candidate_memory_evidence
+WHEN NOT EXISTS (
+    SELECT 1 FROM candidate_memory
+    WHERE id = NEW.candidate_id
+      AND life_id = NEW.life_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'candidate_memory_evidence candidate must belong to the same life');
+END;
+
+CREATE TRIGGER candidate_memory_evidence_life_update
+BEFORE UPDATE OF candidate_id, life_id ON candidate_memory_evidence
+WHEN NOT EXISTS (
+    SELECT 1 FROM candidate_memory
+    WHERE id = NEW.candidate_id
+      AND life_id = NEW.life_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'candidate_memory_evidence candidate must belong to the same life');
 END;
 
 INSERT INTO candidate_memory (

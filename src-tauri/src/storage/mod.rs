@@ -795,6 +795,120 @@ pub fn get_persona_template(
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use rusqlite::params;
+
+    /// Test-only fixture: inserts a confirmed memory directly into `memory_record`
+    /// and creates the initial `memory_revision` snapshot.
+    ///
+    /// This bypasses the deprecated `confirm()` path which now returns
+    /// `CANDIDATE_CONFIRMATION_UNAVAILABLE`. Tests that need a confirmed memory
+    /// for revision, outbox, retrieval, or management testing should use this
+    /// fixture instead of calling `create_candidate` + `confirm`.
+    ///
+    /// Does NOT create an outbox entry unless `enqueue_outbox` is true.
+    /// Does NOT call LanceDB, Embedding, or any model.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn insert_confirmed_memory_fixture(
+        service: &StorageService,
+        life_id: &str,
+        kind: &str,
+        content: &str,
+        summary: Option<&str>,
+        importance: f64,
+        confidence: f64,
+        is_sensitive: bool,
+        enqueue_outbox: bool,
+    ) -> crate::memory::MemoryRecord {
+        use crate::memory::{MemoryKind, MemorySourceType, MemoryStatus};
+
+        let id = format!("confirmed-fixture-{}", unique_suffix());
+        let now = "2026-07-13T00:00:00.000Z";
+        let state = service.state().unwrap();
+        let connection = &state.connection;
+
+        connection
+            .execute(
+                "INSERT INTO memory_record (
+                    id, life_id, kind, status, content, summary, source_type, source_ref,
+                    source_created_at, importance, confidence, is_sensitive, created_at,
+                    updated_at, confirmed_at, revision
+                 ) VALUES (
+                    ?1, ?2, ?3, 'confirmed', ?4, ?5, 'manual', 'fixture',
+                    ?6, ?7, ?8, ?9, ?6, ?6, ?6, 1
+                 )",
+                params![
+                    id,
+                    life_id,
+                    kind,
+                    content,
+                    summary,
+                    now,
+                    importance,
+                    confidence,
+                    is_sensitive as i32,
+                ],
+            )
+            .unwrap();
+
+        // Create the initial confirmed revision snapshot.
+        connection
+            .execute(
+                "INSERT INTO memory_revision (
+                    id, life_id, memory_id, revision, kind, content, summary,
+                    is_sensitive, change_type, created_at
+                 ) VALUES (
+                    ?1, ?2, ?3, 1, ?4, ?5, ?6, ?7, 'confirmed', ?8
+                 )",
+                params![
+                    format!("memory-revision-{id}-1"),
+                    life_id,
+                    id,
+                    kind,
+                    content,
+                    summary,
+                    is_sensitive as i32,
+                    now,
+                ],
+            )
+            .unwrap();
+
+        if enqueue_outbox {
+            connection
+                .execute(
+                    "INSERT INTO memory_vector_sync_outbox (
+                        life_id, memory_id, desired_action, state,
+                        attempt_count, next_attempt_at, created_at, updated_at
+                     ) VALUES (
+                        ?1, ?2, 'upsert', 'pending', 0, NULL, ?3, ?3
+                     )",
+                    params![life_id, id, now],
+                )
+                .unwrap();
+        }
+
+        crate::memory::MemoryRecord {
+            id,
+            life_id: life_id.to_string(),
+            kind: MemoryKind::parse(kind).unwrap(),
+            status: MemoryStatus::Confirmed,
+            content: content.to_string(),
+            summary: summary.map(str::to_string),
+            source_type: MemorySourceType::Manual,
+            source_ref: Some("fixture".into()),
+            source_created_at: now.to_string(),
+            importance,
+            confidence,
+            is_sensitive,
+            created_at: now.to_string(),
+            updated_at: now.to_string(),
+            confirmed_at: Some(now.to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

@@ -834,10 +834,7 @@ mod tests {
     };
 
     use crate::{
-        memory::{
-            ConfirmMemoryRequest, CreateMemoryCandidateRequest, MemoryKind, MemoryService,
-            MemorySourceType,
-        },
+        memory::{CreateMemoryCandidateRequest, MemoryKind, MemoryService, MemorySourceType},
         model::profile::{
             CreateModelProfileRequest, ModelProfileService, ModelProviderKind,
             SetActiveModelProfileRequest,
@@ -977,28 +974,31 @@ mod tests {
     }
 
     fn create_memory(storage: &StorageService, status: MemoryStatus, sensitive: bool) {
-        let service = MemoryService::new(storage);
-        let memory = service
-            .create_candidate(CreateMemoryCandidateRequest {
-                life_id: "life-a".into(),
-                kind: MemoryKind::Fact,
-                content: "temporary authoritative memory".into(),
-                summary: Some("temporary summary".into()),
-                source_type: MemorySourceType::Manual,
-                source_ref: None,
-                source_created_at: "2026-07-13T00:00:00Z".into(),
-                importance: 0.5,
-                confidence: 0.9,
-                is_sensitive: sensitive,
-            })
-            .unwrap();
         if status == MemoryStatus::Confirmed {
-            service
-                .confirm(ConfirmMemoryRequest {
+            crate::storage::test_support::insert_confirmed_memory_fixture(
+                storage,
+                "life-a",
+                "fact",
+                "temporary authoritative memory",
+                Some("temporary summary"),
+                0.5,
+                0.9,
+                sensitive,
+                false,
+            );
+        } else {
+            MemoryService::new(storage)
+                .create_candidate(CreateMemoryCandidateRequest {
                     life_id: "life-a".into(),
-                    memory_id: memory.id,
-                    user_confirmed: true,
-                    sensitive_consent: sensitive,
+                    kind: MemoryKind::Fact,
+                    content: "temporary authoritative memory".into(),
+                    summary: Some("temporary summary".into()),
+                    source_type: MemorySourceType::Manual,
+                    source_ref: None,
+                    source_created_at: "2026-07-13T00:00:00Z".into(),
+                    importance: 0.5,
+                    confidence: 0.9,
+                    is_sensitive: sensitive,
                 })
                 .unwrap();
         }
@@ -1192,10 +1192,12 @@ mod tests {
         let report =
             tauri::async_runtime::block_on(service.rebuild("life-a", &NeverCancel)).unwrap();
         assert!(report.completed);
-        assert_eq!(report.scanned_count, 3);
+        // Candidates are now in candidate_memory, not memory_record, so rebuild
+        // only scans memory_record (confirmed memories).
+        assert_eq!(report.scanned_count, 2);
         assert_eq!(report.eligible_count, 1);
         assert_eq!(report.indexed_count, 1);
-        assert_eq!(report.skipped_candidate_count, 1);
+        assert_eq!(report.skipped_candidate_count, 0);
         assert_eq!(report.skipped_sensitive_count, 1);
         assert!(temp.path().join("data/vectors/lancedb").is_dir());
     }

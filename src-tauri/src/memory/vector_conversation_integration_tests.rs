@@ -35,8 +35,8 @@ use crate::{
             MemoryVectorSyncProcessDisposition, MemoryVectorSyncSettingsRepository,
             MemoryVectorSyncWorker, MemoryVectorSyncWorkerConfig, MemoryVectorSyncWorkerErrorCode,
         },
-        ConfirmMemoryRequest, CreateMemoryCandidateRequest, MemoryError, MemoryKind, MemoryRecord,
-        MemoryService, MemorySourceType, MemoryStatus,
+        CreateMemoryCandidateRequest, MemoryError, MemoryKind, MemoryRecord, MemoryService,
+        MemorySourceType, MemoryStatus,
     },
     model::{
         profile::{
@@ -248,15 +248,15 @@ fn create_candidate(
         .unwrap()
 }
 
-fn confirm(storage: &StorageService, memory: MemoryRecord) -> MemoryRecord {
-    MemoryService::new(storage)
-        .confirm(ConfirmMemoryRequest {
-            life_id: memory.life_id,
-            memory_id: memory.id,
-            user_confirmed: true,
-            sensitive_consent: memory.is_sensitive,
-        })
-        .unwrap()
+fn create_confirmed(
+    storage: &StorageService,
+    life_id: &str,
+    content: &str,
+    sensitive: bool,
+) -> MemoryRecord {
+    crate::storage::test_support::insert_confirmed_memory_fixture(
+        storage, life_id, "fact", content, None, 0.8, 0.9, sensitive, !sensitive,
+    )
 }
 
 fn activate_embedding_profile(
@@ -407,10 +407,7 @@ fn confirmed_memory_flows_through_outbox_lance_hybrid_and_governed_context() {
             .set_vector_sync_enabled(LIFE_A, true)
             .unwrap();
 
-        let memory = confirm(
-            &fixture.storage,
-            create_candidate(&fixture.storage, LIFE_A, text, false),
-        );
+        let memory = create_confirmed(&fixture.storage, LIFE_A, text, false);
         let jobs = MemoryVectorSyncOutboxRepository::list(&fixture.storage, LIFE_A).unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].desired_action, MemoryVectorSyncAction::Upsert);
@@ -492,14 +489,9 @@ fn confirmed_memory_flows_through_outbox_lance_hybrid_and_governed_context() {
         assert_eq!(vector_only_context.used_memory_ids, vec![memory.id.clone()]);
 
         let candidate = create_candidate(&fixture.storage, LIFE_A, "stale candidate", false);
-        let sensitive = confirm(
-            &fixture.storage,
-            create_candidate(&fixture.storage, LIFE_A, "private sensitive memory", true),
-        );
-        let other_life = confirm(
-            &fixture.storage,
-            create_candidate(&fixture.storage, LIFE_B, "other life memory", false),
-        );
+        let sensitive =
+            create_confirmed(&fixture.storage, LIFE_A, "private sensitive memory", true);
+        let other_life = create_confirmed(&fixture.storage, LIFE_B, "other life memory", false);
         assert!(
             MemoryVectorSyncOutboxRepository::list(&fixture.storage, LIFE_A)
                 .unwrap()
@@ -598,10 +590,7 @@ fn worker_gating_revision_delete_retry_and_model_space_are_end_to_end_safe() {
             &server.base_url,
             MODEL_A,
         );
-        let original = confirm(
-            &fixture.storage,
-            create_candidate(&fixture.storage, LIFE_A, original_text, false),
-        );
+        let original = create_confirmed(&fixture.storage, LIFE_A, original_text, false);
 
         let disabled = fixture
             .worker()
@@ -708,10 +697,7 @@ fn worker_gating_revision_delete_retry_and_model_space_are_end_to_end_safe() {
             .unwrap();
         assert!(deleted_hits.iter().all(|hit| hit.memory_id != original.id));
 
-        let recreated = confirm(
-            &fixture.storage,
-            create_candidate(&fixture.storage, LIFE_A, recreated_text, false),
-        );
+        let recreated = create_confirmed(&fixture.storage, LIFE_A, recreated_text, false);
         assert_ne!(recreated.id, original.id);
         fixture
             .worker()
@@ -740,14 +726,11 @@ fn worker_gating_revision_delete_retry_and_model_space_are_end_to_end_safe() {
             .iter()
             .all(|hit| hit.memory_id != original.id));
 
-        let failing_memory = confirm(
+        let failing_memory = create_confirmed(
             &fixture.storage,
-            create_candidate(
-                &fixture.storage,
-                LIFE_A,
-                "keyword survives embedding outage",
-                false,
-            ),
+            LIFE_A,
+            "keyword survives embedding outage",
+            false,
         );
         update_embedding_profile(
             &fixture.storage,
@@ -1051,10 +1034,7 @@ fn retrieval_failures_budget_injection_and_session_commit_contract_are_safe() {
         let fixture = Fixture::new();
         let provider = DeterministicEmbeddingProvider::new(DIMENSION);
         let text = "keyword and vector degradation fixture";
-        let memory = confirm(
-            &fixture.storage,
-            create_candidate(&fixture.storage, LIFE_A, text, false),
-        );
+        let memory = create_confirmed(&fixture.storage, LIFE_A, text, false);
         let vector = vector_for(&provider, text).await;
         let store = fixture.store().await;
         let space = VectorSpace {

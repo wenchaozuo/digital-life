@@ -1,16 +1,19 @@
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
-use crate::memory::vector_sync_outbox::MemoryVectorSyncAction;
 use crate::memory::{
-    vector_index::MemoryVectorIndexRepository, ConfirmMemoryRequest, CreateMemoryCandidateRequest,
-    DeleteMemoryResult, MemoryError, MemoryKind, MemoryQuery, MemoryRecord, MemoryRepository,
-    MemorySourceType, MemoryStatus, UpdateMemoryRequest,
+    candidate::{
+        CandidateInferenceStatus, CandidateMemoryError, CandidateMemoryListFilter,
+        CandidateMemoryRecord, CandidateMemoryRepository, CandidateMemorySourceType,
+        CandidateMemoryStatus, CandidateMemoryStorageUpdate, NewCandidateMemory,
+        MAX_CANDIDATE_PAGE_SIZE, PRIMARY_USER_SUBJECT_ID,
+    },
+    vector_index::MemoryVectorIndexRepository,
+    ConfirmMemoryRequest, CreateMemoryCandidateRequest, DeleteMemoryResult, MemoryError,
+    MemoryKind, MemoryQuery, MemoryRecord, MemoryRepository, MemorySourceType, MemoryStatus,
+    UpdateMemoryRequest,
 };
 
-use super::{
-    memory_revision::insert_confirmed_revision_in_transaction,
-    vector_sync_outbox::enqueue_in_transaction, StorageService,
-};
+use super::StorageService;
 
 pub(super) struct StoredMemoryRecord {
     id: String,
@@ -59,201 +62,208 @@ pub(super) const MEMORY_COLUMNS: &str =
     source_ref, source_created_at, importance, confidence, is_sensitive, created_at, \
     updated_at, confirmed_at";
 
+/// Temporary compatibility adapter.
+/// Remove during D-5 command migration.
 impl MemoryRepository for StorageService {
     fn create_candidate(
         &self,
         id: &str,
         request: CreateMemoryCandidateRequest,
     ) -> Result<MemoryRecord, MemoryError> {
-        let state = self.state().map_err(|_| MemoryError::database())?;
-        let life_exists: bool = state
-            .connection
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM life_identity WHERE id = ?1)",
-                params![request.life_id],
-                |row| row.get(0),
-            )
-            .map_err(|_| MemoryError::database())?;
-        if !life_exists {
-            return Err(MemoryError::new(
-                "LIFE_NOT_FOUND",
-                "The specified life was not found.",
-                true,
-            ));
-        }
-
-        state
-            .connection
-            .execute(
-                "INSERT INTO memory_record (
-                    id, life_id, kind, status, content, summary, source_type, source_ref,
-                    source_created_at, importance, confidence, is_sensitive, created_at,
-                    updated_at, confirmed_at
-                 ) VALUES (
-                    ?1, ?2, ?3, 'candidate', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), NULL
-                 )",
-                params![
-                    id,
-                    request.life_id,
-                    request.kind.as_str(),
-                    request.content.trim(),
-                    normalize_optional(request.summary),
-                    request.source_type.as_str(),
-                    normalize_optional(request.source_ref),
-                    request.source_created_at,
-                    request.importance,
-                    request.confidence,
-                    request.is_sensitive,
-                ],
-            )
-            .map_err(|_| MemoryError::database())?;
-
-        load_owned_memory(&state.connection, &request.life_id, id)
+        let now = current_timestamp(self)?;
+        let (source_type, inference_status) = candidate_source(request.source_type);
+        let life_id = request.life_id.clone();
+        let record = <Self as CandidateMemoryRepository>::insert_candidate(
+            self,
+            NewCandidateMemory {
+                id: id.to_string(),
+                life_id,
+                subject_id: PRIMARY_USER_SUBJECT_ID.to_string(),
+                kind: request.kind,
+                content: Some(request.content),
+                summary: request.summary,
+                source_type,
+                source_id: request.source_ref,
+                confidence: request.confidence,
+                importance: request.importance,
+                is_sensitive: request.is_sensitive,
+                inference_status,
+                status: CandidateMemoryStatus::Pending,
+                dedup_fingerprint: None,
+                proposed_at: request.source_created_at,
+                expires_at: None,
+                reviewed_at: None,
+                last_user_edit_at: None,
+                confirmed_memory_id: None,
+                accepted_request_id: None,
+                rejection_reason_code: None,
+                superseded_by_candidate_id: None,
+                conflicts_with_memory_id: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .map_err(map_candidate_error)?;
+        candidate_as_legacy(record)
     }
 
     fn list(&self, query: MemoryQuery) -> Result<Vec<MemoryRecord>, MemoryError> {
-        let state = self.state().map_err(|_| MemoryError::database())?;
-        let status = query.status.map(MemoryStatus::as_str);
-        let kind = query.kind.map(MemoryKind::as_str);
-        let sql = format!(
-            "SELECT {MEMORY_COLUMNS} FROM memory_record
-             WHERE life_id = ?1
-               AND (?2 IS NULL OR status = ?2)
-               AND (?3 IS NULL OR kind = ?3)
-             ORDER BY created_at ASC, id ASC"
-        );
-        let mut statement = state
-            .connection
-            .prepare(&sql)
-            .map_err(|_| MemoryError::database())?;
-        let rows = statement
-            .query_map(params![query.life_id, status, kind], read_stored_memory)
-            .map_err(|_| MemoryError::database())?;
-
-        rows.map(|row| row.map_err(|_| MemoryError::database())?.try_into())
-            .collect()
+        let mut records = Vec::new();
+        if query.status != Some(MemoryStatus::Candidate) {
+            let state = self.state().map_err(|_| MemoryError::database())?;
+            let kind = query.kind.map(MemoryKind::as_str);
+            let confirmed_status = MemoryStatus::Confirmed.as_str();
+            let sql = format!(
+                "SELECT {MEMORY_COLUMNS} FROM memory_record
+                 WHERE life_id = ?1 AND status = ?2
+                   AND (?3 IS NULL OR kind = ?3)
+                 ORDER BY created_at ASC, id ASC"
+            );
+            let mut statement = state
+                .connection
+                .prepare(&sql)
+                .map_err(|_| MemoryError::database())?;
+            let rows = statement
+                .query_map(
+                    params![&query.life_id, confirmed_status, kind],
+                    read_stored_memory,
+                )
+                .map_err(|_| MemoryError::database())?;
+            records.extend(
+                rows.map(|row| row.map_err(|_| MemoryError::database())?.try_into())
+                    .collect::<Result<Vec<MemoryRecord>, MemoryError>>()?,
+            );
+        }
+        if query.status != Some(MemoryStatus::Confirmed) {
+            let mut cursor = None;
+            loop {
+                let (page, next) = <Self as CandidateMemoryRepository>::list_candidates(
+                    self,
+                    CandidateMemoryListFilter {
+                        life_id: query.life_id.clone(),
+                        status: Some(CandidateMemoryStatus::Pending),
+                        kind: query.kind,
+                        page_size: Some(MAX_CANDIDATE_PAGE_SIZE),
+                        cursor,
+                        ..Default::default()
+                    },
+                )
+                .map_err(map_candidate_error)?;
+                records.extend(
+                    page.into_iter()
+                        .map(candidate_as_legacy)
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+                let Some(next_cursor) = next else { break };
+                cursor = Some(next_cursor);
+            }
+        }
+        records.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(records)
     }
 
     fn get(&self, life_id: &str, memory_id: &str) -> Result<MemoryRecord, MemoryError> {
-        let state = self.state().map_err(|_| MemoryError::database())?;
-        load_owned_memory(&state.connection, life_id, memory_id)
+        let confirmed = {
+            let state = self.state().map_err(|_| MemoryError::database())?;
+            load_owned_memory(&state.connection, life_id, memory_id)
+        };
+        match confirmed {
+            Ok(record) => Ok(record),
+            Err(error) if error.code != "MEMORY_NOT_FOUND" => Err(error),
+            Err(_) => <Self as CandidateMemoryRepository>::get_candidate(self, life_id, memory_id)
+                .map_err(map_candidate_error)
+                .and_then(candidate_as_legacy),
+        }
     }
 
     fn update_candidate(&self, request: UpdateMemoryRequest) -> Result<MemoryRecord, MemoryError> {
-        let mut state = self.state().map_err(|_| MemoryError::database())?;
-        let transaction = state
-            .connection
-            .transaction()
-            .map_err(|_| MemoryError::database())?;
-        let existing = load_owned_memory(&transaction, &request.life_id, &request.memory_id)?;
-        if existing.status != MemoryStatus::Candidate {
+        let existing = <Self as CandidateMemoryRepository>::get_candidate(
+            self,
+            &request.life_id,
+            &request.memory_id,
+        )
+        .map_err(map_candidate_error)?;
+        if existing.status != CandidateMemoryStatus::Pending {
             return Err(MemoryError::invalid_transition());
         }
-
-        transaction
-            .execute(
-                "UPDATE memory_record SET
-                    kind = ?3,
-                    content = ?4,
-                    summary = ?5,
-                    source_type = ?6,
-                    source_ref = ?7,
-                    source_created_at = ?8,
-                    importance = ?9,
-                    confidence = ?10,
-                    is_sensitive = ?11,
-                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                 WHERE id = ?1 AND life_id = ?2 AND status = 'candidate'",
-                params![
-                    request.memory_id,
-                    request.life_id,
-                    request.kind.as_str(),
-                    request.content.trim(),
-                    normalize_optional(request.summary),
-                    request.source_type.as_str(),
-                    normalize_optional(request.source_ref),
-                    request.source_created_at,
-                    request.importance,
-                    request.confidence,
-                    request.is_sensitive,
-                ],
-            )
-            .map_err(|_| MemoryError::database())?;
-        let updated = load_owned_memory(&transaction, &request.life_id, &request.memory_id)?;
-        transaction.commit().map_err(|_| MemoryError::database())?;
-        Ok(updated)
+        let (source_type, inference_status) = candidate_source(request.source_type);
+        let updated_at = current_timestamp(self)?;
+        <Self as CandidateMemoryRepository>::update_candidate_guarded(
+            self,
+            &request.life_id,
+            &request.memory_id,
+            existing.revision,
+            CandidateMemoryStorageUpdate {
+                kind: request.kind,
+                content: Some(request.content),
+                summary: request.summary,
+                source_type,
+                source_id: request.source_ref,
+                confidence: request.confidence,
+                importance: request.importance,
+                is_sensitive: request.is_sensitive,
+                inference_status,
+                status: CandidateMemoryStatus::Pending,
+                dedup_fingerprint: existing.dedup_fingerprint,
+                proposed_at: request.source_created_at,
+                expires_at: existing.expires_at,
+                reviewed_at: existing.reviewed_at,
+                last_user_edit_at: Some(updated_at.clone()),
+                confirmed_memory_id: None,
+                accepted_request_id: None,
+                rejection_reason_code: None,
+                superseded_by_candidate_id: existing.superseded_by_candidate_id,
+                conflicts_with_memory_id: existing.conflicts_with_memory_id,
+                updated_at,
+            },
+        )
+        .map_err(map_candidate_error)
+        .and_then(candidate_as_legacy)
     }
 
     fn confirm(&self, request: ConfirmMemoryRequest) -> Result<MemoryRecord, MemoryError> {
-        let mut state = self.state().map_err(|_| MemoryError::database())?;
-        let transaction = state
-            .connection
-            .transaction()
-            .map_err(|_| MemoryError::database())?;
-        let existing = load_owned_memory(&transaction, &request.life_id, &request.memory_id)?;
-        if existing.status != MemoryStatus::Candidate {
-            return Err(MemoryError::invalid_transition());
-        }
-        if existing.is_sensitive && !request.sensitive_consent {
-            return Err(MemoryError::new(
-                "SENSITIVE_CONSENT_REQUIRED",
-                "Explicit consent is required to confirm sensitive memory.",
-                true,
-            ));
-        }
-
-        transaction
-            .execute(
-                "UPDATE memory_record SET
-                    status = 'confirmed',
-                    confirmed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                 WHERE id = ?1 AND life_id = ?2 AND status = 'candidate'",
-                params![request.memory_id, request.life_id],
-            )
-            .map_err(|_| MemoryError::database())?;
-        let confirmed = load_owned_memory(&transaction, &request.life_id, &request.memory_id)?;
-        insert_confirmed_revision_in_transaction(&transaction, &confirmed)?;
-        if !confirmed.is_sensitive {
-            enqueue_in_transaction(
-                &transaction,
-                &request.life_id,
-                &request.memory_id,
-                MemoryVectorSyncAction::Upsert,
-            )
-            .map_err(|_| MemoryError::database())?;
-        }
-        transaction.commit().map_err(|_| MemoryError::database())?;
-        Ok(confirmed)
+        let _legacy_revision_writer =
+            super::memory_revision::insert_confirmed_revision_in_transaction;
+        <Self as CandidateMemoryRepository>::get_candidate(
+            self,
+            &request.life_id,
+            &request.memory_id,
+        )
+        .map_err(map_candidate_error)?;
+        Err(MemoryError::new(
+            "CANDIDATE_CONFIRMATION_UNAVAILABLE",
+            "Candidate confirmation is unavailable until the governed confirmation service is installed.",
+            true,
+        ))
     }
 
     fn delete(&self, life_id: &str, memory_id: &str) -> Result<DeleteMemoryResult, MemoryError> {
-        let mut state = self.state().map_err(|_| MemoryError::database())?;
-        let transaction = state
-            .connection
-            .transaction()
-            .map_err(|_| MemoryError::database())?;
-        let existing = load_owned_memory(&transaction, life_id, memory_id)?;
-        if existing.status != MemoryStatus::Candidate {
-            return Err(MemoryError::new(
-                "MEMORY_NOT_CONFIRMED",
-                "Confirmed memories require revision-aware permanent deletion.",
-                true,
-            ));
+        if let Err(error) =
+            <Self as CandidateMemoryRepository>::get_candidate(self, life_id, memory_id)
+        {
+            if error.code == "CANDIDATE_MEMORY_NOT_FOUND" && {
+                let state = self.state().map_err(|_| MemoryError::database())?;
+                load_owned_memory(&state.connection, life_id, memory_id).is_ok()
+            } {
+                return Err(MemoryError::new(
+                    "MEMORY_NOT_CONFIRMED",
+                    "Confirmed memories require revision-aware permanent deletion.",
+                    true,
+                ));
+            }
+            return Err(map_candidate_error(error));
         }
-        let deleted = transaction
-            .execute(
-                "DELETE FROM memory_record WHERE id = ?1 AND life_id = ?2",
-                params![memory_id, life_id],
-            )
-            .map_err(|_| MemoryError::database())?;
-        transaction.commit().map_err(|_| MemoryError::database())?;
-
+        let deleted = <Self as CandidateMemoryRepository>::delete_candidate_permanently(
+            self, life_id, memory_id,
+        )
+        .map_err(map_candidate_error)?;
         Ok(DeleteMemoryResult {
             memory_id: memory_id.to_string(),
-            deleted: deleted == 1,
+            deleted,
         })
     }
 }
@@ -299,7 +309,9 @@ pub(super) fn load_owned_memory(
     life_id: &str,
     memory_id: &str,
 ) -> Result<MemoryRecord, MemoryError> {
-    let sql = format!("SELECT {MEMORY_COLUMNS} FROM memory_record WHERE id = ?1");
+    let sql = format!(
+        "SELECT {MEMORY_COLUMNS} FROM memory_record WHERE id = ?1 AND status = 'confirmed'"
+    );
     let stored = connection
         .query_row(&sql, params![memory_id], read_stored_memory)
         .optional()
@@ -309,6 +321,94 @@ pub(super) fn load_owned_memory(
         return Err(MemoryError::life_mismatch());
     }
     stored.try_into()
+}
+
+fn current_timestamp(storage: &StorageService) -> Result<String, MemoryError> {
+    let state = storage.state().map_err(|_| MemoryError::database())?;
+    state
+        .connection
+        .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", [], |row| {
+            row.get(0)
+        })
+        .map_err(|_| MemoryError::database())
+}
+
+fn candidate_source(
+    source_type: MemorySourceType,
+) -> (CandidateMemorySourceType, CandidateInferenceStatus) {
+    let _legacy_source_name = source_type.as_str();
+    match source_type {
+        MemorySourceType::Manual => (
+            CandidateMemorySourceType::Manual,
+            CandidateInferenceStatus::Explicit,
+        ),
+        MemorySourceType::Conversation => (
+            CandidateMemorySourceType::Conversation,
+            CandidateInferenceStatus::Extracted,
+        ),
+        MemorySourceType::System => (
+            CandidateMemorySourceType::Reflection,
+            CandidateInferenceStatus::Extracted,
+        ),
+        MemorySourceType::Import => (
+            CandidateMemorySourceType::Import,
+            CandidateInferenceStatus::Extracted,
+        ),
+    }
+}
+
+fn legacy_source(source_type: CandidateMemorySourceType) -> MemorySourceType {
+    match source_type {
+        CandidateMemorySourceType::Manual | CandidateMemorySourceType::ExplicitUserRequest => {
+            MemorySourceType::Manual
+        }
+        CandidateMemorySourceType::Conversation => MemorySourceType::Conversation,
+        CandidateMemorySourceType::Import => MemorySourceType::Import,
+        CandidateMemorySourceType::LifeEvent
+        | CandidateMemorySourceType::Reflection
+        | CandidateMemorySourceType::AgentProposal
+        | CandidateMemorySourceType::PluginProposal => MemorySourceType::System,
+    }
+}
+
+fn candidate_as_legacy(candidate: CandidateMemoryRecord) -> Result<MemoryRecord, MemoryError> {
+    if candidate.status != CandidateMemoryStatus::Pending {
+        return Err(MemoryError::not_found());
+    }
+    let content = candidate
+        .content
+        .filter(|content| !content.trim().is_empty())
+        .ok_or_else(MemoryError::database)?;
+    Ok(MemoryRecord {
+        id: candidate.id,
+        life_id: candidate.life_id,
+        kind: candidate.kind,
+        status: MemoryStatus::Candidate,
+        content,
+        summary: candidate.summary,
+        source_type: legacy_source(candidate.source_type),
+        source_ref: candidate.source_id,
+        source_created_at: candidate.proposed_at,
+        importance: candidate.importance,
+        confidence: candidate.confidence,
+        is_sensitive: candidate.is_sensitive,
+        created_at: candidate.created_at,
+        updated_at: candidate.updated_at,
+        confirmed_at: None,
+    })
+}
+
+fn map_candidate_error(error: CandidateMemoryError) -> MemoryError {
+    match error.code.as_str() {
+        "CANDIDATE_MEMORY_NOT_FOUND" => MemoryError::not_found(),
+        "CANDIDATE_MEMORY_LIFE_MISMATCH" => MemoryError::life_mismatch(),
+        "CANDIDATE_MEMORY_REVISION_CONFLICT" => MemoryError::new(
+            "MEMORY_REVISION_CONFLICT",
+            "The candidate memory changed after it was loaded. Refresh and try again.",
+            true,
+        ),
+        _ => MemoryError::new(&error.code, error.message, error.recoverable),
+    }
 }
 
 pub(super) fn read_stored_memory(row: &Row<'_>) -> rusqlite::Result<StoredMemoryRecord> {
@@ -328,13 +428,6 @@ pub(super) fn read_stored_memory(row: &Row<'_>) -> rusqlite::Result<StoredMemory
         created_at: row.get(12)?,
         updated_at: row.get(13)?,
         confirmed_at: row.get(14)?,
-    })
-}
-
-fn normalize_optional(value: Option<String>) -> Option<String> {
-    value.and_then(|value| {
-        let trimmed = value.trim();
-        (!trimmed.is_empty()).then(|| trimmed.to_string())
     })
 }
 
@@ -548,6 +641,32 @@ mod tests {
     }
 
     #[test]
+    fn legacy_candidate_create_uses_candidate_memory_as_sole_authority() {
+        let root = TestRoot::new("legacy-candidate-authority");
+        let service = seeded_service(&root);
+        let record = create_candidate(&service, "life-a", false);
+        let state = service.state().unwrap();
+        let legacy_count: i64 = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM memory_record WHERE id = ?1 AND status = 'candidate'",
+                rusqlite::params![record.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let authoritative_count: i64 = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM candidate_memory WHERE id = ?1 AND status = 'pending'",
+                rusqlite::params![record.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_count, 0);
+        assert_eq!(authoritative_count, 1);
+    }
+
+    #[test]
     fn empty_content_is_rejected() {
         let root = TestRoot::new("empty-content");
         let service = seeded_service(&root);
@@ -589,30 +708,29 @@ mod tests {
     }
 
     #[test]
-    fn user_can_confirm_candidate_once() {
-        let root = TestRoot::new("confirm-once");
+    fn legacy_confirmation_is_blocked_without_writing_confirmed_memory() {
+        let root = TestRoot::new("confirm-blocked");
         let service = seeded_service(&root);
         let candidate = create_candidate(&service, "life-a", false);
-        let confirmed = MemoryService::new(&service)
+        let error = MemoryService::new(&service)
             .confirm(ConfirmMemoryRequest {
                 life_id: "life-a".into(),
                 memory_id: candidate.id.clone(),
                 user_confirmed: true,
                 sensitive_consent: false,
             })
-            .unwrap();
-        assert_eq!(confirmed.status, MemoryStatus::Confirmed);
-        assert!(confirmed.confirmed_at.is_some());
-
-        let error = MemoryService::new(&service)
-            .confirm(ConfirmMemoryRequest {
-                life_id: "life-a".into(),
-                memory_id: candidate.id,
-                user_confirmed: true,
-                sensitive_consent: false,
-            })
             .unwrap_err();
-        assert_eq!(error.code, "INVALID_STATE_TRANSITION");
+        assert_eq!(error.code, "CANDIDATE_CONFIRMATION_UNAVAILABLE");
+        let state = service.state().unwrap();
+        let legacy_count: i64 = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM memory_record WHERE id = ?1",
+                rusqlite::params![candidate.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_count, 0);
     }
 
     #[test]
@@ -635,22 +753,29 @@ mod tests {
     fn confirmed_memory_cannot_be_updated_or_returned_to_candidate() {
         let root = TestRoot::new("confirmed-update");
         let service = seeded_service(&root);
-        let candidate = create_candidate(&service, "life-a", false);
-        MemoryService::new(&service)
-            .confirm(ConfirmMemoryRequest {
-                life_id: "life-a".into(),
-                memory_id: candidate.id.clone(),
-                user_confirmed: true,
-                sensitive_consent: false,
-            })
+        let state = service.state().unwrap();
+        state
+            .connection
+            .execute(
+                "INSERT INTO memory_record (
+                    id, life_id, kind, status, content, summary, source_type, source_ref,
+                    source_created_at, importance, confidence, is_sensitive, created_at,
+                    updated_at, confirmed_at, revision
+                 ) VALUES (
+                    'confirmed', 'life-a', 'experience', 'confirmed', 'Confirmed', NULL,
+                    'manual', NULL, ?1, 0.7, 0.8, 0, ?1, ?1, ?1, 1
+                 )",
+                rusqlite::params!["2026-07-11T01:00:00.000Z"],
+            )
             .unwrap();
+        drop(state);
         let error = MemoryService::new(&service)
-            .update_candidate(update_request("life-a", &candidate.id))
+            .update_candidate(update_request("life-a", "confirmed"))
             .unwrap_err();
-        assert_eq!(error.code, "INVALID_STATE_TRANSITION");
+        assert_eq!(error.code, "MEMORY_NOT_FOUND");
         assert_eq!(
             MemoryService::new(&service)
-                .get("life-a", &candidate.id)
+                .get("life-a", "confirmed")
                 .unwrap()
                 .status,
             MemoryStatus::Confirmed
@@ -658,29 +783,27 @@ mod tests {
     }
 
     #[test]
-    fn sensitive_memory_requires_separate_explicit_consent() {
-        let root = TestRoot::new("sensitive");
+    fn legacy_confirmation_does_not_bypass_sensitive_candidate_governance() {
+        let root = TestRoot::new("sensitive-confirm-blocked");
         let service = seeded_service(&root);
         let candidate = create_candidate(&service, "life-a", true);
-        let error = MemoryService::new(&service)
-            .confirm(ConfirmMemoryRequest {
-                life_id: "life-a".into(),
-                memory_id: candidate.id.clone(),
-                user_confirmed: true,
-                sensitive_consent: false,
-            })
-            .unwrap_err();
-        assert_eq!(error.code, "SENSITIVE_CONSENT_REQUIRED");
-
-        let confirmed = MemoryService::new(&service)
-            .confirm(ConfirmMemoryRequest {
-                life_id: "life-a".into(),
-                memory_id: candidate.id,
-                user_confirmed: true,
-                sensitive_consent: true,
-            })
-            .unwrap();
-        assert_eq!(confirmed.status, MemoryStatus::Confirmed);
+        for sensitive_consent in [false, true] {
+            let error = MemoryService::new(&service)
+                .confirm(ConfirmMemoryRequest {
+                    life_id: "life-a".into(),
+                    memory_id: candidate.id.clone(),
+                    user_confirmed: true,
+                    sensitive_consent,
+                })
+                .unwrap_err();
+            assert_eq!(error.code, "CANDIDATE_CONFIRMATION_UNAVAILABLE");
+        }
+        assert!(
+            MemoryService::new(&service)
+                .get("life-a", &candidate.id)
+                .unwrap()
+                .is_sensitive
+        );
     }
 
     #[test]

@@ -367,8 +367,8 @@ mod tests {
 
     use crate::memory::{
         revisions::{
-            DeleteMemoryPermanentlyRequest, MemoryRevisionChangeType, MemoryRevisionService,
-            SetMemorySensitivityRequest, UpdateConfirmedMemoryRequest,
+            DeleteMemoryPermanentlyRequest, MemoryRevisionService, SetMemorySensitivityRequest,
+            UpdateConfirmedMemoryRequest,
         },
         ConfirmMemoryRequest, CreateMemoryCandidateRequest, MemoryKind, MemoryService,
         MemorySourceType, UpdateMemoryRequest,
@@ -450,15 +450,17 @@ mod tests {
         life_id: &str,
         sensitive: bool,
     ) -> crate::memory::MemoryRecord {
-        let candidate = candidate(service, life_id, sensitive);
-        MemoryService::new(service)
-            .confirm(ConfirmMemoryRequest {
-                life_id: life_id.into(),
-                memory_id: candidate.id,
-                user_confirmed: true,
-                sensitive_consent: sensitive,
-            })
-            .unwrap()
+        super::super::test_support::insert_confirmed_memory_fixture(
+            service,
+            life_id,
+            "fact",
+            "Original content",
+            Some("Original summary"),
+            0.5,
+            0.8,
+            sensitive,
+            true,
+        )
     }
 
     fn update(
@@ -562,7 +564,7 @@ mod tests {
     }
 
     #[test]
-    fn confirmation_creates_revision_but_candidate_edit_does_not() {
+    fn candidate_edit_does_not_create_revision_and_confirm_is_unavailable() {
         let root = TestRoot::new("initial");
         let service = seeded(&root);
         let candidate = candidate(&service, "life-a", false);
@@ -582,27 +584,39 @@ mod tests {
                 is_sensitive: false,
             })
             .unwrap();
-        assert!(MemoryRevisionService::new(&service)
-            .list_revisions("life-a", &candidate.id)
+        // Candidate edit must not create a memory_revision entry.
+        let revision_count: i64 = service
+            .state()
             .unwrap()
-            .is_empty());
-        memory
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM memory_revision WHERE memory_id = ?1",
+                rusqlite::params![candidate.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(revision_count, 0);
+        let error = memory
             .confirm(ConfirmMemoryRequest {
                 life_id: "life-a".into(),
                 memory_id: candidate.id.clone(),
                 user_confirmed: true,
                 sensitive_consent: false,
             })
+            .unwrap_err();
+        assert_eq!(error.code, "CANDIDATE_CONFIRMATION_UNAVAILABLE");
+        // Confirm does not create a revision when it returns an error.
+        let revision_count: i64 = service
+            .state()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM memory_revision WHERE memory_id = ?1",
+                rusqlite::params![candidate.id],
+                |row| row.get(0),
+            )
             .unwrap();
-        let revisions = MemoryRevisionService::new(&service)
-            .list_revisions("life-a", &candidate.id)
-            .unwrap();
-        assert_eq!(revisions.len(), 1);
-        assert_eq!(revisions[0].revision, 1);
-        assert_eq!(
-            revisions[0].change_type,
-            MemoryRevisionChangeType::Confirmed
-        );
+        assert_eq!(revision_count, 0);
     }
 
     #[test]

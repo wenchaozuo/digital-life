@@ -103,6 +103,13 @@ pub struct ModelConnectionTestRequest {
     pub purpose: ModelRuntimePurpose,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ActiveModelChatRequest {
+    pub messages: Vec<ModelMessage>,
+    pub system_context: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ModelRuntimeErrorCode {
@@ -237,6 +244,31 @@ where
     ) -> Result<ResolvedEmbeddingProvider, ModelRuntimeError> {
         let profile_id = self.active_profile_id(ModelRuntimePurpose::Embedding)?;
         self.resolve_embedding_provider(&profile_id)
+    }
+
+    pub async fn chat_with_active_model(
+        &self,
+        request: ActiveModelChatRequest,
+    ) -> Result<super::ModelResponse, ModelRuntimeError> {
+        let resolved = self.resolve_active_chat_provider()?;
+        let temperature = resolved
+            .profile
+            .temperature
+            .ok_or_else(|| runtime_error(ModelRuntimeErrorCode::InvalidProfile))?;
+        let max_tokens = resolved
+            .profile
+            .max_tokens
+            .ok_or_else(|| runtime_error(ModelRuntimeErrorCode::InvalidProfile))?;
+        resolved
+            .provider
+            .chat(ModelRequest {
+                messages: request.messages,
+                system_context: request.system_context,
+                temperature: temperature as f32,
+                max_tokens,
+            })
+            .await
+            .map_err(map_chat_error)
     }
 
     pub fn resolve_chat_provider(
@@ -531,7 +563,7 @@ fn map_chat_error(error: ModelError) -> ModelRuntimeError {
         "MODEL_RESPONSE_INVALID" | "MODEL_RESPONSE_EMPTY" => {
             ModelRuntimeErrorCode::InvalidProviderResponse
         }
-        _ => ModelRuntimeErrorCode::ConnectionTestFailed,
+        _ => ModelRuntimeErrorCode::InvalidProviderResponse,
     };
     runtime_error(code)
 }
@@ -574,7 +606,7 @@ fn runtime_error(code: ModelRuntimeErrorCode) -> ModelRuntimeError {
         }
         ModelRuntimeErrorCode::RateLimited => ("The model service rate limit was reached.", true),
         ModelRuntimeErrorCode::NetworkUnavailable => ("The model service is unavailable.", true),
-        ModelRuntimeErrorCode::RequestTimeout => ("The connection test timed out.", true),
+        ModelRuntimeErrorCode::RequestTimeout => ("The model request timed out.", true),
         ModelRuntimeErrorCode::InvalidProviderResponse => {
             ("The model service returned an invalid response.", true)
         }
@@ -588,6 +620,19 @@ fn runtime_error(code: ModelRuntimeErrorCode) -> ModelRuntimeError {
         ),
     };
     ModelRuntimeError::new(code, message, recoverable)
+}
+
+#[cfg(windows)]
+#[tauri::command]
+pub async fn chat_with_active_model(
+    storage: State<'_, StorageService>,
+    secrets: State<'_, WindowsCredentialSecretStore>,
+    coordinator: State<'_, ModelRuntimeCoordinator>,
+    request: ActiveModelChatRequest,
+) -> Result<super::ModelResponse, ModelRuntimeError> {
+    ModelRuntimeService::new(storage.inner(), secrets.inner(), coordinator.inner())
+        .chat_with_active_model(request)
+        .await
 }
 
 #[cfg(windows)]
@@ -729,15 +774,26 @@ mod tests {
     }
 
     fn create_chat(storage: &StorageService, name: &str, base_url: &str) -> ModelProfile {
+        create_chat_with_config(storage, name, base_url, "chat-model", 0.7, 4096)
+    }
+
+    fn create_chat_with_config(
+        storage: &StorageService,
+        name: &str,
+        base_url: &str,
+        model_name: &str,
+        temperature: f64,
+        max_tokens: u32,
+    ) -> ModelProfile {
         ModelProfileService::new(storage)
             .create(CreateModelProfileRequest {
                 purpose: ModelPurpose::Chat,
                 provider_kind: ModelProviderKind::OpenaiCompatible,
                 display_name: name.into(),
                 base_url: base_url.into(),
-                model_name: "chat-model".into(),
-                temperature: Some(0.7),
-                max_tokens: Some(4096),
+                model_name: model_name.into(),
+                temperature: Some(temperature),
+                max_tokens: Some(max_tokens),
                 embedding_dimension: None,
             })
             .unwrap()
@@ -787,6 +843,16 @@ mod tests {
         r#"{"model":"chat-model","choices":[{"message":{"content":"mock-response-body"},"finish_reason":"stop"}]}"#
     }
 
+    fn active_chat_request() -> ActiveModelChatRequest {
+        ActiveModelChatRequest {
+            messages: vec![ModelMessage {
+                role: ModelMessageRole::User,
+                content: "hello active model".into(),
+            }],
+            system_context: Some("governed persona context".into()),
+        }
+    }
+
     fn embedding_response(dimension: usize) -> String {
         let values = (0..dimension)
             .map(|index| (index + 1).to_string())
@@ -825,6 +891,186 @@ mod tests {
         assert_eq!(resolved_chat.profile.temperature, Some(0.7));
         assert_eq!(resolved_embedding.profile.profile_id, embedding.id);
         assert_eq!(resolved_embedding.profile.embedding_dimension, Some(2));
+    }
+
+    #[test]
+    fn active_chat_uses_profile_configuration_and_returns_provider_response() {
+        tauri::async_runtime::block_on(async {
+            let server = MockHttpServer::start(200, chat_response(), Duration::ZERO);
+            let (_root, storage) = test_storage();
+            let secrets = InMemorySecretStore::new();
+            let coordinator = ModelRuntimeCoordinator::default();
+            let chat = create_chat_with_config(
+                &storage,
+                "Active Chat",
+                &server.base_url,
+                "active-chat-model",
+                0.35,
+                321,
+            );
+            ModelProfileService::new(&storage)
+                .set_active(SetActiveModelProfileRequest {
+                    purpose: ModelPurpose::Chat,
+                    profile_id: chat.id.clone(),
+                })
+                .unwrap();
+            store_credential(&secrets, ModelRuntimePurpose::Chat, &chat.id);
+
+            let response = ModelRuntimeService::new(&storage, &secrets, &coordinator)
+                .chat_with_active_model(active_chat_request())
+                .await
+                .unwrap();
+            let body = server.request_body();
+
+            assert_eq!(response.text, "mock-response-body");
+            assert!(body.contains(r#""model":"active-chat-model""#));
+            assert!(body.contains(r#""temperature":0.35"#));
+            assert!(body.contains(r#""max_tokens":321"#));
+            assert!(body.contains("governed persona context"));
+            assert!(body.contains("hello active model"));
+            assert!(!body.contains(TEST_CREDENTIAL_PLACEHOLDER));
+        });
+    }
+
+    #[test]
+    fn active_chat_never_auto_selects_and_requires_chat_credential() {
+        tauri::async_runtime::block_on(async {
+            let (_root, storage) = test_storage();
+            let secrets = InMemorySecretStore::new();
+            let coordinator = ModelRuntimeCoordinator::default();
+            let chat = create_chat(&storage, "Unselected", "http://127.0.0.1:9/v1");
+            let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
+
+            assert_eq!(
+                runtime
+                    .chat_with_active_model(active_chat_request())
+                    .await
+                    .unwrap_err()
+                    .code,
+                ModelRuntimeErrorCode::NoActiveProfile
+            );
+
+            ModelProfileService::new(&storage)
+                .set_active(SetActiveModelProfileRequest {
+                    purpose: ModelPurpose::Chat,
+                    profile_id: chat.id.clone(),
+                })
+                .unwrap();
+            store_credential(&secrets, ModelRuntimePurpose::Embedding, &chat.id);
+            assert_eq!(
+                runtime
+                    .chat_with_active_model(active_chat_request())
+                    .await
+                    .unwrap_err()
+                    .code,
+                ModelRuntimeErrorCode::CredentialNotFound
+            );
+        });
+    }
+
+    #[test]
+    fn deleting_active_chat_profile_leaves_no_implicit_fallback() {
+        tauri::async_runtime::block_on(async {
+            let (_root, storage) = test_storage();
+            let secrets = InMemorySecretStore::new();
+            let coordinator = ModelRuntimeCoordinator::default();
+            let active = create_chat(&storage, "Active", "http://127.0.0.1:9/v1");
+            let _fallback = create_chat(&storage, "Not selected", "http://127.0.0.1:9/v1");
+            let profiles = ModelProfileService::new(&storage);
+            profiles
+                .set_active(SetActiveModelProfileRequest {
+                    purpose: ModelPurpose::Chat,
+                    profile_id: active.id.clone(),
+                })
+                .unwrap();
+            store_credential(&secrets, ModelRuntimePurpose::Chat, &active.id);
+            profiles.delete(&active.id).unwrap();
+
+            let error = ModelRuntimeService::new(&storage, &secrets, &coordinator)
+                .chat_with_active_model(active_chat_request())
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, ModelRuntimeErrorCode::NoActiveProfile);
+        });
+    }
+
+    #[test]
+    fn active_chat_resolves_profile_again_after_switch() {
+        tauri::async_runtime::block_on(async {
+            let first_server = MockHttpServer::start(200, chat_response(), Duration::ZERO);
+            let second_server = MockHttpServer::start(200, chat_response(), Duration::ZERO);
+            let (_root, storage) = test_storage();
+            let secrets = InMemorySecretStore::new();
+            let coordinator = ModelRuntimeCoordinator::default();
+            let first = create_chat_with_config(
+                &storage,
+                "First",
+                &first_server.base_url,
+                "first-model",
+                0.2,
+                100,
+            );
+            let second = create_chat_with_config(
+                &storage,
+                "Second",
+                &second_server.base_url,
+                "second-model",
+                0.8,
+                200,
+            );
+            store_credential(&secrets, ModelRuntimePurpose::Chat, &first.id);
+            store_credential(&secrets, ModelRuntimePurpose::Chat, &second.id);
+            let profiles = ModelProfileService::new(&storage);
+            profiles
+                .set_active(SetActiveModelProfileRequest {
+                    purpose: ModelPurpose::Chat,
+                    profile_id: first.id.clone(),
+                })
+                .unwrap();
+            let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
+            runtime
+                .chat_with_active_model(active_chat_request())
+                .await
+                .unwrap();
+            profiles
+                .set_active(SetActiveModelProfileRequest {
+                    purpose: ModelPurpose::Chat,
+                    profile_id: second.id.clone(),
+                })
+                .unwrap();
+            runtime
+                .chat_with_active_model(active_chat_request())
+                .await
+                .unwrap();
+
+            assert!(first_server
+                .request_body()
+                .contains(r#""model":"first-model""#));
+            assert!(second_server
+                .request_body()
+                .contains(r#""model":"second-model""#));
+        });
+    }
+
+    #[test]
+    fn active_chat_request_rejects_frontend_model_and_secret_fields() {
+        for forbidden in [
+            "apiKey",
+            "baseUrl",
+            "modelName",
+            "profileId",
+            "providerKind",
+            "authorization",
+            "temperature",
+            "maxTokens",
+        ] {
+            let mut value = serde_json::json!({
+                "messages": [{"role": "user", "content": "hello"}],
+                "systemContext": null
+            });
+            value[forbidden] = serde_json::Value::String("forbidden".into());
+            assert!(serde_json::from_value::<ActiveModelChatRequest>(value).is_err());
+        }
     }
 
     #[test]
@@ -1071,7 +1317,9 @@ mod tests {
     #[test]
     fn command_surface_has_no_plaintext_credential_reader() {
         let source = include_str!("../lib.rs");
+        assert!(source.contains("model::runtime::chat_with_active_model"));
         assert!(source.contains("model::runtime::test_model_profile_connection"));
+        assert!(!source.contains("model::chat_with_model"));
         assert!(!source.contains("get_api_key"));
         assert!(!source.contains("read_credential"));
     }

@@ -1,11 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
 
-export interface ModelConfig {
-  baseUrl: string;
-  apiKey: string;
-  modelName: string;
-}
-
 export type ModelMessageRole = "user" | "assistant" | "system";
 
 export interface ModelMessage {
@@ -16,8 +10,6 @@ export interface ModelMessage {
 export interface ModelRequest {
   messages: ModelMessage[];
   systemContext: string | null;
-  temperature: number;
-  maxTokens: number;
 }
 
 export interface ModelUsage {
@@ -60,8 +52,8 @@ export interface ModelStreamEvent {
 }
 
 export class ModelService {
-  async chat(config: ModelConfig, request: ModelRequest): Promise<ModelResponse> {
-    return invoke<ModelResponse>("chat_with_model", { config, request });
+  async chat(request: ModelRequest): Promise<ModelResponse> {
+    return invoke<ModelResponse>("chat_with_active_model", { request });
   }
 }
 

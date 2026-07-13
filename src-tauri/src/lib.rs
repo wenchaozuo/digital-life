@@ -23,7 +23,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            model::chat_with_model,
+            model::runtime::chat_with_active_model,
             model::profile::create_model_profile,
             model::profile::list_model_profiles,
             model::profile::get_model_profile,

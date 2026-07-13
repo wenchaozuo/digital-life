@@ -3,5 +3,5 @@
   "identifier": "settings-window",
   "description": "Capability for the storage settings window",
   "windows": ["settings"],
-  "permissions": ["core:default", "dialog:default"]
+  "permissions": ["core:default", "dialog:default", "settings-commands"]
 }

@@ -1,0 +1,14 @@
+[[permission]]
+identifier = "main-commands"
+description = "Commands required by the main digital-life window."
+commands.allow = [
+    "open_settings_window",
+    "open_chat_window",
+    "initialize_storage",
+    "save_life_identity",
+    "get_current_life_identity",
+    "get_life_identity",
+    "update_life_identity_base_info",
+    "save_persona_template",
+    "get_persona_template",
+]

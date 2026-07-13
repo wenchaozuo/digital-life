@@ -1,3 +1,39 @@
 fn main() {
-    tauri_build::build()
+    tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
+        tauri_build::AppManifest::new().commands(&[
+            "chat_with_active_model",
+            "create_model_profile",
+            "list_model_profiles",
+            "get_model_profile",
+            "update_model_profile",
+            "delete_model_profile",
+            "set_active_model_profile",
+            "get_active_model_profile",
+            "test_model_profile_connection",
+            "create_memory_candidate",
+            "list_memories",
+            "get_memory",
+            "update_memory_candidate",
+            "confirm_memory",
+            "delete_memory",
+            "retrieve_memories",
+            "save_api_credential",
+            "has_api_credential",
+            "delete_api_credential",
+            "open_settings_window",
+            "open_chat_window",
+            "close_settings_window",
+            "initialize_storage",
+            "get_storage_location",
+            "validate_storage_location",
+            "migrate_storage_location",
+            "save_life_identity",
+            "get_current_life_identity",
+            "get_life_identity",
+            "update_life_identity_base_info",
+            "save_persona_template",
+            "get_persona_template",
+        ]),
+    ))
+    .expect("failed to build Tauri application manifest")
 }

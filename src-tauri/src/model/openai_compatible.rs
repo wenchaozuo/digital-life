@@ -6,11 +6,9 @@ use serde::{Deserialize, Serialize};
 use crate::secrets::SecretValue;
 
 use super::{
-    ModelConfig, ModelError, ModelFinishReason, ModelFuture, ModelMessageRole, ModelProvider,
-    ModelRequest, ModelResponse, ModelUsage,
+    ModelError, ModelFinishReason, ModelFuture, ModelMessageRole, ModelProvider, ModelRequest,
+    ModelResponse, ModelUsage,
 };
-
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct OpenAICompatibleProvider {
     client: Client,
@@ -20,18 +18,6 @@ pub struct OpenAICompatibleProvider {
 }
 
 impl OpenAICompatibleProvider {
-    pub fn new(config: ModelConfig) -> Result<Self, ModelError> {
-        let api_key = SecretValue::new(config.api_key).map_err(|_| {
-            ModelError::new(
-                "MODEL_API_KEY_REQUIRED",
-                "An API key is required for this model provider.",
-                true,
-            )
-        })?;
-
-        Self::new_with_secret(config.base_url, config.model_name, api_key, REQUEST_TIMEOUT)
-    }
-
     pub(crate) fn new_with_secret(
         base_url: String,
         model_name: String,
@@ -328,11 +314,12 @@ mod tests {
     use crate::model::{ModelMessage, ModelMessageRole};
 
     fn provider() -> OpenAICompatibleProvider {
-        OpenAICompatibleProvider::new(ModelConfig {
-            base_url: "https://example.invalid/v1/".into(),
-            api_key: "runtime-only-test-key".into(),
-            model_name: "test-model".into(),
-        })
+        OpenAICompatibleProvider::new_with_secret(
+            "https://example.invalid/v1/".into(),
+            "test-model".into(),
+            SecretValue::new("runtime-only-test-key".into()).unwrap(),
+            Duration::from_secs(60),
+        )
         .unwrap()
     }
 
@@ -368,11 +355,12 @@ mod tests {
     #[test]
     fn invalid_url_error_does_not_expose_api_key() {
         let secret = "runtime-only-test-key";
-        let error = OpenAICompatibleProvider::new(ModelConfig {
-            base_url: "not a url".into(),
-            api_key: secret.into(),
-            model_name: "test-model".into(),
-        })
+        let error = OpenAICompatibleProvider::new_with_secret(
+            "not a url".into(),
+            "test-model".into(),
+            SecretValue::new(secret.into()).unwrap(),
+            Duration::from_secs(60),
+        )
         .err()
         .unwrap();
 

@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { invoke } from "@tauri-apps/api/core";
 import { computed, onMounted, onUnmounted, ref, reactive } from "vue";
 import { bodyStateMachine, type BodyState } from "../body";
 import {
@@ -6,7 +7,6 @@ import {
   conversationService,
   type ConversationMessage,
 } from "../conversation";
-import type { ModelConfig } from "../model";
 import ChatInput from "./ChatInput.vue";
 import MessageBubble from "./MessageBubble.vue";
 import { MemoryReviewController } from "./memoryReviewController";
@@ -16,12 +16,20 @@ import { createClosePanelHandler } from "./memoryReviewAdapter";
 
 const bodyState = ref<BodyState>(bodyStateMachine.getState());
 const messages = ref<readonly ConversationMessage[]>([]);
-const endpoint = ref("");
-const apiKey = ref("");
-const modelName = ref("");
-const error = ref("");
+const error = ref<{ code: string; message: string }>();
 const isSending = ref(false);
 const showSystemMessages = ref(false);
+const modelSetupErrorCodes = new Set([
+  "NO_ACTIVE_PROFILE",
+  "PROFILE_NOT_FOUND",
+  "PROFILE_PURPOSE_MISMATCH",
+  "CREDENTIAL_NOT_FOUND",
+  "UNSUPPORTED_PROVIDER",
+  "PROVIDER_INITIALIZATION_FAILED",
+]);
+const showModelSettingsAction = computed(() =>
+  error.value ? modelSetupErrorCodes.has(error.value.code) : false,
+);
 const visibleMessages = computed(() =>
   messages.value.filter(
     (message) => message.role !== "system" || showSystemMessages.value,
@@ -45,29 +53,27 @@ async function send(content: string): Promise<void> {
   }
 
   isSending.value = true;
-  error.value = "";
-  const modelConfig: ModelConfig = {
-    baseUrl: endpoint.value,
-    apiKey: apiKey.value,
-    modelName: modelName.value,
-  };
+  error.value = undefined;
 
   try {
     await conversationService.send({
       userInput: content,
-      modelConfig,
-      temperature: 0.7,
-      maxTokens: 512,
     });
   } catch (caught) {
-    error.value =
-      caught instanceof ConversationError
-        ? `${caught.code}: ${caught.message}`
-        : "CONVERSATION_MODEL_FAILED: The model request could not be completed.";
+    error.value = caught instanceof ConversationError
+      ? { code: caught.code, message: caught.message }
+      : {
+          code: "CONVERSATION_MODEL_FAILED",
+          message: "The model request could not be completed.",
+        };
   } finally {
     refreshMessages();
     isSending.value = false;
   }
+}
+
+async function openModelSettings(): Promise<void> {
+  await invoke("open_settings_window");
 }
 
 async function toggleMemoryPanel() {
@@ -119,13 +125,6 @@ onUnmounted(() => {
       <button class="close-banner-btn" type="button" @click="showUnconfirmedHint = false">&times;</button>
     </div>
 
-    <details class="runtime-config">
-      <summary>Runtime model configuration</summary>
-      <label>Endpoint<input v-model="endpoint" autocomplete="off" placeholder="Runtime only" /></label>
-      <label>API key<input v-model="apiKey" type="password" autocomplete="off" placeholder="Runtime only" /></label>
-      <label>Model<input v-model="modelName" autocomplete="off" placeholder="Model name" /></label>
-    </details>
-
     <div class="chat-actions">
       <button class="system-toggle" type="button" @click="showSystemMessages = !showSystemMessages">
         {{ showSystemMessages ? "Hide system messages" : "Show system messages" }}
@@ -145,7 +144,13 @@ onUnmounted(() => {
       />
     </section>
 
-    <p v-if="error" class="chat-error">{{ error }}</p>
+    <section v-if="error" class="chat-error" aria-live="polite">
+      <strong>{{ error.code }}</strong>
+      <span>{{ error.message }}</span>
+      <button v-if="showModelSettingsAction" type="button" @click="openModelSettings">
+        Open model settings
+      </button>
+    </section>
     <ChatInput :disabled="isSending" @send="send" />
   </main>
 
@@ -347,7 +352,7 @@ input {
 
 .chat-page {
   display: grid;
-  grid-template-rows: auto auto auto minmax(0, 1fr) auto auto;
+  grid-template-rows: auto auto minmax(0, 1fr) auto auto;
   gap: 0.85rem;
   min-height: 100vh;
   box-sizing: border-box;
@@ -374,31 +379,8 @@ input {
   text-transform: uppercase;
 }
 
-.runtime-config {
-  display: grid;
-  gap: 0.55rem;
-  border: 1px solid #334155;
-  border-radius: 0.7rem;
-  background: #172033;
-  padding: 0.7rem;
-}
-
-.runtime-config summary,
 .system-toggle {
   cursor: pointer;
-}
-
-.runtime-config label {
-  display: grid;
-  gap: 0.25rem;
-}
-
-.runtime-config input {
-  border: 1px solid #475569;
-  border-radius: 0.45rem;
-  background: #0f172a;
-  color: #f8fafc;
-  padding: 0.45rem;
 }
 
 .chat-actions {
@@ -455,9 +437,20 @@ input {
 }
 
 .chat-error {
-  margin: 0;
+  display: grid;
+  justify-items: start;
+  gap: 0.35rem;
   color: #fecaca;
   overflow-wrap: anywhere;
+}
+
+.chat-error button {
+  border: 1px solid #dc2626;
+  border-radius: 0.45rem;
+  background: #7f1d1d;
+  color: #fff;
+  cursor: pointer;
+  padding: 0.4rem 0.65rem;
 }
 
 /* Backdrop */

@@ -1,6 +1,6 @@
 import { bodyStateMachine } from "../body";
 import { lifeIdentityManager, type LifeIdentity } from "../life";
-import { modelService, type ModelRequest } from "../model";
+import { modelService, type ModelRequest, type ModelResponse } from "../model";
 import {
   MemorySourceTypes,
   memoryExtractor,
@@ -12,6 +12,7 @@ import { PromptCompiler } from "../prompt";
 import {
   combineConversationSystemContext,
   prepareConversationMemoryContext,
+  type MemoryRetrieverPort,
 } from "./memoryContextIntegration";
 import { ConversationSession } from "./session";
 import type {
@@ -21,34 +22,78 @@ import type {
 } from "./types";
 
 export class ConversationError extends Error {
+  readonly code: string;
+  readonly recoverable: boolean;
+
   constructor(
-    public readonly code: string,
+    code: string,
     message: string,
-    public readonly recoverable: boolean,
+    recoverable: boolean,
   ) {
     super(message);
     this.name = "ConversationError";
+    this.code = code;
+    this.recoverable = recoverable;
   }
+}
+
+interface ConversationModelPort {
+  chat(request: ModelRequest): Promise<ModelResponse>;
+}
+
+interface ConversationLifePort {
+  getCurrent(): Promise<LifeIdentity | undefined>;
+}
+
+interface ConversationPersonaPort {
+  getById(id: string): Promise<PersonaTemplate | undefined>;
+}
+
+interface ConversationBodyPort {
+  transition(state: "thinking" | "speaking" | "idle" | "error"): unknown;
+  getState(): string;
+}
+
+export interface ConversationServiceDependencies {
+  model: ConversationModelPort;
+  life: ConversationLifePort;
+  persona: ConversationPersonaPort;
+  memory: MemoryRetrieverPort;
+  body: ConversationBodyPort;
+  session: ConversationSession;
 }
 
 export class ConversationService {
   private readonly promptCompiler = new PromptCompiler();
-  private readonly session = new ConversationSession();
+  private readonly dependencies: ConversationServiceDependencies;
   private isSending = false;
 
+  constructor(
+    dependencies: Partial<ConversationServiceDependencies> = {},
+  ) {
+    this.dependencies = {
+      model: dependencies.model ?? modelService,
+      life: dependencies.life ?? lifeIdentityManager,
+      persona: dependencies.persona ?? personaManager,
+      memory: dependencies.memory ?? memoryRetrieverService,
+      body: dependencies.body ?? bodyStateMachine,
+      session: dependencies.session ?? new ConversationSession(),
+    };
+  }
+
   getSession(): ConversationSession {
-    return this.session;
+    return this.dependencies.session;
   }
 
   clearSession(): void {
-    this.session.clear();
+    this.dependencies.session.clear();
   }
 
   async extractMemoryCandidates(): Promise<MemoryExtractionResult> {
     const life = await this.requireCurrentLife();
     return memoryExtractor.extract({
       lifeId: life.id,
-      messages: this.session.getMessages(),
+      messages: this.dependencies.session.getMessages(),
       sourceType: MemorySourceTypes.Conversation,
     });
   }
@@ -72,7 +117,7 @@ export class ConversationService {
     }
 
     this.isSending = true;
-    bodyStateMachine.transition("thinking");
+    this.dependencies.body.transition("thinking");
 
     try {
       const life = await this.requireCurrentLife();
@@ -81,7 +126,7 @@ export class ConversationService {
       const memoryPreparation = await prepareConversationMemoryContext(
         life.id,
         userInput,
-        memoryRetrieverService,
+        this.dependencies.memory,
       );
       const systemContext = combineConversationSystemContext(
         compilation.systemContext,
@@ -92,28 +137,26 @@ export class ConversationService {
         content: userInput,
         timestamp: new Date().toISOString(),
       };
-      const history = this.session.getMessages();
-      this.session.addMessage(userMessage);
+      const history = this.dependencies.session.getMessages();
+      this.dependencies.session.addMessage(userMessage);
       const modelRequest: ModelRequest = {
         messages: [...history, userMessage].map(({ role, content }) => ({
           role,
           content,
         })),
         systemContext,
-        temperature: request.temperature,
-        maxTokens: request.maxTokens,
       };
-      const modelResponse = await modelService.chat(request.modelConfig, modelRequest);
+      const modelResponse = await this.dependencies.model.chat(modelRequest);
       const assistantMessage: ConversationMessage = {
         role: "assistant",
         content: modelResponse.text,
         timestamp: new Date().toISOString(),
       };
-      this.session.addMessage(assistantMessage);
+      this.dependencies.session.addMessage(assistantMessage);
 
-      bodyStateMachine.transition("speaking");
+      this.dependencies.body.transition("speaking");
       return {
-        sessionId: this.session.sessionId,
+        sessionId: this.dependencies.session.sessionId,
         lifeId: life.id,
         personaId: persona.id,
         promptCompilerVersion: compilation.compilerVersion,
@@ -128,18 +171,18 @@ export class ConversationService {
         memoryWarning: memoryPreparation.warning,
       };
     } catch (error) {
-      bodyStateMachine.transition("error");
+      this.dependencies.body.transition("error");
       throw toConversationError(error);
     } finally {
-      if (bodyStateMachine.getState() === "speaking") {
-        bodyStateMachine.transition("idle");
+      if (this.dependencies.body.getState() === "speaking") {
+        this.dependencies.body.transition("idle");
       }
       this.isSending = false;
     }
   }
 
   private async requireCurrentLife(): Promise<LifeIdentity> {
-    const life = await lifeIdentityManager.getCurrent();
+    const life = await this.dependencies.life.getCurrent();
     if (!life) {
       throw new ConversationError(
         "CONVERSATION_LIFE_NOT_FOUND",
@@ -152,7 +195,7 @@ export class ConversationService {
   }
 
   private async requirePersona(life: LifeIdentity): Promise<PersonaTemplate> {
-    const persona = await personaManager.getById(life.personaId);
+    const persona = await this.dependencies.persona.getById(life.personaId);
     if (!persona) {
       throw new ConversationError(
         "CONVERSATION_PERSONA_NOT_FOUND",

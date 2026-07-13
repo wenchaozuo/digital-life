@@ -2,7 +2,6 @@ export {
   MODEL_STREAM_EVENT_NAME,
   ModelService,
   modelService,
-  type ModelConfig,
   type ModelError,
   type ModelFinishReason,
   type ModelMessage,

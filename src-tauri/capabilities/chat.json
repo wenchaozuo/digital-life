@@ -3,5 +3,5 @@
   "identifier": "chat-window",
   "description": "Capability for the chat window",
   "windows": ["chat"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "chat-commands"]
 }

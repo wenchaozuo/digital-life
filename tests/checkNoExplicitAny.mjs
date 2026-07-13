@@ -10,6 +10,10 @@ const filesToCheck = [
   'src/settings/model/ModelProfileForm.vue',
   'src/settings/model/ModelProfileCard.vue',
   'src/settings/model/ModelProfilesView.vue',
+  'src/model/modelService.ts',
+  'src/conversation/conversationService.ts',
+  'src/conversation/types.ts',
+  'src/chat/ChatView.vue',
   'tests/modelSettings.test.ts'
 ];
 

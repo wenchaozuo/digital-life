@@ -11,14 +11,6 @@ pub const MODEL_STREAM_EVENT_NAME: &str = "model:stream";
 
 pub type ModelFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ModelConfig {
-    pub base_url: String,
-    pub api_key: String,
-    pub model_name: String,
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelMessageRole {
@@ -28,7 +20,7 @@ pub enum ModelMessageRole {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ModelMessage {
     pub role: ModelMessageRole,
     pub content: String,
@@ -117,30 +109,9 @@ pub trait ModelProvider: Send + Sync {
     ) -> ModelFuture<'a, Result<(), ModelError>>;
 }
 
-#[tauri::command]
-pub async fn chat_with_model(
-    config: ModelConfig,
-    request: ModelRequest,
-) -> Result<ModelResponse, ModelError> {
-    let provider = OpenAICompatibleProvider::new(config)?;
-    provider.chat(request).await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn model_config_is_deserializable_without_being_serializable() {
-        let config: ModelConfig = serde_json::from_value(serde_json::json!({
-            "baseUrl": "https://example.invalid/v1",
-            "apiKey": "runtime-only-test-key",
-            "modelName": "test-model"
-        }))
-        .unwrap();
-
-        assert_eq!(config.model_name, "test-model");
-    }
 
     #[test]
     fn stream_event_name_is_stable() {

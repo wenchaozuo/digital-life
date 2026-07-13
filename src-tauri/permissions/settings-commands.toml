@@ -1,0 +1,20 @@
+[[permission]]
+identifier = "settings-commands"
+description = "Storage, model-profile, connection-test, and credential management commands for Settings."
+commands.allow = [
+    "close_settings_window",
+    "get_storage_location",
+    "validate_storage_location",
+    "migrate_storage_location",
+    "create_model_profile",
+    "list_model_profiles",
+    "get_model_profile",
+    "update_model_profile",
+    "delete_model_profile",
+    "set_active_model_profile",
+    "get_active_model_profile",
+    "test_model_profile_connection",
+    "save_api_credential",
+    "has_api_credential",
+    "delete_api_credential",
+]

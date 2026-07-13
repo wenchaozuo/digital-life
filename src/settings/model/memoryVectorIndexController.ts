@@ -261,14 +261,16 @@ export function errorFromUnknown(
     const code = vectorIndexErrorCode(record.code);
     return {
       code,
-      message: guidanceFor(code),
+      safeMessage: guidanceFor(code),
       operation,
+      recoverable: true,
     };
   }
   return {
     code: "VECTOR_INDEX_UI_ERROR",
-    message: "The memory vector index operation could not be completed.",
+    safeMessage: "The memory vector index operation could not be completed.",
     operation,
+    recoverable: true,
   };
 }
 
@@ -276,8 +278,9 @@ function jobError(job: VectorIndexJobResult): VectorIndexError {
   const code = job.errorCode ?? (job.status === "cancelled" ? "REBUILD_CANCELLED" : "REBUILD_FAILED");
   return {
     code,
-    message: job.errorMessage ?? guidanceFor(code),
+    safeMessage: job.errorMessage ?? guidanceFor(code),
     operation: "pollJob",
+    recoverable: true,
   };
 }
 

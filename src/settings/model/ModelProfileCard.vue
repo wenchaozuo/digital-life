@@ -121,7 +121,7 @@ async function deleteProfile(): Promise<void> {
     </section>
     <section v-if="runtime.error" class="card-error" role="alert">
       <strong>{{ runtime.error.code }}</strong>
-      <p>{{ runtime.error.message }}</p>
+      <p>{{ runtime.error.safeMessage }}</p>
     </section>
   </article>
 </template>

@@ -208,7 +208,7 @@ defineExpose({ clearSensitiveInputs, requestLeave });
       :purpose="purpose"
       :profile="editingProfile"
       :saving="controller.formState === 'savingProfile'"
-      :error-message="controller.formError?.message"
+      :error-message="controller.formError?.safeMessage"
       @submit="saveProfile"
       @request-close="requestCloseForm"
       @dirty-change="formDirty = $event"
@@ -217,7 +217,7 @@ defineExpose({ clearSensitiveInputs, requestLeave });
     <section v-if="controller.listState === 'loading'" class="empty-state">Loading profiles…</section>
     <section v-else-if="controller.listState === 'failed'" class="empty-state error" role="alert">
       <strong>{{ controller.listError?.code }}</strong>
-      <p>{{ controller.listError?.message }}</p>
+      <p>{{ controller.listError?.safeMessage }}</p>
       <button type="button" @click="controller.refresh">Retry</button>
     </section>
     <section v-else-if="controller.profiles.length === 0" class="empty-state">

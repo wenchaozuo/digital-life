@@ -172,7 +172,7 @@ defineExpose({
 
     <section v-if="controller.error" class="index-error" role="alert">
       <strong>{{ controller.error.code }}</strong>
-      <p>{{ controller.error.message }}</p>
+      <p>{{ controller.error.safeMessage }}</p>
       <p>Operation: {{ controller.error.operation }}</p>
     </section>
   </section>

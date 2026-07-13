@@ -79,8 +79,9 @@ export type VectorIndexErrorCode =
 
 export interface VectorIndexError {
   code: VectorIndexErrorCode;
-  message: string;
+  safeMessage: string;
   operation: VectorIndexOperation;
+  recoverable: boolean;
 }
 
 export type VectorIndexOperation = "loadStatus" | "startRebuild" | "pollJob" | "cancelJob";

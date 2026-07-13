@@ -336,5 +336,5 @@ test("10. 凭据操作错误不会回显当前输入", () => {
     "saveCredential",
   );
   assert.equal(error.code, "CREDENTIAL_ERROR");
-  assert.doesNotMatch(error.message, /component-only-placeholder/);
+  assert.doesNotMatch(error.safeMessage, /component-only-placeholder/);
 });

@@ -36,8 +36,9 @@ export type ModelSettingsOperation =
 
 export interface ModelSettingsError {
   code: string;
-  message: string;
+  safeMessage: string;
   operation: ModelSettingsOperation;
+  recoverable: boolean;
 }
 
 export interface ProfileCardRuntimeState {
@@ -149,8 +150,9 @@ export class ModelProfileController {
       this.formState = "failed";
       this.formError = {
         code: "INVALID_PROFILE_FORM",
-        message: "Complete the required model profile fields before saving.",
+        safeMessage: "Complete the required model profile fields before saving.",
         operation: "saveProfile",
+        recoverable: true,
       };
       return undefined;
     }
@@ -177,8 +179,9 @@ export class ModelProfileController {
     if (apiKey.trim().length === 0) {
       this.setCardError(profileId, {
         code: "API_KEY_REQUIRED",
-        message: "Enter an API Key before saving.",
+        safeMessage: "Enter an API Key before saving.",
         operation: "saveCredential",
+        recoverable: true,
       });
       return false;
     }
@@ -225,8 +228,9 @@ export class ModelProfileController {
     if (!state.credentialExists) {
       this.setCardError(profileId, {
         code: "CREDENTIAL_REQUIRED",
-        message: "Save an API Key before testing this profile.",
+        safeMessage: "Save an API Key before testing this profile.",
         operation: "testConnection",
+        recoverable: true,
       });
       return undefined;
     }
@@ -240,8 +244,9 @@ export class ModelProfileController {
         ? undefined
         : {
             code: result.errorCode ?? "CONNECTION_TEST_FAILED",
-            message: result.errorMessage ?? "The connection test did not succeed.",
+            safeMessage: result.errorMessage ?? "The connection test did not succeed.",
             operation: "testConnection" as const,
+            recoverable: true,
           };
       this.cardStates[profileId] = {
         state: result.success ? "succeeded" : "failed",
@@ -263,8 +268,9 @@ export class ModelProfileController {
       if (credential.exists) {
         this.setCardError(profileId, {
           code: "CREDENTIAL_EXISTS",
-          message: "Delete this profile's API Key before deleting the profile.",
+          safeMessage: "Delete this profile's API Key before deleting the profile.",
           operation: "deleteProfile",
+          recoverable: true,
         });
         return false;
       }
@@ -360,23 +366,26 @@ export function errorFromUnknown(
   const credentialOperation =
     operation === "saveCredential" || operation === "deleteCredential";
   if (isErrorRecord(caught)) {
+    const recoverable = typeof caught.recoverable === "boolean" ? caught.recoverable : true;
     return {
       code: typeof caught.code === "string" ? caught.code : "MODEL_SETTINGS_ERROR",
-      message:
+      safeMessage:
         !credentialOperation && typeof caught.message === "string"
           ? caught.message
           : credentialOperation
             ? "The credential operation could not be completed."
             : "The model settings operation could not be completed.",
       operation,
+      recoverable,
     };
   }
   return {
     code: "MODEL_SETTINGS_ERROR",
-    message: credentialOperation
+    safeMessage: credentialOperation
       ? "The credential operation could not be completed."
       : "The model settings operation could not be completed.",
     operation,
+    recoverable: true,
   };
 }
 

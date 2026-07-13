@@ -10,11 +10,15 @@ const filesToCheck = [
   'src/settings/model/ModelProfileForm.vue',
   'src/settings/model/ModelProfileCard.vue',
   'src/settings/model/ModelProfilesView.vue',
+  'src/settings/model/memoryVectorIndexService.ts',
+  'src/settings/model/memoryVectorIndexController.ts',
+  'src/settings/model/MemoryVectorIndexPanel.vue',
   'src/model/modelService.ts',
   'src/conversation/conversationService.ts',
   'src/conversation/types.ts',
   'src/chat/ChatView.vue',
-  'tests/modelSettings.test.ts'
+  'tests/modelSettings.test.ts',
+  'tests/memoryVectorIndexSettings.test.ts'
 ];
 
 let failed = false;

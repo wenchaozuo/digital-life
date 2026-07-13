@@ -3,6 +3,7 @@ identifier = "settings-commands"
 description = "Storage, model-profile, credential, and manual vector-index management commands for Settings."
 commands.allow = [
     "close_settings_window",
+    "get_current_life_identity",
     "get_storage_location",
     "validate_storage_location",
     "migrate_storage_location",

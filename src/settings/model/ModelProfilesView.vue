@@ -3,6 +3,7 @@ import { onMounted, onUnmounted, reactive, ref } from "vue";
 import type { ModelProfile, ModelPurpose } from "../../model";
 import ModelProfileCard from "./ModelProfileCard.vue";
 import ModelProfileForm from "./ModelProfileForm.vue";
+import MemoryVectorIndexPanel from "./MemoryVectorIndexPanel.vue";
 import {
   ModelProfileController,
   type ModelProfileDraft,
@@ -15,6 +16,24 @@ const editingProfile = ref<ModelProfile>();
 const formVisible = ref(false);
 const formDirty = ref(false);
 const clearEpoch = ref(0);
+interface MemoryVectorIndexPanelHandle {
+  refreshStatus(): void;
+  notifyActiveEmbeddingProfileChanged(): void;
+  deactivate(): void;
+}
+const memoryVectorIndexPanel = ref<MemoryVectorIndexPanelHandle>();
+
+function refreshMemoryVectorIndexStatus(): void {
+  if (props.purpose === "embedding") {
+    memoryVectorIndexPanel.value?.refreshStatus();
+  }
+}
+
+function notifyActiveEmbeddingProfileChanged(): void {
+  if (props.purpose === "embedding") {
+    memoryVectorIndexPanel.value?.notifyActiveEmbeddingProfileChanged();
+  }
+}
 
 function openCreate(): void {
   editingProfile.value = undefined;
@@ -46,9 +65,15 @@ function requestCloseForm(): void {
 }
 
 async function saveProfile(draft: ModelProfileDraft): Promise<void> {
+  const updatedActiveProfile = editingProfile.value?.id === controller.activeProfile?.profileId;
   const saved = await controller.saveProfile(draft, editingProfile.value?.id);
   if (saved) {
     closeForm();
+    if (updatedActiveProfile) {
+      notifyActiveEmbeddingProfileChanged();
+    } else {
+      refreshMemoryVectorIndexStatus();
+    }
   }
 }
 
@@ -58,6 +83,43 @@ async function testConnection(profileId: string): Promise<void> {
 
 function clearSensitiveInputs(): void {
   clearEpoch.value += 1;
+}
+
+async function saveCredential(profileId: string, apiKey: string): Promise<boolean> {
+  const saved = await controller.saveCredential(profileId, apiKey);
+  if (saved) {
+    refreshMemoryVectorIndexStatus();
+  }
+  return saved;
+}
+
+async function deleteCredential(profileId: string): Promise<boolean> {
+  const deleted = await controller.deleteCredential(profileId);
+  if (deleted) {
+    refreshMemoryVectorIndexStatus();
+  }
+  return deleted;
+}
+
+async function setActive(profileId: string): Promise<boolean> {
+  const activated = await controller.setActive(profileId);
+  if (activated) {
+    notifyActiveEmbeddingProfileChanged();
+  }
+  return activated;
+}
+
+async function deleteProfile(profileId: string): Promise<boolean> {
+  const deletedActiveProfile = profileId === controller.activeProfile?.profileId;
+  const deleted = await controller.deleteProfile(profileId);
+  if (deleted) {
+    if (deletedActiveProfile) {
+      notifyActiveEmbeddingProfileChanged();
+    } else {
+      refreshMemoryVectorIndexStatus();
+    }
+  }
+  return deleted;
 }
 
 function requestLeave(): boolean {
@@ -83,6 +145,7 @@ onMounted(() => {
 onUnmounted(() => {
   document.removeEventListener("visibilitychange", onVisibilityChange);
   clearSensitiveInputs();
+  memoryVectorIndexPanel.value?.deactivate();
 });
 
 defineExpose({ clearSensitiveInputs, requestLeave });
@@ -131,14 +194,19 @@ defineExpose({ clearSensitiveInputs, requestLeave });
         :active="controller.activeProfile?.profileId === profile.id"
         :runtime="controller.cardState(profile.id)"
         :clear-epoch="clearEpoch"
-        :on-save-credential="controller.saveCredential.bind(controller)"
-        :on-delete-credential="controller.deleteCredential.bind(controller)"
-        :on-set-active="controller.setActive.bind(controller)"
+        :on-save-credential="saveCredential"
+        :on-delete-credential="deleteCredential"
+        :on-set-active="setActive"
         :on-test-connection="testConnection"
-        :on-delete-profile="controller.deleteProfile.bind(controller)"
+        :on-delete-profile="deleteProfile"
         @edit="openEdit"
       />
     </div>
+
+    <MemoryVectorIndexPanel
+      v-if="purpose === 'embedding'"
+      ref="memoryVectorIndexPanel"
+    />
   </section>
 </template>
 

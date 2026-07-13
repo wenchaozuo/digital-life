@@ -6,6 +6,10 @@ import {
 } from "./memoryVectorIndexController.ts";
 import type { VectorIndexJobStatus } from "./memoryVectorIndexService.ts";
 
+const props = defineProps<{
+  syncRunning?: boolean;
+}>();
+
 const controller = reactive(new MemoryVectorIndexController());
 const activeEmbeddingProfileChanged = ref(false);
 
@@ -151,7 +155,7 @@ defineExpose({
       </section>
 
       <div class="actions">
-        <button type="button" class="primary" :disabled="!controller.canStartRebuild" @click="openRebuildConfirmation">
+        <button type="button" class="primary" :disabled="!controller.canStartRebuild || props.syncRunning" @click="openRebuildConfirmation">
           Rebuild index
         </button>
         <button

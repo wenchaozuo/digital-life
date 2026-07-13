@@ -59,5 +59,5 @@ test("failure cannot update display history and deletion clears selected convers
   assert.ok(deletion);
   assert.match(deletion, /await this\.dependencies\.history\.delete\(conversationId\)/);
   assert.match(deletion, /this\.currentConversation = undefined/);
-  assert.match(deletion, /clearForConversationSwitch\(\)/);
+  assert.match(deletion, /switchConversation\(\)/);
 });

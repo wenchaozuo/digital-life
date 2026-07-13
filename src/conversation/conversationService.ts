@@ -64,6 +64,26 @@ export class ConversationService {
   getConversationId(): string | undefined { return this.currentConversation?.id; }
   getConversationTitle(): string | undefined { return this.currentConversation?.title; }
 
+  /** Preserves SQLite's authoritative, already-sorted conversation order. */
+  listConversations(): Promise<ConversationSummary[]> {
+    return this.dependencies.history.list();
+  }
+
+  async createConversation(title = "新对话"): Promise<ConversationSummary> {
+    if (this.isSending || this.isDeleting || this.isRestoring) {
+      throw new ConversationError("CONVERSATION_IN_PROGRESS", "The current conversation is busy.", true);
+    }
+    this.isRestoring = true;
+    try {
+      const conversation = await this.dependencies.history.create(title);
+      this.dependencies.session.switchConversation();
+      this.currentConversation = conversation;
+      return conversation;
+    } finally {
+      this.isRestoring = false;
+    }
+  }
+
   async initialize(): Promise<void> {
     if (this.isSending || this.isDeleting || this.isRestoring) return;
     this.isRestoring = true;
@@ -71,7 +91,7 @@ export class ConversationService {
       const conversations = await this.dependencies.history.list();
       if (conversations.length === 0) {
         this.currentConversation = undefined;
-        this.dependencies.session.clearForConversationSwitch();
+        this.dependencies.session.switchConversation();
         return;
       }
       await this.restoreConversation(conversations[0]);
@@ -108,7 +128,7 @@ export class ConversationService {
     try {
       await this.dependencies.history.delete(conversationId);
       this.currentConversation = undefined;
-      this.dependencies.session.clearForConversationSwitch();
+      this.dependencies.session.switchConversation();
     } finally {
       this.isDeleting = false;
     }
@@ -161,6 +181,7 @@ export class ConversationService {
 
   private async restoreConversation(conversation: ConversationSummary): Promise<void> {
     const messages = await this.dependencies.history.getMessages(conversation.id);
+    this.dependencies.session.switchConversation();
     this.currentConversation = conversation;
     this.dependencies.session.replaceMessagesFromPersistence(messages);
   }

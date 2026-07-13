@@ -65,6 +65,11 @@ export class ConversationSession {
   }
 
   clearForConversationSwitch(): void {
+    this.switchConversation();
+  }
+
+  /** Clears the display-only cache before replacing it with one persisted conversation. */
+  switchConversation(): void {
     this.messageHistory = [];
     this.activityAt = new Date().toISOString();
     this.notifyListeners();

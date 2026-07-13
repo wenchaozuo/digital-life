@@ -6,8 +6,10 @@ import {
   ConversationError,
   conversationService,
   type ConversationMessage,
+  type ConversationSummary,
 } from "../conversation";
 import ChatInput from "./ChatInput.vue";
+import ConversationSidebar from "./ConversationSidebar.vue";
 import MessageBubble from "./MessageBubble.vue";
 import { MemoryReviewController } from "./memoryReviewController";
 import { memoryService, memoryExtractor } from "../memory";
@@ -17,8 +19,9 @@ import { createClosePanelHandler } from "./memoryReviewAdapter";
 const bodyState = ref<BodyState>(bodyStateMachine.getState());
 const messages = ref<readonly ConversationMessage[]>([]);
 const error = ref<{ code: string; message: string }>();
-const isSending = ref(false);
-const isRestoring = ref(true);
+type ConversationUiState = "idle" | "loadingConversation" | "sending" | "error";
+const conversationState = ref<ConversationUiState>("loadingConversation");
+const conversations = ref<readonly ConversationSummary[]>([]);
 const clearSignal = ref(0);
 const memoryNotice = ref<string>();
 const modelSetupErrorCodes = new Set([
@@ -34,6 +37,10 @@ const showModelSettingsAction = computed(() =>
 );
 const visibleMessages = computed(() => messages.value);
 const conversationTitle = ref<string>();
+const selectedConversationId = computed(() => conversationService.getConversationId());
+const isConversationLoading = computed(() => conversationState.value === "loadingConversation");
+const isSending = computed(() => conversationState.value === "sending");
+const interactionDisabled = computed(() => isConversationLoading.value || isSending.value);
 
 const showMemoryPanel = ref(false);
 const showUnconfirmedHint = ref(false);
@@ -47,16 +54,27 @@ function refreshMessages(): void {
   conversationTitle.value = conversationService.getConversationTitle();
 }
 
+async function refreshConversations(): Promise<void> {
+  conversations.value = await conversationService.listConversations();
+}
+
+function showConversationError(caught: unknown, fallback: string): void {
+  error.value = caught instanceof ConversationError
+    ? { code: caught.code, message: caught.message }
+    : { code: "CONVERSATION_STORAGE_UNAVAILABLE", message: fallback };
+  conversationState.value = "error";
+}
+
 async function restoreConversation(): Promise<void> {
+  conversationState.value = "loadingConversation";
   try {
     await conversationService.initialize();
+    await refreshConversations();
     refreshMessages();
   } catch (caught) {
-    error.value = caught instanceof ConversationError
-      ? { code: caught.code, message: caught.message }
-      : { code: "CONVERSATION_STORAGE_UNAVAILABLE", message: "Conversation history could not be restored." };
+    showConversationError(caught, "Conversation history could not be restored.");
   } finally {
-    isRestoring.value = false;
+    if (conversationState.value === "loadingConversation") conversationState.value = "idle";
   }
 }
 
@@ -70,11 +88,11 @@ function memoryNoticeFor(codes: readonly string[], rebuildRecommended: boolean):
 }
 
 async function send(content: string): Promise<void> {
-  if (isSending.value) {
+  if (interactionDisabled.value) {
     return;
   }
 
-  isSending.value = true;
+  conversationState.value = "sending";
   error.value = undefined;
 
   try {
@@ -83,16 +101,63 @@ async function send(content: string): Promise<void> {
     });
     clearSignal.value += 1;
     memoryNotice.value = memoryNoticeFor(response.memory.degradationCodes, response.memory.rebuildRecommended);
+    await refreshConversations();
   } catch (caught) {
     error.value = caught instanceof ConversationError
       ? { code: caught.code, message: caught.message }
-      : {
-          code: "CONVERSATION_MODEL_FAILED",
-          message: "The model request could not be completed.",
-        };
+      : { code: "CONVERSATION_MODEL_FAILED", message: "The model request could not be completed." };
+    conversationState.value = "error";
   } finally {
     refreshMessages();
-    isSending.value = false;
+    if (conversationState.value === "sending") conversationState.value = "idle";
+  }
+}
+
+async function createConversation(): Promise<void> {
+  if (interactionDisabled.value) return;
+  conversationState.value = "loadingConversation";
+  error.value = undefined;
+  try {
+    await conversationService.createConversation();
+    clearSignal.value += 1;
+    refreshMessages();
+    await refreshConversations();
+  } catch (caught) {
+    showConversationError(caught, "A new conversation could not be created.");
+  } finally {
+    if (conversationState.value === "loadingConversation") conversationState.value = "idle";
+  }
+}
+
+async function switchConversation(conversation: ConversationSummary): Promise<void> {
+  if (interactionDisabled.value || conversation.id === selectedConversationId.value) return;
+  conversationState.value = "loadingConversation";
+  error.value = undefined;
+  try {
+    await conversationService.switchConversation(conversation);
+    clearSignal.value += 1;
+    refreshMessages();
+  } catch (caught) {
+    showConversationError(caught, "The conversation could not be loaded.");
+  } finally {
+    if (conversationState.value === "loadingConversation") conversationState.value = "idle";
+  }
+}
+
+async function deleteConversation(conversation: ConversationSummary): Promise<void> {
+  if (interactionDisabled.value || conversation.id !== selectedConversationId.value) return;
+  if (!window.confirm(`Delete conversation “${conversation.title}”? This cannot be undone.`)) return;
+  conversationState.value = "loadingConversation";
+  error.value = undefined;
+  try {
+    await conversationService.deleteCurrentConversation();
+    clearSignal.value += 1;
+    refreshMessages();
+    await refreshConversations();
+  } catch (caught) {
+    showConversationError(caught, "The conversation could not be deleted.");
+  } finally {
+    if (conversationState.value === "loadingConversation") conversationState.value = "idle";
   }
 }
 
@@ -136,6 +201,16 @@ onUnmounted(() => {
 
 <template>
   <main class="chat-page">
+    <ConversationSidebar
+      :conversations="conversations"
+      :selected-conversation-id="selectedConversationId"
+      :disabled="interactionDisabled"
+      :loading="isConversationLoading"
+      @create="createConversation"
+      @select="switchConversation"
+      @delete="deleteConversation"
+    />
+    <section class="chat-content">
     <header class="chat-header">
       <div>
         <p class="eyebrow">Digital Life</p>
@@ -152,7 +227,7 @@ onUnmounted(() => {
     </div>
 
     <div class="chat-actions">
-      <button class="memory-check-btn" type="button" @click="toggleMemoryPanel">
+      <button class="memory-check-btn" type="button" :disabled="interactionDisabled" @click="toggleMemoryPanel">
         检查可记忆内容
       </button>
     </div>
@@ -175,7 +250,8 @@ onUnmounted(() => {
       </button>
     </section>
     <p v-if="memoryNotice" class="memory-notice" aria-live="polite">{{ memoryNotice }}</p>
-    <ChatInput :disabled="isSending || isRestoring" :clear-signal="clearSignal" @send="send" />
+    <ChatInput :disabled="interactionDisabled" :clear-signal="clearSignal" @send="send" />
+    </section>
   </main>
 
   <!-- Backdrop Overlay -->
@@ -376,11 +452,18 @@ input {
 
 .chat-page {
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr) auto auto;
+  grid-template-columns: minmax(13rem, 18rem) minmax(0, 1fr);
   gap: 0.85rem;
   min-height: 100vh;
   box-sizing: border-box;
   padding: 1rem;
+}
+
+.chat-content {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr) auto auto;
+  gap: 0.85rem;
+  min-height: 0;
 }
 
 .chat-header {
@@ -466,6 +549,11 @@ input {
   gap: 0.35rem;
   color: #fecaca;
   overflow-wrap: anywhere;
+}
+
+.memory-check-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
 }
 
 .chat-error button {
@@ -969,5 +1057,15 @@ input {
   font-size: 0.8rem;
   line-height: 1.4;
   margin-bottom: 1rem;
+}
+
+@media (max-width: 760px) {
+  .chat-page {
+    grid-template-columns: 1fr;
+  }
+
+  .conversation-sidebar {
+    max-height: 14rem;
+  }
 }
 </style>

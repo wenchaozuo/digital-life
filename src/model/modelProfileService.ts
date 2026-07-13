@@ -51,9 +51,44 @@ export interface ModelProfileError {
     | "INVALID_PARAMETERS"
     | "PROFILE_NOT_FOUND"
     | "PURPOSE_MISMATCH"
+    | "UNSUPPORTED_PROVIDER"
     | "DATABASE_ERROR";
   message: string;
   recoverable: boolean;
+}
+
+export type ModelRuntimeErrorCode =
+  | "NO_ACTIVE_PROFILE"
+  | "PROFILE_NOT_FOUND"
+  | "PROFILE_PURPOSE_MISMATCH"
+  | "CREDENTIAL_NOT_FOUND"
+  | "UNSUPPORTED_PROVIDER"
+  | "INVALID_PROFILE"
+  | "PROVIDER_INITIALIZATION_FAILED"
+  | "AUTHENTICATION_FAILED"
+  | "RATE_LIMITED"
+  | "NETWORK_UNAVAILABLE"
+  | "REQUEST_TIMEOUT"
+  | "INVALID_PROVIDER_RESPONSE"
+  | "DIMENSION_MISMATCH"
+  | "CONNECTION_TEST_FAILED"
+  | "CONNECTION_TEST_IN_PROGRESS";
+
+export interface ModelConnectionTestRequest {
+  profileId: string;
+  purpose: ModelPurpose;
+}
+
+export interface ModelConnectionTestResult {
+  profileId: string;
+  purpose: ModelPurpose;
+  success: boolean;
+  providerKind: ModelProviderKind | null;
+  modelName: string | null;
+  latencyMs: number;
+  embeddingDimension: number | null;
+  errorCode: ModelRuntimeErrorCode | null;
+  errorMessage: string | null;
 }
 
 export class ModelProfileService {
@@ -95,6 +130,14 @@ export class ModelProfileService {
   ): Promise<ActiveModelProfile | null> {
     return invoke<ActiveModelProfile | null>("get_active_model_profile", {
       purpose,
+    });
+  }
+
+  async testConnection(
+    request: ModelConnectionTestRequest,
+  ): Promise<ModelConnectionTestResult> {
+    return invoke<ModelConnectionTestResult>("test_model_profile_connection", {
+      request,
     });
   }
 }

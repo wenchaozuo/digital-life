@@ -3,6 +3,8 @@ use std::time::Duration;
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 
+use crate::secrets::SecretValue;
+
 use super::{
     ModelConfig, ModelError, ModelFinishReason, ModelFuture, ModelMessageRole, ModelProvider,
     ModelRequest, ModelResponse, ModelUsage,
@@ -13,21 +15,38 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 pub struct OpenAICompatibleProvider {
     client: Client,
     endpoint: Url,
-    api_key: String,
+    api_key: SecretValue,
     model_name: String,
 }
 
 impl OpenAICompatibleProvider {
     pub fn new(config: ModelConfig) -> Result<Self, ModelError> {
-        if config.api_key.trim().is_empty() {
-            return Err(ModelError::new(
+        let api_key = SecretValue::new(config.api_key).map_err(|_| {
+            ModelError::new(
                 "MODEL_API_KEY_REQUIRED",
                 "An API key is required for this model provider.",
                 true,
+            )
+        })?;
+
+        Self::new_with_secret(config.base_url, config.model_name, api_key, REQUEST_TIMEOUT)
+    }
+
+    pub(crate) fn new_with_secret(
+        base_url: String,
+        model_name: String,
+        api_key: SecretValue,
+        timeout: Duration,
+    ) -> Result<Self, ModelError> {
+        if timeout.is_zero() {
+            return Err(ModelError::new(
+                "MODEL_HTTP_CLIENT_ERROR",
+                "The model HTTP timeout is invalid.",
+                false,
             ));
         }
 
-        if config.model_name.trim().is_empty() {
+        if model_name.trim().is_empty() {
             return Err(ModelError::new(
                 "MODEL_NAME_REQUIRED",
                 "A model name is required.",
@@ -35,23 +54,20 @@ impl OpenAICompatibleProvider {
             ));
         }
 
-        let endpoint = Self::chat_endpoint(&config.base_url)?;
-        let client = Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .map_err(|_| {
-                ModelError::new(
-                    "MODEL_HTTP_CLIENT_ERROR",
-                    "The model HTTP client could not be initialized.",
-                    false,
-                )
-            })?;
+        let endpoint = Self::chat_endpoint(&base_url)?;
+        let client = Client::builder().timeout(timeout).build().map_err(|_| {
+            ModelError::new(
+                "MODEL_HTTP_CLIENT_ERROR",
+                "The model HTTP client could not be initialized.",
+                false,
+            )
+        })?;
 
         Ok(Self {
             client,
             endpoint,
-            api_key: config.api_key,
-            model_name: config.model_name,
+            api_key,
+            model_name,
         })
     }
 
@@ -177,24 +193,51 @@ impl ModelProvider for OpenAICompatibleProvider {
             let response = self
                 .client
                 .post(self.endpoint.clone())
-                .bearer_auth(&self.api_key)
+                .bearer_auth(self.api_key.expose_secret())
                 .json(&payload)
                 .send()
                 .await
-                .map_err(|_| {
-                    ModelError::new(
-                        "MODEL_REQUEST_FAILED",
-                        "The model request could not be sent.",
-                        true,
-                    )
+                .map_err(|error| {
+                    if error.is_connect() {
+                        ModelError::new(
+                            "MODEL_NETWORK_UNAVAILABLE",
+                            "The model service is unavailable.",
+                            true,
+                        )
+                    } else if error.is_timeout() {
+                        ModelError::new(
+                            "MODEL_REQUEST_TIMEOUT",
+                            "The model request timed out.",
+                            true,
+                        )
+                    } else {
+                        ModelError::new(
+                            "MODEL_NETWORK_UNAVAILABLE",
+                            "The model service is unavailable.",
+                            true,
+                        )
+                    }
                 })?;
 
             if !response.status().is_success() {
-                return Err(ModelError::new(
-                    "MODEL_HTTP_ERROR",
-                    format!("The model service returned HTTP {}.", response.status()),
-                    true,
-                ));
+                let (code, message, recoverable) = match response.status() {
+                    reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => (
+                        "MODEL_AUTHENTICATION_FAILED",
+                        "The model service rejected authentication.",
+                        false,
+                    ),
+                    reqwest::StatusCode::TOO_MANY_REQUESTS => (
+                        "MODEL_RATE_LIMITED",
+                        "The model service rate limit was reached.",
+                        true,
+                    ),
+                    _ => (
+                        "MODEL_HTTP_ERROR",
+                        "The model service returned an unsuccessful HTTP status.",
+                        true,
+                    ),
+                };
+                return Err(ModelError::new(code, message, recoverable));
             }
 
             let response = response.json::<OpenAIChatResponse>().await.map_err(|_| {

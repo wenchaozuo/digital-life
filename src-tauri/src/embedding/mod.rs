@@ -76,6 +76,7 @@ pub enum EmbeddingErrorCode {
     NetworkError,
     AuthenticationFailed,
     RateLimited,
+    RequestTimeout,
     InvalidProviderResponse,
     DimensionMismatch,
 }

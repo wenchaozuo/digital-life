@@ -17,6 +17,7 @@ pub fn run() {
                 .map_err(|error| std::io::Error::other(error.message))?;
             app.manage(storage);
             app.manage(secrets::WindowsCredentialSecretStore::new());
+            app.manage(model::runtime::ModelRuntimeCoordinator::default());
             create_configured_windows(app)?;
             configure_window_lifecycle(app)?;
             Ok(())
@@ -30,6 +31,7 @@ pub fn run() {
             model::profile::delete_model_profile,
             model::profile::set_active_model_profile,
             model::profile::get_active_model_profile,
+            model::runtime::test_model_profile_connection,
             memory::create_memory_candidate,
             memory::list_memories,
             memory::get_memory,

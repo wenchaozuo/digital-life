@@ -1,6 +1,8 @@
 use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 
+use crate::secrets::SecretValue;
+
 use super::{
     validate_request, validate_response, EmbeddingError, EmbeddingErrorCode, EmbeddingFuture,
     EmbeddingModelInfo, EmbeddingProvider, EmbeddingRequest, EmbeddingResponse,
@@ -18,18 +20,21 @@ pub struct OpenAICompatibleEmbeddingConfig {
 }
 
 /// A runtime-only secret. It deliberately implements neither `Debug` nor serde.
-pub struct RuntimeEmbeddingApiKey(String);
+pub struct RuntimeEmbeddingApiKey(SecretValue);
 
 impl RuntimeEmbeddingApiKey {
     pub fn new(value: String) -> Result<Self, EmbeddingError> {
-        if value.trim().is_empty() {
-            return Err(EmbeddingError::new(
+        SecretValue::new(value).map(Self).map_err(|_| {
+            EmbeddingError::new(
                 EmbeddingErrorCode::InvalidRequest,
                 "An embedding API key is required.",
                 false,
-            ));
-        }
-        Ok(Self(value))
+            )
+        })
+    }
+
+    pub(crate) fn from_secret(value: SecretValue) -> Self {
+        Self(value)
     }
 }
 
@@ -221,16 +226,30 @@ impl EmbeddingProvider for OpenAICompatibleEmbeddingProvider {
             let response = self
                 .client
                 .post(self.endpoint.clone())
-                .bearer_auth(&self.api_key.0)
+                .bearer_auth(self.api_key.0.expose_secret())
                 .json(&payload)
                 .send()
                 .await
-                .map_err(|_| {
-                    EmbeddingError::new(
-                        EmbeddingErrorCode::NetworkError,
-                        "The embedding request could not be sent.",
-                        true,
-                    )
+                .map_err(|error| {
+                    if error.is_connect() {
+                        EmbeddingError::new(
+                            EmbeddingErrorCode::NetworkError,
+                            "The embedding service is unavailable.",
+                            true,
+                        )
+                    } else if error.is_timeout() {
+                        EmbeddingError::new(
+                            EmbeddingErrorCode::RequestTimeout,
+                            "The embedding request timed out.",
+                            true,
+                        )
+                    } else {
+                        EmbeddingError::new(
+                            EmbeddingErrorCode::NetworkError,
+                            "The embedding service is unavailable.",
+                            true,
+                        )
+                    }
                 })?;
             if !response.status().is_success() {
                 return Err(Self::map_http_error(response.status()));

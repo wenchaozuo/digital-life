@@ -126,7 +126,7 @@ impl StorageService {
         Self::initialize_with_roots(default_root, project_root)
     }
 
-    fn initialize_with_roots(
+    pub(crate) fn initialize_with_roots(
         default_root: PathBuf,
         project_root: Option<PathBuf>,
     ) -> Result<Self, StorageError> {

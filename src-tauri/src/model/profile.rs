@@ -55,7 +55,7 @@ impl ModelProviderKind {
     pub(crate) fn parse(value: &str) -> Result<Self, ModelProfileError> {
         match value {
             "openai_compatible" => Ok(Self::OpenaiCompatible),
-            _ => Err(ModelProfileError::database()),
+            _ => Err(ModelProfileError::unsupported_provider()),
         }
     }
 }
@@ -139,6 +139,7 @@ pub enum ModelProfileErrorCode {
     InvalidParameters,
     ProfileNotFound,
     PurposeMismatch,
+    UnsupportedProvider,
     DatabaseError,
 }
 
@@ -175,6 +176,14 @@ impl ModelProfileError {
         Self::new(
             ModelProfileErrorCode::PurposeMismatch,
             "The model profile purpose does not match the requested purpose.",
+            false,
+        )
+    }
+
+    pub(crate) fn unsupported_provider() -> Self {
+        Self::new(
+            ModelProfileErrorCode::UnsupportedProvider,
+            "The model profile provider is not supported.",
             false,
         )
     }

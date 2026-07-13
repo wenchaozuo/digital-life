@@ -20,9 +20,12 @@ export {
   type ActiveModelProfile,
   type CreateModelProfileRequest,
   type DeleteModelProfileResult,
+  type ModelConnectionTestRequest,
+  type ModelConnectionTestResult,
   type ModelProfile,
   type ModelProfileError,
   type ModelProviderKind,
   type ModelPurpose,
+  type ModelRuntimeErrorCode,
   type UpdateModelProfileRequest,
 } from "./modelProfileService";

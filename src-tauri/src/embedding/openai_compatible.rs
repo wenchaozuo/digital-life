@@ -203,6 +203,10 @@ impl EmbeddingProvider for OpenAICompatibleEmbeddingProvider {
         self.config.expected_dimension
     }
 
+    fn max_batch_size(&self) -> usize {
+        self.options.limits.max_batch_size
+    }
+
     fn embed<'a>(
         &'a self,
         request: EmbeddingRequest,

@@ -158,6 +158,9 @@ pub trait EmbeddingProvider: Send + Sync {
     fn model_info(&self) -> EmbeddingModelInfo;
     fn model_name(&self) -> &str;
     fn vector_dimension(&self) -> Option<usize>;
+    fn max_batch_size(&self) -> usize {
+        DEFAULT_MAX_BATCH_SIZE
+    }
     fn embed<'a>(
         &'a self,
         request: EmbeddingRequest,
@@ -318,6 +321,10 @@ impl EmbeddingProvider for DeterministicEmbeddingProvider {
 
     fn vector_dimension(&self) -> Option<usize> {
         Some(self.dimension)
+    }
+
+    fn max_batch_size(&self) -> usize {
+        self.limits.max_batch_size
     }
 
     fn embed<'a>(

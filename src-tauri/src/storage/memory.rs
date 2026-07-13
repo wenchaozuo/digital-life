@@ -1,9 +1,9 @@
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
 use crate::memory::{
-    ConfirmMemoryRequest, CreateMemoryCandidateRequest, DeleteMemoryResult, MemoryError,
-    MemoryKind, MemoryQuery, MemoryRecord, MemoryRepository, MemorySourceType, MemoryStatus,
-    UpdateMemoryRequest,
+    vector_index::MemoryVectorIndexRepository, ConfirmMemoryRequest, CreateMemoryCandidateRequest,
+    DeleteMemoryResult, MemoryError, MemoryKind, MemoryQuery, MemoryRecord, MemoryRepository,
+    MemorySourceType, MemoryStatus, UpdateMemoryRequest,
 };
 
 use super::StorageService;
@@ -233,6 +233,42 @@ impl MemoryRepository for StorageService {
             memory_id: memory_id.to_string(),
             deleted: deleted == 1,
         })
+    }
+}
+
+impl MemoryVectorIndexRepository for StorageService {
+    fn get_authoritative(
+        &self,
+        life_id: &str,
+        memory_id: &str,
+    ) -> Result<MemoryRecord, MemoryError> {
+        <Self as MemoryRepository>::get(self, life_id, memory_id)
+    }
+
+    fn list_page(
+        &self,
+        life_id: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<MemoryRecord>, MemoryError> {
+        let state = self.state().map_err(|_| MemoryError::database())?;
+        let limit = i64::try_from(limit).map_err(|_| MemoryError::database())?;
+        let offset = i64::try_from(offset).map_err(|_| MemoryError::database())?;
+        let sql = format!(
+            "SELECT {MEMORY_COLUMNS} FROM memory_record
+             WHERE life_id = ?1
+             ORDER BY created_at ASC, id ASC
+             LIMIT ?2 OFFSET ?3"
+        );
+        let mut statement = state
+            .connection
+            .prepare(&sql)
+            .map_err(|_| MemoryError::database())?;
+        let rows = statement
+            .query_map(params![life_id, limit, offset], read_stored_memory)
+            .map_err(|_| MemoryError::database())?;
+        rows.map(|row| row.map_err(|_| MemoryError::database())?.try_into())
+            .collect()
     }
 }
 

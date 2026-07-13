@@ -9,6 +9,7 @@ use tauri::State;
 use crate::storage::StorageService;
 
 pub mod retrieval;
+pub mod vector_index;
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]

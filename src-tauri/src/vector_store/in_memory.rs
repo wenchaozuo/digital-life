@@ -173,6 +173,35 @@ impl VectorStore for InMemoryVectorStore {
         })
     }
 
+    fn delete_from_space<'a>(
+        &'a self,
+        life_id: &'a str,
+        memory_id: &'a str,
+        space: &'a VectorSpace,
+    ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
+        Box::pin(async move {
+            validate_identifier(life_id, "Life ID")?;
+            validate_identifier(memory_id, "Memory ID")?;
+            space.validate()?;
+            let mut records = self.write_records()?;
+            let before = records.len();
+            records.retain(|_, record| {
+                record.life_id != life_id
+                    || record.memory_id != memory_id
+                    || record.space() != *space
+            });
+            let removed = before - records.len();
+            if removed == 0 {
+                return Err(VectorStoreError::new(
+                    VectorStoreErrorCode::VectorNotFound,
+                    "No vector index exists for this life, memory, and vector space.",
+                    false,
+                ));
+            }
+            Ok(removed)
+        })
+    }
+
     fn clear_space<'a>(
         &'a self,
         life_id: &'a str,

@@ -526,6 +526,50 @@ impl VectorStore for LanceDbVectorStore {
         })
     }
 
+    fn delete_from_space<'a>(
+        &'a self,
+        life_id: &'a str,
+        memory_id: &'a str,
+        space: &'a VectorSpace,
+    ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
+        Box::pin(async move {
+            validate_identifier(life_id, "Life ID")?;
+            validate_identifier(memory_id, "Memory ID")?;
+            validate_lance_space(space)?;
+            let _guard = self.mutation_lock.lock().await;
+            let Some(table) = self.open_existing_space(space).await? else {
+                return Err(VectorStoreError::new(
+                    VectorStoreErrorCode::VectorNotFound,
+                    "No vector index exists for this life, memory, and vector space.",
+                    false,
+                ));
+            };
+            let predicate = format!(
+                "life_id = {} AND memory_id = {} AND embedding_model = {} AND dimension = {}",
+                sql_literal(life_id),
+                sql_literal(memory_id),
+                sql_literal(&space.embedding_model),
+                space.dimension
+            );
+            let count = table
+                .count_rows(Some(predicate.clone()))
+                .await
+                .map_err(|_| internal_error())?;
+            if count == 0 {
+                return Err(VectorStoreError::new(
+                    VectorStoreErrorCode::VectorNotFound,
+                    "No vector index exists for this life, memory, and vector space.",
+                    false,
+                ));
+            }
+            table
+                .delete(&predicate)
+                .await
+                .map_err(|_| internal_error())?;
+            Ok(count)
+        })
+    }
+
     fn clear_space<'a>(
         &'a self,
         life_id: &'a str,

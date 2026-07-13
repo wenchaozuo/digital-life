@@ -170,6 +170,13 @@ pub trait VectorStore: Send + Sync {
         memory_id: &'a str,
     ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>>;
 
+    fn delete_from_space<'a>(
+        &'a self,
+        life_id: &'a str,
+        memory_id: &'a str,
+        space: &'a VectorSpace,
+    ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>>;
+
     fn delete_by_life<'a>(
         &'a self,
         life_id: &'a str,

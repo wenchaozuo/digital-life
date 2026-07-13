@@ -1,3 +1,4 @@
+mod candidate_memory;
 mod conversation;
 mod location;
 mod memory;
@@ -54,6 +55,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         7,
         "007_memory_revisions",
         include_str!("migrations/007_memory_revisions.sql"),
+    ),
+    (
+        8,
+        "008_candidate_memory_storage",
+        include_str!("migrations/008_candidate_memory_storage.sql"),
     ),
 ];
 

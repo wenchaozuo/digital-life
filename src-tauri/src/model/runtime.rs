@@ -257,6 +257,16 @@ where
         request: ActiveModelChatRequest,
     ) -> Result<super::ModelResponse, ModelRuntimeError> {
         let resolved = self.resolve_active_chat_provider()?;
+        self.chat_with_resolved_provider(resolved, request).await
+    }
+
+    /// Executes a request with a provider that was just resolved by this
+    /// service. This stays crate-internal so credentials never cross IPC.
+    pub(crate) async fn chat_with_resolved_provider(
+        &self,
+        resolved: ResolvedChatProvider,
+        request: ActiveModelChatRequest,
+    ) -> Result<super::ModelResponse, ModelRuntimeError> {
         let temperature = resolved
             .profile
             .temperature

@@ -5,7 +5,7 @@
 mod compiler;
 
 pub use compiler::{
-    PromptCommunicationStyle, PromptCompilationRequest, PromptCompilationResult, PromptCompiler,
-    PromptCompilerError, PromptCompilerErrorCode, PromptLifeIdentity, PromptPersona,
-    SafetyRulesVersion, PROMPT_COMPILER_VERSION,
+    InitiativeLevel, PromptCommunicationStyle, PromptCompilationRequest, PromptCompilationResult,
+    PromptCompiler, PromptCompilerError, PromptCompilerErrorCode, PromptLifeIdentity,
+    PromptPersona, SafetyRulesVersion, PROMPT_COMPILER_VERSION,
 };

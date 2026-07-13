@@ -1,3 +1,4 @@
+pub mod conversation;
 pub mod embedding;
 pub mod memory;
 pub mod model;
@@ -19,6 +20,8 @@ pub fn run() {
             app.manage(storage);
             app.manage(secrets::WindowsCredentialSecretStore::new());
             app.manage(model::runtime::ModelRuntimeCoordinator::default());
+            app.manage(conversation::ConversationCognitionCoordinator::default());
+            app.manage(vector_store::LanceDbVectorStoreRegistry::default());
             app.manage(
                 memory::vector_index_runtime::MemoryVectorIndexRuntimeCoordinator::default(),
             );
@@ -27,6 +30,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            conversation::service::chat_with_governed_context,
             model::runtime::chat_with_active_model,
             model::profile::create_model_profile,
             model::profile::list_model_profiles,

@@ -17,6 +17,9 @@ pub mod vector_index_runtime;
 pub mod vector_sync_outbox;
 pub mod vector_sync_worker;
 
+#[cfg(test)]
+mod vector_conversation_integration_tests;
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryKind {

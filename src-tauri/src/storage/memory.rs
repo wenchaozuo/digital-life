@@ -337,6 +337,48 @@ fn normalize_optional(value: Option<String>) -> Option<String> {
 }
 
 #[cfg(test)]
+impl StorageService {
+    /// Simulates an authoritative confirmed-memory revision for integration
+    /// tests without relaxing the production candidate-only update boundary.
+    pub(crate) fn revise_confirmed_memory_for_vector_sync_test(
+        &self,
+        life_id: &str,
+        memory_id: &str,
+        kind: MemoryKind,
+        content: &str,
+        summary: Option<&str>,
+    ) -> Result<MemoryRecord, MemoryError> {
+        let mut state = self.state().map_err(|_| MemoryError::database())?;
+        let transaction = state
+            .connection
+            .transaction()
+            .map_err(|_| MemoryError::database())?;
+        let existing = load_owned_memory(&transaction, life_id, memory_id)?;
+        if existing.status != MemoryStatus::Confirmed {
+            return Err(MemoryError::invalid_transition());
+        }
+        transaction
+            .execute(
+                "UPDATE memory_record SET kind = ?3, content = ?4, summary = ?5,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 WHERE id = ?1 AND life_id = ?2 AND status = 'confirmed'",
+                params![memory_id, life_id, kind.as_str(), content.trim(), summary],
+            )
+            .map_err(|_| MemoryError::database())?;
+        enqueue_in_transaction(
+            &transaction,
+            life_id,
+            memory_id,
+            MemoryVectorSyncAction::Upsert,
+        )
+        .map_err(|_| MemoryError::database())?;
+        let revised = load_owned_memory(&transaction, life_id, memory_id)?;
+        transaction.commit().map_err(|_| MemoryError::database())?;
+        Ok(revised)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::{fs, path::PathBuf};
 

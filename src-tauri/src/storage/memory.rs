@@ -8,7 +8,7 @@ use crate::memory::{
 
 use super::StorageService;
 
-struct StoredMemoryRecord {
+pub(super) struct StoredMemoryRecord {
     id: String,
     life_id: String,
     kind: String,
@@ -50,7 +50,8 @@ impl TryFrom<StoredMemoryRecord> for MemoryRecord {
     }
 }
 
-const MEMORY_COLUMNS: &str = "id, life_id, kind, status, content, summary, source_type, \
+pub(super) const MEMORY_COLUMNS: &str =
+    "id, life_id, kind, status, content, summary, source_type, \
     source_ref, source_created_at, importance, confidence, is_sensitive, created_at, \
     updated_at, confirmed_at";
 
@@ -289,7 +290,7 @@ fn load_owned_memory(
     stored.try_into()
 }
 
-fn read_stored_memory(row: &Row<'_>) -> rusqlite::Result<StoredMemoryRecord> {
+pub(super) fn read_stored_memory(row: &Row<'_>) -> rusqlite::Result<StoredMemoryRecord> {
     Ok(StoredMemoryRecord {
         id: row.get(0)?,
         life_id: row.get(1)?,

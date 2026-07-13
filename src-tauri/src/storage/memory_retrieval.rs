@@ -2,10 +2,11 @@ use rusqlite::{params, params_from_iter, types::Value};
 
 use crate::memory::{
     retrieval::{MemoryRetrievalRepository, MemoryRetrievalResult, RetrievalQuery},
-    MemoryError, MemoryKind,
+    retrieval_router::MemoryRetrievalRouterRepository,
+    MemoryError, MemoryKind, MemoryRecord,
 };
 
-use super::StorageService;
+use super::{memory::read_stored_memory, memory::MEMORY_COLUMNS, StorageService};
 
 impl MemoryRetrievalRepository for StorageService {
     fn retrieve_confirmed(
@@ -94,6 +95,51 @@ impl MemoryRetrievalRepository for StorageService {
             })
         })
         .collect()
+    }
+}
+
+impl MemoryRetrievalRouterRepository for StorageService {
+    fn life_exists(&self, life_id: &str) -> Result<bool, MemoryError> {
+        let state = self.state().map_err(|_| MemoryError::database())?;
+        state
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM life_identity WHERE id = ?1)",
+                params![life_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| MemoryError::database())
+    }
+
+    fn load_authoritative_candidates(
+        &self,
+        life_id: &str,
+        memory_ids: &[String],
+    ) -> Result<Vec<MemoryRecord>, MemoryError> {
+        if memory_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let state = self.state().map_err(|_| MemoryError::database())?;
+        let placeholders = vec!["?"; memory_ids.len()].join(", ");
+        let sql = format!(
+            "SELECT {MEMORY_COLUMNS} FROM memory_record
+             WHERE life_id = ? AND status = 'confirmed' AND is_sensitive = 0
+               AND id IN ({placeholders})
+             ORDER BY id ASC"
+        );
+        let mut values = Vec::with_capacity(memory_ids.len() + 1);
+        values.push(Value::Text(life_id.to_string()));
+        values.extend(memory_ids.iter().cloned().map(Value::Text));
+        let mut statement = state
+            .connection
+            .prepare(&sql)
+            .map_err(|_| MemoryError::database())?;
+        let rows = statement
+            .query_map(params_from_iter(values), read_stored_memory)
+            .map_err(|_| MemoryError::database())?;
+        rows.map(|row| row.map_err(|_| MemoryError::database())?.try_into())
+            .collect()
     }
 }
 

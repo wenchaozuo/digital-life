@@ -1,12 +1,13 @@
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
+use crate::memory::vector_sync_outbox::MemoryVectorSyncAction;
 use crate::memory::{
     vector_index::MemoryVectorIndexRepository, ConfirmMemoryRequest, CreateMemoryCandidateRequest,
     DeleteMemoryResult, MemoryError, MemoryKind, MemoryQuery, MemoryRecord, MemoryRepository,
     MemorySourceType, MemoryStatus, UpdateMemoryRequest,
 };
 
-use super::StorageService;
+use super::{vector_sync_outbox::enqueue_in_transaction, StorageService};
 
 pub(super) struct StoredMemoryRecord {
     id: String,
@@ -211,6 +212,15 @@ impl MemoryRepository for StorageService {
             )
             .map_err(|_| MemoryError::database())?;
         let confirmed = load_owned_memory(&transaction, &request.life_id, &request.memory_id)?;
+        if !confirmed.is_sensitive {
+            enqueue_in_transaction(
+                &transaction,
+                &request.life_id,
+                &request.memory_id,
+                MemoryVectorSyncAction::Upsert,
+            )
+            .map_err(|_| MemoryError::database())?;
+        }
         transaction.commit().map_err(|_| MemoryError::database())?;
         Ok(confirmed)
     }
@@ -221,7 +231,16 @@ impl MemoryRepository for StorageService {
             .connection
             .transaction()
             .map_err(|_| MemoryError::database())?;
-        load_owned_memory(&transaction, life_id, memory_id)?;
+        let existing = load_owned_memory(&transaction, life_id, memory_id)?;
+        if existing.status == MemoryStatus::Confirmed {
+            enqueue_in_transaction(
+                &transaction,
+                life_id,
+                memory_id,
+                MemoryVectorSyncAction::Delete,
+            )
+            .map_err(|_| MemoryError::database())?;
+        }
         let deleted = transaction
             .execute(
                 "DELETE FROM memory_record WHERE id = ?1 AND life_id = ?2",
@@ -457,7 +476,7 @@ mod tests {
             .connection
             .query_row("SELECT COUNT(*) FROM memory_record", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         assert_eq!(memory_count, 0);
     }
 

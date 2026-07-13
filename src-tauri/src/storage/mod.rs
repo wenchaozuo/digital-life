@@ -3,6 +3,7 @@ mod memory;
 mod memory_retrieval;
 mod migration;
 mod model_profile;
+mod vector_sync_outbox;
 
 use std::{
     fmt::Display,
@@ -29,6 +30,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         3,
         "003_model_profiles",
         include_str!("migrations/003_model_profiles.sql"),
+    ),
+    (
+        4,
+        "004_memory_vector_sync_outbox",
+        include_str!("migrations/004_memory_vector_sync_outbox.sql"),
     ),
 ];
 

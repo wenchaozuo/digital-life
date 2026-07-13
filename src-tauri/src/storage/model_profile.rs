@@ -386,7 +386,7 @@ mod tests {
             .unwrap()
             .map(Result::unwrap)
             .collect();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         assert_eq!(profile_count, 0);
         assert!(!columns.iter().any(|column| {
             let column = column.to_ascii_lowercase();

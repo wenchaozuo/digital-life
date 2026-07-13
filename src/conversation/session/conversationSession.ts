@@ -40,6 +40,19 @@ export class ConversationSession {
     this.notifyListeners();
   }
 
+  /** Atomically commits a completed user/assistant turn. */
+  appendTurn(userMessage: ConversationMessage, assistantMessage: ConversationMessage): void {
+    if (userMessage.role !== "user" || assistantMessage.role !== "assistant") {
+      throw new Error("A conversation turn must contain one user and one assistant message.");
+    }
+    this.messageHistory.push({ ...userMessage }, { ...assistantMessage });
+    if (this.messageHistory.length > this.messageLimit) {
+      this.messageHistory.splice(0, this.messageHistory.length - this.messageLimit);
+    }
+    this.activityAt = assistantMessage.timestamp;
+    this.notifyListeners();
+  }
+
   getMessages(): readonly ConversationMessage[] {
     return this.messageHistory.map((message) => ({ ...message }));
   }

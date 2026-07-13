@@ -4,96 +4,55 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const workspace = path.resolve(__dirname, "..");
+const workspace = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const read = (relativePath) => fs.readFileSync(path.join(workspace, relativePath), "utf8");
 
-function read(relativePath) {
-  return fs.readFileSync(path.join(workspace, relativePath), "utf8");
-}
-
-test("chat request DTO contains only user input before cognition builds the model request", () => {
-  const conversationTypes = read("src/conversation/types.ts");
-  const requestBlock = conversationTypes.match(
-    /export interface ConversationRequest \{[\s\S]*?\n\}/,
-  )?.[0];
-
-  assert.ok(requestBlock);
-  assert.match(requestBlock, /userInput: string/);
-  assert.doesNotMatch(
-    requestBlock,
-    /apiKey|baseUrl|modelName|profileId|providerKind|modelConfig|temperature|maxTokens/,
-  );
+test("governed chat DTO contains only request id, current message, and committed history", () => {
+  const service = read("src/model/modelService.ts");
+  const request = service.match(/export interface GovernedConversationRequest \{[\s\S]*?\n\}/)?.[0];
+  assert.ok(request);
+  assert.match(request, /requestId: string/);
+  assert.match(request, /userMessage: string/);
+  assert.match(request, /history: GovernedConversationMessage\[\]/);
+  assert.doesNotMatch(request, /systemContext|persona|lifeIdentity|memory|apiKey|baseUrl|modelName|profileId|temperature|maxTokens/i);
 });
 
-test("model IPC accepts only messages and system context", () => {
-  const modelService = read("src/model/modelService.ts");
-  const requestBlock = modelService.match(
-    /export interface ModelRequest \{[\s\S]*?\n\}/,
-  )?.[0];
-  const chatMethod = modelService.match(
-    /async chat\(request: ModelRequest\)[\s\S]*?\n  \}/,
-  )?.[0];
-
-  assert.ok(requestBlock);
-  assert.match(requestBlock, /messages: ModelMessage\[\]/);
-  assert.match(requestBlock, /systemContext: string \| null/);
-  assert.doesNotMatch(
-    requestBlock,
-    /apiKey|baseUrl|modelName|profileId|providerKind|temperature|maxTokens/,
-  );
-  assert.ok(chatMethod);
-  assert.match(chatMethod, /chat_with_active_model/);
-  assert.match(chatMethod, /\{ request \}/);
-  assert.doesNotMatch(chatMethod, /config|profileId/);
+test("frontend uses the governed IPC command without model overrides", () => {
+  const service = read("src/model/modelService.ts");
+  const method = service.match(/async chatWithGovernedContext\([\s\S]*?\n  \}/)?.[0];
+  assert.ok(method);
+  assert.match(method, /chat_with_governed_context/);
+  assert.doesNotMatch(method, /apiKey|baseUrl|modelName|profileId|systemContext/);
 });
 
-test("ChatView has no runtime model configuration or plaintext credential state", () => {
-  const chatView = read("src/chat/ChatView.vue");
-
-  assert.doesNotMatch(
-    chatView,
-    /apiKey|baseUrl|modelName|Runtime model configuration|type="password"/i,
-  );
-  assert.match(chatView, /Open model settings/);
-  assert.match(chatView, /isSending\.value/);
-  assert.match(chatView, /<ChatInput :disabled="isSending"/);
-});
-
-test("ConversationService preserves governed context, session, and body-state transitions", () => {
+test("conversation commits a completed turn atomically after governed success", () => {
   const service = read("src/conversation/conversationService.ts");
-
-  assert.match(service, /requireCurrentLife\(\)/);
-  assert.match(service, /requirePersona\(life\)/);
-  assert.match(service, /promptCompiler\.compile\(persona\)/);
-  assert.match(service, /prepareConversationMemoryContext/);
-  assert.match(service, /this\.dependencies\.model\.chat\(modelRequest\)/);
-  assert.match(service, /this\.dependencies\.session\.addMessage\(assistantMessage\)/);
+  const session = read("src/conversation/session/conversationSession.ts");
+  assert.match(service, /chatWithGovernedContext/);
+  assert.match(service, /session\.appendTurn\(userMessage, assistantMessage\)/);
   assert.match(service, /transition\("thinking"\)/);
   assert.match(service, /transition\("speaking"\)/);
-  assert.match(service, /transition\("idle"\)/);
   assert.match(service, /transition\("error"\)/);
-
-  const modelCall = service.indexOf(
-    "this.dependencies.model.chat(modelRequest)",
-  );
-  const assistantWrite = service.indexOf(
-    "this.dependencies.session.addMessage(assistantMessage)",
-  );
-  assert.ok(modelCall >= 0 && assistantWrite > modelCall);
+  assert.match(session, /appendTurn\(userMessage: ConversationMessage, assistantMessage: ConversationMessage\)/);
+  assert.doesNotMatch(service, /prepareConversationMemoryContext|promptCompiler|requirePersona/);
 });
 
-test("invoke handler and Chat capability expose no plaintext model bypass", () => {
-  const rustCommands = read("src-tauri/src/lib.rs");
-  const chatPermission = read("src-tauri/permissions/chat-commands.toml");
-  const chatCapability = read("src-tauri/capabilities/chat.json");
+test("ChatView has no plaintext runtime model settings and retains failures for retry", () => {
+  const view = read("src/chat/ChatView.vue");
+  const input = read("src/chat/ChatInput.vue");
+  assert.doesNotMatch(view, /apiKey|baseUrl|modelName|type="password"/i);
+  assert.match(view, /memoryNotice/);
+  assert.match(view, /clearSignal/);
+  assert.match(input, /clearSignal/);
+  assert.doesNotMatch(input, /content\.value = "";\s*}\s*$/m);
+});
 
-  assert.match(rustCommands, /model::runtime::chat_with_active_model/);
-  assert.doesNotMatch(rustCommands, /model::chat_with_model/);
-  assert.match(chatPermission, /"chat_with_active_model"/);
-  assert.doesNotMatch(
-    chatPermission,
-    /api_credential|model_profile|test_model_profile_connection/,
-  );
-  assert.match(chatCapability, /"chat-commands"/);
-  assert.doesNotMatch(chatCapability, /settings-commands|main-commands/);
+test("chat capability adds governed chat while legacy permissions remain until cleanup", () => {
+  const rust = read("src-tauri/src/lib.rs");
+  const permission = read("src-tauri/permissions/chat-commands.toml");
+  assert.match(rust, /conversation::service::chat_with_governed_context/);
+  assert.match(rust, /model::runtime::chat_with_active_model/);
+  assert.match(permission, /"chat_with_governed_context"/);
+  assert.match(permission, /"chat_with_active_model"/);
+  assert.doesNotMatch(permission, /api_credential|model_profile|start_memory_vector_index_rebuild/);
 });

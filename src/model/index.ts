@@ -11,6 +11,11 @@ export {
   type ModelStreamEvent,
   type ModelStreamEventKind,
   type ModelUsage,
+  type ConversationDegradationCode,
+  type ConversationMemoryMetadata,
+  type GovernedConversationMessage,
+  type GovernedConversationRequest,
+  type GovernedConversationResponse,
 } from "./modelService";
 
 export {

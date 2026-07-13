@@ -18,7 +18,8 @@ const bodyState = ref<BodyState>(bodyStateMachine.getState());
 const messages = ref<readonly ConversationMessage[]>([]);
 const error = ref<{ code: string; message: string }>();
 const isSending = ref(false);
-const showSystemMessages = ref(false);
+const clearSignal = ref(0);
+const memoryNotice = ref<string>();
 const modelSetupErrorCodes = new Set([
   "NO_ACTIVE_PROFILE",
   "PROFILE_NOT_FOUND",
@@ -30,11 +31,7 @@ const modelSetupErrorCodes = new Set([
 const showModelSettingsAction = computed(() =>
   error.value ? modelSetupErrorCodes.has(error.value.code) : false,
 );
-const visibleMessages = computed(() =>
-  messages.value.filter(
-    (message) => message.role !== "system" || showSystemMessages.value,
-  ),
-);
+const visibleMessages = computed(() => messages.value);
 
 const showMemoryPanel = ref(false);
 const showUnconfirmedHint = ref(false);
@@ -47,6 +44,15 @@ function refreshMessages(): void {
   messages.value = conversationService.getSession().getMessages();
 }
 
+function memoryNoticeFor(codes: readonly string[], rebuildRecommended: boolean): string | undefined {
+  if (rebuildRecommended) return "Vector memory may need rebuilding.";
+  if (codes.includes("KEYWORD_UNAVAILABLE") || codes.includes("BOTH_RETRIEVAL_UNAVAILABLE")) {
+    return "Memory retrieval was unavailable; this reply used persona and session context.";
+  }
+  if (codes.length > 0) return "Vector memory was unavailable; keyword memory was used when available.";
+  return undefined;
+}
+
 async function send(content: string): Promise<void> {
   if (isSending.value) {
     return;
@@ -56,9 +62,11 @@ async function send(content: string): Promise<void> {
   error.value = undefined;
 
   try {
-    await conversationService.send({
+    const response = await conversationService.send({
       userInput: content,
     });
+    clearSignal.value += 1;
+    memoryNotice.value = memoryNoticeFor(response.memory.degradationCodes, response.memory.rebuildRecommended);
   } catch (caught) {
     error.value = caught instanceof ConversationError
       ? { code: caught.code, message: caught.message }
@@ -126,9 +134,6 @@ onUnmounted(() => {
     </div>
 
     <div class="chat-actions">
-      <button class="system-toggle" type="button" @click="showSystemMessages = !showSystemMessages">
-        {{ showSystemMessages ? "Hide system messages" : "Show system messages" }}
-      </button>
       <button class="memory-check-btn" type="button" @click="toggleMemoryPanel">
         检查可记忆内容
       </button>
@@ -151,7 +156,8 @@ onUnmounted(() => {
         Open model settings
       </button>
     </section>
-    <ChatInput :disabled="isSending" @send="send" />
+    <p v-if="memoryNotice" class="memory-notice" aria-live="polite">{{ memoryNotice }}</p>
+    <ChatInput :disabled="isSending" :clear-signal="clearSignal" @send="send" />
   </main>
 
   <!-- Backdrop Overlay -->

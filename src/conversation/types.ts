@@ -1,8 +1,6 @@
-import type { ModelResponse } from "../model";
-import type { PromptCompilerVersion } from "../prompt";
-import type { ConversationMemoryWarning } from "./memoryContextIntegration";
+import type { ConversationMemoryMetadata, GovernedConversationResponse } from "../model";
 
-export type ConversationMessageRole = "user" | "assistant" | "system";
+export type ConversationMessageRole = "user" | "assistant";
 
 export interface ConversationMessage {
   role: ConversationMessageRole;
@@ -16,15 +14,8 @@ export interface ConversationRequest {
 
 export interface ConversationResponse {
   sessionId: string;
-  lifeId: string;
-  personaId: string;
-  promptCompilerVersion: PromptCompilerVersion;
   userMessage: ConversationMessage;
   assistantMessage: ConversationMessage;
-  modelResponse: ModelResponse;
-  retrievedMemoryCount?: number;
-  usedMemoryCount?: number;
-  usedMemoryIds?: readonly string[];
-  memoryContextTruncated?: boolean;
-  memoryWarning?: ConversationMemoryWarning;
+  runtime: GovernedConversationResponse;
+  memory: ConversationMemoryMetadata;
 }

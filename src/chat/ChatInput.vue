@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { ref, watch } from "vue";
 
 const props = defineProps<{
   disabled: boolean;
+  clearSignal: number;
 }>();
 
 const emit = defineEmits<{
@@ -18,8 +19,9 @@ function submit(): void {
   }
 
   emit("send", value);
-  content.value = "";
 }
+
+watch(() => props.clearSignal, () => { content.value = ""; });
 </script>
 
 <template>

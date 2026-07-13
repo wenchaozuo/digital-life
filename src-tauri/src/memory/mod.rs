@@ -12,6 +12,7 @@ pub mod context_builder;
 pub mod retrieval;
 pub mod retrieval_router;
 pub mod retrieval_runtime;
+pub mod revisions;
 pub mod vector_index;
 pub mod vector_index_runtime;
 pub mod vector_sync_outbox;
@@ -229,6 +230,30 @@ impl MemoryError {
         Self::new(
             "DATABASE_ERROR",
             "The memory storage operation failed.",
+            true,
+        )
+    }
+
+    pub(crate) fn not_confirmed() -> Self {
+        Self::new(
+            "MEMORY_NOT_CONFIRMED",
+            "Only confirmed memories can be revised.",
+            true,
+        )
+    }
+
+    pub(crate) fn revision_conflict() -> Self {
+        Self::new(
+            "MEMORY_REVISION_CONFLICT",
+            "The memory changed after it was loaded. Refresh and try again.",
+            true,
+        )
+    }
+
+    pub(crate) fn delete_conflict() -> Self {
+        Self::new(
+            "MEMORY_DELETE_CONFLICT",
+            "The memory changed after it was loaded and was not deleted.",
             true,
         )
     }

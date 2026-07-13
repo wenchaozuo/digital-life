@@ -27,6 +27,7 @@ use crate::{
             MemoryRetrievalRouterRepository, RetrievalCandidate, RetrievalSource,
             RetrievalStrategy, VectorRetrievalStatus,
         },
+        revisions::{DeleteMemoryPermanentlyRequest, MemoryRevisionService},
         vector_sync_outbox::{
             MemoryVectorSyncAction, MemoryVectorSyncOutboxRepository, MemoryVectorSyncState,
         },
@@ -676,8 +677,12 @@ fn worker_gating_revision_delete_retry_and_model_space_are_end_to_end_safe() {
         assert_eq!(revised.candidates[0].content, revised_text);
         assert!(!revised.candidates[0].content.contains(original_text));
 
-        MemoryService::new(&fixture.storage)
-            .delete(LIFE_A, &original.id)
+        MemoryRevisionService::new(&fixture.storage)
+            .delete_permanently(DeleteMemoryPermanentlyRequest {
+                life_id: LIFE_A.into(),
+                memory_id: original.id.clone(),
+                expected_revision: 2,
+            })
             .unwrap();
         let delete_job = MemoryVectorSyncOutboxRepository::list(&fixture.storage, LIFE_A).unwrap();
         assert_eq!(delete_job[0].desired_action, MemoryVectorSyncAction::Delete);

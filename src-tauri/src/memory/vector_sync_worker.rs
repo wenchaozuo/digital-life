@@ -1041,8 +1041,10 @@ mod tests {
 
     use crate::{
         memory::{
-            vector_sync_outbox::EnqueueMemoryVectorSyncRequest, ConfirmMemoryRequest,
-            CreateMemoryCandidateRequest, MemoryKind, MemoryService, MemorySourceType,
+            revisions::{DeleteMemoryPermanentlyRequest, MemoryRevisionService},
+            vector_sync_outbox::EnqueueMemoryVectorSyncRequest,
+            ConfirmMemoryRequest, CreateMemoryCandidateRequest, MemoryKind, MemoryService,
+            MemorySourceType,
         },
         model::profile::{
             CreateModelProfileRequest, ModelProfileService, ModelProviderKind, ModelPurpose,
@@ -1359,8 +1361,12 @@ mod tests {
             })
             .unwrap();
         let deleted = confirmed(&storage, false);
-        MemoryService::new(&storage)
-            .delete("life", &deleted.id)
+        MemoryRevisionService::new(&storage)
+            .delete_permanently(DeleteMemoryPermanentlyRequest {
+                life_id: "life".into(),
+                memory_id: deleted.id.clone(),
+                expected_revision: 1,
+            })
             .unwrap();
         let secrets = InMemorySecretStore::new();
         let runtime = ModelRuntimeCoordinator::default();

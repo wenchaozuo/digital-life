@@ -7,7 +7,10 @@ use crate::memory::{
     MemorySourceType, MemoryStatus, UpdateMemoryRequest,
 };
 
-use super::{vector_sync_outbox::enqueue_in_transaction, StorageService};
+use super::{
+    memory_revision::insert_confirmed_revision_in_transaction,
+    vector_sync_outbox::enqueue_in_transaction, StorageService,
+};
 
 pub(super) struct StoredMemoryRecord {
     id: String,
@@ -212,6 +215,7 @@ impl MemoryRepository for StorageService {
             )
             .map_err(|_| MemoryError::database())?;
         let confirmed = load_owned_memory(&transaction, &request.life_id, &request.memory_id)?;
+        insert_confirmed_revision_in_transaction(&transaction, &confirmed)?;
         if !confirmed.is_sensitive {
             enqueue_in_transaction(
                 &transaction,
@@ -232,14 +236,12 @@ impl MemoryRepository for StorageService {
             .transaction()
             .map_err(|_| MemoryError::database())?;
         let existing = load_owned_memory(&transaction, life_id, memory_id)?;
-        if existing.status == MemoryStatus::Confirmed {
-            enqueue_in_transaction(
-                &transaction,
-                life_id,
-                memory_id,
-                MemoryVectorSyncAction::Delete,
-            )
-            .map_err(|_| MemoryError::database())?;
+        if existing.status != MemoryStatus::Candidate {
+            return Err(MemoryError::new(
+                "MEMORY_NOT_CONFIRMED",
+                "Confirmed memories require revision-aware permanent deletion.",
+                true,
+            ));
         }
         let deleted = transaction
             .execute(
@@ -292,7 +294,7 @@ impl MemoryVectorIndexRepository for StorageService {
     }
 }
 
-fn load_owned_memory(
+pub(super) fn load_owned_memory(
     connection: &Connection,
     life_id: &str,
     memory_id: &str,
@@ -348,33 +350,20 @@ impl StorageService {
         content: &str,
         summary: Option<&str>,
     ) -> Result<MemoryRecord, MemoryError> {
-        let mut state = self.state().map_err(|_| MemoryError::database())?;
-        let transaction = state
-            .connection
-            .transaction()
-            .map_err(|_| MemoryError::database())?;
-        let existing = load_owned_memory(&transaction, life_id, memory_id)?;
-        if existing.status != MemoryStatus::Confirmed {
-            return Err(MemoryError::invalid_transition());
-        }
-        transaction
-            .execute(
-                "UPDATE memory_record SET kind = ?3, content = ?4, summary = ?5,
-                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                 WHERE id = ?1 AND life_id = ?2 AND status = 'confirmed'",
-                params![memory_id, life_id, kind.as_str(), content.trim(), summary],
-            )
-            .map_err(|_| MemoryError::database())?;
-        enqueue_in_transaction(
-            &transaction,
-            life_id,
-            memory_id,
-            MemoryVectorSyncAction::Upsert,
-        )
-        .map_err(|_| MemoryError::database())?;
-        let revised = load_owned_memory(&transaction, life_id, memory_id)?;
-        transaction.commit().map_err(|_| MemoryError::database())?;
-        Ok(revised)
+        use crate::memory::revisions::{MemoryRevisionService, UpdateConfirmedMemoryRequest};
+
+        let revisions = MemoryRevisionService::new(self);
+        let expected_revision = revisions.current_revision(life_id, memory_id)?;
+        revisions
+            .update_confirmed(UpdateConfirmedMemoryRequest {
+                life_id: life_id.to_string(),
+                memory_id: memory_id.to_string(),
+                expected_revision,
+                kind,
+                content: content.to_string(),
+                summary: summary.map(str::to_string),
+            })
+            .map(|result| result.memory)
     }
 }
 
@@ -518,7 +507,7 @@ mod tests {
             .connection
             .query_row("SELECT COUNT(*) FROM memory_record", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         assert_eq!(memory_count, 0);
     }
 

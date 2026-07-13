@@ -488,6 +488,7 @@ mod tests {
     use super::*;
     use crate::{
         memory::{
+            revisions::{DeleteMemoryPermanentlyRequest, MemoryRevisionService},
             ConfirmMemoryRequest, CreateMemoryCandidateRequest, MemoryKind, MemoryService,
             MemorySourceType,
         },
@@ -578,7 +579,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
     }
 
     #[test]
@@ -618,7 +619,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         drop(storage);
 
         let reopened = StorageService::initialize_with_roots(data_root, None).unwrap();
@@ -658,8 +659,12 @@ mod tests {
             })
             .unwrap();
         assert_eq!(storage.list("life").unwrap().len(), 1);
-        MemoryService::new(&storage)
-            .delete("life", &record.id)
+        MemoryRevisionService::new(&storage)
+            .delete_permanently(DeleteMemoryPermanentlyRequest {
+                life_id: "life".into(),
+                memory_id: record.id.clone(),
+                expected_revision: 1,
+            })
             .unwrap();
         let jobs = storage.list("life").unwrap();
         assert_eq!(jobs.len(), 1);

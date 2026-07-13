@@ -2,6 +2,7 @@ mod conversation;
 mod location;
 mod memory;
 mod memory_retrieval;
+mod memory_revision;
 mod migration;
 mod model_profile;
 mod vector_sync_outbox;
@@ -47,6 +48,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         6,
         "006_conversation_history",
         include_str!("migrations/006_conversation_history.sql"),
+    ),
+    (
+        7,
+        "007_memory_revisions",
+        include_str!("migrations/007_memory_revisions.sql"),
     ),
 ];
 

@@ -157,6 +157,7 @@ mod tests {
     use crate::{
         memory::{
             retrieval::{MemoryRetriever, RetrievalQuery},
+            revisions::{DeleteMemoryPermanentlyRequest, MemoryRevisionService},
             ConfirmMemoryRequest, CreateMemoryCandidateRequest, MemoryKind, MemoryService,
             MemorySourceType,
         },
@@ -508,8 +509,12 @@ mod tests {
             0.5,
             true,
         );
-        MemoryService::new(&service)
-            .delete("life-a", &memory.id)
+        MemoryRevisionService::new(&service)
+            .delete_permanently(DeleteMemoryPermanentlyRequest {
+                life_id: "life-a".into(),
+                memory_id: memory.id.clone(),
+                expected_revision: 1,
+            })
             .unwrap();
 
         assert!(MemoryRetriever::new(&service)

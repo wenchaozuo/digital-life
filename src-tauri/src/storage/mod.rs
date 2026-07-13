@@ -1,3 +1,4 @@
+mod conversation;
 mod location;
 mod memory;
 mod memory_retrieval;
@@ -41,6 +42,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         5,
         "005_memory_vector_sync_settings",
         include_str!("migrations/005_memory_vector_sync_settings.sql"),
+    ),
+    (
+        6,
+        "006_conversation_history",
+        include_str!("migrations/006_conversation_history.sql"),
     ),
 ];
 

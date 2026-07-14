@@ -1,10 +1,12 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use super::{
     candidate::{
         CandidateMemoryAuditRecord, CandidateMemoryError, CandidateMemoryRecord,
-        CandidateMemoryRepository, CandidateMemorySourceType, CandidateMemoryStatus,
-        CandidateMemoryStorageUpdate, NewCandidateMemoryAudit, NewCandidateMemoryEvidence,
+        CandidateMemoryRepository, CandidateMemorySourceType,
     },
     MemoryKind,
 };
@@ -92,43 +94,165 @@ pub struct CandidateEditResult {
     pub candidate: CandidateMemoryRecord,
 }
 
-// ── Prohibited content detection ──────────────────────────────────────
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExpiredCandidateScan {
+    pub candidate_id: String,
+    pub revision: i64,
+}
 
-const PROHIBITED_PATTERNS: &[&str] = &[
-    "api_key",
-    "api-key",
-    "apikey",
-    "secret_key",
-    "secret-key",
-    "secretkey",
-    "password",
-    "passwd",
-    "cookie",
-    "session_token",
-    "session-token",
-    "sessiontoken",
-    "access_token",
-    "access-token",
-    "accesstoken",
-    "refresh_token",
-    "refresh-token",
-    "refreshtoken",
-    "private_key",
-    "private-key",
-    "privatekey",
-    "bearer ",
-    "authorization:",
-    "x-api-key",
-    "payment_secret",
-    "credit_card",
-    "creditcard",
-];
+/// Atomic persistence boundary for Candidate lifecycle operations.
+///
+/// Implementations must execute every method in one database transaction. The
+/// low-level `CandidateMemoryRepository` remains available for storage-focused
+/// reads and fixtures, but the domain service never composes its write methods.
+pub trait CandidateLifecycleRepository: CandidateMemoryRepository {
+    fn edit_candidate_atomic(
+        &self,
+        life_id: &str,
+        request: EditCandidateRequest,
+        now: &str,
+        audit_id: &str,
+    ) -> Result<CandidateEditResult, CandidateMemoryError>;
+
+    fn reject_candidate_atomic(
+        &self,
+        life_id: &str,
+        request: RejectCandidateRequest,
+        now: &str,
+        audit_id: &str,
+    ) -> Result<CandidateLifecycleResult, CandidateMemoryError>;
+
+    fn scan_expired_candidates(
+        &self,
+        life_id: &str,
+        now: &str,
+        limit: usize,
+    ) -> Result<Vec<ExpiredCandidateScan>, CandidateMemoryError>;
+
+    fn expire_candidate_atomic(
+        &self,
+        life_id: &str,
+        candidate_id: &str,
+        scanned_expected_revision: i64,
+        now: &str,
+        audit_id: &str,
+    ) -> Result<Option<CandidateLifecycleResult>, CandidateMemoryError>;
+
+    fn supersede_candidate_atomic(
+        &self,
+        life_id: &str,
+        request: SupersedeCandidateRequest,
+        now: &str,
+        audit_id: &str,
+    ) -> Result<CandidateLifecycleResult, CandidateMemoryError>;
+
+    fn delete_candidate_atomic(
+        &self,
+        life_id: &str,
+        request: DeleteCandidateRequest,
+        now: &str,
+        audit_id: &str,
+    ) -> Result<CandidateMemoryAuditRecord, CandidateMemoryError>;
+
+    fn add_evidence_atomic(
+        &self,
+        life_id: &str,
+        request: AddEvidenceRequest,
+        now: &str,
+        evidence_id: &str,
+        audit_id: &str,
+    ) -> Result<Option<CandidateMemoryRecord>, CandidateMemoryError>;
+}
+
+// ── Prohibited content detection ──────────────────────────────────────
 
 pub fn contains_prohibited_content(text: &str) -> bool {
     let lower = text.to_lowercase();
-    PROHIBITED_PATTERNS
-        .iter()
-        .any(|pattern| lower.contains(pattern))
+    contains_pem_private_key(&lower)
+        || contains_authorization_bearer(&lower)
+        || contains_secret_assignment(&lower)
+        || contains_jwt(&lower)
+}
+
+fn contains_pem_private_key(text: &str) -> bool {
+    text.contains("-----begin ") && text.contains(" private key-----")
+}
+
+fn contains_authorization_bearer(text: &str) -> bool {
+    text.lines().any(|line| {
+        let Some((name, value)) = line.split_once(':') else {
+            return false;
+        };
+        if name.trim() != "authorization" {
+            return false;
+        }
+        let mut parts = value.split_whitespace();
+        matches!(parts.next(), Some("bearer")) && parts.next().is_some_and(is_credential_value)
+    })
+}
+
+fn contains_secret_assignment(text: &str) -> bool {
+    const SECRET_KEYS: &[&str] = &[
+        "password",
+        "passwd",
+        "secret",
+        "secret_key",
+        "secret-key",
+        "api_key",
+        "api-key",
+        "apikey",
+        "x-api-key",
+        "token",
+        "access_token",
+        "access-token",
+        "refresh_token",
+        "refresh-token",
+        "session_token",
+        "session-token",
+        "cookie",
+        "session",
+        "payment_secret",
+    ];
+
+    text.split(['\n', ';', ',']).any(|segment| {
+        let Some(separator) = segment.find(['=', ':']) else {
+            return false;
+        };
+        let key = segment[..separator].trim().trim_matches(|character: char| {
+            !character.is_ascii_alphanumeric() && character != '_' && character != '-'
+        });
+        let value = segment[separator + 1..]
+            .trim()
+            .trim_matches(|character: char| matches!(character, '\'' | '"' | '`'));
+        SECRET_KEYS.contains(&key) && is_credential_value(value)
+    })
+}
+
+fn is_credential_value(value: &str) -> bool {
+    let token = value
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim_matches(|character: char| {
+            !character.is_ascii_alphanumeric()
+                && !matches!(character, '_' | '-' | '.' | '/' | '+' | '=')
+        });
+    token.len() >= 12
+        && token.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(character, '_' | '-' | '.' | '/' | '+' | '=')
+        })
+}
+
+fn contains_jwt(text: &str) -> bool {
+    text.split(|character: char| character.is_whitespace() || matches!(character, '"' | '\'' | ',' | ';' | '(' | ')' | '[' | ']'))
+        .any(|token| {
+            let mut segments = token.split('.');
+            let parts = (segments.next(), segments.next(), segments.next(), segments.next());
+            matches!(parts, (Some(a), Some(b), Some(c), None)
+                if a.len() >= 8 && b.len() >= 8 && c.len() >= 8
+                    && [a, b, c].iter().all(|part| part.chars().all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))))
+        })
 }
 
 // ── Dedup fingerprint ─────────────────────────────────────────────────
@@ -163,7 +287,7 @@ fn normalize_for_dedup(input: &str) -> String {
 
 const REJECTION_DOMAIN: &str = "candidate-rejection-suppression-v1";
 
-fn compute_rejection_fingerprint(
+pub(crate) fn compute_rejection_fingerprint(
     life_id: &str,
     subject_id: &str,
     kind: MemoryKind,
@@ -218,22 +342,24 @@ fn epoch_to_ymd_hms(secs: i64) -> (i64, i64, i64, i64, i64, i64) {
 
 fn generate_id(prefix: &str) -> String {
     use std::fmt::Write;
+    static ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or_default();
     let mut s = String::with_capacity(64);
-    write!(s, "{prefix}-{nanos}").ok();
+    let sequence = ID_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    write!(s, "{prefix}-{}-{nanos}-{sequence}", std::process::id()).ok();
     s
 }
 
 // ── Domain Service ────────────────────────────────────────────────────
 
-pub struct CandidateMemoryService<'a, R: CandidateMemoryRepository + ?Sized> {
+pub struct CandidateMemoryService<'a, R: CandidateLifecycleRepository + ?Sized> {
     repository: &'a R,
 }
 
-impl<'a, R: CandidateMemoryRepository + ?Sized> CandidateMemoryService<'a, R> {
+impl<'a, R: CandidateLifecycleRepository + ?Sized> CandidateMemoryService<'a, R> {
     pub fn new(repository: &'a R) -> Self {
         Self { repository }
     }
@@ -243,106 +369,20 @@ impl<'a, R: CandidateMemoryRepository + ?Sized> CandidateMemoryService<'a, R> {
     pub fn edit(
         &self,
         life_id: &str,
-        request: EditCandidateRequest,
+        mut request: EditCandidateRequest,
     ) -> Result<CandidateEditResult, CandidateMemoryError> {
         validate_life_id(life_id)?;
         validate_content(&request.content)?;
-
-        if contains_prohibited_content(&request.content)
-            || request
-                .summary
-                .as_deref()
-                .is_some_and(contains_prohibited_content)
-        {
-            return Err(CandidateMemoryError::new(
-                "CANDIDATE_MEMORY_PROHIBITED_CONTENT",
-                "The candidate contains prohibited content such as credentials or tokens.",
-                true,
-            ));
-        }
-
-        let candidate = self
-            .repository
-            .get_candidate(life_id, &request.candidate_id)?;
-        if candidate.life_id != life_id {
-            return Err(CandidateMemoryError::life_mismatch());
-        }
-        if candidate.status != CandidateMemoryStatus::Pending {
-            return Err(CandidateMemoryError::invalid_status());
-        }
-        if candidate.revision != request.expected_revision {
-            return Err(CandidateMemoryError::revision_conflict());
-        }
-
-        let normalized_content = request.content.trim().to_string();
-        let normalized_summary = request
+        request.content = request.content.trim().to_string();
+        request.summary = request
             .summary
             .as_deref()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-
-        let content_changed = candidate.content.as_deref() != Some(normalized_content.as_str());
-        let summary_changed = candidate.summary != normalized_summary;
-        let kind_changed = candidate.kind != request.kind;
-
-        if !content_changed && !summary_changed && !kind_changed {
-            return Ok(CandidateEditResult {
-                outcome: CandidateEditOutcome::NoChange,
-                candidate,
-            });
-        }
-
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
         let now = current_timestamp();
-        let new_fingerprint = compute_dedup_fingerprint(
-            life_id,
-            &candidate.subject_id,
-            request.kind,
-            &normalized_content,
-        );
-
-        let update = CandidateMemoryStorageUpdate {
-            kind: request.kind,
-            content: Some(normalized_content),
-            summary: normalized_summary,
-            source_type: candidate.source_type,
-            source_id: candidate.source_id.clone(),
-            confidence: candidate.confidence,
-            importance: candidate.importance,
-            is_sensitive: candidate.is_sensitive,
-            inference_status: candidate.inference_status,
-            status: CandidateMemoryStatus::Pending,
-            dedup_fingerprint: Some(new_fingerprint),
-            proposed_at: candidate.proposed_at.clone(),
-            expires_at: candidate.expires_at.clone(),
-            reviewed_at: candidate.reviewed_at.clone(),
-            last_user_edit_at: Some(now.clone()),
-            confirmed_memory_id: None,
-            accepted_request_id: None,
-            rejection_reason_code: None,
-            superseded_by_candidate_id: None,
-            conflicts_with_memory_id: None,
-            updated_at: now.clone(),
-        };
-
-        let updated = self.repository.update_candidate_guarded(
-            life_id,
-            &request.candidate_id,
-            request.expected_revision,
-            update,
-        )?;
-
-        let _audit = self.write_audit(
-            life_id,
-            &request.candidate_id,
-            "candidate_edited",
-            "user",
-            None,
-        )?;
-
-        Ok(CandidateEditResult {
-            outcome: CandidateEditOutcome::Changed,
-            candidate: updated,
-        })
+        self.repository
+            .edit_candidate_atomic(life_id, request, &now, &generate_id("audit"))
     }
 
     // ── Reject ────────────────────────────────────────────────────────
@@ -353,74 +393,9 @@ impl<'a, R: CandidateMemoryRepository + ?Sized> CandidateMemoryService<'a, R> {
         request: RejectCandidateRequest,
     ) -> Result<CandidateLifecycleResult, CandidateMemoryError> {
         validate_life_id(life_id)?;
-
-        let candidate = self
-            .repository
-            .get_candidate(life_id, &request.candidate_id)?;
-        if candidate.life_id != life_id {
-            return Err(CandidateMemoryError::life_mismatch());
-        }
-        if candidate.status != CandidateMemoryStatus::Pending {
-            return Err(CandidateMemoryError::invalid_status());
-        }
-        if candidate.revision != request.expected_revision {
-            return Err(CandidateMemoryError::revision_conflict());
-        }
-
-        let content_for_fingerprint = candidate.content.clone().unwrap_or_default();
-        let suppression_fingerprint = compute_rejection_fingerprint(
-            life_id,
-            &candidate.subject_id,
-            candidate.kind,
-            &content_for_fingerprint,
-        );
-
         let now = current_timestamp();
-        let update = CandidateMemoryStorageUpdate {
-            kind: candidate.kind,
-            content: None,
-            summary: None,
-            source_type: candidate.source_type,
-            source_id: None,
-            confidence: candidate.confidence,
-            importance: candidate.importance,
-            is_sensitive: candidate.is_sensitive,
-            inference_status: candidate.inference_status,
-            status: CandidateMemoryStatus::Rejected,
-            dedup_fingerprint: Some(suppression_fingerprint),
-            proposed_at: candidate.proposed_at.clone(),
-            expires_at: candidate.expires_at.clone(),
-            reviewed_at: Some(now.clone()),
-            last_user_edit_at: candidate.last_user_edit_at.clone(),
-            confirmed_memory_id: None,
-            accepted_request_id: None,
-            rejection_reason_code: Some(request.reason.as_str().to_string()),
-            superseded_by_candidate_id: None,
-            conflicts_with_memory_id: None,
-            updated_at: now,
-        };
-
-        let updated = self.repository.update_candidate_guarded(
-            life_id,
-            &request.candidate_id,
-            request.expected_revision,
-            update,
-        )?;
-
-        self.delete_all_evidence(life_id, &request.candidate_id)?;
-
-        let audit = self.write_audit(
-            life_id,
-            &request.candidate_id,
-            "candidate_rejected",
-            "user",
-            None,
-        )?;
-
-        Ok(CandidateLifecycleResult {
-            candidate: updated,
-            audit,
-        })
+        self.repository
+            .reject_candidate_atomic(life_id, request, &now, &generate_id("audit"))
     }
 
     // ── Expire ────────────────────────────────────────────────────────
@@ -429,69 +404,21 @@ impl<'a, R: CandidateMemoryRepository + ?Sized> CandidateMemoryService<'a, R> {
         &self,
         life_id: &str,
         candidate_id: &str,
+        scanned_expected_revision: i64,
+        now: &str,
     ) -> Result<Option<CandidateLifecycleResult>, CandidateMemoryError> {
         validate_life_id(life_id)?;
         validate_candidate_id(candidate_id)?;
-
-        let candidate = self.repository.get_candidate(life_id, candidate_id)?;
-        if candidate.life_id != life_id {
-            return Err(CandidateMemoryError::life_mismatch());
+        if scanned_expected_revision <= 0 || now.trim().is_empty() {
+            return Err(CandidateMemoryError::constraint());
         }
-        if candidate.status != CandidateMemoryStatus::Pending {
-            return Ok(None);
-        }
-
-        let now = current_timestamp();
-        let Some(ref expires_at) = candidate.expires_at else {
-            return Ok(None);
-        };
-        if expires_at > &now {
-            return Ok(None);
-        }
-
-        let update = CandidateMemoryStorageUpdate {
-            kind: candidate.kind,
-            content: None,
-            summary: None,
-            source_type: candidate.source_type,
-            source_id: None,
-            confidence: candidate.confidence,
-            importance: candidate.importance,
-            is_sensitive: candidate.is_sensitive,
-            inference_status: candidate.inference_status,
-            status: CandidateMemoryStatus::Expired,
-            dedup_fingerprint: None,
-            proposed_at: candidate.proposed_at.clone(),
-            expires_at: candidate.expires_at.clone(),
-            reviewed_at: Some(now.clone()),
-            last_user_edit_at: candidate.last_user_edit_at.clone(),
-            confirmed_memory_id: None,
-            accepted_request_id: None,
-            rejection_reason_code: None,
-            superseded_by_candidate_id: None,
-            conflicts_with_memory_id: None,
-            updated_at: now,
-        };
-
-        let updated = match self.repository.update_candidate_guarded(
+        self.repository.expire_candidate_atomic(
             life_id,
             candidate_id,
-            candidate.revision,
-            update,
-        ) {
-            Ok(updated) => updated,
-            Err(error) if error.code == "CANDIDATE_MEMORY_REVISION_CONFLICT" => return Ok(None),
-            Err(error) => return Err(error),
-        };
-
-        self.delete_all_evidence(life_id, candidate_id)?;
-
-        let audit = self.write_audit(life_id, candidate_id, "candidate_expired", "system", None)?;
-
-        Ok(Some(CandidateLifecycleResult {
-            candidate: updated,
-            audit,
-        }))
+            scanned_expected_revision,
+            now,
+            &generate_id("audit"),
+        )
     }
 
     pub fn expire_batch(
@@ -502,25 +429,17 @@ impl<'a, R: CandidateMemoryRepository + ?Sized> CandidateMemoryService<'a, R> {
         validate_life_id(life_id)?;
         let limit = limit.min(500);
         let now = current_timestamp();
-
-        let (candidates, _) =
-            self.repository
-                .list_candidates(super::candidate::CandidateMemoryListFilter {
-                    life_id: life_id.to_string(),
-                    status: Some(CandidateMemoryStatus::Pending),
-                    page_size: Some(limit),
-                    ..Default::default()
-                })?;
-
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let candidates = self
+            .repository
+            .scan_expired_candidates(life_id, &now, limit)?;
         let mut results = Vec::new();
         for candidate in candidates {
-            let Some(ref expires_at) = candidate.expires_at else {
-                continue;
-            };
-            if expires_at > &now {
-                continue;
-            }
-            if let Some(result) = self.expire_one(life_id, &candidate.id)? {
+            if let Some(result) =
+                self.expire_one(life_id, &candidate.candidate_id, candidate.revision, &now)?
+            {
                 results.push(result);
             }
         }
@@ -544,72 +463,9 @@ impl<'a, R: CandidateMemoryRepository + ?Sized> CandidateMemoryService<'a, R> {
             ));
         }
 
-        let candidate = self
-            .repository
-            .get_candidate(life_id, &request.candidate_id)?;
-        if candidate.life_id != life_id {
-            return Err(CandidateMemoryError::life_mismatch());
-        }
-        if candidate.status != CandidateMemoryStatus::Pending {
-            return Err(CandidateMemoryError::invalid_status());
-        }
-        if candidate.revision != request.expected_revision {
-            return Err(CandidateMemoryError::revision_conflict());
-        }
-
-        let replacement = self
-            .repository
-            .get_candidate(life_id, &request.replacement_candidate_id)?;
-        if replacement.life_id != life_id {
-            return Err(CandidateMemoryError::life_mismatch());
-        }
-
         let now = current_timestamp();
-        let update = CandidateMemoryStorageUpdate {
-            kind: candidate.kind,
-            content: None,
-            summary: None,
-            source_type: candidate.source_type,
-            source_id: None,
-            confidence: candidate.confidence,
-            importance: candidate.importance,
-            is_sensitive: candidate.is_sensitive,
-            inference_status: candidate.inference_status,
-            status: CandidateMemoryStatus::Superseded,
-            dedup_fingerprint: None,
-            proposed_at: candidate.proposed_at.clone(),
-            expires_at: candidate.expires_at.clone(),
-            reviewed_at: Some(now.clone()),
-            last_user_edit_at: candidate.last_user_edit_at.clone(),
-            confirmed_memory_id: None,
-            accepted_request_id: None,
-            rejection_reason_code: None,
-            superseded_by_candidate_id: Some(request.replacement_candidate_id),
-            conflicts_with_memory_id: None,
-            updated_at: now,
-        };
-
-        let updated = self.repository.update_candidate_guarded(
-            life_id,
-            &request.candidate_id,
-            request.expected_revision,
-            update,
-        )?;
-
-        self.delete_all_evidence(life_id, &request.candidate_id)?;
-
-        let audit = self.write_audit(
-            life_id,
-            &request.candidate_id,
-            "candidate_superseded",
-            "user",
-            None,
-        )?;
-
-        Ok(CandidateLifecycleResult {
-            candidate: updated,
-            audit,
-        })
+        self.repository
+            .supersede_candidate_atomic(life_id, request, &now, &generate_id("audit"))
     }
 
     // ── Permanent delete ──────────────────────────────────────────────
@@ -620,29 +476,9 @@ impl<'a, R: CandidateMemoryRepository + ?Sized> CandidateMemoryService<'a, R> {
         request: DeleteCandidateRequest,
     ) -> Result<CandidateMemoryAuditRecord, CandidateMemoryError> {
         validate_life_id(life_id)?;
-
-        let candidate = self
-            .repository
-            .get_candidate(life_id, &request.candidate_id)?;
-        if candidate.life_id != life_id {
-            return Err(CandidateMemoryError::life_mismatch());
-        }
-        if candidate.revision != request.expected_revision {
-            return Err(CandidateMemoryError::revision_conflict());
-        }
-
-        let audit = self.write_audit(
-            life_id,
-            &request.candidate_id,
-            "candidate_deleted",
-            "user",
-            None,
-        )?;
-
+        let now = current_timestamp();
         self.repository
-            .delete_candidate_permanently(life_id, &request.candidate_id)?;
-
-        Ok(audit)
+            .delete_candidate_atomic(life_id, request, &now, &generate_id("audit"))
     }
 
     // ── Evidence merge ────────────────────────────────────────────────
@@ -653,183 +489,17 @@ impl<'a, R: CandidateMemoryRepository + ?Sized> CandidateMemoryService<'a, R> {
         request: AddEvidenceRequest,
     ) -> Result<Option<CandidateMemoryRecord>, CandidateMemoryError> {
         validate_life_id(life_id)?;
-
-        let candidate = self
-            .repository
-            .get_candidate(life_id, &request.candidate_id)?;
-        if candidate.life_id != life_id {
-            return Err(CandidateMemoryError::life_mismatch());
-        }
-        if candidate.status != CandidateMemoryStatus::Pending {
-            return Err(CandidateMemoryError::invalid_status());
-        }
-
-        let existing = self
-            .repository
-            .list_evidence(life_id, &request.candidate_id)?;
-        let is_duplicate = existing.iter().any(|e| {
-            e.source_type == request.source_type
-                && e.source_id == request.source_id
-                && e.conversation_id == request.conversation_id
-                && e.message_id == request.message_id
-        });
-
-        if is_duplicate {
-            return Ok(None);
-        }
-
-        let evidence_id = generate_id("evidence");
         let now = current_timestamp();
-        self.repository
-            .insert_evidence(NewCandidateMemoryEvidence {
-                id: evidence_id,
-                candidate_id: request.candidate_id.clone(),
-                life_id: life_id.to_string(),
-                source_type: request.source_type,
-                source_id: request.source_id,
-                conversation_id: request.conversation_id,
-                message_id: request.message_id,
-                observed_at: now.clone(),
-            })?;
-
-        let update = CandidateMemoryStorageUpdate {
-            kind: candidate.kind,
-            content: candidate.content.clone(),
-            summary: candidate.summary.clone(),
-            source_type: candidate.source_type,
-            source_id: candidate.source_id.clone(),
-            confidence: candidate.confidence,
-            importance: candidate.importance,
-            is_sensitive: candidate.is_sensitive,
-            inference_status: candidate.inference_status,
-            status: candidate.status,
-            dedup_fingerprint: candidate.dedup_fingerprint.clone(),
-            proposed_at: candidate.proposed_at.clone(),
-            expires_at: candidate.expires_at.clone(),
-            reviewed_at: candidate.reviewed_at.clone(),
-            last_user_edit_at: candidate.last_user_edit_at.clone(),
-            confirmed_memory_id: None,
-            accepted_request_id: None,
-            rejection_reason_code: None,
-            superseded_by_candidate_id: None,
-            conflicts_with_memory_id: None,
-            updated_at: now,
-        };
-
-        let updated = self.repository.update_candidate_guarded(
+        self.repository.add_evidence_atomic(
             life_id,
-            &request.candidate_id,
-            candidate.revision,
-            update,
-        )?;
-
-        self.write_audit(
-            life_id,
-            &request.candidate_id,
-            "candidate_evidence_added",
-            "system",
-            None,
-        )?;
-
-        Ok(Some(updated))
+            request,
+            &now,
+            &generate_id("evidence"),
+            &generate_id("audit"),
+        )
     }
 
     // ── Source deletion governance ─────────────────────────────────────
-
-    pub fn handle_source_deleted(
-        &self,
-        life_id: &str,
-        conversation_id: &str,
-    ) -> Result<Vec<CandidateMemoryRecord>, CandidateMemoryError> {
-        validate_life_id(life_id)?;
-
-        let (candidates, _) =
-            self.repository
-                .list_candidates(super::candidate::CandidateMemoryListFilter {
-                    life_id: life_id.to_string(),
-                    status: Some(CandidateMemoryStatus::Pending),
-                    source_type: Some(CandidateMemorySourceType::Conversation),
-                    ..Default::default()
-                })?;
-
-        let mut deleted = Vec::new();
-        for candidate in candidates {
-            let evidence = self.repository.list_evidence(life_id, &candidate.id)?;
-
-            let has_conversation_evidence = evidence
-                .iter()
-                .any(|e| e.conversation_id.as_deref() == Some(conversation_id));
-
-            if !has_conversation_evidence {
-                continue;
-            }
-
-            let remaining = evidence
-                .iter()
-                .filter(|e| e.conversation_id.as_deref() != Some(conversation_id))
-                .count();
-
-            if remaining > 0 {
-                continue;
-            }
-
-            if candidate.source_type == CandidateMemorySourceType::Manual
-                || candidate.source_type == CandidateMemorySourceType::ExplicitUserRequest
-            {
-                continue;
-            }
-
-            self.write_audit(
-                life_id,
-                &candidate.id,
-                "candidate_orphaned_source_deleted",
-                "system",
-                None,
-            )?;
-
-            self.repository
-                .delete_candidate_permanently(life_id, &candidate.id)?;
-            deleted.push(candidate);
-        }
-
-        Ok(deleted)
-    }
-
-    // ── Internal helpers ──────────────────────────────────────────────
-
-    fn write_audit(
-        &self,
-        life_id: &str,
-        candidate_id: &str,
-        action: &str,
-        actor_type: &str,
-        request_id: Option<&str>,
-    ) -> Result<CandidateMemoryAuditRecord, CandidateMemoryError> {
-        let now = current_timestamp();
-        let id = generate_id("audit");
-        self.repository.append_audit(NewCandidateMemoryAudit {
-            id,
-            candidate_id: candidate_id.to_string(),
-            life_id: life_id.to_string(),
-            action: action.to_string(),
-            actor_type: actor_type.to_string(),
-            request_id: request_id.map(str::to_string),
-            result_status: "success".to_string(),
-            created_at: now,
-        })
-    }
-
-    fn delete_all_evidence(
-        &self,
-        life_id: &str,
-        candidate_id: &str,
-    ) -> Result<(), CandidateMemoryError> {
-        let evidence_list = self.repository.list_evidence(life_id, candidate_id)?;
-        for evidence in evidence_list {
-            self.repository.delete_evidence(life_id, &evidence.id)?;
-        }
-        Ok(())
-    }
 }
 
 // ── Validation helpers ────────────────────────────────────────────────
@@ -1079,8 +749,8 @@ mod tests {
         memory::{
             candidate::{
                 CandidateInferenceStatus, CandidateMemoryRepository, CandidateMemorySourceType,
-                CandidateMemoryStatus, NewCandidateMemory, NewCandidateMemoryEvidence,
-                PRIMARY_USER_SUBJECT_ID,
+                CandidateMemoryStatus, NewCandidateMemory, NewCandidateMemoryAudit,
+                NewCandidateMemoryEvidence, PRIMARY_USER_SUBJECT_ID,
             },
             MemoryKind,
         },
@@ -1439,7 +1109,7 @@ mod tests {
                     candidate_id: "c1".into(),
                     expected_revision: 1,
                     kind: MemoryKind::Fact,
-                    content: "my api_key is secret123".into(),
+                    content: "api_key=long-test-api-key-value".into(),
                     summary: None,
                 },
             )
@@ -1701,7 +1371,10 @@ mod tests {
         )
         .unwrap();
         let svc = CandidateMemoryService::new(&service);
-        let result = svc.expire_one("life-a", "c1").unwrap().unwrap();
+        let result = svc
+            .expire_one("life-a", "c1", 1, "2026-07-14T12:00:00.000Z")
+            .unwrap()
+            .unwrap();
         assert_eq!(result.candidate.status, CandidateMemoryStatus::Expired);
         assert!(result.candidate.content.is_none());
         assert!(result.candidate.reviewed_at.is_some());
@@ -1718,7 +1391,9 @@ mod tests {
         let service = seeded_service(&root);
         insert_pending_with_expiry(&service, "c1", "life-a", "2099-12-31T23:59:59.000Z");
         let svc = CandidateMemoryService::new(&service);
-        let result = svc.expire_one("life-a", "c1").unwrap();
+        let result = svc
+            .expire_one("life-a", "c1", 1, "2026-07-14T12:00:00.000Z")
+            .unwrap();
         assert!(result.is_none());
     }
 
@@ -1735,7 +1410,9 @@ mod tests {
             CandidateMemorySourceType::Manual,
         );
         let svc = CandidateMemoryService::new(&service);
-        let result = svc.expire_one("life-a", "c1").unwrap();
+        let result = svc
+            .expire_one("life-a", "c1", 1, "2026-07-14T12:00:00.000Z")
+            .unwrap();
         assert!(result.is_none());
     }
 
@@ -1763,7 +1440,9 @@ mod tests {
         )
         .unwrap();
         // Try to expire - should return None since it's rejected
-        let result = svc.expire_one("life-a", "c1").unwrap();
+        let result = svc
+            .expire_one("life-a", "c1", 2, "2026-07-14T12:00:00.000Z")
+            .unwrap();
         assert!(result.is_none());
     }
 
@@ -1790,7 +1469,8 @@ mod tests {
         let service = seeded_service(&root);
         insert_pending_with_expiry(&service, "c1", "life-a", "2020-01-01T00:00:00.000Z");
         let svc = CandidateMemoryService::new(&service);
-        svc.expire_one("life-a", "c1").unwrap();
+        svc.expire_one("life-a", "c1", 1, "2026-07-14T12:00:00.000Z")
+            .unwrap();
         assert_eq!(
             test_support::count_table(&service, "memory_vector_sync_outbox"),
             0
@@ -2535,10 +2215,10 @@ mod tests {
             },
         )
         .unwrap();
-        let svc = CandidateMemoryService::new(&service);
-        let deleted = svc.handle_source_deleted("life-a", "conv-a").unwrap();
-        assert_eq!(deleted.len(), 1);
-        assert_eq!(deleted[0].id, "c1");
+        crate::conversation::history::ConversationRepository::delete_conversation(
+            &service, "life-a", "conv-a",
+        )
+        .unwrap();
         let error = super::super::candidate::CandidateMemoryRepository::get_candidate(
             &service, "life-a", "c1",
         )
@@ -2588,9 +2268,10 @@ mod tests {
             },
         )
         .unwrap();
-        let svc = CandidateMemoryService::new(&service);
-        let deleted = svc.handle_source_deleted("life-a", "conv-a").unwrap();
-        assert!(deleted.is_empty());
+        crate::conversation::history::ConversationRepository::delete_conversation(
+            &service, "life-a", "conv-a",
+        )
+        .unwrap();
         let candidate = super::super::candidate::CandidateMemoryRepository::get_candidate(
             &service, "life-a", "c1",
         )
@@ -2599,7 +2280,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_candidate_without_evidence_preserved() {
+    fn manual_candidate_with_deleted_conversation_evidence_is_preserved() {
         let root = TestRoot::new("source-manual");
         let service = seeded_service(&root);
         insert_pending(
@@ -2610,20 +2291,56 @@ mod tests {
             MemoryKind::Fact,
             CandidateMemorySourceType::Manual,
         );
-        let svc = CandidateMemoryService::new(&service);
-        let deleted = svc.handle_source_deleted("life-a", "conv-x").unwrap();
-        assert!(deleted.is_empty());
+        test_support::insert_conversation_with_message(&service, "life-a", "a");
+        super::super::candidate::CandidateMemoryRepository::insert_evidence(
+            &service,
+            NewCandidateMemoryEvidence {
+                id: "ev1".into(),
+                candidate_id: "c1".into(),
+                life_id: "life-a".into(),
+                source_type: CandidateMemorySourceType::Conversation,
+                source_id: None,
+                conversation_id: Some("conv-a".into()),
+                message_id: None,
+                observed_at: "2026-07-14T10:00:00.000Z".into(),
+            },
+        )
+        .unwrap();
+        crate::conversation::history::ConversationRepository::delete_conversation(
+            &service, "life-a", "conv-a",
+        )
+        .unwrap();
+        let candidate = super::super::candidate::CandidateMemoryRepository::get_candidate(
+            &service, "life-a", "c1",
+        )
+        .unwrap();
+        assert_eq!(candidate.status, CandidateMemoryStatus::Pending);
     }
 
     // ── Prohibited content tests ──────────────────────────────────────
 
     #[test]
-    fn prohibited_patterns_detected() {
-        assert!(contains_prohibited_content("my api_key is abc"));
-        assert!(contains_prohibited_content("password: secret"));
-        assert!(contains_prohibited_content("Bearer xyz"));
-        assert!(contains_prohibited_content("Authorization: Basic abc"));
-        assert!(!contains_prohibited_content("The weather is nice"));
+    fn prohibited_detector_allows_concepts_and_rejects_credential_values() {
+        for natural_language in [
+            "我忘记密码了",
+            "请提醒我更换 API Key",
+            "Cookie 是浏览器的一种机制",
+            "Access Token 已经过期",
+            "不要保存验证码",
+            "Private Key 不应该公开",
+        ] {
+            assert!(!contains_prohibited_content(natural_language));
+        }
+        for credential_like in [
+            "password=very-long-test-secret-value",
+            "Authorization: Bearer test_long_token_value_123456789",
+            "-----BEGIN TEST PRIVATE KEY-----\nZmFrZS10ZXN0LWtleQ==\n-----END TEST PRIVATE KEY-----",
+            "eyJ0ZXN0IjoiYSJ9.eyJ0ZXN0IjoiYiJ9.test_signature_value",
+            "session_token=long-test-session-token",
+            "api_key=long-test-api-key-value",
+        ] {
+            assert!(contains_prohibited_content(credential_like));
+        }
     }
 
     // ── Type safety tests ─────────────────────────────────────────────

@@ -61,6 +61,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "008_candidate_memory_storage",
         include_str!("migrations/008_candidate_memory_storage.sql"),
     ),
+    (
+        9,
+        "009_candidate_evidence_uniqueness",
+        include_str!("migrations/009_candidate_evidence_uniqueness.sql"),
+    ),
 ];
 
 #[derive(Clone, Debug, Serialize)]
@@ -180,7 +185,11 @@ impl StorageService {
     fn open_connection(database_path: &Path) -> Result<Connection, StorageError> {
         let mut connection = Connection::open(database_path).map_err(StorageError::database)?;
         connection
-            .execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")
+            .execute_batch(
+                "PRAGMA foreign_keys = ON;
+                 PRAGMA journal_mode = WAL;
+                 PRAGMA busy_timeout = 5000;",
+            )
             .map_err(StorageError::database)?;
         Self::migrate_schema(&mut connection)?;
         Ok(connection)

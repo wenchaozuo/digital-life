@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 
 use crate::conversation::history::{
     generate_id, AppendConversationTurnRequest, AppendConversationTurnResult,
@@ -112,10 +112,19 @@ impl ConversationRepository for StorageService {
         life_id: &str,
         conversation_id: &str,
     ) -> Result<(), ConversationHistoryError> {
-        let state = self.state().map_err(|_| storage_unavailable())?;
-        ensure_conversation_owner(&state.connection, life_id, conversation_id)?;
-        let deleted = state
+        let mut state = self.state().map_err(|_| storage_unavailable())?;
+        let transaction = state
             .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| storage_unavailable())?;
+        ensure_conversation_owner(&transaction, life_id, conversation_id)?;
+        let affected = super::candidate_memory::collect_candidates_for_conversation(
+            &transaction,
+            life_id,
+            conversation_id,
+        )
+        .map_err(|_| storage_unavailable())?;
+        let deleted = transaction
             .execute(
                 "DELETE FROM conversation WHERE id = ?1 AND life_id = ?2",
                 params![conversation_id, life_id],
@@ -126,6 +135,13 @@ impl ConversationRepository for StorageService {
                 ConversationHistoryErrorCode::ConversationNotFound,
             ));
         }
+        super::candidate_memory::delete_orphaned_source_candidates(
+            &transaction,
+            life_id,
+            &affected,
+        )
+        .map_err(|_| storage_unavailable())?;
+        transaction.commit().map_err(|_| storage_unavailable())?;
         Ok(())
     }
 
@@ -328,6 +344,58 @@ impl ConversationRepository for StorageService {
              WHERE conversation_id = ?1 AND life_id = ?2",
             params![conversation_id, life_id],
         )
+    }
+}
+
+#[cfg(test)]
+impl StorageService {
+    pub(crate) fn delete_conversation_message_governed(
+        &self,
+        life_id: &str,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<(), ConversationHistoryError> {
+        let mut state = self.state().map_err(|_| storage_unavailable())?;
+        let transaction = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| storage_unavailable())?;
+        ensure_conversation_owner(&transaction, life_id, conversation_id)?;
+        let message_exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM conversation_message
+                    WHERE id = ?1 AND conversation_id = ?2 AND life_id = ?3
+                 )",
+                params![message_id, conversation_id, life_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| storage_unavailable())?;
+        if !message_exists {
+            return Err(ConversationHistoryError::new(
+                ConversationHistoryErrorCode::ConversationNotFound,
+            ));
+        }
+        let affected = super::candidate_memory::collect_candidates_for_message(
+            &transaction,
+            life_id,
+            message_id,
+        )
+        .map_err(|_| storage_unavailable())?;
+        transaction
+            .execute(
+                "DELETE FROM conversation_message
+                 WHERE id = ?1 AND conversation_id = ?2 AND life_id = ?3",
+                params![message_id, conversation_id, life_id],
+            )
+            .map_err(|_| storage_unavailable())?;
+        super::candidate_memory::delete_orphaned_source_candidates(
+            &transaction,
+            life_id,
+            &affected,
+        )
+        .map_err(|_| storage_unavailable())?;
+        transaction.commit().map_err(|_| storage_unavailable())
     }
 }
 
@@ -638,7 +706,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
         let mut columns = Vec::new();
         for table in ["conversation", "conversation_message"] {
             columns.extend(

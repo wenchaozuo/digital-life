@@ -1,4 +1,7 @@
-use rusqlite::{params, Connection, Error as SqlError, ErrorCode, OptionalExtension, Row};
+use rusqlite::{
+    params, Connection, Error as SqlError, ErrorCode, OptionalExtension, Row, Transaction,
+    TransactionBehavior,
+};
 
 use crate::memory::{
     candidate::{
@@ -8,6 +11,13 @@ use crate::memory::{
         CandidateMemoryStatus, CandidateMemoryStorageUpdate, NewCandidateMemory,
         NewCandidateMemoryAudit, NewCandidateMemoryEvidence, DEFAULT_CANDIDATE_PAGE_SIZE,
         MAX_CANDIDATE_PAGE_SIZE,
+    },
+    candidate_service::{
+        compute_dedup_fingerprint, compute_rejection_fingerprint, contains_prohibited_content,
+        AddEvidenceRequest, CandidateEditOutcome, CandidateEditResult,
+        CandidateLifecycleRepository, CandidateLifecycleResult, DeleteCandidateRequest,
+        EditCandidateRequest, ExpiredCandidateScan, RejectCandidateRequest,
+        SupersedeCandidateRequest,
     },
     MemoryKind,
 };
@@ -505,6 +515,635 @@ impl CandidateMemoryRepository for StorageService {
     }
 }
 
+impl CandidateLifecycleRepository for StorageService {
+    fn edit_candidate_atomic(
+        &self,
+        life_id: &str,
+        request: EditCandidateRequest,
+        now: &str,
+        audit_id: &str,
+    ) -> Result<CandidateEditResult, CandidateMemoryError> {
+        validate_identifier(life_id)?;
+        validate_identifier(&request.candidate_id)?;
+        validate_identifier(now)?;
+        validate_identifier(audit_id)?;
+        let mut state = self
+            .state()
+            .map_err(|_| CandidateMemoryError::storage_unavailable())?;
+        let transaction = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sql_error)?;
+        let candidate = load_owned_candidate(&transaction, life_id, &request.candidate_id)?;
+        ensure_pending_revision(&candidate, request.expected_revision)?;
+        if contains_prohibited_content(&request.content)
+            || request
+                .summary
+                .as_deref()
+                .is_some_and(contains_prohibited_content)
+        {
+            return Err(prohibited_content_error());
+        }
+        let content_changed = candidate.content.as_deref() != Some(request.content.as_str());
+        let summary_changed = candidate.summary != request.summary;
+        let kind_changed = candidate.kind != request.kind;
+        if !content_changed && !summary_changed && !kind_changed {
+            return Ok(CandidateEditResult {
+                outcome: CandidateEditOutcome::NoChange,
+                candidate,
+            });
+        }
+        let fingerprint = compute_dedup_fingerprint(
+            life_id,
+            &candidate.subject_id,
+            request.kind,
+            &request.content,
+        );
+        let changed = transaction
+            .execute(
+                "UPDATE candidate_memory SET
+                    kind = ?4, content = ?5, summary = ?6, dedup_fingerprint = ?7,
+                    last_user_edit_at = ?8, updated_at = ?8, revision = revision + 1
+                 WHERE id = ?1 AND life_id = ?2 AND revision = ?3 AND status = 'pending'",
+                params![
+                    request.candidate_id,
+                    life_id,
+                    request.expected_revision,
+                    request.kind.as_str(),
+                    request.content,
+                    request.summary,
+                    fingerprint,
+                    now,
+                ],
+            )
+            .map_err(map_sql_error)?;
+        if changed != 1 {
+            return Err(CandidateMemoryError::revision_conflict());
+        }
+        insert_audit(
+            &transaction,
+            audit_id,
+            life_id,
+            &request.candidate_id,
+            "candidate_edited",
+            "user",
+            now,
+        )?;
+        let updated = load_owned_candidate(&transaction, life_id, &request.candidate_id)?;
+        transaction.commit().map_err(map_sql_error)?;
+        Ok(CandidateEditResult {
+            outcome: CandidateEditOutcome::Changed,
+            candidate: updated,
+        })
+    }
+
+    fn reject_candidate_atomic(
+        &self,
+        life_id: &str,
+        request: RejectCandidateRequest,
+        now: &str,
+        audit_id: &str,
+    ) -> Result<CandidateLifecycleResult, CandidateMemoryError> {
+        validate_atomic_identifiers(life_id, &request.candidate_id, now, audit_id)?;
+        let mut state = self
+            .state()
+            .map_err(|_| CandidateMemoryError::storage_unavailable())?;
+        let transaction = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sql_error)?;
+        let candidate = load_owned_candidate(&transaction, life_id, &request.candidate_id)?;
+        ensure_pending_revision(&candidate, request.expected_revision)?;
+        let suppression_fingerprint = compute_rejection_fingerprint(
+            life_id,
+            &candidate.subject_id,
+            candidate.kind,
+            candidate.content.as_deref().unwrap_or_default(),
+        );
+        let changed = transaction
+            .execute(
+                "UPDATE candidate_memory SET
+                    status = 'rejected', content = NULL, summary = NULL, source_id = NULL,
+                    dedup_fingerprint = ?4, reviewed_at = ?5, rejection_reason_code = ?6,
+                    updated_at = ?5, revision = revision + 1
+                 WHERE id = ?1 AND life_id = ?2 AND revision = ?3 AND status = 'pending'",
+                params![
+                    request.candidate_id,
+                    life_id,
+                    request.expected_revision,
+                    suppression_fingerprint,
+                    now,
+                    request.reason.as_str(),
+                ],
+            )
+            .map_err(map_sql_error)?;
+        if changed != 1 {
+            return Err(CandidateMemoryError::revision_conflict());
+        }
+        delete_candidate_evidence(&transaction, life_id, &request.candidate_id)?;
+        let audit = insert_audit(
+            &transaction,
+            audit_id,
+            life_id,
+            &request.candidate_id,
+            "candidate_rejected",
+            "user",
+            now,
+        )?;
+        let updated = load_owned_candidate(&transaction, life_id, &request.candidate_id)?;
+        transaction.commit().map_err(map_sql_error)?;
+        Ok(CandidateLifecycleResult {
+            candidate: updated,
+            audit,
+        })
+    }
+
+    fn scan_expired_candidates(
+        &self,
+        life_id: &str,
+        now: &str,
+        limit: usize,
+    ) -> Result<Vec<ExpiredCandidateScan>, CandidateMemoryError> {
+        validate_identifier(life_id)?;
+        validate_identifier(now)?;
+        if limit == 0 || limit > 500 {
+            return Err(CandidateMemoryError::invalid_query());
+        }
+        let state = self
+            .state()
+            .map_err(|_| CandidateMemoryError::storage_unavailable())?;
+        ensure_life_exists(&state.connection, life_id)?;
+        let mut statement = state
+            .connection
+            .prepare(
+                "SELECT id, revision FROM candidate_memory
+                 WHERE life_id = ?1 AND status = 'pending'
+                   AND expires_at IS NOT NULL AND expires_at <= ?2
+                 ORDER BY expires_at ASC, id ASC LIMIT ?3",
+            )
+            .map_err(map_sql_error)?;
+        let rows = statement
+            .query_map(params![life_id, now, limit as i64], |row| {
+                Ok(ExpiredCandidateScan {
+                    candidate_id: row.get(0)?,
+                    revision: row.get(1)?,
+                })
+            })
+            .map_err(map_sql_error)?;
+        rows.map(|row| row.map_err(map_sql_error)).collect()
+    }
+
+    fn expire_candidate_atomic(
+        &self,
+        life_id: &str,
+        candidate_id: &str,
+        scanned_expected_revision: i64,
+        now: &str,
+        audit_id: &str,
+    ) -> Result<Option<CandidateLifecycleResult>, CandidateMemoryError> {
+        validate_atomic_identifiers(life_id, candidate_id, now, audit_id)?;
+        if scanned_expected_revision <= 0 {
+            return Err(CandidateMemoryError::constraint());
+        }
+        let mut state = self
+            .state()
+            .map_err(|_| CandidateMemoryError::storage_unavailable())?;
+        let transaction = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sql_error)?;
+        load_owned_candidate(&transaction, life_id, candidate_id)?;
+        let changed = transaction
+            .execute(
+                "UPDATE candidate_memory SET
+                    status = 'expired', content = NULL, summary = NULL, source_id = NULL,
+                    dedup_fingerprint = NULL, reviewed_at = ?4, updated_at = ?4,
+                    revision = revision + 1
+                 WHERE id = ?1 AND life_id = ?2 AND revision = ?3
+                   AND status = 'pending' AND expires_at IS NOT NULL AND expires_at <= ?4",
+                params![candidate_id, life_id, scanned_expected_revision, now],
+            )
+            .map_err(map_sql_error)?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        delete_candidate_evidence(&transaction, life_id, candidate_id)?;
+        let audit = insert_audit(
+            &transaction,
+            audit_id,
+            life_id,
+            candidate_id,
+            "candidate_expired",
+            "system",
+            now,
+        )?;
+        let updated = load_owned_candidate(&transaction, life_id, candidate_id)?;
+        transaction.commit().map_err(map_sql_error)?;
+        Ok(Some(CandidateLifecycleResult {
+            candidate: updated,
+            audit,
+        }))
+    }
+
+    fn supersede_candidate_atomic(
+        &self,
+        life_id: &str,
+        request: SupersedeCandidateRequest,
+        now: &str,
+        audit_id: &str,
+    ) -> Result<CandidateLifecycleResult, CandidateMemoryError> {
+        validate_atomic_identifiers(life_id, &request.candidate_id, now, audit_id)?;
+        validate_identifier(&request.replacement_candidate_id)?;
+        if request.candidate_id == request.replacement_candidate_id {
+            return Err(CandidateMemoryError::constraint());
+        }
+        let mut state = self
+            .state()
+            .map_err(|_| CandidateMemoryError::storage_unavailable())?;
+        let transaction = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sql_error)?;
+        let candidate = load_owned_candidate(&transaction, life_id, &request.candidate_id)?;
+        ensure_pending_revision(&candidate, request.expected_revision)?;
+        let replacement =
+            load_owned_candidate(&transaction, life_id, &request.replacement_candidate_id)?;
+        if replacement.status != CandidateMemoryStatus::Pending {
+            return Err(CandidateMemoryError::invalid_status());
+        }
+        let changed = transaction
+            .execute(
+                "UPDATE candidate_memory SET
+                    status = 'superseded', superseded_by_candidate_id = ?4,
+                    content = NULL, summary = NULL, source_id = NULL,
+                    dedup_fingerprint = NULL, reviewed_at = ?5, updated_at = ?5,
+                    revision = revision + 1
+                 WHERE id = ?1 AND life_id = ?2 AND revision = ?3 AND status = 'pending'",
+                params![
+                    request.candidate_id,
+                    life_id,
+                    request.expected_revision,
+                    request.replacement_candidate_id,
+                    now,
+                ],
+            )
+            .map_err(map_sql_error)?;
+        if changed != 1 {
+            return Err(CandidateMemoryError::revision_conflict());
+        }
+        delete_candidate_evidence(&transaction, life_id, &request.candidate_id)?;
+        let audit = insert_audit(
+            &transaction,
+            audit_id,
+            life_id,
+            &request.candidate_id,
+            "candidate_superseded",
+            "user",
+            now,
+        )?;
+        let updated = load_owned_candidate(&transaction, life_id, &request.candidate_id)?;
+        transaction.commit().map_err(map_sql_error)?;
+        Ok(CandidateLifecycleResult {
+            candidate: updated,
+            audit,
+        })
+    }
+
+    fn delete_candidate_atomic(
+        &self,
+        life_id: &str,
+        request: DeleteCandidateRequest,
+        now: &str,
+        audit_id: &str,
+    ) -> Result<CandidateMemoryAuditRecord, CandidateMemoryError> {
+        validate_atomic_identifiers(life_id, &request.candidate_id, now, audit_id)?;
+        let mut state = self
+            .state()
+            .map_err(|_| CandidateMemoryError::storage_unavailable())?;
+        let transaction = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sql_error)?;
+        let candidate = load_owned_candidate(&transaction, life_id, &request.candidate_id)?;
+        if candidate.revision != request.expected_revision {
+            return Err(CandidateMemoryError::revision_conflict());
+        }
+        let audit = insert_audit(
+            &transaction,
+            audit_id,
+            life_id,
+            &request.candidate_id,
+            "candidate_deleted",
+            "user",
+            now,
+        )?;
+        let deleted = transaction
+            .execute(
+                "DELETE FROM candidate_memory
+                 WHERE id = ?1 AND life_id = ?2 AND revision = ?3",
+                params![request.candidate_id, life_id, request.expected_revision],
+            )
+            .map_err(map_sql_error)?;
+        if deleted != 1 {
+            return Err(CandidateMemoryError::revision_conflict());
+        }
+        transaction.commit().map_err(map_sql_error)?;
+        Ok(audit)
+    }
+
+    fn add_evidence_atomic(
+        &self,
+        life_id: &str,
+        request: AddEvidenceRequest,
+        now: &str,
+        evidence_id: &str,
+        audit_id: &str,
+    ) -> Result<Option<CandidateMemoryRecord>, CandidateMemoryError> {
+        validate_atomic_identifiers(life_id, &request.candidate_id, now, audit_id)?;
+        validate_identifier(evidence_id)?;
+        let mut state = self
+            .state()
+            .map_err(|_| CandidateMemoryError::storage_unavailable())?;
+        let transaction = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sql_error)?;
+        let candidate = load_owned_candidate(&transaction, life_id, &request.candidate_id)?;
+        if candidate.status != CandidateMemoryStatus::Pending {
+            return Err(CandidateMemoryError::invalid_status());
+        }
+        let evidence = NewCandidateMemoryEvidence {
+            id: evidence_id.to_string(),
+            candidate_id: request.candidate_id.clone(),
+            life_id: life_id.to_string(),
+            source_type: request.source_type,
+            source_id: normalize_optional(request.source_id),
+            conversation_id: normalize_optional(request.conversation_id),
+            message_id: normalize_optional(request.message_id),
+            observed_at: now.to_string(),
+        };
+        validate_evidence(&evidence)?;
+        validate_evidence_references(&transaction, &evidence)?;
+        let duplicate: bool = transaction
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM candidate_memory_evidence
+                    WHERE candidate_id = ?1 AND source_type = ?2
+                      AND source_id IS ?3 AND conversation_id IS ?4 AND message_id IS ?5
+                 )",
+                params![
+                    evidence.candidate_id,
+                    evidence.source_type.as_str(),
+                    evidence.source_id,
+                    evidence.conversation_id,
+                    evidence.message_id,
+                ],
+                |row| row.get(0),
+            )
+            .map_err(map_sql_error)?;
+        if duplicate {
+            return Ok(None);
+        }
+        let inserted = transaction
+            .execute(
+                "INSERT INTO candidate_memory_evidence (
+                    id, candidate_id, life_id, source_type, source_id, conversation_id,
+                    message_id, observed_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT DO NOTHING",
+                params![
+                    evidence.id,
+                    evidence.candidate_id,
+                    evidence.life_id,
+                    evidence.source_type.as_str(),
+                    evidence.source_id,
+                    evidence.conversation_id,
+                    evidence.message_id,
+                    evidence.observed_at,
+                ],
+            )
+            .map_err(map_sql_error)?;
+        if inserted == 0 {
+            return Ok(None);
+        }
+        let updated = transaction
+            .execute(
+                "UPDATE candidate_memory SET updated_at = ?4, revision = revision + 1
+                 WHERE id = ?1 AND life_id = ?2 AND revision = ?3 AND status = 'pending'",
+                params![request.candidate_id, life_id, candidate.revision, now],
+            )
+            .map_err(map_sql_error)?;
+        if updated != 1 {
+            return Err(CandidateMemoryError::revision_conflict());
+        }
+        insert_audit(
+            &transaction,
+            audit_id,
+            life_id,
+            &request.candidate_id,
+            "candidate_evidence_added",
+            "system",
+            now,
+        )?;
+        let updated = load_owned_candidate(&transaction, life_id, &request.candidate_id)?;
+        transaction.commit().map_err(map_sql_error)?;
+        Ok(Some(updated))
+    }
+}
+
+fn ensure_pending_revision(
+    candidate: &CandidateMemoryRecord,
+    expected_revision: i64,
+) -> Result<(), CandidateMemoryError> {
+    if candidate.status != CandidateMemoryStatus::Pending {
+        return Err(CandidateMemoryError::invalid_status());
+    }
+    if candidate.revision != expected_revision {
+        return Err(CandidateMemoryError::revision_conflict());
+    }
+    Ok(())
+}
+
+fn validate_atomic_identifiers(
+    life_id: &str,
+    candidate_id: &str,
+    now: &str,
+    audit_id: &str,
+) -> Result<(), CandidateMemoryError> {
+    validate_identifier(life_id)?;
+    validate_identifier(candidate_id)?;
+    validate_identifier(now)?;
+    validate_identifier(audit_id)
+}
+
+fn prohibited_content_error() -> CandidateMemoryError {
+    CandidateMemoryError::new(
+        "CANDIDATE_MEMORY_PROHIBITED_CONTENT",
+        "The candidate contains credential-like content that cannot be stored.",
+        true,
+    )
+}
+
+fn delete_candidate_evidence(
+    transaction: &Transaction<'_>,
+    life_id: &str,
+    candidate_id: &str,
+) -> Result<(), CandidateMemoryError> {
+    transaction
+        .execute(
+            "DELETE FROM candidate_memory_evidence
+             WHERE candidate_id = ?1 AND life_id = ?2",
+            params![candidate_id, life_id],
+        )
+        .map_err(map_sql_error)?;
+    Ok(())
+}
+
+fn insert_audit(
+    transaction: &Transaction<'_>,
+    audit_id: &str,
+    life_id: &str,
+    candidate_id: &str,
+    action: &str,
+    actor_type: &str,
+    now: &str,
+) -> Result<CandidateMemoryAuditRecord, CandidateMemoryError> {
+    transaction
+        .execute(
+            "INSERT INTO candidate_memory_audit (
+                id, candidate_id, life_id, action, actor_type, request_id,
+                result_status, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, 'success', ?6)",
+            params![audit_id, candidate_id, life_id, action, actor_type, now],
+        )
+        .map_err(map_sql_error)?;
+    load_audit(transaction, life_id, audit_id)
+}
+
+#[derive(Clone)]
+pub(super) struct SourceAffectedCandidate {
+    candidate_id: String,
+    revision: i64,
+    source_type: CandidateMemorySourceType,
+    status: CandidateMemoryStatus,
+}
+
+pub(super) fn collect_candidates_for_conversation(
+    transaction: &Transaction<'_>,
+    life_id: &str,
+    conversation_id: &str,
+) -> Result<Vec<SourceAffectedCandidate>, CandidateMemoryError> {
+    collect_source_candidates(
+        transaction,
+        life_id,
+        "e.conversation_id = ?2 OR e.message_id IN (
+            SELECT id FROM conversation_message
+            WHERE conversation_id = ?2 AND life_id = ?1
+         )",
+        conversation_id,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn collect_candidates_for_message(
+    transaction: &Transaction<'_>,
+    life_id: &str,
+    message_id: &str,
+) -> Result<Vec<SourceAffectedCandidate>, CandidateMemoryError> {
+    collect_source_candidates(transaction, life_id, "e.message_id = ?2", message_id)
+}
+
+fn collect_source_candidates(
+    transaction: &Transaction<'_>,
+    life_id: &str,
+    predicate: &str,
+    source_id: &str,
+) -> Result<Vec<SourceAffectedCandidate>, CandidateMemoryError> {
+    let sql = format!(
+        "SELECT DISTINCT c.id, c.revision, c.source_type, c.status
+         FROM candidate_memory c
+         JOIN candidate_memory_evidence e ON e.candidate_id = c.id AND e.life_id = c.life_id
+         WHERE c.life_id = ?1 AND ({predicate})
+         ORDER BY c.id ASC"
+    );
+    let mut statement = transaction.prepare(&sql).map_err(map_sql_error)?;
+    let rows = statement
+        .query_map(params![life_id, source_id], |row| {
+            let source_type: String = row.get(2)?;
+            let status: String = row.get(3)?;
+            Ok((row.get(0)?, row.get(1)?, source_type, status))
+        })
+        .map_err(map_sql_error)?;
+    rows.map(|row| {
+        let (candidate_id, revision, source_type, status) = row.map_err(map_sql_error)?;
+        Ok(SourceAffectedCandidate {
+            candidate_id,
+            revision,
+            source_type: CandidateMemorySourceType::parse(&source_type)?,
+            status: CandidateMemoryStatus::parse(&status)?,
+        })
+    })
+    .collect()
+}
+
+pub(super) fn delete_orphaned_source_candidates(
+    transaction: &Transaction<'_>,
+    life_id: &str,
+    affected: &[SourceAffectedCandidate],
+) -> Result<usize, CandidateMemoryError> {
+    let mut deleted = 0;
+    for candidate in affected {
+        if candidate.status != CandidateMemoryStatus::Pending
+            || candidate.source_type != CandidateMemorySourceType::Conversation
+        {
+            continue;
+        }
+        let remaining: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM candidate_memory_evidence
+                 WHERE candidate_id = ?1 AND life_id = ?2",
+                params![candidate.candidate_id, life_id],
+                |row| row.get(0),
+            )
+            .map_err(map_sql_error)?;
+        if remaining != 0 {
+            continue;
+        }
+        let audit_id = format!("audit-source-delete-{}", super::unique_suffix());
+        insert_audit(
+            transaction,
+            &audit_id,
+            life_id,
+            &candidate.candidate_id,
+            "candidate_orphaned_source_deleted",
+            "system",
+            &current_database_timestamp(transaction)?,
+        )?;
+        let changed = transaction
+            .execute(
+                "DELETE FROM candidate_memory
+                 WHERE id = ?1 AND life_id = ?2 AND revision = ?3 AND status = 'pending'",
+                params![candidate.candidate_id, life_id, candidate.revision],
+            )
+            .map_err(map_sql_error)?;
+        if changed != 1 {
+            return Err(CandidateMemoryError::revision_conflict());
+        }
+        deleted += 1;
+    }
+    Ok(deleted)
+}
+
+fn current_database_timestamp(
+    transaction: &Transaction<'_>,
+) -> Result<String, CandidateMemoryError> {
+    transaction
+        .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", [], |row| {
+            row.get(0)
+        })
+        .map_err(map_sql_error)
+}
+
 fn load_owned_candidate(
     connection: &Connection,
     life_id: &str,
@@ -778,17 +1417,28 @@ fn map_sql_error(error: SqlError) -> CandidateMemoryError {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::{Arc, Barrier},
+        thread,
+    };
 
     use rusqlite::{params, Connection};
 
     use crate::{
+        conversation::history::ConversationRepository,
         memory::{
             candidate::{
                 CandidateInferenceStatus, CandidateMemoryListFilter, CandidateMemoryRepository,
                 CandidateMemorySourceType, CandidateMemoryStatus, CandidateMemoryStorageUpdate,
                 NewCandidateMemory, NewCandidateMemoryAudit, NewCandidateMemoryEvidence,
                 PRIMARY_USER_SUBJECT_ID,
+            },
+            candidate_service::{
+                AddEvidenceRequest, CandidateMemoryService, DeleteCandidateRequest,
+                EditCandidateRequest, RejectCandidateRequest, RejectionReason,
+                SupersedeCandidateRequest,
             },
             MemoryKind,
         },
@@ -1100,7 +1750,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_database_applies_all_migrations_through_008_with_foreign_keys_enabled() {
+    fn empty_database_applies_all_migrations_through_009_with_foreign_keys_enabled() {
         let root = TestRoot::new("empty-migration");
         let service = StorageService::initialize_with_roots(root.0.join("data"), None).unwrap();
         let state = service.state().unwrap();
@@ -1114,7 +1764,7 @@ mod tests {
             .connection
             .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
         assert_eq!(foreign_keys, 1);
         for table in [
             "candidate_memory",
@@ -1145,7 +1795,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
         let old_candidate_count: i64 = state
             .connection
             .query_row(
@@ -1220,6 +1870,143 @@ mod tests {
             })
             .unwrap();
         assert_eq!(migrated_count, 2);
+    }
+
+    #[test]
+    fn migration_008_to_009_deduplicates_evidence_without_touching_authoritative_data() {
+        let root = TestRoot::new("upgrade-009");
+        let data_root = create_v7_database(&root);
+        let database = data_root.join(DATABASE_FILE_NAME);
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch("PRAGMA foreign_keys = ON;")
+            .unwrap();
+        connection
+            .execute_batch(include_str!("migrations/008_candidate_memory_storage.sql"))
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO schema_migration (version, name, applied_at)
+                 VALUES (8, '008_candidate_memory_storage', '2026-07-14T00:00:00.000Z')",
+                [],
+            )
+            .unwrap();
+        for id in ["evidence-a", "evidence-b"] {
+            connection
+                .execute(
+                    "INSERT INTO candidate_memory_evidence (
+                        id, candidate_id, life_id, source_type, source_id,
+                        conversation_id, message_id, observed_at
+                     ) VALUES (?1, 'candidate-manual', 'life-a', 'manual', NULL, NULL, NULL,
+                        '2026-07-14T00:00:00.000Z')",
+                    params![id],
+                )
+                .unwrap();
+        }
+        drop(connection);
+
+        let service = StorageService::initialize_with_roots(data_root, None).unwrap();
+        let state = service.state().unwrap();
+        let evidence: Vec<String> = state
+            .connection
+            .prepare("SELECT id FROM candidate_memory_evidence ORDER BY rowid")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let candidate_revision: i64 = state
+            .connection
+            .query_row(
+                "SELECT revision FROM candidate_memory WHERE id = 'candidate-manual'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let confirmed_count: i64 = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM memory_record WHERE id = 'confirmed-old'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let revision_count: i64 = state
+            .connection
+            .query_row("SELECT COUNT(*) FROM memory_revision", [], |row| row.get(0))
+            .unwrap();
+        let outbox_count: i64 = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM memory_vector_sync_outbox",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(evidence, ["evidence-a"]);
+        assert_eq!(candidate_revision, 1);
+        assert_eq!(confirmed_count, 1);
+        assert_eq!(revision_count, 1);
+        assert_eq!(outbox_count, 1);
+    }
+
+    #[test]
+    fn migration_009_failure_rolls_back_deduplication_and_index_creation() {
+        let root = TestRoot::new("upgrade-009-rollback");
+        let data_root = create_v7_database(&root);
+        let database = data_root.join(DATABASE_FILE_NAME);
+        let mut connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch("PRAGMA foreign_keys = ON;")
+            .unwrap();
+        connection
+            .execute_batch(include_str!("migrations/008_candidate_memory_storage.sql"))
+            .unwrap();
+        for id in ["evidence-a", "evidence-b"] {
+            connection
+                .execute(
+                    "INSERT INTO candidate_memory_evidence (
+                        id, candidate_id, life_id, source_type, source_id,
+                        conversation_id, message_id, observed_at
+                     ) VALUES (?1, 'candidate-manual', 'life-a', 'manual', NULL, NULL, NULL,
+                        '2026-07-14T00:00:00.000Z')",
+                    params![id],
+                )
+                .unwrap();
+        }
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_migration_009_delete
+                 BEFORE DELETE ON candidate_memory_evidence
+                 BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;",
+            )
+            .unwrap();
+        let transaction = connection.transaction().unwrap();
+        assert!(transaction
+            .execute_batch(include_str!(
+                "migrations/009_candidate_evidence_uniqueness.sql"
+            ))
+            .is_err());
+        drop(transaction);
+        let evidence_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM candidate_memory_evidence",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let index_exists: i64 = connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'index' AND name = 'idx_candidate_memory_evidence_identity'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(evidence_count, 2);
+        assert_eq!(index_exists, 0);
     }
 
     #[test]
@@ -1871,6 +2658,874 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(count, 0);
+        }
+    }
+
+    fn install_failure_trigger(service: &StorageService, sql: &str) {
+        service
+            .state()
+            .unwrap()
+            .connection
+            .execute_batch(sql)
+            .unwrap();
+    }
+
+    fn audit_count(service: &StorageService, action: &str) -> i64 {
+        service
+            .state()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM candidate_memory_audit WHERE action = ?1",
+                params![action],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn add_fixture_evidence(service: &StorageService, candidate_id: &str, evidence_id: &str) {
+        <StorageService as CandidateMemoryRepository>::insert_evidence(
+            service,
+            NewCandidateMemoryEvidence {
+                id: evidence_id.into(),
+                candidate_id: candidate_id.into(),
+                life_id: "life-a".into(),
+                source_type: CandidateMemorySourceType::Manual,
+                source_id: Some(evidence_id.into()),
+                conversation_id: None,
+                message_id: None,
+                observed_at: "2026-07-14T10:00:00.000Z".into(),
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn edit_audit_failure_rolls_back_candidate_update() {
+        let root = TestRoot::new("atomic-edit-audit");
+        let service = seeded_service(&root);
+        let before = insert_candidate(&service, "c1", "life-a", "2026-07-14T10:00:00.000Z");
+        install_failure_trigger(
+            &service,
+            "CREATE TEMP TRIGGER fail_edit_audit BEFORE INSERT ON candidate_memory_audit
+             WHEN NEW.action = 'candidate_edited'
+             BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;",
+        );
+        let error = CandidateMemoryService::new(&service)
+            .edit(
+                "life-a",
+                EditCandidateRequest {
+                    candidate_id: "c1".into(),
+                    expected_revision: 1,
+                    kind: MemoryKind::Goal,
+                    content: "Changed content".into(),
+                    summary: Some("Changed summary".into()),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "CANDIDATE_MEMORY_CONSTRAINT_VIOLATION");
+        assert_eq!(
+            <StorageService as CandidateMemoryRepository>::get_candidate(&service, "life-a", "c1")
+                .unwrap(),
+            before
+        );
+        assert_eq!(audit_count(&service, "candidate_edited"), 0);
+    }
+
+    #[test]
+    fn reject_evidence_delete_failure_rolls_back_everything() {
+        let root = TestRoot::new("atomic-reject-evidence");
+        let service = seeded_service(&root);
+        let before = insert_candidate(&service, "c1", "life-a", "2026-07-14T10:00:00.000Z");
+        add_fixture_evidence(&service, "c1", "ev1");
+        install_failure_trigger(
+            &service,
+            "CREATE TEMP TRIGGER fail_reject_evidence BEFORE DELETE ON candidate_memory_evidence
+             BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;",
+        );
+        CandidateMemoryService::new(&service)
+            .reject(
+                "life-a",
+                RejectCandidateRequest {
+                    candidate_id: "c1".into(),
+                    expected_revision: 1,
+                    reason: RejectionReason::Other,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            <StorageService as CandidateMemoryRepository>::get_candidate(&service, "life-a", "c1")
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            <StorageService as CandidateMemoryRepository>::count_evidence(&service, "life-a", "c1")
+                .unwrap(),
+            1
+        );
+        assert_eq!(audit_count(&service, "candidate_rejected"), 0);
+    }
+
+    #[test]
+    fn reject_audit_failure_rolls_back_candidate_and_evidence() {
+        let root = TestRoot::new("atomic-reject-audit");
+        let service = seeded_service(&root);
+        let before = insert_candidate(&service, "c1", "life-a", "2026-07-14T10:00:00.000Z");
+        add_fixture_evidence(&service, "c1", "ev1");
+        install_failure_trigger(
+            &service,
+            "CREATE TEMP TRIGGER fail_reject_audit BEFORE INSERT ON candidate_memory_audit
+             WHEN NEW.action = 'candidate_rejected'
+             BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;",
+        );
+        CandidateMemoryService::new(&service)
+            .reject(
+                "life-a",
+                RejectCandidateRequest {
+                    candidate_id: "c1".into(),
+                    expected_revision: 1,
+                    reason: RejectionReason::Other,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            <StorageService as CandidateMemoryRepository>::get_candidate(&service, "life-a", "c1")
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            <StorageService as CandidateMemoryRepository>::count_evidence(&service, "life-a", "c1")
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn expire_audit_failure_rolls_back_candidate_and_evidence() {
+        let root = TestRoot::new("atomic-expire-audit");
+        let service = seeded_service(&root);
+        let mut candidate = pending("c1", "life-a", "2026-07-14T10:00:00.000Z");
+        candidate.expires_at = Some("2020-01-01T00:00:00.000Z".into());
+        let before =
+            <StorageService as CandidateMemoryRepository>::insert_candidate(&service, candidate)
+                .unwrap();
+        add_fixture_evidence(&service, "c1", "ev1");
+        install_failure_trigger(
+            &service,
+            "CREATE TEMP TRIGGER fail_expire_audit BEFORE INSERT ON candidate_memory_audit
+             WHEN NEW.action = 'candidate_expired'
+             BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;",
+        );
+        CandidateMemoryService::new(&service)
+            .expire_one("life-a", "c1", 1, "2026-07-14T12:00:00.000Z")
+            .unwrap_err();
+        assert_eq!(
+            <StorageService as CandidateMemoryRepository>::get_candidate(&service, "life-a", "c1")
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            <StorageService as CandidateMemoryRepository>::count_evidence(&service, "life-a", "c1")
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn supersede_evidence_delete_failure_rolls_back_both_candidates() {
+        let root = TestRoot::new("atomic-supersede-evidence");
+        let service = seeded_service(&root);
+        let before = insert_candidate(&service, "c1", "life-a", "2026-07-14T10:00:00.000Z");
+        let replacement = insert_candidate(&service, "c2", "life-a", "2026-07-14T11:00:00.000Z");
+        add_fixture_evidence(&service, "c1", "ev1");
+        install_failure_trigger(
+            &service,
+            "CREATE TEMP TRIGGER fail_supersede_evidence BEFORE DELETE ON candidate_memory_evidence
+             BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;",
+        );
+        CandidateMemoryService::new(&service)
+            .supersede(
+                "life-a",
+                SupersedeCandidateRequest {
+                    candidate_id: "c1".into(),
+                    replacement_candidate_id: "c2".into(),
+                    expected_revision: 1,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            <StorageService as CandidateMemoryRepository>::get_candidate(&service, "life-a", "c1")
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            <StorageService as CandidateMemoryRepository>::get_candidate(&service, "life-a", "c2")
+                .unwrap(),
+            replacement
+        );
+    }
+
+    #[test]
+    fn supersede_audit_failure_rolls_back_candidate_and_evidence() {
+        let root = TestRoot::new("atomic-supersede-audit");
+        let service = seeded_service(&root);
+        let before = insert_candidate(&service, "c1", "life-a", "2026-07-14T10:00:00.000Z");
+        insert_candidate(&service, "c2", "life-a", "2026-07-14T11:00:00.000Z");
+        add_fixture_evidence(&service, "c1", "ev1");
+        install_failure_trigger(
+            &service,
+            "CREATE TEMP TRIGGER fail_supersede_audit BEFORE INSERT ON candidate_memory_audit
+             WHEN NEW.action = 'candidate_superseded'
+             BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;",
+        );
+        CandidateMemoryService::new(&service)
+            .supersede(
+                "life-a",
+                SupersedeCandidateRequest {
+                    candidate_id: "c1".into(),
+                    replacement_candidate_id: "c2".into(),
+                    expected_revision: 1,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            <StorageService as CandidateMemoryRepository>::get_candidate(&service, "life-a", "c1")
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            <StorageService as CandidateMemoryRepository>::count_evidence(&service, "life-a", "c1")
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn candidate_delete_failure_rolls_back_delete_audit() {
+        let root = TestRoot::new("atomic-delete");
+        let service = seeded_service(&root);
+        let before = insert_candidate(&service, "c1", "life-a", "2026-07-14T10:00:00.000Z");
+        add_fixture_evidence(&service, "c1", "ev1");
+        install_failure_trigger(
+            &service,
+            "CREATE TEMP TRIGGER fail_candidate_delete BEFORE DELETE ON candidate_memory
+             WHEN OLD.id = 'c1'
+             BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;",
+        );
+        CandidateMemoryService::new(&service)
+            .delete_permanently(
+                "life-a",
+                DeleteCandidateRequest {
+                    candidate_id: "c1".into(),
+                    expected_revision: 1,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            <StorageService as CandidateMemoryRepository>::get_candidate(&service, "life-a", "c1")
+                .unwrap(),
+            before
+        );
+        assert_eq!(audit_count(&service, "candidate_deleted"), 0);
+    }
+
+    #[test]
+    fn evidence_candidate_update_failure_rolls_back_insert() {
+        let root = TestRoot::new("atomic-evidence-update");
+        let service = seeded_service(&root);
+        let before = insert_candidate(&service, "c1", "life-a", "2026-07-14T10:00:00.000Z");
+        install_failure_trigger(
+            &service,
+            "CREATE TEMP TRIGGER fail_evidence_revision BEFORE UPDATE ON candidate_memory
+             WHEN NEW.id = 'c1'
+             BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;",
+        );
+        CandidateMemoryService::new(&service)
+            .add_evidence(
+                "life-a",
+                AddEvidenceRequest {
+                    candidate_id: "c1".into(),
+                    source_type: CandidateMemorySourceType::Manual,
+                    source_id: Some("source-a".into()),
+                    conversation_id: None,
+                    message_id: None,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            <StorageService as CandidateMemoryRepository>::get_candidate(&service, "life-a", "c1")
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            <StorageService as CandidateMemoryRepository>::count_evidence(&service, "life-a", "c1")
+                .unwrap(),
+            0
+        );
+        assert_eq!(audit_count(&service, "candidate_evidence_added"), 0);
+    }
+
+    #[test]
+    fn evidence_audit_failure_rolls_back_insert_and_revision() {
+        let root = TestRoot::new("atomic-evidence-audit");
+        let service = seeded_service(&root);
+        let before = insert_candidate(&service, "c1", "life-a", "2026-07-14T10:00:00.000Z");
+        install_failure_trigger(
+            &service,
+            "CREATE TEMP TRIGGER fail_evidence_audit BEFORE INSERT ON candidate_memory_audit
+             WHEN NEW.action = 'candidate_evidence_added'
+             BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;",
+        );
+        CandidateMemoryService::new(&service)
+            .add_evidence(
+                "life-a",
+                AddEvidenceRequest {
+                    candidate_id: "c1".into(),
+                    source_type: CandidateMemorySourceType::Manual,
+                    source_id: Some("source-a".into()),
+                    conversation_id: None,
+                    message_id: None,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            <StorageService as CandidateMemoryRepository>::get_candidate(&service, "life-a", "c1")
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            <StorageService as CandidateMemoryRepository>::count_evidence(&service, "life-a", "c1")
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn concurrent_edits_with_same_revision_commit_exactly_once() {
+        let root = TestRoot::new("concurrent-edit");
+        let data_root = root.0.join("data");
+        let first = seeded_service(&root);
+        insert_candidate(&first, "c1", "life-a", "2026-07-14T10:00:00.000Z");
+        let second = StorageService::initialize_with_roots(data_root.clone(), None).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = [(first, "First edit"), (second, "Second edit")]
+            .into_iter()
+            .map(|(service, content)| {
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    CandidateMemoryService::new(&service).edit(
+                        "life-a",
+                        EditCandidateRequest {
+                            candidate_id: "c1".into(),
+                            expected_revision: 1,
+                            kind: MemoryKind::Fact,
+                            content: content.into(),
+                            summary: None,
+                        },
+                    )
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter_map(|result| result.as_ref().err())
+                .filter(|error| error.code == "CANDIDATE_MEMORY_REVISION_CONFLICT")
+                .count(),
+            1
+        );
+        let verification = StorageService::initialize_with_roots(data_root, None).unwrap();
+        assert_eq!(
+            <StorageService as CandidateMemoryRepository>::get_candidate(
+                &verification,
+                "life-a",
+                "c1",
+            )
+            .unwrap()
+            .revision,
+            2
+        );
+        assert_eq!(audit_count(&verification, "candidate_edited"), 1);
+    }
+
+    #[test]
+    fn concurrent_edit_and_expire_cannot_overwrite_each_other() {
+        let root = TestRoot::new("concurrent-edit-expire");
+        let data_root = root.0.join("data");
+        let first = seeded_service(&root);
+        let mut candidate = pending("c1", "life-a", "2026-07-14T10:00:00.000Z");
+        candidate.expires_at = Some("2020-01-01T00:00:00.000Z".into());
+        <StorageService as CandidateMemoryRepository>::insert_candidate(&first, candidate).unwrap();
+        let second = StorageService::initialize_with_roots(data_root.clone(), None).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let edit_barrier = Arc::clone(&barrier);
+        let edit = thread::spawn(move || {
+            edit_barrier.wait();
+            CandidateMemoryService::new(&first).edit(
+                "life-a",
+                EditCandidateRequest {
+                    candidate_id: "c1".into(),
+                    expected_revision: 1,
+                    kind: MemoryKind::Fact,
+                    content: "User edit wins safely".into(),
+                    summary: None,
+                },
+            )
+        });
+        let expire = thread::spawn(move || {
+            barrier.wait();
+            CandidateMemoryService::new(&second).expire_one(
+                "life-a",
+                "c1",
+                1,
+                "2026-07-14T12:00:00.000Z",
+            )
+        });
+        let edit_result = edit.join().unwrap();
+        let expire_result = expire.join().unwrap();
+        assert_ne!(edit_result.is_ok(), matches!(expire_result, Ok(Some(_))));
+        let verification = StorageService::initialize_with_roots(data_root, None).unwrap();
+        let stored = <StorageService as CandidateMemoryRepository>::get_candidate(
+            &verification,
+            "life-a",
+            "c1",
+        )
+        .unwrap();
+        assert_eq!(stored.revision, 2);
+        if edit_result.is_ok() {
+            assert_eq!(stored.content.as_deref(), Some("User edit wins safely"));
+            assert_eq!(stored.status, CandidateMemoryStatus::Pending);
+        } else {
+            assert_eq!(stored.status, CandidateMemoryStatus::Expired);
+        }
+        assert_eq!(
+            audit_count(&verification, "candidate_edited")
+                + audit_count(&verification, "candidate_expired"),
+            1
+        );
+    }
+
+    #[test]
+    fn concurrent_identical_evidence_is_a_single_noop_safe_write() {
+        let root = TestRoot::new("concurrent-evidence-same");
+        let data_root = root.0.join("data");
+        let first = seeded_service(&root);
+        insert_candidate(&first, "c1", "life-a", "2026-07-14T10:00:00.000Z");
+        let second = StorageService::initialize_with_roots(data_root.clone(), None).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = [first, second]
+            .into_iter()
+            .map(|service| {
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    CandidateMemoryService::new(&service).add_evidence(
+                        "life-a",
+                        AddEvidenceRequest {
+                            candidate_id: "c1".into(),
+                            source_type: CandidateMemorySourceType::Manual,
+                            source_id: Some("same-source".into()),
+                            conversation_id: None,
+                            message_id: None,
+                        },
+                    )
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap().unwrap())
+            .collect();
+        assert_eq!(results.iter().filter(|result| result.is_some()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_none()).count(), 1);
+        let verification = StorageService::initialize_with_roots(data_root, None).unwrap();
+        assert_eq!(
+            <StorageService as CandidateMemoryRepository>::count_evidence(
+                &verification,
+                "life-a",
+                "c1",
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            <StorageService as CandidateMemoryRepository>::get_candidate(
+                &verification,
+                "life-a",
+                "c1",
+            )
+            .unwrap()
+            .revision,
+            2
+        );
+        assert_eq!(audit_count(&verification, "candidate_evidence_added"), 1);
+    }
+
+    #[test]
+    fn concurrent_distinct_evidence_preserves_both_revision_updates() {
+        let root = TestRoot::new("concurrent-evidence-distinct");
+        let data_root = root.0.join("data");
+        let first = seeded_service(&root);
+        insert_candidate(&first, "c1", "life-a", "2026-07-14T10:00:00.000Z");
+        let second = StorageService::initialize_with_roots(data_root.clone(), None).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = [(first, "source-a"), (second, "source-b")]
+            .into_iter()
+            .map(|(service, source_id)| {
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    CandidateMemoryService::new(&service).add_evidence(
+                        "life-a",
+                        AddEvidenceRequest {
+                            candidate_id: "c1".into(),
+                            source_type: CandidateMemorySourceType::Manual,
+                            source_id: Some(source_id.into()),
+                            conversation_id: None,
+                            message_id: None,
+                        },
+                    )
+                })
+            })
+            .collect();
+        for handle in handles {
+            assert!(handle.join().unwrap().unwrap().is_some());
+        }
+        let verification = StorageService::initialize_with_roots(data_root, None).unwrap();
+        assert_eq!(
+            <StorageService as CandidateMemoryRepository>::count_evidence(
+                &verification,
+                "life-a",
+                "c1",
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            <StorageService as CandidateMemoryRepository>::get_candidate(
+                &verification,
+                "life-a",
+                "c1",
+            )
+            .unwrap()
+            .revision,
+            3
+        );
+        assert_eq!(audit_count(&verification, "candidate_evidence_added"), 2);
+    }
+
+    #[test]
+    fn conversation_delete_candidate_cleanup_failure_rolls_back_source_delete() {
+        let root = TestRoot::new("conversation-delete-rollback");
+        let service = seeded_service(&root);
+        let mut candidate = pending("c1", "life-a", "2026-07-14T10:00:00.000Z");
+        candidate.source_type = CandidateMemorySourceType::Conversation;
+        <StorageService as CandidateMemoryRepository>::insert_candidate(&service, candidate)
+            .unwrap();
+        insert_conversation_with_message(&service, "life-a", "a");
+        <StorageService as CandidateMemoryRepository>::insert_evidence(
+            &service,
+            NewCandidateMemoryEvidence {
+                id: "ev1".into(),
+                candidate_id: "c1".into(),
+                life_id: "life-a".into(),
+                source_type: CandidateMemorySourceType::Conversation,
+                source_id: None,
+                conversation_id: Some("conversation-a".into()),
+                message_id: Some("message-a".into()),
+                observed_at: "2026-07-14T10:00:00.000Z".into(),
+            },
+        )
+        .unwrap();
+        install_failure_trigger(
+            &service,
+            "CREATE TEMP TRIGGER fail_orphan_candidate_delete BEFORE DELETE ON candidate_memory
+             WHEN OLD.id = 'c1'
+             BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;",
+        );
+        ConversationRepository::delete_conversation(&service, "life-a", "conversation-a")
+            .unwrap_err();
+        let state = service.state().unwrap();
+        let conversation_exists: bool = state
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM conversation WHERE id = 'conversation-a')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let evidence_exists: bool = state
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM candidate_memory_evidence WHERE id = 'ev1')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(conversation_exists);
+        assert!(evidence_exists);
+        drop(state);
+        assert!(
+            <StorageService as CandidateMemoryRepository>::get_candidate(&service, "life-a", "c1")
+                .is_ok()
+        );
+        assert_eq!(
+            audit_count(&service, "candidate_orphaned_source_deleted"),
+            0
+        );
+    }
+
+    #[test]
+    fn source_delete_audit_contains_no_source_or_content_payload() {
+        let root = TestRoot::new("conversation-delete-audit-privacy");
+        let service = seeded_service(&root);
+        let mut candidate = pending("c1", "life-a", "2026-07-14T10:00:00.000Z");
+        candidate.source_type = CandidateMemorySourceType::Conversation;
+        candidate.content = Some("private candidate content".into());
+        <StorageService as CandidateMemoryRepository>::insert_candidate(&service, candidate)
+            .unwrap();
+        insert_conversation_with_message(&service, "life-a", "a");
+        <StorageService as CandidateMemoryRepository>::insert_evidence(
+            &service,
+            NewCandidateMemoryEvidence {
+                id: "ev1".into(),
+                candidate_id: "c1".into(),
+                life_id: "life-a".into(),
+                source_type: CandidateMemorySourceType::Conversation,
+                source_id: Some("sensitive-source-id".into()),
+                conversation_id: Some("conversation-a".into()),
+                message_id: Some("message-a".into()),
+                observed_at: "2026-07-14T10:00:00.000Z".into(),
+            },
+        )
+        .unwrap();
+        ConversationRepository::delete_conversation(&service, "life-a", "conversation-a").unwrap();
+        let state = service.state().unwrap();
+        let audit_text: String = state
+            .connection
+            .query_row(
+                "SELECT candidate_id || '|' || action || '|' || actor_type || '|' || result_status
+                 FROM candidate_memory_audit
+                 WHERE action = 'candidate_orphaned_source_deleted'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!audit_text.contains("conversation-a"));
+        assert!(!audit_text.contains("message-a"));
+        assert!(!audit_text.contains("sensitive-source-id"));
+        assert!(!audit_text.contains("private candidate content"));
+    }
+
+    #[test]
+    fn conversation_source_delete_never_removes_accepted_candidate_or_confirmed_memory() {
+        let root = TestRoot::new("conversation-delete-accepted");
+        let service = seeded_service(&root);
+        insert_confirmed_memory(&service, "memory-confirmed", "life-a");
+        let mut candidate = pending("c1", "life-a", "2026-07-14T10:00:00.000Z");
+        candidate.source_type = CandidateMemorySourceType::Conversation;
+        candidate.status = CandidateMemoryStatus::Accepted;
+        candidate.content = None;
+        candidate.summary = None;
+        candidate.confirmed_memory_id = Some("memory-confirmed".into());
+        candidate.accepted_request_id = Some("accepted-request".into());
+        <StorageService as CandidateMemoryRepository>::insert_candidate(&service, candidate)
+            .unwrap();
+        insert_conversation_with_message(&service, "life-a", "a");
+        <StorageService as CandidateMemoryRepository>::insert_evidence(
+            &service,
+            NewCandidateMemoryEvidence {
+                id: "ev1".into(),
+                candidate_id: "c1".into(),
+                life_id: "life-a".into(),
+                source_type: CandidateMemorySourceType::Conversation,
+                source_id: None,
+                conversation_id: Some("conversation-a".into()),
+                message_id: Some("message-a".into()),
+                observed_at: "2026-07-14T10:00:00.000Z".into(),
+            },
+        )
+        .unwrap();
+        ConversationRepository::delete_conversation(&service, "life-a", "conversation-a").unwrap();
+        let accepted =
+            <StorageService as CandidateMemoryRepository>::get_candidate(&service, "life-a", "c1")
+                .unwrap();
+        assert_eq!(accepted.status, CandidateMemoryStatus::Accepted);
+        let confirmed_exists: bool = service
+            .state()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM memory_record WHERE id = 'memory-confirmed')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(confirmed_exists);
+    }
+
+    #[test]
+    fn governed_message_delete_removes_only_orphan_candidate() {
+        let root = TestRoot::new("message-delete-orphan");
+        let service = seeded_service(&root);
+        let mut candidate = pending("c1", "life-a", "2026-07-14T10:00:00.000Z");
+        candidate.source_type = CandidateMemorySourceType::Conversation;
+        <StorageService as CandidateMemoryRepository>::insert_candidate(&service, candidate)
+            .unwrap();
+        insert_conversation_with_message(&service, "life-a", "a");
+        <StorageService as CandidateMemoryRepository>::insert_evidence(
+            &service,
+            NewCandidateMemoryEvidence {
+                id: "ev1".into(),
+                candidate_id: "c1".into(),
+                life_id: "life-a".into(),
+                source_type: CandidateMemorySourceType::Conversation,
+                source_id: None,
+                conversation_id: Some("conversation-a".into()),
+                message_id: Some("message-a".into()),
+                observed_at: "2026-07-14T10:00:00.000Z".into(),
+            },
+        )
+        .unwrap();
+        service
+            .delete_conversation_message_governed("life-a", "conversation-a", "message-a")
+            .unwrap();
+        assert!(
+            <StorageService as CandidateMemoryRepository>::get_candidate(&service, "life-a", "c1")
+                .is_err()
+        );
+        let state = service.state().unwrap();
+        let conversation_exists: bool = state
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM conversation WHERE id = 'conversation-a')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(conversation_exists);
+    }
+
+    #[test]
+    fn governed_message_delete_preserves_candidate_with_other_evidence() {
+        let root = TestRoot::new("message-delete-remaining");
+        let service = seeded_service(&root);
+        let mut candidate = pending("c1", "life-a", "2026-07-14T10:00:00.000Z");
+        candidate.source_type = CandidateMemorySourceType::Conversation;
+        <StorageService as CandidateMemoryRepository>::insert_candidate(&service, candidate)
+            .unwrap();
+        insert_conversation_with_message(&service, "life-a", "a");
+        {
+            let state = service.state().unwrap();
+            state
+                .connection
+                .execute(
+                    "INSERT INTO conversation_message (
+                        id, conversation_id, life_id, turn_id, role, content, sequence_no, created_at
+                     ) VALUES ('message-b', 'conversation-a', 'life-a', 'turn-2', 'assistant',
+                        'Message B', 2, '2026-07-14T00:01:00.000Z')",
+                    [],
+                )
+                .unwrap();
+        }
+        for (evidence_id, message_id) in [("ev1", "message-a"), ("ev2", "message-b")] {
+            <StorageService as CandidateMemoryRepository>::insert_evidence(
+                &service,
+                NewCandidateMemoryEvidence {
+                    id: evidence_id.into(),
+                    candidate_id: "c1".into(),
+                    life_id: "life-a".into(),
+                    source_type: CandidateMemorySourceType::Conversation,
+                    source_id: None,
+                    conversation_id: Some("conversation-a".into()),
+                    message_id: Some(message_id.into()),
+                    observed_at: "2026-07-14T10:00:00.000Z".into(),
+                },
+            )
+            .unwrap();
+        }
+        service
+            .delete_conversation_message_governed("life-a", "conversation-a", "message-a")
+            .unwrap();
+        assert!(
+            <StorageService as CandidateMemoryRepository>::get_candidate(&service, "life-a", "c1")
+                .is_ok()
+        );
+        assert_eq!(
+            <StorageService as CandidateMemoryRepository>::count_evidence(&service, "life-a", "c1")
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn message_delete_and_candidate_cleanup_failures_both_roll_back() {
+        for failure_point in ["message", "candidate"] {
+            let root = TestRoot::new(&format!("message-delete-rollback-{failure_point}"));
+            let service = seeded_service(&root);
+            let mut candidate = pending("c1", "life-a", "2026-07-14T10:00:00.000Z");
+            candidate.source_type = CandidateMemorySourceType::Conversation;
+            <StorageService as CandidateMemoryRepository>::insert_candidate(&service, candidate)
+                .unwrap();
+            insert_conversation_with_message(&service, "life-a", "a");
+            <StorageService as CandidateMemoryRepository>::insert_evidence(
+                &service,
+                NewCandidateMemoryEvidence {
+                    id: "ev1".into(),
+                    candidate_id: "c1".into(),
+                    life_id: "life-a".into(),
+                    source_type: CandidateMemorySourceType::Conversation,
+                    source_id: None,
+                    conversation_id: Some("conversation-a".into()),
+                    message_id: Some("message-a".into()),
+                    observed_at: "2026-07-14T10:00:00.000Z".into(),
+                },
+            )
+            .unwrap();
+            let trigger = if failure_point == "message" {
+                "CREATE TEMP TRIGGER fail_message_delete BEFORE DELETE ON conversation_message
+                 BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;"
+            } else {
+                "CREATE TEMP TRIGGER fail_message_orphan_cleanup BEFORE DELETE ON candidate_memory
+                 WHEN OLD.id = 'c1'
+                 BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;"
+            };
+            install_failure_trigger(&service, trigger);
+            service
+                .delete_conversation_message_governed("life-a", "conversation-a", "message-a")
+                .unwrap_err();
+            let state = service.state().unwrap();
+            let message_exists: bool = state
+                .connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM conversation_message WHERE id = 'message-a')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let evidence_exists: bool = state
+                .connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM candidate_memory_evidence WHERE id = 'ev1')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(message_exists);
+            assert!(evidence_exists);
+            drop(state);
+            assert!(
+                <StorageService as CandidateMemoryRepository>::get_candidate(
+                    &service, "life-a", "c1"
+                )
+                .is_ok()
+            );
         }
     }
 

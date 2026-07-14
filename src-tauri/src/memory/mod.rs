@@ -9,6 +9,7 @@ use tauri::State;
 use crate::storage::StorageService;
 
 pub mod candidate;
+pub mod candidate_service;
 pub mod context_builder;
 pub mod management;
 pub mod retrieval;

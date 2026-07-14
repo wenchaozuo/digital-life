@@ -709,7 +709,7 @@ fn path_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-fn unique_suffix() -> String {
+pub(crate) fn unique_suffix() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
@@ -905,6 +905,52 @@ pub(crate) mod test_support {
             updated_at: now.to_string(),
             confirmed_at: Some(now.to_string()),
         }
+    }
+
+    pub(crate) fn insert_conversation_with_message(
+        service: &StorageService,
+        life_id: &str,
+        suffix: &str,
+    ) {
+        use rusqlite::params;
+        let state = service.state().unwrap();
+        state
+            .connection
+            .execute(
+                "INSERT INTO conversation (
+                    id, life_id, title, revision, created_at, updated_at, last_message_at
+                 ) VALUES (?1, ?2, 'Conv', 0, ?3, ?3, ?3)",
+                params![
+                    format!("conv-{suffix}"),
+                    life_id,
+                    "2026-07-14T00:00:00.000Z"
+                ],
+            )
+            .unwrap();
+        state
+            .connection
+            .execute(
+                "INSERT INTO conversation_message (
+                    id, conversation_id, life_id, turn_id, role, content, sequence_no, created_at
+                 ) VALUES (?1, ?2, ?3, 'turn-1', 'user', 'Msg', 1, ?4)",
+                params![
+                    format!("msg-{suffix}"),
+                    format!("conv-{suffix}"),
+                    life_id,
+                    "2026-07-14T00:00:00.000Z"
+                ],
+            )
+            .unwrap();
+    }
+
+    pub(crate) fn count_table(service: &StorageService, table: &str) -> i64 {
+        let state = service.state().unwrap();
+        state
+            .connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap()
     }
 }
 

@@ -328,6 +328,14 @@ impl CandidateMemoryError {
         )
     }
 
+    pub fn invalid_status() -> Self {
+        Self::new(
+            "CANDIDATE_MEMORY_INVALID_STATUS",
+            "The candidate memory is not in the expected status for this operation.",
+            true,
+        )
+    }
+
     pub fn storage_unavailable() -> Self {
         Self::new(
             "CANDIDATE_MEMORY_STORAGE_UNAVAILABLE",

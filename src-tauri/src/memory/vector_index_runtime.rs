@@ -827,8 +827,9 @@ fn generate_job_id(sequence: &AtomicU64) -> VectorIndexJobId {
 #[cfg(test)]
 mod tests {
     use std::{
-        io::{Read, Write},
-        net::{TcpListener, TcpStream},
+        io::{ErrorKind, Read, Write},
+        net::{SocketAddr, TcpListener, TcpStream},
+        sync::mpsc::{self, Receiver, Sender},
         thread,
         time::Duration,
     };
@@ -845,9 +846,32 @@ mod tests {
 
     use super::*;
 
+    const MOCK_REQUEST_MAX_BYTES: usize = 64 * 1024;
+    const MOCK_ACCEPT_TIMEOUT: Duration = Duration::from_secs(5);
+    const MOCK_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum TestServerError {
+        Shutdown,
+        AcceptTimedOut,
+        AcceptFailed,
+        StreamConfigurationFailed,
+        RequestTimedOut,
+        RequestClosed,
+        RequestTooLarge,
+        InvalidRequest,
+        RequestReadFailed,
+        ResponseWriteFailed,
+        SynchronizationFailed,
+        WorkerPanicked,
+    }
+
     struct TestServer {
         base_url: String,
-        handle: Option<thread::JoinHandle<()>>,
+        address: SocketAddr,
+        shutdown: Option<Sender<()>>,
+        accepted: Receiver<()>,
+        handle: Option<thread::JoinHandle<Result<(), TestServerError>>>,
     }
 
     impl TestServer {
@@ -855,67 +879,135 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let address = listener.local_addr().unwrap();
-            let handle = thread::spawn(move || {
-                let mut stream = accept_blocking_connection(&listener);
-                read_request(&mut stream);
+            let (shutdown, shutdown_receiver) = mpsc::channel();
+            let (accepted_sender, accepted) = mpsc::channel();
+            let handle = thread::spawn(move || -> Result<(), TestServerError> {
+                let mut stream = accept_blocking_connection(&listener, &shutdown_receiver)?;
+                accepted_sender
+                    .send(())
+                    .map_err(|_| TestServerError::SynchronizationFailed)?;
+                let _request = read_request(&mut stream)?;
                 let reply = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     response.len(),
                     response
                 );
-                stream.write_all(reply.as_bytes()).unwrap();
+                stream
+                    .write_all(reply.as_bytes())
+                    .map_err(|_| TestServerError::ResponseWriteFailed)
             });
             Self {
                 base_url: format!("http://{address}/v1"),
+                address,
+                shutdown: Some(shutdown),
+                accepted,
                 handle: Some(handle),
+            }
+        }
+
+        fn panicking_for_test() -> Self {
+            let (shutdown, _shutdown_receiver) = mpsc::channel();
+            let (_accepted_sender, accepted) = mpsc::channel();
+            let handle = thread::spawn(|| -> Result<(), TestServerError> {
+                panic!("controlled mock server panic");
+            });
+            Self {
+                base_url: "http://127.0.0.1:0/v1".into(),
+                address: "127.0.0.1:0".parse().unwrap(),
+                shutdown: Some(shutdown),
+                accepted,
+                handle: Some(handle),
+            }
+        }
+
+        fn wait_for_accept(&self) -> Result<(), TestServerError> {
+            self.accepted
+                .recv_timeout(MOCK_READ_TIMEOUT)
+                .map_err(|_| TestServerError::SynchronizationFailed)
+        }
+
+        fn finish(&mut self) -> Result<(), TestServerError> {
+            if let Some(shutdown) = self.shutdown.take() {
+                let _ = shutdown.send(());
+            }
+            let Some(handle) = self.handle.take() else {
+                return Ok(());
+            };
+            match handle.join() {
+                Ok(result) => result,
+                Err(_) => Err(TestServerError::WorkerPanicked),
             }
         }
     }
 
-    fn accept_blocking_connection(listener: &TcpListener) -> TcpStream {
-        let stream = (0..500)
-            .find_map(|_| match listener.accept() {
-                Ok((stream, _)) => Some(stream),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(10));
-                    None
+    fn accept_blocking_connection(
+        listener: &TcpListener,
+        shutdown: &Receiver<()>,
+    ) -> Result<TcpStream, TestServerError> {
+        let attempts = MOCK_ACCEPT_TIMEOUT.as_millis() / 10;
+        for _ in 0..attempts {
+            match shutdown.try_recv() {
+                Ok(_) | Err(mpsc::TryRecvError::Disconnected) => {
+                    return Err(TestServerError::Shutdown)
                 }
-                Err(error) => panic!("mock listener failed: {error}"),
-            })
-            .expect("mock embedding request was not received");
-        // The listener is non-blocking only so tests can time out while waiting
-        // for a client. The accepted stream must be blocking before read_request;
-        // otherwise a valid client that has connected but not yet written races
-        // into WouldBlock and panics the fixture thread during teardown.
-        stream.set_nonblocking(false).unwrap();
-        stream
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    // The listener is non-blocking only so the shutdown channel can
+                    // interrupt accept promptly. Requests themselves are read from a
+                    // blocking stream with a bounded read timeout.
+                    stream
+                        .set_nonblocking(false)
+                        .map_err(|_| TestServerError::StreamConfigurationFailed)?;
+                    return Ok(stream);
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    match shutdown.recv_timeout(Duration::from_millis(10)) {
+                        Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            return Err(TestServerError::Shutdown)
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                }
+                Err(_) => return Err(TestServerError::AcceptFailed),
+            }
+        }
+        Err(TestServerError::AcceptTimedOut)
     }
 
     impl Drop for TestServer {
         fn drop(&mut self) {
-            if let Some(handle) = self.handle.take() {
-                handle.join().unwrap();
-            }
+            let _ = self.finish();
         }
     }
 
-    fn read_request(stream: &mut TcpStream) {
+    fn read_request(stream: &mut TcpStream) -> Result<Vec<u8>, TestServerError> {
         stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
+            .set_read_timeout(Some(MOCK_READ_TIMEOUT))
+            .map_err(|_| TestServerError::StreamConfigurationFailed)?;
         let mut bytes = Vec::new();
         let mut buffer = [0u8; 1024];
         loop {
-            let read = stream.read(&mut buffer).unwrap();
+            let read = stream
+                .read(&mut buffer)
+                .map_err(|error| match error.kind() {
+                    ErrorKind::TimedOut | ErrorKind::WouldBlock => TestServerError::RequestTimedOut,
+                    _ => TestServerError::RequestReadFailed,
+                })?;
             if read == 0 {
-                break;
+                return Err(TestServerError::RequestClosed);
+            }
+            if bytes.len().saturating_add(read) > MOCK_REQUEST_MAX_BYTES {
+                return Err(TestServerError::RequestTooLarge);
             }
             bytes.extend_from_slice(&buffer[..read]);
             let Some(header_end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") else {
                 continue;
             };
             let body_start = header_end + 4;
-            let headers = String::from_utf8_lossy(&bytes[..body_start]);
+            let headers = std::str::from_utf8(&bytes[..body_start])
+                .map_err(|_| TestServerError::InvalidRequest)?;
             let length = headers
                 .lines()
                 .find_map(|line| {
@@ -923,40 +1015,97 @@ mod tests {
                         .strip_prefix("content-length:")
                         .and_then(|value| value.trim().parse::<usize>().ok())
                 })
-                .unwrap_or(0);
-            if bytes.len() >= body_start + length {
-                break;
+                .ok_or(TestServerError::InvalidRequest)?;
+            let expected_total = body_start
+                .checked_add(length)
+                .ok_or(TestServerError::RequestTooLarge)?;
+            if expected_total > MOCK_REQUEST_MAX_BYTES {
+                return Err(TestServerError::RequestTooLarge);
+            }
+            if bytes.len() >= expected_total {
+                return Ok(bytes);
             }
         }
     }
 
     #[test]
-    fn mock_server_accepts_connections_in_blocking_mode_before_the_request_arrives() {
-        use std::sync::mpsc;
-
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let address = listener.local_addr().unwrap();
-        let (ready_sender, ready_receiver) = mpsc::channel();
-        let (read_sender, read_receiver) = mpsc::channel();
-        let handle = thread::spawn(move || {
-            let mut stream = accept_blocking_connection(&listener);
-            ready_sender.send(()).unwrap();
-            let mut byte = [0_u8; 1];
-            read_sender.send(stream.read_exact(&mut byte)).unwrap();
-        });
-
-        let mut client = TcpStream::connect(address).unwrap();
-        ready_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert!(read_receiver
-            .recv_timeout(Duration::from_millis(50))
-            .is_err());
-        client.write_all(b"x").unwrap();
-        read_receiver
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap()
+    fn mock_server_handles_delayed_request_with_a_complete_http_response() {
+        const BODY: &str =
+            r#"{"model":"test-embedding-model","data":[{"index":0,"embedding":[1.0,0.0,0.0]}]}"#;
+        let mut server = TestServer::embeddings(BODY);
+        let mut client = TcpStream::connect(server.address).unwrap();
+        server.wait_for_accept().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(50)))
             .unwrap();
-        handle.join().unwrap();
+        let mut probe = [0u8; 1];
+        assert!(matches!(
+            client.read(&mut probe).unwrap_err().kind(),
+            ErrorKind::TimedOut | ErrorKind::WouldBlock
+        ));
+        let request =
+            "POST /v1/embeddings HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}";
+        client.write_all(request.as_bytes()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("Content-Type: application/json\r\n"));
+        assert!(response.ends_with(BODY));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(response.split("\r\n\r\n").nth(1).unwrap())
+                .unwrap()["model"],
+            "test-embedding-model"
+        );
+        server.finish().unwrap();
+        assert!(server.finish().is_ok());
+    }
+
+    #[test]
+    fn mock_server_reports_worker_panic_at_finish_and_drop_stays_safe() {
+        let mut server = TestServer::panicking_for_test();
+        assert_eq!(server.finish(), Err(TestServerError::WorkerPanicked));
+        drop(server);
+
+        let server = TestServer::panicking_for_test();
+        drop(server);
+    }
+
+    #[test]
+    fn mock_server_times_out_when_a_client_never_sends_a_request() {
+        let mut server = TestServer::embeddings("{}");
+        let _client = TcpStream::connect(server.address).unwrap();
+        server.wait_for_accept().unwrap();
+        assert_eq!(server.finish(), Err(TestServerError::RequestTimedOut));
+    }
+
+    #[test]
+    fn mock_server_handles_partial_request_disconnect_without_panicking() {
+        let mut server = TestServer::embeddings("{}");
+        let mut client = TcpStream::connect(server.address).unwrap();
+        server.wait_for_accept().unwrap();
+        client
+            .write_all(
+                b"POST /v1/embeddings HTTP/1.1\r\nHost: localhost\r\nContent-Length: 8\r\n\r\n{}",
+            )
+            .unwrap();
+        drop(client);
+        assert_eq!(server.finish(), Err(TestServerError::RequestClosed));
+    }
+
+    #[test]
+    fn mock_server_rejects_oversized_requests_without_unbounded_buffering() {
+        let mut server = TestServer::embeddings("{}");
+        let mut client = TcpStream::connect(server.address).unwrap();
+        server.wait_for_accept().unwrap();
+        let request = format!(
+            "POST /v1/embeddings HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+            MOCK_REQUEST_MAX_BYTES + 1
+        );
+        client.write_all(request.as_bytes()).unwrap();
+        assert_eq!(server.finish(), Err(TestServerError::RequestTooLarge));
     }
 
     fn test_storage() -> (tempfile::TempDir, StorageService) {
@@ -1210,7 +1359,7 @@ mod tests {
 
     #[test]
     fn runtime_rebuild_indexes_only_confirmed_non_sensitive_memory() {
-        let server = TestServer::embeddings(
+        let mut server = TestServer::embeddings(
             r#"{"model":"test-embedding-model","data":[{"index":0,"embedding":[1.0,0.0,0.0]}],"usage":{"prompt_tokens":2,"total_tokens":2}}"#,
         );
         let (temp, storage) = test_storage();
@@ -1239,5 +1388,6 @@ mod tests {
         assert_eq!(report.skipped_candidate_count, 0);
         assert_eq!(report.skipped_sensitive_count, 1);
         assert!(temp.path().join("data/vectors/lancedb").is_dir());
+        server.finish().unwrap();
     }
 }

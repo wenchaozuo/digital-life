@@ -15,14 +15,19 @@ use crate::memory::{
     candidate_service::{
         compute_dedup_fingerprint, compute_rejection_fingerprint, contains_prohibited_content,
         AddEvidenceRequest, CandidateEditOutcome, CandidateEditResult,
-        CandidateLifecycleRepository, CandidateLifecycleResult, DeleteCandidateRequest,
+        CandidateLifecycleRepository, CandidateLifecycleResult, ConfirmCandidateOutcome,
+        ConfirmCandidateRequest, ConfirmCandidateResult, DeleteCandidateRequest,
         EditCandidateRequest, ExpiredCandidateScan, RejectCandidateRequest,
         SupersedeCandidateRequest,
     },
-    MemoryKind,
+    vector_sync_outbox::MemoryVectorSyncAction,
+    MemoryKind, MemoryRecord, MemoryStatus,
 };
 
-use super::StorageService;
+use super::{
+    memory::legacy_source, memory_revision::insert_confirmed_revision_in_transaction,
+    vector_sync_outbox::enqueue_in_transaction, StorageService,
+};
 
 const CANDIDATE_COLUMNS: &str = "id, life_id, subject_id, kind, content, summary, source_type, \
     source_id, confidence, importance, is_sensitive, inference_status, status, revision, \
@@ -927,6 +932,217 @@ impl CandidateLifecycleRepository for StorageService {
         transaction.commit().map_err(map_sql_error)?;
         Ok(Some(updated))
     }
+
+    fn confirm_candidate_atomic(
+        &self,
+        life_id: &str,
+        request: ConfirmCandidateRequest,
+        now: &str,
+        memory_id: &str,
+        audit_id: &str,
+    ) -> Result<ConfirmCandidateResult, CandidateMemoryError> {
+        validate_atomic_identifiers(life_id, &request.candidate_id, now, audit_id)?;
+        validate_identifier(memory_id)?;
+        validate_identifier(&request.request_id)?;
+        if request.expected_revision <= 0 {
+            return Err(CandidateMemoryError::constraint());
+        }
+        let mut state = self
+            .state()
+            .map_err(|_| CandidateMemoryError::storage_unavailable())?;
+        let transaction = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sql_error)?;
+        let candidate = load_owned_candidate(&transaction, life_id, &request.candidate_id)?;
+
+        // Idempotent replay: an already-accepted candidate whose acceptance was
+        // recorded under this same request id returns its prior confirmed memory.
+        if candidate.status == CandidateMemoryStatus::Accepted {
+            if candidate.accepted_request_id.as_deref() != Some(request.request_id.as_str()) {
+                // A distinct request id targeting an already-accepted candidate is a
+                // request-scoped conflict, not merely a wrong-status operation.
+                return Err(CandidateMemoryError::request_conflict());
+            }
+            let confirmed_memory_id = candidate
+                .confirmed_memory_id
+                .clone()
+                .ok_or_else(CandidateMemoryError::invalid_status)?;
+            let memory = load_confirmed_memory(&transaction, life_id, &confirmed_memory_id)?;
+            transaction.commit().map_err(map_sql_error)?;
+            return Ok(ConfirmCandidateResult {
+                outcome: ConfirmCandidateOutcome::AlreadyConfirmed,
+                candidate,
+                memory,
+                audit: None,
+            });
+        }
+
+        ensure_pending_revision(&candidate, request.expected_revision)?;
+        if candidate.is_sensitive
+            && request
+                .sensitive_grant
+                .as_ref()
+                .is_none_or(|grant| grant.candidate_id() != request.candidate_id)
+        {
+            return Err(CandidateMemoryError::sensitive_consent_required());
+        }
+        let content = candidate
+            .content
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(CandidateMemoryError::invalid_status)?;
+
+        // Re-run the deterministic prohibited-content gate inside the transaction on
+        // the freshly re-read candidate, so nothing credential-like is promoted into
+        // authoritative memory even if it slipped past an earlier check.
+        if contains_prohibited_content(&content)
+            || candidate
+                .summary
+                .as_deref()
+                .is_some_and(contains_prohibited_content)
+        {
+            return Err(prohibited_content_error());
+        }
+
+        let memory = build_confirmed_memory(&candidate, memory_id, &content, now);
+        insert_confirmed_memory(&transaction, &memory)?;
+        insert_confirmed_revision_in_transaction(&transaction, &memory)
+            .map_err(|_| CandidateMemoryError::storage_unavailable())?;
+        let action = if memory.is_sensitive {
+            MemoryVectorSyncAction::Delete
+        } else {
+            MemoryVectorSyncAction::Upsert
+        };
+        enqueue_in_transaction(&transaction, life_id, memory_id, action)
+            .map_err(|_| CandidateMemoryError::storage_unavailable())?;
+
+        let changed = transaction
+            .execute(
+                "UPDATE candidate_memory SET
+                    status = 'accepted', content = NULL, summary = NULL, source_id = NULL,
+                    dedup_fingerprint = NULL, reviewed_at = ?4, updated_at = ?4,
+                    confirmed_memory_id = ?5, accepted_request_id = ?6,
+                    revision = revision + 1
+                 WHERE id = ?1 AND life_id = ?2 AND revision = ?3 AND status = 'pending'",
+                params![
+                    request.candidate_id,
+                    life_id,
+                    request.expected_revision,
+                    now,
+                    memory_id,
+                    request.request_id,
+                ],
+            )
+            .map_err(confirm_update_error)?;
+        if changed != 1 {
+            return Err(CandidateMemoryError::revision_conflict());
+        }
+        delete_candidate_evidence(&transaction, life_id, &request.candidate_id)?;
+        let audit = insert_audit_with_request_id(
+            &transaction,
+            audit_id,
+            life_id,
+            &request.candidate_id,
+            "candidate_confirmed",
+            "user",
+            Some(&request.request_id),
+            now,
+        )?;
+        let updated = load_owned_candidate(&transaction, life_id, &request.candidate_id)?;
+        transaction.commit().map_err(map_sql_error)?;
+        Ok(ConfirmCandidateResult {
+            outcome: ConfirmCandidateOutcome::Confirmed,
+            candidate: updated,
+            memory,
+            audit: Some(audit),
+        })
+    }
+}
+
+fn build_confirmed_memory(
+    candidate: &CandidateMemoryRecord,
+    memory_id: &str,
+    content: &str,
+    now: &str,
+) -> MemoryRecord {
+    MemoryRecord {
+        id: memory_id.to_string(),
+        life_id: candidate.life_id.clone(),
+        kind: candidate.kind,
+        status: MemoryStatus::Confirmed,
+        content: content.to_string(),
+        summary: candidate.summary.clone(),
+        source_type: legacy_source(candidate.source_type),
+        source_ref: candidate.source_id.clone(),
+        source_created_at: candidate.proposed_at.clone(),
+        importance: candidate.importance,
+        confidence: candidate.confidence,
+        is_sensitive: candidate.is_sensitive,
+        created_at: now.to_string(),
+        updated_at: now.to_string(),
+        confirmed_at: Some(now.to_string()),
+    }
+}
+
+fn insert_confirmed_memory(
+    transaction: &Transaction<'_>,
+    memory: &MemoryRecord,
+) -> Result<(), CandidateMemoryError> {
+    let inserted = transaction
+        .execute(
+            "INSERT INTO memory_record (
+                id, life_id, kind, status, content, summary, source_type, source_ref,
+                source_created_at, importance, confidence, is_sensitive, created_at,
+                updated_at, confirmed_at, revision
+             ) VALUES (
+                ?1, ?2, ?3, 'confirmed', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?12, 1
+             )",
+            params![
+                memory.id,
+                memory.life_id,
+                memory.kind.as_str(),
+                memory.content,
+                memory.summary,
+                memory.source_type.as_str(),
+                memory.source_ref,
+                memory.source_created_at,
+                memory.importance,
+                memory.confidence,
+                memory.is_sensitive,
+                memory.created_at,
+            ],
+        )
+        .map_err(map_sql_error)?;
+    if inserted != 1 {
+        return Err(CandidateMemoryError::storage_unavailable());
+    }
+    Ok(())
+}
+
+fn load_confirmed_memory(
+    connection: &Connection,
+    life_id: &str,
+    memory_id: &str,
+) -> Result<MemoryRecord, CandidateMemoryError> {
+    super::memory::load_owned_memory(connection, life_id, memory_id)
+        .map_err(|_| CandidateMemoryError::storage_unavailable())
+}
+
+/// Maps the accepted-request-id uniqueness violation onto a stable domain error
+/// so a request id reused across candidates does not surface as a generic
+/// constraint failure.
+fn confirm_update_error(error: SqlError) -> CandidateMemoryError {
+    if let SqlError::SqliteFailure(code, message) = &error {
+        if code.code == ErrorCode::ConstraintViolation
+            && message
+                .as_deref()
+                .is_some_and(|message| message.contains("candidate_memory.accepted_request_id"))
+        {
+            return CandidateMemoryError::request_conflict();
+        }
+    }
+    map_sql_error(error)
 }
 
 fn ensure_pending_revision(
@@ -986,13 +1202,44 @@ fn insert_audit(
     actor_type: &str,
     now: &str,
 ) -> Result<CandidateMemoryAuditRecord, CandidateMemoryError> {
+    insert_audit_with_request_id(
+        transaction,
+        audit_id,
+        life_id,
+        candidate_id,
+        action,
+        actor_type,
+        None,
+        now,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_audit_with_request_id(
+    transaction: &Transaction<'_>,
+    audit_id: &str,
+    life_id: &str,
+    candidate_id: &str,
+    action: &str,
+    actor_type: &str,
+    request_id: Option<&str>,
+    now: &str,
+) -> Result<CandidateMemoryAuditRecord, CandidateMemoryError> {
     transaction
         .execute(
             "INSERT INTO candidate_memory_audit (
                 id, candidate_id, life_id, action, actor_type, request_id,
                 result_status, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, 'success', ?6)",
-            params![audit_id, candidate_id, life_id, action, actor_type, now],
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'success', ?7)",
+            params![
+                audit_id,
+                candidate_id,
+                life_id,
+                action,
+                actor_type,
+                request_id,
+                now
+            ],
         )
         .map_err(map_sql_error)?;
     load_audit(transaction, life_id, audit_id)
@@ -1417,11 +1664,12 @@ mod tests {
                 PRIMARY_USER_SUBJECT_ID,
             },
             candidate_service::{
-                AddEvidenceRequest, CandidateMemoryService, DeleteCandidateRequest,
-                EditCandidateRequest, RejectCandidateRequest, RejectionReason,
+                AddEvidenceRequest, CandidateMemoryService, ConfirmCandidateOutcome,
+                ConfirmCandidateRequest, DeleteCandidateRequest, EditCandidateRequest,
+                RejectCandidateRequest, RejectionReason, SensitiveConfirmationGrant,
                 SupersedeCandidateRequest,
             },
-            MemoryKind,
+            MemoryKind, MemoryStatus,
         },
         storage::{
             unique_suffix, LifeIdentityRecord, PersonaTemplateRecord, StorageService,
@@ -3543,6 +3791,865 @@ mod tests {
                     &service, "life-a", "c1"
                 )
                 .is_ok()
+            );
+        }
+    }
+
+    // ── Confirm (D-4) ─────────────────────────────────────────────────
+
+    fn insert_sensitive_candidate(
+        service: &StorageService,
+        id: &str,
+        life_id: &str,
+    ) -> crate::memory::candidate::CandidateMemoryRecord {
+        let mut candidate = pending(id, life_id, "2026-07-14T10:00:00.000Z");
+        candidate.is_sensitive = true;
+        candidate.source_type = CandidateMemorySourceType::Manual;
+        candidate.source_id = None;
+        <StorageService as CandidateMemoryRepository>::insert_candidate(service, candidate).unwrap()
+    }
+
+    fn count_rows(service: &StorageService, sql: &str) -> i64 {
+        service
+            .state()
+            .unwrap()
+            .connection
+            .query_row(sql, [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn confirm_request(
+        candidate_id: &str,
+        revision: i64,
+        request_id: &str,
+    ) -> ConfirmCandidateRequest {
+        ConfirmCandidateRequest {
+            candidate_id: candidate_id.into(),
+            expected_revision: revision,
+            request_id: request_id.into(),
+            sensitive_grant: None,
+        }
+    }
+
+    #[test]
+    fn confirm_promotes_pending_candidate_to_confirmed_memory() {
+        let root = TestRoot::new("confirm-ok");
+        let service = seeded_service(&root);
+        // Seed with every payload column populated so the NULL-out assertions bite.
+        let mut candidate = pending("c1", "life-a", "2026-07-14T10:00:00.000Z");
+        candidate.dedup_fingerprint = Some("fingerprint-c1".into());
+        <StorageService as CandidateMemoryRepository>::insert_candidate(&service, candidate)
+            .unwrap();
+        add_fixture_evidence(&service, "c1", "ev1");
+        let result = CandidateMemoryService::new(&service)
+            .confirm("life-a", confirm_request("c1", 1, "req-1"))
+            .unwrap();
+        assert_eq!(result.outcome, ConfirmCandidateOutcome::Confirmed);
+        assert_eq!(result.candidate.status, CandidateMemoryStatus::Accepted);
+        assert!(result.candidate.content.is_none());
+        // The accepted candidate row nulls out every payload/provenance column.
+        let (content, summary, source_id, fingerprint): (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = service
+            .state()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT content, summary, source_id, dedup_fingerprint
+                 FROM candidate_memory WHERE id = 'c1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(content, None);
+        assert_eq!(summary, None);
+        assert_eq!(source_id, None);
+        assert_eq!(fingerprint, None);
+        assert_eq!(result.candidate.revision, 2);
+        assert_eq!(
+            result.candidate.confirmed_memory_id.as_deref(),
+            Some(result.memory.id.as_str())
+        );
+        assert_eq!(
+            result.candidate.accepted_request_id.as_deref(),
+            Some("req-1")
+        );
+        assert_eq!(result.memory.status, MemoryStatus::Confirmed);
+        assert_eq!(result.memory.content, "Candidate c1");
+        assert_eq!(
+            result.memory.confirmed_at.as_deref(),
+            result.candidate.reviewed_at.as_deref()
+        );
+        // Evidence cleared, audit + revision written.
+        assert_eq!(
+            <StorageService as CandidateMemoryRepository>::count_evidence(&service, "life-a", "c1")
+                .unwrap(),
+            0
+        );
+        assert_eq!(audit_count(&service, "candidate_confirmed"), 1);
+        assert_eq!(
+            count_rows(
+                &service,
+                "SELECT COUNT(*) FROM memory_revision WHERE change_type = 'confirmed'"
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn confirm_non_sensitive_enqueues_upsert() {
+        let root = TestRoot::new("confirm-upsert");
+        let service = seeded_service(&root);
+        insert_candidate(&service, "c1", "life-a", "2026-07-14T10:00:00.000Z");
+        let result = CandidateMemoryService::new(&service)
+            .confirm("life-a", confirm_request("c1", 1, "req-1"))
+            .unwrap();
+        let action: String = service
+            .state()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT desired_action FROM memory_vector_sync_outbox WHERE memory_id = ?1",
+                params![result.memory.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(action, "upsert");
+    }
+
+    #[test]
+    fn confirm_sensitive_requires_consent_and_enqueues_delete() {
+        let root = TestRoot::new("confirm-sensitive");
+        let service = seeded_service(&root);
+        insert_sensitive_candidate(&service, "c1", "life-a");
+        // Missing grant is refused without side effects.
+        let error = CandidateMemoryService::new(&service)
+            .confirm("life-a", confirm_request("c1", 1, "req-1"))
+            .unwrap_err();
+        assert_eq!(error.code, "CANDIDATE_MEMORY_SENSITIVE_CONSENT_REQUIRED");
+        assert_eq!(
+            count_rows(&service, "SELECT COUNT(*) FROM memory_record"),
+            0
+        );
+        // A grant acknowledging a *different* candidate cannot be reused as consent.
+        let error = CandidateMemoryService::new(&service)
+            .confirm(
+                "life-a",
+                ConfirmCandidateRequest {
+                    sensitive_grant: Some(SensitiveConfirmationGrant::acknowledge("other")),
+                    ..confirm_request("c1", 1, "req-1")
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "CANDIDATE_MEMORY_SENSITIVE_CONSENT_REQUIRED");
+        assert_eq!(
+            count_rows(&service, "SELECT COUNT(*) FROM memory_record"),
+            0
+        );
+        // A grant acknowledging this candidate confirms; sensitive memory must not upsert.
+        let result = CandidateMemoryService::new(&service)
+            .confirm(
+                "life-a",
+                ConfirmCandidateRequest {
+                    sensitive_grant: Some(SensitiveConfirmationGrant::acknowledge("c1")),
+                    ..confirm_request("c1", 1, "req-1")
+                },
+            )
+            .unwrap();
+        assert!(result.memory.is_sensitive);
+        let action: String = service
+            .state()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT desired_action FROM memory_vector_sync_outbox WHERE memory_id = ?1",
+                params![result.memory.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(action, "delete");
+    }
+
+    #[test]
+    fn confirm_result_and_audit_do_not_leak_candidate_internals() {
+        let root = TestRoot::new("confirm-no-leak");
+        let service = seeded_service(&root);
+        let mut candidate = pending("c1", "life-a", "2026-07-14T10:00:00.000Z");
+        candidate.content = Some("SECRETCONTENT-marker".into());
+        candidate.summary = Some("SECRETSUMMARY-marker".into());
+        candidate.source_id = Some("SECRETSOURCE-marker".into());
+        candidate.dedup_fingerprint = Some("SECRETFINGERPRINT-marker".into());
+        <StorageService as CandidateMemoryRepository>::insert_candidate(&service, candidate)
+            .unwrap();
+        add_fixture_evidence(&service, "c1", "SECRETEVIDENCE-marker");
+        let result = CandidateMemoryService::new(&service)
+            .confirm("life-a", confirm_request("c1", 1, "req-1"))
+            .unwrap();
+        // The audit record carries only ids/metadata — never candidate payload.
+        let audit_json = serde_json::to_string(&result.audit.unwrap()).unwrap();
+        for marker in [
+            "SECRETCONTENT",
+            "SECRETSUMMARY",
+            "SECRETSOURCE",
+            "SECRETFINGERPRINT",
+            "SECRETEVIDENCE",
+        ] {
+            assert!(
+                !audit_json.contains(marker),
+                "audit leaked {marker}: {audit_json}"
+            );
+        }
+        // The returned candidate is scrubbed of payload/provenance too.
+        assert!(result.candidate.content.is_none());
+        assert!(result.candidate.summary.is_none());
+        assert!(result.candidate.source_id.is_none());
+        assert!(result.candidate.dedup_fingerprint.is_none());
+    }
+
+    #[test]
+    fn confirm_error_messages_reveal_no_sql_paths_or_raw_sqlite_text() {
+        let root = TestRoot::new("confirm-error-privacy");
+        let service = seeded_service(&root);
+        insert_candidate(&service, "c1", "life-a", "2026-07-14T10:00:00.000Z");
+        install_failure_trigger(
+            &service,
+            "CREATE TEMP TRIGGER fail_confirm_probe BEFORE INSERT ON memory_record
+             WHEN NEW.status = 'confirmed'
+             BEGIN SELECT RAISE(ABORT, 'raw sqlite detail /secret/path.db'); END;",
+        );
+        let error = CandidateMemoryService::new(&service)
+            .confirm("life-a", confirm_request("c1", 1, "req-1"))
+            .unwrap_err();
+        let text = format!("{} {}", error.code, error.message).to_lowercase();
+        for needle in [
+            "raw sqlite detail",
+            "/secret/path.db",
+            "insert into",
+            "memory_record",
+            "trigger",
+            ".db",
+        ] {
+            assert!(!text.contains(needle), "error leaked {needle}: {text}");
+        }
+    }
+
+    #[test]
+    fn confirm_is_idempotent_for_same_request_id() {
+        let root = TestRoot::new("confirm-idempotent");
+        let service = seeded_service(&root);
+        insert_candidate(&service, "c1", "life-a", "2026-07-14T10:00:00.000Z");
+        let first = CandidateMemoryService::new(&service)
+            .confirm("life-a", confirm_request("c1", 1, "req-1"))
+            .unwrap();
+        // Replay with the accepted revision and same request id returns the prior memory.
+        let second = CandidateMemoryService::new(&service)
+            .confirm("life-a", confirm_request("c1", 2, "req-1"))
+            .unwrap();
+        assert_eq!(second.outcome, ConfirmCandidateOutcome::AlreadyConfirmed);
+        assert!(second.audit.is_none());
+        assert_eq!(second.memory.id, first.memory.id);
+        assert_eq!(second.candidate.revision, 2);
+        // No duplicate memory, outbox, or audit rows were created.
+        assert_eq!(
+            count_rows(&service, "SELECT COUNT(*) FROM memory_record"),
+            1
+        );
+        assert_eq!(
+            count_rows(&service, "SELECT COUNT(*) FROM memory_vector_sync_outbox"),
+            1
+        );
+        assert_eq!(audit_count(&service, "candidate_confirmed"), 1);
+    }
+
+    #[test]
+    fn confirm_accepted_with_different_request_id_is_request_conflict() {
+        let root = TestRoot::new("confirm-accepted-other-req");
+        let service = seeded_service(&root);
+        insert_candidate(&service, "c1", "life-a", "2026-07-14T10:00:00.000Z");
+        let first = CandidateMemoryService::new(&service)
+            .confirm("life-a", confirm_request("c1", 1, "req-1"))
+            .unwrap();
+        let error = CandidateMemoryService::new(&service)
+            .confirm("life-a", confirm_request("c1", 2, "req-2"))
+            .unwrap_err();
+        assert_eq!(error.code, "CANDIDATE_MEMORY_REQUEST_CONFLICT");
+        // The accepted candidate and its confirmed memory are untouched by the reject.
+        let stored =
+            <StorageService as CandidateMemoryRepository>::get_candidate(&service, "life-a", "c1")
+                .unwrap();
+        assert_eq!(stored.status, CandidateMemoryStatus::Accepted);
+        assert_eq!(stored.accepted_request_id.as_deref(), Some("req-1"));
+        assert_eq!(
+            stored.confirmed_memory_id.as_deref(),
+            Some(first.memory.id.as_str())
+        );
+        assert_eq!(
+            count_rows(&service, "SELECT COUNT(*) FROM memory_record"),
+            1
+        );
+    }
+
+    #[test]
+    fn confirm_reused_request_id_across_candidates_is_request_conflict() {
+        let root = TestRoot::new("confirm-req-conflict");
+        let service = seeded_service(&root);
+        insert_candidate(&service, "c1", "life-a", "2026-07-14T10:00:00.000Z");
+        insert_candidate(&service, "c2", "life-a", "2026-07-14T10:05:00.000Z");
+        CandidateMemoryService::new(&service)
+            .confirm("life-a", confirm_request("c1", 1, "shared-req"))
+            .unwrap();
+        let error = CandidateMemoryService::new(&service)
+            .confirm("life-a", confirm_request("c2", 1, "shared-req"))
+            .unwrap_err();
+        assert_eq!(error.code, "CANDIDATE_MEMORY_REQUEST_CONFLICT");
+        // c2 remains pending and no second memory leaked.
+        assert_eq!(
+            <StorageService as CandidateMemoryRepository>::get_candidate(&service, "life-a", "c2")
+                .unwrap()
+                .status,
+            CandidateMemoryStatus::Pending
+        );
+        assert_eq!(
+            count_rows(&service, "SELECT COUNT(*) FROM memory_record"),
+            1
+        );
+    }
+
+    #[test]
+    fn confirm_revision_conflict_is_rejected() {
+        let root = TestRoot::new("confirm-revision");
+        let service = seeded_service(&root);
+        insert_candidate(&service, "c1", "life-a", "2026-07-14T10:00:00.000Z");
+        let error = CandidateMemoryService::new(&service)
+            .confirm("life-a", confirm_request("c1", 99, "req-1"))
+            .unwrap_err();
+        assert_eq!(error.code, "CANDIDATE_MEMORY_REVISION_CONFLICT");
+        assert_eq!(
+            count_rows(&service, "SELECT COUNT(*) FROM memory_record"),
+            0
+        );
+    }
+
+    #[test]
+    fn confirm_cross_life_is_rejected() {
+        let root = TestRoot::new("confirm-life");
+        let service = seeded_service(&root);
+        insert_candidate(&service, "c1", "life-a", "2026-07-14T10:00:00.000Z");
+        let error = CandidateMemoryService::new(&service)
+            .confirm("life-b", confirm_request("c1", 1, "req-1"))
+            .unwrap_err();
+        assert_eq!(error.code, "CANDIDATE_MEMORY_LIFE_MISMATCH");
+    }
+
+    #[test]
+    fn confirm_rejected_candidate_is_invalid_status() {
+        let root = TestRoot::new("confirm-rejected");
+        let service = seeded_service(&root);
+        insert_candidate(&service, "c1", "life-a", "2026-07-14T10:00:00.000Z");
+        CandidateMemoryService::new(&service)
+            .reject(
+                "life-a",
+                RejectCandidateRequest {
+                    candidate_id: "c1".into(),
+                    expected_revision: 1,
+                    reason: RejectionReason::Other,
+                },
+            )
+            .unwrap();
+        let error = CandidateMemoryService::new(&service)
+            .confirm("life-a", confirm_request("c1", 2, "req-1"))
+            .unwrap_err();
+        assert_eq!(error.code, "CANDIDATE_MEMORY_INVALID_STATUS");
+    }
+
+    /// Asserts a failed confirm left no trace: the candidate is byte-for-byte
+    /// unchanged (still pending, content + source retained, revision unchanged, no
+    /// `confirmed_memory_id` / `accepted_request_id`), its evidence survives, and no
+    /// memory, revision, outbox, or success audit row exists.
+    fn assert_confirm_left_no_trace(
+        service: &StorageService,
+        candidate_id: &str,
+        before: &crate::memory::candidate::CandidateMemoryRecord,
+        expected_evidence: usize,
+    ) {
+        let stored = <StorageService as CandidateMemoryRepository>::get_candidate(
+            service,
+            "life-a",
+            candidate_id,
+        )
+        .unwrap();
+        assert_eq!(&stored, before);
+        assert_eq!(stored.status, CandidateMemoryStatus::Pending);
+        assert!(stored.content.is_some());
+        assert!(stored.confirmed_memory_id.is_none());
+        assert!(stored.accepted_request_id.is_none());
+        assert_eq!(count_rows(service, "SELECT COUNT(*) FROM memory_record"), 0);
+        assert_eq!(
+            count_rows(service, "SELECT COUNT(*) FROM memory_revision"),
+            0
+        );
+        assert_eq!(
+            count_rows(service, "SELECT COUNT(*) FROM memory_vector_sync_outbox"),
+            0
+        );
+        assert_eq!(
+            <StorageService as CandidateMemoryRepository>::count_evidence(
+                service,
+                "life-a",
+                candidate_id,
+            )
+            .unwrap(),
+            expected_evidence
+        );
+        assert_eq!(audit_count(service, "candidate_confirmed"), 0);
+    }
+
+    fn confirm_failure_case(name: &str, trigger_sql: &str) {
+        let root = TestRoot::new(name);
+        let service = seeded_service(&root);
+        let before = insert_candidate(&service, "c1", "life-a", "2026-07-14T10:00:00.000Z");
+        add_fixture_evidence(&service, "c1", "ev1");
+        install_failure_trigger(&service, trigger_sql);
+        let error = CandidateMemoryService::new(&service)
+            .confirm("life-a", confirm_request("c1", 1, "req-1"))
+            .unwrap_err();
+        // Error surface is a stable code with a generic message (no SQL/paths).
+        assert!(error.code.starts_with("CANDIDATE_MEMORY_"));
+        assert!(!error.message.to_lowercase().contains("fixture failure"));
+        assert_confirm_left_no_trace(&service, "c1", &before, 1);
+    }
+
+    #[test]
+    fn confirm_memory_insert_failure_rolls_back_cleanly() {
+        confirm_failure_case(
+            "confirm-fail-memory",
+            "CREATE TEMP TRIGGER fail_confirm_memory BEFORE INSERT ON memory_record
+             WHEN NEW.status = 'confirmed'
+             BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;",
+        );
+    }
+
+    #[test]
+    fn confirm_revision_insert_failure_rolls_back_cleanly() {
+        confirm_failure_case(
+            "confirm-fail-revision",
+            "CREATE TEMP TRIGGER fail_confirm_revision BEFORE INSERT ON memory_revision
+             BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;",
+        );
+    }
+
+    #[test]
+    fn confirm_outbox_insert_failure_rolls_back_cleanly() {
+        confirm_failure_case(
+            "confirm-fail-outbox",
+            "CREATE TEMP TRIGGER fail_confirm_outbox BEFORE INSERT ON memory_vector_sync_outbox
+             BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;",
+        );
+    }
+
+    #[test]
+    fn confirm_candidate_update_failure_rolls_back_cleanly() {
+        confirm_failure_case(
+            "confirm-fail-candidate",
+            "CREATE TEMP TRIGGER fail_confirm_candidate BEFORE UPDATE ON candidate_memory
+             WHEN NEW.status = 'accepted'
+             BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;",
+        );
+    }
+
+    #[test]
+    fn confirm_evidence_delete_failure_rolls_back_cleanly() {
+        confirm_failure_case(
+            "confirm-fail-evidence",
+            "CREATE TEMP TRIGGER fail_confirm_evidence BEFORE DELETE ON candidate_memory_evidence
+             BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;",
+        );
+    }
+
+    #[test]
+    fn confirm_audit_insert_failure_rolls_back_cleanly() {
+        confirm_failure_case(
+            "confirm-fail-audit",
+            "CREATE TEMP TRIGGER fail_confirm_audit BEFORE INSERT ON candidate_memory_audit
+             WHEN NEW.action = 'candidate_confirmed'
+             BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;",
+        );
+    }
+
+    #[test]
+    fn confirm_duplicate_request_id_constraint_rolls_back_before_commit() {
+        // A real DB UNIQUE constraint (accepted_request_id), not a fixture trigger:
+        // c1 is genuinely confirmed under "shared", then c2 attempts the same id.
+        let root = TestRoot::new("confirm-fail-constraint");
+        let service = seeded_service(&root);
+        CandidateMemoryService::new(&service)
+            .confirm("life-a", {
+                insert_candidate(&service, "c1", "life-a", "2026-07-14T10:00:00.000Z");
+                confirm_request("c1", 1, "shared")
+            })
+            .unwrap();
+        let before = insert_candidate(&service, "c2", "life-a", "2026-07-14T10:05:00.000Z");
+        add_fixture_evidence(&service, "c2", "ev2");
+        let error = CandidateMemoryService::new(&service)
+            .confirm("life-a", confirm_request("c2", 1, "shared"))
+            .unwrap_err();
+        assert_eq!(error.code, "CANDIDATE_MEMORY_REQUEST_CONFLICT");
+        // c2 is fully rolled back; only c1's single memory/audit remain.
+        let stored =
+            <StorageService as CandidateMemoryRepository>::get_candidate(&service, "life-a", "c2")
+                .unwrap();
+        assert_eq!(stored, before);
+        assert_eq!(stored.status, CandidateMemoryStatus::Pending);
+        assert!(stored.confirmed_memory_id.is_none());
+        assert!(stored.accepted_request_id.is_none());
+        assert_eq!(
+            count_rows(&service, "SELECT COUNT(*) FROM memory_record"),
+            1
+        );
+        assert_eq!(
+            count_rows(&service, "SELECT COUNT(*) FROM memory_revision"),
+            1
+        );
+        assert_eq!(
+            <StorageService as CandidateMemoryRepository>::count_evidence(&service, "life-a", "c2")
+                .unwrap(),
+            1usize
+        );
+        assert_eq!(audit_count(&service, "candidate_confirmed"), 1);
+    }
+
+    #[test]
+    fn concurrent_confirm_same_request_id_creates_single_memory() {
+        let root = TestRoot::new("confirm-concurrent");
+        let data_root = root.0.join("data");
+        let first = seeded_service(&root);
+        insert_candidate(&first, "c1", "life-a", "2026-07-14T10:00:00.000Z");
+        let second = StorageService::initialize_with_roots(data_root.clone(), None).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = [first, second]
+            .into_iter()
+            .map(|service| {
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    CandidateMemoryService::new(&service)
+                        .confirm("life-a", confirm_request("c1", 1, "req-1"))
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap().unwrap())
+            .collect();
+        // Exactly one fresh confirmation; the other observes the idempotent replay.
+        assert_eq!(
+            results
+                .iter()
+                .filter(|r| r.outcome == ConfirmCandidateOutcome::Confirmed)
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|r| r.outcome == ConfirmCandidateOutcome::AlreadyConfirmed)
+                .count(),
+            1
+        );
+        let verification = StorageService::initialize_with_roots(data_root, None).unwrap();
+        assert_eq!(
+            count_rows(&verification, "SELECT COUNT(*) FROM memory_record"),
+            1
+        );
+        assert_eq!(audit_count(&verification, "candidate_confirmed"), 1);
+    }
+
+    /// Opens a second independent connection over the same data root and returns
+    /// (first, second) services plus the data root for post-run verification.
+    fn two_services(root: &TestRoot) -> (StorageService, StorageService, PathBuf) {
+        let data_root = root.0.join("data");
+        let first = seeded_service(root);
+        let second = StorageService::initialize_with_roots(data_root.clone(), None).unwrap();
+        (first, second, data_root)
+    }
+
+    #[test]
+    fn concurrent_confirm_vs_confirm_distinct_request_ids_confirm_once() {
+        let root = TestRoot::new("confirm-vs-confirm-distinct");
+        let (first, second, data_root) = two_services(&root);
+        insert_candidate(&first, "c1", "life-a", "2026-07-14T10:00:00.000Z");
+        let barrier = Arc::new(Barrier::new(2));
+        let a = {
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                CandidateMemoryService::new(&first)
+                    .confirm("life-a", confirm_request("c1", 1, "req-a"))
+            })
+        };
+        let b = thread::spawn(move || {
+            barrier.wait();
+            CandidateMemoryService::new(&second)
+                .confirm("life-a", confirm_request("c1", 1, "req-b"))
+        });
+        let results = [a.join().unwrap(), b.join().unwrap()];
+        // One fresh confirm; the loser sees the accepted candidate under a foreign
+        // request id and is refused with REQUEST_CONFLICT. Never two memories.
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+        let winner_req = results
+            .iter()
+            .find_map(|r| r.as_ref().ok())
+            .unwrap()
+            .candidate
+            .accepted_request_id
+            .clone()
+            .unwrap();
+        assert!(winner_req == "req-a" || winner_req == "req-b");
+        assert_eq!(
+            results
+                .iter()
+                .filter_map(|r| r.as_ref().err())
+                .filter(|e| e.code == "CANDIDATE_MEMORY_REQUEST_CONFLICT")
+                .count(),
+            1
+        );
+        let verification = StorageService::initialize_with_roots(data_root, None).unwrap();
+        assert_eq!(
+            count_rows(&verification, "SELECT COUNT(*) FROM memory_record"),
+            1
+        );
+        assert_eq!(audit_count(&verification, "candidate_confirmed"), 1);
+        let stored = <StorageService as CandidateMemoryRepository>::get_candidate(
+            &verification,
+            "life-a",
+            "c1",
+        )
+        .unwrap();
+        assert_eq!(stored.status, CandidateMemoryStatus::Accepted);
+        assert_eq!(
+            stored.accepted_request_id.as_deref(),
+            Some(winner_req.as_str())
+        );
+    }
+
+    #[test]
+    fn concurrent_confirm_vs_edit_are_mutually_exclusive() {
+        let root = TestRoot::new("confirm-vs-edit");
+        let (first, second, data_root) = two_services(&root);
+        insert_candidate(&first, "c1", "life-a", "2026-07-14T10:00:00.000Z");
+        let barrier = Arc::new(Barrier::new(2));
+        let confirm = {
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                CandidateMemoryService::new(&first)
+                    .confirm("life-a", confirm_request("c1", 1, "req-1"))
+            })
+        };
+        let edit = thread::spawn(move || {
+            barrier.wait();
+            CandidateMemoryService::new(&second).edit(
+                "life-a",
+                EditCandidateRequest {
+                    candidate_id: "c1".into(),
+                    expected_revision: 1,
+                    kind: MemoryKind::Goal,
+                    content: "Edited before confirm".into(),
+                    summary: None,
+                },
+            )
+        });
+        let confirm_result = confirm.join().unwrap();
+        let edit_result = edit.join().unwrap();
+        // Exactly one of the two revision-1 writers wins.
+        assert_ne!(confirm_result.is_ok(), edit_result.is_ok());
+        let verification = StorageService::initialize_with_roots(data_root, None).unwrap();
+        let stored = <StorageService as CandidateMemoryRepository>::get_candidate(
+            &verification,
+            "life-a",
+            "c1",
+        )
+        .unwrap();
+        assert_eq!(stored.revision, 2);
+        if confirm_result.is_ok() {
+            assert_eq!(stored.status, CandidateMemoryStatus::Accepted);
+            assert_eq!(
+                count_rows(&verification, "SELECT COUNT(*) FROM memory_record"),
+                1
+            );
+        } else {
+            assert_eq!(stored.status, CandidateMemoryStatus::Pending);
+            assert_eq!(stored.content.as_deref(), Some("Edited before confirm"));
+            assert_eq!(
+                count_rows(&verification, "SELECT COUNT(*) FROM memory_record"),
+                0
+            );
+        }
+        assert_eq!(
+            audit_count(&verification, "candidate_confirmed")
+                + audit_count(&verification, "candidate_edited"),
+            1
+        );
+    }
+
+    #[test]
+    fn concurrent_confirm_vs_reject_are_mutually_exclusive() {
+        let root = TestRoot::new("confirm-vs-reject");
+        let (first, second, data_root) = two_services(&root);
+        insert_candidate(&first, "c1", "life-a", "2026-07-14T10:00:00.000Z");
+        let barrier = Arc::new(Barrier::new(2));
+        let confirm = {
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                CandidateMemoryService::new(&first)
+                    .confirm("life-a", confirm_request("c1", 1, "req-1"))
+            })
+        };
+        let reject = thread::spawn(move || {
+            barrier.wait();
+            CandidateMemoryService::new(&second).reject(
+                "life-a",
+                RejectCandidateRequest {
+                    candidate_id: "c1".into(),
+                    expected_revision: 1,
+                    reason: RejectionReason::Other,
+                },
+            )
+        });
+        let confirm_result = confirm.join().unwrap();
+        let reject_result = reject.join().unwrap();
+        assert_ne!(confirm_result.is_ok(), reject_result.is_ok());
+        let verification = StorageService::initialize_with_roots(data_root, None).unwrap();
+        let stored = <StorageService as CandidateMemoryRepository>::get_candidate(
+            &verification,
+            "life-a",
+            "c1",
+        )
+        .unwrap();
+        assert_eq!(stored.revision, 2);
+        if confirm_result.is_ok() {
+            assert_eq!(stored.status, CandidateMemoryStatus::Accepted);
+            assert_eq!(
+                count_rows(&verification, "SELECT COUNT(*) FROM memory_record"),
+                1
+            );
+        } else {
+            assert_eq!(stored.status, CandidateMemoryStatus::Rejected);
+            assert_eq!(
+                count_rows(&verification, "SELECT COUNT(*) FROM memory_record"),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_confirm_vs_expire_are_mutually_exclusive() {
+        let root = TestRoot::new("confirm-vs-expire");
+        let (first, second, data_root) = two_services(&root);
+        let mut candidate = pending("c1", "life-a", "2026-07-14T10:00:00.000Z");
+        candidate.expires_at = Some("2020-01-01T00:00:00.000Z".into());
+        <StorageService as CandidateMemoryRepository>::insert_candidate(&first, candidate).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let confirm = {
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                CandidateMemoryService::new(&first)
+                    .confirm("life-a", confirm_request("c1", 1, "req-1"))
+            })
+        };
+        let expire = thread::spawn(move || {
+            barrier.wait();
+            CandidateMemoryService::new(&second).expire_one(
+                "life-a",
+                "c1",
+                1,
+                "2026-07-14T12:00:00.000Z",
+            )
+        });
+        let confirm_result = confirm.join().unwrap();
+        let expire_result = expire.join().unwrap();
+        // Exactly one revision-1 writer wins the row.
+        assert_ne!(confirm_result.is_ok(), matches!(expire_result, Ok(Some(_))));
+        let verification = StorageService::initialize_with_roots(data_root, None).unwrap();
+        let stored = <StorageService as CandidateMemoryRepository>::get_candidate(
+            &verification,
+            "life-a",
+            "c1",
+        )
+        .unwrap();
+        assert_eq!(stored.revision, 2);
+        if confirm_result.is_ok() {
+            assert_eq!(stored.status, CandidateMemoryStatus::Accepted);
+            assert_eq!(
+                count_rows(&verification, "SELECT COUNT(*) FROM memory_record"),
+                1
+            );
+        } else {
+            assert_eq!(stored.status, CandidateMemoryStatus::Expired);
+            assert_eq!(
+                count_rows(&verification, "SELECT COUNT(*) FROM memory_record"),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_confirm_vs_permanent_delete_are_mutually_exclusive() {
+        let root = TestRoot::new("confirm-vs-delete");
+        let (first, second, data_root) = two_services(&root);
+        insert_candidate(&first, "c1", "life-a", "2026-07-14T10:00:00.000Z");
+        let barrier = Arc::new(Barrier::new(2));
+        let confirm = {
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                CandidateMemoryService::new(&first)
+                    .confirm("life-a", confirm_request("c1", 1, "req-1"))
+            })
+        };
+        let delete = thread::spawn(move || {
+            barrier.wait();
+            CandidateMemoryService::new(&second).delete_permanently(
+                "life-a",
+                DeleteCandidateRequest {
+                    candidate_id: "c1".into(),
+                    expected_revision: 1,
+                },
+            )
+        });
+        let confirm_result = confirm.join().unwrap();
+        let delete_result = delete.join().unwrap();
+        assert_ne!(confirm_result.is_ok(), delete_result.is_ok());
+        let verification = StorageService::initialize_with_roots(data_root, None).unwrap();
+        let exists = count_rows(
+            &verification,
+            "SELECT COUNT(*) FROM candidate_memory WHERE id = 'c1'",
+        );
+        if confirm_result.is_ok() {
+            // Confirm won: candidate accepted, memory present, delete lost to revision guard.
+            assert_eq!(exists, 1);
+            assert_eq!(
+                count_rows(&verification, "SELECT COUNT(*) FROM memory_record"),
+                1
+            );
+            let stored = <StorageService as CandidateMemoryRepository>::get_candidate(
+                &verification,
+                "life-a",
+                "c1",
+            )
+            .unwrap();
+            assert_eq!(stored.status, CandidateMemoryStatus::Accepted);
+        } else {
+            // Delete won: candidate row gone, no memory ever created.
+            assert_eq!(exists, 0);
+            assert_eq!(
+                count_rows(&verification, "SELECT COUNT(*) FROM memory_record"),
+                0
             );
         }
     }

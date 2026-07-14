@@ -65,6 +65,63 @@ pub struct DeleteCandidateRequest {
     pub expected_revision: i64,
 }
 
+/// Explicit consent captured when confirming a candidate flagged as sensitive.
+///
+/// The grant is bound to a specific `candidate_id` and can only be produced via
+/// [`SensitiveConfirmationGrant::acknowledge`]. The inner field is private, so a
+/// caller cannot fabricate consent by flipping a public boolean or struct field;
+/// they must deliberately acknowledge the exact candidate being confirmed, and
+/// `confirm` rejects a grant whose candidate id does not match the request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SensitiveConfirmationGrant {
+    candidate_id: String,
+}
+
+impl SensitiveConfirmationGrant {
+    /// Record explicit user consent to confirm the sensitive candidate `candidate_id`.
+    pub fn acknowledge(candidate_id: impl Into<String>) -> Self {
+        Self {
+            candidate_id: candidate_id.into(),
+        }
+    }
+
+    /// The candidate this consent was granted for.
+    pub fn candidate_id(&self) -> &str {
+        &self.candidate_id
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConfirmCandidateRequest {
+    pub candidate_id: String,
+    pub expected_revision: i64,
+    /// Idempotency key. Re-issuing the same request against the same accepted
+    /// candidate returns the previously confirmed memory instead of confirming
+    /// twice.
+    pub request_id: String,
+    /// Required only when the candidate is sensitive; must be acknowledged for the
+    /// same `candidate_id`.
+    pub sensitive_grant: Option<SensitiveConfirmationGrant>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfirmCandidateOutcome {
+    /// The candidate was pending and has now been confirmed.
+    Confirmed,
+    /// The candidate was already accepted by this same `request_id`; the prior
+    /// result is returned unchanged.
+    AlreadyConfirmed,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConfirmCandidateResult {
+    pub outcome: ConfirmCandidateOutcome,
+    pub candidate: CandidateMemoryRecord,
+    pub memory: crate::memory::MemoryRecord,
+    /// Present only for a fresh confirmation; `None` on idempotent replay.
+    pub audit: Option<CandidateMemoryAuditRecord>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct AddEvidenceRequest {
     pub candidate_id: String,
@@ -162,6 +219,15 @@ pub trait CandidateLifecycleRepository: CandidateMemoryRepository {
         evidence_id: &str,
         audit_id: &str,
     ) -> Result<Option<CandidateMemoryRecord>, CandidateMemoryError>;
+
+    fn confirm_candidate_atomic(
+        &self,
+        life_id: &str,
+        request: ConfirmCandidateRequest,
+        now: &str,
+        memory_id: &str,
+        audit_id: &str,
+    ) -> Result<ConfirmCandidateResult, CandidateMemoryError>;
 }
 
 // ── Prohibited content detection ──────────────────────────────────────
@@ -495,6 +561,28 @@ impl<'a, R: CandidateLifecycleRepository + ?Sized> CandidateMemoryService<'a, R>
             request,
             &now,
             &generate_id("evidence"),
+            &generate_id("audit"),
+        )
+    }
+
+    // ── Confirm ───────────────────────────────────────────────────────
+
+    pub fn confirm(
+        &self,
+        life_id: &str,
+        request: ConfirmCandidateRequest,
+    ) -> Result<ConfirmCandidateResult, CandidateMemoryError> {
+        validate_life_id(life_id)?;
+        validate_candidate_id(&request.candidate_id)?;
+        if request.request_id.trim().is_empty() || request.expected_revision <= 0 {
+            return Err(CandidateMemoryError::constraint());
+        }
+        let now = current_timestamp();
+        self.repository.confirm_candidate_atomic(
+            life_id,
+            request,
+            &now,
+            &generate_id("memory"),
             &generate_id("audit"),
         )
     }

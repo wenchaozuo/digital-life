@@ -344,6 +344,22 @@ impl CandidateMemoryError {
         )
     }
 
+    pub fn sensitive_consent_required() -> Self {
+        Self::new(
+            "CANDIDATE_MEMORY_SENSITIVE_CONSENT_REQUIRED",
+            "Confirming a sensitive candidate memory requires explicit user consent.",
+            true,
+        )
+    }
+
+    pub fn request_conflict() -> Self {
+        Self::new(
+            "CANDIDATE_MEMORY_REQUEST_CONFLICT",
+            "The confirmation request id was already used for a different candidate memory.",
+            true,
+        )
+    }
+
     pub fn new(code: &str, message: impl Into<String>, recoverable: bool) -> Self {
         Self {
             code: code.to_string(),

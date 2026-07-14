@@ -305,7 +305,7 @@ fn candidate_source(
     }
 }
 
-fn legacy_source(source_type: CandidateMemorySourceType) -> MemorySourceType {
+pub(super) fn legacy_source(source_type: CandidateMemorySourceType) -> MemorySourceType {
     match source_type {
         CandidateMemorySourceType::Manual | CandidateMemorySourceType::ExplicitUserRequest => {
             MemorySourceType::Manual

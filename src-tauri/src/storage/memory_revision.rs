@@ -564,12 +564,12 @@ mod tests {
     }
 
     #[test]
-    fn candidate_edit_does_not_create_revision_and_confirm_is_unavailable() {
+    fn legacy_candidate_edit_is_unavailable_and_confirm_is_unavailable() {
         let root = TestRoot::new("initial");
         let service = seeded(&root);
         let candidate = candidate(&service, "life-a", false);
         let memory = MemoryService::new(&service);
-        memory
+        let update_error = memory
             .update_candidate(UpdateMemoryRequest {
                 life_id: "life-a".into(),
                 memory_id: candidate.id.clone(),
@@ -583,8 +583,9 @@ mod tests {
                 confidence: 0.8,
                 is_sensitive: false,
             })
-            .unwrap();
-        // Candidate edit must not create a memory_revision entry.
+            .unwrap_err();
+        assert_eq!(update_error.code, "CANDIDATE_LIFECYCLE_COMMAND_UNAVAILABLE");
+        // A disabled legacy edit must not create a memory_revision entry.
         let revision_count: i64 = service
             .state()
             .unwrap()

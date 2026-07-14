@@ -323,28 +323,6 @@ impl CandidateMemoryRepository for StorageService {
         Ok(updated)
     }
 
-    fn delete_candidate_permanently(
-        &self,
-        life_id: &str,
-        candidate_id: &str,
-    ) -> Result<bool, CandidateMemoryError> {
-        validate_identifier(life_id)?;
-        validate_identifier(candidate_id)?;
-        let mut state = self
-            .state()
-            .map_err(|_| CandidateMemoryError::storage_unavailable())?;
-        let transaction = state.connection.transaction().map_err(map_sql_error)?;
-        load_owned_candidate(&transaction, life_id, candidate_id)?;
-        let deleted = transaction
-            .execute(
-                "DELETE FROM candidate_memory WHERE id = ?1 AND life_id = ?2",
-                params![candidate_id, life_id],
-            )
-            .map_err(map_sql_error)?;
-        transaction.commit().map_err(map_sql_error)?;
-        Ok(deleted == 1)
-    }
-
     fn insert_evidence(
         &self,
         evidence: NewCandidateMemoryEvidence,
@@ -1044,7 +1022,8 @@ pub(super) fn collect_candidates_for_conversation(
     )
 }
 
-#[cfg(test)]
+/// Internal source-governance helper paired with the future message deletion API.
+#[allow(dead_code)]
 pub(super) fn collect_candidates_for_message(
     transaction: &Transaction<'_>,
     life_id: &str,
@@ -1401,6 +1380,7 @@ fn map_sql_error(error: SqlError) -> CandidateMemoryError {
         SqlError::SqliteFailure(code, message) if code.code == ErrorCode::ConstraintViolation => {
             if message.as_deref().is_some_and(|message| {
                 message.contains("idx_candidate_memory_pending_dedup")
+                    || message.contains("idx_candidate_memory_evidence_identity")
                     || (message.contains("candidate_memory.life_id")
                         && message.contains("candidate_memory.subject_id")
                         && message.contains("candidate_memory.kind")
@@ -1416,6 +1396,7 @@ fn map_sql_error(error: SqlError) -> CandidateMemoryError {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use std::{
         fs,
@@ -2537,6 +2518,42 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_evidence_identity_maps_to_a_stable_duplicate_error() {
+        let root = TestRoot::new("evidence-identity-duplicate");
+        let service = seeded_service(&root);
+        insert_candidate(
+            &service,
+            "candidate-a",
+            "life-a",
+            "2026-07-14T10:00:00.000Z",
+        );
+        let evidence = NewCandidateMemoryEvidence {
+            id: "evidence-a".into(),
+            candidate_id: "candidate-a".into(),
+            life_id: "life-a".into(),
+            source_type: CandidateMemorySourceType::Manual,
+            source_id: Some("manual-source".into()),
+            conversation_id: None,
+            message_id: None,
+            observed_at: "2026-07-14T10:00:00.000Z".into(),
+        };
+        <StorageService as CandidateMemoryRepository>::insert_evidence(&service, evidence.clone())
+            .unwrap();
+        let duplicate = NewCandidateMemoryEvidence {
+            id: "evidence-b".into(),
+            ..evidence
+        };
+        let error =
+            <StorageService as CandidateMemoryRepository>::insert_evidence(&service, duplicate)
+                .unwrap_err();
+        assert_eq!(error.code, "CANDIDATE_MEMORY_DUPLICATE");
+        assert!(!error
+            .message
+            .contains("idx_candidate_memory_evidence_identity"));
+        assert!(!error.message.contains("INSERT"));
+    }
+
+    #[test]
     fn candidate_delete_cascades_evidence_but_preserves_audit_and_audit_can_purge() {
         let root = TestRoot::new("audit");
         let service = seeded_service(&root);
@@ -2571,14 +2588,15 @@ mod tests {
             )
             .unwrap();
         }
-        assert!(
-            <StorageService as CandidateMemoryRepository>::delete_candidate_permanently(
-                &service,
+        CandidateMemoryService::new(&service)
+            .delete_permanently(
                 "life-a",
-                "candidate",
+                DeleteCandidateRequest {
+                    candidate_id: "candidate".into(),
+                    expected_revision: 1,
+                },
             )
-            .unwrap()
-        );
+            .unwrap();
         let state = service.state().unwrap();
         let evidence_count: i64 = state
             .connection
@@ -2595,7 +2613,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(evidence_count, 0);
-        assert_eq!(audit_count, 2);
+        assert_eq!(audit_count, 3);
         drop(state);
         assert_eq!(
             <StorageService as CandidateMemoryRepository>::purge_audit_before(

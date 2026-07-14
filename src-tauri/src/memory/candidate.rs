@@ -373,6 +373,13 @@ pub trait CandidateMemoryRepository {
         &self,
         filter: CandidateMemoryListFilter,
     ) -> Result<(Vec<CandidateMemoryRecord>, Option<CandidateMemoryCursor>), CandidateMemoryError>;
+    /// Legacy Candidate mutation is disabled. Governed commands will be introduced in D-5.
+    ///
+    /// Kept only for storage fixtures while candidate lifecycle writes use
+    /// `CandidateLifecycleRepository`.
+    #[deprecated(
+        note = "Legacy Candidate mutation is disabled. Governed commands will be introduced in D-5."
+    )]
     fn update_candidate_guarded(
         &self,
         life_id: &str,
@@ -380,11 +387,13 @@ pub trait CandidateMemoryRepository {
         expected_revision: i64,
         update: CandidateMemoryStorageUpdate,
     ) -> Result<CandidateMemoryRecord, CandidateMemoryError>;
-    fn delete_candidate_permanently(
-        &self,
-        life_id: &str,
-        candidate_id: &str,
-    ) -> Result<bool, CandidateMemoryError>;
+    /// Legacy Candidate mutation is disabled. Governed commands will be introduced in D-5.
+    ///
+    /// Kept only for storage fixtures while candidate lifecycle writes use
+    /// `CandidateLifecycleRepository`.
+    #[deprecated(
+        note = "Legacy Candidate mutation is disabled. Governed commands will be introduced in D-5."
+    )]
     fn insert_evidence(
         &self,
         evidence: NewCandidateMemoryEvidence,
@@ -399,6 +408,13 @@ pub trait CandidateMemoryRepository {
         life_id: &str,
         candidate_id: &str,
     ) -> Result<usize, CandidateMemoryError>;
+    /// Legacy Candidate mutation is disabled. Governed commands will be introduced in D-5.
+    ///
+    /// Kept only for storage fixtures while candidate lifecycle writes use
+    /// `CandidateLifecycleRepository`.
+    #[deprecated(
+        note = "Legacy Candidate mutation is disabled. Governed commands will be introduced in D-5."
+    )]
     fn delete_evidence(
         &self,
         life_id: &str,

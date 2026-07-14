@@ -221,14 +221,6 @@ impl MemoryError {
         )
     }
 
-    pub(crate) fn invalid_transition() -> Self {
-        Self::new(
-            "INVALID_STATE_TRANSITION",
-            "Only candidate memories can be updated or confirmed.",
-            true,
-        )
-    }
-
     pub(crate) fn database() -> Self {
         Self::new(
             "DATABASE_ERROR",
@@ -278,7 +270,6 @@ pub trait MemoryRepository {
     ) -> Result<MemoryRecord, MemoryError>;
     fn list(&self, query: MemoryQuery) -> Result<Vec<MemoryRecord>, MemoryError>;
     fn get(&self, life_id: &str, memory_id: &str) -> Result<MemoryRecord, MemoryError>;
-    fn update_candidate(&self, request: UpdateMemoryRequest) -> Result<MemoryRecord, MemoryError>;
     fn confirm(&self, request: ConfirmMemoryRequest) -> Result<MemoryRecord, MemoryError>;
     fn delete(&self, life_id: &str, memory_id: &str) -> Result<DeleteMemoryResult, MemoryError>;
 }
@@ -318,19 +309,13 @@ impl<'a, R: MemoryRepository> MemoryService<'a, R> {
         self.repository.get(life_id, memory_id)
     }
 
+    /// Legacy Candidate mutation is disabled. Governed commands will be introduced in D-5.
     pub fn update_candidate(
         &self,
         request: UpdateMemoryRequest,
     ) -> Result<MemoryRecord, MemoryError> {
         validate_identifiers(&request.life_id, &request.memory_id)?;
-        validate_memory_content(
-            &request.content,
-            &request.source_created_at,
-            request.importance,
-            request.confidence,
-        )?;
-        validate_source_ref(request.source_ref.as_deref())?;
-        self.repository.update_candidate(request)
+        Err(candidate_lifecycle_command_unavailable())
     }
 
     pub fn confirm(&self, request: ConfirmMemoryRequest) -> Result<MemoryRecord, MemoryError> {
@@ -353,6 +338,14 @@ impl<'a, R: MemoryRepository> MemoryService<'a, R> {
         validate_identifiers(life_id, memory_id)?;
         self.repository.delete(life_id, memory_id)
     }
+}
+
+pub(crate) fn candidate_lifecycle_command_unavailable() -> MemoryError {
+    MemoryError::new(
+        "CANDIDATE_LIFECYCLE_COMMAND_UNAVAILABLE",
+        "Candidate updates and deletion must use the governed Candidate Memory API. This legacy command is disabled.",
+        true,
+    )
 }
 
 fn validate_life_id(life_id: &str) -> Result<(), MemoryError> {
@@ -457,6 +450,7 @@ pub fn get_memory(
 }
 
 #[tauri::command]
+/// Legacy Candidate mutation is disabled. Governed commands will be introduced in D-5.
 pub fn update_memory_candidate(
     storage: State<'_, StorageService>,
     request: UpdateMemoryRequest,
@@ -473,6 +467,7 @@ pub fn confirm_memory(
 }
 
 #[tauri::command]
+/// Legacy Candidate mutation is disabled. Governed commands will be introduced in D-5.
 pub fn delete_memory(
     storage: State<'_, StorageService>,
     life_id: String,

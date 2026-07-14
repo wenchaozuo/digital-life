@@ -4,13 +4,13 @@ use crate::memory::{
     candidate::{
         CandidateInferenceStatus, CandidateMemoryError, CandidateMemoryListFilter,
         CandidateMemoryRecord, CandidateMemoryRepository, CandidateMemorySourceType,
-        CandidateMemoryStatus, CandidateMemoryStorageUpdate, NewCandidateMemory,
-        MAX_CANDIDATE_PAGE_SIZE, PRIMARY_USER_SUBJECT_ID,
+        CandidateMemoryStatus, NewCandidateMemory, MAX_CANDIDATE_PAGE_SIZE,
+        PRIMARY_USER_SUBJECT_ID,
     },
+    candidate_lifecycle_command_unavailable,
     vector_index::MemoryVectorIndexRepository,
     ConfirmMemoryRequest, CreateMemoryCandidateRequest, DeleteMemoryResult, MemoryError,
     MemoryKind, MemoryQuery, MemoryRecord, MemoryRepository, MemorySourceType, MemoryStatus,
-    UpdateMemoryRequest,
 };
 
 use super::StorageService;
@@ -180,51 +180,6 @@ impl MemoryRepository for StorageService {
         }
     }
 
-    fn update_candidate(&self, request: UpdateMemoryRequest) -> Result<MemoryRecord, MemoryError> {
-        let existing = <Self as CandidateMemoryRepository>::get_candidate(
-            self,
-            &request.life_id,
-            &request.memory_id,
-        )
-        .map_err(map_candidate_error)?;
-        if existing.status != CandidateMemoryStatus::Pending {
-            return Err(MemoryError::invalid_transition());
-        }
-        let (source_type, inference_status) = candidate_source(request.source_type);
-        let updated_at = current_timestamp(self)?;
-        <Self as CandidateMemoryRepository>::update_candidate_guarded(
-            self,
-            &request.life_id,
-            &request.memory_id,
-            existing.revision,
-            CandidateMemoryStorageUpdate {
-                kind: request.kind,
-                content: Some(request.content),
-                summary: request.summary,
-                source_type,
-                source_id: request.source_ref,
-                confidence: request.confidence,
-                importance: request.importance,
-                is_sensitive: request.is_sensitive,
-                inference_status,
-                status: CandidateMemoryStatus::Pending,
-                dedup_fingerprint: existing.dedup_fingerprint,
-                proposed_at: request.source_created_at,
-                expires_at: existing.expires_at,
-                reviewed_at: existing.reviewed_at,
-                last_user_edit_at: Some(updated_at.clone()),
-                confirmed_memory_id: None,
-                accepted_request_id: None,
-                rejection_reason_code: None,
-                superseded_by_candidate_id: existing.superseded_by_candidate_id,
-                conflicts_with_memory_id: existing.conflicts_with_memory_id,
-                updated_at,
-            },
-        )
-        .map_err(map_candidate_error)
-        .and_then(candidate_as_legacy)
-    }
-
     fn confirm(&self, request: ConfirmMemoryRequest) -> Result<MemoryRecord, MemoryError> {
         let _legacy_revision_writer =
             super::memory_revision::insert_confirmed_revision_in_transaction;
@@ -242,29 +197,22 @@ impl MemoryRepository for StorageService {
     }
 
     fn delete(&self, life_id: &str, memory_id: &str) -> Result<DeleteMemoryResult, MemoryError> {
-        if let Err(error) =
-            <Self as CandidateMemoryRepository>::get_candidate(self, life_id, memory_id)
-        {
-            if error.code == "CANDIDATE_MEMORY_NOT_FOUND" && {
-                let state = self.state().map_err(|_| MemoryError::database())?;
-                load_owned_memory(&state.connection, life_id, memory_id).is_ok()
-            } {
-                return Err(MemoryError::new(
-                    "MEMORY_NOT_CONFIRMED",
-                    "Confirmed memories require revision-aware permanent deletion.",
-                    true,
-                ));
+        match <Self as CandidateMemoryRepository>::get_candidate(self, life_id, memory_id) {
+            Ok(_) => return Err(candidate_lifecycle_command_unavailable()),
+            Err(error) if error.code != "CANDIDATE_MEMORY_NOT_FOUND" => {
+                return Err(map_candidate_error(error));
             }
-            return Err(map_candidate_error(error));
+            Err(_) => {}
         }
-        let deleted = <Self as CandidateMemoryRepository>::delete_candidate_permanently(
-            self, life_id, memory_id,
-        )
-        .map_err(map_candidate_error)?;
-        Ok(DeleteMemoryResult {
-            memory_id: memory_id.to_string(),
-            deleted,
-        })
+        let state = self.state().map_err(|_| MemoryError::database())?;
+        if load_owned_memory(&state.connection, life_id, memory_id).is_ok() {
+            return Err(MemoryError::new(
+                "MEMORY_NOT_CONFIRMED",
+                "Confirmed memories require revision-aware permanent deletion.",
+                true,
+            ));
+        }
+        Err(MemoryError::not_found())
     }
 }
 
@@ -667,6 +615,130 @@ mod tests {
     }
 
     #[test]
+    fn legacy_candidate_update_is_disabled_without_side_effects() {
+        let root = TestRoot::new("legacy-candidate-update-disabled");
+        let service = seeded_service(&root);
+        let candidate = create_candidate(&service, "life-a", false);
+        {
+            let state = service.state().unwrap();
+            state
+                .connection
+                .execute(
+                    "INSERT INTO candidate_memory_evidence (
+                        id, candidate_id, life_id, source_type, source_id, conversation_id,
+                        message_id, observed_at
+                     ) VALUES ('evidence-a', ?1, 'life-a', 'manual', NULL, NULL, NULL, ?2)",
+                    rusqlite::params![candidate.id, "2026-07-14T10:00:00.000Z"],
+                )
+                .unwrap();
+        }
+        let before = {
+            let state = service.state().unwrap();
+            let candidate_state: (String, Option<String>, String, i64) = state
+                .connection
+                .query_row(
+                    "SELECT content, summary, kind, revision
+                     FROM candidate_memory WHERE id = ?1 AND life_id = 'life-a'",
+                    rusqlite::params![candidate.id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            let evidence_count: i64 = state
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM candidate_memory_evidence WHERE candidate_id = ?1",
+                    rusqlite::params![candidate.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let audit_count: i64 = state
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM candidate_memory_audit WHERE candidate_id = ?1",
+                    rusqlite::params![candidate.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let outbox_count: i64 = state
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM memory_vector_sync_outbox",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let revision_count: i64 = state
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM memory_revision WHERE memory_id = ?1",
+                    rusqlite::params![candidate.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            (
+                candidate_state,
+                evidence_count,
+                audit_count,
+                outbox_count,
+                revision_count,
+            )
+        };
+
+        let error = MemoryService::new(&service)
+            .update_candidate(update_request("life-a", &candidate.id))
+            .unwrap_err();
+        assert_eq!(error.code, "CANDIDATE_LIFECYCLE_COMMAND_UNAVAILABLE");
+
+        let state = service.state().unwrap();
+        let after_candidate: (String, Option<String>, String, i64) = state
+            .connection
+            .query_row(
+                "SELECT content, summary, kind, revision
+                 FROM candidate_memory WHERE id = ?1 AND life_id = 'life-a'",
+                rusqlite::params![candidate.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        let after_evidence: i64 = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM candidate_memory_evidence WHERE candidate_id = ?1",
+                rusqlite::params![candidate.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let after_audit: i64 = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM candidate_memory_audit WHERE candidate_id = ?1",
+                rusqlite::params![candidate.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let after_outbox: i64 = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM memory_vector_sync_outbox",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let after_revisions: i64 = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM memory_revision WHERE memory_id = ?1",
+                rusqlite::params![candidate.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after_candidate, before.0);
+        assert_eq!(after_evidence, before.1);
+        assert_eq!(after_audit, before.2);
+        assert_eq!(after_outbox, before.3);
+        assert_eq!(after_revisions, before.4);
+    }
+
+    #[test]
     fn empty_content_is_rejected() {
         let root = TestRoot::new("empty-content");
         let service = seeded_service(&root);
@@ -750,7 +822,7 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_memory_cannot_be_updated_or_returned_to_candidate() {
+    fn legacy_candidate_update_is_disabled_without_touching_confirmed_memory() {
         let root = TestRoot::new("confirmed-update");
         let service = seeded_service(&root);
         let state = service.state().unwrap();
@@ -772,7 +844,7 @@ mod tests {
         let error = MemoryService::new(&service)
             .update_candidate(update_request("life-a", "confirmed"))
             .unwrap_err();
-        assert_eq!(error.code, "MEMORY_NOT_FOUND");
+        assert_eq!(error.code, "CANDIDATE_LIFECYCLE_COMMAND_UNAVAILABLE");
         assert_eq!(
             MemoryService::new(&service)
                 .get("life-a", "confirmed")
@@ -822,7 +894,7 @@ mod tests {
                 .update_candidate(update_request("life-a", &candidate.id))
                 .unwrap_err()
                 .code,
-            "MEMORY_LIFE_MISMATCH"
+            "CANDIDATE_LIFECYCLE_COMMAND_UNAVAILABLE"
         );
         assert_eq!(
             memory
@@ -851,32 +923,125 @@ mod tests {
     }
 
     #[test]
-    fn permanent_delete_removes_content_and_returns_no_content() {
-        let root = TestRoot::new("hard-delete");
+    fn legacy_candidate_delete_is_disabled_without_side_effects() {
+        let root = TestRoot::new("legacy-candidate-delete-disabled");
         let service = seeded_service(&root);
         let candidate = create_candidate(&service, "life-a", false);
-        let result = MemoryService::new(&service)
+        {
+            let state = service.state().unwrap();
+            state
+                .connection
+                .execute(
+                    "INSERT INTO candidate_memory_evidence (
+                        id, candidate_id, life_id, source_type, source_id, conversation_id,
+                        message_id, observed_at
+                     ) VALUES ('evidence-a', ?1, 'life-a', 'manual', NULL, NULL, NULL, ?2)",
+                    rusqlite::params![candidate.id, "2026-07-14T10:00:00.000Z"],
+                )
+                .unwrap();
+        }
+        let before = {
+            let state = service.state().unwrap();
+            let candidate_state: (String, Option<String>, String, i64) = state
+                .connection
+                .query_row(
+                    "SELECT content, summary, kind, revision
+                     FROM candidate_memory WHERE id = ?1 AND life_id = 'life-a'",
+                    rusqlite::params![candidate.id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            let evidence_count: i64 = state
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM candidate_memory_evidence WHERE candidate_id = ?1",
+                    rusqlite::params![candidate.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let audit_count: i64 = state
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM candidate_memory_audit WHERE candidate_id = ?1",
+                    rusqlite::params![candidate.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let outbox_count: i64 = state
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM memory_vector_sync_outbox",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let revision_count: i64 = state
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM memory_revision WHERE memory_id = ?1",
+                    rusqlite::params![candidate.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            (
+                candidate_state,
+                evidence_count,
+                audit_count,
+                outbox_count,
+                revision_count,
+            )
+        };
+        let error = MemoryService::new(&service)
             .delete("life-a", &candidate.id)
-            .unwrap();
-        assert!(result.deleted);
-        assert_eq!(result.memory_id, candidate.id);
-        assert_eq!(
-            MemoryService::new(&service)
-                .get("life-a", &candidate.id)
-                .unwrap_err()
-                .code,
-            "MEMORY_NOT_FOUND"
-        );
+            .unwrap_err();
+        assert_eq!(error.code, "CANDIDATE_LIFECYCLE_COMMAND_UNAVAILABLE");
         let state = service.state().unwrap();
-        let count: i64 = state
+        let after_candidate: (String, Option<String>, String, i64) = state
             .connection
             .query_row(
-                "SELECT COUNT(*) FROM memory_record WHERE id = ?1 OR content = ?2 OR summary = ?3",
-                rusqlite::params![candidate.id, candidate.content, candidate.summary],
+                "SELECT content, summary, kind, revision
+                 FROM candidate_memory WHERE id = ?1 AND life_id = 'life-a'",
+                rusqlite::params![candidate.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        let after_evidence: i64 = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM candidate_memory_evidence WHERE candidate_id = ?1",
+                rusqlite::params![candidate.id],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 0);
+        let after_audit: i64 = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM candidate_memory_audit WHERE candidate_id = ?1",
+                rusqlite::params![candidate.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let after_outbox: i64 = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM memory_vector_sync_outbox",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let after_revisions: i64 = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM memory_revision WHERE memory_id = ?1",
+                rusqlite::params![candidate.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after_candidate, before.0);
+        assert_eq!(after_evidence, before.1);
+        assert_eq!(after_audit, before.2);
+        assert_eq!(after_outbox, before.3);
+        assert_eq!(after_revisions, before.4);
     }
 
     #[test]

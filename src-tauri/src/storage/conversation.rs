@@ -347,8 +347,10 @@ impl ConversationRepository for StorageService {
     }
 }
 
-#[cfg(test)]
 impl StorageService {
+    /// Internal governed deletion boundary for a future message deletion API.
+    /// It is intentionally not a Tauri command.
+    #[allow(dead_code)]
     pub(crate) fn delete_conversation_message_governed(
         &self,
         life_id: &str,

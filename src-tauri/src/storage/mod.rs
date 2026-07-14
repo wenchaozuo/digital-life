@@ -14,7 +14,10 @@ use std::{
     fmt::Display,
     fs,
     path::{Path, PathBuf},
-    sync::{Mutex, MutexGuard},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex, MutexGuard,
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -24,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
 
 pub const DATABASE_FILE_NAME: &str = "digital-life.sqlite3";
+static UNIQUE_SUFFIX_COUNTER: AtomicU64 = AtomicU64::new(0);
 const MIGRATIONS: &[(i64, &str, &str)] = &[
     (1, "001_initial", include_str!("migrations/001_initial.sql")),
     (
@@ -723,7 +727,8 @@ pub(crate) fn unique_suffix() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
-    format!("{}-{nanos}", std::process::id())
+    let sequence = UNIQUE_SUFFIX_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{}-{nanos}-{sequence}", std::process::id())
 }
 
 #[tauri::command]
@@ -965,6 +970,12 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        collections::HashSet,
+        sync::{Arc, Barrier},
+        thread,
+    };
+
     use super::*;
 
     struct TestRoot(PathBuf);
@@ -982,6 +993,25 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn unique_suffix_is_distinct_for_parallel_storage_fixtures() {
+        let barrier = Arc::new(Barrier::new(16));
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    unique_suffix()
+                })
+            })
+            .collect();
+        let suffixes: HashSet<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(suffixes.len(), 16);
     }
 
     fn seeded_service(root: &Path) -> StorageService {

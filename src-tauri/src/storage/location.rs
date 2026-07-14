@@ -3,12 +3,11 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::{Component, Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
 
-use super::{StorageError, DATABASE_FILE_NAME};
+use super::{unique_suffix, StorageError, DATABASE_FILE_NAME};
 
 pub const LOCATION_CONFIG_FILE_NAME: &str = "storage-location.json";
 
@@ -361,14 +360,6 @@ fn verify_writable(directory: &Path) -> Result<(), StorageError> {
             true,
         )
     })
-}
-
-fn unique_suffix() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    format!("{}-{nanos}", std::process::id())
 }
 
 #[cfg(windows)]

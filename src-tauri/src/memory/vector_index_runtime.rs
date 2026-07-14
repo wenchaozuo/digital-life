@@ -856,16 +856,7 @@ mod tests {
             listener.set_nonblocking(true).unwrap();
             let address = listener.local_addr().unwrap();
             let handle = thread::spawn(move || {
-                let mut stream = (0..500)
-                    .find_map(|_| match listener.accept() {
-                        Ok((stream, _)) => Some(stream),
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            thread::sleep(Duration::from_millis(10));
-                            None
-                        }
-                        Err(error) => panic!("mock listener failed: {error}"),
-                    })
-                    .expect("mock embedding request was not received");
+                let mut stream = accept_blocking_connection(&listener);
                 read_request(&mut stream);
                 let reply = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -879,6 +870,25 @@ mod tests {
                 handle: Some(handle),
             }
         }
+    }
+
+    fn accept_blocking_connection(listener: &TcpListener) -> TcpStream {
+        let stream = (0..500)
+            .find_map(|_| match listener.accept() {
+                Ok((stream, _)) => Some(stream),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                    None
+                }
+                Err(error) => panic!("mock listener failed: {error}"),
+            })
+            .expect("mock embedding request was not received");
+        // The listener is non-blocking only so tests can time out while waiting
+        // for a client. The accepted stream must be blocking before read_request;
+        // otherwise a valid client that has connected but not yet written races
+        // into WouldBlock and panics the fixture thread during teardown.
+        stream.set_nonblocking(false).unwrap();
+        stream
     }
 
     impl Drop for TestServer {
@@ -918,6 +928,35 @@ mod tests {
                 break;
             }
         }
+    }
+
+    #[test]
+    fn mock_server_accepts_connections_in_blocking_mode_before_the_request_arrives() {
+        use std::sync::mpsc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (ready_sender, ready_receiver) = mpsc::channel();
+        let (read_sender, read_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let mut stream = accept_blocking_connection(&listener);
+            ready_sender.send(()).unwrap();
+            let mut byte = [0_u8; 1];
+            read_sender.send(stream.read_exact(&mut byte)).unwrap();
+        });
+
+        let mut client = TcpStream::connect(address).unwrap();
+        ready_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(read_receiver
+            .recv_timeout(Duration::from_millis(50))
+            .is_err());
+        client.write_all(b"x").unwrap();
+        read_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        handle.join().unwrap();
     }
 
     fn test_storage() -> (tempfile::TempDir, StorageService) {

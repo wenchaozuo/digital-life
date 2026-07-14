@@ -3939,7 +3939,9 @@ mod tests {
             .confirm(
                 "life-a",
                 ConfirmCandidateRequest {
-                    sensitive_grant: Some(SensitiveConfirmationGrant::acknowledge("other")),
+                    sensitive_grant: Some(SensitiveConfirmationGrant::acknowledge_for_test(
+                        "other",
+                    )),
                     ..confirm_request("c1", 1, "req-1")
                 },
             )
@@ -3954,7 +3956,7 @@ mod tests {
             .confirm(
                 "life-a",
                 ConfirmCandidateRequest {
-                    sensitive_grant: Some(SensitiveConfirmationGrant::acknowledge("c1")),
+                    sensitive_grant: Some(SensitiveConfirmationGrant::acknowledge_for_test("c1")),
                     ..confirm_request("c1", 1, "req-1")
                 },
             )

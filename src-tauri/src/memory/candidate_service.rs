@@ -67,31 +67,40 @@ pub struct DeleteCandidateRequest {
 
 /// Explicit consent captured when confirming a candidate flagged as sensitive.
 ///
-/// The grant is bound to a specific `candidate_id` and can only be produced via
-/// [`SensitiveConfirmationGrant::acknowledge`]. The inner field is private, so a
-/// caller cannot fabricate consent by flipping a public boolean or struct field;
-/// they must deliberately acknowledge the exact candidate being confirmed, and
-/// `confirm` rejects a grant whose candidate id does not match the request.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The grant is bound to a specific `candidate_id` and has a private field with no
+/// production constructor: it cannot be built through any public, `pub(crate)`,
+/// `Default`, or conversion path, so no ordinary module — candidate service,
+/// repository, or a future Tauri command — can self-issue consent. A real consent
+/// issuance flow (capability token / governed command) is deliberately out of
+/// scope for D-4 and will be introduced by the D-5 command layer. Until then the
+/// grant is only constructible under `#[cfg(test)]`.
+///
+/// `Clone` is intentionally omitted so a single legitimate grant cannot be
+/// duplicated and replayed against other confirmations; the confirm flow only
+/// reads the grant by reference and never needs to copy it.
+#[derive(Debug, PartialEq, Eq)]
 pub struct SensitiveConfirmationGrant {
     candidate_id: String,
 }
 
 impl SensitiveConfirmationGrant {
-    /// Record explicit user consent to confirm the sensitive candidate `candidate_id`.
-    pub fn acknowledge(candidate_id: impl Into<String>) -> Self {
+    /// Test-only constructor. There is deliberately no production entry point for
+    /// building a grant in D-4; see the type-level documentation.
+    #[cfg(test)]
+    pub(crate) fn acknowledge_for_test(candidate_id: impl Into<String>) -> Self {
         Self {
             candidate_id: candidate_id.into(),
         }
     }
 
-    /// The candidate this consent was granted for.
-    pub fn candidate_id(&self) -> &str {
+    /// The candidate this consent was granted for. Crate-visible so the storage
+    /// confirm gate can verify the grant matches the candidate being confirmed.
+    pub(crate) fn candidate_id(&self) -> &str {
         &self.candidate_id
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct ConfirmCandidateRequest {
     pub candidate_id: String,
     pub expected_revision: i64,

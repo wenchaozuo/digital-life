@@ -8,7 +8,6 @@ export {
   MemoryKinds,
   MemorySourceTypes,
   MemoryStatuses,
-  type ConfirmMemoryRequest,
   type CreateMemoryCandidateRequest,
   type DeleteMemoryResult,
   type MemoryKind,

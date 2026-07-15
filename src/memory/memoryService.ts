@@ -1,6 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
-  ConfirmMemoryRequest,
   CreateMemoryCandidateRequest,
   DeleteMemoryResult,
   MemoryQuery,
@@ -44,10 +43,6 @@ export class MemoryService {
     return this.invokeMemory<MemoryRecord>("update_memory_candidate", {
       request,
     });
-  }
-
-  async confirm(request: ConfirmMemoryRequest): Promise<MemoryRecord> {
-    return this.invokeMemory<MemoryRecord>("confirm_memory", { request });
   }
 
   async delete(

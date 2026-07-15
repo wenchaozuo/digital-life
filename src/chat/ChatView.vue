@@ -13,6 +13,7 @@ import ConversationSidebar from "./ConversationSidebar.vue";
 import MessageBubble from "./MessageBubble.vue";
 import { MemoryReviewController } from "./memoryReviewController";
 import { memoryService, memoryExtractor } from "../memory";
+import { candidateConfirmationService } from "../memory/candidateConfirmationService";
 import { lifeIdentityManager } from "../life";
 import { createClosePanelHandler } from "./memoryReviewAdapter";
 
@@ -44,7 +45,7 @@ const interactionDisabled = computed(() => isConversationLoading.value || isSend
 
 const showMemoryPanel = ref(false);
 const showUnconfirmedHint = ref(false);
-const controller = reactive(new MemoryReviewController(memoryService, memoryExtractor));
+const controller = reactive(new MemoryReviewController(memoryService, memoryExtractor, candidateConfirmationService));
 
 let unsubscribeMessages: (() => void) | undefined;
 let unsubscribeBodyState: (() => void) | undefined;
@@ -396,13 +397,13 @@ onUnmounted(() => {
               保存修改
             </button>
 
-            <!-- Stage 2: Confirm Long-term Memory -->
+            <!-- Stage 2: Confirm Long-term Memory (D-5C will implement the two-phase flow) -->
             <button
               v-if="candidate.state === 'candidateCreated'"
               class="btn btn-confirm"
               type="button"
-              :disabled="candidate.isSensitive && !candidate.sensitiveConsentChecked"
-              @click="controller.confirmCandidate(index)"
+              disabled
+              title="Confirmation UI will be implemented in D-5C"
             >
               确认长期记住
             </button>

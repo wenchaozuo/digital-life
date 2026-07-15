@@ -2,12 +2,16 @@ import type {
   MemoryRecord,
   CreateMemoryCandidateRequest,
   UpdateMemoryRequest,
-  ConfirmMemoryRequest,
   DeleteMemoryResult,
   MemoryKind,
   MemorySourceType,
 } from "../memory/types";
 import type { MemoryExtractionResult } from "../memory/extractor/types";
+import type {
+  PreparedCandidateConfirmation,
+  CandidateConfirmationResult,
+  CancelCandidateConfirmationResult,
+} from "../memory/candidateConfirmationTypes";
 
 export type PanelState = "idle" | "extracting" | "empty" | "reviewing" | "failed";
 
@@ -44,8 +48,13 @@ export interface UiCandidate {
 export interface IMemoryService {
   createCandidate(request: CreateMemoryCandidateRequest): Promise<MemoryRecord>;
   updateCandidate(request: UpdateMemoryRequest): Promise<MemoryRecord>;
-  confirm(request: ConfirmMemoryRequest): Promise<MemoryRecord>;
   delete(lifeId: string, memoryId: string): Promise<DeleteMemoryResult>;
+}
+
+export interface ICandidateConfirmationService {
+  prepareCandidateConfirmation(candidateId: string): Promise<PreparedCandidateConfirmation>;
+  confirmCandidateMemory(candidateId: string, approvalToken: string): Promise<CandidateConfirmationResult>;
+  cancelCandidateConfirmationApproval(candidateId: string, approvalToken: string): Promise<CancelCandidateConfirmationResult>;
 }
 
 export interface IMemoryExtractor {
@@ -77,10 +86,16 @@ export class MemoryReviewController {
 
   private memoryService: IMemoryService;
   private memoryExtractor: IMemoryExtractor;
+  private confirmationService: ICandidateConfirmationService;
 
-  constructor(memoryService: IMemoryService, memoryExtractor: IMemoryExtractor) {
+  constructor(
+    memoryService: IMemoryService,
+    memoryExtractor: IMemoryExtractor,
+    confirmationService: ICandidateConfirmationService,
+  ) {
     this.memoryService = memoryService;
     this.memoryExtractor = memoryExtractor;
+    this.confirmationService = confirmationService;
   }
 
   setLifeId(lifeId: string): void {
@@ -257,7 +272,45 @@ export class MemoryReviewController {
     }
   }
 
-  async confirmCandidate(index: number): Promise<void> {
+  async prepareCandidate(index: number): Promise<PreparedCandidateConfirmation | null> {
+    const candidate = this.candidates[index];
+    if (!candidate) {
+      return null;
+    }
+
+    if (candidate.state === "confirmed") {
+      return null;
+    }
+
+    if (!candidate.dbRecord || !candidate.dbRecord.id) {
+      candidate.error = {
+        code: "MISSING_ID",
+        message: "Cannot prepare a candidate that has not been saved.",
+        stage: "confirmation",
+      };
+      return null;
+    }
+
+    candidate.state = "confirming";
+    candidate.error = undefined;
+
+    try {
+      const prepared = await this.confirmationService.prepareCandidateConfirmation(
+        candidate.dbRecord.id,
+      );
+      return prepared;
+    } catch (err: unknown) {
+      candidate.state = "candidateCreated";
+      candidate.error = {
+        code: getErrorCode(err),
+        message: getErrorMessage(err),
+        stage: "confirmation",
+      };
+      return null;
+    }
+  }
+
+  async confirmCandidate(index: number, approvalToken: string): Promise<void> {
     const candidate = this.candidates[index];
     if (!candidate) {
       return;
@@ -276,36 +329,39 @@ export class MemoryReviewController {
       return;
     }
 
-    if (candidate.isSensitive && !candidate.sensitiveConsentChecked) {
-      candidate.error = {
-        code: "SENSITIVE_CONSENT_REQUIRED",
-        message: "Explicit consent is required to confirm sensitive memory.",
-        stage: "confirmation",
-      };
-      return;
-    }
-
     candidate.state = "confirming";
     candidate.error = undefined;
 
     try {
-      const request: ConfirmMemoryRequest = {
-        lifeId: this.lifeId,
-        memoryId: candidate.dbRecord.id,
-        userConfirmed: true,
-        sensitiveConsent: candidate.isSensitive ? candidate.sensitiveConsentChecked : false,
-      };
-
-      const record = await this.memoryService.confirm(request);
-      candidate.dbRecord = record;
+      await this.confirmationService.confirmCandidateMemory(
+        candidate.dbRecord.id,
+        approvalToken,
+      );
       candidate.state = "confirmed";
+      // Note: result.confirmedMemoryId could be used for UI refresh in D-5C
     } catch (err: unknown) {
-      candidate.state = "candidateCreated"; // Remain in candidateCreated state
+      candidate.state = "candidateCreated";
       candidate.error = {
         code: getErrorCode(err),
         message: getErrorMessage(err),
         stage: "confirmation",
       };
+    }
+  }
+
+  async cancelCandidatePreparation(index: number, approvalToken: string): Promise<void> {
+    const candidate = this.candidates[index];
+    if (!candidate || !candidate.dbRecord?.id) {
+      return;
+    }
+
+    try {
+      await this.confirmationService.cancelCandidateConfirmationApproval(
+        candidate.dbRecord.id,
+        approvalToken,
+      );
+    } catch {
+      // Cancel failure is non-critical for UI
     }
   }
 

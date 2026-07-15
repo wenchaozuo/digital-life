@@ -509,3 +509,37 @@ test("13. Controller 不直接调用 ConfirmationService", () => {
   assert.equal(typeof controller.confirmPreparedCandidate, 'function');
   assert.equal(typeof controller.cancelPreparedCandidate, 'function');
 });
+
+test("14. authoritative confirmation refresh updates candidate and confirmed records", async () => {
+  const { mockMemoryService, mockMemoryExtractor, mockConfirmationActions } = createMocks();
+  const listQueries: Array<{ lifeId: string; status?: "candidate" | "confirmed" }> = [];
+  const controller = new MemoryReviewController(mockMemoryService, mockMemoryExtractor, mockConfirmationActions);
+  controller.setLifeId("life-123");
+  await controller.extract([{ role: "user", content: "oolong tea", timestamp: "2026-07-12" }]);
+  await controller.createCandidate(0);
+
+  const confirmedRecord: MemoryRecord = {
+    ...controller.candidates[0].dbRecord!,
+    id: "confirmed-memory-123",
+    status: "confirmed",
+    confirmedAt: "2026-07-13T00:00:00Z",
+  };
+  mockMemoryService.list = async (query) => {
+    listQueries.push(query);
+    return query.status === "confirmed" ? [confirmedRecord] : [];
+  };
+
+  await controller.refreshConfirmationData({
+    candidateId: "db-mem-123",
+    confirmedMemoryId: "confirmed-memory-123",
+    outcome: "confirmed",
+  });
+
+  assert.deepEqual(listQueries, [
+    { lifeId: "life-123", status: "candidate" },
+    { lifeId: "life-123", status: "confirmed" },
+  ]);
+  assert.equal(controller.candidates[0].state, "confirmed");
+  assert.equal(controller.candidates[0].dbRecord, confirmedRecord);
+  assert.deepEqual(controller.confirmedMemories, [confirmedRecord]);
+});

@@ -24,11 +24,13 @@ const emit = defineEmits<{
   cancel: [];
   close: [];
   retryPrepare: [];
+  retryConfirm: [];
 }>();
 
 // ── Refs ──────────────────────────────────────────────────────────────
 
 const dialogRef = ref<HTMLDialogElement | null>(null);
+const closeButtonRef = ref<HTMLButtonElement | null>(null);
 const previousFocus = ref<HTMLElement | null>(null);
 
 // ── Computed ──────────────────────────────────────────────────────────
@@ -44,23 +46,30 @@ const isLoading = computed(
     props.phase === "cancelling",
 );
 
+const isCloseLocked = computed(
+  () => props.phase === "confirming" || props.phase === "cancelling",
+);
+
 const isExpired = computed(() => {
   if (!props.prepared?.expiresAt) return false;
   const timestamp = Date.parse(props.prepared.expiresAt);
   return !Number.isFinite(timestamp) || Date.now() > timestamp;
 });
 
+const errorAction = computed(() => props.error?.action ?? null);
+
 const canConfirm = computed(
   () =>
     props.phase === "prepared" &&
     props.prepared !== null &&
     !isExpired.value &&
-    !isLoading.value,
+    !isLoading.value &&
+    errorAction.value !== "none",
 );
 
 const canCancel = computed(
   () =>
-    (props.phase === "prepared" || props.phase === "failed") &&
+    props.phase === "prepared" &&
     !isLoading.value,
 );
 
@@ -96,8 +105,6 @@ const sourceLabel = computed(() => {
   return map[props.prepared.source] ?? props.prepared.source;
 });
 
-const errorAction = computed(() => props.error?.action ?? null);
-
 const errorMessage = computed(() => {
   if (!props.error) return "";
   // Use safe fixed message, never raw error
@@ -112,33 +119,28 @@ watch(
     if (isOpen) {
       previousFocus.value = document.activeElement as HTMLElement;
       await nextTick();
-      dialogRef.value?.showModal();
-      // Focus the first focusable element
-      dialogRef.value?.focus();
+      if (!props.open || !dialogRef.value) return;
+      if (!dialogRef.value.open) dialogRef.value.showModal();
+      closeButtonRef.value?.focus();
     } else {
-      dialogRef.value?.close();
-      // Restore focus
-      previousFocus.value?.focus();
+      if (dialogRef.value?.open) dialogRef.value.close();
+      if (previousFocus.value?.isConnected) previousFocus.value.focus();
     }
   },
+  { immediate: true },
 );
 
 // ── Keyboard Handling ─────────────────────────────────────────────────
 
 function handleKeydown(event: KeyboardEvent) {
-  if (event.key === "Escape") {
+  if (props.open && event.key === "Escape") {
     event.preventDefault();
     handleEscape();
   }
 }
 
 function handleEscape() {
-  // During confirm/cancel, don't allow close
-  if (props.phase === "confirming" || props.phase === "cancelling") {
-    return;
-  }
-  // Trigger cancel (which will call backend)
-  emit("cancel");
+  requestClose();
 }
 
 // ── Actions ───────────────────────────────────────────────────────────
@@ -154,12 +156,24 @@ function handleCancel() {
 }
 
 function handleClose() {
-  if (isLoading.value) return;
-  emit("close");
+  requestClose();
 }
 
-function handleRetry() {
+function requestClose() {
+  if (isCloseLocked.value) return;
+  if (props.phase === "prepared") {
+    emit("cancel");
+  } else {
+    emit("close");
+  }
+}
+
+function handleRetryPrepare() {
   emit("retryPrepare");
+}
+
+function handleRetryConfirm() {
+  if (canConfirm.value) emit("retryConfirm");
 }
 
 // ── Lifecycle ─────────────────────────────────────────────────────────
@@ -181,7 +195,7 @@ onUnmounted(() => {
     aria-modal="true"
     aria-labelledby="confirmation-title"
     :aria-busy="isLoading"
-    @close="handleClose"
+    @cancel.prevent="handleEscape"
   >
     <!-- Backdrop -->
     <div class="dialog-backdrop" @click="handleClose"></div>
@@ -194,9 +208,10 @@ onUnmounted(() => {
           {{ isSensitive ? "确认保存敏感记忆" : "确认保存记忆" }}
         </h2>
         <button
+          ref="closeButtonRef"
           class="close-btn"
           type="button"
-          :disabled="isLoading"
+          :disabled="isCloseLocked"
           aria-label="关闭"
           @click="handleClose"
         >
@@ -211,7 +226,8 @@ onUnmounted(() => {
       </div>
 
       <!-- Preview Content -->
-      <div v-else-if="prepared" class="dialog-body">
+      <div v-else class="dialog-body">
+        <template v-if="prepared">
         <!-- Sensitive Warning -->
         <div
           v-if="isSensitive"
@@ -251,10 +267,10 @@ onUnmounted(() => {
             </div>
           </div>
 
-          <div v-if="prepared.summary" class="preview-field full-width">
+          <div class="preview-field full-width">
             <span class="field-label">摘要</span>
             <div class="field-content summary">
-              {{ prepared.summary }}
+              {{ prepared.summary ?? "暂无摘要" }}
             </div>
           </div>
 
@@ -264,7 +280,18 @@ onUnmounted(() => {
           </div>
         </div>
 
-        <!-- Error Display -->
+        </template>
+
+        <div v-if="phase === 'confirming'" class="dialog-loading" role="status">
+          <div class="spinner"></div>
+          <p>正在确认保存...</p>
+        </div>
+        <div v-else-if="phase === 'cancelling'" class="dialog-loading" role="status">
+          <div class="spinner"></div>
+          <p>正在取消确认...</p>
+        </div>
+
+        <!-- Error Display, including failed states whose preview was cleared by the Store -->
         <div v-if="error" class="error-banner" role="alert">
           <p class="error-message">{{ errorMessage }}</p>
 
@@ -273,7 +300,7 @@ onUnmounted(() => {
             <button
               class="btn btn-secondary"
               type="button"
-              @click="handleRetry"
+              @click="handleRetryPrepare"
             >
               重新准备
             </button>
@@ -285,7 +312,7 @@ onUnmounted(() => {
               class="btn btn-secondary"
               type="button"
               :disabled="isLoading"
-              @click="handleConfirm"
+              @click="handleRetryConfirm"
             >
               重试
             </button>
@@ -296,7 +323,7 @@ onUnmounted(() => {
             <button
               class="btn btn-secondary"
               type="button"
-              @click="handleRetry"
+              @click="handleRetryPrepare"
             >
               稍后重试
             </button>
@@ -313,11 +340,17 @@ onUnmounted(() => {
             </button>
           </div>
         </div>
+        <div v-else-if="phase === 'failed'" class="error-banner" role="alert">
+          <p class="error-message">确认操作未能完成，请关闭后重新加载候选状态。</p>
+          <div class="error-actions">
+            <button class="btn btn-secondary" type="button" @click="handleClose">关闭</button>
+          </div>
+        </div>
       </div>
 
       <!-- Footer Actions -->
       <footer
-        v-if="prepared && phase !== 'preparing'"
+        v-if="prepared && phase === 'prepared'"
         class="dialog-footer"
       >
         <button
@@ -326,7 +359,7 @@ onUnmounted(() => {
           :disabled="!canCancel"
           @click="handleCancel"
         >
-          {{ phase === "cancelling" ? "取消中..." : "取消" }}
+          取消
         </button>
 
         <button
@@ -336,7 +369,7 @@ onUnmounted(() => {
           :disabled="!canConfirm"
           @click="handleConfirm"
         >
-          {{ phase === "confirming" ? "确认中..." : "确认保存敏感记忆" }}
+          确认保存敏感记忆
         </button>
         <button
           v-else
@@ -345,7 +378,7 @@ onUnmounted(() => {
           :disabled="!canConfirm"
           @click="handleConfirm"
         >
-          {{ phase === "confirming" ? "确认中..." : "确认保存" }}
+          确认保存
         </button>
       </footer>
     </div>

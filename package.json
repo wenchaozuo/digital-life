@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
-    "test": "node tests/checkNoExplicitAny.mjs && node --test tests/memoryExtractor.test.ts tests/memoryReview.test.ts tests/modelSettings.test.ts tests/memoryVectorIndexSettings.test.ts tests/memoryVectorSyncSettings.test.ts tests/memoryVectorSyncWorker.test.mjs tests/secureChat.test.mjs tests/conversationPersistence.test.ts tests/conversationManagementUi.test.ts tests/memoryManagementService.test.ts tests/memoryCenterController.test.ts tests/candidateConfirmationService.test.ts tests/candidateConfirmationStore.test.ts",
+    "test": "npm run test:unit && npm run test:components",
+    "test:unit": "node tests/checkNoExplicitAny.mjs && node --test tests/memoryExtractor.test.ts tests/memoryReview.test.ts tests/modelSettings.test.ts tests/memoryVectorIndexSettings.test.ts tests/memoryVectorSyncSettings.test.ts tests/memoryVectorSyncWorker.test.mjs tests/secureChat.test.mjs tests/conversationPersistence.test.ts tests/conversationManagementUi.test.ts tests/memoryManagementService.test.ts tests/memoryCenterController.test.ts tests/candidateConfirmationService.test.ts tests/candidateConfirmationStore.test.ts",
+    "test:components": "vitest run",
     "preview": "vite preview",
     "tauri": "tauri"
   },
@@ -20,8 +22,11 @@
   "devDependencies": {
     "@tauri-apps/cli": "^2",
     "@vitejs/plugin-vue": "^5.2.1",
+    "@vue/test-utils": "^2.4.11",
+    "happy-dom": "^17.6.3",
     "typescript": "~5.6.2",
     "vite": "^6.0.3",
+    "vitest": "^3.2.7",
     "vue-tsc": "^2.1.10"
   }
 }

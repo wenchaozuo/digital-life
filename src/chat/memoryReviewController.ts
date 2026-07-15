@@ -7,6 +7,7 @@ import type {
   MemorySourceType,
 } from "../memory/types";
 import type { MemoryExtractionResult } from "../memory/extractor/types";
+import type { CandidateConfirmationResult } from "../memory/candidateConfirmationTypes";
 
 // ── Confirmation Actions Interface ────────────────────────────────────
 // Controller depends on this interface, not on Pinia directly.
@@ -58,6 +59,7 @@ export interface UiCandidate {
 
 export interface IMemoryService {
   createCandidate(request: CreateMemoryCandidateRequest): Promise<MemoryRecord>;
+  list?(query: { lifeId: string; status?: "candidate" | "confirmed" }): Promise<readonly MemoryRecord[]>;
   updateCandidate(request: UpdateMemoryRequest): Promise<MemoryRecord>;
   delete(lifeId: string, memoryId: string): Promise<DeleteMemoryResult>;
 }
@@ -86,6 +88,7 @@ function hasCode(err: unknown): err is ErrorWithCode {
 export class MemoryReviewController {
   panelState: PanelState = "idle";
   candidates: UiCandidate[] = [];
+  confirmedMemories: readonly MemoryRecord[] = [];
   lifeId = "";
   error: { code: string; message: string; stage?: string } | null = null;
 
@@ -281,21 +284,18 @@ export class MemoryReviewController {
    */
   async prepareCandidate(index: number): Promise<void> {
     const candidate = this.candidates[index];
+    if (!candidate?.dbRecord?.id) return;
+    await this.prepareCandidateById(candidate.dbRecord.id);
+  }
+
+  async prepareCandidateById(candidateId: string): Promise<void> {
+    const candidate = this.findCandidateByMemoryId(candidateId);
     if (!candidate) return;
     if (candidate.state === "confirmed") return;
-    if (!candidate.dbRecord?.id) {
-      candidate.error = {
-        code: "MISSING_ID",
-        message: "Cannot prepare a candidate that has not been saved.",
-        stage: "confirmation",
-      };
-      return;
-    }
-
     candidate.error = undefined;
 
     try {
-      await this.confirmationActions.prepare(candidate.dbRecord.id);
+      await this.confirmationActions.prepare(candidateId);
     } catch (err: unknown) {
       candidate.error = {
         code: getErrorCode(err),
@@ -312,9 +312,14 @@ export class MemoryReviewController {
   async confirmPreparedCandidate(index: number): Promise<void> {
     const candidate = this.candidates[index];
     if (!candidate?.dbRecord?.id) return;
+    await this.confirmPreparedCandidateById(candidate.dbRecord.id);
+  }
 
+  async confirmPreparedCandidateById(candidateId: string): Promise<void> {
+    const candidate = this.findCandidateByMemoryId(candidateId);
+    if (!candidate) return;
     try {
-      await this.confirmationActions.confirm(candidate.dbRecord.id);
+      await this.confirmationActions.confirm(candidateId);
     } catch (err: unknown) {
       candidate.error = {
         code: getErrorCode(err),
@@ -330,9 +335,14 @@ export class MemoryReviewController {
   async cancelPreparedCandidate(index: number): Promise<void> {
     const candidate = this.candidates[index];
     if (!candidate?.dbRecord?.id) return;
+    await this.cancelPreparedCandidateById(candidate.dbRecord.id);
+  }
 
+  async cancelPreparedCandidateById(candidateId: string): Promise<void> {
+    const candidate = this.findCandidateByMemoryId(candidateId);
+    if (!candidate) return;
     try {
-      await this.confirmationActions.cancel(candidate.dbRecord.id);
+      await this.confirmationActions.cancel(candidateId);
     } catch (err: unknown) {
       candidate.error = {
         code: getErrorCode(err),
@@ -340,6 +350,43 @@ export class MemoryReviewController {
         stage: "confirmation",
       };
     }
+  }
+
+  /** Refresh candidate and confirmed-memory records after an authoritative confirmation. */
+  async refreshConfirmationData(result?: CandidateConfirmationResult): Promise<void> {
+    if (!this.memoryService.list) return;
+
+    const [candidateRecords, confirmedMemories] = await Promise.all([
+      this.memoryService.list({ lifeId: this.lifeId, status: "candidate" }),
+      this.memoryService.list({ lifeId: this.lifeId, status: "confirmed" }),
+    ]);
+    const candidateById = new Map(candidateRecords.map((record) => [record.id, record]));
+    const confirmedById = new Map(confirmedMemories.map((record) => [record.id, record]));
+
+    if (result) {
+      const confirmed = confirmedById.get(result.confirmedMemoryId);
+      const confirmedCandidate = this.findCandidateByMemoryId(result.candidateId);
+      if (confirmed && confirmedCandidate) {
+        confirmedCandidate.dbRecord = confirmed;
+        confirmedCandidate.state = "confirmed";
+      }
+    }
+
+    for (const candidate of this.candidates) {
+      const candidateId = candidate.dbRecord?.id;
+      if (!candidateId) continue;
+      if (candidate.state === "confirmed") continue;
+      const confirmed = confirmedById.get(candidateId);
+      const pending = candidateById.get(candidateId);
+      if (confirmed) {
+        candidate.dbRecord = confirmed;
+        candidate.state = "confirmed";
+      } else if (pending) {
+        candidate.dbRecord = pending;
+        candidate.state = "candidateCreated";
+      }
+    }
+    this.confirmedMemories = confirmedMemories;
   }
 
   async deleteCandidate(index: number): Promise<void> {
@@ -387,6 +434,10 @@ export class MemoryReviewController {
     if (this.candidates.length === 0) {
       this.panelState = "empty";
     }
+  }
+
+  private findCandidateByMemoryId(candidateId: string): UiCandidate | undefined {
+    return this.candidates.find((candidate) => candidate.dbRecord?.id === candidateId);
   }
 
   isModified(index: number): boolean {

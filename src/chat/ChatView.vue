@@ -15,6 +15,10 @@ import CandidateConfirmationDialog from "./components/CandidateConfirmationDialo
 import { MemoryReviewController } from "./memoryReviewController";
 import { memoryService, memoryExtractor } from "../memory";
 import { useCandidateConfirmationStore } from "../stores/candidateConfirmation";
+import {
+  CandidateConfirmationError,
+  type CandidateConfirmationResult,
+} from "../memory/candidateConfirmationTypes";
 import { lifeIdentityManager } from "../life";
 import { createClosePanelHandler } from "./memoryReviewAdapter";
 
@@ -52,7 +56,20 @@ const controller = reactive(new MemoryReviewController(memoryService, memoryExtr
 // ── Confirmation Dialog State ─────────────────────────────────────────
 
 const showConfirmationDialog = ref(false);
-const confirmingCandidateIndex = ref<number>(-1);
+const activeConfirmationCandidateId = ref<string | null>(null);
+const confirmationUiError = ref<CandidateConfirmationError | null>(null);
+const confirmationNotice = ref<string>();
+const confirmationRefreshNotice = ref<string>();
+const dialogError = computed(() => confirmationUiError.value ?? confirmationStore.error);
+const confirmationFlowActive = computed(() => activeConfirmationCandidateId.value !== null);
+
+function setCandidateMismatchError(): void {
+  confirmationUiError.value = new CandidateConfirmationError(
+    "CANDIDATE_CONFIRMATION_INTERNAL_ERROR",
+    "The prepared candidate no longer matches this confirmation.",
+    "none",
+  );
+}
 
 // Open dialog when store enters preparing or prepared phase
 watch(
@@ -61,72 +78,84 @@ watch(
     if (phase === "preparing" || phase === "prepared") {
       showConfirmationDialog.value = true;
     }
+    if (
+      phase === "prepared" &&
+      confirmationStore.prepared &&
+      confirmationStore.prepared.candidateId !== activeConfirmationCandidateId.value
+    ) {
+      setCandidateMismatchError();
+    }
     // Close on success
     if (phase === "succeeded") {
+      const result = confirmationStore.result;
       showConfirmationDialog.value = false;
-      confirmingCandidateIndex.value = -1;
-      // Refresh the candidate list
-      handleConfirmationSuccess();
+      if (result) void handleConfirmationSuccess(result);
     }
     // Close on idle (after cancel)
     if (phase === "idle") {
       showConfirmationDialog.value = false;
-      confirmingCandidateIndex.value = -1;
+      activeConfirmationCandidateId.value = null;
+      confirmationUiError.value = null;
     }
   },
 );
 
-async function handleConfirmationSuccess(): Promise<void> {
-  // Mark the candidate as confirmed in the controller
-  if (confirmingCandidateIndex.value >= 0) {
-    const candidate = controller.candidates[confirmingCandidateIndex.value];
-    if (candidate) {
-      candidate.state = "confirmed";
-    }
-  }
-  // Clear store result after handling
+async function handleConfirmationSuccess(result: CandidateConfirmationResult): Promise<void> {
+  confirmationNotice.value = result.outcome === "idempotentReplay"
+    ? "该记忆此前已经保存。"
+    : "已保存到长期记忆。";
   confirmationStore.clearCandidateConfirmation();
+  try {
+    await controller.refreshConfirmationData(result);
+    confirmationRefreshNotice.value = undefined;
+  } catch {
+    confirmationRefreshNotice.value = "记忆已保存，但列表刷新失败，请稍后重新加载。";
+  }
 }
 
 function handleOpenConfirmation(index: number): void {
-  confirmingCandidateIndex.value = index;
   const candidate = controller.candidates[index];
-  if (!candidate?.dbRecord?.id) return;
+  if (!candidate?.dbRecord?.id || confirmationFlowActive.value) return;
 
-  // Call prepare via controller
-  controller.prepareCandidate(index);
+  activeConfirmationCandidateId.value = candidate.dbRecord.id;
+  confirmationUiError.value = null;
+  void controller.prepareCandidateById(candidate.dbRecord.id);
 }
 
 function handleDialogConfirm(): void {
-  if (confirmingCandidateIndex.value < 0) return;
-  const candidate = controller.candidates[confirmingCandidateIndex.value];
-  if (!candidate?.dbRecord?.id) return;
-
-  controller.confirmPreparedCandidate(confirmingCandidateIndex.value);
+  const candidateId = confirmationStore.prepared?.candidateId;
+  if (!candidateId || candidateId !== activeConfirmationCandidateId.value) {
+    setCandidateMismatchError();
+    return;
+  }
+  void controller.confirmPreparedCandidateById(candidateId);
 }
 
 function handleDialogCancel(): void {
-  if (confirmingCandidateIndex.value < 0) return;
-  const candidate = controller.candidates[confirmingCandidateIndex.value];
-  if (!candidate?.dbRecord?.id) return;
-
-  controller.cancelPreparedCandidate(confirmingCandidateIndex.value);
+  const candidateId = confirmationStore.prepared?.candidateId;
+  if (!candidateId || candidateId !== activeConfirmationCandidateId.value) {
+    setCandidateMismatchError();
+    return;
+  }
+  void controller.cancelPreparedCandidateById(candidateId);
 }
 
 function handleDialogClose(): void {
-  // Local close without backend cancel
-  // Token will expire naturally in Rust
+  if (confirmationStore.phase === "confirming" || confirmationStore.phase === "cancelling") return;
+  // Preparing has no issued token; failed has no cancellable authorization.
   showConfirmationDialog.value = false;
-  confirmingCandidateIndex.value = -1;
   confirmationStore.clearCandidateConfirmation();
 }
 
-function handleDialogRetry(): void {
-  if (confirmingCandidateIndex.value < 0) return;
-  const candidate = controller.candidates[confirmingCandidateIndex.value];
-  if (!candidate?.dbRecord?.id) return;
+function handleDialogRetryPrepare(): void {
+  const candidateId = activeConfirmationCandidateId.value;
+  if (!candidateId) return;
+  confirmationUiError.value = null;
+  void controller.prepareCandidateById(candidateId);
+}
 
-  controller.prepareCandidate(confirmingCandidateIndex.value);
+function handleDialogRetryConfirm(): void {
+  handleDialogConfirm();
 }
 
 let unsubscribeMessages: (() => void) | undefined;
@@ -372,6 +401,12 @@ onUnmounted(() => {
         <div class="panel-notice-info">
           ℹ️ 已入库候选仍在数据库中，但当前页面暂不支持重新加载历史候选。
         </div>
+        <p v-if="confirmationNotice" class="confirmation-notice" role="status">
+          {{ confirmationNotice }}
+        </p>
+        <p v-if="confirmationRefreshNotice" class="confirmation-refresh-notice" role="alert">
+          {{ confirmationRefreshNotice }}
+        </p>
         <div class="list-summary">
           待审查候选: <strong>{{ controller.candidates.length }}</strong> 条
         </div>
@@ -484,7 +519,7 @@ onUnmounted(() => {
               v-if="candidate.state === 'candidateCreated'"
               class="btn btn-confirm"
               type="button"
-              :disabled="confirmationStore.phase !== 'idle' && confirmationStore.phase !== 'failed' && confirmationStore.phase !== 'succeeded'"
+              :disabled="confirmationFlowActive"
               @click="handleOpenConfirmation(index)"
             >
               查看并确认
@@ -516,11 +551,12 @@ onUnmounted(() => {
     :open="showConfirmationDialog"
     :prepared="confirmationStore.prepared"
     :phase="confirmationStore.phase"
-    :error="confirmationStore.error"
+    :error="dialogError"
     @confirm="handleDialogConfirm"
     @cancel="handleDialogCancel"
     @close="handleDialogClose"
-    @retry-prepare="handleDialogRetry"
+    @retry-prepare="handleDialogRetryPrepare"
+    @retry-confirm="handleDialogRetryConfirm"
   />
 </template>
 
@@ -839,6 +875,20 @@ input {
   font-size: 0.9rem;
   color: #94a3b8;
   margin-bottom: 1rem;
+}
+
+.confirmation-notice,
+.confirmation-refresh-notice {
+  margin: 0 0 0.75rem;
+  font-size: 0.85rem;
+}
+
+.confirmation-notice {
+  color: #86efac;
+}
+
+.confirmation-refresh-notice {
+  color: #fbbf24;
 }
 
 .candidate-card {

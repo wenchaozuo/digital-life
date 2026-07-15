@@ -157,6 +157,8 @@ struct StorageState {
 pub struct StorageService {
     state: Mutex<StorageState>,
     location: StorageLocationResolver,
+    #[cfg(test)]
+    candidate_confirmation_panic_failpoint: Mutex<Option<candidate_memory::D4PanicFailpoint>>,
 }
 
 impl StorageService {
@@ -183,6 +185,8 @@ impl StorageService {
                 database_path,
             }),
             location,
+            #[cfg(test)]
+            candidate_confirmation_panic_failpoint: Mutex::new(None),
         })
     }
 

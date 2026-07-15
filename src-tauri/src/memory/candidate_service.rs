@@ -249,6 +249,18 @@ pub trait CandidateLifecycleRepository: CandidateMemoryRepository {
     ) -> Result<ConfirmCandidateResult, CandidateMemoryError>;
 }
 
+/// Narrow, crate-private recovery probe for governed confirmation. This is not
+/// part of the public Candidate lifecycle surface: it can only read the durable
+/// D-4 outcome for one already-authorized life/candidate/request binding.
+pub(crate) trait CandidateConfirmationRecoveryRepository {
+    fn confirmed_memory_for_request(
+        &self,
+        life_id: &str,
+        candidate_id: &str,
+        request_id: &str,
+    ) -> Result<Option<String>, CandidateMemoryError>;
+}
+
 // ── Prohibited content detection ──────────────────────────────────────
 
 pub fn contains_prohibited_content(text: &str) -> bool {

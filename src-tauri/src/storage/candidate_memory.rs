@@ -1,3 +1,5 @@
+use std::panic::{catch_unwind, AssertUnwindSafe};
+
 use rusqlite::{
     params, Connection, Error as SqlError, ErrorCode, OptionalExtension, Row, Transaction,
     TransactionBehavior,
@@ -14,10 +16,10 @@ use crate::memory::{
     },
     candidate_service::{
         compute_dedup_fingerprint, compute_rejection_fingerprint, contains_prohibited_content,
-        AddEvidenceRequest, CandidateEditOutcome, CandidateEditResult,
-        CandidateLifecycleRepository, CandidateLifecycleResult, ConfirmCandidateOutcome,
-        ConfirmCandidateRequest, ConfirmCandidateResult, DeleteCandidateRequest,
-        EditCandidateRequest, ExpiredCandidateScan, RejectCandidateRequest,
+        AddEvidenceRequest, CandidateConfirmationRecoveryRepository, CandidateEditOutcome,
+        CandidateEditResult, CandidateLifecycleRepository, CandidateLifecycleResult,
+        ConfirmCandidateOutcome, ConfirmCandidateRequest, ConfirmCandidateResult,
+        DeleteCandidateRequest, EditCandidateRequest, ExpiredCandidateScan, RejectCandidateRequest,
         SupersedeCandidateRequest,
     },
     vector_sync_outbox::MemoryVectorSyncAction,
@@ -40,6 +42,15 @@ const EVIDENCE_COLUMNS: &str = "id, candidate_id, life_id, source_type, source_i
 
 const AUDIT_COLUMNS: &str = "id, candidate_id, life_id, action, actor_type, request_id, \
     result_status, created_at";
+
+/// Test-only D-4 failpoints. They are consumed by one StorageService instance
+/// and compile out of production builds.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum D4PanicFailpoint {
+    BeforeCommit,
+    AfterCommit,
+}
 
 struct StoredCandidateMemory {
     id: String,
@@ -947,116 +958,199 @@ impl CandidateLifecycleRepository for StorageService {
         if request.expected_revision <= 0 {
             return Err(CandidateMemoryError::constraint());
         }
+        #[cfg(test)]
+        let failpoint = self.take_candidate_confirmation_panic_failpoint_for_test();
         let mut state = self
             .state()
             .map_err(|_| CandidateMemoryError::storage_unavailable())?;
-        let transaction = state
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(map_sql_error)?;
-        let candidate = load_owned_candidate(&transaction, life_id, &request.candidate_id)?;
+        // This is deliberately the narrowest panic boundary: `state` owns the
+        // StorageService MutexGuard and stays outside the unwind. Therefore a
+        // panic from the D-4 transaction rolls the transaction back while the
+        // guard is still held, then the guard drops normally without poisoning
+        // StorageService. AssertUnwindSafe covers only these local transaction
+        // inputs; it never wraps the coordinator or a repository object.
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let transaction = state
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(map_sql_error)?;
+            let candidate = load_owned_candidate(&transaction, life_id, &request.candidate_id)?;
 
-        // Idempotent replay: an already-accepted candidate whose acceptance was
-        // recorded under this same request id returns its prior confirmed memory.
-        if candidate.status == CandidateMemoryStatus::Accepted {
-            if candidate.accepted_request_id.as_deref() != Some(request.request_id.as_str()) {
-                // A distinct request id targeting an already-accepted candidate is a
-                // request-scoped conflict, not merely a wrong-status operation.
-                return Err(CandidateMemoryError::request_conflict());
+            // Idempotent replay: an already-accepted candidate whose acceptance was
+            // recorded under this same request id returns its prior confirmed memory.
+            if candidate.status == CandidateMemoryStatus::Accepted {
+                if candidate.accepted_request_id.as_deref() != Some(request.request_id.as_str()) {
+                    // A distinct request id targeting an already-accepted candidate is a
+                    // request-scoped conflict, not merely a wrong-status operation.
+                    return Err(CandidateMemoryError::request_conflict());
+                }
+                let confirmed_memory_id = candidate
+                    .confirmed_memory_id
+                    .clone()
+                    .ok_or_else(CandidateMemoryError::invalid_status)?;
+                let memory = load_confirmed_memory(&transaction, life_id, &confirmed_memory_id)?;
+                transaction.commit().map_err(map_sql_error)?;
+                return Ok(ConfirmCandidateResult {
+                    outcome: ConfirmCandidateOutcome::AlreadyConfirmed,
+                    candidate,
+                    memory,
+                    audit: None,
+                });
             }
-            let confirmed_memory_id = candidate
-                .confirmed_memory_id
+
+            ensure_pending_revision(&candidate, request.expected_revision)?;
+            if candidate.is_sensitive
+                && request
+                    .sensitive_grant
+                    .as_ref()
+                    .is_none_or(|grant| grant.candidate_id() != request.candidate_id)
+            {
+                return Err(CandidateMemoryError::sensitive_consent_required());
+            }
+            let content = candidate
+                .content
                 .clone()
+                .filter(|value| !value.trim().is_empty())
                 .ok_or_else(CandidateMemoryError::invalid_status)?;
-            let memory = load_confirmed_memory(&transaction, life_id, &confirmed_memory_id)?;
-            transaction.commit().map_err(map_sql_error)?;
-            return Ok(ConfirmCandidateResult {
-                outcome: ConfirmCandidateOutcome::AlreadyConfirmed,
-                candidate,
-                memory,
-                audit: None,
-            });
-        }
 
-        ensure_pending_revision(&candidate, request.expected_revision)?;
-        if candidate.is_sensitive
-            && request
-                .sensitive_grant
-                .as_ref()
-                .is_none_or(|grant| grant.candidate_id() != request.candidate_id)
-        {
-            return Err(CandidateMemoryError::sensitive_consent_required());
-        }
-        let content = candidate
-            .content
-            .clone()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(CandidateMemoryError::invalid_status)?;
+            // Re-run the deterministic prohibited-content gate inside the transaction on
+            // the freshly re-read candidate, so nothing credential-like is promoted into
+            // authoritative memory even if it slipped past an earlier check.
+            if contains_prohibited_content(&content)
+                || candidate
+                    .summary
+                    .as_deref()
+                    .is_some_and(contains_prohibited_content)
+            {
+                return Err(prohibited_content_error());
+            }
 
-        // Re-run the deterministic prohibited-content gate inside the transaction on
-        // the freshly re-read candidate, so nothing credential-like is promoted into
-        // authoritative memory even if it slipped past an earlier check.
-        if contains_prohibited_content(&content)
-            || candidate
-                .summary
-                .as_deref()
-                .is_some_and(contains_prohibited_content)
-        {
-            return Err(prohibited_content_error());
-        }
+            let memory = build_confirmed_memory(&candidate, memory_id, &content, now);
+            insert_confirmed_memory(&transaction, &memory)?;
+            insert_confirmed_revision_in_transaction(&transaction, &memory)
+                .map_err(|_| CandidateMemoryError::storage_unavailable())?;
+            let action = if memory.is_sensitive {
+                MemoryVectorSyncAction::Delete
+            } else {
+                MemoryVectorSyncAction::Upsert
+            };
+            enqueue_in_transaction(&transaction, life_id, memory_id, action)
+                .map_err(|_| CandidateMemoryError::storage_unavailable())?;
 
-        let memory = build_confirmed_memory(&candidate, memory_id, &content, now);
-        insert_confirmed_memory(&transaction, &memory)?;
-        insert_confirmed_revision_in_transaction(&transaction, &memory)
-            .map_err(|_| CandidateMemoryError::storage_unavailable())?;
-        let action = if memory.is_sensitive {
-            MemoryVectorSyncAction::Delete
-        } else {
-            MemoryVectorSyncAction::Upsert
-        };
-        enqueue_in_transaction(&transaction, life_id, memory_id, action)
-            .map_err(|_| CandidateMemoryError::storage_unavailable())?;
-
-        let changed = transaction
-            .execute(
-                "UPDATE candidate_memory SET
+            let changed = transaction
+                .execute(
+                    "UPDATE candidate_memory SET
                     status = 'accepted', content = NULL, summary = NULL, source_id = NULL,
                     dedup_fingerprint = NULL, reviewed_at = ?4, updated_at = ?4,
                     confirmed_memory_id = ?5, accepted_request_id = ?6,
                     revision = revision + 1
                  WHERE id = ?1 AND life_id = ?2 AND revision = ?3 AND status = 'pending'",
-                params![
-                    request.candidate_id,
-                    life_id,
-                    request.expected_revision,
-                    now,
-                    memory_id,
-                    request.request_id,
-                ],
-            )
-            .map_err(confirm_update_error)?;
-        if changed != 1 {
-            return Err(CandidateMemoryError::revision_conflict());
+                    params![
+                        request.candidate_id,
+                        life_id,
+                        request.expected_revision,
+                        now,
+                        memory_id,
+                        request.request_id,
+                    ],
+                )
+                .map_err(confirm_update_error)?;
+            if changed != 1 {
+                return Err(CandidateMemoryError::revision_conflict());
+            }
+            delete_candidate_evidence(&transaction, life_id, &request.candidate_id)?;
+            let audit = insert_audit_with_request_id(
+                &transaction,
+                audit_id,
+                life_id,
+                &request.candidate_id,
+                "candidate_confirmed",
+                "user",
+                Some(&request.request_id),
+                now,
+            )?;
+            let updated = load_owned_candidate(&transaction, life_id, &request.candidate_id)?;
+            #[cfg(test)]
+            if failpoint == Some(D4PanicFailpoint::BeforeCommit) {
+                panic!("test-only D-4 panic before commit");
+            }
+            transaction.commit().map_err(map_sql_error)?;
+            #[cfg(test)]
+            if failpoint == Some(D4PanicFailpoint::AfterCommit) {
+                panic!("test-only D-4 panic after commit");
+            }
+            Ok(ConfirmCandidateResult {
+                outcome: ConfirmCandidateOutcome::Confirmed,
+                candidate: updated,
+                memory,
+                audit: Some(audit),
+            })
+        }));
+        match result {
+            Ok(result) => result,
+            Err(_) => Err(CandidateMemoryError::confirmation_panic_recovered()),
         }
-        delete_candidate_evidence(&transaction, life_id, &request.candidate_id)?;
-        let audit = insert_audit_with_request_id(
-            &transaction,
-            audit_id,
-            life_id,
-            &request.candidate_id,
-            "candidate_confirmed",
-            "user",
-            Some(&request.request_id),
-            now,
-        )?;
-        let updated = load_owned_candidate(&transaction, life_id, &request.candidate_id)?;
-        transaction.commit().map_err(map_sql_error)?;
-        Ok(ConfirmCandidateResult {
-            outcome: ConfirmCandidateOutcome::Confirmed,
-            candidate: updated,
-            memory,
-            audit: Some(audit),
-        })
+    }
+}
+
+impl CandidateConfirmationRecoveryRepository for StorageService {
+    fn confirmed_memory_for_request(
+        &self,
+        life_id: &str,
+        candidate_id: &str,
+        request_id: &str,
+    ) -> Result<Option<String>, CandidateMemoryError> {
+        validate_identifier(life_id)?;
+        validate_identifier(candidate_id)?;
+        validate_identifier(request_id)?;
+        let state = self
+            .state()
+            .map_err(|_| CandidateMemoryError::storage_unavailable())?;
+        state
+            .connection
+            .query_row(
+                "SELECT memory.id
+                 FROM candidate_memory AS candidate
+                 INNER JOIN memory_record AS memory
+                    ON memory.id = candidate.confirmed_memory_id
+                   AND memory.life_id = candidate.life_id
+                   AND memory.status = 'confirmed'
+                 WHERE candidate.life_id = ?1
+                   AND candidate.id = ?2
+                   AND candidate.status = 'accepted'
+                   AND candidate.accepted_request_id = ?3",
+                params![life_id, candidate_id, request_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(map_sql_error)
+    }
+}
+
+impl StorageService {
+    #[cfg(test)]
+    pub(crate) fn request_candidate_confirmation_pre_commit_panic_for_test(&self) {
+        *self
+            .candidate_confirmation_panic_failpoint
+            .lock()
+            .expect("test failpoint mutex must be available") =
+            Some(D4PanicFailpoint::BeforeCommit);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn request_candidate_confirmation_post_commit_panic_for_test(&self) {
+        *self
+            .candidate_confirmation_panic_failpoint
+            .lock()
+            .expect("test failpoint mutex must be available") = Some(D4PanicFailpoint::AfterCommit);
+    }
+
+    #[cfg(test)]
+    fn take_candidate_confirmation_panic_failpoint_for_test(&self) -> Option<D4PanicFailpoint> {
+        self.candidate_confirmation_panic_failpoint
+            .lock()
+            .expect("test failpoint mutex must be available")
+            .take()
     }
 }
 

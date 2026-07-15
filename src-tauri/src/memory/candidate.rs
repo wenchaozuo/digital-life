@@ -344,6 +344,17 @@ impl CandidateMemoryError {
         )
     }
 
+    /// Internal-only outcome used when the storage-owned D-4 panic boundary
+    /// catches an unwind. The confirmation coordinator maps it to the existing
+    /// safe storage-unavailable IPC error; its code and message never cross IPC.
+    pub(crate) fn confirmation_panic_recovered() -> Self {
+        Self::new(
+            "CANDIDATE_MEMORY_CONFIRMATION_PANIC_RECOVERED",
+            "Candidate confirmation storage is temporarily unavailable.",
+            true,
+        )
+    }
+
     pub fn sensitive_consent_required() -> Self {
         Self::new(
             "CANDIDATE_MEMORY_SENSITIVE_CONSENT_REQUIRED",

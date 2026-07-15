@@ -11,6 +11,10 @@ import {
   type CandidateConfirmationResult,
   type CancelCandidateConfirmationResult,
 } from "../src/memory/candidateConfirmationTypes.ts";
+import {
+  CandidateConfirmationService,
+  type InvokeFunction,
+} from "../src/memory/candidateConfirmationService.ts";
 
 // ── Invoke Mock ───────────────────────────────────────────────────────
 
@@ -19,14 +23,17 @@ interface InvokeCall {
   args: Record<string, unknown>;
 }
 
-let invokeCalls: InvokeCall[] = [];
-let invokeResponse: unknown = null;
-let invokeError: unknown = null;
-
-// Mock @tauri-apps/api/core
-const originalModule = await import("@tauri-apps/api/core");
-
-// We'll test the parsing functions and error mapping directly since we can't easily mock ESM imports
+function createInvokeStub(response: unknown): {
+  calls: InvokeCall[];
+  invokeFn: InvokeFunction;
+} {
+  const calls: InvokeCall[] = [];
+  const invokeFn: InvokeFunction = async (command, args) => {
+    calls.push({ command, args: args ?? {} });
+    return response;
+  };
+  return { calls, invokeFn };
+}
 
 // ── Valid Response Factories ──────────────────────────────────────────
 
@@ -409,6 +416,28 @@ test("toCandidateConfirmationError: backend requiresReprepare takes priority", (
   assert.equal(err.requiresReprepare, true);
 });
 
+test("toCandidateConfirmationError: backend false overrides a local reprepare default", () => {
+  const err = toCandidateConfirmationError({
+    code: "CANDIDATE_CONFIRMATION_TOKEN_EXPIRED",
+    requiresReprepare: false,
+  });
+  assert.equal(err.action, "none");
+  assert.equal(err.requiresReprepare, false);
+});
+
+test("toCandidateConfirmationError: backend false preserves non-reprepare recovery actions", () => {
+  const storage = toCandidateConfirmationError({
+    code: "CANDIDATE_CONFIRMATION_STORAGE_UNAVAILABLE",
+    requiresReprepare: false,
+  });
+  const temporary = toCandidateConfirmationError({
+    code: "CANDIDATE_CONFIRMATION_TEMPORARILY_UNAVAILABLE",
+    requiresReprepare: false,
+  });
+  assert.equal(storage.action, "retrySameToken");
+  assert.equal(temporary.action, "retryPrepareLater");
+});
+
 test("toCandidateConfirmationError: unknown code maps to INTERNAL_ERROR", () => {
   const err = toCandidateConfirmationError({ code: "UNKNOWN_CODE" });
   assert.equal(err.code, "CANDIDATE_CONFIRMATION_INTERNAL_ERROR");
@@ -516,25 +545,47 @@ test("recoverable: false for none", () => {
 
 // ── Service invoke pattern tests ──────────────────────────────────────
 
-// These document the expected invoke call structure (tested via integration):
-// prepare: invoke("prepare_candidate_confirmation", { request: { candidateId } })
-// confirm: invoke("confirm_candidate_memory", { request: { candidateId, approvalToken } })
-// cancel:  invoke("cancel_candidate_confirmation_approval", { request: { candidateId, approvalToken } })
+test("service: prepare invokes the exact request wrapper and omits forbidden fields", async () => {
+  const stub = createInvokeStub(validPrepareResponse("candidate-a"));
+  const service = new CandidateConfirmationService(stub.invokeFn);
 
-test("invoke pattern: prepare uses request wrapper with candidateId", () => {
-  // Verified by reading candidateConfirmationService.ts source
-  assert.ok(true);
+  await service.prepareCandidateConfirmation("candidate-a");
+
+  assert.deepEqual(stub.calls, [{
+    command: "prepare_candidate_confirmation",
+    args: { request: { candidateId: "candidate-a" } },
+  }]);
+  const request = stub.calls[0].args.request as Record<string, unknown>;
+  for (const forbidden of [
+    "lifeId", "expectedRevision", "requestId", "isSensitive",
+    "sensitiveConfirmed", "userConfirmed", "Grant",
+  ]) {
+    assert.equal(forbidden in request, false, `${forbidden} must not be sent`);
+  }
 });
 
-test("invoke pattern: confirm uses request wrapper with candidateId and approvalToken", () => {
-  assert.ok(true);
+test("service: confirm invokes the exact request wrapper", async () => {
+  const token = "b".repeat(64);
+  const stub = createInvokeStub(validConfirmResponse("candidate-b"));
+  const service = new CandidateConfirmationService(stub.invokeFn);
+
+  await service.confirmCandidateMemory("candidate-b", token);
+
+  assert.deepEqual(stub.calls, [{
+    command: "confirm_candidate_memory",
+    args: { request: { candidateId: "candidate-b", approvalToken: token } },
+  }]);
 });
 
-test("invoke pattern: cancel uses request wrapper with candidateId and approvalToken", () => {
-  assert.ok(true);
-});
+test("service: cancel invokes the exact request wrapper", async () => {
+  const token = "c".repeat(64);
+  const stub = createInvokeStub(validCancelResponse("candidate-c"));
+  const service = new CandidateConfirmationService(stub.invokeFn);
 
-test("security: does not call old confirm_memory command", () => {
-  // Verified by git grep - no confirm_memory invoke in candidateConfirmationService.ts
-  assert.ok(true);
+  await service.cancelCandidateConfirmationApproval("candidate-c", token);
+
+  assert.deepEqual(stub.calls, [{
+    command: "cancel_candidate_confirmation_approval",
+    args: { request: { candidateId: "candidate-c", approvalToken: token } },
+  }]);
 });

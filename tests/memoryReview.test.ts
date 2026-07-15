@@ -35,8 +35,8 @@ interface MockServiceCalls {
 
 interface MockConfirmationCalls {
   prepare: string[];
-  confirm: number;
-  cancel: number;
+  confirm: string[];
+  cancel: string[];
   clear: number;
 }
 
@@ -50,8 +50,8 @@ function createMocks() {
 
   const confirmationCalls: MockConfirmationCalls = {
     prepare: [],
-    confirm: 0,
-    cancel: 0,
+    confirm: [],
+    cancel: [],
     clear: 0,
   };
 
@@ -105,11 +105,11 @@ function createMocks() {
     async prepare(candidateId: string): Promise<void> {
       confirmationCalls.prepare.push(candidateId);
     },
-    async confirm(): Promise<void> {
-      confirmationCalls.confirm++;
+    async confirm(candidateId: string): Promise<void> {
+      confirmationCalls.confirm.push(candidateId);
     },
-    async cancel(): Promise<void> {
-      confirmationCalls.cancel++;
+    async cancel(candidateId: string): Promise<void> {
+      confirmationCalls.cancel.push(candidateId);
     },
     clearCandidateConfirmation(): void {
       confirmationCalls.clear++;
@@ -174,8 +174,8 @@ test("1. Controller 不接收 Token 参数", () => {
 
   // Verify method signatures - no approvalToken parameter
   assert.equal(controller.prepareCandidate.length, 1); // only index
-  assert.equal(controller.confirmPreparedCandidate.length, 0); // no params
-  assert.equal(controller.cancelPreparedCandidate.length, 0); // no params
+  assert.equal(controller.confirmPreparedCandidate.length, 1); // candidate index only
+  assert.equal(controller.cancelPreparedCandidate.length, 1); // candidate index only
 });
 
 // ── Test: Controller calls Store actions ──────────────────────────────
@@ -194,14 +194,37 @@ test("2. Controller 调用 Store 动作而非直接调用 Service", async () => 
   await controller.prepareCandidate(0);
   assert.equal(confirmationCalls.prepare.length, 1);
   assert.equal(confirmationCalls.prepare[0], "db-mem-123");
+  assert.deepEqual(confirmationCalls.confirm, []);
 
   // Confirm calls store action (no token param)
-  await controller.confirmPreparedCandidate();
-  assert.equal(confirmationCalls.confirm, 1);
+  await controller.confirmPreparedCandidate(0);
+  assert.deepEqual(confirmationCalls.confirm, ["db-mem-123"]);
 
   // Cancel calls store action
-  await controller.cancelPreparedCandidate();
-  assert.equal(confirmationCalls.cancel, 1);
+  await controller.cancelPreparedCandidate(0);
+  assert.deepEqual(confirmationCalls.cancel, ["db-mem-123"]);
+});
+
+test("2b. Controller resolves the active review index to a Candidate ID", async () => {
+  const { confirmationCalls, mockMemoryService, mockMemoryExtractor, mockConfirmationActions } = createMocks();
+  const controller = new MemoryReviewController(mockMemoryService, mockMemoryExtractor, mockConfirmationActions);
+  controller.setLifeId("life-123");
+  await controller.extract([{ role: "user", content: "我喜欢乌龙茶", timestamp: "2026-07-12" }]);
+  await controller.createCandidate(0);
+
+  const secondCandidate = {
+    ...controller.candidates[0],
+    id: "candidate-second",
+    dbRecord: { ...controller.candidates[0].dbRecord!, id: "db-mem-456" },
+  };
+  controller.candidates = [controller.candidates[0], secondCandidate];
+  await controller.prepareCandidate(0);
+  await controller.confirmPreparedCandidate(1);
+  await controller.cancelPreparedCandidate(1);
+
+  assert.deepEqual(confirmationCalls.prepare, ["db-mem-123"]);
+  assert.deepEqual(confirmationCalls.confirm, ["db-mem-456"]);
+  assert.deepEqual(confirmationCalls.cancel, ["db-mem-456"]);
 });
 
 // ── Test: lifeId in all operations ────────────────────────────────────
@@ -426,8 +449,8 @@ test("11. Prepare 失败设置错误", async () => {
         "none",
       );
     },
-    async confirm(): Promise<void> {},
-    async cancel(): Promise<void> {},
+    async confirm(_candidateId: string): Promise<void> {},
+    async cancel(_candidateId: string): Promise<void> {},
     clearCandidateConfirmation(): void {},
   };
 

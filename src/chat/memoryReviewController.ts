@@ -14,8 +14,8 @@ import type { MemoryExtractionResult } from "../memory/extractor/types";
 
 export interface CandidateConfirmationActions {
   prepare(candidateId: string): Promise<void>;
-  confirm(): Promise<void>;
-  cancel(): Promise<void>;
+  confirm(expectedCandidateId: string): Promise<void>;
+  cancel(expectedCandidateId: string): Promise<void>;
   clearCandidateConfirmation(): void;
   readonly canPrepare: boolean;
   readonly canConfirm: boolean;
@@ -309,22 +309,36 @@ export class MemoryReviewController {
    * Confirm the currently prepared candidate via the Store.
    * Token is managed internally by the Store.
    */
-  async confirmPreparedCandidate(): Promise<void> {
+  async confirmPreparedCandidate(index: number): Promise<void> {
+    const candidate = this.candidates[index];
+    if (!candidate?.dbRecord?.id) return;
+
     try {
-      await this.confirmationActions.confirm();
-    } catch {
-      // Store handles error state internally
+      await this.confirmationActions.confirm(candidate.dbRecord.id);
+    } catch (err: unknown) {
+      candidate.error = {
+        code: getErrorCode(err),
+        message: getErrorMessage(err),
+        stage: "confirmation",
+      };
     }
   }
 
   /**
    * Cancel the currently prepared candidate via the Store.
    */
-  async cancelPreparedCandidate(): Promise<void> {
+  async cancelPreparedCandidate(index: number): Promise<void> {
+    const candidate = this.candidates[index];
+    if (!candidate?.dbRecord?.id) return;
+
     try {
-      await this.confirmationActions.cancel();
-    } catch {
-      // Store handles error state internally
+      await this.confirmationActions.cancel(candidate.dbRecord.id);
+    } catch (err: unknown) {
+      candidate.error = {
+        code: getErrorCode(err),
+        message: getErrorMessage(err),
+        stage: "confirmation",
+      };
     }
   }
 

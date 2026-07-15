@@ -1,15 +1,18 @@
 import { defineStore } from "pinia";
-import { ref, computed } from "vue";
+import { computed, ref } from "vue";
 import type {
-  PreparedCandidateConfirmation,
   CandidateConfirmationResult,
+  PreparedCandidateConfirmation,
+  PreparedCandidateConfirmationPreview,
 } from "../memory/candidateConfirmationTypes.ts";
 import {
   CandidateConfirmationError,
+  toCandidateConfirmationError,
 } from "../memory/candidateConfirmationTypes.ts";
-import { candidateConfirmationService } from "../memory/candidateConfirmationService.ts";
-
-// ── Types ─────────────────────────────────────────────────────────────
+import {
+  candidateConfirmationService,
+  type CandidateConfirmationClient,
+} from "../memory/candidateConfirmationService.ts";
 
 export type CandidateConfirmationPhase =
   | "idle"
@@ -20,33 +23,33 @@ export type CandidateConfirmationPhase =
   | "succeeded"
   | "failed";
 
-// ── Store ─────────────────────────────────────────────────────────────
+function localError(message: string): CandidateConfirmationError {
+  return new CandidateConfirmationError(
+    "CANDIDATE_CONFIRMATION_INTERNAL_ERROR",
+    message,
+    "none",
+  );
+}
 
-export const useCandidateConfirmationStore = defineStore(
-  "candidateConfirmation",
-  () => {
-    // ── Stale Promise Protection ─────────────────────────────────────
+function previewOf(
+  prepared: PreparedCandidateConfirmation,
+): PreparedCandidateConfirmationPreview {
+  const { approvalToken: _approvalToken, ...preview } = prepared;
+  return preview;
+}
 
+export function createCandidateConfirmationStore(
+  service: CandidateConfirmationClient = candidateConfirmationService,
+) {
+  return defineStore("candidateConfirmation", () => {
     let generation = 0;
-
-    function nextGeneration(): number {
-      generation += 1;
-      return generation;
-    }
-
-    function isCurrentGeneration(value: number): boolean {
-      return value === generation;
-    }
-
-    // ── State ───────────────────────────────────────────────────────
+    let privateApprovalToken: string | null = null;
 
     const candidateId = ref<string | null>(null);
-    const prepared = ref<PreparedCandidateConfirmation | null>(null);
+    const prepared = ref<PreparedCandidateConfirmationPreview | null>(null);
     const phase = ref<CandidateConfirmationPhase>("idle");
     const error = ref<CandidateConfirmationError | null>(null);
     const result = ref<CandidateConfirmationResult | null>(null);
-
-    // ── Getters ─────────────────────────────────────────────────────
 
     const isIdle = computed(() => phase.value === "idle");
     const isPreparing = computed(() => phase.value === "preparing");
@@ -56,202 +59,41 @@ export const useCandidateConfirmationStore = defineStore(
     const isSucceeded = computed(() => phase.value === "succeeded");
     const isFailed = computed(() => phase.value === "failed");
 
-    const approvalToken = computed(() => prepared.value?.approvalToken ?? null);
-
     const isPreparedConfirmationExpired = computed(() => {
-      if (!prepared.value?.expiresAt) {
-        return false;
-      }
+      if (!prepared.value?.expiresAt) return false;
       const timestamp = Date.parse(prepared.value.expiresAt);
-      if (!Number.isFinite(timestamp)) {
-        return true; // Invalid date treated as expired
-      }
-      return Date.now() > timestamp;
+      return !Number.isFinite(timestamp) || Date.now() > timestamp;
     });
 
     const canPrepare = computed(() =>
-      phase.value === "idle" || phase.value === "failed" || phase.value === "succeeded",
+      phase.value === "idle" ||
+      phase.value === "prepared" ||
+      phase.value === "failed" ||
+      phase.value === "succeeded",
     );
-
     const canConfirm = computed(() =>
       phase.value === "prepared" &&
       prepared.value !== null &&
-      approvalToken.value !== null &&
+      privateApprovalToken !== null &&
       !isPreparedConfirmationExpired.value,
     );
-
     const canCancel = computed(() =>
-      (phase.value === "prepared" || phase.value === "failed") &&
+      phase.value === "prepared" &&
       prepared.value !== null &&
-      approvalToken.value !== null,
+      privateApprovalToken !== null,
     );
 
-    // ── Actions ─────────────────────────────────────────────────────
-
-    /**
-     * Prepare a candidate for confirmation.
-     */
-    async function prepare(id: string): Promise<void> {
-      // Guard: prevent concurrent prepares
-      if (phase.value === "preparing" || phase.value === "confirming" || phase.value === "cancelling") {
-        return;
-      }
-
-      // Clean up old state and capture generation
-      clearState();
-      const myGeneration = nextGeneration();
-
-      candidateId.value = id;
-      phase.value = "preparing";
-      error.value = null;
-
-      try {
-        const response = await candidateConfirmationService.prepareCandidateConfirmation(id);
-
-        // Check generation before writing back
-        if (!isCurrentGeneration(myGeneration)) return;
-
-        prepared.value = response;
-        phase.value = "prepared";
-      } catch (err: unknown) {
-        if (!isCurrentGeneration(myGeneration)) return;
-
-        const confirmationError = err instanceof CandidateConfirmationError
-          ? err
-          : new CandidateConfirmationError(
-              "CANDIDATE_CONFIRMATION_INTERNAL_ERROR",
-              "The confirmation operation failed.",
-              "none",
-            );
-        error.value = confirmationError;
-        phase.value = "failed";
-        prepared.value = null;
-        candidateId.value = null;
-      }
+    function nextGeneration(): number {
+      generation += 1;
+      return generation;
     }
 
-    /**
-     * Confirm the prepared candidate using the approval token.
-     */
-    async function confirm(): Promise<void> {
-      // Guard: can only confirm from prepared state
-      if (phase.value !== "prepared" || !prepared.value || !approvalToken.value) {
-        return;
-      }
-
-      const currentCandidateId = prepared.value.candidateId;
-      const currentToken = approvalToken.value;
-      const myGeneration = nextGeneration();
-
-      phase.value = "confirming";
-      error.value = null;
-
-      try {
-        const response = await candidateConfirmationService.confirmCandidateMemory(
-          currentCandidateId,
-          currentToken,
-        );
-
-        if (!isCurrentGeneration(myGeneration)) return;
-
-        // Success: clear token immediately, save minimal result
-        result.value = {
-          candidateId: response.candidateId,
-          confirmedMemoryId: response.confirmedMemoryId,
-          outcome: response.outcome,
-        };
-        prepared.value = null;
-        phase.value = "succeeded";
-      } catch (err: unknown) {
-        if (!isCurrentGeneration(myGeneration)) return;
-
-        const confirmationError = err instanceof CandidateConfirmationError
-          ? err
-          : new CandidateConfirmationError(
-              "CANDIDATE_CONFIRMATION_INTERNAL_ERROR",
-              "The confirmation operation failed.",
-              "none",
-            );
-
-        error.value = confirmationError;
-
-        // Handle error based on action
-        switch (confirmationError.action) {
-          case "reprepare":
-            // Token is invalid/expired/consumed/cancelled/context changed
-            prepared.value = null;
-            phase.value = "failed";
-            break;
-          case "retrySameToken":
-            // Token is still valid (storage unavailable, in-flight)
-            phase.value = "prepared";
-            break;
-          case "retryPrepareLater":
-          case "none":
-          default:
-            // Clear token for safety
-            prepared.value = null;
-            phase.value = "failed";
-            break;
-        }
-      }
+    function isCurrentGeneration(operationGeneration: number): boolean {
+      return generation === operationGeneration;
     }
-
-    /**
-     * Cancel the prepared confirmation.
-     */
-    async function cancel(): Promise<void> {
-      if (!prepared.value || !approvalToken.value) {
-        clearState();
-        return;
-      }
-
-      const currentCandidateId = prepared.value.candidateId;
-      const currentToken = approvalToken.value;
-      const myGeneration = nextGeneration();
-
-      phase.value = "cancelling";
-      error.value = null;
-
-      try {
-        await candidateConfirmationService.cancelCandidateConfirmationApproval(
-          currentCandidateId,
-          currentToken,
-        );
-
-        if (!isCurrentGeneration(myGeneration)) return;
-
-        // Cancel succeeded
-        prepared.value = null;
-        candidateId.value = null;
-        phase.value = "idle";
-        error.value = null;
-      } catch (err: unknown) {
-        if (!isCurrentGeneration(myGeneration)) return;
-
-        // Cancel failed: clear token locally but report error
-        prepared.value = null;
-        candidateId.value = null;
-        phase.value = "failed";
-        error.value = new CandidateConfirmationError(
-          "CANDIDATE_CONFIRMATION_INTERNAL_ERROR",
-          "Cancellation status unknown; local authorization cleared.",
-          "none",
-        );
-      }
-    }
-
-    /**
-     * Clear all confirmation state without making any backend calls.
-     */
-    function clearCandidateConfirmation(): void {
-      nextGeneration(); // Invalidate all in-flight promises
-      clearState();
-    }
-
-    // ── Private Helpers ─────────────────────────────────────────────
 
     function clearState(): void {
+      privateApprovalToken = null;
       candidateId.value = null;
       prepared.value = null;
       phase.value = "idle";
@@ -259,17 +101,137 @@ export const useCandidateConfirmationStore = defineStore(
       result.value = null;
     }
 
-    // ── Return ──────────────────────────────────────────────────────
+    function clearPreparedAuthorization(): void {
+      privateApprovalToken = null;
+      prepared.value = null;
+    }
+
+    function rejectInvalidTransition(): never {
+      throw localError("The confirmation action is not available in the current state.");
+    }
+
+    function assertPreparedCandidate(expectedCandidateId: string): string {
+      if (
+        phase.value !== "prepared" ||
+        !prepared.value ||
+        !privateApprovalToken ||
+        prepared.value.candidateId !== expectedCandidateId
+      ) {
+        throw localError("The prepared candidate does not match this action.");
+      }
+      return privateApprovalToken;
+    }
+
+    async function prepare(id: string): Promise<void> {
+      if (!canPrepare.value) rejectInvalidTransition();
+
+      const operationGeneration = nextGeneration();
+      clearState();
+      candidateId.value = id;
+      phase.value = "preparing";
+
+      try {
+        const response = await service.prepareCandidateConfirmation(id);
+        if (!isCurrentGeneration(operationGeneration)) return;
+
+        privateApprovalToken = response.approvalToken;
+        prepared.value = previewOf(response);
+        phase.value = "prepared";
+      } catch (caught: unknown) {
+        if (!isCurrentGeneration(operationGeneration)) return;
+
+        clearPreparedAuthorization();
+        candidateId.value = null;
+        error.value = toCandidateConfirmationError(caught);
+        phase.value = "failed";
+      }
+    }
+
+    async function confirm(expectedCandidateId: string): Promise<void> {
+      const approvalToken = assertPreparedCandidate(expectedCandidateId);
+      if (isPreparedConfirmationExpired.value) {
+        clearPreparedAuthorization();
+        phase.value = "failed";
+        error.value = localError("The approval token has expired locally.");
+        return;
+      }
+
+      const operationGeneration = nextGeneration();
+      phase.value = "confirming";
+      error.value = null;
+
+      try {
+        const response = await service.confirmCandidateMemory(expectedCandidateId, approvalToken);
+        if (!isCurrentGeneration(operationGeneration)) return;
+
+        result.value = response;
+        clearPreparedAuthorization();
+        phase.value = "succeeded";
+      } catch (caught: unknown) {
+        if (!isCurrentGeneration(operationGeneration)) return;
+
+        const confirmationError = toCandidateConfirmationError(caught);
+        error.value = confirmationError;
+
+        if (confirmationError.action === "retrySameToken") {
+          phase.value = "prepared";
+          return;
+        }
+
+        clearPreparedAuthorization();
+        phase.value = "failed";
+      }
+    }
+
+    async function cancel(expectedCandidateId: string): Promise<void> {
+      const approvalToken = assertPreparedCandidate(expectedCandidateId);
+      const operationGeneration = nextGeneration();
+      phase.value = "cancelling";
+      error.value = null;
+
+      try {
+        const response = await service.cancelCandidateConfirmationApproval(
+          expectedCandidateId,
+          approvalToken,
+        );
+        if (!isCurrentGeneration(operationGeneration)) return;
+
+        clearPreparedAuthorization();
+        candidateId.value = null;
+
+        if (!response.cancelled) {
+          phase.value = "failed";
+          error.value = localError(
+            "Backend cancellation was not confirmed; local authorization cleared.",
+          );
+          return;
+        }
+
+        phase.value = "idle";
+        error.value = null;
+      } catch (_caught: unknown) {
+        if (!isCurrentGeneration(operationGeneration)) return;
+
+        clearPreparedAuthorization();
+        candidateId.value = null;
+        phase.value = "failed";
+        error.value = localError(
+          "Cancellation status unknown; local authorization cleared.",
+        );
+      }
+    }
+
+    function clearCandidateConfirmation(): void {
+      nextGeneration();
+      clearState();
+    }
 
     return {
-      // State
       candidateId,
       prepared,
       phase,
       error,
       result,
-
-      // Getters
       isIdle,
       isPreparing,
       isPrepared,
@@ -277,17 +239,16 @@ export const useCandidateConfirmationStore = defineStore(
       isCancelling,
       isSucceeded,
       isFailed,
-      approvalToken,
       isPreparedConfirmationExpired,
       canPrepare,
       canConfirm,
       canCancel,
-
-      // Actions
       prepare,
       confirm,
       cancel,
       clearCandidateConfirmation,
     };
-  },
-);
+  });
+}
+
+export const useCandidateConfirmationStore = createCandidateConfirmationStore();

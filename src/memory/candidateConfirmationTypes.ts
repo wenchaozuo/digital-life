@@ -28,6 +28,12 @@ export interface PreparedCandidateConfirmation {
   expiresAt: string;
 }
 
+/** Public confirmation preview. Approval Tokens stay private to the Store. */
+export type PreparedCandidateConfirmationPreview = Omit<
+  PreparedCandidateConfirmation,
+  "approvalToken"
+>;
+
 // ── Confirm Response ──────────────────────────────────────────────────
 
 export interface CandidateConfirmationResult {
@@ -123,13 +129,9 @@ const SAFE_ERROR_MESSAGES: Record<CandidateConfirmationErrorCode, string> = {
 
 // ── Error Code → Recovery Action ──────────────────────────────────────
 
-function recoveryActionForCode(
+function actionForCode(
   code: CandidateConfirmationErrorCode,
-  backendRequiresReprepare?: boolean,
 ): CandidateConfirmationRecoveryAction {
-  // Backend signal takes priority
-  if (backendRequiresReprepare === true) return "reprepare";
-
   switch (code) {
     case "CANDIDATE_CONFIRMATION_TOKEN_INVALID":
     case "CANDIDATE_CONFIRMATION_TOKEN_EXPIRED":
@@ -153,6 +155,23 @@ function recoveryActionForCode(
   }
 }
 
+function recoveryActionForCode(
+  code: CandidateConfirmationErrorCode,
+  backendRequiresReprepare?: boolean,
+): CandidateConfirmationRecoveryAction {
+  const defaultAction = actionForCode(code);
+
+  if (backendRequiresReprepare === true) {
+    return "reprepare";
+  }
+
+  if (backendRequiresReprepare === false && defaultAction === "reprepare") {
+    return "none";
+  }
+
+  return defaultAction;
+}
+
 // ── Error Mapping ─────────────────────────────────────────────────────
 
 export function toCandidateConfirmationError(error: unknown): CandidateConfirmationError {
@@ -174,7 +193,7 @@ export function toCandidateConfirmationError(error: unknown): CandidateConfirmat
     );
 
     return new CandidateConfirmationError(code, message, action, {
-      requiresReprepare: action === "reprepare",
+      requiresReprepare: backendRequiresReprepare ?? (action === "reprepare"),
       retryAfterMs,
     });
   }

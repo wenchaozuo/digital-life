@@ -12,6 +12,23 @@ import {
   parseCancelCandidateConfirmationResult,
 } from "./candidateConfirmationTypes.ts";
 
+export type InvokeFunction = (
+  command: string,
+  args?: Record<string, unknown>,
+) => Promise<unknown>;
+
+export interface CandidateConfirmationClient {
+  prepareCandidateConfirmation(candidateId: string): Promise<PreparedCandidateConfirmation>;
+  confirmCandidateMemory(
+    candidateId: string,
+    approvalToken: string,
+  ): Promise<CandidateConfirmationResult>;
+  cancelCandidateConfirmationApproval(
+    candidateId: string,
+    approvalToken: string,
+  ): Promise<CancelCandidateConfirmationResult>;
+}
+
 // ── Input Validation ──────────────────────────────────────────────────
 
 function validateCandidateId(candidateId: string): void {
@@ -36,7 +53,13 @@ function validateApprovalToken(approvalToken: string): void {
 
 // ── Service Implementation ────────────────────────────────────────────
 
-export class CandidateConfirmationService {
+export class CandidateConfirmationService implements CandidateConfirmationClient {
+  private readonly invokeFn: InvokeFunction;
+
+  constructor(invokeFn: InvokeFunction = invoke) {
+    this.invokeFn = invokeFn;
+  }
+
   /**
    * Prepare a candidate for confirmation and return a preview plus Approval Token.
    */
@@ -46,7 +69,7 @@ export class CandidateConfirmationService {
     validateCandidateId(candidateId);
 
     try {
-      const response = await invoke<unknown>("prepare_candidate_confirmation", {
+      const response = await this.invokeFn("prepare_candidate_confirmation", {
         request: { candidateId },
       });
       return parsePreparedCandidateConfirmation(response, candidateId);
@@ -66,7 +89,7 @@ export class CandidateConfirmationService {
     validateApprovalToken(approvalToken);
 
     try {
-      const response = await invoke<unknown>("confirm_candidate_memory", {
+      const response = await this.invokeFn("confirm_candidate_memory", {
         request: { candidateId, approvalToken },
       });
       return parseCandidateConfirmationResult(response, candidateId);
@@ -86,7 +109,7 @@ export class CandidateConfirmationService {
     validateApprovalToken(approvalToken);
 
     try {
-      const response = await invoke<unknown>("cancel_candidate_confirmation_approval", {
+      const response = await this.invokeFn("cancel_candidate_confirmation_approval", {
         request: { candidateId, approvalToken },
       });
       return parseCancelCandidateConfirmationResult(response, candidateId);

@@ -1,277 +1,328 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-
 import { createPinia, setActivePinia } from "pinia";
 
-// We need to import Vue reactivity for Pinia to work
-import { nextTick } from "vue";
-
-// Import the real store
-import { useCandidateConfirmationStore } from "../src/stores/candidateConfirmation.ts";
-
-// Import types for mocking
+import { createCandidateConfirmationStore } from "../src/stores/candidateConfirmation.ts";
+import type { CandidateConfirmationClient } from "../src/memory/candidateConfirmationService.ts";
 import type {
-  PreparedCandidateConfirmation,
   CandidateConfirmationResult,
   CancelCandidateConfirmationResult,
+  PreparedCandidateConfirmation,
 } from "../src/memory/candidateConfirmationTypes.ts";
-import {
-  CandidateConfirmationError,
-} from "../src/memory/candidateConfirmationTypes.ts";
-
-// ── Deferred Promise for async control ────────────────────────────────
+import { CandidateConfirmationError } from "../src/memory/candidateConfirmationTypes.ts";
 
 interface Deferred<T> {
   promise: Promise<T>;
-  resolve: (value: T) => void;
-  reject: (reason?: unknown) => void;
+  resolve(value: T): void;
+  reject(reason?: unknown): void;
 }
 
-function createDeferred<T>(): Deferred<T> {
+function deferred<T>(): Deferred<T> {
   let resolve!: (value: T) => void;
   let reject!: (reason?: unknown) => void;
-  const promise = new Promise<T>((res, rej) => {
-    resolve = res;
-    reject = rej;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
   });
   return { promise, resolve, reject };
 }
 
-// ── Mock Service ──────────────────────────────────────────────────────
-
-function createMockService() {
-  const prepareDeferred = createDeferred<PreparedCandidateConfirmation>();
-  const confirmDeferred = createDeferred<CandidateConfirmationResult>();
-  const cancelDeferred = createDeferred<CancelCandidateConfirmationResult>();
-
-  return {
-    prepareDeferred,
-    confirmDeferred,
-    cancelDeferred,
-    service: {
-      prepareCandidateConfirmation: async (_candidateId: string): Promise<PreparedCandidateConfirmation> => {
-        return prepareDeferred.promise;
-      },
-      confirmCandidateMemory: async (_candidateId: string, _approvalToken: string): Promise<CandidateConfirmationResult> => {
-        return confirmDeferred.promise;
-      },
-      cancelCandidateConfirmationApproval: async (_candidateId: string, _approvalToken: string): Promise<CancelCandidateConfirmationResult> => {
-        return cancelDeferred.promise;
-      },
-    },
-  };
-}
-
-function createValidPrepared(candidateId: string = "c1"): PreparedCandidateConfirmation {
+function prepared(candidateId: string, approvalToken = "a".repeat(64)): PreparedCandidateConfirmation {
   return {
     candidateId,
     expectedRevision: 1,
     kind: "preference",
-    content: "Test",
-    summary: "Summary",
+    content: "content",
+    summary: "summary",
     isSensitive: false,
     source: "conversation",
     confirmationRequirement: "standard",
-    approvalToken: "a".repeat(64),
-    expiresAt: new Date(Date.now() + 300000).toISOString(),
+    approvalToken,
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
   };
 }
 
-function createValidResult(candidateId: string = "c1"): CandidateConfirmationResult {
-  return {
-    candidateId,
-    confirmedMemoryId: "mem-123",
-    outcome: "confirmed",
-  };
+function confirmed(candidateId: string): CandidateConfirmationResult {
+  return { candidateId, confirmedMemoryId: "memory-1", outcome: "confirmed" };
 }
 
-// ── Setup helper ──────────────────────────────────────────────────────
-
-function setupStore() {
-  const pinia = createPinia();
-  setActivePinia(pinia);
-  const store = useCandidateConfirmationStore();
-  const mock = createMockService();
-
-  // Monkey-patch the store to use our mock service
-  // @ts-expect-error - injecting mock for testing
-  store.$patch({});
-  // We need to replace the service reference in the store
-  // Since the store imports the singleton, we'll test via the store's public API
-  // and control timing with deferred promises
-
-  return { store, pinia, mock };
+function cancelled(candidateId: string, value = true): CancelCandidateConfirmationResult {
+  return { candidateId, cancelled: value };
 }
 
-// ── Phase Tests ───────────────────────────────────────────────────────
+function setup(service: CandidateConfirmationClient) {
+  setActivePinia(createPinia());
+  return createCandidateConfirmationStore(service)();
+}
 
-test("Store: initial state is idle", () => {
-  const pinia = createPinia();
-  setActivePinia(pinia);
-  const store = useCandidateConfirmationStore();
+test("store: prepare holds token privately and confirm consumes it", async () => {
+  const calls: Array<[string, string, string?]> = [];
+  const store = setup({
+    prepareCandidateConfirmation: async (id) => prepared(id, "b".repeat(64)),
+    confirmCandidateMemory: async (id, token) => {
+      calls.push(["confirm", id, token]);
+      return confirmed(id);
+    },
+    cancelCandidateConfirmationApproval: async (id, token) => {
+      calls.push(["cancel", id, token]);
+      return cancelled(id);
+    },
+  });
 
-  assert.equal(store.phase, "idle");
-  assert.equal(store.candidateId, null);
+  await store.prepare("candidate-a");
+  assert.equal(store.phase, "prepared");
+  assert.equal(store.prepared?.candidateId, "candidate-a");
+  assert.equal("approvalToken" in (store.prepared ?? {}), false);
+  assert.equal("approvalToken" in store, false);
+  assert.equal(store.canConfirm, true);
+
+  await store.confirm("candidate-a");
+  assert.deepEqual(calls, [["confirm", "candidate-a", "b".repeat(64)]]);
+  assert.equal(store.phase, "succeeded");
   assert.equal(store.prepared, null);
-  assert.equal(store.error, null);
-  assert.equal(store.result, null);
-  assert.equal(store.canPrepare, true);
-  assert.equal(store.canConfirm, false);
-  assert.equal(store.canCancel, false);
+  assert.equal(store.result?.candidateId, "candidate-a");
 });
 
-test("Store: clearCandidateConfirmation resets to idle", () => {
-  const pinia = createPinia();
-  setActivePinia(pinia);
-  const store = useCandidateConfirmationStore();
+test("store: candidate binding prevents mismatched confirm and cancel", async () => {
+  let confirmCalls = 0;
+  let cancelCalls = 0;
+  const store = setup({
+    prepareCandidateConfirmation: async (id) => prepared(id),
+    confirmCandidateMemory: async (id) => { confirmCalls += 1; return confirmed(id); },
+    cancelCandidateConfirmationApproval: async (id) => { cancelCalls += 1; return cancelled(id); },
+  });
+  await store.prepare("candidate-a");
+
+  await assert.rejects(store.confirm("candidate-b"));
+  await assert.rejects(store.cancel("candidate-b"));
+  assert.equal(confirmCalls, 0);
+  assert.equal(cancelCalls, 0);
+  assert.equal(store.phase, "prepared");
+  assert.equal(store.prepared?.candidateId, "candidate-a");
+});
+
+test("store: concurrent prepare, confirm, and cancel transitions are rejected", async () => {
+  const prepareDeferred = deferred<PreparedCandidateConfirmation>();
+  const confirmDeferred = deferred<CandidateConfirmationResult>();
+  const cancelDeferred = deferred<CancelCandidateConfirmationResult>();
+  let initialPreparePending = true;
+  let cancelCalls = 0;
+  let confirmCalls = 0;
+  const store = setup({
+    prepareCandidateConfirmation: async (id) => {
+      if (initialPreparePending) return prepareDeferred.promise;
+      return prepared(id);
+    },
+    confirmCandidateMemory: async () => { confirmCalls += 1; return confirmDeferred.promise; },
+    cancelCandidateConfirmationApproval: async () => { cancelCalls += 1; return cancelDeferred.promise; },
+  });
+
+  const preparing = store.prepare("candidate-a");
+  await assert.rejects(store.cancel("candidate-a"));
+  await assert.rejects(store.prepare("candidate-b"));
+  assert.equal(cancelCalls, 0);
+  prepareDeferred.resolve(prepared("candidate-a"));
+  await preparing;
+  initialPreparePending = false;
+
+  const confirming = store.confirm("candidate-a");
+  await assert.rejects(store.cancel("candidate-a"));
+  await assert.rejects(store.confirm("candidate-a"));
+  assert.equal(cancelCalls, 0);
+  assert.equal(confirmCalls, 1);
+  confirmDeferred.resolve(confirmed("candidate-a"));
+  await confirming;
+
+  await store.prepare("candidate-c");
+  const cancelling = store.cancel("candidate-c");
+  await assert.rejects(store.confirm("candidate-c"));
+  await assert.rejects(store.cancel("candidate-c"));
+  assert.equal(confirmCalls, 1);
+  cancelDeferred.resolve(cancelled("candidate-c"));
+  await cancelling;
+  assert.equal(store.phase, "idle");
+});
+
+test("store: clear prevents a stale prepare success or failure from writing state", async () => {
+  const first = deferred<PreparedCandidateConfirmation>();
+  const second = deferred<PreparedCandidateConfirmation>();
+  let count = 0;
+  const store = setup({
+    prepareCandidateConfirmation: async () => (++count === 1 ? first.promise : second.promise),
+    confirmCandidateMemory: async (id) => confirmed(id),
+    cancelCandidateConfirmationApproval: async (id) => cancelled(id),
+  });
+
+  const prepareA = store.prepare("candidate-a");
+  store.clearCandidateConfirmation();
+  first.resolve(prepared("candidate-a"));
+  await prepareA;
+  assert.equal(store.phase, "idle");
+
+  const prepareB = store.prepare("candidate-b");
+  second.resolve(prepared("candidate-b"));
+  await prepareB;
+  assert.equal(store.phase, "prepared");
+  assert.equal(store.prepared?.candidateId, "candidate-b");
+
+  const failingPrepare = deferred<PreparedCandidateConfirmation>();
+  const failingStore = setup({
+    prepareCandidateConfirmation: async () => failingPrepare.promise,
+    confirmCandidateMemory: async (id) => confirmed(id),
+    cancelCandidateConfirmationApproval: async (id) => cancelled(id),
+  });
+  const failingOperation = failingStore.prepare("candidate-c");
+  failingStore.clearCandidateConfirmation();
+  failingPrepare.reject(new Error("stale prepare failure"));
+  await failingOperation;
+  assert.equal(failingStore.phase, "idle");
+  assert.equal(failingStore.error, null);
+});
+
+test("store: clear prevents a stale confirm or cancel response from overwriting a newer prepare", async () => {
+  const confirmDeferred = deferred<CandidateConfirmationResult>();
+  const cancelDeferred = deferred<CancelCandidateConfirmationResult>();
+  let confirmPending = true;
+  let cancelPending = false;
+  const store = setup({
+    prepareCandidateConfirmation: async (id) => prepared(id, id === "candidate-a" ? "a".repeat(64) : "b".repeat(64)),
+    confirmCandidateMemory: async (id) => confirmPending ? confirmDeferred.promise : confirmed(id),
+    cancelCandidateConfirmationApproval: async (id) => cancelPending ? cancelDeferred.promise : cancelled(id),
+  });
+
+  await store.prepare("candidate-a");
+  const confirming = store.confirm("candidate-a");
+  store.clearCandidateConfirmation();
+  await store.prepare("candidate-b");
+  confirmDeferred.resolve(confirmed("candidate-a"));
+  await confirming;
+  assert.equal(store.phase, "prepared");
+  assert.equal(store.prepared?.candidateId, "candidate-b");
 
   store.clearCandidateConfirmation();
+  await store.prepare("candidate-a");
+  confirmPending = false;
+  cancelPending = true;
+  const cancelling = store.cancel("candidate-a");
+  store.clearCandidateConfirmation();
+  await store.prepare("candidate-b");
+  cancelDeferred.resolve(cancelled("candidate-a"));
+  await cancelling;
+  assert.equal(store.phase, "prepared");
+  assert.equal(store.prepared?.candidateId, "candidate-b");
 
-  assert.equal(store.phase, "idle");
-  assert.equal(store.candidateId, null);
+  const failedConfirm = deferred<CandidateConfirmationResult>();
+  const failedCancel = deferred<CancelCandidateConfirmationResult>();
+  let failureMode: "confirm" | "cancel" = "confirm";
+  const failureStore = setup({
+    prepareCandidateConfirmation: async (id) => prepared(id),
+    confirmCandidateMemory: async () => failedConfirm.promise,
+    cancelCandidateConfirmationApproval: async () => failedCancel.promise,
+  });
+  await failureStore.prepare("candidate-a");
+  const failedConfirmOperation = failureStore.confirm("candidate-a");
+  failureStore.clearCandidateConfirmation();
+  await failureStore.prepare("candidate-b");
+  failedConfirm.reject(new Error("stale confirm failure"));
+  await failedConfirmOperation;
+  assert.equal(failureStore.phase, "prepared");
+  assert.equal(failureStore.prepared?.candidateId, "candidate-b");
+
+  failureMode = "cancel";
+  failureStore.clearCandidateConfirmation();
+  await failureStore.prepare("candidate-a");
+  const failedCancelOperation = failureStore.cancel("candidate-a");
+  failureStore.clearCandidateConfirmation();
+  await failureStore.prepare("candidate-b");
+  failedCancel.reject(new Error(`${failureMode} failure`));
+  await failedCancelOperation;
+  assert.equal(failureStore.phase, "prepared");
+  assert.equal(failureStore.prepared?.candidateId, "candidate-b");
+});
+
+test("store: retry-same-token retains authorization, while reprepare clears it", async () => {
+  const tokens: string[] = [];
+  let attempt = 0;
+  const store = setup({
+    prepareCandidateConfirmation: async (id) => prepared(id, "d".repeat(64)),
+    confirmCandidateMemory: async (id, token) => {
+      tokens.push(token);
+      attempt += 1;
+      if (attempt === 1) {
+        throw new CandidateConfirmationError(
+          "CANDIDATE_CONFIRMATION_STORAGE_UNAVAILABLE", "", "retrySameToken",
+        );
+      }
+      if (attempt === 2) {
+        throw new CandidateConfirmationError(
+          "CANDIDATE_CONFIRMATION_TOKEN_IN_FLIGHT", "", "retrySameToken",
+        );
+      }
+      if (attempt === 3) {
+        throw new CandidateConfirmationError(
+          "CANDIDATE_CONFIRMATION_TOKEN_EXPIRED", "", "reprepare",
+        );
+      }
+      return confirmed(id);
+    },
+    cancelCandidateConfirmationApproval: async (id) => cancelled(id),
+  });
+
+  await store.prepare("candidate-a");
+  await store.confirm("candidate-a");
+  assert.equal(store.phase, "prepared");
+  await store.confirm("candidate-a");
+  assert.equal(store.phase, "prepared");
+  await store.confirm("candidate-a");
+  assert.equal(store.phase, "failed");
   assert.equal(store.prepared, null);
-  assert.equal(store.error, null);
-  assert.equal(store.result, null);
+  assert.equal(tokens[0], tokens[1]);
+  assert.equal(tokens[1], tokens[2]);
 });
 
-// ── Token Security Tests ──────────────────────────────────────────────
+test("store: cancel false or rejection clears local authorization and reports failure", async () => {
+  let mode: "false" | "reject" = "false";
+  const store = setup({
+    prepareCandidateConfirmation: async (id) => prepared(id),
+    confirmCandidateMemory: async (id) => confirmed(id),
+    cancelCandidateConfirmationApproval: async (id) => {
+      if (mode === "reject") throw new Error("backend detail must not leak");
+      return cancelled(id, false);
+    },
+  });
 
-test("Store: approvalToken is null when no prepared", () => {
-  const pinia = createPinia();
-  setActivePinia(pinia);
-  const store = useCandidateConfirmationStore();
+  await store.prepare("candidate-a");
+  await store.cancel("candidate-a");
+  assert.equal(store.phase, "failed");
+  assert.equal(store.prepared, null);
+  assert.match(store.error?.message ?? "", /local authorization cleared/);
 
-  assert.equal(store.approvalToken, null);
+  mode = "reject";
+  await store.prepare("candidate-b");
+  await store.cancel("candidate-b");
+  assert.equal(store.phase, "failed");
+  assert.equal(store.prepared, null);
+  assert.match(store.error?.message ?? "", /Cancellation status unknown/);
 });
 
-test("Store: no persist configuration", () => {
-  // Verify the store definition doesn't use persist plugin
-  // The store is defined with setup syntax, no persist option
-  const pinia = createPinia();
-  setActivePinia(pinia);
-  const store = useCandidateConfirmationStore();
+test("store: local expiration rejects invalid and past timestamps but permits a future timestamp", async () => {
+  const expirationFor = new Map<string, string>([
+    ["invalid", "not-a-date"],
+    ["past", new Date(Date.now() - 1_000).toISOString()],
+    ["future", new Date(Date.now() + 60_000).toISOString()],
+  ]);
+  const store = setup({
+    prepareCandidateConfirmation: async (id) => ({ ...prepared(id), expiresAt: expirationFor.get(id)! }),
+    confirmCandidateMemory: async (id) => confirmed(id),
+    cancelCandidateConfirmationApproval: async (id) => cancelled(id),
+  });
 
-  // Store should not have any persistence metadata
-  assert.ok(!('$persist' in store), "Store should not have persist config");
-});
-
-// ── Expiration Tests ──────────────────────────────────────────────────
-
-test("Store: isPreparedConfirmationExpired returns false when no prepared", () => {
-  const pinia = createPinia();
-  setActivePinia(pinia);
-  const store = useCandidateConfirmationStore();
-
+  await store.prepare("invalid");
+  assert.equal(store.isPreparedConfirmationExpired, true);
+  assert.equal(store.canConfirm, false);
+  await store.prepare("past");
+  assert.equal(store.isPreparedConfirmationExpired, true);
+  await store.prepare("future");
   assert.equal(store.isPreparedConfirmationExpired, false);
-});
-
-// ── Error Model Tests ─────────────────────────────────────────────────
-
-test("Error: CandidateConfirmationError has action field", () => {
-  const err = new CandidateConfirmationError(
-    "CANDIDATE_CONFIRMATION_TOKEN_EXPIRED",
-    "expired",
-    "reprepare",
-  );
-  assert.equal(err.action, "reprepare");
-  assert.equal(err.requiresReprepare, true);
-  assert.equal(err.recoverable, true);
-});
-
-test("Error: recoverable getter works correctly", () => {
-  const reprepare = new CandidateConfirmationError("CANDIDATE_CONFIRMATION_TOKEN_EXPIRED", "", "reprepare");
-  assert.equal(reprepare.recoverable, true);
-
-  const retry = new CandidateConfirmationError("CANDIDATE_CONFIRMATION_STORAGE_UNAVAILABLE", "", "retrySameToken");
-  assert.equal(retry.recoverable, true);
-
-  const later = new CandidateConfirmationError("CANDIDATE_CONFIRMATION_TEMPORARILY_UNAVAILABLE", "", "retryPrepareLater");
-  assert.equal(later.recoverable, true);
-
-  const none = new CandidateConfirmationError("CANDIDATE_CONFIRMATION_INTERNAL_ERROR", "", "none");
-  assert.equal(none.recoverable, false);
-});
-
-// ── Cancel Failure Semantics Tests ────────────────────────────────────
-
-test("Cancel failure: uses safe message, no raw error leaked", () => {
-  // The store cancel action catches errors and creates a safe message
-  const err = new CandidateConfirmationError(
-    "CANDIDATE_CONFIRMATION_INTERNAL_ERROR",
-    "Cancellation status unknown; local authorization cleared.",
-    "none",
-  );
-  assert.ok(!err.message.includes("token"));
-  assert.ok(!err.message.includes("SQL"));
-});
-
-// ── Generation Tests ──────────────────────────────────────────────────
-
-// These test the generation mechanism conceptually.
-// The actual generation counter is private to the store closure.
-// We verify the observable behavior: stale promises don't overwrite state.
-
-test("Generation: clear invalidates in-flight operations", () => {
-  // Conceptual test - the actual mechanism is internal to the store
-  // When clearCandidateConfirmation() is called, it increments generation
-  // Any in-flight promise that completes after will check generation
-  // and skip writing to store
-  assert.ok(true, "Generation protection is implemented in store");
-});
-
-test("Generation: not exposed to UI", () => {
-  const pinia = createPinia();
-  setActivePinia(pinia);
-  const store = useCandidateConfirmationStore();
-
-  // Generation should not be a reactive property
-  assert.equal('generation' in store, false, "generation should not be exposed");
-});
-
-// ── Controller Interface Tests ────────────────────────────────────────
-
-test("Store implements CandidateConfirmationActions interface", () => {
-  const pinia = createPinia();
-  setActivePinia(pinia);
-  const store = useCandidateConfirmationStore();
-
-  // Verify store has the methods the controller expects
-  assert.equal(typeof store.prepare, 'function');
-  assert.equal(typeof store.confirm, 'function');
-  assert.equal(typeof store.cancel, 'function');
-  assert.equal(typeof store.clearCandidateConfirmation, 'function');
-
-  // Verify computed properties
-  assert.equal(typeof store.canPrepare, 'boolean');
-  assert.equal(typeof store.canConfirm, 'boolean');
-  assert.equal(typeof store.canCancel, 'boolean');
-});
-
-test("Store: canPrepare is true in idle, failed, succeeded", () => {
-  const pinia = createPinia();
-  setActivePinia(pinia);
-  const store = useCandidateConfirmationStore();
-
-  // idle
-  assert.equal(store.canPrepare, true);
-
-  // After clear (idle)
-  store.clearCandidateConfirmation();
-  assert.equal(store.canPrepare, true);
-});
-
-test("Store: canConfirm is false when not prepared", () => {
-  const pinia = createPinia();
-  setActivePinia(pinia);
-  const store = useCandidateConfirmationStore();
-
-  assert.equal(store.canConfirm, false);
-});
-
-test("Store: canCancel is false when no prepared", () => {
-  const pinia = createPinia();
-  setActivePinia(pinia);
-  const store = useCandidateConfirmationStore();
-
-  assert.equal(store.canCancel, false);
+  assert.equal(store.canConfirm, true);
 });

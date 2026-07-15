@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { invoke } from "@tauri-apps/api/core";
-import { computed, onMounted, onUnmounted, ref, reactive } from "vue";
+import { computed, onMounted, onUnmounted, ref, reactive, watch } from "vue";
 import { bodyStateMachine, type BodyState } from "../body";
 import {
   ConversationError,
@@ -11,6 +11,7 @@ import {
 import ChatInput from "./ChatInput.vue";
 import ConversationSidebar from "./ConversationSidebar.vue";
 import MessageBubble from "./MessageBubble.vue";
+import CandidateConfirmationDialog from "./components/CandidateConfirmationDialog.vue";
 import { MemoryReviewController } from "./memoryReviewController";
 import { memoryService, memoryExtractor } from "../memory";
 import { useCandidateConfirmationStore } from "../stores/candidateConfirmation";
@@ -47,6 +48,86 @@ const showMemoryPanel = ref(false);
 const showUnconfirmedHint = ref(false);
 const confirmationStore = useCandidateConfirmationStore();
 const controller = reactive(new MemoryReviewController(memoryService, memoryExtractor, confirmationStore));
+
+// ── Confirmation Dialog State ─────────────────────────────────────────
+
+const showConfirmationDialog = ref(false);
+const confirmingCandidateIndex = ref<number>(-1);
+
+// Open dialog when store enters preparing or prepared phase
+watch(
+  () => confirmationStore.phase,
+  (phase) => {
+    if (phase === "preparing" || phase === "prepared") {
+      showConfirmationDialog.value = true;
+    }
+    // Close on success
+    if (phase === "succeeded") {
+      showConfirmationDialog.value = false;
+      confirmingCandidateIndex.value = -1;
+      // Refresh the candidate list
+      handleConfirmationSuccess();
+    }
+    // Close on idle (after cancel)
+    if (phase === "idle") {
+      showConfirmationDialog.value = false;
+      confirmingCandidateIndex.value = -1;
+    }
+  },
+);
+
+async function handleConfirmationSuccess(): Promise<void> {
+  // Mark the candidate as confirmed in the controller
+  if (confirmingCandidateIndex.value >= 0) {
+    const candidate = controller.candidates[confirmingCandidateIndex.value];
+    if (candidate) {
+      candidate.state = "confirmed";
+    }
+  }
+  // Clear store result after handling
+  confirmationStore.clearCandidateConfirmation();
+}
+
+function handleOpenConfirmation(index: number): void {
+  confirmingCandidateIndex.value = index;
+  const candidate = controller.candidates[index];
+  if (!candidate?.dbRecord?.id) return;
+
+  // Call prepare via controller
+  controller.prepareCandidate(index);
+}
+
+function handleDialogConfirm(): void {
+  if (confirmingCandidateIndex.value < 0) return;
+  const candidate = controller.candidates[confirmingCandidateIndex.value];
+  if (!candidate?.dbRecord?.id) return;
+
+  controller.confirmPreparedCandidate(confirmingCandidateIndex.value);
+}
+
+function handleDialogCancel(): void {
+  if (confirmingCandidateIndex.value < 0) return;
+  const candidate = controller.candidates[confirmingCandidateIndex.value];
+  if (!candidate?.dbRecord?.id) return;
+
+  controller.cancelPreparedCandidate(confirmingCandidateIndex.value);
+}
+
+function handleDialogClose(): void {
+  // Local close without backend cancel
+  // Token will expire naturally in Rust
+  showConfirmationDialog.value = false;
+  confirmingCandidateIndex.value = -1;
+  confirmationStore.clearCandidateConfirmation();
+}
+
+function handleDialogRetry(): void {
+  if (confirmingCandidateIndex.value < 0) return;
+  const candidate = controller.candidates[confirmingCandidateIndex.value];
+  if (!candidate?.dbRecord?.id) return;
+
+  controller.prepareCandidate(confirmingCandidateIndex.value);
+}
 
 let unsubscribeMessages: (() => void) | undefined;
 let unsubscribeBodyState: (() => void) | undefined;
@@ -398,15 +479,15 @@ onUnmounted(() => {
               保存修改
             </button>
 
-            <!-- Stage 2: Confirm Long-term Memory (D-5C will implement the two-phase flow) -->
+            <!-- Stage 2: View and Confirm Long-term Memory -->
             <button
               v-if="candidate.state === 'candidateCreated'"
               class="btn btn-confirm"
               type="button"
-              disabled
-              title="Confirmation UI will be implemented in D-5C"
+              :disabled="confirmationStore.phase !== 'idle' && confirmationStore.phase !== 'failed' && confirmationStore.phase !== 'succeeded'"
+              @click="handleOpenConfirmation(index)"
             >
-              确认长期记住
+              查看并确认
             </button>
 
             <!-- Discard draft OR Delete candidate -->
@@ -429,6 +510,18 @@ onUnmounted(() => {
       </div>
     </div>
   </aside>
+
+  <!-- Candidate Confirmation Dialog -->
+  <CandidateConfirmationDialog
+    :open="showConfirmationDialog"
+    :prepared="confirmationStore.prepared"
+    :phase="confirmationStore.phase"
+    :error="confirmationStore.error"
+    @confirm="handleDialogConfirm"
+    @cancel="handleDialogCancel"
+    @close="handleDialogClose"
+    @retry-prepare="handleDialogRetry"
+  />
 </template>
 
 <style>

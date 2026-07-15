@@ -13,6 +13,9 @@ interface Props {
   prepared: PreparedCandidateConfirmationPreview | null;
   phase: CandidateConfirmationPhase;
   error: CandidateConfirmationError | null;
+  cancelOutcomeUnknown: boolean;
+  isReloadingAuthoritativeState: boolean;
+  authoritativeReloadFailed: boolean;
 }
 
 const props = defineProps<Props>();
@@ -25,6 +28,7 @@ const emit = defineEmits<{
   close: [];
   retryPrepare: [];
   retryConfirm: [];
+  reloadAuthoritativeState: [];
 }>();
 
 // ── Refs ──────────────────────────────────────────────────────────────
@@ -176,6 +180,11 @@ function handleRetryConfirm() {
   if (canConfirm.value) emit("retryConfirm");
 }
 
+function handleReloadAuthoritativeState() {
+  if (!props.cancelOutcomeUnknown || props.isReloadingAuthoritativeState) return;
+  emit("reloadAuthoritativeState");
+}
+
 // ── Lifecycle ─────────────────────────────────────────────────────────
 
 onMounted(() => {
@@ -291,8 +300,31 @@ onUnmounted(() => {
           <p>正在取消确认...</p>
         </div>
 
+        <!-- Cancel outcome unknown: local authorization has been cleared and only a read refresh is allowed. -->
+        <div v-if="cancelOutcomeUnknown" class="error-banner uncertain-cancel-banner" role="alert">
+          <p class="error-message">
+            未能确认后端是否已取消，本地授权信息已清除。请重新加载候选状态以确认当前结果。
+          </p>
+          <p v-if="authoritativeReloadFailed" class="error-message">
+            重新加载失败，请稍后再试。
+          </p>
+          <div class="error-actions">
+            <button
+              class="btn btn-secondary reload-authoritative-state"
+              type="button"
+              :disabled="isReloadingAuthoritativeState"
+              @click="handleReloadAuthoritativeState"
+            >
+              {{ isReloadingAuthoritativeState ? "正在重新加载..." : "重新加载候选状态" }}
+            </button>
+            <button class="btn btn-secondary uncertain-cancel-close" type="button" @click="handleClose">
+              关闭
+            </button>
+          </div>
+        </div>
+
         <!-- Error Display, including failed states whose preview was cleared by the Store -->
-        <div v-if="error" class="error-banner" role="alert">
+        <div v-else-if="error" class="error-banner" role="alert">
           <p class="error-message">{{ errorMessage }}</p>
 
           <!-- Reprepare action -->

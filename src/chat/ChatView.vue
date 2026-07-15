@@ -60,8 +60,19 @@ const activeConfirmationCandidateId = ref<string | null>(null);
 const confirmationUiError = ref<CandidateConfirmationError | null>(null);
 const confirmationNotice = ref<string>();
 const confirmationRefreshNotice = ref<string>();
+const cancelOutcomeUnknown = ref(false);
+const isReloadingAuthoritativeState = ref(false);
+const authoritativeReloadFailed = ref(false);
 const dialogError = computed(() => confirmationUiError.value ?? confirmationStore.error);
 const confirmationFlowActive = computed(() => activeConfirmationCandidateId.value !== null);
+let authoritativeReloadGeneration = 0;
+
+function clearCancelOutcomeUnknown(): void {
+  authoritativeReloadGeneration += 1;
+  cancelOutcomeUnknown.value = false;
+  isReloadingAuthoritativeState.value = false;
+  authoritativeReloadFailed.value = false;
+}
 
 function setCandidateMismatchError(): void {
   confirmationUiError.value = new CandidateConfirmationError(
@@ -96,6 +107,7 @@ watch(
       showConfirmationDialog.value = false;
       activeConfirmationCandidateId.value = null;
       confirmationUiError.value = null;
+      clearCancelOutcomeUnknown();
     }
   },
 );
@@ -119,6 +131,7 @@ function handleOpenConfirmation(index: number): void {
 
   activeConfirmationCandidateId.value = candidate.dbRecord.id;
   confirmationUiError.value = null;
+  clearCancelOutcomeUnknown();
   void controller.prepareCandidateById(candidate.dbRecord.id);
 }
 
@@ -131,18 +144,28 @@ function handleDialogConfirm(): void {
   void controller.confirmPreparedCandidateById(candidateId);
 }
 
-function handleDialogCancel(): void {
+async function handleDialogCancel(): Promise<void> {
   const candidateId = confirmationStore.prepared?.candidateId;
   if (!candidateId || candidateId !== activeConfirmationCandidateId.value) {
     setCandidateMismatchError();
     return;
   }
-  void controller.cancelPreparedCandidateById(candidateId);
+  await controller.cancelPreparedCandidateById(candidateId);
+  if (
+    activeConfirmationCandidateId.value === candidateId &&
+    confirmationStore.phase === "failed" &&
+    confirmationStore.prepared === null
+  ) {
+    cancelOutcomeUnknown.value = true;
+    authoritativeReloadFailed.value = false;
+    showConfirmationDialog.value = true;
+  }
 }
 
 function handleDialogClose(): void {
   if (confirmationStore.phase === "confirming" || confirmationStore.phase === "cancelling") return;
   // Preparing has no issued token; failed has no cancellable authorization.
+  clearCancelOutcomeUnknown();
   showConfirmationDialog.value = false;
   confirmationStore.clearCandidateConfirmation();
 }
@@ -151,11 +174,38 @@ function handleDialogRetryPrepare(): void {
   const candidateId = activeConfirmationCandidateId.value;
   if (!candidateId) return;
   confirmationUiError.value = null;
+  clearCancelOutcomeUnknown();
   void controller.prepareCandidateById(candidateId);
 }
 
 function handleDialogRetryConfirm(): void {
   handleDialogConfirm();
+}
+
+async function handleReloadAuthoritativeState(): Promise<void> {
+  if (!cancelOutcomeUnknown.value || isReloadingAuthoritativeState.value) return;
+
+  const operationGeneration = ++authoritativeReloadGeneration;
+  isReloadingAuthoritativeState.value = true;
+  authoritativeReloadFailed.value = false;
+
+  try {
+    await controller.refreshConfirmationData();
+    if (operationGeneration !== authoritativeReloadGeneration || !cancelOutcomeUnknown.value) return;
+
+    confirmationStore.clearCandidateConfirmation();
+    clearCancelOutcomeUnknown();
+    activeConfirmationCandidateId.value = null;
+    showConfirmationDialog.value = false;
+    confirmationNotice.value = "候选状态已重新加载。";
+  } catch {
+    if (operationGeneration !== authoritativeReloadGeneration || !cancelOutcomeUnknown.value) return;
+    authoritativeReloadFailed.value = true;
+  } finally {
+    if (operationGeneration === authoritativeReloadGeneration) {
+      isReloadingAuthoritativeState.value = false;
+    }
+  }
 }
 
 let unsubscribeMessages: (() => void) | undefined;
@@ -306,6 +356,7 @@ onMounted(() => {
 });
 
 onUnmounted(() => {
+  clearCancelOutcomeUnknown();
   unsubscribeMessages?.();
   unsubscribeBodyState?.();
 });
@@ -552,11 +603,15 @@ onUnmounted(() => {
     :prepared="confirmationStore.prepared"
     :phase="confirmationStore.phase"
     :error="dialogError"
+    :cancel-outcome-unknown="cancelOutcomeUnknown"
+    :is-reloading-authoritative-state="isReloadingAuthoritativeState"
+    :authoritative-reload-failed="authoritativeReloadFailed"
     @confirm="handleDialogConfirm"
     @cancel="handleDialogCancel"
     @close="handleDialogClose"
     @retry-prepare="handleDialogRetryPrepare"
     @retry-confirm="handleDialogRetryConfirm"
+    @reload-authoritative-state="handleReloadAuthoritativeState"
   />
 </template>
 

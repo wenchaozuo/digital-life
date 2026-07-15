@@ -29,6 +29,9 @@ function mountDialog(options: {
   prepared?: PreparedCandidateConfirmationPreview | null;
   phase?: CandidateConfirmationPhase;
   error?: CandidateConfirmationError | null;
+  cancelOutcomeUnknown?: boolean;
+  isReloadingAuthoritativeState?: boolean;
+  authoritativeReloadFailed?: boolean;
 } = {}): VueWrapper {
   return mount(CandidateConfirmationDialog, {
     attachTo: document.body,
@@ -37,6 +40,9 @@ function mountDialog(options: {
       prepared: options.prepared ?? preview(),
       phase: options.phase ?? "prepared",
       error: options.error ?? null,
+      cancelOutcomeUnknown: options.cancelOutcomeUnknown ?? false,
+      isReloadingAuthoritativeState: options.isReloadingAuthoritativeState ?? false,
+      authoritativeReloadFailed: options.authoritativeReloadFailed ?? false,
     },
   });
 }
@@ -199,6 +205,47 @@ describe("CandidateConfirmationDialog", () => {
     });
 
     expect(wrapper.find(".error-actions .btn-secondary").text()).toContain("关闭");
+  });
+
+  it("offers only an explicit authoritative reload for an uncertain cancellation", async () => {
+    const wrapper = mountDialog({
+      prepared: null,
+      phase: "failed",
+      error: new CandidateConfirmationError(
+        "CANDIDATE_CONFIRMATION_INTERNAL_ERROR",
+        "The confirmation operation failed.",
+        "none",
+      ),
+      cancelOutcomeUnknown: true,
+    });
+
+    expect(wrapper.find(".uncertain-cancel-banner").exists()).toBe(true);
+    expect(wrapper.find(".reload-authoritative-state").text()).toContain("重新加载候选状态");
+    expect(wrapper.find(".uncertain-cancel-close").text()).toContain("关闭");
+    expect(wrapper.text()).not.toContain("取消成功");
+    expect(wrapper.html()).not.toContain("approvalToken");
+
+    await wrapper.find(".reload-authoritative-state").trigger("click");
+    await wrapper.find(".uncertain-cancel-close").trigger("click");
+
+    expect(wrapper.emitted("reloadAuthoritativeState")).toHaveLength(1);
+    expect(wrapper.emitted("close")).toHaveLength(1);
+    expect(wrapper.emitted("confirm")).toBeUndefined();
+    expect(wrapper.emitted("cancel")).toBeUndefined();
+  });
+
+  it("blocks duplicate authoritative reload intent while a reload is in progress", async () => {
+    const wrapper = mountDialog({
+      prepared: null,
+      phase: "failed",
+      cancelOutcomeUnknown: true,
+      isReloadingAuthoritativeState: true,
+    });
+
+    const reload = wrapper.find(".reload-authoritative-state");
+    expect(reload.attributes("disabled")).toBeDefined();
+    await reload.trigger("click");
+    expect(wrapper.emitted("reloadAuthoritativeState")).toBeUndefined();
   });
 
   it("exposes dialog semantics and restores focus after closing", async () => {

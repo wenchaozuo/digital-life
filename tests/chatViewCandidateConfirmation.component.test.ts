@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
-import type { PreparedCandidateConfirmationPreview } from "../src/memory/candidateConfirmationTypes.ts";
+import {
+  CandidateConfirmationError,
+  type PreparedCandidateConfirmationPreview,
+} from "../src/memory/candidateConfirmationTypes.ts";
 
 const mocks = vi.hoisted(() => {
   const candidateA = {
@@ -148,6 +151,30 @@ afterEach(() => {
 });
 
 describe("ChatView candidate confirmation wiring", () => {
+  async function enterUncertainCancellation(
+    wrapper: ReturnType<typeof mount>,
+    message: string,
+  ) {
+    await wrapper.findAll(".candidate-card .btn-confirm")[0].trigger("click");
+    mocks.store.prepared = prepared("candidate-a");
+    mocks.store.phase = "prepared";
+    await wrapper.vm.$nextTick();
+    mocks.cancel.mockImplementationOnce(async () => {
+      mocks.store.prepared = null;
+      mocks.store.error = new CandidateConfirmationError(
+        "CANDIDATE_CONFIRMATION_INTERNAL_ERROR",
+        message,
+        "none",
+      );
+      mocks.store.phase = "failed";
+    });
+
+    const dialog = wrapper.findComponent(CandidateConfirmationDialog);
+    await dialog.find(".btn-cancel").trigger("click");
+    await flushPromises();
+    return dialog;
+  }
+
   it("starts only Prepare from the candidate entry point and blocks a second candidate", async () => {
     const wrapper = mountChatView();
     await flushPromises();
@@ -230,5 +257,83 @@ describe("ChatView candidate confirmation wiring", () => {
     expect(mocks.store.clearCandidateConfirmation).toHaveBeenCalledTimes(1);
     expect(mocks.refresh).toHaveBeenCalledTimes(1);
     expect(wrapper.text()).toContain("该记忆此前已经保存。");
+  });
+
+  it("reloads authoritative data after cancelled:false without reusing confirmation actions", async () => {
+    const wrapper = mountChatView();
+    await flushPromises();
+    const dialog = await enterUncertainCancellation(
+      wrapper,
+      "Backend cancellation was not confirmed; local authorization cleared.",
+    );
+
+    expect(dialog.find(".uncertain-cancel-banner").exists()).toBe(true);
+    expect(wrapper.text()).not.toContain("取消成功");
+    await dialog.find(".reload-authoritative-state").trigger("click");
+    await flushPromises();
+
+    expect(mocks.cancel).toHaveBeenCalledTimes(1);
+    expect(mocks.confirm).not.toHaveBeenCalled();
+    expect(mocks.prepare).toHaveBeenCalledTimes(1);
+    expect(mocks.refresh).toHaveBeenCalledTimes(1);
+    expect(mocks.store.clearCandidateConfirmation).toHaveBeenCalledTimes(1);
+    expect(dialog.props("open")).toBe(false);
+  });
+
+  it("offers the same authoritative reload after a cancel command exception", async () => {
+    const wrapper = mountChatView();
+    await flushPromises();
+    const dialog = await enterUncertainCancellation(
+      wrapper,
+      "Cancellation status unknown; local authorization cleared.",
+    );
+
+    await dialog.find(".reload-authoritative-state").trigger("click");
+    await flushPromises();
+
+    expect(mocks.cancel).toHaveBeenCalledTimes(1);
+    expect(mocks.confirm).not.toHaveBeenCalled();
+    expect(mocks.prepare).toHaveBeenCalledTimes(1);
+    expect(mocks.refresh).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the uncertain-cancel dialog open when authoritative reload fails and permits a manual retry", async () => {
+    const wrapper = mountChatView();
+    await flushPromises();
+    const dialog = await enterUncertainCancellation(
+      wrapper,
+      "Cancellation status unknown; local authorization cleared.",
+    );
+    mocks.refresh.mockRejectedValueOnce(new Error("backend details must not be rendered"));
+
+    await dialog.find(".reload-authoritative-state").trigger("click");
+    await flushPromises();
+
+    expect(dialog.props("open")).toBe(true);
+    expect(dialog.text()).toContain("重新加载失败，请稍后再试。");
+    expect(dialog.text()).not.toContain("backend details must not be rendered");
+    expect(dialog.find(".reload-authoritative-state").attributes("disabled")).toBeUndefined();
+    expect(mocks.refresh).toHaveBeenCalledTimes(1);
+
+    await dialog.find(".reload-authoritative-state").trigger("click");
+    await flushPromises();
+    expect(mocks.refresh).toHaveBeenCalledTimes(2);
+  });
+
+  it("closes an uncertain cancellation without refreshing authoritative data", async () => {
+    const wrapper = mountChatView();
+    await flushPromises();
+    const dialog = await enterUncertainCancellation(
+      wrapper,
+      "Backend cancellation was not confirmed; local authorization cleared.",
+    );
+
+    await dialog.find(".uncertain-cancel-close").trigger("click");
+    await flushPromises();
+
+    expect(mocks.refresh).not.toHaveBeenCalled();
+    expect(mocks.store.clearCandidateConfirmation).toHaveBeenCalledTimes(1);
+    expect(dialog.props("open")).toBe(false);
+    expect(wrapper.text()).not.toContain("取消成功");
   });
 });

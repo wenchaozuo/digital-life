@@ -13,7 +13,7 @@ import ConversationSidebar from "./ConversationSidebar.vue";
 import MessageBubble from "./MessageBubble.vue";
 import { MemoryReviewController } from "./memoryReviewController";
 import { memoryService, memoryExtractor } from "../memory";
-import { candidateConfirmationService } from "../memory/candidateConfirmationService";
+import { useCandidateConfirmationStore } from "../stores/candidateConfirmation";
 import { lifeIdentityManager } from "../life";
 import { createClosePanelHandler } from "./memoryReviewAdapter";
 
@@ -45,7 +45,8 @@ const interactionDisabled = computed(() => isConversationLoading.value || isSend
 
 const showMemoryPanel = ref(false);
 const showUnconfirmedHint = ref(false);
-const controller = reactive(new MemoryReviewController(memoryService, memoryExtractor, candidateConfirmationService));
+const confirmationStore = useCandidateConfirmationStore();
+const controller = reactive(new MemoryReviewController(memoryService, memoryExtractor, confirmationStore));
 
 let unsubscribeMessages: (() => void) | undefined;
 let unsubscribeBodyState: (() => void) | undefined;

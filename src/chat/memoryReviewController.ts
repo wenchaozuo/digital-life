@@ -7,11 +7,22 @@ import type {
   MemorySourceType,
 } from "../memory/types";
 import type { MemoryExtractionResult } from "../memory/extractor/types";
-import type {
-  PreparedCandidateConfirmation,
-  CandidateConfirmationResult,
-  CancelCandidateConfirmationResult,
-} from "../memory/candidateConfirmationTypes";
+
+// ── Confirmation Actions Interface ────────────────────────────────────
+// Controller depends on this interface, not on Pinia directly.
+// The production implementation is provided by the Pinia Store.
+
+export interface CandidateConfirmationActions {
+  prepare(candidateId: string): Promise<void>;
+  confirm(): Promise<void>;
+  cancel(): Promise<void>;
+  clearCandidateConfirmation(): void;
+  readonly canPrepare: boolean;
+  readonly canConfirm: boolean;
+  readonly canCancel: boolean;
+}
+
+// ── Types ─────────────────────────────────────────────────────────────
 
 export type PanelState = "idle" | "extracting" | "empty" | "reviewing" | "failed";
 
@@ -51,12 +62,6 @@ export interface IMemoryService {
   delete(lifeId: string, memoryId: string): Promise<DeleteMemoryResult>;
 }
 
-export interface ICandidateConfirmationService {
-  prepareCandidateConfirmation(candidateId: string): Promise<PreparedCandidateConfirmation>;
-  confirmCandidateMemory(candidateId: string, approvalToken: string): Promise<CandidateConfirmationResult>;
-  cancelCandidateConfirmationApproval(candidateId: string, approvalToken: string): Promise<CancelCandidateConfirmationResult>;
-}
-
 export interface IMemoryExtractor {
   extract(request: {
     lifeId: string;
@@ -86,16 +91,16 @@ export class MemoryReviewController {
 
   private memoryService: IMemoryService;
   private memoryExtractor: IMemoryExtractor;
-  private confirmationService: ICandidateConfirmationService;
+  private confirmationActions: CandidateConfirmationActions;
 
   constructor(
     memoryService: IMemoryService,
     memoryExtractor: IMemoryExtractor,
-    confirmationService: ICandidateConfirmationService,
+    confirmationActions: CandidateConfirmationActions,
   ) {
     this.memoryService = memoryService;
     this.memoryExtractor = memoryExtractor;
-    this.confirmationService = confirmationService;
+    this.confirmationActions = confirmationActions;
   }
 
   setLifeId(lifeId: string): void {
@@ -168,7 +173,6 @@ export class MemoryReviewController {
       return;
     }
 
-    // Guard checking conditions for candidate creation
     if (
       candidate.state !== "draft" ||
       (candidate.dbRecord !== undefined && candidate.dbRecord.id.length > 0)
@@ -205,7 +209,7 @@ export class MemoryReviewController {
       candidate.isSensitive = record.isSensitive;
       candidate.state = "candidateCreated";
     } catch (err: unknown) {
-      candidate.state = "draft"; // Revert to draft on failure
+      candidate.state = "draft";
       candidate.error = {
         code: getErrorCode(err),
         message: getErrorMessage(err),
@@ -220,7 +224,6 @@ export class MemoryReviewController {
       return;
     }
 
-    // Refuse editing, updating, and confirmation on confirmed candidates
     if (candidate.state === "confirmed") {
       candidate.error = {
         code: "CONFIRMED_LOCK",
@@ -263,7 +266,7 @@ export class MemoryReviewController {
       candidate.summary = record.summary || "";
       candidate.state = "candidateCreated";
     } catch (err: unknown) {
-      candidate.state = "candidateCreated"; // Keep as candidateCreated
+      candidate.state = "candidateCreated";
       candidate.error = {
         code: getErrorCode(err),
         message: getErrorMessage(err),
@@ -272,75 +275,28 @@ export class MemoryReviewController {
     }
   }
 
-  async prepareCandidate(index: number): Promise<PreparedCandidateConfirmation | null> {
+  /**
+   * Prepare a candidate for confirmation via the Store.
+   * Controller does NOT receive or handle tokens.
+   */
+  async prepareCandidate(index: number): Promise<void> {
     const candidate = this.candidates[index];
-    if (!candidate) {
-      return null;
-    }
-
-    if (candidate.state === "confirmed") {
-      return null;
-    }
-
-    if (!candidate.dbRecord || !candidate.dbRecord.id) {
+    if (!candidate) return;
+    if (candidate.state === "confirmed") return;
+    if (!candidate.dbRecord?.id) {
       candidate.error = {
         code: "MISSING_ID",
         message: "Cannot prepare a candidate that has not been saved.",
         stage: "confirmation",
       };
-      return null;
+      return;
     }
 
-    candidate.state = "confirming";
     candidate.error = undefined;
 
     try {
-      const prepared = await this.confirmationService.prepareCandidateConfirmation(
-        candidate.dbRecord.id,
-      );
-      return prepared;
+      await this.confirmationActions.prepare(candidate.dbRecord.id);
     } catch (err: unknown) {
-      candidate.state = "candidateCreated";
-      candidate.error = {
-        code: getErrorCode(err),
-        message: getErrorMessage(err),
-        stage: "confirmation",
-      };
-      return null;
-    }
-  }
-
-  async confirmCandidate(index: number, approvalToken: string): Promise<void> {
-    const candidate = this.candidates[index];
-    if (!candidate) {
-      return;
-    }
-
-    if (candidate.state === "confirmed") {
-      return;
-    }
-
-    if (!candidate.dbRecord || !candidate.dbRecord.id) {
-      candidate.error = {
-        code: "MISSING_ID",
-        message: "Cannot confirm a candidate that has not been saved.",
-        stage: "confirmation",
-      };
-      return;
-    }
-
-    candidate.state = "confirming";
-    candidate.error = undefined;
-
-    try {
-      await this.confirmationService.confirmCandidateMemory(
-        candidate.dbRecord.id,
-        approvalToken,
-      );
-      candidate.state = "confirmed";
-      // Note: result.confirmedMemoryId could be used for UI refresh in D-5C
-    } catch (err: unknown) {
-      candidate.state = "candidateCreated";
       candidate.error = {
         code: getErrorCode(err),
         message: getErrorMessage(err),
@@ -349,19 +305,26 @@ export class MemoryReviewController {
     }
   }
 
-  async cancelCandidatePreparation(index: number, approvalToken: string): Promise<void> {
-    const candidate = this.candidates[index];
-    if (!candidate || !candidate.dbRecord?.id) {
-      return;
-    }
-
+  /**
+   * Confirm the currently prepared candidate via the Store.
+   * Token is managed internally by the Store.
+   */
+  async confirmPreparedCandidate(): Promise<void> {
     try {
-      await this.confirmationService.cancelCandidateConfirmationApproval(
-        candidate.dbRecord.id,
-        approvalToken,
-      );
+      await this.confirmationActions.confirm();
     } catch {
-      // Cancel failure is non-critical for UI
+      // Store handles error state internally
+    }
+  }
+
+  /**
+   * Cancel the currently prepared candidate via the Store.
+   */
+  async cancelPreparedCandidate(): Promise<void> {
+    try {
+      await this.confirmationActions.cancel();
+    } catch {
+      // Store handles error state internally
     }
   }
 
@@ -379,7 +342,7 @@ export class MemoryReviewController {
         await this.memoryService.delete(this.lifeId, candidate.dbRecord.id);
         this.removeCandidateAt(index);
       } catch (err: unknown) {
-        candidate.state = originalState; // Revert to original lifecycle state
+        candidate.state = originalState;
         candidate.error = {
           code: getErrorCode(err),
           message: getErrorMessage(err),
@@ -399,15 +362,9 @@ export class MemoryReviewController {
   }
 
   closeReviewPanel(): boolean {
-    // 1. Keep only candidates that have been saved in DB
     this.candidates = this.candidates.filter((c) => c.dbRecord !== undefined);
-
-    // 2. Check if there are any database records that are not confirmed
     const hasUnconfirmed = this.candidates.some((c) => c.state !== "confirmed");
-
-    // 3. Reset global panel state
     this.panelState = "idle";
-
     return hasUnconfirmed;
   }
 

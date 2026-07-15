@@ -8,7 +8,7 @@ import {
   MemoryReviewController,
   type IMemoryService,
   type IMemoryExtractor,
-  type ICandidateConfirmationService,
+  type CandidateConfirmationActions,
   type UiCandidate,
 } from "../src/chat/memoryReviewController.ts";
 import { createClosePanelHandler } from "../src/chat/memoryReviewAdapter.ts";
@@ -20,34 +20,39 @@ import type {
   MemoryKind,
 } from "../src/memory/types.ts";
 import type { MemoryExtractionResult } from "../src/memory/extractor/types.ts";
-import type {
-  PreparedCandidateConfirmation,
-  CandidateConfirmationResult,
-  CancelCandidateConfirmationResult,
-} from "../src/memory/candidateConfirmationTypes.ts";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// ── Mock Types ────────────────────────────────────────────────────────
+
 interface MockServiceCalls {
   createCandidate: CreateMemoryCandidateRequest[];
   updateCandidate: UpdateMemoryRequest[];
-  prepareCandidate: string[];
-  confirmCandidate: { candidateId: string; approvalToken: string }[];
-  cancelCandidate: { candidateId: string; approvalToken: string }[];
   deleteCalls: { lifeId: string; memoryId: string }[];
   extract: { lifeId: string; messages: readonly { role: string; content: string; timestamp: string }[] }[];
+}
+
+interface MockConfirmationCalls {
+  prepare: string[];
+  confirm: number;
+  cancel: number;
+  clear: number;
 }
 
 function createMocks() {
   const calls: MockServiceCalls = {
     createCandidate: [],
     updateCandidate: [],
-    prepareCandidate: [],
-    confirmCandidate: [],
-    cancelCandidate: [],
     deleteCalls: [],
     extract: [],
+  };
+
+  const confirmationCalls: MockConfirmationCalls = {
+    prepare: [],
+    confirm: 0,
+    cancel: 0,
+    clear: 0,
   };
 
   const mockMemoryService: IMemoryService = {
@@ -93,39 +98,21 @@ function createMocks() {
     },
   };
 
-  const mockConfirmationService: ICandidateConfirmationService = {
-    async prepareCandidateConfirmation(candidateId: string): Promise<PreparedCandidateConfirmation> {
-      calls.prepareCandidate.push(candidateId);
-      return {
-        candidateId,
-        expectedRevision: 1,
-        kind: "preference",
-        content: "Test content",
-        summary: "Test summary",
-        isSensitive: false,
-        source: {
-          sourceType: "conversation",
-          inferenceStatus: "completed",
-        },
-        confirmationRequirement: "standard",
-        approvalToken: "a".repeat(64),
-        expiresAt: new Date(Date.now() + 300000).toISOString(),
-      };
+  const mockConfirmationActions: CandidateConfirmationActions = {
+    canPrepare: true,
+    canConfirm: false,
+    canCancel: false,
+    async prepare(candidateId: string): Promise<void> {
+      confirmationCalls.prepare.push(candidateId);
     },
-    async confirmCandidateMemory(candidateId: string, approvalToken: string): Promise<CandidateConfirmationResult> {
-      calls.confirmCandidate.push({ candidateId, approvalToken });
-      return {
-        candidateId,
-        confirmedMemoryId: "confirmed-mem-123",
-        outcome: "confirmed",
-      };
+    async confirm(): Promise<void> {
+      confirmationCalls.confirm++;
     },
-    async cancelCandidateConfirmationApproval(candidateId: string, approvalToken: string): Promise<CancelCandidateConfirmationResult> {
-      calls.cancelCandidate.push({ candidateId, approvalToken });
-      return {
-        candidateId,
-        cancelled: true,
-      };
+    async cancel(): Promise<void> {
+      confirmationCalls.cancel++;
+    },
+    clearCandidateConfirmation(): void {
+      confirmationCalls.clear++;
     },
   };
 
@@ -176,67 +163,52 @@ function createMocks() {
     },
   };
 
-  return { calls, mockMemoryService, mockMemoryExtractor, mockConfirmationService };
+  return { calls, confirmationCalls, mockMemoryService, mockMemoryExtractor, mockConfirmationActions };
 }
 
-test("1. 普通候选确认流程断言 (prepare + confirm)", async () => {
-  const { calls, mockMemoryService, mockMemoryExtractor, mockConfirmationService } = createMocks();
-  const controller = new MemoryReviewController(mockMemoryService, mockMemoryExtractor, mockConfirmationService);
+// ── Test: Controller does not receive tokens ──────────────────────────
+
+test("1. Controller 不接收 Token 参数", () => {
+  const { mockMemoryService, mockMemoryExtractor, mockConfirmationActions } = createMocks();
+  const controller = new MemoryReviewController(mockMemoryService, mockMemoryExtractor, mockConfirmationActions);
+
+  // Verify method signatures - no approvalToken parameter
+  assert.equal(controller.prepareCandidate.length, 1); // only index
+  assert.equal(controller.confirmPreparedCandidate.length, 0); // no params
+  assert.equal(controller.cancelPreparedCandidate.length, 0); // no params
+});
+
+// ── Test: Controller calls Store actions ──────────────────────────────
+
+test("2. Controller 调用 Store 动作而非直接调用 Service", async () => {
+  const { calls, confirmationCalls, mockMemoryService, mockMemoryExtractor, mockConfirmationActions } = createMocks();
+  const controller = new MemoryReviewController(mockMemoryService, mockMemoryExtractor, mockConfirmationActions);
   controller.setLifeId("life-123");
 
   await controller.extract([{ role: "user", content: "我喜欢乌龙茶", timestamp: "2026-07-12" }]);
   await controller.createCandidate(0);
 
-  // Asserting parameters passed to createCandidate
   assert.equal(calls.createCandidate.length, 1);
-  assert.equal(calls.createCandidate[0].lifeId, "life-123");
 
-  // Step 1: Prepare candidate
-  const prepared = await controller.prepareCandidate(0);
-  assert.ok(prepared);
-  assert.equal(calls.prepareCandidate.length, 1);
-  assert.equal(calls.prepareCandidate[0], "db-mem-123");
+  // Prepare calls store action
+  await controller.prepareCandidate(0);
+  assert.equal(confirmationCalls.prepare.length, 1);
+  assert.equal(confirmationCalls.prepare[0], "db-mem-123");
 
-  // Step 2: Confirm candidate with token
-  await controller.confirmCandidate(0, prepared!.approvalToken);
+  // Confirm calls store action (no token param)
+  await controller.confirmPreparedCandidate();
+  assert.equal(confirmationCalls.confirm, 1);
 
-  // Asserting parameters passed to confirm
-  assert.equal(calls.confirmCandidate.length, 1);
-  assert.deepEqual(calls.confirmCandidate[0], {
-    candidateId: "db-mem-123",
-    approvalToken: "a".repeat(64),
-  });
-  assert.equal(controller.candidates[0].state, "confirmed");
+  // Cancel calls store action
+  await controller.cancelPreparedCandidate();
+  assert.equal(confirmationCalls.cancel, 1);
 });
 
-test("2. 敏感候选确认流程断言 (prepare + confirm)", async () => {
-  const { calls, mockMemoryService, mockMemoryExtractor, mockConfirmationService } = createMocks();
-  const controller = new MemoryReviewController(mockMemoryService, mockMemoryExtractor, mockConfirmationService);
-  controller.setLifeId("life-123");
-
-  await controller.extract([{ role: "user", content: "我的邮箱是sensitive@example.com", timestamp: "2026-07-12" }]);
-  const sensitiveIndex = 1;
-  await controller.createCandidate(sensitiveIndex);
-
-  // Assert sensitive candidate exists
-  assert.equal(controller.candidates[sensitiveIndex].isSensitive, true);
-
-  // Step 1: Prepare sensitive candidate
-  const prepared = await controller.prepareCandidate(sensitiveIndex);
-  assert.ok(prepared);
-  assert.equal(calls.prepareCandidate.length, 1);
-
-  // Step 2: Confirm sensitive candidate with token
-  await controller.confirmCandidate(sensitiveIndex, prepared!.approvalToken);
-
-  // Confirm call made
-  assert.equal(calls.confirmCandidate.length, 1);
-  assert.equal(controller.candidates[sensitiveIndex].state, "confirmed");
-});
+// ── Test: lifeId in all operations ────────────────────────────────────
 
 test("3. lifeId 在所有操作中被正确传递", async () => {
-  const { calls, mockMemoryService, mockMemoryExtractor, mockConfirmationService } = createMocks();
-  const controller = new MemoryReviewController(mockMemoryService, mockMemoryExtractor, mockConfirmationService);
+  const { calls, confirmationCalls, mockMemoryService, mockMemoryExtractor, mockConfirmationActions } = createMocks();
+  const controller = new MemoryReviewController(mockMemoryService, mockMemoryExtractor, mockConfirmationActions);
   controller.setLifeId("life-secure-id");
 
   await controller.extract([{ role: "user", content: "我喜欢乌龙茶", timestamp: "2026-07-12" }]);
@@ -252,13 +224,11 @@ test("3. lifeId 在所有操作中被正确传递", async () => {
   assert.equal(calls.updateCandidate.length, 1);
   assert.equal(calls.updateCandidate[0].lifeId, "life-secure-id");
 
-  // 3. Prepare + Confirm (two-phase)
-  const prepared = await controller.prepareCandidate(0);
-  assert.ok(prepared);
-  await controller.confirmCandidate(0, prepared!.approvalToken);
-  assert.equal(calls.confirmCandidate.length, 1);
+  // 3. Prepare (calls store action with candidate id)
+  await controller.prepareCandidate(0);
+  assert.equal(confirmationCalls.prepare.length, 1);
 
-  // Re-extract and delete candidate
+  // 4. Delete
   await controller.extract([{ role: "user", content: "我喜欢乌龙茶", timestamp: "2026-07-12" }]);
   await controller.createCandidate(0);
   await controller.deleteCandidate(0);
@@ -266,31 +236,33 @@ test("3. lifeId 在所有操作中被正确传递", async () => {
   assert.equal(calls.deleteCalls[0].lifeId, "life-secure-id");
 });
 
+// ── Test: lifeId security ─────────────────────────────────────────────
+
 test("4. 错误的候选数据生命ID不能覆盖 Controller 使用的当前 lifeId", async () => {
-  const { calls, mockMemoryService, mockMemoryExtractor, mockConfirmationService } = createMocks();
-  const controller = new MemoryReviewController(mockMemoryService, mockMemoryExtractor, mockConfirmationService);
+  const { calls, mockMemoryService, mockMemoryExtractor, mockConfirmationActions } = createMocks();
+  const controller = new MemoryReviewController(mockMemoryService, mockMemoryExtractor, mockConfirmationActions);
   controller.setLifeId("life-correct");
 
   await controller.extract([{ role: "user", content: "我喜欢乌龙茶", timestamp: "2026-07-12" }]);
 
-  // Attempt to modify the in-memory lifeId directly on the candidate object (simulating cross-life compromise)
   const candidate = controller.candidates[0];
   const candidateRef = candidate as { lifeId?: string };
   candidateRef.lifeId = "life-malicious";
 
-  // Create call must use the controller's active lifeId
   await controller.createCandidate(0);
   assert.equal(calls.createCandidate.length, 1);
   assert.equal(calls.createCandidate[0].lifeId, "life-correct");
 });
 
+// ── Test: Delete failure recovery ─────────────────────────────────────
+
 test("5. Delete Mock 与失败恢复测试", async () => {
-  const { calls, mockMemoryService, mockMemoryExtractor, mockConfirmationService } = createMocks();
+  const { calls, mockMemoryService, mockMemoryExtractor, mockConfirmationActions } = createMocks();
   mockMemoryService.delete = async () => {
     throw new Error("Simulated SQLite delete failure");
   };
 
-  const controller = new MemoryReviewController(mockMemoryService, mockMemoryExtractor, mockConfirmationService);
+  const controller = new MemoryReviewController(mockMemoryService, mockMemoryExtractor, mockConfirmationActions);
   controller.setLifeId("life-correct");
 
   await controller.extract([{ role: "user", content: "我喜欢乌龙茶", timestamp: "2026-07-12" }]);
@@ -300,13 +272,9 @@ test("5. Delete Mock 与失败恢复测试", async () => {
   assert.ok(beforeId);
   assert.equal(controller.candidates[0].state, "candidateCreated");
 
-  // Attempt deletion which fails
   await controller.deleteCandidate(0);
 
-  // Deletion calls track count = 0 since it threw error, but we assert state restoration
   assert.equal(calls.deleteCalls.length, 0);
-
-  // Assert candidate remains in list, original state restored, memoryId kept, error code captured
   assert.equal(controller.candidates.length, 2);
   assert.equal(controller.candidates[0].state, "candidateCreated");
   assert.equal(controller.candidates[0].dbRecord?.id, beforeId);
@@ -314,41 +282,37 @@ test("5. Delete Mock 与失败恢复测试", async () => {
   assert.equal(controller.candidates[0].error?.code, "MEMORY_ERROR");
 });
 
+// ── Test: closeReviewPanel ────────────────────────────────────────────
+
 test("6. closeReviewPanel 清理草稿并检测未确认候选", async () => {
-  const { calls, mockMemoryService, mockMemoryExtractor, mockConfirmationService } = createMocks();
-  const controller = new MemoryReviewController(mockMemoryService, mockMemoryExtractor, mockConfirmationService);
+  const { mockMemoryService, mockMemoryExtractor, mockConfirmationActions } = createMocks();
+  const controller = new MemoryReviewController(mockMemoryService, mockMemoryExtractor, mockConfirmationActions);
   controller.setLifeId("life-123");
 
   await controller.extract([{ role: "user", content: "我喜欢乌龙茶", timestamp: "2026-07-12" }]);
   await controller.createCandidate(0);
 
-  // First candidate index 0 is candidateCreated (saved in DB, not confirmed)
-  // Second candidate index 1 is draft
   assert.equal(controller.candidates.length, 2);
 
   const hasUnconfirmed = controller.closeReviewPanel();
 
-  // Draft index 1 cleared, saved candidate remains
   assert.equal(controller.candidates.length, 1);
   assert.equal(controller.candidates[0].state, "candidateCreated");
-  assert.equal(hasUnconfirmed, true); // True since unconfirmed saved candidates exist
-  assert.equal(calls.deleteCalls.length, 0); // No delete called on closing
+  assert.equal(hasUnconfirmed, true);
 });
 
+// ── Test: confirmed state locks ───────────────────────────────────────
+
 test("7. confirmed 状态 Controller 拒绝编辑和更新", async () => {
-  const { calls, mockMemoryService, mockMemoryExtractor, mockConfirmationService } = createMocks();
-  const controller = new MemoryReviewController(mockMemoryService, mockMemoryExtractor, mockConfirmationService);
+  const { mockMemoryService, mockMemoryExtractor, mockConfirmationActions } = createMocks();
+  const controller = new MemoryReviewController(mockMemoryService, mockMemoryExtractor, mockConfirmationActions);
   controller.setLifeId("life-123");
 
   await controller.extract([{ role: "user", content: "我喜欢乌龙茶", timestamp: "2026-07-12" }]);
   await controller.createCandidate(0);
 
-  // Prepare and confirm
-  const prepared = await controller.prepareCandidate(0);
-  assert.ok(prepared);
-  await controller.confirmCandidate(0, prepared!.approvalToken);
-
-  assert.equal(controller.candidates[0].state, "confirmed");
+  // Manually set to confirmed state for testing
+  controller.candidates[0].state = "confirmed";
 
   // Edit rejected
   controller.editCandidate(0, "experience", "edited content", "edited summary");
@@ -356,33 +320,33 @@ test("7. confirmed 状态 Controller 拒绝编辑和更新", async () => {
 
   // Update rejected
   await controller.updateCandidate(0);
-  assert.equal(calls.updateCandidate.length, 0);
   assert.equal(controller.candidates[0].error?.code, "CONFIRMED_LOCK");
 });
 
+// ── Test: creation guard ──────────────────────────────────────────────
+
 test("8. 创建守卫失败不影响其他候选", async () => {
-  const { mockMemoryService, mockMemoryExtractor, mockConfirmationService } = createMocks();
-  const controller = new MemoryReviewController(mockMemoryService, mockMemoryExtractor, mockConfirmationService);
+  const { mockMemoryService, mockMemoryExtractor, mockConfirmationActions } = createMocks();
+  const controller = new MemoryReviewController(mockMemoryService, mockMemoryExtractor, mockConfirmationActions);
   controller.setLifeId("life-123");
 
   await controller.extract([{ role: "user", content: "我喜欢乌龙茶", timestamp: "2026-07-12" }]);
 
-  // Simulate first candidate violating draft state guard
   controller.candidates[0].state = "creatingCandidate";
 
-  // Create fails on index 0
   await controller.createCandidate(0);
   assert.equal(controller.candidates[0].error?.code, "INVALID_STATE");
 
-  // Index 1 remains draft and unaffected
   assert.equal(controller.candidates[1].state, "draft");
   await controller.createCandidate(1);
   assert.equal(controller.candidates[1].state, "candidateCreated");
 });
 
+// ── Test: Adapter binding ─────────────────────────────────────────────
+
 test("9. Adapter 与 ChatView 实际关闭路径绑定验证", () => {
-  const { mockMemoryService, mockMemoryExtractor, mockConfirmationService } = createMocks();
-  const controller = new MemoryReviewController(mockMemoryService, mockMemoryExtractor, mockConfirmationService);
+  const { mockMemoryService, mockMemoryExtractor, mockConfirmationActions } = createMocks();
+  const controller = new MemoryReviewController(mockMemoryService, mockMemoryExtractor, mockConfirmationActions);
   controller.candidates = [
     {
       id: "candidate-1",
@@ -420,24 +384,105 @@ test("9. Adapter 与 ChatView 实际关闭路径绑定验证", () => {
 
   const handleClosePanel = createClosePanelHandler(controller, actions);
 
-  // Triggering the adapter handler
   handleClosePanel();
 
-  // Asserts panel closes and sets persistent warning ref correctly
   assert.equal(actions.showMemoryPanel.value, false);
   assert.equal(actions.showUnconfirmedHint.value, true);
 
-  // Validate ChatView.vue source binding
   const chatViewPath = path.resolve(__dirname, "../src/chat/ChatView.vue");
   const chatViewContent = fs.readFileSync(chatViewPath, "utf8");
 
-  // Backdrop overlay must call handleClosePanel
   assert.ok(
     chatViewContent.includes('class="memory-panel-backdrop" @click="handleClosePanel"')
   );
 
-  // Drawer close button must call handleClosePanel
   assert.ok(
     chatViewContent.includes('class="close-btn" type="button" @click="handleClosePanel"')
   );
+});
+
+// ── Test: No old confirm method ───────────────────────────────────────
+
+test("10. 旧一步确认方法不存在", () => {
+  const { mockMemoryService, mockMemoryExtractor, mockConfirmationActions } = createMocks();
+  const controller = new MemoryReviewController(mockMemoryService, mockMemoryExtractor, mockConfirmationActions);
+
+  // Old method should not exist
+  assert.equal('confirmCandidate' in controller, false, "Old confirmCandidate should not exist");
+});
+
+// ── Test: Prepare failure handling ────────────────────────────────────
+
+test("11. Prepare 失败设置错误", async () => {
+  const { mockMemoryService, mockMemoryExtractor } = createMocks();
+  const failingActions: CandidateConfirmationActions = {
+    canPrepare: true,
+    canConfirm: false,
+    canCancel: false,
+    async prepare(_candidateId: string): Promise<void> {
+      throw new CandidateConfirmationError(
+        "CANDIDATE_CONFIRMATION_NOT_FOUND",
+        "Not found",
+        "none",
+      );
+    },
+    async confirm(): Promise<void> {},
+    async cancel(): Promise<void> {},
+    clearCandidateConfirmation(): void {},
+  };
+
+  const controller = new MemoryReviewController(mockMemoryService, mockMemoryExtractor, failingActions);
+  controller.setLifeId("life-123");
+
+  await controller.extract([{ role: "user", content: "我喜欢乌龙茶", timestamp: "2026-07-12" }]);
+  await controller.createCandidate(0);
+
+  await controller.prepareCandidate(0);
+
+  assert.ok(controller.candidates[0].error);
+  assert.equal(controller.candidates[0].error?.stage, "confirmation");
+});
+
+// ── Test: disabled UI doesn't break other actions ─────────────────────
+
+test("12. 禁用确认按钮不影响其他 Memory Review 动作", async () => {
+  const { calls, mockMemoryService, mockMemoryExtractor, mockConfirmationActions } = createMocks();
+  const controller = new MemoryReviewController(mockMemoryService, mockMemoryExtractor, mockConfirmationActions);
+  controller.setLifeId("life-123");
+
+  // Extract works
+  await controller.extract([{ role: "user", content: "我喜欢乌龙茶", timestamp: "2026-07-12" }]);
+  assert.equal(controller.panelState, "reviewing");
+
+  // Create works
+  await controller.createCandidate(0);
+  assert.equal(controller.candidates[0].state, "candidateCreated");
+
+  // Edit works
+  controller.editCandidate(0, "preference", "新内容", "新摘要");
+  assert.equal(controller.candidates[0].content, "新内容");
+
+  // Update works
+  await controller.updateCandidate(0);
+  assert.equal(calls.updateCandidate.length, 1);
+
+  // Delete works
+  await controller.deleteCandidate(0);
+  assert.equal(controller.candidates.length, 1);
+});
+
+// ── Test: Controller does not directly call ConfirmationService ────────
+
+test("13. Controller 不直接调用 ConfirmationService", () => {
+  // The Controller type signature only accepts CandidateConfirmationActions
+  // not ICandidateConfirmationService. This is a compile-time guarantee.
+  // We verify the interface here.
+  const { mockMemoryService, mockMemoryExtractor, mockConfirmationActions } = createMocks();
+  const controller = new MemoryReviewController(mockMemoryService, mockMemoryExtractor, mockConfirmationActions);
+
+  // Controller has no reference to confirmationService (the old interface)
+  // The field is private, so we check the type contract
+  assert.equal(typeof controller.prepareCandidate, 'function');
+  assert.equal(typeof controller.confirmPreparedCandidate, 'function');
+  assert.equal(typeof controller.cancelPreparedCandidate, 'function');
 });

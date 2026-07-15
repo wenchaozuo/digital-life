@@ -3,13 +3,11 @@ import { ref, computed } from "vue";
 import type {
   PreparedCandidateConfirmation,
   CandidateConfirmationResult,
-} from "../memory/candidateConfirmationTypes";
+} from "../memory/candidateConfirmationTypes.ts";
 import {
   CandidateConfirmationError,
-  isReprepareRequired,
-  isRetryable,
-} from "../memory/candidateConfirmationTypes";
-import { candidateConfirmationService } from "../memory/candidateConfirmationService";
+} from "../memory/candidateConfirmationTypes.ts";
+import { candidateConfirmationService } from "../memory/candidateConfirmationService.ts";
 
 // ── Types ─────────────────────────────────────────────────────────────
 
@@ -27,6 +25,19 @@ export type CandidateConfirmationPhase =
 export const useCandidateConfirmationStore = defineStore(
   "candidateConfirmation",
   () => {
+    // ── Stale Promise Protection ─────────────────────────────────────
+
+    let generation = 0;
+
+    function nextGeneration(): number {
+      generation += 1;
+      return generation;
+    }
+
+    function isCurrentGeneration(value: number): boolean {
+      return value === generation;
+    }
+
     // ── State ───────────────────────────────────────────────────────
 
     const candidateId = ref<string | null>(null);
@@ -34,9 +45,6 @@ export const useCandidateConfirmationStore = defineStore(
     const phase = ref<CandidateConfirmationPhase>("idle");
     const error = ref<CandidateConfirmationError | null>(null);
     const result = ref<CandidateConfirmationResult | null>(null);
-
-    // Private: token is only stored in prepared.value.approvalToken
-    // No separate copy to avoid desync
 
     // ── Getters ─────────────────────────────────────────────────────
 
@@ -54,12 +62,11 @@ export const useCandidateConfirmationStore = defineStore(
       if (!prepared.value?.expiresAt) {
         return false;
       }
-      try {
-        const expiresAt = new Date(prepared.value.expiresAt).getTime();
-        return Date.now() > expiresAt;
-      } catch {
-        return true;
+      const timestamp = Date.parse(prepared.value.expiresAt);
+      if (!Number.isFinite(timestamp)) {
+        return true; // Invalid date treated as expired
       }
+      return Date.now() > timestamp;
     });
 
     const canPrepare = computed(() =>
@@ -83,7 +90,6 @@ export const useCandidateConfirmationStore = defineStore(
 
     /**
      * Prepare a candidate for confirmation.
-     * Guards against concurrent prepares and cleans up old state.
      */
     async function prepare(id: string): Promise<void> {
       // Guard: prevent concurrent prepares
@@ -91,8 +97,9 @@ export const useCandidateConfirmationStore = defineStore(
         return;
       }
 
-      // Clean up old state
+      // Clean up old state and capture generation
       clearState();
+      const myGeneration = nextGeneration();
 
       candidateId.value = id;
       phase.value = "preparing";
@@ -101,28 +108,23 @@ export const useCandidateConfirmationStore = defineStore(
       try {
         const response = await candidateConfirmationService.prepareCandidateConfirmation(id);
 
-        // Verify response candidateId matches request
-        if (response.candidateId !== id) {
-          throw new CandidateConfirmationError(
-            "CANDIDATE_CONFIRMATION_INTERNAL_ERROR",
-            "Prepare response candidateId mismatch",
-            false,
-          );
-        }
+        // Check generation before writing back
+        if (!isCurrentGeneration(myGeneration)) return;
 
         prepared.value = response;
         phase.value = "prepared";
       } catch (err: unknown) {
+        if (!isCurrentGeneration(myGeneration)) return;
+
         const confirmationError = err instanceof CandidateConfirmationError
           ? err
           : new CandidateConfirmationError(
               "CANDIDATE_CONFIRMATION_INTERNAL_ERROR",
-              "Prepare failed unexpectedly",
-              false,
+              "The confirmation operation failed.",
+              "none",
             );
         error.value = confirmationError;
         phase.value = "failed";
-        // Clear any partial state
         prepared.value = null;
         candidateId.value = null;
       }
@@ -130,21 +132,16 @@ export const useCandidateConfirmationStore = defineStore(
 
     /**
      * Confirm the prepared candidate using the approval token.
-     * Only callable from "prepared" phase.
      */
     async function confirm(): Promise<void> {
       // Guard: can only confirm from prepared state
-      if (phase.value !== "prepared") {
-        return;
-      }
-
-      // Guard: prevent concurrent confirms
-      if (!prepared.value || !approvalToken.value) {
+      if (phase.value !== "prepared" || !prepared.value || !approvalToken.value) {
         return;
       }
 
       const currentCandidateId = prepared.value.candidateId;
       const currentToken = approvalToken.value;
+      const myGeneration = nextGeneration();
 
       phase.value = "confirming";
       error.value = null;
@@ -155,14 +152,7 @@ export const useCandidateConfirmationStore = defineStore(
           currentToken,
         );
 
-        // Verify response candidateId
-        if (response.candidateId !== currentCandidateId) {
-          throw new CandidateConfirmationError(
-            "CANDIDATE_CONFIRMATION_INTERNAL_ERROR",
-            "Confirm response candidateId mismatch",
-            false,
-          );
-        }
+        if (!isCurrentGeneration(myGeneration)) return;
 
         // Success: clear token immediately, save minimal result
         result.value = {
@@ -170,51 +160,55 @@ export const useCandidateConfirmationStore = defineStore(
           confirmedMemoryId: response.confirmedMemoryId,
           outcome: response.outcome,
         };
-        prepared.value = null; // Clears token
+        prepared.value = null;
         phase.value = "succeeded";
       } catch (err: unknown) {
+        if (!isCurrentGeneration(myGeneration)) return;
+
         const confirmationError = err instanceof CandidateConfirmationError
           ? err
           : new CandidateConfirmationError(
               "CANDIDATE_CONFIRMATION_INTERNAL_ERROR",
-              "Confirm failed unexpectedly",
-              false,
+              "The confirmation operation failed.",
+              "none",
             );
 
         error.value = confirmationError;
 
-        // Handle error based on type
-        if (isReprepareRequired(confirmationError)) {
-          // Token is invalid/expired/consumed/cancelled/context changed
-          // Clear token and require re-prepare
-          prepared.value = null;
-          phase.value = "failed";
-        } else if (isRetryable(confirmationError)) {
-          // Token is still valid (storage unavailable, in-flight)
-          // Keep prepared state so user can retry with same token
-          phase.value = "prepared";
-        } else {
-          // Unknown or internal error: safest to clear
-          prepared.value = null;
-          phase.value = "failed";
+        // Handle error based on action
+        switch (confirmationError.action) {
+          case "reprepare":
+            // Token is invalid/expired/consumed/cancelled/context changed
+            prepared.value = null;
+            phase.value = "failed";
+            break;
+          case "retrySameToken":
+            // Token is still valid (storage unavailable, in-flight)
+            phase.value = "prepared";
+            break;
+          case "retryPrepareLater":
+          case "none":
+          default:
+            // Clear token for safety
+            prepared.value = null;
+            phase.value = "failed";
+            break;
         }
       }
     }
 
     /**
      * Cancel the prepared confirmation.
-     * Cleans up token even if backend call fails.
      */
     async function cancel(): Promise<void> {
-      // Guard: need prepared state with token
       if (!prepared.value || !approvalToken.value) {
-        // If we have stale state, clean it up locally
         clearState();
         return;
       }
 
       const currentCandidateId = prepared.value.candidateId;
       const currentToken = approvalToken.value;
+      const myGeneration = nextGeneration();
 
       phase.value = "cancelling";
       error.value = null;
@@ -224,21 +218,34 @@ export const useCandidateConfirmationStore = defineStore(
           currentCandidateId,
           currentToken,
         );
-      } catch {
-        // Even if cancel fails, clean up locally
-        // We don't claim backend cancellation succeeded
-      }
 
-      // Always clean up local state
-      prepared.value = null;
-      candidateId.value = null;
-      phase.value = "idle";
+        if (!isCurrentGeneration(myGeneration)) return;
+
+        // Cancel succeeded
+        prepared.value = null;
+        candidateId.value = null;
+        phase.value = "idle";
+        error.value = null;
+      } catch (err: unknown) {
+        if (!isCurrentGeneration(myGeneration)) return;
+
+        // Cancel failed: clear token locally but report error
+        prepared.value = null;
+        candidateId.value = null;
+        phase.value = "failed";
+        error.value = new CandidateConfirmationError(
+          "CANDIDATE_CONFIRMATION_INTERNAL_ERROR",
+          "Cancellation status unknown; local authorization cleared.",
+          "none",
+        );
+      }
     }
 
     /**
      * Clear all confirmation state without making any backend calls.
      */
     function clearCandidateConfirmation(): void {
+      nextGeneration(); // Invalidate all in-flight promises
       clearState();
     }
 

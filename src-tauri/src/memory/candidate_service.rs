@@ -11,6 +11,16 @@ use super::{
     MemoryKind,
 };
 
+/// D-5A governed candidate-confirmation authorization. This is a private child
+/// module so that `SensitiveConfirmationGrant` (whose field is private to this
+/// parent module) can only be constructed here, never by the command layer.
+mod confirmation_authorization;
+
+pub use confirmation_authorization::{
+    ApprovalToken, CancelOutcome, CandidateConfirmationCoordinator, ConfirmationError,
+    ConfirmationOutcome, ConfirmationRequirement, ConfirmationSuccess, PreparedConfirmation,
+};
+
 // ── Domain request types ──────────────────────────────────────────────
 
 #[derive(Clone, Debug, PartialEq)]

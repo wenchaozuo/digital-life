@@ -26,6 +26,7 @@ pub fn run() {
                 memory::vector_index_runtime::MemoryVectorIndexRuntimeCoordinator::default(),
             );
             app.manage(memory::vector_sync_worker::MemoryVectorSyncWorkerCoordinator::default());
+            app.manage(memory::candidate_service::CandidateConfirmationCoordinator::default());
             create_configured_windows(app)?;
             configure_window_lifecycle(app)?;
             Ok(())
@@ -49,8 +50,10 @@ pub fn run() {
             memory::list_memories,
             memory::get_memory,
             memory::update_memory_candidate,
-            memory::confirm_memory,
             memory::delete_memory,
+            memory::candidate_confirmation_commands::prepare_candidate_confirmation,
+            memory::candidate_confirmation_commands::confirm_candidate_memory,
+            memory::candidate_confirmation_commands::cancel_candidate_confirmation_approval,
             memory::management::list_managed_memories,
             memory::management::get_managed_memory,
             memory::management::list_memory_revisions,

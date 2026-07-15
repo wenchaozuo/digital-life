@@ -13,6 +13,8 @@ commands.allow = [
     "get_persona_template",
     "create_memory_candidate",
     "update_memory_candidate",
-    "confirm_memory",
     "delete_memory",
+    "prepare_candidate_confirmation",
+    "confirm_candidate_memory",
+    "cancel_candidate_confirmation_approval",
 ]

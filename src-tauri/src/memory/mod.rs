@@ -9,6 +9,7 @@ use tauri::State;
 use crate::storage::StorageService;
 
 pub mod candidate;
+pub mod candidate_confirmation_commands;
 pub mod candidate_service;
 pub mod context_builder;
 pub mod management;
@@ -318,6 +319,11 @@ impl<'a, R: MemoryRepository> MemoryService<'a, R> {
         Err(candidate_lifecycle_command_unavailable())
     }
 
+    /// Legacy confirmation. The write path is disabled at the storage layer, which
+    /// returns `CANDIDATE_CONFIRMATION_UNAVAILABLE`; governed confirmation now flows
+    /// through the D-5A commands (`prepare_candidate_confirmation` /
+    /// `confirm_candidate_memory`). The pre-write `user_confirmed` guard is retained
+    /// so the contract is unchanged for callers.
     pub fn confirm(&self, request: ConfirmMemoryRequest) -> Result<MemoryRecord, MemoryError> {
         validate_identifiers(&request.life_id, &request.memory_id)?;
         if !request.user_confirmed {

@@ -7,7 +7,8 @@
 //! only validates the calling window, resolves the current life, and maps domain
 //! results to stable IPC shapes.
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
+use serde_json::Value;
 use tauri::{State, WebviewWindow};
 
 use crate::memory::{
@@ -70,111 +71,169 @@ impl ConfirmationCommandError {
             "An approval token is required to confirm this candidate.",
         )
     }
-}
 
-impl From<ConfirmationError> for ConfirmationCommandError {
-    fn from(error: ConfirmationError) -> Self {
-        let requires_reprepare = error.requires_reprepare();
-        let (code, message, retry_after_ms) = match error {
-            ConfirmationError::NoCurrentLife => {
-                return Self::no_current_life();
-            }
-            ConfirmationError::NotFound => (
-                "CANDIDATE_CONFIRMATION_NOT_FOUND",
-                "The candidate is not available for confirmation.",
-                None,
-            ),
-            ConfirmationError::TokenInvalid => (
-                "CANDIDATE_CONFIRMATION_TOKEN_INVALID",
-                "The approval token is invalid.",
-                None,
-            ),
-            ConfirmationError::TokenExpired => (
-                "CANDIDATE_CONFIRMATION_TOKEN_EXPIRED",
-                "The approval token has expired. Prepare the confirmation again.",
-                None,
-            ),
-            ConfirmationError::TokenCancelled => (
-                "CANDIDATE_CONFIRMATION_TOKEN_CANCELLED",
-                "The approval token was cancelled. Prepare the confirmation again.",
-                None,
-            ),
-            ConfirmationError::TokenConsumed => (
-                "CANDIDATE_CONFIRMATION_TOKEN_CONSUMED",
-                "The approval token was already used. Prepare the confirmation again.",
-                None,
-            ),
-            ConfirmationError::TokenInFlight => (
-                "CANDIDATE_CONFIRMATION_TOKEN_IN_FLIGHT",
-                "A confirmation for this token is already in progress.",
-                None,
-            ),
-            ConfirmationError::ContextChanged => (
-                "CANDIDATE_CONFIRMATION_CONTEXT_CHANGED",
-                "The candidate changed since it was prepared. Prepare the confirmation again.",
-                None,
-            ),
-            ConfirmationError::SensitiveApprovalRequired => (
-                "CANDIDATE_CONFIRMATION_APPROVAL_REQUIRED",
-                "Confirming this candidate requires explicit approval.",
-                None,
-            ),
-            ConfirmationError::TokenGeneration => (
-                "CANDIDATE_CONFIRMATION_INTERNAL_ERROR",
-                "Could not generate an approval token.",
-                None,
-            ),
-            ConfirmationError::Busy => (
-                "CANDIDATE_CONFIRMATION_STORAGE_UNAVAILABLE",
-                "Confirmation storage is temporarily at capacity. Try again shortly.",
-                Some(250),
-            ),
-            ConfirmationError::TemporarilyUnavailable { retry_after_ms } => (
-                "CANDIDATE_CONFIRMATION_TEMPORARILY_UNAVAILABLE",
-                "Candidate confirmation storage is temporarily unavailable.",
-                Some(retry_after_ms),
-            ),
-            ConfirmationError::Internal => (
-                "CANDIDATE_CONFIRMATION_INTERNAL_ERROR",
-                "The candidate confirmation could not be completed.",
-                None,
-            ),
-        };
+    /// The IPC request is structurally invalid (unknown fields, wrong types, missing fields).
+    fn invalid_request(detail: &str) -> Self {
         Self {
-            code: code.to_string(),
-            message: message.to_string(),
-            requires_reprepare: requires_reprepare.then_some(true),
-            retry_after_ms,
+            code: "CANDIDATE_CONFIRMATION_INVALID_REQUEST".into(),
+            message: format!("Invalid request: {detail}"),
+            requires_reprepare: None,
+            retry_after_ms: None,
         }
     }
 }
 
-// ── Request / response DTOs ───────────────────────────────────────────
-
-/// `prepare` input. `deny_unknown_fields` rejects any attempt to smuggle a
-/// caller-supplied life id, revision, or request id — those are server-derived.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PrepareConfirmationArgs {
-    pub candidate_id: String,
+impl From<ConfirmationError> for ConfirmationCommandError {
+    fn from(error: ConfirmationError) -> Self {
+        let requires_reprepare = error.requires_reprepare().then_some(true);
+        match error {
+            ConfirmationError::NoCurrentLife => Self::no_current_life(),
+            ConfirmationError::NotFound => Self {
+                code: "CANDIDATE_CONFIRMATION_NOT_FOUND".into(),
+                message: "The candidate is not available for confirmation.".into(),
+                requires_reprepare,
+                retry_after_ms: None,
+            },
+            ConfirmationError::TokenInvalid => Self {
+                code: "CANDIDATE_CONFIRMATION_TOKEN_INVALID".into(),
+                message: "The approval token is invalid.".into(),
+                requires_reprepare,
+                retry_after_ms: None,
+            },
+            ConfirmationError::TokenExpired => Self {
+                code: "CANDIDATE_CONFIRMATION_TOKEN_EXPIRED".into(),
+                message: "The approval token has expired. Prepare the confirmation again.".into(),
+                requires_reprepare,
+                retry_after_ms: None,
+            },
+            ConfirmationError::TokenCancelled => Self {
+                code: "CANDIDATE_CONFIRMATION_TOKEN_CANCELLED".into(),
+                message: "The approval token was cancelled. Prepare the confirmation again.".into(),
+                requires_reprepare,
+                retry_after_ms: None,
+            },
+            ConfirmationError::TokenConsumed => Self {
+                code: "CANDIDATE_CONFIRMATION_TOKEN_CONSUMED".into(),
+                message: "The approval token was already used. Prepare the confirmation again."
+                    .into(),
+                requires_reprepare,
+                retry_after_ms: None,
+            },
+            ConfirmationError::TokenInFlight => Self {
+                code: "CANDIDATE_CONFIRMATION_TOKEN_IN_FLIGHT".into(),
+                message: "A confirmation for this token is already in progress.".into(),
+                requires_reprepare,
+                retry_after_ms: None,
+            },
+            ConfirmationError::ContextChanged => Self {
+                code: "CANDIDATE_CONFIRMATION_CONTEXT_CHANGED".into(),
+                message:
+                    "The candidate changed since it was prepared. Prepare the confirmation again."
+                        .into(),
+                requires_reprepare,
+                retry_after_ms: None,
+            },
+            ConfirmationError::RevisionConflict => Self {
+                code: "CANDIDATE_MEMORY_REVISION_CONFLICT".into(),
+                message: "The candidate memory changed after it was loaded. Refresh and try again."
+                    .into(),
+                requires_reprepare,
+                retry_after_ms: None,
+            },
+            ConfirmationError::RequestConflict => Self {
+                code: "CANDIDATE_MEMORY_REQUEST_CONFLICT".into(),
+                message:
+                    "The confirmation request id was already used for a different candidate memory."
+                        .into(),
+                requires_reprepare,
+                retry_after_ms: None,
+            },
+            ConfirmationError::ProhibitedContent => Self {
+                code: "CANDIDATE_MEMORY_PROHIBITED_CONTENT".into(),
+                message: "The candidate content contains prohibited material.".into(),
+                requires_reprepare,
+                retry_after_ms: None,
+            },
+            ConfirmationError::SensitiveApprovalRequired => Self {
+                code: "CANDIDATE_CONFIRMATION_APPROVAL_REQUIRED".into(),
+                message: "Confirming this candidate requires explicit approval.".into(),
+                requires_reprepare,
+                retry_after_ms: None,
+            },
+            ConfirmationError::TokenGeneration => Self {
+                code: "CANDIDATE_CONFIRMATION_INTERNAL_ERROR".into(),
+                message: "Could not generate an approval token.".into(),
+                requires_reprepare,
+                retry_after_ms: None,
+            },
+            ConfirmationError::RegistryCapacity => Self {
+                code: "CANDIDATE_CONFIRMATION_TEMPORARILY_UNAVAILABLE".into(),
+                message: "Confirmation storage is temporarily at capacity. Try again shortly."
+                    .into(),
+                requires_reprepare,
+                retry_after_ms: Some(250),
+            },
+            ConfirmationError::StorageUnavailable { retry_after_ms } => Self {
+                code: "CANDIDATE_CONFIRMATION_STORAGE_UNAVAILABLE".into(),
+                message: "Candidate confirmation storage is temporarily unavailable.".into(),
+                requires_reprepare,
+                retry_after_ms: Some(retry_after_ms),
+            },
+            ConfirmationError::InvalidRequest(detail) => Self {
+                code: "CANDIDATE_CONFIRMATION_INVALID_REQUEST".into(),
+                message: detail,
+                requires_reprepare,
+                retry_after_ms: None,
+            },
+            ConfirmationError::Internal => Self {
+                code: "CANDIDATE_CONFIRMATION_INTERNAL_ERROR".into(),
+                message: "The candidate confirmation could not be completed.".into(),
+                requires_reprepare,
+                retry_after_ms: None,
+            },
+        }
+    }
 }
 
-/// `confirm` input. The Approval Token is optional at the wire level only so a
-/// missing token maps to a precise `APPROVAL_REQUIRED` error instead of a generic
-/// deserialization failure.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ConfirmCandidateMemoryArgs {
-    pub candidate_id: String,
-    pub approval_token: Option<ApprovalToken>,
+// ── Request parsing ──────────────────────────────────────────────────
+
+/// Allowed top-level field names for `prepare_candidate_confirmation`.
+const PREPARE_FIELDS: &[&str] = &["candidateId"];
+/// Allowed top-level field names for `confirm_candidate_memory`.
+const CONFIRM_FIELDS: &[&str] = &["candidateId", "approvalToken"];
+/// Validate that a JSON object contains only the allowed field names. Returns
+/// `INVALID_REQUEST` if any unknown field is present.
+fn reject_unknown_fields(
+    object: &serde_json::Map<String, Value>,
+    allowed: &[&str],
+) -> Result<(), ConfirmationCommandError> {
+    for key in object.keys() {
+        if !allowed.contains(&key.as_str()) {
+            return Err(ConfirmationCommandError::invalid_request(&format!(
+                "unknown field: {key}"
+            )));
+        }
+    }
+    Ok(())
 }
 
-/// `cancel` input.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CancelConfirmationArgs {
-    pub candidate_id: String,
-    pub approval_token: Option<ApprovalToken>,
+/// Parse the `candidateId` field from a JSON object. Returns `INVALID_REQUEST`
+/// if missing or not a string.
+fn parse_candidate_id(
+    object: &serde_json::Map<String, Value>,
+) -> Result<String, ConfirmationCommandError> {
+    match object.get("candidateId") {
+        Some(Value::String(id)) if !id.is_empty() => Ok(id.clone()),
+        Some(Value::String(_)) => Err(ConfirmationCommandError::invalid_request(
+            "candidateId must not be empty",
+        )),
+        Some(_) => Err(ConfirmationCommandError::invalid_request(
+            "candidateId must be a string",
+        )),
+        None => Err(ConfirmationCommandError::invalid_request(
+            "missing required field: candidateId",
+        )),
+    }
 }
 
 /// `prepare` output: the candidate preview plus the minted token. No `sourceId`,
@@ -288,20 +347,88 @@ fn current_life_id(storage: &StorageService) -> Result<String, ConfirmationComma
     }
 }
 
+// ── Request parsing helpers ───────────────────────────────────────────
+
+/// Parsed prepare request: just the candidate id.
+#[derive(Debug)]
+struct ParsedPrepareRequest {
+    candidate_id: String,
+}
+
+/// Parsed token-bearing request (confirm or cancel): candidate id plus the raw
+/// token value for further validation.
+#[derive(Debug)]
+struct ParsedTokenRequest {
+    candidate_id: String,
+    token_raw: Value,
+}
+
+/// Parse a prepare request from a raw JSON value. Validates unknown fields and
+/// extracts the candidate id.
+fn parse_prepare_request(value: &Value) -> Result<ParsedPrepareRequest, ConfirmationCommandError> {
+    let object = match value {
+        Value::Object(map) => map,
+        _ => {
+            return Err(ConfirmationCommandError::invalid_request(
+                "request must be a JSON object",
+            ))
+        }
+    };
+    reject_unknown_fields(object, PREPARE_FIELDS)?;
+    let candidate_id = parse_candidate_id(object)?;
+    Ok(ParsedPrepareRequest { candidate_id })
+}
+
+/// Parse a token-bearing request (confirm or cancel) from a raw JSON value.
+/// Validates unknown fields, extracts the candidate id, and checks for token
+/// presence. Does NOT deserialize the token — call `deserialize_token` for that.
+fn parse_token_request(value: &Value) -> Result<ParsedTokenRequest, ConfirmationCommandError> {
+    let object = match value {
+        Value::Object(map) => map,
+        _ => {
+            return Err(ConfirmationCommandError::invalid_request(
+                "request must be a JSON object",
+            ))
+        }
+    };
+    reject_unknown_fields(object, CONFIRM_FIELDS)?;
+    let candidate_id = parse_candidate_id(object)?;
+    let token_raw = match object.get("approvalToken") {
+        Some(v) if !v.is_null() => v.clone(),
+        _ => return Err(ConfirmationCommandError::approval_required()),
+    };
+    Ok(ParsedTokenRequest {
+        candidate_id,
+        token_raw,
+    })
+}
+
+/// Deserialize an `ApprovalToken` from a raw JSON value. Returns `TOKEN_INVALID`
+/// if the token is malformed.
+fn deserialize_token(raw: &Value) -> Result<ApprovalToken, ConfirmationCommandError> {
+    serde_json::from_value(raw.clone())
+        .map_err(|_| ConfirmationCommandError::from(ConfirmationError::TokenInvalid))
+}
+
 // ── Commands ──────────────────────────────────────────────────────────
 
 /// Prepare a candidate for confirmation and return a preview plus Approval Token.
+///
+/// Accepts a raw JSON value so that structural validation errors (unknown fields,
+/// missing candidateId, wrong types) produce stable `INVALID_REQUEST` IPC codes
+/// instead of uncontrolled Tauri/Serde string errors.
 #[tauri::command]
 pub fn prepare_candidate_confirmation(
     window: WebviewWindow,
     storage: State<'_, StorageService>,
     coordinator: State<'_, CandidateConfirmationCoordinator>,
-    request: PrepareConfirmationArgs,
+    request: Value,
 ) -> Result<PrepareConfirmationResponse, ConfirmationCommandError> {
     require_chat_window(&window)?;
+    let parsed = parse_prepare_request(&request)?;
     let life_id = current_life_id(storage.inner())?;
     let prepared = coordinator
-        .prepare(storage.inner(), &life_id, &request.candidate_id)
+        .prepare(storage.inner(), &life_id, &parsed.candidate_id)
         .map_err(ConfirmationCommandError::from)?;
     Ok(PrepareConfirmationResponse::from_domain(prepared))
 }
@@ -312,15 +439,14 @@ pub fn confirm_candidate_memory(
     window: WebviewWindow,
     storage: State<'_, StorageService>,
     coordinator: State<'_, CandidateConfirmationCoordinator>,
-    request: ConfirmCandidateMemoryArgs,
+    request: Value,
 ) -> Result<ConfirmCandidateMemoryResponse, ConfirmationCommandError> {
     require_chat_window(&window)?;
-    let token = request
-        .approval_token
-        .ok_or_else(ConfirmationCommandError::approval_required)?;
+    let parsed = parse_token_request(&request)?;
+    let token = deserialize_token(&parsed.token_raw)?;
     let life_id = current_life_id(storage.inner())?;
     let success = coordinator
-        .confirm(storage.inner(), &life_id, &request.candidate_id, &token)
+        .confirm(storage.inner(), &life_id, &parsed.candidate_id, &token)
         .map_err(ConfirmationCommandError::from)?;
     Ok(ConfirmCandidateMemoryResponse::from(success))
 }
@@ -332,19 +458,18 @@ pub fn cancel_candidate_confirmation_approval(
     window: WebviewWindow,
     storage: State<'_, StorageService>,
     coordinator: State<'_, CandidateConfirmationCoordinator>,
-    request: CancelConfirmationArgs,
+    request: Value,
 ) -> Result<CancelConfirmationResponse, ConfirmationCommandError> {
     require_chat_window(&window)?;
-    let token = request
-        .approval_token
-        .ok_or_else(ConfirmationCommandError::approval_required)?;
+    let parsed = parse_token_request(&request)?;
+    let token = deserialize_token(&parsed.token_raw)?;
     let life_id = current_life_id(storage.inner())?;
     let outcome = coordinator
-        .cancel(&life_id, &request.candidate_id, &token)
+        .cancel(&life_id, &parsed.candidate_id, &token)
         .map_err(ConfirmationCommandError::from)?;
     Ok(CancelConfirmationResponse::from_outcome(
         outcome,
-        request.candidate_id,
+        parsed.candidate_id,
     ))
 }
 
@@ -353,38 +478,149 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prepare_args_reject_unknown_fields() {
-        // A caller must not be able to smuggle a server-derived field.
-        let sneaky = r#"{"candidateId":"c1","lifeId":"life-b"}"#;
-        assert!(serde_json::from_str::<PrepareConfirmationArgs>(sneaky).is_err());
-        let ok = r#"{"candidateId":"c1"}"#;
-        assert!(serde_json::from_str::<PrepareConfirmationArgs>(ok).is_ok());
+    fn prepare_unknown_field_returns_invalid_request() {
+        let value: Value =
+            serde_json::from_str(r#"{"candidateId":"c1","lifeId":"life-b"}"#).unwrap();
+        let err = parse_prepare_request(&value).unwrap_err();
+        assert_eq!(err.code, "CANDIDATE_CONFIRMATION_INVALID_REQUEST");
+        assert!(err.message.contains("unknown field"));
     }
 
     #[test]
-    fn confirm_args_reject_unknown_fields_and_allow_missing_token() {
-        let sneaky = r#"{"candidateId":"c1","expectedRevision":3}"#;
-        assert!(serde_json::from_str::<ConfirmCandidateMemoryArgs>(sneaky).is_err());
-        // A missing token deserializes to None so the command can return a precise
-        // APPROVAL_REQUIRED rather than a deserialization failure.
-        let no_token = r#"{"candidateId":"c1"}"#;
-        let parsed: ConfirmCandidateMemoryArgs = serde_json::from_str(no_token).unwrap();
-        assert!(parsed.approval_token.is_none());
+    fn prepare_missing_candidate_id_returns_invalid_request() {
+        let value: Value = serde_json::from_str(r#"{}"#).unwrap();
+        let err = parse_prepare_request(&value).unwrap_err();
+        assert_eq!(err.code, "CANDIDATE_CONFIRMATION_INVALID_REQUEST");
+        assert!(err.message.contains("candidateId"));
     }
 
     #[test]
-    fn confirm_args_accept_a_well_formed_token() {
+    fn prepare_wrong_candidate_id_type_returns_invalid_request() {
+        let value: Value = serde_json::from_str(r#"{"candidateId":42}"#).unwrap();
+        let err = parse_prepare_request(&value).unwrap_err();
+        assert_eq!(err.code, "CANDIDATE_CONFIRMATION_INVALID_REQUEST");
+    }
+
+    #[test]
+    fn confirm_unknown_field_returns_invalid_request() {
+        let value: Value =
+            serde_json::from_str(r#"{"candidateId":"c1","expectedRevision":3}"#).unwrap();
+        let err = parse_token_request(&value).unwrap_err();
+        assert_eq!(err.code, "CANDIDATE_CONFIRMATION_INVALID_REQUEST");
+    }
+
+    #[test]
+    fn confirm_missing_candidate_id_returns_invalid_request() {
         let token = "a".repeat(64);
-        let json = format!(r#"{{"candidateId":"c1","approvalToken":"{token}"}}"#);
-        let parsed: ConfirmCandidateMemoryArgs = serde_json::from_str(&json).unwrap();
-        assert!(parsed.approval_token.is_some());
+        let value: Value =
+            serde_json::from_str(&format!(r#"{{"approvalToken":"{token}"}}"#)).unwrap();
+        let err = parse_token_request(&value).unwrap_err();
+        assert_eq!(err.code, "CANDIDATE_CONFIRMATION_INVALID_REQUEST");
     }
 
     #[test]
-    fn confirm_args_reject_a_malformed_token() {
-        let json = r#"{"candidateId":"c1","approvalToken":"not-hex"}"#;
-        assert!(serde_json::from_str::<ConfirmCandidateMemoryArgs>(json).is_err());
+    fn confirm_missing_token_returns_approval_required() {
+        let value: Value = serde_json::from_str(r#"{"candidateId":"c1"}"#).unwrap();
+        let err = parse_token_request(&value).unwrap_err();
+        assert_eq!(err.code, "CANDIDATE_CONFIRMATION_APPROVAL_REQUIRED");
     }
+
+    #[test]
+    fn confirm_malformed_token_returns_token_invalid() {
+        let value: Value =
+            serde_json::from_str(r#"{"candidateId":"c1","approvalToken":"not-hex"}"#).unwrap();
+        let parsed = parse_token_request(&value).unwrap();
+        let err = deserialize_token(&parsed.token_raw).unwrap_err();
+        assert_eq!(err.code, "CANDIDATE_CONFIRMATION_TOKEN_INVALID");
+    }
+
+    #[test]
+    fn confirm_accepts_a_well_formed_token() {
+        let token = "a".repeat(64);
+        let value: Value = serde_json::from_str(&format!(
+            r#"{{"candidateId":"c1","approvalToken":"{token}"}}"#
+        ))
+        .unwrap();
+        let parsed = parse_token_request(&value).unwrap();
+        assert!(deserialize_token(&parsed.token_raw).is_ok());
+    }
+
+    #[test]
+    fn cancel_unknown_field_returns_invalid_request() {
+        let value: Value = serde_json::from_str(r#"{"candidateId":"c1","foo":true}"#).unwrap();
+        let err = parse_token_request(&value).unwrap_err();
+        assert_eq!(err.code, "CANDIDATE_CONFIRMATION_INVALID_REQUEST");
+    }
+
+    #[test]
+    fn cancel_missing_token_returns_approval_required() {
+        let value: Value = serde_json::from_str(r#"{"candidateId":"c1"}"#).unwrap();
+        let err = parse_token_request(&value).unwrap_err();
+        assert_eq!(err.code, "CANDIDATE_CONFIRMATION_APPROVAL_REQUIRED");
+    }
+
+    #[test]
+    fn cancel_malformed_token_returns_token_invalid() {
+        let value: Value =
+            serde_json::from_str(r#"{"candidateId":"c1","approvalToken":"bad"}"#).unwrap();
+        let parsed = parse_token_request(&value).unwrap();
+        let err = deserialize_token(&parsed.token_raw).unwrap_err();
+        assert_eq!(err.code, "CANDIDATE_CONFIRMATION_TOKEN_INVALID");
+    }
+
+    // ── HIGH 4: confirm/cancel field rejection tests ──────────────────
+
+    #[test]
+    fn confirm_rejects_life_id() {
+        let value: Value = serde_json::from_str(
+            r#"{"candidateId":"c1","lifeId":"life-b","approvalToken":"aabb"}"#,
+        )
+        .unwrap();
+        let err = parse_token_request(&value).unwrap_err();
+        assert_eq!(err.code, "CANDIDATE_CONFIRMATION_INVALID_REQUEST");
+        assert!(err.message.contains("lifeId"));
+    }
+
+    #[test]
+    fn confirm_rejects_expected_revision() {
+        let value: Value = serde_json::from_str(
+            r#"{"candidateId":"c1","expectedRevision":1,"approvalToken":"aabb"}"#,
+        )
+        .unwrap();
+        let err = parse_token_request(&value).unwrap_err();
+        assert_eq!(err.code, "CANDIDATE_CONFIRMATION_INVALID_REQUEST");
+    }
+
+    #[test]
+    fn confirm_rejects_request_id() {
+        let value: Value =
+            serde_json::from_str(r#"{"candidateId":"c1","requestId":"r1","approvalToken":"aabb"}"#)
+                .unwrap();
+        let err = parse_token_request(&value).unwrap_err();
+        assert_eq!(err.code, "CANDIDATE_CONFIRMATION_INVALID_REQUEST");
+    }
+
+    #[test]
+    fn confirm_rejects_is_sensitive() {
+        let value: Value = serde_json::from_str(
+            r#"{"candidateId":"c1","isSensitive":true,"approvalToken":"aabb"}"#,
+        )
+        .unwrap();
+        let err = parse_token_request(&value).unwrap_err();
+        assert_eq!(err.code, "CANDIDATE_CONFIRMATION_INVALID_REQUEST");
+    }
+
+    #[test]
+    fn confirm_rejects_sensitive_confirmed() {
+        let value: Value = serde_json::from_str(
+            r#"{"candidateId":"c1","sensitiveConfirmed":true,"approvalToken":"aabb"}"#,
+        )
+        .unwrap();
+        let err = parse_token_request(&value).unwrap_err();
+        assert_eq!(err.code, "CANDIDATE_CONFIRMATION_INVALID_REQUEST");
+    }
+
+    // ── HIGH 2 + 3: Error mapping tests ──────────────────────────────
 
     #[test]
     fn reprepare_errors_carry_the_flag() {
@@ -394,6 +630,9 @@ mod tests {
             ConfirmationError::TokenCancelled,
             ConfirmationError::ContextChanged,
             ConfirmationError::TokenInvalid,
+            ConfirmationError::RevisionConflict,
+            ConfirmationError::RequestConflict,
+            ConfirmationError::ProhibitedContent,
         ] {
             let mapped = ConfirmationCommandError::from(error);
             assert_eq!(mapped.requires_reprepare, Some(true), "{}", mapped.code);
@@ -402,20 +641,105 @@ mod tests {
 
     #[test]
     fn non_reprepare_errors_omit_the_flag() {
-        let mapped = ConfirmationCommandError::from(ConfirmationError::TokenInFlight);
+        for error in [
+            ConfirmationError::TokenInFlight,
+            ConfirmationError::RegistryCapacity,
+            ConfirmationError::StorageUnavailable {
+                retry_after_ms: 250,
+            },
+            ConfirmationError::SensitiveApprovalRequired,
+        ] {
+            let mapped = ConfirmationCommandError::from(error);
+            assert_eq!(mapped.requires_reprepare, None, "{}", mapped.code);
+        }
+    }
+
+    #[test]
+    fn registry_capacity_maps_to_temporarily_unavailable() {
+        let mapped = ConfirmationCommandError::from(ConfirmationError::RegistryCapacity);
+        assert_eq!(
+            mapped.code,
+            "CANDIDATE_CONFIRMATION_TEMPORARILY_UNAVAILABLE"
+        );
+        assert_eq!(mapped.retry_after_ms, Some(250));
         assert_eq!(mapped.requires_reprepare, None);
-        assert_eq!(mapped.code, "CANDIDATE_CONFIRMATION_TOKEN_IN_FLIGHT");
+    }
+
+    #[test]
+    fn d4_storage_failure_maps_to_storage_unavailable() {
+        let mapped = ConfirmationCommandError::from(ConfirmationError::StorageUnavailable {
+            retry_after_ms: 500,
+        });
+        assert_eq!(mapped.code, "CANDIDATE_CONFIRMATION_STORAGE_UNAVAILABLE");
+        assert_eq!(mapped.retry_after_ms, Some(500));
+        assert_eq!(mapped.requires_reprepare, None);
+    }
+
+    #[test]
+    fn storage_unavailable_is_retryable_with_same_token() {
+        let mapped = ConfirmationCommandError::from(ConfirmationError::StorageUnavailable {
+            retry_after_ms: 250,
+        });
+        assert_eq!(mapped.requires_reprepare, None);
+        assert!(mapped.retry_after_ms.is_some());
+    }
+
+    #[test]
+    fn registry_capacity_failure_does_not_consume_existing_token() {
+        let mapped = ConfirmationCommandError::from(ConfirmationError::RegistryCapacity);
+        assert_eq!(mapped.requires_reprepare, None);
+    }
+
+    #[test]
+    fn revision_conflict_preserves_dedicated_ipc_code() {
+        let mapped = ConfirmationCommandError::from(ConfirmationError::RevisionConflict);
+        assert_eq!(mapped.code, "CANDIDATE_MEMORY_REVISION_CONFLICT");
+        assert_eq!(mapped.requires_reprepare, Some(true));
+    }
+
+    #[test]
+    fn request_conflict_preserves_dedicated_ipc_code() {
+        let mapped = ConfirmationCommandError::from(ConfirmationError::RequestConflict);
+        assert_eq!(mapped.code, "CANDIDATE_MEMORY_REQUEST_CONFLICT");
+        assert_eq!(mapped.requires_reprepare, Some(true));
+    }
+
+    #[test]
+    fn prohibited_content_preserves_dedicated_ipc_code() {
+        let mapped = ConfirmationCommandError::from(ConfirmationError::ProhibitedContent);
+        assert_eq!(mapped.code, "CANDIDATE_MEMORY_PROHIBITED_CONTENT");
+        assert_eq!(mapped.requires_reprepare, Some(true));
+    }
+
+    #[test]
+    fn candidate_state_change_maps_to_context_changed() {
+        let mapped = ConfirmationCommandError::from(ConfirmationError::ContextChanged);
+        assert_eq!(mapped.code, "CANDIDATE_CONFIRMATION_CONTEXT_CHANGED");
+        assert_eq!(mapped.requires_reprepare, Some(true));
+    }
+
+    #[test]
+    fn sensitivity_change_maps_to_context_changed() {
+        // Sensitivity flip is detected as a context change at the coordinator level.
+        let mapped = ConfirmationCommandError::from(ConfirmationError::ContextChanged);
+        assert_eq!(mapped.code, "CANDIDATE_CONFIRMATION_CONTEXT_CHANGED");
     }
 
     #[test]
     fn transient_errors_carry_retry_after() {
-        let mapped = ConfirmationCommandError::from(ConfirmationError::TemporarilyUnavailable {
+        // D-4 storage failure → STORAGE_UNAVAILABLE with retryAfterMs.
+        let mapped = ConfirmationCommandError::from(ConfirmationError::StorageUnavailable {
             retry_after_ms: 250,
         });
         assert_eq!(mapped.retry_after_ms, Some(250));
-        let busy = ConfirmationCommandError::from(ConfirmationError::Busy);
-        assert_eq!(busy.retry_after_ms, Some(250));
-        assert_eq!(busy.code, "CANDIDATE_CONFIRMATION_STORAGE_UNAVAILABLE");
+        assert_eq!(mapped.code, "CANDIDATE_CONFIRMATION_STORAGE_UNAVAILABLE");
+        // Registry capacity → TEMPORARILY_UNAVAILABLE with retryAfterMs.
+        let capacity = ConfirmationCommandError::from(ConfirmationError::RegistryCapacity);
+        assert_eq!(capacity.retry_after_ms, Some(250));
+        assert_eq!(
+            capacity.code,
+            "CANDIDATE_CONFIRMATION_TEMPORARILY_UNAVAILABLE"
+        );
     }
 
     #[test]

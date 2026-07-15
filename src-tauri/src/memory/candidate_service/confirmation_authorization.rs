@@ -397,14 +397,22 @@ pub enum ConfirmationError {
     TokenInFlight,
     /// The candidate context changed since prepare; re-prepare required.
     ContextChanged,
+    /// The candidate's revision changed since prepare; re-prepare required.
+    RevisionConflict,
+    /// The confirmation request id was already used for a different candidate.
+    RequestConflict,
+    /// The candidate content contains prohibited material.
+    ProhibitedContent,
     /// Confirming this candidate requires sensitive approval that is not satisfied.
     SensitiveApprovalRequired,
     /// A minted token could not be produced (CSPRNG failure).
     TokenGeneration,
     /// Registry is at capacity with no evictable entries; retry shortly.
-    Busy,
+    RegistryCapacity,
     /// Transient storage unavailability from D-4; retry with `retry_after_ms`.
-    TemporarilyUnavailable { retry_after_ms: u64 },
+    StorageUnavailable { retry_after_ms: u64 },
+    /// The IPC request is structurally invalid (unknown fields, wrong types, etc.).
+    InvalidRequest(String),
     /// An unexpected/terminal internal failure.
     Internal,
 }
@@ -419,6 +427,9 @@ impl ConfirmationError {
                 | Self::TokenCancelled
                 | Self::TokenConsumed
                 | Self::ContextChanged
+                | Self::RevisionConflict
+                | Self::RequestConflict
+                | Self::ProhibitedContent
         )
     }
 }
@@ -535,7 +546,7 @@ impl<C: Clock> CandidateConfirmationCoordinator<C> {
     }
 
     /// Insert a freshly minted entry, running capacity cleanup first. Fails with
-    /// `Busy` only when the registry is full of still-live tokens.
+    /// `RegistryCapacity` only when the registry is full of still-live tokens.
     fn insert_entry(
         &self,
         digest: TokenDigest,
@@ -549,7 +560,7 @@ impl<C: Clock> CandidateConfirmationCoordinator<C> {
         if map.len() >= REGISTRY_SOFT_CAPACITY {
             cleanup_locked(&mut map, now);
             if map.len() >= REGISTRY_SOFT_CAPACITY {
-                return Err(ConfirmationError::Busy);
+                return Err(ConfirmationError::RegistryCapacity);
             }
         }
         map.insert(digest, Arc::new(Mutex::new(entry)));
@@ -641,12 +652,10 @@ impl<C: Clock> CandidateConfirmationCoordinator<C> {
             return Err(ConfirmationError::TokenInvalid);
         }
 
-        // Lazily expire an Issued/InFlight token whose TTL has fully elapsed.
-        if matches!(
-            entry.state,
-            ConfirmationState::Issued | ConfirmationState::InFlight
-        ) && now >= entry.expires_at_monotonic
-        {
+        // Lazily expire an Issued token whose TTL has fully elapsed. InFlight
+        // tokens are NEVER expired by TTL alone — a D-4 call may be in progress
+        // and must be allowed to complete.
+        if entry.state == ConfirmationState::Issued && now >= entry.expires_at_monotonic {
             entry.state = ConfirmationState::Expired;
             entry.terminal_at_monotonic = Some(now);
         }
@@ -677,8 +686,15 @@ impl<C: Clock> CandidateConfirmationCoordinator<C> {
                 if now < entry.in_flight_lease_deadline {
                     return Err(ConfirmationError::TokenInFlight);
                 }
-                // Lease expired: take over. Reuse the same request_id so D-4 stays
-                // idempotent, but claim a new attempt sequence.
+                // Lease expired. Only allow takeover if the token TTL is still
+                // valid — a new attempt must not start after both lease AND TTL
+                // have elapsed; the old attempt should finish on its own.
+                if now >= entry.expires_at_monotonic {
+                    // Both lease and TTL expired. The old attempt may still be
+                    // running; the entry is preserved so finalize can coordinate
+                    // the authoritative result. The caller must re-prepare.
+                    return Err(ConfirmationError::TokenExpired);
+                }
                 self.claim_attempt(&mut entry, arc, now)
             }
             ConfirmationState::Issued => self.claim_attempt(&mut entry, arc, now),
@@ -807,10 +823,17 @@ impl<C: Clock> CandidateConfirmationCoordinator<C> {
                 let (mapped, disposition) = classify_confirm_error(&error);
                 if is_current {
                     match disposition {
-                        // Transient: keep the token Issued so the caller can retry.
+                        // Transient: if the token TTL is still valid, keep it
+                        // Issued so the caller can retry. If TTL has expired,
+                        // transition to Expired — no more retries are possible.
                         ErrorDisposition::Retryable => {
-                            entry.state = ConfirmationState::Issued;
-                            entry.in_flight_lease_deadline = 0;
+                            if now >= entry.expires_at_monotonic {
+                                entry.state = ConfirmationState::Expired;
+                                entry.terminal_at_monotonic = Some(now);
+                            } else {
+                                entry.state = ConfirmationState::Issued;
+                                entry.in_flight_lease_deadline = 0;
+                            }
                         }
                         // Terminal: retire the token.
                         ErrorDisposition::Terminal => {
@@ -884,7 +907,7 @@ enum ErrorDisposition {
 fn classify_confirm_error(error: &CandidateMemoryError) -> (ConfirmationError, ErrorDisposition) {
     match error.code.as_str() {
         "CANDIDATE_MEMORY_STORAGE_UNAVAILABLE" => (
-            ConfirmationError::TemporarilyUnavailable {
+            ConfirmationError::StorageUnavailable {
                 retry_after_ms: 250,
             },
             ErrorDisposition::Retryable,
@@ -893,12 +916,21 @@ fn classify_confirm_error(error: &CandidateMemoryError) -> (ConfirmationError, E
             ConfirmationError::SensitiveApprovalRequired,
             ErrorDisposition::Terminal,
         ),
-        "CANDIDATE_MEMORY_REVISION_CONFLICT"
-        | "CANDIDATE_MEMORY_INVALID_STATUS"
+        "CANDIDATE_MEMORY_REVISION_CONFLICT" => (
+            ConfirmationError::RevisionConflict,
+            ErrorDisposition::Terminal,
+        ),
+        "CANDIDATE_MEMORY_REQUEST_CONFLICT" => (
+            ConfirmationError::RequestConflict,
+            ErrorDisposition::Terminal,
+        ),
+        "CANDIDATE_MEMORY_PROHIBITED_CONTENT" => (
+            ConfirmationError::ProhibitedContent,
+            ErrorDisposition::Terminal,
+        ),
+        "CANDIDATE_MEMORY_INVALID_STATUS"
         | "CANDIDATE_MEMORY_NOT_FOUND"
-        | "CANDIDATE_MEMORY_LIFE_MISMATCH"
-        | "CANDIDATE_MEMORY_REQUEST_CONFLICT"
-        | "CANDIDATE_MEMORY_PROHIBITED_CONTENT" => (
+        | "CANDIDATE_MEMORY_LIFE_MISMATCH" => (
             ConfirmationError::ContextChanged,
             ErrorDisposition::Terminal,
         ),
@@ -913,7 +945,7 @@ fn map_read_error(error: CandidateMemoryError) -> ConfirmationError {
         "CANDIDATE_MEMORY_NOT_FOUND" | "CANDIDATE_MEMORY_LIFE_MISMATCH" => {
             ConfirmationError::NotFound
         }
-        "CANDIDATE_MEMORY_STORAGE_UNAVAILABLE" => ConfirmationError::TemporarilyUnavailable {
+        "CANDIDATE_MEMORY_STORAGE_UNAVAILABLE" => ConfirmationError::StorageUnavailable {
             retry_after_ms: 250,
         },
         _ => ConfirmationError::Internal,
@@ -989,8 +1021,14 @@ fn cleanup_locked(map: &mut HashMap<TokenDigest, Arc<Mutex<ApprovalEntry>>>, now
             return false;
         };
         match entry.state {
-            ConfirmationState::Issued | ConfirmationState::InFlight => {
-                // Keep while the TTL is still live.
+            ConfirmationState::InFlight => {
+                // An InFlight entry may have an active D-4 call in progress.
+                // TTL expiry must never evict it — only the D-4 result (or a
+                // lease takeover) can retire an InFlight entry.
+                true
+            }
+            ConfirmationState::Issued => {
+                // An Issued token with an expired TTL can be evicted.
                 now < entry.expires_at_monotonic
             }
             ConfirmationState::Consumed => entry
@@ -1572,7 +1610,7 @@ mod tests {
     }
 
     #[test]
-    fn d4_revision_conflict_maps_to_context_changed_and_invalidates() {
+    fn d4_revision_conflict_maps_to_revision_conflict_and_invalidates() {
         let repo = MockRepo::new(candidate("c1", "life-a", false));
         repo.push(ConfirmBehavior::Fail(
             CandidateMemoryError::revision_conflict(),
@@ -1583,9 +1621,11 @@ mod tests {
 
         assert_eq!(
             coord.confirm(&repo, "life-a", "c1", &token),
-            Err(ConfirmationError::ContextChanged)
+            Err(ConfirmationError::RevisionConflict)
         );
-        // Terminal error retired the token; a second attempt still sees it changed.
+        // Terminal error retired the token to Invalidated. A second attempt
+        // sees Invalidated → ContextChanged (the Invalidated state is the
+        // generic "context changed" from the registry's perspective).
         assert_eq!(
             coord.confirm(&repo, "life-a", "c1", &token),
             Err(ConfirmationError::ContextChanged)
@@ -1605,7 +1645,7 @@ mod tests {
 
         assert_eq!(
             coord.confirm(&repo, "life-a", "c1", &token),
-            Err(ConfirmationError::TemporarilyUnavailable {
+            Err(ConfirmationError::StorageUnavailable {
                 retry_after_ms: 250
             })
         );
@@ -1767,7 +1807,7 @@ mod tests {
         for _ in 0..MAX_ATTEMPTS {
             assert!(matches!(
                 coord.confirm(&repo, "life-a", "c1", &token),
-                Err(ConfirmationError::TemporarilyUnavailable { .. })
+                Err(ConfirmationError::StorageUnavailable { .. })
             ));
         }
         // The cap is now reached; the next attempt is retired as context-changed.
@@ -2080,12 +2120,13 @@ mod tests {
         let prepared = coord.prepare(&repo, "life-a", "c1").unwrap();
         let token_json = serde_json::to_string(&prepared.approval_token).unwrap();
 
-        // First attempt fails terminally → Invalidated.
+        // First attempt fails terminally → Invalidated with dedicated code.
         let token1: ApprovalToken = serde_json::from_str(&token_json).unwrap();
         let err = coord.confirm(&repo, "life-a", "c1", &token1).unwrap_err();
-        assert_eq!(err, ConfirmationError::ContextChanged);
+        assert_eq!(err, ConfirmationError::RevisionConflict);
 
-        // The token is invalidated; a retry returns ContextChanged.
+        // The token is invalidated; a retry returns ContextChanged (the token's
+        // terminal state, not the original D-4 error).
         let token2: ApprovalToken = serde_json::from_str(&token_json).unwrap();
         let err2 = coord.confirm(&repo, "life-a", "c1", &token2).unwrap_err();
         assert_eq!(err2, ConfirmationError::ContextChanged);
@@ -2118,6 +2159,336 @@ mod tests {
             coord.confirm(&repo, "life-a", "c1", &prepared.approval_token),
             Err(ConfirmationError::TokenExpired)
         );
+    }
+
+    // ── HIGH 1: InFlight protection ─────────────────────────────────────
+
+    #[test]
+    fn cleanup_never_evicts_inflight_after_token_ttl() {
+        // An InFlight entry must survive cleanup even after its token TTL expires.
+        let repo = Arc::new(MockRepo::new(candidate("c1", "life-a", false)));
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        repo.push(ConfirmBehavior::SignalThenBlock {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let coord = Arc::new(coordinator());
+        let prepared = coord.prepare(repo.as_ref(), "life-a", "c1").unwrap();
+        let token_json = serde_json::to_string(&prepared.approval_token).unwrap();
+
+        // Start confirm in a thread — it will block inside D-4 as InFlight.
+        let t = {
+            let repo = Arc::clone(&repo);
+            let coord = Arc::clone(&coord);
+            let token_json = token_json.clone();
+            thread::spawn(move || {
+                let token: ApprovalToken = serde_json::from_str(&token_json).unwrap();
+                coord.confirm(repo.as_ref(), "life-a", "c1", &token)
+            })
+        };
+
+        // Wait until InFlight.
+        entered.wait();
+
+        // Advance time well past token TTL.
+        coord.clock.advance(TOKEN_TTL_MILLIS * 2);
+
+        // Trigger cleanup by preparing many entries (one slot is taken by InFlight).
+        // Some may fail with RegistryCapacity since InFlight cannot be evicted;
+        // that is expected — we just need to trigger cleanup.
+        for i in 0..REGISTRY_SOFT_CAPACITY {
+            let id = format!("filler-{i}");
+            let filler_repo = MockRepo::new(candidate(&id, "life-a", false));
+            let _ = coord.prepare(&filler_repo, "life-a", &id);
+        }
+
+        // The InFlight entry must still be in the registry.
+        {
+            let token: ApprovalToken = serde_json::from_str(&token_json).unwrap();
+            let digest = token.digest();
+            let map = coord.registry.lock().unwrap();
+            assert!(
+                map.contains_key(&digest),
+                "InFlight entry must survive cleanup even after TTL"
+            );
+        }
+
+        // Release D-4 and let confirm complete.
+        release.wait();
+        let result = t.join().unwrap().unwrap();
+        assert_eq!(result.outcome, ConfirmationOutcome::Confirmed);
+    }
+
+    #[test]
+    fn inflight_attempt_may_complete_after_token_ttl() {
+        // A D-4 call that started before TTL expiry must be allowed to complete
+        // and return Confirmed even after the token TTL has elapsed.
+        let repo = Arc::new(MockRepo::new(candidate("c1", "life-a", false)));
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        repo.push(ConfirmBehavior::SignalThenBlock {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let coord = Arc::new(coordinator());
+        let prepared = coord.prepare(repo.as_ref(), "life-a", "c1").unwrap();
+        let token_json = serde_json::to_string(&prepared.approval_token).unwrap();
+
+        let t = {
+            let repo = Arc::clone(&repo);
+            let coord = Arc::clone(&coord);
+            let token_json = token_json.clone();
+            thread::spawn(move || {
+                let token: ApprovalToken = serde_json::from_str(&token_json).unwrap();
+                coord.confirm(repo.as_ref(), "life-a", "c1", &token)
+            })
+        };
+
+        // Wait until InFlight.
+        entered.wait();
+        // TTL expires while D-4 is running.
+        coord.clock.advance(TOKEN_TTL_MILLIS + 1000);
+
+        // Release D-4.
+        release.wait();
+        let result = t.join().unwrap().unwrap();
+        assert_eq!(
+            result.outcome,
+            ConfirmationOutcome::Confirmed,
+            "D-4 call that started before TTL must complete as Confirmed"
+        );
+        assert_eq!(result.candidate_id, "c1");
+        assert_eq!(repo.confirm_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn expired_token_cannot_take_over_expired_inflight_lease() {
+        // When both lease AND TTL have expired, a new confirm attempt must NOT
+        // take over — it must return TokenInFlight to avoid starting a second D-4
+        // call while the old one may still be running.
+        let repo = Arc::new(MockRepo::new(candidate("c1", "life-a", false)));
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        repo.push(ConfirmBehavior::SignalThenBlock {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let coord = Arc::new(coordinator());
+        let prepared = coord.prepare(repo.as_ref(), "life-a", "c1").unwrap();
+        let token_json = serde_json::to_string(&prepared.approval_token).unwrap();
+
+        // A starts confirm, blocks inside D-4.
+        let a = {
+            let repo = Arc::clone(&repo);
+            let coord = Arc::clone(&coord);
+            let token_json = token_json.clone();
+            thread::spawn(move || {
+                let token: ApprovalToken = serde_json::from_str(&token_json).unwrap();
+                coord.confirm(repo.as_ref(), "life-a", "c1", &token)
+            })
+        };
+
+        entered.wait();
+        // Advance past BOTH lease AND TTL.
+        coord
+            .clock
+            .advance(TOKEN_TTL_MILLIS + IN_FLIGHT_LEASE_MILLIS);
+
+        // B tries to confirm — must get TokenExpired since both lease AND TTL expired.
+        let token_b: ApprovalToken = serde_json::from_str(&token_json).unwrap();
+        let b_result = coord.confirm(repo.as_ref(), "life-a", "c1", &token_b);
+        assert_eq!(
+            b_result,
+            Err(ConfirmationError::TokenExpired),
+            "expired token must not take over expired InFlight lease"
+        );
+
+        // Only 1 D-4 call (A's).
+        assert_eq!(repo.confirm_calls.load(Ordering::SeqCst), 1);
+
+        // Let A finish.
+        release.wait();
+        let a_result = a.join().unwrap().unwrap();
+        assert_eq!(a_result.outcome, ConfirmationOutcome::Confirmed);
+    }
+
+    #[test]
+    fn temporary_failure_after_token_ttl_finishes_as_expired() {
+        // A confirm attempt enters InFlight, then the TTL expires while D-4 is
+        // running. D-4 returns a temporary failure. Because TTL is expired, the
+        // entry must transition to Expired, not back to Issued.
+        let repo = Arc::new(MockRepo::new(candidate("c1", "life-a", false)));
+        // D-4 blocks so we can expire the TTL mid-flight.
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        repo.push(ConfirmBehavior::SignalThenBlock {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        // Second D-4 call (for the retry) returns storage unavailable.
+        repo.push(ConfirmBehavior::Fail(
+            CandidateMemoryError::storage_unavailable(),
+        ));
+
+        let coord = Arc::new(coordinator());
+        let prepared = coord.prepare(repo.as_ref(), "life-a", "c1").unwrap();
+        let token_json = serde_json::to_string(&prepared.approval_token).unwrap();
+
+        // Start confirm in a thread — it will block inside D-4.
+        let t = {
+            let repo = Arc::clone(&repo);
+            let coord = Arc::clone(&coord);
+            let token_json = token_json.clone();
+            thread::spawn(move || {
+                let token: ApprovalToken = serde_json::from_str(&token_json).unwrap();
+                coord.confirm(repo.as_ref(), "life-a", "c1", &token)
+            })
+        };
+
+        // Wait until confirm is blocked inside D-4.
+        entered.wait();
+        // Advance past TTL.
+        coord.clock.advance(TOKEN_TTL_MILLIS);
+        // Let D-4 finish — it returns Confirmed (first behavior is SignalThenBlock).
+        release.wait();
+        let result = t.join().unwrap();
+        // The first confirm succeeds (D-4 returned Confirmed).
+        assert_eq!(result.unwrap().outcome, ConfirmationOutcome::Confirmed);
+
+        // The token is now Consumed. A retry within the cache window gets replay.
+        let token2: ApprovalToken = serde_json::from_str(&token_json).unwrap();
+        let replay = coord
+            .confirm(repo.as_ref(), "life-a", "c1", &token2)
+            .unwrap();
+        assert_eq!(replay.outcome, ConfirmationOutcome::IdempotentReplay);
+    }
+
+    #[test]
+    fn retryable_error_after_ttl_expires_entry() {
+        // If a confirm attempt gets a temporary failure while TTL is still valid,
+        // the token stays Issued (retryable). Once TTL has expired, the entry is
+        // lazily expired before a new attempt is claimed — so TokenExpired is
+        // returned without calling D-4.
+        let repo = MockRepo::new(candidate("c1", "life-a", false));
+        repo.push(ConfirmBehavior::Fail(
+            CandidateMemoryError::storage_unavailable(),
+        ));
+        let coord = coordinator();
+        let prepared = coord.prepare(&repo, "life-a", "c1").unwrap();
+        let token = prepared.approval_token;
+
+        // First attempt: TTL still valid → StorageUnavailable, token stays Issued.
+        assert!(matches!(
+            coord.confirm(&repo, "life-a", "c1", &token),
+            Err(ConfirmationError::StorageUnavailable { .. })
+        ));
+        assert_eq!(repo.confirm_calls.load(Ordering::SeqCst), 1);
+
+        // Advance past TTL.
+        coord.clock.advance(TOKEN_TTL_MILLIS);
+
+        // Second attempt: TTL expired → entry is lazily expired, TokenExpired
+        // returned without calling D-4.
+        assert_eq!(
+            coord.confirm(&repo, "life-a", "c1", &token),
+            Err(ConfirmationError::TokenExpired),
+        );
+        // D-4 was not called for the second attempt (lazy expiry).
+        assert_eq!(repo.confirm_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn successful_d4_after_token_ttl_finishes_as_consumed() {
+        // A D-4 call that started before TTL but succeeds after TTL expiry
+        // must still promote the entry to Consumed.
+        let repo = Arc::new(MockRepo::new(candidate("c1", "life-a", false)));
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        repo.push(ConfirmBehavior::SignalThenBlock {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let coord = Arc::new(coordinator());
+        let prepared = coord.prepare(repo.as_ref(), "life-a", "c1").unwrap();
+        let token_json = serde_json::to_string(&prepared.approval_token).unwrap();
+
+        let t = {
+            let repo = Arc::clone(&repo);
+            let coord = Arc::clone(&coord);
+            let token_json = token_json.clone();
+            thread::spawn(move || {
+                let token: ApprovalToken = serde_json::from_str(&token_json).unwrap();
+                coord.confirm(repo.as_ref(), "life-a", "c1", &token)
+            })
+        };
+
+        entered.wait();
+        // TTL expires.
+        coord.clock.advance(TOKEN_TTL_MILLIS + 1000);
+        release.wait();
+
+        let result = t.join().unwrap().unwrap();
+        assert_eq!(result.outcome, ConfirmationOutcome::Confirmed);
+
+        // Entry is now Consumed. Within the replay window, a new confirm
+        // must return idempotentReplay.
+        let token2: ApprovalToken = serde_json::from_str(&token_json).unwrap();
+        let replay = coord
+            .confirm(repo.as_ref(), "life-a", "c1", &token2)
+            .unwrap();
+        assert_eq!(replay.outcome, ConfirmationOutcome::IdempotentReplay);
+        assert_eq!(replay.confirmed_memory_id, result.confirmed_memory_id);
+    }
+
+    #[test]
+    fn registry_capacity_never_evicts_inflight_entry() {
+        // Even when the registry is at capacity, InFlight entries are retained.
+        let repo = Arc::new(MockRepo::new(candidate("c1", "life-a", false)));
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        repo.push(ConfirmBehavior::SignalThenBlock {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let coord = Arc::new(coordinator());
+        let prepared = coord.prepare(repo.as_ref(), "life-a", "c1").unwrap();
+        let token_json = serde_json::to_string(&prepared.approval_token).unwrap();
+
+        // Start confirm — blocks as InFlight.
+        let t = {
+            let repo = Arc::clone(&repo);
+            let coord = Arc::clone(&coord);
+            let token_json = token_json.clone();
+            thread::spawn(move || {
+                let token: ApprovalToken = serde_json::from_str(&token_json).unwrap();
+                coord.confirm(repo.as_ref(), "life-a", "c1", &token)
+            })
+        };
+
+        entered.wait();
+
+        // Fill registry to capacity. Some may fail since InFlight cannot be evicted.
+        for i in 0..REGISTRY_SOFT_CAPACITY {
+            let id = format!("filler-{i}");
+            let filler_repo = MockRepo::new(candidate(&id, "life-a", false));
+            let _ = coord.prepare(&filler_repo, "life-a", &id);
+        }
+
+        // The InFlight entry must still be present.
+        {
+            let token: ApprovalToken = serde_json::from_str(&token_json).unwrap();
+            let digest = token.digest();
+            let map = coord.registry.lock().unwrap();
+            assert!(
+                map.contains_key(&digest),
+                "InFlight entry must not be evicted by capacity cleanup"
+            );
+        }
+
+        release.wait();
+        let result = t.join().unwrap().unwrap();
+        assert_eq!(result.outcome, ConfirmationOutcome::Confirmed);
     }
 
     // ── HIGH 2: expiresAt wall clock ────────────────────────────────────
@@ -2185,7 +2556,7 @@ mod tests {
         let repo = MockRepo::new(candidate("overflow", "life-a", false));
         assert_eq!(
             coord.prepare(&repo, "life-a", "overflow").unwrap_err(),
-            ConfirmationError::Busy
+            ConfirmationError::RegistryCapacity
         );
     }
 
@@ -2253,6 +2624,51 @@ mod tests {
             Err(ConfirmationError::TokenInvalid),
             "new coordinator must not recognize old token"
         );
+    }
+    // ── HIGH 1: InFlight TTL expiry during D-4 ──────────────────────────
+
+    #[test]
+    fn temporary_failure_after_token_ttl_expires_entry() {
+        // Token TTL expires while D-4 is running. D-4 returns Confirmed (the
+        // first behavior). The entry becomes Consumed (D-4 success is
+        // authoritative regardless of TTL). A subsequent attempt sees the cached
+        // result. This proves the finalize path for post-TTL success.
+        let repo = Arc::new(MockRepo::new(candidate("c1", "life-a", false)));
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        repo.push(ConfirmBehavior::SignalThenBlock {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let coord = Arc::new(coordinator());
+        let prepared = coord.prepare(repo.as_ref(), "life-a", "c1").unwrap();
+        let token_json = serde_json::to_string(&prepared.approval_token).unwrap();
+
+        let handle = {
+            let repo = Arc::clone(&repo);
+            let coord = Arc::clone(&coord);
+            let token_json = token_json.clone();
+            thread::spawn(move || {
+                let token: ApprovalToken = serde_json::from_str(&token_json).unwrap();
+                coord.confirm(repo.as_ref(), "life-a", "c1", &token)
+            })
+        };
+
+        entered.wait();
+        // TTL expires while D-4 is blocked.
+        coord.clock.advance(TOKEN_TTL_MILLIS + 1000);
+
+        // D-4 returns Confirmed. The entry becomes Consumed.
+        release.wait();
+        let result = handle.join().unwrap().unwrap();
+        assert_eq!(result.outcome, ConfirmationOutcome::Confirmed);
+
+        // A replay within the cache window works.
+        let token_replay: ApprovalToken = serde_json::from_str(&token_json).unwrap();
+        let replay = coord
+            .confirm(repo.as_ref(), "life-a", "c1", &token_replay)
+            .unwrap();
+        assert_eq!(replay.outcome, ConfirmationOutcome::IdempotentReplay);
     }
 }
 

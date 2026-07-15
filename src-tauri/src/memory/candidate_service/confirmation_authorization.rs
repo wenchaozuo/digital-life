@@ -15,6 +15,7 @@
 use std::{
     collections::HashMap,
     fmt,
+    panic::{catch_unwind, AssertUnwindSafe},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -46,6 +47,10 @@ const IN_FLIGHT_LEASE_MILLIS: u64 = 30 * 1000;
 /// How long a consumed token's minimal safe result stays replayable, in
 /// milliseconds (5 minutes).
 const CONSUMED_CACHE_MILLIS: u64 = 5 * 60 * 1000;
+/// A caught panic cannot be reported as a completed D-4 transaction. Retain the
+/// original authorization binding long enough for the caller to retry the exact
+/// same request id, then retire it so orphaned work cannot exhaust the registry.
+const PANIC_RECOVERY_WINDOW_MILLIS: u64 = 5 * 60 * 1000;
 /// Maximum number of D-4 attempts a single token may drive before it is retired.
 const MAX_ATTEMPTS: u32 = 3;
 /// Soft capacity of the registry; cleanup runs before growing beyond this.
@@ -255,6 +260,10 @@ enum ConfirmationState {
     Issued,
     /// A confirm attempt is currently driving a D-4 call under a lease.
     InFlight,
+    /// A D-4 invocation panicked before its result could be finalized. The next
+    /// confirm with this exact token reuses the captured request id to reconcile
+    /// with D-4's idempotent transaction; it is never a new authorization.
+    RecoveryPending,
     /// A confirm attempt committed a D-4 result; a minimal safe result is cached
     /// for idempotent replay within the consumed cache window.
     Consumed,
@@ -289,6 +298,7 @@ struct ApprovalEntry {
     attempt_count: u32,
     attempt_sequence: u64,
     in_flight_lease_deadline: u64,
+    recovery_deadline_monotonic: Option<u64>,
     cached_result: Option<CachedSafeResult>,
     terminal_at_monotonic: Option<u64>,
 }
@@ -445,6 +455,8 @@ pub struct CandidateConfirmationCoordinator<C: Clock = SystemClock> {
     registry: Mutex<HashMap<TokenDigest, Arc<Mutex<ApprovalEntry>>>>,
     sequence: AtomicU64,
     clock: C,
+    #[cfg(test)]
+    panic_after_d4_before_finalize: std::sync::atomic::AtomicBool,
 }
 
 impl Default for CandidateConfirmationCoordinator<SystemClock> {
@@ -459,6 +471,8 @@ impl<C: Clock> CandidateConfirmationCoordinator<C> {
             registry: Mutex::new(HashMap::new()),
             sequence: AtomicU64::new(1),
             clock,
+            #[cfg(test)]
+            panic_after_d4_before_finalize: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -502,6 +516,7 @@ impl<C: Clock> CandidateConfirmationCoordinator<C> {
             attempt_count: 0,
             attempt_sequence: 0,
             in_flight_lease_deadline: 0,
+            recovery_deadline_monotonic: None,
             cached_result: None,
             terminal_at_monotonic: None,
         };
@@ -591,6 +606,7 @@ struct AttemptTicket {
     request_id: String,
     is_sensitive: bool,
     attempt_sequence: u64,
+    is_recovery: bool,
 }
 
 impl<C: Clock> CandidateConfirmationCoordinator<C> {
@@ -619,11 +635,23 @@ impl<C: Clock> CandidateConfirmationCoordinator<C> {
             AttemptDecision::Proceed(ticket) => ticket,
         };
 
-        // Phase 2: no locks held. Re-validate context, then call D-4.
-        let d4_result = self.run_confirm(repository, &ticket);
+        // Phase 2: no locks held. A panic boundary is deliberately adjacent to
+        // D-4 and finalization. It prevents a command-thread panic from leaving
+        // an unbounded InFlight entry, while preserving the original request id
+        // for a bounded reconciliation retry.
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let d4_result = self.run_confirm(repository, &ticket);
+            #[cfg(test)]
+            self.panic_after_d4_before_finalize_if_requested();
+            // Finalization is inside the same boundary: even an unexpected panic
+            // while updating the in-memory registry must not strand this token.
+            self.finalize(&ticket, d4_result)
+        }));
 
-        // Phase 3: finalize the token state (best-effort) and map to the result.
-        self.finalize(&ticket, d4_result)
+        match result {
+            Ok(result) => result,
+            Err(_) => Err(self.recover_from_panic(&ticket)),
+        }
     }
 }
 
@@ -682,6 +710,17 @@ impl<C: Clock> CandidateConfirmationCoordinator<C> {
             ConfirmationState::Expired => Err(ConfirmationError::TokenExpired),
             ConfirmationState::Cancelled => Err(ConfirmationError::TokenCancelled),
             ConfirmationState::Invalidated => Err(ConfirmationError::ContextChanged),
+            ConfirmationState::RecoveryPending => {
+                let recovery_deadline = entry
+                    .recovery_deadline_monotonic
+                    .ok_or(ConfirmationError::Internal)?;
+                if now >= recovery_deadline {
+                    entry.state = ConfirmationState::Invalidated;
+                    entry.terminal_at_monotonic = Some(now);
+                    return Err(ConfirmationError::ContextChanged);
+                }
+                self.claim_attempt(&mut entry, arc, now, true)
+            }
             ConfirmationState::InFlight => {
                 if now < entry.in_flight_lease_deadline {
                     return Err(ConfirmationError::TokenInFlight);
@@ -695,9 +734,9 @@ impl<C: Clock> CandidateConfirmationCoordinator<C> {
                     // the authoritative result. The caller must re-prepare.
                     return Err(ConfirmationError::TokenExpired);
                 }
-                self.claim_attempt(&mut entry, arc, now)
+                self.claim_attempt(&mut entry, arc, now, false)
             }
-            ConfirmationState::Issued => self.claim_attempt(&mut entry, arc, now),
+            ConfirmationState::Issued => self.claim_attempt(&mut entry, arc, now, false),
         }
     }
 }
@@ -710,6 +749,7 @@ impl<C: Clock> CandidateConfirmationCoordinator<C> {
         entry: &mut ApprovalEntry,
         arc: &Arc<Mutex<ApprovalEntry>>,
         now: u64,
+        is_recovery: bool,
     ) -> Result<AttemptDecision, ConfirmationError> {
         if entry.attempt_count >= MAX_ATTEMPTS {
             entry.state = ConfirmationState::Invalidated;
@@ -729,6 +769,7 @@ impl<C: Clock> CandidateConfirmationCoordinator<C> {
             request_id: entry.request_id.clone(),
             is_sensitive: entry.is_sensitive,
             attempt_sequence,
+            is_recovery,
         }))
     }
 }
@@ -748,9 +789,15 @@ impl<C: Clock> CandidateConfirmationCoordinator<C> {
         // Cheap pre-check: if the candidate vanished or its sensitivity flipped since
         // prepare, surface a context change without troubling D-4. D-4 still performs
         // the authoritative revision/status/sensitivity checks inside its transaction.
-        let current = repository.get_candidate(&ticket.life_id, &ticket.candidate_id)?;
-        if current.is_sensitive != ticket.is_sensitive {
-            return Err(CandidateMemoryError::invalid_status());
+        // A panic recovery intentionally bypasses this speculative read. D-4 gets
+        // the unchanged request id and remains authoritative: it can return the
+        // committed result after a post-commit panic, or reject a changed candidate
+        // atomically before any new confirmation is created.
+        if !ticket.is_recovery {
+            let current = repository.get_candidate(&ticket.life_id, &ticket.candidate_id)?;
+            if current.is_sensitive != ticket.is_sensitive {
+                return Err(CandidateMemoryError::invalid_status());
+            }
         }
 
         let sensitive_grant = if ticket.is_sensitive {
@@ -827,7 +874,18 @@ impl<C: Clock> CandidateConfirmationCoordinator<C> {
                         // Issued so the caller can retry. If TTL has expired,
                         // transition to Expired — no more retries are possible.
                         ErrorDisposition::Retryable => {
-                            if now >= entry.expires_at_monotonic {
+                            if ticket.is_recovery {
+                                if entry
+                                    .recovery_deadline_monotonic
+                                    .is_some_and(|deadline| now < deadline)
+                                {
+                                    entry.state = ConfirmationState::RecoveryPending;
+                                    entry.in_flight_lease_deadline = 0;
+                                } else {
+                                    entry.state = ConfirmationState::Invalidated;
+                                    entry.terminal_at_monotonic = Some(now);
+                                }
+                            } else if now >= entry.expires_at_monotonic {
                                 entry.state = ConfirmationState::Expired;
                                 entry.terminal_at_monotonic = Some(now);
                             } else {
@@ -848,6 +906,50 @@ impl<C: Clock> CandidateConfirmationCoordinator<C> {
             }
         }
     }
+
+    /// Turn a caught command-thread panic into a bounded same-token recovery
+    /// opportunity. No panic payload is logged or exposed. A stale panicking
+    /// attempt cannot overwrite a newer attempt's state.
+    fn recover_from_panic(&self, ticket: &AttemptTicket) -> ConfirmationError {
+        let now = self.clock.monotonic_millis();
+        // If finalization itself panicked while holding this entry lock, recover
+        // the guard rather than leaving a poisoned, unreachable InFlight entry.
+        let mut entry = match ticket.entry.lock() {
+            Ok(entry) => entry,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if entry.state == ConfirmationState::InFlight
+            && entry.attempt_sequence == ticket.attempt_sequence
+        {
+            entry.state = ConfirmationState::RecoveryPending;
+            entry.in_flight_lease_deadline = 0;
+            entry.recovery_deadline_monotonic =
+                Some(now.saturating_add(PANIC_RECOVERY_WINDOW_MILLIS));
+        }
+        drop(entry);
+        // A caught panic is now represented by RecoveryPending, not an unusable
+        // poisoned mutex. Future same-token recovery can safely acquire it.
+        ticket.entry.clear_poison();
+        ConfirmationError::StorageUnavailable {
+            retry_after_ms: 250,
+        }
+    }
+
+    #[cfg(test)]
+    fn request_panic_after_d4_before_finalize_for_test(&self) {
+        self.panic_after_d4_before_finalize
+            .store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn panic_after_d4_before_finalize_if_requested(&self) {
+        if self
+            .panic_after_d4_before_finalize
+            .swap(false, Ordering::SeqCst)
+        {
+            panic!("test-only panic after D-4 before finalize");
+        }
+    }
 }
 
 /// When a stale attempt's D-4 call succeeds, promote the entry to Consumed if
@@ -865,7 +967,8 @@ fn promote_to_consumed_if_authoritative(
         // rolled back): the database success is authoritative, so promote.
         ConfirmationState::InFlight
         | ConfirmationState::Invalidated
-        | ConfirmationState::Issued => {
+        | ConfirmationState::Issued
+        | ConfirmationState::RecoveryPending => {
             entry.state = ConfirmationState::Consumed;
             entry.terminal_at_monotonic = Some(now);
             entry.cached_result = Some(CachedSafeResult {
@@ -994,7 +1097,7 @@ impl<C: Clock> CandidateConfirmationCoordinator<C> {
                 entry.terminal_at_monotonic = Some(now);
                 Ok(CancelOutcome::Cancelled)
             }
-            ConfirmationState::InFlight => {
+            ConfirmationState::InFlight | ConfirmationState::RecoveryPending => {
                 // InFlight means a D-4 call may be in progress. Regardless of
                 // whether the lease has expired, cancel must not transition the
                 // state — the caller is told the token is in flight. Only a new
@@ -1016,7 +1119,7 @@ impl<C: Clock> CandidateConfirmationCoordinator<C> {
 /// its replay cache window elapses. Still-live Issued/InFlight tokens are preserved.
 fn cleanup_locked(map: &mut HashMap<TokenDigest, Arc<Mutex<ApprovalEntry>>>, now: u64) {
     map.retain(|_, arc| {
-        let Ok(entry) = arc.lock() else {
+        let Ok(mut entry) = arc.lock() else {
             // A poisoned entry can never be driven safely again; drop it.
             return false;
         };
@@ -1026,6 +1129,24 @@ fn cleanup_locked(map: &mut HashMap<TokenDigest, Arc<Mutex<ApprovalEntry>>>, now
                 // TTL expiry must never evict it — only the D-4 result (or a
                 // lease takeover) can retire an InFlight entry.
                 true
+            }
+            ConfirmationState::RecoveryPending => {
+                let Some(deadline) = entry.recovery_deadline_monotonic else {
+                    entry.state = ConfirmationState::Invalidated;
+                    entry.terminal_at_monotonic = Some(now);
+                    return true;
+                };
+                if now < deadline {
+                    true
+                } else {
+                    entry.state = ConfirmationState::Invalidated;
+                    entry.terminal_at_monotonic = Some(now);
+                    // Recovery has had its full bounded window. Drop the orphan
+                    // immediately so a panic cannot permanently consume registry
+                    // capacity; D-4 remains the durable authority if the caller
+                    // returns after this in-memory token has expired.
+                    false
+                }
             }
             ConfirmationState::Issued => {
                 // An Issued token with an expired TTL can be evicted.
@@ -1078,6 +1199,7 @@ mod tests {
         Confirm,
         AlreadyConfirmed,
         Fail(CandidateMemoryError),
+        Panic,
         /// Wait on `gate` inside the D-4 call, then confirm. Used to interleave a
         /// second attempt with a blocked one.
         BlockThenConfirm(Arc<Barrier>),
@@ -1086,6 +1208,13 @@ mod tests {
         SignalThenBlock {
             entered: Arc<Barrier>,
             release: Arc<Barrier>,
+        },
+        /// Signal arrival in D-4, then return the supplied error after release.
+        /// Used to prove an older attempt cannot overwrite a newer terminal state.
+        SignalThenBlockFail {
+            entered: Arc<Barrier>,
+            release: Arc<Barrier>,
+            error: CandidateMemoryError,
         },
     }
 
@@ -1258,6 +1387,7 @@ mod tests {
                 ConfirmBehavior::Confirm => ConfirmCandidateOutcome::Confirmed,
                 ConfirmBehavior::AlreadyConfirmed => ConfirmCandidateOutcome::AlreadyConfirmed,
                 ConfirmBehavior::Fail(error) => return Err(error),
+                ConfirmBehavior::Panic => panic!("test-only D-4 panic"),
                 ConfirmBehavior::BlockThenConfirm(gate) => {
                     gate.wait();
                     ConfirmCandidateOutcome::Confirmed
@@ -1266,6 +1396,15 @@ mod tests {
                     entered.wait();
                     release.wait();
                     ConfirmCandidateOutcome::Confirmed
+                }
+                ConfirmBehavior::SignalThenBlockFail {
+                    entered,
+                    release,
+                    error,
+                } => {
+                    entered.wait();
+                    release.wait();
+                    return Err(error);
                 }
             };
             let candidate = self
@@ -2628,6 +2767,236 @@ mod tests {
     // ── HIGH 1: InFlight TTL expiry during D-4 ──────────────────────────
 
     #[test]
+    fn panic_before_d4_commit_does_not_leave_permanent_inflight() {
+        let repo = MockRepo::new(candidate("c1", "life-a", false));
+        repo.push(ConfirmBehavior::Panic);
+        let coord = coordinator();
+        let prepared = coord.prepare(&repo, "life-a", "c1").unwrap();
+        let token_json = serde_json::to_string(&prepared.approval_token).unwrap();
+
+        let first_token: ApprovalToken = serde_json::from_str(&token_json).unwrap();
+        assert!(matches!(
+            coord.confirm(&repo, "life-a", "c1", &first_token),
+            Err(ConfirmationError::StorageUnavailable { .. })
+        ));
+
+        let retry_token: ApprovalToken = serde_json::from_str(&token_json).unwrap();
+        let recovered = coord.confirm(&repo, "life-a", "c1", &retry_token).unwrap();
+        assert_eq!(recovered.outcome, ConfirmationOutcome::Confirmed);
+        assert_eq!(repo.confirm_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn panic_orphans_cannot_permanently_exhaust_registry() {
+        let repo = MockRepo::new(candidate("orphan", "life-a", false));
+        repo.push(ConfirmBehavior::Panic);
+        let coord = coordinator();
+        let prepared = coord.prepare(&repo, "life-a", "orphan").unwrap();
+        assert!(matches!(
+            coord.confirm(&repo, "life-a", "orphan", &prepared.approval_token),
+            Err(ConfirmationError::StorageUnavailable { .. })
+        ));
+
+        // The final fresh insert forces cleanup after the bounded recovery window.
+        coord
+            .clock
+            .advance(PANIC_RECOVERY_WINDOW_MILLIS.saturating_add(1));
+        for i in 0..REGISTRY_SOFT_CAPACITY {
+            let id = format!("fresh-{i}");
+            let fresh_repo = MockRepo::new(candidate(&id, "life-a", false));
+            coord.prepare(&fresh_repo, "life-a", &id).unwrap();
+        }
+        assert_eq!(coord.registry.lock().unwrap().len(), REGISTRY_SOFT_CAPACITY);
+    }
+
+    #[test]
+    fn cancel_cannot_override_panic_recovery_state() {
+        let repo = MockRepo::new(candidate("c1", "life-a", false));
+        repo.push(ConfirmBehavior::Panic);
+        let coord = coordinator();
+        let prepared = coord.prepare(&repo, "life-a", "c1").unwrap();
+        let token_json = serde_json::to_string(&prepared.approval_token).unwrap();
+
+        let first_token: ApprovalToken = serde_json::from_str(&token_json).unwrap();
+        assert!(matches!(
+            coord.confirm(&repo, "life-a", "c1", &first_token),
+            Err(ConfirmationError::StorageUnavailable { .. })
+        ));
+        let cancel_token: ApprovalToken = serde_json::from_str(&token_json).unwrap();
+        assert_eq!(
+            coord.cancel("life-a", "c1", &cancel_token),
+            Err(ConfirmationError::TokenInFlight)
+        );
+
+        let retry_token: ApprovalToken = serde_json::from_str(&token_json).unwrap();
+        assert_eq!(
+            coord
+                .confirm(&repo, "life-a", "c1", &retry_token)
+                .unwrap()
+                .outcome,
+            ConfirmationOutcome::Confirmed
+        );
+    }
+
+    #[test]
+    fn stale_temporary_error_from_old_attempt_cannot_restore_newer_consumed_entry() {
+        let repo = Arc::new(MockRepo::new(candidate("c1", "life-a", false)));
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        repo.push(ConfirmBehavior::SignalThenBlockFail {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            error: CandidateMemoryError::storage_unavailable(),
+        });
+        repo.push(ConfirmBehavior::Confirm);
+        let coord = Arc::new(coordinator());
+        let prepared = coord.prepare(repo.as_ref(), "life-a", "c1").unwrap();
+        let token_json = serde_json::to_string(&prepared.approval_token).unwrap();
+
+        let old_attempt = {
+            let repo = Arc::clone(&repo);
+            let coord = Arc::clone(&coord);
+            let token_json = token_json.clone();
+            thread::spawn(move || {
+                let token: ApprovalToken = serde_json::from_str(&token_json).unwrap();
+                coord.confirm(repo.as_ref(), "life-a", "c1", &token)
+            })
+        };
+        entered.wait();
+        coord.clock.advance(IN_FLIGHT_LEASE_MILLIS);
+
+        let takeover_token: ApprovalToken = serde_json::from_str(&token_json).unwrap();
+        let takeover = coord
+            .confirm(repo.as_ref(), "life-a", "c1", &takeover_token)
+            .unwrap();
+        assert_eq!(takeover.outcome, ConfirmationOutcome::Confirmed);
+        release.wait();
+
+        assert!(matches!(
+            old_attempt.join().unwrap(),
+            Err(ConfirmationError::StorageUnavailable { .. })
+        ));
+        let replay_token: ApprovalToken = serde_json::from_str(&token_json).unwrap();
+        let replay = coord
+            .confirm(repo.as_ref(), "life-a", "c1", &replay_token)
+            .unwrap();
+        assert_eq!(replay.outcome, ConfirmationOutcome::IdempotentReplay);
+        assert_eq!(replay.confirmed_memory_id, takeover.confirmed_memory_id);
+    }
+
+    #[test]
+    fn stale_business_error_from_old_attempt_cannot_invalidate_newer_attempt() {
+        let repo = Arc::new(MockRepo::new(candidate("c1", "life-a", false)));
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        repo.push(ConfirmBehavior::SignalThenBlockFail {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            error: CandidateMemoryError::new(
+                "CANDIDATE_MEMORY_REVISION_CONFLICT",
+                "revision conflict",
+                true,
+            ),
+        });
+        repo.push(ConfirmBehavior::Confirm);
+        let coord = Arc::new(coordinator());
+        let prepared = coord.prepare(repo.as_ref(), "life-a", "c1").unwrap();
+        let token_json = serde_json::to_string(&prepared.approval_token).unwrap();
+
+        let old_attempt = {
+            let repo = Arc::clone(&repo);
+            let coord = Arc::clone(&coord);
+            let token_json = token_json.clone();
+            thread::spawn(move || {
+                let token: ApprovalToken = serde_json::from_str(&token_json).unwrap();
+                coord.confirm(repo.as_ref(), "life-a", "c1", &token)
+            })
+        };
+        entered.wait();
+        coord.clock.advance(IN_FLIGHT_LEASE_MILLIS);
+        let takeover_token: ApprovalToken = serde_json::from_str(&token_json).unwrap();
+        let takeover = coord
+            .confirm(repo.as_ref(), "life-a", "c1", &takeover_token)
+            .unwrap();
+        release.wait();
+
+        assert_eq!(
+            old_attempt.join().unwrap(),
+            Err(ConfirmationError::RevisionConflict)
+        );
+        let replay_token: ApprovalToken = serde_json::from_str(&token_json).unwrap();
+        let replay = coord
+            .confirm(repo.as_ref(), "life-a", "c1", &replay_token)
+            .unwrap();
+        assert_eq!(replay.outcome, ConfirmationOutcome::IdempotentReplay);
+        assert_eq!(replay.confirmed_memory_id, takeover.confirmed_memory_id);
+    }
+
+    #[test]
+    fn different_candidates_do_not_share_entry_lock() {
+        let repo_a = Arc::new(MockRepo::new(candidate("a", "life-a", false)));
+        let repo_b = Arc::new(MockRepo::new(candidate("b", "life-a", false)));
+        let entered_a = Arc::new(Barrier::new(2));
+        let release_a = Arc::new(Barrier::new(2));
+        let entered_b = Arc::new(Barrier::new(2));
+        let release_b = Arc::new(Barrier::new(2));
+        repo_a.push(ConfirmBehavior::SignalThenBlock {
+            entered: Arc::clone(&entered_a),
+            release: Arc::clone(&release_a),
+        });
+        repo_b.push(ConfirmBehavior::SignalThenBlock {
+            entered: Arc::clone(&entered_b),
+            release: Arc::clone(&release_b),
+        });
+        let coord = Arc::new(coordinator());
+        let token_a = serde_json::to_string(
+            &coord
+                .prepare(repo_a.as_ref(), "life-a", "a")
+                .unwrap()
+                .approval_token,
+        )
+        .unwrap();
+        let token_b = serde_json::to_string(
+            &coord
+                .prepare(repo_b.as_ref(), "life-a", "b")
+                .unwrap()
+                .approval_token,
+        )
+        .unwrap();
+
+        let a = {
+            let repo = Arc::clone(&repo_a);
+            let coord = Arc::clone(&coord);
+            thread::spawn(move || {
+                let token: ApprovalToken = serde_json::from_str(&token_a).unwrap();
+                coord.confirm(repo.as_ref(), "life-a", "a", &token)
+            })
+        };
+        entered_a.wait();
+        let b = {
+            let repo = Arc::clone(&repo_b);
+            let coord = Arc::clone(&coord);
+            thread::spawn(move || {
+                let token: ApprovalToken = serde_json::from_str(&token_b).unwrap();
+                coord.confirm(repo.as_ref(), "life-a", "b", &token)
+            })
+        };
+        // This barrier proves B reached D-4 while A was still blocked, without
+        // timing sleeps or global test serialization.
+        entered_b.wait();
+        release_b.wait();
+        release_a.wait();
+        assert_eq!(
+            a.join().unwrap().unwrap().outcome,
+            ConfirmationOutcome::Confirmed
+        );
+        assert_eq!(
+            b.join().unwrap().unwrap().outcome,
+            ConfirmationOutcome::Confirmed
+        );
+    }
+
+    #[test]
     fn temporary_failure_after_token_ttl_expires_entry() {
         // Token TTL expires while D-4 is running. D-4 returns Confirmed (the
         // first behavior). The entry becomes Consumed (D-4 success is
@@ -2679,14 +3048,18 @@ mod tests {
 mod integration_tests {
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     use super::*;
     use crate::memory::candidate::{
         CandidateInferenceStatus, CandidateMemoryRepository, CandidateMemorySourceType,
         NewCandidateMemory, PRIMARY_USER_SUBJECT_ID,
     };
+    use crate::memory::{MemoryQuery, MemoryRepository, MemoryStatus};
     use crate::storage::{
-        unique_suffix, LifeIdentityRecord, PersonaTemplateRecord, StorageService,
+        test_support::candidate_confirmation_artifact_counts, unique_suffix, LifeIdentityRecord,
+        PersonaTemplateRecord, StorageService,
     };
 
     struct TestRoot(PathBuf);
@@ -2855,5 +3228,146 @@ mod integration_tests {
         let second = coord.confirm(&service, "life-a", "c1", &token2).unwrap();
         assert_eq!(second.outcome, ConfirmationOutcome::IdempotentReplay);
         assert_eq!(second.confirmed_memory_id, first.confirmed_memory_id);
+    }
+
+    #[test]
+    fn panic_after_d4_commit_recovers_with_same_request_id() {
+        let root = TestRoot::new("panic-after-commit");
+        let service = seeded_service(&root);
+        insert(&service, "c1", false);
+        let coord = CandidateConfirmationCoordinator::default();
+        let prepared = coord.prepare(&service, "life-a", "c1").unwrap();
+        let digest = prepared.approval_token.digest();
+        let request_id = {
+            let map = coord.registry.lock().unwrap();
+            let entry = Arc::clone(map.get(&digest).unwrap());
+            drop(map);
+            let request_id = entry.lock().unwrap().request_id.clone();
+            request_id
+        };
+
+        // The injected panic happens only after D-4 committed but before this
+        // coordinator can cache the response. The caller receives a safe retryable
+        // error, then retries the same token/request id for D-4 idempotency.
+        coord.request_panic_after_d4_before_finalize_for_test();
+        assert!(matches!(
+            coord.confirm(&service, "life-a", "c1", &prepared.approval_token),
+            Err(ConfirmationError::StorageUnavailable { .. })
+        ));
+        let recovered = coord
+            .confirm(&service, "life-a", "c1", &prepared.approval_token)
+            .unwrap();
+        assert_eq!(recovered.outcome, ConfirmationOutcome::IdempotentReplay);
+
+        let stored =
+            <StorageService as CandidateMemoryRepository>::get_candidate(&service, "life-a", "c1")
+                .unwrap();
+        assert_eq!(stored.status, CandidateMemoryStatus::Accepted);
+        assert_eq!(stored.revision, 2);
+        assert_eq!(
+            stored.accepted_request_id.as_deref(),
+            Some(request_id.as_str())
+        );
+        assert_eq!(
+            stored.confirmed_memory_id.as_deref(),
+            Some(recovered.confirmed_memory_id.as_str())
+        );
+        assert_eq!(
+            <StorageService as CandidateMemoryRepository>::count_evidence(&service, "life-a", "c1")
+                .unwrap(),
+            0
+        );
+        let memories = <StorageService as MemoryRepository>::list(
+            &service,
+            MemoryQuery {
+                life_id: "life-a".into(),
+                status: Some(MemoryStatus::Confirmed),
+                kind: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(memories.len(), 1);
+        let counts = candidate_confirmation_artifact_counts(
+            &service,
+            "life-a",
+            "c1",
+            &recovered.confirmed_memory_id,
+        );
+        assert_eq!(counts.memories, 1);
+        assert_eq!(counts.revisions, 1);
+        assert_eq!(counts.outbox_rows, 1);
+        assert_eq!(counts.confirmation_audits, 1);
+    }
+
+    #[test]
+    fn different_tokens_same_candidate_create_one_confirmed_memory() {
+        let root = TestRoot::new("two-tokens-one-candidate");
+        let service = Arc::new(seeded_service(&root));
+        insert(service.as_ref(), "c1", false);
+        let coord = Arc::new(CandidateConfirmationCoordinator::default());
+        let first = coord.prepare(service.as_ref(), "life-a", "c1").unwrap();
+        let second = coord.prepare(service.as_ref(), "life-a", "c1").unwrap();
+        let first_token = serde_json::to_string(&first.approval_token).unwrap();
+        let second_token = serde_json::to_string(&second.approval_token).unwrap();
+        let start = Arc::new(Barrier::new(3));
+
+        let a = {
+            let service = Arc::clone(&service);
+            let coord = Arc::clone(&coord);
+            let start = Arc::clone(&start);
+            thread::spawn(move || {
+                let token: ApprovalToken = serde_json::from_str(&first_token).unwrap();
+                start.wait();
+                coord.confirm(service.as_ref(), "life-a", "c1", &token)
+            })
+        };
+        let b = {
+            let service = Arc::clone(&service);
+            let coord = Arc::clone(&coord);
+            let start = Arc::clone(&start);
+            thread::spawn(move || {
+                let token: ApprovalToken = serde_json::from_str(&second_token).unwrap();
+                start.wait();
+                coord.confirm(service.as_ref(), "life-a", "c1", &token)
+            })
+        };
+        start.wait();
+        let a = a.join().unwrap();
+        let b = b.join().unwrap();
+        let successes = [a.as_ref().ok(), b.as_ref().ok()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(successes.len(), 1);
+        assert_eq!(successes[0].outcome, ConfirmationOutcome::Confirmed);
+        assert!(matches!(
+            a.err().or_else(|| b.err()),
+            Some(ConfirmationError::RequestConflict)
+        ));
+
+        let stored = <StorageService as CandidateMemoryRepository>::get_candidate(
+            service.as_ref(),
+            "life-a",
+            "c1",
+        )
+        .unwrap();
+        let memory_id = stored.confirmed_memory_id.as_deref().unwrap();
+        assert_eq!(stored.status, CandidateMemoryStatus::Accepted);
+        assert_eq!(stored.revision, 2);
+        assert_eq!(
+            <StorageService as CandidateMemoryRepository>::count_evidence(
+                service.as_ref(),
+                "life-a",
+                "c1",
+            )
+            .unwrap(),
+            0
+        );
+        let counts =
+            candidate_confirmation_artifact_counts(service.as_ref(), "life-a", "c1", memory_id);
+        assert_eq!(counts.memories, 1);
+        assert_eq!(counts.revisions, 1);
+        assert_eq!(counts.outbox_rows, 1);
+        assert_eq!(counts.confirmation_audits, 1);
     }
 }

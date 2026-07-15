@@ -813,6 +813,49 @@ pub(crate) mod test_support {
     use super::*;
     use rusqlite::params;
 
+    /// Minimal D-5A verification view for assertions about D-4 idempotency. It
+    /// exposes counts only; no content, paths, vectors, or credentials leave the
+    /// temporary test database.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(crate) struct CandidateConfirmationArtifactCounts {
+        pub memories: i64,
+        pub revisions: i64,
+        pub outbox_rows: i64,
+        pub confirmation_audits: i64,
+    }
+
+    pub(crate) fn candidate_confirmation_artifact_counts(
+        service: &StorageService,
+        life_id: &str,
+        candidate_id: &str,
+        memory_id: &str,
+    ) -> CandidateConfirmationArtifactCounts {
+        let state = service.state().unwrap();
+        let connection = &state.connection;
+        let count = |sql: &str, values: &[&dyn rusqlite::ToSql]| {
+            connection.query_row(sql, values, |row| row.get(0)).unwrap()
+        };
+        CandidateConfirmationArtifactCounts {
+            memories: count(
+                "SELECT COUNT(*) FROM memory_record WHERE life_id = ?1 AND id = ?2",
+                &[&life_id, &memory_id],
+            ),
+            revisions: count(
+                "SELECT COUNT(*) FROM memory_revision WHERE life_id = ?1 AND memory_id = ?2",
+                &[&life_id, &memory_id],
+            ),
+            outbox_rows: count(
+                "SELECT COUNT(*) FROM memory_vector_sync_outbox WHERE life_id = ?1 AND memory_id = ?2",
+                &[&life_id, &memory_id],
+            ),
+            confirmation_audits: count(
+                "SELECT COUNT(*) FROM candidate_memory_audit
+                 WHERE life_id = ?1 AND candidate_id = ?2 AND action = 'candidate_confirmed'",
+                &[&life_id, &candidate_id],
+            ),
+        }
+    }
+
     /// Test-only fixture: inserts a confirmed memory directly into `memory_record`
     /// and creates the initial `memory_revision` snapshot.
     ///

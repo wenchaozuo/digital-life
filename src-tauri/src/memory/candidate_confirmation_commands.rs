@@ -476,6 +476,52 @@ pub fn cancel_candidate_confirmation_approval(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Deserialize;
+
+    /// Mirrors Tauri's named command-argument binding for the production
+    /// `request: Value` parameter. The command macro resolves `request` from the
+    /// invoke object before our parser receives its raw JSON value.
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct TauriNamedRequestEnvelope {
+        request: Value,
+    }
+
+    fn parse_tauri_prepare_invoke(value: Value) -> Result<ParsedPrepareRequest, String> {
+        let envelope: TauriNamedRequestEnvelope =
+            serde_json::from_value(value).map_err(|error| error.to_string())?;
+        parse_prepare_request(&envelope.request).map_err(|error| error.code)
+    }
+
+    #[test]
+    fn tauri_named_request_wrapper_reaches_structured_prepare_parser() {
+        let parsed =
+            parse_tauri_prepare_invoke(serde_json::json!({"request": {"candidateId": "c1"}}))
+                .unwrap();
+        assert_eq!(parsed.candidate_id, "c1");
+
+        // The production command is named `request: Value`, so a direct invoke
+        // payload has no matching command argument and is rejected before parsing.
+        assert!(parse_tauri_prepare_invoke(serde_json::json!({"candidateId": "c1"})).is_err());
+    }
+
+    #[test]
+    fn tauri_wrapped_non_object_requests_return_structured_invalid_request() {
+        for request in [
+            Value::Null,
+            Value::String("c1".into()),
+            Value::Array(vec![]),
+        ] {
+            let error =
+                parse_tauri_prepare_invoke(serde_json::json!({"request": request})).unwrap_err();
+            assert_eq!(error, "CANDIDATE_CONFIRMATION_INVALID_REQUEST");
+        }
+        let error = parse_tauri_prepare_invoke(
+            serde_json::json!({"request": {"candidateId": "c1", "lifeId": "life-a"}}),
+        )
+        .unwrap_err();
+        assert_eq!(error, "CANDIDATE_CONFIRMATION_INVALID_REQUEST");
+    }
 
     #[test]
     fn prepare_unknown_field_returns_invalid_request() {

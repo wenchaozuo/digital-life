@@ -283,6 +283,17 @@ struct CachedSafeResult {
     confirmed_memory_id: String,
 }
 
+/// Immutable deadlines captured the first time a D-4 panic is recovered.
+/// The write deadline is always the original Approval Token expiry; the longer
+/// reconciliation deadline grants read-only time to discover a commit whose
+/// response was lost. Re-entering recovery must never replace this value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RecoveryWindow {
+    first_recovery_started_at: u64,
+    write_retry_deadline: u64,
+    reconciliation_deadline: u64,
+}
+
 /// One Approval Token's registry record. Contains only non-secret binding metadata
 /// plus lifecycle bookkeeping — never the raw token or candidate content.
 struct ApprovalEntry {
@@ -296,7 +307,7 @@ struct ApprovalEntry {
     attempt_count: u32,
     attempt_sequence: u64,
     in_flight_lease_deadline: u64,
-    reconciliation_deadline_monotonic: Option<u64>,
+    recovery_window: Option<RecoveryWindow>,
     cached_result: Option<CachedSafeResult>,
     terminal_at_monotonic: Option<u64>,
 }
@@ -512,7 +523,7 @@ impl<C: Clock> CandidateConfirmationCoordinator<C> {
             attempt_count: 0,
             attempt_sequence: 0,
             in_flight_lease_deadline: 0,
-            reconciliation_deadline_monotonic: None,
+            recovery_window: None,
             cached_result: None,
             terminal_at_monotonic: None,
         };
@@ -600,8 +611,8 @@ impl<C: Clock> CandidateConfirmationCoordinator<C> {
                 };
                 if entry.state != ConfirmationState::RecoveryPending
                     || !entry
-                        .reconciliation_deadline_monotonic
-                        .is_some_and(|deadline| now >= deadline)
+                        .recovery_window
+                        .is_some_and(|window| now >= window.reconciliation_deadline)
                 {
                     continue;
                 }
@@ -616,6 +627,7 @@ impl<C: Clock> CandidateConfirmationCoordinator<C> {
                     expected_revision: entry.expected_revision,
                     request_id: entry.request_id.clone(),
                     is_sensitive: entry.is_sensitive,
+                    write_retry_deadline: entry.expires_at_monotonic,
                     attempt_sequence,
                     is_recovery: true,
                     read_only_recovery: true,
@@ -649,6 +661,7 @@ struct AttemptTicket {
     expected_revision: i64,
     request_id: String,
     is_sensitive: bool,
+    write_retry_deadline: u64,
     attempt_sequence: u64,
     is_recovery: bool,
     read_only_recovery: bool,
@@ -754,14 +767,12 @@ impl<C: Clock> CandidateConfirmationCoordinator<C> {
             ConfirmationState::Cancelled => Err(ConfirmationError::TokenCancelled),
             ConfirmationState::Invalidated => Err(ConfirmationError::ContextChanged),
             ConfirmationState::RecoveryPending => {
-                let reconciliation_deadline = entry
-                    .reconciliation_deadline_monotonic
-                    .ok_or(ConfirmationError::Internal)?;
-                // At and after the reconciliation deadline a final read-only
-                // probe decides Consumed vs Expired; no write is ever allowed
-                // once the original token TTL has elapsed.
-                let read_only_recovery = now >= entry.expires_at_monotonic;
-                let _final_probe_due = now >= reconciliation_deadline;
+                let recovery_window = entry.recovery_window.ok_or(ConfirmationError::Internal)?;
+                // The first panic freezes both deadlines. After the original
+                // token expiry every recovery attempt is read-only, including
+                // the final probe at the reconciliation deadline.
+                let read_only_recovery =
+                    !may_retry_write(recovery_window.write_retry_deadline, now);
                 self.claim_attempt(&mut entry, arc, now, true, read_only_recovery)
             }
             ConfirmationState::InFlight => {
@@ -814,6 +825,7 @@ impl<C: Clock> CandidateConfirmationCoordinator<C> {
             expected_revision: entry.expected_revision,
             request_id: entry.request_id.clone(),
             is_sensitive: entry.is_sensitive,
+            write_retry_deadline: entry.expires_at_monotonic,
             attempt_sequence,
             is_recovery,
             read_only_recovery,
@@ -849,6 +861,11 @@ impl<C: Clock> CandidateConfirmationCoordinator<C> {
             if ticket.read_only_recovery {
                 return Ok(ConfirmationExecution::ReconciledNotCommitted);
             }
+            // The clock may cross the original expiry after the attempt was
+            // claimed. Re-check before reading candidate content or entering D-4.
+            if !may_retry_write(ticket.write_retry_deadline, self.clock.monotonic_millis()) {
+                return Ok(ConfirmationExecution::ReconciledNotCommitted);
+            }
         }
 
         // Before the original TTL, a recovery may retry D-4 only after the
@@ -874,6 +891,13 @@ impl<C: Clock> CandidateConfirmationCoordinator<C> {
             request_id: ticket.request_id.clone(),
             sensitive_grant,
         };
+        // A recovery write is authorized only while the original Approval Token
+        // is live. The reconciliation window never participates in this decision.
+        if ticket.is_recovery
+            && !may_retry_write(ticket.write_retry_deadline, self.clock.monotonic_millis())
+        {
+            return Ok(ConfirmationExecution::ReconciledNotCommitted);
+        }
         Ok(ConfirmationExecution::D4(
             CandidateMemoryService::new(repository).confirm(&ticket.life_id, request),
         ))
@@ -962,19 +986,7 @@ impl<C: Clock> CandidateConfirmationCoordinator<C> {
                         // transition to Expired — no more retries are possible.
                         ErrorDisposition::Retryable => {
                             if ticket.is_recovery {
-                                if entry
-                                    .reconciliation_deadline_monotonic
-                                    .is_some_and(|deadline| now < deadline)
-                                {
-                                    entry.state = ConfirmationState::RecoveryPending;
-                                    entry.in_flight_lease_deadline = 0;
-                                } else if now >= entry.expires_at_monotonic {
-                                    entry.state = ConfirmationState::Expired;
-                                    entry.terminal_at_monotonic = Some(now);
-                                } else {
-                                    entry.state = ConfirmationState::Issued;
-                                    entry.in_flight_lease_deadline = 0;
-                                }
+                                finish_failed_recovery_probe(&mut entry, now);
                             } else if now >= entry.expires_at_monotonic {
                                 entry.state = ConfirmationState::Expired;
                                 entry.terminal_at_monotonic = Some(now);
@@ -989,7 +1001,20 @@ impl<C: Clock> CandidateConfirmationCoordinator<C> {
                             entry.terminal_at_monotonic = Some(now);
                         }
                         ErrorDisposition::RecoveryPending => {
-                            enter_recovery(&mut entry, now);
+                            if ticket.is_recovery
+                                && entry
+                                    .recovery_window
+                                    .is_some_and(|window| now >= window.reconciliation_deadline)
+                            {
+                                // A failed final probe cannot prove either commit
+                                // or rollback. Retire the in-memory authorization
+                                // without claiming the durable transaction failed.
+                                entry.state = ConfirmationState::Invalidated;
+                                entry.terminal_at_monotonic = Some(now);
+                                entry.in_flight_lease_deadline = 0;
+                            } else {
+                                enter_recovery(&mut entry, now);
+                            }
                         }
                     }
                 }
@@ -1004,13 +1029,37 @@ impl<C: Clock> CandidateConfirmationCoordinator<C> {
 fn enter_recovery(entry: &mut ApprovalEntry, now: u64) {
     entry.state = ConfirmationState::RecoveryPending;
     entry.in_flight_lease_deadline = 0;
-    // Reconciliation may continue briefly after expiry, but writes remain bound
-    // exclusively to `expires_at_monotonic` (the original approval deadline).
-    entry.reconciliation_deadline_monotonic = Some(
-        entry
+    entry.recovery_window.get_or_insert_with(|| RecoveryWindow {
+        first_recovery_started_at: now,
+        write_retry_deadline: entry.expires_at_monotonic,
+        reconciliation_deadline: entry
             .expires_at_monotonic
             .max(now.saturating_add(RECOVERY_RECONCILIATION_WINDOW_MILLIS)),
-    );
+    });
+}
+
+/// Whether a recovery may start or continue a D-4 write retry. This deliberately
+/// depends only on the original Approval Token expiry captured in RecoveryWindow.
+fn may_retry_write(write_retry_deadline: u64, now: u64) -> bool {
+    now < write_retry_deadline
+}
+
+/// A transient final reconciliation failure is not evidence that D-4 rolled
+/// back. Before the frozen deadline it remains recoverable; at/after the deadline
+/// it becomes Invalidated so the registry stays bounded without misreporting an
+/// unknown durable outcome as Expired/uncommitted.
+fn finish_failed_recovery_probe(entry: &mut ApprovalEntry, now: u64) {
+    if entry
+        .recovery_window
+        .is_some_and(|window| now < window.reconciliation_deadline)
+    {
+        entry.state = ConfirmationState::RecoveryPending;
+        entry.in_flight_lease_deadline = 0;
+    } else {
+        entry.state = ConfirmationState::Invalidated;
+        entry.terminal_at_monotonic = Some(now);
+        entry.in_flight_lease_deadline = 0;
+    }
 }
 
 /// When a stale attempt's D-4 call succeeds, promote the entry to Consumed if
@@ -1024,10 +1073,11 @@ fn promote_to_consumed_if_authoritative(
     match entry.state {
         // Already consumed — keep the existing cached result.
         ConfirmationState::Consumed => {}
-        // InFlight (newer attempt), Invalidated, or Issued (retryable error
-        // rolled back): the database success is authoritative, so promote.
+        // InFlight (newer attempt), Invalidated/Expired, or Issued (retryable
+        // error rolled back): the database success is authoritative, so promote.
         ConfirmationState::InFlight
         | ConfirmationState::Invalidated
+        | ConfirmationState::Expired
         | ConfirmationState::Issued
         | ConfirmationState::RecoveryPending => {
             entry.state = ConfirmationState::Consumed;
@@ -1037,9 +1087,10 @@ fn promote_to_consumed_if_authoritative(
                 confirmed_memory_id: result.memory.id.clone(),
             });
         }
-        // Expired or Cancelled: user-initiated terminal states take precedence
-        // over a background D-4 success. Do not regress.
-        ConfirmationState::Expired | ConfirmationState::Cancelled => {}
+        // Cancelled is only reachable before any D-4 attempt is claimed. Keep
+        // that explicit user terminal state if a logically impossible stale
+        // result is ever presented here.
+        ConfirmationState::Cancelled => {}
     }
 }
 
@@ -1199,12 +1250,12 @@ fn cleanup_locked(map: &mut HashMap<TokenDigest, Arc<Mutex<ApprovalEntry>>>, now
                 true
             }
             ConfirmationState::RecoveryPending => {
-                let Some(deadline) = entry.reconciliation_deadline_monotonic else {
-                    entry.state = ConfirmationState::Expired;
+                let Some(window) = entry.recovery_window else {
+                    entry.state = ConfirmationState::Invalidated;
                     entry.terminal_at_monotonic = Some(now);
                     return true;
                 };
-                if now < deadline {
+                if now < window.reconciliation_deadline {
                     true
                 } else {
                     entry.state = ConfirmationState::Invalidated;
@@ -1285,13 +1336,23 @@ mod tests {
         },
     }
 
+    enum RecoveryProbeBehavior {
+        Fail(CandidateMemoryError),
+        SignalThenNotCommitted {
+            entered: Arc<Barrier>,
+            release: Arc<Barrier>,
+        },
+    }
+
     /// A programmable stand-in for the lifecycle repository. Only `get_candidate`
     /// and `confirm_candidate_atomic` carry behavior; the rest are unreachable in
     /// the confirmation flow and panic if hit.
     struct MockRepo {
         candidate: Mutex<Option<Record>>,
         behaviors: Mutex<VecDeque<ConfirmBehavior>>,
+        recovery_behaviors: Mutex<VecDeque<RecoveryProbeBehavior>>,
         confirm_calls: AtomicUsize,
+        recovery_probe_calls: AtomicUsize,
     }
 
     impl MockRepo {
@@ -1299,7 +1360,9 @@ mod tests {
             Self {
                 candidate: Mutex::new(Some(candidate)),
                 behaviors: Mutex::new(VecDeque::new()),
+                recovery_behaviors: Mutex::new(VecDeque::new()),
                 confirm_calls: AtomicUsize::new(0),
+                recovery_probe_calls: AtomicUsize::new(0),
             }
         }
 
@@ -1309,6 +1372,20 @@ mod tests {
 
         fn set_candidate(&self, candidate: Option<Record>) {
             *self.candidate.lock().unwrap() = candidate;
+        }
+
+        fn push_recovery_error(&self, error: CandidateMemoryError) {
+            self.recovery_behaviors
+                .lock()
+                .unwrap()
+                .push_back(RecoveryProbeBehavior::Fail(error));
+        }
+
+        fn push_blocking_recovery_probe(&self, entered: Arc<Barrier>, release: Arc<Barrier>) {
+            self.recovery_behaviors
+                .lock()
+                .unwrap()
+                .push_back(RecoveryProbeBehavior::SignalThenNotCommitted { entered, release });
         }
     }
 
@@ -1439,10 +1516,27 @@ mod tests {
             &self,
             life_id: &str,
             candidate_id: &str,
-            _request_id: &str,
+            request_id: &str,
         ) -> Result<Option<String>, CandidateMemoryError> {
+            self.recovery_probe_calls.fetch_add(1, Ordering::SeqCst);
+            let behavior = self.recovery_behaviors.lock().unwrap().pop_front();
+            match behavior {
+                Some(RecoveryProbeBehavior::Fail(error)) => return Err(error),
+                Some(RecoveryProbeBehavior::SignalThenNotCommitted { entered, release }) => {
+                    entered.wait();
+                    release.wait();
+                    return Ok(None);
+                }
+                None => {}
+            }
             let candidate = self.get_candidate(life_id, candidate_id)?;
-            Ok(candidate.confirmed_memory_id)
+            if candidate.status == CandidateMemoryStatus::Accepted
+                && candidate.accepted_request_id.as_deref() == Some(request_id)
+            {
+                Ok(candidate.confirmed_memory_id)
+            } else {
+                Ok(None)
+            }
         }
     }
 
@@ -1574,6 +1668,24 @@ mod tests {
 
     fn coordinator() -> CandidateConfirmationCoordinator<FakeClock> {
         CandidateConfirmationCoordinator::with_clock(FakeClock::new())
+    }
+
+    fn recovery_snapshot(
+        coordinator: &CandidateConfirmationCoordinator<FakeClock>,
+        token: &ApprovalToken,
+    ) -> (RecoveryWindow, u32, String, ConfirmationState) {
+        let digest = token.digest();
+        let entry = {
+            let registry = coordinator.registry.lock().unwrap();
+            Arc::clone(registry.get(&digest).unwrap())
+        };
+        let entry = entry.lock().unwrap();
+        (
+            entry.recovery_window.unwrap(),
+            entry.attempt_count,
+            entry.request_id.clone(),
+            entry.state.clone(),
+        )
     }
 
     /// Round-trip a token through JSON so tests exercise the real serde path the
@@ -2867,6 +2979,231 @@ mod tests {
     }
 
     #[test]
+    fn repeated_recovery_panic_does_not_extend_reconciliation_deadline() {
+        let repo = MockRepo::new(candidate("c1", "life-a", false));
+        repo.push(ConfirmBehavior::Fail(
+            CandidateMemoryError::confirmation_panic_recovered(),
+        ));
+        repo.push(ConfirmBehavior::Fail(
+            CandidateMemoryError::confirmation_panic_recovered(),
+        ));
+        let coord = coordinator();
+        let prepared = coord.prepare(&repo, "life-a", "c1").unwrap();
+
+        assert!(matches!(
+            coord.confirm(&repo, "life-a", "c1", &prepared.approval_token),
+            Err(ConfirmationError::StorageUnavailable { .. })
+        ));
+        let (first_window, first_attempts, request_id, state) =
+            recovery_snapshot(&coord, &prepared.approval_token);
+        assert_eq!(state, ConfirmationState::RecoveryPending);
+        assert_eq!(first_attempts, 1);
+
+        coord.clock.advance(1_000);
+        assert!(matches!(
+            coord.confirm(&repo, "life-a", "c1", &prepared.approval_token),
+            Err(ConfirmationError::StorageUnavailable { .. })
+        ));
+        let (second_window, second_attempts, second_request_id, state) =
+            recovery_snapshot(&coord, &prepared.approval_token);
+
+        assert_eq!(state, ConfirmationState::RecoveryPending);
+        assert_eq!(second_attempts, 2);
+        assert_eq!(request_id, second_request_id);
+        assert_eq!(first_window, second_window);
+        assert_eq!(repo.confirm_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(repo.recovery_probe_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn repeated_recovery_panic_does_not_extend_write_retry_deadline() {
+        let repo = MockRepo::new(candidate("c1", "life-a", false));
+        repo.push(ConfirmBehavior::Fail(
+            CandidateMemoryError::confirmation_panic_recovered(),
+        ));
+        repo.push(ConfirmBehavior::Fail(
+            CandidateMemoryError::confirmation_panic_recovered(),
+        ));
+        let coord = coordinator();
+        let prepared = coord.prepare(&repo, "life-a", "c1").unwrap();
+
+        assert!(matches!(
+            coord.confirm(&repo, "life-a", "c1", &prepared.approval_token),
+            Err(ConfirmationError::StorageUnavailable { .. })
+        ));
+        let (first_window, _, _, _) = recovery_snapshot(&coord, &prepared.approval_token);
+        assert_eq!(first_window.first_recovery_started_at, 0);
+        assert_eq!(first_window.write_retry_deadline, TOKEN_TTL_MILLIS);
+
+        coord.clock.advance(TOKEN_TTL_MILLIS / 2);
+        assert!(matches!(
+            coord.confirm(&repo, "life-a", "c1", &prepared.approval_token),
+            Err(ConfirmationError::StorageUnavailable { .. })
+        ));
+        let (second_window, _, _, _) = recovery_snapshot(&coord, &prepared.approval_token);
+
+        assert_eq!(second_window.first_recovery_started_at, 0);
+        assert_eq!(second_window.write_retry_deadline, TOKEN_TTL_MILLIS);
+        assert_eq!(second_window, first_window);
+    }
+
+    #[test]
+    fn recovery_crossing_original_ttl_during_read_probe_never_retries_write() {
+        let repo = Arc::new(MockRepo::new(candidate("c1", "life-a", false)));
+        repo.push(ConfirmBehavior::Fail(
+            CandidateMemoryError::confirmation_panic_recovered(),
+        ));
+        let coord = Arc::new(coordinator());
+        let prepared = coord.prepare(repo.as_ref(), "life-a", "c1").unwrap();
+        let token_json = serde_json::to_string(&prepared.approval_token).unwrap();
+        assert!(matches!(
+            coord.confirm(repo.as_ref(), "life-a", "c1", &prepared.approval_token),
+            Err(ConfirmationError::StorageUnavailable { .. })
+        ));
+        coord.clock.advance(TOKEN_TTL_MILLIS - 1);
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        repo.push_blocking_recovery_probe(Arc::clone(&entered), Arc::clone(&release));
+
+        let recovery = {
+            let repo = Arc::clone(&repo);
+            let coord = Arc::clone(&coord);
+            thread::spawn(move || {
+                let token: ApprovalToken = serde_json::from_str(&token_json).unwrap();
+                coord.confirm(repo.as_ref(), "life-a", "c1", &token)
+            })
+        };
+        entered.wait();
+        coord.clock.advance(2);
+        release.wait();
+
+        assert_eq!(
+            recovery.join().unwrap(),
+            Err(ConfirmationError::TokenExpired)
+        );
+        assert_eq!(repo.confirm_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(repo.recovery_probe_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn repeated_recovery_panic_cannot_keep_entry_alive_forever() {
+        let repo = MockRepo::new(candidate("c1", "life-a", false));
+        repo.push(ConfirmBehavior::Fail(
+            CandidateMemoryError::confirmation_panic_recovered(),
+        ));
+        repo.push(ConfirmBehavior::Fail(
+            CandidateMemoryError::confirmation_panic_recovered(),
+        ));
+        let coord = coordinator();
+        let prepared = coord.prepare(&repo, "life-a", "c1").unwrap();
+
+        assert!(matches!(
+            coord.confirm(&repo, "life-a", "c1", &prepared.approval_token),
+            Err(ConfirmationError::StorageUnavailable { .. })
+        ));
+        coord.clock.advance(1_000);
+        assert!(matches!(
+            coord.confirm(&repo, "life-a", "c1", &prepared.approval_token),
+            Err(ConfirmationError::StorageUnavailable { .. })
+        ));
+        let (window, _, _, _) = recovery_snapshot(&coord, &prepared.approval_token);
+        let now = coord.clock.monotonic_millis();
+        coord
+            .clock
+            .advance(window.reconciliation_deadline.saturating_sub(now));
+
+        assert_eq!(
+            coord.confirm(&repo, "life-a", "c1", &prepared.approval_token),
+            Err(ConfirmationError::TokenExpired)
+        );
+        let (_, _, _, state) = recovery_snapshot(&coord, &prepared.approval_token);
+        assert_eq!(state, ConfirmationState::Expired);
+        assert_eq!(repo.confirm_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(repo.recovery_probe_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn final_reconciliation_probe_resolves_uncommitted_to_expired() {
+        let repo = MockRepo::new(candidate("c1", "life-a", false));
+        repo.push(ConfirmBehavior::Fail(
+            CandidateMemoryError::confirmation_panic_recovered(),
+        ));
+        let coord = coordinator();
+        let prepared = coord.prepare(&repo, "life-a", "c1").unwrap();
+        assert!(matches!(
+            coord.confirm(&repo, "life-a", "c1", &prepared.approval_token),
+            Err(ConfirmationError::StorageUnavailable { .. })
+        ));
+        let (window, _, _, _) = recovery_snapshot(&coord, &prepared.approval_token);
+        coord.clock.advance(window.reconciliation_deadline);
+
+        assert_eq!(
+            coord.confirm(&repo, "life-a", "c1", &prepared.approval_token),
+            Err(ConfirmationError::TokenExpired)
+        );
+        assert_eq!(repo.confirm_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(repo.recovery_probe_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn final_reconciliation_probe_resolves_committed_to_consumed() {
+        let repo = MockRepo::new(candidate("c1", "life-a", false));
+        repo.push(ConfirmBehavior::Fail(
+            CandidateMemoryError::confirmation_panic_recovered(),
+        ));
+        let coord = coordinator();
+        let prepared = coord.prepare(&repo, "life-a", "c1").unwrap();
+        assert!(matches!(
+            coord.confirm(&repo, "life-a", "c1", &prepared.approval_token),
+            Err(ConfirmationError::StorageUnavailable { .. })
+        ));
+        let (window, _, request_id, _) = recovery_snapshot(&coord, &prepared.approval_token);
+        let mut committed = candidate("c1", "life-a", false);
+        committed.status = CandidateMemoryStatus::Accepted;
+        committed.confirmed_memory_id = Some("memory-committed".into());
+        committed.accepted_request_id = Some(request_id);
+        repo.set_candidate(Some(committed));
+        coord.clock.advance(window.reconciliation_deadline);
+
+        let recovered = coord
+            .confirm(&repo, "life-a", "c1", &prepared.approval_token)
+            .unwrap();
+        assert_eq!(recovered.outcome, ConfirmationOutcome::IdempotentReplay);
+        assert_eq!(recovered.confirmed_memory_id, "memory-committed");
+        let (_, _, _, state) = recovery_snapshot(&coord, &prepared.approval_token);
+        assert_eq!(state, ConfirmationState::Consumed);
+        assert_eq!(repo.confirm_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(repo.recovery_probe_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn failed_final_reconciliation_probe_invalidates_bounded_recovery() {
+        let repo = MockRepo::new(candidate("c1", "life-a", false));
+        repo.push(ConfirmBehavior::Fail(
+            CandidateMemoryError::confirmation_panic_recovered(),
+        ));
+        let coord = coordinator();
+        let prepared = coord.prepare(&repo, "life-a", "c1").unwrap();
+        assert!(matches!(
+            coord.confirm(&repo, "life-a", "c1", &prepared.approval_token),
+            Err(ConfirmationError::StorageUnavailable { .. })
+        ));
+        let (window, _, _, _) = recovery_snapshot(&coord, &prepared.approval_token);
+        coord.clock.advance(window.reconciliation_deadline);
+        repo.push_recovery_error(CandidateMemoryError::storage_unavailable());
+
+        assert!(matches!(
+            coord.confirm(&repo, "life-a", "c1", &prepared.approval_token),
+            Err(ConfirmationError::StorageUnavailable { .. })
+        ));
+        assert_eq!(
+            coord.confirm(&repo, "life-a", "c1", &prepared.approval_token),
+            Err(ConfirmationError::ContextChanged)
+        );
+        assert_eq!(repo.confirm_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn panic_orphans_cannot_permanently_exhaust_registry() {
         let repo = MockRepo::new(candidate("orphan", "life-a", false));
         repo.push(ConfirmBehavior::Fail(
@@ -2969,6 +3306,66 @@ mod tests {
             .unwrap();
         assert_eq!(replay.outcome, ConfirmationOutcome::IdempotentReplay);
         assert_eq!(replay.confirmed_memory_id, takeover.confirmed_memory_id);
+    }
+
+    #[test]
+    fn stale_authoritative_success_promotes_newer_expired_entry_to_consumed() {
+        let repo = Arc::new(MockRepo::new(candidate("c1", "life-a", false)));
+        let old_entered = Arc::new(Barrier::new(2));
+        let old_release = Arc::new(Barrier::new(2));
+        let takeover_entered = Arc::new(Barrier::new(2));
+        let takeover_release = Arc::new(Barrier::new(2));
+        repo.push(ConfirmBehavior::SignalThenBlock {
+            entered: Arc::clone(&old_entered),
+            release: Arc::clone(&old_release),
+        });
+        repo.push(ConfirmBehavior::SignalThenBlockFail {
+            entered: Arc::clone(&takeover_entered),
+            release: Arc::clone(&takeover_release),
+            error: CandidateMemoryError::storage_unavailable(),
+        });
+        let coord = Arc::new(coordinator());
+        let prepared = coord.prepare(repo.as_ref(), "life-a", "c1").unwrap();
+        let token_json = serde_json::to_string(&prepared.approval_token).unwrap();
+
+        let old_attempt = {
+            let repo = Arc::clone(&repo);
+            let coord = Arc::clone(&coord);
+            let token_json = token_json.clone();
+            thread::spawn(move || {
+                let token: ApprovalToken = serde_json::from_str(&token_json).unwrap();
+                coord.confirm(repo.as_ref(), "life-a", "c1", &token)
+            })
+        };
+        old_entered.wait();
+        coord.clock.advance(IN_FLIGHT_LEASE_MILLIS);
+
+        let takeover = {
+            let repo = Arc::clone(&repo);
+            let coord = Arc::clone(&coord);
+            let token_json = token_json.clone();
+            thread::spawn(move || {
+                let token: ApprovalToken = serde_json::from_str(&token_json).unwrap();
+                coord.confirm(repo.as_ref(), "life-a", "c1", &token)
+            })
+        };
+        takeover_entered.wait();
+        coord.clock.advance(TOKEN_TTL_MILLIS);
+        takeover_release.wait();
+        assert!(matches!(
+            takeover.join().unwrap(),
+            Err(ConfirmationError::StorageUnavailable { .. })
+        ));
+
+        old_release.wait();
+        let committed = old_attempt.join().unwrap().unwrap();
+        assert_eq!(committed.outcome, ConfirmationOutcome::IdempotentReplay);
+        let replay_token: ApprovalToken = serde_json::from_str(&token_json).unwrap();
+        let replay = coord
+            .confirm(repo.as_ref(), "life-a", "c1", &replay_token)
+            .unwrap();
+        assert_eq!(replay.outcome, ConfirmationOutcome::IdempotentReplay);
+        assert_eq!(replay.confirmed_memory_id, committed.confirmed_memory_id);
     }
 
     #[test]
@@ -3143,6 +3540,7 @@ mod integration_tests {
         CandidateInferenceStatus, CandidateMemoryRepository, CandidateMemorySourceType,
         NewCandidateMemory, PRIMARY_USER_SUBJECT_ID,
     };
+    use crate::memory::candidate_service::AddEvidenceRequest;
     use crate::memory::{MemoryQuery, MemoryRepository, MemoryStatus};
     use crate::storage::{
         test_support::candidate_confirmation_artifact_counts, unique_suffix, LifeIdentityRecord,
@@ -3392,6 +3790,23 @@ mod integration_tests {
         let service = seeded_service(&root);
         insert(&service, "c1", false);
         insert(&service, "c2", false);
+        CandidateMemoryService::new(&service)
+            .add_evidence(
+                "life-a",
+                AddEvidenceRequest {
+                    candidate_id: "c1".into(),
+                    source_type: CandidateMemorySourceType::Manual,
+                    source_id: Some("pre-commit-evidence".into()),
+                    conversation_id: None,
+                    message_id: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            <StorageService as CandidateMemoryRepository>::count_evidence(&service, "life-a", "c1")
+                .unwrap(),
+            1
+        );
         let coord = CandidateConfirmationCoordinator::with_clock(FakeClock::new());
         let prepared = coord.prepare(&service, "life-a", "c1").unwrap();
 
@@ -3412,15 +3827,23 @@ mod integration_tests {
         )
         .unwrap()
         .is_empty());
+        let d4_calls = service.candidate_confirmation_d4_calls_for_test();
+        assert_eq!(d4_calls.len(), 1);
+        let counts =
+            candidate_confirmation_artifact_counts(&service, "life-a", "c1", &d4_calls[0].1);
+        assert_eq!(counts.memories, 0);
+        assert_eq!(counts.revisions, 0);
+        assert_eq!(counts.outbox_rows, 0);
+        assert_eq!(counts.confirmation_audits, 0);
         let candidate =
             <StorageService as CandidateMemoryRepository>::get_candidate(&service, "life-a", "c1")
                 .unwrap();
         assert_eq!(candidate.status, CandidateMemoryStatus::Pending);
-        assert_eq!(candidate.revision, 1);
+        assert_eq!(candidate.revision, prepared.expected_revision);
         assert_eq!(
             <StorageService as CandidateMemoryRepository>::count_evidence(&service, "life-a", "c1")
                 .unwrap(),
-            0
+            1
         );
 
         // Acquiring and using the same StorageService after the caught panic
@@ -3451,6 +3874,9 @@ mod integration_tests {
             .confirm(&service, "life-a", "c1", &prepared.approval_token)
             .unwrap();
         assert_eq!(retried.outcome, ConfirmationOutcome::Confirmed);
+        let d4_calls = service.candidate_confirmation_d4_calls_for_test();
+        assert_eq!(d4_calls.len(), 2);
+        assert_eq!(d4_calls[0].0, d4_calls[1].0);
         assert_eq!(
             <StorageService as MemoryRepository>::list(
                 &service,
@@ -3467,7 +3893,7 @@ mod integration_tests {
     }
 
     #[test]
-    fn pre_commit_panic_near_expiry_cannot_confirm_after_original_token_ttl() {
+    fn pre_commit_panic_after_original_ttl_never_retries_write() {
         let root = TestRoot::new("pre-commit-expired");
         let service = seeded_service(&root);
         insert(&service, "c1", false);
@@ -3483,6 +3909,8 @@ mod integration_tests {
             coord.confirm(&service, "life-a", "c1", &prepared.approval_token),
             Err(ConfirmationError::TokenExpired)
         );
+        assert_eq!(service.candidate_confirmation_d4_calls_for_test().len(), 1);
+        assert_eq!(service.candidate_confirmation_recovery_reads_for_test(), 1);
         assert!(<StorageService as MemoryRepository>::list(
             &service,
             MemoryQuery {
@@ -3496,7 +3924,7 @@ mod integration_tests {
     }
 
     #[test]
-    fn post_commit_panic_after_token_expiry_reconciles_read_only() {
+    fn post_commit_panic_after_original_ttl_only_reconciles_read_only() {
         let root = TestRoot::new("post-commit-expired");
         let service = seeded_service(&root);
         insert(&service, "c1", false);
@@ -3515,6 +3943,8 @@ mod integration_tests {
                 .outcome,
             ConfirmationOutcome::IdempotentReplay
         );
+        assert_eq!(service.candidate_confirmation_d4_calls_for_test().len(), 1);
+        assert!(service.candidate_confirmation_recovery_reads_for_test() >= 1);
         assert_eq!(
             <StorageService as MemoryRepository>::list(
                 &service,

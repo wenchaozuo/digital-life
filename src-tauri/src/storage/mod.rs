@@ -159,6 +159,10 @@ pub struct StorageService {
     location: StorageLocationResolver,
     #[cfg(test)]
     candidate_confirmation_panic_failpoint: Mutex<Option<candidate_memory::D4PanicFailpoint>>,
+    #[cfg(test)]
+    candidate_confirmation_d4_calls: Mutex<Vec<(String, String)>>,
+    #[cfg(test)]
+    candidate_confirmation_recovery_reads: AtomicU64,
 }
 
 impl StorageService {
@@ -187,6 +191,10 @@ impl StorageService {
             location,
             #[cfg(test)]
             candidate_confirmation_panic_failpoint: Mutex::new(None),
+            #[cfg(test)]
+            candidate_confirmation_d4_calls: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            candidate_confirmation_recovery_reads: AtomicU64::new(0),
         })
     }
 

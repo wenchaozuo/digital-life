@@ -959,6 +959,8 @@ impl CandidateLifecycleRepository for StorageService {
             return Err(CandidateMemoryError::constraint());
         }
         #[cfg(test)]
+        self.record_candidate_confirmation_d4_call_for_test(&request.request_id, memory_id);
+        #[cfg(test)]
         let failpoint = self.take_candidate_confirmation_panic_failpoint_for_test();
         let mut state = self
             .state()
@@ -1103,6 +1105,9 @@ impl CandidateConfirmationRecoveryRepository for StorageService {
         validate_identifier(life_id)?;
         validate_identifier(candidate_id)?;
         validate_identifier(request_id)?;
+        #[cfg(test)]
+        self.candidate_confirmation_recovery_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let state = self
             .state()
             .map_err(|_| CandidateMemoryError::storage_unavailable())?;
@@ -1128,6 +1133,28 @@ impl CandidateConfirmationRecoveryRepository for StorageService {
 }
 
 impl StorageService {
+    #[cfg(test)]
+    fn record_candidate_confirmation_d4_call_for_test(&self, request_id: &str, memory_id: &str) {
+        self.candidate_confirmation_d4_calls
+            .lock()
+            .expect("test D-4 call trace mutex must be available")
+            .push((request_id.to_string(), memory_id.to_string()));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn candidate_confirmation_d4_calls_for_test(&self) -> Vec<(String, String)> {
+        self.candidate_confirmation_d4_calls
+            .lock()
+            .expect("test D-4 call trace mutex must be available")
+            .clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn candidate_confirmation_recovery_reads_for_test(&self) -> u64 {
+        self.candidate_confirmation_recovery_reads
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     #[cfg(test)]
     pub(crate) fn request_candidate_confirmation_pre_commit_panic_for_test(&self) {
         *self

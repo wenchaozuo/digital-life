@@ -11,6 +11,9 @@ use super::{
     MemoryKind,
 };
 
+#[cfg(test)]
+use crate::candidate_memory_internal::fingerprint::compute_dedup_fingerprint;
+
 /// D-5A governed candidate-confirmation authorization. This is a private child
 /// module so that `SensitiveConfirmationGrant` (whose field is private to this
 /// parent module) can only be constructed here, never by the command layer.
@@ -354,52 +357,7 @@ fn contains_jwt(text: &str) -> bool {
 
 // ── Dedup fingerprint ─────────────────────────────────────────────────
 
-const DEDUP_DOMAIN: &str = "candidate-dedup-v1";
-
-pub fn compute_dedup_fingerprint(
-    life_id: &str,
-    subject_id: &str,
-    kind: MemoryKind,
-    content: &str,
-) -> String {
-    use std::io::Write;
-    let normalized = normalize_for_dedup(content);
-    let mut hasher = sha256::Sha256::new();
-    write!(hasher, "{}", DEDUP_DOMAIN).ok();
-    write!(hasher, "\x00{}", life_id).ok();
-    write!(hasher, "\x00{}", subject_id).ok();
-    write!(hasher, "\x00{}", kind.as_str()).ok();
-    write!(hasher, "\x00{}", normalized).ok();
-    hex::encode(hasher.finalize())
-}
-
-fn normalize_for_dedup(input: &str) -> String {
-    use unicode_normalization::UnicodeNormalization;
-    let nfkc = input.chars().nfkc().collect::<String>();
-    let collapsed = nfkc.split_whitespace().collect::<Vec<_>>().join(" ");
-    collapsed.trim().to_string()
-}
-
 // ── Rejection suppression fingerprint ─────────────────────────────────
-
-const REJECTION_DOMAIN: &str = "candidate-rejection-suppression-v1";
-
-pub(crate) fn compute_rejection_fingerprint(
-    life_id: &str,
-    subject_id: &str,
-    kind: MemoryKind,
-    content: &str,
-) -> String {
-    use std::io::Write;
-    let normalized = normalize_for_dedup(content);
-    let mut hasher = sha256::Sha256::new();
-    write!(hasher, "{}", REJECTION_DOMAIN).ok();
-    write!(hasher, "\x00{}", life_id).ok();
-    write!(hasher, "\x00{}", subject_id).ok();
-    write!(hasher, "\x00{}", kind.as_str()).ok();
-    write!(hasher, "\x00{}", normalized).ok();
-    hex::encode(hasher.finalize())
-}
 
 // ── Timestamp helper ──────────────────────────────────────────────────
 
@@ -650,7 +608,7 @@ fn validate_content(content: &str) -> Result<(), CandidateMemoryError> {
 
 // ── sha256 minimal implementation ─────────────────────────────────────
 
-mod sha256 {
+pub(crate) mod sha256 {
     pub struct Sha256 {
         state: [u32; 8],
         buffer: [u8; 64],
@@ -780,82 +738,13 @@ mod sha256 {
 
 // ── hex encoding ──────────────────────────────────────────────────────
 
-mod hex {
+pub(crate) mod hex {
     pub fn encode(bytes: [u8; 32]) -> String {
         let mut s = String::with_capacity(64);
         for byte in bytes {
             s.push_str(&format!("{byte:02x}"));
         }
         s
-    }
-}
-
-// ── NFKC normalization (minimal deterministic) ───────────────────────
-
-mod unicode_normalization {
-    pub struct Nfkc<I: Iterator<Item = char>>(I);
-
-    impl<I: Iterator<Item = char>> Iterator for Nfkc<I> {
-        type Item = char;
-        fn next(&mut self) -> Option<char> {
-            self.0.next().map(nfkc_map)
-        }
-    }
-
-    pub trait UnicodeNormalization: Iterator<Item = char> + Sized {
-        fn nfkc(self) -> Nfkc<Self> {
-            Nfkc(self)
-        }
-    }
-
-    impl<I: Iterator<Item = char>> UnicodeNormalization for I {}
-
-    fn nfkc_map(c: char) -> char {
-        match c {
-            '\u{00B5}' => 'μ',
-            '\u{00C0}' => 'À',
-            '\u{00C1}' => 'Á',
-            '\u{00C2}' => 'Â',
-            '\u{00C3}' => 'Ã',
-            '\u{00C4}' => 'Ä',
-            '\u{00C5}' => 'Å',
-            '\u{00E0}' => 'à',
-            '\u{00E1}' => 'á',
-            '\u{00E2}' => 'â',
-            '\u{00E3}' => 'ã',
-            '\u{00E4}' => 'ä',
-            '\u{00E5}' => 'å',
-            '\u{0391}' => 'Α',
-            '\u{0392}' => 'Β',
-            '\u{0395}' => 'Ε',
-            '\u{0396}' => 'Ζ',
-            '\u{0397}' => 'Η',
-            '\u{0399}' => 'Ι',
-            '\u{039A}' => 'Κ',
-            '\u{039C}' => 'Μ',
-            '\u{039D}' => 'Ν',
-            '\u{039F}' => 'Ο',
-            '\u{03A1}' => 'Ρ',
-            '\u{03A4}' => 'Τ',
-            '\u{03A5}' => 'Υ',
-            '\u{03A7}' => 'Χ',
-            '\u{2000}' => ' ',
-            '\u{2001}' => ' ',
-            '\u{2002}' => ' ',
-            '\u{2003}' => ' ',
-            '\u{2004}' => ' ',
-            '\u{2005}' => ' ',
-            '\u{2006}' => ' ',
-            '\u{2007}' => ' ',
-            '\u{2008}' => ' ',
-            '\u{2009}' => ' ',
-            '\u{200A}' => ' ',
-            '\u{202F}' => ' ',
-            '\u{205F}' => ' ',
-            '\u{3000}' => ' ',
-            '\u{FEFF}' => '\0',
-            other => other,
-        }
     }
 }
 

@@ -7,7 +7,7 @@ use crate::conversation::history::{
     ConversationRole, CreateConversationRequest, RenameConversationRequest,
 };
 
-use super::StorageService;
+use super::{candidate_extraction, StorageService};
 
 const CONVERSATION_COLUMNS: &str =
     "id, life_id, title, revision, created_at, updated_at, last_message_at";
@@ -363,21 +363,33 @@ impl StorageService {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| storage_unavailable())?;
         ensure_conversation_owner(&transaction, life_id, conversation_id)?;
-        let message_exists: bool = transaction
+        let message: Option<(String, String)> = transaction
             .query_row(
-                "SELECT EXISTS(
-                    SELECT 1 FROM conversation_message
-                    WHERE id = ?1 AND conversation_id = ?2 AND life_id = ?3
-                 )",
+                "SELECT role, turn_id FROM conversation_message
+                 WHERE id = ?1 AND conversation_id = ?2 AND life_id = ?3",
                 params![message_id, conversation_id, life_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
+            .optional()
             .map_err(|_| storage_unavailable())?;
-        if !message_exists {
+        let Some((role, turn_id)) = message else {
             return Err(ConversationHistoryError::new(
                 ConversationHistoryErrorCode::ConversationNotFound,
             ));
-        }
+        };
+        let selected_user_message_id = if role == "user" {
+            Some(message_id.to_string())
+        } else {
+            transaction
+                .query_row(
+                    "SELECT id FROM conversation_message
+                     WHERE conversation_id = ?1 AND life_id = ?2 AND turn_id = ?3 AND role = 'user'",
+                    params![conversation_id, life_id, turn_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|_| storage_unavailable())?
+        };
         let affected = super::candidate_memory::collect_candidates_for_message(
             &transaction,
             life_id,
@@ -391,6 +403,22 @@ impl StorageService {
                 params![message_id, conversation_id, life_id],
             )
             .map_err(|_| storage_unavailable())?;
+        transaction
+            .execute(
+                "UPDATE conversation SET revision = revision + 1,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                 last_message_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 WHERE id = ?1 AND life_id = ?2",
+                params![conversation_id, life_id],
+            )
+            .map_err(|_| storage_unavailable())?;
+        if let Some(selected_user_message_id) = selected_user_message_id {
+            candidate_extraction::invalidate_snapshots_for_deleted_user_message(
+                &transaction,
+                &selected_user_message_id,
+            )
+            .map_err(|_| storage_unavailable())?;
+        }
         super::candidate_memory::delete_orphaned_source_candidates(
             &transaction,
             life_id,
@@ -708,7 +736,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
         let mut columns = Vec::new();
         for table in ["conversation", "conversation_message"] {
             columns.extend(

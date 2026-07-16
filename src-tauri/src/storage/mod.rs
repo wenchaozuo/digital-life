@@ -1,3 +1,4 @@
+mod candidate_extraction;
 mod candidate_memory;
 mod conversation;
 mod location;
@@ -69,6 +70,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         9,
         "009_candidate_evidence_uniqueness",
         include_str!("migrations/009_candidate_evidence_uniqueness.sql"),
+    ),
+    (
+        10,
+        "010_candidate_extraction_foundation",
+        include_str!("migrations/010_candidate_extraction_foundation.sql"),
     ),
 ];
 

@@ -167,7 +167,7 @@ mod tests {
                     0
                 ))
                 .unwrap(),
-            9
+            10
         );
         drop(storage);
         let reopened = StorageService::initialize_with_roots(data_root, None).unwrap();

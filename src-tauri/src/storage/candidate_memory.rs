@@ -5,25 +5,30 @@ use rusqlite::{
     TransactionBehavior,
 };
 
-use crate::memory::{
-    candidate::{
-        CandidateInferenceStatus, CandidateMemoryAuditRecord, CandidateMemoryCursor,
-        CandidateMemoryError, CandidateMemoryEvidenceRecord, CandidateMemoryListFilter,
-        CandidateMemoryRecord, CandidateMemoryRepository, CandidateMemorySourceType,
-        CandidateMemoryStatus, CandidateMemoryStorageUpdate, NewCandidateMemory,
-        NewCandidateMemoryAudit, NewCandidateMemoryEvidence, DEFAULT_CANDIDATE_PAGE_SIZE,
-        MAX_CANDIDATE_PAGE_SIZE,
+use crate::{
+    candidate_memory_internal::fingerprint::{
+        compute_dedup_fingerprint, compute_rejection_fingerprint,
     },
-    candidate_service::{
-        compute_dedup_fingerprint, compute_rejection_fingerprint, contains_prohibited_content,
-        AddEvidenceRequest, CandidateConfirmationRecoveryRepository, CandidateEditOutcome,
-        CandidateEditResult, CandidateLifecycleRepository, CandidateLifecycleResult,
-        ConfirmCandidateOutcome, ConfirmCandidateRequest, ConfirmCandidateResult,
-        DeleteCandidateRequest, EditCandidateRequest, ExpiredCandidateScan, RejectCandidateRequest,
-        SupersedeCandidateRequest,
+    memory::{
+        candidate::{
+            CandidateInferenceStatus, CandidateMemoryAuditRecord, CandidateMemoryCursor,
+            CandidateMemoryError, CandidateMemoryEvidenceRecord, CandidateMemoryListFilter,
+            CandidateMemoryRecord, CandidateMemoryRepository, CandidateMemorySourceType,
+            CandidateMemoryStatus, CandidateMemoryStorageUpdate, NewCandidateMemory,
+            NewCandidateMemoryAudit, NewCandidateMemoryEvidence, DEFAULT_CANDIDATE_PAGE_SIZE,
+            MAX_CANDIDATE_PAGE_SIZE,
+        },
+        candidate_service::{
+            contains_prohibited_content, AddEvidenceRequest,
+            CandidateConfirmationRecoveryRepository, CandidateEditOutcome, CandidateEditResult,
+            CandidateLifecycleRepository, CandidateLifecycleResult, ConfirmCandidateOutcome,
+            ConfirmCandidateRequest, ConfirmCandidateResult, DeleteCandidateRequest,
+            EditCandidateRequest, ExpiredCandidateScan, RejectCandidateRequest,
+            SupersedeCandidateRequest,
+        },
+        vector_sync_outbox::MemoryVectorSyncAction,
+        MemoryKind, MemoryRecord, MemoryStatus,
     },
-    vector_sync_outbox::MemoryVectorSyncAction,
-    MemoryKind, MemoryRecord, MemoryStatus,
 };
 
 use super::{
@@ -122,54 +127,12 @@ impl CandidateMemoryRepository for StorageService {
         &self,
         candidate: NewCandidateMemory,
     ) -> Result<CandidateMemoryRecord, CandidateMemoryError> {
-        validate_candidate_insert(&candidate)?;
         let candidate_id = candidate.id.clone();
         let life_id = candidate.life_id.clone();
         let state = self
             .state()
             .map_err(|_| CandidateMemoryError::storage_unavailable())?;
-        state
-            .connection
-            .execute(
-                "INSERT INTO candidate_memory (
-                    id, life_id, subject_id, kind, content, summary, source_type, source_id,
-                    confidence, importance, is_sensitive, inference_status, status, revision,
-                    dedup_fingerprint, proposed_at, expires_at, reviewed_at, last_user_edit_at,
-                    confirmed_memory_id, accepted_request_id, rejection_reason_code,
-                    superseded_by_candidate_id, conflicts_with_memory_id, created_at, updated_at
-                 ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 1,
-                    ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25
-                 )",
-                params![
-                    candidate.id,
-                    candidate.life_id,
-                    candidate.subject_id,
-                    candidate.kind.as_str(),
-                    normalize_optional(candidate.content),
-                    normalize_optional(candidate.summary),
-                    candidate.source_type.as_str(),
-                    normalize_optional(candidate.source_id),
-                    candidate.confidence,
-                    candidate.importance,
-                    candidate.is_sensitive,
-                    candidate.inference_status.as_str(),
-                    candidate.status.as_str(),
-                    normalize_optional(candidate.dedup_fingerprint),
-                    candidate.proposed_at,
-                    normalize_optional(candidate.expires_at),
-                    normalize_optional(candidate.reviewed_at),
-                    normalize_optional(candidate.last_user_edit_at),
-                    normalize_optional(candidate.confirmed_memory_id),
-                    normalize_optional(candidate.accepted_request_id),
-                    normalize_optional(candidate.rejection_reason_code),
-                    normalize_optional(candidate.superseded_by_candidate_id),
-                    normalize_optional(candidate.conflicts_with_memory_id),
-                    candidate.created_at,
-                    candidate.updated_at,
-                ],
-            )
-            .map_err(map_sql_error)?;
+        insert_candidate_with_connection(&state.connection, &candidate)?;
 
         load_owned_candidate(&state.connection, &life_id, &candidate_id)
     }
@@ -507,6 +470,84 @@ impl CandidateMemoryRepository for StorageService {
             .map_err(map_sql_error)?;
         Ok(deleted)
     }
+}
+
+/// The sole D-3 Candidate INSERT primitive used by both ordinary candidate
+/// creation and the D-6 extraction transaction.
+#[allow(dead_code)]
+pub(super) fn insert_candidate_in_transaction(
+    transaction: &Transaction<'_>,
+    candidate: &NewCandidateMemory,
+) -> Result<(), CandidateMemoryError> {
+    insert_candidate_with_connection(transaction, candidate)
+}
+
+pub(super) fn insert_extraction_audit_in_transaction(
+    transaction: &Transaction<'_>,
+    audit_id: &str,
+    life_id: &str,
+    candidate_id: &str,
+    now: &str,
+) -> Result<(), CandidateMemoryError> {
+    insert_audit(
+        transaction,
+        audit_id,
+        life_id,
+        candidate_id,
+        "extracted",
+        "system",
+        now,
+    )?;
+    Ok(())
+}
+
+fn insert_candidate_with_connection(
+    connection: &Connection,
+    candidate: &NewCandidateMemory,
+) -> Result<(), CandidateMemoryError> {
+    validate_candidate_insert(candidate)?;
+    connection
+        .execute(
+            "INSERT INTO candidate_memory (
+                id, life_id, subject_id, kind, content, summary, source_type, source_id,
+                confidence, importance, is_sensitive, inference_status, status, revision,
+                dedup_fingerprint, proposed_at, expires_at, reviewed_at, last_user_edit_at,
+                confirmed_memory_id, accepted_request_id, rejection_reason_code,
+                superseded_by_candidate_id, conflicts_with_memory_id, created_at, updated_at
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 1,
+                ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25
+             )",
+            params![
+                candidate.id,
+                candidate.life_id,
+                candidate.subject_id,
+                candidate.kind.as_str(),
+                normalize_optional(candidate.content.clone()),
+                normalize_optional(candidate.summary.clone()),
+                candidate.source_type.as_str(),
+                normalize_optional(candidate.source_id.clone()),
+                candidate.confidence,
+                candidate.importance,
+                candidate.is_sensitive,
+                candidate.inference_status.as_str(),
+                candidate.status.as_str(),
+                normalize_optional(candidate.dedup_fingerprint.clone()),
+                candidate.proposed_at,
+                normalize_optional(candidate.expires_at.clone()),
+                normalize_optional(candidate.reviewed_at.clone()),
+                normalize_optional(candidate.last_user_edit_at.clone()),
+                normalize_optional(candidate.confirmed_memory_id.clone()),
+                normalize_optional(candidate.accepted_request_id.clone()),
+                normalize_optional(candidate.rejection_reason_code.clone()),
+                normalize_optional(candidate.superseded_by_candidate_id.clone()),
+                normalize_optional(candidate.conflicts_with_memory_id.clone()),
+                candidate.created_at,
+                candidate.updated_at,
+            ],
+        )
+        .map_err(map_sql_error)?;
+    Ok(())
 }
 
 impl CandidateLifecycleRepository for StorageService {
@@ -2114,7 +2155,7 @@ mod tests {
             .connection
             .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
         assert_eq!(foreign_keys, 1);
         for table in [
             "candidate_memory",
@@ -2145,7 +2186,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
         let old_candidate_count: i64 = state
             .connection
             .query_row(

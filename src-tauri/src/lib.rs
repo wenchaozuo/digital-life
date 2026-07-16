@@ -1,3 +1,4 @@
+mod candidate_memory_internal;
 pub mod conversation;
 pub mod embedding;
 pub mod memory;

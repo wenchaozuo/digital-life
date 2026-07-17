@@ -49,7 +49,7 @@ const showModelSettingsAction = computed(() =>
 );
 const visibleMessages = computed(() => messages.value);
 const conversationTitle = ref<string>();
-const selectedConversationId = computed(() => conversationService.getConversationId());
+const selectedConversationId = ref<string | undefined>(conversationService.getConversationId());
 const isConversationLoading = computed(() => conversationState.value === "loadingConversation");
 const isSending = computed(() => conversationState.value === "sending");
 const interactionDisabled = computed(() => isConversationLoading.value || isSending.value);
@@ -61,6 +61,13 @@ let manualExtractionGeneration = 0;
 const manualExtractionDisabled = computed(() =>
   interactionDisabled.value || !hasCurrentConversation.value || manualExtractionStatus.value === "loading",
 );
+
+function invalidateManualExtractionForConversationChange(): void {
+  manualExtractionGeneration += 1;
+  manualExtractionStatus.value = "idle";
+  manualExtractionNotice.value = undefined;
+  manualExtractionError.value = undefined;
+}
 
 const showMemoryPanel = ref(false);
 const showUnconfirmedHint = ref(false);
@@ -226,6 +233,7 @@ let unsubscribeMessages: (() => void) | undefined;
 let unsubscribeBodyState: (() => void) | undefined;
 
 function refreshMessages(): void {
+  selectedConversationId.value = conversationService.getConversationId();
   messages.value = conversationService.getSession().getMessages();
   conversationTitle.value = conversationService.getConversationTitle();
 }
@@ -291,6 +299,7 @@ async function send(content: string): Promise<void> {
 
 async function createConversation(): Promise<void> {
   if (interactionDisabled.value) return;
+  invalidateManualExtractionForConversationChange();
   conversationState.value = "loadingConversation";
   error.value = undefined;
   try {
@@ -307,6 +316,7 @@ async function createConversation(): Promise<void> {
 
 async function switchConversation(conversation: ConversationSummary): Promise<void> {
   if (interactionDisabled.value || conversation.id === selectedConversationId.value) return;
+  invalidateManualExtractionForConversationChange();
   conversationState.value = "loadingConversation";
   error.value = undefined;
   try {

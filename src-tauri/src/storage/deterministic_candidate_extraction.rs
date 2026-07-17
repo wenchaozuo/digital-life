@@ -10,8 +10,10 @@ mod deterministic_extractor;
 use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
 
-use super::candidate_extraction::ExtractionCancellation;
-use super::{candidate_extraction::CandidateExtractionAttemptOutcome, StorageService};
+use super::candidate_extraction::{
+    CandidateExtractionAttemptOutcome, CommitReconciliationResult, ExtractionCancellation,
+};
+use super::StorageService;
 use deterministic_extractor::{deterministic_descriptor, DeterministicCandidateExtractor};
 
 const SAFETY_POLICY_VERSION: &str = "candidate-extraction-safety-v1";
@@ -97,27 +99,40 @@ pub(crate) fn trigger_deterministic_candidate_extraction(
     };
 
     let cancellation = ExtractionCancellation::new();
-    let outcome =
-        storage.run_candidate_extraction_attempt(&extractor, &started, &cancellation, None);
+    response_from_attempt_outcome(
+        storage,
+        life_id,
+        conversation_id,
+        storage.run_candidate_extraction_attempt(&extractor, &started, &cancellation, None),
+    )
+}
 
+fn response_from_attempt_outcome(
+    storage: &StorageService,
+    life_id: &str,
+    conversation_id: &str,
+    outcome: CandidateExtractionAttemptOutcome,
+) -> Result<ExtractionTriggerResponse, SafeCommandError> {
     match outcome {
         CandidateExtractionAttemptOutcome::Completed => {
-            // Success - read authoritative state
             read_existing_run(storage, life_id, conversation_id)?
                 .map(response_from_existing)
                 .ok_or_else(storage_unavailable)
         }
-        CandidateExtractionAttemptOutcome::StorageFailure => {
-            // HIGH-1: StorageFailure could be due to commit uncertainty.
-            // Try to read the authoritative state - if the run is completed,
-            // the commit succeeded even though the response was uncertain.
-            if let Some(existing) = read_existing_run(storage, life_id, conversation_id)? {
-                if existing.status == ExtractionTriggerStatus::Completed {
-                    return Ok(response_from_existing(existing));
-                }
-            }
-            Err(storage_unavailable())
+        CandidateExtractionAttemptOutcome::CommitOutcomeUncertain(identity) => {
+            response_from_commit_reconciliation(
+                storage,
+                life_id,
+                conversation_id,
+                storage
+                    .reconcile_candidate_extraction_attempt_uncertainty(identity)
+                    .map_err(|_| storage_unavailable())?,
+            )
         }
+        // Ordinary storage failures must never be treated as proof that a
+        // committed run exists. Only D-6's typed uncertainty variant may
+        // enter authoritative commit reconciliation.
+        CandidateExtractionAttemptOutcome::StorageFailure => Err(storage_unavailable()),
         CandidateExtractionAttemptOutcome::RetryScheduled => {
             Ok(simple_response(ExtractionTriggerStatus::RetryWait))
         }
@@ -127,6 +142,31 @@ pub(crate) fn trigger_deterministic_candidate_extraction(
         CandidateExtractionAttemptOutcome::StaleAttempt => {
             Ok(simple_response(ExtractionTriggerStatus::StaleOrConflict))
         }
+    }
+}
+
+fn response_from_commit_reconciliation(
+    storage: &StorageService,
+    life_id: &str,
+    conversation_id: &str,
+    result: CommitReconciliationResult,
+) -> Result<ExtractionTriggerResponse, SafeCommandError> {
+    match result {
+        CommitReconciliationResult::Completed { .. } => {
+            read_existing_run(storage, life_id, conversation_id)?
+                .map(response_from_existing)
+                .ok_or_else(storage_unavailable)
+        }
+        CommitReconciliationResult::TerminalFailed => {
+            Ok(simple_response(ExtractionTriggerStatus::Failed))
+        }
+        CommitReconciliationResult::SnapshotInvalidated => Ok(simple_response(
+            ExtractionTriggerStatus::SnapshotInvalidated,
+        )),
+        CommitReconciliationResult::CommitOutcomeUnavailable => {
+            Ok(simple_response(ExtractionTriggerStatus::Processing))
+        }
+        CommitReconciliationResult::StorageUnavailable => Err(storage_unavailable()),
     }
 }
 
@@ -240,6 +280,11 @@ mod tests {
     use crate::conversation::history::{
         AppendConversationTurnRequest, ConversationRepository, CreateConversationRequest,
     };
+    use crate::storage::candidate_extraction::{
+        commit_reconciliation_calls_for_test, reset_commit_reconciliation_calls_for_test,
+        set_finalize_failpoint_for_test, set_reconciliation_read_unavailable_for_test,
+        CandidateExtractionAttemptOutcome, FinalizeFailpoint,
+    };
     use crate::storage::{LifeIdentityRecord, PersonaTemplateRecord};
     use std::fs;
 
@@ -304,6 +349,51 @@ mod tests {
                 expected_revision: Some(expected_revision),
             })
             .unwrap();
+    }
+
+    fn persisted_counts(storage: &StorageService) -> (i64, i64, i64, i64, i64) {
+        let state = storage.state().unwrap();
+        let run_count = state
+            .connection
+            .query_row("SELECT COUNT(*) FROM candidate_extraction_run", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let candidate_count = state
+            .connection
+            .query_row("SELECT COUNT(*) FROM candidate_memory", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let evidence_count = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM candidate_memory_evidence",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let candidate_audit_count = state
+            .connection
+            .query_row("SELECT COUNT(*) FROM candidate_memory_audit", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let extraction_audit_count = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM candidate_extraction_audit",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        (
+            run_count,
+            candidate_count,
+            evidence_count,
+            candidate_audit_count,
+            extraction_audit_count,
+        )
     }
 
     #[test]
@@ -433,44 +523,132 @@ mod tests {
     }
 
     #[test]
-    fn storage_failure_with_completed_run_returns_completed() {
-        // This tests the HIGH-1 fix: when StorageFailure occurs due to commit
-        // uncertainty, but the run is actually completed, we should return completed.
+    fn post_commit_uncertainty_reconciles_through_the_real_d7_facade() {
         let (storage, root) = setup();
         let conversation_id = create_conversation(&storage, "conv-uncertain");
-        append_turn(&storage, &conversation_id, 0, "turn-1", "我喜欢喝茶");
+        append_turn(&storage, &conversation_id, 0, "turn-1", "I like tea.");
 
-        // First, complete a successful extraction
-        let response1 =
+        reset_commit_reconciliation_calls_for_test();
+        set_finalize_failpoint_for_test(Some(FinalizeFailpoint::PostCommitResponseUncertain));
+        let response =
             trigger_deterministic_candidate_extraction(&storage, "life-d7", &conversation_id)
                 .unwrap();
-        assert_eq!(response1.status, ExtractionTriggerStatus::Completed);
-        assert_eq!(response1.created_count, Some(1));
+        assert_eq!(response.status, ExtractionTriggerStatus::Completed);
+        assert_eq!(response.created_count, Some(1));
+        assert_eq!(commit_reconciliation_calls_for_test(), 1);
+        assert_eq!(persisted_counts(&storage), (1, 1, 1, 1, 2));
 
-        // Now trigger again - should return existing completed run
-        let response2 =
+        let replay =
             trigger_deterministic_candidate_extraction(&storage, "life-d7", &conversation_id)
                 .unwrap();
-        assert_eq!(response2.status, ExtractionTriggerStatus::Completed);
-        assert_eq!(response2.created_count, Some(1));
+        assert_eq!(replay, response);
+        assert_eq!(commit_reconciliation_calls_for_test(), 1);
+        assert_eq!(persisted_counts(&storage), (1, 1, 1, 1, 2));
+        let _ = fs::remove_dir_all(root);
+    }
 
-        // Verify no duplicate data
-        let state = storage.state().unwrap();
-        let run_count: i64 = state
-            .connection
-            .query_row("SELECT COUNT(*) FROM candidate_extraction_run", [], |row| {
-                row.get(0)
-            })
+    #[test]
+    fn ordinary_storage_failure_never_reconciles_or_uses_a_completed_run_as_proof() {
+        let (storage, root) = setup();
+        let conversation_id = create_conversation(&storage, "conv-storage-failure");
+        append_turn(&storage, &conversation_id, 0, "turn-1", "I like tea.");
+        trigger_deterministic_candidate_extraction(&storage, "life-d7", &conversation_id).unwrap();
+        let before = persisted_counts(&storage);
+
+        reset_commit_reconciliation_calls_for_test();
+        let error = response_from_attempt_outcome(
+            &storage,
+            "life-d7",
+            &conversation_id,
+            CandidateExtractionAttemptOutcome::StorageFailure,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "CANDIDATE_EXTRACTION_UNAVAILABLE");
+        assert_eq!(commit_reconciliation_calls_for_test(), 0);
+        assert_eq!(persisted_counts(&storage), before);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ordinary_storage_failure_from_the_real_pipeline_never_reconciles() {
+        let (storage, root) = setup();
+        let conversation_id = create_conversation(&storage, "conv-ordinary-failure");
+        append_turn(&storage, &conversation_id, 0, "turn-1", "I like tea.");
+
+        reset_commit_reconciliation_calls_for_test();
+        set_finalize_failpoint_for_test(Some(FinalizeFailpoint::BeforeCommit));
+        let error =
+            trigger_deterministic_candidate_extraction(&storage, "life-d7", &conversation_id)
+                .unwrap_err();
+        assert_eq!(error.code, "CANDIDATE_EXTRACTION_UNAVAILABLE");
+        assert_eq!(commit_reconciliation_calls_for_test(), 0);
+        assert_eq!(persisted_counts(&storage).1, 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn uncertainty_reconciliation_read_failure_returns_unavailable_without_replay() {
+        let (storage, root) = setup();
+        let conversation_id = create_conversation(&storage, "conv-reconcile-read-failure");
+        append_turn(&storage, &conversation_id, 0, "turn-1", "I like tea.");
+
+        reset_commit_reconciliation_calls_for_test();
+        set_finalize_failpoint_for_test(Some(FinalizeFailpoint::PostCommitResponseUncertain));
+        set_reconciliation_read_unavailable_for_test(true);
+        let error =
+            trigger_deterministic_candidate_extraction(&storage, "life-d7", &conversation_id)
+                .unwrap_err();
+        set_reconciliation_read_unavailable_for_test(false);
+        assert_eq!(error.code, "CANDIDATE_EXTRACTION_UNAVAILABLE");
+        assert_eq!(commit_reconciliation_calls_for_test(), 1);
+        assert_eq!(persisted_counts(&storage), (1, 1, 1, 1, 2));
+
+        let retry =
+            trigger_deterministic_candidate_extraction(&storage, "life-d7", &conversation_id)
+                .unwrap();
+        assert_eq!(retry.status, ExtractionTriggerStatus::Completed);
+        assert_eq!(persisted_counts(&storage), (1, 1, 1, 1, 2));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn typed_uncertainty_debug_output_redacts_internal_identity() {
+        let (storage, root) = setup();
+        let conversation_id = create_conversation(&storage, "conv-private-run-id");
+        append_turn(&storage, &conversation_id, 0, "turn-private", "I like tea.");
+        let started = storage
+            .start_candidate_extraction(
+                "life-d7",
+                &conversation_id,
+                deterministic_descriptor(),
+                SAFETY_POLICY_VERSION,
+            )
+            .unwrap()
             .unwrap();
-        let candidate_count: i64 = state
-            .connection
-            .query_row("SELECT COUNT(*) FROM candidate_memory", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(run_count, 1);
-        assert_eq!(candidate_count, 1);
-        drop(state);
+        set_finalize_failpoint_for_test(Some(FinalizeFailpoint::PostCommitResponseUncertain));
+        let outcome = storage.run_candidate_extraction_attempt(
+            &DeterministicCandidateExtractor::new(),
+            &started,
+            &ExtractionCancellation::new(),
+            None,
+        );
+        assert!(matches!(
+            &outcome,
+            CandidateExtractionAttemptOutcome::CommitOutcomeUncertain(_)
+        ));
+        let debug = format!("{outcome:?}").to_lowercase();
+        for forbidden in [
+            "conv-private-run-id",
+            "turn-private",
+            "token",
+            "digest",
+            "snapshot",
+            "message",
+            "select",
+            "sqlite",
+        ] {
+            assert!(!debug.contains(forbidden));
+        }
         let _ = fs::remove_dir_all(root);
     }
 }

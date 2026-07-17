@@ -72,7 +72,7 @@ type RunReconciliationRow = (
 /// Only available in test builds. Production builds have zero overhead.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FinalizeFailpoint {
+pub(super) enum FinalizeFailpoint {
     BeforeFenceValidation,
     BeforeFirstCandidateInsert,
     AfterFirstCandidateInsert,
@@ -94,12 +94,38 @@ pub(crate) enum FinalizeFailpoint {
 #[cfg(test)]
 thread_local! {
     static ACTIVE_FAILPOINT: std::cell::Cell<Option<FinalizeFailpoint>> = const { std::cell::Cell::new(None) };
+    static COMMIT_RECONCILIATION_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static RECONCILIATION_READ_UNAVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Set a failpoint for the current thread. Returns the previous value.
 #[cfg(test)]
 fn set_finalize_failpoint(fp: Option<FinalizeFailpoint>) -> Option<FinalizeFailpoint> {
     ACTIVE_FAILPOINT.with(|cell| cell.replace(fp))
+}
+
+/// Test-only controls for exercising the D-7 facade through D-6's real
+/// commit-uncertainty seam. They are unavailable from production builds.
+#[cfg(test)]
+pub(super) fn set_finalize_failpoint_for_test(
+    fp: Option<FinalizeFailpoint>,
+) -> Option<FinalizeFailpoint> {
+    set_finalize_failpoint(fp)
+}
+
+#[cfg(test)]
+pub(super) fn reset_commit_reconciliation_calls_for_test() {
+    COMMIT_RECONCILIATION_CALLS.with(|cell| cell.set(0));
+}
+
+#[cfg(test)]
+pub(super) fn commit_reconciliation_calls_for_test() -> usize {
+    COMMIT_RECONCILIATION_CALLS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(super) fn set_reconciliation_read_unavailable_for_test(unavailable: bool) {
+    RECONCILIATION_READ_UNAVAILABLE.with(|cell| cell.set(unavailable));
 }
 
 /// Check if the current failpoint matches and return an error if so.
@@ -125,18 +151,41 @@ fn check_finalize_failpoint(_expected: u8) -> Result<(), ExtractionError> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExtractionErrorReason {
+    Other,
+    CommitOutcomeUncertain,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ExtractionError {
     pub code: &'static str,
     pub recoverable: bool,
+    reason: ExtractionErrorReason,
 }
 
 impl ExtractionError {
     const fn new(code: &'static str, recoverable: bool) -> Self {
-        Self { code, recoverable }
+        Self {
+            code,
+            recoverable,
+            reason: ExtractionErrorReason::Other,
+        }
     }
     const fn storage() -> Self {
         Self::new("CANDIDATE_EXTRACTION_STORAGE_UNAVAILABLE", true)
+    }
+
+    const fn commit_outcome_uncertain() -> Self {
+        Self {
+            code: "CANDIDATE_EXTRACTION_COMMIT_UNCERTAIN",
+            recoverable: true,
+            reason: ExtractionErrorReason::CommitOutcomeUncertain,
+        }
+    }
+
+    const fn is_commit_outcome_uncertain(&self) -> bool {
+        matches!(self.reason, ExtractionErrorReason::CommitOutcomeUncertain)
     }
 }
 
@@ -320,9 +369,35 @@ impl ExtractionCancellation {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CandidateExtractionAttemptOutcome {
+/// Opaque identity minted by D-6 only when a finalize commit is uncertain.
+///
+/// The D-7 facade can return this value only to the D-6 reconciliation helper;
+/// it cannot inspect or reconstruct the identity.
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct CommitReconciliationIdentity {
+    run_id: String,
+    attempt_sequence: i64,
+}
+
+impl CommitReconciliationIdentity {
+    fn from_started(started: &StartedExtraction) -> Self {
+        Self {
+            run_id: started.request.run_id.clone(),
+            attempt_sequence: started.request.attempt_sequence,
+        }
+    }
+}
+
+impl std::fmt::Debug for CommitReconciliationIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CommitReconciliationIdentity([REDACTED])")
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum CandidateExtractionAttemptOutcome {
     Completed,
+    CommitOutcomeUncertain(CommitReconciliationIdentity),
     RetryScheduled,
     TerminalFailed,
     StaleAttempt,
@@ -428,7 +503,7 @@ impl StorageService {
     /// ends before the future is created or polled; durable transitions happen
     /// only after that future has completed, timed out, panicked, or been
     /// cancelled.
-    pub(crate) fn run_candidate_extraction_attempt(
+    pub(super) fn run_candidate_extraction_attempt(
         &self,
         extractor: &dyn CandidateExtractor,
         started: &StartedExtraction,
@@ -496,6 +571,11 @@ impl StorageService {
         match extraction {
             Ok(batch) => match self.finalize_candidate_extraction_atomic(started, batch) {
                 Ok(()) => CandidateExtractionAttemptOutcome::Completed,
+                Err(error) if error.is_commit_outcome_uncertain() => {
+                    CandidateExtractionAttemptOutcome::CommitOutcomeUncertain(
+                        CommitReconciliationIdentity::from_started(started),
+                    )
+                }
                 Err(error) if is_stale_fence_error(&error) => {
                     CandidateExtractionAttemptOutcome::StaleAttempt
                 }
@@ -749,10 +829,7 @@ impl StorageService {
             // Simulate commit uncertainty by dropping the transaction without commit
             drop(tx);
             drop(state);
-            return Err(ExtractionError::new(
-                "CANDIDATE_EXTRACTION_COMMIT_UNCERTAIN",
-                true,
-            ));
+            return Err(ExtractionError::commit_outcome_uncertain());
         }
         tx.commit().map_err(|_| ExtractionError::storage())?;
         // Fix 3: Post-commit response uncertainty seam
@@ -762,10 +839,7 @@ impl StorageService {
         {
             ACTIVE_FAILPOINT.with(|cell| cell.set(None));
             // Commit succeeded but response delivery uncertain
-            return Err(ExtractionError::new(
-                "CANDIDATE_EXTRACTION_COMMIT_UNCERTAIN",
-                true,
-            ));
+            return Err(ExtractionError::commit_outcome_uncertain());
         }
         Ok(())
     }
@@ -1169,11 +1243,18 @@ impl StorageService {
     /// When the COMMIT of finalize_candidate_extraction_atomic is uncertain,
     /// this function re-reads the Run status to determine the authoritative outcome.
     /// It never re-plays Candidate ingest.
-    pub(crate) fn reconcile_extraction_commit_uncertainty(
+    pub(super) fn reconcile_extraction_commit_uncertainty(
         &self,
         run_id: &str,
         attempt_sequence: i64,
     ) -> Result<CommitReconciliationResult, ExtractionError> {
+        #[cfg(test)]
+        {
+            COMMIT_RECONCILIATION_CALLS.with(|cell| cell.set(cell.get() + 1));
+            if RECONCILIATION_READ_UNAVAILABLE.with(std::cell::Cell::get) {
+                return Err(ExtractionError::storage());
+            }
+        }
         let state = self.state().map_err(|_| ExtractionError::storage())?;
         let run: Option<RunReconciliationRow> = state
             .connection
@@ -1226,11 +1307,20 @@ impl StorageService {
             },
         }
     }
+
+    /// Reconcile an opaque D-6 uncertainty identity without exposing run or
+    /// attempt fields to D-7's command or frontend layers.
+    pub(super) fn reconcile_candidate_extraction_attempt_uncertainty(
+        &self,
+        identity: CommitReconciliationIdentity,
+    ) -> Result<CommitReconciliationResult, ExtractionError> {
+        self.reconcile_extraction_commit_uncertainty(&identity.run_id, identity.attempt_sequence)
+    }
 }
 
 /// Result of commit uncertainty reconciliation.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum CommitReconciliationResult {
+pub(super) enum CommitReconciliationResult {
     /// The Run completed successfully. No re-ingest needed.
     Completed {
         total_proposal_count: i64,

@@ -88,6 +88,7 @@ pub(crate) enum FinalizeFailpoint {
     AfterExtractionAuditInsert,
     BeforeCommit,
     CommitResponseUncertain,
+    PostCommitResponseUncertain,
 }
 
 #[cfg(test)]
@@ -434,6 +435,14 @@ impl StorageService {
         cancellation: &ExtractionCancellation,
         timeout: Option<Duration>,
     ) -> CandidateExtractionAttemptOutcome {
+        // Fix 1: Runtime descriptor binding - verify extractor matches fence
+        let runtime_descriptor = extractor.descriptor();
+        if runtime_descriptor.extractor_id != started.fence().descriptor.extractor_id
+            || runtime_descriptor.extractor_version != started.fence().descriptor.extractor_version
+        {
+            return CandidateExtractionAttemptOutcome::StaleAttempt;
+        }
+
         if cancellation.reason() == Some(ExtractionCancellationReason::StaleAttempt) {
             return CandidateExtractionAttemptOutcome::StaleAttempt;
         }
@@ -579,6 +588,20 @@ impl StorageService {
         #[cfg(test)]
         check_finalize_failpoint(FinalizeFailpoint::BeforeFenceValidation)?;
         validate_fence(&tx, started.fence(), now)?;
+        // Fix 2: Finalize minimum lease remaining check
+        let lease_remaining: i64 = tx
+            .query_row(
+                "SELECT lease_expires_at_epoch_s - ?1 FROM candidate_extraction_run WHERE id=?2",
+                params![now, started.request.run_id],
+                |r| r.get(0),
+            )
+            .map_err(|_| ExtractionError::storage())?;
+        if lease_remaining < FINALIZE_MIN_REMAINING_S {
+            return Err(ExtractionError::new(
+                "CANDIDATE_EXPIRY_INSUFFICIENT_FOR_FINALIZE",
+                false,
+            ));
+        }
         validate_snapshot_commitment(&tx, started)?;
         renew_fence(&tx, started.fence(), now)?;
         let mut counts = classified.counts;
@@ -717,7 +740,7 @@ impl StorageService {
         // Failpoint 14: Before commit
         #[cfg(test)]
         check_finalize_failpoint(FinalizeFailpoint::BeforeCommit)?;
-        // Failpoint 15: Commit response uncertain
+        // Failpoint 15: Commit response uncertain (pre-commit)
         #[cfg(test)]
         if ACTIVE_FAILPOINT.with(|cell| cell.get())
             == Some(FinalizeFailpoint::CommitResponseUncertain)
@@ -731,7 +754,20 @@ impl StorageService {
                 true,
             ));
         }
-        tx.commit().map_err(|_| ExtractionError::storage())
+        tx.commit().map_err(|_| ExtractionError::storage())?;
+        // Fix 3: Post-commit response uncertainty seam
+        #[cfg(test)]
+        if ACTIVE_FAILPOINT.with(|cell| cell.get())
+            == Some(FinalizeFailpoint::PostCommitResponseUncertain)
+        {
+            ACTIVE_FAILPOINT.with(|cell| cell.set(None));
+            // Commit succeeded but response delivery uncertain
+            return Err(ExtractionError::new(
+                "CANDIDATE_EXTRACTION_COMMIT_UNCERTAIN",
+                true,
+            ));
+        }
+        Ok(())
     }
 
     /// Records an extractor, timeout, cancellation, or panic outcome without
@@ -6270,6 +6306,419 @@ mod tests {
             .filter(|(id, _, _)| id == &started.request.run_id)
             .collect();
         assert_eq!(our_run.len(), 1, "our expired run is in recovery");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // ── Test Extractor Helpers ──────────────────────────────────────
+
+    /// Test extractor that counts how many times the future was polled.
+    struct CountingExtractor<'a> {
+        descriptor: ExtractorDescriptor,
+        poll_count: &'a std::sync::atomic::AtomicUsize,
+    }
+
+    impl<'a> CandidateExtractor for CountingExtractor<'a> {
+        fn descriptor(&self) -> &ExtractorDescriptor {
+            &self.descriptor
+        }
+        fn extract<'b>(
+            &'b self,
+            _request: CandidateExtractionRequest,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<CandidateExtractionBatch, ExtractionError>> + Send + 'b>,
+        > {
+            self.poll_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async { Ok(CandidateExtractionBatch::default()) })
+        }
+    }
+
+    /// Test extractor with fixed descriptor.
+    struct TestExtractor {
+        descriptor: ExtractorDescriptor,
+    }
+
+    impl CandidateExtractor for TestExtractor {
+        fn descriptor(&self) -> &ExtractorDescriptor {
+            &self.descriptor
+        }
+        fn extract<'a>(
+            &'a self,
+            _request: CandidateExtractionRequest,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<CandidateExtractionBatch, ExtractionError>> + Send + 'a>,
+        > {
+            Box::pin(async { Ok(CandidateExtractionBatch::default()) })
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // A. Runtime Descriptor Binding Tests
+    // ════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn descriptor_id_mismatch_stops_extraction() {
+        let (service, root, started) = setup_extraction();
+        let wrong_extractor = TestExtractor {
+            descriptor: ExtractorDescriptor {
+                extractor_id: "wrong-id".into(),
+                extractor_version: "1".into(),
+            },
+        };
+        let cancellation = ExtractionCancellation::new();
+        let outcome = service.run_candidate_extraction_attempt(
+            &wrong_extractor,
+            &started,
+            &cancellation,
+            Some(Duration::from_secs(5)),
+        );
+        assert_eq!(outcome, CandidateExtractionAttemptOutcome::StaleAttempt);
+        // Verify zero durable changes
+        let state = service.state().unwrap();
+        let status: String = state
+            .connection
+            .query_row(
+                "SELECT status FROM candidate_extraction_run WHERE id=?1",
+                params![started.request.run_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "processing", "run unchanged on descriptor mismatch");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn descriptor_version_mismatch_stops_extraction() {
+        let (service, root, started) = setup_extraction();
+        let wrong_extractor = TestExtractor {
+            descriptor: ExtractorDescriptor {
+                extractor_id: "test-extractor".into(),
+                extractor_version: "999".into(),
+            },
+        };
+        let cancellation = ExtractionCancellation::new();
+        let outcome = service.run_candidate_extraction_attempt(
+            &wrong_extractor,
+            &started,
+            &cancellation,
+            Some(Duration::from_secs(5)),
+        );
+        assert_eq!(outcome, CandidateExtractionAttemptOutcome::StaleAttempt);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn descriptor_matching_allows_extraction() {
+        let (service, root, started) = setup_extraction();
+        let matching_extractor = TestExtractor {
+            descriptor: ExtractorDescriptor {
+                extractor_id: "test-extractor".into(),
+                extractor_version: "1".into(),
+            },
+        };
+        let cancellation = ExtractionCancellation::new();
+        let outcome = service.run_candidate_extraction_attempt(
+            &matching_extractor,
+            &started,
+            &cancellation,
+            Some(Duration::from_secs(5)),
+        );
+        // Should complete (not StaleAttempt)
+        assert_ne!(outcome, CandidateExtractionAttemptOutcome::StaleAttempt);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn descriptor_mismatch_future_never_polled() {
+        let (service, root, started) = setup_extraction();
+        let poll_count = std::sync::atomic::AtomicUsize::new(0);
+        let wrong_extractor = CountingExtractor {
+            descriptor: ExtractorDescriptor {
+                extractor_id: "wrong-id".into(),
+                extractor_version: "1".into(),
+            },
+            poll_count: &poll_count,
+        };
+        let cancellation = ExtractionCancellation::new();
+        let outcome = service.run_candidate_extraction_attempt(
+            &wrong_extractor,
+            &started,
+            &cancellation,
+            Some(Duration::from_secs(5)),
+        );
+        assert_eq!(outcome, CandidateExtractionAttemptOutcome::StaleAttempt);
+        assert_eq!(
+            poll_count.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "future never polled"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // B. Finalize Minimum Lease Remaining Tests
+    // ════════════════════════════════════════════════════════════════════
+
+    /// Set lease to expire in N seconds from now (DB time)
+    fn set_lease_remaining(service: &StorageService, run_id: &str, remaining_seconds: i64) {
+        let state = service.state().unwrap();
+        let now: i64 = state
+            .connection
+            .query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        state
+            .connection
+            .execute(
+                "UPDATE candidate_extraction_run SET lease_expires_at_epoch_s=?1 WHERE id=?2",
+                params![now + remaining_seconds, run_id],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn finalize_rejects_59_seconds_remaining() {
+        let (service, root, started) = setup_extraction();
+        set_lease_remaining(&service, &started.request.run_id, 59);
+        let batch = make_batch(&started);
+        let result = service.finalize_candidate_extraction_atomic(&started, batch);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().code,
+            "CANDIDATE_EXPIRY_INSUFFICIENT_FOR_FINALIZE"
+        );
+        // Verify zero changes
+        let state = service.state().unwrap();
+        let status: String = state
+            .connection
+            .query_row(
+                "SELECT status FROM candidate_extraction_run WHERE id=?1",
+                params![started.request.run_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "processing", "run unchanged on 59s rejection");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn finalize_accepts_60_seconds_remaining() {
+        let (service, root, started) = setup_extraction();
+        set_lease_remaining(&service, &started.request.run_id, 60);
+        let batch = make_batch(&started);
+        let result = service.finalize_candidate_extraction_atomic(&started, batch);
+        assert!(result.is_ok(), "60 seconds should be accepted");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn finalize_accepts_61_seconds_remaining() {
+        let (service, root, started) = setup_extraction();
+        set_lease_remaining(&service, &started.request.run_id, 61);
+        let batch = make_batch(&started);
+        let result = service.finalize_candidate_extraction_atomic(&started, batch);
+        assert!(result.is_ok(), "61 seconds should be accepted");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn finalize_rejects_expired_lease() {
+        let (service, root, started) = setup_extraction();
+        expire_lease(&service, &started.request.run_id);
+        let batch = make_batch(&started);
+        let result = service.finalize_candidate_extraction_atomic(&started, batch);
+        assert!(result.is_err(), "expired lease should be rejected");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // C. Committed-But-Response-Uncertain Tests
+    // ════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn post_commit_uncertain_data_actually_persisted() {
+        let (service, root, started) = setup_extraction();
+        set_finalize_failpoint(Some(FinalizeFailpoint::PostCommitResponseUncertain));
+        let batch = make_batch(&started);
+        let result = service.finalize_candidate_extraction_atomic(&started, batch);
+        assert!(result.is_err(), "post-commit seam returns error");
+        // But data IS persisted because commit succeeded
+        let state = service.state().unwrap();
+        let status: String = state
+            .connection
+            .query_row(
+                "SELECT status FROM candidate_extraction_run WHERE id=?1",
+                params![started.request.run_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            status, "completed",
+            "run is completed despite uncertain response"
+        );
+        let candidate_count: i64 = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM candidate_memory WHERE life_id=?1",
+                params![started.request.life_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(candidate_count, 1, "candidate persisted");
+        let evidence_count: i64 = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM candidate_memory_evidence WHERE life_id=?1",
+                params![started.request.life_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(evidence_count, 1, "evidence persisted");
+        let audit_count: i64 = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM candidate_extraction_audit WHERE run_id=?1",
+                params![started.request.run_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(audit_count, 2, "attempt_started + completed audits");
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn post_commit_uncertain_reconciliation_returns_completed() {
+        let (service, root, started) = setup_extraction();
+        set_finalize_failpoint(Some(FinalizeFailpoint::PostCommitResponseUncertain));
+        let batch = make_batch(&started);
+        service
+            .finalize_candidate_extraction_atomic(&started, batch)
+            .unwrap_err();
+        // Reconcile should see completed
+        let result = service
+            .reconcile_extraction_commit_uncertainty(
+                &started.request.run_id,
+                started.request.attempt_sequence,
+            )
+            .unwrap();
+        match result {
+            CommitReconciliationResult::Completed {
+                total_proposal_count,
+                created_count,
+                ..
+            } => {
+                assert_eq!(total_proposal_count, 1);
+                assert_eq!(created_count, 1);
+            }
+            other => panic!("Expected Completed, got {:?}", other),
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn post_commit_uncertain_idempotent_reconciliation() {
+        let (service, root, started) = setup_extraction();
+        set_finalize_failpoint(Some(FinalizeFailpoint::PostCommitResponseUncertain));
+        let batch = make_batch(&started);
+        service
+            .finalize_candidate_extraction_atomic(&started, batch)
+            .unwrap_err();
+        // Reconcile twice
+        let r1 = service
+            .reconcile_extraction_commit_uncertainty(
+                &started.request.run_id,
+                started.request.attempt_sequence,
+            )
+            .unwrap();
+        let r2 = service
+            .reconcile_extraction_commit_uncertainty(
+                &started.request.run_id,
+                started.request.attempt_sequence,
+            )
+            .unwrap();
+        assert_eq!(r1, r2, "idempotent");
+        // Verify counts unchanged
+        let state = service.state().unwrap();
+        let candidate_count: i64 = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM candidate_memory WHERE life_id=?1",
+                params![started.request.life_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(candidate_count, 1, "no duplicate candidates");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn post_commit_uncertain_concurrent_reconciliation() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let (service, root, started) = setup_extraction();
+        set_finalize_failpoint(Some(FinalizeFailpoint::PostCommitResponseUncertain));
+        let batch = make_batch(&started);
+        service
+            .finalize_candidate_extraction_atomic(&started, batch)
+            .unwrap_err();
+
+        let svc = Arc::new(service);
+        let barrier = Arc::new(Barrier::new(2));
+        let run_id = started.request.run_id.clone();
+        let attempt = started.request.attempt_sequence;
+
+        let s1 = svc.clone();
+        let b1 = barrier.clone();
+        let r1 = run_id.clone();
+        let h1 = thread::spawn(move || {
+            b1.wait();
+            s1.reconcile_extraction_commit_uncertainty(&r1, attempt)
+        });
+
+        let s2 = svc.clone();
+        let b2 = barrier.clone();
+        let r2 = run_id.clone();
+        let h2 = thread::spawn(move || {
+            b2.wait();
+            s2.reconcile_extraction_commit_uncertainty(&r2, attempt)
+        });
+
+        let res1 = h1.join().unwrap().unwrap();
+        let res2 = h2.join().unwrap().unwrap();
+        assert_eq!(res1, res2, "concurrent reconciliation same result");
+
+        // Verify no extra writes
+        let state = svc.state().unwrap();
+        let candidate_count: i64 = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM candidate_memory WHERE life_id=?1",
+                params![started.request.life_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            candidate_count, 1,
+            "no duplicate from concurrent reconciliation"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn post_commit_uncertain_re_finalize_rejected() {
+        let (service, root, started) = setup_extraction();
+        set_finalize_failpoint(Some(FinalizeFailpoint::PostCommitResponseUncertain));
+        let batch = make_batch(&started);
+        service
+            .finalize_candidate_extraction_atomic(&started, batch)
+            .unwrap_err();
+        // Try to finalize again - should fail because run is already completed
+        let batch2 = make_batch(&started);
+        let result = service.finalize_candidate_extraction_atomic(&started, batch2);
+        assert!(result.is_err(), "re-finalize must be rejected");
         let _ = std::fs::remove_dir_all(root);
     }
 }

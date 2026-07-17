@@ -1222,6 +1222,58 @@ struct Snapshot {
     conversation_revision: i64,
 }
 
+/// A reloaded snapshot row, kept separate from SQLite access so the invariants
+/// that SQLite cannot represent (for example a legacy role value) remain
+/// directly testable without adding a production construction path.
+#[derive(Clone)]
+struct ReloadedSnapshotMessage {
+    ordinal: i64,
+    message_id: String,
+    sequence_no: i64,
+    content: String,
+    conversation_id: String,
+    life_id: String,
+    role: String,
+    has_paired_assistant: bool,
+}
+
+fn snapshot_message_is_valid(
+    message: &ReloadedSnapshotMessage,
+    expected_ordinal: i64,
+    life_id: &str,
+    conversation_id: &str,
+) -> bool {
+    message.ordinal == expected_ordinal
+        && message.conversation_id == conversation_id
+        && message.life_id == life_id
+        && message.role == "user"
+        && message.sequence_no > 0
+        && message.has_paired_assistant
+}
+
+fn snapshot_metadata_is_valid(
+    messages: &[ExtractionMessage],
+    selected_count: i64,
+    first_seq: i64,
+    last_seq: i64,
+    utf8_bytes: i64,
+    expected_hash: &str,
+) -> bool {
+    let actual_bytes: i64 = messages
+        .iter()
+        .map(|message| message.content.len() as i64)
+        .sum();
+    messages.len() as i64 == selected_count
+        && messages
+            .first()
+            .is_some_and(|message| message.sequence_no == first_seq)
+        && messages
+            .last()
+            .is_some_and(|message| message.sequence_no == last_seq)
+        && actual_bytes == utf8_bytes
+        && snapshot_hash(messages) == expected_hash
+}
+
 /// Reload and validate a snapshot from the database.
 ///
 /// Returns Ok(Some(snapshot)) if valid, Ok(None) if invalidated, or an error.
@@ -1297,14 +1349,6 @@ fn reload_and_validate_snapshot(
             turn_id,
             role,
         ) = row.map_err(|_| ExtractionError::storage())?;
-        // Validate each message
-        if msg_conversation_id != conversation_id
-            || msg_life_id != life_id
-            || role != "user"
-            || sequence_no <= 0
-        {
-            return Ok(None);
-        }
         // Check paired assistant exists
         let has_assistant: bool = tx
             .query_row(
@@ -1313,39 +1357,37 @@ fn reload_and_validate_snapshot(
                 |r| r.get(0),
             )
             .map_err(|_| ExtractionError::storage())?;
-        if !has_assistant {
-            return Ok(None);
-        }
-        // Validate ordinal is continuous
-        if ordinal != i as i64 {
-            return Ok(None);
-        }
-        actual_bytes += content.len() as i64;
-        messages.push(ExtractionMessage {
+        let message = ReloadedSnapshotMessage {
+            ordinal,
             message_id,
             sequence_no,
             content,
-        });
-    }
-    // Validate count matches
-    if messages.len() as i64 != selected_count {
-        return Ok(None);
-    }
-    // Validate sequence range
-    if let (Some(first), Some(last)) = (messages.first(), messages.last()) {
-        if first.sequence_no != first_seq || last.sequence_no != last_seq {
+            conversation_id: msg_conversation_id,
+            life_id: msg_life_id,
+            role,
+            has_paired_assistant: has_assistant,
+        };
+        if !snapshot_message_is_valid(&message, i as i64, &life_id, &conversation_id) {
             return Ok(None);
         }
+        actual_bytes += message.content.len() as i64;
+        messages.push(ExtractionMessage {
+            message_id: message.message_id,
+            sequence_no: message.sequence_no,
+            content: message.content,
+        });
     }
-    // Validate UTF-8 bytes
-    if actual_bytes != utf8_bytes {
+    if !snapshot_metadata_is_valid(
+        &messages,
+        selected_count,
+        first_seq,
+        last_seq,
+        utf8_bytes,
+        &expected_hash,
+    ) {
         return Ok(None);
     }
-    // Recompute hash
     let hash = snapshot_hash(&messages);
-    if hash != expected_hash {
-        return Ok(None);
-    }
     Ok(Some(Snapshot {
         messages,
         hash,
@@ -4690,6 +4732,18 @@ mod tests {
             )
             .unwrap();
         assert_eq!(evidence_count, 0, "failpoint rollback: no evidence");
+        let candidate_audit_count: i64 = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM candidate_memory_audit WHERE life_id=?1",
+                params![started.request.life_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            candidate_audit_count, 0,
+            "failpoint rollback: no candidate audit"
+        );
         // Run not completed
         let status: String = state
             .connection
@@ -4713,6 +4767,15 @@ mod tests {
             audit_count, 1,
             "failpoint rollback: only attempt_started audit"
         );
+        let run_count: i64 = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM candidate_extraction_run WHERE id=?1",
+                params![started.request.run_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(run_count, 1, "failpoint rollback: run count unchanged");
     }
 
     #[test]
@@ -5012,34 +5075,34 @@ mod tests {
 
     #[test]
     fn commit_uncertainty_concurrent_reconciliation() {
-        use std::sync::{Arc, Barrier};
+        use std::sync::Barrier;
         use std::thread;
 
-        let (service, root, started) = setup_extraction();
+        let (service1, root, started) = setup_extraction();
         let batch = make_batch(&started);
-        service
+        service1
             .finalize_candidate_extraction_atomic(&started, batch)
             .unwrap();
+        let service2 =
+            StorageService::initialize_with_roots(root.join("default"), Some(root.join("project")))
+                .unwrap();
 
-        let svc = Arc::new(service);
-        let barrier = Arc::new(Barrier::new(2));
+        let barrier = std::sync::Arc::new(Barrier::new(2));
         let run_id = started.request.run_id.clone();
         let attempt = started.request.attempt_sequence;
 
-        let svc1 = svc.clone();
         let b1 = barrier.clone();
         let rid1 = run_id.clone();
         let h1 = thread::spawn(move || {
             b1.wait();
-            svc1.reconcile_extraction_commit_uncertainty(&rid1, attempt)
+            service1.reconcile_extraction_commit_uncertainty(&rid1, attempt)
         });
 
-        let svc2 = svc.clone();
         let b2 = barrier.clone();
         let rid2 = run_id.clone();
         let h2 = thread::spawn(move || {
             b2.wait();
-            svc2.reconcile_extraction_commit_uncertainty(&rid2, attempt)
+            service2.reconcile_extraction_commit_uncertainty(&rid2, attempt)
         });
 
         let r1 = h1.join().unwrap().unwrap();
@@ -5709,28 +5772,95 @@ mod tests {
 
     #[test]
     fn snapshot_reload_6_role_change_invalidates() {
-        // Role change is detected by reload_and_validate_snapshot
-        // The CHECK constraint prevents setting invalid roles, so we verify
-        // the validation logic exists by checking the function signature
-        // Real role changes would require deleting and re-inserting
-        let (_service, root, _started) = setup_extraction();
-        // Just verify the service is operational
+        let (service, root, started) = setup_extraction();
+        let state = service.state().unwrap();
+        assert!(
+            state
+                .connection
+                .execute(
+                    "UPDATE conversation_message SET role='invalid' WHERE id=?1",
+                    params![started.request.messages[0].message_id],
+                )
+                .is_err(),
+            "conversation role CHECK rejects an illegal stored role"
+        );
+        drop(state);
+        let invalid = ReloadedSnapshotMessage {
+            ordinal: 0,
+            message_id: "message".into(),
+            sequence_no: 1,
+            content: "user text".into(),
+            conversation_id: started.request.conversation_id.clone(),
+            life_id: started.request.life_id.clone(),
+            role: "assistant".into(),
+            has_paired_assistant: true,
+        };
+        assert!(
+            !snapshot_message_is_valid(
+                &invalid,
+                0,
+                &started.request.life_id,
+                &started.request.conversation_id
+            ),
+            "pure reload validation rejects a synthetic non-user snapshot row"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn snapshot_reload_7_sequence_change_invalidates() {
-        // Sequence change is detected by reload_and_validate_snapshot
-        // The snapshot validates first_sequence_no and last_sequence_no
-        let (_service, root, _started) = setup_extraction();
+        let (service, root, started) = setup_extraction();
+        let state = service.state().unwrap();
+        assert!(state.connection.execute(
+            "UPDATE candidate_extraction_snapshot_message SET sequence_no=0 WHERE run_id=?1",
+            params![started.request.run_id],
+        ).is_err(), "snapshot sequence CHECK rejects zero");
+        drop(state);
+        let invalid = ReloadedSnapshotMessage {
+            ordinal: 0,
+            message_id: "message".into(),
+            sequence_no: 0,
+            content: "user text".into(),
+            conversation_id: started.request.conversation_id.clone(),
+            life_id: started.request.life_id.clone(),
+            role: "user".into(),
+            has_paired_assistant: true,
+        };
+        assert!(
+            !snapshot_message_is_valid(
+                &invalid,
+                0,
+                &started.request.life_id,
+                &started.request.conversation_id
+            ),
+            "pure reload validation rejects a synthetic non-positive sequence"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn snapshot_reload_8_child_count_mismatch_invalidates() {
-        // Child count mismatch is detected by reload_and_validate_snapshot
-        // The snapshot validates selected_message_count matches actual children
-        let (_service, root, _started) = setup_extraction();
+        let (service, root, started) = setup_extraction();
+        let state = service.state().unwrap();
+        state
+            .connection
+            .execute(
+                "DELETE FROM candidate_extraction_snapshot_message WHERE run_id=?1",
+                params![started.request.run_id],
+            )
+            .unwrap();
+        drop(state);
+        expire_lease(&service, &started.request.run_id);
+        assert!(service
+            .take_over_expired_extraction_lease(
+                "life-extraction",
+                &started.request.conversation_id,
+                &descriptor(),
+                "candidate-extraction-safety-v1",
+            )
+            .unwrap()
+            .is_none());
+        assert_snapshot_invalidated(&service, &started.request.run_id);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -5761,6 +5891,103 @@ mod tests {
     }
 
     // ════════════════════════════════════════════════════════════════════
+    #[test]
+    fn snapshot_reload_10_ordinal_schema_and_validator_reject_non_contiguous_child() {
+        let (service, root, started) = setup_extraction();
+        let state = service.state().unwrap();
+        assert!(
+            state
+                .connection
+                .execute(
+                    "UPDATE candidate_extraction_snapshot_message SET ordinal=64 WHERE run_id=?1",
+                    params![started.request.run_id],
+                )
+                .is_err(),
+            "snapshot ordinal CHECK rejects values outside the persisted range"
+        );
+        drop(state);
+        let invalid = ReloadedSnapshotMessage {
+            ordinal: 1,
+            message_id: "message".into(),
+            sequence_no: 1,
+            content: "user text".into(),
+            conversation_id: started.request.conversation_id.clone(),
+            life_id: started.request.life_id.clone(),
+            role: "user".into(),
+            has_paired_assistant: true,
+        };
+        assert!(!snapshot_message_is_valid(
+            &invalid,
+            0,
+            &started.request.life_id,
+            &started.request.conversation_id,
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn snapshot_reload_11_life_and_conversation_identity_validator_rejects_mismatch() {
+        let (_service, root, started) = setup_extraction();
+        let wrong_life = ReloadedSnapshotMessage {
+            ordinal: 0,
+            message_id: "message".into(),
+            sequence_no: 1,
+            content: "user text".into(),
+            conversation_id: started.request.conversation_id.clone(),
+            life_id: "other-life".into(),
+            role: "user".into(),
+            has_paired_assistant: true,
+        };
+        let wrong_conversation = ReloadedSnapshotMessage {
+            conversation_id: "other-conversation".into(),
+            life_id: started.request.life_id.clone(),
+            ..wrong_life.clone()
+        };
+        assert!(!snapshot_message_is_valid(
+            &wrong_life,
+            0,
+            &started.request.life_id,
+            &started.request.conversation_id,
+        ));
+        assert!(!snapshot_message_is_valid(
+            &wrong_conversation,
+            0,
+            &started.request.life_id,
+            &started.request.conversation_id,
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn snapshot_reload_12_to_15_metadata_validator_rejects_count_range_bytes_and_hash() {
+        let messages = vec![
+            ExtractionMessage {
+                message_id: "one".into(),
+                sequence_no: 1,
+                content: "a".into(),
+            },
+            ExtractionMessage {
+                message_id: "two".into(),
+                sequence_no: 2,
+                content: "界".into(),
+            },
+        ];
+        let hash = snapshot_hash(&messages);
+        assert!(snapshot_metadata_is_valid(&messages, 2, 1, 2, 4, &hash));
+        assert!(!snapshot_metadata_is_valid(&messages, 1, 1, 2, 4, &hash));
+        assert!(!snapshot_metadata_is_valid(&messages, 2, 9, 2, 4, &hash));
+        assert!(!snapshot_metadata_is_valid(&messages, 2, 1, 9, 4, &hash));
+        assert!(!snapshot_metadata_is_valid(&messages, 2, 1, 2, 3, &hash));
+        assert!(!snapshot_metadata_is_valid(
+            &messages,
+            2,
+            1,
+            2,
+            4,
+            &"0".repeat(64)
+        ));
+    }
+
     // Recovery: terminal states not operable
     // ════════════════════════════════════════════════════════════════════
 

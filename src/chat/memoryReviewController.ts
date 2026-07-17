@@ -389,6 +389,27 @@ export class MemoryReviewController {
     this.confirmedMemories = confirmedMemories;
   }
 
+  /** Reload the existing persisted candidate list after a D-7 manual trigger. */
+  async refreshCandidateRecords(): Promise<void> {
+    if (!this.memoryService.list || !this.lifeId) return;
+    const records = await this.memoryService.list({ lifeId: this.lifeId, status: "candidate" });
+    this.candidates = records.map((record) => ({
+      id: record.id,
+      kind: record.kind,
+      content: record.content,
+      summary: record.summary || "",
+      importance: record.importance,
+      confidence: record.confidence,
+      isSensitive: record.isSensitive,
+      sourceType: record.sourceType,
+      sourceCreatedAt: record.sourceCreatedAt,
+      sensitiveConsentChecked: false,
+      state: "candidateCreated" as const,
+      dbRecord: record,
+    }));
+    this.panelState = this.candidates.length > 0 ? "reviewing" : "empty";
+  }
+
   async deleteCandidate(index: number): Promise<void> {
     const candidate = this.candidates[index];
     if (!candidate) {

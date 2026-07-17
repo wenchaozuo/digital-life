@@ -18,3 +18,11 @@ export {
   type UpdateMemoryRequest,
 } from "./types";
 export * from "./extractor";
+export {
+  ManualCandidateExtractionService,
+  extractionStatusMessage,
+  manualCandidateExtractionService,
+  parseExtractionTriggerResponse,
+  type ExtractionTriggerResponse,
+  type ExtractionTriggerStatus,
+} from "./manualCandidateExtraction";

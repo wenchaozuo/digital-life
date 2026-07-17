@@ -13,7 +13,13 @@ import ConversationSidebar from "./ConversationSidebar.vue";
 import MessageBubble from "./MessageBubble.vue";
 import CandidateConfirmationDialog from "./components/CandidateConfirmationDialog.vue";
 import { MemoryReviewController } from "./memoryReviewController";
-import { memoryService, memoryExtractor } from "../memory";
+import {
+  extractionStatusMessage,
+  manualCandidateExtractionService,
+  memoryService,
+  memoryExtractor,
+  type ExtractionTriggerStatus,
+} from "../memory";
 import { useCandidateConfirmationStore } from "../stores/candidateConfirmation";
 import {
   CandidateConfirmationError,
@@ -47,6 +53,14 @@ const selectedConversationId = computed(() => conversationService.getConversatio
 const isConversationLoading = computed(() => conversationState.value === "loadingConversation");
 const isSending = computed(() => conversationState.value === "sending");
 const interactionDisabled = computed(() => isConversationLoading.value || isSending.value);
+const hasCurrentConversation = computed(() => selectedConversationId.value !== undefined);
+const manualExtractionStatus = ref<ExtractionTriggerStatus | "idle" | "loading">("idle");
+const manualExtractionNotice = ref<string>();
+const manualExtractionError = ref<string>();
+let manualExtractionGeneration = 0;
+const manualExtractionDisabled = computed(() =>
+  interactionDisabled.value || !hasCurrentConversation.value || manualExtractionStatus.value === "loading",
+);
 
 const showMemoryPanel = ref(false);
 const showUnconfirmedHint = ref(false);
@@ -341,6 +355,44 @@ async function toggleMemoryPanel() {
   }
 }
 
+async function triggerManualCandidateExtraction(): Promise<void> {
+  const conversationId = selectedConversationId.value;
+  if (!conversationId || manualExtractionDisabled.value) return;
+
+  const generation = ++manualExtractionGeneration;
+  manualExtractionStatus.value = "loading";
+  manualExtractionNotice.value = undefined;
+  manualExtractionError.value = undefined;
+  try {
+    const life = await lifeIdentityManager.getCurrent();
+    if (generation !== manualExtractionGeneration) return;
+    if (!life) {
+      manualExtractionStatus.value = "failed";
+      manualExtractionError.value = "候选记忆提取暂不可用，请稍后重试。";
+      return;
+    }
+    const response = await manualCandidateExtractionService.trigger(life.id, conversationId);
+    if (generation !== manualExtractionGeneration) return;
+    manualExtractionStatus.value = response.status;
+    manualExtractionNotice.value = extractionStatusMessage(response);
+    if (response.status === "completed") {
+      controller.setLifeId(life.id);
+      await controller.refreshCandidateRecords();
+      if (generation !== manualExtractionGeneration) return;
+      showMemoryPanel.value = true;
+    }
+  } catch {
+    if (generation !== manualExtractionGeneration) return;
+    manualExtractionStatus.value = "failed";
+    manualExtractionError.value = "候选记忆提取暂不可用，请稍后手动重试。";
+  } finally {
+    if (generation === manualExtractionGeneration && manualExtractionStatus.value === "loading") {
+      manualExtractionStatus.value = "failed";
+      manualExtractionError.value = "候选记忆提取暂不可用，请稍后手动重试。";
+    }
+  }
+}
+
 const handleClosePanel = createClosePanelHandler(controller, {
   showMemoryPanel,
   showUnconfirmedHint,
@@ -356,6 +408,7 @@ onMounted(() => {
 });
 
 onUnmounted(() => {
+  manualExtractionGeneration += 1;
   clearCancelOutcomeUnknown();
   unsubscribeMessages?.();
   unsubscribeBodyState?.();
@@ -390,6 +443,14 @@ onUnmounted(() => {
     </div>
 
     <div class="chat-actions">
+      <button
+        class="memory-check-btn"
+        type="button"
+        :disabled="manualExtractionDisabled"
+        @click="triggerManualCandidateExtraction"
+      >
+        {{ manualExtractionStatus === 'loading' ? '正在提取候选记忆...' : '从当前对话提取候选记忆' }}
+      </button>
       <button class="memory-check-btn" type="button" :disabled="interactionDisabled" @click="toggleMemoryPanel">
         检查可记忆内容
       </button>
@@ -413,6 +474,8 @@ onUnmounted(() => {
       </button>
     </section>
     <p v-if="memoryNotice" class="memory-notice" aria-live="polite">{{ memoryNotice }}</p>
+    <p v-if="manualExtractionNotice" class="memory-notice" aria-live="polite">{{ manualExtractionNotice }}</p>
+    <p v-if="manualExtractionError" class="memory-notice" role="alert">{{ manualExtractionError }}</p>
     <ChatInput :disabled="interactionDisabled" :clear-signal="clearSignal" @send="send" />
     </section>
   </main>

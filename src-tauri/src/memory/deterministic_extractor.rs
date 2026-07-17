@@ -185,7 +185,10 @@ impl DeterministicCandidateExtractor {
                             summary: None,
                             confidence: Some(0.8),
                             importance: Some(0.7),
-                            sensitivity_hint: SensitivityHint::Unknown,
+                            // The deterministic rules do not infer sensitivity. D-6 remains
+                            // the sole safety authority and blocks any sensitive content it
+                            // detects from the normalized proposal.
+                            sensitivity_hint: SensitivityHint::NotSensitive,
                             conflict_hint: false,
                             source_message_ids: vec![message_id.to_string()],
                         });
@@ -206,7 +209,9 @@ impl DeterministicCandidateExtractor {
                             summary: None,
                             confidence: Some(0.8),
                             importance: Some(0.7),
-                            sensitivity_hint: SensitivityHint::Unknown,
+                            // See the Chinese-rule branch above: D-6 performs the safety
+                            // classification after this deterministic proposal is returned.
+                            sensitivity_hint: SensitivityHint::NotSensitive,
                             conflict_hint: false,
                             source_message_ids: vec![message_id.to_string()],
                         });

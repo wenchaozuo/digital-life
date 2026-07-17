@@ -1040,6 +1040,97 @@ mod tests {
 
     use super::*;
 
+    mod extraction_error_factory_visibility {
+        use std::{future::Future, pin::Pin};
+
+        use futures::executor::block_on;
+
+        use super::super::candidate_extraction::{
+            CandidateExtractionBatch, CandidateExtractionRequest, CandidateExtractor,
+            ExtractionError, ExtractorDescriptor,
+        };
+
+        #[derive(Clone, Copy)]
+        enum FailureKind {
+            ProviderUnavailable,
+            ProviderNonrecoverable,
+            Contract,
+        }
+
+        struct SiblingExtractor {
+            descriptor: ExtractorDescriptor,
+            failure: FailureKind,
+        }
+
+        impl CandidateExtractor for SiblingExtractor {
+            fn descriptor(&self) -> &ExtractorDescriptor {
+                &self.descriptor
+            }
+
+            fn extract<'a>(
+                &'a self,
+                _request: CandidateExtractionRequest,
+            ) -> Pin<
+                Box<
+                    dyn Future<Output = Result<CandidateExtractionBatch, ExtractionError>>
+                        + Send
+                        + 'a,
+                >,
+            > {
+                let error = match self.failure {
+                    FailureKind::ProviderUnavailable => ExtractionError::provider_unavailable(),
+                    FailureKind::ProviderNonrecoverable => {
+                        ExtractionError::provider_nonrecoverable()
+                    }
+                    FailureKind::Contract => ExtractionError::contract_failure(),
+                };
+                Box::pin(async move { Err(error) })
+            }
+        }
+
+        fn request() -> CandidateExtractionRequest {
+            CandidateExtractionRequest {
+                run_id: "factory-visibility-run".into(),
+                attempt_sequence: 1,
+                life_id: "factory-visibility-life".into(),
+                conversation_id: "factory-visibility-conversation".into(),
+                conversation_revision: 1,
+                policy_version: "candidate-extraction-safety-v1".into(),
+                snapshot_hash: "0".repeat(64),
+                messages: Vec::new(),
+            }
+        }
+
+        #[test]
+        fn sibling_candidate_extractor_can_call_all_restricted_factories() {
+            for (failure, expected_code) in [
+                (
+                    FailureKind::ProviderUnavailable,
+                    "CANDIDATE_EXTRACTION_EXTRACTOR_UNAVAILABLE",
+                ),
+                (
+                    FailureKind::ProviderNonrecoverable,
+                    "CANDIDATE_EXTRACTION_PROVIDER_ERROR",
+                ),
+                (
+                    FailureKind::Contract,
+                    "CANDIDATE_EXTRACTION_EXTRACTOR_CONTRACT_FAILURE",
+                ),
+            ] {
+                let extractor = SiblingExtractor {
+                    descriptor: ExtractorDescriptor {
+                        extractor_id: "factory-visibility-extractor".into(),
+                        extractor_version: "1".into(),
+                    },
+                    failure,
+                };
+                assert_eq!(extractor.descriptor().extractor_version, "1");
+                let error = block_on(extractor.extract(request())).unwrap_err();
+                assert_eq!(error.code, expected_code);
+            }
+        }
+    }
+
     struct TestRoot(PathBuf);
 
     impl TestRoot {

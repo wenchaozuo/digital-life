@@ -154,13 +154,16 @@ fn check_finalize_failpoint(_expected: u8) -> Result<(), ExtractionError> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExtractionErrorReason {
     Other,
+    ProviderUnavailable,
+    ProviderNonrecoverable,
+    ContractFailure,
     CommitOutcomeUncertain,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ExtractionError {
-    pub code: &'static str,
-    pub recoverable: bool,
+    pub(super) code: &'static str,
+    recoverable: bool,
     reason: ExtractionErrorReason,
 }
 
@@ -172,6 +175,40 @@ impl ExtractionError {
             reason: ExtractionErrorReason::Other,
         }
     }
+
+    /// A transient provider failure which may use D-6's bounded retry path.
+    ///
+    /// This zero-argument factory deliberately cannot carry provider response
+    /// data, endpoints, credentials, or an arbitrary error chain into D-6.
+    pub(crate) const fn provider_unavailable() -> Self {
+        Self {
+            code: "CANDIDATE_EXTRACTION_EXTRACTOR_UNAVAILABLE",
+            recoverable: true,
+            reason: ExtractionErrorReason::ProviderUnavailable,
+        }
+    }
+
+    /// A provider failure which must terminate without another extraction.
+    ///
+    /// The fixed safe code prevents authentication or invalid-request details
+    /// from being persisted or exposed by `Debug` output.
+    pub(crate) const fn provider_nonrecoverable() -> Self {
+        Self {
+            code: "CANDIDATE_EXTRACTION_PROVIDER_ERROR",
+            recoverable: false,
+            reason: ExtractionErrorReason::ProviderNonrecoverable,
+        }
+    }
+
+    /// An extractor/provider response contract failure which is not retryable.
+    pub(crate) const fn contract_failure() -> Self {
+        Self {
+            code: "CANDIDATE_EXTRACTION_EXTRACTOR_CONTRACT_FAILURE",
+            recoverable: false,
+            reason: ExtractionErrorReason::ContractFailure,
+        }
+    }
+
     const fn storage() -> Self {
         Self::new("CANDIDATE_EXTRACTION_STORAGE_UNAVAILABLE", true)
     }
@@ -186,6 +223,48 @@ impl ExtractionError {
 
     const fn is_commit_outcome_uncertain(&self) -> bool {
         matches!(self.reason, ExtractionErrorReason::CommitOutcomeUncertain)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ExtractionAttemptFailure {
+    safe_error_code: &'static str,
+    retryable: bool,
+}
+
+impl ExtractionAttemptFailure {
+    const fn retryable(safe_error_code: &'static str) -> Self {
+        Self {
+            safe_error_code,
+            retryable: true,
+        }
+    }
+
+    const fn from_extractor(error: ExtractionError) -> Self {
+        let safe_error_code = match error.reason {
+            ExtractionErrorReason::ProviderUnavailable => {
+                "CANDIDATE_EXTRACTION_EXTRACTOR_UNAVAILABLE"
+            }
+            ExtractionErrorReason::ProviderNonrecoverable => "CANDIDATE_EXTRACTION_PROVIDER_ERROR",
+            ExtractionErrorReason::ContractFailure => {
+                "CANDIDATE_EXTRACTION_EXTRACTOR_CONTRACT_FAILURE"
+            }
+            ExtractionErrorReason::Other => error.code,
+            // Commit uncertainty is minted only by D-6 finalize. If it is ever
+            // returned from an extractor, fail closed instead of entering either
+            // the retry or reconciliation path.
+            ExtractionErrorReason::CommitOutcomeUncertain => {
+                "CANDIDATE_EXTRACTION_EXTRACTOR_CONTRACT_FAILURE"
+            }
+        };
+        let retryable = match error.reason {
+            ExtractionErrorReason::CommitOutcomeUncertain => false,
+            _ => error.recoverable,
+        };
+        Self {
+            safe_error_code,
+            retryable,
+        }
     }
 }
 
@@ -543,27 +622,33 @@ impl StorageService {
                     return CandidateExtractionAttemptOutcome::StaleAttempt;
                 }
                 Some(ExtractionCancellationReason::Shutdown) => {
-                    break Err("CANDIDATE_EXTRACTION_CANCELLED_SHUTDOWN");
+                    break Err(ExtractionAttemptFailure::retryable(
+                        "CANDIDATE_EXTRACTION_CANCELLED_SHUTDOWN",
+                    ));
                 }
                 Some(ExtractionCancellationReason::InternalRequest) => {
-                    break Err("CANDIDATE_EXTRACTION_CANCELLED_INTERNAL_REQUEST");
+                    break Err(ExtractionAttemptFailure::retryable(
+                        "CANDIDATE_EXTRACTION_CANCELLED_INTERNAL_REQUEST",
+                    ));
                 }
                 None => {}
             }
             if Instant::now() >= deadline {
                 // Leaving this scope drops the still-pending future.
-                break Err("CANDIDATE_EXTRACTION_TIMEOUT");
+                break Err(ExtractionAttemptFailure::retryable(
+                    "CANDIDATE_EXTRACTION_TIMEOUT",
+                ));
             }
             match Pin::new(&mut future).poll(&mut context) {
                 Poll::Ready(Ok(Ok(batch))) => break Ok(batch),
                 Poll::Ready(Ok(Err(error))) => {
-                    break Err(if error.recoverable {
-                        "CANDIDATE_EXTRACTION_EXTRACTOR_UNAVAILABLE"
-                    } else {
-                        "CANDIDATE_EXTRACTION_EXTRACTOR_CONTRACT_FAILURE"
-                    });
+                    break Err(ExtractionAttemptFailure::from_extractor(error));
                 }
-                Poll::Ready(Err(_)) => break Err("CANDIDATE_EXTRACTION_EXTRACTOR_PANIC"),
+                Poll::Ready(Err(_)) => {
+                    break Err(ExtractionAttemptFailure::retryable(
+                        "CANDIDATE_EXTRACTION_EXTRACTOR_PANIC",
+                    ));
+                }
                 Poll::Pending => std::thread::sleep(Duration::from_millis(1)),
             }
         };
@@ -583,12 +668,18 @@ impl StorageService {
                 // never remapped as extractor panics or provider failures.
                 Err(_) => CandidateExtractionAttemptOutcome::StorageFailure,
             },
-            Err(code) => {
+            Err(failure) => {
                 if cancellation.reason() == Some(ExtractionCancellationReason::StaleAttempt) {
                     return CandidateExtractionAttemptOutcome::StaleAttempt;
                 }
-                match self.fail_candidate_extraction_attempt(started, code, true) {
-                    Ok(()) if started.request.attempt_sequence < MAX_ATTEMPTS => {
+                match self.fail_candidate_extraction_attempt(
+                    started,
+                    failure.safe_error_code,
+                    failure.retryable,
+                ) {
+                    Ok(())
+                        if failure.retryable && started.request.attempt_sequence < MAX_ATTEMPTS =>
+                    {
                         CandidateExtractionAttemptOutcome::RetryScheduled
                     }
                     Ok(()) => CandidateExtractionAttemptOutcome::TerminalFailed,
@@ -2807,7 +2898,51 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum FactoryFailure {
+        ProviderUnavailable,
+        ProviderNonrecoverable,
+        Contract,
+    }
+
+    struct FactoryFailingExtractor {
+        descriptor: ExtractorDescriptor,
+        failure: FactoryFailure,
+        call_count: Arc<AtomicU8>,
+    }
+
+    impl CandidateExtractor for FactoryFailingExtractor {
+        fn descriptor(&self) -> &ExtractorDescriptor {
+            &self.descriptor
+        }
+
+        fn extract<'a>(
+            &'a self,
+            _request: CandidateExtractionRequest,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<CandidateExtractionBatch, ExtractionError>> + Send + 'a>,
+        > {
+            self.call_count.fetch_add(1, Ordering::Relaxed);
+            let error = match self.failure {
+                FactoryFailure::ProviderUnavailable => ExtractionError::provider_unavailable(),
+                FactoryFailure::ProviderNonrecoverable => {
+                    ExtractionError::provider_nonrecoverable()
+                }
+                FactoryFailure::Contract => ExtractionError::contract_failure(),
+            };
+            Box::pin(async move { Err(error) })
+        }
+    }
+
     fn start_for_orchestrator(service: &StorageService, id: &str) -> StartedExtraction {
+        start_for_orchestrator_with_user_content(service, id, "selected user text")
+    }
+
+    fn start_for_orchestrator_with_user_content(
+        service: &StorageService,
+        id: &str,
+        user_content: &str,
+    ) -> StartedExtraction {
         let conversation = service
             .create_conversation(
                 id,
@@ -2822,7 +2957,7 @@ mod tests {
                 life_id: "life-extraction".into(),
                 conversation_id: conversation.id.clone(),
                 turn_id: format!("{id}-turn"),
-                user_content: "selected user text".into(),
+                user_content: user_content.into(),
                 assistant_content: "selected assistant text".into(),
                 expected_revision: Some(0),
             })
@@ -2838,6 +2973,20 @@ mod tests {
             .unwrap()
     }
 
+    fn claim_due_retry(
+        service: &StorageService,
+        conversation_id: &str,
+    ) -> Option<StartedExtraction> {
+        service
+            .claim_due_extraction_retry(
+                "life-extraction",
+                conversation_id,
+                &descriptor(),
+                "candidate-extraction-safety-v1",
+            )
+            .unwrap()
+    }
+
     fn extraction_run_state(service: &StorageService, run_id: &str) -> (String, Option<String>) {
         let state = service.state().unwrap();
         state
@@ -2848,6 +2997,240 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn restricted_extraction_error_factories_have_fixed_safe_dispositions() {
+        let provider_unavailable = ExtractionError::provider_unavailable();
+        let provider_nonrecoverable = ExtractionError::provider_nonrecoverable();
+        let contract_failure = ExtractionError::contract_failure();
+
+        assert_eq!(
+            provider_unavailable.code,
+            "CANDIDATE_EXTRACTION_EXTRACTOR_UNAVAILABLE"
+        );
+        assert!(provider_unavailable.recoverable);
+        assert_eq!(
+            provider_unavailable.reason,
+            ExtractionErrorReason::ProviderUnavailable
+        );
+        assert_eq!(
+            provider_nonrecoverable.code,
+            "CANDIDATE_EXTRACTION_PROVIDER_ERROR"
+        );
+        assert!(!provider_nonrecoverable.recoverable);
+        assert_eq!(
+            provider_nonrecoverable.reason,
+            ExtractionErrorReason::ProviderNonrecoverable
+        );
+        assert_eq!(
+            contract_failure.code,
+            "CANDIDATE_EXTRACTION_EXTRACTOR_CONTRACT_FAILURE"
+        );
+        assert!(!contract_failure.recoverable);
+        assert_eq!(
+            contract_failure.reason,
+            ExtractionErrorReason::ContractFailure
+        );
+
+        let mut attempted_code_injection = ExtractionError::provider_nonrecoverable();
+        attempted_code_injection.code = "provider-body-canary-D8A-R1";
+        let mapped = ExtractionAttemptFailure::from_extractor(attempted_code_injection);
+        assert_eq!(
+            mapped.safe_error_code,
+            "CANDIDATE_EXTRACTION_PROVIDER_ERROR"
+        );
+        assert!(!mapped.retryable);
+
+        let debug =
+            format!("{provider_unavailable:?}|{provider_nonrecoverable:?}|{contract_failure:?}");
+        for canary in [
+            "api-key-canary-D8A-R1",
+            "Authorization: Bearer auth-canary-D8A-R1",
+            "provider-body-canary-D8A-R1",
+            "url-query-canary-D8A-R1",
+            "conversation-body-canary-D8A-R1",
+        ] {
+            assert!(!debug.contains(canary));
+        }
+    }
+
+    #[test]
+    fn recoverable_provider_failure_uses_due_retry_claim_and_stops_at_three_attempts() {
+        let (service, root) = service();
+        let mut started = start_for_orchestrator(&service, "recoverable-provider-failure");
+        let run_id = started.request.run_id.clone();
+        let conversation_id = started.request.conversation_id.clone();
+        let call_count = Arc::new(AtomicU8::new(0));
+        let extractor = FactoryFailingExtractor {
+            descriptor: descriptor(),
+            failure: FactoryFailure::ProviderUnavailable,
+            call_count: call_count.clone(),
+        };
+
+        for attempt in 1..=MAX_ATTEMPTS {
+            assert_eq!(started.request.attempt_sequence, attempt);
+            let outcome = service.run_candidate_extraction_attempt(
+                &extractor,
+                &started,
+                &ExtractionCancellation::new(),
+                None,
+            );
+            if attempt < MAX_ATTEMPTS {
+                assert_eq!(outcome, CandidateExtractionAttemptOutcome::RetryScheduled);
+                assert_eq!(
+                    extraction_run_state(&service, &run_id),
+                    (
+                        "retry_wait".into(),
+                        Some("CANDIDATE_EXTRACTION_EXTRACTOR_UNAVAILABLE".into())
+                    )
+                );
+                make_retry_due(&service, &run_id);
+                started = claim_due_retry(&service, &conversation_id)
+                    .expect("the existing claim API must claim a due recoverable retry");
+            } else {
+                assert_eq!(outcome, CandidateExtractionAttemptOutcome::TerminalFailed);
+                assert_eq!(
+                    extraction_run_state(&service, &run_id),
+                    (
+                        "failed".into(),
+                        Some("CANDIDATE_EXTRACTION_EXTRACTOR_UNAVAILABLE".into())
+                    )
+                );
+            }
+        }
+
+        assert_eq!(call_count.load(Ordering::Relaxed), MAX_ATTEMPTS as u8);
+        assert!(claim_due_retry(&service, &conversation_id).is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn nonrecoverable_provider_failure_is_terminal_and_cannot_be_claimed() {
+        let (service, root) = service();
+        let started = start_for_orchestrator(&service, "nonrecoverable-provider-failure");
+        let run_id = started.request.run_id.clone();
+        let conversation_id = started.request.conversation_id.clone();
+        let call_count = Arc::new(AtomicU8::new(0));
+        let extractor = FactoryFailingExtractor {
+            descriptor: descriptor(),
+            failure: FactoryFailure::ProviderNonrecoverable,
+            call_count: call_count.clone(),
+        };
+
+        assert_eq!(
+            service.run_candidate_extraction_attempt(
+                &extractor,
+                &started,
+                &ExtractionCancellation::new(),
+                None,
+            ),
+            CandidateExtractionAttemptOutcome::TerminalFailed
+        );
+        assert_eq!(
+            extraction_run_state(&service, &run_id),
+            (
+                "failed".into(),
+                Some("CANDIDATE_EXTRACTION_PROVIDER_ERROR".into())
+            )
+        );
+        assert!(claim_due_retry(&service, &conversation_id).is_none());
+        assert_eq!(call_count.load(Ordering::Relaxed), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn contract_failure_is_terminal_and_cannot_be_claimed() {
+        let (service, root) = service();
+        let started = start_for_orchestrator(&service, "extractor-contract-failure");
+        let run_id = started.request.run_id.clone();
+        let conversation_id = started.request.conversation_id.clone();
+        let call_count = Arc::new(AtomicU8::new(0));
+        let extractor = FactoryFailingExtractor {
+            descriptor: descriptor(),
+            failure: FactoryFailure::Contract,
+            call_count: call_count.clone(),
+        };
+
+        assert_eq!(
+            service.run_candidate_extraction_attempt(
+                &extractor,
+                &started,
+                &ExtractionCancellation::new(),
+                None,
+            ),
+            CandidateExtractionAttemptOutcome::TerminalFailed
+        );
+        assert_eq!(
+            extraction_run_state(&service, &run_id),
+            (
+                "failed".into(),
+                Some("CANDIDATE_EXTRACTION_EXTRACTOR_CONTRACT_FAILURE".into())
+            )
+        );
+        assert!(claim_due_retry(&service, &conversation_id).is_none());
+        assert_eq!(call_count.load(Ordering::Relaxed), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn extractor_failure_debug_and_durable_error_records_exclude_canaries() {
+        let canaries = [
+            "api-key-canary-D8A-R1",
+            "Authorization: Bearer auth-canary-D8A-R1",
+            "provider-body-canary-D8A-R1",
+            "https://provider.invalid/v1?secret=url-query-canary-D8A-R1",
+            "conversation-body-canary-D8A-R1",
+        ];
+        let user_content = canaries.join(" | ");
+        let (service, root) = service();
+        let started = start_for_orchestrator_with_user_content(
+            &service,
+            "extractor-error-canaries",
+            &user_content,
+        );
+        let run_id = started.request.run_id.clone();
+        let extractor = FactoryFailingExtractor {
+            descriptor: descriptor(),
+            failure: FactoryFailure::ProviderNonrecoverable,
+            call_count: Arc::new(AtomicU8::new(0)),
+        };
+
+        assert_eq!(
+            service.run_candidate_extraction_attempt(
+                &extractor,
+                &started,
+                &ExtractionCancellation::new(),
+                None,
+            ),
+            CandidateExtractionAttemptOutcome::TerminalFailed
+        );
+        let run_record = extraction_run_state(&service, &run_id);
+        let audit_record: String = {
+            let state = service.state().unwrap();
+            state
+                .connection
+                .query_row(
+                    "SELECT COALESCE(group_concat(event || ':' || COALESCE(safe_error_code, ''), '|'), '') FROM candidate_extraction_audit WHERE run_id=?1",
+                    params![run_id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let persisted_error_record = format!("{run_record:?}|{audit_record}");
+        let debug = format!("{:?}", ExtractionError::provider_nonrecoverable());
+        for canary in canaries {
+            assert!(!debug.contains(canary));
+            assert!(!persisted_error_record.contains(canary));
+        }
+        assert_eq!(
+            run_record,
+            (
+                "failed".into(),
+                Some("CANDIDATE_EXTRACTION_PROVIDER_ERROR".into())
+            )
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -6625,6 +7008,41 @@ mod tests {
     // ════════════════════════════════════════════════════════════════════
     // C. Committed-But-Response-Uncertain Tests
     // ════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn commit_uncertainty_reconciliation_does_not_call_extractor_again() {
+        let (service, root, started) = setup_extraction();
+        let call_count = std::sync::atomic::AtomicUsize::new(0);
+        let extractor = CountingExtractor {
+            descriptor: descriptor(),
+            poll_count: &call_count,
+        };
+        set_finalize_failpoint(Some(FinalizeFailpoint::PostCommitResponseUncertain));
+
+        let identity = match service.run_candidate_extraction_attempt(
+            &extractor,
+            &started,
+            &ExtractionCancellation::new(),
+            None,
+        ) {
+            CandidateExtractionAttemptOutcome::CommitOutcomeUncertain(identity) => identity,
+            other => panic!("expected commit uncertainty, got {other:?}"),
+        };
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        assert!(matches!(
+            service
+                .reconcile_candidate_extraction_attempt_uncertainty(identity)
+                .unwrap(),
+            CommitReconciliationResult::Completed { .. }
+        ));
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "reconciliation must not invoke the extractor"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn post_commit_uncertain_data_actually_persisted() {

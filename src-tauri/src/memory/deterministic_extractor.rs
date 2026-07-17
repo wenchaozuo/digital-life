@@ -197,8 +197,7 @@ impl DeterministicCandidateExtractor {
             // Check English markers
             for marker in rule.markers_en {
                 if let Some(extracted) = Self::extract_after_marker(content, marker) {
-                    let cleaned = extracted
-                        .trim_end_matches(['.', ',', '!', ';']);
+                    let cleaned = extracted.trim_end_matches(['.', ',', '!', ';']);
                     if !cleaned.is_empty() && cleaned.len() >= 2 {
                         proposals.push(CandidateExtractionProposal {
                             action: ProposalAction::Propose,

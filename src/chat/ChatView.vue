@@ -373,11 +373,21 @@ async function triggerManualCandidateExtraction(): Promise<void> {
     }
     const response = await manualCandidateExtractionService.trigger(life.id, conversationId);
     if (generation !== manualExtractionGeneration) return;
+
+    // Set extraction status - this is authoritative from the backend
     manualExtractionStatus.value = response.status;
     manualExtractionNotice.value = extractionStatusMessage(response);
+
+    // Try to refresh candidate list, but don't let refresh failure overwrite success
     if (response.status === "completed") {
       controller.setLifeId(life.id);
-      await controller.refreshCandidateRecords();
+      try {
+        await controller.refreshCandidateRecords();
+      } catch {
+        // Refresh failure - show warning but keep completed status
+        if (generation !== manualExtractionGeneration) return;
+        manualExtractionError.value = "候选记忆已提取，但列表刷新失败，请稍后重新打开或刷新。";
+      }
       if (generation !== manualExtractionGeneration) return;
       showMemoryPanel.value = true;
     }

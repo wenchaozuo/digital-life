@@ -97,11 +97,26 @@ pub(crate) fn trigger_deterministic_candidate_extraction(
     };
 
     let cancellation = ExtractionCancellation::new();
-    match storage.run_candidate_extraction_attempt(&extractor, &started, &cancellation, None) {
+    let outcome =
+        storage.run_candidate_extraction_attempt(&extractor, &started, &cancellation, None);
+
+    match outcome {
         CandidateExtractionAttemptOutcome::Completed => {
+            // Success - read authoritative state
             read_existing_run(storage, life_id, conversation_id)?
                 .map(response_from_existing)
                 .ok_or_else(storage_unavailable)
+        }
+        CandidateExtractionAttemptOutcome::StorageFailure => {
+            // HIGH-1: StorageFailure could be due to commit uncertainty.
+            // Try to read the authoritative state - if the run is completed,
+            // the commit succeeded even though the response was uncertain.
+            if let Some(existing) = read_existing_run(storage, life_id, conversation_id)? {
+                if existing.status == ExtractionTriggerStatus::Completed {
+                    return Ok(response_from_existing(existing));
+                }
+            }
+            Err(storage_unavailable())
         }
         CandidateExtractionAttemptOutcome::RetryScheduled => {
             Ok(simple_response(ExtractionTriggerStatus::RetryWait))
@@ -112,7 +127,6 @@ pub(crate) fn trigger_deterministic_candidate_extraction(
         CandidateExtractionAttemptOutcome::StaleAttempt => {
             Ok(simple_response(ExtractionTriggerStatus::StaleOrConflict))
         }
-        CandidateExtractionAttemptOutcome::StorageFailure => Err(storage_unavailable()),
     }
 }
 
@@ -415,6 +429,48 @@ mod tests {
         ] {
             assert!(!exposed.to_lowercase().contains(forbidden));
         }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn storage_failure_with_completed_run_returns_completed() {
+        // This tests the HIGH-1 fix: when StorageFailure occurs due to commit
+        // uncertainty, but the run is actually completed, we should return completed.
+        let (storage, root) = setup();
+        let conversation_id = create_conversation(&storage, "conv-uncertain");
+        append_turn(&storage, &conversation_id, 0, "turn-1", "我喜欢喝茶");
+
+        // First, complete a successful extraction
+        let response1 =
+            trigger_deterministic_candidate_extraction(&storage, "life-d7", &conversation_id)
+                .unwrap();
+        assert_eq!(response1.status, ExtractionTriggerStatus::Completed);
+        assert_eq!(response1.created_count, Some(1));
+
+        // Now trigger again - should return existing completed run
+        let response2 =
+            trigger_deterministic_candidate_extraction(&storage, "life-d7", &conversation_id)
+                .unwrap();
+        assert_eq!(response2.status, ExtractionTriggerStatus::Completed);
+        assert_eq!(response2.created_count, Some(1));
+
+        // Verify no duplicate data
+        let state = storage.state().unwrap();
+        let run_count: i64 = state
+            .connection
+            .query_row("SELECT COUNT(*) FROM candidate_extraction_run", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let candidate_count: i64 = state
+            .connection
+            .query_row("SELECT COUNT(*) FROM candidate_memory", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(run_count, 1);
+        assert_eq!(candidate_count, 1);
+        drop(state);
         let _ = fs::remove_dir_all(root);
     }
 }

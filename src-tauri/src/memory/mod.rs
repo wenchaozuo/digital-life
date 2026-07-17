@@ -12,6 +12,8 @@ pub mod candidate;
 pub mod candidate_confirmation_commands;
 pub mod candidate_service;
 pub mod context_builder;
+pub mod deterministic_extractor;
+pub mod extraction_commands;
 pub mod management;
 pub mod retrieval;
 pub mod retrieval_router;

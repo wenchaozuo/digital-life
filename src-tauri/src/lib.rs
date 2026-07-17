@@ -55,6 +55,7 @@ pub fn run() {
             memory::candidate_confirmation_commands::prepare_candidate_confirmation,
             memory::candidate_confirmation_commands::confirm_candidate_memory,
             memory::candidate_confirmation_commands::cancel_candidate_confirmation_approval,
+            memory::extraction_commands::extract_candidate_memories,
             memory::management::list_managed_memories,
             memory::management::get_managed_memory,
             memory::management::list_memory_revisions,

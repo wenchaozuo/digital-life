@@ -274,6 +274,16 @@ impl StartedExtraction {
     fn fence(&self) -> &ExtractionFence {
         &self.fence
     }
+
+    /// Get the run ID (public accessor for command layer).
+    pub(crate) fn run_id(&self) -> &str {
+        &self.request.run_id
+    }
+
+    /// Get the attempt sequence (public accessor for command layer).
+    pub(crate) fn attempt_sequence(&self) -> i64 {
+        self.request.attempt_sequence
+    }
 }
 
 impl std::fmt::Debug for StartedExtraction {

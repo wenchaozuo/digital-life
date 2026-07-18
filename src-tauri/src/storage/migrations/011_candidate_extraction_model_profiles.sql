@@ -40,6 +40,7 @@ CREATE TABLE model_profile_011 (
 );
 
 INSERT INTO model_profile_011 (
+    rowid,
     id,
     purpose,
     provider_kind,
@@ -53,6 +54,7 @@ INSERT INTO model_profile_011 (
     updated_at
 )
 SELECT
+    rowid,
     id,
     purpose,
     provider_kind,
@@ -67,12 +69,13 @@ SELECT
 FROM model_profile;
 
 CREATE TABLE active_model_profile_011 (
+    source_rowid INTEGER NOT NULL,
     purpose TEXT PRIMARY KEY CHECK (purpose IN ('chat', 'embedding', 'candidate_extraction')),
     profile_id TEXT NOT NULL
 );
 
-INSERT INTO active_model_profile_011 (purpose, profile_id)
-SELECT purpose, profile_id
+INSERT INTO active_model_profile_011 (source_rowid, purpose, profile_id)
+SELECT rowid, purpose, profile_id
 FROM active_model_profile;
 
 DROP TABLE active_model_profile;
@@ -91,8 +94,8 @@ CREATE TABLE active_model_profile (
         ON DELETE CASCADE
 );
 
-INSERT INTO active_model_profile (purpose, profile_id)
-SELECT purpose, profile_id
+INSERT INTO active_model_profile (rowid, purpose, profile_id)
+SELECT source_rowid, purpose, profile_id
 FROM active_model_profile_011;
 
 DROP TABLE active_model_profile_011;

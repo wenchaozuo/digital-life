@@ -1146,4 +1146,268 @@ mod tests {
         assert!(!json.contains("credential"));
         assert!(!json.contains("secret"));
     }
+
+    #[test]
+    fn migration_011_preserves_rowid_with_model_profile_delete_holes() {
+        let root = TestRoot::new("migration-011-rowid-profile-hole");
+        let data_root = root.0.join("data");
+        let connection = create_schema_10(&data_root);
+
+        // 1. Insert 3 profiles in schema 10
+        connection
+            .execute(
+                "INSERT INTO model_profile (
+                    id, purpose, provider_kind, display_name, base_url, model_name,
+                    temperature, max_tokens, embedding_dimension, created_at, updated_at
+                 ) VALUES (
+                    'profile-1', 'chat', 'openai_compatible', 'Profile 1',
+                    'https://chat.example.invalid/v1', 'chat-model', 0.7, 4096, NULL,
+                    '2026-07-18T01:00:00.000Z', '2026-07-18T01:00:00.000Z'
+                 )",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO model_profile (
+                    id, purpose, provider_kind, display_name, base_url, model_name,
+                    temperature, max_tokens, embedding_dimension, created_at, updated_at
+                 ) VALUES (
+                    'profile-2', 'chat', 'openai_compatible', 'Profile 2',
+                    'https://chat.example.invalid/v1', 'chat-model', 0.7, 4096, NULL,
+                    '2026-07-18T01:00:00.000Z', '2026-07-18T01:00:00.000Z'
+                 )",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO model_profile (
+                    id, purpose, provider_kind, display_name, base_url, model_name,
+                    temperature, max_tokens, embedding_dimension, created_at, updated_at
+                 ) VALUES (
+                    'profile-3', 'embedding', 'openai_compatible', 'Profile 3',
+                    'https://embedding.example.invalid/v1', 'embedding-model', NULL, NULL, 1536,
+                    '2026-07-18T01:00:00.000Z', '2026-07-18T01:00:00.000Z'
+                 )",
+                [],
+            )
+            .unwrap();
+
+        // 2. Verify rowids
+        let rowids_before: Vec<(i64, String)> = connection
+            .prepare("SELECT rowid, id FROM model_profile ORDER BY rowid")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            rowids_before,
+            vec![
+                (1, "profile-1".to_string()),
+                (2, "profile-2".to_string()),
+                (3, "profile-3".to_string())
+            ]
+        );
+
+        // 3. Delete the first one to create a hole at rowid=1
+        connection
+            .execute("DELETE FROM model_profile WHERE id = 'profile-1'", [])
+            .unwrap();
+
+        // 4. Verify remaining rowids (they should still be 2 and 3, not renumbered)
+        let rowids_after_delete: Vec<(i64, String)> = connection
+            .prepare("SELECT rowid, id FROM model_profile ORDER BY rowid")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            rowids_after_delete,
+            vec![(2, "profile-2".to_string()), (3, "profile-3".to_string())]
+        );
+
+        // Record other fields
+        let details_before = profile_rows(&connection);
+
+        drop(connection);
+
+        // 5. Run migration 11 by initializing storage service
+        let storage = StorageService::initialize_with_roots(data_root, None).unwrap();
+        let state = storage.state().unwrap();
+
+        // 6. Verify rowids after migration
+        let rowids_after_migration: Vec<(i64, String)> = state
+            .connection
+            .prepare("SELECT rowid, id FROM model_profile ORDER BY rowid")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        // They must remain exactly 2 and 3!
+        assert_eq!(
+            rowids_after_migration,
+            vec![(2, "profile-2".to_string()), (3, "profile-3".to_string())]
+        );
+
+        // Verify other fields
+        let details_after = profile_rows(&state.connection);
+        assert_eq!(details_after, details_before);
+
+        let version: i64 = state
+            .connection
+            .query_row("SELECT MAX(version) FROM schema_migration", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 11);
+    }
+
+    #[test]
+    fn migration_011_preserves_rowid_with_active_model_profile_delete_holes() {
+        let root = TestRoot::new("migration-011-rowid-active-hole");
+        let data_root = root.0.join("data");
+        let connection = create_schema_10(&data_root);
+
+        // 1. Create profiles for foreign keys
+        connection
+            .execute(
+                "INSERT INTO model_profile (
+                    id, purpose, provider_kind, display_name, base_url, model_name,
+                    temperature, max_tokens, embedding_dimension, created_at, updated_at
+                 ) VALUES (
+                    'chat-prof', 'chat', 'openai_compatible', 'Chat Prof',
+                    'https://chat.example.invalid/v1', 'chat-model', 0.7, 4096, NULL,
+                    '2026-07-18T01:00:00.000Z', '2026-07-18T01:00:00.000Z'
+                 )",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO model_profile (
+                    id, purpose, provider_kind, display_name, base_url, model_name,
+                    temperature, max_tokens, embedding_dimension, created_at, updated_at
+                 ) VALUES (
+                    'embed-prof', 'embedding', 'openai_compatible', 'Embed Prof',
+                    'https://embedding.example.invalid/v1', 'embedding-model', NULL, NULL, 1536,
+                    '2026-07-18T01:00:00.000Z', '2026-07-18T01:00:00.000Z'
+                 )",
+                [],
+            )
+            .unwrap();
+
+        // 2. Create active mappings
+        connection
+            .execute(
+                "INSERT INTO active_model_profile (purpose, profile_id) VALUES ('chat', 'chat-prof')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO active_model_profile (purpose, profile_id) VALUES ('embedding', 'embed-prof')",
+                [],
+            )
+            .unwrap();
+
+        let rowids_before: Vec<(i64, String, String)> = connection
+            .prepare("SELECT rowid, purpose, profile_id FROM active_model_profile ORDER BY rowid")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            rowids_before,
+            vec![
+                (1, "chat".to_string(), "chat-prof".to_string()),
+                (2, "embedding".to_string(), "embed-prof".to_string())
+            ]
+        );
+
+        // 3. Delete the first active mapping
+        connection
+            .execute(
+                "DELETE FROM active_model_profile WHERE purpose = 'chat'",
+                [],
+            )
+            .unwrap();
+
+        let rowids_after_delete: Vec<(i64, String, String)> = connection
+            .prepare("SELECT rowid, purpose, profile_id FROM active_model_profile ORDER BY rowid")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            rowids_after_delete,
+            vec![(2, "embedding".to_string(), "embed-prof".to_string())]
+        );
+
+        // 4. Re-create the chat mapping to ensure we have a rowid other than 1 and 2
+        connection
+            .execute(
+                "INSERT INTO active_model_profile (purpose, profile_id) VALUES ('chat', 'chat-prof')",
+                [],
+            )
+            .unwrap();
+
+        let rowids_after_recreate: Vec<(i64, String, String)> = connection
+            .prepare("SELECT rowid, purpose, profile_id FROM active_model_profile ORDER BY rowid")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            rowids_after_recreate,
+            vec![
+                (2, "embedding".to_string(), "embed-prof".to_string()),
+                (3, "chat".to_string(), "chat-prof".to_string())
+            ]
+        );
+
+        let details_before = active_rows(&connection);
+
+        drop(connection);
+
+        // 5. Run migration 11 by initializing storage service
+        let storage = StorageService::initialize_with_roots(data_root, None).unwrap();
+        let state = storage.state().unwrap();
+
+        // 6. Verify rowids after migration
+        let rowids_after_migration: Vec<(i64, String, String)> = state
+            .connection
+            .prepare("SELECT rowid, purpose, profile_id FROM active_model_profile ORDER BY rowid")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        // They must remain exactly 2 and 3!
+        assert_eq!(
+            rowids_after_migration,
+            vec![
+                (2, "embedding".to_string(), "embed-prof".to_string()),
+                (3, "chat".to_string(), "chat-prof".to_string())
+            ]
+        );
+
+        // Verify other fields
+        let details_after = active_rows(&state.connection);
+        assert_eq!(details_after, details_before);
+
+        let version: i64 = state
+            .connection
+            .query_row("SELECT MAX(version) FROM schema_migration", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 11);
+    }
 }

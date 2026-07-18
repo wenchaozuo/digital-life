@@ -1126,7 +1126,7 @@ mod tests {
                 };
                 assert_eq!(extractor.descriptor().extractor_version, "1");
                 let error = block_on(extractor.extract(request())).unwrap_err();
-                assert_eq!(error.code, expected_code);
+                assert_eq!(error.code(), expected_code);
             }
         }
     }

@@ -95,7 +95,7 @@ pub(crate) fn trigger_deterministic_candidate_extraction(
     ) {
         Ok(Some(started)) => started,
         Ok(None) => return Ok(simple_response(ExtractionTriggerStatus::NoEligibleSnapshot)),
-        Err(error) => return Err(map_start_error(error.code)),
+        Err(error) => return Err(map_start_error(error.code())),
     };
 
     let cancellation = ExtractionCancellation::new();

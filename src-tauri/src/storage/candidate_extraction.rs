@@ -162,7 +162,7 @@ enum ExtractionErrorReason {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ExtractionError {
-    pub(super) code: &'static str,
+    code: &'static str,
     recoverable: bool,
     reason: ExtractionErrorReason,
 }
@@ -207,6 +207,10 @@ impl ExtractionError {
             recoverable: false,
             reason: ExtractionErrorReason::ContractFailure,
         }
+    }
+
+    pub(super) const fn code(&self) -> &'static str {
+        self.code
     }
 
     const fn storage() -> Self {
@@ -3033,6 +3037,8 @@ mod tests {
             ExtractionErrorReason::ContractFailure
         );
 
+        // Defense in depth inside D-6: even an internal field mutation cannot
+        // alter the fixed persisted code selected from the private reason.
         let mut attempted_code_injection = ExtractionError::provider_nonrecoverable();
         attempted_code_injection.code = "provider-body-canary-D8A-R1";
         let mapped = ExtractionAttemptFailure::from_extractor(attempted_code_injection);

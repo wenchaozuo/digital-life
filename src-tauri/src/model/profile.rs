@@ -7,19 +7,24 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
-use crate::storage::StorageService;
+use crate::{
+    secrets::{SecretIdentifier, SecretPurpose, SecretStore, WindowsCredentialSecretStore},
+    storage::StorageService,
+};
 
 const MAX_DISPLAY_NAME_CHARACTERS: usize = 128;
 const MAX_MODEL_NAME_CHARACTERS: usize = 256;
 const MAX_BASE_URL_CHARACTERS: usize = 2048;
 const MAX_TOKENS: u32 = 1_000_000;
+const MAX_CANDIDATE_EXTRACTION_TOKENS: u32 = 4_096;
 const MAX_EMBEDDING_DIMENSION: u32 = 65_536;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum ModelPurpose {
     Chat,
     Embedding,
+    CandidateExtraction,
 }
 
 impl ModelPurpose {
@@ -27,6 +32,7 @@ impl ModelPurpose {
         match self {
             Self::Chat => "chat",
             Self::Embedding => "embedding",
+            Self::CandidateExtraction => "candidate_extraction",
         }
     }
 
@@ -34,6 +40,7 @@ impl ModelPurpose {
         match value {
             "chat" => Ok(Self::Chat),
             "embedding" => Ok(Self::Embedding),
+            "candidate_extraction" => Ok(Self::CandidateExtraction),
             _ => Err(ModelProfileError::database()),
         }
     }
@@ -140,6 +147,8 @@ pub enum ModelProfileErrorCode {
     ProfileNotFound,
     PurposeMismatch,
     UnsupportedProvider,
+    CredentialDeleteRequired,
+    CredentialStoreUnavailable,
     DatabaseError,
 }
 
@@ -185,6 +194,22 @@ impl ModelProfileError {
             ModelProfileErrorCode::UnsupportedProvider,
             "The model profile provider is not supported.",
             false,
+        )
+    }
+
+    fn credential_delete_required() -> Self {
+        Self::new(
+            ModelProfileErrorCode::CredentialDeleteRequired,
+            "Delete the model profile credential before deleting the profile.",
+            true,
+        )
+    }
+
+    fn credential_store_unavailable() -> Self {
+        Self::new(
+            ModelProfileErrorCode::CredentialStoreUnavailable,
+            "Secure credential storage could not be checked. The model profile was not deleted.",
+            true,
         )
     }
 
@@ -270,11 +295,6 @@ impl<'a, R: ModelProfileRepository> ModelProfileService<'a, R> {
             .update_profile(&normalized.into_profile(profile_id, existing.created_at))
     }
 
-    pub fn delete(&self, profile_id: &str) -> Result<DeleteModelProfileResult, ModelProfileError> {
-        validate_profile_id(profile_id)?;
-        self.repository.delete_profile(profile_id)
-    }
-
     pub fn set_active(
         &self,
         request: SetActiveModelProfileRequest,
@@ -296,6 +316,36 @@ impl<'a, R: ModelProfileRepository> ModelProfileService<'a, R> {
         purpose: ModelPurpose,
     ) -> Result<Option<ActiveModelProfile>, ModelProfileError> {
         self.repository.get_active_profile(purpose)
+    }
+}
+
+pub(crate) fn delete_model_profile_with_store<R, S>(
+    repository: &R,
+    secret_store: &S,
+    profile_id: &str,
+) -> Result<DeleteModelProfileResult, ModelProfileError>
+where
+    R: ModelProfileRepository,
+    S: SecretStore + ?Sized,
+{
+    validate_profile_id(profile_id)?;
+    let profile = repository
+        .get_profile(profile_id)?
+        .ok_or_else(ModelProfileError::not_found)?;
+    let identifier = SecretIdentifier::new(credential_purpose(profile.purpose), profile.id.clone())
+        .map_err(|_| ModelProfileError::credential_store_unavailable())?;
+    match secret_store.has_secret(&identifier) {
+        Ok(true) => Err(ModelProfileError::credential_delete_required()),
+        Ok(false) => repository.delete_profile(profile_id),
+        Err(_) => Err(ModelProfileError::credential_store_unavailable()),
+    }
+}
+
+const fn credential_purpose(purpose: ModelPurpose) -> SecretPurpose {
+    match purpose {
+        ModelPurpose::Chat => SecretPurpose::ChatModelApiKey,
+        ModelPurpose::Embedding => SecretPurpose::EmbeddingModelApiKey,
+        ModelPurpose::CandidateExtraction => SecretPurpose::CandidateExtractionModelApiKey,
     }
 }
 
@@ -456,6 +506,12 @@ fn validate_parameters(
                 && embedding_dimension
                     .is_some_and(|value| (1..=MAX_EMBEDDING_DIMENSION).contains(&value))
         }
+        ModelPurpose::CandidateExtraction => {
+            temperature == Some(0.0)
+                && max_tokens
+                    .is_some_and(|value| (1..=MAX_CANDIDATE_EXTRACTION_TOKENS).contains(&value))
+                && embedding_dimension.is_none()
+        }
     };
     if !valid {
         return Err(ModelProfileError::new(
@@ -519,9 +575,10 @@ pub fn update_model_profile(
 #[tauri::command]
 pub fn delete_model_profile(
     storage: State<'_, StorageService>,
+    secrets: State<'_, WindowsCredentialSecretStore>,
     profile_id: String,
 ) -> Result<DeleteModelProfileResult, ModelProfileError> {
-    ModelProfileService::new(storage.inner()).delete(&profile_id)
+    delete_model_profile_with_store(storage.inner(), secrets.inner(), &profile_id)
 }
 
 #[tauri::command]
@@ -554,6 +611,46 @@ mod validation_tests {
             temperature: Some(0.7),
             max_tokens: Some(4096),
             embedding_dimension: None,
+        }
+    }
+
+    fn candidate_request() -> CreateModelProfileRequest {
+        CreateModelProfileRequest {
+            purpose: ModelPurpose::CandidateExtraction,
+            provider_kind: ModelProviderKind::OpenaiCompatible,
+            display_name: "Candidate Extraction".into(),
+            base_url: "https://candidate.example.invalid/v1".into(),
+            model_name: "candidate-model".into(),
+            temperature: Some(0.0),
+            max_tokens: Some(4096),
+            embedding_dimension: None,
+        }
+    }
+
+    #[test]
+    fn model_purpose_wire_values_are_strict_and_stable() {
+        assert_eq!(
+            serde_json::to_string(&ModelPurpose::Chat).unwrap(),
+            "\"chat\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ModelPurpose::Embedding).unwrap(),
+            "\"embedding\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ModelPurpose::CandidateExtraction).unwrap(),
+            "\"candidate_extraction\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ModelPurpose>("\"candidate_extraction\"").unwrap(),
+            ModelPurpose::CandidateExtraction
+        );
+        for invalid in [
+            "\"candidateExtraction\"",
+            "\"CANDIDATE_EXTRACTION\"",
+            "\"unknown\"",
+        ] {
+            assert!(serde_json::from_str::<ModelPurpose>(invalid).is_err());
         }
     }
 
@@ -627,6 +724,57 @@ mod validation_tests {
         let mut invalid = embedding;
         invalid.max_tokens = Some(1);
         assert!(NormalizedProfile::from_create(invalid).is_err());
+    }
+
+    #[test]
+    fn candidate_extraction_parameters_are_fixed_and_bounded() {
+        assert!(NormalizedProfile::from_create(candidate_request()).is_ok());
+
+        for mutate in [
+            |request: &mut CreateModelProfileRequest| request.temperature = None,
+            |request: &mut CreateModelProfileRequest| request.temperature = Some(0.1),
+            |request: &mut CreateModelProfileRequest| request.max_tokens = None,
+            |request: &mut CreateModelProfileRequest| request.max_tokens = Some(0),
+            |request: &mut CreateModelProfileRequest| request.max_tokens = Some(4097),
+            |request: &mut CreateModelProfileRequest| request.embedding_dimension = Some(1),
+        ] {
+            let mut request = candidate_request();
+            mutate(&mut request);
+            assert_eq!(
+                NormalizedProfile::from_create(request).unwrap_err().code,
+                ModelProfileErrorCode::InvalidParameters
+            );
+        }
+
+        let mut invalid_model = candidate_request();
+        invalid_model.model_name = " ".into();
+        assert_eq!(
+            NormalizedProfile::from_create(invalid_model)
+                .unwrap_err()
+                .code,
+            ModelProfileErrorCode::InvalidRequest
+        );
+
+        let mut invalid_url = candidate_request();
+        invalid_url.base_url = "https://candidate.example.invalid/v1?authorization=hidden".into();
+        assert_eq!(
+            NormalizedProfile::from_create(invalid_url)
+                .unwrap_err()
+                .code,
+            ModelProfileErrorCode::InvalidBaseUrl
+        );
+
+        let unsupported_provider = serde_json::json!({
+            "purpose": "candidate_extraction",
+            "providerKind": "unsupported",
+            "displayName": "Candidate",
+            "baseUrl": "https://candidate.example.invalid/v1",
+            "modelName": "candidate-model",
+            "temperature": 0.0,
+            "maxTokens": 4096,
+            "embeddingDimension": null
+        });
+        assert!(serde_json::from_value::<CreateModelProfileRequest>(unsupported_provider).is_err());
     }
 
     #[test]

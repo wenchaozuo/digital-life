@@ -210,4 +210,35 @@ mod tests {
         assert!(target.starts_with(PRODUCTION_NAMESPACE));
         assert!(!target.contains("private-profile-name"));
     }
+
+    #[test]
+    fn target_name_isolates_model_credential_purposes_for_the_same_profile() {
+        let store = WindowsCredentialSecretStore::new();
+        let profile_id = "shared-private-profile";
+        let chat = store
+            .target_name(
+                &SecretIdentifier::new(SecretPurpose::ChatModelApiKey, profile_id).unwrap(),
+            )
+            .unwrap();
+        let embedding = store
+            .target_name(
+                &SecretIdentifier::new(SecretPurpose::EmbeddingModelApiKey, profile_id).unwrap(),
+            )
+            .unwrap();
+        let candidate = store
+            .target_name(
+                &SecretIdentifier::new(SecretPurpose::CandidateExtractionModelApiKey, profile_id)
+                    .unwrap(),
+            )
+            .unwrap();
+
+        assert_ne!(chat, embedding);
+        assert_ne!(chat, candidate);
+        assert_ne!(embedding, candidate);
+        for target in [chat, embedding, candidate] {
+            let target = String::from_utf16_lossy(&target);
+            assert!(target.starts_with(PRODUCTION_NAMESPACE));
+            assert!(!target.contains(profile_id));
+        }
+    }
 }

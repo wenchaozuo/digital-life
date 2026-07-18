@@ -77,6 +77,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "010_candidate_extraction_foundation",
         include_str!("migrations/010_candidate_extraction_foundation.sql"),
     ),
+    (
+        11,
+        "011_candidate_extraction_model_profiles",
+        include_str!("migrations/011_candidate_extraction_model_profiles.sql"),
+    ),
 ];
 
 #[derive(Clone, Debug, Serialize)]

@@ -2155,7 +2155,7 @@ mod tests {
             .connection
             .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
         assert_eq!(foreign_keys, 1);
         for table in [
             "candidate_memory",
@@ -2186,7 +2186,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
         let old_candidate_count: i64 = state
             .connection
             .query_row(

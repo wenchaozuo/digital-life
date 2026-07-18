@@ -667,8 +667,8 @@ mod tests {
 
     use crate::{
         model::profile::{
-            CreateModelProfileRequest, ListModelProfilesRequest, ModelProfileService,
-            SetActiveModelProfileRequest,
+            delete_model_profile_with_store, CreateModelProfileRequest, ListModelProfilesRequest,
+            ModelProfileService, SetActiveModelProfileRequest,
         },
         secrets::{InMemorySecretStore, SecretStore, SecretValue},
     };
@@ -987,7 +987,13 @@ mod tests {
                 })
                 .unwrap();
             store_credential(&secrets, ModelRuntimePurpose::Chat, &active.id);
-            profiles.delete(&active.id).unwrap();
+            secrets
+                .delete_secret(
+                    &SecretIdentifier::new(SecretPurpose::ChatModelApiKey, active.id.clone())
+                        .unwrap(),
+                )
+                .unwrap();
+            delete_model_profile_with_store(&storage, &secrets, &active.id).unwrap();
 
             let error = ModelRuntimeService::new(&storage, &secrets, &coordinator)
                 .chat_with_active_model(active_chat_request())

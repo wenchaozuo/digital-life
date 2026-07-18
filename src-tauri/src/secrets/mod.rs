@@ -24,6 +24,7 @@ const MAX_PROFILE_ID_CHARACTERS: usize = 128;
 pub enum SecretPurpose {
     ChatModelApiKey,
     EmbeddingModelApiKey,
+    CandidateExtractionModelApiKey,
 }
 
 impl SecretPurpose {
@@ -31,6 +32,7 @@ impl SecretPurpose {
         match self {
             Self::ChatModelApiKey => "chat-model-api-key",
             Self::EmbeddingModelApiKey => "embedding-model-api-key",
+            Self::CandidateExtractionModelApiKey => "candidate-extraction-model-api-key",
         }
     }
 }
@@ -327,6 +329,7 @@ mod tests {
         let chat_a = identifier(SecretPurpose::ChatModelApiKey, "profile-a");
         let chat_b = identifier(SecretPurpose::ChatModelApiKey, "profile-b");
         let embedding_a = identifier(SecretPurpose::EmbeddingModelApiKey, "profile-a");
+        let candidate_a = identifier(SecretPurpose::CandidateExtractionModelApiKey, "profile-a");
 
         assert!(!store.has_secret(&chat_a).unwrap());
         assert!(
@@ -348,6 +351,46 @@ mod tests {
         );
         assert!(!store.has_secret(&chat_b).unwrap());
         assert!(!store.has_secret(&embedding_a).unwrap());
+        assert!(!store.has_secret(&candidate_a).unwrap());
+    }
+
+    #[test]
+    fn candidate_credential_crud_and_wire_purpose_are_isolated() {
+        let store = InMemorySecretStore::new();
+        let profile_id = "shared-profile";
+        let candidate = identifier(SecretPurpose::CandidateExtractionModelApiKey, profile_id);
+        let chat = identifier(SecretPurpose::ChatModelApiKey, profile_id);
+        let embedding = identifier(SecretPurpose::EmbeddingModelApiKey, profile_id);
+        let placeholder = format!("placeholder-{}", std::process::id());
+
+        assert_eq!(
+            serde_json::to_string(&SecretPurpose::CandidateExtractionModelApiKey).unwrap(),
+            "\"CANDIDATE_EXTRACTION_MODEL_API_KEY\""
+        );
+        assert_eq!(
+            serde_json::from_str::<SecretPurpose>("\"CANDIDATE_EXTRACTION_MODEL_API_KEY\"")
+                .unwrap(),
+            SecretPurpose::CandidateExtractionModelApiKey
+        );
+        assert!(
+            serde_json::from_str::<SecretPurpose>("\"candidate_extraction_model_api_key\"")
+                .is_err()
+        );
+
+        assert!(!store.has_secret(&candidate).unwrap());
+        store
+            .set_secret(&candidate, SecretValue::new(placeholder.clone()).unwrap())
+            .unwrap();
+        assert!(store.has_secret(&candidate).unwrap());
+        assert!(store.get_secret(&candidate).unwrap().expose_secret() == placeholder);
+        assert!(!store.has_secret(&chat).unwrap());
+        assert!(!store.has_secret(&embedding).unwrap());
+        assert_eq!(
+            format!("{:?}", store.get_secret(&candidate).unwrap()),
+            "[REDACTED]"
+        );
+        assert!(store.delete_secret(&candidate).unwrap().deleted);
+        assert!(!store.has_secret(&candidate).unwrap());
     }
 
     #[test]

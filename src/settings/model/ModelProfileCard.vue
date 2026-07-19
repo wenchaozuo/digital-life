@@ -76,8 +76,10 @@ async function deleteProfile(): Promise<void> {
     <dl>
       <div><dt>Base URL</dt><dd>{{ profile.baseUrl }}</dd></div>
       <div><dt>Model</dt><dd>{{ profile.modelName }}</dd></div>
-      <div v-if="profile.purpose === 'chat'"><dt>Temperature</dt><dd>{{ profile.temperature }}</dd></div>
-      <div v-if="profile.purpose === 'chat'"><dt>Max tokens</dt><dd>{{ profile.maxTokens }}</dd></div>
+
+
+      <div v-if="profile.purpose === 'chat' || profile.purpose === 'candidate_extraction'"><dt>Temperature</dt><dd>{{ profile.temperature }}</dd></div>
+      <div v-if="profile.purpose === 'chat' || profile.purpose === 'candidate_extraction'"><dt>Max tokens</dt><dd>{{ profile.maxTokens }}</dd></div>
       <div v-if="profile.purpose === 'embedding'"><dt>Embedding dimension</dt><dd>{{ profile.embeddingDimension }}</dd></div>
     </dl>
 
@@ -105,7 +107,8 @@ async function deleteProfile(): Promise<void> {
     <div class="actions">
       <button type="button" :disabled="busy" @click="emit('edit', profile)">Edit</button>
       <button type="button" :disabled="busy || active" @click="onSetActive(profile.id)">Set as current</button>
-      <button type="button" :disabled="busy || !runtime.credentialExists" @click="onTestConnection(profile.id)">
+
+      <button v-if="profile.purpose !== 'candidate_extraction'" type="button" :disabled="busy || !runtime.credentialExists" @click="onTestConnection(profile.id)">
         {{ runtime.state === "testingConnection" ? "Testing…" : "Test connection" }}
       </button>
       <button type="button" class="danger" :disabled="busy" @click="deleteProfile">Delete profile</button>

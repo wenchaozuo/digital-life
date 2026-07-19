@@ -29,7 +29,7 @@ const migration = ref<StorageMigrationResult>();
 const phase = ref<StorageSettingsPhase>("unselected");
 const error = ref<StorageSettingsError>();
 const confirmationVisible = ref(false);
-type SettingsSection = "storage" | "chat" | "embedding" | "memory";
+type SettingsSection = "storage" | "chat" | "embedding" | "candidate_extraction" | "memory";
 interface SettingsViewHandle {
   clearSensitiveInputs(): void;
   requestLeave(): boolean;
@@ -37,9 +37,12 @@ interface SettingsViewHandle {
 const activeSection = ref<SettingsSection>("storage");
 const modelProfilesView = ref<SettingsViewHandle>();
 const memoryCenterView = ref<SettingsViewHandle>();
-const activeModelPurpose = computed<ModelPurpose>(() =>
-  activeSection.value === "embedding" ? "embedding" : "chat",
-);
+const activeModelPurpose = computed<ModelPurpose>(() => {
+  if (activeSection.value === "embedding") return "embedding";
+  if (activeSection.value === "candidate_extraction") return "candidate_extraction";
+  return "chat";
+});
+
 
 const canInteract = computed(() => canInteractWithLocation(phase.value));
 const canMigrate = computed(() =>
@@ -208,10 +211,13 @@ onMounted(async () => {
         <p>Manage local storage and independently configured model profiles.</p>
       </header>
 
+
+
       <nav class="settings-nav" aria-label="Settings sections">
         <button type="button" :class="{ selected: activeSection === 'storage' }" :disabled="phase === 'migrating'" @click="switchSection('storage')">Storage location</button>
         <button type="button" :class="{ selected: activeSection === 'chat' }" :disabled="phase === 'migrating'" @click="switchSection('chat')">Conversation models</button>
         <button type="button" :class="{ selected: activeSection === 'embedding' }" :disabled="phase === 'migrating'" @click="switchSection('embedding')">Embedding models</button>
+        <button type="button" :class="{ selected: activeSection === 'candidate_extraction' }" :disabled="phase === 'migrating'" @click="switchSection('candidate_extraction')">Candidate profiles</button>
         <button type="button" :class="{ selected: activeSection === 'memory' }" :disabled="phase === 'migrating'" @click="switchSection('memory')">Memory Center</button>
       </nav>
 

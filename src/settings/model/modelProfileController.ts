@@ -65,7 +65,18 @@ export interface EmbeddingProfileDraft {
   embeddingDimension: number;
 }
 
-export type ModelProfileDraft = ChatProfileDraft | EmbeddingProfileDraft;
+export interface CandidateExtractionProfileDraft {
+  purpose: "candidate_extraction";
+  displayName: string;
+  baseUrl: string;
+  modelName: string;
+  maxTokens: number;
+}
+
+export type ModelProfileDraft =
+  | ChatProfileDraft
+  | EmbeddingProfileDraft
+  | CandidateExtractionProfileDraft;
 
 export interface IModelProfileService {
   create(request: CreateModelProfileRequest): Promise<ModelProfile>;
@@ -328,9 +339,13 @@ function createRequest(draft: ModelProfileDraft): CreateModelProfileRequest {
     baseUrl: draft.baseUrl.trim(),
     modelName: draft.modelName.trim(),
   };
-  return draft.purpose === "chat"
-    ? { ...base, temperature: draft.temperature, maxTokens: draft.maxTokens }
-    : { ...base, embeddingDimension: draft.embeddingDimension };
+  if (draft.purpose === "chat") {
+    return { ...base, temperature: draft.temperature, maxTokens: draft.maxTokens };
+  } else if (draft.purpose === "embedding") {
+    return { ...base, embeddingDimension: draft.embeddingDimension };
+  } else {
+    return { ...base, temperature: 0.0, maxTokens: draft.maxTokens };
+  }
 }
 
 function updateRequest(
@@ -349,14 +364,20 @@ export function isDraftValid(draft: ModelProfileDraft): boolean {
   ) {
     return false;
   }
-  return draft.purpose === "chat"
-    ? Number.isFinite(draft.temperature) &&
+  if (draft.purpose === "chat") {
+    return Number.isFinite(draft.temperature) &&
         draft.temperature >= 0 &&
         draft.temperature <= 2 &&
         Number.isInteger(draft.maxTokens) &&
-        draft.maxTokens > 0
-    : Number.isInteger(draft.embeddingDimension) &&
+        draft.maxTokens > 0;
+  } else if (draft.purpose === "embedding") {
+    return Number.isInteger(draft.embeddingDimension) &&
         draft.embeddingDimension > 0;
+  } else {
+    return Number.isInteger(draft.maxTokens) &&
+        draft.maxTokens >= 1 &&
+        draft.maxTokens <= 4096;
+  }
 }
 
 export function errorFromUnknown(
@@ -367,14 +388,22 @@ export function errorFromUnknown(
     operation === "saveCredential" || operation === "deleteCredential";
   if (isErrorRecord(caught)) {
     const recoverable = typeof caught.recoverable === "boolean" ? caught.recoverable : true;
+    const code = typeof caught.code === "string" ? caught.code : "MODEL_SETTINGS_ERROR";
+
+    let safeMessage = "The model settings operation could not be completed.";
+    if (code === "CREDENTIAL_DELETE_REQUIRED") {
+      safeMessage = "Delete this profile's API Key before deleting the profile.";
+    } else if (code === "CREDENTIAL_STORE_UNAVAILABLE") {
+      safeMessage = "Secure credential storage is currently unavailable.";
+    } else if (!credentialOperation && typeof caught.message === "string") {
+      safeMessage = caught.message;
+    } else if (credentialOperation) {
+      safeMessage = "The credential operation could not be completed.";
+    }
+
     return {
-      code: typeof caught.code === "string" ? caught.code : "MODEL_SETTINGS_ERROR",
-      safeMessage:
-        !credentialOperation && typeof caught.message === "string"
-          ? caught.message
-          : credentialOperation
-            ? "The credential operation could not be completed."
-            : "The model settings operation could not be completed.",
+      code,
+      safeMessage,
       operation,
       recoverable,
     };

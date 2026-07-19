@@ -1410,4 +1410,287 @@ mod tests {
             .unwrap();
         assert_eq!(version, 11);
     }
+
+    #[test]
+    fn candidate_extraction_model_security_config_tests() {
+        use crate::secrets::{
+            delete_api_credential_with_store, has_api_credential_with_store,
+            save_api_credential_with_store, ApiCredentialRequest, InMemorySecretStore,
+            SaveApiCredentialRequest, SecretPurpose, SecretStoreErrorCode,
+        };
+
+        const TEST_KEY: &str = "test-placeholder-canary";
+
+        let root = TestRoot::new("candidate-security-config");
+        let storage = service(&root);
+        let store = InMemorySecretStore::new();
+
+        // 1. Create a candidate extraction profile
+        let profiles = ModelProfileService::new(&storage);
+        let candidate_profile = profiles.create(candidate_request("Candidate")).unwrap();
+        let profile_id = &candidate_profile.id;
+
+        // 1a. Create a chat profile and embedding profile for isolation testing
+        let chat_profile = profiles.create(chat_request("Chat")).unwrap();
+        let embed_profile = profiles.create(embedding_request("Embedding")).unwrap();
+
+        // Check: Candidate Profile 无凭据时 has_secret=false
+        let has_req = ApiCredentialRequest {
+            purpose: SecretPurpose::CandidateExtractionModelApiKey,
+            profile_id: profile_id.clone(),
+        };
+        let status = has_api_credential_with_store(&storage, &store, has_req.clone()).unwrap();
+        assert!(!status.exists);
+
+        // Check: 保存空值被拒绝
+        let save_empty_req = SaveApiCredentialRequest {
+            purpose: SecretPurpose::CandidateExtractionModelApiKey,
+            profile_id: profile_id.clone(),
+            api_key: "   ".to_string(),
+        };
+        let save_empty_err =
+            save_api_credential_with_store(&storage, &store, save_empty_req).unwrap_err();
+        assert_eq!(save_empty_err.code, SecretStoreErrorCode::InvalidSecret);
+
+        // Check: Profile 不存在被拒绝
+        let save_non_existent = SaveApiCredentialRequest {
+            purpose: SecretPurpose::CandidateExtractionModelApiKey,
+            profile_id: "non-existent-id".to_string(),
+            api_key: "valid-key-123".to_string(),
+        };
+        let save_non_existent_err =
+            save_api_credential_with_store(&storage, &store, save_non_existent).unwrap_err();
+        assert_eq!(save_non_existent_err.code, SecretStoreErrorCode::NotFound);
+
+        // Check: Chat Profile 不能通过 Candidate 命令保存 Candidate Key
+        let save_chat_mismatch = SaveApiCredentialRequest {
+            purpose: SecretPurpose::CandidateExtractionModelApiKey,
+            profile_id: chat_profile.id.clone(),
+            api_key: "valid-key-123".to_string(),
+        };
+        let save_chat_mismatch_err =
+            save_api_credential_with_store(&storage, &store, save_chat_mismatch).unwrap_err();
+        assert_eq!(
+            save_chat_mismatch_err.code,
+            SecretStoreErrorCode::InvalidIdentifier
+        );
+
+        // Check: Embedding Profile 同样被拒绝
+        let save_embed_mismatch = SaveApiCredentialRequest {
+            purpose: SecretPurpose::CandidateExtractionModelApiKey,
+            profile_id: embed_profile.id.clone(),
+            api_key: "valid-key-123".to_string(),
+        };
+        let save_embed_mismatch_err =
+            save_api_credential_with_store(&storage, &store, save_embed_mismatch).unwrap_err();
+        assert_eq!(
+            save_embed_mismatch_err.code,
+            SecretStoreErrorCode::InvalidIdentifier
+        );
+
+        // Check: 保存 placeholder 后为 true
+        let save_req = SaveApiCredentialRequest {
+            purpose: SecretPurpose::CandidateExtractionModelApiKey,
+            profile_id: profile_id.clone(),
+            api_key: TEST_KEY.to_string(),
+        };
+        let save_res = save_api_credential_with_store(&storage, &store, save_req.clone()).unwrap();
+        assert!(save_res.exists || save_res.updated);
+
+        let status2 = has_api_credential_with_store(&storage, &store, has_req.clone()).unwrap();
+        assert!(status2.exists);
+
+        // Check: 替换凭据后仍为 true
+        let replace_req = SaveApiCredentialRequest {
+            purpose: SecretPurpose::CandidateExtractionModelApiKey,
+            profile_id: profile_id.clone(),
+            api_key: "new-placeholder-key-canary".to_string(),
+        };
+        let replace_res = save_api_credential_with_store(&storage, &store, replace_req).unwrap();
+        assert!(replace_res.exists || replace_res.updated);
+
+        let status3 = has_api_credential_with_store(&storage, &store, has_req.clone()).unwrap();
+        assert!(status3.exists);
+
+        // Check: Candidate Key 不影响相同 ID 的其他 purpose (e.g. Chat/Embedding)
+        let has_chat_mismatch = ApiCredentialRequest {
+            purpose: SecretPurpose::ChatModelApiKey,
+            profile_id: profile_id.clone(),
+        };
+        let has_chat_mismatch_err =
+            has_api_credential_with_store(&storage, &store, has_chat_mismatch).unwrap_err();
+        assert_eq!(
+            has_chat_mismatch_err.code,
+            SecretStoreErrorCode::InvalidIdentifier
+        );
+
+        // Check: Store unavailable 时查询、保存、删除均返回安全错误
+        let has_unavailable_err =
+            has_api_credential_with_store(&storage, &UnavailableSecretStore, has_req.clone())
+                .unwrap_err();
+        assert_eq!(
+            has_unavailable_err.code,
+            SecretStoreErrorCode::StoreUnavailable
+        );
+
+        let save_unavailable_err =
+            save_api_credential_with_store(&storage, &UnavailableSecretStore, save_req.clone())
+                .unwrap_err();
+        assert_eq!(
+            save_unavailable_err.code,
+            SecretStoreErrorCode::StoreUnavailable
+        );
+
+        let delete_unavailable_err =
+            delete_api_credential_with_store(&storage, &UnavailableSecretStore, has_req.clone())
+                .unwrap_err();
+        assert_eq!(
+            delete_unavailable_err.code,
+            SecretStoreErrorCode::StoreUnavailable
+        );
+
+        // Check: 错误不包含 placeholder、target 或底层错误
+        let err_str = format!("{:?}", save_unavailable_err);
+        assert!(!err_str.contains(TEST_KEY));
+        assert!(!err_str.contains("Credential Manager"));
+
+        // Check: SQLite 原始文件不包含 placeholder
+        let db_bytes = std::fs::read(root.0.join("data").join(DATABASE_FILE_NAME)).unwrap();
+        assert!(!db_bytes
+            .windows(TEST_KEY.len())
+            .any(|w| w == TEST_KEY.as_bytes()));
+
+        // Check: 非空 Secret 的首尾字符不会被静默修改
+        let key_with_spaces = "   test-canary-with-spaces   ".to_string();
+        let save_spaces_req = SaveApiCredentialRequest {
+            purpose: SecretPurpose::CandidateExtractionModelApiKey,
+            profile_id: profile_id.clone(),
+            api_key: key_with_spaces.clone(),
+        };
+        save_api_credential_with_store(&storage, &store, save_spaces_req).unwrap();
+        let spaces_identifier = crate::secrets::SecretIdentifier::new(
+            SecretPurpose::CandidateExtractionModelApiKey,
+            profile_id,
+        ).unwrap();
+        assert_eq!(store.get_secret(&spaces_identifier).unwrap().expose_secret(), key_with_spaces);
+
+        // Check: Candidate Profile 不能通过 Chat/Embedding purpose 错配写入
+        let save_chat_mismatch_to_candidate = SaveApiCredentialRequest {
+            purpose: SecretPurpose::ChatModelApiKey,
+            profile_id: profile_id.clone(),
+            api_key: "some-key".to_string(),
+        };
+        let save_chat_mismatch_to_candidate_err =
+            save_api_credential_with_store(&storage, &store, save_chat_mismatch_to_candidate).unwrap_err();
+        assert_eq!(
+            save_chat_mismatch_to_candidate_err.code,
+            SecretStoreErrorCode::InvalidIdentifier
+        );
+
+        let save_embed_mismatch_to_candidate = SaveApiCredentialRequest {
+            purpose: SecretPurpose::EmbeddingModelApiKey,
+            profile_id: profile_id.clone(),
+            api_key: "some-key".to_string(),
+        };
+        let save_embed_mismatch_to_candidate_err =
+            save_api_credential_with_store(&storage, &store, save_embed_mismatch_to_candidate).unwrap_err();
+        assert_eq!(
+            save_embed_mismatch_to_candidate_err.code,
+            SecretStoreErrorCode::InvalidIdentifier
+        );
+
+        // Check: 相同 profile ID 的三个 purpose 凭据在 SecretStore 里互不影响
+        let chat_id = crate::secrets::SecretIdentifier::new(SecretPurpose::ChatModelApiKey, "common-id").unwrap();
+        let embed_id = crate::secrets::SecretIdentifier::new(SecretPurpose::EmbeddingModelApiKey, "common-id").unwrap();
+        let candidate_id = crate::secrets::SecretIdentifier::new(SecretPurpose::CandidateExtractionModelApiKey, "common-id").unwrap();
+
+        store.set_secret(&chat_id, crate::secrets::SecretValue::new("chat-val".to_string()).unwrap()).unwrap();
+        store.set_secret(&embed_id, crate::secrets::SecretValue::new("embed-val".to_string()).unwrap()).unwrap();
+        store.set_secret(&candidate_id, crate::secrets::SecretValue::new("candidate-val".to_string()).unwrap()).unwrap();
+
+        assert_eq!(store.get_secret(&chat_id).unwrap().expose_secret(), "chat-val");
+        assert_eq!(store.get_secret(&embed_id).unwrap().expose_secret(), "embed-val");
+        assert_eq!(store.get_secret(&candidate_id).unwrap().expose_secret(), "candidate-val");
+
+        store.delete_secret(&chat_id).unwrap();
+        assert!(!store.has_secret(&chat_id).unwrap());
+        assert!(store.has_secret(&embed_id).unwrap());
+        assert!(store.has_secret(&candidate_id).unwrap());
+
+        // Restore target key for profile deletion guard check
+        let save_req = SaveApiCredentialRequest {
+            purpose: SecretPurpose::CandidateExtractionModelApiKey,
+            profile_id: profile_id.clone(),
+            api_key: TEST_KEY.to_string(),
+        };
+        save_api_credential_with_store(&storage, &store, save_req).unwrap();
+
+        // Check: 删除 Profile 有凭据时仍被 guard 拒绝
+        let delete_profile_err =
+            delete_model_profile_with_store(&storage, &store, profile_id).unwrap_err();
+        assert_eq!(
+            delete_profile_err.code,
+            ModelProfileErrorCode::CredentialDeleteRequired
+        );
+
+        // Check: 删除后为 false
+        let delete_key_res =
+            delete_api_credential_with_store(&storage, &store, has_req.clone()).unwrap();
+        assert!(delete_key_res.deleted);
+
+        let status4 = has_api_credential_with_store(&storage, &store, has_req.clone()).unwrap();
+        assert!(!status4.exists);
+
+        // Check: 删除 Key 后可删除 Profile
+        let delete_profile_res =
+            delete_model_profile_with_store(&storage, &store, profile_id).unwrap();
+        assert!(delete_profile_res.deleted);
+
+        // Check: Active Candidate 切换不影响 Chat/Embedding
+        profiles
+            .set_active(SetActiveModelProfileRequest {
+                purpose: ModelPurpose::Chat,
+                profile_id: chat_profile.id.clone(),
+            })
+            .unwrap();
+        profiles
+            .set_active(SetActiveModelProfileRequest {
+                purpose: ModelPurpose::Embedding,
+                profile_id: embed_profile.id.clone(),
+            })
+            .unwrap();
+
+        let new_candidate = profiles.create(candidate_request("New Candidate")).unwrap();
+        profiles
+            .set_active(SetActiveModelProfileRequest {
+                purpose: ModelPurpose::CandidateExtraction,
+                profile_id: new_candidate.id.clone(),
+            })
+            .unwrap();
+
+        assert_eq!(
+            profiles
+                .get_active(ModelPurpose::Chat)
+                .unwrap()
+                .unwrap()
+                .profile_id,
+            chat_profile.id
+        );
+        assert_eq!(
+            profiles
+                .get_active(ModelPurpose::Embedding)
+                .unwrap()
+                .unwrap()
+                .profile_id,
+            embed_profile.id
+        );
+        assert_eq!(
+            profiles
+                .get_active(ModelPurpose::CandidateExtraction)
+                .unwrap()
+                .unwrap()
+                .profile_id,
+            new_candidate.id
+        );
+    }
 }

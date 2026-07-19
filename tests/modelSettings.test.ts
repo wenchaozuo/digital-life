@@ -54,8 +54,12 @@ function profile(id: string, purpose: ModelPurpose): ModelProfile {
   };
 }
 
+
+
 function credentialPurpose(purpose: ModelPurpose): CredentialPurpose {
-  return purpose === "chat" ? "CHAT_MODEL_API_KEY" : "EMBEDDING_MODEL_API_KEY";
+  if (purpose === "chat") return "CHAT_MODEL_API_KEY";
+  if (purpose === "embedding") return "EMBEDDING_MODEL_API_KEY";
+  return "CANDIDATE_EXTRACTION_MODEL_API_KEY";
 }
 
 function createMocks(initial: readonly ModelProfile[]) {
@@ -337,4 +341,63 @@ test("10. 凭据操作错误不会回显当前输入", () => {
   );
   assert.equal(error.code, "CREDENTIAL_ERROR");
   assert.doesNotMatch(error.safeMessage, /component-only-placeholder/);
+});
+
+test("11. Candidate Extraction Profile parameter bounds validation", async () => {
+  const mocks = createMocks([]);
+  const controller = new ModelProfileController("candidate_extraction", mocks.modelService, mocks.credentialService);
+
+  // Invalid: maxTokens = 0 (below min 1)
+  const saved1 = await controller.saveProfile({
+    purpose: "candidate_extraction",
+    displayName: "Candidate",
+    baseUrl: "https://candidate.example/v1",
+    modelName: "candidate-model",
+    maxTokens: 0,
+  });
+  assert.equal(saved1, undefined);
+  assert.equal(controller.formState, "failed");
+  assert.equal(controller.formError?.code, "INVALID_PROFILE_FORM");
+
+  // Invalid: maxTokens = 4097 (above max 4096)
+  const saved2 = await controller.saveProfile({
+    purpose: "candidate_extraction",
+    displayName: "Candidate",
+    baseUrl: "https://candidate.example/v1",
+    modelName: "candidate-model",
+    maxTokens: 4097,
+  });
+  assert.equal(saved2, undefined);
+
+  // Valid: maxTokens = 2048 (in range 1..=4096)
+  const saved3 = await controller.saveProfile({
+    purpose: "candidate_extraction",
+    displayName: "Candidate",
+    baseUrl: "https://candidate.example/v1",
+    modelName: "candidate-model",
+    maxTokens: 2048,
+  });
+  assert.ok(saved3);
+  assert.equal(mocks.calls.creates.length, 1);
+  assert.equal(mocks.calls.creates[0]?.purpose, "candidate_extraction");
+  assert.equal(mocks.calls.creates[0]?.maxTokens, 2048);
+  // Temperature should be mapped to 0.0 in updateRequest / createRequest
+  assert.equal(mocks.calls.creates[0]?.temperature, 0.0);
+});
+
+test("12. Error mappings for secure API operations", () => {
+  const errDeleteRequired = errorFromUnknown(
+    { code: "CREDENTIAL_DELETE_REQUIRED", message: "underlying info" },
+    "deleteProfile",
+  );
+  assert.equal(errDeleteRequired.code, "CREDENTIAL_DELETE_REQUIRED");
+  assert.equal(errDeleteRequired.safeMessage, "Delete this profile's API Key before deleting the profile.");
+
+  const errStoreUnavailable = errorFromUnknown(
+    { code: "CREDENTIAL_STORE_UNAVAILABLE", message: "underlying storage failure" },
+    "saveCredential",
+  );
+  assert.equal(errStoreUnavailable.code, "CREDENTIAL_STORE_UNAVAILABLE");
+  assert.equal(errStoreUnavailable.safeMessage, "Secure credential storage is currently unavailable.");
+  assert.doesNotMatch(errStoreUnavailable.safeMessage, /underlying/);
 });

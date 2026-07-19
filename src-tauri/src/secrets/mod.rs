@@ -17,6 +17,9 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 use zeroize::Zeroizing;
 
+use crate::model::profile::{credential_purpose, ModelProfileRepository};
+use crate::storage::StorageService;
+
 const MAX_PROFILE_ID_CHARACTERS: usize = 128;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
@@ -192,7 +195,7 @@ pub trait SecretStore: Send + Sync {
     ) -> Result<SecretStatus, SecretStoreError>;
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SaveApiCredentialRequest {
     pub purpose: SecretPurpose,
@@ -274,31 +277,112 @@ fn delete_with_store<S: SecretStore + ?Sized>(
     })
 }
 
+pub(crate) fn save_api_credential_with_store<R: ModelProfileRepository, S: SecretStore + ?Sized>(
+    repository: &R,
+    store: &S,
+    request: SaveApiCredentialRequest,
+) -> Result<SaveApiCredentialResponse, SecretStoreError> {
+    let profile = repository
+        .get_profile(&request.profile_id)
+        .map_err(|e| SecretStoreError::new(SecretStoreErrorCode::InternalError, e.message, true))?
+        .ok_or_else(|| {
+            SecretStoreError::new(
+                SecretStoreErrorCode::NotFound,
+                "The model profile was not found.",
+                true,
+            )
+        })?;
+    if credential_purpose(profile.purpose) != request.purpose {
+        return Err(SecretStoreError::new(
+            SecretStoreErrorCode::InvalidIdentifier,
+            "The model profile purpose does not match the requested credential purpose.",
+            false,
+        ));
+    }
+    save_with_store(store, request)
+}
+
+pub(crate) fn has_api_credential_with_store<R: ModelProfileRepository, S: SecretStore + ?Sized>(
+    repository: &R,
+    store: &S,
+    request: ApiCredentialRequest,
+) -> Result<HasApiCredentialResponse, SecretStoreError> {
+    let profile = repository
+        .get_profile(&request.profile_id)
+        .map_err(|e| SecretStoreError::new(SecretStoreErrorCode::InternalError, e.message, true))?
+        .ok_or_else(|| {
+            SecretStoreError::new(
+                SecretStoreErrorCode::NotFound,
+                "The model profile was not found.",
+                true,
+            )
+        })?;
+    if credential_purpose(profile.purpose) != request.purpose {
+        return Err(SecretStoreError::new(
+            SecretStoreErrorCode::InvalidIdentifier,
+            "The model profile purpose does not match the requested credential purpose.",
+            false,
+        ));
+    }
+    has_with_store(store, request)
+}
+
+pub(crate) fn delete_api_credential_with_store<
+    R: ModelProfileRepository,
+    S: SecretStore + ?Sized,
+>(
+    repository: &R,
+    store: &S,
+    request: ApiCredentialRequest,
+) -> Result<DeleteApiCredentialResponse, SecretStoreError> {
+    let profile = repository
+        .get_profile(&request.profile_id)
+        .map_err(|e| SecretStoreError::new(SecretStoreErrorCode::InternalError, e.message, true))?
+        .ok_or_else(|| {
+            SecretStoreError::new(
+                SecretStoreErrorCode::NotFound,
+                "The model profile was not found.",
+                true,
+            )
+        })?;
+    if credential_purpose(profile.purpose) != request.purpose {
+        return Err(SecretStoreError::new(
+            SecretStoreErrorCode::InvalidIdentifier,
+            "The model profile purpose does not match the requested credential purpose.",
+            false,
+        ));
+    }
+    delete_with_store(store, request)
+}
+
 #[cfg(windows)]
 #[tauri::command]
 pub fn save_api_credential(
+    storage: State<'_, StorageService>,
     store: State<'_, WindowsCredentialSecretStore>,
     request: SaveApiCredentialRequest,
 ) -> Result<SaveApiCredentialResponse, SecretStoreError> {
-    save_with_store(store.inner(), request)
+    save_api_credential_with_store(storage.inner(), store.inner(), request)
 }
 
 #[cfg(windows)]
 #[tauri::command]
 pub fn has_api_credential(
+    storage: State<'_, StorageService>,
     store: State<'_, WindowsCredentialSecretStore>,
     request: ApiCredentialRequest,
 ) -> Result<HasApiCredentialResponse, SecretStoreError> {
-    has_with_store(store.inner(), request)
+    has_api_credential_with_store(storage.inner(), store.inner(), request)
 }
 
 #[cfg(windows)]
 #[tauri::command]
 pub fn delete_api_credential(
+    storage: State<'_, StorageService>,
     store: State<'_, WindowsCredentialSecretStore>,
     request: ApiCredentialRequest,
 ) -> Result<DeleteApiCredentialResponse, SecretStoreError> {
-    delete_with_store(store.inner(), request)
+    delete_api_credential_with_store(storage.inner(), store.inner(), request)
 }
 
 #[cfg(test)]

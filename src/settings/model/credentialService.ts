@@ -3,7 +3,8 @@ import type { ModelPurpose } from "../../model/modelProfileService.ts";
 
 export type CredentialPurpose =
   | "CHAT_MODEL_API_KEY"
-  | "EMBEDDING_MODEL_API_KEY";
+  | "EMBEDDING_MODEL_API_KEY"
+  | "CANDIDATE_EXTRACTION_MODEL_API_KEY";
 
 export interface CredentialStatus {
   purpose: CredentialPurpose;
@@ -35,9 +36,13 @@ export interface ICredentialService {
 export function credentialPurposeFor(
   purpose: ModelPurpose,
 ): CredentialPurpose {
-  return purpose === "chat"
-    ? "CHAT_MODEL_API_KEY"
-    : "EMBEDDING_MODEL_API_KEY";
+  if (purpose === "chat") {
+    return "CHAT_MODEL_API_KEY";
+  } else if (purpose === "embedding") {
+    return "EMBEDDING_MODEL_API_KEY";
+  } else {
+    return "CANDIDATE_EXTRACTION_MODEL_API_KEY";
+  }
 }
 
 export class CredentialService implements ICredentialService {

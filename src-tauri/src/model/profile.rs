@@ -341,7 +341,7 @@ where
     }
 }
 
-const fn credential_purpose(purpose: ModelPurpose) -> SecretPurpose {
+pub(crate) const fn credential_purpose(purpose: ModelPurpose) -> SecretPurpose {
     match purpose {
         ModelPurpose::Chat => SecretPurpose::ChatModelApiKey,
         ModelPurpose::Embedding => SecretPurpose::EmbeddingModelApiKey,

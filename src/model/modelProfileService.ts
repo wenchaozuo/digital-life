@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 
-export type ModelPurpose = "chat" | "embedding";
+export type ModelPurpose = "chat" | "embedding" | "candidate_extraction";
 export type ModelProviderKind = "openai_compatible";
 
 export interface ModelProfile {
@@ -52,7 +52,9 @@ export interface ModelProfileError {
     | "PROFILE_NOT_FOUND"
     | "PURPOSE_MISMATCH"
     | "UNSUPPORTED_PROVIDER"
-    | "DATABASE_ERROR";
+    | "DATABASE_ERROR"
+    | "CREDENTIAL_DELETE_REQUIRED"
+    | "CREDENTIAL_STORE_UNAVAILABLE";
   message: string;
   recoverable: boolean;
 }

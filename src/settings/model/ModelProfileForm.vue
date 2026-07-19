@@ -19,32 +19,44 @@ const emit = defineEmits<{
   dirtyChange: [dirty: boolean];
 }>();
 
+
+
 const displayName = ref(props.profile?.displayName ?? "");
 const baseUrl = ref(props.profile?.baseUrl ?? "");
 const modelName = ref(props.profile?.modelName ?? "");
-const temperature = ref(props.profile?.temperature ?? 0.7);
-const maxTokens = ref(props.profile?.maxTokens ?? 4096);
+const temperature = ref(props.profile?.temperature ?? (props.purpose === "candidate_extraction" ? 0.0 : 0.7));
+const maxTokens = ref(props.profile?.maxTokens ?? (props.purpose === "candidate_extraction" ? 2048 : 4096));
 const embeddingDimension = ref(props.profile?.embeddingDimension ?? 1536);
 
 const initialSnapshot = snapshot();
-const draft = computed<ModelProfileDraft>(() =>
-  props.purpose === "chat"
-    ? {
-        purpose: "chat",
-        displayName: displayName.value,
-        baseUrl: baseUrl.value,
-        modelName: modelName.value,
-        temperature: Number(temperature.value),
-        maxTokens: Number(maxTokens.value),
-      }
-    : {
-        purpose: "embedding",
-        displayName: displayName.value,
-        baseUrl: baseUrl.value,
-        modelName: modelName.value,
-        embeddingDimension: Number(embeddingDimension.value),
-      },
-);
+const draft = computed<ModelProfileDraft>(() => {
+  if (props.purpose === "chat") {
+    return {
+      purpose: "chat",
+      displayName: displayName.value,
+      baseUrl: baseUrl.value,
+      modelName: modelName.value,
+      temperature: Number(temperature.value),
+      maxTokens: Number(maxTokens.value),
+    };
+  } else if (props.purpose === "embedding") {
+    return {
+      purpose: "embedding",
+      displayName: displayName.value,
+      baseUrl: baseUrl.value,
+      modelName: modelName.value,
+      embeddingDimension: Number(embeddingDimension.value),
+    };
+  } else {
+    return {
+      purpose: "candidate_extraction",
+      displayName: displayName.value,
+      baseUrl: baseUrl.value,
+      modelName: modelName.value,
+      maxTokens: Number(maxTokens.value),
+    };
+  }
+});
 
 const isValid = computed(() => isDraftValid(draft.value));
 const isDirty = computed(() => snapshot() !== initialSnapshot);
@@ -73,7 +85,8 @@ function submit(): void {
 <template>
   <section class="model-profile-form" :aria-label="profile ? 'Edit model profile' : 'Create model profile'">
     <header>
-      <h3>{{ profile ? "Edit" : "Create" }} {{ purpose === "chat" ? "chat" : "embedding" }} profile</h3>
+
+      <h3>{{ profile ? "Edit" : "Create" }} {{ purpose === "chat" ? "chat" : purpose === "embedding" ? "embedding" : "candidate extraction" }} profile</h3>
       <p>Profile settings do not contain an API Key.</p>
     </header>
 
@@ -90,6 +103,8 @@ function submit(): void {
       <input v-model="modelName" autocomplete="off" maxlength="256" />
     </label>
 
+
+
     <template v-if="purpose === 'chat'">
       <label>
         Temperature
@@ -100,11 +115,20 @@ function submit(): void {
         <input v-model.number="maxTokens" type="number" min="1" max="1000000" step="1" />
       </label>
     </template>
-    <label v-else>
+    <template v-else-if="purpose === 'candidate_extraction'">
+      <label>
+        Temperature (Fixed)
+        <input type="number" value="0.0" disabled />
+      </label>
+      <label>
+        Max tokens
+        <input v-model.number="maxTokens" type="number" min="1" max="4096" step="1" />
+      </label>
+    </template>
+    <label v-else-if="purpose === 'embedding'">
       Embedding dimension
       <input v-model.number="embeddingDimension" type="number" min="1" max="65536" step="1" />
     </label>
-
     <p v-if="!isValid" class="form-warning">Enter a valid HTTP or HTTPS URL and all required values.</p>
     <p v-if="errorMessage" class="form-error">{{ errorMessage }}</p>
     <div class="form-actions">

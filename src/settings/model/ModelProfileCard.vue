@@ -52,7 +52,9 @@ async function deleteCredential(): Promise<void> {
   if (!window.confirm("Delete the saved API Key for this profile? This cannot be undone.")) {
     return;
   }
-  await props.onDeleteCredential(props.profile.id);
+  if (await props.onDeleteCredential(props.profile.id)) {
+    clearSensitiveInput();
+  }
 }
 
 async function deleteProfile(): Promise<void> {

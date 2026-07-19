@@ -68,6 +68,167 @@ describe("ModelProfileCard component", () => {
     expect(input.attributes("type")).toBe("password");
     expect(input.attributes("autocomplete")).toBe("new-password");
   });
+
+  it("clears input on save success", async () => {
+    const onSaveCredential = vi.fn().mockResolvedValue(true);
+    const wrapper = mount(ModelProfileCard, {
+      props: {
+        profile: createCandidateProfile(),
+        active: false,
+        runtime: { state: "idle", credentialExists: false },
+        clearEpoch: 1,
+        onSaveCredential,
+        onDeleteCredential: vi.fn(),
+        onSetActive: vi.fn(),
+        onTestConnection: vi.fn(),
+        onDeleteProfile: vi.fn(),
+      },
+    });
+
+    const input = wrapper.find("input[placeholder='Enter a new API Key']");
+    await input.setValue("new-secret-key");
+    await wrapper.findAll("button").find(b => b.text().includes("Save / replace"))!.trigger("click");
+
+    expect(onSaveCredential).toHaveBeenCalledWith("candidate-prof", "new-secret-key");
+    expect((input.element as HTMLInputElement).value).toBe("");
+  });
+
+  it("does not clear input on save failure", async () => {
+    const onSaveCredential = vi.fn().mockResolvedValue(false);
+    const wrapper = mount(ModelProfileCard, {
+      props: {
+        profile: createCandidateProfile(),
+        active: false,
+        runtime: { state: "idle", credentialExists: false },
+        clearEpoch: 1,
+        onSaveCredential,
+        onDeleteCredential: vi.fn(),
+        onSetActive: vi.fn(),
+        onTestConnection: vi.fn(),
+        onDeleteProfile: vi.fn(),
+      },
+    });
+
+    const input = wrapper.find("input[placeholder='Enter a new API Key']");
+    await input.setValue("new-secret-key");
+    await wrapper.findAll("button").find(b => b.text().includes("Save / replace"))!.trigger("click");
+
+    expect((input.element as HTMLInputElement).value).toBe("new-secret-key");
+  });
+
+  it("clears input on delete success and stops if cancelled", async () => {
+    const onDeleteCredential = vi.fn().mockResolvedValue(true);
+    const wrapper = mount(ModelProfileCard, {
+      props: {
+        profile: createCandidateProfile(),
+        active: false,
+        runtime: { state: "idle", credentialExists: true },
+        clearEpoch: 1,
+        onSaveCredential: vi.fn(),
+        onDeleteCredential,
+        onSetActive: vi.fn(),
+        onTestConnection: vi.fn(),
+        onDeleteProfile: vi.fn(),
+      },
+    });
+
+    const input = wrapper.find("input[placeholder='Enter a new API Key']");
+    await input.setValue("old-garbage");
+
+    // Mock cancel
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
+    await wrapper.findAll("button").find(b => b.text().includes("Delete API Key"))!.trigger("click");
+    expect(onDeleteCredential).not.toHaveBeenCalled();
+    expect((input.element as HTMLInputElement).value).toBe("old-garbage");
+
+    // Mock confirm
+    confirmSpy.mockReturnValue(true);
+    await wrapper.findAll("button").find(b => b.text().includes("Delete API Key"))!.trigger("click");
+    expect(onDeleteCredential).toHaveBeenCalledWith("candidate-prof");
+    expect((input.element as HTMLInputElement).value).toBe("");
+
+    confirmSpy.mockRestore();
+  });
+
+  it("does not clear input on delete failure", async () => {
+    const onDeleteCredential = vi.fn().mockResolvedValue(false);
+    const wrapper = mount(ModelProfileCard, {
+      props: {
+        profile: createCandidateProfile(),
+        active: false,
+        runtime: { state: "idle", credentialExists: true },
+        clearEpoch: 1,
+        onSaveCredential: vi.fn(),
+        onDeleteCredential,
+        onSetActive: vi.fn(),
+        onTestConnection: vi.fn(),
+        onDeleteProfile: vi.fn(),
+      },
+    });
+
+    const input = wrapper.find("input[placeholder='Enter a new API Key']");
+    await input.setValue("old-garbage");
+
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    await wrapper.findAll("button").find(b => b.text().includes("Delete API Key"))!.trigger("click");
+
+    expect(onDeleteCredential).toHaveBeenCalledWith("candidate-prof");
+    expect((input.element as HTMLInputElement).value).toBe("old-garbage");
+
+    confirmSpy.mockRestore();
+  });
+
+  it("clears input when clearEpoch changes", async () => {
+    const wrapper = mount(ModelProfileCard, {
+      props: {
+        profile: createCandidateProfile(),
+        active: false,
+        runtime: { state: "idle", credentialExists: false },
+        clearEpoch: 1,
+        onSaveCredential: vi.fn(),
+        onDeleteCredential: vi.fn(),
+        onSetActive: vi.fn(),
+        onTestConnection: vi.fn(),
+        onDeleteProfile: vi.fn(),
+      },
+    });
+
+    const input = wrapper.find("input[placeholder='Enter a new API Key']");
+    await input.setValue("temp-key");
+
+    await wrapper.setProps({ clearEpoch: 2 });
+    expect((input.element as HTMLInputElement).value).toBe("");
+  });
+
+  it("displays card error appropriately, specifically for CREDENTIAL_DELETE_REQUIRED", () => {
+    const wrapper = mount(ModelProfileCard, {
+      props: {
+        profile: createCandidateProfile(),
+        active: false,
+        runtime: {
+          state: "idle",
+          credentialExists: true,
+          error: {
+            code: "CREDENTIAL_DELETE_REQUIRED",
+            safeMessage: "Please delete the API Key before deleting this profile.",
+            operation: "deleteProfile",
+            recoverable: false
+          }
+        },
+        clearEpoch: 1,
+        onSaveCredential: vi.fn(),
+        onDeleteCredential: vi.fn(),
+        onSetActive: vi.fn(),
+        onTestConnection: vi.fn(),
+        onDeleteProfile: vi.fn(),
+      },
+    });
+
+    const errorSection = wrapper.find(".card-error");
+    expect(errorSection.exists()).toBe(true);
+    expect(errorSection.text()).toContain("CREDENTIAL_DELETE_REQUIRED");
+    expect(errorSection.text()).toContain("Please delete the API Key before deleting this profile.");
+  });
 });
 
 describe("ModelProfileForm component", () => {

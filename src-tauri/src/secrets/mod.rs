@@ -195,7 +195,7 @@ pub trait SecretStore: Send + Sync {
     ) -> Result<SecretStatus, SecretStoreError>;
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SaveApiCredentialRequest {
     pub purpose: SecretPurpose,

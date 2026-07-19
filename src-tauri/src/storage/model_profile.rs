@@ -1494,7 +1494,7 @@ mod tests {
             profile_id: profile_id.clone(),
             api_key: TEST_KEY.to_string(),
         };
-        let save_res = save_api_credential_with_store(&storage, &store, save_req.clone()).unwrap();
+        let save_res = save_api_credential_with_store(&storage, &store, save_req).unwrap();
         assert!(save_res.exists || save_res.updated);
 
         let status2 = has_api_credential_with_store(&storage, &store, has_req.clone()).unwrap();
@@ -1533,8 +1533,13 @@ mod tests {
             SecretStoreErrorCode::StoreUnavailable
         );
 
+        let save_unavailable_req = SaveApiCredentialRequest {
+            purpose: SecretPurpose::CandidateExtractionModelApiKey,
+            profile_id: profile_id.clone(),
+            api_key: TEST_KEY.to_string(),
+        };
         let save_unavailable_err =
-            save_api_credential_with_store(&storage, &UnavailableSecretStore, save_req.clone())
+            save_api_credential_with_store(&storage, &UnavailableSecretStore, save_unavailable_req)
                 .unwrap_err();
         assert_eq!(
             save_unavailable_err.code,
@@ -1571,8 +1576,15 @@ mod tests {
         let spaces_identifier = crate::secrets::SecretIdentifier::new(
             SecretPurpose::CandidateExtractionModelApiKey,
             profile_id,
-        ).unwrap();
-        assert_eq!(store.get_secret(&spaces_identifier).unwrap().expose_secret(), key_with_spaces);
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .get_secret(&spaces_identifier)
+                .unwrap()
+                .expose_secret(),
+            key_with_spaces
+        );
 
         // Check: Candidate Profile 不能通过 Chat/Embedding purpose 错配写入
         let save_chat_mismatch_to_candidate = SaveApiCredentialRequest {
@@ -1581,7 +1593,8 @@ mod tests {
             api_key: "some-key".to_string(),
         };
         let save_chat_mismatch_to_candidate_err =
-            save_api_credential_with_store(&storage, &store, save_chat_mismatch_to_candidate).unwrap_err();
+            save_api_credential_with_store(&storage, &store, save_chat_mismatch_to_candidate)
+                .unwrap_err();
         assert_eq!(
             save_chat_mismatch_to_candidate_err.code,
             SecretStoreErrorCode::InvalidIdentifier
@@ -1593,24 +1606,57 @@ mod tests {
             api_key: "some-key".to_string(),
         };
         let save_embed_mismatch_to_candidate_err =
-            save_api_credential_with_store(&storage, &store, save_embed_mismatch_to_candidate).unwrap_err();
+            save_api_credential_with_store(&storage, &store, save_embed_mismatch_to_candidate)
+                .unwrap_err();
         assert_eq!(
             save_embed_mismatch_to_candidate_err.code,
             SecretStoreErrorCode::InvalidIdentifier
         );
 
         // Check: 相同 profile ID 的三个 purpose 凭据在 SecretStore 里互不影响
-        let chat_id = crate::secrets::SecretIdentifier::new(SecretPurpose::ChatModelApiKey, "common-id").unwrap();
-        let embed_id = crate::secrets::SecretIdentifier::new(SecretPurpose::EmbeddingModelApiKey, "common-id").unwrap();
-        let candidate_id = crate::secrets::SecretIdentifier::new(SecretPurpose::CandidateExtractionModelApiKey, "common-id").unwrap();
+        let chat_id =
+            crate::secrets::SecretIdentifier::new(SecretPurpose::ChatModelApiKey, "common-id")
+                .unwrap();
+        let embed_id =
+            crate::secrets::SecretIdentifier::new(SecretPurpose::EmbeddingModelApiKey, "common-id")
+                .unwrap();
+        let candidate_id = crate::secrets::SecretIdentifier::new(
+            SecretPurpose::CandidateExtractionModelApiKey,
+            "common-id",
+        )
+        .unwrap();
 
-        store.set_secret(&chat_id, crate::secrets::SecretValue::new("chat-val".to_string()).unwrap()).unwrap();
-        store.set_secret(&embed_id, crate::secrets::SecretValue::new("embed-val".to_string()).unwrap()).unwrap();
-        store.set_secret(&candidate_id, crate::secrets::SecretValue::new("candidate-val".to_string()).unwrap()).unwrap();
+        store
+            .set_secret(
+                &chat_id,
+                crate::secrets::SecretValue::new("chat-val".to_string()).unwrap(),
+            )
+            .unwrap();
+        store
+            .set_secret(
+                &embed_id,
+                crate::secrets::SecretValue::new("embed-val".to_string()).unwrap(),
+            )
+            .unwrap();
+        store
+            .set_secret(
+                &candidate_id,
+                crate::secrets::SecretValue::new("candidate-val".to_string()).unwrap(),
+            )
+            .unwrap();
 
-        assert_eq!(store.get_secret(&chat_id).unwrap().expose_secret(), "chat-val");
-        assert_eq!(store.get_secret(&embed_id).unwrap().expose_secret(), "embed-val");
-        assert_eq!(store.get_secret(&candidate_id).unwrap().expose_secret(), "candidate-val");
+        assert_eq!(
+            store.get_secret(&chat_id).unwrap().expose_secret(),
+            "chat-val"
+        );
+        assert_eq!(
+            store.get_secret(&embed_id).unwrap().expose_secret(),
+            "embed-val"
+        );
+        assert_eq!(
+            store.get_secret(&candidate_id).unwrap().expose_secret(),
+            "candidate-val"
+        );
 
         store.delete_secret(&chat_id).unwrap();
         assert!(!store.has_secret(&chat_id).unwrap());
@@ -1692,5 +1738,88 @@ mod tests {
                 .profile_id,
             new_candidate.id
         );
+    }
+
+    #[test]
+    fn chat_and_embedding_model_security_config_tests() {
+        use crate::secrets::{
+            delete_api_credential_with_store, has_api_credential_with_store,
+            save_api_credential_with_store, ApiCredentialRequest, InMemorySecretStore,
+            SaveApiCredentialRequest, SecretPurpose, SecretStoreErrorCode,
+        };
+
+        let root = TestRoot::new("chat-embed-security");
+        let storage = service(&root);
+        let store = InMemorySecretStore::new();
+        let profiles = ModelProfileService::new(&storage);
+
+        let chat_profile = profiles.create(chat_request("Chat")).unwrap();
+        let embed_profile = profiles.create(embedding_request("Embedding")).unwrap();
+
+        // Check: save/has/del for Chat
+        let chat_save = SaveApiCredentialRequest {
+            purpose: SecretPurpose::ChatModelApiKey,
+            profile_id: chat_profile.id.clone(),
+            api_key: "chat-key".to_string(),
+        };
+        let chat_save_res = save_api_credential_with_store(&storage, &store, chat_save).unwrap();
+        assert!(chat_save_res.exists || chat_save_res.updated);
+
+        let chat_has = ApiCredentialRequest {
+            purpose: SecretPurpose::ChatModelApiKey,
+            profile_id: chat_profile.id.clone(),
+        };
+        assert!(
+            has_api_credential_with_store(&storage, &store, chat_has.clone())
+                .unwrap()
+                .exists
+        );
+
+        let chat_del =
+            delete_api_credential_with_store(&storage, &store, chat_has.clone()).unwrap();
+        assert!(chat_del.deleted);
+        assert!(
+            !has_api_credential_with_store(&storage, &store, chat_has.clone())
+                .unwrap()
+                .exists
+        );
+
+        // Check: save/has/del for Embedding
+        let embed_save = SaveApiCredentialRequest {
+            purpose: SecretPurpose::EmbeddingModelApiKey,
+            profile_id: embed_profile.id.clone(),
+            api_key: "embed-key".to_string(),
+        };
+        let embed_save_res = save_api_credential_with_store(&storage, &store, embed_save).unwrap();
+        assert!(embed_save_res.exists || embed_save_res.updated);
+
+        let embed_has = ApiCredentialRequest {
+            purpose: SecretPurpose::EmbeddingModelApiKey,
+            profile_id: embed_profile.id.clone(),
+        };
+        assert!(
+            has_api_credential_with_store(&storage, &store, embed_has.clone())
+                .unwrap()
+                .exists
+        );
+
+        let embed_del =
+            delete_api_credential_with_store(&storage, &store, embed_has.clone()).unwrap();
+        assert!(embed_del.deleted);
+        assert!(
+            !has_api_credential_with_store(&storage, &store, embed_has.clone())
+                .unwrap()
+                .exists
+        );
+
+        // Check: purpose mismatch
+        let chat_embed_mismatch = SaveApiCredentialRequest {
+            purpose: SecretPurpose::EmbeddingModelApiKey,
+            profile_id: chat_profile.id.clone(),
+            api_key: "wrong-key".to_string(),
+        };
+        let mismatch_err =
+            save_api_credential_with_store(&storage, &store, chat_embed_mismatch).unwrap_err();
+        assert_eq!(mismatch_err.code, SecretStoreErrorCode::InvalidIdentifier);
     }
 }

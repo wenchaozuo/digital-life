@@ -405,6 +405,31 @@ mod tests {
             normalize_ip(parse_ip("::192.0.2.1")),
             parse_ip("::192.0.2.1")
         );
+
+        let cases = [
+            ("::ffff:127.0.0.1", "127.0.0.1", IpSafetyClass::Loopback),
+            ("::ffff:10.0.0.1", "10.0.0.1", IpSafetyClass::Private),
+            (
+                "::ffff:192.0.2.1",
+                "192.0.2.1",
+                IpSafetyClass::Documentation,
+            ),
+            ("::ffff:198.18.0.1", "198.18.0.1", IpSafetyClass::Benchmark),
+        ];
+
+        for (mapped_str, normalized_str, expected_class) in cases {
+            let mapped_ip = parse_ip(mapped_str);
+            let normalized_ip = parse_ip(normalized_str);
+
+            assert_eq!(normalize_ip(mapped_ip), normalized_ip);
+            assert_eq!(classify_ip(mapped_ip), expected_class);
+            assert_eq!(classify_ip(normalized_ip), expected_class);
+            assert_ne!(classify_ip(mapped_ip), IpSafetyClass::Global);
+        }
+
+        let non_mapped = parse_ip("2001:db8::1");
+        assert_eq!(normalize_ip(non_mapped), non_mapped);
+        assert_eq!(classify_ip(non_mapped), IpSafetyClass::Documentation);
     }
 
     #[test]
@@ -838,5 +863,74 @@ mod tests {
             TransportPolicyError::PeerMismatch
         );
         assert!(!format!("{candidate:?}").contains("127.0.0.1"));
+    }
+
+    #[test]
+    fn cross_kind_loopback_set_remote_target_rejection() {
+        let loopback_tgt = loopback_target();
+        let remote_tgt = remote_target();
+
+        let loopback_set =
+            validate_resolved_candidates(&loopback_tgt, [parse_ip("127.0.0.1")]).unwrap();
+        let loopback_cand = loopback_set.candidate(0).unwrap();
+
+        let peer_addr = SocketAddr::new(parse_ip("127.0.0.1"), remote_tgt.port());
+        let err = loopback_set
+            .validate_connected_peer(&remote_tgt, &loopback_cand, peer_addr)
+            .unwrap_err();
+        assert_eq!(err, TransportPolicyError::UnsafePeer);
+
+        let display = format!("{err}");
+        let debug = format!("{err:?}");
+        assert!(!display.contains("127.0.0.1"));
+        assert!(!display.contains("443"));
+        assert!(!debug.contains("127.0.0.1"));
+        assert!(!debug.contains("443"));
+    }
+
+    #[test]
+    fn cross_kind_global_set_loopback_target_rejection() {
+        let loopback_tgt = loopback_target();
+        let remote_tgt = remote_target();
+
+        let global_set = validate_resolved_candidates(&remote_tgt, [parse_ip("1.1.1.1")]).unwrap();
+        let global_cand = global_set.candidate(0).unwrap();
+
+        let peer_addr = SocketAddr::new(parse_ip("1.1.1.1"), loopback_tgt.port());
+        let err = global_set
+            .validate_connected_peer(&loopback_tgt, &global_cand, peer_addr)
+            .unwrap_err();
+        assert_eq!(err, TransportPolicyError::UnsafePeer);
+
+        let display = format!("{err}");
+        let debug = format!("{err:?}");
+        assert!(!display.contains("1.1.1.1"));
+        assert!(!display.contains("80"));
+        assert!(!debug.contains("1.1.1.1"));
+        assert!(!debug.contains("80"));
+    }
+
+    #[test]
+    fn same_ip_different_candidateset_rejection() {
+        let target = remote_target();
+        let first = validate_resolved_candidates(&target, [parse_ip("1.1.1.1")]).unwrap();
+        let third = validate_resolved_candidates(&target, [parse_ip("1.1.1.1")]).unwrap();
+        let third_candidate = third.candidate(0).unwrap();
+
+        let err = first
+            .validate_connected_peer(
+                &target,
+                &third_candidate,
+                SocketAddr::new(parse_ip("1.1.1.1"), target.port()),
+            )
+            .unwrap_err();
+        assert_eq!(err, TransportPolicyError::PeerMismatch);
+
+        let display = format!("{err}");
+        let debug = format!("{err:?}");
+        assert!(!display.contains("1.1.1.1"));
+        assert!(!display.contains("443"));
+        assert!(!debug.contains("1.1.1.1"));
+        assert!(!debug.contains("443"));
     }
 }

@@ -472,4 +472,143 @@ mod tests {
         let path_debug = format!("{:?}", target.base_path());
         assert!(!path_debug.contains("sensitive-path"));
     }
+
+    #[test]
+    fn scheme_ftp_rejected() {
+        let err = validate_and_normalize_url("ftp://example.com/").unwrap_err();
+        assert_eq!(err, TransportPolicyError::UnsupportedScheme);
+        let display = format!("{err}");
+        let debug = format!("{err:?}");
+        assert!(!display.contains("ftp"));
+        assert!(!display.contains("example.com"));
+        assert!(!debug.contains("ftp"));
+        assert!(!debug.contains("example.com"));
+    }
+
+    #[test]
+    fn scheme_ws_rejected() {
+        let err = validate_and_normalize_url("ws://example.com/").unwrap_err();
+        assert_eq!(err, TransportPolicyError::UnsupportedScheme);
+        let display = format!("{err}");
+        let debug = format!("{err:?}");
+        assert!(!display.contains("ws"));
+        assert!(!display.contains("example.com"));
+        assert!(!debug.contains("ws"));
+        assert!(!debug.contains("example.com"));
+    }
+
+    #[test]
+    fn scheme_wss_rejected() {
+        let err = validate_and_normalize_url("wss://example.com/").unwrap_err();
+        assert_eq!(err, TransportPolicyError::UnsupportedScheme);
+        let display = format!("{err}");
+        let debug = format!("{err:?}");
+        assert!(!display.contains("wss"));
+        assert!(!display.contains("example.com"));
+        assert!(!debug.contains("wss"));
+        assert!(!debug.contains("example.com"));
+    }
+
+    #[test]
+    fn query_independent_rejection() {
+        let url = "https://example.com/v1?secret_query_canary=1";
+        let err = validate_and_normalize_url(url).unwrap_err();
+        assert_eq!(err, TransportPolicyError::ForbiddenQuery);
+        let display = format!("{err}");
+        let debug = format!("{err:?}");
+        assert!(!display.contains("secret_query_canary"));
+        assert!(!display.contains("example.com"));
+        assert!(!debug.contains("secret_query_canary"));
+        assert!(!debug.contains("example.com"));
+    }
+
+    #[test]
+    fn fragment_independent_rejection() {
+        let url = "https://example.com/v1#secret_fragment_canary";
+        let err = validate_and_normalize_url(url).unwrap_err();
+        assert_eq!(err, TransportPolicyError::ForbiddenFragment);
+        let display = format!("{err}");
+        let debug = format!("{err:?}");
+        assert!(!display.contains("secret_fragment_canary"));
+        assert!(!display.contains("example.com"));
+        assert!(!debug.contains("secret_fragment_canary"));
+        assert!(!debug.contains("example.com"));
+    }
+
+    #[test]
+    fn invalid_punycode_rejection() {
+        // 1. 空或不完整 punycode label (parser 拒绝)
+        {
+            let url = "https://xn--.com/";
+            let err = validate_and_normalize_url(url).unwrap_err();
+            assert_eq!(err, TransportPolicyError::UnsupportedScheme);
+            let display = format!("{err}");
+            let debug = format!("{err:?}");
+            assert!(!display.contains("xn--"));
+            assert!(!debug.contains("xn--"));
+        }
+
+        // 2. parser 接受，但项目 IDNA / grammar 拒绝 (ends with hyphen or leading hyphen)
+        {
+            // ASCII ending with hyphen
+            let url1 = "https://a-.example/";
+            let err1 = validate_and_normalize_url(url1).unwrap_err();
+            assert_eq!(err1, TransportPolicyError::ForbiddenHostForm);
+            let display = format!("{err1}");
+            let debug = format!("{err1:?}");
+            assert!(!display.contains("a-"));
+            assert!(!debug.contains("a-"));
+
+            // xn-- label starting with hyphen (invalid structure)
+            let url2 = "https://-xn--0zwm56d.com/";
+            let err2 = validate_and_normalize_url(url2).unwrap_err();
+            assert_eq!(err2, TransportPolicyError::ForbiddenHostForm);
+            let display = format!("{err2}");
+            let debug = format!("{err2:?}");
+            assert!(!display.contains("xn--0zwm56d"));
+            assert!(!debug.contains("xn--0zwm56d"));
+        }
+
+        // 3. label 长度非法的 xn-- case (parser 拒绝 due to length limit of 63 per label)
+        {
+            let long_label = format!("xn--{}", "a".repeat(60));
+            let url = format!("https://{long_label}.com/");
+            let err = validate_and_normalize_url(&url).unwrap_err();
+            assert_eq!(err, TransportPolicyError::UnsupportedScheme);
+            let display = format!("{err}");
+            let debug = format!("{err:?}");
+            assert!(!display.contains(&long_label));
+            assert!(!debug.contains(&long_label));
+        }
+    }
+
+    #[test]
+    fn unicode_dot_normalization_and_localhost_confusion() {
+        // U+3002 IDEOGRAPHIC FULL STOP
+        // U+FF0E FULLWIDTH FULL STOP
+        // U+FF61 HALFWIDTH IDEOGRAPHIC FULL STOP
+
+        // Verify normalization for example.com
+        for dot in ["。", "．", "｡"] {
+            let url = format!("https://example{}com/", dot);
+            let target = validate_and_normalize_url(&url).unwrap();
+            assert_eq!(target.host_ascii(), "example.com");
+            assert_eq!(target.kind(), TransportTargetKind::RemoteHttps);
+        }
+
+        // Verify localhost dot suffix is NOT categorized as loopback
+        for dot in ["。", "．", "｡"] {
+            let url_https = format!("https://localhost{}/", dot);
+            let err_https = validate_and_normalize_url(&url_https).unwrap_err();
+            assert_eq!(err_https, TransportPolicyError::ForbiddenHostForm);
+            assert!(!format!("{err_https}").contains("localhost"));
+            assert!(!format!("{err_https:?}").contains("localhost"));
+
+            let url_http = format!("http://localhost{}/", dot);
+            let err_http = validate_and_normalize_url(&url_http).unwrap_err();
+            assert_eq!(err_http, TransportPolicyError::UnsupportedScheme);
+            assert!(!format!("{err_http}").contains("localhost"));
+            assert!(!format!("{err_http:?}").contains("localhost"));
+        }
+    }
 }

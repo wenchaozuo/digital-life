@@ -1,6 +1,7 @@
 mod openai_compatible;
 pub mod profile;
 pub mod runtime;
+pub(crate) mod transport;
 
 use std::{future::Future, pin::Pin};
 

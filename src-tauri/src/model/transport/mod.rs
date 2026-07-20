@@ -1,4 +1,6 @@
+pub(crate) mod connector;
 pub(crate) mod ip_policy;
+pub(crate) mod tls;
 pub(crate) mod url_policy;
 
 use std::fmt;

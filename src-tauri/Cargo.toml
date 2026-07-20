@@ -32,9 +32,14 @@ arrow-schema = "=58.0.0"
 futures = "0.3"
 sha2 = "0.10"
 zeroize = "1.9"
+rustls = { version = "=0.23.41", default-features = false, features = ["ring", "std", "tls12"] }
+tokio = { version = "=1.52.3", default-features = false, features = ["io-util", "net", "sync", "time"] }
+tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "=1.0.8"
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "=1.52.3", default-features = false, features = ["macros", "rt-multi-thread"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Storage_FileSystem"] }

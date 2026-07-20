@@ -1,22 +1,44 @@
-#![allow(dead_code)]
-
 pub(crate) mod ip_policy;
 pub(crate) mod url_policy;
 
 use std::fmt;
 
+/// D-8C2 applies this DNS-answer cap before opening a connection.
+#[allow(dead_code)]
 pub(crate) const MAX_DNS_CANDIDATES: usize = 16;
+/// D-8C2 enforces this raw URL input bound at the policy boundary.
+#[allow(dead_code)]
+pub(crate) const MAX_TRANSPORT_BASE_URL_BYTES: usize = 4096;
+/// Frozen for D-8C2 request admission.
+#[allow(dead_code)]
 pub(crate) const CONNECT_PHASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Frozen for D-8C2 request admission.
+#[allow(dead_code)]
 pub(crate) const TRANSPORT_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
+/// Frozen for D-8C3 outbound request framing.
+#[allow(dead_code)]
 pub(crate) const MAX_REQUEST_BODY_BYTES: u64 = 262144;
+/// Frozen for D-8C3 inbound body collection.
+#[allow(dead_code)]
 pub(crate) const MAX_RESPONSE_BODY_BYTES: u64 = 1048576;
+/// Frozen for D-8C3 HTTP/1 header admission.
+#[allow(dead_code)]
 pub(crate) const MAX_RESPONSE_HEADER_BYTES: usize = 32768;
+/// Frozen for D-8C3 HTTP/1 header admission.
+#[allow(dead_code)]
 pub(crate) const MAX_HEADERS_PER_BLOCK: usize = 128;
+/// Frozen for D-8C3 bounded header staging.
+#[allow(dead_code)]
 pub(crate) const HEADER_STAGING_BYTES: usize = 8192;
+/// Frozen for D-8C2 transport scheduling.
+#[allow(dead_code)]
 pub(crate) const MAX_TRANSPORT_CONCURRENCY: usize = 4;
 
+/// D-8C2 maps only these fixed, non-sensitive policy outcomes across its boundary.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TransportPolicyError {
+    BaseUrlTooLong,
     UnsupportedScheme,
     MissingHost,
     ForbiddenUserinfo,
@@ -38,6 +60,7 @@ pub(crate) enum TransportPolicyError {
 impl fmt::Display for TransportPolicyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let msg = match self {
+            Self::BaseUrlTooLong => "Transport base URL is too long",
             Self::UnsupportedScheme => "Unsupported scheme",
             Self::MissingHost => "Missing host",
             Self::ForbiddenUserinfo => "Forbidden userinfo",

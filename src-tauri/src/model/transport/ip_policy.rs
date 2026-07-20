@@ -1,7 +1,15 @@
 use super::url_policy::{TransportTargetKind, ValidatedTransportTarget};
 use super::{TransportPolicyError, MAX_DNS_CANDIDATES};
+use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 
+/// D-8C2 consumes this opaque set identity when binding a connect attempt.
+#[allow(dead_code)]
+static NEXT_CANDIDATE_SET_ID: AtomicU64 = AtomicU64::new(1);
+
+/// D-8C2 uses this closed classification before any socket is opened.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IpSafetyClass {
     Global,
@@ -16,102 +24,164 @@ pub(crate) enum IpSafetyClass {
     ReservedOrSpecial,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// D-8C2 receives this sealed result instead of DNS addresses it can mutate.
+#[allow(dead_code)]
 pub(crate) struct ValidatedCandidateSet {
-    pub(crate) candidates: Vec<IpAddr>,
+    set_id: u64,
+    candidates: Vec<IpAddr>,
 }
 
-pub(crate) fn normalize_ip(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V4(ipv4) => IpAddr::V4(ipv4),
-        IpAddr::V6(ipv6) => {
-            if let Some(ipv4) = ipv6.to_ipv4_mapped() {
-                IpAddr::V4(ipv4)
-            } else {
-                IpAddr::V6(ipv6)
-            }
+/// D-8C2 presents this opaque token to the peer-validation boundary.
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+pub(crate) struct ValidatedCandidate {
+    set_id: u64,
+    index: usize,
+    ip: IpAddr,
+}
+
+#[allow(dead_code)]
+impl ValidatedCandidateSet {
+    pub(crate) const fn len(&self) -> usize {
+        self.candidates.len()
+    }
+
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.candidates.is_empty()
+    }
+
+    pub(crate) fn candidate(&self, index: usize) -> Option<ValidatedCandidate> {
+        self.candidates
+            .get(index)
+            .copied()
+            .map(|ip| ValidatedCandidate {
+                set_id: self.set_id,
+                index,
+                ip,
+            })
+    }
+
+    pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = ValidatedCandidate> + '_ {
+        self.candidates
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, ip)| ValidatedCandidate {
+                set_id: self.set_id,
+                index,
+                ip,
+            })
+    }
+
+    pub(crate) fn contains_normalized(&self, ip: IpAddr) -> bool {
+        self.candidates.contains(&normalize_ip(ip))
+    }
+
+    pub(crate) fn validate_connected_peer(
+        &self,
+        target: &ValidatedTransportTarget,
+        selected: &ValidatedCandidate,
+        actual_peer: SocketAddr,
+    ) -> Result<(), TransportPolicyError> {
+        let selected_ip = self.selected_ip(selected)?;
+        let normalized_peer_ip = normalize_ip(actual_peer.ip());
+
+        if normalized_peer_ip != selected_ip || actual_peer.port() != target.port() {
+            return Err(TransportPolicyError::PeerMismatch);
         }
+
+        match (target.kind(), classify_ip(normalized_peer_ip)) {
+            (TransportTargetKind::RemoteHttps, IpSafetyClass::Global)
+            | (TransportTargetKind::LoopbackHttp, IpSafetyClass::Loopback) => Ok(()),
+            _ => Err(TransportPolicyError::UnsafePeer),
+        }
+    }
+
+    fn selected_ip(&self, selected: &ValidatedCandidate) -> Result<IpAddr, TransportPolicyError> {
+        if selected.set_id != self.set_id
+            || self.candidates.get(selected.index).copied() != Some(selected.ip)
+        {
+            return Err(TransportPolicyError::PeerMismatch);
+        }
+        Ok(selected.ip)
     }
 }
 
+#[allow(dead_code)]
+impl ValidatedCandidate {
+    pub(crate) const fn ip(&self) -> IpAddr {
+        self.ip
+    }
+}
+
+impl fmt::Debug for ValidatedCandidateSet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ValidatedCandidateSet { redacted: true }")
+    }
+}
+
+impl fmt::Debug for ValidatedCandidate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ValidatedCandidate { redacted: true }")
+    }
+}
+
+/// D-8C2 normalizes a connected peer only through this policy helper.
+#[allow(dead_code)]
+pub(crate) fn normalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(ipv4) => IpAddr::V4(ipv4),
+        IpAddr::V6(ipv6) => ipv6.to_ipv4_mapped().map_or(IpAddr::V6(ipv6), IpAddr::V4),
+    }
+}
+
+/// D-8C2 checks every DNS answer and connected peer with this classifier.
+#[allow(dead_code)]
 pub(crate) fn classify_ip(ip: IpAddr) -> IpSafetyClass {
-    let normalized = normalize_ip(ip);
-    match normalized {
+    match normalize_ip(ip) {
         IpAddr::V4(ipv4) => classify_ipv4(ipv4),
         IpAddr::V6(ipv6) => classify_ipv6(ipv6),
     }
 }
 
 fn classify_ipv4(ip: Ipv4Addr) -> IpSafetyClass {
-    let octets = ip.octets();
-
-    // 127.0.0.0/8 -> Loopback
-    if octets[0] == 127 {
+    if ipv4_in_cidr(ip, [127, 0, 0, 0], 8) {
         return IpSafetyClass::Loopback;
     }
-
-    // 10.0.0.0/8 -> Private
-    if octets[0] == 10 {
+    if ipv4_in_cidr(ip, [10, 0, 0, 0], 8)
+        || ipv4_in_cidr(ip, [172, 16, 0, 0], 12)
+        || ipv4_in_cidr(ip, [192, 168, 0, 0], 16)
+    {
         return IpSafetyClass::Private;
     }
-
-    // 172.16.0.0/12 -> Private (172.16.0.0 to 172.31.255.255)
-    if octets[0] == 172 && (octets[1] >= 16 && octets[1] <= 31) {
-        return IpSafetyClass::Private;
-    }
-
-    // 192.168.0.0/16 -> Private
-    if octets[0] == 192 && octets[1] == 168 {
-        return IpSafetyClass::Private;
-    }
-
-    // 0.0.0.0/8 -> ReservedOrSpecial
-    if octets[0] == 0 {
-        return IpSafetyClass::ReservedOrSpecial;
-    }
-
-    // 100.64.0.0/10 -> CarrierGradeNat (100.64.0.0 to 100.127.255.255)
-    if octets[0] == 100 && (octets[1] >= 64 && octets[1] <= 127) {
-        return IpSafetyClass::CarrierGradeNat;
-    }
-
-    // 169.254.0.0/16 -> LinkLocal
-    if octets[0] == 169 && octets[1] == 254 {
+    if ipv4_in_cidr(ip, [169, 254, 0, 0], 16) {
         return IpSafetyClass::LinkLocal;
     }
-
-    // 192.0.0.0/24 -> ReservedOrSpecial
-    if octets[0] == 192 && octets[1] == 0 && octets[2] == 0 {
-        return IpSafetyClass::ReservedOrSpecial;
+    if ipv4_in_cidr(ip, [100, 64, 0, 0], 10) {
+        return IpSafetyClass::CarrierGradeNat;
     }
-
-    // 192.0.2.0/24 -> Documentation
-    if octets[0] == 192 && octets[1] == 0 && octets[2] == 2 {
+    if ipv4_in_cidr(ip, [192, 0, 2, 0], 24)
+        || ipv4_in_cidr(ip, [198, 51, 100, 0], 24)
+        || ipv4_in_cidr(ip, [203, 0, 113, 0], 24)
+    {
         return IpSafetyClass::Documentation;
     }
-
-    // 198.18.0.0/15 -> Benchmark (198.18.0.0 to 199.19.255.255)
-    if octets[0] == 198 && (octets[1] == 18 || octets[1] == 19) {
+    if ipv4_in_cidr(ip, [198, 18, 0, 0], 15) {
         return IpSafetyClass::Benchmark;
     }
-
-    // 198.51.100.0/24 -> Documentation
-    if octets[0] == 198 && octets[1] == 51 && octets[2] == 100 {
-        return IpSafetyClass::Documentation;
-    }
-
-    // 203.0.113.0/24 -> Documentation
-    if octets[0] == 203 && octets[1] == 0 && octets[2] == 113 {
-        return IpSafetyClass::Documentation;
-    }
-
-    // 224.0.0.0/4 -> Multicast (224.0.0.0 to 239.255.255.255)
-    if octets[0] >= 224 && octets[0] <= 239 {
+    if ipv4_in_cidr(ip, [224, 0, 0, 0], 4) {
         return IpSafetyClass::Multicast;
     }
 
-    // 240.0.0.0/4 -> ReservedOrSpecial (includes 255.255.255.255)
-    if octets[0] >= 240 {
+    // Reject IANA special-purpose and infrastructure prefixes conservatively.
+    if ipv4_in_cidr(ip, [0, 0, 0, 0], 8)
+        || ipv4_in_cidr(ip, [192, 0, 0, 0], 24)
+        || ipv4_in_cidr(ip, [192, 31, 196, 0], 24)
+        || ipv4_in_cidr(ip, [192, 52, 193, 0], 24)
+        || ipv4_in_cidr(ip, [192, 88, 99, 0], 24)
+        || ipv4_in_cidr(ip, [192, 175, 48, 0], 24)
+        || ipv4_in_cidr(ip, [240, 0, 0, 0], 4)
+    {
         return IpSafetyClass::ReservedOrSpecial;
     }
 
@@ -119,409 +189,654 @@ fn classify_ipv4(ip: Ipv4Addr) -> IpSafetyClass {
 }
 
 fn classify_ipv6(ip: Ipv6Addr) -> IpSafetyClass {
-    let segments = ip.segments();
-
-    // ::1/128 -> Loopback
     if ip.is_loopback() {
         return IpSafetyClass::Loopback;
     }
-
-    // ::/128 -> Unspecified
     if ip.is_unspecified() {
         return IpSafetyClass::Unspecified;
     }
-
-    // fc00::/7 -> Private (Unique Local Addresses)
-    if (segments[0] & 0xfe00) == 0xfc00 {
+    if ipv6_in_cidr(ip, Ipv6Addr::UNSPECIFIED, 96) {
+        return IpSafetyClass::ReservedOrSpecial;
+    }
+    if ipv6_in_cidr(ip, "64:ff9b::".parse().expect("valid IPv6 CIDR base"), 96)
+        || ipv6_in_cidr(ip, "64:ff9b:1::".parse().expect("valid IPv6 CIDR base"), 48)
+        || ipv6_in_cidr(ip, "100::".parse().expect("valid IPv6 CIDR base"), 64)
+        || ipv6_in_cidr(ip, "2002::".parse().expect("valid IPv6 CIDR base"), 16)
+        || ipv6_in_cidr(ip, "3ffe::".parse().expect("valid IPv6 CIDR base"), 16)
+        || ipv6_in_cidr(ip, "3fff::".parse().expect("valid IPv6 CIDR base"), 20)
+        || ipv6_in_cidr(ip, "fec0::".parse().expect("valid IPv6 CIDR base"), 10)
+    {
+        return IpSafetyClass::ReservedOrSpecial;
+    }
+    if ipv6_in_cidr(ip, "fc00::".parse().expect("valid IPv6 CIDR base"), 7) {
         return IpSafetyClass::Private;
     }
-
-    // fe80::/10 -> LinkLocal
-    if (segments[0] & 0xffc0) == 0xfe80 {
+    if ipv6_in_cidr(ip, "fe80::".parse().expect("valid IPv6 CIDR base"), 10) {
         return IpSafetyClass::LinkLocal;
     }
-
-    // ff00::/8 -> Multicast
-    if (segments[0] & 0xff00) == 0xff00 {
+    if ipv6_in_cidr(ip, "ff00::".parse().expect("valid IPv6 CIDR base"), 8) {
         return IpSafetyClass::Multicast;
     }
-
-    // 100::/64 -> ReservedOrSpecial (Discard-only prefix)
-    if segments[0] == 0x0100 && segments[1] == 0 && segments[2] == 0 && segments[3] == 0 {
+    if ipv6_in_cidr(ip, "2001:db8::".parse().expect("valid IPv6 CIDR base"), 32) {
+        return IpSafetyClass::Documentation;
+    }
+    if ipv6_in_cidr(ip, "2001:2::".parse().expect("valid IPv6 CIDR base"), 48) {
+        return IpSafetyClass::Benchmark;
+    }
+    if ipv6_in_cidr(ip, "2001::".parse().expect("valid IPv6 CIDR base"), 23) {
         return IpSafetyClass::ReservedOrSpecial;
     }
 
-    // 2001:2::/48 -> Benchmark
-    if segments[0] == 0x2001 && segments[1] == 2 && segments[2] == 0 {
-        return IpSafetyClass::Benchmark;
+    if ipv6_in_cidr(ip, "2000::".parse().expect("valid IPv6 CIDR base"), 3) {
+        IpSafetyClass::Global
+    } else {
+        IpSafetyClass::ReservedOrSpecial
     }
-
-    // 2001:db8::/32 -> Documentation
-    if segments[0] == 0x2001 && segments[1] == 0x0db8 {
-        return IpSafetyClass::Documentation;
-    }
-
-    IpSafetyClass::Global
 }
 
+fn ipv4_in_cidr(ip: Ipv4Addr, network: [u8; 4], prefix: u8) -> bool {
+    let ip = u32::from_be_bytes(ip.octets());
+    let network = u32::from_be_bytes(network);
+    let mask = u32::MAX << (32 - prefix);
+    ip & mask == network & mask
+}
+
+fn ipv6_in_cidr(ip: Ipv6Addr, network: Ipv6Addr, prefix: u8) -> bool {
+    let ip = u128::from_be_bytes(ip.octets());
+    let network = u128::from_be_bytes(network.octets());
+    let mask = u128::MAX << (128 - prefix);
+    ip & mask == network & mask
+}
+
+/// D-8C2 validates the bounded DNS batch before selecting one opaque candidate.
+#[allow(dead_code)]
 pub(crate) fn validate_resolved_candidates(
     target: &ValidatedTransportTarget,
     candidates: impl IntoIterator<Item = IpAddr>,
 ) -> Result<ValidatedCandidateSet, TransportPolicyError> {
-    let raw_candidates: Vec<IpAddr> = candidates.into_iter().collect();
+    let mut raw = Vec::with_capacity(MAX_DNS_CANDIDATES);
+    for candidate in candidates {
+        if raw.len() == MAX_DNS_CANDIDATES {
+            return Err(TransportPolicyError::TooManyDnsCandidates);
+        }
+        raw.push(candidate);
+    }
 
-    if raw_candidates.is_empty() {
+    if raw.is_empty() {
         return Err(TransportPolicyError::EmptyDnsResult);
     }
 
-    if raw_candidates.len() > MAX_DNS_CANDIDATES {
-        return Err(TransportPolicyError::TooManyDnsCandidates);
-    }
-
-    // Normalize and deduplicate while keeping insertion order
-    let mut normalized = Vec::new();
-    for ip in raw_candidates {
-        let norm_ip = normalize_ip(ip);
-        if !normalized.contains(&norm_ip) {
-            normalized.push(norm_ip);
+    let mut normalized = Vec::with_capacity(raw.len());
+    for ip in raw {
+        let normalized_ip = normalize_ip(ip);
+        if !normalized.contains(&normalized_ip) {
+            normalized.push(normalized_ip);
         }
     }
 
-    // Validate candidates based on target kind
-    match target.kind {
-        TransportTargetKind::RemoteHttps => {
-            let mut has_global = false;
-            let mut has_non_global = false;
-            for ip in &normalized {
-                let class = classify_ip(*ip);
-                if let IpSafetyClass::Global = class {
-                    has_global = true;
-                } else {
-                    has_non_global = true;
-                }
-            }
-            if has_non_global {
-                if has_global {
-                    return Err(TransportPolicyError::MixedUnsafeDnsResult);
-                } else {
-                    return Err(TransportPolicyError::UnsafeDnsCandidate);
-                }
-            }
-        }
-        TransportTargetKind::LoopbackHttp => {
-            let mut has_loopback = false;
-            let mut has_non_loopback = false;
-            for ip in &normalized {
-                let class = classify_ip(*ip);
-                if let IpSafetyClass::Loopback = class {
-                    has_loopback = true;
-                } else {
-                    has_non_loopback = true;
-                }
-            }
-            if has_non_loopback {
-                if has_loopback {
-                    return Err(TransportPolicyError::MixedUnsafeDnsResult);
-                } else {
-                    return Err(TransportPolicyError::UnsafeDnsCandidate);
-                }
-            }
-        }
+    let expected = match target.kind() {
+        TransportTargetKind::RemoteHttps => IpSafetyClass::Global,
+        TransportTargetKind::LoopbackHttp => IpSafetyClass::Loopback,
+    };
+    let has_expected = normalized.iter().any(|ip| classify_ip(*ip) == expected);
+    if normalized.iter().any(|ip| classify_ip(*ip) != expected) {
+        return Err(if has_expected {
+            TransportPolicyError::MixedUnsafeDnsResult
+        } else {
+            TransportPolicyError::UnsafeDnsCandidate
+        });
     }
 
     Ok(ValidatedCandidateSet {
+        set_id: NEXT_CANDIDATE_SET_ID.fetch_add(1, Ordering::Relaxed),
         candidates: normalized,
     })
-}
-
-pub(crate) fn validate_connected_peer(
-    target: &ValidatedTransportTarget,
-    selected_candidate: IpAddr,
-    actual_peer: SocketAddr,
-) -> Result<(), TransportPolicyError> {
-    let normalized_peer_ip = normalize_ip(actual_peer.ip());
-    let normalized_candidate = normalize_ip(selected_candidate);
-
-    if normalized_peer_ip != normalized_candidate {
-        return Err(TransportPolicyError::PeerMismatch);
-    }
-
-    if actual_peer.port() != target.port {
-        return Err(TransportPolicyError::PeerMismatch);
-    }
-
-    // Re-verify the address classification
-    let class = classify_ip(normalized_peer_ip);
-    match target.kind {
-        TransportTargetKind::RemoteHttps => {
-            if let IpSafetyClass::Global = class {
-                Ok(())
-            } else {
-                Err(TransportPolicyError::UnsafePeer)
-            }
-        }
-        TransportTargetKind::LoopbackHttp => {
-            if let IpSafetyClass::Loopback = class {
-                Ok(())
-            } else {
-                Err(TransportPolicyError::UnsafePeer)
-            }
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::transport::url_policy::validate_and_normalize_url;
+    use std::cell::Cell;
+    use std::rc::Rc;
     use std::str::FromStr;
 
-    fn parse_ip(s: &str) -> IpAddr {
-        IpAddr::from_str(s).unwrap()
+    fn parse_ip(value: &str) -> IpAddr {
+        IpAddr::from_str(value).unwrap()
+    }
+
+    fn parse_ipv4(value: &str) -> Ipv4Addr {
+        value.parse().unwrap()
+    }
+
+    fn parse_ipv6(value: &str) -> Ipv6Addr {
+        value.parse().unwrap()
+    }
+
+    fn assert_ipv4_range_bounds(
+        network: &str,
+        prefix: u8,
+        expected: IpSafetyClass,
+        before: Option<IpSafetyClass>,
+        after: Option<IpSafetyClass>,
+    ) {
+        let start = u32::from(parse_ipv4(network));
+        let width = 32 - prefix;
+        let end = start | ((1_u32 << width) - 1);
+        for value in [start, end] {
+            assert_eq!(
+                classify_ip(IpAddr::V4(Ipv4Addr::from(value))),
+                expected,
+                "{network}/{prefix} boundary {value}"
+            );
+        }
+        if let Some(expected) = before {
+            assert_eq!(
+                classify_ip(IpAddr::V4(Ipv4Addr::from(start - 1))),
+                expected,
+                "before {network}/{prefix}"
+            );
+        }
+        if let Some(expected) = after {
+            assert_eq!(
+                classify_ip(IpAddr::V4(Ipv4Addr::from(end + 1))),
+                expected,
+                "after {network}/{prefix}"
+            );
+        }
+    }
+
+    fn assert_ipv6_range_bounds(
+        network: &str,
+        prefix: u8,
+        expected: IpSafetyClass,
+        before_is_global: Option<bool>,
+        after_is_global: Option<bool>,
+    ) {
+        let start = u128::from(parse_ipv6(network));
+        let width = 128 - prefix;
+        let end = start | ((1_u128 << width) - 1);
+        for value in [start, end] {
+            assert_eq!(
+                classify_ip(IpAddr::V6(Ipv6Addr::from(value))),
+                expected,
+                "{network}/{prefix} boundary {value:x}"
+            );
+        }
+        if let Some(expected) = before_is_global {
+            assert_eq!(
+                classify_ip(IpAddr::V6(Ipv6Addr::from(start - 1))) == IpSafetyClass::Global,
+                expected,
+                "before {network}/{prefix}"
+            );
+        }
+        if let Some(expected) = after_is_global {
+            assert_eq!(
+                classify_ip(IpAddr::V6(Ipv6Addr::from(end + 1))) == IpSafetyClass::Global,
+                expected,
+                "after {network}/{prefix}"
+            );
+        }
+    }
+
+    fn remote_target() -> ValidatedTransportTarget {
+        validate_and_normalize_url("https://example.com/").unwrap()
+    }
+
+    fn loopback_target() -> ValidatedTransportTarget {
+        validate_and_normalize_url("http://localhost/").unwrap()
     }
 
     #[test]
-    fn test_normalize_ip() {
+    fn normalize_mapped_ipv6_only() {
         assert_eq!(
             normalize_ip(parse_ip("::ffff:127.0.0.1")),
             parse_ip("127.0.0.1")
         );
         assert_eq!(
-            normalize_ip(parse_ip("::ffff:192.168.1.1")),
-            parse_ip("192.168.1.1")
+            normalize_ip(parse_ip("::ffff:10.0.0.1")),
+            parse_ip("10.0.0.1")
         );
-        assert_eq!(normalize_ip(parse_ip("1.1.1.1")), parse_ip("1.1.1.1"));
-        assert_eq!(normalize_ip(parse_ip("::1")), parse_ip("::1"));
+        assert_eq!(
+            normalize_ip(parse_ip("::ffff:192.0.2.1")),
+            parse_ip("192.0.2.1")
+        );
+        assert_eq!(
+            normalize_ip(parse_ip("::192.0.2.1")),
+            parse_ip("::192.0.2.1")
+        );
     }
 
     #[test]
-    fn test_ip_classification() {
-        // Table for IPv4 boundary and target checks
-        let cases = vec![
-            // 127.0.0.0/8
-            ("127.0.0.1", IpSafetyClass::Loopback),
-            ("127.0.0.0", IpSafetyClass::Loopback),
-            ("127.255.255.255", IpSafetyClass::Loopback),
-            ("126.255.255.255", IpSafetyClass::Global),
-            ("128.0.0.0", IpSafetyClass::Global),
-            // 10.0.0.0/8
-            ("10.0.0.0", IpSafetyClass::Private),
-            ("10.255.255.255", IpSafetyClass::Private),
-            ("9.255.255.255", IpSafetyClass::Global),
-            ("11.0.0.0", IpSafetyClass::Global),
-            // 172.16.0.0/12
-            ("172.16.0.0", IpSafetyClass::Private),
-            ("172.31.255.255", IpSafetyClass::Private),
-            ("172.15.255.255", IpSafetyClass::Global),
-            ("172.32.0.0", IpSafetyClass::Global),
-            // 192.168.0.0/16
-            ("192.168.0.0", IpSafetyClass::Private),
-            ("192.168.255.255", IpSafetyClass::Private),
-            ("192.167.255.255", IpSafetyClass::Global),
-            ("192.169.0.0", IpSafetyClass::Global),
-            // 0.0.0.0/8
-            ("0.0.0.0", IpSafetyClass::ReservedOrSpecial),
-            ("0.255.255.255", IpSafetyClass::ReservedOrSpecial),
-            ("1.0.0.0", IpSafetyClass::Global),
-            // 100.64.0.0/10
-            ("100.64.0.0", IpSafetyClass::CarrierGradeNat),
-            ("100.127.255.255", IpSafetyClass::CarrierGradeNat),
-            ("100.63.255.255", IpSafetyClass::Global),
-            ("100.128.0.0", IpSafetyClass::Global),
-            // 169.254.0.0/16
-            ("169.254.0.0", IpSafetyClass::LinkLocal),
-            ("169.254.255.255", IpSafetyClass::LinkLocal),
-            ("169.253.255.255", IpSafetyClass::Global),
-            ("169.255.0.0", IpSafetyClass::Global),
-            // 192.0.2.0/24
-            ("192.0.2.0", IpSafetyClass::Documentation),
-            ("192.0.2.255", IpSafetyClass::Documentation),
-            ("192.0.0.255", IpSafetyClass::ReservedOrSpecial),
-            ("192.0.1.255", IpSafetyClass::Global),
-            ("192.0.3.0", IpSafetyClass::Global),
-            // 198.18.0.0/15
-            ("198.18.0.0", IpSafetyClass::Benchmark),
-            ("199.19.255.255", IpSafetyClass::Global), // wait, 198.18.0.0/15 is 198.18.0.0 to 198.19.255.255.
-            ("198.19.255.255", IpSafetyClass::Benchmark),
+    fn ipv4_special_ranges_have_boundaries() {
+        assert_ipv4_range_bounds(
+            "0.0.0.0",
+            8,
+            IpSafetyClass::ReservedOrSpecial,
+            None,
+            Some(IpSafetyClass::Global),
+        );
+        assert_ipv4_range_bounds(
+            "10.0.0.0",
+            8,
+            IpSafetyClass::Private,
+            Some(IpSafetyClass::Global),
+            Some(IpSafetyClass::Global),
+        );
+        assert_ipv4_range_bounds(
+            "100.64.0.0",
+            10,
+            IpSafetyClass::CarrierGradeNat,
+            Some(IpSafetyClass::Global),
+            Some(IpSafetyClass::Global),
+        );
+        assert_ipv4_range_bounds(
+            "127.0.0.0",
+            8,
+            IpSafetyClass::Loopback,
+            Some(IpSafetyClass::Global),
+            Some(IpSafetyClass::Global),
+        );
+        assert_ipv4_range_bounds(
+            "169.254.0.0",
+            16,
+            IpSafetyClass::LinkLocal,
+            Some(IpSafetyClass::Global),
+            Some(IpSafetyClass::Global),
+        );
+        assert_ipv4_range_bounds(
+            "172.16.0.0",
+            12,
+            IpSafetyClass::Private,
+            Some(IpSafetyClass::Global),
+            Some(IpSafetyClass::Global),
+        );
+        assert_ipv4_range_bounds(
+            "192.0.0.0",
+            24,
+            IpSafetyClass::ReservedOrSpecial,
+            Some(IpSafetyClass::Global),
+            Some(IpSafetyClass::Global),
+        );
+        assert_ipv4_range_bounds(
+            "192.0.2.0",
+            24,
+            IpSafetyClass::Documentation,
+            Some(IpSafetyClass::Global),
+            Some(IpSafetyClass::Global),
+        );
+        assert_ipv4_range_bounds(
+            "192.31.196.0",
+            24,
+            IpSafetyClass::ReservedOrSpecial,
+            Some(IpSafetyClass::Global),
+            Some(IpSafetyClass::Global),
+        );
+        assert_ipv4_range_bounds(
+            "192.52.193.0",
+            24,
+            IpSafetyClass::ReservedOrSpecial,
+            Some(IpSafetyClass::Global),
+            Some(IpSafetyClass::Global),
+        );
+        assert_ipv4_range_bounds(
+            "192.88.99.0",
+            24,
+            IpSafetyClass::ReservedOrSpecial,
+            Some(IpSafetyClass::Global),
+            Some(IpSafetyClass::Global),
+        );
+        assert_ipv4_range_bounds(
+            "192.168.0.0",
+            16,
+            IpSafetyClass::Private,
+            Some(IpSafetyClass::Global),
+            Some(IpSafetyClass::Global),
+        );
+        assert_ipv4_range_bounds(
+            "192.175.48.0",
+            24,
+            IpSafetyClass::ReservedOrSpecial,
+            Some(IpSafetyClass::Global),
+            Some(IpSafetyClass::Global),
+        );
+        assert_ipv4_range_bounds(
+            "198.18.0.0",
+            15,
+            IpSafetyClass::Benchmark,
+            Some(IpSafetyClass::Global),
+            Some(IpSafetyClass::Global),
+        );
+        assert_ipv4_range_bounds(
+            "198.51.100.0",
+            24,
+            IpSafetyClass::Documentation,
+            Some(IpSafetyClass::Global),
+            Some(IpSafetyClass::Global),
+        );
+        assert_ipv4_range_bounds(
+            "203.0.113.0",
+            24,
+            IpSafetyClass::Documentation,
+            Some(IpSafetyClass::Global),
+            Some(IpSafetyClass::Global),
+        );
+        assert_ipv4_range_bounds(
+            "224.0.0.0",
+            4,
+            IpSafetyClass::Multicast,
+            Some(IpSafetyClass::Global),
+            Some(IpSafetyClass::ReservedOrSpecial),
+        );
+        assert_ipv4_range_bounds(
+            "240.0.0.0",
+            4,
+            IpSafetyClass::ReservedOrSpecial,
+            Some(IpSafetyClass::Multicast),
+            None,
+        );
+
+        let cases = [
+            ("192.88.98.255", IpSafetyClass::Global),
+            ("192.88.99.0", IpSafetyClass::ReservedOrSpecial),
+            ("192.88.99.255", IpSafetyClass::ReservedOrSpecial),
+            ("192.88.100.0", IpSafetyClass::Global),
             ("198.17.255.255", IpSafetyClass::Global),
+            ("198.18.0.0", IpSafetyClass::Benchmark),
+            ("198.19.255.255", IpSafetyClass::Benchmark),
             ("198.20.0.0", IpSafetyClass::Global),
-            // 224.0.0.0/4
             ("224.0.0.0", IpSafetyClass::Multicast),
             ("239.255.255.255", IpSafetyClass::Multicast),
-            ("223.255.255.255", IpSafetyClass::Global),
-            // 240.0.0.0/4
             ("240.0.0.0", IpSafetyClass::ReservedOrSpecial),
             ("255.255.255.255", IpSafetyClass::ReservedOrSpecial),
-            // IPv6 Link-Local fe80::/10
-            ("fe80::1", IpSafetyClass::LinkLocal),
-            ("fec0::1", IpSafetyClass::Global), // Site-Local deprecated, treated as Global in our rule or Private depending on spec, but fe80::/10 is Fe80..Febf.
-            // IPv6 Unique-Local fc00::/7
-            ("fc00::1", IpSafetyClass::Private),
-            ("fdff::1", IpSafetyClass::Private),
-            // IPv6 Documentation 2001:db8::/32
-            ("2001:db8::1", IpSafetyClass::Documentation),
-            // IPv6 Benchmark 2001:2::/48
-            ("2001:2::1", IpSafetyClass::Benchmark),
-            // IPv6 Discard 100::/64
+            ("192.0.0.0", IpSafetyClass::ReservedOrSpecial),
+            ("192.0.0.255", IpSafetyClass::ReservedOrSpecial),
+            ("192.0.1.255", IpSafetyClass::Global),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(classify_ip(parse_ip(input)), expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn ipv6_is_positive_global_only() {
+        assert_ipv6_range_bounds(
+            "64:ff9b::",
+            96,
+            IpSafetyClass::ReservedOrSpecial,
+            Some(false),
+            Some(false),
+        );
+        assert_ipv6_range_bounds(
+            "64:ff9b:1::",
+            48,
+            IpSafetyClass::ReservedOrSpecial,
+            Some(false),
+            Some(false),
+        );
+        assert_ipv6_range_bounds(
+            "100::",
+            64,
+            IpSafetyClass::ReservedOrSpecial,
+            Some(false),
+            Some(false),
+        );
+        assert_ipv6_range_bounds(
+            "2001::",
+            23,
+            IpSafetyClass::ReservedOrSpecial,
+            Some(true),
+            Some(true),
+        );
+        assert_ipv6_range_bounds(
+            "2001:2::",
+            48,
+            IpSafetyClass::Benchmark,
+            Some(false),
+            Some(false),
+        );
+        assert_ipv6_range_bounds(
+            "2001:db8::",
+            32,
+            IpSafetyClass::Documentation,
+            Some(true),
+            Some(true),
+        );
+        assert_ipv6_range_bounds(
+            "2002::",
+            16,
+            IpSafetyClass::ReservedOrSpecial,
+            Some(true),
+            Some(true),
+        );
+        assert_ipv6_range_bounds(
+            "3ffe::",
+            16,
+            IpSafetyClass::ReservedOrSpecial,
+            Some(true),
+            Some(false),
+        );
+        assert_ipv6_range_bounds(
+            "3fff::",
+            20,
+            IpSafetyClass::ReservedOrSpecial,
+            Some(false),
+            Some(true),
+        );
+        assert_ipv6_range_bounds(
+            "fc00::",
+            7,
+            IpSafetyClass::Private,
+            Some(false),
+            Some(false),
+        );
+        assert_ipv6_range_bounds(
+            "fec0::",
+            10,
+            IpSafetyClass::ReservedOrSpecial,
+            Some(false),
+            Some(false),
+        );
+        assert_ipv6_range_bounds(
+            "fe80::",
+            10,
+            IpSafetyClass::LinkLocal,
+            Some(false),
+            Some(false),
+        );
+        assert_ipv6_range_bounds("ff00::", 8, IpSafetyClass::Multicast, Some(false), None);
+
+        let cases = [
+            ("2001:4860:4860::8888", IpSafetyClass::Global),
+            ("::192.0.2.1", IpSafetyClass::ReservedOrSpecial),
+            ("64:ff9b::1", IpSafetyClass::ReservedOrSpecial),
+            ("64:ff9b:1::1", IpSafetyClass::ReservedOrSpecial),
             ("100::1", IpSafetyClass::ReservedOrSpecial),
-            // Mapped IP
-            ("::ffff:127.0.0.1", IpSafetyClass::Loopback),
-            ("::ffff:10.0.0.1", IpSafetyClass::Private),
+            ("2001::1", IpSafetyClass::ReservedOrSpecial),
+            ("2001:2::1", IpSafetyClass::Benchmark),
+            ("2001:10::1", IpSafetyClass::ReservedOrSpecial),
+            ("2001:20::1", IpSafetyClass::ReservedOrSpecial),
+            ("2001:db8::1", IpSafetyClass::Documentation),
+            ("2002::1", IpSafetyClass::ReservedOrSpecial),
+            ("3ffe::1", IpSafetyClass::ReservedOrSpecial),
+            ("fec0::1", IpSafetyClass::ReservedOrSpecial),
+            ("fe80::1", IpSafetyClass::LinkLocal),
+            ("fc00::1", IpSafetyClass::Private),
+            ("ff02::1", IpSafetyClass::Multicast),
         ];
-
-        for (ip_str, expected) in cases {
-            let ip = parse_ip(ip_str);
-            assert_eq!(classify_ip(ip), expected, "IP: {}", ip_str);
+        for (input, expected) in cases {
+            assert_eq!(classify_ip(parse_ip(input)), expected, "{input}");
         }
     }
 
     #[test]
-    fn test_dns_candidate_policy_remote_https() {
-        let target = ValidatedTransportTarget {
-            kind: TransportTargetKind::RemoteHttps,
-            scheme: "https".to_string(),
-            host: "example.com".to_string(),
-            port: 443,
-            base_path: "/".to_string(),
-        };
-
-        // Empty DNS candidates
-        let err = validate_resolved_candidates(&target, vec![]).unwrap_err();
-        assert_eq!(err, TransportPolicyError::EmptyDnsResult);
-
-        // 17 candidates (max 16)
-        let mut seventeen = Vec::new();
-        for i in 1..=17 {
-            seventeen.push(parse_ip(&format!("1.1.1.{}", i)));
+    fn dns_reads_no_more_than_seventeen_items() {
+        struct CountingIter {
+            values: Vec<IpAddr>,
+            next_index: usize,
+            polls: Rc<Cell<usize>>,
         }
-        let err = validate_resolved_candidates(&target, seventeen).unwrap_err();
-        assert_eq!(err, TransportPolicyError::TooManyDnsCandidates);
 
-        // Deduplication
-        let candidates = vec![
-            parse_ip("1.1.1.1"),
-            parse_ip("1.1.1.1"),
-            parse_ip("::ffff:1.1.1.1"), // mapped duplicate
-            parse_ip("2.2.2.2"),
-        ];
-        let set = validate_resolved_candidates(&target, candidates).unwrap();
-        assert_eq!(set.candidates.len(), 2);
-        assert_eq!(set.candidates[0], parse_ip("1.1.1.1"));
-        assert_eq!(set.candidates[1], parse_ip("2.2.2.2"));
+        impl Iterator for CountingIter {
+            type Item = IpAddr;
 
-        // Global only
-        let set =
-            validate_resolved_candidates(&target, vec![parse_ip("1.1.1.1"), parse_ip("8.8.8.8")])
-                .unwrap();
-        assert_eq!(set.candidates.len(), 2);
+            fn next(&mut self) -> Option<Self::Item> {
+                self.polls.set(self.polls.get() + 1);
+                let value = self.values.get(self.next_index).copied();
+                self.next_index += usize::from(value.is_some());
+                value
+            }
+        }
 
-        // Unsafe candidate (all unsafe)
-        let err = validate_resolved_candidates(
+        let polls = Rc::new(Cell::new(0));
+        let values = (1..=64)
+            .map(|last| parse_ip(&format!("8.8.8.{last}")))
+            .collect();
+        let result = validate_resolved_candidates(
+            &remote_target(),
+            CountingIter {
+                values,
+                next_index: 0,
+                polls: Rc::clone(&polls),
+            },
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            TransportPolicyError::TooManyDnsCandidates
+        );
+        assert_eq!(polls.get(), 17);
+    }
+
+    #[test]
+    fn dns_policy_is_bounded_deduplicated_and_sealed() {
+        let target = remote_target();
+        assert_eq!(
+            validate_resolved_candidates(&target, Vec::<IpAddr>::new()).unwrap_err(),
+            TransportPolicyError::EmptyDnsResult
+        );
+
+        let sixteen_duplicates = vec![parse_ip("1.1.1.1"); 16];
+        let set = validate_resolved_candidates(&target, sixteen_duplicates).unwrap();
+        assert_eq!(set.len(), 1);
+        assert!(set.contains_normalized(parse_ip("::ffff:1.1.1.1")));
+
+        let seventeen_duplicates = vec![parse_ip("1.1.1.1"); 17];
+        assert_eq!(
+            validate_resolved_candidates(&target, seventeen_duplicates).unwrap_err(),
+            TransportPolicyError::TooManyDnsCandidates
+        );
+
+        let set = validate_resolved_candidates(
             &target,
-            vec![parse_ip("10.0.0.1"), parse_ip("192.168.1.1")],
+            [
+                parse_ip("1.1.1.1"),
+                parse_ip("::ffff:1.1.1.1"),
+                parse_ip("8.8.8.8"),
+            ],
         )
-        .unwrap_err();
-        assert_eq!(err, TransportPolicyError::UnsafeDnsCandidate);
+        .unwrap();
+        assert_eq!(set.len(), 2);
+        assert_eq!(
+            set.iter()
+                .map(|candidate| candidate.ip())
+                .collect::<Vec<_>>(),
+            [parse_ip("1.1.1.1"), parse_ip("8.8.8.8")]
+        );
 
-        // Mixed candidate
-        let err =
-            validate_resolved_candidates(&target, vec![parse_ip("1.1.1.1"), parse_ip("10.0.0.1")])
-                .unwrap_err();
-        assert_eq!(err, TransportPolicyError::MixedUnsafeDnsResult);
+        assert_eq!(
+            validate_resolved_candidates(&target, [parse_ip("1.1.1.1"), parse_ip("10.0.0.1")])
+                .unwrap_err(),
+            TransportPolicyError::MixedUnsafeDnsResult
+        );
+        assert_eq!(
+            validate_resolved_candidates(
+                &loopback_target(),
+                [parse_ip("127.0.0.1"), parse_ip("10.0.0.1")]
+            )
+            .unwrap_err(),
+            TransportPolicyError::MixedUnsafeDnsResult
+        );
+
+        assert!(!format!("{set:?}").contains("1.1.1.1"));
     }
 
     #[test]
-    fn test_dns_candidate_policy_loopback_http() {
-        let target = ValidatedTransportTarget {
-            kind: TransportTargetKind::LoopbackHttp,
-            scheme: "http".to_string(),
-            host: "localhost".to_string(),
-            port: 80,
-            base_path: "/".to_string(),
-        };
+    fn peer_must_use_a_candidate_from_its_own_set() {
+        let target = remote_target();
+        let first = validate_resolved_candidates(&target, [parse_ip("1.1.1.1")]).unwrap();
+        let second = validate_resolved_candidates(&target, [parse_ip("8.8.8.8")]).unwrap();
+        let first_candidate = first.candidate(0).unwrap();
+        let second_candidate = second.candidate(0).unwrap();
 
-        // Loopback only
-        let set =
-            validate_resolved_candidates(&target, vec![parse_ip("127.0.0.1"), parse_ip("::1")])
-                .unwrap();
-        assert_eq!(set.candidates.len(), 2);
-
-        // Unsafe (all non-loopback)
-        let err =
-            validate_resolved_candidates(&target, vec![parse_ip("1.1.1.1"), parse_ip("8.8.8.8")])
-                .unwrap_err();
-        assert_eq!(err, TransportPolicyError::UnsafeDnsCandidate);
-
-        // Mixed candidates
-        let err =
-            validate_resolved_candidates(&target, vec![parse_ip("127.0.0.1"), parse_ip("1.1.1.1")])
-                .unwrap_err();
-        assert_eq!(err, TransportPolicyError::MixedUnsafeDnsResult);
-    }
-
-    #[test]
-    fn test_peer_verification() {
-        let target_remote = ValidatedTransportTarget {
-            kind: TransportTargetKind::RemoteHttps,
-            scheme: "https".to_string(),
-            host: "example.com".to_string(),
-            port: 443,
-            base_path: "/".to_string(),
-        };
-
-        let target_loopback = ValidatedTransportTarget {
-            kind: TransportTargetKind::LoopbackHttp,
-            scheme: "http".to_string(),
-            host: "localhost".to_string(),
-            port: 80,
-            base_path: "/".to_string(),
-        };
-
-        // Perfect match
-        let res = validate_connected_peer(
-            &target_remote,
-            parse_ip("1.1.1.1"),
-            SocketAddr::new(parse_ip("1.1.1.1"), 443),
+        assert!(first
+            .validate_connected_peer(
+                &target,
+                &first_candidate,
+                SocketAddr::new(parse_ip("1.1.1.1"), target.port()),
+            )
+            .is_ok());
+        assert_eq!(
+            first
+                .validate_connected_peer(
+                    &target,
+                    &second_candidate,
+                    SocketAddr::new(parse_ip("8.8.8.8"), target.port()),
+                )
+                .unwrap_err(),
+            TransportPolicyError::PeerMismatch
         );
-        assert!(res.is_ok());
-
-        // Port mismatch
-        let res = validate_connected_peer(
-            &target_remote,
-            parse_ip("1.1.1.1"),
-            SocketAddr::new(parse_ip("1.1.1.1"), 8443),
+        assert_eq!(
+            first
+                .validate_connected_peer(
+                    &target,
+                    &first_candidate,
+                    SocketAddr::new(parse_ip("8.8.8.8"), target.port()),
+                )
+                .unwrap_err(),
+            TransportPolicyError::PeerMismatch
         );
-        assert_eq!(res.unwrap_err(), TransportPolicyError::PeerMismatch);
-
-        // IP mismatch
-        let res = validate_connected_peer(
-            &target_remote,
-            parse_ip("1.1.1.1"),
-            SocketAddr::new(parse_ip("2.2.2.2"), 443),
+        assert_eq!(
+            first
+                .validate_connected_peer(
+                    &target,
+                    &first_candidate,
+                    SocketAddr::new(parse_ip("1.1.1.1"), target.port() + 1),
+                )
+                .unwrap_err(),
+            TransportPolicyError::PeerMismatch
         );
-        assert_eq!(res.unwrap_err(), TransportPolicyError::PeerMismatch);
 
-        // Remote peer is not global (private IP)
-        let res = validate_connected_peer(
-            &target_remote,
-            parse_ip("10.0.0.1"),
-            SocketAddr::new(parse_ip("10.0.0.1"), 443),
-        );
-        assert_eq!(res.unwrap_err(), TransportPolicyError::UnsafePeer);
+        let mapped_global =
+            validate_resolved_candidates(&target, [parse_ip("::ffff:1.1.1.1")]).unwrap();
+        let mapped_candidate = mapped_global.candidate(0).unwrap();
+        assert!(mapped_global
+            .validate_connected_peer(
+                &target,
+                &mapped_candidate,
+                SocketAddr::new(parse_ip("1.1.1.1"), target.port()),
+            )
+            .is_ok());
 
-        // Loopback match
-        let res = validate_connected_peer(
-            &target_loopback,
-            parse_ip("127.0.0.1"),
-            SocketAddr::new(parse_ip("127.0.0.1"), 80),
+        let loopback =
+            validate_resolved_candidates(&loopback_target(), [parse_ip("127.0.0.1")]).unwrap();
+        let candidate = loopback.candidate(0).unwrap();
+        assert!(loopback
+            .validate_connected_peer(
+                &loopback_target(),
+                &candidate,
+                SocketAddr::new(parse_ip("127.0.0.1"), 80),
+            )
+            .is_ok());
+        assert_eq!(
+            loopback
+                .validate_connected_peer(
+                    &loopback_target(),
+                    &candidate,
+                    SocketAddr::new(parse_ip("127.0.0.2"), 80),
+                )
+                .unwrap_err(),
+            TransportPolicyError::PeerMismatch
         );
-        assert!(res.is_ok());
-
-        // Loopback peer is not loopback
-        let res = validate_connected_peer(
-            &target_loopback,
-            parse_ip("1.1.1.1"),
-            SocketAddr::new(parse_ip("1.1.1.1"), 80),
-        );
-        assert_eq!(res.unwrap_err(), TransportPolicyError::UnsafePeer);
+        assert!(!format!("{candidate:?}").contains("127.0.0.1"));
     }
 }

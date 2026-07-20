@@ -1,66 +1,103 @@
-use super::TransportPolicyError;
+use super::{TransportPolicyError, MAX_TRANSPORT_BASE_URL_BYTES};
+use std::fmt;
 use url::{Host, Url};
 
+/// D-8C2 dispatches connection behavior only through this fixed target kind.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TransportTargetKind {
     RemoteHttps,
     LoopbackHttp,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ValidatedTransportTarget {
-    pub(crate) kind: TransportTargetKind,
-    pub(crate) scheme: String,
-    pub(crate) host: String,
-    pub(crate) port: u16,
-    pub(crate) base_path: String,
+/// D-8C2 receives parsed segments, never an arbitrary normalized path string.
+#[allow(dead_code)]
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ValidatedBasePath {
+    segments: Vec<String>,
+    trailing_slash: bool,
 }
 
-impl ValidatedTransportTarget {
-    pub(crate) fn allows_stored_api_key(&self) -> bool {
-        match self.kind {
-            TransportTargetKind::RemoteHttps => true,
-            TransportTargetKind::LoopbackHttp => false,
-        }
+#[allow(dead_code)]
+impl ValidatedBasePath {
+    pub(crate) fn segments(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.segments.iter().map(String::as_str)
+    }
+
+    pub(crate) const fn has_trailing_slash(&self) -> bool {
+        self.trailing_slash
     }
 }
 
+impl fmt::Debug for ValidatedBasePath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ValidatedBasePath { redacted: true }")
+    }
+}
+
+/// D-8C2 receives this sealed URL policy result before any connection is made.
+#[allow(dead_code)]
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ValidatedTransportTarget {
+    kind: TransportTargetKind,
+    host_ascii: String,
+    port: u16,
+    base_path: ValidatedBasePath,
+}
+
+#[allow(dead_code)]
+impl ValidatedTransportTarget {
+    pub(crate) const fn kind(&self) -> TransportTargetKind {
+        self.kind
+    }
+
+    pub(crate) fn host_ascii(&self) -> &str {
+        &self.host_ascii
+    }
+
+    pub(crate) const fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub(crate) fn base_path(&self) -> &ValidatedBasePath {
+        &self.base_path
+    }
+
+    pub(crate) const fn allows_stored_api_key(&self) -> bool {
+        matches!(self.kind, TransportTargetKind::RemoteHttps)
+    }
+}
+
+impl fmt::Debug for ValidatedTransportTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ValidatedTransportTarget")
+            .field("kind", &self.kind)
+            .field("redacted", &true)
+            .finish()
+    }
+}
+
+/// D-8C2 enters URL policy only through this parser and validator.
+#[allow(dead_code)]
 pub(crate) fn validate_and_normalize_url(
     url_str: &str,
 ) -> Result<ValidatedTransportTarget, TransportPolicyError> {
+    if url_str.len() > MAX_TRANSPORT_BASE_URL_BYTES {
+        return Err(TransportPolicyError::BaseUrlTooLong);
+    }
     if url_str.contains('\\') {
         return Err(TransportPolicyError::UnsafePath);
     }
-    if has_trailing_dot_in_raw_host(url_str) {
+
+    let raw_authority = raw_authority(url_str);
+    let raw_host = raw_authority.and_then(raw_host_from_authority);
+    if raw_host.is_some_and(|host| host.ends_with('.')) {
         return Err(TransportPolicyError::ForbiddenTrailingDot);
     }
-    if has_unsafe_path_segments_in_raw_url(url_str) {
-        return Err(TransportPolicyError::UnsafePath);
-    }
 
+    let base_path = validate_raw_base_path(raw_path(url_str))?;
     let parsed = Url::parse(url_str).map_err(|_| TransportPolicyError::UnsupportedScheme)?;
 
-    // Validate scheme
-    let scheme = parsed.scheme();
-    let kind = match scheme {
-        "https" => TransportTargetKind::RemoteHttps,
-        "http" => {
-            let host = parsed.host().ok_or(TransportPolicyError::MissingHost)?;
-            let is_loopback = match host {
-                Host::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
-                Host::Ipv4(ip) => ip.is_loopback(),
-                Host::Ipv6(ip) => ip.is_loopback(),
-            };
-            if is_loopback {
-                TransportTargetKind::LoopbackHttp
-            } else {
-                return Err(TransportPolicyError::UnsupportedScheme);
-            }
-        }
-        _ => return Err(TransportPolicyError::UnsupportedScheme),
-    };
-
-    // Userinfo, query, fragment validation
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(TransportPolicyError::ForbiddenUserinfo);
     }
@@ -71,347 +108,368 @@ pub(crate) fn validate_and_normalize_url(
         return Err(TransportPolicyError::ForbiddenFragment);
     }
 
-    // Host validation
     let host = parsed.host().ok_or(TransportPolicyError::MissingHost)?;
-    let normalized_host = match kind {
+    let kind = match parsed.scheme() {
+        "https" => TransportTargetKind::RemoteHttps,
+        "http" if is_canonical_loopback_host(&host, raw_host) => TransportTargetKind::LoopbackHttp,
+        "http" => return Err(TransportPolicyError::UnsupportedScheme),
+        _ => return Err(TransportPolicyError::UnsupportedScheme),
+    };
+
+    let host_ascii = match kind {
         TransportTargetKind::RemoteHttps => match host {
-            Host::Domain(domain) => {
-                if domain.eq_ignore_ascii_case("localhost") {
-                    return Err(TransportPolicyError::ForbiddenHostForm);
-                }
-                domain.to_ascii_lowercase()
-            }
+            Host::Domain(domain) => validate_remote_dns_hostname(domain)?,
             Host::Ipv4(_) | Host::Ipv6(_) => {
                 return Err(TransportPolicyError::ForbiddenRemoteIpLiteral);
             }
         },
-        TransportTargetKind::LoopbackHttp => match host {
-            Host::Domain(domain) => {
-                if !domain.eq_ignore_ascii_case("localhost") {
-                    return Err(TransportPolicyError::ForbiddenHostForm);
-                }
-                "localhost".to_string()
-            }
-            Host::Ipv4(ip) => {
-                if !ip.is_loopback() {
-                    return Err(TransportPolicyError::ForbiddenHostForm);
-                }
-                ip.to_string()
-            }
-            Host::Ipv6(ip) => {
-                if !ip.is_loopback() {
-                    return Err(TransportPolicyError::ForbiddenHostForm);
-                }
-                "[::1]".to_string()
-            }
-        },
+        TransportTargetKind::LoopbackHttp => normalize_loopback_host(host, raw_host)?,
     };
 
-    // Port validation
     let port = match parsed.port() {
         Some(0) => return Err(TransportPolicyError::InvalidPort),
-        Some(p) => p,
+        Some(port) => port,
         None => match kind {
             TransportTargetKind::RemoteHttps => 443,
             TransportTargetKind::LoopbackHttp => 80,
         },
     };
 
-    // Path validation
-    let path = parsed.path();
-    if path.contains("//") {
-        return Err(TransportPolicyError::UnsafePath);
-    }
-
-    if let Some(segments) = parsed.path_segments() {
-        for segment in segments {
-            if contains_unsafe_path_segment(segment) {
-                return Err(TransportPolicyError::UnsafePath);
-            }
-        }
-    }
-
     Ok(ValidatedTransportTarget {
         kind,
-        scheme: scheme.to_string(),
-        host: normalized_host,
+        host_ascii,
         port,
-        base_path: path.to_string(),
+        base_path,
     })
 }
 
-fn has_trailing_dot_in_raw_host(url_str: &str) -> bool {
-    if let Some(pos) = url_str.find("://") {
-        let host_part = &url_str[pos + 3..];
-        let host_end = host_part
-            .find(['/', '?', '#', ':'])
-            .unwrap_or(host_part.len());
-        let raw_host = &host_part[..host_end];
-        raw_host.ends_with('.')
-    } else {
-        false
-    }
+fn raw_authority(url_str: &str) -> Option<&str> {
+    let scheme_end = url_str.find("://")?;
+    let after_scheme = &url_str[scheme_end + 3..];
+    let authority_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    Some(&after_scheme[..authority_end])
 }
 
-fn contains_unsafe_path_segment(segment: &str) -> bool {
-    let mut bytes = Vec::new();
-    let chars: Vec<char> = segment.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == '%' && i + 2 < chars.len() {
-            let h1 = chars[i + 1].to_digit(16);
-            let h2 = chars[i + 2].to_digit(16);
-            if let (Some(d1), Some(d2)) = (h1, h2) {
-                bytes.push((d1 * 16 + d2) as u8);
-                i += 3;
+fn raw_host_from_authority(authority: &str) -> Option<&str> {
+    let host_and_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, value)| value);
+    if host_and_port.starts_with('[') {
+        let end = host_and_port.find(']')?;
+        return Some(&host_and_port[..=end]);
+    }
+    Some(host_and_port.split(':').next().unwrap_or_default())
+}
+
+fn raw_path(url_str: &str) -> Option<&str> {
+    let scheme_end = url_str.find("://")?;
+    let after_scheme = &url_str[scheme_end + 3..];
+    let path_start = after_scheme.find('/')?;
+    let path_and_suffix = &after_scheme[path_start..];
+    let path_end = path_and_suffix
+        .find(['?', '#'])
+        .unwrap_or(path_and_suffix.len());
+    Some(&path_and_suffix[..path_end])
+}
+
+fn validate_raw_base_path(
+    raw_path: Option<&str>,
+) -> Result<ValidatedBasePath, TransportPolicyError> {
+    let raw_path = raw_path.unwrap_or("");
+    if raw_path.is_empty() || raw_path == "/" {
+        return Ok(ValidatedBasePath {
+            segments: Vec::new(),
+            trailing_slash: true,
+        });
+    }
+
+    if !raw_path.starts_with('/') || raw_path.contains('\\') {
+        return Err(TransportPolicyError::UnsafePath);
+    }
+
+    let trailing_slash = raw_path.ends_with('/');
+    let mut segments = Vec::new();
+    for (index, segment) in raw_path[1..].split('/').enumerate() {
+        let is_last = index + 1 == raw_path[1..].split('/').count();
+        if segment.is_empty() {
+            if trailing_slash && is_last {
                 continue;
             }
+            return Err(TransportPolicyError::UnsafePath);
         }
-        bytes.push(chars[i] as u8);
-        i += 1;
+        if segment == "." || segment == ".." || !segment.bytes().all(is_safe_path_byte) {
+            return Err(TransportPolicyError::UnsafePath);
+        }
+        segments.push(segment.to_string());
     }
 
-    if bytes == b"." || bytes == b".." {
-        return true;
-    }
-    if bytes.contains(&b'/') || bytes.contains(&b'\\') {
-        return true;
-    }
-    false
+    Ok(ValidatedBasePath {
+        segments,
+        trailing_slash,
+    })
 }
 
-fn has_unsafe_path_segments_in_raw_url(url_str: &str) -> bool {
-    if let Some(pos) = url_str.find("://") {
-        let after_scheme = &url_str[pos + 3..];
-        if let Some(slash_pos) = after_scheme.find('/') {
-            let raw_path = &after_scheme[slash_pos..];
-            for segment in raw_path.split('/') {
-                if contains_unsafe_path_segment(segment) {
-                    return true;
-                }
-            }
+const fn is_safe_path_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~')
+}
+
+fn validate_remote_dns_hostname(domain: &str) -> Result<String, TransportPolicyError> {
+    let normalized = domain.to_ascii_lowercase();
+    if normalized.is_empty()
+        || normalized.len() > 253
+        || normalized.eq_ignore_ascii_case("localhost")
+        || normalized.starts_with('.')
+        || normalized.ends_with('.')
+    {
+        return Err(TransportPolicyError::ForbiddenHostForm);
+    }
+
+    for label in normalized.split('.') {
+        if label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            return Err(TransportPolicyError::ForbiddenHostForm);
         }
     }
-    false
+
+    Ok(normalized)
+}
+
+fn is_canonical_loopback_host(host: &Host<&str>, raw_host: Option<&str>) -> bool {
+    let Some(raw_host) = raw_host else {
+        return false;
+    };
+    match host {
+        Host::Domain(domain) => {
+            domain.eq_ignore_ascii_case("localhost") && raw_host.eq_ignore_ascii_case("localhost")
+        }
+        Host::Ipv4(ip) => ip.is_loopback() && is_canonical_ipv4_literal(raw_host, *ip),
+        Host::Ipv6(ip) => ip.is_loopback() && raw_host == "[::1]",
+    }
+}
+
+fn normalize_loopback_host(
+    host: Host<&str>,
+    raw_host: Option<&str>,
+) -> Result<String, TransportPolicyError> {
+    if !is_canonical_loopback_host(&host, raw_host) {
+        return Err(TransportPolicyError::ForbiddenHostForm);
+    }
+    match host {
+        Host::Domain(_) => Ok("localhost".to_string()),
+        Host::Ipv4(ip) => Ok(ip.to_string()),
+        Host::Ipv6(_) => Ok("::1".to_string()),
+    }
+}
+
+fn is_canonical_ipv4_literal(raw_host: &str, parsed: std::net::Ipv4Addr) -> bool {
+    raw_host == parsed.to_string()
+        && raw_host.split('.').count() == 4
+        && raw_host.split('.').all(|part| {
+            !part.is_empty()
+                && (part == "0" || !part.starts_with('0'))
+                && part.bytes().all(|byte| byte.is_ascii_digit())
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_valid_remote_https() {
-        let res = validate_and_normalize_url("https://example.com/api/v1").unwrap();
-        assert_eq!(res.kind, TransportTargetKind::RemoteHttps);
-        assert_eq!(res.scheme, "https");
-        assert_eq!(res.host, "example.com");
-        assert_eq!(res.port, 443);
-        assert_eq!(res.base_path, "/api/v1");
-        assert!(res.allows_stored_api_key());
+    fn repeated(byte: char, count: usize) -> String {
+        std::iter::repeat_n(byte, count).collect()
+    }
 
-        // Custom port
-        let res = validate_and_normalize_url("https://example.com:8443/").unwrap();
-        assert_eq!(res.port, 8443);
-        assert_eq!(res.base_path, "/");
+    fn remote_url_with_total_length(length: usize) -> String {
+        let prefix = "https://example.com/";
+        format!("{prefix}{}", repeated('a', length - prefix.len()))
+    }
+
+    fn hostname_with_lengths(lengths: &[usize]) -> String {
+        lengths
+            .iter()
+            .map(|length| repeated('a', *length))
+            .collect::<Vec<_>>()
+            .join(".")
     }
 
     #[test]
-    fn test_valid_loopback_http() {
-        let res = validate_and_normalize_url("http://127.0.0.1/").unwrap();
-        assert_eq!(res.kind, TransportTargetKind::LoopbackHttp);
-        assert_eq!(res.host, "127.0.0.1");
-        assert_eq!(res.port, 80);
-        assert!(!res.allows_stored_api_key());
+    fn url_length_is_checked_before_parse() {
+        let exact = remote_url_with_total_length(MAX_TRANSPORT_BASE_URL_BYTES);
+        assert_eq!(exact.len(), MAX_TRANSPORT_BASE_URL_BYTES);
+        assert!(validate_and_normalize_url(&exact).is_ok());
 
-        // Localhost
-        let res = validate_and_normalize_url("http://localhost:8080/foo").unwrap();
-        assert_eq!(res.host, "localhost");
-        assert_eq!(res.port, 8080);
-        assert_eq!(res.base_path, "/foo");
-
-        // IPv6 loopback
-        let res = validate_and_normalize_url("http://[::1]:9000/").unwrap();
-        assert_eq!(res.host, "[::1]");
-        assert_eq!(res.port, 9000);
+        let over = remote_url_with_total_length(MAX_TRANSPORT_BASE_URL_BYTES + 1);
+        assert_eq!(
+            validate_and_normalize_url(&over).unwrap_err(),
+            TransportPolicyError::BaseUrlTooLong
+        );
     }
 
     #[test]
-    fn test_rejected_schemes() {
+    fn valid_remote_https_normalizes_idna_and_path() {
+        let ascii = validate_and_normalize_url("https://xn--0zwm56d.com/api/v1/").unwrap();
+        let unicode = validate_and_normalize_url("https://测试.com/api/v1/").unwrap();
+        assert_eq!(ascii.kind(), TransportTargetKind::RemoteHttps);
+        assert_eq!(ascii.host_ascii(), unicode.host_ascii());
+        assert_eq!(ascii.port(), 443);
+        assert!(ascii.allows_stored_api_key());
+        assert_eq!(
+            ascii.base_path().segments().collect::<Vec<_>>(),
+            ["api", "v1"]
+        );
+        assert!(ascii.base_path().has_trailing_slash());
+    }
+
+    #[test]
+    fn remote_hostname_grammar_is_strict() {
+        for host in [
+            ".example.com",
+            "example..com",
+            "-a.example",
+            "a-.example",
+            "a_b.example",
+            "localhost",
+        ] {
+            assert_eq!(
+                validate_and_normalize_url(&format!("https://{host}/")).unwrap_err(),
+                TransportPolicyError::ForbiddenHostForm,
+                "{host}"
+            );
+        }
+        assert_eq!(
+            validate_and_normalize_url("https://example.com./").unwrap_err(),
+            TransportPolicyError::ForbiddenTrailingDot
+        );
+
+        let label_63 = repeated('a', 63);
+        assert!(validate_and_normalize_url(&format!("https://{label_63}.example/")).is_ok());
+        let label_64 = repeated('a', 64);
+        assert_eq!(
+            validate_and_normalize_url(&format!("https://{label_64}.example/")).unwrap_err(),
+            TransportPolicyError::ForbiddenHostForm
+        );
+
+        let host_253 = hostname_with_lengths(&[63, 63, 63, 61]);
+        assert_eq!(host_253.len(), 253);
+        assert!(validate_and_normalize_url(&format!("https://{host_253}/")).is_ok());
+        let host_254 = hostname_with_lengths(&[63, 63, 63, 62]);
+        assert_eq!(host_254.len(), 254);
+        assert_eq!(
+            validate_and_normalize_url(&format!("https://{host_254}/")).unwrap_err(),
+            TransportPolicyError::ForbiddenHostForm
+        );
+    }
+
+    #[test]
+    fn loopback_hosts_must_be_canonical() {
+        for url in [
+            "http://127.0.0.1/",
+            "http://127.255.255.255/",
+            "http://LOCALHOST/",
+            "http://[::1]/",
+        ] {
+            let target = validate_and_normalize_url(url).unwrap();
+            assert_eq!(target.kind(), TransportTargetKind::LoopbackHttp);
+            assert!(!target.allows_stored_api_key());
+        }
+
+        for url in [
+            "http://127.1/",
+            "http://2130706433/",
+            "http://0177.0.0.1/",
+            "http://0x7f000001/",
+            "http://[::ffff:127.0.0.1]/",
+            "http://localhost./",
+            "http://localhost.example/",
+            "http://ⅼocalhost/",
+            "https://localhost/",
+            "http://example.com/",
+        ] {
+            assert!(validate_and_normalize_url(url).is_err(), "{url}");
+        }
+    }
+
+    #[test]
+    fn path_grammar_rejects_ambiguous_encodings() {
+        for path in [
+            "/.",
+            "/..",
+            "/%2e",
+            "/%2E",
+            "/%2e%2e",
+            "/.%2e",
+            "/%2e.",
+            "/%252e",
+            "/%252e%252e",
+            "/%255c",
+            "/%252f",
+            "/%2f",
+            "/%5c",
+            "/%25",
+            "/foo\\bar",
+            "/foo//bar",
+            "/测试",
+        ] {
+            assert_eq!(
+                validate_and_normalize_url(&format!("https://example.com{path}")).unwrap_err(),
+                TransportPolicyError::UnsafePath,
+                "{path}"
+            );
+        }
+
+        for path in ["", "/", "/.well-known", "/v1.2", "/v1/"] {
+            let target = validate_and_normalize_url(&format!("https://example.com{path}")).unwrap();
+            assert!(
+                target.base_path().has_trailing_slash() == path.is_empty() || path.ends_with('/')
+            );
+        }
+    }
+
+    #[test]
+    fn ports_and_non_loopback_schemes_are_rejected() {
+        assert_eq!(
+            validate_and_normalize_url("https://example.com:0/").unwrap_err(),
+            TransportPolicyError::InvalidPort
+        );
         assert_eq!(
             validate_and_normalize_url("http://example.com/").unwrap_err(),
             TransportPolicyError::UnsupportedScheme
         );
         assert_eq!(
-            validate_and_normalize_url("ftp://example.com/").unwrap_err(),
-            TransportPolicyError::UnsupportedScheme
-        );
-        assert_eq!(
-            validate_and_normalize_url("ws://localhost/").unwrap_err(),
-            TransportPolicyError::UnsupportedScheme
-        );
-        assert_eq!(
-            validate_and_normalize_url("wss://localhost/").unwrap_err(),
-            TransportPolicyError::UnsupportedScheme
-        );
-    }
-
-    #[test]
-    fn test_remote_https_rejected_literals() {
-        assert_eq!(
             validate_and_normalize_url("https://127.0.0.1/").unwrap_err(),
             TransportPolicyError::ForbiddenRemoteIpLiteral
         );
-        assert_eq!(
-            validate_and_normalize_url("https://[::1]/").unwrap_err(),
-            TransportPolicyError::ForbiddenRemoteIpLiteral
-        );
-        assert_eq!(
-            validate_and_normalize_url("https://localhost/").unwrap_err(),
-            TransportPolicyError::ForbiddenHostForm
-        );
-        assert_eq!(
-            validate_and_normalize_url("https://8.8.8.8/").unwrap_err(),
-            TransportPolicyError::ForbiddenRemoteIpLiteral
-        );
     }
 
     #[test]
-    fn test_userinfo_query_fragment_rejections() {
-        assert_eq!(
-            validate_and_normalize_url("https://user:pass@example.com/").unwrap_err(),
-            TransportPolicyError::ForbiddenUserinfo
-        );
-        assert_eq!(
-            validate_and_normalize_url("https://example.com/?query=1").unwrap_err(),
-            TransportPolicyError::ForbiddenQuery
-        );
-        assert_eq!(
-            validate_and_normalize_url("https://example.com/#frag").unwrap_err(),
-            TransportPolicyError::ForbiddenFragment
-        );
-    }
+    fn errors_and_debug_are_redacted() {
+        let canary = "https://secret_user:secret_password@internal-host.example/path?secret_query=1#secret_fragment";
+        let error = validate_and_normalize_url(canary).unwrap_err();
+        let rendered = format!("{error:?} {error}");
+        for secret in [
+            "secret_user",
+            "secret_password",
+            "internal-host",
+            "secret_query",
+            "secret_fragment",
+        ] {
+            assert!(!rendered.contains(secret));
+        }
 
-    #[test]
-    fn test_trailing_dot_rejections() {
-        assert_eq!(
-            validate_and_normalize_url("https://example.com./").unwrap_err(),
-            TransportPolicyError::ForbiddenTrailingDot
-        );
-        assert_eq!(
-            validate_and_normalize_url("https://example.com.:8443/").unwrap_err(),
-            TransportPolicyError::ForbiddenTrailingDot
-        );
-    }
-
-    #[test]
-    fn test_invalid_ports() {
-        assert_eq!(
-            validate_and_normalize_url("https://example.com:0/").unwrap_err(),
-            TransportPolicyError::InvalidPort
-        );
-    }
-
-    #[test]
-    fn test_path_safety() {
-        // Backslash in path
-        assert_eq!(
-            validate_and_normalize_url("https://example.com/foo\\bar").unwrap_err(),
-            TransportPolicyError::UnsafePath
-        );
-        // Duplicate slash in path
-        assert_eq!(
-            validate_and_normalize_url("https://example.com/foo//bar").unwrap_err(),
-            TransportPolicyError::UnsafePath
-        );
-
-        // Path traversals (encoded / decoded)
-        assert_eq!(
-            validate_and_normalize_url("https://example.com/.").unwrap_err(),
-            TransportPolicyError::UnsafePath
-        );
-        assert_eq!(
-            validate_and_normalize_url("https://example.com/..").unwrap_err(),
-            TransportPolicyError::UnsafePath
-        );
-        assert_eq!(
-            validate_and_normalize_url("https://example.com/%2e").unwrap_err(),
-            TransportPolicyError::UnsafePath
-        );
-        assert_eq!(
-            validate_and_normalize_url("https://example.com/%2E").unwrap_err(),
-            TransportPolicyError::UnsafePath
-        );
-        assert_eq!(
-            validate_and_normalize_url("https://example.com/%2e%2e").unwrap_err(),
-            TransportPolicyError::UnsafePath
-        );
-        assert_eq!(
-            validate_and_normalize_url("https://example.com/.%2e").unwrap_err(),
-            TransportPolicyError::UnsafePath
-        );
-        assert_eq!(
-            validate_and_normalize_url("https://example.com/%2e.").unwrap_err(),
-            TransportPolicyError::UnsafePath
-        );
-    }
-
-    #[test]
-    fn test_unicode_punycode_dns() {
-        // Punycode should be normalized and allowed
-        let res = validate_and_normalize_url("https://xn--tiq49xqgb.com/").unwrap();
-        assert_eq!(res.host, "xn--tiq49xqgb.com");
-
-        // Unicode should be parsed and converted to punycode by the url parser
-        let res = validate_and_normalize_url("https://测试.com/").unwrap();
-        assert_eq!(res.host, "xn--0zwm56d.com");
-    }
-
-    #[test]
-    fn test_error_leakage_safety() {
-        let canary_url = "https://secret_user:secret_password@canary.hostname.internal:8080/path?secret_query=1#secret_fragment";
-
-        // 1. Userinfo violation
-        let err = validate_and_normalize_url(canary_url).unwrap_err();
-        let display_str = format!("{}", err);
-        let debug_str = format!("{:?}", err);
-
-        assert!(
-            !display_str.contains("secret_user"),
-            "Leaks username in Display"
-        );
-        assert!(
-            !display_str.contains("secret_password"),
-            "Leaks password in Display"
-        );
-        assert!(
-            !display_str.contains("canary.hostname.internal"),
-            "Leaks hostname in Display"
-        );
-        assert!(
-            !display_str.contains("secret_query"),
-            "Leaks query in Display"
-        );
-        assert!(
-            !display_str.contains("secret_fragment"),
-            "Leaks fragment in Display"
-        );
-
-        assert!(
-            !debug_str.contains("secret_user"),
-            "Leaks username in Debug"
-        );
-        assert!(
-            !debug_str.contains("secret_password"),
-            "Leaks password in Debug"
-        );
-        assert!(
-            !debug_str.contains("canary.hostname.internal"),
-            "Leaks hostname in Debug"
-        );
-        assert!(!debug_str.contains("secret_query"), "Leaks query in Debug");
-        assert!(
-            !debug_str.contains("secret_fragment"),
-            "Leaks fragment in Debug"
-        );
+        let target =
+            validate_and_normalize_url("https://private-host.example/sensitive-path").unwrap();
+        let target_debug = format!("{target:?}");
+        assert!(!target_debug.contains("private-host"));
+        assert!(!target_debug.contains("sensitive-path"));
+        let path_debug = format!("{:?}", target.base_path());
+        assert!(!path_debug.contains("sensitive-path"));
     }
 }

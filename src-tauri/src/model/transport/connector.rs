@@ -117,30 +117,130 @@ pub(crate) async fn establish_connection(
         return Err(TransportConnectError::ConnectPhaseTimeout);
     }
     let phase_deadline = std::cmp::min(now + CONNECT_PHASE_TIMEOUT, total_deadline);
-    timeout_at(phase_deadline, establish_with_system_dns(target))
-        .await
-        .map_err(|_| TransportConnectError::ConnectPhaseTimeout)?
+    timeout_at(
+        phase_deadline,
+        establish_connection_orchestrated(
+            target,
+            ProductionResolver,
+            ProductionDialer,
+            ProductionTlsProvider(target),
+        ),
+    )
+    .await
+    .map_err(|_| TransportConnectError::ConnectPhaseTimeout)?
 }
 
-async fn establish_with_system_dns(
+trait TransportResolver {
+    async fn resolve(
+        &self,
+        target: &ValidatedTransportTarget,
+    ) -> Result<Vec<IpAddr>, TransportConnectError>;
+}
+
+trait TransportDialer {
+    async fn dial(&self, candidate_ip: IpAddr, port: u16) -> io::Result<(TcpStream, SocketAddr)>;
+}
+
+trait TlsConnectorProvider {
+    fn connector(&self) -> Result<(TlsConnector, ServerName<'static>), TransportConnectError>;
+}
+
+struct ProductionResolver;
+
+impl TransportResolver for ProductionResolver {
+    async fn resolve(
+        &self,
+        target: &ValidatedTransportTarget,
+    ) -> Result<Vec<IpAddr>, TransportConnectError> {
+        match (target.kind(), target.host_ascii().parse::<IpAddr>()) {
+            (TransportTargetKind::LoopbackHttp, Ok(ip)) => Ok(vec![ip]),
+            _ => {
+                let addresses = tokio::net::lookup_host((target.host_ascii(), target.port()))
+                    .await
+                    .map_err(|_| TransportConnectError::DnsResolutionFailed)?;
+                Ok(addresses.map(|address| address.ip()).collect())
+            }
+        }
+    }
+}
+
+struct ProductionDialer;
+
+impl TransportDialer for ProductionDialer {
+    async fn dial(&self, candidate_ip: IpAddr, port: u16) -> io::Result<(TcpStream, SocketAddr)> {
+        let address = SocketAddr::new(candidate_ip, port);
+        let stream = TcpStream::connect(address).await?;
+        let peer = stream.peer_addr()?;
+        Ok((stream, peer))
+    }
+}
+
+struct ProductionTlsProvider<'a>(&'a ValidatedTransportTarget);
+
+impl<'a> TlsConnectorProvider for ProductionTlsProvider<'a> {
+    fn connector(&self) -> Result<(TlsConnector, ServerName<'static>), TransportConnectError> {
+        let config = tls::production_client_config()
+            .map_err(|_| TransportConnectError::TlsConfigurationFailed)?;
+        let server_name = tls::server_name(self.0.host_ascii())
+            .map_err(|_| TransportConnectError::TlsIdentityFailed)?;
+        Ok((TlsConnector::from(config), server_name))
+    }
+}
+
+async fn establish_connection_orchestrated<R, D, T>(
     target: &ValidatedTransportTarget,
+    resolver: R,
+    dialer: D,
+    tls_provider: T,
+) -> Result<EstablishedTransport, TransportConnectError>
+where
+    R: TransportResolver,
+    D: TransportDialer,
+    T: TlsConnectorProvider,
+{
+    let resolved_ips = resolver.resolve(target).await?;
+    let candidates = validate_resolved_candidates(target, resolved_ips)
+        .map_err(|_| TransportConnectError::DnsResultRejected)?;
+
+    let mut saw_peer_failure = false;
+    for candidate in candidates.iter() {
+        let (stream, peer) = match dialer.dial(candidate.ip(), target.port()).await {
+            Ok(res) => res,
+            Err(_) => {
+                continue;
+            }
+        };
+
+        if candidates
+            .validate_connected_peer(target, &candidate, peer)
+            .is_err()
+        {
+            saw_peer_failure = true;
+            continue;
+        }
+
+        return establish_protocol_orchestrated(target, stream, &tls_provider).await;
+    }
+
+    Err(if saw_peer_failure {
+        TransportConnectError::PeerValidationFailed
+    } else {
+        TransportConnectError::TcpConnectFailed
+    })
+}
+
+async fn establish_protocol_orchestrated<T: TlsConnectorProvider>(
+    target: &ValidatedTransportTarget,
+    stream: TcpStream,
+    tls_provider: &T,
 ) -> Result<EstablishedTransport, TransportConnectError> {
-    let candidates = resolve_system_candidates(target).await?;
-    connect_validated_candidates(target, candidates).await
-}
-
-async fn resolve_system_candidates(
-    target: &ValidatedTransportTarget,
-) -> Result<ValidatedCandidateSet, TransportConnectError> {
-    match (target.kind(), target.host_ascii().parse::<IpAddr>()) {
-        (TransportTargetKind::LoopbackHttp, Ok(ip)) => validate_resolved_candidates(target, [ip])
-            .map_err(|_| TransportConnectError::DnsResultRejected),
-        _ => {
-            let addresses = tokio::net::lookup_host((target.host_ascii(), target.port()))
-                .await
-                .map_err(|_| TransportConnectError::DnsResolutionFailed)?;
-            validate_resolved_candidates(target, addresses.map(|address| address.ip()))
-                .map_err(|_| TransportConnectError::DnsResultRejected)
+    match target.kind() {
+        TransportTargetKind::LoopbackHttp => Ok(EstablishedTransport {
+            stream: EstablishedTransportStream::Plain(stream),
+        }),
+        TransportTargetKind::RemoteHttps => {
+            let (connector, server_name) = tls_provider.connector()?;
+            establish_tls_stream(connector, server_name, stream).await
         }
     }
 }
@@ -258,6 +358,101 @@ where
 }
 
 #[cfg(test)]
+struct TestResolver {
+    ips: Vec<IpAddr>,
+    call_count: Option<Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+#[cfg(test)]
+impl TransportResolver for TestResolver {
+    async fn resolve(
+        &self,
+        _target: &ValidatedTransportTarget,
+    ) -> Result<Vec<IpAddr>, TransportConnectError> {
+        if let Some(ref count) = self.call_count {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        Ok(self.ips.clone())
+    }
+}
+
+#[cfg(test)]
+struct LocalTestDialer {
+    connect_addr: SocketAddr,
+    reported_peer: Option<SocketAddr>,
+    dial_count: Option<Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+#[cfg(test)]
+impl TransportDialer for LocalTestDialer {
+    async fn dial(&self, candidate_ip: IpAddr, port: u16) -> io::Result<(TcpStream, SocketAddr)> {
+        if let Some(ref count) = self.dial_count {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        let stream = TcpStream::connect(self.connect_addr).await?;
+        let peer = self
+            .reported_peer
+            .unwrap_or_else(|| SocketAddr::new(candidate_ip, port));
+        Ok((stream, peer))
+    }
+}
+
+#[cfg(test)]
+struct TestTlsProvider<'a> {
+    target: &'a ValidatedTransportTarget,
+    config: Arc<rustls::ClientConfig>,
+}
+
+#[cfg(test)]
+impl<'a> TlsConnectorProvider for TestTlsProvider<'a> {
+    fn connector(&self) -> Result<(TlsConnector, ServerName<'static>), TransportConnectError> {
+        let server_name = tls::server_name(self.target.host_ascii())
+            .map_err(|_| TransportConnectError::TlsIdentityFailed)?;
+        Ok((TlsConnector::from(self.config.clone()), server_name))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn establish_connection_for_test(
+    target: &ValidatedTransportTarget,
+    total_deadline: Instant,
+    resolved_ips: Vec<IpAddr>,
+    connect_addr: SocketAddr,
+    reported_peer: Option<SocketAddr>,
+    tls_config: Arc<rustls::ClientConfig>,
+    resolver_calls: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    dial_calls: Option<Arc<std::sync::atomic::AtomicUsize>>,
+) -> Result<EstablishedTransport, TransportConnectError> {
+    let now = Instant::now();
+    if total_deadline <= now {
+        return Err(TransportConnectError::ConnectPhaseTimeout);
+    }
+    let phase_deadline = std::cmp::min(now + CONNECT_PHASE_TIMEOUT, total_deadline);
+    timeout_at(
+        phase_deadline,
+        establish_connection_orchestrated(
+            target,
+            TestResolver {
+                ips: resolved_ips,
+                call_count: resolver_calls,
+            },
+            LocalTestDialer {
+                connect_addr,
+                reported_peer,
+                dial_count: dial_calls,
+            },
+            TestTlsProvider {
+                target,
+                config: tls_config,
+            },
+        ),
+    )
+    .await
+    .map_err(|_| TransportConnectError::ConnectPhaseTimeout)?
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::transport::tls::test_support::{
@@ -265,6 +460,7 @@ mod tests {
     };
     use crate::model::transport::url_policy::validate_and_normalize_url;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::net::TcpListener;
     use tokio_rustls::TlsAcceptor;
 
@@ -438,5 +634,176 @@ mod tests {
         let rendered = format!("{error:?} {error}");
         assert!(!rendered.contains("h2"));
         server.await.unwrap().unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn full_connector_path_http11_alpn_negotiation_succeeds() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        let port = local_addr.port();
+        let target = validate_and_normalize_url(&format!("https://foobar.com:{port}/")).unwrap();
+        let resolver_calls = Arc::new(AtomicUsize::new(0));
+        let dial_calls = Arc::new(AtomicUsize::new(0));
+        let tls_accepted = Arc::new(AtomicBool::new(false));
+        let tls_accepted_clone = Arc::clone(&tls_accepted);
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let acceptor = TlsAcceptor::from(fixture_server_config(vec![b"http/1.1".to_vec()]));
+            let res = acceptor.accept(stream).await;
+            if res.is_ok() {
+                tls_accepted_clone.store(true, Ordering::SeqCst);
+            }
+            res
+        });
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let global_ip = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
+        let res = establish_connection_for_test(
+            &target,
+            deadline,
+            vec![global_ip],
+            local_addr,
+            None,
+            fixture_client_config(true),
+            Some(Arc::clone(&resolver_calls)),
+            Some(Arc::clone(&dial_calls)),
+        )
+        .await;
+
+        assert!(res.is_ok());
+        server.await.unwrap().unwrap();
+        assert!(tls_accepted.load(Ordering::SeqCst));
+        assert_eq!(resolver_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(dial_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn full_connector_path_no_alpn_rejected_with_redacted_error() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        let port = local_addr.port();
+        let target = validate_and_normalize_url(&format!("https://foobar.com:{port}/")).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let acceptor = TlsAcceptor::from(fixture_server_config(Vec::new()));
+            acceptor.accept(stream).await
+        });
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let global_ip = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
+        let res = establish_connection_for_test(
+            &target,
+            deadline,
+            vec![global_ip],
+            local_addr,
+            None,
+            fixture_client_config(true),
+            None,
+            None,
+        )
+        .await;
+
+        let err = match res {
+            Err(err) => err,
+            Ok(_) => panic!("missing ALPN must not establish a connection"),
+        };
+        assert_eq!(err, TransportConnectError::TlsProtocolMismatch);
+        server.await.unwrap().unwrap();
+
+        let rendered = format!("{err:?} {err}");
+        for canary in ["h2", "http/1.1", "foobar.com", "93.184.216.34"] {
+            assert!(!rendered.contains(canary));
+        }
+    }
+
+    #[tokio::test]
+    async fn full_connector_path_h2_only_rejected_without_establishing_transport() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        let port = local_addr.port();
+        let target = validate_and_normalize_url(&format!("https://foobar.com:{port}/")).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let acceptor = TlsAcceptor::from(fixture_server_config(vec![b"h2".to_vec()]));
+            acceptor.accept(stream).await
+        });
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let global_ip = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
+        let res = establish_connection_for_test(
+            &target,
+            deadline,
+            vec![global_ip],
+            local_addr,
+            None,
+            fixture_client_config(true),
+            None,
+            None,
+        )
+        .await;
+
+        let err = match res {
+            Err(err) => err,
+            Ok(_) => panic!("h2-only ALPN must not establish a connection"),
+        };
+        assert!(matches!(
+            err,
+            TransportConnectError::TlsHandshakeFailed | TransportConnectError::TlsProtocolMismatch
+        ));
+        let _ = server.await;
+
+        let rendered = format!("{err:?} {err}");
+        assert!(!rendered.contains("h2"));
+    }
+
+    #[tokio::test]
+    async fn full_connector_path_peer_mismatch_blocks_tls_handshake() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        let port = local_addr.port();
+        let target = validate_and_normalize_url(&format!("https://foobar.com:{port}/")).unwrap();
+        let tls_accepted = Arc::new(AtomicBool::new(false));
+        let tls_accepted_clone = Arc::clone(&tls_accepted);
+
+        let server = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let acceptor = TlsAcceptor::from(fixture_server_config(vec![b"http/1.1".to_vec()]));
+                let res = acceptor.accept(stream).await;
+                if res.is_ok() {
+                    tls_accepted_clone.store(true, Ordering::SeqCst);
+                }
+                res
+            } else {
+                Err(io::Error::other("accept failed"))
+            }
+        });
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let global_ip = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
+        // Report mismatched peer IP 93.184.216.35 instead of candidate 93.184.216.34
+        let mismatched_peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 35)), port);
+
+        let res = establish_connection_for_test(
+            &target,
+            deadline,
+            vec![global_ip],
+            local_addr,
+            Some(mismatched_peer),
+            fixture_client_config(true),
+            None,
+            None,
+        )
+        .await;
+
+        let err = match res {
+            Err(err) => err,
+            Ok(_) => panic!("peer mismatch must not establish a connection"),
+        };
+        assert_eq!(err, TransportConnectError::PeerValidationFailed);
+        assert!(!tls_accepted.load(Ordering::SeqCst));
+        server.abort();
     }
 }

@@ -33,7 +33,7 @@ pub(super) fn server_name(host_ascii: &str) -> Result<ServerName<'static>, ()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     use rustls::ServerConfig;
@@ -112,7 +112,7 @@ mod tests {
         output
     }
 
-    fn fixture_server_config(alpn: Vec<Vec<u8>>) -> Arc<ServerConfig> {
+    pub(crate) fn fixture_server_config(alpn: Vec<Vec<u8>>) -> Arc<ServerConfig> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let mut config = ServerConfig::builder_with_provider(provider)
             .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
@@ -132,7 +132,7 @@ mod tests {
         Arc::new(config)
     }
 
-    fn fixture_client_config(trust_fixture_root: bool) -> Arc<ClientConfig> {
+    pub(crate) fn fixture_client_config(trust_fixture_root: bool) -> Arc<ClientConfig> {
         let mut roots = RootCertStore::empty();
         if trust_fixture_root {
             roots

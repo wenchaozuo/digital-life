@@ -2,12 +2,15 @@ use super::ip_policy::{validate_resolved_candidates, ValidatedCandidateSet};
 use super::tls;
 use super::url_policy::{TransportTargetKind, ValidatedTransportTarget};
 use super::CONNECT_PHASE_TIMEOUT;
+use rustls::pki_types::ServerName;
 use std::fmt;
 #[cfg(test)]
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
+#[cfg(test)]
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
@@ -26,6 +29,7 @@ pub(crate) enum TransportConnectError {
     TlsConfigurationFailed,
     TlsHandshakeFailed,
     TlsIdentityFailed,
+    TlsProtocolMismatch,
 }
 
 impl fmt::Display for TransportConnectError {
@@ -39,6 +43,7 @@ impl fmt::Display for TransportConnectError {
             Self::TlsConfigurationFailed => "TLS configuration failed",
             Self::TlsHandshakeFailed => "TLS handshake failed",
             Self::TlsIdentityFailed => "TLS identity validation failed",
+            Self::TlsProtocolMismatch => "TLS protocol negotiation failed",
         };
         f.write_str(message)
     }
@@ -191,15 +196,37 @@ async fn establish_protocol(
                 .map_err(|_| TransportConnectError::TlsConfigurationFailed)?;
             let server_name = tls::server_name(target.host_ascii())
                 .map_err(|_| TransportConnectError::TlsIdentityFailed)?;
-            let stream = TlsConnector::from(config)
-                .connect(server_name, stream)
-                .await
-                .map_err(|_| TransportConnectError::TlsHandshakeFailed)?;
-            Ok(EstablishedTransport {
-                stream: EstablishedTransportStream::Tls(Box::new(stream)),
-            })
+            establish_tls_stream(TlsConnector::from(config), server_name, stream).await
         }
     }
+}
+
+async fn establish_tls_stream(
+    connector: TlsConnector,
+    server_name: ServerName<'static>,
+    stream: TcpStream,
+) -> Result<EstablishedTransport, TransportConnectError> {
+    let stream = connector
+        .connect(server_name, stream)
+        .await
+        .map_err(|_| TransportConnectError::TlsHandshakeFailed)?;
+    if stream.get_ref().1.alpn_protocol() != Some(b"http/1.1".as_slice()) {
+        return Err(TransportConnectError::TlsProtocolMismatch);
+    }
+    Ok(EstablishedTransport {
+        stream: EstablishedTransportStream::Tls(Box::new(stream)),
+    })
+}
+
+#[cfg(test)]
+async fn establish_tls_stream_for_test(
+    host_ascii: &str,
+    config: Arc<rustls::ClientConfig>,
+    stream: TcpStream,
+) -> Result<EstablishedTransport, TransportConnectError> {
+    let server_name =
+        tls::server_name(host_ascii).map_err(|_| TransportConnectError::TlsIdentityFailed)?;
+    establish_tls_stream(TlsConnector::from(config), server_name, stream).await
 }
 
 #[cfg(test)]
@@ -233,9 +260,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::transport::tls::test_support::{
+        fixture_client_config, fixture_server_config,
+    };
     use crate::model::transport::url_policy::validate_and_normalize_url;
     use std::net::{IpAddr, Ipv4Addr};
     use tokio::net::TcpListener;
+    use tokio_rustls::TlsAcceptor;
 
     #[tokio::test]
     async fn loopback_literal_connects_without_dns_and_exposes_only_a_stream() {
@@ -335,5 +366,77 @@ mod tests {
             Ok(_) => panic!("expired deadline must not establish a connection"),
         };
         assert_eq!(error, TransportConnectError::ConnectPhaseTimeout);
+    }
+
+    #[tokio::test]
+    async fn production_tls_stream_requires_exact_http11_alpn() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            TlsAcceptor::from(fixture_server_config(vec![b"http/1.1".to_vec()]))
+                .accept(stream)
+                .await
+        });
+        let stream = TcpStream::connect(address).await.unwrap();
+        assert!(
+            establish_tls_stream_for_test("foobar.com", fixture_client_config(true), stream)
+                .await
+                .is_ok()
+        );
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn production_tls_stream_rejects_missing_alpn_without_leaking_protocol_data() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            TlsAcceptor::from(fixture_server_config(Vec::new()))
+                .accept(stream)
+                .await
+        });
+        let stream = TcpStream::connect(address).await.unwrap();
+        let error =
+            match establish_tls_stream_for_test("foobar.com", fixture_client_config(true), stream)
+                .await
+            {
+                Err(error) => error,
+                Ok(_) => panic!("missing ALPN must not produce an established transport"),
+            };
+        assert_eq!(error, TransportConnectError::TlsProtocolMismatch);
+        let rendered = format!("{error:?} {error}");
+        for canary in ["h2", "http/1.1", "foobar.com", "secret-cert-canary", "443"] {
+            assert!(!rendered.contains(canary));
+        }
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn production_tls_stream_never_establishes_h2_only_peer() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            TlsAcceptor::from(fixture_server_config(vec![b"h2".to_vec()]))
+                .accept(stream)
+                .await
+        });
+        let stream = TcpStream::connect(address).await.unwrap();
+        let error =
+            match establish_tls_stream_for_test("foobar.com", fixture_client_config(true), stream)
+                .await
+            {
+                Err(error) => error,
+                Ok(_) => panic!("h2-only peer must not produce an established transport"),
+            };
+        assert!(matches!(
+            error,
+            TransportConnectError::TlsHandshakeFailed | TransportConnectError::TlsProtocolMismatch
+        ));
+        let rendered = format!("{error:?} {error}");
+        assert!(!rendered.contains("h2"));
+        server.await.unwrap().unwrap_err();
     }
 }

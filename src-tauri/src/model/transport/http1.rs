@@ -534,6 +534,30 @@ mod tests {
         assert!(!rendered.contains("/private"));
     }
 
+    #[test]
+    fn body_frame_limit_accepts_exact_boundary_and_rejects_next_byte() {
+        let mut exact = Vec::new();
+        append_body_frame(
+            &mut exact,
+            Bytes::from(vec![b'x'; MAX_RESPONSE_BODY_BYTES as usize]),
+            SendDisposition::PossiblySent,
+        )
+        .unwrap();
+        assert_eq!(exact.len(), MAX_RESPONSE_BODY_BYTES as usize);
+        let error = append_body_frame(
+            &mut exact,
+            Bytes::from_static(b"x"),
+            SendDisposition::PossiblySent,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), Http1ErrorKind::ResponseBodyTooLarge);
+        assert_eq!(error.disposition(), SendDisposition::PossiblySent);
+
+        let mut identity = HeaderMap::new();
+        identity.insert(CONTENT_ENCODING, HeaderValue::from_static("identity"));
+        assert!(content_encoding_is_identity(&identity));
+    }
+
     #[tokio::test]
     async fn response_body_limits_and_content_encoding_are_enforced() {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -611,6 +635,26 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.kind(), Http1ErrorKind::TransportTimeout);
         assert_eq!(error.disposition(), SendDisposition::PossiblySent);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn redirects_are_returned_without_a_second_connection() {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let target = loopback_target(&listener).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 302 Found\r\nLocation: /other\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let response = exchange(&target, prepared(Vec::new())).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FOUND);
         server.await.unwrap();
     }
 }

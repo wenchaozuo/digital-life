@@ -1,5 +1,6 @@
 mod openai_compatible;
 pub mod profile;
+pub(crate) mod provider;
 pub mod runtime;
 pub(crate) mod transport;
 

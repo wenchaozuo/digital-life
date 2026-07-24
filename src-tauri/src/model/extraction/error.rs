@@ -6,6 +6,7 @@ use crate::model::{provider::ProviderError, transport::http1::SendDisposition};
 pub(crate) enum LlmExtractionErrorKind {
     DescriptorUnavailable,
     DescriptorVersionMismatch,
+    ProfilePurposeInvalid,
     ExtractionInputInvalid,
     ExtractionRequestTooLarge,
     ProviderFailure,
@@ -67,6 +68,9 @@ impl fmt::Display for LlmExtractionError {
             }
             LlmExtractionErrorKind::DescriptorVersionMismatch => {
                 "The extraction descriptor version mismatch."
+            }
+            LlmExtractionErrorKind::ProfilePurposeInvalid => {
+                "The model profile purpose is not valid for extraction."
             }
             LlmExtractionErrorKind::ExtractionInputInvalid => {
                 "The extraction input is invalid or out of bounds."

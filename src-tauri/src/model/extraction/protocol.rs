@@ -1,15 +1,13 @@
 use serde::Serialize;
 
-use crate::{
-    model::{
-        profile::ModelProfile, provider::ProviderJsonRequest, transport::MAX_REQUEST_BODY_BYTES,
-    },
-    storage::candidate_extraction::CandidateExtractionRequest,
+use crate::model::{
+    profile::ModelProfile, provider::ProviderJsonRequest, transport::MAX_REQUEST_BODY_BYTES,
 };
 
 use super::{
     descriptor::LlmExtractorDescriptor,
     error::{LlmExtractionError, LlmExtractionErrorKind},
+    wire::ExtractionWireInputV1,
 };
 
 #[derive(Serialize)]
@@ -36,18 +34,18 @@ struct UserMessageContentItemDto<'a> {
 
 pub(crate) fn build_provider_request(
     descriptor: &LlmExtractorDescriptor,
-    request: &CandidateExtractionRequest,
+    input: &ExtractionWireInputV1,
     profile: &ModelProfile,
 ) -> Result<ProviderJsonRequest, LlmExtractionError> {
-    descriptor.validate_request(request)?;
+    descriptor.validate_input(input)?;
 
-    let user_items: Vec<UserMessageContentItemDto<'_>> = request
-        .messages
+    let user_items: Vec<UserMessageContentItemDto<'_>> = input
+        .messages()
         .iter()
         .map(|m| UserMessageContentItemDto {
-            message_id: &m.message_id,
-            sequence_no: m.sequence_no,
-            content: &m.content,
+            message_id: m.message_id(),
+            sequence_no: m.sequence_no(),
+            content: m.content(),
         })
         .collect();
 

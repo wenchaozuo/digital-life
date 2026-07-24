@@ -1,11 +1,9 @@
 use std::fmt;
 
-use crate::storage::candidate_extraction::CandidateExtractionRequest;
-
-use super::error::{LlmExtractionError, LlmExtractionErrorKind};
-
-const MAX_SELECTED_USER_MESSAGES: usize = 64;
-const MAX_SELECTED_UTF8_BYTES: usize = 131_072;
+use super::{
+    error::{LlmExtractionError, LlmExtractionErrorKind},
+    wire::ExtractionWireInputV1,
+};
 
 const V1_SYSTEM_PROMPT: &str = "\
 You are a memory extraction assistant. Your task is to extract user candidate memories from user messages.
@@ -15,7 +13,7 @@ You must return ONLY a JSON object conforming to the following structure:
   \"proposals\": [
     {
       \"action\": \"propose\" | \"ignore\",
-      \"kind\": \"preference\" | \"goal\" | \"experience\" | \"profile\",
+      \"kind\": \"preference\" | \"goal\" | \"experience\" | \"fact\" | \"relationship\" | \"skill\" | \"other\",
       \"content\": \"string\",
       \"summary\": \"string\",
       \"confidence\": number between 0.0 and 1.0,
@@ -26,6 +24,8 @@ You must return ONLY a JSON object conforming to the following structure:
     }
   ]
 }
+For \"propose\", every listed field except \"action\" is required and non-null.
+For \"ignore\", provide only \"action\" and non-empty \"source_message_ids\".
 Do NOT include markdown formatting or ```json fences. Return ONLY the raw JSON object. Maximum 5 proposals.";
 
 /// Version-bound extractor descriptor.
@@ -60,43 +60,22 @@ impl LlmExtractorDescriptor {
         self.policy_version
     }
 
-    pub(crate) const fn system_prompt(&self) -> &'static str {
+    pub(super) const fn system_prompt(&self) -> &'static str {
         self.system_prompt
     }
 
-    /// Validate the descriptor against an extraction request before construction/sending.
-    pub(crate) fn validate_request(
+    /// The input is already bounded by its sealed constructor. Keep this
+    /// check at the descriptor boundary so malformed internal values fail
+    /// before request construction or any provider interaction.
+    pub(super) fn validate_input(
         &self,
-        request: &CandidateExtractionRequest,
+        input: &ExtractionWireInputV1,
     ) -> Result<(), LlmExtractionError> {
-        if request.policy_version.trim() != self.policy_version {
-            return Err(LlmExtractionError::definitely_not_sent(
-                LlmExtractionErrorKind::DescriptorVersionMismatch,
-            ));
-        }
-
-        if request.messages.is_empty() || request.messages.len() > MAX_SELECTED_USER_MESSAGES {
+        if input.message_count() == 0 {
             return Err(LlmExtractionError::definitely_not_sent(
                 LlmExtractionErrorKind::ExtractionInputInvalid,
             ));
         }
-
-        let mut total_bytes: usize = 0;
-        for msg in &request.messages {
-            if msg.content.trim().is_empty() {
-                return Err(LlmExtractionError::definitely_not_sent(
-                    LlmExtractionErrorKind::ExtractionInputInvalid,
-                ));
-            }
-            total_bytes = total_bytes.saturating_add(msg.content.len());
-        }
-
-        if total_bytes > MAX_SELECTED_UTF8_BYTES {
-            return Err(LlmExtractionError::definitely_not_sent(
-                LlmExtractionErrorKind::ExtractionInputInvalid,
-            ));
-        }
-
         Ok(())
     }
 }

@@ -1,4 +1,4 @@
-mod candidate_extraction;
+pub(crate) mod candidate_extraction;
 mod candidate_memory;
 mod conversation;
 pub(crate) mod deterministic_candidate_extraction;

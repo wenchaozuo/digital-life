@@ -1,3 +1,4 @@
+pub(crate) mod extraction;
 mod openai_compatible;
 pub mod profile;
 pub(crate) mod provider;

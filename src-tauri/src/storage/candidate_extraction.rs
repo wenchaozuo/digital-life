@@ -157,6 +157,8 @@ enum ExtractionErrorReason {
     ProviderUnavailable,
     ProviderNonrecoverable,
     ContractFailure,
+    LlmDefinitelyNotSent,
+    LlmPossiblySent,
     CommitOutcomeUncertain,
 }
 
@@ -209,6 +211,30 @@ impl ExtractionError {
         }
     }
 
+    /// An LLM failure proven to have occurred before a Provider send.
+    ///
+    /// This zero-argument factory deliberately carries no provider detail;
+    /// D-8C6's one-shot runner always records it as terminal.
+    pub(crate) const fn llm_definitely_not_sent() -> Self {
+        Self {
+            code: "CANDIDATE_EXTRACTION_LLM_DEFINITELY_NOT_SENT",
+            recoverable: false,
+            reason: ExtractionErrorReason::LlmDefinitelyNotSent,
+        }
+    }
+
+    /// An LLM failure for which a Provider send cannot be ruled out.
+    ///
+    /// The fixed code and terminal disposition avoid persisting response data
+    /// while ensuring the Provider is never called a second time.
+    pub(crate) const fn llm_possibly_sent() -> Self {
+        Self {
+            code: "CANDIDATE_EXTRACTION_LLM_POSSIBLY_SENT",
+            recoverable: false,
+            reason: ExtractionErrorReason::LlmPossiblySent,
+        }
+    }
+
     pub(super) const fn code(&self) -> &'static str {
         self.code
     }
@@ -253,6 +279,10 @@ impl ExtractionAttemptFailure {
             ExtractionErrorReason::ContractFailure => {
                 "CANDIDATE_EXTRACTION_EXTRACTOR_CONTRACT_FAILURE"
             }
+            ExtractionErrorReason::LlmDefinitelyNotSent => {
+                "CANDIDATE_EXTRACTION_LLM_DEFINITELY_NOT_SENT"
+            }
+            ExtractionErrorReason::LlmPossiblySent => "CANDIDATE_EXTRACTION_LLM_POSSIBLY_SENT",
             ExtractionErrorReason::Other => error.code,
             // Commit uncertainty is minted only by D-6 finalize. If it is ever
             // returned from an extractor, fail closed instead of entering either
@@ -268,6 +298,25 @@ impl ExtractionAttemptFailure {
         Self {
             safe_error_code,
             retryable,
+        }
+    }
+
+    /// Preserves the fixed extractor-error code while preventing D-6's
+    /// bounded retry planner from invoking an LLM Provider a second time.
+    const fn one_shot_llm(error: ExtractionError) -> Self {
+        let mapped = Self::from_extractor(error);
+        Self {
+            safe_error_code: mapped.safe_error_code,
+            retryable: false,
+        }
+    }
+
+    /// Timeout and panic are conservatively possibly-sent: the runner cannot
+    /// prove the Provider request had not crossed its send boundary.
+    const fn llm_possibly_sent() -> Self {
+        Self {
+            safe_error_code: "CANDIDATE_EXTRACTION_LLM_POSSIBLY_SENT",
+            retryable: false,
         }
     }
 }
@@ -657,6 +706,81 @@ impl StorageService {
             }
         };
 
+        if extraction.is_err()
+            && cancellation.reason() == Some(ExtractionCancellationReason::StaleAttempt)
+        {
+            return CandidateExtractionAttemptOutcome::StaleAttempt;
+        }
+
+        self.complete_candidate_extraction_attempt(started, extraction)
+    }
+
+    /// Runs exactly one asynchronous LLM extraction attempt.  This is visible
+    /// only to a future private `storage` sibling; it has no retry or fallback
+    /// path because a Provider send may be non-idempotent.
+    pub(super) async fn run_candidate_extraction_attempt_once_async(
+        &self,
+        extractor: &dyn CandidateExtractor,
+        started: &StartedExtraction,
+    ) -> CandidateExtractionAttemptOutcome {
+        self.run_candidate_extraction_attempt_once_async_with_timeout(
+            extractor,
+            started,
+            DEFAULT_EXTRACTION_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Keeps the production timeout fixed at thirty seconds while allowing the
+    /// in-module tests to prove timeout semantics without sleeping for thirty
+    /// seconds.  It is private and cannot become a production timeout knob.
+    async fn run_candidate_extraction_attempt_once_async_with_timeout(
+        &self,
+        extractor: &dyn CandidateExtractor,
+        started: &StartedExtraction,
+        timeout: Duration,
+    ) -> CandidateExtractionAttemptOutcome {
+        let runtime_descriptor = extractor.descriptor();
+        if runtime_descriptor.extractor_id != started.fence().descriptor.extractor_id
+            || runtime_descriptor.extractor_version != started.fence().descriptor.extractor_version
+        {
+            return CandidateExtractionAttemptOutcome::StaleAttempt;
+        }
+
+        let request = match self.reload_candidate_extraction_request(started) {
+            Ok(Some(request)) => request,
+            Ok(None) => return CandidateExtractionAttemptOutcome::StaleAttempt,
+            Err(error) if is_stale_fence_error(&error) => {
+                return CandidateExtractionAttemptOutcome::StaleAttempt;
+            }
+            Err(_) => return CandidateExtractionAttemptOutcome::StorageFailure,
+        };
+
+        // The supervisor is not a new network deadline: D-8C3 owns the
+        // network deadline.  If it fires, dropping this same future stops any
+        // further polling and conservatively records PossiblySent.
+        let extraction = match tokio::time::timeout(
+            timeout,
+            AssertUnwindSafe(extractor.extract(request)).catch_unwind(),
+        )
+        .await
+        {
+            Ok(Ok(Ok(batch))) => Ok(batch),
+            Ok(Ok(Err(error))) => Err(ExtractionAttemptFailure::one_shot_llm(error)),
+            Ok(Err(_)) | Err(_) => Err(ExtractionAttemptFailure::llm_possibly_sent()),
+        };
+
+        self.complete_candidate_extraction_attempt(started, extraction)
+    }
+
+    /// The shared completion path deliberately owns all D-6 persistence after
+    /// an extractor future has ended.  Both runners retain the existing
+    /// classify, fence, lease, atomic-finalize, and reconciliation semantics.
+    fn complete_candidate_extraction_attempt(
+        &self,
+        started: &StartedExtraction,
+        extraction: Result<CandidateExtractionBatch, ExtractionAttemptFailure>,
+    ) -> CandidateExtractionAttemptOutcome {
         match extraction {
             Ok(batch) => match self.finalize_candidate_extraction_atomic(started, batch) {
                 Ok(()) => CandidateExtractionAttemptOutcome::Completed,
@@ -673,9 +797,6 @@ impl StorageService {
                 Err(_) => CandidateExtractionAttemptOutcome::StorageFailure,
             },
             Err(failure) => {
-                if cancellation.reason() == Some(ExtractionCancellationReason::StaleAttempt) {
-                    return CandidateExtractionAttemptOutcome::StaleAttempt;
-                }
                 match self.fail_candidate_extraction_attempt(
                     started,
                     failure.safe_error_code,
@@ -2907,6 +3028,8 @@ mod tests {
         ProviderUnavailable,
         ProviderNonrecoverable,
         Contract,
+        LlmDefinitelyNotSent,
+        LlmPossiblySent,
     }
 
     struct FactoryFailingExtractor {
@@ -2933,8 +3056,78 @@ mod tests {
                     ExtractionError::provider_nonrecoverable()
                 }
                 FactoryFailure::Contract => ExtractionError::contract_failure(),
+                FactoryFailure::LlmDefinitelyNotSent => ExtractionError::llm_definitely_not_sent(),
+                FactoryFailure::LlmPossiblySent => ExtractionError::llm_possibly_sent(),
             };
             Box::pin(async move { Err(error) })
+        }
+    }
+
+    struct BatchExtractor {
+        descriptor: ExtractorDescriptor,
+        batch: CandidateExtractionBatch,
+        call_count: Arc<AtomicU8>,
+    }
+
+    impl CandidateExtractor for BatchExtractor {
+        fn descriptor(&self) -> &ExtractorDescriptor {
+            &self.descriptor
+        }
+
+        fn extract<'a>(
+            &'a self,
+            _request: CandidateExtractionRequest,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<CandidateExtractionBatch, ExtractionError>> + Send + 'a>,
+        > {
+            self.call_count.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move { Ok(self.batch.clone()) })
+        }
+    }
+
+    struct PendingDropFuture {
+        entered: Arc<AtomicU8>,
+        dropped: Arc<AtomicU8>,
+    }
+
+    impl Future for PendingDropFuture {
+        type Output = Result<CandidateExtractionBatch, ExtractionError>;
+
+        fn poll(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Self::Output> {
+            self.entered.store(1, Ordering::Release);
+            Poll::Pending
+        }
+    }
+
+    impl Drop for PendingDropFuture {
+        fn drop(&mut self) {
+            self.dropped.store(1, Ordering::Release);
+        }
+    }
+
+    struct PendingDropExtractor {
+        descriptor: ExtractorDescriptor,
+        call_count: Arc<AtomicU8>,
+        entered: Arc<AtomicU8>,
+        dropped: Arc<AtomicU8>,
+    }
+
+    impl CandidateExtractor for PendingDropExtractor {
+        fn descriptor(&self) -> &ExtractorDescriptor {
+            &self.descriptor
+        }
+
+        fn extract<'a>(
+            &'a self,
+            _request: CandidateExtractionRequest,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<CandidateExtractionBatch, ExtractionError>> + Send + 'a>,
+        > {
+            self.call_count.fetch_add(1, Ordering::Relaxed);
+            Box::pin(PendingDropFuture {
+                entered: self.entered.clone(),
+                dropped: self.dropped.clone(),
+            })
         }
     }
 
@@ -3008,6 +3201,8 @@ mod tests {
         let provider_unavailable = ExtractionError::provider_unavailable();
         let provider_nonrecoverable = ExtractionError::provider_nonrecoverable();
         let contract_failure = ExtractionError::contract_failure();
+        let llm_definitely_not_sent = ExtractionError::llm_definitely_not_sent();
+        let llm_possibly_sent = ExtractionError::llm_possibly_sent();
 
         assert_eq!(
             provider_unavailable.code,
@@ -3036,6 +3231,24 @@ mod tests {
             contract_failure.reason,
             ExtractionErrorReason::ContractFailure
         );
+        assert_eq!(
+            llm_definitely_not_sent.code,
+            "CANDIDATE_EXTRACTION_LLM_DEFINITELY_NOT_SENT"
+        );
+        assert!(!llm_definitely_not_sent.recoverable);
+        assert_eq!(
+            llm_definitely_not_sent.reason,
+            ExtractionErrorReason::LlmDefinitelyNotSent
+        );
+        assert_eq!(
+            llm_possibly_sent.code,
+            "CANDIDATE_EXTRACTION_LLM_POSSIBLY_SENT"
+        );
+        assert!(!llm_possibly_sent.recoverable);
+        assert_eq!(
+            llm_possibly_sent.reason,
+            ExtractionErrorReason::LlmPossiblySent
+        );
 
         // Defense in depth inside D-6: even an internal field mutation cannot
         // alter the fixed persisted code selected from the private reason.
@@ -3048,8 +3261,27 @@ mod tests {
         );
         assert!(!mapped.retryable);
 
+        assert_eq!(
+            ExtractionAttemptFailure::from_extractor(ExtractionError::llm_definitely_not_sent())
+                .safe_error_code,
+            "CANDIDATE_EXTRACTION_LLM_DEFINITELY_NOT_SENT"
+        );
+        assert!(
+            !ExtractionAttemptFailure::from_extractor(ExtractionError::llm_definitely_not_sent())
+                .retryable
+        );
+        assert_eq!(
+            ExtractionAttemptFailure::from_extractor(ExtractionError::llm_possibly_sent())
+                .safe_error_code,
+            "CANDIDATE_EXTRACTION_LLM_POSSIBLY_SENT"
+        );
+        assert!(
+            !ExtractionAttemptFailure::from_extractor(ExtractionError::llm_possibly_sent())
+                .retryable
+        );
+
         let debug =
-            format!("{provider_unavailable:?}|{provider_nonrecoverable:?}|{contract_failure:?}");
+            format!("{provider_unavailable:?}|{provider_nonrecoverable:?}|{contract_failure:?}|{llm_definitely_not_sent:?}|{llm_possibly_sent:?}");
         for canary in [
             "api-key-canary-D8A-R1",
             "Authorization: Bearer auth-canary-D8A-R1",
@@ -3059,6 +3291,201 @@ mod tests {
         ] {
             assert!(!debug.contains(canary));
         }
+    }
+
+    #[tokio::test]
+    async fn llm_one_shot_async_runner_completes_through_existing_finalize_path() {
+        let (service, root) = service();
+        let started = start_for_orchestrator(&service, "llm-one-shot-success");
+        let run_id = started.request.run_id.clone();
+        let calls = Arc::new(AtomicU8::new(0));
+        let extractor = BatchExtractor {
+            descriptor: descriptor(),
+            batch: make_batch(&started),
+            call_count: calls.clone(),
+        };
+
+        assert_eq!(
+            service
+                .run_candidate_extraction_attempt_once_async(&extractor, &started)
+                .await,
+            CandidateExtractionAttemptOutcome::Completed
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(extraction_run_state(&service, &run_id).0, "completed");
+        let state = service.state().unwrap();
+        let (candidates, evidence, completed_audits): (i64, i64, i64) = state
+            .connection
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM candidate_memory WHERE life_id='life-extraction'),
+                    (SELECT COUNT(*) FROM candidate_memory_evidence WHERE life_id='life-extraction'),
+                    (SELECT COUNT(*) FROM candidate_extraction_audit WHERE run_id=?1 AND event='completed')",
+                params![run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((candidates, evidence, completed_audits), (1, 1, 1));
+        drop(state);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn llm_one_shot_commit_uncertainty_reconciles_without_a_second_extractor_call() {
+        let (service, root) = service();
+        let started = start_for_orchestrator(&service, "llm-one-shot-commit-uncertainty");
+        let calls = Arc::new(AtomicU8::new(0));
+        let extractor = BatchExtractor {
+            descriptor: descriptor(),
+            batch: make_batch(&started),
+            call_count: calls.clone(),
+        };
+        set_finalize_failpoint(Some(FinalizeFailpoint::PostCommitResponseUncertain));
+
+        let identity = match service
+            .run_candidate_extraction_attempt_once_async(&extractor, &started)
+            .await
+        {
+            CandidateExtractionAttemptOutcome::CommitOutcomeUncertain(identity) => identity,
+            other => panic!("expected commit uncertainty, got {other:?}"),
+        };
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            service
+                .reconcile_candidate_extraction_attempt_uncertainty(identity)
+                .unwrap(),
+            CommitReconciliationResult::Completed {
+                total_proposal_count: 1,
+                created_count: 1,
+                evidence_merged_count: 0,
+                hard_secret_blocked_count: 0,
+            }
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn llm_one_shot_factory_errors_are_terminal_and_cannot_be_claimed() {
+        for (name, failure, expected_code) in [
+            (
+                "llm-one-shot-provider-unavailable",
+                FactoryFailure::ProviderUnavailable,
+                "CANDIDATE_EXTRACTION_EXTRACTOR_UNAVAILABLE",
+            ),
+            (
+                "llm-definitely-not-sent",
+                FactoryFailure::LlmDefinitelyNotSent,
+                "CANDIDATE_EXTRACTION_LLM_DEFINITELY_NOT_SENT",
+            ),
+            (
+                "llm-possibly-sent",
+                FactoryFailure::LlmPossiblySent,
+                "CANDIDATE_EXTRACTION_LLM_POSSIBLY_SENT",
+            ),
+        ] {
+            let (service, root) = service();
+            let started = start_for_orchestrator(&service, name);
+            let run_id = started.request.run_id.clone();
+            let conversation_id = started.request.conversation_id.clone();
+            let calls = Arc::new(AtomicU8::new(0));
+            let extractor = FactoryFailingExtractor {
+                descriptor: descriptor(),
+                failure,
+                call_count: calls.clone(),
+            };
+
+            assert_eq!(
+                service
+                    .run_candidate_extraction_attempt_once_async(&extractor, &started)
+                    .await,
+                CandidateExtractionAttemptOutcome::TerminalFailed
+            );
+            assert_eq!(
+                extraction_run_state(&service, &run_id),
+                ("failed".into(), Some(expected_code.into()))
+            );
+            assert!(claim_due_retry(&service, &conversation_id).is_none());
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+            let state = service.state().unwrap();
+            let (candidates, evidence): (i64, i64) = state
+                .connection
+                .query_row(
+                    "SELECT
+                        (SELECT COUNT(*) FROM candidate_memory WHERE life_id='life-extraction'),
+                        (SELECT COUNT(*) FROM candidate_memory_evidence WHERE life_id='life-extraction')",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!((candidates, evidence), (0, 0));
+            drop(state);
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[tokio::test]
+    async fn llm_one_shot_timeout_drops_the_same_future_and_is_possibly_sent() {
+        let (service, root) = service();
+        let started = start_for_orchestrator(&service, "llm-one-shot-timeout");
+        let calls = Arc::new(AtomicU8::new(0));
+        let entered = Arc::new(AtomicU8::new(0));
+        let dropped = Arc::new(AtomicU8::new(0));
+        let extractor = PendingDropExtractor {
+            descriptor: descriptor(),
+            call_count: calls.clone(),
+            entered: entered.clone(),
+            dropped: dropped.clone(),
+        };
+
+        assert_eq!(
+            service
+                .run_candidate_extraction_attempt_once_async_with_timeout(
+                    &extractor,
+                    &started,
+                    Duration::from_millis(1),
+                )
+                .await,
+            CandidateExtractionAttemptOutcome::TerminalFailed
+        );
+        assert_eq!(entered.load(Ordering::Acquire), 1);
+        assert_eq!(dropped.load(Ordering::Acquire), 1);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            extraction_run_state(&service, &started.request.run_id),
+            (
+                "failed".into(),
+                Some("CANDIDATE_EXTRACTION_LLM_POSSIBLY_SENT".into())
+            )
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn llm_one_shot_panic_is_possibly_sent_without_retry() {
+        let (service, root) = service();
+        let started = start_for_orchestrator(&service, "llm-one-shot-panic");
+
+        assert_eq!(
+            service
+                .run_candidate_extraction_attempt_once_async(
+                    &PanicExtractor {
+                        descriptor: descriptor(),
+                    },
+                    &started
+                )
+                .await,
+            CandidateExtractionAttemptOutcome::TerminalFailed
+        );
+        assert_eq!(
+            extraction_run_state(&service, &started.request.run_id),
+            (
+                "failed".into(),
+                Some("CANDIDATE_EXTRACTION_LLM_POSSIBLY_SENT".into())
+            )
+        );
+        assert!(service.state().is_ok());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

@@ -6,17 +6,23 @@
 
 use tauri::{State, WebviewWindow};
 
-use crate::storage::deterministic_candidate_extraction::{
-    trigger_deterministic_candidate_extraction, ExtractionTriggerResponse, SafeCommandError,
+use crate::{
+    secrets::WindowsCredentialSecretStore,
+    storage::{
+        deterministic_candidate_extraction::{ExtractionTriggerResponse, SafeCommandError},
+        trigger_candidate_extraction, LlmCandidateExtractionCoordinator, StorageService,
+    },
 };
-use crate::storage::StorageService;
 
 const CHAT_WINDOW_LABEL: &str = "chat";
 
 #[tauri::command]
+#[allow(private_interfaces)] // Tauri State is internal, never part of IPC input.
 pub async fn extract_candidate_memories(
     window: WebviewWindow,
     storage: State<'_, StorageService>,
+    coordinator: State<'_, LlmCandidateExtractionCoordinator>,
+    secrets: State<'_, WindowsCredentialSecretStore>,
     life_id: String,
     conversation_id: String,
 ) -> Result<ExtractionTriggerResponse, SafeCommandError> {
@@ -26,5 +32,12 @@ pub async fn extract_candidate_memories(
             "Candidate memory extraction is only available from the chat window.",
         ));
     }
-    trigger_deterministic_candidate_extraction(&storage, &life_id, &conversation_id)
+    trigger_candidate_extraction(
+        &storage,
+        &coordinator,
+        secrets.inner(),
+        &life_id,
+        &conversation_id,
+    )
+    .await
 }

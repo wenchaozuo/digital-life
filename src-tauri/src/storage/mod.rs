@@ -2,6 +2,7 @@ mod candidate_extraction;
 mod candidate_memory;
 mod conversation;
 pub(crate) mod deterministic_candidate_extraction;
+mod llm_candidate_extraction;
 mod location;
 mod memory;
 mod memory_management;
@@ -11,6 +12,10 @@ mod migration;
 mod model_profile;
 mod vector_sync_outbox;
 mod vector_sync_settings;
+
+pub(crate) use llm_candidate_extraction::{
+    trigger_candidate_extraction, LlmCandidateExtractionCoordinator,
+};
 
 use std::{
     fmt::Display,

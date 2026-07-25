@@ -20,6 +20,7 @@ pub fn run() {
                 .map_err(|error| std::io::Error::other(error.message))?;
             app.manage(storage);
             app.manage(secrets::WindowsCredentialSecretStore::new());
+            app.manage(storage::LlmCandidateExtractionCoordinator::default());
             app.manage(model::runtime::ModelRuntimeCoordinator::default());
             app.manage(conversation::ConversationCognitionCoordinator::default());
             app.manage(vector_store::LanceDbVectorStoreRegistry::default());

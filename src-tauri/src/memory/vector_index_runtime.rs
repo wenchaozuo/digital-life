@@ -829,7 +829,11 @@ mod tests {
     use std::{
         io::{ErrorKind, Read, Write},
         net::{SocketAddr, TcpListener, TcpStream},
-        sync::mpsc::{self, Receiver, Sender},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            mpsc::{self, Receiver, Sender},
+            Arc,
+        },
         thread,
         time::Duration,
     };
@@ -871,6 +875,8 @@ mod tests {
         address: SocketAddr,
         shutdown: Option<Sender<()>>,
         accepted: Receiver<()>,
+        connections: Arc<AtomicUsize>,
+        requests: Arc<AtomicUsize>,
         handle: Option<thread::JoinHandle<Result<(), TestServerError>>>,
     }
 
@@ -881,12 +887,18 @@ mod tests {
             let address = listener.local_addr().unwrap();
             let (shutdown, shutdown_receiver) = mpsc::channel();
             let (accepted_sender, accepted) = mpsc::channel();
+            let connections = Arc::new(AtomicUsize::new(0));
+            let requests = Arc::new(AtomicUsize::new(0));
+            let worker_connections = Arc::clone(&connections);
+            let worker_requests = Arc::clone(&requests);
             let handle = thread::spawn(move || -> Result<(), TestServerError> {
                 let mut stream = accept_blocking_connection(&listener, &shutdown_receiver)?;
+                worker_connections.fetch_add(1, Ordering::SeqCst);
                 accepted_sender
                     .send(())
                     .map_err(|_| TestServerError::SynchronizationFailed)?;
                 let _request = read_request(&mut stream)?;
+                worker_requests.fetch_add(1, Ordering::SeqCst);
                 let reply = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     response.len(),
@@ -901,6 +913,8 @@ mod tests {
                 address,
                 shutdown: Some(shutdown),
                 accepted,
+                connections,
+                requests,
                 handle: Some(handle),
             }
         }
@@ -916,6 +930,8 @@ mod tests {
                 address: "127.0.0.1:0".parse().unwrap(),
                 shutdown: Some(shutdown),
                 accepted,
+                connections: Arc::new(AtomicUsize::new(0)),
+                requests: Arc::new(AtomicUsize::new(0)),
                 handle: Some(handle),
             }
         }
@@ -924,6 +940,14 @@ mod tests {
             self.accepted
                 .recv_timeout(MOCK_READ_TIMEOUT)
                 .map_err(|_| TestServerError::SynchronizationFailed)
+        }
+
+        fn connection_count(&self) -> usize {
+            self.connections.load(Ordering::SeqCst)
+        }
+
+        fn request_count(&self) -> usize {
+            self.requests.load(Ordering::SeqCst)
         }
 
         fn finish(&mut self) -> Result<(), TestServerError> {
@@ -1160,7 +1184,11 @@ mod tests {
         profile.id
     }
 
-    fn create_memory(storage: &StorageService, status: MemoryStatus, sensitive: bool) {
+    fn create_memory(
+        storage: &StorageService,
+        status: MemoryStatus,
+        sensitive: bool,
+    ) -> crate::memory::MemoryRecord {
         if status == MemoryStatus::Confirmed {
             crate::storage::test_support::insert_confirmed_memory_fixture(
                 storage,
@@ -1172,7 +1200,7 @@ mod tests {
                 0.9,
                 sensitive,
                 false,
-            );
+            )
         } else {
             MemoryService::new(storage)
                 .create_candidate(CreateMemoryCandidateRequest {
@@ -1187,7 +1215,7 @@ mod tests {
                     confidence: 0.9,
                     is_sensitive: sensitive,
                 })
-                .unwrap();
+                .unwrap()
         }
     }
 
@@ -1312,7 +1340,10 @@ mod tests {
     #[test]
     fn chat_credential_is_not_accepted_for_embedding() {
         let (temp, storage) = test_storage();
-        let profile_id = active_embedding_profile(&storage, "http://127.0.0.1:9/v1", 3);
+        let mut server = TestServer::embeddings(
+            r#"{"object":"list","model":"test-embedding-model","data":[{"object":"embedding","index":0,"embedding":[1.0,0.0,0.0]}]}"#,
+        );
+        let profile_id = active_embedding_profile(&storage, &server.base_url, 3);
         let secrets = InMemorySecretStore::new();
         secrets
             .set_secret(
@@ -1321,16 +1352,31 @@ mod tests {
             )
             .unwrap();
         // Eligible memory forces an embed attempt so wrong-purpose credentials fail at D-8.
-        create_memory(&storage, MemoryStatus::Confirmed, false);
+        let memory = create_memory(&storage, MemoryStatus::Confirmed, false);
+        let before = memory.clone();
         let runtime = ModelRuntimeCoordinator::default();
         let service =
             MemoryVectorIndexRuntimeService::new(&storage, &storage, &secrets, &storage, &runtime);
         let error =
             tauri::async_runtime::block_on(service.rebuild("life-a", &NeverCancel)).unwrap_err();
-        // Wrong-purpose credentials are rejected at embed time (not resolve time).
-        // Lance may open before embed; the rebuild must still fail without indexing.
         assert_eq!(error.code, VectorIndexRuntimeErrorCode::RebuildFailed);
-        let _ = temp;
+        assert!(temp.path().join("data/vectors/lancedb").is_dir());
+
+        let jobs = MemoryVectorIndexRuntimeCoordinator::default();
+        let status = tauri::async_runtime::block_on(service.status("life-a", &jobs)).unwrap();
+        assert!(status.index_directory_exists);
+        assert!(!status.credential_exists);
+        assert_eq!(status.eligible_memory_count, 1);
+        assert_eq!(status.indexed_count, 0);
+
+        assert_eq!(server.connection_count(), 0);
+        assert_eq!(server.request_count(), 0);
+        assert_eq!(server.finish(), Err(TestServerError::Shutdown));
+
+        let after = MemoryService::new(&storage)
+            .get("life-a", &memory.id)
+            .unwrap();
+        assert_eq!(after, before);
     }
 
     #[test]

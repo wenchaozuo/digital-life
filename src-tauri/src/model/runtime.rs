@@ -78,7 +78,7 @@ pub struct ResolvedChatProvider {
     provider: OpenAICompatibleProvider,
 }
 
-pub struct ResolvedEmbeddingProvider<'a> {
+pub(crate) struct ResolvedEmbeddingProvider<'a> {
     pub profile: ResolvedModelProfile,
     provider: Box<dyn EmbeddingProvider + 'a>,
 }
@@ -90,7 +90,7 @@ impl ResolvedChatProvider {
 }
 
 impl<'a> ResolvedEmbeddingProvider<'a> {
-    pub fn provider(&self) -> &dyn EmbeddingProvider {
+    pub(crate) fn provider(&self) -> &dyn EmbeddingProvider {
         self.provider.as_ref()
     }
 
@@ -244,7 +244,7 @@ where
         self.resolve_chat_provider(&profile_id)
     }
 
-    pub fn resolve_active_embedding_provider(
+    pub(crate) fn resolve_active_embedding_provider(
         &self,
     ) -> Result<ResolvedEmbeddingProvider<'a>, ModelRuntimeError> {
         let profile_id = self.active_profile_id(ModelRuntimePurpose::Embedding)?;
@@ -294,7 +294,7 @@ where
         self.build_chat_provider(profile)
     }
 
-    pub fn resolve_embedding_provider(
+    pub(crate) fn resolve_embedding_provider(
         &self,
         profile_id: &str,
     ) -> Result<ResolvedEmbeddingProvider<'a>, ModelRuntimeError> {
@@ -418,7 +418,7 @@ where
         // Credential is read only inside a later embed()/D-8 execute. Construction
         // validates purpose/model/dimension and builds the borrowed adapter only.
         let provider = build_openai_compatible_embedding_provider(&profile, self.secrets).map_err(
-            |error| match error.code {
+            |error| match error.code() {
                 EmbeddingErrorCode::InvalidRequest => {
                     runtime_error(ModelRuntimeErrorCode::InvalidProfile)
                 }
@@ -467,7 +467,7 @@ where
             })
             .await
             .map_err(map_embedding_error)?;
-        let dimension = u32::try_from(response.dimension)
+        let dimension = u32::try_from(response.dimension())
             .map_err(|_| runtime_error(ModelRuntimeErrorCode::DimensionMismatch))?;
         Ok(Some(dimension))
     }
@@ -575,7 +575,7 @@ fn map_chat_error(error: ModelError) -> ModelRuntimeError {
 }
 
 fn map_embedding_error(error: EmbeddingError) -> ModelRuntimeError {
-    let code = match error.code {
+    let code = match error.code() {
         EmbeddingErrorCode::AuthenticationFailed => ModelRuntimeErrorCode::AuthenticationFailed,
         EmbeddingErrorCode::RateLimited => ModelRuntimeErrorCode::RateLimited,
         EmbeddingErrorCode::NetworkError => ModelRuntimeErrorCode::NetworkUnavailable,

@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     embedding::{
-        EmbeddingError, EmbeddingErrorCode, EmbeddingFuture, EmbeddingModelInfo, EmbeddingProvider,
-        EmbeddingRequest, EmbeddingResponse,
+        EmbeddingBatch, EmbeddingError, EmbeddingErrorCode, EmbeddingFuture, EmbeddingModelInfo,
+        EmbeddingProvider, EmbeddingRequest,
     },
     model::{
         profile::ModelProfileRepository,
@@ -427,12 +427,10 @@ impl EmbeddingProvider for KeywordOnlyEmbeddingProvider {
     fn embed<'a>(
         &'a self,
         _request: EmbeddingRequest,
-    ) -> EmbeddingFuture<'a, Result<EmbeddingResponse, EmbeddingError>> {
+    ) -> EmbeddingFuture<'a, Result<EmbeddingBatch, EmbeddingError>> {
         Box::pin(async {
-            Err(EmbeddingError::new(
+            Err(EmbeddingError::definitely_not_sent(
                 EmbeddingErrorCode::InvalidRequest,
-                "Keyword-only retrieval does not embed text.",
-                false,
             ))
         })
     }
@@ -641,7 +639,7 @@ mod tests {
     };
 
     use crate::{
-        embedding::{EmbeddingUsage, EmbeddingVector},
+        embedding::EmbeddingBatch,
         memory::retrieval::MemoryRetrievalRepository,
         memory::{MemoryRecord, MemorySourceType, MemoryStatus},
         vector_store::LanceDbVectorStore,
@@ -739,20 +737,9 @@ mod tests {
         fn embed<'a>(
             &'a self,
             _request: EmbeddingRequest,
-        ) -> EmbeddingFuture<'a, Result<EmbeddingResponse, EmbeddingError>> {
+        ) -> EmbeddingFuture<'a, Result<EmbeddingBatch, EmbeddingError>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async {
-                Ok(EmbeddingResponse {
-                    model_name: "model-a".into(),
-                    dimension: 2,
-                    vectors: vec![EmbeddingVector {
-                        input_index: 0,
-                        values: vec![1.0, 0.0],
-                    }],
-                    input_count: 1,
-                    usage: Some(EmbeddingUsage::default()),
-                })
-            })
+            Box::pin(async { EmbeddingBatch::from_test_vectors(vec![vec![1.0, 0.0]]) })
         }
     }
     struct Factory {

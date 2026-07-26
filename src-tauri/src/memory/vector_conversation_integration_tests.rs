@@ -11,9 +11,8 @@ use std::{
 
 use crate::{
     embedding::{
-        DeterministicEmbeddingProvider, EmbeddingError, EmbeddingErrorCode, EmbeddingFuture,
-        EmbeddingModelInfo, EmbeddingProvider, EmbeddingPurpose, EmbeddingRequest,
-        EmbeddingResponse,
+        DeterministicEmbeddingProvider, EmbeddingBatch, EmbeddingError, EmbeddingErrorCode,
+        EmbeddingFuture, EmbeddingModelInfo, EmbeddingProvider, EmbeddingPurpose, EmbeddingRequest,
     },
     memory::{
         context_builder::{
@@ -328,9 +327,11 @@ async fn vector_for(provider: &dyn EmbeddingProvider, text: &str) -> Vec<f32> {
         })
         .await
         .unwrap()
-        .vectors
-        .remove(0)
-        .values
+        .into_vectors()
+        .into_iter()
+        .next()
+        .unwrap()
+        .into_values()
 }
 
 fn hybrid_request(life_id: &str, query: &str) -> HybridRetrievalRequest {
@@ -976,12 +977,10 @@ impl EmbeddingProvider for FailingEmbeddingProvider {
     fn embed<'a>(
         &'a self,
         _request: EmbeddingRequest,
-    ) -> EmbeddingFuture<'a, Result<EmbeddingResponse, EmbeddingError>> {
+    ) -> EmbeddingFuture<'a, Result<EmbeddingBatch, EmbeddingError>> {
         Box::pin(async {
-            Err(EmbeddingError::new(
+            Err(EmbeddingError::possibly_sent(
                 EmbeddingErrorCode::NetworkError,
-                "Test embedding unavailable.",
-                true,
             ))
         })
     }
@@ -1017,19 +1016,8 @@ impl EmbeddingProvider for FixedEmbeddingProvider {
     fn embed<'a>(
         &'a self,
         _request: EmbeddingRequest,
-    ) -> EmbeddingFuture<'a, Result<EmbeddingResponse, EmbeddingError>> {
-        Box::pin(async move {
-            Ok(EmbeddingResponse {
-                model_name: self.model.clone(),
-                dimension: self.vector.len(),
-                vectors: vec![crate::embedding::EmbeddingVector {
-                    input_index: 0,
-                    values: self.vector.clone(),
-                }],
-                input_count: 1,
-                usage: None,
-            })
-        })
+    ) -> EmbeddingFuture<'a, Result<EmbeddingBatch, EmbeddingError>> {
+        Box::pin(async move { EmbeddingBatch::from_test_vectors(vec![self.vector.clone()]) })
     }
 }
 

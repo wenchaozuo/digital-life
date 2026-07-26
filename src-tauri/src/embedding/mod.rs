@@ -7,10 +7,10 @@ mod openai_compatible;
 mod protocol;
 
 pub(crate) use openai_compatible::build_openai_compatible_embedding_provider;
-pub use openai_compatible::OpenAiCompatibleEmbeddingProvider;
 #[allow(unused_imports)]
 pub(crate) use protocol::{
-    EmbeddingBatch, MAX_EMBEDDING_BATCH_MEMORIES, MAX_VECTOR_DIMENSION, PROTOCOL_VERSION,
+    EmbeddingBatch, EmbeddingVector, MAX_EMBEDDING_BATCH_MEMORIES, MAX_VECTOR_DIMENSION,
+    PROTOCOL_VERSION,
 };
 
 use std::{future::Future, pin::Pin};
@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::transport::http1::SendDisposition;
 
-pub type EmbeddingFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+pub(crate) type EmbeddingFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -35,30 +35,6 @@ pub struct EmbeddingRequest {
     pub purpose: EmbeddingPurpose,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct EmbeddingVector {
-    pub input_index: usize,
-    pub values: Vec<f32>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct EmbeddingUsage {
-    pub prompt_tokens: Option<u64>,
-    pub total_tokens: Option<u64>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct EmbeddingResponse {
-    pub model_name: String,
-    pub dimension: usize,
-    pub vectors: Vec<EmbeddingVector>,
-    pub input_count: usize,
-    pub usage: Option<EmbeddingUsage>,
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct EmbeddingModelInfo {
@@ -69,9 +45,8 @@ pub struct EmbeddingModelInfo {
 
 /// Fixed embedding boundary codes. Newer D-9B semantic names map onto these
 /// stable variants so out-of-scope call-site matches remain exhaustive.
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum EmbeddingErrorCode {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EmbeddingErrorCode {
     InvalidRequest,
     EmptyText,
     BatchLimitExceeded,
@@ -84,48 +59,25 @@ pub enum EmbeddingErrorCode {
     DimensionMismatch,
 }
 
-#[derive(Clone, PartialEq, Eq)]
-pub struct EmbeddingError {
-    pub code: EmbeddingErrorCode,
-    pub message: String,
-    pub recoverable: bool,
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EmbeddingError {
+    code: EmbeddingErrorCode,
+    recoverable: bool,
     disposition: SendDisposition,
 }
 
 impl EmbeddingError {
-    pub(crate) fn new(
-        code: EmbeddingErrorCode,
-        message: impl Into<String>,
-        recoverable: bool,
-    ) -> Self {
+    pub(crate) const fn definitely_not_sent(code: EmbeddingErrorCode) -> Self {
         Self {
             code,
-            message: message.into(),
-            recoverable,
-            disposition: if recoverable {
-                SendDisposition::PossiblySent
-            } else {
-                SendDisposition::DefinitelyNotSent
-            },
-        }
-    }
-
-    pub(crate) fn definitely_not_sent(
-        code: EmbeddingErrorCode,
-        message: impl Into<String>,
-    ) -> Self {
-        Self {
-            code,
-            message: message.into(),
             recoverable: false,
             disposition: SendDisposition::DefinitelyNotSent,
         }
     }
 
-    pub(crate) fn possibly_sent(code: EmbeddingErrorCode, message: impl Into<String>) -> Self {
+    pub(crate) const fn possibly_sent(code: EmbeddingErrorCode) -> Self {
         Self {
             code,
-            message: message.into(),
             recoverable: true,
             disposition: SendDisposition::PossiblySent,
         }
@@ -158,15 +110,39 @@ impl EmbeddingError {
         };
         Self {
             code,
-            message: error.to_string(),
             recoverable,
             disposition: error.disposition(),
         }
     }
 
+    pub(crate) const fn code(&self) -> EmbeddingErrorCode {
+        self.code
+    }
+
+    pub(crate) const fn is_recoverable(&self) -> bool {
+        self.recoverable
+    }
+
     #[allow(dead_code)]
-    pub(crate) const fn disposition(&self) -> SendDisposition {
+    pub(crate) const fn send_disposition(&self) -> SendDisposition {
         self.disposition
+    }
+
+    const fn safe_message(&self) -> &'static str {
+        match self.code {
+            EmbeddingErrorCode::InvalidRequest => "Embedding request is invalid.",
+            EmbeddingErrorCode::EmptyText => "Embedding text is invalid.",
+            EmbeddingErrorCode::BatchLimitExceeded => "Embedding batch is too large.",
+            EmbeddingErrorCode::TextLimitExceeded => "Embedding text exceeds limits.",
+            EmbeddingErrorCode::NetworkError => "Embedding network operation failed.",
+            EmbeddingErrorCode::AuthenticationFailed => "Embedding authentication failed.",
+            EmbeddingErrorCode::RateLimited => "Embedding service rate limit was reached.",
+            EmbeddingErrorCode::RequestTimeout => "Embedding request timed out.",
+            EmbeddingErrorCode::InvalidProviderResponse => {
+                "Embedding provider response is invalid."
+            }
+            EmbeddingErrorCode::DimensionMismatch => "Embedding dimension does not match.",
+        }
     }
 }
 
@@ -182,46 +158,15 @@ impl std::fmt::Debug for EmbeddingError {
 
 impl std::fmt::Display for EmbeddingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
+        f.write_str(self.safe_message())
     }
 }
 
 impl std::error::Error for EmbeddingError {}
 
-impl Serialize for EmbeddingError {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("EmbeddingError", 3)?;
-        state.serialize_field("code", &self.code)?;
-        state.serialize_field("message", &self.message)?;
-        state.serialize_field("recoverable", &self.recoverable)?;
-        state.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for EmbeddingError {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Wire {
-            code: EmbeddingErrorCode,
-            message: String,
-            recoverable: bool,
-        }
-        let wire = Wire::deserialize(deserializer)?;
-        Ok(Self::new(wire.code, wire.message, wire.recoverable))
-    }
-}
-
 /// Rust-internal provider boundary. Implementations must not persist requests,
 /// responses, or vectors; future storage is a separate derived-data concern.
-pub trait EmbeddingProvider: Send + Sync {
+pub(crate) trait EmbeddingProvider: Send + Sync {
     fn model_info(&self) -> EmbeddingModelInfo;
     fn model_name(&self) -> &str;
     fn vector_dimension(&self) -> Option<usize>;
@@ -231,7 +176,7 @@ pub trait EmbeddingProvider: Send + Sync {
     fn embed<'a>(
         &'a self,
         request: EmbeddingRequest,
-    ) -> EmbeddingFuture<'a, Result<EmbeddingResponse, EmbeddingError>>;
+    ) -> EmbeddingFuture<'a, Result<EmbeddingBatch, EmbeddingError>>;
 }
 
 #[cfg(test)]
@@ -295,26 +240,17 @@ impl EmbeddingProvider for DeterministicEmbeddingProvider {
     fn embed<'a>(
         &'a self,
         request: EmbeddingRequest,
-    ) -> EmbeddingFuture<'a, Result<EmbeddingResponse, EmbeddingError>> {
+    ) -> EmbeddingFuture<'a, Result<EmbeddingBatch, EmbeddingError>> {
         Box::pin(async move {
             protocol::validate_documents(&request.texts)?;
             protocol::validate_dimension_limits(self.dimension, request.texts.len())?;
-            let input_count = request.texts.len();
-            Ok(EmbeddingResponse {
-                model_name: self.model_name.clone(),
-                dimension: self.dimension,
-                vectors: request
+            EmbeddingBatch::from_test_vectors(
+                request
                     .texts
                     .iter()
-                    .enumerate()
-                    .map(|(input_index, text)| EmbeddingVector {
-                        input_index,
-                        values: self.values_for(text),
-                    })
+                    .map(|text| self.values_for(text))
                     .collect(),
-                input_count,
-                usage: None,
-            })
+            )
         })
     }
 }
@@ -325,12 +261,14 @@ mod tests {
     use crate::model::transport::http1::SendDisposition;
 
     #[test]
-    fn error_debug_omits_message_payload() {
-        let canary = "CANARY_SECRET_PAYLOAD";
-        let error =
-            EmbeddingError::possibly_sent(EmbeddingErrorCode::InvalidProviderResponse, canary);
-        assert!(!format!("{error:?}").contains(canary));
-        assert_eq!(error.disposition(), SendDisposition::PossiblySent);
+    fn error_rendering_is_fixed_and_has_no_source() {
+        let error = EmbeddingError::possibly_sent(EmbeddingErrorCode::InvalidProviderResponse);
+        for canary in ["API_KEY_CANARY", "DOCUMENT_CANARY", "RESPONSE_BODY_CANARY"] {
+            assert!(!format!("{error:?}").contains(canary));
+            assert!(!error.to_string().contains(canary));
+        }
+        assert!(std::error::Error::source(&error).is_none());
+        assert_eq!(error.send_disposition(), SendDisposition::PossiblySent);
     }
 
     #[test]
@@ -345,9 +283,9 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(
             first
-                .vectors
+                .vectors()
                 .iter()
-                .map(|vector| vector.input_index)
+                .map(|vector| vector.input_index())
                 .collect::<Vec<_>>(),
             vec![0, 1]
         );

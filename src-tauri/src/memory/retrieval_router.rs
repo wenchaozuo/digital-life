@@ -226,7 +226,7 @@ impl MemoryCandidateMerger {
     }
 }
 
-pub struct MemoryRetrievalRouter<'a, R, E, V>
+pub(crate) struct MemoryRetrievalRouter<'a, R, E, V>
 where
     R: MemoryRetrievalRouterRepository,
     E: EmbeddingProvider + ?Sized,
@@ -244,7 +244,7 @@ where
     E: EmbeddingProvider + ?Sized,
     V: VectorStore + ?Sized,
 {
-    pub fn new(
+    pub(crate) fn new(
         repository: &'a R,
         embedding_provider: &'a E,
         vector_store: &'a V,
@@ -269,7 +269,7 @@ where
         })
     }
 
-    pub async fn retrieve(
+    pub(crate) async fn retrieve(
         &self,
         request: HybridRetrievalRequest,
     ) -> Result<HybridRetrievalResult, MemoryRetrievalRouterError> {
@@ -408,14 +408,12 @@ where
             })
             .await
             .map_err(|_| vector_unavailable())?;
-        if response.input_count != 1
-            || response.vectors.len() != 1
-            || response.vectors[0].input_index != 0
-            || response.model_name != self.vector_space.embedding_model
-            || response.dimension != self.vector_space.dimension
-            || response.vectors[0].values.len() != self.vector_space.dimension
-            || response.vectors[0]
-                .values
+        if response.len() != 1
+            || response.vectors()[0].input_index() != 0
+            || response.dimension() != self.vector_space.dimension
+            || response.vectors()[0].dimension() != self.vector_space.dimension
+            || response.vectors()[0]
+                .values()
                 .iter()
                 .any(|value| !value.is_finite())
         {
@@ -425,7 +423,7 @@ where
             .search(VectorSearchQuery {
                 life_id: request.life_id.clone(),
                 space: self.vector_space.clone(),
-                vector: response.vectors[0].values.clone(),
+                vector: response.vectors()[0].values().to_vec(),
                 limit,
                 min_score: request.min_score,
             })
@@ -490,8 +488,7 @@ mod tests {
 
     use crate::{
         embedding::{
-            EmbeddingError, EmbeddingErrorCode, EmbeddingFuture, EmbeddingModelInfo,
-            EmbeddingResponse, EmbeddingVector,
+            EmbeddingBatch, EmbeddingError, EmbeddingErrorCode, EmbeddingFuture, EmbeddingModelInfo,
         },
         memory::{MemorySourceType, MemoryStatus},
         vector_store::{VectorRecord, VectorStoreError, VectorStoreErrorCode, VectorStoreFuture},
@@ -578,26 +575,15 @@ mod tests {
         fn embed<'a>(
             &'a self,
             request: EmbeddingRequest,
-        ) -> EmbeddingFuture<'a, Result<EmbeddingResponse, EmbeddingError>> {
+        ) -> EmbeddingFuture<'a, Result<EmbeddingBatch, EmbeddingError>> {
             Box::pin(async move {
                 self.purposes.lock().unwrap().push(request.purpose);
                 if self.fail.load(Ordering::SeqCst) {
-                    return Err(EmbeddingError::new(
+                    return Err(EmbeddingError::possibly_sent(
                         EmbeddingErrorCode::NetworkError,
-                        "Test embedding unavailable.",
-                        true,
                     ));
                 }
-                Ok(EmbeddingResponse {
-                    model_name: "test-model".into(),
-                    dimension: 2,
-                    vectors: vec![EmbeddingVector {
-                        input_index: 0,
-                        values: vec![1.0, 0.0],
-                    }],
-                    input_count: 1,
-                    usage: None,
-                })
+                EmbeddingBatch::from_test_vectors(vec![vec![1.0, 0.0]])
             })
         }
     }

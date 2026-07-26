@@ -13,8 +13,8 @@ use super::{
         self, build_provider_request, decode_response_envelope, validate_dimension_limits,
         validate_documents, MAX_VECTOR_DIMENSION,
     },
-    EmbeddingError, EmbeddingErrorCode, EmbeddingFuture, EmbeddingModelInfo, EmbeddingProvider,
-    EmbeddingRequest, EmbeddingResponse,
+    EmbeddingBatch, EmbeddingError, EmbeddingErrorCode, EmbeddingFuture, EmbeddingModelInfo,
+    EmbeddingProvider, EmbeddingRequest,
 };
 
 /// Long-lived adapter: controlled config + SecretStore borrow only.
@@ -36,31 +36,21 @@ where
         if profile.purpose != ModelPurpose::Embedding {
             return Err(EmbeddingError::definitely_not_sent(
                 EmbeddingErrorCode::InvalidRequest,
-                "The model profile purpose is not valid for embedding.",
             ));
         }
         if profile.model_name.trim().is_empty() {
             return Err(EmbeddingError::definitely_not_sent(
                 EmbeddingErrorCode::InvalidRequest,
-                "An embedding model name is required.",
             ));
         }
         let dimension = profile.embedding_dimension.ok_or_else(|| {
-            EmbeddingError::definitely_not_sent(
-                EmbeddingErrorCode::InvalidRequest,
-                "The embedding dimension is required.",
-            )
+            EmbeddingError::definitely_not_sent(EmbeddingErrorCode::InvalidRequest)
         })?;
-        let expected_dimension = usize::try_from(dimension).map_err(|_| {
-            EmbeddingError::definitely_not_sent(
-                EmbeddingErrorCode::InvalidRequest,
-                "The embedding dimension is invalid.",
-            )
-        })?;
+        let expected_dimension = usize::try_from(dimension)
+            .map_err(|_| EmbeddingError::definitely_not_sent(EmbeddingErrorCode::InvalidRequest))?;
         if expected_dimension == 0 || expected_dimension > MAX_VECTOR_DIMENSION {
             return Err(EmbeddingError::definitely_not_sent(
                 EmbeddingErrorCode::InvalidRequest,
-                "The embedding dimension is invalid.",
             ));
         }
 
@@ -112,7 +102,7 @@ where
     fn embed<'a>(
         &'a self,
         request: EmbeddingRequest,
-    ) -> EmbeddingFuture<'a, Result<EmbeddingResponse, EmbeddingError>> {
+    ) -> EmbeddingFuture<'a, Result<EmbeddingBatch, EmbeddingError>> {
         Box::pin(async move {
             validate_documents(&request.texts)?;
             validate_dimension_limits(self.expected_dimension, request.texts.len())?;
@@ -128,7 +118,7 @@ where
                 request.texts.len(),
                 self.expected_dimension,
             )?;
-            Ok(batch.into_public_response(self.model_name.clone()))
+            Ok(batch)
         })
     }
 }
@@ -260,8 +250,8 @@ mod tests {
         let mut profile = embedding_profile("https://provider.example.invalid/v1", 3);
         profile.purpose = ModelPurpose::Chat;
         let err = OpenAiCompatibleEmbeddingProvider::try_new(&profile, &store).unwrap_err();
-        assert_eq!(err.code, EmbeddingErrorCode::InvalidRequest);
-        assert_eq!(err.disposition(), SendDisposition::DefinitelyNotSent);
+        assert_eq!(err.code(), EmbeddingErrorCode::InvalidRequest);
+        assert_eq!(err.send_disposition(), SendDisposition::DefinitelyNotSent);
         assert_eq!(store.reads(), 0);
     }
 
@@ -276,8 +266,8 @@ mod tests {
             purpose: super::super::EmbeddingPurpose::Document,
         }))
         .unwrap_err();
-        assert_eq!(err.code, EmbeddingErrorCode::InvalidRequest);
-        assert_eq!(err.disposition(), SendDisposition::DefinitelyNotSent);
+        assert_eq!(err.code(), EmbeddingErrorCode::InvalidRequest);
+        assert_eq!(err.send_disposition(), SendDisposition::DefinitelyNotSent);
         assert_eq!(store.reads(), 0);
         assert!(!format!("{provider:?}").contains("d9b-test-canary-never-log"));
         assert!(!format!("{provider:?}").contains("provider.example"));
@@ -289,7 +279,7 @@ mod tests {
         seed(&store, "emb-profile");
         let profile = embedding_profile("https://provider.example.invalid/v1", 4097);
         let err = OpenAiCompatibleEmbeddingProvider::try_new(&profile, &store).unwrap_err();
-        assert_eq!(err.code, EmbeddingErrorCode::InvalidRequest);
+        assert_eq!(err.code(), EmbeddingErrorCode::InvalidRequest);
         assert_eq!(store.reads(), 0);
     }
 
@@ -304,7 +294,7 @@ mod tests {
             purpose: super::super::EmbeddingPurpose::Query,
         }))
         .unwrap_err();
-        assert_eq!(err.disposition(), SendDisposition::DefinitelyNotSent);
+        assert_eq!(err.send_disposition(), SendDisposition::DefinitelyNotSent);
         assert_eq!(store.reads(), 1);
         assert!(!format!("{err:?}").contains("d9b-test-canary-never-log"));
     }

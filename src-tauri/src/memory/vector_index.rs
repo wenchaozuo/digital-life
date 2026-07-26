@@ -13,8 +13,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     embedding::{
-        EmbeddingError, EmbeddingErrorCode, EmbeddingProvider, EmbeddingPurpose, EmbeddingRequest,
-        EmbeddingResponse,
+        EmbeddingBatch, EmbeddingError, EmbeddingErrorCode, EmbeddingProvider, EmbeddingPurpose,
+        EmbeddingRequest,
     },
     vector_store::{VectorRecord, VectorSpace, VectorStore},
 };
@@ -144,6 +144,7 @@ pub trait MemoryRebuildObserver: Send + Sync {
     fn on_progress(&self, progress: MemoryRebuildProgress);
 }
 
+#[allow(dead_code)]
 struct NoopRebuildObserver;
 
 impl MemoryRebuildObserver for NoopRebuildObserver {
@@ -190,7 +191,7 @@ struct IndexPayload {
     content_hash: String,
 }
 
-pub struct MemoryVectorIndexService<'a, R, E, V>
+pub(crate) struct MemoryVectorIndexService<'a, R, E, V>
 where
     R: MemoryVectorIndexRepository + ?Sized,
     E: EmbeddingProvider + ?Sized,
@@ -203,13 +204,14 @@ where
     active_operations: Mutex<HashSet<IndexOperationKey>>,
 }
 
+#[allow(dead_code)]
 impl<'a, R, E, V> MemoryVectorIndexService<'a, R, E, V>
 where
     R: MemoryVectorIndexRepository + ?Sized,
     E: EmbeddingProvider + ?Sized,
     V: VectorStore + ?Sized,
 {
-    pub fn new(
+    pub(crate) fn new(
         repository: &'a R,
         embedding_provider: &'a E,
         vector_store: &'a V,
@@ -235,11 +237,11 @@ where
         })
     }
 
-    pub fn vector_space(&self) -> &VectorSpace {
+    pub(crate) fn vector_space(&self) -> &VectorSpace {
         &self.vector_space
     }
 
-    pub async fn index_memory(
+    pub(crate) async fn index_memory(
         &self,
         request: MemoryIndexRequest,
     ) -> Result<MemoryIndexResult, MemoryIndexError> {
@@ -260,9 +262,9 @@ where
             })
             .await
             .map_err(map_embedding_error)?;
-        validate_embedding_response(&response, 1, &self.vector_space)?;
+        validate_embedding_batch(&response, 1, &self.vector_space)?;
         let vector = response
-            .vectors
+            .into_vectors()
             .into_iter()
             .next()
             .ok_or_else(embedding_failed)?;
@@ -272,7 +274,7 @@ where
                 memory_id: memory.id.clone(),
                 embedding_model: self.vector_space.embedding_model.clone(),
                 dimension: self.vector_space.dimension,
-                vector: vector.values,
+                vector: vector.into_values(),
                 content_hash: content_hash.clone(),
             })
             .await
@@ -286,7 +288,7 @@ where
         })
     }
 
-    pub async fn remove_memory_index(
+    pub(crate) async fn remove_memory_index(
         &self,
         life_id: &str,
         memory_id: &str,
@@ -310,7 +312,7 @@ where
         })
     }
 
-    pub async fn rebuild_life_index(
+    pub(crate) async fn rebuild_life_index(
         &self,
         request: MemoryRebuildRequest,
     ) -> Result<MemoryRebuildReport, MemoryIndexError> {
@@ -409,14 +411,14 @@ where
                 })
                 .await
                 .map_err(map_embedding_error)?;
-            validate_embedding_response(&response, batch.len(), &self.vector_space)?;
-            for (payload, vector) in batch.iter().zip(response.vectors) {
+            validate_embedding_batch(&response, batch.len(), &self.vector_space)?;
+            for (payload, vector) in batch.iter().zip(response.into_vectors()) {
                 records.push(VectorRecord {
                     life_id: payload.life_id.clone(),
                     memory_id: payload.memory_id.clone(),
                     embedding_model: self.vector_space.embedding_model.clone(),
                     dimension: self.vector_space.dimension,
-                    vector: vector.values,
+                    vector: vector.into_values(),
                     content_hash: payload.content_hash.clone(),
                 });
             }
@@ -610,27 +612,23 @@ fn hash_field(hasher: &mut Sha256, value: &[u8]) {
     hasher.update(value);
 }
 
-fn validate_embedding_response(
-    response: &EmbeddingResponse,
+fn validate_embedding_batch(
+    response: &EmbeddingBatch,
     input_count: usize,
     space: &VectorSpace,
 ) -> Result<(), MemoryIndexError> {
-    if response.model_name != space.embedding_model
-        || response.dimension != space.dimension
-        || response.input_count != input_count
-        || response.vectors.len() != input_count
-    {
+    if response.dimension() != space.dimension || response.len() != input_count {
         return Err(MemoryIndexError::new(
             MemoryIndexErrorCode::DimensionMismatch,
             "The embedding response does not match the configured vector space.",
             true,
         ));
     }
-    for (expected_index, vector) in response.vectors.iter().enumerate() {
-        if vector.input_index != expected_index
-            || vector.values.len() != space.dimension
-            || vector.values.is_empty()
-            || vector.values.iter().any(|value| !value.is_finite())
+    for (expected_index, vector) in response.vectors().iter().enumerate() {
+        if vector.input_index() != expected_index
+            || vector.dimension() != space.dimension
+            || vector.values().is_empty()
+            || vector.values().iter().any(|value| !value.is_finite())
         {
             return Err(embedding_failed());
         }
@@ -683,7 +681,7 @@ fn embedding_failed() -> MemoryIndexError {
 }
 
 fn map_embedding_error(error: EmbeddingError) -> MemoryIndexError {
-    let code = match error.code {
+    let code = match error.code() {
         EmbeddingErrorCode::AuthenticationFailed => MemoryIndexErrorCode::AuthenticationFailed,
         EmbeddingErrorCode::RateLimited => MemoryIndexErrorCode::RateLimited,
         EmbeddingErrorCode::NetworkError => MemoryIndexErrorCode::NetworkUnavailable,
@@ -700,7 +698,7 @@ fn map_embedding_error(error: EmbeddingError) -> MemoryIndexError {
     MemoryIndexError::new(
         code,
         "Memory embedding generation failed.",
-        error.recoverable,
+        error.is_recoverable(),
     )
 }
 
@@ -736,8 +734,8 @@ mod tests {
 
     use crate::{
         embedding::{
-            DeterministicEmbeddingProvider, EmbeddingError, EmbeddingErrorCode, EmbeddingFuture,
-            EmbeddingModelInfo, EmbeddingUsage, EmbeddingVector,
+            DeterministicEmbeddingProvider, EmbeddingBatch, EmbeddingError, EmbeddingErrorCode,
+            EmbeddingFuture, EmbeddingModelInfo,
         },
         memory::{MemoryKind, MemorySourceType},
         vector_store::{
@@ -929,31 +927,20 @@ mod tests {
         fn response(
             dimension: usize,
             request: EmbeddingRequest,
-        ) -> Result<EmbeddingResponse, EmbeddingError> {
-            let input_count = request.texts.len();
+        ) -> Result<EmbeddingBatch, EmbeddingError> {
             let vectors = request
                 .texts
                 .iter()
-                .enumerate()
-                .map(|(input_index, text)| {
+                .map(|text| {
                     let seed = text.bytes().fold(1u32, |state, byte| {
                         state.wrapping_mul(31).wrapping_add(byte as u32)
                     });
-                    EmbeddingVector {
-                        input_index,
-                        values: (0..dimension)
-                            .map(|index| ((seed.wrapping_add(index as u32) % 997) + 1) as f32)
-                            .collect(),
-                    }
+                    (0..dimension)
+                        .map(|index| ((seed.wrapping_add(index as u32) % 997) + 1) as f32)
+                        .collect()
                 })
                 .collect();
-            Ok(EmbeddingResponse {
-                model_name: "test-model".into(),
-                dimension,
-                vectors,
-                input_count,
-                usage: Some(EmbeddingUsage::default()),
-            })
+            EmbeddingBatch::from_test_vectors(vectors)
         }
     }
 
@@ -980,14 +967,12 @@ mod tests {
         fn embed<'a>(
             &'a self,
             request: EmbeddingRequest,
-        ) -> EmbeddingFuture<'a, Result<EmbeddingResponse, EmbeddingError>> {
+        ) -> EmbeddingFuture<'a, Result<EmbeddingBatch, EmbeddingError>> {
             self.calls.lock().unwrap().push(request.texts.clone());
             if self.fail.load(Ordering::SeqCst) {
                 return Box::pin(async {
-                    Err(EmbeddingError::new(
+                    Err(EmbeddingError::possibly_sent(
                         EmbeddingErrorCode::NetworkError,
-                        "Synthetic test failure.",
-                        true,
                     ))
                 });
             }

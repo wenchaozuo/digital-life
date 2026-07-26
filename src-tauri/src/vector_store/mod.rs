@@ -414,6 +414,7 @@ pub enum VectorStoreErrorCode {
     GenerationDropFailed,
     GenerationLocked,
     GenerationCorrupt,
+    GenerationDropRequiresRegistry,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

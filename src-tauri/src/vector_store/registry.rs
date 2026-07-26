@@ -2,7 +2,7 @@
 
 use std::{
     collections::VecDeque,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -32,7 +32,14 @@ pub struct LanceDbVectorStoreRegistryError {
 
 struct CachedStore {
     canonical_root: PathBuf,
+    generation_key: Option<GenerationRegistryKey>,
     store: Arc<LanceDbVectorStore>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GenerationRegistryKey {
+    root_identity: PathBuf,
+    generation_id: VectorGenerationId,
 }
 
 /// Registry for derived vector stores only. It retains neither profiles nor
@@ -103,6 +110,7 @@ impl LanceDbVectorStoreRegistry {
         }
         stores.push_front(CachedStore {
             canonical_root,
+            generation_key: None,
             store: Arc::clone(&store),
         });
         while stores.len() > self.capacity {
@@ -153,6 +161,7 @@ impl LanceDbVectorStoreRegistry {
         }
         stores.push_front(CachedStore {
             canonical_root,
+            generation_key: None,
             store: Arc::clone(&store),
         });
         while stores.len() > self.capacity {
@@ -191,15 +200,14 @@ impl LanceDbVectorStoreRegistry {
         data_root: &Path,
         generation_id: &VectorGenerationId,
     ) -> Result<Arc<LanceDbVectorStore>, LanceDbVectorStoreRegistryError> {
+        let key = generation_registry_key(data_root, generation_id)?;
         let index_root = generation_store_root(data_root, generation_id);
         if index_root.exists() && !index_root.is_dir() {
             return Err(error(LanceDbVectorStoreRegistryErrorCode::StoreUnavailable));
         }
         if index_root.is_dir() {
-            if let Ok(canonical_root) = std::fs::canonicalize(&index_root) {
-                if let Some(store) = self.lookup(&canonical_root)? {
-                    return Ok(store);
-                }
+            if let Some(store) = self.lookup_generation(&key)? {
+                return Ok(store);
             }
         }
         let store = Arc::new(
@@ -209,7 +217,7 @@ impl LanceDbVectorStoreRegistry {
         );
         let canonical_root = std::fs::canonicalize(&index_root)
             .map_err(|_| error(LanceDbVectorStoreRegistryErrorCode::StoreUnavailable))?;
-        self.insert_cache(canonical_root, Arc::clone(&store))?;
+        self.insert_generation_cache(canonical_root, key, Arc::clone(&store))?;
         Ok(store)
     }
 
@@ -219,6 +227,7 @@ impl LanceDbVectorStoreRegistry {
         data_root: &Path,
         generation_id: &VectorGenerationId,
     ) -> Result<Option<Arc<LanceDbVectorStore>>, LanceDbVectorStoreRegistryError> {
+        let key = generation_registry_key(data_root, generation_id)?;
         let index_root = generation_store_root(data_root, generation_id);
         if !index_root.exists() {
             return Ok(None);
@@ -228,7 +237,7 @@ impl LanceDbVectorStoreRegistry {
         }
         let canonical_root = std::fs::canonicalize(&index_root)
             .map_err(|_| error(LanceDbVectorStoreRegistryErrorCode::StoreUnavailable))?;
-        if let Some(store) = self.lookup(&canonical_root)? {
+        if let Some(store) = self.lookup_generation(&key)? {
             return Ok(Some(store));
         }
         let store = Arc::new(
@@ -236,7 +245,7 @@ impl LanceDbVectorStoreRegistry {
                 .await
                 .map_err(|_| error(LanceDbVectorStoreRegistryErrorCode::StoreUnavailable))?,
         );
-        self.insert_cache(canonical_root, Arc::clone(&store))?;
+        self.insert_generation_cache(canonical_root, key, Arc::clone(&store))?;
         Ok(Some(store))
     }
 
@@ -247,9 +256,10 @@ impl LanceDbVectorStoreRegistry {
         data_root: &Path,
         generation_id: &VectorGenerationId,
     ) -> Result<(), VectorStoreError> {
+        let key = generation_registry_key_for_drop(data_root, generation_id)?;
         let index_root = generation_store_root(data_root, generation_id);
-        // Release any cached handles first so Windows can delete the directory.
-        if let Ok(canonical) = std::fs::canonicalize(&index_root) {
+        // Release only the exact root + generation cache entry before deleting.
+        {
             let mut stores = self.stores.lock().map_err(|_| {
                 VectorStoreError::new(
                     VectorStoreErrorCode::GenerationLocked,
@@ -257,29 +267,37 @@ impl LanceDbVectorStoreRegistry {
                     true,
                 )
             })?;
-            stores.retain(|entry| entry.canonical_root != canonical);
-        } else {
-            let mut stores = self.stores.lock().map_err(|_| {
-                VectorStoreError::new(
-                    VectorStoreErrorCode::GenerationLocked,
-                    "The vector generation is locked by an open handle.",
-                    true,
-                )
-            })?;
-            stores.retain(|entry| {
-                !entry.canonical_root.ends_with(
-                    Path::new("generations")
-                        .join(generation_id.as_str())
-                        .join("lancedb"),
-                )
-            });
+            stores.retain(|entry| entry.generation_key.as_ref() != Some(&key));
         }
         LanceDbVectorStore::drop_generation_directory(&index_root).await
     }
 
-    fn insert_cache(
+    fn lookup_generation(
+        &self,
+        key: &GenerationRegistryKey,
+    ) -> Result<Option<Arc<LanceDbVectorStore>>, LanceDbVectorStoreRegistryError> {
+        let mut stores = self
+            .stores
+            .lock()
+            .map_err(|_| error(LanceDbVectorStoreRegistryErrorCode::StoreUnavailable))?;
+        let Some(position) = stores
+            .iter()
+            .position(|entry| entry.generation_key.as_ref() == Some(key))
+        else {
+            return Ok(None);
+        };
+        let entry = stores
+            .remove(position)
+            .expect("position was derived from deque");
+        let store = Arc::clone(&entry.store);
+        stores.push_front(entry);
+        Ok(Some(store))
+    }
+
+    fn insert_generation_cache(
         &self,
         canonical_root: PathBuf,
+        generation_key: GenerationRegistryKey,
         store: Arc<LanceDbVectorStore>,
     ) -> Result<(), LanceDbVectorStoreRegistryError> {
         let mut stores = self
@@ -288,7 +306,7 @@ impl LanceDbVectorStoreRegistry {
             .map_err(|_| error(LanceDbVectorStoreRegistryErrorCode::StoreUnavailable))?;
         if let Some(position) = stores
             .iter()
-            .position(|entry| entry.canonical_root == canonical_root)
+            .position(|entry| entry.generation_key.as_ref() == Some(&generation_key))
         {
             let entry = stores
                 .remove(position)
@@ -298,6 +316,7 @@ impl LanceDbVectorStoreRegistry {
         }
         stores.push_front(CachedStore {
             canonical_root,
+            generation_key: Some(generation_key),
             store,
         });
         while stores.len() > self.capacity {
@@ -313,6 +332,77 @@ impl LanceDbVectorStoreRegistry {
             .map(|stores| stores.len())
             .unwrap_or_default()
     }
+
+    #[cfg(test)]
+    fn has_cached_generation(&self, data_root: &Path, generation_id: &VectorGenerationId) -> bool {
+        let Ok(key) = generation_registry_key(data_root, generation_id) else {
+            return false;
+        };
+        self.stores
+            .lock()
+            .map(|stores| {
+                stores
+                    .iter()
+                    .any(|entry| entry.generation_key.as_ref() == Some(&key))
+            })
+            .unwrap_or(false)
+    }
+}
+
+fn generation_registry_key(
+    data_root: &Path,
+    generation_id: &VectorGenerationId,
+) -> Result<GenerationRegistryKey, LanceDbVectorStoreRegistryError> {
+    root_identity(data_root)
+        .map(|root_identity| GenerationRegistryKey {
+            root_identity,
+            generation_id: generation_id.clone(),
+        })
+        .map_err(|_| error(LanceDbVectorStoreRegistryErrorCode::StoreUnavailable))
+}
+
+fn generation_registry_key_for_drop(
+    data_root: &Path,
+    generation_id: &VectorGenerationId,
+) -> Result<GenerationRegistryKey, VectorStoreError> {
+    root_identity(data_root)
+        .map(|root_identity| GenerationRegistryKey {
+            root_identity,
+            generation_id: generation_id.clone(),
+        })
+        .map_err(|_| {
+            VectorStoreError::new(
+                VectorStoreErrorCode::GenerationDropFailed,
+                "The vector generation could not be dropped.",
+                true,
+            )
+        })
+}
+
+fn root_identity(data_root: &Path) -> std::io::Result<PathBuf> {
+    let absolute = std::path::absolute(data_root)?;
+    let lexical = lexical_normalize(&absolute);
+    if lexical.exists() {
+        std::fs::canonicalize(lexical)
+    } else {
+        Ok(lexical)
+    }
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::Normal(value) => normalized.push(value),
+            Component::ParentDir => {
+                let _ = normalized.pop();
+            }
+        }
+    }
+    normalized
 }
 
 fn error(code: LanceDbVectorStoreRegistryErrorCode) -> LanceDbVectorStoreRegistryError {
@@ -334,6 +424,8 @@ fn error(code: LanceDbVectorStoreRegistryErrorCode) -> LanceDbVectorStoreRegistr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vector_store::{GenerationVectorRecord, VectorGenerationContext, VectorStore};
+    use std::sync::Arc;
 
     #[test]
     fn missing_directory_is_not_created() {
@@ -407,6 +499,96 @@ mod tests {
             assert!(!gen_path.exists());
             // Idempotent drop.
             registry.drop_generation(temp.path(), &gen).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn generation_cache_and_drop_are_isolated_by_root_and_generation_identity() {
+        tauri::async_runtime::block_on(async {
+            let root_a = tempfile::tempdir().unwrap();
+            let root_b = tempfile::tempdir().unwrap();
+            let missing_root = tempfile::tempdir().unwrap();
+            let registry = LanceDbVectorStoreRegistry::default();
+            let generation = VectorGenerationId::parse("same-generation").unwrap();
+            let context =
+                VectorGenerationContext::new(generation.clone(), "same-generation-descriptor", 2)
+                    .unwrap();
+
+            let a = registry
+                .generation_store_for_write(root_a.path(), &generation)
+                .await
+                .unwrap();
+            let b = registry
+                .generation_store_for_write(root_b.path(), &generation)
+                .await
+                .unwrap();
+            a.create_generation(&context).await.unwrap();
+            b.create_generation(&context).await.unwrap();
+            b.upsert_generation(
+                &context,
+                GenerationVectorRecord::try_new(
+                    generation.clone(),
+                    "life-b",
+                    "memory-b",
+                    1,
+                    "content-memory-b",
+                    context.descriptor_hash(),
+                    vec![1.0, 0.0],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+            assert!(registry.has_cached_generation(root_a.path(), &generation));
+            assert!(registry.has_cached_generation(root_b.path(), &generation));
+
+            // A missing root with the same generation identifier must not evict B.
+            registry
+                .drop_generation(missing_root.path(), &generation)
+                .await
+                .unwrap();
+            assert!(registry.has_cached_generation(root_b.path(), &generation));
+            let reopened_b = registry
+                .existing_generation_store(root_b.path(), &generation)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(Arc::ptr_eq(&b, &reopened_b));
+
+            let path_a = generation_store_root(root_a.path(), &generation);
+            let path_b = generation_store_root(root_b.path(), &generation);
+            drop(a);
+            registry
+                .drop_generation(root_a.path(), &generation)
+                .await
+                .unwrap();
+            assert!(!path_a.exists());
+            assert!(path_b.exists());
+            assert!(!registry.has_cached_generation(root_a.path(), &generation));
+            assert!(registry.has_cached_generation(root_b.path(), &generation));
+            assert_eq!(b.count_generation(&context, None).await.unwrap(), 1);
+        });
+    }
+
+    #[test]
+    fn generation_registry_drop_supports_unicode_data_roots() {
+        tauri::async_runtime::block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let unicode_root = temp.path().join("向量索引根目录");
+            let registry = LanceDbVectorStoreRegistry::default();
+            let generation = VectorGenerationId::parse("unicode-generation").unwrap();
+            let store = registry
+                .generation_store_for_write(&unicode_root, &generation)
+                .await
+                .unwrap();
+            let generation_root = generation_store_root(&unicode_root, &generation);
+            assert!(generation_root.is_dir());
+            drop(store);
+            registry
+                .drop_generation(&unicode_root, &generation)
+                .await
+                .unwrap();
+            assert!(!generation_root.exists());
         });
     }
 }

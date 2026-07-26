@@ -387,6 +387,7 @@ impl VectorStore for InMemoryVectorStore {
             if let Some(life_id) = life_id {
                 validate_identifier(life_id, "Life ID")?;
             }
+            self.validate_existing_generation(context)?;
             let gen = context.generation_id().as_str();
             let records = self.generation_records.read().map_err(|_| {
                 VectorStoreError::new(
@@ -417,6 +418,7 @@ impl VectorStore for InMemoryVectorStore {
                     false,
                 ));
             }
+            self.validate_existing_generation(context)?;
             let gen = context.generation_id().as_str();
             let records = self.generation_records.read().map_err(|_| {
                 VectorStoreError::new(
@@ -453,29 +455,7 @@ impl VectorStore for InMemoryVectorStore {
         context: &'a VectorGenerationContext,
     ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
         Box::pin(async move {
-            let generations = self.generations.read().map_err(|_| {
-                VectorStoreError::new(
-                    VectorStoreErrorCode::StoreUnavailable,
-                    "The in-memory vector store is unavailable.",
-                    true,
-                )
-            })?;
-            let Some(meta) = generations.get(context.generation_id().as_str()) else {
-                return Err(VectorStoreError::new(
-                    VectorStoreErrorCode::GenerationNotFound,
-                    "The vector generation was not found.",
-                    true,
-                ));
-            };
-            if meta.descriptor_hash != context.descriptor_hash()
-                || meta.dimension != context.dimension()
-            {
-                return Err(VectorStoreError::new(
-                    VectorStoreErrorCode::GenerationSchemaMismatch,
-                    "The vector generation schema does not match.",
-                    false,
-                ));
-            }
+            self.validate_existing_generation(context)?;
             Ok(())
         })
     }
@@ -509,6 +489,38 @@ impl VectorStore for InMemoryVectorStore {
                 .retain(|key, _| key.generation_id != id);
             Ok(())
         })
+    }
+}
+
+impl InMemoryVectorStore {
+    fn validate_existing_generation(
+        &self,
+        context: &VectorGenerationContext,
+    ) -> Result<(), VectorStoreError> {
+        let generations = self.generations.read().map_err(|_| {
+            VectorStoreError::new(
+                VectorStoreErrorCode::StoreUnavailable,
+                "The in-memory vector store is unavailable.",
+                true,
+            )
+        })?;
+        let Some(meta) = generations.get(context.generation_id().as_str()) else {
+            return Err(VectorStoreError::new(
+                VectorStoreErrorCode::GenerationNotFound,
+                "The vector generation was not found.",
+                true,
+            ));
+        };
+        if meta.descriptor_hash != context.descriptor_hash()
+            || meta.dimension != context.dimension()
+        {
+            return Err(VectorStoreError::new(
+                VectorStoreErrorCode::GenerationSchemaMismatch,
+                "The vector generation schema does not match.",
+                false,
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -700,5 +712,39 @@ mod tests {
         assert_eq!(serialized.as_object().unwrap().len(), 2);
         assert_eq!(serialized["memoryId"], "memory");
         assert!(serialized.get("content").is_none());
+    }
+
+    #[test]
+    fn generation_existence_distinguishes_missing_created_empty_and_dropped() {
+        let store = InMemoryVectorStore::new();
+        let context = VectorGenerationContext::new(
+            VectorGenerationId::parse("memory-existence").unwrap(),
+            "descriptor-memory-existence",
+            2,
+        )
+        .unwrap();
+
+        for error in [
+            block_on(store.count_generation(&context, None)).unwrap_err(),
+            block_on(store.sample_generation_metadata(&context, 1)).unwrap_err(),
+            block_on(store.health_check_generation(&context)).unwrap_err(),
+        ] {
+            assert_eq!(error.code, VectorStoreErrorCode::GenerationNotFound);
+        }
+
+        block_on(store.create_generation(&context)).unwrap();
+        assert_eq!(block_on(store.count_generation(&context, None)).unwrap(), 0);
+        assert!(block_on(store.sample_generation_metadata(&context, 1))
+            .unwrap()
+            .is_empty());
+        block_on(store.health_check_generation(&context)).unwrap();
+
+        block_on(store.drop_generation(context.generation_id())).unwrap();
+        assert_eq!(
+            block_on(store.count_generation(&context, None))
+                .unwrap_err()
+                .code,
+            VectorStoreErrorCode::GenerationNotFound
+        );
     }
 }

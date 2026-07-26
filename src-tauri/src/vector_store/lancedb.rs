@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -29,6 +29,8 @@ const GENERATION_TABLE: &str = "vs_generation";
 const GENERATION_ID_METADATA: &str = "digital_life.generation_id";
 const GENERATION_DESCRIPTOR_METADATA: &str = "digital_life.descriptor_hash";
 const GENERATION_DIMENSION_METADATA: &str = "digital_life.generation_dimension";
+const GENERATION_MARKER_FILE: &str = ".digital_life_generation_v1";
+const GENERATION_MARKER_CONTENT: &[u8] = b"digital-life-generation-v1\n";
 
 /// Persistent, rebuildable LanceDB vector index.
 ///
@@ -471,24 +473,33 @@ impl LanceDbVectorStore {
     async fn open_generation_table(
         &self,
         context: &VectorGenerationContext,
-    ) -> Result<Option<Table>, VectorStoreError> {
+    ) -> Result<Table, VectorStoreError> {
+        let marker = self.generation_marker_state()?;
         let names = self
             .connection
             .table_names()
             .execute()
             .await
-            .map_err(|_| read_failed())?;
-        if !names.iter().any(|n| n == GENERATION_TABLE) {
-            return Ok(None);
+            .map_err(|_| corrupt())?;
+        let has_table = names.iter().any(|n| n == GENERATION_TABLE);
+        if !marker {
+            return if has_table {
+                Err(corrupt())
+            } else {
+                Err(generation_not_found())
+            };
+        }
+        if !has_table {
+            return Err(corrupt());
         }
         let table = self
             .connection
             .open_table(GENERATION_TABLE)
             .execute()
             .await
-            .map_err(|_| read_failed())?;
+            .map_err(|_| corrupt())?;
         self.validate_generation_table(&table, context).await?;
-        Ok(Some(table))
+        Ok(table)
     }
 
     async fn ensure_generation_table(
@@ -496,9 +507,14 @@ impl LanceDbVectorStore {
         context: &VectorGenerationContext,
     ) -> Result<Table, VectorStoreError> {
         let _guard = self.table_init_lock.lock().await;
-        if let Some(table) = self.open_generation_table(context).await? {
-            return Ok(table);
+        match self.open_generation_table(context).await {
+            Ok(table) => return Ok(table),
+            Err(error) if error.code != VectorStoreErrorCode::GenerationNotFound => {
+                return Err(error)
+            }
+            Err(_) => {}
         }
+        self.write_generation_marker()?;
         let table = self
             .connection
             .create_empty_table(GENERATION_TABLE, Self::generation_schema(context)?)
@@ -509,63 +525,41 @@ impl LanceDbVectorStore {
         Ok(table)
     }
 
+    fn generation_marker_path(&self) -> PathBuf {
+        self.root.join(GENERATION_MARKER_FILE)
+    }
+
+    fn generation_marker_state(&self) -> Result<bool, VectorStoreError> {
+        if !self.root.exists() {
+            return Ok(false);
+        }
+        if !self.root.is_dir() {
+            return Err(corrupt());
+        }
+        match std::fs::read(self.generation_marker_path()) {
+            Ok(content) if content == GENERATION_MARKER_CONTENT => Ok(true),
+            Ok(_) => Err(corrupt()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(_) => Err(corrupt()),
+        }
+    }
+
+    fn write_generation_marker(&self) -> Result<(), VectorStoreError> {
+        std::fs::write(self.generation_marker_path(), GENERATION_MARKER_CONTENT)
+            .map_err(|_| store_unavailable())
+    }
+
     async fn validate_generation_table(
         &self,
         table: &Table,
         expected: &VectorGenerationContext,
     ) -> Result<(), VectorStoreError> {
         let schema = table.schema().await.map_err(|_| corrupt())?;
-        let gen = schema.metadata().get(GENERATION_ID_METADATA);
-        let desc = schema.metadata().get(GENERATION_DESCRIPTOR_METADATA);
-        let dim = schema
-            .metadata()
-            .get(GENERATION_DIMENSION_METADATA)
-            .and_then(|v| v.parse::<usize>().ok());
-        let required = [
-            "generation_id",
-            "life_id",
-            "memory_id",
-            "memory_revision",
-            "content_hash",
-            "descriptor_hash",
-            "dimension",
-            "vector",
-        ];
-        for name in required {
-            if schema.field_with_name(name).is_err() {
-                return Err(schema_mismatch());
-            }
-        }
-        // Forbid content/summary-like columns.
-        for forbidden in ["content", "summary", "endpoint", "credential", "api_key"] {
-            if schema.field_with_name(forbidden).is_ok() {
-                return Err(schema_mismatch());
-            }
-        }
-        let vector_dimension = match schema
-            .field_with_name("vector")
-            .map(|field| field.data_type())
-        {
-            Ok(DataType::FixedSizeList(item, dimension))
-                if item.data_type() == &DataType::Float32 && *dimension > 0 =>
-            {
-                *dimension as usize
-            }
-            _ => return Err(schema_mismatch()),
-        };
-        if gen != Some(&expected.generation_id().as_str().to_owned())
-            || desc != Some(&expected.descriptor_hash().to_owned())
-            || dim != Some(expected.dimension())
-            || vector_dimension != expected.dimension()
+        let expected_schema = Self::generation_schema(expected)?;
+        if schema.fields() != expected_schema.fields()
+            || schema.metadata() != expected_schema.metadata()
         {
             return Err(schema_mismatch());
-        }
-        match schema
-            .field_with_name("dimension")
-            .map(|f| f.data_type().clone())
-        {
-            Ok(DataType::Int32) => {}
-            _ => return Err(schema_mismatch()),
         }
         Ok(())
     }
@@ -609,8 +603,10 @@ impl LanceDbVectorStore {
         validate_identifier(life_id, "Life ID")?;
         validate_identifier(memory_id, "Memory ID")?;
         let _guard = self.mutation_lock.lock().await;
-        let Some(table) = self.open_generation_table(context).await? else {
-            return Ok(());
+        let table = match self.open_generation_table(context).await {
+            Ok(table) => table,
+            Err(error) if error.code == VectorStoreErrorCode::GenerationNotFound => return Ok(()),
+            Err(error) => return Err(error),
         };
         let predicate = format!(
             "generation_id = {} AND life_id = {} AND memory_id = {}",
@@ -632,8 +628,10 @@ impl LanceDbVectorStore {
     ) -> Result<(), VectorStoreError> {
         validate_identifier(life_id, "Life ID")?;
         let _guard = self.mutation_lock.lock().await;
-        let Some(table) = self.open_generation_table(context).await? else {
-            return Ok(());
+        let table = match self.open_generation_table(context).await {
+            Ok(table) => table,
+            Err(error) if error.code == VectorStoreErrorCode::GenerationNotFound => return Ok(()),
+            Err(error) => return Err(error),
         };
         let predicate = format!(
             "generation_id = {} AND life_id = {}",
@@ -655,9 +653,7 @@ impl LanceDbVectorStore {
         if let Some(life_id) = life_id {
             validate_identifier(life_id, "Life ID")?;
         }
-        let Some(table) = self.open_generation_table(context).await? else {
-            return Ok(0);
-        };
+        let table = self.open_generation_table(context).await?;
         let predicate = match life_id {
             Some(life_id) => format!(
                 "generation_id = {} AND life_id = {}",
@@ -687,9 +683,7 @@ impl LanceDbVectorStore {
                 false,
             ));
         }
-        let Some(table) = self.open_generation_table(context).await? else {
-            return Ok(Vec::new());
-        };
+        let table = self.open_generation_table(context).await?;
         let filter = format!(
             "generation_id = {}",
             sql_literal(context.generation_id().as_str())
@@ -753,48 +747,67 @@ impl LanceDbVectorStore {
         &self,
         context: &VectorGenerationContext,
     ) -> Result<(), VectorStoreError> {
-        let Some(table) = self.open_generation_table(context).await? else {
-            return Err(VectorStoreError::new(
-                VectorStoreErrorCode::GenerationNotFound,
-                "The vector generation was not found.",
-                true,
-            ));
-        };
-        self.validate_generation_table(&table, context).await?;
-        let count = table
-            .count_rows(Some(format!(
-                "generation_id = {}",
-                sql_literal(context.generation_id().as_str())
-            )))
+        let table = self.open_generation_table(context).await?;
+        let mut stream = table
+            .query()
+            .select(Select::columns(&[
+                "generation_id",
+                "life_id",
+                "memory_id",
+                "memory_revision",
+                "content_hash",
+                "descriptor_hash",
+                "dimension",
+            ]))
+            .execute()
             .await
             .map_err(|_| corrupt())?;
-        if count > 0 {
-            let samples = self
-                .sample_generation_metadata_inner(context, 1.min(count))
-                .await?;
-            if let Some(sample) = samples.first() {
-                if sample.generation_id != context.generation_id().as_str()
-                    || sample.descriptor_hash != context.descriptor_hash()
-                    || sample.dimension != context.dimension()
+        let mut keys = HashSet::new();
+        while let Some(batch) = stream.try_next().await.map_err(|_| corrupt())? {
+            let generation_ids = column_string(&batch, "generation_id").map_err(|_| corrupt())?;
+            let life_ids = column_string(&batch, "life_id").map_err(|_| corrupt())?;
+            let memory_ids = column_string(&batch, "memory_id").map_err(|_| corrupt())?;
+            let revisions = batch
+                .column_by_name("memory_revision")
+                .and_then(|array| array.as_any().downcast_ref::<Int64Array>())
+                .ok_or_else(corrupt)?;
+            let content_hashes = column_string(&batch, "content_hash").map_err(|_| corrupt())?;
+            let descriptor_hashes =
+                column_string(&batch, "descriptor_hash").map_err(|_| corrupt())?;
+            let dimensions = batch
+                .column_by_name("dimension")
+                .and_then(|array| array.as_any().downcast_ref::<Int32Array>())
+                .ok_or_else(corrupt)?;
+            for row in 0..batch.num_rows() {
+                if generation_ids.is_null(row)
+                    || life_ids.is_null(row)
+                    || memory_ids.is_null(row)
+                    || revisions.is_null(row)
+                    || content_hashes.is_null(row)
+                    || descriptor_hashes.is_null(row)
+                    || dimensions.is_null(row)
                 {
                     return Err(corrupt());
                 }
-            }
-        }
-        // Duplicate logical key detection via full metadata sample within limit.
-        let sample_limit = count.min(super::MAX_SEARCH_LIMIT);
-        if sample_limit > 0 {
-            let samples = self
-                .sample_generation_metadata_inner(context, sample_limit)
-                .await?;
-            let mut seen = std::collections::BTreeSet::new();
-            for sample in &samples {
-                let key = (
-                    sample.generation_id.clone(),
-                    sample.life_id.clone(),
-                    sample.memory_id.clone(),
-                );
-                if !seen.insert(key) {
+                let generation_id = generation_ids.value(row);
+                let life_id = life_ids.value(row);
+                let memory_id = memory_ids.value(row);
+                let descriptor_hash = descriptor_hashes.value(row);
+                if generation_id != context.generation_id().as_str()
+                    || descriptor_hash != context.descriptor_hash()
+                    || dimensions.value(row) != context.dimension() as i32
+                    || revisions.value(row) < 0
+                    || validate_identifier(life_id, "Life ID").is_err()
+                    || validate_identifier(memory_id, "Memory ID").is_err()
+                    || super::validate_hash(content_hashes.value(row), "Content hash").is_err()
+                {
+                    return Err(corrupt());
+                }
+                if !keys.insert((
+                    generation_id.to_owned(),
+                    life_id.to_owned(),
+                    memory_id.to_owned(),
+                )) {
                     return Err(corrupt());
                 }
             }
@@ -1190,24 +1203,15 @@ impl VectorStore for LanceDbVectorStore {
         &'a self,
         generation_id: &'a VectorGenerationId,
     ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
-        // Drop is directory-level and must be invoked via registry for handle release.
-        // When called on a store, only clear the generation table if present.
+        // Complete persistent drops are registry-owned so cached handles are released
+        // before the generation directory is removed.
         Box::pin(async move {
             let _ = generation_id;
-            let names = self
-                .connection
-                .table_names()
-                .execute()
-                .await
-                .map_err(|_| drop_failed())?;
-            if names.iter().any(|n| n == GENERATION_TABLE) {
-                let _guard = self.mutation_lock.lock().await;
-                self.connection
-                    .drop_table(GENERATION_TABLE, &[])
-                    .await
-                    .map_err(|_| drop_failed())?;
-            }
-            Ok(())
+            Err(VectorStoreError::new(
+                VectorStoreErrorCode::GenerationDropRequiresRegistry,
+                "Persistent vector generation drop requires the registry.",
+                false,
+            ))
         })
     }
 }
@@ -1284,10 +1288,10 @@ fn corrupt() -> VectorStoreError {
     )
 }
 
-fn drop_failed() -> VectorStoreError {
+fn generation_not_found() -> VectorStoreError {
     VectorStoreError::new(
-        VectorStoreErrorCode::GenerationDropFailed,
-        "The vector generation could not be dropped.",
+        VectorStoreErrorCode::GenerationNotFound,
+        "The vector generation was not found.",
         true,
     )
 }
@@ -1306,6 +1310,7 @@ fn column_string<'a>(
 mod tests {
     use super::*;
     use crate::vector_store::InMemoryVectorStore;
+    use std::sync::Arc;
 
     fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
         tauri::async_runtime::block_on(future)
@@ -1631,6 +1636,16 @@ mod tests {
         .unwrap()
     }
 
+    async fn append_generation_records(
+        store: &LanceDbVectorStore,
+        context: &VectorGenerationContext,
+        records: &[GenerationVectorRecord],
+    ) {
+        let table = store.open_generation_table(context).await.unwrap();
+        let (_, batch) = LanceDbVectorStore::generation_records_batch(records, context).unwrap();
+        table.add(vec![batch]).execute().await.unwrap();
+    }
+
     #[test]
     fn generation_create_upsert_delete_count_sample_and_health_are_idempotent() {
         block_on(async {
@@ -1771,11 +1786,7 @@ mod tests {
             let store = LanceDbVectorStore::open(temp.path()).await.unwrap();
             let context = gen_context("gen-schema", 3);
             store.create_generation(&context).await.unwrap();
-            let table = store
-                .open_generation_table(&context)
-                .await
-                .unwrap()
-                .unwrap();
+            let table = store.open_generation_table(&context).await.unwrap();
             let schema = table.schema().await.unwrap();
             let names: Vec<_> = schema.fields().iter().map(|f| f.name().as_str()).collect();
             assert_eq!(
@@ -1807,6 +1818,215 @@ mod tests {
             assert!(!error
                 .message
                 .contains(temp.path().to_string_lossy().as_ref()));
+        });
+    }
+
+    #[test]
+    fn generation_existence_distinguishes_missing_empty_and_corrupt_table() {
+        block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let store = LanceDbVectorStore::open(temp.path()).await.unwrap();
+            let context = gen_context("gen-existence", 2);
+
+            for error in [
+                store.count_generation(&context, None).await.unwrap_err(),
+                store
+                    .sample_generation_metadata(&context, 1)
+                    .await
+                    .unwrap_err(),
+                store.health_check_generation(&context).await.unwrap_err(),
+            ] {
+                assert_eq!(error.code, VectorStoreErrorCode::GenerationNotFound);
+            }
+
+            store.create_generation(&context).await.unwrap();
+            assert_eq!(store.count_generation(&context, None).await.unwrap(), 0);
+            assert!(store
+                .sample_generation_metadata(&context, 1)
+                .await
+                .unwrap()
+                .is_empty());
+            store.health_check_generation(&context).await.unwrap();
+
+            store
+                .connection
+                .drop_table(GENERATION_TABLE, &[])
+                .await
+                .unwrap();
+            for error in [
+                store.count_generation(&context, None).await.unwrap_err(),
+                store
+                    .sample_generation_metadata(&context, 1)
+                    .await
+                    .unwrap_err(),
+                store.health_check_generation(&context).await.unwrap_err(),
+            ] {
+                assert_eq!(error.code, VectorStoreErrorCode::GenerationCorrupt);
+            }
+        });
+    }
+
+    #[test]
+    fn generation_health_rejects_extra_type_and_nullability_schema_changes() {
+        block_on(async {
+            type SchemaModifier = Box<dyn Fn(SchemaRef) -> SchemaRef>;
+            let cases: Vec<(&str, SchemaModifier)> = vec![
+                (
+                    "extra",
+                    Box::new(|expected| {
+                        let mut fields = expected.fields().to_vec();
+                        fields.push(Arc::new(Field::new("unexpected", DataType::Utf8, false)));
+                        Arc::new(Schema::new_with_metadata(
+                            fields,
+                            expected.metadata().clone(),
+                        ))
+                    }),
+                ),
+                (
+                    "type",
+                    Box::new(|expected| {
+                        let mut fields = expected.fields().to_vec();
+                        fields[6] = Arc::new(Field::new("dimension", DataType::Int64, false));
+                        Arc::new(Schema::new_with_metadata(
+                            fields,
+                            expected.metadata().clone(),
+                        ))
+                    }),
+                ),
+                (
+                    "nullable",
+                    Box::new(|expected| {
+                        let mut fields = expected.fields().to_vec();
+                        fields[0] = Arc::new(Field::new("generation_id", DataType::Utf8, true));
+                        Arc::new(Schema::new_with_metadata(
+                            fields,
+                            expected.metadata().clone(),
+                        ))
+                    }),
+                ),
+            ];
+            for (name, modify) in cases {
+                let temp = tempfile::tempdir().unwrap();
+                let store = LanceDbVectorStore::open(temp.path()).await.unwrap();
+                let context = gen_context(&format!("gen-schema-{name}"), 2);
+                store.write_generation_marker().unwrap();
+                store
+                    .connection
+                    .create_empty_table(
+                        GENERATION_TABLE,
+                        modify(LanceDbVectorStore::generation_schema(&context).unwrap()),
+                    )
+                    .execute()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    store
+                        .health_check_generation(&context)
+                        .await
+                        .unwrap_err()
+                        .code,
+                    VectorStoreErrorCode::GenerationSchemaMismatch
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn generation_health_scans_past_one_hundred_rows_for_corrupt_records_and_duplicates() {
+        block_on(async {
+            let make_records = |context: &VectorGenerationContext| {
+                (0..121)
+                    .map(|index| {
+                        gen_record(
+                            context,
+                            "life-a",
+                            &format!("memory-{index}"),
+                            1,
+                            vec![index as f32, 1.0],
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+
+            let temp = tempfile::tempdir().unwrap();
+            let store = LanceDbVectorStore::open(temp.path()).await.unwrap();
+            let context = gen_context("gen-late-corrupt", 2);
+            store.create_generation(&context).await.unwrap();
+            let mut records = make_records(&context);
+            records[120] = GenerationVectorRecord::try_new(
+                context.generation_id().clone(),
+                "life-a",
+                "memory-120",
+                1,
+                "content-memory-120",
+                "wrong-descriptor",
+                vec![120.0, 1.0],
+            )
+            .unwrap();
+            append_generation_records(&store, &context, &records).await;
+            assert_eq!(
+                store
+                    .health_check_generation(&context)
+                    .await
+                    .unwrap_err()
+                    .code,
+                VectorStoreErrorCode::GenerationCorrupt
+            );
+
+            let duplicate_temp = tempfile::tempdir().unwrap();
+            let duplicate_store = LanceDbVectorStore::open(duplicate_temp.path())
+                .await
+                .unwrap();
+            let duplicate_context = gen_context("gen-late-duplicate", 2);
+            duplicate_store
+                .create_generation(&duplicate_context)
+                .await
+                .unwrap();
+            let mut duplicate_records = make_records(&duplicate_context);
+            duplicate_records[120] = gen_record(
+                &duplicate_context,
+                "life-a",
+                "memory-0",
+                2,
+                vec![120.0, 1.0],
+            );
+            append_generation_records(&duplicate_store, &duplicate_context, &duplicate_records)
+                .await;
+            assert_eq!(
+                duplicate_store
+                    .health_check_generation(&duplicate_context)
+                    .await
+                    .unwrap_err()
+                    .code,
+                VectorStoreErrorCode::GenerationCorrupt
+            );
+        });
+    }
+
+    #[test]
+    fn direct_lance_generation_drop_requires_registry_and_preserves_data() {
+        block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let store = LanceDbVectorStore::open(temp.path()).await.unwrap();
+            let context = gen_context("gen-direct-drop", 2);
+            store.create_generation(&context).await.unwrap();
+            store
+                .upsert_generation(
+                    &context,
+                    gen_record(&context, "life-a", "memory-a", 1, vec![1.0, 0.0]),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                store
+                    .drop_generation(context.generation_id())
+                    .await
+                    .unwrap_err()
+                    .code,
+                VectorStoreErrorCode::GenerationDropRequiresRegistry
+            );
+            assert_eq!(store.count_generation(&context, None).await.unwrap(), 1);
+            assert!(temp.path().is_dir());
         });
     }
 

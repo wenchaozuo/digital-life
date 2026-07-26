@@ -16,6 +16,7 @@ mod vector_sync_settings;
 pub(crate) use llm_candidate_extraction::{
     trigger_candidate_extraction, LlmCandidateExtractionCoordinator,
 };
+pub(crate) use vector_sync_outbox::{FencedFinalizeResult, FencedVectorSyncClaim};
 
 use std::{
     fmt::Display,
@@ -86,6 +87,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         11,
         "011_candidate_extraction_model_profiles",
         include_str!("migrations/011_candidate_extraction_model_profiles.sql"),
+    ),
+    (
+        12,
+        "012_fenced_vector_sync",
+        include_str!("migrations/012_fenced_vector_sync.sql"),
     ),
 ];
 
@@ -960,18 +966,21 @@ pub(crate) mod test_support {
             )
             .unwrap();
 
+        drop(state);
         if enqueue_outbox {
-            connection
-                .execute(
-                    "INSERT INTO memory_vector_sync_outbox (
-                        life_id, memory_id, desired_action, state,
-                        attempt_count, next_attempt_at, created_at, updated_at
-                     ) VALUES (
-                        ?1, ?2, 'upsert', 'pending', 0, NULL, ?3, ?3
-                     )",
-                    params![life_id, id, now],
-                )
-                .unwrap();
+            use crate::memory::vector_sync_outbox::{
+                EnqueueMemoryVectorSyncRequest, MemoryVectorSyncAction,
+                MemoryVectorSyncOutboxRepository,
+            };
+            <StorageService as MemoryVectorSyncOutboxRepository>::enqueue(
+                service,
+                EnqueueMemoryVectorSyncRequest {
+                    life_id: life_id.to_string(),
+                    memory_id: id.clone(),
+                    desired_action: MemoryVectorSyncAction::Upsert,
+                },
+            )
+            .unwrap();
         }
 
         crate::memory::MemoryRecord {

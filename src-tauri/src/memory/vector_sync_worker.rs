@@ -14,13 +14,17 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
 
 use crate::{
+    embedding::{EmbeddingProvider, EmbeddingPurpose, EmbeddingRequest},
     model::{
         profile::ModelProfileRepository,
         runtime::{ModelRuntimeCoordinator, ModelRuntimeErrorCode, ModelRuntimeService},
     },
     secrets::{SecretStore, WindowsCredentialSecretStore},
-    storage::StorageService,
-    vector_store::{LanceDbVectorStoreRegistry, VectorStore, VectorStoreErrorCode},
+    storage::{FencedFinalizeResult, FencedVectorSyncClaim, StorageService},
+    vector_store::{
+        GenerationVectorRecord, LanceDbVectorStoreRegistry, VectorGenerationContext, VectorStore,
+        VectorStoreErrorCode,
+    },
 };
 
 use super::{
@@ -42,6 +46,199 @@ const MAX_ATTEMPTS: u32 = 5;
 const INITIAL_RETRY_SECONDS: u32 = 30;
 const MAX_RETRY_SECONDS: u32 = 3_600;
 const MAX_FINISHED_RUNS: usize = 20;
+
+/// One explicit D-9D1 outbox operation.  This is deliberately separate from
+/// the legacy life-scoped drain worker: it has no loop, no profile discovery,
+/// and no authority write transaction around embedding or LanceDB I/O.
+#[allow(dead_code)]
+pub(crate) struct FencedVectorSyncSingleEventConsumer<'a> {
+    storage: &'a StorageService,
+    embedding: &'a dyn EmbeddingProvider,
+    vectors: &'a dyn VectorStore,
+    generation: VectorGenerationContext,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum FencedVectorSyncSingleEventResult {
+    NoEligibleEvent,
+    Completed,
+    Stale,
+    RetryWait,
+    Blocked,
+    LostLeaseOrSuperseded,
+}
+
+#[allow(dead_code)]
+impl<'a> FencedVectorSyncSingleEventConsumer<'a> {
+    pub(crate) fn new(
+        storage: &'a StorageService,
+        embedding: &'a dyn EmbeddingProvider,
+        vectors: &'a dyn VectorStore,
+        generation: VectorGenerationContext,
+    ) -> Self {
+        Self {
+            storage,
+            embedding,
+            vectors,
+            generation,
+        }
+    }
+
+    pub(crate) async fn process_one(
+        &self,
+        lease_owner: &str,
+    ) -> Result<FencedVectorSyncSingleEventResult, MemoryVectorSyncWorkerError> {
+        let claim = self
+            .storage
+            .claim_one_fenced_vector_sync(
+                self.generation.generation_id().as_str(),
+                self.generation.descriptor_hash(),
+                self.generation.dimension(),
+                lease_owner,
+            )
+            .map_err(|_| worker_error(MemoryVectorSyncWorkerErrorCode::OutboxUnavailable))?;
+        let Some(claim) = claim else {
+            return Ok(FencedVectorSyncSingleEventResult::NoEligibleEvent);
+        };
+        self.execute_claim(claim).await
+    }
+
+    async fn execute_claim(
+        &self,
+        claim: FencedVectorSyncClaim,
+    ) -> Result<FencedVectorSyncSingleEventResult, MemoryVectorSyncWorkerError> {
+        match claim.action() {
+            MemoryVectorSyncAction::Delete => {
+                if !self
+                    .storage
+                    .fenced_vector_claim_is_current(&claim)
+                    .map_err(|_| worker_error(MemoryVectorSyncWorkerErrorCode::OutboxUnavailable))?
+                {
+                    return Ok(FencedVectorSyncSingleEventResult::LostLeaseOrSuperseded);
+                }
+                let outcome = self
+                    .vectors
+                    .delete_generation_memory(&self.generation, claim.life_id(), claim.memory_id())
+                    .await;
+                match outcome {
+                    Ok(()) => self.finalize(&claim, None, None, false),
+                    Err(error) if error.code == VectorStoreErrorCode::VectorNotFound => {
+                        self.finalize(&claim, None, None, false)
+                    }
+                    Err(_) => self.finalize(&claim, None, Some("VECTOR_STORE_UNAVAILABLE"), true),
+                }
+            }
+            MemoryVectorSyncAction::Upsert => {
+                let Some(document) =
+                    self.storage
+                        .read_fenced_vector_document(&claim)
+                        .map_err(|_| {
+                            worker_error(MemoryVectorSyncWorkerErrorCode::RepositoryUnavailable)
+                        })?
+                else {
+                    return self
+                        .finalize(&claim, None, None, false)
+                        .map(|_| FencedVectorSyncSingleEventResult::Stale);
+                };
+                if !self
+                    .storage
+                    .fenced_vector_claim_is_current(&claim)
+                    .map_err(|_| worker_error(MemoryVectorSyncWorkerErrorCode::OutboxUnavailable))?
+                {
+                    return Ok(FencedVectorSyncSingleEventResult::LostLeaseOrSuperseded);
+                }
+                let response = self
+                    .embedding
+                    .embed(EmbeddingRequest {
+                        texts: vec![document],
+                        purpose: EmbeddingPurpose::Document,
+                    })
+                    .await;
+                let batch = match response {
+                    Ok(batch) => batch,
+                    Err(error) => {
+                        return self.finalize(
+                            &claim,
+                            None,
+                            Some(embedding_error_code(error.code())),
+                            error.is_recoverable(),
+                        )
+                    }
+                };
+                let vector = batch
+                    .vectors()
+                    .first()
+                    .filter(|v| v.dimension() == self.generation.dimension())
+                    .ok_or_else(|| {
+                        worker_error(MemoryVectorSyncWorkerErrorCode::InvalidProviderResponse)
+                    })?;
+                let record = GenerationVectorRecord::try_new(
+                    self.generation.generation_id().clone(),
+                    claim.life_id(),
+                    claim.memory_id(),
+                    claim.target_revision().ok_or_else(|| {
+                        worker_error(MemoryVectorSyncWorkerErrorCode::InvalidRequest)
+                    })?,
+                    claim.target_content_hash().ok_or_else(|| {
+                        worker_error(MemoryVectorSyncWorkerErrorCode::InvalidRequest)
+                    })?,
+                    self.generation.descriptor_hash(),
+                    vector.values().to_vec(),
+                )
+                .map_err(|_| {
+                    worker_error(MemoryVectorSyncWorkerErrorCode::InvalidProviderResponse)
+                })?;
+                match self
+                    .vectors
+                    .upsert_generation(&self.generation, record)
+                    .await
+                {
+                    Ok(()) => self.finalize(&claim, claim.target_content_hash(), None, false),
+                    Err(_) => self.finalize(&claim, None, Some("VECTOR_STORE_UNAVAILABLE"), true),
+                }
+            }
+        }
+    }
+
+    fn finalize(
+        &self,
+        claim: &FencedVectorSyncClaim,
+        hash: Option<&str>,
+        error: Option<&str>,
+        retry: bool,
+    ) -> Result<FencedVectorSyncSingleEventResult, MemoryVectorSyncWorkerError> {
+        let result = self
+            .storage
+            .finalize_fenced_vector_sync(claim, hash, error, retry)
+            .map_err(|_| worker_error(MemoryVectorSyncWorkerErrorCode::OutboxUnavailable))?;
+        Ok(match result {
+            FencedFinalizeResult::LostLeaseOrSuperseded => {
+                FencedVectorSyncSingleEventResult::LostLeaseOrSuperseded
+            }
+            FencedFinalizeResult::Applied if error.is_some() && retry => {
+                FencedVectorSyncSingleEventResult::RetryWait
+            }
+            FencedFinalizeResult::Applied if error.is_some() => {
+                FencedVectorSyncSingleEventResult::Blocked
+            }
+            FencedFinalizeResult::Applied => FencedVectorSyncSingleEventResult::Completed,
+        })
+    }
+}
+
+#[allow(dead_code)]
+fn embedding_error_code(code: crate::embedding::EmbeddingErrorCode) -> &'static str {
+    use crate::embedding::EmbeddingErrorCode::*;
+    match code {
+        AuthenticationFailed => "AUTHENTICATION_FAILED",
+        RateLimited => "RATE_LIMITED",
+        RequestTimeout => "REQUEST_TIMEOUT",
+        NetworkError => "NETWORK_UNAVAILABLE",
+        InvalidProviderResponse | DimensionMismatch => "INVALID_PROVIDER_RESPONSE",
+        InvalidRequest | EmptyText | BatchLimitExceeded | TextLimitExceeded => "INVALID_REQUEST",
+    }
+}
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]

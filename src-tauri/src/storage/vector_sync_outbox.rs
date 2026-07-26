@@ -1,10 +1,14 @@
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
+use sha2::{Digest, Sha256};
 
-use crate::memory::vector_sync_outbox::{
-    ClaimMemoryVectorSyncLeaseRequest, ClaimMemoryVectorSyncRequest,
-    EnqueueMemoryVectorSyncRequest, MemoryVectorSyncAction, MemoryVectorSyncJob,
-    MemoryVectorSyncOutboxError, MemoryVectorSyncOutboxErrorCode, MemoryVectorSyncOutboxRepository,
-    MemoryVectorSyncState,
+use crate::memory::{
+    candidate_service::contains_prohibited_content,
+    vector_sync_outbox::{
+        ClaimMemoryVectorSyncLeaseRequest, ClaimMemoryVectorSyncRequest,
+        EnqueueMemoryVectorSyncRequest, MemoryVectorSyncAction, MemoryVectorSyncJob,
+        MemoryVectorSyncOutboxError, MemoryVectorSyncOutboxErrorCode,
+        MemoryVectorSyncOutboxRepository, MemoryVectorSyncState,
+    },
 };
 
 use super::StorageService;
@@ -18,15 +22,15 @@ pub(super) fn enqueue_in_transaction(
     action: MemoryVectorSyncAction,
 ) -> Result<(), MemoryVectorSyncOutboxError> {
     validate_ids(life_id, memory_id)?;
-    let owner: Option<String> = transaction
+    let memory: Option<(String, String, String, i64, String, Option<String>)> = transaction
         .query_row(
-            "SELECT life_id FROM memory_record WHERE id = ?1",
+            "SELECT life_id, kind, status, revision, content, summary FROM memory_record WHERE id = ?1",
             params![memory_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
         )
         .optional()
         .map_err(|_| outbox_error())?;
-    match owner.as_deref() {
+    match memory.as_ref().map(|row| row.0.as_str()) {
         None => {
             return Err(MemoryVectorSyncOutboxError::new(
                 MemoryVectorSyncOutboxErrorCode::SyncJobNotFound,
@@ -39,18 +43,452 @@ pub(super) fn enqueue_in_transaction(
         }
         Some(_) => {}
     }
+    let (target_revision, target_content_hash) = match action {
+        MemoryVectorSyncAction::Upsert => {
+            let (_, kind, status, revision, content, summary) =
+                memory.as_ref().expect("checked memory");
+            if status != "confirmed" {
+                return Err(outbox_error());
+            }
+            let selected = summary
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(content);
+            if selected.trim().is_empty() {
+                return Err(outbox_error());
+            }
+            if contains_prohibited_content(content)
+                || summary.as_deref().is_some_and(contains_prohibited_content)
+            {
+                return Err(outbox_error());
+            }
+            (
+                Some(*revision),
+                Some(canonical_content_hash(
+                    kind,
+                    content,
+                    summary.as_deref(),
+                    selected,
+                )),
+            )
+        }
+        MemoryVectorSyncAction::Delete => (None, None),
+    };
+    let changed = transaction
+        .execute(
+            "UPDATE memory_vector_sync_mutation_clock
+         SET last_sequence = last_sequence + 1
+         WHERE singleton = 1 AND last_sequence < 9223372036854775807",
+            [],
+        )
+        .map_err(|_| outbox_error())?;
+    if changed != 1 {
+        return Err(outbox_error());
+    }
+    let sequence: i64 = transaction
+        .query_row(
+            "SELECT last_sequence FROM memory_vector_sync_mutation_clock WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| outbox_error())?;
     transaction
         .execute(
-            "INSERT INTO memory_vector_sync_outbox (life_id, memory_id, desired_action)
-         VALUES (?1, ?2, ?3)
+            "INSERT INTO memory_vector_sync_outbox (life_id, memory_id, desired_action, mutation_sequence, target_revision, target_content_hash, migration_disposition)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)
          ON CONFLICT(life_id, memory_id) DO UPDATE SET
            desired_action = excluded.desired_action, state = 'pending', attempt_count = 0,
            next_attempt_at = NULL, lease_owner = NULL, lease_expires_at = NULL,
+           lease_fence_epoch = NULL, claimed_generation_id = NULL, last_send_disposition = NULL,
+           migration_disposition = NULL, mutation_sequence = excluded.mutation_sequence,
+           target_revision = excluded.target_revision, target_content_hash = excluded.target_content_hash,
            last_error_code = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
-            params![life_id, memory_id, action.as_str()],
+            params![life_id, memory_id, action.as_str(), sequence, target_revision, target_content_hash],
         )
         .map_err(|_| outbox_error())?;
     Ok(())
+}
+
+fn canonical_content_hash(
+    kind: &str,
+    content: &str,
+    summary: Option<&str>,
+    selected: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    for field in [
+        b"memory-index-v1".as_slice(),
+        kind.as_bytes(),
+        selected.as_bytes(),
+        content.as_bytes(),
+        summary.unwrap_or_default().as_bytes(),
+    ] {
+        hasher.update((field.len() as u64).to_be_bytes());
+        hasher.update(field);
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Private capability returned only after the global runtime lease and the
+/// event lease have both been acquired.  It deliberately has no constructor
+/// and its debug output never contains memory text or provider data.
+#[allow(dead_code)]
+pub(crate) struct FencedVectorSyncClaim {
+    id: i64,
+    life_id: String,
+    memory_id: String,
+    action: MemoryVectorSyncAction,
+    mutation_sequence: i64,
+    target_revision: Option<i64>,
+    target_content_hash: Option<String>,
+    generation_id: String,
+    lease_owner: String,
+    fence_epoch: i64,
+}
+
+impl std::fmt::Debug for FencedVectorSyncClaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FencedVectorSyncClaim")
+            .field("id", &self.id)
+            .field("action", &self.action)
+            .field("mutation_sequence", &self.mutation_sequence)
+            .field("has_target", &self.target_revision.is_some())
+            .field("generation_id_len", &self.generation_id.len())
+            .field("fence_epoch", &self.fence_epoch)
+            .finish()
+    }
+}
+
+#[allow(dead_code)]
+impl FencedVectorSyncClaim {
+    pub(crate) fn action(&self) -> MemoryVectorSyncAction {
+        self.action
+    }
+    pub(crate) fn life_id(&self) -> &str {
+        &self.life_id
+    }
+    pub(crate) fn memory_id(&self) -> &str {
+        &self.memory_id
+    }
+    pub(crate) fn generation_id(&self) -> &str {
+        &self.generation_id
+    }
+    pub(crate) fn target_revision(&self) -> Option<i64> {
+        self.target_revision
+    }
+    pub(crate) fn target_content_hash(&self) -> Option<&str> {
+        self.target_content_hash.as_deref()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum FencedFinalizeResult {
+    Applied,
+    LostLeaseOrSuperseded,
+}
+
+#[allow(dead_code)]
+impl StorageService {
+    /// D-9D1 creates only explicit, non-active generations.  Activation and
+    /// rebuild orchestration remain D-9D3 responsibilities.
+    pub(crate) fn register_building_vector_generation(
+        &self,
+        generation_id: &str,
+        descriptor_hash: &str,
+        dimension: usize,
+    ) -> Result<(), crate::storage::StorageError> {
+        if generation_id.is_empty() || descriptor_hash.is_empty() || dimension == 0 {
+            return Err(single_event_error());
+        }
+        let state = self.state()?;
+        state.connection.execute(
+            "INSERT INTO memory_vector_generation (generation_id, descriptor_hash, dimension, state)
+             VALUES (?1, ?2, ?3, 'building')
+             ON CONFLICT(generation_id) DO UPDATE SET descriptor_hash = excluded.descriptor_hash,
+              dimension = excluded.dimension, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE memory_vector_generation.state = 'building'",
+            params![generation_id, descriptor_hash, dimension as i64],
+        ).map_err(|_| single_event_error())?;
+        Ok(())
+    }
+
+    pub(crate) fn claim_one_fenced_vector_sync(
+        &self,
+        generation_id: &str,
+        descriptor_hash: &str,
+        dimension: usize,
+        lease_owner: &str,
+    ) -> Result<Option<FencedVectorSyncClaim>, crate::storage::StorageError> {
+        if generation_id.is_empty()
+            || descriptor_hash.is_empty()
+            || dimension == 0
+            || lease_owner.is_empty()
+            || lease_owner.len() > 128
+        {
+            return Err(single_event_error());
+        }
+        let mut state = self.state()?;
+        let tx = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| single_event_error())?;
+        let generation_ok: Option<i64> = tx.query_row(
+            "SELECT 1 FROM memory_vector_generation WHERE generation_id=?1 AND descriptor_hash=?2 AND dimension=?3 AND state='building'",
+            params![generation_id, descriptor_hash, dimension as i64], |row| row.get(0),
+        ).optional().map_err(|_| single_event_error())?;
+        if generation_ok.is_none() {
+            tx.commit().map_err(|_| single_event_error())?;
+            return Ok(None);
+        }
+        acquire_runtime_lease(&tx, lease_owner)?;
+        // A malformed post-012 upsert is fail-closed without materializing its
+        // current memory body. Legacy quarantine is separately and permanently
+        // excluded by the claim predicate below.
+        tx.execute(
+            "UPDATE memory_vector_sync_outbox SET state='blocked', lease_owner=NULL,
+             lease_expires_at=NULL, lease_fence_epoch=NULL, claimed_generation_id=NULL,
+             last_error_code='VECTOR_TARGET_BINDING_MISSING', updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE desired_action='upsert' AND migration_disposition IS NULL
+               AND (target_revision IS NULL OR target_content_hash IS NULL)
+               AND state IN ('pending','retry_wait','processing')",
+            [],
+        ).map_err(|_| single_event_error())?;
+        tx.execute(
+            "UPDATE memory_vector_sync_outbox SET state='pending', lease_owner=NULL,
+             lease_expires_at=NULL, lease_fence_epoch=NULL, claimed_generation_id=NULL,
+             last_send_disposition=NULL, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE state='processing' AND lease_expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+            [],
+        )
+        .map_err(|_| single_event_error())?;
+        let fence_epoch: i64 = tx.query_row(
+            "SELECT fence_epoch FROM memory_vector_sync_runtime_lease WHERE lease_name='memory-vector-single-event-consumer' AND owner_id=?1 AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+            params![lease_owner], |row| row.get(0),
+        ).optional().map_err(|_| single_event_error())?.ok_or_else(single_event_error)?;
+        let id: Option<i64> = tx.query_row(
+            "SELECT id FROM memory_vector_sync_outbox WHERE migration_disposition IS NULL AND
+              ((desired_action='upsert' AND target_revision IS NOT NULL AND target_content_hash IS NOT NULL)
+               OR (desired_action='delete' AND target_revision IS NULL AND target_content_hash IS NULL)) AND
+              (state='pending' OR (state='retry_wait' AND next_attempt_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now')))
+             ORDER BY mutation_sequence ASC, id ASC LIMIT 1", [], |row| row.get(0),
+        ).optional().map_err(|_| single_event_error())?;
+        let Some(id) = id else {
+            tx.commit().map_err(|_| single_event_error())?;
+            return Ok(None);
+        };
+        let changed = tx.execute(
+            "UPDATE memory_vector_sync_outbox SET state='processing', attempt_count=attempt_count+1,
+             lease_owner=?2, lease_fence_epoch=?3, claimed_generation_id=?4,
+             lease_expires_at=strftime('%Y-%m-%dT%H:%M:%fZ','now','+120 seconds'), next_attempt_at=NULL,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE id=?1 AND migration_disposition IS NULL AND state IN ('pending','retry_wait')",
+            params![id, lease_owner, fence_epoch, generation_id],
+        ).map_err(|_| single_event_error())?;
+        if changed != 1 {
+            return Err(single_event_error());
+        }
+        let claim = tx.query_row(
+            "SELECT id, life_id, memory_id, desired_action, mutation_sequence, target_revision, target_content_hash,
+                    claimed_generation_id, lease_owner, lease_fence_epoch
+             FROM memory_vector_sync_outbox WHERE id=?1", params![id], fenced_claim_from_row,
+        ).map_err(|_| single_event_error())?;
+        tx.commit().map_err(|_| single_event_error())?;
+        Ok(Some(claim))
+    }
+
+    /// Reads authority only after a structurally valid upsert claim exists.
+    /// A mismatch is returned as `None`, making stale data a safe no-write.
+    pub(crate) fn read_fenced_vector_document(
+        &self,
+        claim: &FencedVectorSyncClaim,
+    ) -> Result<Option<String>, crate::storage::StorageError> {
+        if claim.action != MemoryVectorSyncAction::Upsert {
+            return Ok(None);
+        }
+        let state = self.state()?;
+        let row: Option<(String, String, i64, String, Option<String>, i64)> = state.connection.query_row(
+            "SELECT kind, status, revision, content, summary, is_sensitive FROM memory_record WHERE id=?1 AND life_id=?2",
+            params![claim.memory_id, claim.life_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        ).optional().map_err(|_| single_event_error())?;
+        let Some((kind, status, revision, content, summary, sensitive)) = row else {
+            return Ok(None);
+        };
+        if status != "confirmed" || sensitive != 0 || Some(revision) != claim.target_revision {
+            return Ok(None);
+        }
+        if contains_prohibited_content(&content)
+            || summary.as_deref().is_some_and(contains_prohibited_content)
+        {
+            return Ok(None);
+        }
+        let selected = summary
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(&content);
+        if selected.trim().is_empty()
+            || Some(canonical_content_hash(&kind, &content, summary.as_deref(), selected).as_str())
+                != claim.target_content_hash()
+        {
+            return Ok(None);
+        }
+        Ok(Some(selected.to_owned()))
+    }
+
+    /// A second, short authority check immediately before external I/O.  It
+    /// cannot make SQLite and LanceDB one transaction, but it prevents a known
+    /// superseded claim from initiating a provider or vector operation.
+    pub(crate) fn fenced_vector_claim_is_current(
+        &self,
+        claim: &FencedVectorSyncClaim,
+    ) -> Result<bool, crate::storage::StorageError> {
+        let state = self.state()?;
+        state
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM memory_vector_sync_outbox
+             WHERE id=?1 AND mutation_sequence=?2 AND state='processing'
+               AND lease_owner=?3 AND lease_fence_epoch=?4 AND claimed_generation_id=?5)",
+                params![
+                    claim.id,
+                    claim.mutation_sequence,
+                    claim.lease_owner,
+                    claim.fence_epoch,
+                    claim.generation_id
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|_| single_event_error())
+    }
+
+    pub(crate) fn finalize_fenced_vector_sync(
+        &self,
+        claim: &FencedVectorSyncClaim,
+        content_hash: Option<&str>,
+        error_code: Option<&str>,
+        retry: bool,
+    ) -> Result<FencedFinalizeResult, crate::storage::StorageError> {
+        let mut state = self.state()?;
+        let tx = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| single_event_error())?;
+        let predicate = "id=?1 AND mutation_sequence=?2 AND state='processing' AND lease_owner=?3 AND lease_fence_epoch=?4 AND claimed_generation_id=?5";
+        if let Some(error_code) = error_code {
+            let changed = tx.execute(
+                &format!("UPDATE memory_vector_sync_outbox SET state={}, next_attempt_at={}, lease_owner=NULL, lease_expires_at=NULL, lease_fence_epoch=NULL, claimed_generation_id=NULL, last_error_code=?6, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE {predicate}", if retry { "'retry_wait'" } else { "'blocked'" }, if retry { "strftime('%Y-%m-%dT%H:%M:%fZ','now','+30 seconds')" } else { "NULL" }),
+                params![claim.id, claim.mutation_sequence, claim.lease_owner, claim.fence_epoch, claim.generation_id, safe_error_code(error_code)],
+            ).map_err(|_| single_event_error())?;
+            tx.commit().map_err(|_| single_event_error())?;
+            return Ok(if changed == 1 {
+                FencedFinalizeResult::Applied
+            } else {
+                FencedFinalizeResult::LostLeaseOrSuperseded
+            });
+        }
+        let current: i64 = tx
+            .query_row(
+                &format!(
+                    "SELECT EXISTS(SELECT 1 FROM memory_vector_sync_outbox WHERE {predicate})"
+                ),
+                params![
+                    claim.id,
+                    claim.mutation_sequence,
+                    claim.lease_owner,
+                    claim.fence_epoch,
+                    claim.generation_id
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|_| single_event_error())?;
+        if current != 1 {
+            tx.commit().map_err(|_| single_event_error())?;
+            return Ok(FencedFinalizeResult::LostLeaseOrSuperseded);
+        }
+        if claim.action == MemoryVectorSyncAction::Upsert {
+            let hash = content_hash.ok_or_else(single_event_error)?;
+            let changed = tx.execute(
+                &format!("INSERT INTO memory_vector_generation_item (generation_id, life_id, memory_id, memory_revision, content_hash)
+                 SELECT ?5, ?6, ?7, ?8, ?9 WHERE EXISTS (SELECT 1 FROM memory_vector_sync_outbox WHERE {predicate})
+                 ON CONFLICT(generation_id, life_id, memory_id) DO UPDATE SET memory_revision=excluded.memory_revision, content_hash=excluded.content_hash, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')"),
+                params![claim.id, claim.mutation_sequence, claim.lease_owner, claim.fence_epoch, claim.generation_id, claim.life_id, claim.memory_id, claim.target_revision, hash],
+            ).map_err(|_| single_event_error())?;
+            if changed != 1 {
+                tx.commit().map_err(|_| single_event_error())?;
+                return Ok(FencedFinalizeResult::LostLeaseOrSuperseded);
+            }
+        } else {
+            tx.execute("DELETE FROM memory_vector_generation_item WHERE generation_id=?1 AND life_id=?2 AND memory_id=?3", params![claim.generation_id, claim.life_id, claim.memory_id]).map_err(|_| single_event_error())?;
+        }
+        let changed = tx
+            .execute(
+                &format!("DELETE FROM memory_vector_sync_outbox WHERE {predicate}"),
+                params![
+                    claim.id,
+                    claim.mutation_sequence,
+                    claim.lease_owner,
+                    claim.fence_epoch,
+                    claim.generation_id
+                ],
+            )
+            .map_err(|_| single_event_error())?;
+        tx.commit().map_err(|_| single_event_error())?;
+        Ok(if changed == 1 {
+            FencedFinalizeResult::Applied
+        } else {
+            FencedFinalizeResult::LostLeaseOrSuperseded
+        })
+    }
+}
+
+#[allow(dead_code)]
+fn acquire_runtime_lease(
+    tx: &Transaction<'_>,
+    owner: &str,
+) -> Result<(), crate::storage::StorageError> {
+    tx.execute("INSERT OR IGNORE INTO memory_vector_sync_runtime_lease (lease_name, fence_epoch) VALUES ('memory-vector-single-event-consumer', 0)", []).map_err(|_| single_event_error())?;
+    let changed = tx.execute(
+        "UPDATE memory_vector_sync_runtime_lease SET owner_id=?1, fence_epoch=fence_epoch+1,
+         expires_at=strftime('%Y-%m-%dT%H:%M:%fZ','now','+120 seconds'), updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE lease_name='memory-vector-single-event-consumer' AND (owner_id IS NULL OR owner_id=?1 OR expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        params![owner],
+    ).map_err(|_| single_event_error())?;
+    if changed == 1 {
+        Ok(())
+    } else {
+        Err(single_event_error())
+    }
+}
+
+#[allow(dead_code)]
+fn fenced_claim_from_row(row: &Row<'_>) -> rusqlite::Result<FencedVectorSyncClaim> {
+    let action: String = row.get(3)?;
+    Ok(FencedVectorSyncClaim {
+        id: row.get(0)?,
+        life_id: row.get(1)?,
+        memory_id: row.get(2)?,
+        action: MemoryVectorSyncAction::parse(&action)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        mutation_sequence: row.get(4)?,
+        target_revision: row.get(5)?,
+        target_content_hash: row.get(6)?,
+        generation_id: row.get(7)?,
+        lease_owner: row.get(8)?,
+        fence_epoch: row.get(9)?,
+    })
+}
+
+#[allow(dead_code)]
+fn single_event_error() -> crate::storage::StorageError {
+    crate::storage::StorageError::new(
+        "VECTOR_SYNC_UNAVAILABLE",
+        "Vector synchronization is unavailable.",
+        true,
+    )
 }
 
 impl MemoryVectorSyncOutboxRepository for StorageService {
@@ -593,7 +1031,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
     }
 
     #[test]
@@ -633,7 +1071,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
         drop(storage);
 
         let reopened = StorageService::initialize_with_roots(data_root, None).unwrap();
@@ -648,6 +1086,74 @@ mod tests {
             )
             .unwrap();
         assert_eq!(migration_count, 1);
+    }
+
+    #[test]
+    fn migration_012_quarantines_legacy_upserts_and_releases_only_processing_deletes() {
+        let root = TestRoot::new();
+        let data_root = root.0.join("data");
+        fs::create_dir_all(&data_root).unwrap();
+        let database_path = data_root.join(super::super::DATABASE_FILE_NAME);
+        let connection = Connection::open(&database_path).unwrap();
+        connection.execute_batch("CREATE TABLE schema_migration (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL);").unwrap();
+        for (version, name, sql) in super::super::MIGRATIONS.iter().take(11) {
+            connection.execute_batch(sql).unwrap();
+            connection.execute("INSERT INTO schema_migration (version, name, applied_at) VALUES (?1, ?2, '2026-01-01T00:00:00Z')", params![version, name]).unwrap();
+        }
+        connection.execute("INSERT INTO memory_vector_sync_outbox (life_id, memory_id, desired_action, state, attempt_count, last_error_code, created_at, updated_at) VALUES ('life', 'legacy-upsert', 'upsert', 'processing', 2, 'OLD_CODE', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')", []).unwrap();
+        connection.execute("INSERT INTO memory_vector_sync_outbox (life_id, memory_id, desired_action, state, attempt_count, last_error_code, created_at, updated_at) VALUES ('life', 'legacy-delete', 'delete', 'processing', 3, 'DELETE_CODE', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')", []).unwrap();
+        drop(connection);
+        let storage = StorageService::initialize_with_roots(data_root, None).unwrap();
+        let state = storage.state().unwrap();
+        let upsert: (String, Option<String>, Option<i64>, Option<String>, i64, String) = state.connection.query_row(
+            "SELECT state, migration_disposition, target_revision, target_content_hash, attempt_count, last_error_code FROM memory_vector_sync_outbox WHERE memory_id='legacy-upsert'", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+        ).unwrap();
+        assert_eq!(
+            upsert,
+            (
+                "blocked".into(),
+                Some("legacy_upsert_rebuild_required".into()),
+                None,
+                None,
+                2,
+                "OLD_CODE".into()
+            )
+        );
+        let delete: (String, Option<String>, i64, String) = state.connection.query_row(
+            "SELECT state, migration_disposition, attempt_count, last_error_code FROM memory_vector_sync_outbox WHERE memory_id='legacy-delete'", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).unwrap();
+        assert_eq!(delete, ("pending".into(), None, 3, "DELETE_CODE".into()));
+        let clock: i64 = state
+            .connection
+            .query_row(
+                "SELECT last_sequence FROM memory_vector_sync_mutation_clock WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let max_sequence: i64 = state
+            .connection
+            .query_row(
+                "SELECT MAX(mutation_sequence) FROM memory_vector_sync_outbox",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(clock >= max_sequence);
+    }
+
+    #[test]
+    fn post_012_mutation_replaces_legacy_quarantine_with_bound_target() {
+        let (_root, storage) = storage();
+        let record = confirmed(&storage, false);
+        let state = storage.state().unwrap();
+        let row: (i64, Option<i64>, Option<String>, Option<String>) = state.connection.query_row(
+            "SELECT mutation_sequence, target_revision, target_content_hash, migration_disposition FROM memory_vector_sync_outbox WHERE memory_id=?1", params![record.id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).unwrap();
+        assert!(row.0 > 0);
+        assert_eq!(row.1, Some(1));
+        assert!(row.2.is_some());
+        assert_eq!(row.3, None);
     }
 
     #[test]

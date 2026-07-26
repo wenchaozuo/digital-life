@@ -1,215 +1,112 @@
-use reqwest::{Client, StatusCode, Url};
-use serde::{Deserialize, Serialize};
+//! Borrowed OpenAI-compatible embedding adapter over the D-8 provider chain.
 
-use crate::secrets::SecretValue;
-
-use super::{
-    validate_request, validate_response, EmbeddingError, EmbeddingErrorCode, EmbeddingFuture,
-    EmbeddingModelInfo, EmbeddingProvider, EmbeddingRequest, EmbeddingResponse,
-    EmbeddingRuntimeOptions, EmbeddingUsage, EmbeddingVector,
+use crate::{
+    model::{
+        profile::{ModelProfile, ModelPurpose},
+        provider::{OpenAiCompatibleProvider, OpenAiCompatibleProviderConfig},
+    },
+    secrets::SecretStore,
 };
 
-/// Serializable non-secret settings. The runtime API key is supplied separately.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct OpenAICompatibleEmbeddingConfig {
-    pub base_url: String,
-    pub model_name: String,
-    #[serde(default)]
-    pub expected_dimension: Option<usize>,
+use super::{
+    protocol::{
+        self, build_provider_request, decode_response_envelope, validate_dimension_limits,
+        validate_documents, MAX_VECTOR_DIMENSION,
+    },
+    EmbeddingError, EmbeddingErrorCode, EmbeddingFuture, EmbeddingModelInfo, EmbeddingProvider,
+    EmbeddingRequest, EmbeddingResponse,
+};
+
+/// Long-lived adapter: controlled config + SecretStore borrow only.
+pub struct OpenAiCompatibleEmbeddingProvider<'s, S>
+where
+    S: SecretStore + ?Sized,
+{
+    config: OpenAiCompatibleProviderConfig,
+    secrets: &'s S,
+    model_name: String,
+    expected_dimension: usize,
 }
 
-/// A runtime-only secret. It deliberately implements neither `Debug` nor serde.
-pub struct RuntimeEmbeddingApiKey(SecretValue);
-
-impl RuntimeEmbeddingApiKey {
-    pub fn new(value: String) -> Result<Self, EmbeddingError> {
-        SecretValue::new(value).map(Self).map_err(|_| {
-            EmbeddingError::new(
+impl<'s, S> OpenAiCompatibleEmbeddingProvider<'s, S>
+where
+    S: SecretStore + ?Sized,
+{
+    fn try_new(profile: &ModelProfile, secrets: &'s S) -> Result<Self, EmbeddingError> {
+        if profile.purpose != ModelPurpose::Embedding {
+            return Err(EmbeddingError::definitely_not_sent(
                 EmbeddingErrorCode::InvalidRequest,
-                "An embedding API key is required.",
-                false,
-            )
-        })
-    }
-
-    pub(crate) fn from_secret(value: SecretValue) -> Self {
-        Self(value)
-    }
-}
-
-pub struct OpenAICompatibleEmbeddingProvider {
-    client: Client,
-    endpoint: Url,
-    api_key: RuntimeEmbeddingApiKey,
-    config: OpenAICompatibleEmbeddingConfig,
-    options: EmbeddingRuntimeOptions,
-}
-
-impl OpenAICompatibleEmbeddingProvider {
-    pub fn new(
-        config: OpenAICompatibleEmbeddingConfig,
-        api_key: RuntimeEmbeddingApiKey,
-        options: EmbeddingRuntimeOptions,
-    ) -> Result<Self, EmbeddingError> {
-        if config.model_name.trim().is_empty() {
-            return Err(EmbeddingError::new(
+                "The model profile purpose is not valid for embedding.",
+            ));
+        }
+        if profile.model_name.trim().is_empty() {
+            return Err(EmbeddingError::definitely_not_sent(
                 EmbeddingErrorCode::InvalidRequest,
                 "An embedding model name is required.",
-                false,
             ));
         }
-        if matches!(config.expected_dimension, Some(0)) {
-            return Err(EmbeddingError::new(
+        let dimension = profile.embedding_dimension.ok_or_else(|| {
+            EmbeddingError::definitely_not_sent(
                 EmbeddingErrorCode::InvalidRequest,
-                "The expected embedding dimension must be greater than zero.",
-                false,
-            ));
-        }
-        let options = EmbeddingRuntimeOptions {
-            limits: options.limits.validate()?,
-            ..options
-        };
-        if options.timeout.is_zero() {
-            return Err(EmbeddingError::new(
-                EmbeddingErrorCode::InvalidRequest,
-                "The embedding request timeout must be greater than zero.",
-                false,
-            ));
-        }
-        let endpoint = Self::embeddings_endpoint(&config.base_url)?;
-        let client = Client::builder()
-            .timeout(options.timeout)
-            .build()
-            .map_err(|_| {
-                EmbeddingError::new(
-                    EmbeddingErrorCode::NetworkError,
-                    "The embedding HTTP client could not be initialized.",
-                    false,
-                )
-            })?;
-        Ok(Self {
-            client,
-            endpoint,
-            api_key,
-            config,
-            options,
-        })
-    }
-
-    fn embeddings_endpoint(base_url: &str) -> Result<Url, EmbeddingError> {
-        let mut url = Url::parse(base_url.trim()).map_err(|_| {
-            EmbeddingError::new(
-                EmbeddingErrorCode::InvalidRequest,
-                "The embedding base URL is invalid.",
-                false,
+                "The embedding dimension is required.",
             )
         })?;
-        if !matches!(url.scheme(), "http" | "https")
-            || url.host_str().is_none()
-            || !url.username().is_empty()
-            || url.password().is_some()
-        {
-            return Err(EmbeddingError::new(
+        let expected_dimension = usize::try_from(dimension).map_err(|_| {
+            EmbeddingError::definitely_not_sent(
                 EmbeddingErrorCode::InvalidRequest,
-                "The embedding base URL must be an absolute HTTP or HTTPS URL without credentials.",
-                false,
+                "The embedding dimension is invalid.",
+            )
+        })?;
+        if expected_dimension == 0 || expected_dimension > MAX_VECTOR_DIMENSION {
+            return Err(EmbeddingError::definitely_not_sent(
+                EmbeddingErrorCode::InvalidRequest,
+                "The embedding dimension is invalid.",
             ));
         }
-        let path = format!("{}/embeddings", url.path().trim_end_matches('/'));
-        url.set_path(&path);
-        url.set_query(None);
-        url.set_fragment(None);
-        Ok(url)
-    }
 
-    fn map_http_error(status: StatusCode) -> EmbeddingError {
-        let (code, message, recoverable) = match status {
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => (
-                EmbeddingErrorCode::AuthenticationFailed,
-                "The embedding service rejected authentication.",
-                false,
-            ),
-            StatusCode::TOO_MANY_REQUESTS => (
-                EmbeddingErrorCode::RateLimited,
-                "The embedding service rate limit was reached.",
-                true,
-            ),
-            _ => (
-                EmbeddingErrorCode::NetworkError,
-                "The embedding service returned an unsuccessful HTTP status.",
-                true,
-            ),
-        };
-        EmbeddingError::new(code, message, recoverable)
-    }
-
-    fn map_response(
-        &self,
-        response: OpenAIEmbeddingResponse,
-        expected_input_count: usize,
-    ) -> Result<EmbeddingResponse, EmbeddingError> {
-        let vectors = response
-            .data
-            .into_iter()
-            .map(|data| {
-                let input_index = data.index.ok_or_else(|| {
-                    EmbeddingError::new(
-                        EmbeddingErrorCode::InvalidProviderResponse,
-                        "The embedding service omitted a vector index.",
-                        true,
-                    )
-                })?;
-                Ok(EmbeddingVector {
-                    input_index,
-                    values: data.embedding,
-                })
-            })
-            .collect::<Result<Vec<_>, EmbeddingError>>()?;
-        let dimension = vectors
-            .first()
-            .map(|vector| vector.values.len())
-            .unwrap_or(0);
-        let model_name = if response.model.trim().is_empty() {
-            self.config.model_name.clone()
-        } else {
-            response.model
-        };
-        validate_response(
-            EmbeddingResponse {
-                model_name,
-                dimension,
-                vectors,
-                input_count: expected_input_count,
-                usage: response.usage.map(|usage| EmbeddingUsage {
-                    prompt_tokens: usage.prompt_tokens,
-                    total_tokens: usage.total_tokens,
-                }),
-            },
-            expected_input_count,
-            self.config.expected_dimension,
-        )
+        let config = build_provider_config(profile)?;
+        Ok(Self {
+            config,
+            secrets,
+            model_name: profile.model_name.clone(),
+            expected_dimension,
+        })
     }
 }
 
-impl EmbeddingProvider for OpenAICompatibleEmbeddingProvider {
+impl<S> std::fmt::Debug for OpenAiCompatibleEmbeddingProvider<'_, S>
+where
+    S: SecretStore + ?Sized,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenAiCompatibleEmbeddingProvider")
+            .field("protocol", &protocol::PROTOCOL_VERSION)
+            .field("expected_dimension", &self.expected_dimension)
+            .finish()
+    }
+}
+
+impl<S> EmbeddingProvider for OpenAiCompatibleEmbeddingProvider<'_, S>
+where
+    S: SecretStore + ?Sized + Sync,
+{
     fn model_info(&self) -> EmbeddingModelInfo {
         EmbeddingModelInfo {
-            model_name: self.config.model_name.clone(),
-            dimension: self.config.expected_dimension,
+            model_name: self.model_name.clone(),
+            dimension: Some(self.expected_dimension),
         }
     }
 
     fn model_name(&self) -> &str {
-        &self.config.model_name
+        &self.model_name
     }
 
     fn vector_dimension(&self) -> Option<usize> {
-        self.config.expected_dimension
+        Some(self.expected_dimension)
     }
 
     fn max_batch_size(&self) -> usize {
-        self.options.limits.max_batch_size
+        protocol::MAX_EMBEDDING_BATCH_MEMORIES
     }
 
     fn embed<'a>(
@@ -217,207 +114,218 @@ impl EmbeddingProvider for OpenAICompatibleEmbeddingProvider {
         request: EmbeddingRequest,
     ) -> EmbeddingFuture<'a, Result<EmbeddingResponse, EmbeddingError>> {
         Box::pin(async move {
-            validate_request(&request, self.options.limits)?;
-            let input_count = request.texts.len();
-            let payload = OpenAIEmbeddingRequest {
-                model: &self.config.model_name,
-                input: request.texts,
-            };
-            let response = self
-                .client
-                .post(self.endpoint.clone())
-                .bearer_auth(self.api_key.0.expose_secret())
-                .json(&payload)
-                .send()
+            validate_documents(&request.texts)?;
+            validate_dimension_limits(self.expected_dimension, request.texts.len())?;
+            let provider_request = build_provider_request(&self.model_name, &request.texts)?;
+            let provider = OpenAiCompatibleProvider::new(self.secrets);
+            let response = provider
+                .execute(&self.config, provider_request)
                 .await
-                .map_err(|error| {
-                    if error.is_connect() {
-                        EmbeddingError::new(
-                            EmbeddingErrorCode::NetworkError,
-                            "The embedding service is unavailable.",
-                            true,
-                        )
-                    } else if error.is_timeout() {
-                        EmbeddingError::new(
-                            EmbeddingErrorCode::RequestTimeout,
-                            "The embedding request timed out.",
-                            true,
-                        )
-                    } else {
-                        EmbeddingError::new(
-                            EmbeddingErrorCode::NetworkError,
-                            "The embedding service is unavailable.",
-                            true,
-                        )
-                    }
-                })?;
-            if !response.status().is_success() {
-                return Err(Self::map_http_error(response.status()));
-            }
-            let body = response
-                .json::<OpenAIEmbeddingResponse>()
-                .await
-                .map_err(|_| {
-                    EmbeddingError::new(
-                        EmbeddingErrorCode::InvalidProviderResponse,
-                        "The embedding service returned an invalid response.",
-                        true,
-                    )
-                })?;
-            self.map_response(body, input_count)
+                .map_err(EmbeddingError::from_provider_error)?;
+            let batch = decode_response_envelope(
+                response.body(),
+                &self.model_name,
+                request.texts.len(),
+                self.expected_dimension,
+            )?;
+            Ok(batch.into_public_response(self.model_name.clone()))
         })
     }
 }
 
-#[derive(Serialize)]
-struct OpenAIEmbeddingRequest<'a> {
-    model: &'a str,
-    input: Vec<String>,
+/// Crate-internal factory. Lifetime is bound to the borrowed SecretStore.
+pub(crate) fn build_openai_compatible_embedding_provider<'s, S>(
+    profile: &ModelProfile,
+    secrets: &'s S,
+) -> Result<Box<dyn EmbeddingProvider + 's>, EmbeddingError>
+where
+    S: SecretStore + ?Sized + Sync,
+{
+    let provider = OpenAiCompatibleEmbeddingProvider::try_new(profile, secrets)?;
+    Ok(Box::new(provider))
 }
 
-#[derive(Deserialize)]
-struct OpenAIEmbeddingResponse {
-    #[serde(default)]
-    model: String,
-    data: Vec<OpenAIEmbeddingData>,
-    usage: Option<OpenAIEmbeddingUsage>,
-}
-
-#[derive(Deserialize)]
-struct OpenAIEmbeddingData {
-    index: Option<usize>,
-    embedding: Vec<f32>,
-}
-
-#[derive(Deserialize)]
-struct OpenAIEmbeddingUsage {
-    #[serde(default)]
-    prompt_tokens: Option<u64>,
-    #[serde(default)]
-    total_tokens: Option<u64>,
+fn build_provider_config(
+    profile: &ModelProfile,
+) -> Result<OpenAiCompatibleProviderConfig, EmbeddingError> {
+    match OpenAiCompatibleProviderConfig::from_profile(profile) {
+        Ok(config) => Ok(config),
+        Err(production_error) => {
+            #[cfg(test)]
+            {
+                if let Ok(config) =
+                    OpenAiCompatibleProviderConfig::from_embedding_loopback_profile_for_test(
+                        profile,
+                    )
+                {
+                    return Ok(config);
+                }
+            }
+            Err(EmbeddingError::from_provider_error(production_error))
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
-    use crate::embedding::{EmbeddingPurpose, EmbeddingRequest, EmbeddingRuntimeOptions};
+    use crate::{
+        model::{
+            profile::{ModelProviderKind, ModelPurpose},
+            transport::http1::SendDisposition,
+        },
+        secrets::{
+            InMemorySecretStore, SecretIdentifier, SecretPurpose, SecretStatus, SecretStore,
+            SecretStoreError, SecretValue,
+        },
+    };
 
-    fn provider(expected_dimension: Option<usize>) -> OpenAICompatibleEmbeddingProvider {
-        OpenAICompatibleEmbeddingProvider::new(
-            OpenAICompatibleEmbeddingConfig {
-                base_url: "https://example.invalid/v1/".into(),
-                model_name: "test-model".into(),
-                expected_dimension,
-            },
-            RuntimeEmbeddingApiKey::new("test-secret".into()).unwrap(),
-            EmbeddingRuntimeOptions::default(),
-        )
-        .unwrap()
+    struct CountingStore {
+        inner: InMemorySecretStore,
+        reads: AtomicUsize,
     }
 
-    fn parsed(body: serde_json::Value) -> OpenAIEmbeddingResponse {
-        serde_json::from_value(body).unwrap()
+    impl CountingStore {
+        fn new() -> Self {
+            Self {
+                inner: InMemorySecretStore::new(),
+                reads: AtomicUsize::new(0),
+            }
+        }
+
+        fn reads(&self) -> usize {
+            self.reads.load(Ordering::SeqCst)
+        }
     }
 
-    #[test]
-    fn builds_embeddings_endpoint() {
-        assert_eq!(
-            OpenAICompatibleEmbeddingProvider::embeddings_endpoint("https://example.invalid/v1/")
-                .unwrap()
-                .as_str(),
-            "https://example.invalid/v1/embeddings"
-        );
+    impl SecretStore for CountingStore {
+        fn set_secret(
+            &self,
+            identifier: &SecretIdentifier,
+            value: SecretValue,
+        ) -> Result<SecretStatus, SecretStoreError> {
+            self.inner.set_secret(identifier, value)
+        }
+
+        fn get_secret(
+            &self,
+            identifier: &SecretIdentifier,
+        ) -> Result<SecretValue, SecretStoreError> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.inner.get_secret(identifier)
+        }
+
+        fn has_secret(&self, identifier: &SecretIdentifier) -> Result<bool, SecretStoreError> {
+            self.inner.has_secret(identifier)
+        }
+
+        fn delete_secret(
+            &self,
+            identifier: &SecretIdentifier,
+        ) -> Result<SecretStatus, SecretStoreError> {
+            self.inner.delete_secret(identifier)
+        }
     }
 
-    #[test]
-    fn restores_response_order_using_indexes() {
-        let response = provider(None)
-            .map_response(
-                parsed(serde_json::json!({
-                    "model": "test-model",
-                    "data": [
-                        { "index": 1, "embedding": [2.0, 3.0] },
-                        { "index": 0, "embedding": [0.0, 1.0] }
-                    ]
-                })),
-                2,
+    fn embedding_profile(base_url: &str, dimension: u32) -> ModelProfile {
+        ModelProfile {
+            id: "emb-profile".into(),
+            purpose: ModelPurpose::Embedding,
+            provider_kind: ModelProviderKind::OpenaiCompatible,
+            display_name: "Embedding".into(),
+            base_url: base_url.into(),
+            model_name: "test-embedding-model".into(),
+            temperature: None,
+            max_tokens: None,
+            embedding_dimension: Some(dimension),
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    fn seed(store: &CountingStore, profile_id: &str) {
+        store
+            .set_secret(
+                &SecretIdentifier::new(SecretPurpose::EmbeddingModelApiKey, profile_id).unwrap(),
+                SecretValue::new("d9b-test-canary-never-log".into()).unwrap(),
             )
             .unwrap();
-        assert_eq!(response.vectors[0].values, vec![0.0, 1.0]);
-        assert_eq!(response.vectors[1].values, vec![2.0, 3.0]);
     }
 
     #[test]
-    fn rejects_missing_duplicate_count_and_dimension_errors() {
-        let missing = provider(None)
-            .map_response(
-                parsed(serde_json::json!({ "data": [{ "embedding": [1.0] }] })),
-                1,
-            )
-            .unwrap_err();
-        assert_eq!(missing.code, EmbeddingErrorCode::InvalidProviderResponse);
-
-        let duplicate = provider(None)
-            .map_response(
-                parsed(serde_json::json!({ "data": [
-                { "index": 0, "embedding": [1.0] }, { "index": 0, "embedding": [1.0] }
-            ] })),
-                2,
-            )
-            .unwrap_err();
-        assert_eq!(duplicate.code, EmbeddingErrorCode::InvalidProviderResponse);
-
-        let count = provider(None)
-            .map_response(
-                parsed(serde_json::json!({ "data": [{ "index": 0, "embedding": [1.0] }] })),
-                2,
-            )
-            .unwrap_err();
-        assert_eq!(count.code, EmbeddingErrorCode::InvalidProviderResponse);
-
-        let dimensions = provider(None)
-            .map_response(
-                parsed(serde_json::json!({ "data": [
-                { "index": 0, "embedding": [1.0] }, { "index": 1, "embedding": [1.0, 2.0] }
-            ] })),
-                2,
-            )
-            .unwrap_err();
-        assert_eq!(dimensions.code, EmbeddingErrorCode::DimensionMismatch);
+    fn purpose_mismatch_reads_zero_credentials() {
+        let store = CountingStore::new();
+        let mut profile = embedding_profile("https://provider.example.invalid/v1", 3);
+        profile.purpose = ModelPurpose::Chat;
+        let err = OpenAiCompatibleEmbeddingProvider::try_new(&profile, &store).unwrap_err();
+        assert_eq!(err.code, EmbeddingErrorCode::InvalidRequest);
+        assert_eq!(err.disposition(), SendDisposition::DefinitelyNotSent);
+        assert_eq!(store.reads(), 0);
     }
 
     #[test]
-    fn maps_authentication_and_rate_limit_errors_without_secret_disclosure() {
-        let secret = "test-secret";
-        let authentication =
-            OpenAICompatibleEmbeddingProvider::map_http_error(StatusCode::UNAUTHORIZED);
-        let rate_limit =
-            OpenAICompatibleEmbeddingProvider::map_http_error(StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(
-            authentication.code,
-            EmbeddingErrorCode::AuthenticationFailed
-        );
-        assert_eq!(rate_limit.code, EmbeddingErrorCode::RateLimited);
-        assert!(!authentication.message.contains(secret));
-        assert!(!rate_limit.message.contains(secret));
+    fn invalid_input_reads_zero_credentials_and_never_executes() {
+        let store = CountingStore::new();
+        seed(&store, "emb-profile");
+        let profile = embedding_profile("https://provider.example.invalid/v1", 3);
+        let provider = OpenAiCompatibleEmbeddingProvider::try_new(&profile, &store).unwrap();
+        let err = tauri::async_runtime::block_on(provider.embed(EmbeddingRequest {
+            texts: vec![],
+            purpose: super::super::EmbeddingPurpose::Document,
+        }))
+        .unwrap_err();
+        assert_eq!(err.code, EmbeddingErrorCode::InvalidRequest);
+        assert_eq!(err.disposition(), SendDisposition::DefinitelyNotSent);
+        assert_eq!(store.reads(), 0);
+        assert!(!format!("{provider:?}").contains("d9b-test-canary-never-log"));
+        assert!(!format!("{provider:?}").contains("provider.example"));
     }
 
     #[test]
-    fn response_has_no_input_text_and_provider_has_no_storage_dependency() {
-        let request = EmbeddingRequest {
-            texts: vec!["private text".into()],
-            purpose: EmbeddingPurpose::Query,
-        };
-        let response = provider(None)
-            .map_response(
-                parsed(serde_json::json!({
-                    "data": [{ "index": 0, "embedding": [1.0] }]
-                })),
-                request.texts.len(),
-            )
-            .unwrap();
-        assert!(!serde_json::to_string(&response)
-            .unwrap()
-            .contains("private text"));
+    fn dimension_over_limit_rejected_before_credential_read() {
+        let store = CountingStore::new();
+        seed(&store, "emb-profile");
+        let profile = embedding_profile("https://provider.example.invalid/v1", 4097);
+        let err = OpenAiCompatibleEmbeddingProvider::try_new(&profile, &store).unwrap_err();
+        assert_eq!(err.code, EmbeddingErrorCode::InvalidRequest);
+        assert_eq!(store.reads(), 0);
+    }
+
+    #[test]
+    fn missing_credential_is_definitely_not_sent_and_reads_once_on_embed() {
+        let store = CountingStore::new();
+        let profile = embedding_profile("https://provider.example.invalid/v1", 3);
+        let provider = OpenAiCompatibleEmbeddingProvider::try_new(&profile, &store).unwrap();
+        assert_eq!(store.reads(), 0);
+        let err = tauri::async_runtime::block_on(provider.embed(EmbeddingRequest {
+            texts: vec!["hello".into()],
+            purpose: super::super::EmbeddingPurpose::Query,
+        }))
+        .unwrap_err();
+        assert_eq!(err.disposition(), SendDisposition::DefinitelyNotSent);
+        assert_eq!(store.reads(), 1);
+        assert!(!format!("{err:?}").contains("d9b-test-canary-never-log"));
+    }
+
+    #[test]
+    fn loopback_test_seam_is_used_for_embedding_loopback_profiles() {
+        let store = CountingStore::new();
+        seed(&store, "emb-profile");
+        let profile = embedding_profile("http://127.0.0.1:9/v1", 3);
+        // Construction succeeds via cfg(test) seam without reading secrets.
+        let provider = OpenAiCompatibleEmbeddingProvider::try_new(&profile, &store).unwrap();
+        assert_eq!(store.reads(), 0);
+        assert_eq!(provider.model_name(), "test-embedding-model");
+        assert_eq!(provider.vector_dimension(), Some(3));
+    }
+
+    #[test]
+    fn factory_returns_borrowed_trait_object() {
+        let store = CountingStore::new();
+        let profile = embedding_profile("http://127.0.0.1:9/v1", 2);
+        let provider = build_openai_compatible_embedding_provider(&profile, &store).unwrap();
+        assert_eq!(provider.model_name(), "test-embedding-model");
     }
 }

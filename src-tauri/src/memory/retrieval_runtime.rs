@@ -47,13 +47,13 @@ impl MemoryRetrievalDataRootResolver for StorageService {
     }
 }
 
-pub struct ResolvedRuntimeEmbeddingProvider {
+pub struct ResolvedRuntimeEmbeddingProvider<'a> {
     pub model_name: String,
     pub dimension: usize,
-    provider: Box<dyn EmbeddingProvider>,
+    provider: Box<dyn EmbeddingProvider + 'a>,
 }
 
-impl ResolvedRuntimeEmbeddingProvider {
+impl ResolvedRuntimeEmbeddingProvider<'_> {
     fn provider(&self) -> &dyn EmbeddingProvider {
         self.provider.as_ref()
     }
@@ -62,7 +62,7 @@ impl ResolvedRuntimeEmbeddingProvider {
 pub trait ActiveEmbeddingProviderFactory: Send + Sync {
     fn resolve_active_embedding_provider(
         &self,
-    ) -> Result<ResolvedRuntimeEmbeddingProvider, RetrievalDegradationCode>;
+    ) -> Result<ResolvedRuntimeEmbeddingProvider<'_>, RetrievalDegradationCode>;
 }
 
 pub struct ModelRuntimeEmbeddingProviderFactory<'a, P, S>
@@ -96,7 +96,7 @@ where
 {
     fn resolve_active_embedding_provider(
         &self,
-    ) -> Result<ResolvedRuntimeEmbeddingProvider, RetrievalDegradationCode> {
+    ) -> Result<ResolvedRuntimeEmbeddingProvider<'_>, RetrievalDegradationCode> {
         let resolved = ModelRuntimeService::new(self.profiles, self.secrets, self.coordinator)
             .resolve_active_embedding_provider()
             .map_err(map_model_runtime_error)?;
@@ -109,7 +109,7 @@ where
         Ok(ResolvedRuntimeEmbeddingProvider {
             model_name,
             dimension,
-            provider: Box::new(resolved.into_provider()),
+            provider: resolved.into_provider(),
         })
     }
 }
@@ -762,7 +762,7 @@ mod tests {
     impl ActiveEmbeddingProviderFactory for Factory {
         fn resolve_active_embedding_provider(
             &self,
-        ) -> Result<ResolvedRuntimeEmbeddingProvider, RetrievalDegradationCode> {
+        ) -> Result<ResolvedRuntimeEmbeddingProvider<'_>, RetrievalDegradationCode> {
             if let Some(error) = self.error {
                 return Err(error);
             }

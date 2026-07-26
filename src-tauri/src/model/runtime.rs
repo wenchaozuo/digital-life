@@ -13,9 +13,8 @@ use tauri::State;
 
 use crate::{
     embedding::{
-        EmbeddingError, EmbeddingErrorCode, EmbeddingProvider, EmbeddingPurpose, EmbeddingRequest,
-        EmbeddingRuntimeOptions, OpenAICompatibleEmbeddingConfig,
-        OpenAICompatibleEmbeddingProvider, RuntimeEmbeddingApiKey,
+        build_openai_compatible_embedding_provider, EmbeddingError, EmbeddingErrorCode,
+        EmbeddingProvider, EmbeddingPurpose, EmbeddingRequest,
     },
     secrets::{
         SecretIdentifier, SecretPurpose, SecretStore, SecretStoreErrorCode,
@@ -79,9 +78,9 @@ pub struct ResolvedChatProvider {
     provider: OpenAICompatibleProvider,
 }
 
-pub struct ResolvedEmbeddingProvider {
+pub struct ResolvedEmbeddingProvider<'a> {
     pub profile: ResolvedModelProfile,
-    provider: OpenAICompatibleEmbeddingProvider,
+    provider: Box<dyn EmbeddingProvider + 'a>,
 }
 
 impl ResolvedChatProvider {
@@ -90,14 +89,14 @@ impl ResolvedChatProvider {
     }
 }
 
-impl ResolvedEmbeddingProvider {
+impl<'a> ResolvedEmbeddingProvider<'a> {
     pub fn provider(&self) -> &dyn EmbeddingProvider {
-        &self.provider
+        self.provider.as_ref()
     }
 
     /// Transfers the short-lived provider into another Rust-internal
-    /// orchestrator without exposing its credential to IPC or serialization.
-    pub(crate) fn into_provider(self) -> OpenAICompatibleEmbeddingProvider {
+    /// orchestrator without exposing credentials to IPC or serialization.
+    pub(crate) fn into_provider(self) -> Box<dyn EmbeddingProvider + 'a> {
         self.provider
     }
 }
@@ -247,7 +246,7 @@ where
 
     pub fn resolve_active_embedding_provider(
         &self,
-    ) -> Result<ResolvedEmbeddingProvider, ModelRuntimeError> {
+    ) -> Result<ResolvedEmbeddingProvider<'a>, ModelRuntimeError> {
         let profile_id = self.active_profile_id(ModelRuntimePurpose::Embedding)?;
         self.resolve_embedding_provider(&profile_id)
     }
@@ -298,7 +297,7 @@ where
     pub fn resolve_embedding_provider(
         &self,
         profile_id: &str,
-    ) -> Result<ResolvedEmbeddingProvider, ModelRuntimeError> {
+    ) -> Result<ResolvedEmbeddingProvider<'a>, ModelRuntimeError> {
         let profile = self.load_profile(profile_id, ModelRuntimePurpose::Embedding)?;
         self.build_embedding_provider(profile)
     }
@@ -415,26 +414,17 @@ where
     fn build_embedding_provider(
         &self,
         profile: ModelProfile,
-    ) -> Result<ResolvedEmbeddingProvider, ModelRuntimeError> {
-        let secret = self.secret_for(&profile.id, ModelRuntimePurpose::Embedding)?;
-        let dimension = profile
-            .embedding_dimension
-            .ok_or_else(|| runtime_error(ModelRuntimeErrorCode::InvalidProfile))?;
-        let expected_dimension = usize::try_from(dimension)
-            .map_err(|_| runtime_error(ModelRuntimeErrorCode::InvalidProfile))?;
-        let provider = OpenAICompatibleEmbeddingProvider::new(
-            OpenAICompatibleEmbeddingConfig {
-                base_url: profile.base_url.clone(),
-                model_name: profile.model_name.clone(),
-                expected_dimension: Some(expected_dimension),
+    ) -> Result<ResolvedEmbeddingProvider<'a>, ModelRuntimeError> {
+        // Credential is read only inside a later embed()/D-8 execute. Construction
+        // validates purpose/model/dimension and builds the borrowed adapter only.
+        let provider = build_openai_compatible_embedding_provider(&profile, self.secrets).map_err(
+            |error| match error.code {
+                EmbeddingErrorCode::InvalidRequest => {
+                    runtime_error(ModelRuntimeErrorCode::InvalidProfile)
+                }
+                _ => runtime_error(ModelRuntimeErrorCode::ProviderInitializationFailed),
             },
-            RuntimeEmbeddingApiKey::from_secret(secret),
-            EmbeddingRuntimeOptions {
-                timeout: self.coordinator.request_timeout,
-                ..EmbeddingRuntimeOptions::default()
-            },
-        )
-        .map_err(|_| runtime_error(ModelRuntimeErrorCode::ProviderInitializationFailed))?;
+        )?;
         Ok(ResolvedEmbeddingProvider {
             profile: resolved_profile(&profile, ModelRuntimePurpose::Embedding),
             provider,
@@ -861,7 +851,9 @@ mod tests {
             .map(|index| (index + 1).to_string())
             .collect::<Vec<_>>()
             .join(",");
-        format!(r#"{{"model":"embedding-model","data":[{{"index":0,"embedding":[{values}]}}]}}"#)
+        format!(
+            r#"{{"object":"list","model":"embedding-model","data":[{{"object":"embedding","index":0,"embedding":[{values}]}}],"usage":{{"prompt_tokens":1,"total_tokens":1}}}}"#
+        )
     }
 
     #[test]
@@ -1124,20 +1116,24 @@ mod tests {
 
     #[test]
     fn chat_and_embedding_credentials_cannot_be_reused_across_purposes() {
-        let (_root, storage) = test_storage();
-        let secrets = InMemorySecretStore::new();
-        let coordinator = ModelRuntimeCoordinator::default();
-        let embedding = create_embedding(&storage, "Embedding", "http://127.0.0.1:9/v1", 2);
-        store_credential(&secrets, ModelRuntimePurpose::Chat, &embedding.id);
-        let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
-        assert_eq!(
-            runtime
-                .resolve_embedding_provider(&embedding.id)
-                .err()
-                .unwrap()
-                .code,
-            ModelRuntimeErrorCode::CredentialNotFound
-        );
+        tauri::async_runtime::block_on(async {
+            let (_root, storage) = test_storage();
+            let secrets = InMemorySecretStore::new();
+            let coordinator = ModelRuntimeCoordinator::default();
+            let embedding = create_embedding(&storage, "Embedding", "http://127.0.0.1:9/v1", 2);
+            // Wrong-purpose secret must not satisfy Embedding credential identity.
+            store_credential(&secrets, ModelRuntimePurpose::Chat, &embedding.id);
+            let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
+            // Construction no longer reads secrets; verify on a real embed path.
+            let result = runtime
+                .test_connection(request(&embedding, ModelRuntimePurpose::Embedding))
+                .await;
+            assert!(!result.success);
+            assert_eq!(
+                result.error_code,
+                Some(ModelRuntimeErrorCode::AuthenticationFailed)
+            );
+        });
     }
 
     #[test]

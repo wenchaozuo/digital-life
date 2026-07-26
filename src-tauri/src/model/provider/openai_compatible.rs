@@ -18,6 +18,9 @@ use crate::{
 
 use super::{ProviderError, ProviderErrorKind, ProviderHttpResponse};
 
+#[cfg(test)]
+use crate::model::{profile::ModelPurpose, transport::url_policy::TransportTargetKind};
+
 const CHAT_COMPLETIONS_PATH: &str = "chat/completions";
 const EMBEDDINGS_PATH: &str = "embeddings";
 
@@ -49,6 +52,40 @@ impl OpenAiCompatibleProviderConfig {
             ));
         }
 
+        Self::assemble_from_validated_profile(profile, target)
+    }
+
+    /// Test-only Embedding LoopbackHttp seam. Production `from_profile` still
+    /// rejects loopback stored keys; this constructor never ships in non-test builds.
+    #[cfg(test)]
+    pub(crate) fn from_embedding_loopback_profile_for_test(
+        profile: &ModelProfile,
+    ) -> Result<Self, ProviderError> {
+        if profile.purpose != ModelPurpose::Embedding
+            || profile.provider_kind != ModelProviderKind::OpenaiCompatible
+            || profile.model_name.trim().is_empty()
+        {
+            return Err(ProviderError::definitely_not_sent(
+                ProviderErrorKind::InvalidConfiguration,
+            ));
+        }
+
+        let target = validate_and_normalize_url(&profile.base_url).map_err(|_| {
+            ProviderError::definitely_not_sent(ProviderErrorKind::InvalidConfiguration)
+        })?;
+        if target.kind() != TransportTargetKind::LoopbackHttp {
+            return Err(ProviderError::definitely_not_sent(
+                ProviderErrorKind::InvalidConfiguration,
+            ));
+        }
+
+        Self::assemble_from_validated_profile(profile, target)
+    }
+
+    fn assemble_from_validated_profile(
+        profile: &ModelProfile,
+        target: ValidatedTransportTarget,
+    ) -> Result<Self, ProviderError> {
         let credential = SecretIdentifier::new(credential_purpose(profile.purpose), &profile.id)
             .map_err(|_| {
                 ProviderError::definitely_not_sent(ProviderErrorKind::InvalidConfiguration)
@@ -307,6 +344,77 @@ mod tests {
             "http://127.0.0.1:8080/v1".to_string(),
         ))
         .is_err());
+    }
+
+    fn embedding_profile(base_url: String) -> ModelProfile {
+        ModelProfile {
+            id: "embedding-profile".to_string(),
+            purpose: ModelPurpose::Embedding,
+            provider_kind: ModelProviderKind::OpenaiCompatible,
+            display_name: "Embedding profile".to_string(),
+            base_url,
+            model_name: "test-embedding-model".to_string(),
+            temperature: None,
+            max_tokens: None,
+            embedding_dimension: Some(3),
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn production_from_profile_rejects_embedding_loopback_stored_key() {
+        let result = OpenAiCompatibleProviderConfig::from_profile(&embedding_profile(
+            "http://127.0.0.1:9/v1".to_string(),
+        ));
+        assert!(result.is_err());
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("expected loopback stored-key rejection"),
+        };
+        assert_eq!(error.kind(), ProviderErrorKind::InvalidConfiguration);
+        assert_eq!(error.disposition(), SendDisposition::DefinitelyNotSent);
+    }
+
+    #[test]
+    fn embedding_loopback_test_seam_accepts_only_embedding_loopback_http() {
+        let config = OpenAiCompatibleProviderConfig::from_embedding_loopback_profile_for_test(
+            &embedding_profile("http://127.0.0.1:9/v1".to_string()),
+        )
+        .unwrap();
+        assert_eq!(config.origin_form, "/v1/embeddings");
+        assert_eq!(config.credential.profile_id, "embedding-profile");
+        assert_eq!(
+            config.credential.purpose,
+            SecretPurpose::EmbeddingModelApiKey
+        );
+        assert_eq!(config.model_name, "test-embedding-model");
+        assert_eq!(config.target.kind(), TransportTargetKind::LoopbackHttp);
+
+        assert!(
+            OpenAiCompatibleProviderConfig::from_embedding_loopback_profile_for_test(
+                &embedding_profile("https://provider.example.invalid/v1".to_string()),
+            )
+            .is_err()
+        );
+        assert!(
+            OpenAiCompatibleProviderConfig::from_embedding_loopback_profile_for_test(&profile(
+                "http://127.0.0.1:9/v1".to_string(),
+            ))
+            .is_err()
+        );
+        let mut chat = embedding_profile("http://127.0.0.1:9/v1".to_string());
+        chat.purpose = ModelPurpose::Chat;
+        assert!(
+            OpenAiCompatibleProviderConfig::from_embedding_loopback_profile_for_test(&chat)
+                .is_err()
+        );
+        let mut extraction = embedding_profile("http://127.0.0.1:9/v1".to_string());
+        extraction.purpose = ModelPurpose::CandidateExtraction;
+        assert!(
+            OpenAiCompatibleProviderConfig::from_embedding_loopback_profile_for_test(&extraction)
+                .is_err()
+        );
     }
 
     #[test]

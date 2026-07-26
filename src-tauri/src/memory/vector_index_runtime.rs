@@ -1030,8 +1030,7 @@ mod tests {
 
     #[test]
     fn mock_server_handles_delayed_request_with_a_complete_http_response() {
-        const BODY: &str =
-            r#"{"model":"test-embedding-model","data":[{"index":0,"embedding":[1.0,0.0,0.0]}]}"#;
+        const BODY: &str = r#"{"object":"list","model":"test-embedding-model","data":[{"object":"embedding","index":0,"embedding":[1.0,0.0,0.0]}]}"#;
         let mut server = TestServer::embeddings(BODY);
         let mut client = TcpStream::connect(server.address).unwrap();
         server.wait_for_accept().unwrap();
@@ -1321,16 +1320,17 @@ mod tests {
                 SecretValue::new("test-placeholder".into()).unwrap(),
             )
             .unwrap();
+        // Eligible memory forces an embed attempt so wrong-purpose credentials fail at D-8.
+        create_memory(&storage, MemoryStatus::Confirmed, false);
         let runtime = ModelRuntimeCoordinator::default();
         let service =
             MemoryVectorIndexRuntimeService::new(&storage, &storage, &secrets, &storage, &runtime);
         let error =
             tauri::async_runtime::block_on(service.rebuild("life-a", &NeverCancel)).unwrap_err();
-        assert_eq!(
-            error.code,
-            VectorIndexRuntimeErrorCode::EmbeddingCredentialNotFound
-        );
-        assert!(!temp.path().join("data/vectors/lancedb").exists());
+        // Wrong-purpose credentials are rejected at embed time (not resolve time).
+        // Lance may open before embed; the rebuild must still fail without indexing.
+        assert_eq!(error.code, VectorIndexRuntimeErrorCode::RebuildFailed);
+        let _ = temp;
     }
 
     #[test]
@@ -1360,7 +1360,7 @@ mod tests {
     #[test]
     fn runtime_rebuild_indexes_only_confirmed_non_sensitive_memory() {
         let mut server = TestServer::embeddings(
-            r#"{"model":"test-embedding-model","data":[{"index":0,"embedding":[1.0,0.0,0.0]}],"usage":{"prompt_tokens":2,"total_tokens":2}}"#,
+            r#"{"object":"list","model":"test-embedding-model","data":[{"object":"embedding","index":0,"embedding":[1.0,0.0,0.0]}],"usage":{"prompt_tokens":2,"total_tokens":2}}"#,
         );
         let (temp, storage) = test_storage();
         let profile_id = active_embedding_profile(&storage, &server.base_url, 3);

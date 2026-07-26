@@ -168,8 +168,13 @@ impl MockEmbeddingServer {
                 read_http_request(&mut stream);
                 thread_calls.fetch_add(1, Ordering::SeqCst);
                 let body = serde_json::json!({
+                    "object": "list",
                     "model": model,
-                    "data": [{"index": 0, "embedding": vector}]
+                    "data": [{
+                        "object": "embedding",
+                        "index": 0,
+                        "embedding": vector
+                    }]
                 })
                 .to_string();
                 let reply = format!(

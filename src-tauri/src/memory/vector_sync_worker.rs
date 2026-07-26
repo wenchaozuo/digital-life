@@ -1092,7 +1092,7 @@ mod tests {
         fn success() -> Self {
             Self::response(
                 "200 OK",
-                r#"{"model":"test-embedding-model","data":[{"index":0,"embedding":[1.0,0.0,0.0]}]}"#,
+                r#"{"object":"list","model":"test-embedding-model","data":[{"object":"embedding","index":0,"embedding":[1.0,0.0,0.0]}]}"#,
             )
         }
     }

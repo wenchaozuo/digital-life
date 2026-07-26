@@ -4,7 +4,8 @@ use std::{
 };
 
 use super::{
-    validate_identifier, VectorRecord, VectorSearchHit, VectorSearchQuery, VectorSpace,
+    validate_identifier, GenerationVectorRecord, VectorGenerationContext, VectorGenerationId,
+    VectorMetadataSample, VectorRecord, VectorSearchHit, VectorSearchQuery, VectorSpace,
     VectorStore, VectorStoreError, VectorStoreErrorCode, VectorStoreFuture,
 };
 
@@ -25,11 +26,26 @@ impl From<&VectorRecord> for RecordKey {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct GenerationRecordKey {
+    generation_id: String,
+    life_id: String,
+    memory_id: String,
+}
+
+#[derive(Clone)]
+struct GenerationMeta {
+    descriptor_hash: String,
+    dimension: usize,
+}
+
 /// Deterministic, non-persistent implementation for tests and development.
 /// It is exported only in test/debug builds and is never selected by default.
 #[derive(Default)]
 pub struct InMemoryVectorStore {
     records: RwLock<HashMap<RecordKey, VectorRecord>>,
+    generations: RwLock<HashMap<String, GenerationMeta>>,
+    generation_records: RwLock<HashMap<GenerationRecordKey, GenerationVectorRecord>>,
 }
 
 impl InMemoryVectorStore {
@@ -244,6 +260,253 @@ impl VectorStore for InMemoryVectorStore {
         Box::pin(async move {
             validate_identifier(life_id, "Life ID")?;
             drop(self.read_records()?);
+            Ok(())
+        })
+    }
+
+    fn create_generation<'a>(
+        &'a self,
+        context: &'a VectorGenerationContext,
+    ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
+        Box::pin(async move {
+            let mut generations = self.generations.write().map_err(|_| {
+                VectorStoreError::new(
+                    VectorStoreErrorCode::StoreUnavailable,
+                    "The in-memory vector store is unavailable.",
+                    true,
+                )
+            })?;
+            let id = context.generation_id().as_str().to_owned();
+            if let Some(existing) = generations.get(&id) {
+                if existing.descriptor_hash != context.descriptor_hash()
+                    || existing.dimension != context.dimension()
+                {
+                    return Err(VectorStoreError::new(
+                        VectorStoreErrorCode::GenerationSchemaMismatch,
+                        "The vector generation schema does not match.",
+                        false,
+                    ));
+                }
+                return Ok(());
+            }
+            generations.insert(
+                id,
+                GenerationMeta {
+                    descriptor_hash: context.descriptor_hash().to_owned(),
+                    dimension: context.dimension(),
+                },
+            );
+            Ok(())
+        })
+    }
+
+    fn upsert_generation<'a>(
+        &'a self,
+        context: &'a VectorGenerationContext,
+        record: GenerationVectorRecord,
+    ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
+        Box::pin(async move {
+            record.validate_against(context)?;
+            self.create_generation(context).await?;
+            let key = GenerationRecordKey {
+                generation_id: record.generation_id().as_str().to_owned(),
+                life_id: record.life_id().to_owned(),
+                memory_id: record.memory_id().to_owned(),
+            };
+            self.generation_records
+                .write()
+                .map_err(|_| {
+                    VectorStoreError::new(
+                        VectorStoreErrorCode::StoreUnavailable,
+                        "The in-memory vector store is unavailable.",
+                        true,
+                    )
+                })?
+                .insert(key, record);
+            Ok(())
+        })
+    }
+
+    fn delete_generation_memory<'a>(
+        &'a self,
+        context: &'a VectorGenerationContext,
+        life_id: &'a str,
+        memory_id: &'a str,
+    ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
+        Box::pin(async move {
+            validate_identifier(life_id, "Life ID")?;
+            validate_identifier(memory_id, "Memory ID")?;
+            let key = GenerationRecordKey {
+                generation_id: context.generation_id().as_str().to_owned(),
+                life_id: life_id.to_owned(),
+                memory_id: memory_id.to_owned(),
+            };
+            let _ = self
+                .generation_records
+                .write()
+                .map_err(|_| {
+                    VectorStoreError::new(
+                        VectorStoreErrorCode::StoreUnavailable,
+                        "The in-memory vector store is unavailable.",
+                        true,
+                    )
+                })?
+                .remove(&key);
+            Ok(())
+        })
+    }
+
+    fn delete_generation_life<'a>(
+        &'a self,
+        context: &'a VectorGenerationContext,
+        life_id: &'a str,
+    ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
+        Box::pin(async move {
+            validate_identifier(life_id, "Life ID")?;
+            let gen = context.generation_id().as_str();
+            self.generation_records
+                .write()
+                .map_err(|_| {
+                    VectorStoreError::new(
+                        VectorStoreErrorCode::StoreUnavailable,
+                        "The in-memory vector store is unavailable.",
+                        true,
+                    )
+                })?
+                .retain(|key, _| !(key.generation_id == gen && key.life_id == life_id));
+            Ok(())
+        })
+    }
+
+    fn count_generation<'a>(
+        &'a self,
+        context: &'a VectorGenerationContext,
+        life_id: Option<&'a str>,
+    ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
+        Box::pin(async move {
+            if let Some(life_id) = life_id {
+                validate_identifier(life_id, "Life ID")?;
+            }
+            let gen = context.generation_id().as_str();
+            let records = self.generation_records.read().map_err(|_| {
+                VectorStoreError::new(
+                    VectorStoreErrorCode::StoreUnavailable,
+                    "The in-memory vector store is unavailable.",
+                    true,
+                )
+            })?;
+            Ok(records
+                .keys()
+                .filter(|key| {
+                    key.generation_id == gen && life_id.is_none_or(|life| key.life_id == life)
+                })
+                .count())
+        })
+    }
+
+    fn sample_generation_metadata<'a>(
+        &'a self,
+        context: &'a VectorGenerationContext,
+        limit: usize,
+    ) -> VectorStoreFuture<'a, Result<Vec<VectorMetadataSample>, VectorStoreError>> {
+        Box::pin(async move {
+            if limit == 0 || limit > super::MAX_SEARCH_LIMIT {
+                return Err(VectorStoreError::new(
+                    VectorStoreErrorCode::InvalidLimit,
+                    "Metadata sample limit must be within the supported range.",
+                    false,
+                ));
+            }
+            let gen = context.generation_id().as_str();
+            let records = self.generation_records.read().map_err(|_| {
+                VectorStoreError::new(
+                    VectorStoreErrorCode::StoreUnavailable,
+                    "The in-memory vector store is unavailable.",
+                    true,
+                )
+            })?;
+            let mut samples = records
+                .values()
+                .filter(|record| record.generation_id().as_str() == gen)
+                .map(|record| VectorMetadataSample {
+                    generation_id: record.generation_id().as_str().to_owned(),
+                    life_id: record.life_id().to_owned(),
+                    memory_id: record.memory_id().to_owned(),
+                    memory_revision: record.memory_revision(),
+                    content_hash: record.content_hash().to_owned(),
+                    descriptor_hash: record.descriptor_hash().to_owned(),
+                    dimension: record.dimension(),
+                })
+                .collect::<Vec<_>>();
+            samples.sort_by(|a, b| {
+                a.life_id
+                    .cmp(&b.life_id)
+                    .then_with(|| a.memory_id.cmp(&b.memory_id))
+            });
+            samples.truncate(limit);
+            Ok(samples)
+        })
+    }
+
+    fn health_check_generation<'a>(
+        &'a self,
+        context: &'a VectorGenerationContext,
+    ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
+        Box::pin(async move {
+            let generations = self.generations.read().map_err(|_| {
+                VectorStoreError::new(
+                    VectorStoreErrorCode::StoreUnavailable,
+                    "The in-memory vector store is unavailable.",
+                    true,
+                )
+            })?;
+            let Some(meta) = generations.get(context.generation_id().as_str()) else {
+                return Err(VectorStoreError::new(
+                    VectorStoreErrorCode::GenerationNotFound,
+                    "The vector generation was not found.",
+                    true,
+                ));
+            };
+            if meta.descriptor_hash != context.descriptor_hash()
+                || meta.dimension != context.dimension()
+            {
+                return Err(VectorStoreError::new(
+                    VectorStoreErrorCode::GenerationSchemaMismatch,
+                    "The vector generation schema does not match.",
+                    false,
+                ));
+            }
+            Ok(())
+        })
+    }
+
+    fn drop_generation<'a>(
+        &'a self,
+        generation_id: &'a VectorGenerationId,
+    ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
+        Box::pin(async move {
+            let id = generation_id.as_str();
+            let _ = self
+                .generations
+                .write()
+                .map_err(|_| {
+                    VectorStoreError::new(
+                        VectorStoreErrorCode::StoreUnavailable,
+                        "The in-memory vector store is unavailable.",
+                        true,
+                    )
+                })?
+                .remove(id);
+            self.generation_records
+                .write()
+                .map_err(|_| {
+                    VectorStoreError::new(
+                        VectorStoreErrorCode::StoreUnavailable,
+                        "The in-memory vector store is unavailable.",
+                        true,
+                    )
+                })?
+                .retain(|key, _| key.generation_id != id);
             Ok(())
         })
     }

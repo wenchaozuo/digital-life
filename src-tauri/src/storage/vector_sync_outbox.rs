@@ -486,6 +486,65 @@ impl StorageService {
             FencedFinalizeResult::LostLeaseOrSuperseded
         })
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_fenced_outbox_failure_snapshot(
+        &self,
+    ) -> Result<(i64, Option<String>, String), crate::storage::StorageError> {
+        let state = self.state()?;
+        state.connection.query_row(
+            "SELECT attempt_count, last_send_disposition, last_error_code FROM memory_vector_sync_outbox",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|_| single_event_error())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_expire_fenced_runtime_lease(
+        &self,
+    ) -> Result<(), crate::storage::StorageError> {
+        let state = self.state()?;
+        state
+            .connection
+            .execute(
+                "UPDATE memory_vector_sync_runtime_lease SET expires_at='2000-01-01T00:00:00.000Z'",
+                [],
+            )
+            .map_err(|_| single_event_error())?;
+        state
+            .connection
+            .execute(
+                "UPDATE memory_vector_sync_outbox SET lease_expires_at='2000-01-01T00:00:00.000Z' WHERE state='processing'",
+                [],
+            )
+            .map_err(|_| single_event_error())?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_fenced_completion_snapshot(
+        &self,
+    ) -> Result<(String, i64, i64), crate::storage::StorageError> {
+        let state = self.state()?;
+        let job = state
+            .connection
+            .query_row(
+                "SELECT state, attempt_count FROM memory_vector_sync_outbox",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|_| single_event_error())?;
+        let items = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM memory_vector_generation_item",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| single_event_error())?;
+        Ok((job.0, job.1, items))
+    }
 }
 
 #[allow(dead_code)]
@@ -1337,6 +1396,97 @@ mod tests {
             .map(Result::unwrap)
             .collect();
         assert!(!columns.iter().any(|column| column == "mutation_sequence"));
+    }
+
+    #[test]
+    #[allow(clippy::type_complexity)]
+    fn migration_012_preserves_non_contiguous_rowids_and_maps_all_legacy_delete_states() {
+        let root = TestRoot::new();
+        let data_root = root.0.join("data");
+        fs::create_dir_all(&data_root).unwrap();
+        let database_path = data_root.join(super::super::DATABASE_FILE_NAME);
+        let connection = Connection::open(&database_path).unwrap();
+        connection.execute_batch("CREATE TABLE schema_migration (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL);").unwrap();
+        for (version, name, sql) in super::super::MIGRATIONS.iter().take(11) {
+            connection.execute_batch(sql).unwrap();
+            connection.execute("INSERT INTO schema_migration (version, name, applied_at) VALUES (?1, ?2, '2026-01-01T00:00:00Z')", params![version, name]).unwrap();
+        }
+        let fixtures = [
+            (2_i64, "upsert", "pending"),
+            (7, "delete", "pending"),
+            (19, "delete", "processing"),
+            (41, "delete", "retry_wait"),
+            (103, "delete", "blocked"),
+            (211, "delete", "failed"),
+        ];
+        for (index, (id, action, state)) in fixtures.iter().enumerate() {
+            connection
+                .execute(
+                    "INSERT INTO memory_vector_sync_outbox
+                 (id, life_id, memory_id, desired_action, state, attempt_count, last_error_code,
+                  next_attempt_at, lease_owner, lease_expires_at, created_at, updated_at)
+                 VALUES (?1, 'life', ?2, ?3, ?4, ?5, ?6, ?7, 'legacy-owner',
+                         '2099-01-01T00:00:00Z', ?8, ?9)",
+                    params![
+                        id,
+                        format!("legacy-{id}"),
+                        action,
+                        state,
+                        (index + 1) as i64,
+                        format!("OLD_{id}"),
+                        format!("2026-01-{:02}T00:00:00Z", index + 1),
+                        format!("2025-12-{:02}T00:00:00Z", index + 1),
+                        format!("2026-02-{:02}T00:00:00Z", index + 1),
+                    ],
+                )
+                .unwrap();
+        }
+        let before: Vec<(i64, i64, String, String, String, i64, String, Option<String>, String, String)> = connection.prepare(
+            "SELECT rowid, id, life_id, memory_id, desired_action, attempt_count, last_error_code, next_attempt_at, created_at, updated_at FROM memory_vector_sync_outbox ORDER BY id"
+        ).unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?))).unwrap().map(Result::unwrap).collect();
+        drop(connection);
+
+        let storage = StorageService::initialize_with_roots(data_root, None).unwrap();
+        let state = storage.state().unwrap();
+        let after: Vec<(i64, i64, String, String, String, String, i64, String, Option<String>, String, Option<String>, Option<i64>, Option<String>, Option<String>, Option<String>, Option<i64>, Option<String>)> = state.connection.prepare(
+            "SELECT rowid, id, life_id, memory_id, desired_action, state, attempt_count, last_error_code, next_attempt_at, created_at, migration_disposition, target_revision, target_content_hash, lease_owner, lease_expires_at, lease_fence_epoch, last_send_disposition FROM memory_vector_sync_outbox ORDER BY id"
+        ).unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?, row.get(10)?, row.get(11)?, row.get(12)?, row.get(13)?, row.get(14)?, row.get(15)?, row.get(16)?))).unwrap().map(Result::unwrap).collect();
+        assert_eq!(before.len(), after.len());
+        for (index, row) in after.iter().enumerate() {
+            let original = &before[index];
+            assert_eq!(
+                (row.0, row.1, &row.2, &row.3, &row.4, row.6, &row.7, &row.8, &row.9),
+                (
+                    original.0,
+                    original.1,
+                    &original.2,
+                    &original.3,
+                    &original.4,
+                    original.5,
+                    &original.6,
+                    &original.7,
+                    &original.8
+                )
+            );
+            assert_eq!(row.13, None);
+            assert_eq!(row.14, None);
+            assert_eq!(row.15, None);
+            assert_eq!(row.16, None);
+            if row.4 == "upsert" {
+                assert_eq!(row.5, "blocked");
+                assert_eq!(row.10.as_deref(), Some("legacy_upsert_rebuild_required"));
+            } else {
+                let expected = if original.4 == "delete" && fixtures[index].2 == "processing" {
+                    "pending"
+                } else {
+                    fixtures[index].2
+                };
+                assert_eq!(row.5, expected);
+                assert_eq!(row.10, None);
+                assert_eq!(row.11, None);
+                assert_eq!(row.12, None);
+            }
+        }
     }
 
     #[test]

@@ -48,6 +48,19 @@ const INITIAL_RETRY_SECONDS: u32 = 30;
 const MAX_RETRY_SECONDS: u32 = 3_600;
 const MAX_FINISHED_RUNS: usize = 20;
 
+#[cfg(test)]
+static STOP_AFTER_LANCE_UPSERT_FOR_TEST: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+fn stop_after_lance_upsert_for_test() -> bool {
+    STOP_AFTER_LANCE_UPSERT_FOR_TEST.swap(false, Ordering::AcqRel)
+}
+
+#[cfg(test)]
+fn set_stop_after_lance_upsert_for_test() {
+    STOP_AFTER_LANCE_UPSERT_FOR_TEST.store(true, Ordering::Release);
+}
+
 /// One explicit D-9D1 outbox operation.  This is deliberately separate from
 /// the legacy life-scoped drain worker: it has no loop, no profile discovery,
 /// and no authority write transaction around embedding or LanceDB I/O.
@@ -249,7 +262,15 @@ impl<'a> FencedVectorSyncSingleEventConsumer<'a> {
                     .upsert_generation(&self.generation, record)
                     .await
                 {
-                    Ok(()) => self.finalize(&claim, claim.target_content_hash(), None, false, None),
+                    Ok(()) => {
+                        #[cfg(test)]
+                        if stop_after_lance_upsert_for_test() {
+                            return Err(worker_error(
+                                MemoryVectorSyncWorkerErrorCode::InternalError,
+                            ));
+                        }
+                        self.finalize(&claim, claim.target_content_hash(), None, false, None)
+                    }
                     Err(_) => {
                         self.finalize(&claim, None, Some("VECTOR_STORE_UNAVAILABLE"), true, None)
                     }
@@ -1300,12 +1321,13 @@ mod tests {
             vector_sync_outbox::EnqueueMemoryVectorSyncRequest,
         },
         model::profile::{
-            CreateModelProfileRequest, ModelProfileService, ModelProviderKind, ModelPurpose,
-            SetActiveModelProfileRequest,
+            CreateModelProfileRequest, ModelProfile, ModelProfileService, ModelProviderKind,
+            ModelPurpose, SetActiveModelProfileRequest,
         },
         secrets::{InMemorySecretStore, SecretIdentifier, SecretPurpose, SecretStore, SecretValue},
         storage::{LifeIdentityRecord, PersonaTemplateRecord},
     };
+    use std::{io::Read, net::TcpListener, thread};
 
     use super::*;
 
@@ -1402,6 +1424,176 @@ mod tests {
         assert_eq!(job.state, MemoryVectorSyncState::Pending);
         assert_eq!(job.attempt_count, 0);
         assert!(!temp.path().join("data/vectors/lancedb").exists());
+    }
+
+    #[test]
+    fn after_lance_test_failpoint_is_one_shot_and_test_only() {
+        set_stop_after_lance_upsert_for_test();
+        assert!(stop_after_lance_upsert_for_test());
+        assert!(!stop_after_lance_upsert_for_test());
+    }
+
+    #[test]
+    fn worker_persists_real_definitely_not_sent_from_embedding_provider() {
+        let (_temp, storage) = test_storage();
+        confirmed(&storage, false);
+        let descriptor = "a".repeat(64);
+        storage
+            .register_building_vector_generation("gen-dnf", &descriptor, 3)
+            .unwrap();
+        let context = VectorGenerationContext::new(
+            crate::vector_store::VectorGenerationId::parse("gen-dnf").unwrap(),
+            descriptor,
+            3,
+        )
+        .unwrap();
+        let vectors = crate::vector_store::InMemoryVectorStore::default();
+        tauri::async_runtime::block_on(vectors.create_generation(&context)).unwrap();
+        let profile = ModelProfile {
+            id: "profile-dnf".into(),
+            purpose: ModelPurpose::Embedding,
+            provider_kind: ModelProviderKind::OpenaiCompatible,
+            display_name: "test".into(),
+            base_url: "http://127.0.0.1:9/v1".into(),
+            model_name: "test-embedding-model".into(),
+            temperature: None,
+            max_tokens: None,
+            embedding_dimension: Some(3),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        };
+        let secrets = InMemorySecretStore::new();
+        let provider =
+            crate::embedding::build_openai_compatible_embedding_provider(&profile, &secrets)
+                .unwrap();
+        let consumer = FencedVectorSyncSingleEventConsumer::new(
+            &storage,
+            provider.as_ref(),
+            &vectors,
+            context,
+        );
+        let result = tauri::async_runtime::block_on(consumer.process_one("worker-a")).unwrap();
+        assert_eq!(result, FencedVectorSyncSingleEventResult::Blocked);
+        let row = storage.test_fenced_outbox_failure_snapshot().unwrap();
+        assert_eq!(
+            row,
+            (
+                1,
+                Some("definitely_not_sent".into()),
+                "AUTHENTICATION_FAILED".into()
+            )
+        );
+    }
+
+    #[test]
+    fn worker_persists_real_possibly_sent_from_loopback_transport() {
+        let (_temp, storage) = test_storage();
+        confirmed(&storage, false);
+        let descriptor = "b".repeat(64);
+        storage
+            .register_building_vector_generation("gen-ps", &descriptor, 3)
+            .unwrap();
+        let context = VectorGenerationContext::new(
+            crate::vector_store::VectorGenerationId::parse("gen-ps").unwrap(),
+            descriptor,
+            3,
+        )
+        .unwrap();
+        let vectors = crate::vector_store::InMemoryVectorStore::default();
+        tauri::async_runtime::block_on(vectors.create_generation(&context)).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0_u8; 2048];
+            let _ = stream.read(&mut buffer);
+        });
+        let profile = ModelProfile {
+            id: "profile-ps".into(),
+            purpose: ModelPurpose::Embedding,
+            provider_kind: ModelProviderKind::OpenaiCompatible,
+            display_name: "test".into(),
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            model_name: "test-embedding-model".into(),
+            temperature: None,
+            max_tokens: None,
+            embedding_dimension: Some(3),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        };
+        let secrets = InMemorySecretStore::new();
+        secrets
+            .set_secret(
+                &SecretIdentifier::new(SecretPurpose::EmbeddingModelApiKey, profile.id.clone())
+                    .unwrap(),
+                SecretValue::new("test-placeholder".into()).unwrap(),
+            )
+            .unwrap();
+        let provider =
+            crate::embedding::build_openai_compatible_embedding_provider(&profile, &secrets)
+                .unwrap();
+        let consumer = FencedVectorSyncSingleEventConsumer::new(
+            &storage,
+            provider.as_ref(),
+            &vectors,
+            context,
+        );
+        let result = tauri::async_runtime::block_on(consumer.process_one("worker-a")).unwrap();
+        server.join().unwrap();
+        assert_eq!(result, FencedVectorSyncSingleEventResult::RetryWait);
+        let row = storage.test_fenced_outbox_failure_snapshot().unwrap();
+        assert_eq!(row.0, 1);
+        assert_eq!(row.1.as_deref(), Some("possibly_sent"));
+        assert_eq!(row.2, "NETWORK_UNAVAILABLE");
+    }
+
+    #[test]
+    fn lance_success_before_finalize_recovers_idempotently() {
+        let (temp, storage) = test_storage();
+        confirmed(&storage, false);
+        let descriptor = "c".repeat(64);
+        storage
+            .register_building_vector_generation("gen-crash", &descriptor, 3)
+            .unwrap();
+        let context = VectorGenerationContext::new(
+            crate::vector_store::VectorGenerationId::parse("gen-crash").unwrap(),
+            descriptor,
+            3,
+        )
+        .unwrap();
+        let vectors = tauri::async_runtime::block_on(
+            crate::vector_store::LanceDbVectorStore::open(temp.path().join("lance")),
+        )
+        .unwrap();
+        tauri::async_runtime::block_on(vectors.create_generation(&context)).unwrap();
+        let provider = crate::embedding::DeterministicEmbeddingProvider::new(3);
+        let consumer = FencedVectorSyncSingleEventConsumer::new(
+            &storage,
+            &provider,
+            &vectors,
+            context.clone(),
+        );
+        set_stop_after_lance_upsert_for_test();
+        let error = tauri::async_runtime::block_on(consumer.process_one("owner-a")).unwrap_err();
+        assert_eq!(error.code, MemoryVectorSyncWorkerErrorCode::InternalError);
+        assert_eq!(
+            storage.test_fenced_completion_snapshot().unwrap(),
+            ("processing".into(), 1, 0)
+        );
+        assert_eq!(
+            tauri::async_runtime::block_on(vectors.count_generation(&context, Some("life")))
+                .unwrap(),
+            1
+        );
+        storage.test_expire_fenced_runtime_lease().unwrap();
+        let result = tauri::async_runtime::block_on(consumer.process_one("owner-b")).unwrap();
+        assert_eq!(result, FencedVectorSyncSingleEventResult::Completed);
+        assert_eq!(
+            tauri::async_runtime::block_on(vectors.count_generation(&context, Some("life")))
+                .unwrap(),
+            1
+        );
+        assert!(storage.list("life").unwrap().is_empty());
     }
 
     #[test]

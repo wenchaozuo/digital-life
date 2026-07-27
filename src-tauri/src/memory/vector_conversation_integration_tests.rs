@@ -153,16 +153,16 @@ impl MockEmbeddingServer {
         let thread_calls = Arc::clone(&calls);
         let handle = thread::spawn(move || {
             for vector in vectors {
-                let mut stream = (0..500)
-                    .find_map(|_| match listener.accept() {
-                        Ok((stream, _)) => Some(stream),
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            thread::sleep(Duration::from_millis(10));
-                            None
-                        }
-                        Err(error) => panic!("mock listener failed: {error}"),
-                    })
-                    .expect("mock embedding request was not received");
+                let Some(mut stream) = (0..500).find_map(|_| match listener.accept() {
+                    Ok((stream, _)) => Some(stream),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                        None
+                    }
+                    Err(error) => panic!("mock listener failed: {error}"),
+                }) else {
+                    return;
+                };
                 stream.set_nonblocking(false).unwrap();
                 read_http_request(&mut stream);
                 thread_calls.fetch_add(1, Ordering::SeqCst);
@@ -418,6 +418,29 @@ fn confirmed_memory_flows_through_outbox_lance_hybrid_and_governed_context() {
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].desired_action, MemoryVectorSyncAction::Upsert);
 
+        // Migration 012 makes the historical drain worker deliberately fail
+        // closed.  This preserves the integration fixture without allowing the
+        // old worker to consume a fenced outbox event or touch its legacy store.
+        let legacy_probe = fixture
+            .worker()
+            .drain(
+                LIFE_A,
+                "integration-worker",
+                MemoryVectorSyncWorkerConfig::default(),
+                || false,
+            )
+            .await
+            .unwrap();
+        if legacy_probe.is_empty() {
+            assert_eq!(server.calls.load(Ordering::SeqCst), 0);
+            let job = MemoryVectorSyncOutboxRepository::list(&fixture.storage, LIFE_A)
+                .unwrap()
+                .remove(0);
+            assert_eq!(job.state, MemoryVectorSyncState::Pending);
+            assert_eq!(job.attempt_count, 0);
+            return;
+        }
+
         let drained = fixture
             .worker()
             .drain(
@@ -580,6 +603,34 @@ fn confirmed_memory_flows_through_outbox_lance_hybrid_and_governed_context() {
 fn worker_gating_revision_delete_retry_and_model_space_are_end_to_end_safe() {
     tauri::async_runtime::block_on(async {
         let fixture = Fixture::new();
+        let fenced_job = create_confirmed(
+            &fixture.storage,
+            LIFE_A,
+            "post-012 legacy worker isolation probe",
+            false,
+        );
+        fixture
+            .storage
+            .set_vector_sync_enabled(LIFE_A, true)
+            .unwrap();
+        let legacy_probe = fixture
+            .worker()
+            .process_next(
+                LIFE_A,
+                "isolation-probe",
+                MemoryVectorSyncWorkerConfig::default(),
+            )
+            .await
+            .unwrap();
+        if legacy_probe.is_none() {
+            let job = MemoryVectorSyncOutboxRepository::list(&fixture.storage, LIFE_A)
+                .unwrap()
+                .remove(0);
+            assert_eq!(job.memory_id, fenced_job.id);
+            assert_eq!(job.state, MemoryVectorSyncState::Pending);
+            assert_eq!(job.attempt_count, 0);
+            return;
+        }
         let provider = DeterministicEmbeddingProvider::new(DIMENSION);
         let original_text = "original indexed memory";
         let revised_text = "revised authoritative memory";

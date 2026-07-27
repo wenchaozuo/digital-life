@@ -15,6 +15,7 @@ use tauri::{AppHandle, Manager, State};
 
 use crate::{
     embedding::{EmbeddingProvider, EmbeddingPurpose, EmbeddingRequest},
+    model::transport::http1::SendDisposition,
     model::{
         profile::ModelProfileRepository,
         runtime::{ModelRuntimeCoordinator, ModelRuntimeErrorCode, ModelRuntimeService},
@@ -117,16 +118,25 @@ impl<'a> FencedVectorSyncSingleEventConsumer<'a> {
                 {
                     return Ok(FencedVectorSyncSingleEventResult::LostLeaseOrSuperseded);
                 }
+                if !self
+                    .storage
+                    .mark_fenced_attempt_started(&claim)
+                    .map_err(|_| worker_error(MemoryVectorSyncWorkerErrorCode::OutboxUnavailable))?
+                {
+                    return Ok(FencedVectorSyncSingleEventResult::LostLeaseOrSuperseded);
+                }
                 let outcome = self
                     .vectors
                     .delete_generation_memory(&self.generation, claim.life_id(), claim.memory_id())
                     .await;
                 match outcome {
-                    Ok(()) => self.finalize(&claim, None, None, false),
+                    Ok(()) => self.finalize(&claim, None, None, false, None),
                     Err(error) if error.code == VectorStoreErrorCode::VectorNotFound => {
-                        self.finalize(&claim, None, None, false)
+                        self.finalize(&claim, None, None, false, None)
                     }
-                    Err(_) => self.finalize(&claim, None, Some("VECTOR_STORE_UNAVAILABLE"), true),
+                    Err(_) => {
+                        self.finalize(&claim, None, Some("VECTOR_STORE_UNAVAILABLE"), true, None)
+                    }
                 }
             }
             MemoryVectorSyncAction::Upsert => {
@@ -138,12 +148,19 @@ impl<'a> FencedVectorSyncSingleEventConsumer<'a> {
                         })?
                 else {
                     return self
-                        .finalize(&claim, None, None, false)
+                        .finalize(&claim, None, Some("VECTOR_TARGET_STALE"), false, None)
                         .map(|_| FencedVectorSyncSingleEventResult::Stale);
                 };
                 if !self
                     .storage
                     .fenced_vector_claim_is_current(&claim)
+                    .map_err(|_| worker_error(MemoryVectorSyncWorkerErrorCode::OutboxUnavailable))?
+                {
+                    return Ok(FencedVectorSyncSingleEventResult::LostLeaseOrSuperseded);
+                }
+                if !self
+                    .storage
+                    .mark_fenced_attempt_started(&claim)
                     .map_err(|_| worker_error(MemoryVectorSyncWorkerErrorCode::OutboxUnavailable))?
                 {
                     return Ok(FencedVectorSyncSingleEventResult::LostLeaseOrSuperseded);
@@ -163,39 +180,79 @@ impl<'a> FencedVectorSyncSingleEventConsumer<'a> {
                             None,
                             Some(embedding_error_code(error.code())),
                             error.is_recoverable(),
+                            Some(send_disposition_code(error.send_disposition())),
                         )
                     }
                 };
-                let vector = batch
-                    .vectors()
-                    .first()
-                    .filter(|v| v.dimension() == self.generation.dimension())
-                    .ok_or_else(|| {
-                        worker_error(MemoryVectorSyncWorkerErrorCode::InvalidProviderResponse)
-                    })?;
+                let vector = batch.vectors().first().filter(|v| {
+                    batch.len() == 1
+                        && v.input_index() == 0
+                        && v.dimension() == self.generation.dimension()
+                });
+                let Some(vector) = vector else {
+                    return self.finalize(
+                        &claim,
+                        None,
+                        Some("INVALID_PROVIDER_RESPONSE"),
+                        false,
+                        None,
+                    );
+                };
+                let Some(target_revision) = claim.target_revision() else {
+                    return self.finalize(
+                        &claim,
+                        None,
+                        Some("VECTOR_TARGET_BINDING_MISSING"),
+                        false,
+                        None,
+                    );
+                };
+                let Some(target_content_hash) = claim.target_content_hash() else {
+                    return self.finalize(
+                        &claim,
+                        None,
+                        Some("VECTOR_TARGET_BINDING_MISSING"),
+                        false,
+                        None,
+                    );
+                };
                 let record = GenerationVectorRecord::try_new(
                     self.generation.generation_id().clone(),
                     claim.life_id(),
                     claim.memory_id(),
-                    claim.target_revision().ok_or_else(|| {
-                        worker_error(MemoryVectorSyncWorkerErrorCode::InvalidRequest)
-                    })?,
-                    claim.target_content_hash().ok_or_else(|| {
-                        worker_error(MemoryVectorSyncWorkerErrorCode::InvalidRequest)
-                    })?,
+                    target_revision,
+                    target_content_hash,
                     self.generation.descriptor_hash(),
                     vector.values().to_vec(),
-                )
-                .map_err(|_| {
-                    worker_error(MemoryVectorSyncWorkerErrorCode::InvalidProviderResponse)
-                })?;
+                );
+                let record = match record {
+                    Ok(record) => record,
+                    Err(_) => {
+                        return self.finalize(
+                            &claim,
+                            None,
+                            Some("INVALID_PROVIDER_RESPONSE"),
+                            false,
+                            None,
+                        )
+                    }
+                };
+                if !self
+                    .storage
+                    .fenced_vector_claim_is_current(&claim)
+                    .map_err(|_| worker_error(MemoryVectorSyncWorkerErrorCode::OutboxUnavailable))?
+                {
+                    return Ok(FencedVectorSyncSingleEventResult::LostLeaseOrSuperseded);
+                }
                 match self
                     .vectors
                     .upsert_generation(&self.generation, record)
                     .await
                 {
-                    Ok(()) => self.finalize(&claim, claim.target_content_hash(), None, false),
-                    Err(_) => self.finalize(&claim, None, Some("VECTOR_STORE_UNAVAILABLE"), true),
+                    Ok(()) => self.finalize(&claim, claim.target_content_hash(), None, false, None),
+                    Err(_) => {
+                        self.finalize(&claim, None, Some("VECTOR_STORE_UNAVAILABLE"), true, None)
+                    }
                 }
             }
         }
@@ -207,10 +264,11 @@ impl<'a> FencedVectorSyncSingleEventConsumer<'a> {
         hash: Option<&str>,
         error: Option<&str>,
         retry: bool,
+        send_disposition: Option<&str>,
     ) -> Result<FencedVectorSyncSingleEventResult, MemoryVectorSyncWorkerError> {
         let result = self
             .storage
-            .finalize_fenced_vector_sync(claim, hash, error, retry)
+            .finalize_fenced_vector_sync(claim, hash, error, retry, send_disposition)
             .map_err(|_| worker_error(MemoryVectorSyncWorkerErrorCode::OutboxUnavailable))?;
         Ok(match result {
             FencedFinalizeResult::LostLeaseOrSuperseded => {
@@ -237,6 +295,13 @@ fn embedding_error_code(code: crate::embedding::EmbeddingErrorCode) -> &'static 
         NetworkError => "NETWORK_UNAVAILABLE",
         InvalidProviderResponse | DimensionMismatch => "INVALID_PROVIDER_RESPONSE",
         InvalidRequest | EmptyText | BatchLimitExceeded | TextLimitExceeded => "INVALID_REQUEST",
+    }
+}
+
+fn send_disposition_code(disposition: SendDisposition) -> &'static str {
+    match disposition {
+        SendDisposition::DefinitelyNotSent => "definitely_not_sent",
+        SendDisposition::PossiblySent => "possibly_sent",
     }
 }
 
@@ -1229,13 +1294,6 @@ fn now_millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        io::{Read, Write},
-        net::{TcpListener, TcpStream},
-        thread,
-        time::Duration,
-    };
-
     use crate::{
         memory::{
             revisions::{DeleteMemoryPermanentlyRequest, MemoryRevisionService},
@@ -1243,95 +1301,13 @@ mod tests {
         },
         model::profile::{
             CreateModelProfileRequest, ModelProfileService, ModelProviderKind, ModelPurpose,
-            SetActiveModelProfileRequest, UpdateModelProfileRequest,
+            SetActiveModelProfileRequest,
         },
         secrets::{InMemorySecretStore, SecretIdentifier, SecretPurpose, SecretStore, SecretValue},
         storage::{LifeIdentityRecord, PersonaTemplateRecord},
     };
 
     use super::*;
-
-    struct TestServer {
-        base_url: String,
-        handle: Option<thread::JoinHandle<()>>,
-    }
-
-    impl TestServer {
-        fn response(status: &'static str, body: &'static str) -> Self {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.set_nonblocking(true).unwrap();
-            let address = listener.local_addr().unwrap();
-            let handle = thread::spawn(move || {
-                let mut stream = (0..500)
-                    .find_map(|_| match listener.accept() {
-                        Ok((stream, _)) => Some(stream),
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            thread::sleep(Duration::from_millis(10));
-                            None
-                        }
-                        Err(error) => panic!("mock listener failed: {error}"),
-                    })
-                    .expect("mock embedding request was not received");
-                stream.set_nonblocking(false).unwrap();
-                read_request(&mut stream);
-                let reply = format!(
-                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                stream.write_all(reply.as_bytes()).unwrap();
-            });
-            Self {
-                base_url: format!("http://{address}/v1"),
-                handle: Some(handle),
-            }
-        }
-
-        fn success() -> Self {
-            Self::response(
-                "200 OK",
-                r#"{"object":"list","model":"test-embedding-model","data":[{"object":"embedding","index":0,"embedding":[1.0,0.0,0.0]}]}"#,
-            )
-        }
-    }
-
-    impl Drop for TestServer {
-        fn drop(&mut self) {
-            if let Some(handle) = self.handle.take() {
-                handle.join().unwrap();
-            }
-        }
-    }
-
-    fn read_request(stream: &mut TcpStream) {
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        let mut bytes = Vec::new();
-        let mut buffer = [0u8; 1024];
-        loop {
-            let read = stream.read(&mut buffer).unwrap();
-            if read == 0 {
-                break;
-            }
-            bytes.extend_from_slice(&buffer[..read]);
-            let Some(header_end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") else {
-                continue;
-            };
-            let body_start = header_end + 4;
-            let headers = String::from_utf8_lossy(&bytes[..body_start]);
-            let length = headers
-                .lines()
-                .find_map(|line| {
-                    line.to_ascii_lowercase()
-                        .strip_prefix("content-length:")
-                        .and_then(|value| value.trim().parse::<usize>().ok())
-                })
-                .unwrap_or(0);
-            if bytes.len() >= body_start + length {
-                break;
-            }
-        }
-    }
 
     fn test_storage() -> (tempfile::TempDir, StorageService) {
         let temp = tempfile::tempdir().unwrap();
@@ -1396,22 +1372,6 @@ mod tests {
         profile.id
     }
 
-    fn update_profile_base(storage: &StorageService, profile_id: &str, base_url: &str) {
-        ModelProfileService::new(storage)
-            .update(UpdateModelProfileRequest {
-                profile_id: profile_id.to_string(),
-                purpose: ModelPurpose::Embedding,
-                provider_kind: ModelProviderKind::OpenaiCompatible,
-                display_name: "Test embedding".into(),
-                base_url: base_url.to_string(),
-                model_name: "test-embedding-model".into(),
-                temperature: None,
-                max_tokens: None,
-                embedding_dimension: Some(3),
-            })
-            .unwrap();
-    }
-
     fn secret(secrets: &InMemorySecretStore, profile_id: String, purpose: SecretPurpose) {
         secrets
             .set_secret(
@@ -1445,7 +1405,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_profile_and_embedding_credential_are_blocked_without_fallback() {
+    fn legacy_worker_never_resolves_profile_or_credential_for_post_012_outbox() {
         let (_temp, storage) = test_storage();
         storage.set_vector_sync_enabled("life", true).unwrap();
         confirmed(&storage, false);
@@ -1460,18 +1420,14 @@ mod tests {
             "worker",
             MemoryVectorSyncWorkerConfig::default(),
         ))
-        .unwrap()
         .unwrap();
-        assert_eq!(
-            result.disposition,
-            MemoryVectorSyncProcessDisposition::Blocked
-        );
+        assert!(result.is_none());
         assert_eq!(
             storage.list("life").unwrap()[0].state,
-            MemoryVectorSyncState::Blocked
+            MemoryVectorSyncState::Pending
         );
+        assert_eq!(storage.list("life").unwrap()[0].attempt_count, 0);
 
-        storage.retry_failures("life").unwrap();
         let profile = activate_profile(&storage, "http://127.0.0.1:9/v1");
         secret(&secrets, profile, SecretPurpose::ChatModelApiKey);
         let result = tauri::async_runtime::block_on(worker.process_next(
@@ -1479,27 +1435,20 @@ mod tests {
             "worker",
             MemoryVectorSyncWorkerConfig::default(),
         ))
-        .unwrap()
         .unwrap();
-        assert_eq!(
-            result.disposition,
-            MemoryVectorSyncProcessDisposition::Blocked
-        );
+        assert!(result.is_none());
         assert_eq!(
             storage.list("life").unwrap()[0].state,
-            MemoryVectorSyncState::Blocked
+            MemoryVectorSyncState::Pending
         );
     }
 
     #[test]
-    fn confirmed_non_sensitive_upsert_uses_mock_and_persists_only_derived_index() {
-        let server = TestServer::success();
+    fn legacy_worker_never_calls_provider_or_creates_a_legacy_index() {
         let (temp, storage) = test_storage();
         storage.set_vector_sync_enabled("life", true).unwrap();
         confirmed(&storage, false);
-        let profile = activate_profile(&storage, &server.base_url);
         let secrets = InMemorySecretStore::new();
-        secret(&secrets, profile, SecretPurpose::EmbeddingModelApiKey);
         let runtime = ModelRuntimeCoordinator::default();
         let stores = LanceDbVectorStoreRegistry::default();
         let worker = MemoryVectorSyncWorker::new(
@@ -1510,18 +1459,14 @@ mod tests {
             "worker",
             MemoryVectorSyncWorkerConfig::default(),
         ))
-        .unwrap()
         .unwrap();
-        assert_eq!(
-            result.disposition,
-            MemoryVectorSyncProcessDisposition::Completed
-        );
-        assert!(storage.list("life").unwrap().is_empty());
-        assert!(temp.path().join("data/vectors/lancedb").is_dir());
+        assert!(result.is_none());
+        assert_eq!(storage.list("life").unwrap().len(), 1);
+        assert!(!temp.path().join("data/vectors/lancedb").exists());
     }
 
     #[test]
-    fn sensitive_and_delete_jobs_never_need_embedding() {
+    fn legacy_worker_drain_leaves_post_012_jobs_untouched() {
         let (temp, storage) = test_storage();
         storage.set_vector_sync_enabled("life", true).unwrap();
         // Sensitive confirmed — manually enqueue upsert (fixture skips outbox for sensitive).
@@ -1555,22 +1500,17 @@ mod tests {
             || false,
         ))
         .unwrap();
-        assert_eq!(results.len(), 2);
-        assert!(results
-            .iter()
-            .all(|result| { result.disposition == MemoryVectorSyncProcessDisposition::Completed }));
-        assert!(storage.list("life").unwrap().is_empty());
+        assert!(results.is_empty());
+        assert_eq!(storage.list("life").unwrap().len(), 2);
         assert!(!temp.path().join("data/vectors/lancedb").exists());
     }
 
     #[test]
-    fn network_and_rate_limit_failures_wait_and_max_attempts_fail() {
+    fn legacy_worker_never_starts_an_external_attempt() {
         let (_temp, storage) = test_storage();
         storage.set_vector_sync_enabled("life", true).unwrap();
-        let memory = confirmed(&storage, false);
-        let profile = activate_profile(&storage, "http://127.0.0.1:9/v1");
+        confirmed(&storage, false);
         let secrets = InMemorySecretStore::new();
-        secret(&secrets, profile, SecretPurpose::EmbeddingModelApiKey);
         let runtime = ModelRuntimeCoordinator::default();
         let stores = LanceDbVectorStoreRegistry::default();
         let worker = MemoryVectorSyncWorker::new(
@@ -1581,105 +1521,11 @@ mod tests {
             "worker",
             MemoryVectorSyncWorkerConfig::default(),
         ))
-        .unwrap()
         .unwrap();
-        assert_eq!(
-            result.disposition,
-            MemoryVectorSyncProcessDisposition::RetryWait
-        );
-        assert_eq!(
-            storage.list("life").unwrap()[0].state,
-            MemoryVectorSyncState::RetryWait
-        );
-
-        storage.retry_failures("life").unwrap();
-        for attempt in 0..4 {
-            storage
-                .claim_next(
-                    super::super::vector_sync_outbox::ClaimMemoryVectorSyncRequest {
-                        life_id: "life".into(),
-                        lease_owner: format!("attempt-{attempt}"),
-                        lease_expires_at: "2999-01-01T00:00:00.000Z".into(),
-                    },
-                )
-                .unwrap()
-                .unwrap();
-            storage
-                .mark_retry(
-                    "life",
-                    &memory.id,
-                    &format!("attempt-{attempt}"),
-                    "2000-01-01T00:00:00.000Z",
-                    "NETWORK_UNAVAILABLE",
-                )
-                .unwrap();
-        }
-        let result = tauri::async_runtime::block_on(worker.process_next(
-            "life",
-            "worker",
-            MemoryVectorSyncWorkerConfig::default(),
-        ))
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            result.disposition,
-            MemoryVectorSyncProcessDisposition::Failed
-        );
-        assert_eq!(
-            storage.list("life").unwrap()[0].state,
-            MemoryVectorSyncState::Failed
-        );
-
-        let rate_server = TestServer::response("429 Too Many Requests", "{}");
-        let active = ModelProfileService::new(&storage)
-            .get_active(ModelPurpose::Embedding)
-            .unwrap()
-            .unwrap();
-        update_profile_base(&storage, &active.profile_id, &rate_server.base_url);
-        storage.retry_failures("life").unwrap();
-        let result = tauri::async_runtime::block_on(worker.process_next(
-            "life",
-            "worker",
-            MemoryVectorSyncWorkerConfig::default(),
-        ))
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            result.disposition,
-            MemoryVectorSyncProcessDisposition::RetryWait
-        );
-
-        let invalid_server = TestServer::response("200 OK", "{}");
-        storage.retry_failures("life").unwrap();
-        update_profile_base(&storage, &active.profile_id, &invalid_server.base_url);
-        let result = tauri::async_runtime::block_on(worker.process_next(
-            "life",
-            "worker",
-            MemoryVectorSyncWorkerConfig::default(),
-        ))
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            result.disposition,
-            MemoryVectorSyncProcessDisposition::Failed
-        );
-
-        let auth_server = TestServer::response("401 Unauthorized", "{}");
-        storage.retry_failures("life").unwrap();
-        update_profile_base(&storage, &active.profile_id, &auth_server.base_url);
-        let result = tauri::async_runtime::block_on(worker.process_next(
-            "life",
-            "worker",
-            MemoryVectorSyncWorkerConfig::default(),
-        ))
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            result.disposition,
-            MemoryVectorSyncProcessDisposition::Blocked
-        );
-        assert_eq!(retry_delay(1), 30);
-        assert_eq!(retry_delay(5), 480);
+        assert!(result.is_none());
+        let job = storage.list("life").unwrap().remove(0);
+        assert_eq!(job.state, MemoryVectorSyncState::Pending);
+        assert_eq!(job.attempt_count, 0);
     }
 
     #[test]

@@ -306,7 +306,8 @@ impl<'a> FencedVectorSyncSingleEventConsumer<'a> {
                             ));
                         }
                         #[cfg(test)]
-                        check_test_pause_point(VectorSyncTestPausePoint::AfterLanceBeforeFinalize).await;
+                        check_test_pause_point(VectorSyncTestPausePoint::AfterLanceBeforeFinalize)
+                            .await;
                         self.finalize(&claim, claim.target_content_hash(), None, false, None)
                     }
                     Err(_) => {
@@ -1466,6 +1467,7 @@ mod tests {
 
     #[test]
     fn after_lance_test_failpoint_is_one_shot_and_test_only() {
+        let _hook_guard = TEST_HOOK_MUTEX.lock().unwrap();
         set_stop_after_lance_upsert_for_test();
         assert!(stop_after_lance_upsert_for_test());
         assert!(!stop_after_lance_upsert_for_test());
@@ -1587,6 +1589,7 @@ mod tests {
 
     #[test]
     fn lance_success_before_finalize_recovers_idempotently() {
+        let _hook_guard = TEST_HOOK_MUTEX.lock().unwrap();
         let (temp, storage) = test_storage();
         confirmed(&storage, false);
         let descriptor = "c".repeat(64);
@@ -1805,12 +1808,12 @@ mod tests {
         .is_err());
     }
 
-    use std::sync::atomic::AtomicUsize;
     use crate::embedding::{EmbeddingBatch, EmbeddingError, EmbeddingFuture, EmbeddingModelInfo};
     use crate::vector_store::{
         VectorRecord, VectorSearchHit, VectorSearchQuery, VectorSpace, VectorStoreError,
         VectorStoreFuture,
     };
+    use std::sync::atomic::AtomicUsize;
 
     struct CountingEmbeddingProvider<P> {
         inner: P,
@@ -1950,7 +1953,8 @@ mod tests {
             memory_id: &'a str,
         ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
             self.lance_deletes.fetch_add(1, Ordering::SeqCst);
-            self.inner.delete_generation_memory(context, life_id, memory_id)
+            self.inner
+                .delete_generation_memory(context, life_id, memory_id)
         }
 
         fn delete_generation_life<'a>(
@@ -2007,8 +2011,11 @@ mod tests {
         }
     }
 
+    static TEST_HOOK_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn fence_lost_before_embedding_has_zero_io() {
+        let _hook_guard = TEST_HOOK_MUTEX.lock().unwrap();
         let (_temp, storage) = test_storage();
         let storage = Arc::new(storage);
         confirmed(&storage, false);
@@ -2080,7 +2087,10 @@ mod tests {
         let result = tauri::async_runtime::block_on(consumer.process_one("worker-a")).unwrap();
         set_test_pause_hook(None);
 
-        assert_eq!(result, FencedVectorSyncSingleEventResult::LostLeaseOrSuperseded);
+        assert_eq!(
+            result,
+            FencedVectorSyncSingleEventResult::LostLeaseOrSuperseded
+        );
         assert_eq!(provider_requests.load(Ordering::SeqCst), 0);
         assert_eq!(credential_reads.load(Ordering::SeqCst), 0);
         assert_eq!(embedding_successes.load(Ordering::SeqCst), 0);
@@ -2095,6 +2105,7 @@ mod tests {
 
     #[test]
     fn fence_lost_after_embedding_before_lance_has_zero_lance_writes() {
+        let _hook_guard = TEST_HOOK_MUTEX.lock().unwrap();
         let (_temp, storage) = test_storage();
         let storage = Arc::new(storage);
         confirmed(&storage, false);
@@ -2153,6 +2164,7 @@ mod tests {
                     .unwrap()
                     .expect("worker-b claim must succeed");
                 *claim_b_slot_clone.lock().unwrap() = Some(cb);
+                set_test_pause_hook(None);
             }
         }))));
 
@@ -2166,13 +2178,44 @@ mod tests {
         let result = tauri::async_runtime::block_on(consumer.process_one("worker-a")).unwrap();
         set_test_pause_hook(None);
 
-        assert_eq!(result, FencedVectorSyncSingleEventResult::LostLeaseOrSuperseded);
+        assert_eq!(
+            result,
+            FencedVectorSyncSingleEventResult::LostLeaseOrSuperseded
+        );
+        assert_eq!(credential_reads.load(Ordering::SeqCst), 0);
         assert_eq!(provider_requests.load(Ordering::SeqCst), 1);
         assert_eq!(embedding_successes.load(Ordering::SeqCst), 1);
         assert_eq!(lance_upserts.load(Ordering::SeqCst), 0);
+        assert_eq!(lance_deletes.load(Ordering::SeqCst), 0);
         assert_eq!(storage.test_generation_item_count().unwrap(), 0);
 
         let claim_b = claim_b_slot.lock().unwrap().take().unwrap();
+        let snap_mid = storage
+            .test_get_outbox_snapshot_detailed("life", claim_b.memory_id())
+            .unwrap();
+        assert_eq!(snap_mid.total_count, 1, "Phase B: Outbox event intact");
+        assert_eq!(
+            snap_mid.state, "processing",
+            "Phase B: State remains processing for worker-b"
+        );
+        assert_eq!(
+            snap_mid.lease_owner.as_deref(),
+            Some("worker-b"),
+            "Phase B: Owner is worker-b"
+        );
+        assert_eq!(
+            snap_mid.last_error_code, None,
+            "Phase B: No error code written by old owner"
+        );
+        assert_eq!(
+            snap_mid.last_send_disposition, None,
+            "Phase B: No send disposition written by old owner"
+        );
+        assert_eq!(
+            snap_mid.attempt_count, 1,
+            "Phase B: attempt_count not extra incremented"
+        );
+
         let result_b = tauri::async_runtime::block_on(consumer.execute_claim(claim_b)).unwrap();
         assert_eq!(result_b, FencedVectorSyncSingleEventResult::Completed);
         assert_eq!(storage.test_generation_item_count().unwrap(), 1);
@@ -2180,6 +2223,7 @@ mod tests {
 
     #[test]
     fn stale_token_cannot_write_after_lance_and_fence_takeover() {
+        let _hook_guard = TEST_HOOK_MUTEX.lock().unwrap();
         let (temp, storage) = test_storage();
         confirmed(&storage, false);
         let descriptor = "c".repeat(64);
@@ -2211,7 +2255,10 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let doc = storage.read_fenced_vector_document(&claim_a).unwrap().unwrap();
+        let doc = storage
+            .read_fenced_vector_document(&claim_a)
+            .unwrap()
+            .unwrap();
         let batch = tauri::async_runtime::block_on(provider.embed(EmbeddingRequest {
             texts: vec![doc],
             purpose: EmbeddingPurpose::Document,
@@ -2252,7 +2299,13 @@ mod tests {
         assert!(!storage.mark_fenced_attempt_started(&claim_a).unwrap());
         assert_eq!(
             storage
-                .finalize_fenced_vector_sync(&claim_a, claim_a.target_content_hash(), None, false, None)
+                .finalize_fenced_vector_sync(
+                    &claim_a,
+                    claim_a.target_content_hash(),
+                    None,
+                    false,
+                    None
+                )
                 .unwrap(),
             FencedFinalizeResult::LostLeaseOrSuperseded
         );
@@ -2276,6 +2329,17 @@ mod tests {
         assert_eq!(snap.total_count, 1);
         assert_eq!(snap.state, "processing");
         assert_eq!(snap.lease_owner.as_deref(), Some("worker-b"));
+        assert_eq!(snap.attempt_count, 0);
+        assert_eq!(snap.last_error_code, None);
+        assert_eq!(snap.last_send_disposition, None);
+        assert_eq!(snap.mutation_sequence, claim_a.mutation_sequence());
+        assert_eq!(snap.desired_action, "upsert");
+        assert_eq!(snap.target_revision, claim_a.target_revision());
+        assert_eq!(
+            snap.target_content_hash.as_deref(),
+            claim_a.target_content_hash()
+        );
+        assert_eq!(snap.claimed_generation_id.as_deref(), Some("gen-pc"));
 
         let consumer_b = FencedVectorSyncSingleEventConsumer::new(
             &storage,

@@ -1343,7 +1343,9 @@ fn supersession_matrix_rejects_all_old_token_writes_and_clears_claimed_generatio
                     .unwrap();
             }
             NewAction::RevisionUpdate => {
-                use crate::memory::revisions::{MemoryRevisionRepository, MemoryRevisionService, UpdateConfirmedMemoryRequest};
+                use crate::memory::revisions::{
+                    MemoryRevisionRepository, MemoryRevisionService, UpdateConfirmedMemoryRequest,
+                };
 
                 let cur_revision = storage.current_revision(life_id, &mem_id).unwrap();
                 let revision_service = MemoryRevisionService::new(storage);
@@ -1401,7 +1403,10 @@ fn supersession_matrix_rejects_all_old_token_writes_and_clears_claimed_generatio
                 assert!(snap.target_content_hash.is_none());
             }
         }
-        assert_eq!(snap.state, "pending", "Case {case_num}: state reset to pending");
+        assert_eq!(
+            snap.state, "pending",
+            "Case {case_num}: state reset to pending"
+        );
         assert_eq!(
             snap.claimed_generation_id, None,
             "Case {case_num}: claimed_generation_id IS NULL"
@@ -1470,6 +1475,13 @@ fn supersession_matrix_rejects_all_old_token_writes_and_clears_claimed_generatio
         if let Some(ref claim_a) = old_claim {
             assert_ne!(claim_b.fence_epoch(), claim_a.fence_epoch());
         }
+        assert!(
+            storage
+                .claim_one_fenced_vector_sync("gen-matrix", &descriptor, 3, "worker-b")
+                .unwrap()
+                .is_none(),
+            "Case {case_num}: only one item claimed"
+        );
 
         // Finalize claim_b to leave outbox clean for next case iteration
         let hash = claim_b.target_content_hash().map(|s| s.to_string());
@@ -1528,17 +1540,29 @@ fn concurrent_two_connections_competition_safety() {
         })
         .unwrap();
 
-    // Worker A on Connection A attempts to finalize with old claim token
+    // Worker A on Connection A attempts writes with old claim token
+    assert!(!storage.mark_fenced_attempt_started(&claim_a).unwrap());
     let res = storage
+        .finalize_fenced_vector_sync(&claim_a, claim_a.target_content_hash(), None, false, None)
+        .unwrap();
+    assert_eq!(
+        res,
+        crate::storage::FencedFinalizeResult::LostLeaseOrSuperseded
+    );
+
+    let res_fail = storage
         .finalize_fenced_vector_sync(
             &claim_a,
-            claim_a.target_content_hash(),
             None,
-            false,
-            None,
+            Some("STALE_ERR"),
+            true,
+            Some("definitely_not_sent"),
         )
         .unwrap();
-    assert_eq!(res, crate::storage::FencedFinalizeResult::LostLeaseOrSuperseded);
+    assert_eq!(
+        res_fail,
+        crate::storage::FencedFinalizeResult::LostLeaseOrSuperseded
+    );
 
     // Verify Connection B's new mutation is completely intact in SQLite
     let snap = storage

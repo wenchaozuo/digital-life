@@ -661,15 +661,16 @@ impl StorageService {
     }
 
     #[cfg(test)]
-    pub(crate) fn test_generation_item_count(
-        &self,
-    ) -> Result<usize, crate::storage::StorageError> {
+    pub(crate) fn test_generation_item_count(&self) -> Result<usize, crate::storage::StorageError> {
         let state = self.state()?;
-        state.connection.query_row(
-            "SELECT COUNT(*) FROM memory_vector_generation_item",
-            [],
-            |r| r.get(0),
-        ).map_err(|_| single_event_error())
+        state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM memory_vector_generation_item",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|_| single_event_error())
     }
 }
 

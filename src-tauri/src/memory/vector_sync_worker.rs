@@ -1979,6 +1979,15 @@ mod tests {
         credential_reads: Arc<AtomicUsize>,
     }
 
+    impl<S> CountingSecretStore<S> {
+        fn new(inner: S, credential_reads: Arc<AtomicUsize>) -> Self {
+            Self {
+                inner,
+                credential_reads,
+            }
+        }
+    }
+
     impl<S: SecretStore> SecretStore for CountingSecretStore<S> {
         fn set_secret(
             &self,
@@ -2052,13 +2061,12 @@ mod tests {
 
         let raw_secrets = InMemorySecretStore::new();
         let credential_reads = Arc::new(AtomicUsize::new(0));
-        let _secrets = CountingSecretStore {
-            inner: raw_secrets,
-            credential_reads: Arc::clone(&credential_reads),
-        };
+        let _secrets = CountingSecretStore::new(raw_secrets, Arc::clone(&credential_reads));
 
         let claim_b_slot = Arc::new(std::sync::Mutex::new(None));
+        let snap_b_takeover_slot = Arc::new(std::sync::Mutex::new(None));
         let claim_b_slot_clone = Arc::clone(&claim_b_slot);
+        let snap_b_takeover_slot_clone = Arc::clone(&snap_b_takeover_slot);
         let storage_clone = Arc::clone(&storage);
         let context_clone = context.clone();
         set_test_pause_hook(Some(Arc::new(Box::new(move |point| {
@@ -2073,6 +2081,10 @@ mod tests {
                     )
                     .unwrap()
                     .expect("worker-b claim must succeed");
+                let snap = storage_clone
+                    .test_get_outbox_snapshot_detailed("life", cb.memory_id())
+                    .unwrap();
+                *snap_b_takeover_slot_clone.lock().unwrap() = Some(snap);
                 *claim_b_slot_clone.lock().unwrap() = Some(cb);
             }
         }))));
@@ -2095,9 +2107,19 @@ mod tests {
         assert_eq!(credential_reads.load(Ordering::SeqCst), 0);
         assert_eq!(embedding_successes.load(Ordering::SeqCst), 0);
         assert_eq!(lance_upserts.load(Ordering::SeqCst), 0);
+        assert_eq!(lance_deletes.load(Ordering::SeqCst), 0);
         assert_eq!(storage.test_generation_item_count().unwrap(), 0);
 
         let claim_b = claim_b_slot.lock().unwrap().take().unwrap();
+        let snap_b_takeover = snap_b_takeover_slot.lock().unwrap().take().unwrap();
+        let snap_after_worker_a = storage
+            .test_get_outbox_snapshot_detailed("life", claim_b.memory_id())
+            .unwrap();
+        assert_eq!(
+            snap_b_takeover, snap_after_worker_a,
+            "Phase A: Worker A produced ZERO side-effects on Outbox snapshot"
+        );
+
         let result_b = tauri::async_runtime::block_on(consumer.execute_claim(claim_b)).unwrap();
         assert_eq!(result_b, FencedVectorSyncSingleEventResult::Completed);
         assert_eq!(storage.test_generation_item_count().unwrap(), 1);
@@ -2131,21 +2153,66 @@ mod tests {
             lance_deletes: Arc::clone(&lance_deletes),
         };
 
-        let raw_provider = crate::embedding::DeterministicEmbeddingProvider::new(3);
+        // Real D-8 Loopback HTTP Server
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
         let provider_requests = Arc::new(AtomicUsize::new(0));
-        let embedding_successes = Arc::new(AtomicUsize::new(0));
-        let provider = CountingEmbeddingProvider {
-            inner: raw_provider,
-            provider_requests: Arc::clone(&provider_requests),
-            embedding_successes: Arc::clone(&embedding_successes),
+        let provider_requests_clone = Arc::clone(&provider_requests);
+
+        let server_handle = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut buffer = [0_u8; 2048];
+                let _ = stream.read(&mut buffer);
+                provider_requests_clone.fetch_add(1, Ordering::SeqCst);
+                let body = r#"{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1,0.2,0.3]}],"model":"test-embedding-model","usage":{"prompt_tokens":1,"total_tokens":1}}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let profile = ModelProfile {
+            id: "profile-pb".into(),
+            purpose: ModelPurpose::Embedding,
+            provider_kind: ModelProviderKind::OpenaiCompatible,
+            display_name: "Phase B Loopback".into(),
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            model_name: "test-embedding-model".into(),
+            temperature: None,
+            max_tokens: None,
+            embedding_dimension: Some(3),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
         };
 
         let raw_secrets = InMemorySecretStore::new();
+        let secret_id = crate::secrets::SecretIdentifier::new(
+            crate::secrets::SecretPurpose::EmbeddingModelApiKey,
+            profile.id.clone(),
+        )
+        .unwrap();
+        raw_secrets
+            .set_secret(
+                &secret_id,
+                crate::secrets::SecretValue::new("test-key".into()).unwrap(),
+            )
+            .unwrap();
+
         let credential_reads = Arc::new(AtomicUsize::new(0));
-        let _secrets = CountingSecretStore {
-            inner: raw_secrets,
-            credential_reads: Arc::clone(&credential_reads),
-        };
+        let counting_secrets = CountingSecretStore::new(raw_secrets, Arc::clone(&credential_reads));
+
+        let provider = crate::embedding::build_openai_compatible_embedding_provider(
+            &profile,
+            &counting_secrets,
+        )
+        .unwrap();
 
         let claim_b_slot = Arc::new(std::sync::Mutex::new(None));
         let claim_b_slot_clone = Arc::clone(&claim_b_slot);
@@ -2170,7 +2237,7 @@ mod tests {
 
         let consumer = FencedVectorSyncSingleEventConsumer::new(
             storage.as_ref(),
-            &provider,
+            provider.as_ref(),
             &vectors,
             context.clone(),
         );
@@ -2182,9 +2249,8 @@ mod tests {
             result,
             FencedVectorSyncSingleEventResult::LostLeaseOrSuperseded
         );
-        assert_eq!(credential_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(credential_reads.load(Ordering::SeqCst), 1);
         assert_eq!(provider_requests.load(Ordering::SeqCst), 1);
-        assert_eq!(embedding_successes.load(Ordering::SeqCst), 1);
         assert_eq!(lance_upserts.load(Ordering::SeqCst), 0);
         assert_eq!(lance_deletes.load(Ordering::SeqCst), 0);
         assert_eq!(storage.test_generation_item_count().unwrap(), 0);
@@ -2217,8 +2283,11 @@ mod tests {
         );
 
         let result_b = tauri::async_runtime::block_on(consumer.execute_claim(claim_b)).unwrap();
+        server_handle.join().unwrap();
         assert_eq!(result_b, FencedVectorSyncSingleEventResult::Completed);
         assert_eq!(storage.test_generation_item_count().unwrap(), 1);
+        assert_eq!(credential_reads.load(Ordering::SeqCst), 2);
+        assert_eq!(provider_requests.load(Ordering::SeqCst), 2);
     }
 
     #[test]

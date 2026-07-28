@@ -1309,9 +1309,58 @@ fn supersession_matrix_rejects_all_old_token_writes_and_clears_claimed_generatio
                     .unwrap()
             }
             InitialState::QuarantinedLegacy => {
+                // Section IX & X & XI: Stage 1 Quarantine Fixture
                 storage
                     .test_insert_legacy_quarantine_fixture(life_id, &mem_id)
                     .unwrap();
+
+                let snap_q = storage
+                    .test_get_outbox_snapshot_detailed(life_id, &mem_id)
+                    .unwrap();
+                assert_eq!(
+                    snap_q.state, "blocked",
+                    "Stage 1 Quarantine: state must be blocked"
+                );
+                assert_eq!(
+                    snap_q.migration_disposition.as_deref(),
+                    Some("legacy_upsert_rebuild_required"),
+                    "Stage 1 Quarantine: disposition required"
+                );
+                assert_eq!(
+                    snap_q.lease_owner, None,
+                    "Stage 1 Quarantine: lease_owner IS NULL"
+                );
+                assert_eq!(
+                    snap_q.lease_fence_epoch, None,
+                    "Stage 1 Quarantine: lease_fence_epoch IS NULL"
+                );
+                assert_eq!(
+                    snap_q.lease_expires_at, None,
+                    "Stage 1 Quarantine: lease_expires_at IS NULL"
+                );
+                assert_eq!(
+                    snap_q.claimed_generation_id, None,
+                    "Stage 1 Quarantine: claimed_generation_id IS NULL"
+                );
+                assert!(
+                    snap_q.claimed_generation_id_is_null,
+                    "Stage 1 Quarantine: claimed_generation_id_is_null IS true"
+                );
+                assert_eq!(
+                    snap_q.target_revision, None,
+                    "Stage 1 Quarantine: target_revision IS NULL"
+                );
+                assert_eq!(
+                    snap_q.target_content_hash, None,
+                    "Stage 1 Quarantine: target_content_hash IS NULL"
+                );
+                assert!(
+                    storage
+                        .claim_one_fenced_vector_sync("gen-matrix", &descriptor, 3, "worker-a")
+                        .unwrap()
+                        .is_none(),
+                    "Stage 1 Quarantine: fenced claim returns None"
+                );
                 None
             }
         };
@@ -1379,6 +1428,10 @@ fn supersession_matrix_rejects_all_old_token_writes_and_clears_claimed_generatio
             "Case {case_num}: lease_fence_epoch IS NULL required"
         );
         assert_eq!(
+            snap.lease_expires_at, None,
+            "Case {case_num}: lease_expires_at IS NULL required"
+        );
+        assert_eq!(
             snap.last_send_disposition, None,
             "Case {case_num}: last_send_disposition IS NULL"
         );
@@ -1420,8 +1473,9 @@ fn supersession_matrix_rejects_all_old_token_writes_and_clears_claimed_generatio
             "Case {case_num}: last_error_code IS NULL"
         );
 
-        // Old Token 3 Write Operations Invalid (Section X)
+        // Stage 2 Supersession for Legacy Quarantine (Cases 6 & 7) vs Cases 1-5
         if let Some(ref claim_a) = old_claim {
+            // Cases 1-5: Old token writes invalid
             assert!(
                 !storage.mark_fenced_attempt_started(claim_a).unwrap(),
                 "Case {case_num}: old attempt_started must return false"
@@ -1461,33 +1515,84 @@ fn supersession_matrix_rejects_all_old_token_writes_and_clears_claimed_generatio
                 snap, snap_after,
                 "Case {case_num}: snapshot unchanged after stale writes"
             );
-        }
 
-        // New Owner Re-claim (Section XI)
-        storage.test_expire_fenced_runtime_lease().unwrap();
-        let claim_b = storage
-            .claim_one_fenced_vector_sync("gen-matrix", &descriptor, 3, "worker-b")
-            .unwrap()
-            .unwrap();
-        assert_eq!(claim_b.memory_id(), mem_id);
-        assert_eq!(claim_b.mutation_sequence(), snap.mutation_sequence);
-        assert_eq!(claim_b.lease_owner(), "worker-b");
-        if let Some(ref claim_a) = old_claim {
-            assert_ne!(claim_b.fence_epoch(), claim_a.fence_epoch());
-        }
-        assert!(
-            storage
+            // New Owner Re-claim (Section XI)
+            storage.test_expire_fenced_runtime_lease().unwrap();
+            let claim_b = storage
                 .claim_one_fenced_vector_sync("gen-matrix", &descriptor, 3, "worker-b")
                 .unwrap()
-                .is_none(),
-            "Case {case_num}: only one item claimed"
-        );
+                .unwrap();
+            assert_eq!(claim_b.memory_id(), mem_id);
+            assert_eq!(claim_b.mutation_sequence(), snap.mutation_sequence);
+            assert_eq!(claim_b.lease_owner(), "worker-b");
+            assert_ne!(claim_b.fence_epoch(), claim_a.fence_epoch());
 
-        // Finalize claim_b to leave outbox clean for next case iteration
-        let hash = claim_b.target_content_hash().map(|s| s.to_string());
-        storage
-            .finalize_fenced_vector_sync(&claim_b, hash.as_deref(), None, false, None)
-            .unwrap();
+            let hash = claim_b.target_content_hash().map(|s| s.to_string());
+            storage
+                .finalize_fenced_vector_sync(&claim_b, hash.as_deref(), None, false, None)
+                .unwrap();
+        } else {
+            // Cases 6 & 7 Stage 2: Claim Stage 2 mutation as worker-a, write a 2nd mutation, verify worker-a claim is superseded
+            let claim_s2_a = storage
+                .claim_one_fenced_vector_sync("gen-matrix", &descriptor, 3, "worker-a")
+                .unwrap()
+                .unwrap();
+            assert_eq!(claim_s2_a.memory_id(), mem_id);
+
+            // Enqueue 2nd mutation to supersede Stage 2 claim
+            storage
+                .enqueue(EnqueueMemoryVectorSyncRequest {
+                    life_id: life_id.into(),
+                    memory_id: mem_id.clone(),
+                    desired_action: MemoryVectorSyncAction::Delete,
+                })
+                .unwrap();
+
+            assert!(
+                !storage.mark_fenced_attempt_started(&claim_s2_a).unwrap(),
+                "Case {case_num}: Stage 2 old attempt_started must return false"
+            );
+            assert_eq!(
+                storage
+                    .finalize_fenced_vector_sync(
+                        &claim_s2_a,
+                        claim_s2_a.target_content_hash(),
+                        None,
+                        false,
+                        None
+                    )
+                    .unwrap(),
+                crate::storage::FencedFinalizeResult::LostLeaseOrSuperseded,
+                "Case {case_num}: Stage 2 old success finalize must be LostLeaseOrSuperseded"
+            );
+            assert_eq!(
+                storage
+                    .finalize_fenced_vector_sync(
+                        &claim_s2_a,
+                        None,
+                        Some("STALE_ERR"),
+                        true,
+                        Some("definitely_not_sent")
+                    )
+                    .unwrap(),
+                crate::storage::FencedFinalizeResult::LostLeaseOrSuperseded,
+                "Case {case_num}: Stage 2 old failure finalize must be LostLeaseOrSuperseded"
+            );
+
+            storage.test_expire_fenced_runtime_lease().unwrap();
+            let claim_b = storage
+                .claim_one_fenced_vector_sync("gen-matrix", &descriptor, 3, "worker-b")
+                .unwrap()
+                .unwrap();
+            assert_eq!(claim_b.memory_id(), mem_id);
+            assert_eq!(claim_b.lease_owner(), "worker-b");
+            assert_ne!(claim_b.fence_epoch(), claim_s2_a.fence_epoch());
+
+            let hash = claim_b.target_content_hash().map(|s| s.to_string());
+            storage
+                .finalize_fenced_vector_sync(&claim_b, hash.as_deref(), None, false, None)
+                .unwrap();
+        }
     }
 }
 
@@ -1571,5 +1676,6 @@ fn concurrent_two_connections_competition_safety() {
     assert_eq!(snap.total_count, 1);
     assert_eq!(snap.desired_action, "delete");
     assert_eq!(snap.state, "pending");
+    assert_eq!(snap.lease_expires_at, None);
     assert!(snap.claimed_generation_id_is_null); // claimed_generation_id IS NULL
 }

@@ -575,8 +575,8 @@ impl StorageService {
             .map_err(|_| single_event_error())?;
         let row = state.connection.query_row(
             "SELECT id, desired_action, mutation_sequence, target_revision, target_content_hash,
-                    state, attempt_count, lease_owner, lease_fence_epoch, claimed_generation_id,
-                    (claimed_generation_id IS NULL), migration_disposition, last_error_code, last_send_disposition
+                    state, attempt_count, lease_owner, lease_fence_epoch, lease_expires_at, claimed_generation_id,
+                    (claimed_generation_id IS NULL), migration_disposition, last_error_code, last_send_disposition, next_attempt_at
              FROM memory_vector_sync_outbox WHERE life_id=?1 AND memory_id=?2",
             params![life_id, memory_id],
             |r| {
@@ -591,10 +591,12 @@ impl StorageService {
                     r.get(7)?,
                     r.get(8)?,
                     r.get(9)?,
-                    r.get::<_, i64>(10)? == 1,
-                    r.get(11)?,
+                    r.get(10)?,
+                    r.get::<_, i64>(11)? == 1,
                     r.get(12)?,
                     r.get(13)?,
+                    r.get(14)?,
+                    r.get(15)?,
                 ))
             },
         ).map_err(|_| single_event_error())?;
@@ -609,11 +611,13 @@ impl StorageService {
             attempt_count: row.6,
             lease_owner: row.7,
             lease_fence_epoch: row.8,
-            claimed_generation_id: row.9,
-            claimed_generation_id_is_null: row.10,
-            migration_disposition: row.11,
-            last_error_code: row.12,
-            last_send_disposition: row.13,
+            lease_expires_at: row.9,
+            claimed_generation_id: row.10,
+            claimed_generation_id_is_null: row.11,
+            migration_disposition: row.12,
+            last_error_code: row.13,
+            last_send_disposition: row.14,
+            next_attempt_at: row.15,
         })
     }
 
@@ -687,11 +691,13 @@ pub(crate) struct OutboxSnapshotDetailed {
     pub attempt_count: i64,
     pub lease_owner: Option<String>,
     pub lease_fence_epoch: Option<i64>,
+    pub lease_expires_at: Option<String>,
     pub claimed_generation_id: Option<String>,
     pub claimed_generation_id_is_null: bool,
     pub migration_disposition: Option<String>,
     pub last_error_code: Option<String>,
     pub last_send_disposition: Option<String>,
+    pub next_attempt_at: Option<String>,
 }
 
 #[allow(dead_code)]

@@ -1601,16 +1601,43 @@ fn concurrent_two_connections_competition_safety() {
     use crate::memory::vector_sync_outbox::{
         EnqueueMemoryVectorSyncRequest, MemoryVectorSyncOutboxRepository,
     };
+    use std::sync::mpsc;
 
-    let fixture = Fixture::new();
-    let storage = &fixture.storage;
+    let temp = tempfile::tempdir().unwrap();
+    let data_root = temp.path().join("data");
+    let storage_a = StorageService::initialize_with_roots(data_root.clone(), None).unwrap();
+    storage_a
+        .save_persona(PersonaTemplateRecord {
+            id: "persona-a".into(),
+            name: "Persona A".into(),
+            version: 1,
+            persona_json: r#"{"id":"persona-a","name":"Persona A","version":1}"#.into(),
+        })
+        .unwrap();
+    storage_a
+        .save_life(LifeIdentityRecord {
+            id: LIFE_A.into(),
+            name: "Life A".into(),
+            created_at: "2026-07-13T00:00:00.000Z".into(),
+            version: 1,
+            body_id: "test-body".into(),
+            persona_id: "persona-a".into(),
+            persona_version: 1,
+        })
+        .unwrap();
+    let storage_b = StorageService::initialize_with_roots(data_root, None).unwrap();
+    let database_a = storage_a.test_database_main_path().unwrap();
+    let database_b = storage_b.test_database_main_path().unwrap();
+    assert_eq!(database_a, database_b);
+    assert!(database_a.is_file());
+
     let descriptor = "e".repeat(64);
-    storage
+    storage_a
         .register_building_vector_generation("gen-concurrent", &descriptor, 3)
         .unwrap();
 
     let rec = crate::storage::test_support::insert_confirmed_memory_fixture(
-        storage,
+        &storage_a,
         LIFE_A,
         "fact",
         "Concurrent Memory Content",
@@ -1622,8 +1649,7 @@ fn concurrent_two_connections_competition_safety() {
     );
     let mem_id = rec.id;
 
-    // Connection A (Worker A) claims outbox
-    storage
+    storage_a
         .enqueue(EnqueueMemoryVectorSyncRequest {
             life_id: LIFE_A.into(),
             memory_id: mem_id.clone(),
@@ -1631,51 +1657,101 @@ fn concurrent_two_connections_competition_safety() {
         })
         .unwrap();
 
-    let claim_a = storage
-        .claim_one_fenced_vector_sync("gen-concurrent", &descriptor, 3, "worker-a")
-        .unwrap()
-        .unwrap();
+    let (a_claimed_tx, a_claimed_rx) = mpsc::sync_channel(0);
+    let (b_mutated_tx, b_mutated_rx) = mpsc::sync_channel(0);
+    let (a_writes_done_tx, a_writes_done_rx) = mpsc::sync_channel(0);
+    let descriptor_a = descriptor.clone();
+    let descriptor_b = descriptor.clone();
+    let mem_id_a = mem_id.clone();
+    let mem_id_b = mem_id.clone();
 
-    // Connection B (Worker B) writes a new desired mutation via StorageService transaction
-    storage
-        .enqueue(EnqueueMemoryVectorSyncRequest {
-            life_id: LIFE_A.into(),
-            memory_id: mem_id.clone(),
-            desired_action: MemoryVectorSyncAction::Delete,
-        })
-        .unwrap();
+    let worker_a = thread::spawn(move || {
+        let claim_a = storage_a
+            .claim_one_fenced_vector_sync("gen-concurrent", &descriptor_a, 3, "worker-a")
+            .unwrap()
+            .expect("worker-a fenced claim");
+        a_claimed_tx.send(()).unwrap();
+        b_mutated_rx.recv().unwrap();
 
-    // Worker A on Connection A attempts writes with old claim token
-    assert!(!storage.mark_fenced_attempt_started(&claim_a).unwrap());
-    let res = storage
-        .finalize_fenced_vector_sync(&claim_a, claim_a.target_content_hash(), None, false, None)
-        .unwrap();
+        let attempt_started = storage_a.mark_fenced_attempt_started(&claim_a).unwrap();
+        let success = storage_a
+            .finalize_fenced_vector_sync(&claim_a, claim_a.target_content_hash(), None, false, None)
+            .unwrap();
+        let failure = storage_a
+            .finalize_fenced_vector_sync(
+                &claim_a,
+                None,
+                Some("STALE_ERR"),
+                true,
+                Some("definitely_not_sent"),
+            )
+            .unwrap();
+        let after_old_writes = storage_a
+            .test_get_outbox_snapshot_detailed(LIFE_A, mem_id_a.as_str())
+            .unwrap();
+        a_writes_done_tx.send(()).unwrap();
+        (claim_a, attempt_started, success, failure, after_old_writes)
+    });
+
+    let worker_b = thread::spawn(move || {
+        a_claimed_rx.recv().unwrap();
+        storage_b
+            .enqueue(EnqueueMemoryVectorSyncRequest {
+                life_id: LIFE_A.into(),
+                memory_id: mem_id_b.clone(),
+                desired_action: MemoryVectorSyncAction::Delete,
+            })
+            .unwrap();
+        let after_mutation = storage_b
+            .test_get_outbox_snapshot_detailed(LIFE_A, mem_id_b.as_str())
+            .unwrap();
+        b_mutated_tx.send(()).unwrap();
+        a_writes_done_rx.recv().unwrap();
+        let before_claim = storage_b
+            .test_get_outbox_snapshot_detailed(LIFE_A, mem_id_b.as_str())
+            .unwrap();
+        storage_b.test_expire_fenced_runtime_lease().unwrap();
+        let claim_b = storage_b
+            .claim_one_fenced_vector_sync("gen-concurrent", &descriptor_b, 3, "worker-b")
+            .unwrap()
+            .expect("worker-b fenced claim");
+        (after_mutation, before_claim, claim_b)
+    });
+
+    let (claim_a, attempt_started, success, failure, after_old_writes) = worker_a.join().unwrap();
+    let (after_mutation, before_claim, claim_b) = worker_b.join().unwrap();
+
+    assert_eq!(after_mutation.total_count, 1);
+    assert!(after_mutation.mutation_sequence > claim_a.mutation_sequence());
+    assert_eq!(after_mutation.desired_action, "delete");
+    assert_eq!(after_mutation.target_revision, None);
+    assert_eq!(after_mutation.target_content_hash, None);
+    assert_eq!(after_mutation.state, "pending");
+    assert_eq!(after_mutation.lease_owner, None);
+    assert_eq!(after_mutation.lease_fence_epoch, None);
+    assert_eq!(after_mutation.lease_expires_at, None);
+    assert!(after_mutation.claimed_generation_id_is_null);
+    assert_eq!(after_mutation.migration_disposition, None);
+    assert_eq!(after_mutation.last_send_disposition, None);
+
+    assert!(!attempt_started);
     assert_eq!(
-        res,
+        success,
         crate::storage::FencedFinalizeResult::LostLeaseOrSuperseded
     );
-
-    let res_fail = storage
-        .finalize_fenced_vector_sync(
-            &claim_a,
-            None,
-            Some("STALE_ERR"),
-            true,
-            Some("definitely_not_sent"),
-        )
-        .unwrap();
     assert_eq!(
-        res_fail,
+        failure,
         crate::storage::FencedFinalizeResult::LostLeaseOrSuperseded
     );
+    assert_eq!(after_old_writes, after_mutation);
+    assert_eq!(before_claim, after_mutation);
 
-    // Verify Connection B's new mutation is completely intact in SQLite
-    let snap = storage
-        .test_get_outbox_snapshot_detailed(LIFE_A, mem_id.as_str())
-        .unwrap();
-    assert_eq!(snap.total_count, 1);
-    assert_eq!(snap.desired_action, "delete");
-    assert_eq!(snap.state, "pending");
-    assert_eq!(snap.lease_expires_at, None);
-    assert!(snap.claimed_generation_id_is_null); // claimed_generation_id IS NULL
+    assert_eq!(
+        claim_b.mutation_sequence(),
+        after_mutation.mutation_sequence
+    );
+    assert_eq!(claim_b.action(), MemoryVectorSyncAction::Delete);
+    assert_ne!(claim_a.lease_owner(), claim_b.lease_owner());
+    assert_ne!(claim_a.fence_epoch(), claim_b.fence_epoch());
+    assert_ne!(claim_a.mutation_sequence(), claim_b.mutation_sequence());
 }

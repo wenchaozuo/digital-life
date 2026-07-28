@@ -1815,13 +1815,13 @@ mod tests {
     };
     use std::sync::atomic::AtomicUsize;
 
-    struct CountingEmbeddingProvider<P> {
-        inner: P,
+    struct CountingEmbeddingProvider<'a> {
+        inner: &'a dyn EmbeddingProvider,
         provider_requests: Arc<AtomicUsize>,
         embedding_successes: Arc<AtomicUsize>,
     }
 
-    impl<P: EmbeddingProvider> EmbeddingProvider for CountingEmbeddingProvider<P> {
+    impl EmbeddingProvider for CountingEmbeddingProvider<'_> {
         fn model_info(&self) -> EmbeddingModelInfo {
             self.inner.model_info()
         }
@@ -2054,7 +2054,7 @@ mod tests {
         let provider_requests = Arc::new(AtomicUsize::new(0));
         let embedding_successes = Arc::new(AtomicUsize::new(0));
         let provider = CountingEmbeddingProvider {
-            inner: raw_provider,
+            inner: &raw_provider,
             provider_requests: Arc::clone(&provider_requests),
             embedding_successes: Arc::clone(&embedding_successes),
         };
@@ -2157,7 +2157,8 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let provider_requests = Arc::new(AtomicUsize::new(0));
-        let provider_requests_clone = Arc::clone(&provider_requests);
+        let transport_requests = Arc::new(AtomicUsize::new(0));
+        let transport_requests_clone = Arc::clone(&transport_requests);
 
         let server_handle = std::thread::spawn(move || {
             use std::io::{Read, Write};
@@ -2167,7 +2168,7 @@ mod tests {
                 };
                 let mut buffer = [0_u8; 2048];
                 let _ = stream.read(&mut buffer);
-                provider_requests_clone.fetch_add(1, Ordering::SeqCst);
+                transport_requests_clone.fetch_add(1, Ordering::SeqCst);
                 let body = r#"{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1,0.2,0.3]}],"model":"test-embedding-model","usage":{"prompt_tokens":1,"total_tokens":1}}"#;
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -2208,11 +2209,17 @@ mod tests {
         let credential_reads = Arc::new(AtomicUsize::new(0));
         let counting_secrets = CountingSecretStore::new(raw_secrets, Arc::clone(&credential_reads));
 
-        let provider = crate::embedding::build_openai_compatible_embedding_provider(
+        let raw_provider = crate::embedding::build_openai_compatible_embedding_provider(
             &profile,
             &counting_secrets,
         )
         .unwrap();
+        let embedding_successes = Arc::new(AtomicUsize::new(0));
+        let provider = CountingEmbeddingProvider {
+            inner: raw_provider.as_ref(),
+            provider_requests: Arc::clone(&provider_requests),
+            embedding_successes: Arc::clone(&embedding_successes),
+        };
 
         let claim_b_slot = Arc::new(std::sync::Mutex::new(None));
         let claim_b_slot_clone = Arc::clone(&claim_b_slot);
@@ -2237,7 +2244,7 @@ mod tests {
 
         let consumer = FencedVectorSyncSingleEventConsumer::new(
             storage.as_ref(),
-            provider.as_ref(),
+            &provider,
             &vectors,
             context.clone(),
         );
@@ -2251,6 +2258,8 @@ mod tests {
         );
         assert_eq!(credential_reads.load(Ordering::SeqCst), 1);
         assert_eq!(provider_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(transport_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(embedding_successes.load(Ordering::SeqCst), 1);
         assert_eq!(lance_upserts.load(Ordering::SeqCst), 0);
         assert_eq!(lance_deletes.load(Ordering::SeqCst), 0);
         assert_eq!(storage.test_generation_item_count().unwrap(), 0);
@@ -2288,6 +2297,8 @@ mod tests {
         assert_eq!(storage.test_generation_item_count().unwrap(), 1);
         assert_eq!(credential_reads.load(Ordering::SeqCst), 2);
         assert_eq!(provider_requests.load(Ordering::SeqCst), 2);
+        assert_eq!(transport_requests.load(Ordering::SeqCst), 2);
+        assert_eq!(embedding_successes.load(Ordering::SeqCst), 2);
     }
 
     #[test]

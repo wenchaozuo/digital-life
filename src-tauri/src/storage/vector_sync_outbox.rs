@@ -559,6 +559,22 @@ impl StorageService {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_database_main_path(
+        &self,
+    ) -> Result<std::path::PathBuf, crate::storage::StorageError> {
+        let state = self.state()?;
+        state
+            .connection
+            .query_row(
+                "SELECT file FROM pragma_database_list WHERE name='main'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .map(std::path::PathBuf::from)
+            .map_err(|_| single_event_error())
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_get_outbox_snapshot_detailed(
         &self,
         life_id: &str,

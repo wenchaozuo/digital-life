@@ -165,6 +165,18 @@ impl std::fmt::Debug for FencedVectorSyncClaim {
 
 #[allow(dead_code)]
 impl FencedVectorSyncClaim {
+    pub(crate) fn id(&self) -> i64 {
+        self.id
+    }
+    pub(crate) fn mutation_sequence(&self) -> i64 {
+        self.mutation_sequence
+    }
+    pub(crate) fn lease_owner(&self) -> &str {
+        &self.lease_owner
+    }
+    pub(crate) fn fence_epoch(&self) -> i64 {
+        self.fence_epoch
+    }
     pub(crate) fn action(&self) -> MemoryVectorSyncAction {
         self.action
     }
@@ -545,6 +557,140 @@ impl StorageService {
             .map_err(|_| single_event_error())?;
         Ok((job.0, job.1, items))
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_get_outbox_snapshot_detailed(
+        &self,
+        life_id: &str,
+        memory_id: &str,
+    ) -> Result<OutboxSnapshotDetailed, crate::storage::StorageError> {
+        let state = self.state()?;
+        let total_count: usize = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM memory_vector_sync_outbox",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| single_event_error())?;
+        let row = state.connection.query_row(
+            "SELECT id, desired_action, mutation_sequence, target_revision, target_content_hash,
+                    state, attempt_count, lease_owner, lease_fence_epoch, claimed_generation_id,
+                    (claimed_generation_id IS NULL), migration_disposition, last_error_code, last_send_disposition
+             FROM memory_vector_sync_outbox WHERE life_id=?1 AND memory_id=?2",
+            params![life_id, memory_id],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                    r.get(9)?,
+                    r.get::<_, i64>(10)? == 1,
+                    r.get(11)?,
+                    r.get(12)?,
+                    r.get(13)?,
+                ))
+            },
+        ).map_err(|_| single_event_error())?;
+        Ok(OutboxSnapshotDetailed {
+            total_count,
+            id: row.0,
+            desired_action: row.1,
+            mutation_sequence: row.2,
+            target_revision: row.3,
+            target_content_hash: row.4,
+            state: row.5,
+            attempt_count: row.6,
+            lease_owner: row.7,
+            lease_fence_epoch: row.8,
+            claimed_generation_id: row.9,
+            claimed_generation_id_is_null: row.10,
+            migration_disposition: row.11,
+            last_error_code: row.12,
+            last_send_disposition: row.13,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_insert_legacy_quarantine_fixture(
+        &self,
+        life_id: &str,
+        memory_id: &str,
+    ) -> Result<i64, crate::storage::StorageError> {
+        let mut state = self.state()?;
+        let tx = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| single_event_error())?;
+        tx.execute(
+            "INSERT OR IGNORE INTO memory_vector_sync_mutation_clock (singleton, last_sequence) VALUES (1, 0)",
+            [],
+        )
+        .map_err(|_| single_event_error())?;
+        tx.execute(
+            "UPDATE memory_vector_sync_mutation_clock SET last_sequence = last_sequence + 1 WHERE singleton = 1",
+            [],
+        )
+        .map_err(|_| single_event_error())?;
+        let sequence: i64 = tx
+            .query_row(
+                "SELECT last_sequence FROM memory_vector_sync_mutation_clock WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| single_event_error())?;
+        tx.execute(
+            "INSERT INTO memory_vector_sync_outbox (life_id, memory_id, desired_action, state, attempt_count, mutation_sequence, target_revision, target_content_hash, migration_disposition)
+             VALUES (?1, ?2, 'upsert', 'blocked', 0, ?3, NULL, NULL, 'legacy_upsert_rebuild_required')
+             ON CONFLICT(life_id, memory_id) DO UPDATE SET
+               desired_action='upsert', state='blocked', attempt_count=0, mutation_sequence=?3,
+               target_revision=NULL, target_content_hash=NULL, migration_disposition='legacy_upsert_rebuild_required',
+               lease_owner=NULL, lease_expires_at=NULL, lease_fence_epoch=NULL, claimed_generation_id=NULL,
+               updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+            params![life_id, memory_id, sequence],
+        ).map_err(|_| single_event_error())?;
+        let id = tx.last_insert_rowid();
+        tx.commit().map_err(|_| single_event_error())?;
+        Ok(id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_generation_item_count(
+        &self,
+    ) -> Result<usize, crate::storage::StorageError> {
+        let state = self.state()?;
+        state.connection.query_row(
+            "SELECT COUNT(*) FROM memory_vector_generation_item",
+            [],
+            |r| r.get(0),
+        ).map_err(|_| single_event_error())
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OutboxSnapshotDetailed {
+    pub total_count: usize,
+    pub id: i64,
+    pub desired_action: String,
+    pub mutation_sequence: i64,
+    pub target_revision: Option<i64>,
+    pub target_content_hash: Option<String>,
+    pub state: String,
+    pub attempt_count: i64,
+    pub lease_owner: Option<String>,
+    pub lease_fence_epoch: Option<i64>,
+    pub claimed_generation_id: Option<String>,
+    pub claimed_generation_id_is_null: bool,
+    pub migration_disposition: Option<String>,
+    pub last_error_code: Option<String>,
+    pub last_send_disposition: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -603,7 +749,7 @@ fn fenced_claim_current_in(
             claim.fence_epoch,
             claim.generation_id
         ],
-        |row| row.get(0),
+        |row| Ok(row.get::<_, i64>(0)? == 1),
     )
     .map_err(|_| single_event_error())
 }

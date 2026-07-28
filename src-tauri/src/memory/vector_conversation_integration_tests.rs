@@ -1227,3 +1227,325 @@ fn retrieval_failures_budget_injection_and_session_commit_contract_are_safe() {
         assert!(!frontend.contains("history: this.dependencies.session"));
     });
 }
+
+#[test]
+fn supersession_matrix_rejects_all_old_token_writes_and_clears_claimed_generation() {
+    use crate::memory::vector_sync_outbox::{
+        EnqueueMemoryVectorSyncRequest, MemoryVectorSyncOutboxRepository,
+    };
+
+    let fixture = Fixture::new();
+    let storage = &fixture.storage;
+
+    let descriptor = "d".repeat(64);
+    storage
+        .register_building_vector_generation("gen-matrix", &descriptor, 3)
+        .unwrap();
+
+    #[derive(Clone, Copy, Debug)]
+    enum InitialState {
+        ProcessingUpsert,
+        ProcessingDelete,
+        QuarantinedLegacy,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum NewAction {
+        Upsert,
+        Delete,
+        RevisionUpdate,
+    }
+
+    let cases = [
+        (1, InitialState::ProcessingUpsert, NewAction::Upsert),
+        (2, InitialState::ProcessingUpsert, NewAction::Delete),
+        (3, InitialState::ProcessingDelete, NewAction::Upsert),
+        (4, InitialState::ProcessingDelete, NewAction::Delete),
+        (5, InitialState::ProcessingUpsert, NewAction::RevisionUpdate),
+        (6, InitialState::QuarantinedLegacy, NewAction::Upsert),
+        (7, InitialState::QuarantinedLegacy, NewAction::Delete),
+    ];
+
+    for (case_num, init_state, new_act) in cases {
+        storage.test_expire_fenced_runtime_lease().unwrap();
+        let life_id = LIFE_A;
+
+        let rec = crate::storage::test_support::insert_confirmed_memory_fixture(
+            storage,
+            life_id,
+            "fact",
+            &format!("Content for case {case_num}"),
+            Some(&format!("Summary {case_num}")),
+            0.5,
+            0.8,
+            false,
+            true,
+        );
+        let mem_id = rec.id;
+
+        let old_claim = match init_state {
+            InitialState::ProcessingUpsert => {
+                storage
+                    .enqueue(EnqueueMemoryVectorSyncRequest {
+                        life_id: life_id.into(),
+                        memory_id: mem_id.clone(),
+                        desired_action: MemoryVectorSyncAction::Upsert,
+                    })
+                    .unwrap();
+                storage
+                    .claim_one_fenced_vector_sync("gen-matrix", &descriptor, 3, "worker-a")
+                    .unwrap()
+            }
+            InitialState::ProcessingDelete => {
+                storage
+                    .enqueue(EnqueueMemoryVectorSyncRequest {
+                        life_id: life_id.into(),
+                        memory_id: mem_id.clone(),
+                        desired_action: MemoryVectorSyncAction::Delete,
+                    })
+                    .unwrap();
+                storage
+                    .claim_one_fenced_vector_sync("gen-matrix", &descriptor, 3, "worker-a")
+                    .unwrap()
+            }
+            InitialState::QuarantinedLegacy => {
+                storage
+                    .test_insert_legacy_quarantine_fixture(life_id, &mem_id)
+                    .unwrap();
+                None
+            }
+        };
+
+        let old_seq = if let Some(ref claim) = old_claim {
+            claim.mutation_sequence()
+        } else {
+            0
+        };
+
+        // Execute New Operation / Revision Update (Section IX)
+        match new_act {
+            NewAction::Upsert => {
+                storage
+                    .enqueue(EnqueueMemoryVectorSyncRequest {
+                        life_id: life_id.into(),
+                        memory_id: mem_id.clone(),
+                        desired_action: MemoryVectorSyncAction::Upsert,
+                    })
+                    .unwrap();
+            }
+            NewAction::Delete => {
+                storage
+                    .enqueue(EnqueueMemoryVectorSyncRequest {
+                        life_id: life_id.into(),
+                        memory_id: mem_id.clone(),
+                        desired_action: MemoryVectorSyncAction::Delete,
+                    })
+                    .unwrap();
+            }
+            NewAction::RevisionUpdate => {
+                use crate::memory::revisions::{MemoryRevisionRepository, MemoryRevisionService, UpdateConfirmedMemoryRequest};
+
+                let cur_revision = storage.current_revision(life_id, &mem_id).unwrap();
+                let revision_service = MemoryRevisionService::new(storage);
+                revision_service
+                    .update_confirmed(UpdateConfirmedMemoryRequest {
+                        life_id: life_id.into(),
+                        memory_id: mem_id.clone(),
+                        expected_revision: cur_revision,
+                        kind: crate::memory::MemoryKind::Fact,
+                        content: format!("Updated content case {case_num}"),
+                        summary: Some(format!("Updated summary case {case_num}")),
+                    })
+                    .unwrap();
+            }
+        }
+
+        // Direct SQL assertions on snapshot
+        let snap = storage
+            .test_get_outbox_snapshot_detailed(life_id, &mem_id)
+            .unwrap();
+        assert!(
+            snap.claimed_generation_id_is_null,
+            "Case {case_num}: claimed_generation_id IS NULL required"
+        );
+        assert_eq!(
+            snap.lease_owner, None,
+            "Case {case_num}: lease_owner IS NULL required"
+        );
+        assert_eq!(
+            snap.lease_fence_epoch, None,
+            "Case {case_num}: lease_fence_epoch IS NULL required"
+        );
+        assert_eq!(
+            snap.last_send_disposition, None,
+            "Case {case_num}: last_send_disposition IS NULL"
+        );
+
+        assert_eq!(
+            snap.total_count, 1,
+            "Case {case_num}: Outbox must have exactly 1 row"
+        );
+        assert!(
+            snap.mutation_sequence > old_seq,
+            "Case {case_num}: mutation_sequence strictly increased"
+        );
+        match new_act {
+            NewAction::Upsert | NewAction::RevisionUpdate => {
+                assert_eq!(snap.desired_action, "upsert");
+                assert!(snap.target_revision.is_some());
+                assert!(snap.target_content_hash.is_some());
+            }
+            NewAction::Delete => {
+                assert_eq!(snap.desired_action, "delete");
+                assert!(snap.target_revision.is_none());
+                assert!(snap.target_content_hash.is_none());
+            }
+        }
+        assert_eq!(snap.state, "pending", "Case {case_num}: state reset to pending");
+        assert_eq!(
+            snap.claimed_generation_id, None,
+            "Case {case_num}: claimed_generation_id IS NULL"
+        );
+        assert_eq!(
+            snap.migration_disposition, None,
+            "Case {case_num}: migration_disposition IS NULL"
+        );
+        assert_eq!(
+            snap.last_error_code, None,
+            "Case {case_num}: last_error_code IS NULL"
+        );
+
+        // Old Token 3 Write Operations Invalid (Section X)
+        if let Some(ref claim_a) = old_claim {
+            assert!(
+                !storage.mark_fenced_attempt_started(claim_a).unwrap(),
+                "Case {case_num}: old attempt_started must return false"
+            );
+            assert_eq!(
+                storage
+                    .finalize_fenced_vector_sync(
+                        claim_a,
+                        claim_a.target_content_hash(),
+                        None,
+                        false,
+                        None
+                    )
+                    .unwrap(),
+                crate::storage::FencedFinalizeResult::LostLeaseOrSuperseded,
+                "Case {case_num}: old success finalize must be LostLeaseOrSuperseded"
+            );
+            assert_eq!(
+                storage
+                    .finalize_fenced_vector_sync(
+                        claim_a,
+                        None,
+                        Some("STALE_ERR"),
+                        true,
+                        Some("definitely_not_sent")
+                    )
+                    .unwrap(),
+                crate::storage::FencedFinalizeResult::LostLeaseOrSuperseded,
+                "Case {case_num}: old failure finalize must be LostLeaseOrSuperseded"
+            );
+
+            // Re-verify snapshot is completely unchanged by old token writes
+            let snap_after = storage
+                .test_get_outbox_snapshot_detailed(life_id, &mem_id)
+                .unwrap();
+            assert_eq!(
+                snap, snap_after,
+                "Case {case_num}: snapshot unchanged after stale writes"
+            );
+        }
+
+        // New Owner Re-claim (Section XI)
+        storage.test_expire_fenced_runtime_lease().unwrap();
+        let claim_b = storage
+            .claim_one_fenced_vector_sync("gen-matrix", &descriptor, 3, "worker-b")
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim_b.memory_id(), mem_id);
+        assert_eq!(claim_b.mutation_sequence(), snap.mutation_sequence);
+        assert_eq!(claim_b.lease_owner(), "worker-b");
+        if let Some(ref claim_a) = old_claim {
+            assert_ne!(claim_b.fence_epoch(), claim_a.fence_epoch());
+        }
+
+        // Finalize claim_b to leave outbox clean for next case iteration
+        let hash = claim_b.target_content_hash().map(|s| s.to_string());
+        storage
+            .finalize_fenced_vector_sync(&claim_b, hash.as_deref(), None, false, None)
+            .unwrap();
+    }
+}
+
+#[test]
+fn concurrent_two_connections_competition_safety() {
+    use crate::memory::vector_sync_outbox::{
+        EnqueueMemoryVectorSyncRequest, MemoryVectorSyncOutboxRepository,
+    };
+
+    let fixture = Fixture::new();
+    let storage = &fixture.storage;
+    let descriptor = "e".repeat(64);
+    storage
+        .register_building_vector_generation("gen-concurrent", &descriptor, 3)
+        .unwrap();
+
+    let rec = crate::storage::test_support::insert_confirmed_memory_fixture(
+        storage,
+        LIFE_A,
+        "fact",
+        "Concurrent Memory Content",
+        Some("Concurrent Summary"),
+        0.5,
+        0.8,
+        false,
+        true,
+    );
+    let mem_id = rec.id;
+
+    // Connection A (Worker A) claims outbox
+    storage
+        .enqueue(EnqueueMemoryVectorSyncRequest {
+            life_id: LIFE_A.into(),
+            memory_id: mem_id.clone(),
+            desired_action: MemoryVectorSyncAction::Upsert,
+        })
+        .unwrap();
+
+    let claim_a = storage
+        .claim_one_fenced_vector_sync("gen-concurrent", &descriptor, 3, "worker-a")
+        .unwrap()
+        .unwrap();
+
+    // Connection B (Worker B) writes a new desired mutation via StorageService transaction
+    storage
+        .enqueue(EnqueueMemoryVectorSyncRequest {
+            life_id: LIFE_A.into(),
+            memory_id: mem_id.clone(),
+            desired_action: MemoryVectorSyncAction::Delete,
+        })
+        .unwrap();
+
+    // Worker A on Connection A attempts to finalize with old claim token
+    let res = storage
+        .finalize_fenced_vector_sync(
+            &claim_a,
+            claim_a.target_content_hash(),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+    assert_eq!(res, crate::storage::FencedFinalizeResult::LostLeaseOrSuperseded);
+
+    // Verify Connection B's new mutation is completely intact in SQLite
+    let snap = storage
+        .test_get_outbox_snapshot_detailed(LIFE_A, mem_id.as_str())
+        .unwrap();
+    assert_eq!(snap.total_count, 1);
+    assert_eq!(snap.desired_action, "delete");
+    assert_eq!(snap.state, "pending");
+    assert!(snap.claimed_generation_id_is_null); // claimed_generation_id IS NULL
+}

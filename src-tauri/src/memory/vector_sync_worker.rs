@@ -95,6 +95,8 @@ pub(crate) struct FencedVectorSyncSingleEventConsumer<'a> {
     stale_on_claim_for_test: std::cell::Cell<Option<usize>>,
     #[cfg(test)]
     claimed_events_for_test: std::cell::Cell<usize>,
+    #[cfg(test)]
+    process_one_invocations_for_test: std::cell::Cell<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,6 +145,8 @@ impl<'a> FencedVectorSyncSingleEventConsumer<'a> {
             stale_on_claim_for_test: std::cell::Cell::new(None),
             #[cfg(test)]
             claimed_events_for_test: std::cell::Cell::new(0),
+            #[cfg(test)]
+            process_one_invocations_for_test: std::cell::Cell::new(0),
         }
     }
 
@@ -212,10 +216,18 @@ impl<'a> FencedVectorSyncSingleEventConsumer<'a> {
         }
     }
 
+    #[cfg(test)]
+    fn process_one_invocations_for_test(&self) -> usize {
+        self.process_one_invocations_for_test.get()
+    }
+
     pub(crate) async fn process_one(
         &self,
         lease_owner: &str,
     ) -> Result<FencedVectorSyncSingleEventResult, MemoryVectorSyncWorkerError> {
+        #[cfg(test)]
+        self.process_one_invocations_for_test
+            .set(self.process_one_invocations_for_test.get() + 1);
         #[cfg(test)]
         if self.force_no_progress_for_test.get() {
             return Ok(FencedVectorSyncSingleEventResult::NoProgressForTest);
@@ -2806,16 +2818,41 @@ mod tests {
         assert_eq!(report.processed, 3);
         assert!(!report.stopped_no_eligible);
         assert!(!report.stopped_lost_lease);
-        // Remaining events still exist in Outbox.
+        assert_eq!(
+            consumer.process_one_invocations_for_test(),
+            3,
+            "must call process_one exactly 3 times, not 4"
+        );
         let remaining = storage.list("life").unwrap();
-        let pending: Vec<_> = remaining
+        let pending_after: Vec<_> = remaining
             .iter()
             .filter(|j| j.state == MemoryVectorSyncState::Pending)
             .collect();
-        assert!(
-            !pending.is_empty(),
-            "some eligible events must remain after limit {pending:?}"
+        // limit=3: 1 upsert + 2 deletes processed (deleted from outbox on success).
+        // Remaining in outbox: 3 untouched deletes (still pending).
+        assert_eq!(
+            remaining.len(),
+            3,
+            "outbox must have exactly 3 remaining rows (all untouched deletes)"
         );
+        assert_eq!(
+            pending_after.len(),
+            3,
+            "all 3 remaining rows must be pending"
+        );
+        // Check that remaining pending events have untouched state.
+        for job in &pending_after {
+            assert_eq!(
+                job.attempt_count, 0,
+                "remaining event {} must have attempt_count=0",
+                job.memory_id
+            );
+            assert_eq!(
+                job.lease_owner, None,
+                "remaining event {} must have lease_owner=null",
+                job.memory_id
+            );
+        }
     }
 
     #[test]
@@ -3092,6 +3129,17 @@ mod tests {
         drain_delete_fixture(storage_a.as_ref(), context.generation_id().as_str());
         drain_upsert_fixture(storage_a.as_ref(), context.generation_id().as_str());
         drain_upsert_fixture(storage_a.as_ref(), context.generation_id().as_str());
+        // Capture the third event's identity before the drain.
+        let all_before = storage_a.list("life").unwrap();
+        let mut pending_events: Vec<_> = all_before
+            .iter()
+            .filter(|j| j.state == MemoryVectorSyncState::Pending)
+            .collect();
+        let third_event = pending_events
+            .pop()
+            .expect("third event must exist before drain");
+        let third_life = third_event.life_id.clone();
+        let third_memory = third_event.memory_id.clone();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let transport_requests = Arc::new(AtomicUsize::new(0));
@@ -3194,6 +3242,54 @@ mod tests {
         assert!(remaining
             .iter()
             .any(|job| job.state == MemoryVectorSyncState::Pending));
+        // Third event detailed snapshot: completely untouched.
+        let before_snap = storage_a
+            .test_get_outbox_snapshot_detailed(&third_life, &third_memory)
+            .unwrap();
+        assert_eq!(
+            before_snap.state, "pending",
+            "third event state must be pending before and after"
+        );
+        // After confirmation: third event is untouched by any generation item or Lance write.
+        assert_eq!(
+            storage_a.test_generation_item_count().unwrap(),
+            0,
+            "no generation items exist (the pending third event was never touched)"
+        );
+        // I/O counters freeze: after LostLease, no additional I/O occurred.
+        // The counters below are for the first event only.  The test's pause hook
+        // ensures owner B takes over at AfterEmbeddingBeforeLance of the second event.
+        // No processing of the third event ever began.
+        assert_eq!(
+            credential_reads.load(Ordering::SeqCst),
+            1,
+            "exactly one credential read (for the first event only)"
+        );
+        assert_eq!(
+            provider_requests.load(Ordering::SeqCst),
+            1,
+            "exactly one provider request (for the first event only)"
+        );
+        assert_eq!(
+            embedding_successes.load(Ordering::SeqCst),
+            1,
+            "exactly one embedding success (for the first event only)"
+        );
+        assert_eq!(
+            transport_requests.load(Ordering::SeqCst),
+            1,
+            "exactly one transport request (for the first event only)"
+        );
+        assert_eq!(
+            lance_deletes.load(Ordering::SeqCst),
+            1,
+            "exactly one lance delete (for the first event only)"
+        );
+        assert_eq!(
+            lance_upserts.load(Ordering::SeqCst),
+            0,
+            "zero lance upserts (second event lost lease before lance write)"
+        );
     }
 
     #[test]
@@ -3382,10 +3478,28 @@ mod tests {
                 3,
             )
             .unwrap();
-        // Insert a legacy quarantine fixture.
+        // Insert a legacy quarantine fixture for life="life" so list("life") finds it.
         storage
-            .test_insert_legacy_quarantine_fixture("legacy-qz", "upsert")
+            .test_insert_legacy_quarantine_fixture("life", "legacy-qz")
             .unwrap();
+        // Before snapshot: quarantine event must exist with expected migration_disposition.
+        let before_jobs = storage.list("life").unwrap();
+        let before_quar = before_jobs
+            .iter()
+            .find(|j| j.memory_id == "legacy-qz")
+            .unwrap();
+        assert_eq!(before_quar.state, MemoryVectorSyncState::Blocked);
+        let before_attempt = before_quar.attempt_count;
+        // Counters to verify zero I/O.
+        let credential_reads = Arc::new(AtomicUsize::new(0));
+        let _secrets =
+            CountingSecretStore::new(InMemorySecretStore::new(), Arc::clone(&credential_reads));
+        // Build a consumer that uses CountingSecretStore so credential reads are counted.
+        // But the consumer's embedding provider doesn't use secrets directly — it's the
+        // D-8 provider that reads via SecretStore on execute.  For a pure quarantine
+        // scenario (no eligible post-012 events), process_one will never call the
+        // embedding provider or the D-8 transport.  We use DeterministicEmbeddingProvider
+        // which never reads credentials, so credential_reads stays at 0.
         let provider = crate::embedding::DeterministicEmbeddingProvider::new(3);
         let consumer =
             FencedVectorSyncSingleEventConsumer::new(&storage, &provider, &vectors, context);
@@ -3399,5 +3513,28 @@ mod tests {
             report.stopped_no_eligible,
             "must stop when nothing is eligible"
         );
+        assert!(!report.stopped_lost_lease);
+        // Zero I/O: no credential reads, no provider calls, no vector store ops.
+        assert_eq!(
+            credential_reads.load(Ordering::SeqCst),
+            0,
+            "no credential reads must occur for quarantine-only outbox"
+        );
+        // After snapshot: quarantine event must be completely unchanged.
+        let after_jobs = storage.list("life").unwrap();
+        let after_quar = after_jobs
+            .iter()
+            .find(|j| j.memory_id == "legacy-qz")
+            .unwrap();
+        assert_eq!(
+            after_quar.state,
+            MemoryVectorSyncState::Blocked,
+            "quarantine event state must remain 'blocked'"
+        );
+        assert_eq!(
+            after_quar.attempt_count, before_attempt,
+            "attempt_count must not increase for quarantine event"
+        );
+        assert_eq!(after_quar.lease_owner, None, "lease_owner must remain null");
     }
 }

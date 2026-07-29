@@ -106,6 +106,8 @@ pub(crate) struct FencedVectorSyncSingleEventConsumer<'a> {
     embedding: &'a dyn EmbeddingProvider,
     vectors: &'a dyn VectorStore,
     generation: VectorGenerationContext,
+    #[cfg(test)]
+    force_stale_result_for_test: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -134,7 +136,15 @@ impl<'a> FencedVectorSyncSingleEventConsumer<'a> {
             embedding,
             vectors,
             generation,
+            #[cfg(test)]
+            force_stale_result_for_test: false,
         }
+    }
+
+    #[cfg(test)]
+    fn with_forced_stale_result_for_test(mut self) -> Self {
+        self.force_stale_result_for_test = true;
+        self
     }
 
     pub(crate) async fn process_one(
@@ -191,6 +201,12 @@ impl<'a> FencedVectorSyncSingleEventConsumer<'a> {
                 }
             }
             MemoryVectorSyncAction::Upsert => {
+                #[cfg(test)]
+                if self.force_stale_result_for_test {
+                    return self
+                        .finalize(&claim, None, Some("VECTOR_TARGET_STALE"), false, None)
+                        .map(|_| FencedVectorSyncSingleEventResult::Stale);
+                }
                 let Some(document) =
                     self.storage
                         .read_fenced_vector_document(&claim)
@@ -550,12 +566,12 @@ impl VectorSyncDrainReport {
                 self.retry_scheduled += 1;
                 self.processed += 1;
             }
-            FencedVectorSyncSingleEventResult::Blocked
-            | FencedVectorSyncSingleEventResult::Stale => {
+            FencedVectorSyncSingleEventResult::Blocked => {
                 self.blocked += 1;
                 self.processed += 1;
             }
-            FencedVectorSyncSingleEventResult::Failed => {
+            FencedVectorSyncSingleEventResult::Stale
+            | FencedVectorSyncSingleEventResult::Failed => {
                 self.failed += 1;
                 self.processed += 1;
             }
@@ -2655,7 +2671,7 @@ mod tests {
     }
 
     #[test]
-    fn drain_continues_after_event_level_failures() {
+    fn drain_classifies_blocked_without_failed() {
         let (_temp, storage) = test_storage();
         let (context, vectors) = drained_context();
         // First event: no credential → blocked.
@@ -2683,14 +2699,45 @@ mod tests {
             &vectors,
             context.clone(),
         );
-        // First event fails (no secret), second event was not enqueued yet.
-        // Drain with limit 2: first fails, then no more eligible.
+        // No credential is a blocked event, then no more eligible events remain.
         let report =
             tauri::async_runtime::block_on(drain_fenced_vector_sync(&consumer, "w-err", 5))
                 .unwrap();
-        assert!(report.processed >= 1);
-        assert!(report.blocked >= 1 || report.failed >= 1);
+        assert_eq!(report.processed, 1);
+        assert_eq!(report.applied_upserts, 0);
+        assert_eq!(report.applied_deletes, 0);
+        assert_eq!(report.retry_scheduled, 0);
+        assert_eq!(report.blocked, 1);
+        assert_eq!(report.failed, 0);
         assert!(report.stopped_no_eligible);
+        assert!(!report.stopped_lost_lease);
+    }
+
+    #[test]
+    fn drain_classifies_stale_as_failed() {
+        let (_temp, storage) = test_storage();
+        let (context, vectors) = drained_context();
+        drain_upsert_fixture(&storage, context.generation_id().as_str());
+        let provider = crate::embedding::DeterministicEmbeddingProvider::new(3);
+        let consumer =
+            FencedVectorSyncSingleEventConsumer::new(&storage, &provider, &vectors, context)
+                .with_forced_stale_result_for_test();
+
+        let report =
+            tauri::async_runtime::block_on(drain_fenced_vector_sync(&consumer, "w-stale", 2))
+                .unwrap();
+
+        assert_eq!(report.processed, 1);
+        assert_eq!(report.applied_upserts, 0);
+        assert_eq!(report.applied_deletes, 0);
+        assert_eq!(report.retry_scheduled, 0);
+        assert_eq!(report.blocked, 0);
+        assert_eq!(report.failed, 1);
+        assert!(report.stopped_no_eligible);
+        assert!(!report.stopped_lost_lease);
+        let job = storage.list("life").unwrap().remove(0);
+        assert_eq!(job.state, MemoryVectorSyncState::Blocked);
+        assert_eq!(job.attempt_count, 0);
     }
 
     #[test]

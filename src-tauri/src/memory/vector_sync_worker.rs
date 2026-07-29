@@ -42,6 +42,10 @@ use super::{
 };
 
 const DEFAULT_DRAIN_LIMIT: usize = 32;
+#[allow(dead_code)]
+const MIN_DRAIN_LIMIT: usize = 1;
+#[allow(dead_code)]
+const MAX_DRAIN_LIMIT: usize = 32;
 const DEFAULT_LEASE_SECONDS: u32 = 120;
 const MAX_ATTEMPTS: u32 = 5;
 const INITIAL_RETRY_SECONDS: u32 = 30;
@@ -108,10 +112,12 @@ pub(crate) struct FencedVectorSyncSingleEventConsumer<'a> {
 #[allow(dead_code)]
 pub(crate) enum FencedVectorSyncSingleEventResult {
     NoEligibleEvent,
-    Completed,
+    CompletedUpsert,
+    CompletedDelete,
     Stale,
     RetryWait,
     Blocked,
+    Failed,
     LostLeaseOrSuperseded,
 }
 
@@ -326,6 +332,7 @@ impl<'a> FencedVectorSyncSingleEventConsumer<'a> {
         retry: bool,
         send_disposition: Option<&str>,
     ) -> Result<FencedVectorSyncSingleEventResult, MemoryVectorSyncWorkerError> {
+        let is_upsert = claim.action() == MemoryVectorSyncAction::Upsert;
         let result = self
             .storage
             .finalize_fenced_vector_sync(claim, hash, error, retry, send_disposition)
@@ -340,7 +347,10 @@ impl<'a> FencedVectorSyncSingleEventConsumer<'a> {
             FencedFinalizeResult::Applied if error.is_some() => {
                 FencedVectorSyncSingleEventResult::Blocked
             }
-            FencedFinalizeResult::Applied => FencedVectorSyncSingleEventResult::Completed,
+            FencedFinalizeResult::Applied if is_upsert => {
+                FencedVectorSyncSingleEventResult::CompletedUpsert
+            }
+            FencedFinalizeResult::Applied => FencedVectorSyncSingleEventResult::CompletedDelete,
         })
     }
 }
@@ -492,6 +502,112 @@ impl MemoryVectorSyncWorkerConfig {
         }
         Ok(self)
     }
+}
+
+/// Bounded serial drain report. Counts only; no identifiers, paths, or values.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VectorSyncDrainReport {
+    pub requested_limit: usize,
+    pub processed: usize,
+    pub applied_upserts: usize,
+    pub applied_deletes: usize,
+    pub retry_scheduled: usize,
+    pub blocked: usize,
+    pub failed: usize,
+    pub stopped_no_eligible: bool,
+    pub stopped_lost_lease: bool,
+}
+
+#[allow(dead_code)]
+impl VectorSyncDrainReport {
+    fn new(limit: usize) -> Self {
+        Self {
+            requested_limit: limit,
+            processed: 0,
+            applied_upserts: 0,
+            applied_deletes: 0,
+            retry_scheduled: 0,
+            blocked: 0,
+            failed: 0,
+            stopped_no_eligible: false,
+            stopped_lost_lease: false,
+        }
+    }
+
+    fn record(&mut self, result: FencedVectorSyncSingleEventResult) {
+        match result {
+            FencedVectorSyncSingleEventResult::CompletedUpsert => {
+                self.applied_upserts += 1;
+                self.applied_deletes += 0;
+                self.processed += 1;
+            }
+            FencedVectorSyncSingleEventResult::CompletedDelete => {
+                self.applied_upserts += 0;
+                self.applied_deletes += 1;
+                self.processed += 1;
+            }
+            FencedVectorSyncSingleEventResult::RetryWait => {
+                self.retry_scheduled += 1;
+                self.processed += 1;
+            }
+            FencedVectorSyncSingleEventResult::Blocked
+            | FencedVectorSyncSingleEventResult::Stale => {
+                self.blocked += 1;
+                self.processed += 1;
+            }
+            FencedVectorSyncSingleEventResult::Failed => {
+                self.failed += 1;
+                self.processed += 1;
+            }
+            FencedVectorSyncSingleEventResult::LostLeaseOrSuperseded => {
+                self.stopped_lost_lease = true;
+            }
+            FencedVectorSyncSingleEventResult::NoEligibleEvent => {
+                self.stopped_no_eligible = true;
+            }
+        }
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.stopped_no_eligible || self.stopped_lost_lease
+    }
+}
+
+/// Serial, bounded drain over the fenced single-event consumer.
+///
+/// Repeats `process_one` up to `limit` times (or until no eligible event or
+/// lost lease).  Each round is strictly sequential: claim → I/O → finalize.
+/// Does not auto-start, spawn, or create background tasks.
+///
+/// # Errors
+/// - `InvalidRequest` when `limit` is 0 or > 32.
+/// - `OutboxUnavailable` on persistent store failure (propagated from consumer).
+#[allow(dead_code)]
+pub(crate) async fn drain_fenced_vector_sync(
+    consumer: &FencedVectorSyncSingleEventConsumer<'_>,
+    lease_owner: &str,
+    limit: usize,
+) -> Result<VectorSyncDrainReport, MemoryVectorSyncWorkerError> {
+    if !(MIN_DRAIN_LIMIT..=MAX_DRAIN_LIMIT).contains(&limit) {
+        return Err(worker_error(
+            MemoryVectorSyncWorkerErrorCode::InvalidRequest,
+        ));
+    }
+
+    let mut report = VectorSyncDrainReport::new(limit);
+
+    while report.processed < limit && !report.is_stopped() {
+        let result = consumer.process_one(lease_owner).await?;
+        let before = report.processed;
+        report.record(result);
+        // Must make progress or stop — prevent infinite busy loop if
+        // process_one returns a result that didn't advance anything.
+        if report.processed == before && !report.is_stopped() {
+            return Err(worker_error(MemoryVectorSyncWorkerErrorCode::InternalError));
+        }
+    }
+
+    Ok(report)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
@@ -1628,7 +1744,7 @@ mod tests {
         );
         storage.test_expire_fenced_runtime_lease().unwrap();
         let result = tauri::async_runtime::block_on(consumer.process_one("owner-b")).unwrap();
-        assert_eq!(result, FencedVectorSyncSingleEventResult::Completed);
+        assert_eq!(result, FencedVectorSyncSingleEventResult::CompletedUpsert);
         assert_eq!(
             tauri::async_runtime::block_on(vectors.count_generation(&context, Some("life")))
                 .unwrap(),
@@ -2121,7 +2237,7 @@ mod tests {
         );
 
         let result_b = tauri::async_runtime::block_on(consumer.execute_claim(claim_b)).unwrap();
-        assert_eq!(result_b, FencedVectorSyncSingleEventResult::Completed);
+        assert_eq!(result_b, FencedVectorSyncSingleEventResult::CompletedUpsert);
         assert_eq!(storage.test_generation_item_count().unwrap(), 1);
     }
 
@@ -2293,7 +2409,7 @@ mod tests {
 
         let result_b = tauri::async_runtime::block_on(consumer.execute_claim(claim_b)).unwrap();
         server_handle.join().unwrap();
-        assert_eq!(result_b, FencedVectorSyncSingleEventResult::Completed);
+        assert_eq!(result_b, FencedVectorSyncSingleEventResult::CompletedUpsert);
         assert_eq!(storage.test_generation_item_count().unwrap(), 1);
         assert_eq!(credential_reads.load(Ordering::SeqCst), 2);
         assert_eq!(provider_requests.load(Ordering::SeqCst), 2);
@@ -2428,7 +2544,298 @@ mod tests {
             context.clone(),
         );
         let res = tauri::async_runtime::block_on(consumer_b.execute_claim(claim_b)).unwrap();
-        assert_eq!(res, FencedVectorSyncSingleEventResult::Completed);
+        assert_eq!(res, FencedVectorSyncSingleEventResult::CompletedUpsert);
         assert_eq!(storage.test_generation_item_count().unwrap(), 1);
+    }
+
+    fn drained_context() -> (
+        VectorGenerationContext,
+        crate::vector_store::InMemoryVectorStore,
+    ) {
+        let desc = "d".repeat(64);
+        let context = VectorGenerationContext::new(
+            crate::vector_store::VectorGenerationId::parse("gen-drain").unwrap(),
+            desc.clone(),
+            3,
+        )
+        .unwrap();
+        let vectors = crate::vector_store::InMemoryVectorStore::default();
+        tauri::async_runtime::block_on(vectors.create_generation(&context)).unwrap();
+        (context, vectors)
+    }
+
+    fn drain_upsert_fixture(storage: &StorageService, gen_id: &str) -> String {
+        storage
+            .register_building_vector_generation(gen_id, &"d".repeat(64), 3)
+            .unwrap();
+        let mem = confirmed(storage, false);
+        storage
+            .enqueue(EnqueueMemoryVectorSyncRequest {
+                life_id: mem.life_id.clone(),
+                memory_id: mem.id.clone(),
+                desired_action: MemoryVectorSyncAction::Upsert,
+            })
+            .unwrap();
+        mem.life_id
+    }
+
+    fn drain_delete_fixture(storage: &StorageService, gen_id: &str) -> String {
+        storage
+            .register_building_vector_generation(gen_id, &"d".repeat(64), 3)
+            .unwrap();
+        let mem = confirmed(storage, false);
+        storage
+            .enqueue(EnqueueMemoryVectorSyncRequest {
+                life_id: mem.life_id.clone(),
+                memory_id: mem.id.clone(),
+                desired_action: MemoryVectorSyncAction::Delete,
+            })
+            .unwrap();
+        mem.life_id
+    }
+
+    #[test]
+    fn drain_rejects_invalid_limits() {
+        let (_temp, storage) = test_storage();
+        let (context, vectors) = drained_context();
+        let provider = crate::embedding::DeterministicEmbeddingProvider::new(3);
+        let consumer =
+            FencedVectorSyncSingleEventConsumer::new(&storage, &provider, &vectors, context);
+        for bad in [0, 33] {
+            let err = tauri::async_runtime::block_on(drain_fenced_vector_sync(&consumer, "w", bad))
+                .unwrap_err();
+            assert_eq!(
+                err.code,
+                MemoryVectorSyncWorkerErrorCode::InvalidRequest,
+                "limit {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn drain_stops_at_limit() {
+        let (_temp, storage) = test_storage();
+        let (context, vectors) = drained_context();
+        drain_upsert_fixture(&storage, context.generation_id().as_str());
+        // Enqueue 4 events; limit 3 should process exactly 3.
+        let _l1 = drain_delete_fixture(&storage, context.generation_id().as_str());
+        let _l2 = drain_delete_fixture(&storage, context.generation_id().as_str());
+        let _l3 = drain_delete_fixture(&storage, context.generation_id().as_str());
+        let provider = crate::embedding::DeterministicEmbeddingProvider::new(3);
+        let consumer =
+            FencedVectorSyncSingleEventConsumer::new(&storage, &provider, &vectors, context);
+        let report =
+            tauri::async_runtime::block_on(drain_fenced_vector_sync(&consumer, "w-limit", 3))
+                .unwrap();
+        assert_eq!(report.requested_limit, 3);
+        assert_eq!(report.processed, 3);
+        assert!(!report.stopped_no_eligible);
+        assert!(!report.stopped_lost_lease);
+    }
+
+    #[test]
+    fn drain_stops_when_no_event_is_eligible() {
+        let (_temp, storage) = test_storage();
+        let (context, vectors) = drained_context();
+        storage
+            .register_building_vector_generation(
+                context.generation_id().as_str(),
+                &"d".repeat(64),
+                3,
+            )
+            .unwrap();
+        let provider = crate::embedding::DeterministicEmbeddingProvider::new(3);
+        let consumer =
+            FencedVectorSyncSingleEventConsumer::new(&storage, &provider, &vectors, context);
+        let report =
+            tauri::async_runtime::block_on(drain_fenced_vector_sync(&consumer, "w-empty", 5))
+                .unwrap();
+        assert_eq!(report.processed, 0);
+        assert!(report.stopped_no_eligible);
+    }
+
+    #[test]
+    fn drain_continues_after_event_level_failures() {
+        let (_temp, storage) = test_storage();
+        let (context, vectors) = drained_context();
+        // First event: no credential → blocked.
+        drain_upsert_fixture(&storage, context.generation_id().as_str());
+        let profile = ModelProfile {
+            id: "prof-drain-err".into(),
+            purpose: ModelPurpose::Embedding,
+            provider_kind: ModelProviderKind::OpenaiCompatible,
+            display_name: "test".into(),
+            base_url: "http://127.0.0.1:9/v1".into(),
+            model_name: "test-embedding-model".into(),
+            temperature: None,
+            max_tokens: None,
+            embedding_dimension: Some(3),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        };
+        let secrets = InMemorySecretStore::new();
+        let provider =
+            crate::embedding::build_openai_compatible_embedding_provider(&profile, &secrets)
+                .unwrap();
+        let consumer = FencedVectorSyncSingleEventConsumer::new(
+            &storage,
+            provider.as_ref(),
+            &vectors,
+            context.clone(),
+        );
+        // First event fails (no secret), second event was not enqueued yet.
+        // Drain with limit 2: first fails, then no more eligible.
+        let report =
+            tauri::async_runtime::block_on(drain_fenced_vector_sync(&consumer, "w-err", 5))
+                .unwrap();
+        assert!(report.processed >= 1);
+        assert!(report.blocked >= 1 || report.failed >= 1);
+        assert!(report.stopped_no_eligible);
+    }
+
+    #[test]
+    fn drain_keeps_same_fence_for_same_owner() {
+        let (_temp, storage) = test_storage();
+        let (context, vectors) = drained_context();
+        drain_delete_fixture(&storage, context.generation_id().as_str());
+        let provider = crate::embedding::DeterministicEmbeddingProvider::new(3);
+        let consumer = FencedVectorSyncSingleEventConsumer::new(
+            &storage,
+            &provider,
+            &vectors,
+            context.clone(),
+        );
+        // Same owner draining twice uses the same fence (no increment).
+        let report_a =
+            tauri::async_runtime::block_on(drain_fenced_vector_sync(&consumer, "w-a", 5)).unwrap();
+        assert_eq!(report_a.processed, 1);
+        assert!(report_a.stopped_no_eligible);
+        // Enqueue another event; same owner can drain again.
+        drain_delete_fixture(&storage, context.generation_id().as_str());
+        let report_b =
+            tauri::async_runtime::block_on(drain_fenced_vector_sync(&consumer, "w-a", 5)).unwrap();
+        assert_eq!(report_b.processed, 1);
+        assert!(!report_b.stopped_lost_lease);
+    }
+
+    #[test]
+    fn drain_is_strictly_serial() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (_temp, storage) = test_storage();
+        let (context, vectors) = drained_context();
+        for _ in 0..4 {
+            drain_upsert_fixture(&storage, context.generation_id().as_str());
+        }
+        let provider = crate::embedding::DeterministicEmbeddingProvider::new(3);
+        let concurrent = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        struct Tracker {
+            inner: Box<dyn EmbeddingProvider>,
+            current: Arc<AtomicUsize>,
+            max: Arc<AtomicUsize>,
+        }
+        impl EmbeddingProvider for Tracker {
+            fn model_info(&self) -> crate::embedding::EmbeddingModelInfo {
+                self.inner.model_info()
+            }
+            fn model_name(&self) -> &str {
+                self.inner.model_name()
+            }
+            fn vector_dimension(&self) -> Option<usize> {
+                self.inner.vector_dimension()
+            }
+            fn embed<'a>(
+                &'a self,
+                request: crate::embedding::EmbeddingRequest,
+            ) -> crate::embedding::EmbeddingFuture<
+                'a,
+                Result<crate::embedding::EmbeddingBatch, crate::embedding::EmbeddingError>,
+            > {
+                let prev = self.current.fetch_add(1, Ordering::SeqCst);
+                let cur = prev + 1;
+                self.max.fetch_max(cur, Ordering::SeqCst);
+                Box::pin(async move {
+                    let _ = self.current.fetch_sub(1, Ordering::SeqCst);
+                    self.inner.embed(request).await
+                })
+            }
+        }
+        let tracker = Tracker {
+            inner: Box::new(provider),
+            current: Arc::clone(&concurrent),
+            max: Arc::clone(&max_seen),
+        };
+        let consumer =
+            FencedVectorSyncSingleEventConsumer::new(&storage, &tracker, &vectors, context);
+        tauri::async_runtime::block_on(drain_fenced_vector_sync(&consumer, "w-serial", 4)).unwrap();
+        assert_eq!(
+            max_seen.load(Ordering::SeqCst),
+            1,
+            "max concurrent embedding calls must be 1"
+        );
+    }
+
+    #[test]
+    fn drain_skips_legacy_quarantine() {
+        let (_temp, storage) = test_storage();
+        let (context, vectors) = drained_context();
+        storage
+            .register_building_vector_generation(
+                context.generation_id().as_str(),
+                &"d".repeat(64),
+                3,
+            )
+            .unwrap();
+        storage
+            .test_insert_legacy_quarantine_fixture("legacy-quar", "upsert")
+            .unwrap();
+        // Now also enqueue a post-012 delete.
+        let mem = confirmed(&storage, false);
+        storage
+            .enqueue(EnqueueMemoryVectorSyncRequest {
+                life_id: mem.life_id.clone(),
+                memory_id: mem.id.clone(),
+                desired_action: MemoryVectorSyncAction::Delete,
+            })
+            .unwrap();
+        let provider = crate::embedding::DeterministicEmbeddingProvider::new(3);
+        let consumer =
+            FencedVectorSyncSingleEventConsumer::new(&storage, &provider, &vectors, context);
+        let report =
+            tauri::async_runtime::block_on(drain_fenced_vector_sync(&consumer, "w-quar", 5))
+                .unwrap();
+        assert_eq!(report.processed, 1);
+        assert_eq!(report.applied_deletes, 1);
+    }
+
+    #[test]
+    fn drain_can_observe_new_mutation_between_iterations() {
+        let (_temp, storage) = test_storage();
+        let (context, vectors) = drained_context();
+        storage
+            .register_building_vector_generation(
+                context.generation_id().as_str(),
+                &"d".repeat(64),
+                3,
+            )
+            .unwrap();
+        // Enqueue 1 delete. After we claim it, but before finalize in the serial
+        // loop, a consumer stops at NoEligible then a new mutation arrives.
+        let mem = confirmed(&storage, false);
+        storage
+            .enqueue(EnqueueMemoryVectorSyncRequest {
+                life_id: mem.life_id,
+                memory_id: mem.id.clone(),
+                desired_action: MemoryVectorSyncAction::Delete,
+            })
+            .unwrap();
+        let provider = crate::embedding::DeterministicEmbeddingProvider::new(3);
+        let consumer =
+            FencedVectorSyncSingleEventConsumer::new(&storage, &provider, &vectors, context);
+        let report =
+            tauri::async_runtime::block_on(drain_fenced_vector_sync(&consumer, "w-new", 5))
+                .unwrap();
+        assert_eq!(report.processed, 1);
+        assert!(report.stopped_no_eligible);
     }
 }

@@ -2926,6 +2926,11 @@ mod tests {
         assert_eq!(lance_upserts.load(Ordering::SeqCst), 0);
         assert_eq!(lance_deletes.load(Ordering::SeqCst), 0);
         assert_eq!(storage.test_generation_item_count().unwrap(), 0);
+        // Worker A's claim was never attempt-started: Provider=0, Lance=0.
+        // The LostLease return from before start_attempt guarantees attempt_count remains 0
+        // because the code only marks the attempt AFTER the second fenced_vector_claim_is_current
+        // check (which fails).  The Outbox was not mutated by worker A.
+        // Verify by checking the takeover event's snapshot: worker A never touched it.
 
         let claim_b = claim_b_slot.lock().unwrap().take().unwrap();
         let snap_b_takeover = snap_b_takeover_slot.lock().unwrap().take().unwrap();

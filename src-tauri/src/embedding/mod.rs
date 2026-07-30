@@ -17,7 +17,10 @@ use std::{future::Future, pin::Pin};
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::transport::http1::SendDisposition;
+use crate::model::{
+    provider::{ProviderCredentialError, ProviderErrorKind, ProviderResponseClass},
+    transport::http1::SendDisposition,
+};
 
 pub(crate) type EmbeddingFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -59,11 +62,41 @@ pub(crate) enum EmbeddingErrorCode {
     DimensionMismatch,
 }
 
+/// Evidence retained for retry policy without exposing provider response data
+/// or transport internals to consumers of the embedding boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EmbeddingRetrySafety {
+    DefinitelyNotSent,
+    ResponseReceived,
+    PossiblySent,
+}
+
+/// Stable origin categories used by the bounded vector-sync retry policy.
+/// They contain no credential reference, endpoint, request payload, response
+/// body, or embedding vector.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EmbeddingRetryClass {
+    InvalidRequest,
+    CredentialNotConfigured,
+    CredentialUnavailable,
+    CredentialReadFailed,
+    TransportUnavailable,
+    RequestTimeout,
+    RateLimited,
+    AuthenticationRejected,
+    OtherClientError,
+    ProviderUnavailable,
+    InvalidProviderResponse,
+    DimensionMismatch,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EmbeddingError {
     code: EmbeddingErrorCode,
     recoverable: bool,
     disposition: SendDisposition,
+    retry_safety: EmbeddingRetrySafety,
+    retry_class: EmbeddingRetryClass,
 }
 
 impl EmbeddingError {
@@ -72,6 +105,8 @@ impl EmbeddingError {
             code,
             recoverable: false,
             disposition: SendDisposition::DefinitelyNotSent,
+            retry_safety: EmbeddingRetrySafety::DefinitelyNotSent,
+            retry_class: retry_class_for_code(code),
         }
     }
 
@@ -80,38 +115,102 @@ impl EmbeddingError {
             code,
             recoverable: true,
             disposition: SendDisposition::PossiblySent,
+            retry_safety: retry_safety_for_complete_embedding_result(code),
+            retry_class: retry_class_for_code(code),
         }
     }
 
     pub(crate) fn from_provider_error(error: crate::model::provider::ProviderError) -> Self {
-        use crate::model::provider::{ProviderCredentialError, ProviderErrorKind};
-        let (code, recoverable) = match error.kind() {
-            ProviderErrorKind::Credential(ProviderCredentialError::NotConfigured) => {
-                // Missing embedding credential: blocked-class at worker via AuthenticationFailed.
-                (EmbeddingErrorCode::AuthenticationFailed, false)
-            }
-            ProviderErrorKind::AuthenticationRejected => {
-                (EmbeddingErrorCode::AuthenticationFailed, false)
-            }
-            ProviderErrorKind::RateLimited => (EmbeddingErrorCode::RateLimited, true),
-            ProviderErrorKind::TransportTimeout | ProviderErrorKind::RemoteTimeoutResponse => {
-                (EmbeddingErrorCode::RequestTimeout, true)
-            }
-            ProviderErrorKind::TransportUnavailable
-            | ProviderErrorKind::ProviderUnavailable
-            | ProviderErrorKind::UnexpectedStatus
-            | ProviderErrorKind::ResponseRejected
-            | ProviderErrorKind::ResponseTooLarge
-            | ProviderErrorKind::RequestRejected
-            | ProviderErrorKind::Credential(_) => (EmbeddingErrorCode::NetworkError, true),
-            ProviderErrorKind::InvalidConfiguration
-            | ProviderErrorKind::InvalidJsonRequest
-            | ProviderErrorKind::RequestTooLarge => (EmbeddingErrorCode::InvalidRequest, false),
+        let (code, recoverable, retry_class) = match error.response_class() {
+            Some(response_class) => match response_class {
+                ProviderResponseClass::RequestTimeout => (
+                    EmbeddingErrorCode::RequestTimeout,
+                    true,
+                    EmbeddingRetryClass::RequestTimeout,
+                ),
+                ProviderResponseClass::RateLimited => (
+                    EmbeddingErrorCode::RateLimited,
+                    true,
+                    EmbeddingRetryClass::RateLimited,
+                ),
+                ProviderResponseClass::AuthenticationRejected => (
+                    EmbeddingErrorCode::AuthenticationFailed,
+                    false,
+                    EmbeddingRetryClass::AuthenticationRejected,
+                ),
+                ProviderResponseClass::OtherClientError => (
+                    EmbeddingErrorCode::NetworkError,
+                    true,
+                    EmbeddingRetryClass::OtherClientError,
+                ),
+                ProviderResponseClass::ServerError => (
+                    EmbeddingErrorCode::NetworkError,
+                    true,
+                    EmbeddingRetryClass::ProviderUnavailable,
+                ),
+                ProviderResponseClass::InvalidResponse => (
+                    EmbeddingErrorCode::NetworkError,
+                    true,
+                    EmbeddingRetryClass::InvalidProviderResponse,
+                ),
+            },
+            None => match error.kind() {
+                ProviderErrorKind::Credential(ProviderCredentialError::NotConfigured) => {
+                    // Missing embedding credential: blocked-class at worker via AuthenticationFailed.
+                    (
+                        EmbeddingErrorCode::AuthenticationFailed,
+                        false,
+                        EmbeddingRetryClass::CredentialNotConfigured,
+                    )
+                }
+                ProviderErrorKind::Credential(ProviderCredentialError::Unavailable) => (
+                    EmbeddingErrorCode::NetworkError,
+                    true,
+                    EmbeddingRetryClass::CredentialUnavailable,
+                ),
+                ProviderErrorKind::Credential(ProviderCredentialError::ReadFailed) => (
+                    EmbeddingErrorCode::NetworkError,
+                    true,
+                    EmbeddingRetryClass::CredentialReadFailed,
+                ),
+                ProviderErrorKind::TransportTimeout => (
+                    EmbeddingErrorCode::RequestTimeout,
+                    true,
+                    EmbeddingRetryClass::RequestTimeout,
+                ),
+                ProviderErrorKind::TransportUnavailable
+                | ProviderErrorKind::ResponseRejected
+                | ProviderErrorKind::ResponseTooLarge => (
+                    EmbeddingErrorCode::NetworkError,
+                    true,
+                    EmbeddingRetryClass::TransportUnavailable,
+                ),
+                ProviderErrorKind::InvalidConfiguration
+                | ProviderErrorKind::InvalidJsonRequest
+                | ProviderErrorKind::RequestTooLarge
+                | ProviderErrorKind::RequestRejected => (
+                    EmbeddingErrorCode::InvalidRequest,
+                    false,
+                    EmbeddingRetryClass::InvalidRequest,
+                ),
+                ProviderErrorKind::AuthenticationRejected
+                | ProviderErrorKind::RemoteTimeoutResponse
+                | ProviderErrorKind::RateLimited
+                | ProviderErrorKind::ProviderUnavailable
+                | ProviderErrorKind::UnexpectedStatus => {
+                    unreachable!("response classes are exhaustive")
+                }
+            },
         };
         Self {
             code,
             recoverable,
             disposition: error.disposition(),
+            retry_safety: match error.response_class() {
+                Some(_) => EmbeddingRetrySafety::ResponseReceived,
+                None => retry_safety_from_disposition(error.disposition()),
+            },
+            retry_class,
         }
     }
 
@@ -126,6 +225,16 @@ impl EmbeddingError {
     #[allow(dead_code)]
     pub(crate) const fn send_disposition(&self) -> SendDisposition {
         self.disposition
+    }
+
+    #[allow(dead_code)]
+    pub(crate) const fn retry_safety(&self) -> EmbeddingRetrySafety {
+        self.retry_safety
+    }
+
+    #[allow(dead_code)]
+    pub(crate) const fn retry_class(&self) -> EmbeddingRetryClass {
+        self.retry_class
     }
 
     const fn safe_message(&self) -> &'static str {
@@ -152,7 +261,42 @@ impl std::fmt::Debug for EmbeddingError {
             .field("code", &self.code)
             .field("recoverable", &self.recoverable)
             .field("disposition", &self.disposition)
+            .field("retry_safety", &self.retry_safety)
+            .field("retry_class", &self.retry_class)
             .finish()
+    }
+}
+
+const fn retry_safety_from_disposition(disposition: SendDisposition) -> EmbeddingRetrySafety {
+    match disposition {
+        SendDisposition::DefinitelyNotSent => EmbeddingRetrySafety::DefinitelyNotSent,
+        SendDisposition::PossiblySent => EmbeddingRetrySafety::PossiblySent,
+    }
+}
+
+const fn retry_safety_for_complete_embedding_result(
+    code: EmbeddingErrorCode,
+) -> EmbeddingRetrySafety {
+    match code {
+        EmbeddingErrorCode::InvalidProviderResponse | EmbeddingErrorCode::DimensionMismatch => {
+            EmbeddingRetrySafety::ResponseReceived
+        }
+        _ => EmbeddingRetrySafety::PossiblySent,
+    }
+}
+
+const fn retry_class_for_code(code: EmbeddingErrorCode) -> EmbeddingRetryClass {
+    match code {
+        EmbeddingErrorCode::InvalidRequest
+        | EmbeddingErrorCode::EmptyText
+        | EmbeddingErrorCode::BatchLimitExceeded
+        | EmbeddingErrorCode::TextLimitExceeded => EmbeddingRetryClass::InvalidRequest,
+        EmbeddingErrorCode::NetworkError => EmbeddingRetryClass::TransportUnavailable,
+        EmbeddingErrorCode::AuthenticationFailed => EmbeddingRetryClass::AuthenticationRejected,
+        EmbeddingErrorCode::RateLimited => EmbeddingRetryClass::RateLimited,
+        EmbeddingErrorCode::RequestTimeout => EmbeddingRetryClass::RequestTimeout,
+        EmbeddingErrorCode::InvalidProviderResponse => EmbeddingRetryClass::InvalidProviderResponse,
+        EmbeddingErrorCode::DimensionMismatch => EmbeddingRetryClass::DimensionMismatch,
     }
 }
 
@@ -269,6 +413,76 @@ mod tests {
         }
         assert!(std::error::Error::source(&error).is_none());
         assert_eq!(error.send_disposition(), SendDisposition::PossiblySent);
+        assert_eq!(error.retry_safety(), EmbeddingRetrySafety::ResponseReceived);
+        assert_eq!(
+            error.retry_class(),
+            EmbeddingRetryClass::InvalidProviderResponse
+        );
+    }
+
+    #[test]
+    fn embedding_retry_classification_preserves_structured_provider_evidence() {
+        use crate::model::provider::{ProviderCredentialError, ProviderError, ProviderErrorKind};
+
+        let cases = [
+            (
+                ProviderError::definitely_not_sent(ProviderErrorKind::Credential(
+                    ProviderCredentialError::NotConfigured,
+                )),
+                EmbeddingRetrySafety::DefinitelyNotSent,
+                EmbeddingRetryClass::CredentialNotConfigured,
+            ),
+            (
+                ProviderError::definitely_not_sent(ProviderErrorKind::Credential(
+                    ProviderCredentialError::Unavailable,
+                )),
+                EmbeddingRetrySafety::DefinitelyNotSent,
+                EmbeddingRetryClass::CredentialUnavailable,
+            ),
+            (
+                ProviderError::definitely_not_sent(ProviderErrorKind::Credential(
+                    ProviderCredentialError::ReadFailed,
+                )),
+                EmbeddingRetrySafety::DefinitelyNotSent,
+                EmbeddingRetryClass::CredentialReadFailed,
+            ),
+            (
+                ProviderError::definitely_not_sent(ProviderErrorKind::TransportUnavailable),
+                EmbeddingRetrySafety::DefinitelyNotSent,
+                EmbeddingRetryClass::TransportUnavailable,
+            ),
+            (
+                ProviderError::from_status(ProviderErrorKind::RemoteTimeoutResponse, 408),
+                EmbeddingRetrySafety::ResponseReceived,
+                EmbeddingRetryClass::RequestTimeout,
+            ),
+            (
+                ProviderError::from_status(ProviderErrorKind::RateLimited, 429),
+                EmbeddingRetrySafety::ResponseReceived,
+                EmbeddingRetryClass::RateLimited,
+            ),
+            (
+                ProviderError::from_status(ProviderErrorKind::AuthenticationRejected, 401),
+                EmbeddingRetrySafety::ResponseReceived,
+                EmbeddingRetryClass::AuthenticationRejected,
+            ),
+            (
+                ProviderError::from_status(ProviderErrorKind::RequestRejected, 422),
+                EmbeddingRetrySafety::ResponseReceived,
+                EmbeddingRetryClass::OtherClientError,
+            ),
+            (
+                ProviderError::from_status(ProviderErrorKind::ProviderUnavailable, 503),
+                EmbeddingRetrySafety::ResponseReceived,
+                EmbeddingRetryClass::ProviderUnavailable,
+            ),
+        ];
+
+        for (provider_error, expected_safety, expected_class) in cases {
+            let error = EmbeddingError::from_provider_error(provider_error);
+            assert_eq!(error.retry_safety(), expected_safety);
+            assert_eq!(error.retry_class(), expected_class);
+        }
     }
 
     #[test]

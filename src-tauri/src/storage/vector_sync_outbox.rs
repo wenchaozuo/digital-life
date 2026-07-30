@@ -204,6 +204,26 @@ pub(crate) enum FencedFinalizeResult {
     LostLeaseOrSuperseded,
 }
 
+/// The durable result of marking the next external I/O attempt.  `Started`
+/// contains the authoritative, one-based value written by that same SQLite
+/// transaction; a stale, superseded, or expired fence cannot advance it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FencedAttemptStartResult {
+    Started { attempt_count: u32 },
+    LostLeaseOrSuperseded,
+}
+
+// Keep older fenced-test assertions source-compatible while callers migrate to
+// the count-bearing result. Production callers use an explicit match.
+#[cfg(test)]
+impl std::ops::Not for FencedAttemptStartResult {
+    type Output = bool;
+
+    fn not(self) -> Self::Output {
+        matches!(self, Self::LostLeaseOrSuperseded)
+    }
+}
+
 #[allow(dead_code)]
 impl StorageService {
     /// D-9D1 creates only explicit, non-active generations.  Activation and
@@ -405,7 +425,7 @@ impl StorageService {
     pub(crate) fn mark_fenced_attempt_started(
         &self,
         claim: &FencedVectorSyncClaim,
-    ) -> Result<bool, crate::storage::StorageError> {
+    ) -> Result<FencedAttemptStartResult, crate::storage::StorageError> {
         let mut state = self.state()?;
         let tx = state
             .connection
@@ -417,21 +437,48 @@ impl StorageService {
                 "UPDATE memory_vector_sync_outbox SET attempt_count=attempt_count+1,
                  updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
                  WHERE id=?1 AND mutation_sequence=?2 AND state='processing' AND lease_owner=?3
-                   AND lease_fence_epoch=?4 AND claimed_generation_id=?5",
+                   AND lease_fence_epoch=?4 AND claimed_generation_id=?5
+                   AND target_revision IS ?6 AND target_content_hash IS ?7",
                 params![
                     claim.id,
                     claim.mutation_sequence,
                     claim.lease_owner,
                     claim.fence_epoch,
-                    claim.generation_id
+                    claim.generation_id,
+                    claim.target_revision,
+                    claim.target_content_hash,
                 ],
             )
             .map_err(|_| single_event_error())?
         } else {
             0
         };
+        let result = if changed == 1 {
+            let count: i64 = tx
+                .query_row(
+                    "SELECT attempt_count FROM memory_vector_sync_outbox
+                     WHERE id=?1 AND mutation_sequence=?2 AND state='processing' AND lease_owner=?3
+                       AND lease_fence_epoch=?4 AND claimed_generation_id=?5
+                       AND target_revision IS ?6 AND target_content_hash IS ?7",
+                    params![
+                        claim.id,
+                        claim.mutation_sequence,
+                        claim.lease_owner,
+                        claim.fence_epoch,
+                        claim.generation_id,
+                        claim.target_revision,
+                        claim.target_content_hash,
+                    ],
+                    |row| row.get(0),
+                )
+                .map_err(|_| single_event_error())?;
+            let attempt_count = u32::try_from(count).map_err(|_| single_event_error())?;
+            FencedAttemptStartResult::Started { attempt_count }
+        } else {
+            FencedAttemptStartResult::LostLeaseOrSuperseded
+        };
         tx.commit().map_err(|_| single_event_error())?;
-        Ok(changed == 1)
+        Ok(result)
     }
 
     pub(crate) fn finalize_fenced_vector_sync(
@@ -1875,6 +1922,136 @@ mod tests {
     }
 
     #[test]
+    fn mark_fenced_attempt_started_returns_the_atomic_persisted_count() {
+        let (_root, storage) = storage();
+        confirmed(&storage, false);
+        storage
+            .register_building_vector_generation("generation-a", "descriptor-a", 2)
+            .unwrap();
+        let claim = storage
+            .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-a")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            storage.mark_fenced_attempt_started(&claim).unwrap(),
+            FencedAttemptStartResult::Started { attempt_count: 1 }
+        );
+        assert_eq!(
+            storage.mark_fenced_attempt_started(&claim).unwrap(),
+            FencedAttemptStartResult::Started { attempt_count: 2 }
+        );
+        assert_eq!(storage.list("life").unwrap()[0].attempt_count, 2);
+    }
+
+    #[test]
+    fn mark_fenced_attempt_started_rejects_mismatched_claim_fields_without_incrementing() {
+        let cases = [
+            (
+                "mutation sequence",
+                "UPDATE memory_vector_sync_outbox SET mutation_sequence=mutation_sequence+1",
+            ),
+            (
+                "target revision",
+                "UPDATE memory_vector_sync_outbox SET target_revision=target_revision+1",
+            ),
+            (
+                "target hash",
+                "UPDATE memory_vector_sync_outbox SET target_content_hash='different-hash'",
+            ),
+            (
+                "claimed generation",
+                "UPDATE memory_vector_sync_outbox SET claimed_generation_id='generation-b'",
+            ),
+            (
+                "owner",
+                "UPDATE memory_vector_sync_outbox SET lease_owner='worker-b'",
+            ),
+        ];
+
+        for (name, mutation) in cases {
+            let (_root, storage) = storage();
+            confirmed(&storage, false);
+            storage
+                .register_building_vector_generation("generation-a", "descriptor-a", 2)
+                .unwrap();
+            let claim = storage
+                .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-a")
+                .unwrap()
+                .unwrap();
+            storage
+                .state()
+                .unwrap()
+                .connection
+                .execute(mutation, [])
+                .unwrap();
+
+            assert_eq!(
+                storage.mark_fenced_attempt_started(&claim).unwrap(),
+                FencedAttemptStartResult::LostLeaseOrSuperseded,
+                "{name} mismatch must fail closed"
+            );
+            assert_eq!(
+                storage.list("life").unwrap()[0].attempt_count,
+                0,
+                "{name} mismatch must not consume an attempt"
+            );
+        }
+    }
+
+    #[test]
+    fn mark_fenced_attempt_started_rejects_an_old_fence_from_an_independent_storage_service() {
+        let (root, first) = storage();
+        confirmed(&first, false);
+        first
+            .register_building_vector_generation("generation-a", "descriptor-a", 2)
+            .unwrap();
+        let old_claim = first
+            .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-a")
+            .unwrap()
+            .unwrap();
+        let second = StorageService::initialize_with_roots(root.0.join("data"), None).unwrap();
+
+        first.test_expire_fenced_runtime_lease().unwrap();
+        let new_claim = second
+            .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-b")
+            .unwrap()
+            .unwrap();
+        assert_ne!(old_claim.fence_epoch(), new_claim.fence_epoch());
+        assert_eq!(
+            first.mark_fenced_attempt_started(&old_claim).unwrap(),
+            FencedAttemptStartResult::LostLeaseOrSuperseded
+        );
+        assert_eq!(first.list("life").unwrap()[0].attempt_count, 0);
+    }
+
+    #[test]
+    fn mark_fenced_attempt_started_rejects_a_superseded_mutation_without_incrementing() {
+        let (_root, storage) = storage();
+        let record = confirmed(&storage, false);
+        storage
+            .register_building_vector_generation("generation-a", "descriptor-a", 2)
+            .unwrap();
+        let claim = storage
+            .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-a")
+            .unwrap()
+            .unwrap();
+        storage
+            .enqueue(EnqueueMemoryVectorSyncRequest {
+                life_id: "life".into(),
+                memory_id: record.id,
+                desired_action: MemoryVectorSyncAction::Delete,
+            })
+            .unwrap();
+
+        assert_eq!(
+            storage.mark_fenced_attempt_started(&claim).unwrap(),
+            FencedAttemptStartResult::LostLeaseOrSuperseded
+        );
+        assert_eq!(storage.list("life").unwrap()[0].attempt_count, 0);
+    }
+
+    #[test]
     fn fenced_attempt_and_finalize_require_the_current_runtime_lease() {
         let (_root, storage) = storage();
         confirmed(&storage, false);
@@ -1886,7 +2063,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(storage.list("life").unwrap()[0].attempt_count, 0);
-        assert!(storage.mark_fenced_attempt_started(&claim).unwrap());
+        assert_eq!(
+            storage.mark_fenced_attempt_started(&claim).unwrap(),
+            FencedAttemptStartResult::Started { attempt_count: 1 }
+        );
         assert_eq!(storage.list("life").unwrap()[0].attempt_count, 1);
 
         let state = storage.state().unwrap();
@@ -1928,7 +2108,10 @@ mod tests {
             .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-a")
             .unwrap()
             .unwrap();
-        assert!(storage.mark_fenced_attempt_started(&claim).unwrap());
+        assert_eq!(
+            storage.mark_fenced_attempt_started(&claim).unwrap(),
+            FencedAttemptStartResult::Started { attempt_count: 1 }
+        );
         assert_eq!(
             storage
                 .finalize_fenced_vector_sync(
@@ -1975,7 +2158,10 @@ mod tests {
             .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-a")
             .unwrap()
             .unwrap();
-        assert!(storage.mark_fenced_attempt_started(&claim).unwrap());
+        assert_eq!(
+            storage.mark_fenced_attempt_started(&claim).unwrap(),
+            FencedAttemptStartResult::Started { attempt_count: 1 }
+        );
         assert_eq!(
             storage
                 .finalize_fenced_vector_sync(

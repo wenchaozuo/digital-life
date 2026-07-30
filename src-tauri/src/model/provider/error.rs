@@ -12,6 +12,18 @@ pub(crate) enum ProviderCredentialError {
     ReadFailed,
 }
 
+/// A redacted, stable classification for a complete provider response.  It
+/// deliberately retains neither the response body nor the raw status code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderResponseClass {
+    RequestTimeout,
+    RateLimited,
+    AuthenticationRejected,
+    OtherClientError,
+    ServerError,
+    InvalidResponse,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProviderErrorKind {
     InvalidConfiguration,
@@ -52,7 +64,23 @@ impl ProviderError {
         self.status
     }
 
-    pub(super) const fn definitely_not_sent(kind: ProviderErrorKind) -> Self {
+    pub(crate) const fn response_class(self) -> Option<ProviderResponseClass> {
+        match self.kind {
+            ProviderErrorKind::RemoteTimeoutResponse => Some(ProviderResponseClass::RequestTimeout),
+            ProviderErrorKind::RateLimited => Some(ProviderResponseClass::RateLimited),
+            ProviderErrorKind::AuthenticationRejected => {
+                Some(ProviderResponseClass::AuthenticationRejected)
+            }
+            ProviderErrorKind::ProviderUnavailable => Some(ProviderResponseClass::ServerError),
+            ProviderErrorKind::RequestRejected if self.status.is_some() => {
+                Some(ProviderResponseClass::OtherClientError)
+            }
+            ProviderErrorKind::UnexpectedStatus => Some(ProviderResponseClass::InvalidResponse),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn definitely_not_sent(kind: ProviderErrorKind) -> Self {
         Self {
             kind,
             disposition: SendDisposition::DefinitelyNotSent,
@@ -60,7 +88,7 @@ impl ProviderError {
         }
     }
 
-    pub(super) const fn from_status(kind: ProviderErrorKind, status: u16) -> Self {
+    pub(crate) const fn from_status(kind: ProviderErrorKind, status: u16) -> Self {
         Self {
             kind,
             disposition: SendDisposition::PossiblySent,
@@ -142,3 +170,65 @@ impl fmt::Display for ProviderError {
 }
 
 impl std::error::Error for ProviderError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_error_response_class_keeps_explicit_statuses_structured_and_redacted() {
+        let cases = [
+            (
+                ProviderErrorKind::RemoteTimeoutResponse,
+                408,
+                ProviderResponseClass::RequestTimeout,
+            ),
+            (
+                ProviderErrorKind::RateLimited,
+                429,
+                ProviderResponseClass::RateLimited,
+            ),
+            (
+                ProviderErrorKind::AuthenticationRejected,
+                401,
+                ProviderResponseClass::AuthenticationRejected,
+            ),
+            (
+                ProviderErrorKind::AuthenticationRejected,
+                403,
+                ProviderResponseClass::AuthenticationRejected,
+            ),
+            (
+                ProviderErrorKind::RequestRejected,
+                422,
+                ProviderResponseClass::OtherClientError,
+            ),
+            (
+                ProviderErrorKind::ProviderUnavailable,
+                503,
+                ProviderResponseClass::ServerError,
+            ),
+        ];
+        for (kind, status, expected) in cases {
+            let error = ProviderError::from_status(kind, status);
+            assert_eq!(error.response_class(), Some(expected));
+            assert!(!format!("{error:?}").contains("response-body-canary"));
+        }
+    }
+
+    #[test]
+    fn provider_error_transport_and_credential_errors_have_no_response_class() {
+        for kind in [
+            ProviderErrorKind::Credential(ProviderCredentialError::NotConfigured),
+            ProviderErrorKind::Credential(ProviderCredentialError::Unavailable),
+            ProviderErrorKind::Credential(ProviderCredentialError::ReadFailed),
+            ProviderErrorKind::TransportUnavailable,
+            ProviderErrorKind::TransportTimeout,
+        ] {
+            assert_eq!(
+                ProviderError::definitely_not_sent(kind).response_class(),
+                None
+            );
+        }
+    }
+}

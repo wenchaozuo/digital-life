@@ -10,7 +10,9 @@ mod openai_compatible;
 mod response;
 
 #[allow(unused_imports)]
-pub(crate) use error::{ProviderCredentialError, ProviderError, ProviderErrorKind};
+pub(crate) use error::{
+    ProviderCredentialError, ProviderError, ProviderErrorKind, ProviderResponseClass,
+};
 #[allow(unused_imports)]
 pub(crate) use openai_compatible::{
     OpenAiCompatibleProvider, OpenAiCompatibleProviderConfig, ProviderJsonRequest,

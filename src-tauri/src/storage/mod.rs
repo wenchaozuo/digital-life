@@ -16,7 +16,9 @@ mod vector_sync_settings;
 pub(crate) use llm_candidate_extraction::{
     trigger_candidate_extraction, LlmCandidateExtractionCoordinator,
 };
-pub(crate) use vector_sync_outbox::{FencedFinalizeResult, FencedVectorSyncClaim};
+pub(crate) use vector_sync_outbox::{
+    FencedAttemptStartResult, FencedFinalizeResult, FencedVectorSyncClaim,
+};
 
 use std::{
     fmt::Display,

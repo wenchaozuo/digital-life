@@ -14,14 +14,19 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
 
 use crate::{
-    embedding::{EmbeddingProvider, EmbeddingPurpose, EmbeddingRequest},
+    embedding::{
+        EmbeddingProvider, EmbeddingPurpose, EmbeddingRequest, EmbeddingRetryClass,
+        EmbeddingRetrySafety,
+    },
     model::transport::http1::SendDisposition,
     model::{
         profile::ModelProfileRepository,
         runtime::{ModelRuntimeCoordinator, ModelRuntimeErrorCode, ModelRuntimeService},
     },
     secrets::{SecretStore, WindowsCredentialSecretStore},
-    storage::{FencedFinalizeResult, FencedVectorSyncClaim, StorageService},
+    storage::{
+        FencedAttemptStartResult, FencedFinalizeResult, FencedVectorSyncClaim, StorageService,
+    },
     vector_store::{
         GenerationVectorRecord, LanceDbVectorStoreRegistry, VectorGenerationContext, VectorStore,
         VectorStoreErrorCode,
@@ -47,10 +52,178 @@ const MIN_DRAIN_LIMIT: usize = 1;
 #[allow(dead_code)]
 const MAX_DRAIN_LIMIT: usize = 32;
 const DEFAULT_LEASE_SECONDS: u32 = 120;
-const MAX_ATTEMPTS: u32 = 5;
+pub(crate) const MAX_VECTOR_SYNC_ATTEMPTS: u32 = 5;
 const INITIAL_RETRY_SECONDS: u32 = 30;
 const MAX_RETRY_SECONDS: u32 = 3_600;
 const MAX_FINISHED_RUNS: usize = 20;
+
+/// Pure retry-policy input.  Authority, lease, quarantine, completion, and
+/// no-eligible outcomes never enter this classifier.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RetryErrorClass {
+    Embedding(EmbeddingRetryClass),
+    EmbeddingInvalidVector,
+    LanceTransient,
+    LancePermanent,
+    InternalInvariant,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RetryOperation {
+    Upsert,
+    Delete,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RetryDisposition {
+    Retryable,
+    Blocked,
+    ProviderResultUnknown,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StableVectorSyncErrorCode {
+    AuthenticationFailed,
+    ProviderResultUnknown,
+    RateLimited,
+    RequestTimeout,
+    ProviderUnavailable,
+    InvalidRequest,
+    InvalidProviderResponse,
+    EmbeddingDimensionMismatch,
+    EmbeddingInvalidVector,
+    LanceTransient,
+    LancePermanent,
+    InternalInvariant,
+}
+
+#[allow(dead_code)]
+impl StableVectorSyncErrorCode {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::AuthenticationFailed => "AUTHENTICATION_FAILED",
+            Self::ProviderResultUnknown => "PROVIDER_RESULT_UNKNOWN",
+            Self::RateLimited => "RATE_LIMITED",
+            Self::RequestTimeout => "REQUEST_TIMEOUT",
+            // This preserves the existing fenced-worker persistent code.
+            Self::ProviderUnavailable => "NETWORK_UNAVAILABLE",
+            Self::InvalidRequest => "INVALID_REQUEST",
+            Self::InvalidProviderResponse => "INVALID_PROVIDER_RESPONSE",
+            Self::EmbeddingDimensionMismatch => "EMBEDDING_DIMENSION_MISMATCH",
+            Self::EmbeddingInvalidVector => "EMBEDDING_INVALID_VECTOR",
+            Self::LanceTransient => "LANCE_TRANSIENT",
+            Self::LancePermanent => "LANCE_PERMANENT",
+            Self::InternalInvariant => "INTERNAL_INVARIANT",
+        }
+    }
+}
+
+/// No-I/O, no-clock classification for a failure after an attempt marker is
+/// durably written.  It does not schedule retries or mutate an outbox row.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RetryDecision {
+    pub(crate) disposition: RetryDisposition,
+    pub(crate) stable_error_code: StableVectorSyncErrorCode,
+    pub(crate) retry_safety: EmbeddingRetrySafety,
+    pub(crate) consumes_attempt: bool,
+    pub(crate) consumes_provider_slot: bool,
+    pub(crate) blocked_by_attempt_limit: bool,
+    pub(crate) requires_follow_up: bool,
+}
+
+#[allow(dead_code)]
+pub(crate) const fn retry_decision(
+    error: RetryErrorClass,
+    retry_safety: EmbeddingRetrySafety,
+    attempt_count: u32,
+    operation: RetryOperation,
+) -> RetryDecision {
+    let blocked_by_attempt_limit = attempt_count >= MAX_VECTOR_SYNC_ATTEMPTS;
+    let stable_error_code = stable_error_code_for(error);
+    let consumes_provider_slot = matches!(
+        (operation, error),
+        (RetryOperation::Upsert, RetryErrorClass::Embedding(_))
+    );
+    let provider_result_unknown = matches!(retry_safety, EmbeddingRetrySafety::PossiblySent)
+        && matches!(error, RetryErrorClass::Embedding(_));
+    let disposition = if provider_result_unknown {
+        RetryDisposition::ProviderResultUnknown
+    } else if blocked_by_attempt_limit || !retryable_error(error) {
+        RetryDisposition::Blocked
+    } else {
+        RetryDisposition::Retryable
+    };
+    RetryDecision {
+        disposition,
+        stable_error_code: if provider_result_unknown {
+            StableVectorSyncErrorCode::ProviderResultUnknown
+        } else {
+            stable_error_code
+        },
+        retry_safety,
+        consumes_attempt: true,
+        consumes_provider_slot,
+        blocked_by_attempt_limit,
+        requires_follow_up: matches!(disposition, RetryDisposition::ProviderResultUnknown),
+    }
+}
+
+#[allow(dead_code)]
+const fn stable_error_code_for(error: RetryErrorClass) -> StableVectorSyncErrorCode {
+    match error {
+        RetryErrorClass::Embedding(EmbeddingRetryClass::CredentialNotConfigured)
+        | RetryErrorClass::Embedding(EmbeddingRetryClass::AuthenticationRejected) => {
+            StableVectorSyncErrorCode::AuthenticationFailed
+        }
+        RetryErrorClass::Embedding(EmbeddingRetryClass::CredentialUnavailable)
+        | RetryErrorClass::Embedding(EmbeddingRetryClass::CredentialReadFailed)
+        | RetryErrorClass::Embedding(EmbeddingRetryClass::TransportUnavailable)
+        | RetryErrorClass::Embedding(EmbeddingRetryClass::ProviderUnavailable) => {
+            StableVectorSyncErrorCode::ProviderUnavailable
+        }
+        RetryErrorClass::Embedding(EmbeddingRetryClass::RequestTimeout) => {
+            StableVectorSyncErrorCode::RequestTimeout
+        }
+        RetryErrorClass::Embedding(EmbeddingRetryClass::RateLimited) => {
+            StableVectorSyncErrorCode::RateLimited
+        }
+        RetryErrorClass::Embedding(EmbeddingRetryClass::InvalidRequest)
+        | RetryErrorClass::Embedding(EmbeddingRetryClass::OtherClientError) => {
+            StableVectorSyncErrorCode::InvalidRequest
+        }
+        RetryErrorClass::Embedding(EmbeddingRetryClass::InvalidProviderResponse) => {
+            StableVectorSyncErrorCode::InvalidProviderResponse
+        }
+        RetryErrorClass::Embedding(EmbeddingRetryClass::DimensionMismatch) => {
+            StableVectorSyncErrorCode::EmbeddingDimensionMismatch
+        }
+        RetryErrorClass::EmbeddingInvalidVector => {
+            StableVectorSyncErrorCode::EmbeddingInvalidVector
+        }
+        RetryErrorClass::LanceTransient => StableVectorSyncErrorCode::LanceTransient,
+        RetryErrorClass::LancePermanent => StableVectorSyncErrorCode::LancePermanent,
+        RetryErrorClass::InternalInvariant => StableVectorSyncErrorCode::InternalInvariant,
+    }
+}
+
+#[allow(dead_code)]
+const fn retryable_error(error: RetryErrorClass) -> bool {
+    matches!(
+        error,
+        RetryErrorClass::Embedding(EmbeddingRetryClass::CredentialUnavailable)
+            | RetryErrorClass::Embedding(EmbeddingRetryClass::CredentialReadFailed)
+            | RetryErrorClass::Embedding(EmbeddingRetryClass::TransportUnavailable)
+            | RetryErrorClass::Embedding(EmbeddingRetryClass::RequestTimeout)
+            | RetryErrorClass::Embedding(EmbeddingRetryClass::RateLimited)
+            | RetryErrorClass::Embedding(EmbeddingRetryClass::ProviderUnavailable)
+            | RetryErrorClass::LanceTransient
+    )
+}
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -275,11 +448,14 @@ impl<'a> FencedVectorSyncSingleEventConsumer<'a> {
                 {
                     return Ok(FencedVectorSyncSingleEventResult::LostLeaseOrSuperseded);
                 }
-                if !self
-                    .storage
-                    .mark_fenced_attempt_started(&claim)
-                    .map_err(|_| worker_error(MemoryVectorSyncWorkerErrorCode::OutboxUnavailable))?
-                {
+                if matches!(
+                    self.storage
+                        .mark_fenced_attempt_started(&claim)
+                        .map_err(|_| worker_error(
+                            MemoryVectorSyncWorkerErrorCode::OutboxUnavailable
+                        ))?,
+                    FencedAttemptStartResult::LostLeaseOrSuperseded
+                ) {
                     return Ok(FencedVectorSyncSingleEventResult::LostLeaseOrSuperseded);
                 }
                 let outcome = self
@@ -326,11 +502,14 @@ impl<'a> FencedVectorSyncSingleEventConsumer<'a> {
                 {
                     return Ok(FencedVectorSyncSingleEventResult::LostLeaseOrSuperseded);
                 }
-                if !self
-                    .storage
-                    .mark_fenced_attempt_started(&claim)
-                    .map_err(|_| worker_error(MemoryVectorSyncWorkerErrorCode::OutboxUnavailable))?
-                {
+                if matches!(
+                    self.storage
+                        .mark_fenced_attempt_started(&claim)
+                        .map_err(|_| worker_error(
+                            MemoryVectorSyncWorkerErrorCode::OutboxUnavailable
+                        ))?,
+                    FencedAttemptStartResult::LostLeaseOrSuperseded
+                ) {
                     return Ok(FencedVectorSyncSingleEventResult::LostLeaseOrSuperseded);
                 }
                 let response = self
@@ -1062,7 +1241,9 @@ where
     ) -> Result<MemoryVectorSyncProcessDisposition, MemoryVectorSyncWorkerError> {
         let code = failure.code.as_str();
         match failure.failure_class {
-            Some(MemoryVectorSyncFailureClass::Retriable) if job.attempt_count < MAX_ATTEMPTS => {
+            Some(MemoryVectorSyncFailureClass::Retriable)
+                if job.attempt_count < MAX_VECTOR_SYNC_ATTEMPTS =>
+            {
                 self.outbox
                     .mark_retry_after(
                         &job.life_id,
@@ -3736,6 +3917,212 @@ mod tests {
         assert_eq!(
             after_quarantine.migration_disposition.as_deref(),
             Some("legacy_upsert_rebuild_required")
+        );
+    }
+
+    #[test]
+    fn retry_decision_classifies_the_fenced_failure_matrix_without_io() {
+        struct Case {
+            error: RetryErrorClass,
+            safety: EmbeddingRetrySafety,
+            operation: RetryOperation,
+            disposition: RetryDisposition,
+            code: StableVectorSyncErrorCode,
+            provider_slot: bool,
+        }
+
+        let cases = [
+            Case {
+                error: RetryErrorClass::Embedding(EmbeddingRetryClass::CredentialUnavailable),
+                safety: EmbeddingRetrySafety::DefinitelyNotSent,
+                operation: RetryOperation::Upsert,
+                disposition: RetryDisposition::Retryable,
+                code: StableVectorSyncErrorCode::ProviderUnavailable,
+                provider_slot: true,
+            },
+            Case {
+                error: RetryErrorClass::Embedding(EmbeddingRetryClass::CredentialReadFailed),
+                safety: EmbeddingRetrySafety::DefinitelyNotSent,
+                operation: RetryOperation::Upsert,
+                disposition: RetryDisposition::Retryable,
+                code: StableVectorSyncErrorCode::ProviderUnavailable,
+                provider_slot: true,
+            },
+            Case {
+                error: RetryErrorClass::Embedding(EmbeddingRetryClass::TransportUnavailable),
+                safety: EmbeddingRetrySafety::DefinitelyNotSent,
+                operation: RetryOperation::Upsert,
+                disposition: RetryDisposition::Retryable,
+                code: StableVectorSyncErrorCode::ProviderUnavailable,
+                provider_slot: true,
+            },
+            Case {
+                error: RetryErrorClass::Embedding(EmbeddingRetryClass::RequestTimeout),
+                safety: EmbeddingRetrySafety::DefinitelyNotSent,
+                operation: RetryOperation::Upsert,
+                disposition: RetryDisposition::Retryable,
+                code: StableVectorSyncErrorCode::RequestTimeout,
+                provider_slot: true,
+            },
+            Case {
+                error: RetryErrorClass::Embedding(EmbeddingRetryClass::RequestTimeout),
+                safety: EmbeddingRetrySafety::PossiblySent,
+                operation: RetryOperation::Upsert,
+                disposition: RetryDisposition::ProviderResultUnknown,
+                code: StableVectorSyncErrorCode::ProviderResultUnknown,
+                provider_slot: true,
+            },
+            Case {
+                error: RetryErrorClass::Embedding(EmbeddingRetryClass::RateLimited),
+                safety: EmbeddingRetrySafety::ResponseReceived,
+                operation: RetryOperation::Upsert,
+                disposition: RetryDisposition::Retryable,
+                code: StableVectorSyncErrorCode::RateLimited,
+                provider_slot: true,
+            },
+            Case {
+                error: RetryErrorClass::Embedding(EmbeddingRetryClass::CredentialNotConfigured),
+                safety: EmbeddingRetrySafety::DefinitelyNotSent,
+                operation: RetryOperation::Upsert,
+                disposition: RetryDisposition::Blocked,
+                code: StableVectorSyncErrorCode::AuthenticationFailed,
+                provider_slot: true,
+            },
+            Case {
+                error: RetryErrorClass::Embedding(EmbeddingRetryClass::AuthenticationRejected),
+                safety: EmbeddingRetrySafety::ResponseReceived,
+                operation: RetryOperation::Upsert,
+                disposition: RetryDisposition::Blocked,
+                code: StableVectorSyncErrorCode::AuthenticationFailed,
+                provider_slot: true,
+            },
+            Case {
+                error: RetryErrorClass::Embedding(EmbeddingRetryClass::OtherClientError),
+                safety: EmbeddingRetrySafety::ResponseReceived,
+                operation: RetryOperation::Upsert,
+                disposition: RetryDisposition::Blocked,
+                code: StableVectorSyncErrorCode::InvalidRequest,
+                provider_slot: true,
+            },
+            Case {
+                error: RetryErrorClass::Embedding(EmbeddingRetryClass::ProviderUnavailable),
+                safety: EmbeddingRetrySafety::ResponseReceived,
+                operation: RetryOperation::Upsert,
+                disposition: RetryDisposition::Retryable,
+                code: StableVectorSyncErrorCode::ProviderUnavailable,
+                provider_slot: true,
+            },
+            Case {
+                error: RetryErrorClass::Embedding(EmbeddingRetryClass::InvalidProviderResponse),
+                safety: EmbeddingRetrySafety::ResponseReceived,
+                operation: RetryOperation::Upsert,
+                disposition: RetryDisposition::Blocked,
+                code: StableVectorSyncErrorCode::InvalidProviderResponse,
+                provider_slot: true,
+            },
+            Case {
+                error: RetryErrorClass::Embedding(EmbeddingRetryClass::DimensionMismatch),
+                safety: EmbeddingRetrySafety::ResponseReceived,
+                operation: RetryOperation::Upsert,
+                disposition: RetryDisposition::Blocked,
+                code: StableVectorSyncErrorCode::EmbeddingDimensionMismatch,
+                provider_slot: true,
+            },
+            Case {
+                error: RetryErrorClass::EmbeddingInvalidVector,
+                safety: EmbeddingRetrySafety::ResponseReceived,
+                operation: RetryOperation::Upsert,
+                disposition: RetryDisposition::Blocked,
+                code: StableVectorSyncErrorCode::EmbeddingInvalidVector,
+                provider_slot: false,
+            },
+            Case {
+                error: RetryErrorClass::LanceTransient,
+                safety: EmbeddingRetrySafety::ResponseReceived,
+                operation: RetryOperation::Delete,
+                disposition: RetryDisposition::Retryable,
+                code: StableVectorSyncErrorCode::LanceTransient,
+                provider_slot: false,
+            },
+            Case {
+                error: RetryErrorClass::LancePermanent,
+                safety: EmbeddingRetrySafety::ResponseReceived,
+                operation: RetryOperation::Delete,
+                disposition: RetryDisposition::Blocked,
+                code: StableVectorSyncErrorCode::LancePermanent,
+                provider_slot: false,
+            },
+            Case {
+                error: RetryErrorClass::InternalInvariant,
+                safety: EmbeddingRetrySafety::DefinitelyNotSent,
+                operation: RetryOperation::Delete,
+                disposition: RetryDisposition::Blocked,
+                code: StableVectorSyncErrorCode::InternalInvariant,
+                provider_slot: false,
+            },
+        ];
+
+        for case in cases {
+            let decision = retry_decision(case.error, case.safety, 1, case.operation);
+            assert_eq!(decision.retry_safety, case.safety);
+            assert_eq!(decision.disposition, case.disposition);
+            assert_eq!(decision.stable_error_code, case.code);
+            assert!(decision.consumes_attempt);
+            assert_eq!(decision.consumes_provider_slot, case.provider_slot);
+            assert_eq!(
+                decision.requires_follow_up,
+                case.disposition == RetryDisposition::ProviderResultUnknown
+            );
+        }
+    }
+
+    #[test]
+    fn retry_decision_fails_closed_at_and_above_the_attempt_limit() {
+        for attempt_count in [1, 4] {
+            let decision = retry_decision(
+                RetryErrorClass::Embedding(EmbeddingRetryClass::RateLimited),
+                EmbeddingRetrySafety::ResponseReceived,
+                attempt_count,
+                RetryOperation::Upsert,
+            );
+            assert_eq!(decision.disposition, RetryDisposition::Retryable);
+            assert!(!decision.blocked_by_attempt_limit);
+        }
+        for attempt_count in [MAX_VECTOR_SYNC_ATTEMPTS, 6, u32::MAX] {
+            let decision = retry_decision(
+                RetryErrorClass::Embedding(EmbeddingRetryClass::RateLimited),
+                EmbeddingRetrySafety::ResponseReceived,
+                attempt_count,
+                RetryOperation::Upsert,
+            );
+            assert_eq!(decision.disposition, RetryDisposition::Blocked);
+            assert!(decision.blocked_by_attempt_limit);
+            assert!(decision.consumes_attempt);
+            assert!(decision.consumes_provider_slot);
+        }
+    }
+
+    #[test]
+    fn retry_classification_is_redacted_and_never_parses_dynamic_error_text() {
+        let decision = retry_decision(
+            RetryErrorClass::Embedding(EmbeddingRetryClass::InvalidProviderResponse),
+            EmbeddingRetrySafety::ResponseReceived,
+            1,
+            RetryOperation::Upsert,
+        );
+        let rendered = format!("{decision:?}");
+        for canary in [
+            "https://provider.invalid/v1",
+            "Authorization",
+            "credential-canary",
+            "response-body-canary",
+            "vector-canary",
+        ] {
+            assert!(!rendered.contains(canary));
+        }
+        assert_eq!(
+            decision.stable_error_code.as_str(),
+            "INVALID_PROVIDER_RESPONSE"
         );
     }
 }

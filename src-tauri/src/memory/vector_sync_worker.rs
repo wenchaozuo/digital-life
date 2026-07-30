@@ -1953,6 +1953,7 @@ mod tests {
             CreateModelProfileRequest, ModelProfile, ModelProfileService, ModelProviderKind,
             ModelPurpose, SetActiveModelProfileRequest,
         },
+        model::provider::{ProviderCredentialError, ProviderError, ProviderErrorKind},
         secrets::{InMemorySecretStore, SecretIdentifier, SecretPurpose, SecretStore, SecretValue},
         storage::{LifeIdentityRecord, PersonaTemplateRecord},
     };
@@ -2724,10 +2725,10 @@ mod tests {
             self.inner.create_generation(context)
         }
 
-            fn upsert_generation<'a>(
-                &'a self,
-                context: &'a VectorGenerationContext,
-                record: GenerationVectorRecord,
+        fn upsert_generation<'a>(
+            &'a self,
+            context: &'a VectorGenerationContext,
+            record: GenerationVectorRecord,
         ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
             self.lance_upserts.fetch_add(1, Ordering::SeqCst);
             let current = Arc::clone(&self.current_lance_writes);
@@ -5969,5 +5970,1095 @@ mod tests {
         //
         // Classification: Case B - bytes were sent past transport, but no complete
         // HTTP response received. The disposition "possibly_sent" is correct.
+    }
+
+    struct FakeCredentialProvider {
+        kind: ProviderCredentialError,
+        requests: AtomicUsize,
+    }
+
+    impl EmbeddingProvider for FakeCredentialProvider {
+        fn model_info(&self) -> EmbeddingModelInfo {
+            EmbeddingModelInfo {
+                model_name: "fake-cred".into(),
+                dimension: Some(3),
+            }
+        }
+        fn model_name(&self) -> &str {
+            "fake-cred"
+        }
+        fn vector_dimension(&self) -> Option<usize> {
+            Some(3)
+        }
+        fn max_batch_size(&self) -> usize {
+            32
+        }
+        fn embed<'a>(
+            &'a self,
+            _request: EmbeddingRequest,
+        ) -> EmbeddingFuture<'a, Result<EmbeddingBatch, EmbeddingError>> {
+            self.requests.fetch_add(1, Ordering::SeqCst);
+            let kind = self.kind;
+            Box::pin(async move {
+                Err(EmbeddingError::from_provider_error(
+                    ProviderError::definitely_not_sent(ProviderErrorKind::Credential(kind)),
+                ))
+            })
+        }
+    }
+
+    #[test]
+    fn database_retry_matrix_credential_transient_errors() {
+        // Credential Unavailable
+        {
+            let (_temp, storage) = test_storage();
+            let (context, vectors) = drained_context();
+            drain_upsert_fixture(&storage, context.generation_id().as_str());
+            let clock = FixedRetryClock::new(100_000);
+            let provider = FakeCredentialProvider {
+                kind: ProviderCredentialError::Unavailable,
+                requests: AtomicUsize::new(0),
+            };
+            let consumer =
+                FencedVectorSyncSingleEventConsumer::new(&storage, &provider, &vectors, context)
+                    .with_retry_clock_for_test(Box::new(clock));
+            let report = tauri::async_runtime::block_on(drain_fenced_vector_sync(
+                &consumer,
+                "w-cred-unav",
+                1,
+            ))
+            .unwrap();
+            assert_eq!(report.retry_scheduled, 1);
+            assert_eq!(report.processed, 1);
+            assert_eq!(provider.requests.load(Ordering::SeqCst), 1);
+            let row = storage.test_fenced_outbox_failure_snapshot().unwrap();
+            assert_eq!(row.0, 1);
+            assert_eq!(row.1.as_deref(), Some("definitely_not_sent"));
+            assert_eq!(row.2, "PROVIDER_UNAVAILABLE");
+            let jobs = storage.list("life").unwrap();
+            assert_eq!(jobs[0].state, MemoryVectorSyncState::RetryWait);
+            assert!(jobs[0].next_attempt_at.is_some());
+            assert_eq!(jobs[0].attempt_count, 1);
+        }
+
+        // Credential ReadFailed
+        {
+            let (_temp, storage) = test_storage();
+            let (context, vectors) = drained_context();
+            drain_upsert_fixture(&storage, context.generation_id().as_str());
+            let clock = FixedRetryClock::new(100_000);
+            let provider = FakeCredentialProvider {
+                kind: ProviderCredentialError::ReadFailed,
+                requests: AtomicUsize::new(0),
+            };
+            let consumer =
+                FencedVectorSyncSingleEventConsumer::new(&storage, &provider, &vectors, context)
+                    .with_retry_clock_for_test(Box::new(clock));
+            let report =
+                tauri::async_runtime::block_on(drain_fenced_vector_sync(&consumer, "w-cred-rf", 1))
+                    .unwrap();
+            assert_eq!(report.retry_scheduled, 1);
+            assert_eq!(provider.requests.load(Ordering::SeqCst), 1);
+            let row = storage.test_fenced_outbox_failure_snapshot().unwrap();
+            assert_eq!(row.0, 1);
+            assert_eq!(row.1.as_deref(), Some("definitely_not_sent"));
+            assert_eq!(row.2, "PROVIDER_UNAVAILABLE");
+            let jobs = storage.list("life").unwrap();
+            assert_eq!(jobs[0].state, MemoryVectorSyncState::RetryWait);
+            assert_eq!(jobs[0].attempt_count, 1);
+        }
+
+        // Credential attempt 5: pre-set attempt=4 then run next attempt
+        {
+            let (_temp, storage) = test_storage();
+            let (context, vectors) = drained_context();
+            drain_upsert_fixture(&storage, context.generation_id().as_str());
+            storage.test_set_fenced_attempt_count(4).unwrap();
+            let clock = FixedRetryClock::new(100_000);
+            let provider = FakeCredentialProvider {
+                kind: ProviderCredentialError::Unavailable,
+                requests: AtomicUsize::new(0),
+            };
+            let consumer =
+                FencedVectorSyncSingleEventConsumer::new(&storage, &provider, &vectors, context)
+                    .with_retry_clock_for_test(Box::new(clock));
+            let report = tauri::async_runtime::block_on(drain_fenced_vector_sync(
+                &consumer,
+                "w-cred-att5",
+                1,
+            ))
+            .unwrap();
+            assert_eq!(report.blocked, 1);
+            assert_eq!(provider.requests.load(Ordering::SeqCst), 1);
+            let row = storage.test_fenced_outbox_failure_snapshot().unwrap();
+            assert_eq!(row.0, 5);
+            assert_eq!(row.1.as_deref(), Some("definitely_not_sent"));
+            assert_eq!(row.2, "PROVIDER_UNAVAILABLE");
+            let jobs = storage.list("life").unwrap();
+            assert_eq!(jobs[0].state, MemoryVectorSyncState::Blocked);
+            assert_eq!(jobs[0].attempt_count, 5);
+            assert_eq!(jobs[0].next_attempt_at, None);
+        }
+    }
+
+    #[test]
+    fn database_retry_matrix_pre_send_transport_errors() {
+        // Connect failure: profile pointing to dead endpoint, with valid secret
+        let (_temp, storage) = test_storage();
+        let (context, vectors) = drained_context();
+        drain_upsert_fixture(&storage, context.generation_id().as_str());
+        let profile = ModelProfile {
+            id: "profile-dead-connect".into(),
+            purpose: ModelPurpose::Embedding,
+            provider_kind: ModelProviderKind::OpenaiCompatible,
+            display_name: "dead connect".into(),
+            base_url: "http://127.0.0.1:1/v1".into(),
+            model_name: "test-embedding-model".into(),
+            temperature: None,
+            max_tokens: None,
+            embedding_dimension: Some(3),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        };
+        let raw_secrets = InMemorySecretStore::new();
+        raw_secrets
+            .set_secret(
+                &SecretIdentifier::new(SecretPurpose::EmbeddingModelApiKey, profile.id.clone())
+                    .unwrap(),
+                SecretValue::new("test-key".into()).unwrap(),
+            )
+            .unwrap();
+        let credential_reads = Arc::new(AtomicUsize::new(0));
+        let secrets = CountingSecretStore::new(raw_secrets, Arc::clone(&credential_reads));
+        let raw_provider =
+            crate::embedding::build_openai_compatible_embedding_provider(&profile, &secrets)
+                .unwrap();
+        let provider_requests = Arc::new(AtomicUsize::new(0));
+        let embedding_successes = Arc::new(AtomicUsize::new(0));
+        let provider = CountingEmbeddingProvider {
+            inner: raw_provider.as_ref(),
+            provider_requests: Arc::clone(&provider_requests),
+            embedding_successes: Arc::clone(&embedding_successes),
+        };
+        let clock = FixedRetryClock::new(100_000);
+        let consumer =
+            FencedVectorSyncSingleEventConsumer::new(&storage, &provider, &vectors, context)
+                .with_retry_clock_for_test(Box::new(clock));
+        let report =
+            tauri::async_runtime::block_on(drain_fenced_vector_sync(&consumer, "w-connect", 1))
+                .unwrap();
+        assert_eq!(report.retry_scheduled, 1);
+        assert_eq!(provider_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(embedding_successes.load(Ordering::SeqCst), 0);
+        assert_eq!(credential_reads.load(Ordering::SeqCst), 1);
+        let row = storage.test_fenced_outbox_failure_snapshot().unwrap();
+        assert_eq!(row.0, 1);
+        assert_eq!(row.1.as_deref(), Some("definitely_not_sent"));
+        assert_eq!(row.2, "PROVIDER_UNAVAILABLE");
+        let jobs = storage.list("life").unwrap();
+        assert_eq!(jobs[0].state, MemoryVectorSyncState::RetryWait);
+        assert_eq!(jobs[0].attempt_count, 1);
+        assert!(jobs[0].next_attempt_at.is_some());
+    }
+
+    #[test]
+    fn database_retry_matrix_http_statuses() {
+        struct HttpCase {
+            status: u16,
+            body: &'static str,
+            expected_state: MemoryVectorSyncState,
+            expected_code: &'static str,
+            expected_disposition: Option<&'static str>,
+        }
+
+        let cases = [
+            // 408 → RequestTimeout → retry_wait, REQUEST_TIMEOUT
+            HttpCase {
+                status: 408,
+                body: r#"{"error":"timeout"}"#,
+                expected_state: MemoryVectorSyncState::RetryWait,
+                expected_code: "REQUEST_TIMEOUT",
+                expected_disposition: Some("possibly_sent"),
+            },
+            // 429 → RateLimited → retry_wait, RATE_LIMITED
+            HttpCase {
+                status: 429,
+                body: r#"{"error":"rate limited"}"#,
+                expected_state: MemoryVectorSyncState::RetryWait,
+                expected_code: "RATE_LIMITED",
+                expected_disposition: Some("possibly_sent"),
+            },
+            // 401 → AuthenticationRejected → blocked, AUTHENTICATION_FAILED
+            HttpCase {
+                status: 401,
+                body: r#"{"error":"unauthorized"}"#,
+                expected_state: MemoryVectorSyncState::Blocked,
+                expected_code: "AUTHENTICATION_FAILED",
+                expected_disposition: Some("possibly_sent"),
+            },
+            // 403 → AuthenticationRejected → blocked, AUTHENTICATION_FAILED
+            HttpCase {
+                status: 403,
+                body: r#"{"error":"forbidden"}"#,
+                expected_state: MemoryVectorSyncState::Blocked,
+                expected_code: "AUTHENTICATION_FAILED",
+                expected_disposition: Some("possibly_sent"),
+            },
+            // Other 4xx (400) → OtherClientError → blocked, INVALID_REQUEST
+            HttpCase {
+                status: 400,
+                body: r#"{"error":"bad request"}"#,
+                expected_state: MemoryVectorSyncState::Blocked,
+                expected_code: "INVALID_REQUEST",
+                expected_disposition: Some("possibly_sent"),
+            },
+            // 500 → ServerError → retry_wait, PROVIDER_UNAVAILABLE
+            HttpCase {
+                status: 500,
+                body: r#"{"error":"server error"}"#,
+                expected_state: MemoryVectorSyncState::RetryWait,
+                expected_code: "PROVIDER_UNAVAILABLE",
+                expected_disposition: Some("possibly_sent"),
+            },
+            // 503 → ServerError → retry_wait, PROVIDER_UNAVAILABLE
+            HttpCase {
+                status: 503,
+                body: r#"{"error":"unavailable"}"#,
+                expected_state: MemoryVectorSyncState::RetryWait,
+                expected_code: "PROVIDER_UNAVAILABLE",
+                expected_disposition: Some("possibly_sent"),
+            },
+        ];
+
+        for (i, case) in cases.iter().enumerate() {
+            let status = case.status;
+            let body_str = case.body.to_string();
+            let expected_state = case.expected_state;
+            let expected_code = case.expected_code;
+            let expected_disposition = case.expected_disposition;
+            let (_temp, storage) = test_storage();
+            let (context, vectors) = drained_context();
+            drain_upsert_fixture(&storage, context.generation_id().as_str());
+
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let transport_requests = Arc::new(AtomicUsize::new(0));
+            let transport_counter = Arc::clone(&transport_requests);
+            let server = thread::spawn(move || {
+                use std::io::Write;
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0_u8; 2048];
+                let _ = stream.read(&mut buffer);
+                transport_counter.fetch_add(1, Ordering::SeqCst);
+                let body_bytes = body_str.as_bytes();
+                let response = format!(
+                    "HTTP/1.1 {status} \r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body_bytes.len(),
+                    body_str
+                );
+                let _ = stream.write_all(response.as_bytes());
+            });
+
+            let profile = ModelProfile {
+                id: format!("profile-http-{i}"),
+                purpose: ModelPurpose::Embedding,
+                provider_kind: ModelProviderKind::OpenaiCompatible,
+                display_name: format!("http {i}"),
+                base_url: format!("http://127.0.0.1:{port}/v1"),
+                model_name: "test-embedding-model".into(),
+                temperature: None,
+                max_tokens: None,
+                embedding_dimension: Some(3),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                updated_at: "2026-01-01T00:00:00Z".into(),
+            };
+            let raw_secrets = InMemorySecretStore::new();
+            raw_secrets
+                .set_secret(
+                    &SecretIdentifier::new(SecretPurpose::EmbeddingModelApiKey, profile.id.clone())
+                        .unwrap(),
+                    SecretValue::new("test-key".into()).unwrap(),
+                )
+                .unwrap();
+            let credential_reads = Arc::new(AtomicUsize::new(0));
+            let secrets = CountingSecretStore::new(raw_secrets, Arc::clone(&credential_reads));
+            let raw_provider =
+                crate::embedding::build_openai_compatible_embedding_provider(&profile, &secrets)
+                    .unwrap();
+            let provider_requests = Arc::new(AtomicUsize::new(0));
+            let embedding_successes = Arc::new(AtomicUsize::new(0));
+            let provider = CountingEmbeddingProvider {
+                inner: raw_provider.as_ref(),
+                provider_requests: Arc::clone(&provider_requests),
+                embedding_successes: Arc::clone(&embedding_successes),
+            };
+            let clock = FixedRetryClock::new(100_000);
+            let consumer =
+                FencedVectorSyncSingleEventConsumer::new(&storage, &provider, &vectors, context)
+                    .with_retry_clock_for_test(Box::new(clock));
+            let report = tauri::async_runtime::block_on(drain_fenced_vector_sync(
+                &consumer,
+                &format!("w-http-{i}"),
+                1,
+            ))
+            .unwrap();
+            server.join().unwrap();
+            assert_eq!(report.processed, 1);
+            assert_eq!(
+                report.retry_scheduled,
+                if expected_state == MemoryVectorSyncState::RetryWait {
+                    1
+                } else {
+                    0
+                }
+            );
+            assert_eq!(
+                report.blocked,
+                if expected_state == MemoryVectorSyncState::Blocked {
+                    1
+                } else {
+                    0
+                }
+            );
+            assert_eq!(provider_requests.load(Ordering::SeqCst), 1);
+            assert_eq!(transport_requests.load(Ordering::SeqCst), 1);
+
+            let row = storage.test_fenced_outbox_failure_snapshot().unwrap();
+            assert_eq!(row.0, 1, "HTTP {} attempt_count", status);
+            assert_eq!(
+                row.1.as_deref(),
+                expected_disposition,
+                "HTTP {} disposition",
+                status
+            );
+            assert_eq!(row.2, expected_code, "HTTP {} code", status);
+
+            let jobs = storage.list("life").unwrap();
+            assert_eq!(jobs[0].state, expected_state, "HTTP {} state", status);
+            assert_eq!(jobs[0].attempt_count, 1, "HTTP {} attempt", status);
+            if expected_state == MemoryVectorSyncState::RetryWait {
+                assert!(jobs[0].next_attempt_at.is_some());
+            } else {
+                assert_eq!(jobs[0].next_attempt_at, None);
+            }
+        }
+
+        // 429 attempt 5: pre-set attempt=4, run 429 response, confirm blocked at 5
+        {
+            let (_temp, storage) = test_storage();
+            let (context, vectors) = drained_context();
+            drain_upsert_fixture(&storage, context.generation_id().as_str());
+            storage.test_set_fenced_attempt_count(4).unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let transport_requests = Arc::new(AtomicUsize::new(0));
+            let transport_counter = Arc::clone(&transport_requests);
+            let server = thread::spawn(move || {
+                use std::io::Write;
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0_u8; 2048];
+                let _ = stream.read(&mut buffer);
+                transport_counter.fetch_add(1, Ordering::SeqCst);
+                let body = r#"{"error":"rate limited"}"#;
+                let response = format!(
+                    "HTTP/1.1 429 \r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            });
+            let profile = ModelProfile {
+                id: "profile-429-att5".into(),
+                purpose: ModelPurpose::Embedding,
+                provider_kind: ModelProviderKind::OpenaiCompatible,
+                display_name: "429 att5".into(),
+                base_url: format!("http://127.0.0.1:{port}/v1"),
+                model_name: "test-embedding-model".into(),
+                temperature: None,
+                max_tokens: None,
+                embedding_dimension: Some(3),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                updated_at: "2026-01-01T00:00:00Z".into(),
+            };
+            let raw_secrets = InMemorySecretStore::new();
+            raw_secrets
+                .set_secret(
+                    &SecretIdentifier::new(SecretPurpose::EmbeddingModelApiKey, profile.id.clone())
+                        .unwrap(),
+                    SecretValue::new("test-key".into()).unwrap(),
+                )
+                .unwrap();
+            let secrets = CountingSecretStore::new(raw_secrets, Arc::new(AtomicUsize::new(0)));
+            let raw_provider =
+                crate::embedding::build_openai_compatible_embedding_provider(&profile, &secrets)
+                    .unwrap();
+            let provider_requests = Arc::new(AtomicUsize::new(0));
+            let embedding_successes = Arc::new(AtomicUsize::new(0));
+            let provider = CountingEmbeddingProvider {
+                inner: raw_provider.as_ref(),
+                provider_requests: Arc::clone(&provider_requests),
+                embedding_successes: Arc::clone(&embedding_successes),
+            };
+            let clock = FixedRetryClock::new(100_000);
+            let consumer =
+                FencedVectorSyncSingleEventConsumer::new(&storage, &provider, &vectors, context)
+                    .with_retry_clock_for_test(Box::new(clock));
+            let report = tauri::async_runtime::block_on(drain_fenced_vector_sync(
+                &consumer,
+                "w-429-att5",
+                1,
+            ))
+            .unwrap();
+            server.join().unwrap();
+            assert_eq!(report.blocked, 1);
+            assert_eq!(report.processed, 1);
+            assert_eq!(provider_requests.load(Ordering::SeqCst), 1);
+            assert_eq!(transport_requests.load(Ordering::SeqCst), 1);
+
+            let row = storage.test_fenced_outbox_failure_snapshot().unwrap();
+            assert_eq!(row.0, 5);
+            assert_eq!(row.1.as_deref(), Some("possibly_sent"));
+            assert_eq!(row.2, "RATE_LIMITED");
+            let jobs = storage.list("life").unwrap();
+            assert_eq!(jobs[0].state, MemoryVectorSyncState::Blocked);
+            assert_eq!(jobs[0].attempt_count, 5);
+            assert_eq!(jobs[0].next_attempt_at, None);
+        }
+    }
+
+    #[test]
+    fn database_retry_matrix_provider_content_errors() {
+        // Invalid JSON
+        {
+            let (_temp, storage) = test_storage();
+            let (context, vectors) = drained_context();
+            drain_upsert_fixture(&storage, context.generation_id().as_str());
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let transport_requests = Arc::new(AtomicUsize::new(0));
+            let transport_counter = Arc::clone(&transport_requests);
+            let server = thread::spawn(move || {
+                use std::io::Write;
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0_u8; 2048];
+                let _ = stream.read(&mut buffer);
+                transport_counter.fetch_add(1, Ordering::SeqCst);
+                let body = "not json at all";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            });
+            let profile = ModelProfile {
+                id: "profile-invalid-json".into(),
+                purpose: ModelPurpose::Embedding,
+                provider_kind: ModelProviderKind::OpenaiCompatible,
+                display_name: "invalid json".into(),
+                base_url: format!("http://127.0.0.1:{port}/v1"),
+                model_name: "test-embedding-model".into(),
+                temperature: None,
+                max_tokens: None,
+                embedding_dimension: Some(3),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                updated_at: "2026-01-01T00:00:00Z".into(),
+            };
+            let raw_secrets = InMemorySecretStore::new();
+            raw_secrets
+                .set_secret(
+                    &SecretIdentifier::new(SecretPurpose::EmbeddingModelApiKey, profile.id.clone())
+                        .unwrap(),
+                    SecretValue::new("test-key".into()).unwrap(),
+                )
+                .unwrap();
+            let secrets = CountingSecretStore::new(raw_secrets, Arc::new(AtomicUsize::new(0)));
+            let raw_provider =
+                crate::embedding::build_openai_compatible_embedding_provider(&profile, &secrets)
+                    .unwrap();
+            let provider_requests = Arc::new(AtomicUsize::new(0));
+            let embedding_successes = Arc::new(AtomicUsize::new(0));
+            let provider = CountingEmbeddingProvider {
+                inner: raw_provider.as_ref(),
+                provider_requests: Arc::clone(&provider_requests),
+                embedding_successes: Arc::clone(&embedding_successes),
+            };
+            let clock = FixedRetryClock::new(100_000);
+            let consumer =
+                FencedVectorSyncSingleEventConsumer::new(&storage, &provider, &vectors, context)
+                    .with_retry_clock_for_test(Box::new(clock));
+            let report =
+                tauri::async_runtime::block_on(drain_fenced_vector_sync(&consumer, "w-invjson", 1))
+                    .unwrap();
+            server.join().unwrap();
+            assert_eq!(report.blocked, 1);
+            assert_eq!(provider_requests.load(Ordering::SeqCst), 1);
+            assert_eq!(transport_requests.load(Ordering::SeqCst), 1);
+
+            let row = storage.test_fenced_outbox_failure_snapshot().unwrap();
+            assert_eq!(row.0, 1);
+            assert_eq!(row.1.as_deref(), Some("possibly_sent"));
+            assert_eq!(row.2, "INVALID_PROVIDER_RESPONSE");
+            let jobs = storage.list("life").unwrap();
+            assert_eq!(jobs[0].state, MemoryVectorSyncState::Blocked);
+            assert_eq!(jobs[0].next_attempt_at, None);
+        }
+
+        // Schema / count error: valid JSON but wrong number of vectors
+        {
+            let (_temp, storage) = test_storage();
+            let (context, vectors) = drained_context();
+            drain_upsert_fixture(&storage, context.generation_id().as_str());
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let transport_requests = Arc::new(AtomicUsize::new(0));
+            let transport_counter = Arc::clone(&transport_requests);
+            let server = thread::spawn(move || {
+                use std::io::Write;
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0_u8; 2048];
+                let _ = stream.read(&mut buffer);
+                transport_counter.fetch_add(1, Ordering::SeqCst);
+                let body = r#"{"object":"list","data":[],"model":"test-embedding-model","usage":{"prompt_tokens":0,"total_tokens":0}}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            });
+            let profile = ModelProfile {
+                id: "profile-wrong-count".into(),
+                purpose: ModelPurpose::Embedding,
+                provider_kind: ModelProviderKind::OpenaiCompatible,
+                display_name: "wrong count".into(),
+                base_url: format!("http://127.0.0.1:{port}/v1"),
+                model_name: "test-embedding-model".into(),
+                temperature: None,
+                max_tokens: None,
+                embedding_dimension: Some(3),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                updated_at: "2026-01-01T00:00:00Z".into(),
+            };
+            let raw_secrets = InMemorySecretStore::new();
+            raw_secrets
+                .set_secret(
+                    &SecretIdentifier::new(SecretPurpose::EmbeddingModelApiKey, profile.id.clone())
+                        .unwrap(),
+                    SecretValue::new("test-key".into()).unwrap(),
+                )
+                .unwrap();
+            let secrets = CountingSecretStore::new(raw_secrets, Arc::new(AtomicUsize::new(0)));
+            let raw_provider =
+                crate::embedding::build_openai_compatible_embedding_provider(&profile, &secrets)
+                    .unwrap();
+            let provider_requests = Arc::new(AtomicUsize::new(0));
+            let embedding_successes = Arc::new(AtomicUsize::new(0));
+            let provider = CountingEmbeddingProvider {
+                inner: raw_provider.as_ref(),
+                provider_requests: Arc::clone(&provider_requests),
+                embedding_successes: Arc::clone(&embedding_successes),
+            };
+            let clock = FixedRetryClock::new(100_000);
+            let consumer =
+                FencedVectorSyncSingleEventConsumer::new(&storage, &provider, &vectors, context)
+                    .with_retry_clock_for_test(Box::new(clock));
+            let report = tauri::async_runtime::block_on(drain_fenced_vector_sync(
+                &consumer,
+                "w-wrongcount",
+                1,
+            ))
+            .unwrap();
+            server.join().unwrap();
+            assert_eq!(report.blocked, 1);
+            assert_eq!(provider_requests.load(Ordering::SeqCst), 1);
+            assert_eq!(transport_requests.load(Ordering::SeqCst), 1);
+
+            let row = storage.test_fenced_outbox_failure_snapshot().unwrap();
+            assert_eq!(row.0, 1);
+            assert_eq!(row.1.as_deref(), Some("possibly_sent"));
+            assert_eq!(row.2, "INVALID_PROVIDER_RESPONSE");
+            let jobs = storage.list("life").unwrap();
+            assert_eq!(jobs[0].state, MemoryVectorSyncState::Blocked);
+        }
+
+        // Dimension mismatch: valid JSON but wrong dimension
+        {
+            let (_temp, storage) = test_storage();
+            let (context, vectors) = drained_context();
+            drain_upsert_fixture(&storage, context.generation_id().as_str());
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let transport_requests = Arc::new(AtomicUsize::new(0));
+            let transport_counter = Arc::clone(&transport_requests);
+            let server = thread::spawn(move || {
+                use std::io::Write;
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0_u8; 2048];
+                let _ = stream.read(&mut buffer);
+                transport_counter.fetch_add(1, Ordering::SeqCst);
+                // Valid JSON with 10-d vector but generation expects 3
+                let body = r#"{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0]}],"model":"test-embedding-model","usage":{"prompt_tokens":1,"total_tokens":1}}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            });
+            let profile = ModelProfile {
+                id: "profile-dim-mismatch".into(),
+                purpose: ModelPurpose::Embedding,
+                provider_kind: ModelProviderKind::OpenaiCompatible,
+                display_name: "dim mismatch".into(),
+                base_url: format!("http://127.0.0.1:{port}/v1"),
+                model_name: "test-embedding-model".into(),
+                temperature: None,
+                max_tokens: None,
+                embedding_dimension: Some(3),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                updated_at: "2026-01-01T00:00:00Z".into(),
+            };
+            let raw_secrets = InMemorySecretStore::new();
+            raw_secrets
+                .set_secret(
+                    &SecretIdentifier::new(SecretPurpose::EmbeddingModelApiKey, profile.id.clone())
+                        .unwrap(),
+                    SecretValue::new("test-key".into()).unwrap(),
+                )
+                .unwrap();
+            let secrets = CountingSecretStore::new(raw_secrets, Arc::new(AtomicUsize::new(0)));
+            let raw_provider =
+                crate::embedding::build_openai_compatible_embedding_provider(&profile, &secrets)
+                    .unwrap();
+            let provider_requests = Arc::new(AtomicUsize::new(0));
+            let embedding_successes = Arc::new(AtomicUsize::new(0));
+            let provider = CountingEmbeddingProvider {
+                inner: raw_provider.as_ref(),
+                provider_requests: Arc::clone(&provider_requests),
+                embedding_successes: Arc::clone(&embedding_successes),
+            };
+            let clock = FixedRetryClock::new(100_000);
+            let consumer =
+                FencedVectorSyncSingleEventConsumer::new(&storage, &provider, &vectors, context)
+                    .with_retry_clock_for_test(Box::new(clock));
+            let report =
+                tauri::async_runtime::block_on(drain_fenced_vector_sync(&consumer, "w-dimmis", 1))
+                    .unwrap();
+            server.join().unwrap();
+            assert_eq!(report.blocked, 1);
+            assert_eq!(provider_requests.load(Ordering::SeqCst), 1);
+            assert_eq!(transport_requests.load(Ordering::SeqCst), 1);
+
+            let row = storage.test_fenced_outbox_failure_snapshot().unwrap();
+            assert_eq!(row.0, 1);
+            assert_eq!(row.1.as_deref(), Some("possibly_sent"));
+            assert_eq!(row.2, "EMBEDDING_DIMENSION_MISMATCH");
+            let jobs = storage.list("life").unwrap();
+            assert_eq!(jobs[0].state, MemoryVectorSyncState::Blocked);
+            assert_eq!(jobs[0].next_attempt_at, None);
+        }
+
+        // NaN in embedding vector
+        {
+            let (_temp, storage) = test_storage();
+            let (context, vectors) = drained_context();
+            drain_upsert_fixture(&storage, context.generation_id().as_str());
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let transport_requests = Arc::new(AtomicUsize::new(0));
+            let transport_counter = Arc::clone(&transport_requests);
+            let server = thread::spawn(move || {
+                use std::io::Write;
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0_u8; 2048];
+                let _ = stream.read(&mut buffer);
+                transport_counter.fetch_add(1, Ordering::SeqCst);
+                let body = r#"{"object":"list","data":[{"object":"embedding","index":0,"embedding":[NaN,0.2,0.3]}],"model":"test-embedding-model","usage":{"prompt_tokens":1,"total_tokens":1}}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            });
+            let profile = ModelProfile {
+                id: "profile-nan".into(),
+                purpose: ModelPurpose::Embedding,
+                provider_kind: ModelProviderKind::OpenaiCompatible,
+                display_name: "nan".into(),
+                base_url: format!("http://127.0.0.1:{port}/v1"),
+                model_name: "test-embedding-model".into(),
+                temperature: None,
+                max_tokens: None,
+                embedding_dimension: Some(3),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                updated_at: "2026-01-01T00:00:00Z".into(),
+            };
+            let raw_secrets = InMemorySecretStore::new();
+            raw_secrets
+                .set_secret(
+                    &SecretIdentifier::new(SecretPurpose::EmbeddingModelApiKey, profile.id.clone())
+                        .unwrap(),
+                    SecretValue::new("test-key".into()).unwrap(),
+                )
+                .unwrap();
+            let secrets = CountingSecretStore::new(raw_secrets, Arc::new(AtomicUsize::new(0)));
+            let raw_provider =
+                crate::embedding::build_openai_compatible_embedding_provider(&profile, &secrets)
+                    .unwrap();
+            let provider_requests = Arc::new(AtomicUsize::new(0));
+            let embedding_successes = Arc::new(AtomicUsize::new(0));
+            let provider = CountingEmbeddingProvider {
+                inner: raw_provider.as_ref(),
+                provider_requests: Arc::clone(&provider_requests),
+                embedding_successes: Arc::clone(&embedding_successes),
+            };
+            let clock = FixedRetryClock::new(100_000);
+            let consumer =
+                FencedVectorSyncSingleEventConsumer::new(&storage, &provider, &vectors, context)
+                    .with_retry_clock_for_test(Box::new(clock));
+            let report =
+                tauri::async_runtime::block_on(drain_fenced_vector_sync(&consumer, "w-nan", 1))
+                    .unwrap();
+            server.join().unwrap();
+            assert_eq!(report.blocked, 1);
+            assert_eq!(provider_requests.load(Ordering::SeqCst), 1);
+            assert_eq!(transport_requests.load(Ordering::SeqCst), 1);
+
+            let row = storage.test_fenced_outbox_failure_snapshot().unwrap();
+            assert_eq!(row.0, 1);
+            assert_eq!(row.1.as_deref(), Some("possibly_sent"));
+            assert_eq!(row.2, "INVALID_PROVIDER_RESPONSE");
+            let jobs = storage.list("life").unwrap();
+            assert_eq!(jobs[0].state, MemoryVectorSyncState::Blocked);
+        }
+    }
+
+    #[test]
+    fn database_retry_matrix_lance_permanent_errors() {
+        // Upsert permanent
+        {
+            let (_temp, storage) = test_storage();
+            let (context, raw_vectors) = drained_context();
+            drain_upsert_fixture(&storage, context.generation_id().as_str());
+
+            struct PermanentUpsertLance {
+                inner: crate::vector_store::InMemoryVectorStore,
+                calls: AtomicUsize,
+            }
+            impl VectorStore for PermanentUpsertLance {
+                fn upsert<'a>(
+                    &'a self,
+                    r: VectorRecord,
+                ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
+                    self.inner.upsert(r)
+                }
+                fn upsert_batch<'a>(
+                    &'a self,
+                    r: Vec<VectorRecord>,
+                ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
+                    self.inner.upsert_batch(r)
+                }
+                fn search<'a>(
+                    &'a self,
+                    q: VectorSearchQuery,
+                ) -> VectorStoreFuture<'a, Result<Vec<VectorSearchHit>, VectorStoreError>>
+                {
+                    self.inner.search(q)
+                }
+                fn delete<'a>(
+                    &'a self,
+                    lid: &'a str,
+                    mid: &'a str,
+                ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
+                    self.inner.delete(lid, mid)
+                }
+                fn delete_from_space<'a>(
+                    &'a self,
+                    lid: &'a str,
+                    mid: &'a str,
+                    s: &'a VectorSpace,
+                ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
+                    self.inner.delete_from_space(lid, mid, s)
+                }
+                fn delete_by_life<'a>(
+                    &'a self,
+                    lid: &'a str,
+                ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
+                    self.inner.delete_by_life(lid)
+                }
+                fn clear_space<'a>(
+                    &'a self,
+                    lid: &'a str,
+                    s: &'a VectorSpace,
+                ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
+                    self.inner.clear_space(lid, s)
+                }
+                fn count<'a>(
+                    &'a self,
+                    lid: &'a str,
+                    s: Option<&'a VectorSpace>,
+                ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
+                    self.inner.count(lid, s)
+                }
+                fn health_check<'a>(
+                    &'a self,
+                    lid: &'a str,
+                ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
+                    self.inner.health_check(lid)
+                }
+                fn create_generation<'a>(
+                    &'a self,
+                    ctx: &'a VectorGenerationContext,
+                ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
+                    self.inner.create_generation(ctx)
+                }
+                fn upsert_generation<'a>(
+                    &'a self,
+                    _ctx: &'a VectorGenerationContext,
+                    _record: GenerationVectorRecord,
+                ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async {
+                        Err(VectorStoreError {
+                            code: VectorStoreErrorCode::StoreUnavailable,
+                            message: String::new(),
+                            recoverable: false,
+                        })
+                    })
+                }
+                fn delete_generation_memory<'a>(
+                    &'a self,
+                    ctx: &'a VectorGenerationContext,
+                    lid: &'a str,
+                    mid: &'a str,
+                ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
+                    self.inner.delete_generation_memory(ctx, lid, mid)
+                }
+                fn delete_generation_life<'a>(
+                    &'a self,
+                    ctx: &'a VectorGenerationContext,
+                    lid: &'a str,
+                ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
+                    self.inner.delete_generation_life(ctx, lid)
+                }
+                fn count_generation<'a>(
+                    &'a self,
+                    ctx: &'a VectorGenerationContext,
+                    lid: Option<&'a str>,
+                ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
+                    self.inner.count_generation(ctx, lid)
+                }
+                fn sample_generation_metadata<'a>(
+                    &'a self,
+                    ctx: &'a VectorGenerationContext,
+                    limit: usize,
+                ) -> VectorStoreFuture<
+                    'a,
+                    Result<Vec<crate::vector_store::VectorMetadataSample>, VectorStoreError>,
+                > {
+                    self.inner.sample_generation_metadata(ctx, limit)
+                }
+            }
+
+            tauri::async_runtime::block_on(raw_vectors.create_generation(&context)).unwrap();
+            let lance = PermanentUpsertLance {
+                inner: raw_vectors,
+                calls: AtomicUsize::new(0),
+            };
+            let raw_provider = crate::embedding::DeterministicEmbeddingProvider::new(3);
+            let provider_requests = Arc::new(AtomicUsize::new(0));
+            let embedding_successes = Arc::new(AtomicUsize::new(0));
+            let provider = CountingEmbeddingProvider {
+                inner: &raw_provider,
+                provider_requests: Arc::clone(&provider_requests),
+                embedding_successes: Arc::clone(&embedding_successes),
+            };
+            let clock = FixedRetryClock::new(100_000);
+            let consumer =
+                FencedVectorSyncSingleEventConsumer::new(&storage, &provider, &lance, context)
+                    .with_retry_clock_for_test(Box::new(clock));
+            let report = tauri::async_runtime::block_on(drain_fenced_vector_sync(
+                &consumer,
+                "w-lance-up-perm",
+                1,
+            ))
+            .unwrap();
+            assert_eq!(report.blocked, 1);
+            assert_eq!(provider_requests.load(Ordering::SeqCst), 1);
+            assert_eq!(embedding_successes.load(Ordering::SeqCst), 1);
+            assert_eq!(lance.calls.load(Ordering::SeqCst), 1);
+
+            let row = storage.test_fenced_outbox_failure_snapshot().unwrap();
+            assert_eq!(row.0, 1);
+            assert_eq!(row.1.as_deref(), Some("possibly_sent"));
+            assert_eq!(row.2, "LANCE_PERMANENT");
+            let jobs = storage.list("life").unwrap();
+            assert_eq!(jobs[0].state, MemoryVectorSyncState::Blocked);
+            assert_eq!(jobs[0].next_attempt_at, None);
+        }
+
+        // Delete permanent
+        {
+            let (_temp, storage) = test_storage();
+            let (context, raw_vectors) = drained_context();
+            drain_delete_fixture(&storage, context.generation_id().as_str());
+
+            struct PermanentDeleteLance {
+                inner: crate::vector_store::InMemoryVectorStore,
+                calls: AtomicUsize,
+            }
+            impl VectorStore for PermanentDeleteLance {
+                fn upsert<'a>(
+                    &'a self,
+                    r: VectorRecord,
+                ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
+                    self.inner.upsert(r)
+                }
+                fn upsert_batch<'a>(
+                    &'a self,
+                    r: Vec<VectorRecord>,
+                ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
+                    self.inner.upsert_batch(r)
+                }
+                fn search<'a>(
+                    &'a self,
+                    q: VectorSearchQuery,
+                ) -> VectorStoreFuture<'a, Result<Vec<VectorSearchHit>, VectorStoreError>>
+                {
+                    self.inner.search(q)
+                }
+                fn delete<'a>(
+                    &'a self,
+                    lid: &'a str,
+                    mid: &'a str,
+                ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
+                    self.inner.delete(lid, mid)
+                }
+                fn delete_from_space<'a>(
+                    &'a self,
+                    lid: &'a str,
+                    mid: &'a str,
+                    s: &'a VectorSpace,
+                ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
+                    self.inner.delete_from_space(lid, mid, s)
+                }
+                fn delete_by_life<'a>(
+                    &'a self,
+                    lid: &'a str,
+                ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
+                    self.inner.delete_by_life(lid)
+                }
+                fn clear_space<'a>(
+                    &'a self,
+                    lid: &'a str,
+                    s: &'a VectorSpace,
+                ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
+                    self.inner.clear_space(lid, s)
+                }
+                fn count<'a>(
+                    &'a self,
+                    lid: &'a str,
+                    s: Option<&'a VectorSpace>,
+                ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
+                    self.inner.count(lid, s)
+                }
+                fn health_check<'a>(
+                    &'a self,
+                    lid: &'a str,
+                ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
+                    self.inner.health_check(lid)
+                }
+                fn create_generation<'a>(
+                    &'a self,
+                    ctx: &'a VectorGenerationContext,
+                ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
+                    self.inner.create_generation(ctx)
+                }
+                fn upsert_generation<'a>(
+                    &'a self,
+                    ctx: &'a VectorGenerationContext,
+                    record: GenerationVectorRecord,
+                ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
+                    self.inner.upsert_generation(ctx, record)
+                }
+                fn delete_generation_memory<'a>(
+                    &'a self,
+                    _ctx: &'a VectorGenerationContext,
+                    _lid: &'a str,
+                    _mid: &'a str,
+                ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async {
+                        Err(VectorStoreError {
+                            code: VectorStoreErrorCode::StoreUnavailable,
+                            message: String::new(),
+                            recoverable: false,
+                        })
+                    })
+                }
+                fn delete_generation_life<'a>(
+                    &'a self,
+                    ctx: &'a VectorGenerationContext,
+                    lid: &'a str,
+                ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
+                    self.inner.delete_generation_life(ctx, lid)
+                }
+                fn count_generation<'a>(
+                    &'a self,
+                    ctx: &'a VectorGenerationContext,
+                    lid: Option<&'a str>,
+                ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
+                    self.inner.count_generation(ctx, lid)
+                }
+                fn sample_generation_metadata<'a>(
+                    &'a self,
+                    ctx: &'a VectorGenerationContext,
+                    limit: usize,
+                ) -> VectorStoreFuture<
+                    'a,
+                    Result<Vec<crate::vector_store::VectorMetadataSample>, VectorStoreError>,
+                > {
+                    self.inner.sample_generation_metadata(ctx, limit)
+                }
+            }
+
+            tauri::async_runtime::block_on(raw_vectors.create_generation(&context)).unwrap();
+            let lance = PermanentDeleteLance {
+                inner: raw_vectors,
+                calls: AtomicUsize::new(0),
+            };
+            let raw_provider = crate::embedding::DeterministicEmbeddingProvider::new(3);
+            let provider_requests = Arc::new(AtomicUsize::new(0));
+            let embedding_successes = Arc::new(AtomicUsize::new(0));
+            let provider = CountingEmbeddingProvider {
+                inner: &raw_provider,
+                provider_requests: Arc::clone(&provider_requests),
+                embedding_successes: Arc::clone(&embedding_successes),
+            };
+            let clock = FixedRetryClock::new(100_000);
+            let consumer =
+                FencedVectorSyncSingleEventConsumer::new(&storage, &provider, &lance, context)
+                    .with_retry_clock_for_test(Box::new(clock));
+            let report = tauri::async_runtime::block_on(drain_fenced_vector_sync(
+                &consumer,
+                "w-lance-del-perm",
+                1,
+            ))
+            .unwrap();
+            assert_eq!(report.blocked, 1);
+            assert_eq!(provider_requests.load(Ordering::SeqCst), 0);
+            assert_eq!(embedding_successes.load(Ordering::SeqCst), 0);
+            assert_eq!(lance.calls.load(Ordering::SeqCst), 1);
+
+            let row = storage.test_fenced_outbox_failure_snapshot().unwrap();
+            assert_eq!(row.0, 1);
+            assert_eq!(row.1, None);
+            assert_eq!(row.2, "LANCE_PERMANENT");
+            let jobs = storage.list("life").unwrap();
+            assert_eq!(jobs[0].state, MemoryVectorSyncState::Blocked);
+            assert_eq!(jobs[0].next_attempt_at, None);
+        }
     }
 }

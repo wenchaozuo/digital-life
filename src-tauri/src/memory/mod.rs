@@ -20,6 +20,7 @@ pub mod retrieval_runtime;
 pub mod revisions;
 pub mod vector_index;
 pub mod vector_index_runtime;
+pub mod vector_sync_health;
 pub mod vector_sync_outbox;
 pub mod vector_sync_worker;
 

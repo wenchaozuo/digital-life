@@ -18,7 +18,6 @@ use crate::{
         EmbeddingProvider, EmbeddingPurpose, EmbeddingRequest, EmbeddingRetryClass,
         EmbeddingRetrySafety,
     },
-    model::transport::http1::SendDisposition,
     model::{
         profile::ModelProfileRepository,
         runtime::{ModelRuntimeCoordinator, ModelRuntimeErrorCode, ModelRuntimeService},
@@ -162,8 +161,7 @@ impl StableVectorSyncErrorCode {
             Self::ProviderResultUnknown => "PROVIDER_RESULT_UNKNOWN",
             Self::RateLimited => "RATE_LIMITED",
             Self::RequestTimeout => "REQUEST_TIMEOUT",
-            // This preserves the existing fenced-worker persistent code.
-            Self::ProviderUnavailable => "NETWORK_UNAVAILABLE",
+            Self::ProviderUnavailable => "PROVIDER_UNAVAILABLE",
             Self::InvalidRequest => "INVALID_REQUEST",
             Self::InvalidProviderResponse => "INVALID_PROVIDER_RESPONSE",
             Self::EmbeddingDimensionMismatch => "EMBEDDING_DIMENSION_MISMATCH",
@@ -605,7 +603,7 @@ impl<'a> FencedVectorSyncSingleEventConsumer<'a> {
                             RetryErrorClass::Embedding(error.retry_class()),
                             error.retry_safety(),
                             RetryOperation::Upsert,
-                            Some(send_disposition_code(error.send_disposition())),
+                            Some(send_disposition_for_retry_safety(error.retry_safety())),
                             retry_cutoff,
                         )
                     }
@@ -622,7 +620,7 @@ impl<'a> FencedVectorSyncSingleEventConsumer<'a> {
                         RetryErrorClass::EmbeddingInvalidVector,
                         EmbeddingRetrySafety::ResponseReceived,
                         RetryOperation::Upsert,
-                        None,
+                        Some("possibly_sent"),
                         retry_cutoff,
                     );
                 };
@@ -633,7 +631,7 @@ impl<'a> FencedVectorSyncSingleEventConsumer<'a> {
                         RetryErrorClass::InternalInvariant,
                         EmbeddingRetrySafety::ResponseReceived,
                         RetryOperation::Upsert,
-                        None,
+                        Some("possibly_sent"),
                         retry_cutoff,
                     );
                 };
@@ -644,7 +642,7 @@ impl<'a> FencedVectorSyncSingleEventConsumer<'a> {
                         RetryErrorClass::InternalInvariant,
                         EmbeddingRetrySafety::ResponseReceived,
                         RetryOperation::Upsert,
-                        None,
+                        Some("possibly_sent"),
                         retry_cutoff,
                     );
                 };
@@ -666,7 +664,7 @@ impl<'a> FencedVectorSyncSingleEventConsumer<'a> {
                             RetryErrorClass::EmbeddingInvalidVector,
                             EmbeddingRetrySafety::ResponseReceived,
                             RetryOperation::Upsert,
-                            None,
+                            Some("possibly_sent"),
                             retry_cutoff,
                         )
                     }
@@ -706,7 +704,7 @@ impl<'a> FencedVectorSyncSingleEventConsumer<'a> {
                         },
                         EmbeddingRetrySafety::ResponseReceived,
                         RetryOperation::Upsert,
-                        None,
+                        Some("possibly_sent"),
                         retry_cutoff,
                     ),
                 }
@@ -826,10 +824,12 @@ fn embedding_error_code(code: crate::embedding::EmbeddingErrorCode) -> &'static 
     }
 }
 
-fn send_disposition_code(disposition: SendDisposition) -> &'static str {
-    match disposition {
-        SendDisposition::DefinitelyNotSent => "definitely_not_sent",
-        SendDisposition::PossiblySent => "possibly_sent",
+fn send_disposition_for_retry_safety(retry_safety: EmbeddingRetrySafety) -> &'static str {
+    match retry_safety {
+        EmbeddingRetrySafety::DefinitelyNotSent => "definitely_not_sent",
+        EmbeddingRetrySafety::ResponseReceived | EmbeddingRetrySafety::PossiblySent => {
+            "possibly_sent"
+        }
     }
 }
 
@@ -2120,7 +2120,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_persists_real_possibly_sent_from_loopback_transport() {
+    fn provider_result_unknown_blocks_without_resend() {
         let (_temp, storage) = test_storage();
         confirmed(&storage, false);
         let descriptor = "b".repeat(64);
@@ -2179,10 +2179,17 @@ mod tests {
         assert_eq!(row.0, 1);
         assert_eq!(row.1.as_deref(), Some("possibly_sent"));
         assert_eq!(row.2, "PROVIDER_RESULT_UNKNOWN");
+        assert_eq!(
+            tauri::async_runtime::block_on(drain_fenced_vector_sync(&consumer, "worker-a", 1))
+                .unwrap()
+                .processed,
+            0
+        );
+        assert_eq!(storage.test_fenced_outbox_failure_snapshot().unwrap().0, 1);
     }
 
     #[test]
-    fn lance_success_before_finalize_recovers_idempotently() {
+    fn lance_success_before_finalize_is_not_automatically_replayed() {
         let (temp, storage) = test_storage();
         confirmed(&storage, false);
         let descriptor = "c".repeat(64);
@@ -2221,13 +2228,27 @@ mod tests {
         );
         storage.test_expire_fenced_runtime_lease().unwrap();
         let result = tauri::async_runtime::block_on(consumer.process_one("owner-b")).unwrap();
-        assert_eq!(result, FencedVectorSyncSingleEventResult::CompletedUpsert);
+        assert_eq!(result, FencedVectorSyncSingleEventResult::NoEligibleEvent);
         assert_eq!(
             tauri::async_runtime::block_on(vectors.count_generation(&context, Some("life")))
                 .unwrap(),
             1
         );
-        assert!(storage.list("life").unwrap().is_empty());
+        let job = storage.list("life").unwrap().remove(0);
+        assert_eq!(job.state, MemoryVectorSyncState::Blocked);
+        assert_eq!(job.attempt_count, 1);
+        assert_eq!(
+            job.last_error_code.as_deref(),
+            Some("PROVIDER_RESULT_UNKNOWN")
+        );
+        assert_eq!(
+            storage
+                .test_get_outbox_snapshot_detailed(&job.life_id, &job.memory_id)
+                .unwrap()
+                .last_send_disposition
+                .as_deref(),
+            Some("possibly_sent")
+        );
     }
 
     #[test]
@@ -2512,6 +2533,41 @@ mod tests {
     struct MixedOutcomeEmbeddingProvider {
         inner: crate::embedding::DeterministicEmbeddingProvider,
         requests: AtomicUsize,
+    }
+
+    struct PossiblySentEmbeddingProvider {
+        inner: crate::embedding::DeterministicEmbeddingProvider,
+        requests: AtomicUsize,
+    }
+
+    impl EmbeddingProvider for PossiblySentEmbeddingProvider {
+        fn model_info(&self) -> EmbeddingModelInfo {
+            self.inner.model_info()
+        }
+
+        fn model_name(&self) -> &str {
+            self.inner.model_name()
+        }
+
+        fn vector_dimension(&self) -> Option<usize> {
+            self.inner.vector_dimension()
+        }
+
+        fn max_batch_size(&self) -> usize {
+            self.inner.max_batch_size()
+        }
+
+        fn embed<'a>(
+            &'a self,
+            _request: EmbeddingRequest,
+        ) -> EmbeddingFuture<'a, Result<EmbeddingBatch, EmbeddingError>> {
+            self.requests.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Err(EmbeddingError::possibly_sent(
+                    crate::embedding::EmbeddingErrorCode::NetworkError,
+                ))
+            })
+        }
     }
 
     impl EmbeddingProvider for MixedOutcomeEmbeddingProvider {
@@ -2851,10 +2907,12 @@ mod tests {
     }
 
     #[test]
-    fn fence_lost_after_embedding_before_lance_has_zero_lance_writes() {
-        let (_temp, storage) = test_storage();
+    fn lost_lease_after_provider_preserves_possible_send() {
+        let (temp, storage) = test_storage();
+        let storage_b =
+            StorageService::initialize_with_roots(temp.path().join("data"), None).unwrap();
         let storage = Arc::new(storage);
-        confirmed(&storage, false);
+        let record = confirmed(&storage, false);
         let descriptor = "b".repeat(64);
         storage
             .register_building_vector_generation("gen-pb", &descriptor, 3)
@@ -2890,7 +2948,7 @@ mod tests {
 
         let server_handle = std::thread::spawn(move || {
             use std::io::{Read, Write};
-            for _ in 0..2 {
+            for _ in 0..1 {
                 let Ok((mut stream, _)) = listener.accept() else {
                     break;
                 };
@@ -2949,9 +3007,7 @@ mod tests {
             embedding_successes: Arc::clone(&embedding_successes),
         };
 
-        let claim_b_slot = Arc::new(std::sync::Mutex::new(None));
-        let claim_b_slot_clone = Arc::clone(&claim_b_slot);
-        let storage_clone = Arc::clone(&storage);
+        let storage_b_capture = storage_b;
         let context_clone = context.clone();
         let consumer = FencedVectorSyncSingleEventConsumer::new(
             storage.as_ref(),
@@ -2961,8 +3017,10 @@ mod tests {
         );
         consumer.set_test_pause_hook_for_test(Some(Box::new(move |point| {
             if point == VectorSyncTestPausePoint::AfterEmbeddingBeforeLance {
-                storage_clone.test_expire_fenced_runtime_lease().unwrap();
-                let cb = storage_clone
+                storage_b_capture
+                    .test_expire_fenced_runtime_lease()
+                    .unwrap();
+                assert!(storage_b_capture
                     .claim_one_fenced_vector_sync(
                         context_clone.generation_id().as_str(),
                         context_clone.descriptor_hash(),
@@ -2970,8 +3028,7 @@ mod tests {
                         "worker-b",
                     )
                     .unwrap()
-                    .expect("worker-b claim must succeed");
-                *claim_b_slot_clone.lock().unwrap() = Some(cb);
+                    .is_none());
             }
         })));
 
@@ -2990,41 +3047,35 @@ mod tests {
         assert_eq!(lance_deletes.load(Ordering::SeqCst), 0);
         assert_eq!(storage.test_generation_item_count().unwrap(), 0);
 
-        let claim_b = claim_b_slot.lock().unwrap().take().unwrap();
         let snap_mid = storage
-            .test_get_outbox_snapshot_detailed("life", claim_b.memory_id())
+            .test_get_outbox_snapshot_detailed(&record.life_id, &record.id)
             .unwrap();
         assert_eq!(snap_mid.total_count, 1, "Phase B: Outbox event intact");
         assert_eq!(
-            snap_mid.state, "processing",
-            "Phase B: State remains processing for worker-b"
+            snap_mid.state, "blocked",
+            "expired recovery must fail closed after a provider result"
         );
         assert_eq!(
-            snap_mid.lease_owner.as_deref(),
-            Some("worker-b"),
-            "Phase B: Owner is worker-b"
+            snap_mid.last_error_code.as_deref(),
+            Some("PROVIDER_RESULT_UNKNOWN"),
+            "expired recovery records the unknown provider result"
         );
         assert_eq!(
-            snap_mid.last_error_code, None,
-            "Phase B: No error code written by old owner"
-        );
-        assert_eq!(
-            snap_mid.last_send_disposition, None,
-            "Phase B: No send disposition written by old owner"
+            snap_mid.last_send_disposition.as_deref(),
+            Some("possibly_sent"),
+            "old owner cannot overwrite the attempt marker"
         );
         assert_eq!(
             snap_mid.attempt_count, 1,
             "Phase B: attempt_count not extra incremented"
         );
 
-        let result_b = tauri::async_runtime::block_on(consumer.execute_claim(claim_b, 0)).unwrap();
         server_handle.join().unwrap();
-        assert_eq!(result_b, FencedVectorSyncSingleEventResult::CompletedUpsert);
-        assert_eq!(storage.test_generation_item_count().unwrap(), 1);
-        assert_eq!(credential_reads.load(Ordering::SeqCst), 2);
-        assert_eq!(provider_requests.load(Ordering::SeqCst), 2);
-        assert_eq!(transport_requests.load(Ordering::SeqCst), 2);
-        assert_eq!(embedding_successes.load(Ordering::SeqCst), 2);
+        assert_eq!(storage.test_generation_item_count().unwrap(), 0);
+        assert_eq!(credential_reads.load(Ordering::SeqCst), 1);
+        assert_eq!(provider_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(transport_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(embedding_successes.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -3541,8 +3592,6 @@ mod tests {
     #[test]
     fn drain_stops_immediately_after_lost_lease() {
         let (temp, storage_a) = test_storage();
-        let storage_b =
-            StorageService::initialize_with_roots(temp.path().join("data"), None).unwrap();
         let storage_a = Arc::new(storage_a);
         let descriptor = "d".repeat(64);
         let context = VectorGenerationContext::new(
@@ -3636,31 +3685,18 @@ mod tests {
             provider_requests: Arc::clone(&provider_requests),
             embedding_successes: Arc::clone(&embedding_successes),
         };
-        let claim_b = Arc::new(Mutex::new(None));
-        let claim_b_capture = Arc::clone(&claim_b);
-        let storage_b_capture = storage_b;
-        let context_capture = context.clone();
         let mut consumer = FencedVectorSyncSingleEventConsumer::new(
             storage_a.as_ref(),
             &provider,
             &vectors,
             context.clone(),
         );
+        let storage_for_pause = Arc::clone(&storage_a);
         consumer.set_test_pause_hook_for_test(Some(Box::new(move |point| {
             if point == VectorSyncTestPausePoint::AfterEmbeddingBeforeLance {
-                storage_b_capture
+                storage_for_pause
                     .test_expire_fenced_runtime_lease()
                     .unwrap();
-                let takeover = storage_b_capture
-                    .claim_one_fenced_vector_sync(
-                        context_capture.generation_id().as_str(),
-                        context_capture.descriptor_hash(),
-                        context_capture.dimension(),
-                        "owner-b",
-                    )
-                    .unwrap()
-                    .unwrap();
-                *claim_b_capture.lock().unwrap() = Some(takeover);
             }
         })));
         let frozen_counters = Arc::new(Mutex::new(None));
@@ -3703,19 +3739,24 @@ mod tests {
         assert_eq!(embedding_successes.load(Ordering::SeqCst), 1);
         assert_eq!(transport_requests.load(Ordering::SeqCst), 1);
         assert_eq!(storage_a.test_generation_item_count().unwrap(), 0);
-        let claim_b = claim_b.lock().unwrap().take().unwrap();
-        assert_eq!(claim_b.lease_owner(), "owner-b");
-        assert_ne!(claim_b.lease_owner(), "owner-a");
-        assert!(claim_b.fence_epoch() > 1);
         let remaining = storage_a.list("life").unwrap();
         assert_eq!(
             remaining.len(),
             2,
             "old token cannot finalize second or touch third"
         );
-        assert!(remaining
+        let processing = remaining
             .iter()
-            .any(|job| job.state == MemoryVectorSyncState::Pending));
+            .find(|job| job.state == MemoryVectorSyncState::Processing)
+            .unwrap();
+        assert_eq!(
+            storage_a
+                .test_get_outbox_snapshot_detailed(&processing.life_id, &processing.memory_id)
+                .unwrap()
+                .last_send_disposition
+                .as_deref(),
+            Some("possibly_sent")
+        );
         // Third event detailed snapshot: completely untouched.
         let third_after = storage_a
             .test_get_outbox_snapshot_detailed(&third_life, &third_memory)
@@ -4425,7 +4466,7 @@ mod tests {
             assert_eq!(job.state, expected_state);
             assert_eq!(job.attempt_count as i64, prior_attempts + 1);
             assert_eq!(job.next_attempt_at.as_deref(), expected_time);
-            assert_eq!(job.last_error_code.as_deref(), Some("NETWORK_UNAVAILABLE"));
+            assert_eq!(job.last_error_code.as_deref(), Some("PROVIDER_UNAVAILABLE"));
         }
     }
 
@@ -4472,5 +4513,75 @@ mod tests {
             retry.next_attempt_at.as_deref(),
             Some("1970-01-01T00:02:10.000Z")
         );
+    }
+
+    #[test]
+    fn cost_budget_caps_provider_invocations_at_drain_limit() {
+        let (_temp, storage) = test_storage();
+        let (context, vectors) = drained_context();
+        for _ in 0..MAX_DRAIN_LIMIT {
+            drain_upsert_fixture(&storage, context.generation_id().as_str());
+        }
+        let provider_requests = Arc::new(AtomicUsize::new(0));
+        let embedding_successes = Arc::new(AtomicUsize::new(0));
+        let inner = crate::embedding::DeterministicEmbeddingProvider::new(3);
+        let provider = CountingEmbeddingProvider {
+            inner: &inner,
+            provider_requests: Arc::clone(&provider_requests),
+            embedding_successes: Arc::clone(&embedding_successes),
+        };
+        let consumer =
+            FencedVectorSyncSingleEventConsumer::new(&storage, &provider, &vectors, context)
+                .with_retry_clock_for_test(Box::new(FixedRetryClock::new(100_000)));
+
+        let report = tauri::async_runtime::block_on(drain_fenced_vector_sync(
+            &consumer,
+            "cost-budget",
+            MAX_DRAIN_LIMIT,
+        ))
+        .unwrap();
+        assert_eq!(report.processed, MAX_DRAIN_LIMIT);
+        assert_eq!(report.applied_upserts, MAX_DRAIN_LIMIT);
+        assert_eq!(report.requested_limit, MAX_DRAIN_LIMIT);
+        assert_eq!(consumer.process_one_invocations_for_test(), MAX_DRAIN_LIMIT);
+        assert_eq!(provider_requests.load(Ordering::SeqCst), MAX_DRAIN_LIMIT);
+        assert_eq!(embedding_successes.load(Ordering::SeqCst), MAX_DRAIN_LIMIT);
+        assert!(storage.list("life").unwrap().is_empty());
+    }
+
+    #[test]
+    fn same_drain_unknown_result_never_reclaims() {
+        let (_temp, storage) = test_storage();
+        let (context, vectors) = drained_context();
+        drain_upsert_fixture(&storage, context.generation_id().as_str());
+        drain_delete_fixture(&storage, context.generation_id().as_str());
+        let provider = PossiblySentEmbeddingProvider {
+            inner: crate::embedding::DeterministicEmbeddingProvider::new(3),
+            requests: AtomicUsize::new(0),
+        };
+        let consumer =
+            FencedVectorSyncSingleEventConsumer::new(&storage, &provider, &vectors, context)
+                .with_retry_clock_for_test(Box::new(FixedRetryClock::new(100_000)));
+
+        let first = tauri::async_runtime::block_on(drain_fenced_vector_sync(
+            &consumer,
+            "unknown-same-drain",
+            2,
+        ))
+        .unwrap();
+        assert_eq!(first.processed, 2);
+        assert_eq!(first.blocked, 1);
+        assert_eq!(first.applied_deletes, 1);
+        assert_eq!(provider.requests.load(Ordering::SeqCst), 1);
+
+        let second = tauri::async_runtime::block_on(drain_fenced_vector_sync(
+            &consumer,
+            "unknown-same-drain",
+            2,
+        ))
+        .unwrap();
+        assert_eq!(second.processed, 0);
+        assert!(second.stopped_no_eligible);
+        assert_eq!(provider.requests.load(Ordering::SeqCst), 1);
     }
 }

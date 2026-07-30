@@ -352,14 +352,7 @@ impl StorageService {
                AND state IN ('pending','retry_wait','processing')",
             [],
         ).map_err(|_| single_event_error())?;
-        tx.execute(
-            "UPDATE memory_vector_sync_outbox SET state='pending', lease_owner=NULL,
-             lease_expires_at=NULL, lease_fence_epoch=NULL, claimed_generation_id=NULL,
-             last_send_disposition=NULL, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
-             WHERE state='processing' AND lease_expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now')",
-            [],
-        )
-        .map_err(|_| single_event_error())?;
+        recover_expired_fenced_processing_in(&tx, retry_cutoff_millis)?;
         let id: Option<i64> = match retry_cutoff_millis {
             Some(retry_cutoff_millis) => tx
                 .query_row(
@@ -394,6 +387,7 @@ impl StorageService {
             "UPDATE memory_vector_sync_outbox SET state='processing',
              lease_owner=?2, lease_fence_epoch=?3, claimed_generation_id=?4,
              lease_expires_at=strftime('%Y-%m-%dT%H:%M:%fZ','now','+120 seconds'), next_attempt_at=NULL,
+             last_send_disposition=NULL,
              updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
              WHERE id=?1 AND migration_disposition IS NULL AND state IN ('pending','retry_wait')",
             params![id, lease_owner, fence_epoch, generation_id],
@@ -485,6 +479,7 @@ impl StorageService {
         let changed = if current {
             tx.execute(
                 "UPDATE memory_vector_sync_outbox SET attempt_count=attempt_count+1,
+                 last_send_disposition=CASE WHEN desired_action='upsert' THEN 'possibly_sent' ELSE NULL END,
                  updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
                  WHERE id=?1 AND mutation_sequence=?2 AND state='processing' AND lease_owner=?3
                    AND lease_fence_epoch=?4 AND claimed_generation_id=?5
@@ -943,6 +938,39 @@ fn fenced_claim_current_in(
             claim.generation_id
         ],
         |row| Ok(row.get::<_, i64>(0)? == 1),
+    )
+    .map_err(|_| single_event_error())
+}
+
+/// Recovers only expired fenced processing rows. An upsert with a durable
+/// attempt marker may already have crossed the provider boundary, so recovery
+/// records the uncertainty instead of scheduling another cloud request.
+fn recover_expired_fenced_processing_in(
+    tx: &Transaction<'_>,
+    retry_cutoff_millis: Option<i64>,
+) -> Result<usize, crate::storage::StorageError> {
+    tx.execute(
+        "UPDATE memory_vector_sync_outbox
+         SET state=CASE
+               WHEN desired_action='upsert' AND attempt_count=0 AND last_send_disposition IS NULL THEN 'pending'
+               WHEN desired_action='delete' AND last_send_disposition IS NULL THEN 'pending'
+               ELSE 'blocked'
+             END,
+             next_attempt_at=NULL,
+             lease_owner=NULL, lease_expires_at=NULL, lease_fence_epoch=NULL, claimed_generation_id=NULL,
+             last_error_code=CASE
+               WHEN desired_action='upsert' AND attempt_count>0 AND last_send_disposition='possibly_sent' THEN 'PROVIDER_RESULT_UNKNOWN'
+               WHEN desired_action='upsert' AND attempt_count=0 AND last_send_disposition IS NULL THEN last_error_code
+               WHEN desired_action='delete' AND last_send_disposition IS NULL THEN last_error_code
+               ELSE 'INTERNAL_INVARIANT'
+             END,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE state='processing'
+           AND lease_expires_at <= COALESCE(
+               strftime('%Y-%m-%dT%H:%M:%fZ', ?1 / 1000.0, 'unixepoch'),
+               strftime('%Y-%m-%dT%H:%M:%fZ','now')
+           )",
+        params![retry_cutoff_millis],
     )
     .map_err(|_| single_event_error())
 }
@@ -2486,6 +2514,225 @@ mod tests {
             )
             .unwrap();
         assert_eq!(saved.as_deref(), Some("possibly_sent"));
+    }
+
+    #[test]
+    fn send_disposition_is_atomic_with_attempt_start() {
+        {
+            let (_root, storage) = storage();
+            let record = confirmed(&storage, false);
+            storage
+                .register_building_vector_generation("generation-a", "descriptor-a", 2)
+                .unwrap();
+            let claim = storage
+                .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-a")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                storage.mark_fenced_attempt_started(&claim).unwrap(),
+                FencedAttemptStartResult::Started { attempt_count: 1 }
+            );
+            let started = storage
+                .test_get_outbox_snapshot_detailed("life", &record.id)
+                .unwrap();
+            assert_eq!(started.state, "processing");
+            assert_eq!(started.attempt_count, 1);
+            assert_eq!(
+                started.last_send_disposition.as_deref(),
+                Some("possibly_sent")
+            );
+
+            assert_eq!(
+                storage
+                    .finalize_fenced_vector_failure(
+                        &claim,
+                        "PROVIDER_UNAVAILABLE",
+                        FencedFailureDecision::RetryAfter {
+                            delay_millis: 30_000,
+                        },
+                        Some("definitely_not_sent"),
+                        100_000,
+                        100_000,
+                    )
+                    .unwrap(),
+                FencedFailureFinalizeResult::RetryScheduled {
+                    next_attempt_at_millis: 130_000,
+                }
+            );
+            let next_claim = storage
+                .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-a")
+                .unwrap()
+                .unwrap();
+            let cleared = storage
+                .test_get_outbox_snapshot_detailed("life", &record.id)
+                .unwrap();
+            assert_eq!(cleared.state, "processing");
+            assert_eq!(cleared.last_send_disposition, None);
+
+            storage.test_expire_fenced_runtime_lease().unwrap();
+            assert_eq!(
+                storage.mark_fenced_attempt_started(&next_claim).unwrap(),
+                FencedAttemptStartResult::LostLeaseOrSuperseded
+            );
+            let after_old_fence = storage
+                .test_get_outbox_snapshot_detailed("life", &record.id)
+                .unwrap();
+            assert_eq!(after_old_fence.attempt_count, 1);
+            assert_eq!(after_old_fence.last_send_disposition, None);
+        }
+
+        let (_root, delete_storage) = storage();
+        let record = confirmed(&delete_storage, false);
+        delete_storage
+            .enqueue(EnqueueMemoryVectorSyncRequest {
+                life_id: record.life_id.clone(),
+                memory_id: record.id.clone(),
+                desired_action: MemoryVectorSyncAction::Delete,
+            })
+            .unwrap();
+        delete_storage
+            .register_building_vector_generation("generation-a", "descriptor-a", 2)
+            .unwrap();
+        let delete = delete_storage
+            .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            delete_storage.mark_fenced_attempt_started(&delete).unwrap(),
+            FencedAttemptStartResult::Started { attempt_count: 1 }
+        );
+        assert_eq!(
+            delete_storage
+                .test_get_outbox_snapshot_detailed("life", &record.id)
+                .unwrap()
+                .last_send_disposition,
+            None
+        );
+    }
+
+    #[test]
+    fn expired_upsert_with_possible_send_blocks() {
+        let cases = [
+            ("upsert", 0_i64, None, "pending", None, None),
+            (
+                "upsert",
+                1_i64,
+                Some("possibly_sent"),
+                "blocked",
+                Some("PROVIDER_RESULT_UNKNOWN"),
+                Some("possibly_sent"),
+            ),
+            (
+                "upsert",
+                1_i64,
+                None,
+                "blocked",
+                Some("INTERNAL_INVARIANT"),
+                None,
+            ),
+            (
+                "upsert",
+                1_i64,
+                Some("definitely_not_sent"),
+                "blocked",
+                Some("INTERNAL_INVARIANT"),
+                Some("definitely_not_sent"),
+            ),
+            ("delete", 1_i64, None, "pending", None, None),
+        ];
+
+        for (action, attempts, disposition, expected_state, expected_error, expected_disposition) in
+            cases
+        {
+            let (_root, storage) = storage();
+            let record = confirmed(&storage, false);
+            if action == "delete" {
+                storage
+                    .enqueue(EnqueueMemoryVectorSyncRequest {
+                        life_id: record.life_id.clone(),
+                        memory_id: record.id.clone(),
+                        desired_action: MemoryVectorSyncAction::Delete,
+                    })
+                    .unwrap();
+            }
+            storage
+                .register_building_vector_generation("generation-a", "descriptor-a", 2)
+                .unwrap();
+            let claim = storage
+                .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-a")
+                .unwrap()
+                .unwrap();
+            let mut state = storage.state().unwrap();
+            state
+                .connection
+                .execute(
+                    "UPDATE memory_vector_sync_outbox
+                     SET attempt_count=?1, last_send_disposition=?2,
+                         lease_expires_at='2000-01-01T00:00:00.000Z'",
+                    params![attempts, disposition],
+                )
+                .unwrap();
+            let tx = state
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            assert_eq!(
+                recover_expired_fenced_processing_in(&tx, Some(1_700_000_000_000)).unwrap(),
+                1
+            );
+            tx.commit().unwrap();
+            drop(state);
+
+            let snapshot = storage
+                .test_get_outbox_snapshot_detailed("life", &record.id)
+                .unwrap();
+            assert_eq!(snapshot.state, expected_state, "{action}/{attempts}");
+            assert_eq!(snapshot.attempt_count, attempts, "{action}/{attempts}");
+            assert_eq!(snapshot.last_error_code.as_deref(), expected_error);
+            assert_eq!(
+                snapshot.last_send_disposition.as_deref(),
+                expected_disposition
+            );
+            assert_eq!(snapshot.lease_owner, None);
+            assert_eq!(snapshot.lease_fence_epoch, None);
+            assert_eq!(snapshot.lease_expires_at, None);
+            assert_eq!(snapshot.claimed_generation_id, None);
+            assert_eq!(snapshot.next_attempt_at, None);
+            drop(claim);
+        }
+    }
+
+    #[test]
+    fn expired_processing_leaves_a_live_fence_unchanged() {
+        let (_root, storage) = storage();
+        let record = confirmed(&storage, false);
+        storage
+            .register_building_vector_generation("generation-a", "descriptor-a", 2)
+            .unwrap();
+        let _claim = storage
+            .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-a")
+            .unwrap()
+            .unwrap();
+        let before = storage
+            .test_get_outbox_snapshot_detailed("life", &record.id)
+            .unwrap();
+        let mut state = storage.state().unwrap();
+        let tx = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert_eq!(
+            recover_expired_fenced_processing_in(&tx, Some(0)).unwrap(),
+            0
+        );
+        tx.commit().unwrap();
+        drop(state);
+        assert_eq!(
+            storage
+                .test_get_outbox_snapshot_detailed("life", &record.id)
+                .unwrap(),
+            before
+        );
     }
 
     #[test]

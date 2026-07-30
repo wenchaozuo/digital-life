@@ -2122,7 +2122,7 @@ mod tests {
     #[test]
     fn provider_result_unknown_blocks_without_resend() {
         let (_temp, storage) = test_storage();
-        confirmed(&storage, false);
+        let record = confirmed(&storage, false);
         let descriptor = "b".repeat(64);
         storage
             .register_building_vector_generation("gen-ps", &descriptor, 3)
@@ -2137,10 +2137,13 @@ mod tests {
         tauri::async_runtime::block_on(vectors.create_generation(&context)).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
+        let transport_requests = Arc::new(AtomicUsize::new(0));
+        let transport_requests_for_server = Arc::clone(&transport_requests);
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut buffer = [0_u8; 2048];
             let _ = stream.read(&mut buffer);
+            transport_requests_for_server.fetch_add(1, Ordering::SeqCst);
         });
         let profile = ModelProfile {
             id: "profile-ps".into(),
@@ -2163,29 +2166,62 @@ mod tests {
                 SecretValue::new("test-placeholder".into()).unwrap(),
             )
             .unwrap();
-        let provider =
+        let raw_provider =
             crate::embedding::build_openai_compatible_embedding_provider(&profile, &secrets)
                 .unwrap();
-        let consumer = FencedVectorSyncSingleEventConsumer::new(
-            &storage,
-            provider.as_ref(),
-            &vectors,
-            context,
-        );
-        let result = tauri::async_runtime::block_on(consumer.process_one("worker-a")).unwrap();
+        let provider_requests = Arc::new(AtomicUsize::new(0));
+        let embedding_successes = Arc::new(AtomicUsize::new(0));
+        let provider = CountingEmbeddingProvider {
+            inner: raw_provider.as_ref(),
+            provider_requests: Arc::clone(&provider_requests),
+            embedding_successes,
+        };
+        let clock = FixedRetryClock::new(100_000);
+        let advanced_clock = clock.clone();
+        let consumer =
+            FencedVectorSyncSingleEventConsumer::new(&storage, &provider, &vectors, context)
+                .with_retry_clock_for_test(Box::new(clock));
+        let first =
+            tauri::async_runtime::block_on(drain_fenced_vector_sync(&consumer, "worker-a", 1))
+                .unwrap();
         server.join().unwrap();
-        assert_eq!(result, FencedVectorSyncSingleEventResult::Blocked);
+        assert_eq!(first.processed, 1);
+        assert_eq!(first.blocked, 1);
+        assert_eq!(provider_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(transport_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(consumer.claimed_events_for_test.get(), 1);
         let row = storage.test_fenced_outbox_failure_snapshot().unwrap();
         assert_eq!(row.0, 1);
         assert_eq!(row.1.as_deref(), Some("possibly_sent"));
         assert_eq!(row.2, "PROVIDER_RESULT_UNKNOWN");
-        assert_eq!(
+        let before_second_drain = storage
+            .test_get_outbox_snapshot_detailed(&record.life_id, &record.id)
+            .unwrap();
+        assert_eq!(before_second_drain.next_attempt_at, None);
+
+        advanced_clock.set(200_000);
+        let second =
             tauri::async_runtime::block_on(drain_fenced_vector_sync(&consumer, "worker-a", 1))
-                .unwrap()
-                .processed,
-            0
+                .unwrap();
+        assert_eq!(second.processed, 0);
+        assert!(second.stopped_no_eligible);
+        assert_eq!(provider_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(transport_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(consumer.claimed_events_for_test.get(), 1);
+        let after_second_drain = storage
+            .test_get_outbox_snapshot_detailed(&record.life_id, &record.id)
+            .unwrap();
+        assert_eq!(after_second_drain.state, "blocked");
+        assert_eq!(after_second_drain.attempt_count, 1);
+        assert_eq!(
+            after_second_drain.last_error_code.as_deref(),
+            Some("PROVIDER_RESULT_UNKNOWN")
         );
-        assert_eq!(storage.test_fenced_outbox_failure_snapshot().unwrap().0, 1);
+        assert_eq!(
+            after_second_drain.last_send_disposition.as_deref(),
+            Some("possibly_sent")
+        );
+        assert_eq!(after_second_drain.next_attempt_at, None);
     }
 
     #[test]
@@ -2913,6 +2949,14 @@ mod tests {
             StorageService::initialize_with_roots(temp.path().join("data"), None).unwrap();
         let storage = Arc::new(storage);
         let record = confirmed(&storage, false);
+        let takeover_record = confirmed(&storage, false);
+        storage
+            .enqueue(EnqueueMemoryVectorSyncRequest {
+                life_id: takeover_record.life_id.clone(),
+                memory_id: takeover_record.id.clone(),
+                desired_action: MemoryVectorSyncAction::Delete,
+            })
+            .unwrap();
         let descriptor = "b".repeat(64);
         storage
             .register_building_vector_generation("gen-pb", &descriptor, 3)
@@ -3007,6 +3051,15 @@ mod tests {
             embedding_successes: Arc::clone(&embedding_successes),
         };
 
+        let owner_a = Arc::new(Mutex::new(None));
+        let fence_a = Arc::new(Mutex::new(None));
+        let owner_a_for_observer = Arc::clone(&owner_a);
+        let fence_a_for_observer = Arc::clone(&fence_a);
+        let fence_a_for_pause = Arc::clone(&fence_a);
+        let owner_b = Arc::new(Mutex::new(None));
+        let fence_b = Arc::new(Mutex::new(None));
+        let owner_b_for_pause = Arc::clone(&owner_b);
+        let fence_b_for_pause = Arc::clone(&fence_b);
         let storage_b_capture = storage_b;
         let context_clone = context.clone();
         let consumer = FencedVectorSyncSingleEventConsumer::new(
@@ -3015,12 +3068,16 @@ mod tests {
             &vectors,
             context.clone(),
         );
+        consumer.set_claim_observer_for_test(Some(Box::new(move |claim| {
+            *owner_a_for_observer.lock().unwrap() = Some(claim.lease_owner().to_string());
+            *fence_a_for_observer.lock().unwrap() = Some(claim.fence_epoch());
+        })));
         consumer.set_test_pause_hook_for_test(Some(Box::new(move |point| {
             if point == VectorSyncTestPausePoint::AfterEmbeddingBeforeLance {
                 storage_b_capture
                     .test_expire_fenced_runtime_lease()
                     .unwrap();
-                assert!(storage_b_capture
+                let claim_b = storage_b_capture
                     .claim_one_fenced_vector_sync(
                         context_clone.generation_id().as_str(),
                         context_clone.descriptor_hash(),
@@ -3028,7 +3085,13 @@ mod tests {
                         "worker-b",
                     )
                     .unwrap()
-                    .is_none());
+                    .expect("worker-b must claim the independent delete event");
+                assert_eq!(claim_b.action(), MemoryVectorSyncAction::Delete);
+                assert_eq!(claim_b.lease_owner(), "worker-b");
+                let observed_fence_a = fence_a_for_pause.lock().unwrap().unwrap();
+                assert!(claim_b.fence_epoch() > observed_fence_a);
+                *owner_b_for_pause.lock().unwrap() = Some(claim_b.lease_owner().to_string());
+                *fence_b_for_pause.lock().unwrap() = Some(claim_b.fence_epoch());
             }
         })));
 
@@ -3039,6 +3102,9 @@ mod tests {
             result,
             FencedVectorSyncSingleEventResult::LostLeaseOrSuperseded
         );
+        assert_eq!(owner_a.lock().unwrap().as_deref(), Some("worker-a"));
+        assert_eq!(owner_b.lock().unwrap().as_deref(), Some("worker-b"));
+        assert!(fence_b.lock().unwrap().unwrap() > fence_a.lock().unwrap().unwrap());
         assert_eq!(credential_reads.load(Ordering::SeqCst), 1);
         assert_eq!(provider_requests.load(Ordering::SeqCst), 1);
         assert_eq!(transport_requests.load(Ordering::SeqCst), 1);
@@ -3050,7 +3116,10 @@ mod tests {
         let snap_mid = storage
             .test_get_outbox_snapshot_detailed(&record.life_id, &record.id)
             .unwrap();
-        assert_eq!(snap_mid.total_count, 1, "Phase B: Outbox event intact");
+        assert_eq!(
+            snap_mid.total_count, 2,
+            "both the blocked upsert and B's delete remain durable"
+        );
         assert_eq!(
             snap_mid.state, "blocked",
             "expired recovery must fail closed after a provider result"
@@ -3076,6 +3145,29 @@ mod tests {
         assert_eq!(provider_requests.load(Ordering::SeqCst), 1);
         assert_eq!(transport_requests.load(Ordering::SeqCst), 1);
         assert_eq!(embedding_successes.load(Ordering::SeqCst), 1);
+
+        // B's official claim still owns the runtime lease. Expire it only to
+        // let an explicit consumer run recovery and prove A remains blocked.
+        storage.test_expire_fenced_runtime_lease().unwrap();
+        let after_recovery =
+            tauri::async_runtime::block_on(drain_fenced_vector_sync(&consumer, "worker-a", 1))
+                .unwrap();
+        assert_eq!(after_recovery.processed, 1);
+        let after_recovery_a = storage
+            .test_get_outbox_snapshot_detailed(&record.life_id, &record.id)
+            .unwrap();
+        assert_eq!(after_recovery_a.state, "blocked");
+        assert_eq!(
+            after_recovery_a.last_error_code.as_deref(),
+            Some("PROVIDER_RESULT_UNKNOWN")
+        );
+        assert_eq!(
+            after_recovery_a.last_send_disposition.as_deref(),
+            Some("possibly_sent")
+        );
+        assert_eq!(after_recovery_a.attempt_count, 1);
+        assert_eq!(provider_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(transport_requests.load(Ordering::SeqCst), 1);
     }
 
     #[test]

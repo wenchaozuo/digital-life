@@ -180,6 +180,21 @@ pub(crate) struct StorageState {
     database_path: PathBuf,
 }
 
+pub(crate) struct OutboxSyncHealthAggregate {
+    pub pending_count: usize,
+    pub retry_wait_count: usize,
+    pub blocked_count: usize,
+    pub processing_count: usize,
+    pub expired_processing_count: usize,
+    pub provider_result_unknown_count: usize,
+    pub internal_invariant_count: usize,
+    pub attempts_at_limit_count: usize,
+    pub oldest_pending_epoch_ms: Option<i64>,
+    pub oldest_retry_wait_epoch_ms: Option<i64>,
+    pub oldest_blocked_epoch_ms: Option<i64>,
+    pub sqlite_generation_item_count: usize,
+}
+
 pub struct StorageService {
     state: Mutex<StorageState>,
     location: StorageLocationResolver,
@@ -279,6 +294,80 @@ impl StorageService {
 
     pub(crate) fn state(&self) -> Result<MutexGuard<'_, StorageState>, StorageError> {
         self.state.lock().map_err(StorageError::database)
+    }
+
+    pub(crate) fn inspect_outbox_sync_health(
+        &self,
+        generation_id: &str,
+        max_attempts: u32,
+        snapshot_now_millis: i64,
+    ) -> Result<OutboxSyncHealthAggregate, StorageError> {
+        let state = self.state()?;
+        // Use strftime to convert the millis epoch to an ISO-8601 string for text comparison
+        let (pending, rwait, blocked, processing, expired, unknown, inv, att_limit,
+             oldest_pending, oldest_retry, oldest_blocked) = state.connection.query_row(
+            "SELECT
+                COALESCE(SUM(CASE WHEN state='pending' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN state='retry_wait' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN state='blocked' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN state='processing' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN state='processing' AND lease_expires_at IS NOT NULL AND lease_expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ', ?1 / 1000.0, 'unixepoch') THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN state='blocked' AND last_error_code='PROVIDER_RESULT_UNKNOWN' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN state='blocked' AND last_error_code='INTERNAL_INVARIANT' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN attempt_count >= ?2 AND state IN ('blocked','processing','retry_wait') THEN 1 ELSE 0 END), 0),
+                MIN(CASE WHEN state='pending' THEN ROUND((julianday(created_at) - 2440587.5) * 86400000) ELSE NULL END),
+                MIN(CASE WHEN state='retry_wait' THEN ROUND((julianday(updated_at) - 2440587.5) * 86400000) ELSE NULL END),
+                MIN(CASE WHEN state='blocked' THEN ROUND((julianday(updated_at) - 2440587.5) * 86400000) ELSE NULL END)
+             FROM memory_vector_sync_outbox",
+            rusqlite::params![snapshot_now_millis as f64, max_attempts],
+            |row| Ok((
+                row.get::<_, i64>(0)? as usize,
+                row.get::<_, i64>(1)? as usize,
+                row.get::<_, i64>(2)? as usize,
+                row.get::<_, i64>(3)? as usize,
+                row.get::<_, i64>(4)? as usize,
+                row.get::<_, i64>(5)? as usize,
+                row.get::<_, i64>(6)? as usize,
+                row.get::<_, i64>(7)? as usize,
+                row.get::<_, Option<f64>>(8)?,
+                row.get::<_, Option<f64>>(9)?,
+                row.get::<_, Option<f64>>(10)?,
+            )),
+        ).map_err(|_| StorageError::new(
+            "VECTOR_SYNC_UNAVAILABLE",
+            "Vector sync health query failed.",
+            false,
+        ))?;
+
+        let gen_items: usize = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM memory_vector_generation_item WHERE generation_id=?1",
+                rusqlite::params![generation_id],
+                |row| row.get::<_, i64>(0).map(|v| v as usize),
+            )
+            .map_err(|_| {
+                StorageError::new(
+                    "VECTOR_SYNC_UNAVAILABLE",
+                    "Vector sync health query failed.",
+                    false,
+                )
+            })?;
+
+        Ok(OutboxSyncHealthAggregate {
+            pending_count: pending,
+            retry_wait_count: rwait,
+            blocked_count: blocked,
+            processing_count: processing,
+            expired_processing_count: expired,
+            provider_result_unknown_count: unknown,
+            internal_invariant_count: inv,
+            attempts_at_limit_count: att_limit,
+            oldest_pending_epoch_ms: oldest_pending.map(|v| v as i64),
+            oldest_retry_wait_epoch_ms: oldest_retry.map(|v| v as i64),
+            oldest_blocked_epoch_ms: oldest_blocked.map(|v| v as i64),
+            sqlite_generation_item_count: gen_items,
+        })
     }
 
     pub fn location_info(&self) -> Result<StorageLocationInfo, StorageError> {

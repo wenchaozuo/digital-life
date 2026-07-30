@@ -204,6 +204,19 @@ pub(crate) enum FencedFinalizeResult {
     LostLeaseOrSuperseded,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FencedFailureDecision {
+    RetryAfter { delay_millis: u64 },
+    Blocked,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FencedFailureFinalizeResult {
+    RetryScheduled { next_attempt_at_millis: i64 },
+    Blocked,
+    LostLeaseOrSuperseded,
+}
+
 /// The durable result of marking the next external I/O attempt.  `Started`
 /// contains the authoritative, one-based value written by that same SQLite
 /// transaction; a stale, superseded, or expired fence cannot advance it.
@@ -287,11 +300,29 @@ impl StorageService {
         dimension: usize,
         lease_owner: &str,
     ) -> Result<Option<FencedVectorSyncClaim>, crate::storage::StorageError> {
+        self.claim_one_fenced_vector_sync_with_retry_cutoff(
+            generation_id,
+            descriptor_hash,
+            dimension,
+            lease_owner,
+            None,
+        )
+    }
+
+    pub(crate) fn claim_one_fenced_vector_sync_with_retry_cutoff(
+        &self,
+        generation_id: &str,
+        descriptor_hash: &str,
+        dimension: usize,
+        lease_owner: &str,
+        retry_cutoff_millis: Option<i64>,
+    ) -> Result<Option<FencedVectorSyncClaim>, crate::storage::StorageError> {
         if generation_id.is_empty()
             || descriptor_hash.is_empty()
             || dimension == 0
             || lease_owner.is_empty()
             || lease_owner.len() > 128
+            || retry_cutoff_millis.is_some_and(|value| value < 0)
         {
             return Err(single_event_error());
         }
@@ -329,13 +360,32 @@ impl StorageService {
             [],
         )
         .map_err(|_| single_event_error())?;
-        let id: Option<i64> = tx.query_row(
-            "SELECT id FROM memory_vector_sync_outbox WHERE migration_disposition IS NULL AND
-              ((desired_action='upsert' AND target_revision IS NOT NULL AND target_content_hash IS NOT NULL)
-               OR (desired_action='delete' AND target_revision IS NULL AND target_content_hash IS NULL)) AND
-              (state='pending' OR (state='retry_wait' AND next_attempt_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now')))
-             ORDER BY mutation_sequence ASC, id ASC LIMIT 1", [], |row| row.get(0),
-        ).optional().map_err(|_| single_event_error())?;
+        let id: Option<i64> = match retry_cutoff_millis {
+            Some(retry_cutoff_millis) => tx
+                .query_row(
+                    "SELECT id FROM memory_vector_sync_outbox WHERE migration_disposition IS NULL AND
+                      ((desired_action='upsert' AND target_revision IS NOT NULL AND target_content_hash IS NOT NULL)
+                       OR (desired_action='delete' AND target_revision IS NULL AND target_content_hash IS NULL)) AND
+                      (state='pending' OR (state='retry_wait' AND next_attempt_at <= strftime('%Y-%m-%dT%H:%M:%fZ', ?1 / 1000.0, 'unixepoch')))
+                     ORDER BY mutation_sequence ASC, id ASC LIMIT 1",
+                    params![retry_cutoff_millis],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|_| single_event_error())?,
+            None => tx
+                .query_row(
+                    "SELECT id FROM memory_vector_sync_outbox WHERE migration_disposition IS NULL AND
+                      ((desired_action='upsert' AND target_revision IS NOT NULL AND target_content_hash IS NOT NULL)
+                       OR (desired_action='delete' AND target_revision IS NULL AND target_content_hash IS NULL)) AND
+                      (state='pending' OR (state='retry_wait' AND next_attempt_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now')))
+                     ORDER BY mutation_sequence ASC, id ASC LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|_| single_event_error())?,
+        };
         let Some(id) = id else {
             tx.commit().map_err(|_| single_event_error())?;
             return Ok(None);
@@ -544,6 +594,79 @@ impl StorageService {
         } else {
             FencedFinalizeResult::LostLeaseOrSuperseded
         })
+    }
+
+    pub(crate) fn finalize_fenced_vector_failure(
+        &self,
+        claim: &FencedVectorSyncClaim,
+        error_code: &str,
+        decision: FencedFailureDecision,
+        send_disposition: Option<&str>,
+        clock_now_millis: i64,
+        drain_retry_cutoff_millis: i64,
+    ) -> Result<FencedFailureFinalizeResult, crate::storage::StorageError> {
+        let mut state = self.state()?;
+        let tx = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| single_event_error())?;
+        let predicate = "id=?1 AND mutation_sequence=?2 AND state='processing' AND lease_owner=?3 AND lease_fence_epoch=?4 AND claimed_generation_id=?5";
+        if !fenced_claim_current_in(&tx, claim)? {
+            tx.commit().map_err(|_| single_event_error())?;
+            return Ok(FencedFailureFinalizeResult::LostLeaseOrSuperseded);
+        }
+        let retry_at = match decision {
+            FencedFailureDecision::RetryAfter { delay_millis }
+                if clock_now_millis >= 0 && drain_retry_cutoff_millis >= 0 =>
+            {
+                let base = clock_now_millis.max(drain_retry_cutoff_millis);
+                i64::try_from(delay_millis)
+                    .ok()
+                    .and_then(|delay| base.checked_add(delay))
+            }
+            _ => None,
+        };
+        let result = if let Some(next_attempt_at_millis) = retry_at {
+            let changed = tx.execute(
+                &format!("UPDATE memory_vector_sync_outbox SET state='retry_wait', next_attempt_at=strftime('%Y-%m-%dT%H:%M:%fZ', ?8 / 1000.0, 'unixepoch'), lease_owner=NULL, lease_expires_at=NULL, lease_fence_epoch=NULL, claimed_generation_id=NULL, last_error_code=?6, last_send_disposition=?7, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE {predicate}"),
+                params![claim.id, claim.mutation_sequence, claim.lease_owner, claim.fence_epoch, claim.generation_id, safe_error_code(error_code), send_disposition, next_attempt_at_millis],
+            ).map_err(|_| single_event_error())?;
+            if changed == 1 {
+                FencedFailureFinalizeResult::RetryScheduled {
+                    next_attempt_at_millis,
+                }
+            } else {
+                FencedFailureFinalizeResult::LostLeaseOrSuperseded
+            }
+        } else {
+            let changed = tx.execute(
+                &format!("UPDATE memory_vector_sync_outbox SET state='blocked', next_attempt_at=NULL, lease_owner=NULL, lease_expires_at=NULL, lease_fence_epoch=NULL, claimed_generation_id=NULL, last_error_code=?6, last_send_disposition=?7, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE {predicate}"),
+                params![claim.id, claim.mutation_sequence, claim.lease_owner, claim.fence_epoch, claim.generation_id, safe_error_code(error_code), send_disposition],
+            ).map_err(|_| single_event_error())?;
+            if changed == 1 {
+                FencedFailureFinalizeResult::Blocked
+            } else {
+                FencedFailureFinalizeResult::LostLeaseOrSuperseded
+            }
+        };
+        tx.commit().map_err(|_| single_event_error())?;
+        Ok(result)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_fenced_attempt_count(
+        &self,
+        attempt_count: i64,
+    ) -> Result<(), crate::storage::StorageError> {
+        let state = self.state()?;
+        state
+            .connection
+            .execute(
+                "UPDATE memory_vector_sync_outbox SET attempt_count=?1",
+                params![attempt_count],
+            )
+            .map_err(|_| single_event_error())?;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1919,6 +2042,184 @@ mod tests {
             .unwrap();
         let takeover = acquire_runtime_lease(&transaction, "worker-b").unwrap();
         assert_eq!(takeover, first + 1);
+    }
+
+    #[test]
+    fn fenced_failure_finalize_uses_cutoff_base_and_returns_durable_state() {
+        let (_root, storage) = storage();
+        confirmed(&storage, false);
+        storage
+            .register_building_vector_generation("generation-a", "descriptor-a", 2)
+            .unwrap();
+        let claim = storage
+            .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            storage.mark_fenced_attempt_started(&claim).unwrap(),
+            FencedAttemptStartResult::Started { attempt_count: 1 }
+        );
+        assert_eq!(
+            storage
+                .finalize_fenced_vector_failure(
+                    &claim,
+                    "RATE_LIMITED",
+                    FencedFailureDecision::RetryAfter {
+                        delay_millis: 30_000,
+                    },
+                    Some("definitely_not_sent"),
+                    90_000,
+                    100_000,
+                )
+                .unwrap(),
+            FencedFailureFinalizeResult::RetryScheduled {
+                next_attempt_at_millis: 130_000,
+            }
+        );
+        let job = storage.list("life").unwrap().remove(0);
+        assert_eq!(job.state, MemoryVectorSyncState::RetryWait);
+        assert_eq!(job.attempt_count, 1);
+        assert_eq!(job.last_error_code.as_deref(), Some("RATE_LIMITED"));
+        assert_eq!(
+            job.next_attempt_at.as_deref(),
+            Some("1970-01-01T00:02:10.000Z")
+        );
+    }
+
+    #[test]
+    fn fenced_failure_finalize_uses_a_forward_clock_when_it_exceeds_the_cutoff() {
+        let (_root, storage) = storage();
+        confirmed(&storage, false);
+        storage
+            .register_building_vector_generation("generation-a", "descriptor-a", 2)
+            .unwrap();
+        let claim = storage
+            .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            storage.mark_fenced_attempt_started(&claim).unwrap(),
+            FencedAttemptStartResult::Started { attempt_count: 1 }
+        );
+        assert_eq!(
+            storage
+                .finalize_fenced_vector_failure(
+                    &claim,
+                    "RATE_LIMITED",
+                    FencedFailureDecision::RetryAfter {
+                        delay_millis: 30_000,
+                    },
+                    Some("definitely_not_sent"),
+                    150_000,
+                    100_000,
+                )
+                .unwrap(),
+            FencedFailureFinalizeResult::RetryScheduled {
+                next_attempt_at_millis: 180_000,
+            }
+        );
+    }
+
+    #[test]
+    fn fenced_failure_finalize_blocks_on_attempt_limit_and_time_overflow() {
+        for (attempt_count, clock_now, decision, expected_error) in [
+            (
+                5_i64,
+                100_000_i64,
+                FencedFailureDecision::Blocked,
+                "RATE_LIMITED",
+            ),
+            (
+                1_i64,
+                i64::MAX,
+                FencedFailureDecision::RetryAfter {
+                    delay_millis: 30_000,
+                },
+                "RATE_LIMITED",
+            ),
+        ] {
+            let (_root, storage) = storage();
+            confirmed(&storage, false);
+            storage
+                .register_building_vector_generation("generation-a", "descriptor-a", 2)
+                .unwrap();
+            let claim = storage
+                .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-a")
+                .unwrap()
+                .unwrap();
+            storage
+                .state()
+                .unwrap()
+                .connection
+                .execute(
+                    "UPDATE memory_vector_sync_outbox SET attempt_count=?1",
+                    params![attempt_count],
+                )
+                .unwrap();
+            assert_eq!(
+                storage
+                    .finalize_fenced_vector_failure(
+                        &claim,
+                        expected_error,
+                        decision,
+                        Some("definitely_not_sent"),
+                        clock_now,
+                        100_000,
+                    )
+                    .unwrap(),
+                FencedFailureFinalizeResult::Blocked
+            );
+            let job = storage.list("life").unwrap().remove(0);
+            assert_eq!(job.state, MemoryVectorSyncState::Blocked);
+            assert_eq!(job.next_attempt_at, None);
+            assert_eq!(job.attempt_count as i64, attempt_count);
+            assert_eq!(job.last_error_code.as_deref(), Some(expected_error));
+        }
+    }
+
+    #[test]
+    fn fenced_claim_with_cutoff_keeps_pending_eligible_and_excludes_later_retry_wait() {
+        let (_root, storage) = storage();
+        let record = confirmed(&storage, false);
+        storage
+            .register_building_vector_generation("generation-a", "descriptor-a", 2)
+            .unwrap();
+        storage
+            .state()
+            .unwrap()
+            .connection
+            .execute(
+                "UPDATE memory_vector_sync_outbox SET state='retry_wait', next_attempt_at='1970-01-01T00:02:10.000Z'",
+                [],
+            )
+            .unwrap();
+        assert!(storage
+            .claim_one_fenced_vector_sync_with_retry_cutoff(
+                "generation-a",
+                "descriptor-a",
+                2,
+                "worker-a",
+                Some(100_000),
+            )
+            .unwrap()
+            .is_none());
+        storage
+            .enqueue(EnqueueMemoryVectorSyncRequest {
+                life_id: "life".into(),
+                memory_id: record.id,
+                desired_action: MemoryVectorSyncAction::Delete,
+            })
+            .unwrap();
+        assert!(storage
+            .claim_one_fenced_vector_sync_with_retry_cutoff(
+                "generation-a",
+                "descriptor-a",
+                2,
+                "worker-a",
+                Some(100_000),
+            )
+            .unwrap()
+            .is_some());
     }
 
     #[test]

@@ -25,7 +25,8 @@ use crate::{
     },
     secrets::{SecretStore, WindowsCredentialSecretStore},
     storage::{
-        FencedAttemptStartResult, FencedFinalizeResult, FencedVectorSyncClaim, StorageService,
+        FencedAttemptStartResult, FencedFailureDecision, FencedFailureFinalizeResult,
+        FencedFinalizeResult, FencedVectorSyncClaim, StorageService,
     },
     vector_store::{
         GenerationVectorRecord, LanceDbVectorStoreRegistry, VectorGenerationContext, VectorStore,
@@ -55,7 +56,59 @@ const DEFAULT_LEASE_SECONDS: u32 = 120;
 pub(crate) const MAX_VECTOR_SYNC_ATTEMPTS: u32 = 5;
 const INITIAL_RETRY_SECONDS: u32 = 30;
 const MAX_RETRY_SECONDS: u32 = 3_600;
+const INITIAL_RETRY_MILLIS: u64 = (INITIAL_RETRY_SECONDS as u64) * 1_000;
+const MAX_RETRY_MILLIS: u64 = (MAX_RETRY_SECONDS as u64) * 1_000;
 const MAX_FINISHED_RUNS: usize = 20;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RetryClockError {
+    Unavailable,
+}
+
+pub(crate) trait RetryClock {
+    fn now_utc_millis(&self) -> Result<i64, RetryClockError>;
+}
+
+struct SystemRetryClock;
+
+impl RetryClock for SystemRetryClock {
+    fn now_utc_millis(&self) -> Result<i64, RetryClockError> {
+        let duration = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| RetryClockError::Unavailable)?;
+        i64::try_from(duration.as_millis()).map_err(|_| RetryClockError::Unavailable)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RetryDelayDecision {
+    RetryAfter { delay_millis: u64 },
+    BlockedAtAttemptLimit,
+    InvalidOrOverflow,
+}
+
+pub(crate) const fn retry_delay_millis(attempt_count: u32) -> RetryDelayDecision {
+    if attempt_count == 0 {
+        return RetryDelayDecision::InvalidOrOverflow;
+    }
+    if attempt_count >= MAX_VECTOR_SYNC_ATTEMPTS {
+        return RetryDelayDecision::BlockedAtAttemptLimit;
+    }
+    let shift = attempt_count - 1;
+    let multiplier = match 1_u64.checked_shl(shift) {
+        Some(value) => value,
+        None => return RetryDelayDecision::InvalidOrOverflow,
+    };
+    match INITIAL_RETRY_MILLIS.checked_mul(multiplier) {
+        Some(delay_millis) if delay_millis <= MAX_RETRY_MILLIS => {
+            RetryDelayDecision::RetryAfter { delay_millis }
+        }
+        Some(_) => RetryDelayDecision::RetryAfter {
+            delay_millis: MAX_RETRY_MILLIS,
+        },
+        None => RetryDelayDecision::InvalidOrOverflow,
+    }
+}
 
 /// Pure retry-policy input.  Authority, lease, quarantine, completion, and
 /// no-eligible outcomes never enter this classifier.
@@ -247,6 +300,7 @@ pub(crate) struct FencedVectorSyncSingleEventConsumer<'a> {
     embedding: &'a dyn EmbeddingProvider,
     vectors: &'a dyn VectorStore,
     generation: VectorGenerationContext,
+    retry_clock: Box<dyn RetryClock>,
     #[cfg(test)]
     force_stale_result_for_test: std::cell::Cell<bool>,
     #[cfg(test)]
@@ -300,6 +354,7 @@ impl<'a> FencedVectorSyncSingleEventConsumer<'a> {
             embedding,
             vectors,
             generation,
+            retry_clock: Box::new(SystemRetryClock),
             #[cfg(test)]
             force_stale_result_for_test: std::cell::Cell::new(false),
             #[cfg(test)]
@@ -321,6 +376,12 @@ impl<'a> FencedVectorSyncSingleEventConsumer<'a> {
             #[cfg(test)]
             process_one_invocations_for_test: std::cell::Cell::new(0),
         }
+    }
+
+    #[cfg(test)]
+    fn with_retry_clock_for_test(mut self, retry_clock: Box<dyn RetryClock>) -> Self {
+        self.retry_clock = retry_clock;
+        self
     }
 
     #[cfg(test)]
@@ -398,6 +459,22 @@ impl<'a> FencedVectorSyncSingleEventConsumer<'a> {
         &self,
         lease_owner: &str,
     ) -> Result<FencedVectorSyncSingleEventResult, MemoryVectorSyncWorkerError> {
+        let retry_cutoff = self.capture_retry_cutoff()?;
+        self.process_one_with_retry_cutoff(lease_owner, retry_cutoff)
+            .await
+    }
+
+    fn capture_retry_cutoff(&self) -> Result<i64, MemoryVectorSyncWorkerError> {
+        self.retry_clock
+            .now_utc_millis()
+            .map_err(|_| worker_error(MemoryVectorSyncWorkerErrorCode::InternalError))
+    }
+
+    async fn process_one_with_retry_cutoff(
+        &self,
+        lease_owner: &str,
+        retry_cutoff: i64,
+    ) -> Result<FencedVectorSyncSingleEventResult, MemoryVectorSyncWorkerError> {
         #[cfg(test)]
         self.process_one_invocations_for_test
             .set(self.process_one_invocations_for_test.get() + 1);
@@ -415,11 +492,12 @@ impl<'a> FencedVectorSyncSingleEventConsumer<'a> {
         }
         let claim = self
             .storage
-            .claim_one_fenced_vector_sync(
+            .claim_one_fenced_vector_sync_with_retry_cutoff(
                 self.generation.generation_id().as_str(),
                 self.generation.descriptor_hash(),
                 self.generation.dimension(),
                 lease_owner,
+                Some(retry_cutoff),
             )
             .map_err(|_| worker_error(MemoryVectorSyncWorkerErrorCode::OutboxUnavailable))?;
         let Some(claim) = claim else {
@@ -432,12 +510,13 @@ impl<'a> FencedVectorSyncSingleEventConsumer<'a> {
         if let Some(observer) = self.claim_observer_for_test.borrow().as_ref() {
             observer(&claim);
         }
-        self.execute_claim(claim).await
+        self.execute_claim(claim, retry_cutoff).await
     }
 
     async fn execute_claim(
         &self,
         claim: FencedVectorSyncClaim,
+        retry_cutoff: i64,
     ) -> Result<FencedVectorSyncSingleEventResult, MemoryVectorSyncWorkerError> {
         match claim.action() {
             MemoryVectorSyncAction::Delete => {
@@ -448,16 +527,9 @@ impl<'a> FencedVectorSyncSingleEventConsumer<'a> {
                 {
                     return Ok(FencedVectorSyncSingleEventResult::LostLeaseOrSuperseded);
                 }
-                if matches!(
-                    self.storage
-                        .mark_fenced_attempt_started(&claim)
-                        .map_err(|_| worker_error(
-                            MemoryVectorSyncWorkerErrorCode::OutboxUnavailable
-                        ))?,
-                    FencedAttemptStartResult::LostLeaseOrSuperseded
-                ) {
+                let Some(attempt_count) = self.start_attempt(&claim)? else {
                     return Ok(FencedVectorSyncSingleEventResult::LostLeaseOrSuperseded);
-                }
+                };
                 let outcome = self
                     .vectors
                     .delete_generation_memory(&self.generation, claim.life_id(), claim.memory_id())
@@ -467,9 +539,19 @@ impl<'a> FencedVectorSyncSingleEventConsumer<'a> {
                     Err(error) if error.code == VectorStoreErrorCode::VectorNotFound => {
                         self.finalize(&claim, None, None, false, None)
                     }
-                    Err(_) => {
-                        self.finalize(&claim, None, Some("VECTOR_STORE_UNAVAILABLE"), true, None)
-                    }
+                    Err(error) => self.finalize_failure(
+                        &claim,
+                        attempt_count,
+                        if error.recoverable {
+                            RetryErrorClass::LanceTransient
+                        } else {
+                            RetryErrorClass::LancePermanent
+                        },
+                        EmbeddingRetrySafety::ResponseReceived,
+                        RetryOperation::Delete,
+                        None,
+                        retry_cutoff,
+                    ),
                 }
             }
             MemoryVectorSyncAction::Upsert => {
@@ -502,16 +584,9 @@ impl<'a> FencedVectorSyncSingleEventConsumer<'a> {
                 {
                     return Ok(FencedVectorSyncSingleEventResult::LostLeaseOrSuperseded);
                 }
-                if matches!(
-                    self.storage
-                        .mark_fenced_attempt_started(&claim)
-                        .map_err(|_| worker_error(
-                            MemoryVectorSyncWorkerErrorCode::OutboxUnavailable
-                        ))?,
-                    FencedAttemptStartResult::LostLeaseOrSuperseded
-                ) {
+                let Some(attempt_count) = self.start_attempt(&claim)? else {
                     return Ok(FencedVectorSyncSingleEventResult::LostLeaseOrSuperseded);
-                }
+                };
                 let response = self
                     .embedding
                     .embed(EmbeddingRequest {
@@ -524,12 +599,14 @@ impl<'a> FencedVectorSyncSingleEventConsumer<'a> {
                 let batch = match response {
                     Ok(batch) => batch,
                     Err(error) => {
-                        return self.finalize(
+                        return self.finalize_failure(
                             &claim,
-                            None,
-                            Some(embedding_error_code(error.code())),
-                            error.is_recoverable(),
+                            attempt_count,
+                            RetryErrorClass::Embedding(error.retry_class()),
+                            error.retry_safety(),
+                            RetryOperation::Upsert,
                             Some(send_disposition_code(error.send_disposition())),
+                            retry_cutoff,
                         )
                     }
                 };
@@ -539,30 +616,36 @@ impl<'a> FencedVectorSyncSingleEventConsumer<'a> {
                         && v.dimension() == self.generation.dimension()
                 });
                 let Some(vector) = vector else {
-                    return self.finalize(
+                    return self.finalize_failure(
                         &claim,
+                        attempt_count,
+                        RetryErrorClass::EmbeddingInvalidVector,
+                        EmbeddingRetrySafety::ResponseReceived,
+                        RetryOperation::Upsert,
                         None,
-                        Some("INVALID_PROVIDER_RESPONSE"),
-                        false,
-                        None,
+                        retry_cutoff,
                     );
                 };
                 let Some(target_revision) = claim.target_revision() else {
-                    return self.finalize(
+                    return self.finalize_failure(
                         &claim,
+                        attempt_count,
+                        RetryErrorClass::InternalInvariant,
+                        EmbeddingRetrySafety::ResponseReceived,
+                        RetryOperation::Upsert,
                         None,
-                        Some("VECTOR_TARGET_BINDING_MISSING"),
-                        false,
-                        None,
+                        retry_cutoff,
                     );
                 };
                 let Some(target_content_hash) = claim.target_content_hash() else {
-                    return self.finalize(
+                    return self.finalize_failure(
                         &claim,
+                        attempt_count,
+                        RetryErrorClass::InternalInvariant,
+                        EmbeddingRetrySafety::ResponseReceived,
+                        RetryOperation::Upsert,
                         None,
-                        Some("VECTOR_TARGET_BINDING_MISSING"),
-                        false,
-                        None,
+                        retry_cutoff,
                     );
                 };
                 let record = GenerationVectorRecord::try_new(
@@ -577,12 +660,14 @@ impl<'a> FencedVectorSyncSingleEventConsumer<'a> {
                 let record = match record {
                     Ok(record) => record,
                     Err(_) => {
-                        return self.finalize(
+                        return self.finalize_failure(
                             &claim,
+                            attempt_count,
+                            RetryErrorClass::EmbeddingInvalidVector,
+                            EmbeddingRetrySafety::ResponseReceived,
+                            RetryOperation::Upsert,
                             None,
-                            Some("INVALID_PROVIDER_RESPONSE"),
-                            false,
-                            None,
+                            retry_cutoff,
                         )
                     }
                 };
@@ -611,9 +696,19 @@ impl<'a> FencedVectorSyncSingleEventConsumer<'a> {
                         );
                         self.finalize(&claim, claim.target_content_hash(), None, false, None)
                     }
-                    Err(_) => {
-                        self.finalize(&claim, None, Some("VECTOR_STORE_UNAVAILABLE"), true, None)
-                    }
+                    Err(error) => self.finalize_failure(
+                        &claim,
+                        attempt_count,
+                        if error.recoverable {
+                            RetryErrorClass::LanceTransient
+                        } else {
+                            RetryErrorClass::LancePermanent
+                        },
+                        EmbeddingRetrySafety::ResponseReceived,
+                        RetryOperation::Upsert,
+                        None,
+                        retry_cutoff,
+                    ),
                 }
             }
         }
@@ -646,6 +741,74 @@ impl<'a> FencedVectorSyncSingleEventConsumer<'a> {
                 FencedVectorSyncSingleEventResult::CompletedUpsert
             }
             FencedFinalizeResult::Applied => FencedVectorSyncSingleEventResult::CompletedDelete,
+        })
+    }
+
+    fn start_attempt(
+        &self,
+        claim: &FencedVectorSyncClaim,
+    ) -> Result<Option<u32>, MemoryVectorSyncWorkerError> {
+        match self
+            .storage
+            .mark_fenced_attempt_started(claim)
+            .map_err(|_| worker_error(MemoryVectorSyncWorkerErrorCode::OutboxUnavailable))?
+        {
+            FencedAttemptStartResult::Started { attempt_count } => Ok(Some(attempt_count)),
+            FencedAttemptStartResult::LostLeaseOrSuperseded => Ok(None),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_failure(
+        &self,
+        claim: &FencedVectorSyncClaim,
+        attempt_count: u32,
+        error: RetryErrorClass,
+        retry_safety: EmbeddingRetrySafety,
+        operation: RetryOperation,
+        send_disposition: Option<&str>,
+        retry_cutoff: i64,
+    ) -> Result<FencedVectorSyncSingleEventResult, MemoryVectorSyncWorkerError> {
+        let retry = retry_decision(error, retry_safety, attempt_count, operation);
+        let failure_decision = match retry.disposition {
+            RetryDisposition::Retryable => match retry_delay_millis(attempt_count) {
+                RetryDelayDecision::RetryAfter { delay_millis } => {
+                    FencedFailureDecision::RetryAfter { delay_millis }
+                }
+                RetryDelayDecision::BlockedAtAttemptLimit
+                | RetryDelayDecision::InvalidOrOverflow => FencedFailureDecision::Blocked,
+            },
+            RetryDisposition::Blocked | RetryDisposition::ProviderResultUnknown => {
+                FencedFailureDecision::Blocked
+            }
+        };
+        let clock_now = match failure_decision {
+            FencedFailureDecision::RetryAfter { .. } => self.retry_clock.now_utc_millis().ok(),
+            FencedFailureDecision::Blocked => Some(retry_cutoff),
+        };
+        let result = self
+            .storage
+            .finalize_fenced_vector_failure(
+                claim,
+                retry.stable_error_code.as_str(),
+                if clock_now.is_some() {
+                    failure_decision
+                } else {
+                    FencedFailureDecision::Blocked
+                },
+                send_disposition,
+                clock_now.unwrap_or(retry_cutoff),
+                retry_cutoff,
+            )
+            .map_err(|_| worker_error(MemoryVectorSyncWorkerErrorCode::OutboxUnavailable))?;
+        Ok(match result {
+            FencedFailureFinalizeResult::RetryScheduled { .. } => {
+                FencedVectorSyncSingleEventResult::RetryWait
+            }
+            FencedFailureFinalizeResult::Blocked => FencedVectorSyncSingleEventResult::Blocked,
+            FencedFailureFinalizeResult::LostLeaseOrSuperseded => {
+                FencedVectorSyncSingleEventResult::LostLeaseOrSuperseded
+            }
         })
     }
 }
@@ -892,9 +1055,12 @@ pub(crate) async fn drain_fenced_vector_sync(
     }
 
     let mut report = VectorSyncDrainReport::new(limit);
+    let drain_retry_cutoff = consumer.capture_retry_cutoff()?;
 
     while report.processed < limit && !report.is_stopped() {
-        let result = consumer.process_one(lease_owner).await?;
+        let result = consumer
+            .process_one_with_retry_cutoff(lease_owner, drain_retry_cutoff)
+            .await?;
         let before = report.processed;
         report.record(result);
         // Must make progress or stop — prevent infinite busy loop if
@@ -2008,11 +2174,11 @@ mod tests {
         );
         let result = tauri::async_runtime::block_on(consumer.process_one("worker-a")).unwrap();
         server.join().unwrap();
-        assert_eq!(result, FencedVectorSyncSingleEventResult::RetryWait);
+        assert_eq!(result, FencedVectorSyncSingleEventResult::Blocked);
         let row = storage.test_fenced_outbox_failure_snapshot().unwrap();
         assert_eq!(row.0, 1);
         assert_eq!(row.1.as_deref(), Some("possibly_sent"));
-        assert_eq!(row.2, "NETWORK_UNAVAILABLE");
+        assert_eq!(row.2, "PROVIDER_RESULT_UNKNOWN");
     }
 
     #[test]
@@ -2240,7 +2406,30 @@ mod tests {
         VectorRecord, VectorSearchHit, VectorSearchQuery, VectorSpace, VectorStoreError,
         VectorStoreFuture,
     };
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicI64, AtomicUsize};
+
+    #[derive(Clone)]
+    struct FixedRetryClock {
+        now_millis: Arc<AtomicI64>,
+    }
+
+    impl FixedRetryClock {
+        fn new(now_millis: i64) -> Self {
+            Self {
+                now_millis: Arc::new(AtomicI64::new(now_millis)),
+            }
+        }
+
+        fn set(&self, now_millis: i64) {
+            self.now_millis.store(now_millis, Ordering::SeqCst);
+        }
+    }
+
+    impl RetryClock for FixedRetryClock {
+        fn now_utc_millis(&self) -> Result<i64, RetryClockError> {
+            Ok(self.now_millis.load(Ordering::SeqCst))
+        }
+    }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct IoCounterSnapshot {
@@ -2345,7 +2534,7 @@ mod tests {
             let number = self.requests.fetch_add(1, Ordering::SeqCst) + 1;
             match number {
                 1 => Box::pin(async {
-                    Err(EmbeddingError::possibly_sent(
+                    Err(EmbeddingError::definitely_not_sent(
                         crate::embedding::EmbeddingErrorCode::NetworkError,
                     ))
                 }),
@@ -2656,7 +2845,7 @@ mod tests {
             "Phase A: Worker A produced ZERO side-effects on Outbox snapshot"
         );
 
-        let result_b = tauri::async_runtime::block_on(consumer.execute_claim(claim_b)).unwrap();
+        let result_b = tauri::async_runtime::block_on(consumer.execute_claim(claim_b, 0)).unwrap();
         assert_eq!(result_b, FencedVectorSyncSingleEventResult::CompletedUpsert);
         assert_eq!(storage.test_generation_item_count().unwrap(), 1);
     }
@@ -2828,7 +3017,7 @@ mod tests {
             "Phase B: attempt_count not extra incremented"
         );
 
-        let result_b = tauri::async_runtime::block_on(consumer.execute_claim(claim_b)).unwrap();
+        let result_b = tauri::async_runtime::block_on(consumer.execute_claim(claim_b, 0)).unwrap();
         server_handle.join().unwrap();
         assert_eq!(result_b, FencedVectorSyncSingleEventResult::CompletedUpsert);
         assert_eq!(storage.test_generation_item_count().unwrap(), 1);
@@ -2963,7 +3152,7 @@ mod tests {
             &vectors,
             context.clone(),
         );
-        let res = tauri::async_runtime::block_on(consumer_b.execute_claim(claim_b)).unwrap();
+        let res = tauri::async_runtime::block_on(consumer_b.execute_claim(claim_b, 0)).unwrap();
         assert_eq!(res, FencedVectorSyncSingleEventResult::CompletedUpsert);
         assert_eq!(storage.test_generation_item_count().unwrap(), 1);
     }
@@ -4123,6 +4312,165 @@ mod tests {
         assert_eq!(
             decision.stable_error_code.as_str(),
             "INVALID_PROVIDER_RESPONSE"
+        );
+    }
+
+    #[test]
+    fn retry_delay_is_deterministic_and_fails_closed_at_invalid_attempts() {
+        let cases = [
+            (0, RetryDelayDecision::InvalidOrOverflow),
+            (
+                1,
+                RetryDelayDecision::RetryAfter {
+                    delay_millis: 30_000,
+                },
+            ),
+            (
+                2,
+                RetryDelayDecision::RetryAfter {
+                    delay_millis: 60_000,
+                },
+            ),
+            (
+                3,
+                RetryDelayDecision::RetryAfter {
+                    delay_millis: 120_000,
+                },
+            ),
+            (
+                4,
+                RetryDelayDecision::RetryAfter {
+                    delay_millis: 240_000,
+                },
+            ),
+            (5, RetryDelayDecision::BlockedAtAttemptLimit),
+            (6, RetryDelayDecision::BlockedAtAttemptLimit),
+            (u32::MAX, RetryDelayDecision::BlockedAtAttemptLimit),
+        ];
+        for (attempt_count, expected) in cases {
+            assert_eq!(retry_delay_millis(attempt_count), expected);
+        }
+    }
+
+    #[test]
+    fn retry_clock_is_instance_scoped_and_can_move_backward_or_forward() {
+        let clock = FixedRetryClock::new(100_000);
+        assert_eq!(clock.now_utc_millis().unwrap(), 100_000);
+        clock.set(90_000);
+        assert_eq!(clock.now_utc_millis().unwrap(), 90_000);
+        clock.set(150_000);
+        assert_eq!(clock.now_utc_millis().unwrap(), 150_000);
+    }
+
+    #[test]
+    fn failure_finalize_uses_persisted_attempt_count_for_retry_and_blocked_outcomes() {
+        for (prior_attempts, expected_result, expected_state, expected_time) in [
+            (
+                0_i64,
+                FencedVectorSyncSingleEventResult::RetryWait,
+                MemoryVectorSyncState::RetryWait,
+                Some("1970-01-01T00:02:10.000Z"),
+            ),
+            (
+                1_i64,
+                FencedVectorSyncSingleEventResult::RetryWait,
+                MemoryVectorSyncState::RetryWait,
+                Some("1970-01-01T00:02:40.000Z"),
+            ),
+            (
+                3_i64,
+                FencedVectorSyncSingleEventResult::RetryWait,
+                MemoryVectorSyncState::RetryWait,
+                Some("1970-01-01T00:05:40.000Z"),
+            ),
+            (
+                4_i64,
+                FencedVectorSyncSingleEventResult::Blocked,
+                MemoryVectorSyncState::Blocked,
+                None,
+            ),
+            (
+                5_i64,
+                FencedVectorSyncSingleEventResult::Blocked,
+                MemoryVectorSyncState::Blocked,
+                None,
+            ),
+        ] {
+            let (_temp, storage) = test_storage();
+            let (context, vectors) = drained_context();
+            storage
+                .register_building_vector_generation(
+                    context.generation_id().as_str(),
+                    &"d".repeat(64),
+                    3,
+                )
+                .unwrap();
+            drain_upsert_fixture(&storage, context.generation_id().as_str());
+            storage
+                .test_set_fenced_attempt_count(prior_attempts)
+                .unwrap();
+            let provider = MixedOutcomeEmbeddingProvider {
+                inner: crate::embedding::DeterministicEmbeddingProvider::new(3),
+                requests: AtomicUsize::new(0),
+            };
+            let consumer =
+                FencedVectorSyncSingleEventConsumer::new(&storage, &provider, &vectors, context)
+                    .with_retry_clock_for_test(Box::new(FixedRetryClock::new(100_000)));
+
+            assert_eq!(
+                tauri::async_runtime::block_on(consumer.process_one("attempt-boundary")).unwrap(),
+                expected_result
+            );
+            let job = storage.list("life").unwrap().remove(0);
+            assert_eq!(job.state, expected_state);
+            assert_eq!(job.attempt_count as i64, prior_attempts + 1);
+            assert_eq!(job.next_attempt_at.as_deref(), expected_time);
+            assert_eq!(job.last_error_code.as_deref(), Some("NETWORK_UNAVAILABLE"));
+        }
+    }
+
+    #[test]
+    fn same_drain_uses_one_retry_cutoff_and_does_not_reclaim_its_retry_wait_row() {
+        let (_temp, storage) = test_storage();
+        let (context, vectors) = drained_context();
+        storage
+            .register_building_vector_generation(
+                context.generation_id().as_str(),
+                &"d".repeat(64),
+                3,
+            )
+            .unwrap();
+        drain_upsert_fixture(&storage, context.generation_id().as_str());
+        drain_delete_fixture(&storage, context.generation_id().as_str());
+        let provider = MixedOutcomeEmbeddingProvider {
+            inner: crate::embedding::DeterministicEmbeddingProvider::new(3),
+            requests: AtomicUsize::new(0),
+        };
+        let clock = FixedRetryClock::new(100_000);
+        let advance_clock = clock.clone();
+        let mut consumer =
+            FencedVectorSyncSingleEventConsumer::new(&storage, &provider, &vectors, context)
+                .with_retry_clock_for_test(Box::new(clock));
+        consumer.set_drain_iteration_hook_for_test(Some(Box::new(move |processed, _, _, _| {
+            if processed == 1 {
+                advance_clock.set(200_000);
+            }
+        })));
+
+        let report =
+            tauri::async_runtime::block_on(drain_fenced_vector_sync(&consumer, "retry-cutoff", 5))
+                .unwrap();
+        assert_eq!(report.retry_scheduled, 1);
+        assert_eq!(report.applied_deletes, 1);
+        assert_eq!(report.processed, 2);
+        assert!(report.stopped_no_eligible);
+        assert_eq!(provider.requests.load(Ordering::SeqCst), 1);
+        let retry = storage.list("life").unwrap().remove(0);
+        assert_eq!(retry.state, MemoryVectorSyncState::RetryWait);
+        assert_eq!(retry.attempt_count, 1);
+        assert_eq!(
+            retry.next_attempt_at.as_deref(),
+            Some("1970-01-01T00:02:10.000Z")
         );
     }
 }

@@ -17,7 +17,8 @@ pub(crate) use llm_candidate_extraction::{
     trigger_candidate_extraction, LlmCandidateExtractionCoordinator,
 };
 pub(crate) use vector_sync_outbox::{
-    FencedAttemptStartResult, FencedFinalizeResult, FencedVectorSyncClaim,
+    FencedAttemptStartResult, FencedFailureDecision, FencedFailureFinalizeResult,
+    FencedFinalizeResult, FencedVectorSyncClaim,
 };
 
 use std::{

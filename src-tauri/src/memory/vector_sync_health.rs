@@ -1344,10 +1344,11 @@ mod tests {
             count_calls: Arc::new(AtomicUsize::new(0)),
         };
 
-        // Take before snapshots
-        let before_outbox: Vec<(String, String, Option<String>, i64)> = {
-            let state = storage.state().unwrap();
-            let mut stmt = state.connection.prepare(
+        // Use a direct SQLite connection for before/after verification
+        let db_path = storage.test_database_main_path().unwrap();
+
+        fn read_outbox(conn: &rusqlite::Connection) -> Vec<(String, String, Option<String>, i64)> {
+            let mut stmt = conn.prepare(
                 "SELECT memory_id, state, last_send_disposition, attempt_count FROM memory_vector_sync_outbox ORDER BY memory_id"
             ).unwrap();
             stmt.query_map([], |r| {
@@ -1361,10 +1362,10 @@ mod tests {
             .unwrap()
             .map(|r| r.unwrap())
             .collect()
-        };
-        let before_lease: Vec<(String, i64, String)> = {
-            let state = storage.state().unwrap();
-            let mut stmt = state.connection.prepare(
+        }
+
+        fn read_lease(conn: &rusqlite::Connection) -> Vec<(String, i64, String)> {
+            let mut stmt = conn.prepare(
                 "SELECT owner_id, fence_epoch, expires_at FROM memory_vector_sync_runtime_lease WHERE lease_name='memory-vector-single-event-consumer'"
             ).unwrap();
             stmt.query_map([], |r| {
@@ -1377,7 +1378,13 @@ mod tests {
             .unwrap()
             .map(|r| r.unwrap())
             .collect()
-        };
+        }
+
+        // Take before snapshots
+        let conn_before = rusqlite::Connection::open(&db_path).unwrap();
+        let before_outbox = read_outbox(&conn_before);
+        let before_lease = read_lease(&conn_before);
+        drop(conn_before);
 
         // Execute health check
         let clock = FixedHealthClock::new(1_700_000_000_000);
@@ -1386,39 +1393,10 @@ mod tests {
                 .unwrap();
 
         // Take after snapshots
-        let after_outbox: Vec<(String, String, Option<String>, i64)> = {
-            let state = storage.state().unwrap();
-            let mut stmt = state.connection.prepare(
-                "SELECT memory_id, state, last_send_disposition, attempt_count FROM memory_vector_sync_outbox ORDER BY memory_id"
-            ).unwrap();
-            stmt.query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, Option<String>>(2)?,
-                    r.get::<_, i64>(3)?,
-                ))
-            })
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect()
-        };
-        let after_lease: Vec<(String, i64, String)> = {
-            let state = storage.state().unwrap();
-            let mut stmt = state.connection.prepare(
-                "SELECT owner_id, fence_epoch, expires_at FROM memory_vector_sync_runtime_lease WHERE lease_name='memory-vector-single-event-consumer'"
-            ).unwrap();
-            stmt.query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, String>(2)?,
-                ))
-            })
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect()
-        };
+        let conn_after = rusqlite::Connection::open(&db_path).unwrap();
+        let after_outbox = read_outbox(&conn_after);
+        let after_lease = read_lease(&conn_after);
+        drop(conn_after);
         let after_vs_count =
             tauri::async_runtime::block_on(vs.inner.count_generation(&ctx, None)).unwrap();
         let after_vs_meta =
@@ -1469,9 +1447,10 @@ mod tests {
                 .unwrap();
 
         // Verify nothing changed
+        let db_path = storage.test_database_main_path().unwrap();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
         let (owner, fence, expires_at, updated_at): (String, i64, String, String) = {
-            let state = storage.state().unwrap();
-            state.connection.query_row(
+            conn.query_row(
                 "SELECT owner_id, fence_epoch, expires_at, updated_at FROM memory_vector_sync_runtime_lease WHERE lease_name='memory-vector-single-event-consumer'",
                 [],
                 |r| Ok((

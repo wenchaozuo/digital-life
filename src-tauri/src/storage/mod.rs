@@ -174,8 +174,8 @@ pub struct StorageMigrationResult {
     pub error_message: Option<String>,
 }
 
-pub(crate) struct StorageState {
-    pub(crate) connection: Connection,
+struct StorageState {
+    connection: Connection,
     active_root: PathBuf,
     database_path: PathBuf,
 }
@@ -292,7 +292,7 @@ impl StorageService {
         Ok(())
     }
 
-    pub(crate) fn state(&self) -> Result<MutexGuard<'_, StorageState>, StorageError> {
+    fn state(&self) -> Result<MutexGuard<'_, StorageState>, StorageError> {
         self.state.lock().map_err(StorageError::database)
     }
 

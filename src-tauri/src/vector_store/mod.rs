@@ -613,6 +613,22 @@ pub trait VectorStore: Send + Sync {
             ))
         })
     }
+
+    fn get_generation_metadata<'a>(
+        &'a self,
+        context: &'a VectorGenerationContext,
+        life_id: &'a str,
+        memory_id: &'a str,
+    ) -> VectorStoreFuture<'a, Result<Option<VectorMetadataSample>, VectorStoreError>> {
+        let _ = (context, life_id, memory_id);
+        Box::pin(async {
+            Err(VectorStoreError::new(
+                VectorStoreErrorCode::StoreUnavailable,
+                "Generation-aware storage is unavailable for this vector store.",
+                false,
+            ))
+        })
+    }
 }
 
 pub(crate) fn validate_identifier(value: &str, name: &str) -> Result<(), VectorStoreError> {

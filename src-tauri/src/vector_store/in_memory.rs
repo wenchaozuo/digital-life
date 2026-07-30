@@ -490,6 +490,43 @@ impl VectorStore for InMemoryVectorStore {
             Ok(())
         })
     }
+
+    fn get_generation_metadata<'a>(
+        &'a self,
+        context: &'a VectorGenerationContext,
+        life_id: &'a str,
+        memory_id: &'a str,
+    ) -> VectorStoreFuture<'a, Result<Option<VectorMetadataSample>, VectorStoreError>> {
+        use super::VectorMetadataSample;
+        Box::pin(async move {
+            validate_identifier(life_id, "Life ID")?;
+            validate_identifier(memory_id, "Memory ID")?;
+            let key = GenerationRecordKey {
+                generation_id: context.generation_id().as_str().to_owned(),
+                life_id: life_id.to_owned(),
+                memory_id: memory_id.to_owned(),
+            };
+            let records = self.generation_records.read().map_err(|_| {
+                VectorStoreError::new(
+                    VectorStoreErrorCode::StoreUnavailable,
+                    "The in-memory vector store is unavailable.",
+                    true,
+                )
+            })?;
+            let Some(record) = records.get(&key) else {
+                return Ok(None);
+            };
+            Ok(Some(VectorMetadataSample {
+                generation_id: record.generation_id().as_str().to_owned(),
+                life_id: record.life_id().to_owned(),
+                memory_id: record.memory_id().to_owned(),
+                memory_revision: record.memory_revision(),
+                content_hash: record.content_hash().to_owned(),
+                descriptor_hash: record.descriptor_hash().to_owned(),
+                dimension: record.dimension(),
+            }))
+        })
+    }
 }
 
 impl InMemoryVectorStore {
@@ -746,5 +783,118 @@ mod tests {
                 .code,
             VectorStoreErrorCode::GenerationNotFound
         );
+    }
+
+    fn gen_context(id: &str) -> VectorGenerationContext {
+        VectorGenerationContext::new(
+            VectorGenerationId::parse(id).unwrap(),
+            format!("desc-{id}"),
+            3,
+        )
+        .unwrap()
+    }
+
+    fn gen_record(
+        ctx: &VectorGenerationContext,
+        life: &str,
+        memory: &str,
+        revision: i64,
+        content: &str,
+    ) -> GenerationVectorRecord {
+        GenerationVectorRecord::try_new(
+            ctx.generation_id().clone(),
+            life,
+            memory,
+            revision,
+            content,
+            ctx.descriptor_hash(),
+            vec![0.1, 0.2, 0.3],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn get_generation_metadata_exact_hit() {
+        let store = InMemoryVectorStore::new();
+        let ctx = gen_context("exact-hit");
+        let rec = gen_record(&ctx, "life-a", "mem-1", 2, "hash-content");
+        block_on(store.create_generation(&ctx)).unwrap();
+        block_on(store.upsert_generation(&ctx, rec)).unwrap();
+        let meta = block_on(store.get_generation_metadata(&ctx, "life-a", "mem-1"))
+            .unwrap()
+            .expect("exact hit must return Some");
+        assert_eq!(meta.generation_id, "exact-hit");
+        assert_eq!(meta.life_id, "life-a");
+        assert_eq!(meta.memory_id, "mem-1");
+        assert_eq!(meta.memory_revision, 2);
+        assert_eq!(meta.content_hash, "hash-content");
+        assert_eq!(meta.descriptor_hash, "desc-exact-hit");
+        assert_eq!(meta.dimension, 3);
+    }
+
+    #[test]
+    fn get_generation_metadata_missing() {
+        let store = InMemoryVectorStore::new();
+        let ctx = gen_context("missing");
+        block_on(store.create_generation(&ctx)).unwrap();
+        let meta = block_on(store.get_generation_metadata(&ctx, "life-x", "mem-x")).unwrap();
+        assert!(meta.is_none());
+    }
+
+    #[test]
+    fn get_generation_metadata_generation_isolation() {
+        let store = InMemoryVectorStore::new();
+        let ctx_a = gen_context("gen-a");
+        let ctx_b = gen_context("gen-b");
+        block_on(store.create_generation(&ctx_a)).unwrap();
+        block_on(store.create_generation(&ctx_b)).unwrap();
+        let rec_a = gen_record(&ctx_a, "life", "mem", 1, "hash-a");
+        let rec_b = gen_record(&ctx_b, "life", "mem", 2, "hash-b");
+        block_on(store.upsert_generation(&ctx_a, rec_a)).unwrap();
+        block_on(store.upsert_generation(&ctx_b, rec_b)).unwrap();
+
+        let meta_a = block_on(store.get_generation_metadata(&ctx_a, "life", "mem"))
+            .unwrap()
+            .expect("gen-a must have record");
+        assert_eq!(meta_a.memory_revision, 1);
+        assert_eq!(meta_a.content_hash, "hash-a");
+
+        let meta_b = block_on(store.get_generation_metadata(&ctx_b, "life", "mem"))
+            .unwrap()
+            .expect("gen-b must have record");
+        assert_eq!(meta_b.memory_revision, 2);
+        assert_eq!(meta_b.content_hash, "hash-b");
+
+        // Query gen-a for a record only in gen-b -> None
+        let meta = block_on(store.get_generation_metadata(&ctx_a, "life", "mem-only-b")).unwrap();
+        assert!(meta.is_none());
+    }
+
+    #[test]
+    fn get_generation_metadata_after_delete() {
+        let store = InMemoryVectorStore::new();
+        let ctx = gen_context("after-delete");
+        let rec = gen_record(&ctx, "life", "mem", 1, "hash");
+        block_on(store.create_generation(&ctx)).unwrap();
+        block_on(store.upsert_generation(&ctx, rec)).unwrap();
+        block_on(store.delete_generation_memory(&ctx, "life", "mem")).unwrap();
+        let meta = block_on(store.get_generation_metadata(&ctx, "life", "mem")).unwrap();
+        assert!(meta.is_none());
+    }
+
+    #[test]
+    fn get_generation_metadata_after_update() {
+        let store = InMemoryVectorStore::new();
+        let ctx = gen_context("after-update");
+        block_on(store.create_generation(&ctx)).unwrap();
+        let rec1 = gen_record(&ctx, "life", "mem", 1, "hash-1");
+        block_on(store.upsert_generation(&ctx, rec1)).unwrap();
+        let rec2 = gen_record(&ctx, "life", "mem", 2, "hash-2");
+        block_on(store.upsert_generation(&ctx, rec2)).unwrap();
+        let meta = block_on(store.get_generation_metadata(&ctx, "life", "mem"))
+            .unwrap()
+            .expect("updated record must exist");
+        assert_eq!(meta.memory_revision, 2);
+        assert_eq!(meta.content_hash, "hash-2");
     }
 }

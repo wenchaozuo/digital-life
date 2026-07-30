@@ -894,6 +894,85 @@ impl LanceDbVectorStore {
             .ok_or_else(internal_error)?;
         Ok(Some((hashes.value(0).to_owned(), values.values().to_vec())))
     }
+
+    async fn get_generation_metadata_inner(
+        &self,
+        context: &VectorGenerationContext,
+        life_id: &str,
+        memory_id: &str,
+    ) -> Result<Option<VectorMetadataSample>, VectorStoreError> {
+        validate_identifier(life_id, "Life ID")?;
+        validate_identifier(memory_id, "Memory ID")?;
+        let table = match self.open_generation_table(context).await {
+            Ok(table) => table,
+            Err(error) if error.code == VectorStoreErrorCode::GenerationNotFound => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let predicate = format!(
+            "generation_id = {} AND life_id = {} AND memory_id = {}",
+            sql_literal(context.generation_id().as_str()),
+            sql_literal(life_id),
+            sql_literal(memory_id)
+        );
+        let batches = table
+            .query()
+            .only_if(predicate)
+            .limit(2)
+            .select(Select::columns(&[
+                "generation_id",
+                "life_id",
+                "memory_id",
+                "memory_revision",
+                "content_hash",
+                "descriptor_hash",
+                "dimension",
+            ]))
+            .execute()
+            .await
+            .map_err(|_| read_failed())?
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|_| read_failed())?;
+        let mut total = 0usize;
+        let mut result = None;
+        for batch in &batches {
+            total += batch.num_rows();
+            if total > 1 {
+                return Err(VectorStoreError::new(
+                    VectorStoreErrorCode::GenerationCorrupt,
+                    "Duplicate generation vector identity detected.",
+                    false,
+                ));
+            }
+            let generation_ids = column_string(batch, "generation_id")?;
+            let life_ids = column_string(batch, "life_id")?;
+            let memory_ids = column_string(batch, "memory_id")?;
+            let revisions = batch
+                .column_by_name("memory_revision")
+                .and_then(|a| a.as_any().downcast_ref::<Int64Array>())
+                .ok_or_else(read_failed)?;
+            let content_hashes = column_string(batch, "content_hash")?;
+            let descriptor_hashes = column_string(batch, "descriptor_hash")?;
+            let dimensions = batch
+                .column_by_name("dimension")
+                .and_then(|a| a.as_any().downcast_ref::<Int32Array>())
+                .ok_or_else(read_failed)?;
+            for row in 0..batch.num_rows() {
+                result = Some(VectorMetadataSample {
+                    generation_id: generation_ids.value(row).to_owned(),
+                    life_id: life_ids.value(row).to_owned(),
+                    memory_id: memory_ids.value(row).to_owned(),
+                    memory_revision: revisions.value(row),
+                    content_hash: content_hashes.value(row).to_owned(),
+                    descriptor_hash: descriptor_hashes.value(row).to_owned(),
+                    dimension: dimensions.value(row) as usize,
+                });
+            }
+        }
+        Ok(result)
+    }
 }
 
 impl VectorStore for LanceDbVectorStore {
@@ -1212,6 +1291,18 @@ impl VectorStore for LanceDbVectorStore {
                 "Persistent vector generation drop requires the registry.",
                 false,
             ))
+        })
+    }
+
+    fn get_generation_metadata<'a>(
+        &'a self,
+        context: &'a VectorGenerationContext,
+        life_id: &'a str,
+        memory_id: &'a str,
+    ) -> VectorStoreFuture<'a, Result<Option<VectorMetadataSample>, VectorStoreError>> {
+        Box::pin(async move {
+            self.get_generation_metadata_inner(context, life_id, memory_id)
+                .await
         })
     }
 }
@@ -2054,6 +2145,126 @@ mod tests {
                 VectorStoreErrorCode::GenerationNotFound
             );
             assert_eq!(memory.count_generation(&b, None).await.unwrap(), 1);
+        });
+    }
+
+    #[test]
+    fn get_generation_metadata_exact_hit() {
+        block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let store = LanceDbVectorStore::open(temp.path()).await.unwrap();
+            let ctx = gen_context("meta-exact-hit", 3);
+            store.create_generation(&ctx).await.unwrap();
+            let rec = gen_record(&ctx, "life-a", "mem-1", 2, vec![0.1, 0.2, 0.3]);
+            store.upsert_generation(&ctx, rec).await.unwrap();
+            let meta = store
+                .get_generation_metadata(&ctx, "life-a", "mem-1")
+                .await
+                .unwrap()
+                .expect("exact hit must return Some");
+            assert_eq!(meta.generation_id, "meta-exact-hit");
+            assert_eq!(meta.life_id, "life-a");
+            assert_eq!(meta.memory_id, "mem-1");
+            assert_eq!(meta.memory_revision, 2);
+            assert_eq!(meta.content_hash, "content-mem-1");
+            assert_eq!(meta.descriptor_hash, "desc-meta-exact-hit");
+            assert_eq!(meta.dimension, 3);
+        });
+    }
+
+    #[test]
+    fn get_generation_metadata_missing() {
+        block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let store = LanceDbVectorStore::open(temp.path()).await.unwrap();
+            let ctx = gen_context("meta-missing", 3);
+            store.create_generation(&ctx).await.unwrap();
+            let meta = store
+                .get_generation_metadata(&ctx, "life-x", "mem-x")
+                .await
+                .unwrap();
+            assert!(meta.is_none());
+        });
+    }
+
+    #[test]
+    fn get_generation_metadata_generation_isolation() {
+        // LanceDB stores one generation per directory; use separate stores
+        block_on(async {
+            let temp_a = tempfile::tempdir().unwrap();
+            let temp_b = tempfile::tempdir().unwrap();
+            let store_a = LanceDbVectorStore::open(temp_a.path()).await.unwrap();
+            let store_b = LanceDbVectorStore::open(temp_b.path()).await.unwrap();
+            let ctx_a = gen_context("meta-gen-a", 3);
+            let ctx_b = gen_context("meta-gen-b", 3);
+            store_a.create_generation(&ctx_a).await.unwrap();
+            store_b.create_generation(&ctx_b).await.unwrap();
+            let rec_a = gen_record(&ctx_a, "life", "mem", 1, vec![0.1, 0.2, 0.3]);
+            let rec_b = gen_record(&ctx_b, "life", "mem", 2, vec![0.4, 0.5, 0.6]);
+            store_a.upsert_generation(&ctx_a, rec_a).await.unwrap();
+            store_b.upsert_generation(&ctx_b, rec_b).await.unwrap();
+
+            let meta_a = store_a
+                .get_generation_metadata(&ctx_a, "life", "mem")
+                .await
+                .unwrap()
+                .expect("gen-a must have record");
+            assert_eq!(meta_a.memory_revision, 1);
+
+            let meta_b = store_b
+                .get_generation_metadata(&ctx_b, "life", "mem")
+                .await
+                .unwrap()
+                .expect("gen-b must have record");
+            assert_eq!(meta_b.memory_revision, 2);
+
+            // Query A for a record only in B -> None
+            let meta = store_a
+                .get_generation_metadata(&ctx_a, "life", "mem-only-b")
+                .await
+                .unwrap();
+            assert!(meta.is_none());
+        });
+    }
+
+    #[test]
+    fn get_generation_metadata_after_delete() {
+        block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let store = LanceDbVectorStore::open(temp.path()).await.unwrap();
+            let ctx = gen_context("meta-after-del", 3);
+            store.create_generation(&ctx).await.unwrap();
+            let rec = gen_record(&ctx, "life", "mem", 1, vec![0.1, 0.2, 0.3]);
+            store.upsert_generation(&ctx, rec).await.unwrap();
+            store
+                .delete_generation_memory(&ctx, "life", "mem")
+                .await
+                .unwrap();
+            let meta = store
+                .get_generation_metadata(&ctx, "life", "mem")
+                .await
+                .unwrap();
+            assert!(meta.is_none());
+        });
+    }
+
+    #[test]
+    fn get_generation_metadata_after_update() {
+        block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let store = LanceDbVectorStore::open(temp.path()).await.unwrap();
+            let ctx = gen_context("meta-after-upd", 3);
+            store.create_generation(&ctx).await.unwrap();
+            let rec1 = gen_record(&ctx, "life", "mem", 1, vec![0.1, 0.2, 0.3]);
+            store.upsert_generation(&ctx, rec1).await.unwrap();
+            let rec2 = gen_record(&ctx, "life", "mem", 2, vec![0.4, 0.5, 0.6]);
+            store.upsert_generation(&ctx, rec2).await.unwrap();
+            let meta = store
+                .get_generation_metadata(&ctx, "life", "mem")
+                .await
+                .unwrap()
+                .expect("updated record must exist");
+            assert_eq!(meta.memory_revision, 2);
         });
     }
 }

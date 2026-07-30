@@ -2790,6 +2790,19 @@ mod tests {
         > {
             self.inner.sample_generation_metadata(context, limit)
         }
+
+        fn get_generation_metadata<'a>(
+            &'a self,
+            context: &'a VectorGenerationContext,
+            life_id: &'a str,
+            memory_id: &'a str,
+        ) -> VectorStoreFuture<
+            'a,
+            Result<Option<crate::vector_store::VectorMetadataSample>, VectorStoreError>,
+        > {
+            self.inner
+                .get_generation_metadata(context, life_id, memory_id)
+        }
     }
 
     struct CountingSecretStore<S> {

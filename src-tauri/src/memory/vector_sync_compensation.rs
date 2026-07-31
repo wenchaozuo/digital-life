@@ -108,6 +108,12 @@ pub(crate) fn compare_exact_proof(
 
 /// Map an already-completed VectorStore read result into an exact proof.
 /// Never performs I/O here; the caller must have already issued the query.
+///
+/// The error-code match is exhaustive on every current `VectorStoreErrorCode`
+/// variant. Only `StoreUnavailable` is classified as a transient environment
+/// failure; `VectorReadFailed` deliberately mixes I/O and malformed-column
+/// semantics so it is conservatively classified as corruption instead of
+/// being deferred as if the store were merely temporarily unavailable.
 pub(crate) fn map_vector_store_result(
     expected: &ExpectedGenerationMetadata<'_>,
     result: Result<Option<VectorMetadataSample>, VectorStoreError>,
@@ -120,10 +126,32 @@ pub(crate) fn map_vector_store_result(
                 VectorStoreErrorCode::GenerationNotFound => {
                     VectorProofUnavailableReason::GenerationMissing
                 }
-                VectorStoreErrorCode::GenerationCorrupt => {
+                VectorStoreErrorCode::StoreUnavailable => {
+                    VectorProofUnavailableReason::StoreUnavailable
+                }
+                VectorStoreErrorCode::GenerationCorrupt
+                | VectorStoreErrorCode::GenerationSchemaMismatch
+                | VectorStoreErrorCode::GenerationDimensionMismatch
+                | VectorStoreErrorCode::GenerationDescriptorMismatch
+                | VectorStoreErrorCode::RecordInvalid
+                | VectorStoreErrorCode::VectorInvalid
+                | VectorStoreErrorCode::VectorDimensionMismatch
+                | VectorStoreErrorCode::InvalidVector
+                | VectorStoreErrorCode::DimensionMismatch
+                | VectorStoreErrorCode::InvalidLimit
+                | VectorStoreErrorCode::InvalidScoreThreshold
+                | VectorStoreErrorCode::VectorNotFound
+                | VectorStoreErrorCode::InternalError
+                | VectorStoreErrorCode::InvalidIdentifier
+                | VectorStoreErrorCode::GenerationIdInvalid
+                | VectorStoreErrorCode::VectorWriteFailed
+                | VectorStoreErrorCode::VectorDeleteFailed
+                | VectorStoreErrorCode::VectorReadFailed
+                | VectorStoreErrorCode::GenerationDropFailed
+                | VectorStoreErrorCode::GenerationLocked
+                | VectorStoreErrorCode::GenerationDropRequiresRegistry => {
                     VectorProofUnavailableReason::StoreCorrupt
                 }
-                _ => VectorProofUnavailableReason::StoreUnavailable,
             };
             ExactGenerationProof::Unavailable(reason)
         }
@@ -434,22 +462,170 @@ mod tests {
         );
 
         let mk = |code| VectorStoreError::new(code, "redacted", false);
-        assert_eq!(
-            map_vector_store_result(&exp, Err(mk(VectorStoreErrorCode::GenerationNotFound))),
-            ExactGenerationProof::Unavailable(VectorProofUnavailableReason::GenerationMissing)
+
+        // Exhaustive table over every current VectorStoreErrorCode variant.
+        // The count below is the source-of-truth census from vector_store/mod.rs.
+        let cases: &[(VectorStoreErrorCode, VectorProofUnavailableReason)] = &[
+            (
+                VectorStoreErrorCode::InvalidVector,
+                VectorProofUnavailableReason::StoreCorrupt,
+            ),
+            (
+                VectorStoreErrorCode::DimensionMismatch,
+                VectorProofUnavailableReason::StoreCorrupt,
+            ),
+            (
+                VectorStoreErrorCode::InvalidLimit,
+                VectorProofUnavailableReason::StoreCorrupt,
+            ),
+            (
+                VectorStoreErrorCode::InvalidScoreThreshold,
+                VectorProofUnavailableReason::StoreCorrupt,
+            ),
+            (
+                VectorStoreErrorCode::VectorNotFound,
+                VectorProofUnavailableReason::StoreCorrupt,
+            ),
+            (
+                VectorStoreErrorCode::StoreUnavailable,
+                VectorProofUnavailableReason::StoreUnavailable,
+            ),
+            (
+                VectorStoreErrorCode::InternalError,
+                VectorProofUnavailableReason::StoreCorrupt,
+            ),
+            (
+                VectorStoreErrorCode::InvalidIdentifier,
+                VectorProofUnavailableReason::StoreCorrupt,
+            ),
+            (
+                VectorStoreErrorCode::GenerationIdInvalid,
+                VectorProofUnavailableReason::StoreCorrupt,
+            ),
+            (
+                VectorStoreErrorCode::GenerationNotFound,
+                VectorProofUnavailableReason::GenerationMissing,
+            ),
+            (
+                VectorStoreErrorCode::GenerationSchemaMismatch,
+                VectorProofUnavailableReason::StoreCorrupt,
+            ),
+            (
+                VectorStoreErrorCode::GenerationDimensionMismatch,
+                VectorProofUnavailableReason::StoreCorrupt,
+            ),
+            (
+                VectorStoreErrorCode::GenerationDescriptorMismatch,
+                VectorProofUnavailableReason::StoreCorrupt,
+            ),
+            (
+                VectorStoreErrorCode::RecordInvalid,
+                VectorProofUnavailableReason::StoreCorrupt,
+            ),
+            (
+                VectorStoreErrorCode::VectorInvalid,
+                VectorProofUnavailableReason::StoreCorrupt,
+            ),
+            (
+                VectorStoreErrorCode::VectorDimensionMismatch,
+                VectorProofUnavailableReason::StoreCorrupt,
+            ),
+            (
+                VectorStoreErrorCode::VectorWriteFailed,
+                VectorProofUnavailableReason::StoreCorrupt,
+            ),
+            (
+                VectorStoreErrorCode::VectorDeleteFailed,
+                VectorProofUnavailableReason::StoreCorrupt,
+            ),
+            (
+                VectorStoreErrorCode::VectorReadFailed,
+                VectorProofUnavailableReason::StoreCorrupt,
+            ),
+            (
+                VectorStoreErrorCode::GenerationDropFailed,
+                VectorProofUnavailableReason::StoreCorrupt,
+            ),
+            (
+                VectorStoreErrorCode::GenerationLocked,
+                VectorProofUnavailableReason::StoreCorrupt,
+            ),
+            (
+                VectorStoreErrorCode::GenerationCorrupt,
+                VectorProofUnavailableReason::StoreCorrupt,
+            ),
+            (
+                VectorStoreErrorCode::GenerationDropRequiresRegistry,
+                VectorProofUnavailableReason::StoreCorrupt,
+            ),
+        ];
+
+        // 23 variants currently exist in the source enum.
+        assert_eq!(cases.len(), 23, "enum census drift");
+
+        for (code, expected_reason) in cases {
+            let proof = map_vector_store_result(&exp, Err(mk(*code)));
+            assert_eq!(
+                proof,
+                ExactGenerationProof::Unavailable(*expected_reason),
+                "case {code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn map_vector_store_result_representative_semantic_categories() {
+        let exp = expected();
+        let mk = |code| VectorStoreError::new(code, "redacted", false);
+
+        let assert_reason = |code, reason| {
+            assert_eq!(
+                map_vector_store_result(&exp, Err(mk(code))),
+                ExactGenerationProof::Unavailable(reason),
+                "case {code:?}"
+            );
+        };
+
+        // GenerationMissing set
+        assert_reason(
+            VectorStoreErrorCode::GenerationNotFound,
+            VectorProofUnavailableReason::GenerationMissing,
         );
-        assert_eq!(
-            map_vector_store_result(&exp, Err(mk(VectorStoreErrorCode::GenerationCorrupt))),
-            ExactGenerationProof::Unavailable(VectorProofUnavailableReason::StoreCorrupt)
+
+        // StoreUnavailable set
+        assert_reason(
+            VectorStoreErrorCode::StoreUnavailable,
+            VectorProofUnavailableReason::StoreUnavailable,
         );
-        assert_eq!(
-            map_vector_store_result(&exp, Err(mk(VectorStoreErrorCode::StoreUnavailable))),
-            ExactGenerationProof::Unavailable(VectorProofUnavailableReason::StoreUnavailable)
+
+        // StoreCorrupt set (deterministic/structural)
+        assert_reason(
+            VectorStoreErrorCode::GenerationCorrupt,
+            VectorProofUnavailableReason::StoreCorrupt,
         );
-        // Any other code maps conservatively to StoreUnavailable
-        assert_eq!(
-            map_vector_store_result(&exp, Err(mk(VectorStoreErrorCode::InternalError))),
-            ExactGenerationProof::Unavailable(VectorProofUnavailableReason::StoreUnavailable)
+        assert_reason(
+            VectorStoreErrorCode::GenerationSchemaMismatch,
+            VectorProofUnavailableReason::StoreCorrupt,
+        );
+        assert_reason(
+            VectorStoreErrorCode::GenerationDimensionMismatch,
+            VectorProofUnavailableReason::StoreCorrupt,
+        );
+        assert_reason(
+            VectorStoreErrorCode::GenerationDescriptorMismatch,
+            VectorProofUnavailableReason::StoreCorrupt,
+        );
+        assert_reason(
+            VectorStoreErrorCode::RecordInvalid,
+            VectorProofUnavailableReason::StoreCorrupt,
+        );
+        assert_reason(
+            VectorStoreErrorCode::VectorReadFailed,
+            VectorProofUnavailableReason::StoreCorrupt,
+        );
+        assert_reason(
+            VectorStoreErrorCode::GenerationLocked,
+            VectorProofUnavailableReason::StoreCorrupt,
         );
     }
 

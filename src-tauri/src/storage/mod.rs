@@ -11,6 +11,7 @@ mod memory_retrieval;
 mod memory_revision;
 mod migration;
 mod model_profile;
+pub(crate) mod upgrade_gate;
 mod vector_sync_outbox;
 mod vector_sync_settings;
 

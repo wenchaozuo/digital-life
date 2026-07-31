@@ -642,6 +642,18 @@ mod tests {
             [],
         ).unwrap();
         conn.execute("UPDATE memory_vector_sync_mutation_clock SET last_sequence = last_sequence + 1 WHERE singleton=1", []).unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO memory_vector_sync_outbox (life_id, memory_id, desired_action, state, attempt_count)
+             VALUES ('life', 'pending-att-6', 'upsert', 'pending', 6)",
+            [],
+        ).unwrap();
+        conn.execute("UPDATE memory_vector_sync_mutation_clock SET last_sequence = last_sequence + 1 WHERE singleton=1", []).unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO memory_vector_sync_outbox (life_id, memory_id, desired_action, state, attempt_count)
+             VALUES ('life', 'pending-att-4', 'upsert', 'pending', 4)",
+            [],
+        ).unwrap();
+        conn.execute("UPDATE memory_vector_sync_mutation_clock SET last_sequence = last_sequence + 1 WHERE singleton=1", []).unwrap();
 
         let raw_vs = crate::vector_store::InMemoryVectorStore::default();
         tauri::async_runtime::block_on(raw_vs.create_generation(&ctx)).unwrap();
@@ -656,8 +668,9 @@ mod tests {
             tauri::async_runtime::block_on(inspect_vector_sync_health(&storage, &vs, &ctx, &clock))
                 .unwrap();
 
-        // attempt=4 not counted, attempt=5 and 6 counted, pending-att-5 not counted (pending)
-        assert_eq!(snap.attempts_at_limit_count, 2);
+        // pending+attempt=4 not counted, pending+attempt=5/6 counted (attempt limit fix)
+        // blocked att-5 and att-6 also counted
+        assert_eq!(snap.attempts_at_limit_count, 4);
     }
 
     #[test]

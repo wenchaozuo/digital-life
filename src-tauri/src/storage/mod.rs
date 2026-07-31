@@ -314,7 +314,7 @@ impl StorageService {
                 COALESCE(SUM(CASE WHEN state='processing' AND lease_expires_at IS NOT NULL AND lease_expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ', ?1 / 1000.0, 'unixepoch') THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN state='blocked' AND last_error_code='PROVIDER_RESULT_UNKNOWN' THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN state='blocked' AND last_error_code='INTERNAL_INVARIANT' THEN 1 ELSE 0 END), 0),
-                COALESCE(SUM(CASE WHEN attempt_count >= ?2 AND state IN ('blocked','processing','retry_wait') THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN attempt_count >= ?2 THEN 1 ELSE 0 END), 0),
                 MIN(CASE WHEN state='pending' THEN ROUND((julianday(created_at) - 2440587.5) * 86400000) ELSE NULL END),
                 MIN(CASE WHEN state='retry_wait' THEN ROUND((julianday(updated_at) - 2440587.5) * 86400000) ELSE NULL END),
                 MIN(CASE WHEN state='blocked' THEN ROUND((julianday(updated_at) - 2440587.5) * 86400000) ELSE NULL END)

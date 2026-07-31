@@ -10,18 +10,37 @@ const WRITER_EPOCH_FUNCTION: &str = "digital_life_writer_epoch";
 const WRITER_EPOCH: i64 = 1;
 const STORAGE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Opens the only production SQLite connection shape used by storage code.
+/// Opens the authorized connection shape used by controlled paths that do not
+/// participate in the authoritative database upgrade coordinator, such as a
+/// temporary backup target.
 ///
-/// The connection-local writer capability is registered before any application
-/// operation. Schema-version inspection deliberately precedes WAL setup so a
-/// newer database is rejected without changing its journal mode or migrating it.
+/// Authoritative storage initialization must use the narrower before-WAL phase
+/// through the upgrade coordinator, so it can keep WAL strictly after upgrade
+/// validation.
 pub(super) fn open_authorized_storage_connection(
     database_path: &Path,
 ) -> Result<Connection, StorageError> {
-    open_authorized_storage_connection_with_function_name(database_path, WRITER_EPOCH_FUNCTION)
+    let connection = open_authorized_storage_connection_before_wal(database_path)?;
+    configure_authorized_connection_wal(&connection)?;
+    Ok(connection)
 }
 
-fn open_authorized_storage_connection_with_function_name(
+/// Opens an authorized connection without changing journal mode.
+///
+/// The writer capability, foreign-key enforcement, busy timeout, and schema
+/// version guard are all established before this function returns.  The caller
+/// must either complete the authoritative upgrade protocol and call
+/// [`configure_authorized_connection_wal`] or drop the connection.
+pub(super) fn open_authorized_storage_connection_before_wal(
+    database_path: &Path,
+) -> Result<Connection, StorageError> {
+    open_authorized_storage_connection_before_wal_with_function_name(
+        database_path,
+        WRITER_EPOCH_FUNCTION,
+    )
+}
+
+fn open_authorized_storage_connection_before_wal_with_function_name(
     database_path: &Path,
     writer_epoch_function_name: &str,
 ) -> Result<Connection, StorageError> {
@@ -36,11 +55,18 @@ fn open_authorized_storage_connection_with_function_name(
         return Err(StorageError::database_version_too_new());
     }
 
+    Ok(connection)
+}
+
+/// Configures WAL only after the caller has completed any required schema
+/// upgrade and post-commit verification.
+pub(super) fn configure_authorized_connection_wal(
+    connection: &Connection,
+) -> Result<(), StorageError> {
     connection
         .pragma_update(None, "journal_mode", "WAL")
         .map_err(|_| StorageError::connection_configuration_failed())?;
-
-    Ok(connection)
+    Ok(())
 }
 
 fn register_writer_capability(
@@ -161,7 +187,7 @@ fn open_authorized_storage_connection_with_invalid_registration_for_test(
     database_path: &Path,
 ) -> Result<Connection, StorageError> {
     let invalid_name = "x".repeat(256);
-    open_authorized_storage_connection_with_function_name(database_path, &invalid_name)
+    open_authorized_storage_connection_before_wal_with_function_name(database_path, &invalid_name)
 }
 
 #[cfg(test)]

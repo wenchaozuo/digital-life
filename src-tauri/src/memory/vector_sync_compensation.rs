@@ -629,6 +629,7 @@ mod tests {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn facts(
         action: MemoryVectorSyncAction,
         state: MemoryVectorSyncState,

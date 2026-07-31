@@ -11,9 +11,11 @@ mod memory_retrieval;
 mod memory_revision;
 mod migration;
 mod model_profile;
+mod upgrade_coordinator;
 pub(crate) mod upgrade_gate;
 mod vector_sync_outbox;
 mod vector_sync_settings;
+mod writer_fence_manifest;
 
 pub(crate) use llm_candidate_extraction::{
     trigger_candidate_extraction, LlmCandidateExtractionCoordinator,
@@ -160,6 +162,112 @@ impl StorageError {
         )
     }
 
+    pub(super) fn legacy_writer_detected() -> Self {
+        Self::new(
+            "LEGACY_WRITER_DETECTED",
+            "A legacy writer still has the storage resources open.",
+            true,
+        )
+    }
+
+    pub(super) fn upgrade_exclusive_gate_unavailable() -> Self {
+        Self::new(
+            "UPGRADE_EXCLUSIVE_GATE_UNAVAILABLE",
+            "The storage upgrade exclusive gate is unavailable.",
+            true,
+        )
+    }
+
+    pub(super) fn upgrade_process_inspection_failed() -> Self {
+        Self::new(
+            "UPGRADE_PROCESS_INSPECTION_FAILED",
+            "The storage upgrade process inspection could not be completed.",
+            true,
+        )
+    }
+
+    pub(super) fn upgrade_quiescence_not_reached() -> Self {
+        Self::new(
+            "UPGRADE_QUIESCENCE_NOT_REACHED",
+            "The storage upgrade could not obtain a quiet write window.",
+            true,
+        )
+    }
+
+    pub(super) fn migration_transaction_failed() -> Self {
+        Self::new(
+            "MIGRATION_TRANSACTION_FAILED",
+            "The storage schema migration transaction could not be completed.",
+            true,
+        )
+    }
+
+    pub(super) fn migration_version_invariant_failed() -> Self {
+        Self::new(
+            "MIGRATION_VERSION_INVARIANT_FAILED",
+            "The storage schema migration version invariant was not satisfied.",
+            false,
+        )
+    }
+
+    pub(super) fn migration_post_commit_verification_failed() -> Self {
+        Self::new(
+            "MIGRATION_POST_COMMIT_VERIFICATION_FAILED",
+            "The committed storage schema upgrade could not be verified.",
+            false,
+        )
+    }
+
+    pub(super) fn writer_fence_manifest_missing() -> Self {
+        Self::new(
+            "WRITER_FENCE_MANIFEST_MISSING",
+            "The required database writer fence manifest is missing.",
+            false,
+        )
+    }
+
+    pub(super) fn writer_fence_manifest_mismatch() -> Self {
+        Self::new(
+            "WRITER_FENCE_MANIFEST_MISMATCH",
+            "The database writer fence manifest does not match this application.",
+            false,
+        )
+    }
+
+    pub(super) fn incompatible_database_writer() -> Self {
+        Self::new(
+            "INCOMPATIBLE_DATABASE_WRITER",
+            "The database write was rejected because the writer is incompatible.",
+            false,
+        )
+    }
+
+    pub(super) fn unsupported_platform() -> Self {
+        Self::new(
+            "UNSUPPORTED_PLATFORM",
+            "The storage upgrade coordinator is only available on Windows.",
+            false,
+        )
+    }
+
+    pub(super) fn from_upgrade_gate_error(error: upgrade_gate::UpgradeGateError) -> Self {
+        match error {
+            upgrade_gate::UpgradeGateError::UnsupportedPlatform => Self::unsupported_platform(),
+            upgrade_gate::UpgradeGateError::UpgradeMutexNameDerivationFailed
+            | upgrade_gate::UpgradeGateError::UpgradeExclusiveGateUnavailable => {
+                Self::upgrade_exclusive_gate_unavailable()
+            }
+            upgrade_gate::UpgradeGateError::RestartManagerSessionFailed
+            | upgrade_gate::UpgradeGateError::RestartManagerRegistrationFailed
+            | upgrade_gate::UpgradeGateError::RestartManagerQueryFailed
+            | upgrade_gate::UpgradeGateError::ProcessIdentityReadFailed
+            | upgrade_gate::UpgradeGateError::ProcessVerificationFailed => {
+                Self::upgrade_process_inspection_failed()
+            }
+            upgrade_gate::UpgradeGateError::LegacyWriterDetected => Self::legacy_writer_detected(),
+        }
+    }
+
     fn not_found(entity: &str) -> Self {
         Self::new("NOT_FOUND", format!("{entity} was not found."), true)
     }
@@ -262,10 +370,15 @@ impl StorageService {
         let location = StorageLocationResolver::new(default_root, project_root);
         let active_root = location.resolve_active_root()?;
         fs::create_dir_all(&active_root).map_err(StorageError::database)?;
+        // The Windows Global mutex derives its identity from the authoritative
+        // database path and rejects relative paths. Resolve the newly ensured
+        // directory before deriving that path, while no SQLite handle exists.
+        let active_root =
+            fs::canonicalize(&active_root).map_err(|_| StorageError::connection_open_failed())?;
         let database_path = active_root.join(DATABASE_FILE_NAME);
         let connection = Self::open_connection(&database_path)?;
 
-        Ok(Self {
+        let service = Self {
             state: Mutex::new(StorageState {
                 connection,
                 active_root,
@@ -278,53 +391,14 @@ impl StorageService {
             candidate_confirmation_d4_calls: Mutex::new(Vec::new()),
             #[cfg(test)]
             candidate_confirmation_recovery_reads: AtomicU64::new(0),
-        })
+        };
+        #[cfg(test)]
+        upgrade_coordinator::record_storage_service_publish_for_test();
+        Ok(service)
     }
 
     fn open_connection(database_path: &Path) -> Result<Connection, StorageError> {
-        let mut connection = connection::open_authorized_storage_connection(database_path)?;
-        Self::migrate_schema(&mut connection)?;
-        Ok(connection)
-    }
-
-    fn migrate_schema(connection: &mut Connection) -> Result<(), StorageError> {
-        connection
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS schema_migration (
-                    version INTEGER PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    applied_at TEXT NOT NULL
-                );",
-            )
-            .map_err(StorageError::database)?;
-
-        for (version, name, sql) in MIGRATIONS {
-            let applied: Option<i64> = connection
-                .query_row(
-                    "SELECT version FROM schema_migration WHERE version = ?1",
-                    params![version],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(StorageError::database)?;
-
-            if applied.is_none() {
-                let transaction = connection.transaction().map_err(StorageError::database)?;
-                transaction
-                    .execute_batch(sql)
-                    .map_err(StorageError::database)?;
-                transaction
-                    .execute(
-                        "INSERT INTO schema_migration (version, name, applied_at)
-                         VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
-                        params![version, name],
-                    )
-                    .map_err(StorageError::database)?;
-                transaction.commit().map_err(StorageError::database)?;
-            }
-        }
-
-        Ok(())
+        upgrade_coordinator::open_coordinated_storage_connection(database_path)
     }
 
     fn state(&self) -> Result<MutexGuard<'_, StorageState>, StorageError> {
@@ -630,8 +704,7 @@ impl StorageService {
         expected_schema_version: i64,
         expected_life_id: &str,
     ) -> Result<Connection, StorageError> {
-        let mut connection = connection::open_authorized_storage_connection(database_path)?;
-        Self::migrate_schema(&mut connection)?;
+        let connection = Self::open_connection(database_path)?;
         migration::verify_database(&connection, expected_schema_version, expected_life_id)?;
         Ok(connection)
     }

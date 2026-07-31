@@ -1499,6 +1499,7 @@ mod tests {
         // Helper to insert an operational row
         let mut seq = 0i64;
 
+        #[allow(clippy::too_many_arguments)]
         fn ins(
             conn: &rusqlite::Connection,
             seq: &mut i64,

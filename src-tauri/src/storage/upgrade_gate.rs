@@ -1,8 +1,8 @@
-//! Internal Windows-only coordination primitives for a future storage upgrade.
+//! Internal Windows-only coordination primitives for storage schema upgrades.
 //!
-//! These APIs deliberately do not open SQLite, run migrations, or participate
-//! in `StorageService::initialize`. H1-A3 will decide when to invoke them
-//! before its own transaction and final resource recheck.
+//! These APIs deliberately do not open SQLite or run migrations. The storage
+//! upgrade coordinator owns their ordering around its SQLite transaction and
+//! final resource recheck.
 
 /// A stable, deidentified failure category for the upgrade process gate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -148,9 +148,8 @@ pub(crate) use unsupported::{
     WindowsUpgradeMutexGuard,
 };
 
-// Compile-time H1-A3 handoff contract. This references the narrow APIs without
-// invoking them, so H1-A2 remains deliberately disconnected from storage
-// initialization while signature drift is still caught during compilation.
+// Compile-time coordinator contract. This references the narrow APIs without
+// invoking them, so signature drift is caught during compilation.
 type AcquireUpgradeMutexApi =
     fn(&std::path::Path) -> Result<WindowsUpgradeMutexGuard, UpgradeGateError>;
 type InspectDatabaseResourceOccupantsApi =

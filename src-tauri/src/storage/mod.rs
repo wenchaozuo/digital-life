@@ -1,5 +1,6 @@
 mod candidate_extraction;
 mod candidate_memory;
+mod connection;
 mod conversation;
 pub(crate) mod deterministic_candidate_extraction;
 mod llm_candidate_extraction;
@@ -116,6 +117,46 @@ impl StorageError {
 
     fn database(error: impl Display) -> Self {
         Self::new("DATABASE_ERROR", error.to_string(), true)
+    }
+
+    pub(crate) fn connection_open_failed() -> Self {
+        Self::new(
+            "CONNECTION_OPEN_FAILED",
+            "The storage database could not be opened.",
+            true,
+        )
+    }
+
+    pub(crate) fn writer_capability_registration_failed() -> Self {
+        Self::new(
+            "WRITER_CAPABILITY_REGISTRATION_FAILED",
+            "The storage connection could not register its writer capability.",
+            false,
+        )
+    }
+
+    pub(crate) fn connection_configuration_failed() -> Self {
+        Self::new(
+            "CONNECTION_CONFIGURATION_FAILED",
+            "The storage connection could not be configured.",
+            true,
+        )
+    }
+
+    pub(crate) fn schema_version_read_failed() -> Self {
+        Self::new(
+            "SCHEMA_VERSION_READ_FAILED",
+            "The storage schema version could not be read.",
+            false,
+        )
+    }
+
+    pub(crate) fn database_version_too_new() -> Self {
+        Self::new(
+            "DATABASE_VERSION_TOO_NEW",
+            "The storage database was created by a newer application version.",
+            false,
+        )
     }
 
     fn not_found(entity: &str) -> Self {
@@ -240,14 +281,7 @@ impl StorageService {
     }
 
     fn open_connection(database_path: &Path) -> Result<Connection, StorageError> {
-        let mut connection = Connection::open(database_path).map_err(StorageError::database)?;
-        connection
-            .execute_batch(
-                "PRAGMA foreign_keys = ON;
-                 PRAGMA journal_mode = WAL;
-                 PRAGMA busy_timeout = 5000;",
-            )
-            .map_err(StorageError::database)?;
+        let mut connection = connection::open_authorized_storage_connection(database_path)?;
         Self::migrate_schema(&mut connection)?;
         Ok(connection)
     }
@@ -595,34 +629,14 @@ impl StorageService {
         expected_schema_version: i64,
         expected_life_id: &str,
     ) -> Result<Connection, StorageError> {
-        let connection = Connection::open(database_path).map_err(|error| {
-            StorageError::new(
-                "MIGRATION_REOPEN_FAILED",
-                format!("Cannot reopen the migrated database: {error}"),
-                true,
-            )
-        })?;
-        connection
-            .execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")
-            .map_err(|error| {
-                StorageError::new(
-                    "MIGRATION_REOPEN_PRAGMA_FAILED",
-                    format!("Cannot configure the migrated database: {error}"),
-                    true,
-                )
-            })?;
+        let mut connection = connection::open_authorized_storage_connection(database_path)?;
+        Self::migrate_schema(&mut connection)?;
         migration::verify_database(&connection, expected_schema_version, expected_life_id)?;
         Ok(connection)
     }
 
     fn schema_version(connection: &Connection) -> Result<i64, StorageError> {
-        connection
-            .query_row(
-                "SELECT COALESCE(MAX(version), 0) FROM schema_migration",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(StorageError::database)
+        connection::read_schema_version(connection)
     }
 
     fn current_life_id(connection: &Connection) -> Result<Option<String>, StorageError> {
@@ -1324,6 +1338,27 @@ mod tests {
             .join("default")
             .join(location::LOCATION_CONFIG_FILE_NAME)
             .exists());
+    }
+
+    #[test]
+    fn backup_target_is_reopened_with_an_authorized_storage_connection() {
+        let root = TestRoot::new("migration-authorized-reopen");
+        let service = seeded_service(&root.0);
+        let target = root.0.join("custom");
+
+        let result = service.migrate_location(target.to_str().unwrap());
+
+        assert!(result.success, "{:?}", result.error_message);
+        let state = service.state().unwrap();
+        let epoch: i64 = state
+            .connection
+            .query_row("SELECT digital_life_writer_epoch()", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(epoch, 1);
+        assert_eq!(
+            state.database_path,
+            fs::canonicalize(target.join(DATABASE_FILE_NAME)).unwrap()
+        );
     }
 
     #[test]

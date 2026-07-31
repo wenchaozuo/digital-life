@@ -2,7 +2,7 @@ use std::{fs, path::Path, time::Duration};
 
 use rusqlite::{backup::Backup, Connection, OptionalExtension};
 
-use super::StorageError;
+use super::{connection, StorageError};
 
 pub fn backup_and_verify(
     source: &Connection,
@@ -21,13 +21,7 @@ pub fn backup_and_verify(
     }
 
     let result = (|| -> Result<(), StorageError> {
-        let mut target = Connection::open(temporary_database).map_err(|error| {
-            StorageError::new(
-                "MIGRATION_TARGET_OPEN_FAILED",
-                format!("Cannot open the temporary target database: {error}"),
-                true,
-            )
-        })?;
+        let mut target = connection::open_authorized_storage_connection(temporary_database)?;
 
         {
             let backup = Backup::new(source, &mut target).map_err(|error| {
@@ -48,15 +42,6 @@ pub fn backup_and_verify(
                 })?;
         }
 
-        target
-            .execute_batch("PRAGMA foreign_keys = ON;")
-            .map_err(|error| {
-                StorageError::new(
-                    "MIGRATION_TARGET_PRAGMA_FAILED",
-                    format!("Cannot enable target database validation: {error}"),
-                    true,
-                )
-            })?;
         verify_database(&target, expected_schema_version, expected_life_id)
     })();
 

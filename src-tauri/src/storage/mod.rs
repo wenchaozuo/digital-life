@@ -318,7 +318,7 @@ impl StorageService {
                 MIN(CASE WHEN state='pending' THEN ROUND((julianday(created_at) - 2440587.5) * 86400000) ELSE NULL END),
                 MIN(CASE WHEN state='retry_wait' THEN ROUND((julianday(updated_at) - 2440587.5) * 86400000) ELSE NULL END),
                 MIN(CASE WHEN state='blocked' THEN ROUND((julianday(updated_at) - 2440587.5) * 86400000) ELSE NULL END)
-             FROM memory_vector_sync_outbox",
+             FROM memory_vector_sync_outbox WHERE migration_disposition IS NULL",
             rusqlite::params![snapshot_now_millis as f64, max_attempts],
             |row| Ok((
                 row.get::<_, i64>(0)? as usize,

@@ -1480,4 +1480,362 @@ mod tests {
         assert!(expires_at.contains("2099"), "Expiry unchanged");
         assert!(updated_at.contains("2024"), "Updated_at unchanged");
     }
+
+    #[test]
+    fn vector_sync_health_excludes_migration_isolated_rows() {
+        let (_temp, storage) = test_storage();
+        let ctx = health_context();
+        storage
+            .register_building_vector_generation(
+                ctx.generation_id().as_str(),
+                ctx.descriptor_hash(),
+                ctx.dimension(),
+            )
+            .unwrap();
+
+        let db_path = storage.test_database_main_path().unwrap();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+
+        // Helper to insert an operational row
+        let mut seq = 0i64;
+
+        fn ins(
+            conn: &rusqlite::Connection,
+            seq: &mut i64,
+            life: &str,
+            mem: &str,
+            action: &str,
+            state: &str,
+            att: i64,
+            err_code: Option<&str>,
+            send: Option<&str>,
+            lease_exp: Option<&str>,
+            created: &str,
+            updated: &str,
+        ) {
+            *seq += 1;
+            conn.execute(
+                "INSERT OR REPLACE INTO memory_vector_sync_outbox (life_id, memory_id, desired_action, state, attempt_count, last_error_code, last_send_disposition, lease_expires_at, created_at, updated_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                rusqlite::params![life, mem, action, state, att, err_code, send, lease_exp, created, updated],
+            ).unwrap();
+            conn.execute("UPDATE memory_vector_sync_mutation_clock SET last_sequence = last_sequence + 1 WHERE singleton=1", []).unwrap();
+        }
+
+        // Insert operational baseline
+        ins(
+            &conn,
+            &mut seq,
+            "life",
+            "op-pend",
+            "upsert",
+            "pending",
+            0,
+            None,
+            None,
+            None,
+            "2024-01-01T00:00:00.000Z",
+            "2024-01-01T00:00:00.000Z",
+        );
+        ins(
+            &conn,
+            &mut seq,
+            "life",
+            "op-retry",
+            "upsert",
+            "retry_wait",
+            1,
+            Some("PROVIDER_UNAVAILABLE"),
+            Some("definitely_not_sent"),
+            None,
+            "2024-01-01T00:00:00.000Z",
+            "2024-06-01T00:00:00.000Z",
+        );
+        ins(
+            &conn,
+            &mut seq,
+            "life",
+            "op-b-unk",
+            "upsert",
+            "blocked",
+            1,
+            Some("PROVIDER_RESULT_UNKNOWN"),
+            Some("possibly_sent"),
+            None,
+            "2024-01-01T00:00:00.000Z",
+            "2024-03-01T00:00:00.000Z",
+        );
+        ins(
+            &conn,
+            &mut seq,
+            "life",
+            "op-b-inv",
+            "upsert",
+            "blocked",
+            1,
+            Some("INTERNAL_INVARIANT"),
+            None,
+            None,
+            "2024-01-01T00:00:00.000Z",
+            "2024-03-01T00:00:00.000Z",
+        );
+        ins(
+            &conn,
+            &mut seq,
+            "life",
+            "op-proc",
+            "upsert",
+            "processing",
+            1,
+            None,
+            None,
+            Some("2099-01-01T00:00:00.000Z"),
+            "2024-01-01T00:00:00.000Z",
+            "2024-01-01T00:00:00.000Z",
+        );
+        ins(
+            &conn,
+            &mut seq,
+            "life",
+            "op-proc-ex",
+            "upsert",
+            "processing",
+            2,
+            None,
+            None,
+            Some("2020-01-01T00:00:00.000Z"),
+            "2024-01-01T00:00:00.000Z",
+            "2024-01-01T00:00:00.000Z",
+        );
+        ins(
+            &conn,
+            &mut seq,
+            "life",
+            "op-att5",
+            "upsert",
+            "blocked",
+            5,
+            Some("LANCE_PERMANENT"),
+            Some("possibly_sent"),
+            None,
+            "2024-01-01T00:00:00.000Z",
+            "2024-01-01T00:00:00.000Z",
+        );
+
+        let raw_vs = crate::vector_store::InMemoryVectorStore::default();
+        tauri::async_runtime::block_on(raw_vs.create_generation(&ctx)).unwrap();
+
+        let clock = FixedHealthClock::new(1_700_000_000_000);
+        let snap1 = tauri::async_runtime::block_on(inspect_vector_sync_health(
+            &storage, &raw_vs, &ctx, &clock,
+        ))
+        .unwrap();
+
+        // Insert isolation rows with migration_disposition set
+        ins(
+            &conn,
+            &mut seq,
+            "life",
+            "iso-pend",
+            "upsert",
+            "pending",
+            5,
+            None,
+            None,
+            None,
+            "2000-01-01T00:00:00.000Z",
+            "2000-01-01T00:00:00.000Z",
+        );
+        conn.execute(
+            "UPDATE memory_vector_sync_outbox SET migration_disposition='legacy_upsert_rebuild_required' WHERE memory_id='iso-pend'",
+            [],
+        ).unwrap();
+
+        ins(
+            &conn,
+            &mut seq,
+            "life",
+            "iso-retry",
+            "upsert",
+            "retry_wait",
+            6,
+            Some("PROVIDER_UNAVAILABLE"),
+            Some("definitely_not_sent"),
+            None,
+            "2000-01-01T00:00:00.000Z",
+            "2000-01-01T00:00:00.000Z",
+        );
+        conn.execute(
+            "UPDATE memory_vector_sync_outbox SET migration_disposition='legacy_upsert_rebuild_required' WHERE memory_id='iso-retry'",
+            [],
+        ).unwrap();
+
+        ins(
+            &conn,
+            &mut seq,
+            "life",
+            "iso-b-unk",
+            "upsert",
+            "blocked",
+            7,
+            Some("PROVIDER_RESULT_UNKNOWN"),
+            Some("possibly_sent"),
+            None,
+            "2000-01-01T00:00:00.000Z",
+            "2000-01-01T00:00:00.000Z",
+        );
+        conn.execute(
+            "UPDATE memory_vector_sync_outbox SET migration_disposition='legacy_upsert_rebuild_required' WHERE memory_id='iso-b-unk'",
+            [],
+        ).unwrap();
+
+        ins(
+            &conn,
+            &mut seq,
+            "life",
+            "iso-b-inv",
+            "upsert",
+            "blocked",
+            8,
+            Some("INTERNAL_INVARIANT"),
+            None,
+            None,
+            "2000-01-01T00:00:00.000Z",
+            "2000-01-01T00:00:00.000Z",
+        );
+        conn.execute(
+            "UPDATE memory_vector_sync_outbox SET migration_disposition='legacy_upsert_rebuild_required' WHERE memory_id='iso-b-inv'",
+            [],
+        ).unwrap();
+
+        ins(
+            &conn,
+            &mut seq,
+            "life",
+            "iso-proc",
+            "upsert",
+            "processing",
+            9,
+            None,
+            None,
+            Some("2000-01-01T00:00:00.000Z"),
+            "2000-01-01T00:00:00.000Z",
+            "2000-01-01T00:00:00.000Z",
+        );
+        conn.execute(
+            "UPDATE memory_vector_sync_outbox SET migration_disposition='legacy_upsert_rebuild_required' WHERE memory_id='iso-proc'",
+            [],
+        ).unwrap();
+
+        ins(
+            &conn,
+            &mut seq,
+            "life",
+            "iso-att10",
+            "upsert",
+            "failed",
+            10,
+            Some("MAX_ATTEMPTS"),
+            None,
+            None,
+            "2000-01-01T00:00:00.000Z",
+            "2000-01-01T00:00:00.000Z",
+        );
+        conn.execute(
+            "UPDATE memory_vector_sync_outbox SET migration_disposition='legacy_upsert_rebuild_required' WHERE memory_id='iso-att10'",
+            [],
+        ).unwrap();
+
+        let snap2 = tauri::async_runtime::block_on(inspect_vector_sync_health(
+            &storage, &raw_vs, &ctx, &clock,
+        ))
+        .unwrap();
+
+        // All outbox metrics must be identical
+        assert_eq!(snap1.pending_count, snap2.pending_count, "pending_count");
+        assert_eq!(
+            snap1.retry_wait_count, snap2.retry_wait_count,
+            "retry_wait_count"
+        );
+        assert_eq!(snap1.blocked_count, snap2.blocked_count, "blocked_count");
+        assert_eq!(
+            snap1.processing_count, snap2.processing_count,
+            "processing_count"
+        );
+        assert_eq!(
+            snap1.expired_processing_count, snap2.expired_processing_count,
+            "expired_processing_count"
+        );
+        assert_eq!(
+            snap1.provider_result_unknown_count, snap2.provider_result_unknown_count,
+            "provider_result_unknown_count"
+        );
+        assert_eq!(
+            snap1.internal_invariant_count, snap2.internal_invariant_count,
+            "internal_invariant_count"
+        );
+        assert_eq!(
+            snap1.attempts_at_limit_count, snap2.attempts_at_limit_count,
+            "attempts_at_limit_count"
+        );
+        assert_eq!(
+            snap1.oldest_pending_age_ms, snap2.oldest_pending_age_ms,
+            "oldest_pending_age_ms"
+        );
+        assert_eq!(
+            snap1.oldest_retry_wait_age_ms, snap2.oldest_retry_wait_age_ms,
+            "oldest_retry_wait_age_ms"
+        );
+        assert_eq!(
+            snap1.oldest_blocked_age_ms, snap2.oldest_blocked_age_ms,
+            "oldest_blocked_age_ms"
+        );
+    }
+
+    #[test]
+    fn vector_sync_health_only_migration_isolated_rows() {
+        let (_temp, storage) = test_storage();
+        let ctx = health_context();
+        storage
+            .register_building_vector_generation(
+                ctx.generation_id().as_str(),
+                ctx.descriptor_hash(),
+                ctx.dimension(),
+            )
+            .unwrap();
+
+        let db_path = storage.test_database_main_path().unwrap();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+
+        // Insert ONLY isolation rows
+        for i in 0..3 {
+            conn.execute(
+                "INSERT OR REPLACE INTO memory_vector_sync_outbox (life_id, memory_id, desired_action, state, attempt_count, migration_disposition, created_at, updated_at)
+                 VALUES (?1,?2,'upsert','blocked',1,'legacy_upsert_rebuild_required','2000-01-01T00:00:00.000Z','2000-01-01T00:00:00.000Z')",
+                rusqlite::params!["life", format!("iso-{i}")],
+            ).unwrap();
+            conn.execute("UPDATE memory_vector_sync_mutation_clock SET last_sequence = last_sequence + 1 WHERE singleton=1", []).unwrap();
+        }
+
+        let raw_vs = crate::vector_store::InMemoryVectorStore::default();
+        tauri::async_runtime::block_on(raw_vs.create_generation(&ctx)).unwrap();
+
+        let clock = FixedHealthClock::new(1_700_000_000_000);
+        let snap = tauri::async_runtime::block_on(inspect_vector_sync_health(
+            &storage, &raw_vs, &ctx, &clock,
+        ))
+        .unwrap();
+
+        assert_eq!(snap.pending_count, 0);
+        assert_eq!(snap.retry_wait_count, 0);
+        assert_eq!(snap.blocked_count, 0);
+        assert_eq!(snap.processing_count, 0);
+        assert_eq!(snap.expired_processing_count, 0);
+        assert_eq!(snap.provider_result_unknown_count, 0);
+        assert_eq!(snap.internal_invariant_count, 0);
+        assert_eq!(snap.attempts_at_limit_count, 0);
+        assert_eq!(snap.oldest_pending_age_ms, None);
+        assert_eq!(snap.oldest_retry_wait_age_ms, None);
+        assert_eq!(snap.oldest_blocked_age_ms, None);
+    }
 }

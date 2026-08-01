@@ -956,6 +956,38 @@ mod transaction_tests {
             .unwrap()
     }
 
+    /// Reads the three columns the version-14 identity CHECK spans, so a
+    /// rejected write can be proven to have left none of them partially applied.
+    fn attempt_identity_row(connection: &Connection, memory_id: &str) -> (i64, i64, i64) {
+        connection
+            .query_row(
+                "SELECT attempt_count, fenced_claim_epoch, last_marked_claim_epoch
+                 FROM memory_vector_sync_outbox
+                 WHERE life_id='attempt-life' AND memory_id=?1",
+                params![memory_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+    }
+
+    /// Asserts real SQLite rejected the write with a CHECK constraint violation.
+    /// The assertion is made on SQLite's own primary and extended result codes,
+    /// never on the constraint name or message text.
+    fn assert_check_constraint_violation(result: rusqlite::Result<usize>) {
+        match result {
+            Ok(_) => panic!("real SQLite must reject this write"),
+            Err(rusqlite::Error::SqliteFailure(error, _)) => {
+                assert_eq!(error.code, rusqlite::ErrorCode::ConstraintViolation);
+                assert_eq!(
+                    error.extended_code,
+                    rusqlite::ffi::SQLITE_CONSTRAINT_CHECK,
+                    "the write must fail the CHECK constraint itself"
+                );
+            }
+            Err(other) => panic!("expected a SQLite CHECK violation, got {other:?}"),
+        }
+    }
+
     fn attempt_column_count(connection: &Connection) -> i64 {
         connection
             .query_row(
@@ -965,6 +997,77 @@ mod transaction_tests {
                 |row| row.get(0),
             )
             .unwrap()
+    }
+
+    fn journal_mode_of(database_path: &Path) -> String {
+        let connection = Connection::open(database_path).unwrap();
+        connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    /// Builds a file-backed version-13 database in `DELETE` journal mode with the
+    /// full 18-trigger writer fence, one outbox row whose evidence fields are all
+    /// non-default, and a recognizable mutation-clock value. Returns the row
+    /// snapshot so a later rollback can be compared field by field.
+    fn seed_version_thirteen_commit_fixture(database_path: &Path) -> HistoricalOutboxSnapshot {
+        let mut connection = connection::open_authorized_test_connection(database_path).unwrap();
+        connection
+            .pragma_update(None, "journal_mode", "DELETE")
+            .unwrap();
+
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        apply_pending_migrations_in_transaction(
+            &transaction,
+            0,
+            connection::MAX_SUPPORTED_SCHEMA_VERSION,
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+
+        insert_historical_row(
+            &connection,
+            HistoricalRowFixture {
+                life_id: "commit-life",
+                memory_id: "commit-row",
+                desired_action: "delete",
+                // 'failed' with a recorded migration disposition keeps the row
+                // outside Migration 013's frozen set, so the version-13 upgrade
+                // below cannot rewrite the evidence this test compares.
+                state: "failed",
+                migration_disposition: Some("legacy_upsert_rebuild_required"),
+                attempt_count: 5,
+                mutation_sequence: 7_654,
+                target_revision: Some(21),
+                target_content_hash: Some("commit-target-hash"),
+                claimed_generation_id: Some("commit-generation"),
+                last_error_code: Some("COMMIT_BOUNDARY_ERROR"),
+                last_send_disposition: Some("possibly_sent"),
+                next_attempt_at: Some("2026-10-01T00:00:00.000Z"),
+                lease_owner: Some("commit-owner"),
+                lease_fence_epoch: Some(31),
+                lease_expires_at: Some("2026-10-02T00:00:00.000Z"),
+            },
+        );
+        connection
+            .execute(
+                "UPDATE memory_vector_sync_mutation_clock SET last_sequence=7654
+                 WHERE singleton=1",
+                [],
+            )
+            .unwrap();
+        apply_writer_fence_upgrade(&mut connection);
+        assert_eq!(
+            schema_version(&connection),
+            writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION
+        );
+        assert_eq!(writer_fence_count(&connection), 18);
+
+        let snapshot = historical_snapshot(&connection, "commit-life", "commit-row");
+        drop(connection);
+        snapshot
     }
 
     fn schema_fourteen_validation_connection(
@@ -1326,6 +1429,95 @@ mod transaction_tests {
         );
     }
 
+    /// Proves the `last_marked_claim_epoch >= 0` conjunct is independently
+    /// enforced by real SQLite. The first case uses the frozen default row shape
+    /// (`fenced_claim_epoch = 0`, `attempt_count = 0`); the second raises the
+    /// companion columns so that `>= 0` is the only conjunct a `-1` write can
+    /// violate, and a positive write on that same row then proves the rejection
+    /// was caused by the sign rather than by the row itself.
+    #[test]
+    fn schema_fourteen_last_marked_claim_epoch_negative_write_is_rejected_in_isolation() {
+        let mut connection = version_thirteen_connection();
+        for (memory_id, attempt_count) in [("negative-default", 0), ("negative-isolated", 2)] {
+            insert_historical_row(
+                &connection,
+                HistoricalRowFixture {
+                    life_id: "attempt-life",
+                    memory_id,
+                    desired_action: "delete",
+                    state: "pending",
+                    migration_disposition: None,
+                    attempt_count,
+                    mutation_sequence: 1,
+                    target_revision: None,
+                    target_content_hash: None,
+                    claimed_generation_id: None,
+                    last_error_code: None,
+                    last_send_disposition: None,
+                    next_attempt_at: None,
+                    lease_owner: None,
+                    lease_fence_epoch: None,
+                    lease_expires_at: None,
+                },
+            );
+        }
+        apply_attempt_claim_identity_upgrade(&mut connection);
+
+        // Case 1: the exact frozen default shape. Only `last_marked_claim_epoch`
+        // is written, and it is written to -1.
+        assert_eq!(
+            attempt_identity_row(&connection, "negative-default"),
+            (0, 0, 0)
+        );
+        assert_check_constraint_violation(connection.execute(
+            "UPDATE memory_vector_sync_outbox SET last_marked_claim_epoch=-1
+             WHERE life_id='attempt-life' AND memory_id='negative-default'",
+            [],
+        ));
+        // Re-read proves no column was partially modified.
+        assert_eq!(
+            attempt_identity_row(&connection, "negative-default"),
+            (0, 0, 0)
+        );
+
+        // Case 2: isolate the `>= 0` conjunct. With attempt_count = 2 and
+        // fenced_claim_epoch = 5, a -1 write satisfies both companion conjuncts
+        // (-1 <= 5, and attempt_count > 0), so only `>= 0` can reject it.
+        connection
+            .execute(
+                "UPDATE memory_vector_sync_outbox SET fenced_claim_epoch=5
+                 WHERE life_id='attempt-life' AND memory_id='negative-isolated'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            attempt_identity_row(&connection, "negative-isolated"),
+            (2, 5, 0)
+        );
+        assert_check_constraint_violation(connection.execute(
+            "UPDATE memory_vector_sync_outbox SET last_marked_claim_epoch=-1
+             WHERE life_id='attempt-life' AND memory_id='negative-isolated'",
+            [],
+        ));
+        assert_eq!(
+            attempt_identity_row(&connection, "negative-isolated"),
+            (2, 5, 0)
+        );
+        // A positive write on the identical row is accepted, which proves the
+        // rejection above was caused by the negative value alone.
+        connection
+            .execute(
+                "UPDATE memory_vector_sync_outbox SET last_marked_claim_epoch=3
+                 WHERE life_id='attempt-life' AND memory_id='negative-isolated'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            attempt_identity_row(&connection, "negative-isolated"),
+            (2, 5, 3)
+        );
+    }
+
     #[test]
     fn migration_014_failure_injection_rolls_back_columns_and_version() {
         for failpoint in [
@@ -1378,6 +1570,121 @@ mod transaction_tests {
             );
             assert_eq!(writer_fence_count(&connection), 18);
         }
+    }
+
+    /// Proves that a **real** `Transaction::commit()` failure rolls back every
+    /// version-14 transaction step.
+    ///
+    /// The failure is produced by genuine SQLite lock arbitration rather than by
+    /// injection: on a file-backed rollback-journal (`DELETE`) database, a second
+    /// connection's plain read transaction holds a SHARED lock. That lock is
+    /// compatible with connection A's `BEGIN IMMEDIATE` (RESERVED), so the whole
+    /// migration runs normally, but it blocks the EXCLUSIVE promotion that
+    /// `COMMIT` requires. `COMMIT` therefore returns `SQLITE_BUSY` from SQLite
+    /// itself, after every in-transaction step has already succeeded.
+    ///
+    /// Synchronization is structural: the reader's transaction object is alive
+    /// across the commit call, so no sleep or timing assumption is involved.
+    #[test]
+    fn migration_014_real_commit_failure_rolls_back_every_transaction_step() {
+        let root = tempfile::tempdir().unwrap();
+        let database_path = root.path().join("commit-boundary.sqlite3");
+
+        // A version-13 database with real writer fences, a non-default outbox
+        // row, a recognizable mutation clock, and DELETE journal mode.
+        let evidence = seed_version_thirteen_commit_fixture(&database_path);
+        assert_eq!(journal_mode_of(&database_path), "delete");
+
+        // Connection B: a plain reader. Its SHARED lock is what will deny the
+        // commit its EXCLUSIVE promotion.
+        let mut reader = Connection::open(&database_path).unwrap();
+        let reader_transaction = reader.transaction().unwrap();
+        reader_transaction
+            .query_row(
+                "SELECT COUNT(*) FROM memory_vector_sync_outbox",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+
+        // Connection A: the authorized epoch-1 writer shape, so the 18 writer
+        // fences permit the migration's own writes.
+        let mut writer = connection::open_authorized_test_connection(&database_path).unwrap();
+        // Fail the commit on the first denied promotion instead of retrying for
+        // the production busy timeout. This bounds the test without weakening
+        // it: the error still originates in SQLite's own COMMIT.
+        writer.busy_timeout(Duration::from_millis(0)).unwrap();
+        let transaction = writer
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+
+        // Every version-14 in-transaction step completes before the commit.
+        assert_eq!(
+            apply_attempt_claim_identity_schema_upgrade(&transaction).unwrap(),
+            AttemptClaimIdentitySchemaUpgrade::Applied
+        );
+        assert_eq!(
+            connection::read_schema_version(&transaction).unwrap(),
+            ATTEMPT_CLAIM_IDENTITY_SCHEMA_VERSION
+        );
+        assert_eq!(
+            transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('memory_vector_sync_outbox')
+                     WHERE name IN ('fenced_claim_epoch', 'last_marked_claim_epoch')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+        validate_attempt_claim_identity_schema(&transaction).unwrap();
+        writer_fence_manifest::validate_writer_fence_manifest(&transaction).unwrap();
+
+        // The real commit boundary.
+        let commit_error = transaction.commit().unwrap_err();
+        match commit_error {
+            rusqlite::Error::SqliteFailure(error, _) => {
+                assert_eq!(error.code, rusqlite::ErrorCode::DatabaseBusy);
+            }
+            other => panic!("expected a real SQLite commit busy failure, got {other:?}"),
+        }
+        // The production mapping turns exactly this error into the stable,
+        // deidentified category, without carrying SQLite's message.
+        let mapped = StorageError::migration_transaction_failed();
+        assert_eq!(mapped.code, "MIGRATION_TRANSACTION_FAILED");
+        assert!(!mapped.message.to_lowercase().contains("database is locked"));
+        // No transaction remains open on the writer connection.
+        assert!(writer.is_autocommit());
+        drop(writer);
+        drop(reader_transaction);
+
+        // A brand-new independent connection reads only committed on-disk state.
+        let verifier = Connection::open(&database_path).unwrap();
+        assert_eq!(
+            connection::read_schema_version(&verifier).unwrap(),
+            writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION
+        );
+        assert_eq!(attempt_column_count(&verifier), 0);
+        assert_eq!(writer_fence_count(&verifier), 18);
+        assert_eq!(
+            historical_snapshot(&verifier, "commit-life", "commit-row"),
+            evidence
+        );
+        assert_eq!(
+            verifier
+                .query_row(
+                    "SELECT last_sequence FROM memory_vector_sync_mutation_clock WHERE singleton=1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            7_654
+        );
+        // WAL was never configured: the commit failed before the coordinator's
+        // WAL step could run.
+        assert_eq!(journal_mode_of(&database_path), "delete");
+        assert!(!database_path.with_extension("sqlite3-wal").exists());
     }
 
     #[test]

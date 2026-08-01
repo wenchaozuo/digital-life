@@ -1900,6 +1900,182 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Eq, PartialEq)]
+    struct VersionThirteenCommitEvidence {
+        state: String,
+        migration_disposition: Option<String>,
+        attempt_count: i64,
+        mutation_sequence: i64,
+        target_revision: Option<i64>,
+        target_content_hash: Option<String>,
+        claimed_generation_id: Option<String>,
+        last_error_code: Option<String>,
+        last_send_disposition: Option<String>,
+        next_attempt_at: Option<String>,
+        lease_owner: Option<String>,
+        lease_fence_epoch: Option<i64>,
+        lease_expires_at: Option<String>,
+    }
+
+    fn version_thirteen_commit_evidence(connection: &Connection) -> VersionThirteenCommitEvidence {
+        connection
+            .query_row(
+                "SELECT state, migration_disposition, attempt_count, mutation_sequence,
+                        target_revision, target_content_hash, claimed_generation_id,
+                        last_error_code, last_send_disposition, next_attempt_at,
+                        lease_owner, lease_fence_epoch, lease_expires_at
+                 FROM memory_vector_sync_outbox
+                 WHERE life_id='commit-life' AND memory_id='commit-row'",
+                [],
+                |row| {
+                    Ok(VersionThirteenCommitEvidence {
+                        state: row.get(0)?,
+                        migration_disposition: row.get(1)?,
+                        attempt_count: row.get(2)?,
+                        mutation_sequence: row.get(3)?,
+                        target_revision: row.get(4)?,
+                        target_content_hash: row.get(5)?,
+                        claimed_generation_id: row.get(6)?,
+                        last_error_code: row.get(7)?,
+                        last_send_disposition: row.get(8)?,
+                        next_attempt_at: row.get(9)?,
+                        lease_owner: row.get(10)?,
+                        lease_fence_epoch: row.get(11)?,
+                        lease_expires_at: row.get(12)?,
+                    })
+                },
+            )
+            .unwrap()
+    }
+
+    /// Seeds one outbox row whose evidence fields are all non-default, plus a
+    /// recognizable mutation clock, into an existing version-13 database. The
+    /// authorized epoch-1 connection shape is required because the 18 writer
+    /// fences are already installed at this point.
+    fn seed_version_thirteen_commit_row(path: &Path) -> VersionThirteenCommitEvidence {
+        let authorized = connection::open_authorized_test_connection(path).unwrap();
+        authorized
+            .execute_batch(
+                "INSERT INTO memory_vector_sync_outbox
+                 (life_id, memory_id, desired_action, state, migration_disposition,
+                  attempt_count, mutation_sequence, target_revision, target_content_hash,
+                  claimed_generation_id, last_error_code, last_send_disposition,
+                  next_attempt_at, lease_owner, lease_fence_epoch, lease_expires_at)
+                 VALUES ('commit-life', 'commit-row', 'delete', 'failed',
+                         'legacy_upsert_rebuild_required', 5, 7654, 21,
+                         'commit-target-hash', 'commit-generation',
+                         'COMMIT_BOUNDARY_ERROR', 'possibly_sent',
+                         '2026-10-01T00:00:00.000Z', 'commit-owner', 31,
+                         '2026-10-02T00:00:00.000Z');
+                 UPDATE memory_vector_sync_mutation_clock
+                 SET last_sequence=7654 WHERE singleton=1;",
+            )
+            .unwrap();
+        let evidence = version_thirteen_commit_evidence(&authorized);
+        drop(authorized);
+        evidence
+    }
+
+    /// Proves that when the authoritative upgrade's **real**
+    /// `Transaction::commit()` fails, the production coordinator rolls the whole
+    /// version-14 transaction back, maps the failure to its stable deidentified
+    /// category, and reaches neither the WAL step nor `StorageService`
+    /// publication.
+    ///
+    /// The commit failure is genuine SQLite lock arbitration, not injection. On
+    /// this rollback-journal (`DELETE`) database a second connection's plain read
+    /// transaction holds a SHARED lock, which is compatible with the
+    /// coordinator's `BEGIN IMMEDIATE` (RESERVED) — so `final-rm`, `att-i1`, and
+    /// every in-transaction validation run normally — but denies the EXCLUSIVE
+    /// promotion that `COMMIT` needs. Holding the reader's transaction object
+    /// alive across the call is the synchronization; no sleep is involved.
+    #[test]
+    fn storage_initialize_real_commit_failure_rolls_back_and_skips_wal_and_publish() {
+        let _ = take_upgrade_events();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(super::super::DATABASE_FILE_NAME);
+        prepare_schema_version(&path, writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION);
+        let evidence = seed_version_thirteen_commit_row(&path);
+        assert_eq!(journal_mode(&path), "delete");
+
+        let mut reader = Connection::open(&path).unwrap();
+        let reader_transaction = reader.transaction().unwrap();
+        reader_transaction
+            .query_row(
+                "SELECT COUNT(*) FROM memory_vector_sync_outbox",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+
+        let error = match super::super::StorageService::initialize_with_roots(
+            root.path().to_path_buf(),
+            None,
+        ) {
+            Ok(_) => panic!("a failed migration commit must prevent storage publication"),
+            Err(error) => error,
+        };
+
+        // The stable, deidentified category. It carries no SQLite text, path,
+        // SQL, DDL, identifier, or process id.
+        assert_eq!(error.code, "MIGRATION_TRANSACTION_FAILED");
+        let message = error.message.to_lowercase();
+        for leak in [
+            "database is locked",
+            "sqlite",
+            "commit",
+            "memory_vector_sync_outbox",
+            "commit-life",
+            "commit-generation",
+            ".sqlite3",
+        ] {
+            assert!(
+                !message.contains(leak),
+                "the mapped message must not leak {leak}"
+            );
+        }
+
+        // The coordinator reached the real commit and stopped there: no
+        // post-verify, no WAL, no publish.
+        assert_eq!(
+            take_upgrade_events(),
+            vec![
+                "mutex",
+                "open-before-wal",
+                "version-read",
+                "preflight-rm",
+                "begin-immediate",
+                "final-rm",
+                "att-i1",
+                "commit",
+            ]
+        );
+
+        drop(reader_transaction);
+
+        // A brand-new independent connection reads only committed on-disk state.
+        let verifier = Connection::open(&path).unwrap();
+        assert_eq!(
+            connection::read_schema_version(&verifier).unwrap(),
+            writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION
+        );
+        assert_eq!(attempt_identity_column_count(&verifier), 0);
+        assert_eq!(writer_fence_count(&verifier), 18);
+        assert_eq!(version_thirteen_commit_evidence(&verifier), evidence);
+        assert_eq!(
+            verifier
+                .query_row(
+                    "SELECT last_sequence FROM memory_vector_sync_mutation_clock WHERE singleton=1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            7_654
+        );
+        assert_eq!(journal_mode(&path), "delete");
+        assert!(!path.with_extension("sqlite3-wal").exists());
+    }
+
     #[test]
     fn storage_initialize_records_publish_only_after_the_coordinator_completes() {
         let _ = take_upgrade_events();

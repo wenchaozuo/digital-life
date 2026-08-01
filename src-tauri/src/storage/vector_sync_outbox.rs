@@ -703,9 +703,11 @@ impl StorageService {
         Ok(Some(selected.to_owned()))
     }
 
-    /// A second, short authority check immediately before external I/O.  It
+    /// A second, short authority check immediately before external I/O. It
     /// cannot make SQLite and LanceDB one transaction, but it prevents a known
-    /// superseded claim from initiating a provider or vector operation.
+    /// superseded or expired claim from initiating a provider or vector
+    /// operation. This guard deliberately does not renew either lease: only a
+    /// new claim may establish a fresh bounded lease interval.
     pub(crate) fn fenced_vector_claim_is_current(
         &self,
         claim: &FencedVectorSyncClaim,
@@ -715,18 +717,10 @@ impl StorageService {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| single_event_error())?;
-        let renewed = tx.execute(
-            "UPDATE memory_vector_sync_runtime_lease
-             SET expires_at=strftime('%Y-%m-%dT%H:%M:%fZ','now','+120 seconds'), updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
-             WHERE lease_name='memory-vector-single-event-consumer' AND owner_id=?1 AND fence_epoch=?2
-               AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')",
-            params![claim.lease_owner, claim.fence_epoch],
-        ).map_err(|_| single_event_error())?;
-        let current = renewed == 1
-            && matches!(
-                inspect_fenced_generation_binding_in(&tx, claim)?,
-                FencedBindingCurrent::Current(_)
-            );
+        let current = matches!(
+            inspect_fenced_generation_binding_in(&tx, claim)?,
+            FencedBindingCurrent::Current(_)
+        );
         tx.commit().map_err(|_| single_event_error())?;
         Ok(current)
     }
@@ -1364,38 +1358,65 @@ fn acquire_runtime_lease(
     ).map_err(|_| single_event_error())
 }
 
+fn authoritative_utc_millis_now_in(
+    tx: &Transaction<'_>,
+) -> Result<String, crate::storage::StorageError> {
+    tx.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |row| {
+        row.get(0)
+    })
+    .map_err(|_| single_event_error())
+}
+
+fn lease_is_current_at(expires_at: Option<&str>, now: &str) -> bool {
+    is_valid_utc_millis_timestamp(now)
+        && expires_at.is_some_and(|value| is_valid_utc_millis_timestamp(value) && value > now)
+}
+
 fn fenced_claim_current_in(
     tx: &Transaction<'_>,
     claim: &FencedVectorSyncClaim,
 ) -> Result<bool, crate::storage::StorageError> {
-    tx.query_row(
-        "SELECT EXISTS(
-           SELECT 1 FROM memory_vector_sync_outbox AS o
-           JOIN memory_vector_sync_runtime_lease AS r
-             ON r.lease_name='memory-vector-single-event-consumer'
-           JOIN memory_vector_generation AS g
-             ON g.generation_id=o.claimed_generation_id
-          WHERE o.id=?1 AND o.mutation_sequence=?2 AND o.state='processing'
-            AND o.lease_owner=?3 AND o.lease_fence_epoch=?4 AND o.claimed_generation_id=?5
-            AND o.target_revision IS ?6 AND o.target_content_hash IS ?7
-            AND g.descriptor_hash=?8 AND g.dimension=?9 AND g.state='building'
-            AND r.owner_id=?3 AND r.fence_epoch=?4
-            AND r.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
-        )",
-        params![
-            claim.id,
-            claim.mutation_sequence,
-            claim.lease_owner,
-            claim.fence_epoch,
-            claim.generation_id,
-            claim.target_revision,
-            claim.target_content_hash,
-            claim.descriptor_hash,
-            claim.dimension as i64,
-        ],
-        |row| Ok(row.get::<_, i64>(0)? == 1),
-    )
-    .map_err(|_| single_event_error())
+    // SQLite creates this canonical UTC-millisecond value once. Both lease
+    // comparisons below use that same captured value, after strict structural
+    // validation makes lexical comparison a comparison of the frozen encoding
+    // rather than an assumption about arbitrary text.
+    let now = authoritative_utc_millis_now_in(tx)?;
+    let leases: Option<(Option<String>, Option<String>)> = tx
+        .query_row(
+            "SELECT o.lease_expires_at, r.expires_at
+               FROM memory_vector_sync_outbox AS o
+               JOIN memory_vector_sync_runtime_lease AS r
+                 ON r.lease_name='memory-vector-single-event-consumer'
+               JOIN memory_vector_generation AS g
+                 ON g.generation_id=o.claimed_generation_id
+              WHERE o.id=?1 AND o.desired_action=?2 AND o.mutation_sequence=?3
+                AND o.state='processing' AND o.lease_owner=?4 AND o.lease_fence_epoch=?5
+                AND o.claimed_generation_id=?6
+                AND o.target_revision IS ?7 AND o.target_content_hash IS ?8
+                AND o.migration_disposition IS NULL
+                AND g.descriptor_hash=?9 AND g.dimension=?10 AND g.state='building'
+                AND r.owner_id=?4 AND r.fence_epoch=?5",
+            params![
+                claim.id,
+                claim.action.as_str(),
+                claim.mutation_sequence,
+                claim.lease_owner,
+                claim.fence_epoch,
+                claim.generation_id,
+                claim.target_revision,
+                claim.target_content_hash,
+                claim.descriptor_hash,
+                claim.dimension as i64,
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|_| single_event_error())?;
+    let Some((outbox_expires_at, runtime_expires_at)) = leases else {
+        return Ok(false);
+    };
+    Ok(lease_is_current_at(outbox_expires_at.as_deref(), &now)
+        && lease_is_current_at(runtime_expires_at.as_deref(), &now))
 }
 
 const GENERATION_BINDING_ROW_COLUMNS: &str = "id, desired_action, mutation_sequence, target_revision, target_content_hash, state, attempt_count, claimed_generation_id, lease_owner, lease_fence_epoch, lease_expires_at, last_send_disposition, last_error_code";
@@ -1465,17 +1486,14 @@ fn binding_row_has_claim_processing_lease(
         && row.lease_fence_epoch == Some(claim.fence_epoch)
 }
 
-fn block_generation_binding_invariant_if_current(
+fn block_generation_binding_scan_snapshot_in(
     tx: &Transaction<'_>,
     row: &GenerationBindingRow,
-    force: bool,
 ) -> Result<InvariantBlockOutcome, crate::storage::StorageError> {
-    if !force
-        && !matches!(
-            row.phase(),
-            GenerationBindingPhase::MissingAfterAttempt | GenerationBindingPhase::Invalid
-        )
-    {
+    if !matches!(
+        row.phase(),
+        GenerationBindingPhase::MissingAfterAttempt | GenerationBindingPhase::Invalid
+    ) {
         return Ok(InvariantBlockOutcome::NotInvariant);
     }
     let changed = tx
@@ -1510,6 +1528,60 @@ fn block_generation_binding_invariant_if_current(
     })
 }
 
+fn block_generation_binding_claim_identity_in(
+    tx: &Transaction<'_>,
+    claim: &FencedVectorSyncClaim,
+    observed: &GenerationBindingRow,
+) -> Result<InvariantBlockOutcome, crate::storage::StorageError> {
+    // A worker may quarantine only the lease identity it actually owns. The
+    // observed generation/attempt/expiry form an additional CAS snapshot, but
+    // mutation, target, owner, and fence always come from the original claim.
+    if !binding_row_has_claim_processing_lease(observed, claim) {
+        return Ok(InvariantBlockOutcome::Superseded);
+    }
+    let generation_mismatch =
+        observed.claimed_generation_id.as_deref() != Some(claim.generation_id());
+    if !generation_mismatch
+        && !matches!(
+            observed.phase(),
+            GenerationBindingPhase::MissingAfterAttempt | GenerationBindingPhase::Invalid
+        )
+    {
+        return Ok(InvariantBlockOutcome::NotInvariant);
+    }
+    let changed = tx
+        .execute(
+            "UPDATE memory_vector_sync_outbox
+             SET state='blocked', next_attempt_at=NULL, lease_owner=NULL,
+                 lease_expires_at=NULL, lease_fence_epoch=NULL,
+                 last_error_code='INTERNAL_INVARIANT',
+                 updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE id=?1 AND desired_action=?2 AND mutation_sequence=?3
+               AND target_revision IS ?4 AND target_content_hash IS ?5
+               AND state='processing' AND lease_owner=?6 AND lease_fence_epoch=?7
+               AND attempt_count=?8 AND claimed_generation_id IS ?9
+               AND lease_expires_at IS ?10 AND migration_disposition IS NULL",
+            params![
+                claim.id,
+                claim.action.as_str(),
+                claim.mutation_sequence,
+                claim.target_revision,
+                claim.target_content_hash,
+                claim.lease_owner,
+                claim.fence_epoch,
+                observed.attempt_count,
+                observed.claimed_generation_id.as_deref(),
+                observed.lease_expires_at.as_deref(),
+            ],
+        )
+        .map_err(|_| single_event_error())?;
+    Ok(if changed == 1 {
+        InvariantBlockOutcome::Applied
+    } else {
+        InvariantBlockOutcome::Superseded
+    })
+}
+
 fn quarantine_generation_binding_invariants_in(
     tx: &Transaction<'_>,
 ) -> Result<usize, crate::storage::StorageError> {
@@ -1517,7 +1589,7 @@ fn quarantine_generation_binding_invariants_in(
     let mut quarantined = 0;
     for row in rows {
         if matches!(
-            block_generation_binding_invariant_if_current(tx, &row, false)?,
+            block_generation_binding_scan_snapshot_in(tx, &row)?,
             InvariantBlockOutcome::Applied
         ) {
             quarantined += 1;
@@ -1538,7 +1610,7 @@ fn quarantine_malformed_target_bindings_in(
         match row.phase() {
             GenerationBindingPhase::MissingAfterAttempt | GenerationBindingPhase::Invalid => {
                 if matches!(
-                    block_generation_binding_invariant_if_current(tx, &row, false)?,
+                    block_generation_binding_scan_snapshot_in(tx, &row)?,
                     InvariantBlockOutcome::Applied
                 ) {
                     quarantined += 1;
@@ -1593,22 +1665,24 @@ fn inspect_fenced_generation_binding_in(
     let Some(row) = generation_binding_row_for_claim_in(tx, claim)? else {
         return Ok(FencedBindingCurrent::NotCurrent);
     };
+    // A stale owner, fence, mutation, target, state, or migration boundary is
+    // never evidence that the current row is corrupt. It belongs to a newer
+    // worker or mutation and must remain untouched by this claim.
+    if !binding_row_has_claim_processing_lease(&row, claim) {
+        return Ok(FencedBindingCurrent::NotCurrent);
+    }
     let phase = row.phase();
     let matches_claim_generation =
         row.claimed_generation_id.as_deref() == Some(claim.generation_id());
-    let has_claim_processing_lease = binding_row_has_claim_processing_lease(&row, claim);
     let must_quarantine = matches!(
         phase,
         GenerationBindingPhase::MissingAfterAttempt | GenerationBindingPhase::Invalid
-    ) || (has_claim_processing_lease && !matches_claim_generation);
+    ) || !matches_claim_generation;
     if must_quarantine {
-        let _ = block_generation_binding_invariant_if_current(tx, &row, true)?;
+        let _ = block_generation_binding_claim_identity_in(tx, claim, &row)?;
         return Ok(FencedBindingCurrent::NotCurrent);
     }
-    if !has_claim_processing_lease
-        || !matches_claim_generation
-        || !fenced_claim_current_in(tx, claim)?
-    {
+    if !matches_claim_generation || !fenced_claim_current_in(tx, claim)? {
         return Ok(FencedBindingCurrent::NotCurrent);
     }
     match phase {
@@ -1726,7 +1800,7 @@ fn recover_expired_fenced_processing_in(
             }
             GenerationBindingPhase::MissingAfterAttempt | GenerationBindingPhase::Invalid => {
                 if matches!(
-                    block_generation_binding_invariant_if_current(tx, &row, false)?,
+                    block_generation_binding_scan_snapshot_in(tx, &row)?,
                     InvariantBlockOutcome::Applied
                 ) {
                     recovered += 1;
@@ -2055,9 +2129,8 @@ impl MemoryVectorSyncOutboxRepository for StorageService {
         for row in rows {
             match row.phase() {
                 GenerationBindingPhase::MissingAfterAttempt | GenerationBindingPhase::Invalid => {
-                    let outcome =
-                        block_generation_binding_invariant_if_current(&transaction, &row, false)
-                            .map_err(|_| outbox_error())?;
+                    let outcome = block_generation_binding_scan_snapshot_in(&transaction, &row)
+                        .map_err(|_| outbox_error())?;
                     retried += usize::from(matches!(outcome, InvariantBlockOutcome::Applied));
                 }
                 GenerationBindingPhase::Unbound | GenerationBindingPhase::Durable => {
@@ -2284,7 +2357,9 @@ mod tests {
     use super::*;
     use crate::{
         memory::{
-            revisions::{DeleteMemoryPermanentlyRequest, MemoryRevisionService},
+            revisions::{
+                DeleteMemoryPermanentlyRequest, MemoryRevisionService, UpdateConfirmedMemoryRequest,
+            },
             ConfirmMemoryRequest, CreateMemoryCandidateRequest, MemoryKind, MemoryService,
             MemorySourceType,
         },
@@ -3255,6 +3330,141 @@ mod tests {
         let job = storage.list("life").unwrap().remove(0);
         assert_eq!(job.state, MemoryVectorSyncState::Processing);
         assert_eq!(job.attempt_count, 1);
+    }
+
+    #[test]
+    fn fenced_claim_current_requires_both_unexpired_leases() {
+        let (_root, storage) = storage();
+        let record = confirmed(&storage, false);
+        storage
+            .register_building_vector_generation("generation-a", "descriptor-a", 2)
+            .unwrap();
+        let claim = storage
+            .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-a")
+            .unwrap()
+            .unwrap();
+        let runtime_before: String = storage
+            .state()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT expires_at FROM memory_vector_sync_runtime_lease
+                 WHERE lease_name='memory-vector-single-event-consumer'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(storage.fenced_vector_claim_is_current(&claim).unwrap());
+        let runtime_after: String = storage
+            .state()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT expires_at FROM memory_vector_sync_runtime_lease
+                 WHERE lease_name='memory-vector-single-event-consumer'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            runtime_after, runtime_before,
+            "current guard must not renew"
+        );
+
+        storage
+            .state()
+            .unwrap()
+            .connection
+            .execute(
+                "UPDATE memory_vector_sync_outbox
+                 SET lease_expires_at='2000-01-01T00:00:00.000Z'
+                 WHERE life_id=?1 AND memory_id=?2",
+                params![record.life_id, record.id],
+            )
+            .unwrap();
+        assert!(!storage.fenced_vector_claim_is_current(&claim).unwrap());
+        assert_eq!(
+            storage.mark_fenced_attempt_started(&claim).unwrap(),
+            FencedAttemptStartResult::LostLeaseOrSuperseded
+        );
+        let expired = storage
+            .test_get_outbox_snapshot_detailed("life", claim.memory_id())
+            .unwrap();
+        assert_eq!(expired.state, "processing");
+        assert_eq!(expired.attempt_count, 0);
+        assert_eq!(
+            expired.claimed_generation_id.as_deref(),
+            Some("generation-a")
+        );
+        assert_eq!(expired.lease_owner.as_deref(), Some("worker-a"));
+        assert_eq!(expired.lease_fence_epoch, Some(claim.fence_epoch()));
+        assert_eq!(
+            expired.lease_expires_at.as_deref(),
+            Some("2000-01-01T00:00:00.000Z")
+        );
+        assert_eq!(expired.last_error_code, None);
+        assert_eq!(expired.last_send_disposition, None);
+    }
+
+    #[test]
+    fn fenced_claim_current_stale_mutation_does_not_quarantine_replacement() {
+        let (root, first) = storage();
+        let record = confirmed(&first, false);
+        first
+            .register_building_vector_generation("generation-a", "descriptor-a", 2)
+            .unwrap();
+        let claim = first
+            .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-a")
+            .unwrap()
+            .unwrap();
+        let old = first
+            .test_get_outbox_snapshot_detailed(&record.life_id, &record.id)
+            .unwrap();
+        let old_revision = old.target_revision.expect("old revision");
+        let old_hash = old.target_content_hash.clone().expect("old hash");
+        first
+            .state()
+            .unwrap()
+            .connection
+            .execute(
+                "UPDATE memory_vector_sync_outbox
+                 SET claimed_generation_id=NULL
+                 WHERE life_id=?1 AND memory_id=?2",
+                params![record.life_id, record.id],
+            )
+            .unwrap();
+
+        let second = StorageService::initialize_with_roots(root.0.join("data"), None).unwrap();
+        let update = MemoryRevisionService::new(&second)
+            .update_confirmed(UpdateConfirmedMemoryRequest {
+                life_id: record.life_id.clone(),
+                memory_id: record.id.clone(),
+                expected_revision: old_revision,
+                kind: MemoryKind::Fact,
+                content: "stale worker replacement content".into(),
+                summary: Some("stale worker replacement summary".into()),
+            })
+            .unwrap();
+        assert!(update.revision > old_revision);
+
+        assert!(!first.fenced_vector_claim_is_current(&claim).unwrap());
+        let replacement = first
+            .test_get_outbox_snapshot_detailed(&record.life_id, &record.id)
+            .unwrap();
+        assert_eq!(replacement.state, "pending");
+        assert!(replacement.mutation_sequence > old.mutation_sequence);
+        assert!(replacement.target_revision.expect("new revision") > old_revision);
+        assert_ne!(
+            replacement.target_content_hash.as_deref(),
+            Some(old_hash.as_str())
+        );
+        assert_eq!(replacement.attempt_count, 0);
+        assert_eq!(replacement.claimed_generation_id, None);
+        assert_eq!(replacement.last_send_disposition, None);
+        assert_eq!(replacement.last_error_code, None);
+        assert_eq!(replacement.lease_owner, None);
+        assert_eq!(replacement.lease_fence_epoch, None);
+        assert_eq!(replacement.lease_expires_at, None);
     }
 
     #[test]
@@ -4251,6 +4461,92 @@ mod tests {
     }
 
     #[test]
+    fn claim_quarantine_is_visible_through_production_outbox_health_api() {
+        let (_root, storage) = storage();
+        let operational = confirmed(&storage, false);
+        let isolated = confirmed(&storage, false);
+        let unknown_send = confirmed(&storage, false);
+        storage
+            .register_building_vector_generation("generation-a", "descriptor-a", 2)
+            .unwrap();
+        let database =
+            rusqlite::Connection::open(storage.test_database_main_path().unwrap()).unwrap();
+        database
+            .execute(
+                "UPDATE memory_vector_sync_outbox
+                 SET state='pending', attempt_count=1, claimed_generation_id=NULL,
+                     lease_owner=NULL, lease_fence_epoch=NULL, lease_expires_at=NULL
+                 WHERE life_id=?1 AND memory_id=?2",
+                params![operational.life_id, operational.id],
+            )
+            .unwrap();
+        database
+            .execute(
+                "UPDATE memory_vector_sync_outbox
+                 SET state='pending', attempt_count=1, claimed_generation_id=NULL,
+                     lease_owner=NULL, lease_fence_epoch=NULL, lease_expires_at=NULL,
+                     migration_disposition='legacy_upsert_rebuild_required'
+                 WHERE life_id=?1 AND memory_id=?2",
+                params![isolated.life_id, isolated.id],
+            )
+            .unwrap();
+        database
+            .execute(
+                "UPDATE memory_vector_sync_outbox
+                 SET state='blocked', attempt_count=1, claimed_generation_id='generation-a',
+                     lease_owner=NULL, lease_fence_epoch=NULL, lease_expires_at=NULL,
+                     last_send_disposition='possibly_sent', last_error_code='PROVIDER_RESULT_UNKNOWN'
+                 WHERE life_id=?1 AND memory_id=?2",
+                params![unknown_send.life_id, unknown_send.id],
+            )
+            .unwrap();
+
+        let before = storage
+            .inspect_outbox_sync_health("generation-a", 3, 0)
+            .unwrap();
+        assert_eq!(before.pending_count, 1);
+        assert_eq!(before.blocked_count, 1);
+        assert_eq!(before.internal_invariant_count, 0);
+        assert_eq!(before.provider_result_unknown_count, 1);
+
+        assert!(storage
+            .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-a")
+            .unwrap()
+            .is_none());
+
+        let after = storage
+            .inspect_outbox_sync_health("generation-a", 3, 0)
+            .unwrap();
+        assert_eq!(after.pending_count, 0);
+        assert_eq!(after.blocked_count, 2);
+        assert_eq!(after.internal_invariant_count, 1);
+        assert_eq!(after.provider_result_unknown_count, 1);
+
+        let isolated_after = storage
+            .test_get_outbox_snapshot_detailed(&isolated.life_id, &isolated.id)
+            .unwrap();
+        assert_eq!(isolated_after.state, "pending");
+        assert_eq!(isolated_after.attempt_count, 1);
+        assert_eq!(isolated_after.claimed_generation_id, None);
+        assert_eq!(
+            isolated_after.migration_disposition.as_deref(),
+            Some("legacy_upsert_rebuild_required")
+        );
+        let unknown_after = storage
+            .test_get_outbox_snapshot_detailed(&unknown_send.life_id, &unknown_send.id)
+            .unwrap();
+        assert_eq!(unknown_after.state, "blocked");
+        assert_eq!(
+            unknown_after.last_error_code.as_deref(),
+            Some("PROVIDER_RESULT_UNKNOWN")
+        );
+        assert_eq!(
+            unknown_after.last_send_disposition.as_deref(),
+            Some("possibly_sent")
+        );
+    }
+
+    #[test]
     fn generation_binding_two_connections_claim_at_most_once_for_ten_rounds() {
         for round in 0..10 {
             let (root, first) = storage();
@@ -4332,7 +4628,7 @@ mod tests {
     }
 
     #[test]
-    fn generation_binding_invariant_stale_cas_preserves_new_mutation_for_ten_rounds() {
+    fn generation_binding_invariant_stale_cas_preserves_real_new_mutation_for_ten_rounds() {
         for round in 0..10 {
             let (root, first) = storage();
             let record = confirmed(&first, false);
@@ -4343,6 +4639,11 @@ mod tests {
                 .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-a")
                 .unwrap()
                 .unwrap();
+            let old = first
+                .test_get_outbox_snapshot_detailed(&record.life_id, &record.id)
+                .unwrap();
+            let old_revision = old.target_revision.expect("upsert target revision");
+            let old_hash = old.target_content_hash.clone().expect("upsert target hash");
             first
                 .state()
                 .unwrap()
@@ -4376,13 +4677,17 @@ mod tests {
             let replacement_life_id = record.life_id.clone();
             let replacement_memory_id = record.id.clone();
             let replacement = thread::spawn(move || {
-                second
-                    .enqueue(EnqueueMemoryVectorSyncRequest {
+                let update = MemoryRevisionService::new(&second)
+                    .update_confirmed(UpdateConfirmedMemoryRequest {
                         life_id: replacement_life_id,
                         memory_id: replacement_memory_id,
-                        desired_action: MemoryVectorSyncAction::Upsert,
+                        expected_revision: old_revision,
+                        kind: MemoryKind::Fact,
+                        content: format!("replacement content {round}"),
+                        summary: Some(format!("replacement summary {round}")),
                     })
                     .unwrap();
+                assert!(update.revision > old_revision, "round {round}");
                 committed_tx.send(()).unwrap();
             });
             let stale_block = thread::spawn(move || {
@@ -4393,8 +4698,7 @@ mod tests {
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .unwrap();
                 let outcome =
-                    block_generation_binding_invariant_if_current(&transaction, &expected, false)
-                        .unwrap();
+                    block_generation_binding_scan_snapshot_in(&transaction, &expected).unwrap();
                 transaction.commit().unwrap();
                 outcome
             });
@@ -4411,12 +4715,26 @@ mod tests {
                 .test_get_outbox_snapshot_detailed(&record.life_id, &record.id)
                 .unwrap();
             assert_eq!(snapshot.state, "pending", "round {round}");
+            assert!(
+                snapshot.mutation_sequence > old.mutation_sequence,
+                "round {round}"
+            );
+            assert!(
+                snapshot.target_revision.expect("new target revision") > old_revision,
+                "round {round}"
+            );
+            assert_ne!(
+                snapshot.target_content_hash.as_deref(),
+                Some(old_hash.as_str()),
+                "round {round}"
+            );
             assert_eq!(snapshot.attempt_count, 0, "round {round}");
             assert_eq!(snapshot.claimed_generation_id, None, "round {round}");
             assert_eq!(snapshot.lease_owner, None, "round {round}");
             assert_eq!(snapshot.lease_fence_epoch, None, "round {round}");
             assert_eq!(snapshot.lease_expires_at, None, "round {round}");
             assert_eq!(snapshot.last_error_code, None, "round {round}");
+            assert_eq!(snapshot.last_send_disposition, None, "round {round}");
         }
     }
 }

@@ -7127,9 +7127,10 @@ mod tests {
         }
     }
 
-    fn assert_execute_claim_binding_corruption_has_zero_external_io(
+    fn execute_claim_after_database_mutation_has_zero_external_io(
         action: MemoryVectorSyncAction,
-        corrupted_generation: Option<&str>,
+        mutate: impl FnOnce(&rusqlite::Connection, &std::path::Path, &str, &str, &FencedVectorSyncClaim),
+        assert_after: impl FnOnce(&StorageService, &str, &str, &str, &str, i64),
     ) {
         let (_temp, storage) = test_storage();
         let (context, raw_vectors) = drained_context();
@@ -7151,6 +7152,9 @@ mod tests {
             )
             .unwrap()
             .unwrap();
+        let expected_generation = context.generation_id().as_str().to_owned();
+        let expected_owner = claim.lease_owner().to_owned();
+        let expected_fence = claim.fence_epoch();
         let provider_requests = Arc::new(AtomicUsize::new(0));
         let embedding_successes = Arc::new(AtomicUsize::new(0));
         let raw_provider = crate::embedding::DeterministicEmbeddingProvider::new(3);
@@ -7170,16 +7174,9 @@ mod tests {
         };
         let consumer =
             FencedVectorSyncSingleEventConsumer::new(&storage, &provider, &vectors, context);
-        let database =
-            rusqlite::Connection::open(storage.test_database_main_path().unwrap()).unwrap();
-        database
-            .execute(
-                "UPDATE memory_vector_sync_outbox
-                 SET claimed_generation_id=?1
-                 WHERE life_id=?2 AND memory_id=?3",
-                rusqlite::params![corrupted_generation, life_id, memory_id],
-            )
-            .unwrap();
+        let database_path = storage.test_database_main_path().unwrap();
+        let database = rusqlite::Connection::open(&database_path).unwrap();
+        mutate(&database, &database_path, &life_id, &memory_id, &claim);
         assert_eq!(
             tauri::async_runtime::block_on(consumer.execute_claim(claim, 0)).unwrap(),
             FencedVectorSyncSingleEventResult::LostLeaseOrSuperseded
@@ -7188,22 +7185,203 @@ mod tests {
         assert_eq!(embedding_successes.load(Ordering::SeqCst), 0);
         assert_eq!(lance_upserts.load(Ordering::SeqCst), 0);
         assert_eq!(lance_deletes.load(Ordering::SeqCst), 0);
-        let snapshot = storage
-            .test_get_outbox_snapshot_detailed(&life_id, &memory_id)
+        assert_after(
+            &storage,
+            &life_id,
+            &memory_id,
+            &expected_generation,
+            &expected_owner,
+            expected_fence,
+        );
+    }
+
+    fn assert_runtime_lease_is_current(
+        storage: &StorageService,
+        expected_owner: &str,
+        expected_fence: i64,
+    ) {
+        let database =
+            rusqlite::Connection::open(storage.test_database_main_path().unwrap()).unwrap();
+        let count: i64 = database
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM memory_vector_sync_runtime_lease
+                 WHERE lease_name='memory-vector-single-event-consumer'
+                   AND owner_id=?1 AND fence_epoch=?2
+                   AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+                rusqlite::params![expected_owner, expected_fence],
+                |row| row.get(0),
+            )
             .unwrap();
-        assert_eq!(snapshot.state, "blocked");
-        assert_eq!(
-            snapshot.last_error_code.as_deref(),
-            Some("INTERNAL_INVARIANT")
+        assert_eq!(count, 1, "the runtime lease must remain current");
+    }
+
+    fn assert_outbox_lease_is_current(
+        storage: &StorageService,
+        life_id: &str,
+        memory_id: &str,
+        expected_owner: &str,
+        expected_fence: i64,
+    ) {
+        let database =
+            rusqlite::Connection::open(storage.test_database_main_path().unwrap()).unwrap();
+        let count: i64 = database
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM memory_vector_sync_outbox
+                 WHERE life_id=?1 AND memory_id=?2 AND state='processing'
+                   AND lease_owner=?3 AND lease_fence_epoch=?4
+                   AND lease_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+                rusqlite::params![life_id, memory_id, expected_owner, expected_fence],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "the outbox lease must remain current");
+    }
+
+    fn assert_execute_claim_binding_corruption_has_zero_external_io(
+        action: MemoryVectorSyncAction,
+        corrupted_generation: Option<&str>,
+    ) {
+        execute_claim_after_database_mutation_has_zero_external_io(
+            action,
+            |database, _database_path, life_id, memory_id, _claim| {
+                database
+                    .execute(
+                        "UPDATE memory_vector_sync_outbox
+                         SET claimed_generation_id=?1
+                         WHERE life_id=?2 AND memory_id=?3",
+                        rusqlite::params![corrupted_generation, life_id, memory_id],
+                    )
+                    .unwrap();
+            },
+            |storage,
+             life_id,
+             memory_id,
+             _expected_generation,
+             _expected_owner,
+             _expected_fence| {
+                let snapshot = storage
+                    .test_get_outbox_snapshot_detailed(life_id, memory_id)
+                    .unwrap();
+                assert_eq!(snapshot.state, "blocked");
+                assert_eq!(
+                    snapshot.last_error_code.as_deref(),
+                    Some("INTERNAL_INVARIANT")
+                );
+                assert_eq!(snapshot.attempt_count, 0);
+                assert_eq!(
+                    snapshot.claimed_generation_id.as_deref(),
+                    corrupted_generation
+                );
+                assert_eq!(snapshot.lease_owner, None);
+                assert_eq!(snapshot.lease_fence_epoch, None);
+                assert_eq!(snapshot.lease_expires_at, None);
+            },
         );
-        assert_eq!(snapshot.attempt_count, 0);
-        assert_eq!(
-            snapshot.claimed_generation_id.as_deref(),
-            corrupted_generation
+    }
+
+    fn assert_execute_claim_outbox_lease_expired_has_zero_external_io(
+        action: MemoryVectorSyncAction,
+    ) {
+        execute_claim_after_database_mutation_has_zero_external_io(
+            action,
+            |database, _database_path, life_id, memory_id, _claim| {
+                database
+                    .execute(
+                        "UPDATE memory_vector_sync_outbox
+                         SET lease_expires_at='2000-01-01T00:00:00.000Z'
+                         WHERE life_id=?1 AND memory_id=?2",
+                        rusqlite::params![life_id, memory_id],
+                    )
+                    .unwrap();
+            },
+            |storage, life_id, memory_id, expected_generation, expected_owner, expected_fence| {
+                let before_recovery = storage
+                    .test_get_outbox_snapshot_detailed(life_id, memory_id)
+                    .unwrap();
+                assert_eq!(before_recovery.state, "processing");
+                assert_eq!(before_recovery.attempt_count, 0);
+                assert_eq!(
+                    before_recovery.claimed_generation_id.as_deref(),
+                    Some(expected_generation)
+                );
+                assert_eq!(before_recovery.lease_owner.as_deref(), Some(expected_owner));
+                assert_eq!(before_recovery.lease_fence_epoch, Some(expected_fence));
+                assert_eq!(
+                    before_recovery.lease_expires_at.as_deref(),
+                    Some("2000-01-01T00:00:00.000Z")
+                );
+                assert_eq!(before_recovery.last_error_code, None);
+                assert_eq!(before_recovery.last_send_disposition, None);
+                assert_runtime_lease_is_current(storage, expected_owner, expected_fence);
+
+                assert_eq!(
+                    storage
+                        .test_recover_expired_fenced_processing_for_generation_binding(
+                            1_700_000_000_000,
+                        )
+                        .unwrap(),
+                    1
+                );
+                let after_recovery = storage
+                    .test_get_outbox_snapshot_detailed(life_id, memory_id)
+                    .unwrap();
+                assert_eq!(after_recovery.state, "pending");
+                assert_eq!(after_recovery.attempt_count, 0);
+                assert_eq!(after_recovery.claimed_generation_id, None);
+                assert_eq!(after_recovery.lease_owner, None);
+                assert_eq!(after_recovery.lease_fence_epoch, None);
+                assert_eq!(after_recovery.lease_expires_at, None);
+                assert_eq!(after_recovery.last_error_code, None);
+                assert_eq!(after_recovery.last_send_disposition, None);
+            },
         );
-        assert_eq!(snapshot.lease_owner, None);
-        assert_eq!(snapshot.lease_fence_epoch, None);
-        assert_eq!(snapshot.lease_expires_at, None);
+    }
+
+    fn assert_execute_claim_stale_lease_identity_is_non_mutating(
+        replacement_owner: &str,
+        replacement_fence_delta: i64,
+    ) {
+        execute_claim_after_database_mutation_has_zero_external_io(
+            MemoryVectorSyncAction::Upsert,
+            |database, _database_path, life_id, memory_id, claim| {
+                database
+                    .execute(
+                        "UPDATE memory_vector_sync_outbox
+                         SET claimed_generation_id=NULL, lease_owner=?1,
+                             lease_fence_epoch=?2,
+                             lease_expires_at='2099-01-01T00:00:00.000Z'
+                         WHERE life_id=?3 AND memory_id=?4",
+                        rusqlite::params![
+                            replacement_owner,
+                            claim.fence_epoch() + replacement_fence_delta,
+                            life_id,
+                            memory_id,
+                        ],
+                    )
+                    .unwrap();
+            },
+            |storage, life_id, memory_id, _expected_generation, _expected_owner, expected_fence| {
+                let snapshot = storage
+                    .test_get_outbox_snapshot_detailed(life_id, memory_id)
+                    .unwrap();
+                assert_eq!(snapshot.state, "processing");
+                assert_eq!(snapshot.attempt_count, 0);
+                assert_eq!(snapshot.claimed_generation_id, None);
+                assert_eq!(snapshot.lease_owner.as_deref(), Some(replacement_owner));
+                assert_eq!(
+                    snapshot.lease_fence_epoch,
+                    Some(expected_fence + replacement_fence_delta)
+                );
+                assert_eq!(
+                    snapshot.lease_expires_at.as_deref(),
+                    Some("2099-01-01T00:00:00.000Z")
+                );
+                assert_eq!(snapshot.last_error_code, None);
+                assert_eq!(snapshot.last_send_disposition, None);
+            },
+        );
     }
 
     #[test]
@@ -7235,6 +7413,139 @@ mod tests {
         assert_execute_claim_binding_corruption_has_zero_external_io(
             MemoryVectorSyncAction::Delete,
             Some("generation-not-the-run"),
+        );
+    }
+
+    #[test]
+    fn execute_claim_upsert_expired_outbox_lease_has_zero_external_io() {
+        assert_execute_claim_outbox_lease_expired_has_zero_external_io(
+            MemoryVectorSyncAction::Upsert,
+        );
+    }
+
+    #[test]
+    fn execute_claim_delete_expired_outbox_lease_has_zero_external_io() {
+        assert_execute_claim_outbox_lease_expired_has_zero_external_io(
+            MemoryVectorSyncAction::Delete,
+        );
+    }
+
+    #[test]
+    fn execute_claim_expired_runtime_lease_has_zero_external_io() {
+        execute_claim_after_database_mutation_has_zero_external_io(
+            MemoryVectorSyncAction::Upsert,
+            |database, _database_path, _life_id, _memory_id, _claim| {
+                database
+                    .execute(
+                        "UPDATE memory_vector_sync_runtime_lease
+                         SET expires_at='2000-01-01T00:00:00.000Z'",
+                        [],
+                    )
+                    .unwrap();
+            },
+            |storage, life_id, memory_id, expected_generation, expected_owner, expected_fence| {
+                let snapshot = storage
+                    .test_get_outbox_snapshot_detailed(life_id, memory_id)
+                    .unwrap();
+                assert_eq!(snapshot.state, "processing");
+                assert_eq!(snapshot.attempt_count, 0);
+                assert_eq!(
+                    snapshot.claimed_generation_id.as_deref(),
+                    Some(expected_generation)
+                );
+                assert_eq!(snapshot.lease_owner.as_deref(), Some(expected_owner));
+                assert_eq!(snapshot.lease_fence_epoch, Some(expected_fence));
+                assert_ne!(
+                    snapshot.lease_expires_at.as_deref(),
+                    Some("2000-01-01T00:00:00.000Z")
+                );
+                assert_eq!(snapshot.last_error_code, None);
+                assert_eq!(snapshot.last_send_disposition, None);
+                assert_outbox_lease_is_current(
+                    storage,
+                    life_id,
+                    memory_id,
+                    expected_owner,
+                    expected_fence,
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn execute_claim_stale_owner_with_invalid_binding_preserves_current_lease() {
+        assert_execute_claim_stale_lease_identity_is_non_mutating("worker-b", 1);
+    }
+
+    #[test]
+    fn execute_claim_stale_fence_with_invalid_binding_preserves_current_lease() {
+        assert_execute_claim_stale_lease_identity_is_non_mutating("binding-worker", 1);
+    }
+
+    #[test]
+    fn execute_claim_stale_new_claim_with_invalid_binding_preserves_new_lease() {
+        execute_claim_after_database_mutation_has_zero_external_io(
+            MemoryVectorSyncAction::Upsert,
+            |database, database_path, life_id, memory_id, claim| {
+                database
+                    .execute(
+                        "UPDATE memory_vector_sync_runtime_lease
+                         SET expires_at='2000-01-01T00:00:00.000Z'",
+                        [],
+                    )
+                    .unwrap();
+                database
+                    .execute(
+                        "UPDATE memory_vector_sync_outbox
+                         SET lease_expires_at='2000-01-01T00:00:00.000Z'
+                         WHERE life_id=?1 AND memory_id=?2",
+                        rusqlite::params![life_id, memory_id],
+                    )
+                    .unwrap();
+                let second = StorageService::initialize_with_roots(
+                    database_path.parent().unwrap().to_path_buf(),
+                    None,
+                )
+                .unwrap();
+                let (descriptor_hash, dimension): (String, i64) = database
+                    .query_row(
+                        "SELECT descriptor_hash, dimension FROM memory_vector_generation WHERE generation_id=?1",
+                        rusqlite::params![claim.generation_id()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                let new_claim = second
+                    .claim_one_fenced_vector_sync(
+                        claim.generation_id(),
+                        &descriptor_hash,
+                        usize::try_from(dimension).unwrap(),
+                        "worker-b",
+                    )
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(new_claim.mutation_sequence(), claim.mutation_sequence());
+                assert!(new_claim.fence_epoch() > claim.fence_epoch());
+                database
+                    .execute(
+                        "UPDATE memory_vector_sync_outbox
+                         SET claimed_generation_id=NULL
+                         WHERE life_id=?1 AND memory_id=?2",
+                        rusqlite::params![life_id, memory_id],
+                    )
+                    .unwrap();
+            },
+            |storage, life_id, memory_id, _expected_generation, _expected_owner, expected_fence| {
+                let snapshot = storage
+                    .test_get_outbox_snapshot_detailed(life_id, memory_id)
+                    .unwrap();
+                assert_eq!(snapshot.state, "processing");
+                assert_eq!(snapshot.attempt_count, 0);
+                assert_eq!(snapshot.claimed_generation_id, None);
+                assert_eq!(snapshot.lease_owner.as_deref(), Some("worker-b"));
+                assert!(snapshot.lease_fence_epoch.expect("new worker fence") > expected_fence);
+                assert_eq!(snapshot.last_error_code, None);
+                assert_eq!(snapshot.last_send_disposition, None);
+            },
         );
     }
 }

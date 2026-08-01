@@ -6,11 +6,30 @@ use super::{connection, writer_fence_manifest, StorageError, MIGRATIONS};
 
 pub(super) const LAST_STATIC_MIGRATION_VERSION: i64 = 12;
 const WRITER_FENCE_MIGRATION_NAME: &str = "013_historical_outbox_isolation_and_writer_fence";
+pub(super) const ATTEMPT_CLAIM_IDENTITY_SCHEMA_VERSION: i64 = 14;
+const ATTEMPT_CLAIM_IDENTITY_MIGRATION_NAME: &str = "014_vector_sync_attempt_claim_identity";
+#[cfg(test)]
+const FENCED_CLAIM_EPOCH_COLUMN_DDL: &str =
+    "fenced_claim_epoch INTEGER NOT NULL DEFAULT 0 CHECK (fenced_claim_epoch >= 0)";
+#[cfg(test)]
+const LAST_MARKED_CLAIM_EPOCH_COLUMN_DDL: &str = "last_marked_claim_epoch INTEGER NOT NULL DEFAULT 0 CHECK (last_marked_claim_epoch >= 0 AND last_marked_claim_epoch <= fenced_claim_epoch AND (last_marked_claim_epoch = 0 OR attempt_count > 0))";
+const ADD_FENCED_CLAIM_EPOCH_COLUMN_SQL: &str = "ALTER TABLE memory_vector_sync_outbox ADD COLUMN fenced_claim_epoch INTEGER NOT NULL DEFAULT 0 CHECK (fenced_claim_epoch >= 0)";
+const ADD_LAST_MARKED_CLAIM_EPOCH_COLUMN_SQL: &str = "ALTER TABLE memory_vector_sync_outbox ADD COLUMN last_marked_claim_epoch INTEGER NOT NULL DEFAULT 0 CHECK (last_marked_claim_epoch >= 0 AND last_marked_claim_epoch <= fenced_claim_epoch AND (last_marked_claim_epoch = 0 OR attempt_count > 0))";
+const NORMALIZED_FENCED_CLAIM_EPOCH_COLUMN_DDL: &str =
+    "fenced_claim_epochintegernotnulldefault0check(fenced_claim_epoch>=0)";
+const NORMALIZED_LAST_MARKED_CLAIM_EPOCH_COLUMN_DDL: &str = "last_marked_claim_epochintegernotnulldefault0check(last_marked_claim_epoch>=0andlast_marked_claim_epoch<=fenced_claim_epochand(last_marked_claim_epoch=0orattempt_count>0))";
 
 /// The fixed H1-B schema phase is applied exactly once after static migrations
 /// 1 through 12 have completed in the caller-owned transaction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum WriterFenceSchemaUpgrade {
+    Applied,
+}
+
+/// The fixed ATT-I1 schema phase is applied exactly once after the version-13
+/// writer-fence phase in the caller-owned transaction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum AttemptClaimIdentitySchemaUpgrade {
     Applied,
 }
 
@@ -43,10 +62,7 @@ pub(super) fn apply_pending_migrations_in_transaction(
 pub(super) fn apply_writer_fence_schema_upgrade_if_registered(
     transaction: &Transaction<'_>,
 ) -> Result<WriterFenceSchemaUpgrade, StorageError> {
-    debug_assert_eq!(
-        writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION,
-        connection::MAX_SUPPORTED_SCHEMA_VERSION
-    );
+    debug_assert_eq!(writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION, 13);
     debug_assert_eq!(
         writer_fence_manifest::writer_fence_trigger_specs().len(),
         18
@@ -79,6 +95,167 @@ pub(super) fn apply_writer_fence_schema_upgrade_if_registered(
     }
     writer_fence_manifest::validate_writer_fence_manifest(transaction)?;
     Ok(WriterFenceSchemaUpgrade::Applied)
+}
+
+/// Fixed ATT-I1 extension location. It accepts only the caller-owned
+/// transaction and performs the repository's sole authoritative version-14
+/// schema change; callers cannot supply SQL, callbacks, names, or versions.
+pub(super) fn apply_attempt_claim_identity_schema_upgrade(
+    transaction: &Transaction<'_>,
+) -> Result<AttemptClaimIdentitySchemaUpgrade, StorageError> {
+    if connection::read_schema_version(transaction)?
+        != writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION
+    {
+        return Err(StorageError::migration_version_invariant_failed());
+    }
+
+    #[cfg(test)]
+    if should_fail_migration_014_at_for_test(Migration014Failpoint::FirstColumn) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    transaction
+        .execute_batch(ADD_FENCED_CLAIM_EPOCH_COLUMN_SQL)
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+
+    #[cfg(test)]
+    if should_fail_migration_014_at_for_test(Migration014Failpoint::SecondColumn) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    transaction
+        .execute_batch(ADD_LAST_MARKED_CLAIM_EPOCH_COLUMN_SQL)
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+
+    #[cfg(test)]
+    if should_fail_migration_014_at_for_test(Migration014Failpoint::SchemaVersion) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    transaction
+        .execute(
+            "INSERT INTO schema_migration (version, name, applied_at)
+             VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+            params![
+                ATTEMPT_CLAIM_IDENTITY_SCHEMA_VERSION,
+                ATTEMPT_CLAIM_IDENTITY_MIGRATION_NAME
+            ],
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+
+    #[cfg(test)]
+    if should_fail_migration_014_at_for_test(Migration014Failpoint::SchemaValidation) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    validate_attempt_claim_identity_schema(transaction)?;
+
+    #[cfg(test)]
+    if should_fail_migration_014_at_for_test(Migration014Failpoint::ManifestValidation) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    writer_fence_manifest::validate_writer_fence_manifest(transaction)?;
+    Ok(AttemptClaimIdentitySchemaUpgrade::Applied)
+}
+
+/// Validates the exact ATT-I1 outbox column definitions from SQLite's own
+/// schema. This read-only validator does not repair or mutate database state.
+pub(super) fn validate_attempt_claim_identity_schema(
+    connection: &Connection,
+) -> Result<(), StorageError> {
+    let mut statement = connection
+        .prepare("PRAGMA table_info(memory_vector_sync_outbox)")
+        .map_err(|_| StorageError::attempt_claim_identity_schema_invalid())?;
+    let columns = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })
+        .map_err(|_| StorageError::attempt_claim_identity_schema_invalid())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| StorageError::attempt_claim_identity_schema_invalid())?;
+
+    for expected in ["fenced_claim_epoch", "last_marked_claim_epoch"] {
+        let matches = columns
+            .iter()
+            .filter(|(name, _, _, _)| name == expected)
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            return Err(StorageError::attempt_claim_identity_schema_invalid());
+        }
+        let (_, declared_type, not_null, default_value) = matches[0];
+        if !declared_type.eq_ignore_ascii_case("INTEGER")
+            || *not_null != 1
+            || default_value
+                .as_deref()
+                .map(normalize_schema_fragment)
+                .as_deref()
+                != Some("0")
+        {
+            return Err(StorageError::attempt_claim_identity_schema_invalid());
+        }
+    }
+
+    let table_sql: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema
+             WHERE type='table' AND name='memory_vector_sync_outbox'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| StorageError::attempt_claim_identity_schema_invalid())?;
+    let definitions = table_sql
+        .as_deref()
+        .and_then(normalized_top_level_column_definitions)
+        .ok_or_else(StorageError::attempt_claim_identity_schema_invalid)?;
+    for expected in [
+        NORMALIZED_FENCED_CLAIM_EPOCH_COLUMN_DDL,
+        NORMALIZED_LAST_MARKED_CLAIM_EPOCH_COLUMN_DDL,
+    ] {
+        if definitions
+            .iter()
+            .filter(|definition| definition.as_str() == expected)
+            .count()
+            != 1
+        {
+            return Err(StorageError::attempt_claim_identity_schema_invalid());
+        }
+    }
+    Ok(())
+}
+
+fn normalize_schema_fragment(value: &str) -> String {
+    value
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .map(|byte| byte.to_ascii_lowercase())
+        .map(char::from)
+        .collect()
+}
+
+fn normalized_top_level_column_definitions(table_sql: &str) -> Option<Vec<String>> {
+    let opening = table_sql.find('(')?;
+    let body = &table_sql[opening + 1..];
+    let mut definitions = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (index, character) in body.char_indices() {
+        match character {
+            '(' => depth = depth.checked_add(1)?,
+            ')' if depth == 0 => {
+                definitions.push(normalize_schema_fragment(&body[start..index]));
+                return Some(definitions);
+            }
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                definitions.push(normalize_schema_fragment(&body[start..index]));
+                start = index + character.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn isolate_historical_outbox_in_transaction(
@@ -154,7 +331,7 @@ pub(super) fn verify_schema_after_upgrade(
     expected_schema_version: i64,
 ) -> Result<(), StorageError> {
     #[cfg(test)]
-    if POST_COMMIT_VERIFICATION_FAILURE_FOR_TEST.with(|fail_next| fail_next.replace(false)) {
+    if should_fail_post_commit_verification_at_for_test(PostCommitVerificationFailpoint::Generic) {
         return Err(StorageError::migration_post_commit_verification_failed());
     }
 
@@ -164,7 +341,22 @@ pub(super) fn verify_schema_after_upgrade(
         return Err(StorageError::migration_version_invariant_failed());
     }
 
-    if expected_schema_version == writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION {
+    if expected_schema_version == ATTEMPT_CLAIM_IDENTITY_SCHEMA_VERSION {
+        #[cfg(test)]
+        if should_fail_post_commit_verification_at_for_test(
+            PostCommitVerificationFailpoint::AttemptClaimIdentitySchema,
+        ) {
+            return Err(StorageError::migration_post_commit_verification_failed());
+        }
+        validate_attempt_claim_identity_schema(connection)?;
+    }
+    if expected_schema_version >= writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION {
+        #[cfg(test)]
+        if should_fail_post_commit_verification_at_for_test(
+            PostCommitVerificationFailpoint::WriterFenceManifest,
+        ) {
+            return Err(StorageError::migration_post_commit_verification_failed());
+        }
         writer_fence_manifest::validate_writer_fence_manifest(connection)?;
     }
 
@@ -178,15 +370,44 @@ pub(super) fn verify_schema_after_upgrade(
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PostCommitVerificationFailpoint {
+    Generic,
+    AttemptClaimIdentitySchema,
+    WriterFenceManifest,
+}
+
+#[cfg(test)]
 thread_local! {
-    static POST_COMMIT_VERIFICATION_FAILURE_FOR_TEST: std::cell::Cell<bool> = const {
-        std::cell::Cell::new(false)
+    static POST_COMMIT_VERIFICATION_FAILPOINT: std::cell::Cell<Option<PostCommitVerificationFailpoint>> = const {
+        std::cell::Cell::new(None)
     };
 }
 
 #[cfg(test)]
 pub(super) fn fail_next_post_commit_verification_for_test() {
-    POST_COMMIT_VERIFICATION_FAILURE_FOR_TEST.with(|fail_next| fail_next.set(true));
+    fail_next_post_commit_verification_at_for_test(PostCommitVerificationFailpoint::Generic);
+}
+
+#[cfg(test)]
+pub(super) fn fail_next_post_commit_verification_at_for_test(
+    failpoint: PostCommitVerificationFailpoint,
+) {
+    POST_COMMIT_VERIFICATION_FAILPOINT.with(|next| next.set(Some(failpoint)));
+}
+
+#[cfg(test)]
+fn should_fail_post_commit_verification_at_for_test(
+    failpoint: PostCommitVerificationFailpoint,
+) -> bool {
+    POST_COMMIT_VERIFICATION_FAILPOINT.with(|next| {
+        if next.get() == Some(failpoint) {
+            next.set(None);
+            true
+        } else {
+            false
+        }
+    })
 }
 
 #[cfg(test)]
@@ -213,6 +434,40 @@ pub(super) fn fail_next_migration_013_at_for_test(failpoint: Migration013Failpoi
 #[cfg(test)]
 fn should_fail_migration_013_at_for_test(failpoint: Migration013Failpoint) -> bool {
     MIGRATION_013_FAILPOINT.with(|next| {
+        if next.get() == Some(failpoint) {
+            next.set(None);
+            true
+        } else {
+            false
+        }
+    })
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Migration014Failpoint {
+    FirstColumn,
+    SecondColumn,
+    SchemaVersion,
+    SchemaValidation,
+    ManifestValidation,
+}
+
+#[cfg(test)]
+thread_local! {
+    static MIGRATION_014_FAILPOINT: std::cell::Cell<Option<Migration014Failpoint>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(super) fn fail_next_migration_014_at_for_test(failpoint: Migration014Failpoint) {
+    MIGRATION_014_FAILPOINT.with(|next| next.set(Some(failpoint)));
+}
+
+#[cfg(test)]
+fn should_fail_migration_014_at_for_test(failpoint: Migration014Failpoint) -> bool {
+    MIGRATION_014_FAILPOINT.with(|next| {
         if next.get() == Some(failpoint) {
             next.set(None);
             true
@@ -408,7 +663,10 @@ pub fn verify_database(
         ));
     }
 
-    if expected_schema_version == writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION {
+    if expected_schema_version == ATTEMPT_CLAIM_IDENTITY_SCHEMA_VERSION {
+        validate_attempt_claim_identity_schema(connection)?;
+    }
+    if expected_schema_version >= writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION {
         writer_fence_manifest::validate_writer_fence_manifest(connection)?;
     }
 
@@ -481,7 +739,7 @@ pub fn activate_temporary_database(
 
 #[cfg(test)]
 mod transaction_tests {
-    use rusqlite::{params, Connection, TransactionBehavior};
+    use rusqlite::{functions::FunctionFlags, params, Connection, TransactionBehavior};
 
     use super::*;
 
@@ -656,6 +914,82 @@ mod transaction_tests {
         transaction.commit().unwrap();
     }
 
+    fn version_thirteen_connection() -> Connection {
+        let mut connection = version_twelve_connection();
+        connection
+            .create_scalar_function(
+                "digital_life_writer_epoch",
+                0,
+                FunctionFlags::SQLITE_UTF8
+                    | FunctionFlags::SQLITE_DETERMINISTIC
+                    | FunctionFlags::SQLITE_INNOCUOUS,
+                |_| Ok(1_i64),
+            )
+            .unwrap();
+        apply_writer_fence_upgrade(&mut connection);
+        assert_eq!(
+            schema_version(&connection),
+            writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION
+        );
+        connection
+    }
+
+    fn apply_attempt_claim_identity_upgrade(connection: &mut Connection) {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert_eq!(
+            apply_attempt_claim_identity_schema_upgrade(&transaction).unwrap(),
+            AttemptClaimIdentitySchemaUpgrade::Applied
+        );
+        transaction.commit().unwrap();
+    }
+
+    fn attempt_epoch_values(connection: &Connection, life_id: &str, memory_id: &str) -> (i64, i64) {
+        connection
+            .query_row(
+                "SELECT fenced_claim_epoch, last_marked_claim_epoch
+                 FROM memory_vector_sync_outbox WHERE life_id=?1 AND memory_id=?2",
+                params![life_id, memory_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    fn attempt_column_count(connection: &Connection) -> i64 {
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('memory_vector_sync_outbox')
+                 WHERE name IN ('fenced_claim_epoch', 'last_marked_claim_epoch')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn schema_fourteen_validation_connection(
+        fenced_claim_epoch_definition: Option<&str>,
+        last_marked_claim_epoch_definition: Option<&str>,
+    ) -> Connection {
+        let connection = transaction_connection();
+        let definitions = [
+            Some("id INTEGER PRIMARY KEY"),
+            Some("attempt_count INTEGER NOT NULL DEFAULT 0"),
+            fenced_claim_epoch_definition,
+            last_marked_claim_epoch_definition,
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(", ");
+        connection
+            .execute_batch(&format!(
+                "CREATE TABLE memory_vector_sync_outbox ({definitions})"
+            ))
+            .unwrap();
+        connection
+    }
+
     #[test]
     fn migration_transaction_registry_is_unique_and_strictly_incrementing() {
         validate_migration_registry(MIGRATIONS, LAST_STATIC_MIGRATION_VERSION).unwrap();
@@ -672,7 +1006,7 @@ mod transaction_tests {
     fn migration_transaction_rejects_targets_outside_the_h1_a3_contract() {
         let mut connection = transaction_connection();
         let transaction = connection.transaction().unwrap();
-        for target in [0, connection::MAX_SUPPORTED_SCHEMA_VERSION - 1, 14] {
+        for target in [0, writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION, 15] {
             let error =
                 apply_pending_migrations_in_transaction(&transaction, 0, target).unwrap_err();
             assert_eq!(error.code, "MIGRATION_VERSION_INVARIANT_FAILED");
@@ -808,6 +1142,254 @@ mod transaction_tests {
     }
 
     #[test]
+    fn migration_014_adds_zero_default_epochs_without_rewriting_existing_evidence() {
+        let mut connection = version_thirteen_connection();
+        insert_historical_row(
+            &connection,
+            HistoricalRowFixture {
+                life_id: "attempt-life",
+                memory_id: "processing-row",
+                desired_action: "delete",
+                state: "processing",
+                migration_disposition: None,
+                attempt_count: 3,
+                mutation_sequence: 91,
+                target_revision: Some(7),
+                target_content_hash: Some("attempt-target"),
+                claimed_generation_id: Some("attempt-generation"),
+                last_error_code: Some("ATTEMPT_OLD_ERROR"),
+                last_send_disposition: Some("possibly_sent"),
+                next_attempt_at: Some("2026-07-01T00:00:00.000Z"),
+                lease_owner: Some("attempt-owner"),
+                lease_fence_epoch: Some(8),
+                lease_expires_at: Some("2026-07-02T00:00:00.000Z"),
+            },
+        );
+        let before = historical_snapshot(&connection, "attempt-life", "processing-row");
+
+        apply_attempt_claim_identity_upgrade(&mut connection);
+
+        assert_eq!(
+            schema_version(&connection),
+            ATTEMPT_CLAIM_IDENTITY_SCHEMA_VERSION
+        );
+        assert_eq!(
+            historical_snapshot(&connection, "attempt-life", "processing-row"),
+            before
+        );
+        assert_eq!(
+            attempt_epoch_values(&connection, "attempt-life", "processing-row"),
+            (0, 0)
+        );
+        assert_eq!(writer_fence_count(&connection), 18);
+        validate_attempt_claim_identity_schema(&connection).unwrap();
+    }
+
+    #[test]
+    fn migration_014_preserves_non_processing_rows_and_migration_disposition() {
+        let mut connection = version_thirteen_connection();
+        for (memory_id, state, disposition) in [
+            ("failed", "failed", None),
+            ("blocked", "blocked", None),
+            ("retry", "retry_wait", None),
+            ("isolated", "failed", Some("legacy_upsert_rebuild_required")),
+        ] {
+            insert_historical_row(
+                &connection,
+                HistoricalRowFixture {
+                    life_id: "attempt-life",
+                    memory_id,
+                    desired_action: "delete",
+                    state,
+                    migration_disposition: disposition,
+                    attempt_count: 2,
+                    mutation_sequence: 11,
+                    target_revision: Some(2),
+                    target_content_hash: Some("preserved-target"),
+                    claimed_generation_id: Some("preserved-generation"),
+                    last_error_code: Some("PRESERVED_ERROR"),
+                    last_send_disposition: Some("definitely_not_sent"),
+                    next_attempt_at: Some("2026-08-01T00:00:00.000Z"),
+                    lease_owner: Some("preserved-owner"),
+                    lease_fence_epoch: Some(7),
+                    lease_expires_at: Some("2026-08-02T00:00:00.000Z"),
+                },
+            );
+        }
+        let before = ["failed", "blocked", "retry", "isolated"]
+            .into_iter()
+            .map(|memory_id| historical_snapshot(&connection, "attempt-life", memory_id))
+            .collect::<Vec<_>>();
+
+        apply_attempt_claim_identity_upgrade(&mut connection);
+
+        for (memory_id, expected) in ["failed", "blocked", "retry", "isolated"]
+            .into_iter()
+            .zip(before)
+        {
+            assert_eq!(
+                historical_snapshot(&connection, "attempt-life", memory_id),
+                expected
+            );
+            assert_eq!(
+                attempt_epoch_values(&connection, "attempt-life", memory_id),
+                (0, 0)
+            );
+        }
+    }
+
+    #[test]
+    fn schema_fourteen_validator_accepts_exact_real_sqlite_schema() {
+        let connection = schema_fourteen_validation_connection(
+            Some(FENCED_CLAIM_EPOCH_COLUMN_DDL),
+            Some(LAST_MARKED_CLAIM_EPOCH_COLUMN_DDL),
+        );
+        validate_attempt_claim_identity_schema(&connection).unwrap();
+    }
+
+    #[test]
+    fn schema_fourteen_validator_rejects_missing_or_weakened_identity_columns() {
+        let malformed_schemas = [
+            (None, Some("last_marked_claim_epoch INTEGER NOT NULL DEFAULT 0 CHECK (last_marked_claim_epoch >= 0)")),
+            (Some(FENCED_CLAIM_EPOCH_COLUMN_DDL), None),
+            (Some("fenced_claim_epoch TEXT NOT NULL DEFAULT 0 CHECK (fenced_claim_epoch >= 0)"), Some(LAST_MARKED_CLAIM_EPOCH_COLUMN_DDL)),
+            (Some("fenced_claim_epoch INTEGER DEFAULT 0 CHECK (fenced_claim_epoch >= 0)"), Some(LAST_MARKED_CLAIM_EPOCH_COLUMN_DDL)),
+            (Some("fenced_claim_epoch INTEGER NOT NULL DEFAULT 1 CHECK (fenced_claim_epoch >= 0)"), Some(LAST_MARKED_CLAIM_EPOCH_COLUMN_DDL)),
+            (Some("fenced_claim_epoch INTEGER NOT NULL DEFAULT 0 CHECK (fenced_claim_epoch >= -1)"), Some(LAST_MARKED_CLAIM_EPOCH_COLUMN_DDL)),
+            (Some(FENCED_CLAIM_EPOCH_COLUMN_DDL), Some("last_marked_claim_epoch TEXT NOT NULL DEFAULT 0 CHECK (last_marked_claim_epoch >= 0 AND last_marked_claim_epoch <= fenced_claim_epoch AND (last_marked_claim_epoch = 0 OR attempt_count > 0))")),
+            (Some(FENCED_CLAIM_EPOCH_COLUMN_DDL), Some("last_marked_claim_epoch INTEGER DEFAULT 0 CHECK (last_marked_claim_epoch >= 0 AND last_marked_claim_epoch <= fenced_claim_epoch AND (last_marked_claim_epoch = 0 OR attempt_count > 0))")),
+            (Some(FENCED_CLAIM_EPOCH_COLUMN_DDL), Some("last_marked_claim_epoch INTEGER NOT NULL DEFAULT 1 CHECK (last_marked_claim_epoch >= 0 AND last_marked_claim_epoch <= fenced_claim_epoch AND (last_marked_claim_epoch = 0 OR attempt_count > 0))")),
+            (Some(FENCED_CLAIM_EPOCH_COLUMN_DDL), Some("last_marked_claim_epoch INTEGER NOT NULL DEFAULT 0 CHECK (last_marked_claim_epoch >= 0 AND last_marked_claim_epoch <= fenced_claim_epoch)")),
+        ];
+        for (fenced_claim_epoch_definition, last_marked_claim_epoch_definition) in malformed_schemas
+        {
+            let connection = schema_fourteen_validation_connection(
+                fenced_claim_epoch_definition,
+                last_marked_claim_epoch_definition,
+            );
+            let error = validate_attempt_claim_identity_schema(&connection).unwrap_err();
+            assert_eq!(error.code, "ATTEMPT_CLAIM_IDENTITY_SCHEMA_INVALID");
+        }
+    }
+
+    #[test]
+    fn schema_fourteen_sqlite_constraints_reject_invalid_epoch_values() {
+        let mut connection = version_thirteen_connection();
+        insert_historical_row(
+            &connection,
+            HistoricalRowFixture {
+                life_id: "attempt-life",
+                memory_id: "constraint-row",
+                desired_action: "delete",
+                state: "pending",
+                migration_disposition: None,
+                attempt_count: 0,
+                mutation_sequence: 1,
+                target_revision: None,
+                target_content_hash: None,
+                claimed_generation_id: None,
+                last_error_code: None,
+                last_send_disposition: None,
+                next_attempt_at: None,
+                lease_owner: None,
+                lease_fence_epoch: None,
+                lease_expires_at: None,
+            },
+        );
+        apply_attempt_claim_identity_upgrade(&mut connection);
+
+        assert!(connection
+            .execute(
+                "UPDATE memory_vector_sync_outbox SET fenced_claim_epoch=-1
+                 WHERE life_id='attempt-life' AND memory_id='constraint-row'",
+                [],
+            )
+            .is_err());
+        assert!(connection
+            .execute(
+                "UPDATE memory_vector_sync_outbox SET last_marked_claim_epoch=1
+                 WHERE life_id='attempt-life' AND memory_id='constraint-row'",
+                [],
+            )
+            .is_err());
+        assert!(connection
+            .execute(
+                "UPDATE memory_vector_sync_outbox
+                 SET fenced_claim_epoch=1, last_marked_claim_epoch=1
+                 WHERE life_id='attempt-life' AND memory_id='constraint-row'",
+                [],
+            )
+            .is_err());
+        assert_eq!(
+            attempt_epoch_values(&connection, "attempt-life", "constraint-row"),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn migration_014_failure_injection_rolls_back_columns_and_version() {
+        for failpoint in [
+            Migration014Failpoint::FirstColumn,
+            Migration014Failpoint::SecondColumn,
+            Migration014Failpoint::SchemaVersion,
+            Migration014Failpoint::SchemaValidation,
+            Migration014Failpoint::ManifestValidation,
+        ] {
+            let mut connection = version_thirteen_connection();
+            insert_historical_row(
+                &connection,
+                HistoricalRowFixture {
+                    life_id: "attempt-life",
+                    memory_id: "rollback-row",
+                    desired_action: "delete",
+                    state: "processing",
+                    migration_disposition: None,
+                    attempt_count: 3,
+                    mutation_sequence: 17,
+                    target_revision: Some(4),
+                    target_content_hash: Some("rollback-target"),
+                    claimed_generation_id: Some("rollback-generation"),
+                    last_error_code: Some("ROLLBACK_ERROR"),
+                    last_send_disposition: Some("possibly_sent"),
+                    next_attempt_at: Some("2026-09-01T00:00:00.000Z"),
+                    lease_owner: Some("rollback-owner"),
+                    lease_fence_epoch: Some(12),
+                    lease_expires_at: Some("2026-09-02T00:00:00.000Z"),
+                },
+            );
+            let before = historical_snapshot(&connection, "attempt-life", "rollback-row");
+            fail_next_migration_014_at_for_test(failpoint);
+
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let error = apply_attempt_claim_identity_schema_upgrade(&transaction).unwrap_err();
+            assert_eq!(error.code, "MIGRATION_TRANSACTION_FAILED");
+            drop(transaction);
+
+            assert_eq!(
+                schema_version(&connection),
+                writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION
+            );
+            assert_eq!(attempt_column_count(&connection), 0);
+            assert_eq!(
+                historical_snapshot(&connection, "attempt-life", "rollback-row"),
+                before
+            );
+            assert_eq!(writer_fence_count(&connection), 18);
+        }
+    }
+
+    #[test]
+    fn migration_014_rejects_a_second_application() {
+        let mut connection = version_thirteen_connection();
+        apply_attempt_claim_identity_upgrade(&mut connection);
+        let transaction = connection.transaction().unwrap();
+        let error = apply_attempt_claim_identity_schema_upgrade(&transaction).unwrap_err();
+        assert_eq!(error.code, "MIGRATION_VERSION_INVARIANT_FAILED");
+    }
+
+    #[test]
     fn migration_013_isolates_historical_pending_and_processing_rows_preserving_evidence() {
         let mut connection = version_twelve_connection();
         connection
@@ -891,7 +1473,7 @@ mod transaction_tests {
         );
         assert_eq!(
             schema_version(&connection),
-            connection::MAX_SUPPORTED_SCHEMA_VERSION
+            writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION
         );
         assert_eq!(writer_fence_count(&connection), 18);
 
@@ -992,7 +1574,7 @@ mod transaction_tests {
         );
         assert_eq!(
             schema_version(&connection),
-            connection::MAX_SUPPORTED_SCHEMA_VERSION
+            writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION
         );
         assert_eq!(writer_fence_count(&connection), 18);
     }

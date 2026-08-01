@@ -465,6 +465,42 @@ mod tests {
         }
     }
 
+    fn update_attempt_count(connection: &Connection) -> rusqlite::Result<usize> {
+        connection.execute(
+            "UPDATE memory_vector_sync_outbox
+             SET attempt_count=3
+             WHERE life_id='writer-fence-life' AND memory_id='outbox-seed'",
+            [],
+        )
+    }
+
+    fn update_fenced_claim_epoch(connection: &Connection) -> rusqlite::Result<usize> {
+        connection.execute(
+            "UPDATE memory_vector_sync_outbox
+             SET fenced_claim_epoch=1
+             WHERE life_id='writer-fence-life' AND memory_id='outbox-seed'",
+            [],
+        )
+    }
+
+    fn update_last_marked_claim_epoch(connection: &Connection) -> rusqlite::Result<usize> {
+        connection.execute(
+            "UPDATE memory_vector_sync_outbox
+             SET last_marked_claim_epoch=0
+             WHERE life_id='writer-fence-life' AND memory_id='outbox-seed'",
+            [],
+        )
+    }
+
+    fn expect_static_incompatible_writer(result: rusqlite::Result<usize>) {
+        match result.unwrap_err() {
+            Error::SqliteFailure(_, Some(message)) => {
+                assert_eq!(message, "INCOMPATIBLE_DATABASE_WRITER");
+            }
+            other => panic!("epoch-zero writer must receive the static trigger error: {other}"),
+        }
+    }
+
     #[test]
     fn writer_fence_manifest_has_exactly_eighteen_static_specs() {
         assert_eq!(WRITER_FENCE_SCHEMA_VERSION, 13);
@@ -817,12 +853,77 @@ mod tests {
             )
             .unwrap();
 
-        let error = protected_update(&epoch_zero, "memory_vector_sync_outbox").unwrap_err();
-        match error {
-            Error::SqliteFailure(_, Some(message)) => {
-                assert_eq!(message, "INCOMPATIBLE_DATABASE_WRITER");
-            }
-            other => panic!("epoch-zero writer must receive the static trigger error: {other}"),
-        }
+        expect_static_incompatible_writer(protected_update(
+            &epoch_zero,
+            "memory_vector_sync_outbox",
+        ));
+    }
+
+    #[test]
+    fn attempt_claim_identity_authorized_writer_can_update_both_epoch_columns() {
+        let (_root, path) = initialized_fenced_database();
+        let connection = authorized_connection(&path);
+        seed_protected_rows(&connection);
+
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE memory_vector_sync_outbox
+                     SET fenced_claim_epoch=1, last_marked_claim_epoch=1
+                     WHERE life_id='writer-fence-life' AND memory_id='outbox-seed'",
+                    [],
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT fenced_claim_epoch, last_marked_claim_epoch
+                     FROM memory_vector_sync_outbox
+                     WHERE life_id='writer-fence-life' AND memory_id='outbox-seed'",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .unwrap(),
+            (1, 1)
+        );
+        assert_eq!(writer_fence_trigger_specs().len(), 18);
+    }
+
+    #[test]
+    fn attempt_claim_identity_raw_legacy_writer_cannot_modify_attempt_or_epoch_columns() {
+        let (_root, path) = initialized_fenced_database();
+        let authorized = authorized_connection(&path);
+        seed_protected_rows(&authorized);
+        drop(authorized);
+        let raw = Connection::open(&path).unwrap();
+
+        assert!(update_attempt_count(&raw).is_err());
+        assert!(update_fenced_claim_epoch(&raw).is_err());
+        assert!(update_last_marked_claim_epoch(&raw).is_err());
+    }
+
+    #[test]
+    fn attempt_claim_identity_epoch_zero_writer_is_rejected_with_static_code_for_all_updates() {
+        let (_root, path) = initialized_fenced_database();
+        let authorized = authorized_connection(&path);
+        seed_protected_rows(&authorized);
+        drop(authorized);
+        let epoch_zero = Connection::open(&path).unwrap();
+        epoch_zero
+            .create_scalar_function(
+                "digital_life_writer_epoch",
+                0,
+                FunctionFlags::SQLITE_UTF8
+                    | FunctionFlags::SQLITE_DETERMINISTIC
+                    | FunctionFlags::SQLITE_INNOCUOUS,
+                |_| Ok(0_i64),
+            )
+            .unwrap();
+
+        expect_static_incompatible_writer(update_attempt_count(&epoch_zero));
+        expect_static_incompatible_writer(update_fenced_claim_epoch(&epoch_zero));
+        expect_static_incompatible_writer(update_last_marked_claim_epoch(&epoch_zero));
     }
 }

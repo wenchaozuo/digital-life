@@ -221,6 +221,14 @@ impl StorageError {
         )
     }
 
+    pub(super) fn attempt_claim_identity_schema_invalid() -> Self {
+        Self::new(
+            "ATTEMPT_CLAIM_IDENTITY_SCHEMA_INVALID",
+            "The database attempt claim identity schema is invalid.",
+            false,
+        )
+    }
+
     pub(super) fn writer_fence_manifest_missing() -> Self {
         Self::new(
             "WRITER_FENCE_MANIFEST_MISSING",
@@ -1418,9 +1426,33 @@ mod tests {
     }
 
     #[test]
-    fn backup_target_is_reopened_with_an_authorized_storage_connection() {
+    fn attempt_claim_identity_schema_error_is_static_and_deidentified() {
+        let error = StorageError::attempt_claim_identity_schema_invalid();
+        assert_eq!(error.code, "ATTEMPT_CLAIM_IDENTITY_SCHEMA_INVALID");
+        assert!(!error.message.contains("sqlite_schema"));
+        assert!(!error.message.contains("CREATE TABLE"));
+        assert!(!error.message.contains("\\\\"));
+    }
+
+    #[test]
+    fn backup_preserves_schema_fourteen_attempt_identity_and_writer_fence() {
         let root = TestRoot::new("migration-authorized-reopen");
         let service = seeded_service(&root.0);
+        {
+            let state = service.state().unwrap();
+            state
+                .connection
+                .execute_batch(
+                    "INSERT INTO memory_vector_sync_outbox
+                     (life_id, memory_id, desired_action, state, attempt_count,
+                      mutation_sequence, claimed_generation_id, last_send_disposition,
+                      migration_disposition, fenced_claim_epoch, last_marked_claim_epoch)
+                     VALUES ('life-1', 'backup-attempt-identity', 'delete', 'failed', 3,
+                             9, 'backup-generation', 'possibly_sent',
+                             'legacy_upsert_rebuild_required', 7, 6)",
+                )
+                .unwrap();
+        }
         let target = root.0.join("custom");
 
         let result = service.migrate_location(target.to_str().unwrap());
@@ -1446,6 +1478,37 @@ mod tests {
             )
             .unwrap();
         assert_eq!(writer_fence_count, 18);
+        migration::validate_attempt_claim_identity_schema(&state.connection).unwrap();
+        assert_eq!(
+            state
+                .connection
+                .query_row(
+                    "SELECT attempt_count, claimed_generation_id, last_send_disposition,
+                            migration_disposition, fenced_claim_epoch, last_marked_claim_epoch
+                     FROM memory_vector_sync_outbox
+                     WHERE life_id='life-1' AND memory_id='backup-attempt-identity'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, i64>(5)?,
+                        ))
+                    },
+                )
+                .unwrap(),
+            (
+                3,
+                Some("backup-generation".into()),
+                Some("possibly_sent".into()),
+                Some("legacy_upsert_rebuild_required".into()),
+                7,
+                6,
+            )
+        );
         assert_eq!(
             state.database_path,
             fs::canonicalize(target.join(DATABASE_FILE_NAME)).unwrap()

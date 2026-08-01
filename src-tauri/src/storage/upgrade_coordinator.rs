@@ -2,7 +2,8 @@
 //!
 //! The coordinator is the only production path that combines the Windows
 //! process gate with SQLite's transaction boundary and installs the fixed
-//! version-13 writer-fence schema only within that transaction.
+//! version-13 writer-fence and version-14 attempt-identity schema only within
+//! that transaction.
 
 use std::path::Path;
 
@@ -83,6 +84,8 @@ fn open_after_mutex<G: StorageUpgradeGate>(
     }
 
     if version == connection::MAX_SUPPORTED_SCHEMA_VERSION {
+        record_upgrade_event("schema-14");
+        migration::validate_attempt_claim_identity_schema(&connection)?;
         record_upgrade_event("manifest");
         writer_fence_manifest::validate_writer_fence_manifest(&connection)?;
         record_upgrade_event("post-verify");
@@ -118,16 +121,24 @@ fn open_after_mutex<G: StorageUpgradeGate>(
         UpgradeOccupancy::Occupied => return Err(StorageError::upgrade_quiescence_not_reached()),
     }
 
-    record_upgrade_event("migrations");
-    migration::apply_pending_migrations_in_transaction(
-        &transaction,
-        version,
-        connection::MAX_SUPPORTED_SCHEMA_VERSION,
-    )?;
-    record_upgrade_event("h1-b");
-    let writer_fence_upgrade =
-        migration::apply_writer_fence_schema_upgrade_if_registered(&transaction)?;
-    if writer_fence_upgrade != migration::WriterFenceSchemaUpgrade::Applied {
+    if version <= migration::LAST_STATIC_MIGRATION_VERSION {
+        record_upgrade_event("migrations");
+        migration::apply_pending_migrations_in_transaction(
+            &transaction,
+            version,
+            connection::MAX_SUPPORTED_SCHEMA_VERSION,
+        )?;
+        record_upgrade_event("h1-b");
+        let writer_fence_upgrade =
+            migration::apply_writer_fence_schema_upgrade_if_registered(&transaction)?;
+        if writer_fence_upgrade != migration::WriterFenceSchemaUpgrade::Applied {
+            return Err(StorageError::migration_version_invariant_failed());
+        }
+    }
+
+    record_upgrade_event("att-i1");
+    let attempt_upgrade = migration::apply_attempt_claim_identity_schema_upgrade(&transaction)?;
+    if attempt_upgrade != migration::AttemptClaimIdentitySchemaUpgrade::Applied {
         return Err(StorageError::migration_version_invariant_failed());
     }
 
@@ -429,6 +440,7 @@ mod tests {
     fn prepare_schema_version(path: &Path, version: i64) {
         assert!(
             version == migration::LAST_STATIC_MIGRATION_VERSION
+                || version == writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION
                 || version == connection::MAX_SUPPORTED_SCHEMA_VERSION
         );
         let mut connection = Connection::open(path).unwrap();
@@ -441,10 +453,16 @@ mod tests {
             connection::MAX_SUPPORTED_SCHEMA_VERSION,
         )
         .unwrap();
-        if version == connection::MAX_SUPPORTED_SCHEMA_VERSION {
+        if version >= writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION {
             assert_eq!(
                 migration::apply_writer_fence_schema_upgrade_if_registered(&transaction).unwrap(),
                 migration::WriterFenceSchemaUpgrade::Applied
+            );
+        }
+        if version == connection::MAX_SUPPORTED_SCHEMA_VERSION {
+            assert_eq!(
+                migration::apply_attempt_claim_identity_schema_upgrade(&transaction).unwrap(),
+                migration::AttemptClaimIdentitySchemaUpgrade::Applied
             );
         }
         transaction.commit().unwrap();
@@ -469,6 +487,52 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap()
+    }
+
+    fn attempt_identity_column_count(connection: &Connection) -> i64 {
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('memory_vector_sync_outbox')
+                 WHERE name IN ('fenced_claim_epoch', 'last_marked_claim_epoch')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn assert_version_thirteen_has_no_attempt_identity_columns(path: &Path) {
+        let connection = Connection::open(path).unwrap();
+        assert_eq!(
+            connection::read_schema_version(&connection).unwrap(),
+            writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION
+        );
+        assert_eq!(attempt_identity_column_count(&connection), 0);
+        assert_eq!(writer_fence_count(&connection), 18);
+    }
+
+    fn damage_attempt_identity_schema(
+        path: &Path,
+        fenced_claim_epoch_definition: Option<&str>,
+        last_marked_claim_epoch_definition: Option<&str>,
+    ) {
+        let connection = Connection::open(path).unwrap();
+        let definitions = [
+            Some("id INTEGER PRIMARY KEY"),
+            Some("attempt_count INTEGER NOT NULL DEFAULT 0"),
+            fenced_claim_epoch_definition,
+            last_marked_claim_epoch_definition,
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(", ");
+        connection
+            .execute_batch(&format!(
+                "PRAGMA foreign_keys=OFF;
+                 DROP TABLE memory_vector_sync_outbox;
+                 CREATE TABLE memory_vector_sync_outbox ({definitions})"
+            ))
+            .unwrap();
     }
 
     #[derive(Debug, Eq, PartialEq)]
@@ -589,6 +653,7 @@ mod tests {
                 "final-rm",
                 "migrations",
                 "h1-b",
+                "att-i1",
                 "commit",
                 "post-verify",
                 "wal",
@@ -614,6 +679,7 @@ mod tests {
                 "mutex",
                 "open-before-wal",
                 "version-read",
+                "schema-14",
                 "manifest",
                 "post-verify",
                 "wal",
@@ -624,9 +690,11 @@ mod tests {
     }
 
     #[test]
-    fn storage_upgrade_coordinator_version_thirteen_does_not_repeat_historical_isolation() {
+    fn storage_upgrade_coordinator_version_thirteen_upgrades_attempt_identity_without_replaying_historical_isolation(
+    ) {
+        let _ = take_upgrade_events();
         let (_root, path) = database_path("current-schema-no-repeat");
-        prepare_schema_version(&path, connection::MAX_SUPPORTED_SCHEMA_VERSION);
+        prepare_schema_version(&path, writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION);
         let authorized = connection::open_authorized_test_connection(&path).unwrap();
         authorized
             .execute_batch(
@@ -646,7 +714,11 @@ mod tests {
 
         let connection = open_coordinated_storage_connection_with_gate(&path, &gate).unwrap();
 
-        assert_eq!(gate.inspection_calls.get(), 0);
+        assert_eq!(gate.inspection_calls.get(), 2);
+        assert_eq!(
+            connection::read_schema_version(&connection).unwrap(),
+            connection::MAX_SUPPORTED_SCHEMA_VERSION
+        );
         assert_eq!(
             connection
                 .query_row(
@@ -686,11 +758,137 @@ mod tests {
                 Some("possibly_sent".into()),
             )
         );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT fenced_claim_epoch, last_marked_claim_epoch
+                     FROM memory_vector_sync_outbox
+                     WHERE life_id='current-life' AND memory_id='current-memory'",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .unwrap(),
+            (0, 0)
+        );
         assert_eq!(writer_fence_count(&connection), 18);
+        assert_eq!(
+            take_upgrade_events(),
+            vec![
+                "mutex",
+                "open-before-wal",
+                "version-read",
+                "preflight-rm",
+                "begin-immediate",
+                "final-rm",
+                "att-i1",
+                "commit",
+                "post-verify",
+                "wal",
+            ]
+        );
     }
 
     #[test]
-    fn storage_upgrade_coordinator_version_thirteen_manifest_damage_fails_closed_before_wal() {
+    fn schema_fourteen_startup_rejects_missing_or_weakened_attempt_identity_columns_before_wal() {
+        let malformed_schemas = [
+            (
+                None,
+                Some(
+                    "last_marked_claim_epoch INTEGER NOT NULL DEFAULT 0
+                     CHECK (last_marked_claim_epoch >= 0)",
+                ),
+            ),
+            (
+                Some(
+                    "fenced_claim_epoch INTEGER NOT NULL DEFAULT 0
+                     CHECK (fenced_claim_epoch >= 0)",
+                ),
+                None,
+            ),
+            (
+                Some(
+                    "fenced_claim_epoch TEXT NOT NULL DEFAULT 0
+                     CHECK (fenced_claim_epoch >= 0)",
+                ),
+                Some(
+                    "last_marked_claim_epoch INTEGER NOT NULL DEFAULT 0
+                     CHECK (last_marked_claim_epoch >= 0
+                         AND last_marked_claim_epoch <= fenced_claim_epoch
+                         AND (last_marked_claim_epoch = 0 OR attempt_count > 0))",
+                ),
+            ),
+            (
+                Some("fenced_claim_epoch INTEGER DEFAULT 0 CHECK (fenced_claim_epoch >= 0)"),
+                Some(
+                    "last_marked_claim_epoch INTEGER NOT NULL DEFAULT 0
+                     CHECK (last_marked_claim_epoch >= 0
+                         AND last_marked_claim_epoch <= fenced_claim_epoch
+                         AND (last_marked_claim_epoch = 0 OR attempt_count > 0))",
+                ),
+            ),
+            (
+                Some(
+                    "fenced_claim_epoch INTEGER NOT NULL DEFAULT 1
+                     CHECK (fenced_claim_epoch >= 0)",
+                ),
+                Some(
+                    "last_marked_claim_epoch INTEGER NOT NULL DEFAULT 0
+                     CHECK (last_marked_claim_epoch >= 0
+                         AND last_marked_claim_epoch <= fenced_claim_epoch
+                         AND (last_marked_claim_epoch = 0 OR attempt_count > 0))",
+                ),
+            ),
+            (
+                Some(
+                    "fenced_claim_epoch INTEGER NOT NULL DEFAULT 0
+                     CHECK (fenced_claim_epoch >= -1)",
+                ),
+                Some(
+                    "last_marked_claim_epoch INTEGER NOT NULL DEFAULT 0
+                     CHECK (last_marked_claim_epoch >= 0
+                         AND last_marked_claim_epoch <= fenced_claim_epoch
+                         AND (last_marked_claim_epoch = 0 OR attempt_count > 0))",
+                ),
+            ),
+            (
+                Some(
+                    "fenced_claim_epoch INTEGER NOT NULL DEFAULT 0
+                     CHECK (fenced_claim_epoch >= 0)",
+                ),
+                Some(
+                    "last_marked_claim_epoch INTEGER NOT NULL DEFAULT 0
+                     CHECK (last_marked_claim_epoch >= 0
+                         AND last_marked_claim_epoch <= fenced_claim_epoch)",
+                ),
+            ),
+        ];
+
+        for (fenced_claim_epoch_definition, last_marked_claim_epoch_definition) in malformed_schemas
+        {
+            let _ = take_upgrade_events();
+            let (_root, path) = database_path("schema-fourteen-attempt-damage");
+            prepare_schema_version(&path, connection::MAX_SUPPORTED_SCHEMA_VERSION);
+            damage_attempt_identity_schema(
+                &path,
+                fenced_claim_epoch_definition,
+                last_marked_claim_epoch_definition,
+            );
+            let gate = FakeGate::clear();
+
+            let error = open_coordinated_storage_connection_with_gate(&path, &gate).unwrap_err();
+
+            assert_eq!(error.code, "ATTEMPT_CLAIM_IDENTITY_SCHEMA_INVALID");
+            assert_eq!(gate.inspection_calls.get(), 0);
+            assert_eq!(journal_mode(&path), "delete");
+            assert_eq!(
+                take_upgrade_events(),
+                vec!["mutex", "open-before-wal", "version-read", "schema-14"]
+            );
+        }
+    }
+
+    #[test]
+    fn storage_upgrade_coordinator_version_fourteen_manifest_damage_fails_closed_before_wal() {
         enum ManifestDamage {
             Missing,
             Mismatched,
@@ -751,13 +949,19 @@ mod tests {
             assert_eq!(journal_mode(&path), "delete");
             assert_eq!(
                 take_upgrade_events(),
-                vec!["mutex", "open-before-wal", "version-read", "manifest"]
+                vec![
+                    "mutex",
+                    "open-before-wal",
+                    "version-read",
+                    "schema-14",
+                    "manifest"
+                ]
             );
         }
     }
 
     #[test]
-    fn storage_initialize_version_thirteen_missing_manifest_skips_wal_and_publication() {
+    fn storage_initialize_version_fourteen_missing_manifest_skips_wal_and_publication() {
         let _ = take_upgrade_events();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join(super::super::DATABASE_FILE_NAME);
@@ -773,7 +977,7 @@ mod tests {
             root.path().to_path_buf(),
             None,
         ) {
-            Ok(_) => panic!("a damaged version-13 manifest must prevent storage publication"),
+            Ok(_) => panic!("a damaged version-14 manifest must prevent storage publication"),
             Err(error) => error,
         };
 
@@ -781,12 +985,83 @@ mod tests {
         assert_eq!(journal_mode(&path), "delete");
         assert_eq!(
             take_upgrade_events(),
-            vec!["mutex", "open-before-wal", "version-read", "manifest"]
+            vec![
+                "mutex",
+                "open-before-wal",
+                "version-read",
+                "schema-14",
+                "manifest"
+            ]
         );
     }
 
     #[test]
-    fn storage_upgrade_coordinator_version_twelve_requires_the_writer_fence_upgrade() {
+    fn storage_initialize_version_fourteen_invalid_attempt_schema_skips_wal_and_publication() {
+        let _ = take_upgrade_events();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(super::super::DATABASE_FILE_NAME);
+        prepare_schema_version(&path, connection::MAX_SUPPORTED_SCHEMA_VERSION);
+        damage_attempt_identity_schema(
+            &path,
+            None,
+            Some(
+                "last_marked_claim_epoch INTEGER NOT NULL DEFAULT 0
+                 CHECK (last_marked_claim_epoch >= 0)",
+            ),
+        );
+
+        let error = match super::super::StorageService::initialize_with_roots(
+            root.path().to_path_buf(),
+            None,
+        ) {
+            Ok(_) => panic!("a damaged version-14 attempt schema must prevent storage publication"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code, "ATTEMPT_CLAIM_IDENTITY_SCHEMA_INVALID");
+        assert_eq!(journal_mode(&path), "delete");
+        assert_eq!(
+            take_upgrade_events(),
+            vec!["mutex", "open-before-wal", "version-read", "schema-14"]
+        );
+    }
+
+    #[test]
+    fn storage_initialize_restored_version_fourteen_validates_then_publishes() {
+        let _ = take_upgrade_events();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(super::super::DATABASE_FILE_NAME);
+        prepare_schema_version(&path, connection::MAX_SUPPORTED_SCHEMA_VERSION);
+
+        let service =
+            super::super::StorageService::initialize_with_roots(root.path().to_path_buf(), None)
+                .unwrap();
+        let state = service.state().unwrap();
+
+        assert_eq!(
+            connection::read_schema_version(&state.connection).unwrap(),
+            connection::MAX_SUPPORTED_SCHEMA_VERSION
+        );
+        migration::validate_attempt_claim_identity_schema(&state.connection).unwrap();
+        assert_eq!(writer_fence_count(&state.connection), 18);
+        assert_eq!(
+            take_upgrade_events(),
+            vec![
+                "mutex",
+                "open-before-wal",
+                "version-read",
+                "schema-14",
+                "manifest",
+                "post-verify",
+                "wal",
+                "publish",
+            ]
+        );
+    }
+
+    #[test]
+    fn storage_upgrade_coordinator_version_twelve_requires_writer_fence_and_attempt_identity_upgrades(
+    ) {
         let (_root, path) = database_path("version-twelve-upgrade");
         prepare_schema_version(&path, migration::LAST_STATIC_MIGRATION_VERSION);
         let gate = FakeGate::clear();
@@ -805,6 +1080,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(writer_fence_count, 18);
+        migration::validate_attempt_claim_identity_schema(&connection).unwrap();
         assert_eq!(gate.inspection_calls.get(), 2);
     }
 
@@ -844,6 +1120,55 @@ mod tests {
         assert_eq!(error.code, "UPGRADE_QUIESCENCE_NOT_REACHED");
         assert_eq!(gate.inspection_calls.get(), 2);
         assert_version_twelve_historical_data_is_unchanged(&path);
+        assert_eq!(journal_mode(&path), "delete");
+        assert_eq!(
+            take_upgrade_events(),
+            vec![
+                "mutex",
+                "open-before-wal",
+                "version-read",
+                "preflight-rm",
+                "begin-immediate",
+                "final-rm",
+            ]
+        );
+    }
+
+    #[test]
+    fn storage_upgrade_coordinator_version_thirteen_preflight_occupancy_preserves_schema_and_data()
+    {
+        let _ = take_upgrade_events();
+        let (_root, path) = database_path("version-thirteen-preflight-occupied");
+        prepare_schema_version(&path, writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION);
+        let gate = FakeGate::with_inspections(vec![Ok(UpgradeOccupancy::Occupied)]);
+
+        let error = open_coordinated_storage_connection_with_gate(&path, &gate).unwrap_err();
+
+        assert_eq!(error.code, "LEGACY_WRITER_DETECTED");
+        assert_eq!(gate.inspection_calls.get(), 1);
+        assert_version_thirteen_has_no_attempt_identity_columns(&path);
+        assert_eq!(journal_mode(&path), "delete");
+        assert_eq!(
+            take_upgrade_events(),
+            vec!["mutex", "open-before-wal", "version-read", "preflight-rm"]
+        );
+    }
+
+    #[test]
+    fn storage_upgrade_coordinator_version_thirteen_final_occupancy_rolls_back_migration_014() {
+        let _ = take_upgrade_events();
+        let (_root, path) = database_path("version-thirteen-final-occupied");
+        prepare_schema_version(&path, writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION);
+        let gate = FakeGate::with_inspections(vec![
+            Ok(UpgradeOccupancy::Clear),
+            Ok(UpgradeOccupancy::Occupied),
+        ]);
+
+        let error = open_coordinated_storage_connection_with_gate(&path, &gate).unwrap_err();
+
+        assert_eq!(error.code, "UPGRADE_QUIESCENCE_NOT_REACHED");
+        assert_eq!(gate.inspection_calls.get(), 2);
+        assert_version_thirteen_has_no_attempt_identity_columns(&path);
         assert_eq!(journal_mode(&path), "delete");
         assert_eq!(
             take_upgrade_events(),
@@ -911,6 +1236,42 @@ mod tests {
     }
 
     #[test]
+    fn migration_014_failures_leave_version_thirteen_without_columns_or_wal() {
+        for failpoint in [
+            migration::Migration014Failpoint::FirstColumn,
+            migration::Migration014Failpoint::SecondColumn,
+            migration::Migration014Failpoint::SchemaVersion,
+            migration::Migration014Failpoint::SchemaValidation,
+            migration::Migration014Failpoint::ManifestValidation,
+        ] {
+            let _ = take_upgrade_events();
+            let (_root, path) = database_path("version-thirteen-migration-014-failure");
+            prepare_schema_version(&path, writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION);
+            migration::fail_next_migration_014_at_for_test(failpoint);
+            let gate = FakeGate::clear();
+
+            let error = open_coordinated_storage_connection_with_gate(&path, &gate).unwrap_err();
+
+            assert_eq!(error.code, "MIGRATION_TRANSACTION_FAILED");
+            assert_eq!(gate.inspection_calls.get(), 2);
+            assert_version_thirteen_has_no_attempt_identity_columns(&path);
+            assert_eq!(journal_mode(&path), "delete");
+            assert_eq!(
+                take_upgrade_events(),
+                vec![
+                    "mutex",
+                    "open-before-wal",
+                    "version-read",
+                    "preflight-rm",
+                    "begin-immediate",
+                    "final-rm",
+                    "att-i1",
+                ]
+            );
+        }
+    }
+
+    #[test]
     fn storage_upgrade_coordinator_future_schema_is_rejected_before_rm_migration_and_wal() {
         let _ = take_upgrade_events();
         let (_root, path) = database_path("future-schema");
@@ -926,7 +1287,7 @@ mod tests {
                     applied_at TEXT NOT NULL
                 );
                 INSERT INTO schema_migration (version, name, applied_at)
-                VALUES (14, 'future', '2026-01-01T00:00:00Z');",
+                VALUES (15, 'future', '2026-01-01T00:00:00Z');",
             )
             .unwrap();
         drop(connection);
@@ -935,6 +1296,41 @@ mod tests {
         let error = open_coordinated_storage_connection_with_gate(&path, &gate).unwrap_err();
         assert_eq!(error.code, "DATABASE_VERSION_TOO_NEW");
         assert_eq!(gate.inspection_calls.get(), 0);
+        assert_eq!(journal_mode(&path), "delete");
+        assert_eq!(take_upgrade_events(), vec!["mutex", "open-before-wal"]);
+    }
+
+    #[test]
+    fn storage_initialize_restored_future_schema_is_rejected_before_wal_or_publication() {
+        let _ = take_upgrade_events();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(super::super::DATABASE_FILE_NAME);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .pragma_update(None, "journal_mode", "DELETE")
+            .unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migration (
+                    version INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    applied_at TEXT NOT NULL
+                );
+                INSERT INTO schema_migration (version, name, applied_at)
+                VALUES (15, 'future', '2026-01-01T00:00:00Z')",
+            )
+            .unwrap();
+        drop(connection);
+
+        let error = match super::super::StorageService::initialize_with_roots(
+            root.path().to_path_buf(),
+            None,
+        ) {
+            Ok(_) => panic!("a restored future-schema database must not be published"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code, "DATABASE_VERSION_TOO_NEW");
         assert_eq!(journal_mode(&path), "delete");
         assert_eq!(take_upgrade_events(), vec!["mutex", "open-before-wal"]);
     }
@@ -1117,10 +1513,52 @@ mod tests {
                 "final-rm",
                 "migrations",
                 "h1-b",
+                "att-i1",
                 "commit",
                 "post-verify",
             ]
         );
+    }
+
+    #[test]
+    fn schema_fourteen_and_manifest_post_commit_failures_skip_wal_and_publish() {
+        for failpoint in [
+            migration::PostCommitVerificationFailpoint::AttemptClaimIdentitySchema,
+            migration::PostCommitVerificationFailpoint::WriterFenceManifest,
+        ] {
+            let _ = take_upgrade_events();
+            let (_root, path) = database_path("post-commit-schema-fourteen-failure");
+            let gate = FakeGate::clear();
+            migration::fail_next_post_commit_verification_at_for_test(failpoint);
+
+            let error = open_coordinated_storage_connection_with_gate(&path, &gate).unwrap_err();
+
+            assert_eq!(error.code, "MIGRATION_POST_COMMIT_VERIFICATION_FAILED");
+            let connection = Connection::open(&path).unwrap();
+            assert_eq!(
+                connection::read_schema_version(&connection).unwrap(),
+                connection::MAX_SUPPORTED_SCHEMA_VERSION
+            );
+            migration::validate_attempt_claim_identity_schema(&connection).unwrap();
+            assert_eq!(writer_fence_count(&connection), 18);
+            assert_eq!(journal_mode(&path), "delete");
+            assert_eq!(
+                take_upgrade_events(),
+                vec![
+                    "mutex",
+                    "open-before-wal",
+                    "version-read",
+                    "preflight-rm",
+                    "begin-immediate",
+                    "final-rm",
+                    "migrations",
+                    "h1-b",
+                    "att-i1",
+                    "commit",
+                    "post-verify",
+                ]
+            );
+        }
     }
 
     #[cfg(not(windows))]
@@ -1189,10 +1627,12 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn upgrade_quiescence_windows_final_restart_manager_recheck_blocks_a_late_legacy_writer() {
+    fn upgrade_quiescence_windows_final_restart_manager_recheck_blocks_a_late_legacy_writer_before_migration_014(
+    ) {
         for repetition in 0..10 {
             let _ = take_upgrade_events();
             let (_root, path) = database_path(&format!("windows-final-recheck-{repetition}"));
+            prepare_schema_version(&path, writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION);
             let gate = SpawnOnFinalSystemGate::new();
 
             let error = open_coordinated_storage_connection_with_gate(&path, &gate).unwrap_err();
@@ -1201,7 +1641,12 @@ mod tests {
             gate.release_child();
 
             let connection = Connection::open(&path).unwrap();
-            assert_eq!(connection::read_schema_version(&connection).unwrap(), 0);
+            assert_eq!(
+                connection::read_schema_version(&connection).unwrap(),
+                writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION
+            );
+            assert_eq!(attempt_identity_column_count(&connection), 0);
+            assert_eq!(writer_fence_count(&connection), 18);
             assert_eq!(journal_mode(&path), "delete");
             assert_eq!(
                 take_upgrade_events(),
@@ -1266,7 +1711,64 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn storage_upgrade_coordinator_windows_restored_version_twelve_reopens_through_migration_013() {
+    fn storage_upgrade_coordinator_windows_version_thirteen_competition_upgrades_once_to_fourteen()
+    {
+        for repetition in 0..10 {
+            let root = tempfile::tempdir().unwrap();
+            let database_path = root.path().join(super::super::DATABASE_FILE_NAME);
+            prepare_schema_version(
+                &database_path,
+                writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION,
+            );
+            let (ready_sender, ready_receiver) = mpsc::channel();
+            let (release_sender, release_receiver) = mpsc::channel();
+            let first_path = database_path.clone();
+            let first = thread::spawn(move || {
+                let gate = BlockingSystemGate {
+                    ready: ready_sender,
+                    release: release_receiver,
+                };
+                open_coordinated_storage_connection_with_gate(&first_path, &gate)
+                    .map(drop)
+                    .map_err(|error| error.code)
+            });
+            ready_receiver
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the first initializer must acquire the actual Global mutex");
+
+            let second = match super::super::StorageService::initialize_with_roots(
+                root.path().to_path_buf(),
+                None,
+            ) {
+                Ok(_) => panic!(
+                    "the competing version-13 initializer must not enter while the mutex is held"
+                ),
+                Err(error) => error,
+            };
+            assert_eq!(second.code, "UPGRADE_EXCLUSIVE_GATE_UNAVAILABLE");
+            assert_version_thirteen_has_no_attempt_identity_columns(&database_path);
+
+            release_sender.send(()).unwrap();
+            first.join().unwrap().unwrap();
+            let second = super::super::StorageService::initialize_with_roots(
+                root.path().to_path_buf(),
+                None,
+            )
+            .unwrap();
+            let state = second.state().unwrap();
+            assert_eq!(
+                connection::read_schema_version(&state.connection).unwrap(),
+                connection::MAX_SUPPORTED_SCHEMA_VERSION,
+                "version-13 competition repetition {repetition}"
+            );
+            migration::validate_attempt_claim_identity_schema(&state.connection).unwrap();
+            assert_eq!(writer_fence_count(&state.connection), 18);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn storage_upgrade_coordinator_windows_restored_version_twelve_reopens_through_migration_014() {
         for repetition in 0..10 {
             let root = tempfile::tempdir().unwrap();
             let database_path = root.path().join(super::super::DATABASE_FILE_NAME);
@@ -1285,6 +1787,20 @@ mod tests {
                 "restored version-12 fixture must upgrade on repetition {repetition}"
             );
             assert_eq!(writer_fence_count(&state.connection), 18);
+            migration::validate_attempt_claim_identity_schema(&state.connection).unwrap();
+            assert_eq!(
+                state
+                    .connection
+                    .query_row(
+                        "SELECT fenced_claim_epoch, last_marked_claim_epoch
+                         FROM memory_vector_sync_outbox
+                         WHERE life_id='upgrade-life' AND memory_id='upgrade-memory'",
+                        [],
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                    )
+                    .unwrap(),
+                (0, 0)
+            );
             assert_eq!(
                 version_twelve_historical_evidence(&state.connection),
                 VersionTwelveHistoricalEvidence {
@@ -1328,6 +1844,59 @@ mod tests {
                 .unwrap();
             assert_eq!(second_clock, first_clock);
             assert_eq!(writer_fence_count(&state.connection), 18);
+            migration::validate_attempt_claim_identity_schema(&state.connection).unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn storage_upgrade_coordinator_windows_restored_version_thirteen_reopens_through_migration_014()
+    {
+        for repetition in 0..10 {
+            let root = tempfile::tempdir().unwrap();
+            let database_path = root.path().join(super::super::DATABASE_FILE_NAME);
+            prepare_schema_version(
+                &database_path,
+                writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION,
+            );
+            let authorized = connection::open_authorized_test_connection(&database_path).unwrap();
+            authorized
+                .execute_batch(
+                    "INSERT INTO memory_vector_sync_outbox
+                     (life_id, memory_id, desired_action, state, attempt_count, mutation_sequence)
+                     VALUES ('restored-thirteen-life', 'restored-thirteen-memory',
+                             'delete', 'pending', 2, 8)",
+                )
+                .unwrap();
+            drop(authorized);
+
+            let service = super::super::StorageService::initialize_with_roots(
+                root.path().to_path_buf(),
+                None,
+            )
+            .unwrap();
+            let state = service.state().unwrap();
+            assert_eq!(
+                connection::read_schema_version(&state.connection).unwrap(),
+                connection::MAX_SUPPORTED_SCHEMA_VERSION,
+                "restored version-13 fixture must upgrade on repetition {repetition}"
+            );
+            assert_eq!(
+                state
+                    .connection
+                    .query_row(
+                        "SELECT fenced_claim_epoch, last_marked_claim_epoch
+                         FROM memory_vector_sync_outbox
+                         WHERE life_id='restored-thirteen-life'
+                           AND memory_id='restored-thirteen-memory'",
+                        [],
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                    )
+                    .unwrap(),
+                (0, 0)
+            );
+            assert_eq!(writer_fence_count(&state.connection), 18);
+            migration::validate_attempt_claim_identity_schema(&state.connection).unwrap();
         }
     }
 
@@ -1350,6 +1919,7 @@ mod tests {
                 "final-rm",
                 "migrations",
                 "h1-b",
+                "att-i1",
                 "commit",
                 "post-verify",
                 "wal",

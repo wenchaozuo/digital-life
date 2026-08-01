@@ -516,6 +516,16 @@ impl<'a> FencedVectorSyncSingleEventConsumer<'a> {
         claim: FencedVectorSyncClaim,
         retry_cutoff: i64,
     ) -> Result<FencedVectorSyncSingleEventResult, MemoryVectorSyncWorkerError> {
+        // This first database guard both protects the real external boundary
+        // and quarantines a structurally invalid/mismatched persisted binding
+        // while the original mutation identity is still current.
+        if !self
+            .storage
+            .fenced_vector_claim_is_current(&claim)
+            .map_err(|_| worker_error(MemoryVectorSyncWorkerErrorCode::OutboxUnavailable))?
+        {
+            return Ok(FencedVectorSyncSingleEventResult::LostLeaseOrSuperseded);
+        }
         // A run is bound to one explicit generation context.  A fenced claim
         // must carry that exact persisted generation before any provider or
         // VectorStore operation is considered.
@@ -7117,12 +7127,30 @@ mod tests {
         }
     }
 
-    #[test]
-    fn generation_binding_missing_or_mismatch_calls_no_provider_or_vector_store() {
+    fn assert_execute_claim_binding_corruption_has_zero_external_io(
+        action: MemoryVectorSyncAction,
+        corrupted_generation: Option<&str>,
+    ) {
         let (_temp, storage) = test_storage();
         let (context, raw_vectors) = drained_context();
-        let life_id = drain_upsert_fixture(&storage, context.generation_id().as_str());
+        let life_id = match action {
+            MemoryVectorSyncAction::Upsert => {
+                drain_upsert_fixture(&storage, context.generation_id().as_str())
+            }
+            MemoryVectorSyncAction::Delete => {
+                drain_delete_fixture(&storage, context.generation_id().as_str())
+            }
+        };
         let memory_id = storage.list(&life_id).unwrap()[0].memory_id.clone();
+        let claim = storage
+            .claim_one_fenced_vector_sync(
+                context.generation_id().as_str(),
+                context.descriptor_hash(),
+                context.dimension(),
+                "binding-worker",
+            )
+            .unwrap()
+            .unwrap();
         let provider_requests = Arc::new(AtomicUsize::new(0));
         let embedding_successes = Arc::new(AtomicUsize::new(0));
         let raw_provider = crate::embedding::DeterministicEmbeddingProvider::new(3);
@@ -7144,25 +7172,69 @@ mod tests {
             FencedVectorSyncSingleEventConsumer::new(&storage, &provider, &vectors, context);
         let database =
             rusqlite::Connection::open(storage.test_database_main_path().unwrap()).unwrap();
-
-        for generation in [None, Some("generation-not-the-run")] {
-            database
-                .execute(
-                    "UPDATE memory_vector_sync_outbox
-                     SET state='pending', attempt_count=1, claimed_generation_id=?1,
-                         last_send_disposition='definitely_not_sent'
-                     WHERE life_id=?2 AND memory_id=?3",
-                    rusqlite::params![generation, life_id, memory_id],
-                )
-                .unwrap();
-            assert_eq!(
-                tauri::async_runtime::block_on(consumer.process_one("binding-worker")).unwrap(),
-                FencedVectorSyncSingleEventResult::NoEligibleEvent
-            );
-        }
+        database
+            .execute(
+                "UPDATE memory_vector_sync_outbox
+                 SET claimed_generation_id=?1
+                 WHERE life_id=?2 AND memory_id=?3",
+                rusqlite::params![corrupted_generation, life_id, memory_id],
+            )
+            .unwrap();
+        assert_eq!(
+            tauri::async_runtime::block_on(consumer.execute_claim(claim, 0)).unwrap(),
+            FencedVectorSyncSingleEventResult::LostLeaseOrSuperseded
+        );
         assert_eq!(provider_requests.load(Ordering::SeqCst), 0);
         assert_eq!(embedding_successes.load(Ordering::SeqCst), 0);
         assert_eq!(lance_upserts.load(Ordering::SeqCst), 0);
         assert_eq!(lance_deletes.load(Ordering::SeqCst), 0);
+        let snapshot = storage
+            .test_get_outbox_snapshot_detailed(&life_id, &memory_id)
+            .unwrap();
+        assert_eq!(snapshot.state, "blocked");
+        assert_eq!(
+            snapshot.last_error_code.as_deref(),
+            Some("INTERNAL_INVARIANT")
+        );
+        assert_eq!(snapshot.attempt_count, 0);
+        assert_eq!(
+            snapshot.claimed_generation_id.as_deref(),
+            corrupted_generation
+        );
+        assert_eq!(snapshot.lease_owner, None);
+        assert_eq!(snapshot.lease_fence_epoch, None);
+        assert_eq!(snapshot.lease_expires_at, None);
+    }
+
+    #[test]
+    fn execute_claim_upsert_missing_binding_quarantines_before_external_io() {
+        assert_execute_claim_binding_corruption_has_zero_external_io(
+            MemoryVectorSyncAction::Upsert,
+            None,
+        );
+    }
+
+    #[test]
+    fn execute_claim_upsert_mismatch_binding_quarantines_before_external_io() {
+        assert_execute_claim_binding_corruption_has_zero_external_io(
+            MemoryVectorSyncAction::Upsert,
+            Some("generation-not-the-run"),
+        );
+    }
+
+    #[test]
+    fn execute_claim_delete_missing_binding_quarantines_before_external_io() {
+        assert_execute_claim_binding_corruption_has_zero_external_io(
+            MemoryVectorSyncAction::Delete,
+            None,
+        );
+    }
+
+    #[test]
+    fn execute_claim_delete_mismatch_binding_quarantines_before_external_io() {
+        assert_execute_claim_binding_corruption_has_zero_external_io(
+            MemoryVectorSyncAction::Delete,
+            Some("generation-not-the-run"),
+        );
     }
 }

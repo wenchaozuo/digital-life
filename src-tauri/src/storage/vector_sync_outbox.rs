@@ -146,8 +146,37 @@ pub(crate) struct FencedVectorSyncClaim {
     target_revision: Option<i64>,
     target_content_hash: Option<String>,
     generation_id: String,
+    descriptor_hash: String,
+    dimension: usize,
     lease_owner: String,
     fence_epoch: i64,
+}
+
+/// Internal-only classification of the persisted binding boundary.  It is
+/// deliberately neither serialized nor exposed through the storage API: the
+/// outbox row remains the authority for the binding lifecycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GenerationBindingPhase {
+    Unbound,
+    Ephemeral,
+    Durable,
+    MissingAfterAttempt,
+    Invalid,
+}
+
+fn generation_binding_phase(
+    attempt_count: i64,
+    claimed_generation_id: Option<&str>,
+    state: &str,
+) -> GenerationBindingPhase {
+    match (attempt_count, claimed_generation_id, state) {
+        (0, None, _) => GenerationBindingPhase::Unbound,
+        (0, Some(_), "processing") => GenerationBindingPhase::Ephemeral,
+        (0, Some(_), _) => GenerationBindingPhase::Invalid,
+        (attempts, Some(_), _) if attempts > 0 => GenerationBindingPhase::Durable,
+        (attempts, None, _) if attempts > 0 => GenerationBindingPhase::MissingAfterAttempt,
+        _ => GenerationBindingPhase::Invalid,
+    }
 }
 
 impl std::fmt::Debug for FencedVectorSyncClaim {
@@ -158,6 +187,7 @@ impl std::fmt::Debug for FencedVectorSyncClaim {
             .field("mutation_sequence", &self.mutation_sequence)
             .field("has_target", &self.target_revision.is_some())
             .field("generation_id_len", &self.generation_id.len())
+            .field("dimension", &self.dimension)
             .field("fence_epoch", &self.fence_epoch)
             .finish()
     }
@@ -331,6 +361,21 @@ impl StorageService {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| single_event_error())?;
+        let fence_epoch = acquire_runtime_lease(&tx, lease_owner)?;
+        // A malformed post-012 upsert is fail-closed without materializing its
+        // current memory body. Legacy quarantine is separately and permanently
+        // excluded by the claim predicate below.
+        tx.execute(
+            "UPDATE memory_vector_sync_outbox SET state='blocked', lease_owner=NULL,
+             lease_expires_at=NULL, lease_fence_epoch=NULL,
+             claimed_generation_id=CASE WHEN attempt_count=0 THEN NULL ELSE claimed_generation_id END,
+             last_error_code='VECTOR_TARGET_BINDING_MISSING', updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE desired_action='upsert' AND migration_disposition IS NULL
+               AND (target_revision IS NULL OR target_content_hash IS NULL)
+               AND state IN ('pending','retry_wait','processing')",
+            [],
+        ).map_err(|_| single_event_error())?;
+        recover_expired_fenced_processing_in(&tx, retry_cutoff_millis)?;
         let generation_ok: Option<i64> = tx.query_row(
             "SELECT 1 FROM memory_vector_generation WHERE generation_id=?1 AND descriptor_hash=?2 AND dimension=?3 AND state='building'",
             params![generation_id, descriptor_hash, dimension as i64], |row| row.get(0),
@@ -339,66 +384,92 @@ impl StorageService {
             tx.commit().map_err(|_| single_event_error())?;
             return Ok(None);
         }
-        let fence_epoch = acquire_runtime_lease(&tx, lease_owner)?;
-        // A malformed post-012 upsert is fail-closed without materializing its
-        // current memory body. Legacy quarantine is separately and permanently
-        // excluded by the claim predicate below.
-        tx.execute(
-            "UPDATE memory_vector_sync_outbox SET state='blocked', lease_owner=NULL,
-             lease_expires_at=NULL, lease_fence_epoch=NULL, claimed_generation_id=NULL,
-             last_error_code='VECTOR_TARGET_BINDING_MISSING', updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
-             WHERE desired_action='upsert' AND migration_disposition IS NULL
-               AND (target_revision IS NULL OR target_content_hash IS NULL)
-               AND state IN ('pending','retry_wait','processing')",
-            [],
-        ).map_err(|_| single_event_error())?;
-        recover_expired_fenced_processing_in(&tx, retry_cutoff_millis)?;
-        let id: Option<i64> = match retry_cutoff_millis {
+        let candidate: Option<(i64, i64, Option<String>, String)> = match retry_cutoff_millis {
             Some(retry_cutoff_millis) => tx
                 .query_row(
-                    "SELECT id FROM memory_vector_sync_outbox WHERE migration_disposition IS NULL AND
+                    "SELECT id, attempt_count, claimed_generation_id, state
+                     FROM memory_vector_sync_outbox WHERE migration_disposition IS NULL AND
                       ((desired_action='upsert' AND target_revision IS NOT NULL AND target_content_hash IS NOT NULL)
                        OR (desired_action='delete' AND target_revision IS NULL AND target_content_hash IS NULL)) AND
                       (state='pending' OR (state='retry_wait' AND next_attempt_at <= strftime('%Y-%m-%dT%H:%M:%fZ', ?1 / 1000.0, 'unixepoch')))
+                      AND ((attempt_count=0 AND claimed_generation_id IS NULL)
+                           OR (attempt_count>0 AND claimed_generation_id=?2))
+                      AND NOT (desired_action='upsert' AND
+                               (COALESCE(last_send_disposition, '')='possibly_sent' OR COALESCE(last_error_code, '')='PROVIDER_RESULT_UNKNOWN'))
                      ORDER BY mutation_sequence ASC, id ASC LIMIT 1",
-                    params![retry_cutoff_millis],
-                    |row| row.get(0),
+                    params![retry_cutoff_millis, generation_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .optional()
                 .map_err(|_| single_event_error())?,
             None => tx
                 .query_row(
-                    "SELECT id FROM memory_vector_sync_outbox WHERE migration_disposition IS NULL AND
+                    "SELECT id, attempt_count, claimed_generation_id, state
+                     FROM memory_vector_sync_outbox WHERE migration_disposition IS NULL AND
                       ((desired_action='upsert' AND target_revision IS NOT NULL AND target_content_hash IS NOT NULL)
                        OR (desired_action='delete' AND target_revision IS NULL AND target_content_hash IS NULL)) AND
                       (state='pending' OR (state='retry_wait' AND next_attempt_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now')))
+                      AND ((attempt_count=0 AND claimed_generation_id IS NULL)
+                           OR (attempt_count>0 AND claimed_generation_id=?1))
+                      AND NOT (desired_action='upsert' AND
+                               (COALESCE(last_send_disposition, '')='possibly_sent' OR COALESCE(last_error_code, '')='PROVIDER_RESULT_UNKNOWN'))
                      ORDER BY mutation_sequence ASC, id ASC LIMIT 1",
-                    [],
-                    |row| row.get(0),
+                    params![generation_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .optional()
                 .map_err(|_| single_event_error())?,
         };
-        let Some(id) = id else {
+        let Some((id, attempt_count, claimed_generation_id, event_state)) = candidate else {
             tx.commit().map_err(|_| single_event_error())?;
             return Ok(None);
         };
-        let changed = tx.execute(
-            "UPDATE memory_vector_sync_outbox SET state='processing',
-             lease_owner=?2, lease_fence_epoch=?3, claimed_generation_id=?4,
-             lease_expires_at=strftime('%Y-%m-%dT%H:%M:%fZ','now','+120 seconds'), next_attempt_at=NULL,
-             last_send_disposition=NULL,
-             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
-             WHERE id=?1 AND migration_disposition IS NULL AND state IN ('pending','retry_wait')",
-            params![id, lease_owner, fence_epoch, generation_id],
-        ).map_err(|_| single_event_error())?;
+        let changed = match generation_binding_phase(
+            attempt_count,
+            claimed_generation_id.as_deref(),
+            &event_state,
+        ) {
+            GenerationBindingPhase::Unbound => tx.execute(
+                "UPDATE memory_vector_sync_outbox SET state='processing',
+                 lease_owner=?2, lease_fence_epoch=?3, claimed_generation_id=?4,
+                 lease_expires_at=strftime('%Y-%m-%dT%H:%M:%fZ','now','+120 seconds'), next_attempt_at=NULL,
+                 last_send_disposition=NULL,
+                 updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE id=?1 AND migration_disposition IS NULL AND state IN ('pending','retry_wait')
+                   AND attempt_count=0 AND claimed_generation_id IS NULL",
+                params![id, lease_owner, fence_epoch, generation_id],
+            ),
+            GenerationBindingPhase::Durable
+                if claimed_generation_id.as_deref() == Some(generation_id) =>
+            {
+                tx.execute(
+                    "UPDATE memory_vector_sync_outbox SET state='processing',
+                     lease_owner=?2, lease_fence_epoch=?3,
+                     lease_expires_at=strftime('%Y-%m-%dT%H:%M:%fZ','now','+120 seconds'), next_attempt_at=NULL,
+                     updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                     WHERE id=?1 AND migration_disposition IS NULL AND state IN ('pending','retry_wait')
+                       AND attempt_count>0 AND claimed_generation_id=?4",
+                    params![id, lease_owner, fence_epoch, generation_id],
+                )
+            }
+            GenerationBindingPhase::Ephemeral
+            | GenerationBindingPhase::MissingAfterAttempt
+            | GenerationBindingPhase::Invalid
+            | GenerationBindingPhase::Durable => {
+                tx.commit().map_err(|_| single_event_error())?;
+                return Ok(None);
+            }
+        }
+        .map_err(|_| single_event_error())?;
         if changed != 1 {
             return Err(single_event_error());
         }
         let claim = tx.query_row(
             "SELECT id, life_id, memory_id, desired_action, mutation_sequence, target_revision, target_content_hash,
                     claimed_generation_id, lease_owner, lease_fence_epoch
-             FROM memory_vector_sync_outbox WHERE id=?1", params![id], fenced_claim_from_row,
+             FROM memory_vector_sync_outbox WHERE id=?1", params![id], |row| {
+                fenced_claim_from_row(row, descriptor_hash, dimension)
+             },
         ).map_err(|_| single_event_error())?;
         tx.commit().map_err(|_| single_event_error())?;
         Ok(Some(claim))
@@ -546,7 +617,7 @@ impl StorageService {
         }
         if let Some(error_code) = error_code {
             let changed = tx.execute(
-                &format!("UPDATE memory_vector_sync_outbox SET state={}, next_attempt_at={}, lease_owner=NULL, lease_expires_at=NULL, lease_fence_epoch=NULL, claimed_generation_id=NULL, last_error_code=?6, last_send_disposition=?7, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE {predicate}", if retry { "'retry_wait'" } else { "'blocked'" }, if retry { "strftime('%Y-%m-%dT%H:%M:%fZ','now','+30 seconds')" } else { "NULL" }),
+                &format!("UPDATE memory_vector_sync_outbox SET state={}, next_attempt_at={}, lease_owner=NULL, lease_expires_at=NULL, lease_fence_epoch=NULL, claimed_generation_id=CASE WHEN attempt_count=0 THEN NULL ELSE claimed_generation_id END, last_error_code=?6, last_send_disposition=?7, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE {predicate}", if retry { "'retry_wait'" } else { "'blocked'" }, if retry { "strftime('%Y-%m-%dT%H:%M:%fZ','now','+30 seconds')" } else { "NULL" }),
                 params![claim.id, claim.mutation_sequence, claim.lease_owner, claim.fence_epoch, claim.generation_id, safe_error_code(error_code), send_disposition],
             ).map_err(|_| single_event_error())?;
             tx.commit().map_err(|_| single_event_error())?;
@@ -623,7 +694,7 @@ impl StorageService {
         };
         let result = if let Some(next_attempt_at_millis) = retry_at {
             let changed = tx.execute(
-                &format!("UPDATE memory_vector_sync_outbox SET state='retry_wait', next_attempt_at=strftime('%Y-%m-%dT%H:%M:%fZ', ?8 / 1000.0, 'unixepoch'), lease_owner=NULL, lease_expires_at=NULL, lease_fence_epoch=NULL, claimed_generation_id=NULL, last_error_code=?6, last_send_disposition=?7, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE {predicate}"),
+                &format!("UPDATE memory_vector_sync_outbox SET state='retry_wait', next_attempt_at=strftime('%Y-%m-%dT%H:%M:%fZ', ?8 / 1000.0, 'unixepoch'), lease_owner=NULL, lease_expires_at=NULL, lease_fence_epoch=NULL, claimed_generation_id=CASE WHEN attempt_count=0 THEN NULL ELSE claimed_generation_id END, last_error_code=?6, last_send_disposition=?7, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE {predicate}"),
                 params![claim.id, claim.mutation_sequence, claim.lease_owner, claim.fence_epoch, claim.generation_id, safe_error_code(error_code), send_disposition, next_attempt_at_millis],
             ).map_err(|_| single_event_error())?;
             if changed == 1 {
@@ -635,7 +706,7 @@ impl StorageService {
             }
         } else {
             let changed = tx.execute(
-                &format!("UPDATE memory_vector_sync_outbox SET state='blocked', next_attempt_at=NULL, lease_owner=NULL, lease_expires_at=NULL, lease_fence_epoch=NULL, claimed_generation_id=NULL, last_error_code=?6, last_send_disposition=?7, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE {predicate}"),
+                &format!("UPDATE memory_vector_sync_outbox SET state='blocked', next_attempt_at=NULL, lease_owner=NULL, lease_expires_at=NULL, lease_fence_epoch=NULL, claimed_generation_id=CASE WHEN attempt_count=0 THEN NULL ELSE claimed_generation_id END, last_error_code=?6, last_send_disposition=?7, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE {predicate}"),
                 params![claim.id, claim.mutation_sequence, claim.lease_owner, claim.fence_epoch, claim.generation_id, safe_error_code(error_code), send_disposition],
             ).map_err(|_| single_event_error())?;
             if changed == 1 {
@@ -662,6 +733,42 @@ impl StorageService {
             )
             .map_err(|_| single_event_error())?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_fenced_state_for_generation_binding(
+        &self,
+        state_name: &str,
+        clear_ephemeral_generation: bool,
+    ) -> Result<(), crate::storage::StorageError> {
+        let state = self.state()?;
+        state
+            .connection
+            .execute(
+                "UPDATE memory_vector_sync_outbox
+                 SET state=?1, lease_owner=NULL, lease_expires_at=NULL, lease_fence_epoch=NULL,
+                     claimed_generation_id=CASE WHEN ?2 THEN NULL ELSE claimed_generation_id END,
+                     next_attempt_at=NULL",
+                params![state_name, clear_ephemeral_generation],
+            )
+            .map_err(|_| single_event_error())?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_recover_expired_fenced_processing_for_generation_binding(
+        &self,
+        retry_cutoff_millis: i64,
+    ) -> Result<usize, crate::storage::StorageError> {
+        let mut state = self.state()?;
+        let transaction = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| single_event_error())?;
+        let recovered =
+            recover_expired_fenced_processing_in(&transaction, Some(retry_cutoff_millis))?;
+        transaction.commit().map_err(|_| single_event_error())?;
+        Ok(recovered)
     }
 
     #[cfg(test)]
@@ -925,8 +1032,12 @@ fn fenced_claim_current_in(
            SELECT 1 FROM memory_vector_sync_outbox AS o
            JOIN memory_vector_sync_runtime_lease AS r
              ON r.lease_name='memory-vector-single-event-consumer'
+           JOIN memory_vector_generation AS g
+             ON g.generation_id=o.claimed_generation_id
           WHERE o.id=?1 AND o.mutation_sequence=?2 AND o.state='processing'
             AND o.lease_owner=?3 AND o.lease_fence_epoch=?4 AND o.claimed_generation_id=?5
+            AND o.target_revision IS ?6 AND o.target_content_hash IS ?7
+            AND g.descriptor_hash=?8 AND g.dimension=?9 AND g.state='building'
             AND r.owner_id=?3 AND r.fence_epoch=?4
             AND r.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
         )",
@@ -935,7 +1046,11 @@ fn fenced_claim_current_in(
             claim.mutation_sequence,
             claim.lease_owner,
             claim.fence_epoch,
-            claim.generation_id
+            claim.generation_id,
+            claim.target_revision,
+            claim.target_content_hash,
+            claim.descriptor_hash,
+            claim.dimension as i64,
         ],
         |row| Ok(row.get::<_, i64>(0)? == 1),
     )
@@ -952,13 +1067,17 @@ fn recover_expired_fenced_processing_in(
     tx.execute(
         "UPDATE memory_vector_sync_outbox
          SET state=CASE
+               WHEN attempt_count>0 AND claimed_generation_id IS NULL THEN 'blocked'
                WHEN desired_action='upsert' AND attempt_count=0 AND last_send_disposition IS NULL THEN 'pending'
-               WHEN desired_action='delete' AND last_send_disposition IS NULL THEN 'pending'
+               WHEN desired_action='delete' AND attempt_count=0 AND last_send_disposition IS NULL THEN 'pending'
+               WHEN desired_action='delete' AND attempt_count>0 AND claimed_generation_id IS NOT NULL AND last_send_disposition IS NULL THEN 'pending'
                ELSE 'blocked'
              END,
              next_attempt_at=NULL,
-             lease_owner=NULL, lease_expires_at=NULL, lease_fence_epoch=NULL, claimed_generation_id=NULL,
+             lease_owner=NULL, lease_expires_at=NULL, lease_fence_epoch=NULL,
+             claimed_generation_id=CASE WHEN attempt_count=0 THEN NULL ELSE claimed_generation_id END,
              last_error_code=CASE
+               WHEN attempt_count>0 AND claimed_generation_id IS NULL THEN 'INTERNAL_INVARIANT'
                WHEN desired_action='upsert' AND attempt_count>0 AND last_send_disposition='possibly_sent' THEN 'PROVIDER_RESULT_UNKNOWN'
                WHEN desired_action='upsert' AND attempt_count=0 AND last_send_disposition IS NULL THEN last_error_code
                WHEN desired_action='delete' AND last_send_disposition IS NULL THEN last_error_code
@@ -976,7 +1095,11 @@ fn recover_expired_fenced_processing_in(
 }
 
 #[allow(dead_code)]
-fn fenced_claim_from_row(row: &Row<'_>) -> rusqlite::Result<FencedVectorSyncClaim> {
+fn fenced_claim_from_row(
+    row: &Row<'_>,
+    descriptor_hash: &str,
+    dimension: usize,
+) -> rusqlite::Result<FencedVectorSyncClaim> {
     let action: String = row.get(3)?;
     Ok(FencedVectorSyncClaim {
         id: row.get(0)?,
@@ -988,6 +1111,8 @@ fn fenced_claim_from_row(row: &Row<'_>) -> rusqlite::Result<FencedVectorSyncClai
         target_revision: row.get(5)?,
         target_content_hash: row.get(6)?,
         generation_id: row.get(7)?,
+        descriptor_hash: descriptor_hash.to_owned(),
+        dimension,
         lease_owner: row.get(8)?,
         fence_epoch: row.get(9)?,
     })
@@ -1263,10 +1388,15 @@ impl MemoryVectorSyncOutboxRepository for StorageService {
         state
             .connection
             .execute(
-                "UPDATE memory_vector_sync_outbox SET state = 'pending', attempt_count = 0,
+                "UPDATE memory_vector_sync_outbox SET state = 'pending',
                  next_attempt_at = NULL, lease_owner = NULL, lease_expires_at = NULL,
+                 lease_fence_epoch = NULL,
+                 claimed_generation_id = CASE WHEN attempt_count=0 THEN NULL ELSE claimed_generation_id END,
                  last_error_code = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                 WHERE life_id = ?1 AND state IN ('blocked', 'failed', 'retry_wait')",
+                 WHERE life_id = ?1 AND state IN ('blocked', 'failed', 'retry_wait')
+                   AND (attempt_count=0 OR claimed_generation_id IS NOT NULL)
+                   AND NOT (desired_action='upsert' AND
+                            (COALESCE(last_send_disposition, '')='possibly_sent' OR COALESCE(last_error_code, '')='PROVIDER_RESULT_UNKNOWN'))",
                 params![life_id],
             )
             .map_err(|_| outbox_error())
@@ -2567,7 +2697,14 @@ mod tests {
                 .test_get_outbox_snapshot_detailed("life", &record.id)
                 .unwrap();
             assert_eq!(cleared.state, "processing");
-            assert_eq!(cleared.last_send_disposition, None);
+            assert_eq!(
+                cleared.last_send_disposition.as_deref(),
+                Some("definitely_not_sent")
+            );
+            assert_eq!(
+                cleared.claimed_generation_id.as_deref(),
+                Some("generation-a")
+            );
 
             storage.test_expire_fenced_runtime_lease().unwrap();
             assert_eq!(
@@ -2578,7 +2715,10 @@ mod tests {
                 .test_get_outbox_snapshot_detailed("life", &record.id)
                 .unwrap();
             assert_eq!(after_old_fence.attempt_count, 1);
-            assert_eq!(after_old_fence.last_send_disposition, None);
+            assert_eq!(
+                after_old_fence.last_send_disposition.as_deref(),
+                Some("definitely_not_sent")
+            );
         }
 
         let (_root, delete_storage) = storage();
@@ -2696,7 +2836,14 @@ mod tests {
             assert_eq!(snapshot.lease_owner, None);
             assert_eq!(snapshot.lease_fence_epoch, None);
             assert_eq!(snapshot.lease_expires_at, None);
-            assert_eq!(snapshot.claimed_generation_id, None);
+            assert_eq!(
+                snapshot.claimed_generation_id.as_deref(),
+                if attempts == 0 {
+                    None
+                } else {
+                    Some("generation-a")
+                }
+            );
             assert_eq!(snapshot.next_attempt_at, None);
             drop(claim);
         }
@@ -2765,5 +2912,464 @@ mod tests {
             .register_building_vector_generation("generation-a", "descriptor-a", 2)
             .unwrap_err();
         assert_eq!(state_error.code, "GENERATION_STATE_CONFLICT");
+    }
+
+    #[test]
+    fn generation_binding_phase_accepts_only_unbound_ephemeral_and_durable_rows() {
+        assert_eq!(
+            generation_binding_phase(0, None, "pending"),
+            GenerationBindingPhase::Unbound
+        );
+        assert_eq!(
+            generation_binding_phase(0, Some("generation-a"), "processing"),
+            GenerationBindingPhase::Ephemeral
+        );
+        assert_eq!(
+            generation_binding_phase(1, Some("generation-a"), "retry_wait"),
+            GenerationBindingPhase::Durable
+        );
+        assert_eq!(
+            generation_binding_phase(1, None, "pending"),
+            GenerationBindingPhase::MissingAfterAttempt
+        );
+        assert_eq!(
+            generation_binding_phase(0, Some("generation-a"), "pending"),
+            GenerationBindingPhase::Invalid
+        );
+    }
+
+    #[test]
+    fn claim_one_fenced_vector_sync_preserves_generation_binding_across_retry_and_switch() {
+        let (_root, storage) = storage();
+        let record = confirmed(&storage, false);
+        storage
+            .register_building_vector_generation("generation-a", "descriptor-a", 2)
+            .unwrap();
+        storage
+            .register_building_vector_generation("generation-b", "descriptor-a", 2)
+            .unwrap();
+
+        let first = storage
+            .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-a")
+            .unwrap()
+            .unwrap();
+        let ephemeral = storage
+            .test_get_outbox_snapshot_detailed("life", &record.id)
+            .unwrap();
+        assert_eq!(ephemeral.attempt_count, 0);
+        assert_eq!(ephemeral.state, "processing");
+        assert_eq!(
+            ephemeral.claimed_generation_id.as_deref(),
+            Some("generation-a")
+        );
+
+        assert_eq!(
+            storage.mark_fenced_attempt_started(&first).unwrap(),
+            FencedAttemptStartResult::Started { attempt_count: 1 }
+        );
+        assert_eq!(
+            storage
+                .finalize_fenced_vector_failure(
+                    &first,
+                    "RATE_LIMITED",
+                    FencedFailureDecision::RetryAfter {
+                        delay_millis: 30_000,
+                    },
+                    Some("definitely_not_sent"),
+                    0,
+                    0,
+                )
+                .unwrap(),
+            FencedFailureFinalizeResult::RetryScheduled {
+                next_attempt_at_millis: 30_000,
+            }
+        );
+
+        assert!(storage
+            .claim_one_fenced_vector_sync("generation-b", "descriptor-a", 2, "worker-a")
+            .unwrap()
+            .is_none());
+        let retry = storage
+            .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry.generation_id(), "generation-a");
+        let durable = storage
+            .test_get_outbox_snapshot_detailed("life", &record.id)
+            .unwrap();
+        assert_eq!(durable.attempt_count, 1);
+        assert_eq!(
+            durable.claimed_generation_id.as_deref(),
+            Some("generation-a")
+        );
+        assert_eq!(
+            durable.last_send_disposition.as_deref(),
+            Some("definitely_not_sent")
+        );
+
+        storage
+            .enqueue(EnqueueMemoryVectorSyncRequest {
+                life_id: record.life_id.clone(),
+                memory_id: record.id.clone(),
+                desired_action: MemoryVectorSyncAction::Upsert,
+            })
+            .unwrap();
+        let replacement = storage
+            .test_get_outbox_snapshot_detailed("life", &record.id)
+            .unwrap();
+        assert_eq!(replacement.attempt_count, 0);
+        assert_eq!(replacement.claimed_generation_id, None);
+        assert_eq!(replacement.last_send_disposition, None);
+    }
+
+    #[test]
+    fn claim_one_fenced_vector_sync_rejects_missing_invalid_and_isolated_generation_binding() {
+        let (_root, storage) = storage();
+        let record = confirmed(&storage, false);
+        storage
+            .register_building_vector_generation("generation-a", "descriptor-a", 2)
+            .unwrap();
+        {
+            let state = storage.state().unwrap();
+            state
+                .connection
+                .execute(
+                    "UPDATE memory_vector_sync_outbox
+                     SET state='pending', attempt_count=1, claimed_generation_id=NULL
+                     WHERE life_id='life' AND memory_id=?1",
+                    params![record.id],
+                )
+                .unwrap();
+        }
+        assert!(storage
+            .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-a")
+            .unwrap()
+            .is_none());
+
+        {
+            let state = storage.state().unwrap();
+            state
+                .connection
+                .execute(
+                    "UPDATE memory_vector_sync_outbox
+                     SET attempt_count=0, claimed_generation_id='generation-a', state='pending'
+                     WHERE life_id='life' AND memory_id=?1",
+                    params![record.id],
+                )
+                .unwrap();
+        }
+        assert!(storage
+            .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-a")
+            .unwrap()
+            .is_none());
+
+        {
+            let state = storage.state().unwrap();
+            state
+                .connection
+                .execute(
+                    "UPDATE memory_vector_sync_outbox
+                     SET claimed_generation_id=NULL,
+                         migration_disposition='legacy_upsert_rebuild_required'
+                     WHERE life_id='life' AND memory_id=?1",
+                    params![record.id],
+                )
+                .unwrap();
+        }
+        assert!(storage
+            .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-a")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn mark_fenced_attempt_started_keeps_generation_binding_durable() {
+        let (_root, storage) = storage();
+        let record = confirmed(&storage, false);
+        storage
+            .register_building_vector_generation("generation-a", "descriptor-a", 2)
+            .unwrap();
+        let claim = storage
+            .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            storage.mark_fenced_attempt_started(&claim).unwrap(),
+            FencedAttemptStartResult::Started { attempt_count: 1 }
+        );
+        let snapshot = storage
+            .test_get_outbox_snapshot_detailed("life", &record.id)
+            .unwrap();
+        assert_eq!(snapshot.attempt_count, 1);
+        assert_eq!(
+            snapshot.claimed_generation_id.as_deref(),
+            Some("generation-a")
+        );
+    }
+
+    #[test]
+    fn generation_binding_failure_finalize_releases_only_pre_attempt_ephemeral_binding() {
+        let (_root, storage) = storage();
+        let record = confirmed(&storage, false);
+        storage
+            .register_building_vector_generation("generation-a", "descriptor-a", 2)
+            .unwrap();
+        let pre_attempt = storage
+            .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            storage
+                .finalize_fenced_vector_sync(
+                    &pre_attempt,
+                    None,
+                    Some("VECTOR_TARGET_STALE"),
+                    false,
+                    None,
+                )
+                .unwrap(),
+            FencedFinalizeResult::Applied
+        );
+        let released = storage
+            .test_get_outbox_snapshot_detailed("life", &record.id)
+            .unwrap();
+        assert_eq!(released.attempt_count, 0);
+        assert_eq!(released.claimed_generation_id, None);
+
+        storage
+            .enqueue(EnqueueMemoryVectorSyncRequest {
+                life_id: record.life_id.clone(),
+                memory_id: record.id.clone(),
+                desired_action: MemoryVectorSyncAction::Upsert,
+            })
+            .unwrap();
+        let post_attempt = storage
+            .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-a")
+            .unwrap()
+            .unwrap();
+        storage.mark_fenced_attempt_started(&post_attempt).unwrap();
+        assert_eq!(
+            storage
+                .finalize_fenced_vector_sync(
+                    &post_attempt,
+                    None,
+                    Some("VECTOR_TARGET_STALE"),
+                    false,
+                    Some("definitely_not_sent"),
+                )
+                .unwrap(),
+            FencedFinalizeResult::Applied
+        );
+        let retained = storage
+            .test_get_outbox_snapshot_detailed("life", &record.id)
+            .unwrap();
+        assert_eq!(retained.attempt_count, 1);
+        assert_eq!(
+            retained.claimed_generation_id.as_deref(),
+            Some("generation-a")
+        );
+    }
+
+    #[test]
+    fn recover_expired_generation_binding_releases_ephemeral_and_preserves_durable() {
+        let (_root, storage) = storage();
+        let record = confirmed(&storage, false);
+        storage
+            .register_building_vector_generation("generation-a", "descriptor-a", 2)
+            .unwrap();
+        let first = storage
+            .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-a")
+            .unwrap()
+            .unwrap();
+        storage.test_expire_fenced_runtime_lease().unwrap();
+        let mut state = storage.state().unwrap();
+        let tx = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert_eq!(
+            recover_expired_fenced_processing_in(&tx, Some(1_700_000_000_000)).unwrap(),
+            1
+        );
+        tx.commit().unwrap();
+        drop(state);
+        let ephemeral = storage
+            .test_get_outbox_snapshot_detailed("life", &record.id)
+            .unwrap();
+        assert_eq!(ephemeral.attempt_count, 0);
+        assert_eq!(ephemeral.claimed_generation_id, None);
+
+        let durable_claim = storage
+            .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-b")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            storage.mark_fenced_attempt_started(&durable_claim).unwrap(),
+            FencedAttemptStartResult::Started { attempt_count: 1 }
+        );
+        storage.test_expire_fenced_runtime_lease().unwrap();
+        let mut state = storage.state().unwrap();
+        let tx = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert_eq!(
+            recover_expired_fenced_processing_in(&tx, Some(1_700_000_000_000)).unwrap(),
+            1
+        );
+        tx.commit().unwrap();
+        drop(state);
+        let durable = storage
+            .test_get_outbox_snapshot_detailed("life", &record.id)
+            .unwrap();
+        assert_eq!(durable.attempt_count, 1);
+        assert_eq!(
+            durable.claimed_generation_id.as_deref(),
+            Some("generation-a")
+        );
+        assert_eq!(durable.state, "blocked");
+        drop(first);
+    }
+
+    #[test]
+    fn retry_failures_preserves_durable_generation_binding_and_excludes_unknown_send() {
+        let (_root, storage) = storage();
+        let record = confirmed(&storage, false);
+        storage
+            .register_building_vector_generation("generation-a", "descriptor-a", 2)
+            .unwrap();
+        let claim = storage
+            .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-a")
+            .unwrap()
+            .unwrap();
+        storage.mark_fenced_attempt_started(&claim).unwrap();
+        storage
+            .finalize_fenced_vector_failure(
+                &claim,
+                "RATE_LIMITED",
+                FencedFailureDecision::Blocked,
+                Some("definitely_not_sent"),
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(storage.retry_failures("life").unwrap(), 1);
+        let retried = storage
+            .test_get_outbox_snapshot_detailed("life", &record.id)
+            .unwrap();
+        assert_eq!(retried.state, "pending");
+        assert_eq!(retried.attempt_count, 1);
+        assert_eq!(
+            retried.claimed_generation_id.as_deref(),
+            Some("generation-a")
+        );
+        assert_eq!(
+            retried.last_send_disposition.as_deref(),
+            Some("definitely_not_sent")
+        );
+
+        storage
+            .state()
+            .unwrap()
+            .connection
+            .execute(
+                "UPDATE memory_vector_sync_outbox
+                 SET state='blocked', last_send_disposition='possibly_sent',
+                     last_error_code='PROVIDER_RESULT_UNKNOWN'
+                 WHERE life_id='life' AND memory_id=?1",
+                params![record.id],
+            )
+            .unwrap();
+        assert_eq!(storage.retry_failures("life").unwrap(), 0);
+        let unknown = storage
+            .test_get_outbox_snapshot_detailed("life", &record.id)
+            .unwrap();
+        assert_eq!(unknown.state, "blocked");
+        assert_eq!(unknown.attempt_count, 1);
+        assert_eq!(
+            unknown.claimed_generation_id.as_deref(),
+            Some("generation-a")
+        );
+    }
+
+    #[test]
+    fn generation_binding_two_connections_claim_at_most_once_for_ten_rounds() {
+        for round in 0..10 {
+            let (root, first) = storage();
+            confirmed(&first, false);
+            first
+                .register_building_vector_generation("generation-a", "descriptor-a", 2)
+                .unwrap();
+            let second = StorageService::initialize_with_roots(root.0.join("data"), None).unwrap();
+            let barrier = Arc::new(Barrier::new(2));
+            let first_barrier = Arc::clone(&barrier);
+            let first_thread = thread::spawn(move || {
+                first_barrier.wait();
+                first.claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-a")
+            });
+            let second_thread = thread::spawn(move || {
+                barrier.wait();
+                second.claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-b")
+            });
+            let first_claim = first_thread.join().unwrap();
+            let second_claim = second_thread.join().unwrap();
+            assert_eq!(
+                usize::from(matches!(first_claim, Ok(Some(_))))
+                    + usize::from(matches!(second_claim, Ok(Some(_)))),
+                1,
+                "round {round}"
+            );
+        }
+    }
+
+    #[test]
+    fn generation_binding_recovery_and_retry_compete_for_ten_rounds() {
+        for round in 0..10 {
+            let (root, first) = storage();
+            let record = confirmed(&first, false);
+            first
+                .register_building_vector_generation("generation-a", "descriptor-a", 2)
+                .unwrap();
+            let claim = first
+                .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-a")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                first.mark_fenced_attempt_started(&claim).unwrap(),
+                FencedAttemptStartResult::Started { attempt_count: 1 }
+            );
+            first.test_expire_fenced_runtime_lease().unwrap();
+            let second = StorageService::initialize_with_roots(root.0.join("data"), None).unwrap();
+            let barrier = Arc::new(Barrier::new(2));
+            let first_barrier = Arc::clone(&barrier);
+            let recovery = thread::spawn(move || {
+                first_barrier.wait();
+                first.test_recover_expired_fenced_processing_for_generation_binding(
+                    1_700_000_000_000,
+                )
+            });
+            let retry = thread::spawn(move || {
+                barrier.wait();
+                second.retry_failures("life")
+            });
+            recovery.join().unwrap().unwrap();
+            retry.join().unwrap().unwrap();
+
+            let verifier =
+                StorageService::initialize_with_roots(root.0.join("data"), None).unwrap();
+            let snapshot = verifier
+                .test_get_outbox_snapshot_detailed("life", &record.id)
+                .unwrap();
+            assert_eq!(snapshot.attempt_count, 1, "round {round}");
+            assert_eq!(
+                snapshot.claimed_generation_id.as_deref(),
+                Some("generation-a"),
+                "round {round}"
+            );
+            assert!(
+                matches!(snapshot.state.as_str(), "blocked" | "pending"),
+                "round {round}"
+            );
+        }
     }
 }

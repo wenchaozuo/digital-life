@@ -516,6 +516,12 @@ impl<'a> FencedVectorSyncSingleEventConsumer<'a> {
         claim: FencedVectorSyncClaim,
         retry_cutoff: i64,
     ) -> Result<FencedVectorSyncSingleEventResult, MemoryVectorSyncWorkerError> {
+        // A run is bound to one explicit generation context.  A fenced claim
+        // must carry that exact persisted generation before any provider or
+        // VectorStore operation is considered.
+        if claim.generation_id() != self.generation.generation_id().as_str() {
+            return Ok(FencedVectorSyncSingleEventResult::LostLeaseOrSuperseded);
+        }
         match claim.action() {
             MemoryVectorSyncAction::Delete => {
                 if !self
@@ -4559,7 +4565,19 @@ mod tests {
                 .unwrap();
             drain_upsert_fixture(&storage, context.generation_id().as_str());
             storage
+                .claim_one_fenced_vector_sync(
+                    context.generation_id().as_str(),
+                    context.descriptor_hash(),
+                    context.dimension(),
+                    "attempt-boundary",
+                )
+                .unwrap()
+                .unwrap();
+            storage
                 .test_set_fenced_attempt_count(prior_attempts)
+                .unwrap();
+            storage
+                .test_set_fenced_state_for_generation_binding("pending", prior_attempts == 0)
                 .unwrap();
             let provider = MixedOutcomeEmbeddingProvider {
                 inner: crate::embedding::DeterministicEmbeddingProvider::new(3),
@@ -6086,7 +6104,19 @@ mod tests {
             let (_temp, storage) = test_storage();
             let (context, vectors) = drained_context();
             drain_upsert_fixture(&storage, context.generation_id().as_str());
+            storage
+                .claim_one_fenced_vector_sync(
+                    context.generation_id().as_str(),
+                    context.descriptor_hash(),
+                    context.dimension(),
+                    "w-cred-att5",
+                )
+                .unwrap()
+                .unwrap();
             storage.test_set_fenced_attempt_count(4).unwrap();
+            storage
+                .test_set_fenced_state_for_generation_binding("pending", false)
+                .unwrap();
             let clock = FixedRetryClock::new(100_000);
             let provider = FakeCredentialProvider {
                 kind: ProviderCredentialError::Unavailable,
@@ -6361,7 +6391,19 @@ mod tests {
             let (_temp, storage) = test_storage();
             let (context, vectors) = drained_context();
             drain_upsert_fixture(&storage, context.generation_id().as_str());
+            storage
+                .claim_one_fenced_vector_sync(
+                    context.generation_id().as_str(),
+                    context.descriptor_hash(),
+                    context.dimension(),
+                    "w-429-att5",
+                )
+                .unwrap()
+                .unwrap();
             storage.test_set_fenced_attempt_count(4).unwrap();
+            storage
+                .test_set_fenced_state_for_generation_binding("pending", false)
+                .unwrap();
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let port = listener.local_addr().unwrap().port();
             let transport_requests = Arc::new(AtomicUsize::new(0));
@@ -7073,5 +7115,54 @@ mod tests {
             assert_eq!(jobs[0].state, MemoryVectorSyncState::Blocked);
             assert_eq!(jobs[0].next_attempt_at, None);
         }
+    }
+
+    #[test]
+    fn generation_binding_missing_or_mismatch_calls_no_provider_or_vector_store() {
+        let (_temp, storage) = test_storage();
+        let (context, raw_vectors) = drained_context();
+        let life_id = drain_upsert_fixture(&storage, context.generation_id().as_str());
+        let memory_id = storage.list(&life_id).unwrap()[0].memory_id.clone();
+        let provider_requests = Arc::new(AtomicUsize::new(0));
+        let embedding_successes = Arc::new(AtomicUsize::new(0));
+        let raw_provider = crate::embedding::DeterministicEmbeddingProvider::new(3);
+        let provider = CountingEmbeddingProvider {
+            inner: &raw_provider,
+            provider_requests: Arc::clone(&provider_requests),
+            embedding_successes: Arc::clone(&embedding_successes),
+        };
+        let lance_upserts = Arc::new(AtomicUsize::new(0));
+        let lance_deletes = Arc::new(AtomicUsize::new(0));
+        let vectors = CountingVectorStore {
+            inner: raw_vectors,
+            lance_upserts: Arc::clone(&lance_upserts),
+            lance_deletes: Arc::clone(&lance_deletes),
+            current_lance_writes: Arc::new(AtomicUsize::new(0)),
+            max_concurrent_lance_writes: Arc::new(AtomicUsize::new(0)),
+        };
+        let consumer =
+            FencedVectorSyncSingleEventConsumer::new(&storage, &provider, &vectors, context);
+        let database =
+            rusqlite::Connection::open(storage.test_database_main_path().unwrap()).unwrap();
+
+        for generation in [None, Some("generation-not-the-run")] {
+            database
+                .execute(
+                    "UPDATE memory_vector_sync_outbox
+                     SET state='pending', attempt_count=1, claimed_generation_id=?1,
+                         last_send_disposition='definitely_not_sent'
+                     WHERE life_id=?2 AND memory_id=?3",
+                    rusqlite::params![generation, life_id, memory_id],
+                )
+                .unwrap();
+            assert_eq!(
+                tauri::async_runtime::block_on(consumer.process_one("binding-worker")).unwrap(),
+                FencedVectorSyncSingleEventResult::NoEligibleEvent
+            );
+        }
+        assert_eq!(provider_requests.load(Ordering::SeqCst), 0);
+        assert_eq!(embedding_successes.load(Ordering::SeqCst), 0);
+        assert_eq!(lance_upserts.load(Ordering::SeqCst), 0);
+        assert_eq!(lance_deletes.load(Ordering::SeqCst), 0);
     }
 }

@@ -4,18 +4,20 @@ use rusqlite::{backup::Backup, params, Connection, OptionalExtension, Transactio
 
 use super::{connection, writer_fence_manifest, StorageError, MIGRATIONS};
 
-/// The only H1-A3 extension result for the future writer-fence schema phase.
-/// H1-B must replace this fixed `NotRegistered` state through the repository's
-/// static migration registry; callers cannot supply SQL or callbacks.
+pub(super) const LAST_STATIC_MIGRATION_VERSION: i64 = 12;
+const WRITER_FENCE_MIGRATION_NAME: &str = "013_historical_outbox_isolation_and_writer_fence";
+
+/// The fixed H1-B schema phase is applied exactly once after static migrations
+/// 1 through 12 have completed in the caller-owned transaction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum WriterFenceSchemaUpgrade {
-    NotRegistered,
+    Applied,
 }
 
 /// Applies every pending registered migration in a caller-owned transaction.
 ///
 /// This function never creates a nested transaction, commits, configures WAL,
-/// invokes Restart Manager, or installs the future writer-fence Trigger schema.
+/// invokes Restart Manager, or installs the writer-fence Trigger schema.
 pub(super) fn apply_pending_migrations_in_transaction(
     transaction: &Transaction<'_>,
     from_version: i64,
@@ -24,23 +26,124 @@ pub(super) fn apply_pending_migrations_in_transaction(
     if target_version != connection::MAX_SUPPORTED_SCHEMA_VERSION {
         return Err(StorageError::migration_version_invariant_failed());
     }
-    apply_migrations_from_static_registry(transaction, from_version, target_version, MIGRATIONS)
+    if !(0..=LAST_STATIC_MIGRATION_VERSION).contains(&from_version) {
+        return Err(StorageError::migration_version_invariant_failed());
+    }
+    apply_migrations_from_static_registry(
+        transaction,
+        from_version,
+        LAST_STATIC_MIGRATION_VERSION,
+        MIGRATIONS,
+    )
 }
 
-/// Fixed H1-B extension location. It is deliberately registered as absent in
-/// H1-A3 and has no capability to execute caller-provided SQL.
+/// Fixed H1-B extension location. It accepts only the caller-owned transaction
+/// and executes the repository's static historical-isolation and writer-fence
+/// steps; callers cannot supply SQL, callbacks, names, or a migration registry.
 pub(super) fn apply_writer_fence_schema_upgrade_if_registered(
-    _transaction: &Transaction<'_>,
+    transaction: &Transaction<'_>,
 ) -> Result<WriterFenceSchemaUpgrade, StorageError> {
     debug_assert_eq!(
         writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION,
-        connection::MAX_SUPPORTED_SCHEMA_VERSION + 1
+        connection::MAX_SUPPORTED_SCHEMA_VERSION
     );
     debug_assert_eq!(
         writer_fence_manifest::writer_fence_trigger_specs().len(),
         18
     );
-    Ok(WriterFenceSchemaUpgrade::NotRegistered)
+    if connection::read_schema_version(transaction)? != LAST_STATIC_MIGRATION_VERSION {
+        return Err(StorageError::migration_version_invariant_failed());
+    }
+
+    isolate_historical_outbox_in_transaction(transaction)?;
+    writer_fence_manifest::install_writer_fence_manifest_in_transaction(transaction)?;
+
+    #[cfg(test)]
+    if should_fail_migration_013_at_for_test(Migration013Failpoint::SchemaVersion) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    transaction
+        .execute(
+            "INSERT INTO schema_migration (version, name, applied_at)
+             VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+            params![
+                writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION,
+                WRITER_FENCE_MIGRATION_NAME
+            ],
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+
+    #[cfg(test)]
+    if should_fail_migration_013_at_for_test(Migration013Failpoint::ManifestValidation) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    writer_fence_manifest::validate_writer_fence_manifest(transaction)?;
+    Ok(WriterFenceSchemaUpgrade::Applied)
+}
+
+fn isolate_historical_outbox_in_transaction(
+    transaction: &Transaction<'_>,
+) -> Result<(), StorageError> {
+    #[cfg(test)]
+    if should_fail_migration_013_at_for_test(Migration013Failpoint::HistoricalIsolation) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+
+    // The SQL engine, rather than a Rust-side set, determines the exact
+    // distinct Memory set that receives one mutation-clock increment.
+    let affected_memory_count: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM (
+                 SELECT DISTINCT life_id, memory_id
+                 FROM memory_vector_sync_outbox
+                 WHERE state IN ('pending', 'processing')
+                   AND migration_disposition IS NULL
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    if affected_memory_count < 0 {
+        return Err(StorageError::migration_transaction_failed());
+    }
+
+    let isolated = transaction
+        .execute(
+            "UPDATE memory_vector_sync_outbox
+             SET state='failed', next_attempt_at=NULL,
+                 lease_owner=NULL, lease_expires_at=NULL, lease_fence_epoch=NULL,
+                 migration_disposition='legacy_upsert_rebuild_required',
+                 updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE state IN ('pending', 'processing')
+               AND migration_disposition IS NULL",
+            [],
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    if affected_memory_count == 0 && isolated != 0 {
+        return Err(StorageError::migration_transaction_failed());
+    }
+
+    if affected_memory_count == 0 {
+        return Ok(());
+    }
+
+    #[cfg(test)]
+    if should_fail_migration_013_at_for_test(Migration013Failpoint::MutationClock) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    let clock_changed = transaction
+        .execute(
+            "UPDATE memory_vector_sync_mutation_clock
+             SET last_sequence=last_sequence + ?1
+             WHERE singleton=1
+               AND last_sequence <= 9223372036854775807 - ?1",
+            [affected_memory_count],
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    if clock_changed != 1 {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    Ok(())
 }
 
 /// Performs schema-only post-commit verification for the authoritative
@@ -59,6 +162,10 @@ pub(super) fn verify_schema_after_upgrade(
         .map_err(|_| StorageError::migration_post_commit_verification_failed())?;
     if found_version != expected_schema_version {
         return Err(StorageError::migration_version_invariant_failed());
+    }
+
+    if expected_schema_version == writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION {
+        writer_fence_manifest::validate_writer_fence_manifest(connection)?;
     }
 
     let integrity: String = connection
@@ -80,6 +187,39 @@ thread_local! {
 #[cfg(test)]
 pub(super) fn fail_next_post_commit_verification_for_test() {
     POST_COMMIT_VERIFICATION_FAILURE_FOR_TEST.with(|fail_next| fail_next.set(true));
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Migration013Failpoint {
+    HistoricalIsolation,
+    MutationClock,
+    SchemaVersion,
+    ManifestValidation,
+}
+
+#[cfg(test)]
+thread_local! {
+    static MIGRATION_013_FAILPOINT: std::cell::Cell<Option<Migration013Failpoint>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(super) fn fail_next_migration_013_at_for_test(failpoint: Migration013Failpoint) {
+    MIGRATION_013_FAILPOINT.with(|next| next.set(Some(failpoint)));
+}
+
+#[cfg(test)]
+fn should_fail_migration_013_at_for_test(failpoint: Migration013Failpoint) -> bool {
+    MIGRATION_013_FAILPOINT.with(|next| {
+        if next.get() == Some(failpoint) {
+            next.set(None);
+            true
+        } else {
+            false
+        }
+    })
 }
 
 fn apply_migrations_from_static_registry(
@@ -268,6 +408,10 @@ pub fn verify_database(
         ));
     }
 
+    if expected_schema_version == writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION {
+        writer_fence_manifest::validate_writer_fence_manifest(connection)?;
+    }
+
     let current_life_id: Option<String> = connection
         .query_row(
             "SELECT current_life_id FROM app_state WHERE singleton = 1",
@@ -337,7 +481,7 @@ pub fn activate_temporary_database(
 
 #[cfg(test)]
 mod transaction_tests {
-    use rusqlite::{Connection, TransactionBehavior};
+    use rusqlite::{params, Connection, TransactionBehavior};
 
     use super::*;
 
@@ -368,9 +512,153 @@ mod transaction_tests {
             .unwrap()
     }
 
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct HistoricalOutboxSnapshot {
+        desired_action: String,
+        state: String,
+        attempt_count: i64,
+        mutation_sequence: i64,
+        target_revision: Option<i64>,
+        target_content_hash: Option<String>,
+        claimed_generation_id: Option<String>,
+        last_error_code: Option<String>,
+        last_send_disposition: Option<String>,
+        next_attempt_at: Option<String>,
+        lease_owner: Option<String>,
+        lease_fence_epoch: Option<i64>,
+        lease_expires_at: Option<String>,
+        migration_disposition: Option<String>,
+    }
+
+    struct HistoricalRowFixture<'a> {
+        life_id: &'a str,
+        memory_id: &'a str,
+        desired_action: &'a str,
+        state: &'a str,
+        migration_disposition: Option<&'a str>,
+        attempt_count: i64,
+        mutation_sequence: i64,
+        target_revision: Option<i64>,
+        target_content_hash: Option<&'a str>,
+        claimed_generation_id: Option<&'a str>,
+        last_error_code: Option<&'a str>,
+        last_send_disposition: Option<&'a str>,
+        next_attempt_at: Option<&'a str>,
+        lease_owner: Option<&'a str>,
+        lease_fence_epoch: Option<i64>,
+        lease_expires_at: Option<&'a str>,
+    }
+
+    fn version_twelve_connection() -> Connection {
+        let mut connection = transaction_connection();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        apply_pending_migrations_in_transaction(
+            &transaction,
+            0,
+            connection::MAX_SUPPORTED_SCHEMA_VERSION,
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+        assert_eq!(schema_version(&connection), LAST_STATIC_MIGRATION_VERSION);
+        connection
+    }
+
+    fn writer_fence_count(connection: &Connection) -> i64 {
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type='trigger' AND name GLOB 'digital_life_writer_epoch_*'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn historical_snapshot(
+        connection: &Connection,
+        life_id: &str,
+        memory_id: &str,
+    ) -> HistoricalOutboxSnapshot {
+        connection
+            .query_row(
+                "SELECT desired_action, state, attempt_count, mutation_sequence,
+                        target_revision, target_content_hash, claimed_generation_id,
+                        last_error_code, last_send_disposition, next_attempt_at,
+                        lease_owner, lease_fence_epoch, lease_expires_at,
+                        migration_disposition
+                 FROM memory_vector_sync_outbox
+                 WHERE life_id=?1 AND memory_id=?2",
+                params![life_id, memory_id],
+                |row| {
+                    Ok(HistoricalOutboxSnapshot {
+                        desired_action: row.get(0)?,
+                        state: row.get(1)?,
+                        attempt_count: row.get(2)?,
+                        mutation_sequence: row.get(3)?,
+                        target_revision: row.get(4)?,
+                        target_content_hash: row.get(5)?,
+                        claimed_generation_id: row.get(6)?,
+                        last_error_code: row.get(7)?,
+                        last_send_disposition: row.get(8)?,
+                        next_attempt_at: row.get(9)?,
+                        lease_owner: row.get(10)?,
+                        lease_fence_epoch: row.get(11)?,
+                        lease_expires_at: row.get(12)?,
+                        migration_disposition: row.get(13)?,
+                    })
+                },
+            )
+            .unwrap()
+    }
+
+    fn insert_historical_row(connection: &Connection, row: HistoricalRowFixture<'_>) {
+        connection
+            .execute(
+                "INSERT INTO memory_vector_sync_outbox
+                 (life_id, memory_id, desired_action, state, migration_disposition,
+                  attempt_count, mutation_sequence, target_revision, target_content_hash,
+                  claimed_generation_id, last_error_code, last_send_disposition,
+                  next_attempt_at, lease_owner, lease_fence_epoch, lease_expires_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                         ?13, ?14, ?15, ?16)",
+                params![
+                    row.life_id,
+                    row.memory_id,
+                    row.desired_action,
+                    row.state,
+                    row.migration_disposition,
+                    row.attempt_count,
+                    row.mutation_sequence,
+                    row.target_revision,
+                    row.target_content_hash,
+                    row.claimed_generation_id,
+                    row.last_error_code,
+                    row.last_send_disposition,
+                    row.next_attempt_at,
+                    row.lease_owner,
+                    row.lease_fence_epoch,
+                    row.lease_expires_at,
+                ],
+            )
+            .unwrap();
+    }
+
+    fn apply_writer_fence_upgrade(connection: &mut Connection) {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert_eq!(
+            apply_writer_fence_schema_upgrade_if_registered(&transaction).unwrap(),
+            WriterFenceSchemaUpgrade::Applied
+        );
+        transaction.commit().unwrap();
+    }
+
     #[test]
     fn migration_transaction_registry_is_unique_and_strictly_incrementing() {
-        validate_migration_registry(MIGRATIONS, connection::MAX_SUPPORTED_SCHEMA_VERSION).unwrap();
+        validate_migration_registry(MIGRATIONS, LAST_STATIC_MIGRATION_VERSION).unwrap();
         let missing = [(1, "one", "SELECT 1"), (3, "three", "SELECT 1")];
         let duplicate = [(1, "one", "SELECT 1"), (1, "again", "SELECT 1")];
         let reversed = [(2, "two", "SELECT 1"), (1, "one", "SELECT 1")];
@@ -384,7 +672,7 @@ mod transaction_tests {
     fn migration_transaction_rejects_targets_outside_the_h1_a3_contract() {
         let mut connection = transaction_connection();
         let transaction = connection.transaction().unwrap();
-        for target in [0, connection::MAX_SUPPORTED_SCHEMA_VERSION - 1, 13] {
+        for target in [0, connection::MAX_SUPPORTED_SCHEMA_VERSION - 1, 14] {
             let error =
                 apply_pending_migrations_in_transaction(&transaction, 0, target).unwrap_err();
             assert_eq!(error.code, "MIGRATION_VERSION_INVARIANT_FAILED");
@@ -502,13 +790,288 @@ mod transaction_tests {
     }
 
     #[test]
-    fn migration_transaction_h1_b_extension_is_explicitly_not_registered() {
+    fn migration_transaction_h1_b_extension_is_fixed_after_static_migrations() {
         let mut connection = transaction_connection();
         let transaction = connection.transaction().unwrap();
+        apply_migrations_from_static_registry(
+            &transaction,
+            0,
+            LAST_STATIC_MIGRATION_VERSION,
+            MIGRATIONS,
+        )
+        .unwrap();
         assert_eq!(
             apply_writer_fence_schema_upgrade_if_registered(&transaction).unwrap(),
-            WriterFenceSchemaUpgrade::NotRegistered
+            WriterFenceSchemaUpgrade::Applied
         );
         drop(transaction);
+    }
+
+    #[test]
+    fn migration_013_isolates_historical_pending_and_processing_rows_preserving_evidence() {
+        let mut connection = version_twelve_connection();
+        connection
+            .execute(
+                "UPDATE memory_vector_sync_mutation_clock SET last_sequence=40 WHERE singleton=1",
+                [],
+            )
+            .unwrap();
+        insert_historical_row(
+            &connection,
+            HistoricalRowFixture {
+                life_id: "life-a",
+                memory_id: "pending-upsert",
+                desired_action: "upsert",
+                state: "pending",
+                migration_disposition: None,
+                attempt_count: 2,
+                mutation_sequence: 17,
+                target_revision: Some(7),
+                target_content_hash: Some("hash-pending"),
+                claimed_generation_id: Some("generation-pending"),
+                last_error_code: Some("OLD_PENDING"),
+                last_send_disposition: Some("possibly_sent"),
+                next_attempt_at: Some("2026-02-01T00:00:00.000Z"),
+                lease_owner: Some("legacy-owner-pending"),
+                lease_fence_epoch: Some(41),
+                lease_expires_at: Some("2026-02-02T00:00:00.000Z"),
+            },
+        );
+        insert_historical_row(
+            &connection,
+            HistoricalRowFixture {
+                life_id: "life-b",
+                memory_id: "processing-delete",
+                desired_action: "delete",
+                state: "processing",
+                migration_disposition: None,
+                attempt_count: 3,
+                mutation_sequence: 19,
+                target_revision: None,
+                target_content_hash: None,
+                claimed_generation_id: Some("generation-delete"),
+                last_error_code: Some("OLD_DELETE"),
+                last_send_disposition: Some("definitely_not_sent"),
+                next_attempt_at: Some("2026-03-01T00:00:00.000Z"),
+                lease_owner: Some("legacy-owner-delete"),
+                lease_fence_epoch: Some(42),
+                lease_expires_at: Some("2026-03-02T00:00:00.000Z"),
+            },
+        );
+        let before_pending = historical_snapshot(&connection, "life-a", "pending-upsert");
+        let before_processing = historical_snapshot(&connection, "life-b", "processing-delete");
+
+        apply_writer_fence_upgrade(&mut connection);
+
+        for (life_id, memory_id, before) in [
+            ("life-a", "pending-upsert", before_pending),
+            ("life-b", "processing-delete", before_processing),
+        ] {
+            let mut expected = before;
+            expected.state = "failed".into();
+            expected.next_attempt_at = None;
+            expected.lease_owner = None;
+            expected.lease_fence_epoch = None;
+            expected.lease_expires_at = None;
+            expected.migration_disposition = Some("legacy_upsert_rebuild_required".into());
+            assert_eq!(
+                historical_snapshot(&connection, life_id, memory_id),
+                expected
+            );
+        }
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT last_sequence FROM memory_vector_sync_mutation_clock WHERE singleton=1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            42
+        );
+        assert_eq!(
+            schema_version(&connection),
+            connection::MAX_SUPPORTED_SCHEMA_VERSION
+        );
+        assert_eq!(writer_fence_count(&connection), 18);
+
+        let transaction = connection.transaction().unwrap();
+        let error = apply_writer_fence_schema_upgrade_if_registered(&transaction).unwrap_err();
+        assert_eq!(error.code, "MIGRATION_VERSION_INVARIANT_FAILED");
+    }
+
+    #[test]
+    fn migration_013_leaves_non_operational_and_preisolated_rows_unchanged() {
+        let mut connection = version_twelve_connection();
+        connection
+            .execute(
+                "UPDATE memory_vector_sync_mutation_clock SET last_sequence=27 WHERE singleton=1",
+                [],
+            )
+            .unwrap();
+        let fixtures = [
+            ("retry", "retry_wait", None),
+            ("failed", "failed", None),
+            ("blocked", "blocked", None),
+            (
+                "already-isolated",
+                "pending",
+                Some("legacy_upsert_rebuild_required"),
+            ),
+        ];
+        for (index, (memory_id, state, disposition)) in fixtures.iter().enumerate() {
+            insert_historical_row(
+                &connection,
+                HistoricalRowFixture {
+                    life_id: "life",
+                    memory_id,
+                    desired_action: "delete",
+                    state,
+                    migration_disposition: *disposition,
+                    attempt_count: (index + 1) as i64,
+                    mutation_sequence: (index + 1) as i64,
+                    target_revision: None,
+                    target_content_hash: None,
+                    claimed_generation_id: Some("generation-existing"),
+                    last_error_code: Some("UNCHANGED"),
+                    last_send_disposition: Some("definitely_not_sent"),
+                    next_attempt_at: Some("2026-04-01T00:00:00.000Z"),
+                    lease_owner: Some("existing-owner"),
+                    lease_fence_epoch: Some(9),
+                    lease_expires_at: Some("2026-04-02T00:00:00.000Z"),
+                },
+            );
+        }
+        let before = fixtures
+            .iter()
+            .map(|(memory_id, _, _)| historical_snapshot(&connection, "life", memory_id))
+            .collect::<Vec<_>>();
+
+        apply_writer_fence_upgrade(&mut connection);
+
+        for ((memory_id, _, _), expected) in fixtures.iter().zip(before) {
+            assert_eq!(
+                historical_snapshot(&connection, "life", memory_id),
+                expected,
+                "{memory_id} must remain outside Migration 013's frozen set"
+            );
+        }
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT last_sequence FROM memory_vector_sync_mutation_clock WHERE singleton=1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            27
+        );
+    }
+
+    #[test]
+    fn migration_013_is_a_noop_for_an_empty_historical_set() {
+        let mut connection = version_twelve_connection();
+        connection
+            .execute(
+                "UPDATE memory_vector_sync_mutation_clock SET last_sequence=11 WHERE singleton=1",
+                [],
+            )
+            .unwrap();
+
+        apply_writer_fence_upgrade(&mut connection);
+
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT last_sequence FROM memory_vector_sync_mutation_clock WHERE singleton=1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            11
+        );
+        assert_eq!(
+            schema_version(&connection),
+            connection::MAX_SUPPORTED_SCHEMA_VERSION
+        );
+        assert_eq!(writer_fence_count(&connection), 18);
+    }
+
+    #[test]
+    fn migration_013_failure_injection_rolls_back_outbox_clock_triggers_and_version() {
+        enum Failure {
+            Migration(Migration013Failpoint),
+            Trigger(usize),
+        }
+
+        for failure in [
+            Failure::Migration(Migration013Failpoint::HistoricalIsolation),
+            Failure::Migration(Migration013Failpoint::MutationClock),
+            Failure::Trigger(1),
+            Failure::Trigger(9),
+            Failure::Trigger(18),
+            Failure::Migration(Migration013Failpoint::SchemaVersion),
+            Failure::Migration(Migration013Failpoint::ManifestValidation),
+        ] {
+            let mut connection = version_twelve_connection();
+            connection
+                .execute(
+                    "UPDATE memory_vector_sync_mutation_clock SET last_sequence=8 WHERE singleton=1",
+                    [],
+                )
+                .unwrap();
+            insert_historical_row(
+                &connection,
+                HistoricalRowFixture {
+                    life_id: "life",
+                    memory_id: "rollback-row",
+                    desired_action: "upsert",
+                    state: "pending",
+                    migration_disposition: None,
+                    attempt_count: 4,
+                    mutation_sequence: 31,
+                    target_revision: Some(3),
+                    target_content_hash: Some("rollback-hash"),
+                    claimed_generation_id: Some("rollback-generation"),
+                    last_error_code: Some("ROLLBACK_CODE"),
+                    last_send_disposition: Some("possibly_sent"),
+                    next_attempt_at: Some("2026-05-01T00:00:00.000Z"),
+                    lease_owner: Some("rollback-owner"),
+                    lease_fence_epoch: Some(17),
+                    lease_expires_at: Some("2026-05-02T00:00:00.000Z"),
+                },
+            );
+            let before = historical_snapshot(&connection, "life", "rollback-row");
+            match failure {
+                Failure::Migration(failpoint) => fail_next_migration_013_at_for_test(failpoint),
+                Failure::Trigger(index) => {
+                    writer_fence_manifest::fail_trigger_install_at_for_test(index)
+                }
+            }
+
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let error = apply_writer_fence_schema_upgrade_if_registered(&transaction).unwrap_err();
+            assert_eq!(error.code, "MIGRATION_TRANSACTION_FAILED");
+            drop(transaction);
+
+            assert_eq!(schema_version(&connection), LAST_STATIC_MIGRATION_VERSION);
+            assert_eq!(
+                historical_snapshot(&connection, "life", "rollback-row"),
+                before
+            );
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT last_sequence FROM memory_vector_sync_mutation_clock WHERE singleton=1",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                8
+            );
+            assert_eq!(writer_fence_count(&connection), 0);
+        }
     }
 }

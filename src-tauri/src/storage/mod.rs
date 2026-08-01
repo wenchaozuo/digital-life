@@ -17,6 +17,9 @@ mod vector_sync_outbox;
 mod vector_sync_settings;
 mod writer_fence_manifest;
 
+#[cfg(test)]
+pub(crate) use connection::open_authorized_test_connection;
+
 pub(crate) use llm_candidate_extraction::{
     trigger_candidate_extraction, LlmCandidateExtractionCoordinator,
 };
@@ -1429,6 +1432,20 @@ mod tests {
             .query_row("SELECT digital_life_writer_epoch()", [], |row| row.get(0))
             .unwrap();
         assert_eq!(epoch, 1);
+        assert_eq!(
+            connection::read_schema_version(&state.connection).unwrap(),
+            connection::MAX_SUPPORTED_SCHEMA_VERSION
+        );
+        let writer_fence_count: i64 = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type='trigger' AND name GLOB 'digital_life_writer_epoch_*'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(writer_fence_count, 18);
         assert_eq!(
             state.database_path,
             fs::canonicalize(target.join(DATABASE_FILE_NAME)).unwrap()

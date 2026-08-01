@@ -1,8 +1,8 @@
 //! Authoritative storage schema-upgrade coordination.
 //!
 //! The coordinator is the only production path that combines the Windows
-//! process gate with SQLite's transaction boundary. It deliberately does not
-//! install the future version-13 writer-fence schema.
+//! process gate with SQLite's transaction boundary and installs the fixed
+//! version-13 writer-fence schema only within that transaction.
 
 use std::path::Path;
 
@@ -11,7 +11,7 @@ use rusqlite::{Connection, TransactionBehavior};
 use super::{
     connection, migration,
     upgrade_gate::{self, LegacyWriterInspection, UpgradeGateError, WindowsUpgradeMutexGuard},
-    StorageError,
+    writer_fence_manifest, StorageError,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -83,6 +83,13 @@ fn open_after_mutex<G: StorageUpgradeGate>(
     }
 
     if version == connection::MAX_SUPPORTED_SCHEMA_VERSION {
+        record_upgrade_event("manifest");
+        writer_fence_manifest::validate_writer_fence_manifest(&connection)?;
+        record_upgrade_event("post-verify");
+        migration::verify_schema_after_upgrade(
+            &connection,
+            connection::MAX_SUPPORTED_SCHEMA_VERSION,
+        )?;
         record_upgrade_event("wal");
         connection::configure_authorized_connection_wal(&connection)?;
         return Ok(connection);
@@ -117,12 +124,12 @@ fn open_after_mutex<G: StorageUpgradeGate>(
         version,
         connection::MAX_SUPPORTED_SCHEMA_VERSION,
     )?;
+    record_upgrade_event("h1-b");
     let writer_fence_upgrade =
         migration::apply_writer_fence_schema_upgrade_if_registered(&transaction)?;
-    debug_assert_eq!(
-        writer_fence_upgrade,
-        migration::WriterFenceSchemaUpgrade::NotRegistered
-    );
+    if writer_fence_upgrade != migration::WriterFenceSchemaUpgrade::Applied {
+        return Err(StorageError::migration_version_invariant_failed());
+    }
 
     record_upgrade_event("commit");
     transaction
@@ -420,11 +427,26 @@ mod tests {
     }
 
     fn prepare_schema_version(path: &Path, version: i64) {
+        assert!(
+            version == migration::LAST_STATIC_MIGRATION_VERSION
+                || version == connection::MAX_SUPPORTED_SCHEMA_VERSION
+        );
         let mut connection = Connection::open(path).unwrap();
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .unwrap();
-        migration::apply_pending_migrations_in_transaction(&transaction, 0, version).unwrap();
+        migration::apply_pending_migrations_in_transaction(
+            &transaction,
+            0,
+            connection::MAX_SUPPORTED_SCHEMA_VERSION,
+        )
+        .unwrap();
+        if version == connection::MAX_SUPPORTED_SCHEMA_VERSION {
+            assert_eq!(
+                migration::apply_writer_fence_schema_upgrade_if_registered(&transaction).unwrap(),
+                migration::WriterFenceSchemaUpgrade::Applied
+            );
+        }
         transaction.commit().unwrap();
         connection
             .pragma_update(None, "journal_mode", "DELETE")
@@ -436,6 +458,117 @@ mod tests {
         connection
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
             .unwrap()
+    }
+
+    fn writer_fence_count(connection: &Connection) -> i64 {
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type='trigger' AND name GLOB 'digital_life_writer_epoch_*'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct VersionTwelveHistoricalEvidence {
+        state: String,
+        migration_disposition: Option<String>,
+        attempt_count: i64,
+        mutation_sequence: i64,
+        claimed_generation_id: Option<String>,
+        last_error_code: Option<String>,
+        last_send_disposition: Option<String>,
+        next_attempt_at: Option<String>,
+        lease_owner: Option<String>,
+        lease_fence_epoch: Option<i64>,
+        lease_expires_at: Option<String>,
+    }
+
+    fn seed_version_twelve_historical_row(path: &Path) {
+        let connection = Connection::open(path).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO memory_vector_sync_outbox
+                 (life_id, memory_id, desired_action, state, attempt_count,
+                  mutation_sequence, claimed_generation_id, last_error_code,
+                  last_send_disposition, next_attempt_at, lease_owner,
+                  lease_fence_epoch, lease_expires_at)
+                 VALUES
+                 ('upgrade-life', 'upgrade-memory', 'delete', 'pending', 3, 18,
+                  'upgrade-generation', 'UPGRADE_OLD_ERROR', 'possibly_sent',
+                  '2026-06-01T00:00:00.000Z', 'upgrade-owner', 12,
+                  '2026-06-02T00:00:00.000Z');
+                 UPDATE memory_vector_sync_mutation_clock
+                 SET last_sequence=30 WHERE singleton=1;",
+            )
+            .unwrap();
+    }
+
+    fn version_twelve_historical_evidence(
+        connection: &Connection,
+    ) -> VersionTwelveHistoricalEvidence {
+        connection
+            .query_row(
+                "SELECT state, migration_disposition, attempt_count, mutation_sequence,
+                        claimed_generation_id, last_error_code, last_send_disposition,
+                        next_attempt_at, lease_owner, lease_fence_epoch, lease_expires_at
+                 FROM memory_vector_sync_outbox
+                 WHERE life_id='upgrade-life' AND memory_id='upgrade-memory'",
+                [],
+                |row| {
+                    Ok(VersionTwelveHistoricalEvidence {
+                        state: row.get(0)?,
+                        migration_disposition: row.get(1)?,
+                        attempt_count: row.get(2)?,
+                        mutation_sequence: row.get(3)?,
+                        claimed_generation_id: row.get(4)?,
+                        last_error_code: row.get(5)?,
+                        last_send_disposition: row.get(6)?,
+                        next_attempt_at: row.get(7)?,
+                        lease_owner: row.get(8)?,
+                        lease_fence_epoch: row.get(9)?,
+                        lease_expires_at: row.get(10)?,
+                    })
+                },
+            )
+            .unwrap()
+    }
+
+    fn assert_version_twelve_historical_data_is_unchanged(path: &Path) {
+        let connection = Connection::open(path).unwrap();
+        assert_eq!(
+            connection::read_schema_version(&connection).unwrap(),
+            migration::LAST_STATIC_MIGRATION_VERSION
+        );
+        assert_eq!(
+            version_twelve_historical_evidence(&connection),
+            VersionTwelveHistoricalEvidence {
+                state: "pending".into(),
+                migration_disposition: None,
+                attempt_count: 3,
+                mutation_sequence: 18,
+                claimed_generation_id: Some("upgrade-generation".into()),
+                last_error_code: Some("UPGRADE_OLD_ERROR".into()),
+                last_send_disposition: Some("possibly_sent".into()),
+                next_attempt_at: Some("2026-06-01T00:00:00.000Z".into()),
+                lease_owner: Some("upgrade-owner".into()),
+                lease_fence_epoch: Some(12),
+                lease_expires_at: Some("2026-06-02T00:00:00.000Z".into()),
+            }
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT last_sequence FROM memory_vector_sync_mutation_clock WHERE singleton=1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            30
+        );
+        assert_eq!(writer_fence_count(&connection), 0);
     }
 
     #[test]
@@ -455,6 +588,7 @@ mod tests {
                 "begin-immediate",
                 "final-rm",
                 "migrations",
+                "h1-b",
                 "commit",
                 "post-verify",
                 "wal",
@@ -476,16 +610,185 @@ mod tests {
 
         assert_eq!(
             take_upgrade_events(),
-            vec!["mutex", "open-before-wal", "version-read", "wal"]
+            vec![
+                "mutex",
+                "open-before-wal",
+                "version-read",
+                "manifest",
+                "post-verify",
+                "wal",
+            ]
         );
         assert_eq!(gate.inspection_calls.get(), 0);
         assert_eq!(journal_mode(&path), "wal");
     }
 
     #[test]
-    fn storage_upgrade_coordinator_version_twelve_does_not_require_the_future_writer_manifest() {
-        let (_root, path) = database_path("current-without-writer-manifest");
+    fn storage_upgrade_coordinator_version_thirteen_does_not_repeat_historical_isolation() {
+        let (_root, path) = database_path("current-schema-no-repeat");
         prepare_schema_version(&path, connection::MAX_SUPPORTED_SCHEMA_VERSION);
+        let authorized = connection::open_authorized_test_connection(&path).unwrap();
+        authorized
+            .execute_batch(
+                "INSERT INTO memory_vector_sync_outbox
+                 (life_id, memory_id, desired_action, state, migration_disposition,
+                  attempt_count, mutation_sequence, claimed_generation_id,
+                  last_send_disposition)
+                 VALUES ('current-life', 'current-memory', 'delete', 'failed',
+                         'legacy_upsert_rebuild_required', 4, 33, 'current-generation',
+                         'possibly_sent');
+                 UPDATE memory_vector_sync_mutation_clock
+                 SET last_sequence=33 WHERE singleton=1;",
+            )
+            .unwrap();
+        drop(authorized);
+        let gate = FakeGate::clear();
+
+        let connection = open_coordinated_storage_connection_with_gate(&path, &gate).unwrap();
+
+        assert_eq!(gate.inspection_calls.get(), 0);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT last_sequence FROM memory_vector_sync_mutation_clock WHERE singleton=1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            33
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT state, migration_disposition, attempt_count, mutation_sequence,
+                            claimed_generation_id, last_send_disposition
+                     FROM memory_vector_sync_outbox
+                     WHERE life_id='current-life' AND memory_id='current-memory'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, Option<String>>(5)?,
+                        ))
+                    },
+                )
+                .unwrap(),
+            (
+                "failed".into(),
+                Some("legacy_upsert_rebuild_required".into()),
+                4,
+                33,
+                Some("current-generation".into()),
+                Some("possibly_sent".into()),
+            )
+        );
+        assert_eq!(writer_fence_count(&connection), 18);
+    }
+
+    #[test]
+    fn storage_upgrade_coordinator_version_thirteen_manifest_damage_fails_closed_before_wal() {
+        enum ManifestDamage {
+            Missing,
+            Mismatched,
+            ExtraReserved,
+        }
+
+        for damage in [
+            ManifestDamage::Missing,
+            ManifestDamage::Mismatched,
+            ManifestDamage::ExtraReserved,
+        ] {
+            let _ = take_upgrade_events();
+            let (_root, path) = database_path("current-schema-manifest-damage");
+            prepare_schema_version(&path, connection::MAX_SUPPORTED_SCHEMA_VERSION);
+            let raw = Connection::open(&path).unwrap();
+            match damage {
+                ManifestDamage::Missing => raw
+                    .execute_batch(
+                        "DROP TRIGGER digital_life_writer_epoch_memory_vector_sync_outbox_insert",
+                    )
+                    .unwrap(),
+                ManifestDamage::Mismatched => {
+                    raw.execute_batch(
+                        "DROP TRIGGER digital_life_writer_epoch_memory_vector_sync_outbox_insert;
+                         CREATE TRIGGER digital_life_writer_epoch_memory_vector_sync_outbox_insert
+                         BEFORE UPDATE ON memory_vector_sync_outbox
+                         WHEN digital_life_writer_epoch() IS NOT 1
+                         BEGIN
+                             SELECT RAISE(ROLLBACK, 'INCOMPATIBLE_DATABASE_WRITER');
+                         END",
+                    )
+                    .unwrap();
+                }
+                ManifestDamage::ExtraReserved => raw
+                    .execute_batch(
+                        "CREATE TRIGGER digital_life_writer_epoch_extra_reserved
+                         BEFORE INSERT ON memory_vector_sync_outbox
+                         WHEN digital_life_writer_epoch() IS NOT 1
+                         BEGIN
+                             SELECT RAISE(ROLLBACK, 'INCOMPATIBLE_DATABASE_WRITER');
+                         END",
+                    )
+                    .unwrap(),
+            }
+            drop(raw);
+            let gate = FakeGate::clear();
+
+            let error = open_coordinated_storage_connection_with_gate(&path, &gate).unwrap_err();
+
+            let expected_code = match damage {
+                ManifestDamage::Missing => "WRITER_FENCE_MANIFEST_MISSING",
+                ManifestDamage::Mismatched | ManifestDamage::ExtraReserved => {
+                    "WRITER_FENCE_MANIFEST_MISMATCH"
+                }
+            };
+            assert_eq!(error.code, expected_code);
+            assert_eq!(gate.inspection_calls.get(), 0);
+            assert_eq!(journal_mode(&path), "delete");
+            assert_eq!(
+                take_upgrade_events(),
+                vec!["mutex", "open-before-wal", "version-read", "manifest"]
+            );
+        }
+    }
+
+    #[test]
+    fn storage_initialize_version_thirteen_missing_manifest_skips_wal_and_publication() {
+        let _ = take_upgrade_events();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(super::super::DATABASE_FILE_NAME);
+        prepare_schema_version(&path, connection::MAX_SUPPORTED_SCHEMA_VERSION);
+        let raw = Connection::open(&path).unwrap();
+        raw.execute_batch(
+            "DROP TRIGGER digital_life_writer_epoch_memory_vector_sync_outbox_insert",
+        )
+        .unwrap();
+        drop(raw);
+
+        let error = match super::super::StorageService::initialize_with_roots(
+            root.path().to_path_buf(),
+            None,
+        ) {
+            Ok(_) => panic!("a damaged version-13 manifest must prevent storage publication"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code, "WRITER_FENCE_MANIFEST_MISSING");
+        assert_eq!(journal_mode(&path), "delete");
+        assert_eq!(
+            take_upgrade_events(),
+            vec!["mutex", "open-before-wal", "version-read", "manifest"]
+        );
+    }
+
+    #[test]
+    fn storage_upgrade_coordinator_version_twelve_requires_the_writer_fence_upgrade() {
+        let (_root, path) = database_path("version-twelve-upgrade");
+        prepare_schema_version(&path, migration::LAST_STATIC_MIGRATION_VERSION);
         let gate = FakeGate::clear();
 
         let connection = open_coordinated_storage_connection_with_gate(&path, &gate).unwrap();
@@ -501,8 +804,110 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(writer_fence_count, 0);
-        assert_eq!(gate.inspection_calls.get(), 0);
+        assert_eq!(writer_fence_count, 18);
+        assert_eq!(gate.inspection_calls.get(), 2);
+    }
+
+    #[test]
+    fn storage_upgrade_coordinator_version_twelve_preflight_occupancy_leaves_h1_b_data_untouched() {
+        let _ = take_upgrade_events();
+        let (_root, path) = database_path("version-twelve-preflight-occupied");
+        prepare_schema_version(&path, migration::LAST_STATIC_MIGRATION_VERSION);
+        seed_version_twelve_historical_row(&path);
+        let gate = FakeGate::with_inspections(vec![Ok(UpgradeOccupancy::Occupied)]);
+
+        let error = open_coordinated_storage_connection_with_gate(&path, &gate).unwrap_err();
+
+        assert_eq!(error.code, "LEGACY_WRITER_DETECTED");
+        assert_eq!(gate.inspection_calls.get(), 1);
+        assert_version_twelve_historical_data_is_unchanged(&path);
+        assert_eq!(journal_mode(&path), "delete");
+        assert_eq!(
+            take_upgrade_events(),
+            vec!["mutex", "open-before-wal", "version-read", "preflight-rm"]
+        );
+    }
+
+    #[test]
+    fn storage_upgrade_coordinator_version_twelve_final_occupancy_rolls_back_h1_b_data() {
+        let _ = take_upgrade_events();
+        let (_root, path) = database_path("version-twelve-final-occupied");
+        prepare_schema_version(&path, migration::LAST_STATIC_MIGRATION_VERSION);
+        seed_version_twelve_historical_row(&path);
+        let gate = FakeGate::with_inspections(vec![
+            Ok(UpgradeOccupancy::Clear),
+            Ok(UpgradeOccupancy::Occupied),
+        ]);
+
+        let error = open_coordinated_storage_connection_with_gate(&path, &gate).unwrap_err();
+
+        assert_eq!(error.code, "UPGRADE_QUIESCENCE_NOT_REACHED");
+        assert_eq!(gate.inspection_calls.get(), 2);
+        assert_version_twelve_historical_data_is_unchanged(&path);
+        assert_eq!(journal_mode(&path), "delete");
+        assert_eq!(
+            take_upgrade_events(),
+            vec![
+                "mutex",
+                "open-before-wal",
+                "version-read",
+                "preflight-rm",
+                "begin-immediate",
+                "final-rm",
+            ]
+        );
+    }
+
+    #[test]
+    fn storage_upgrade_coordinator_migration_013_failures_leave_version_twelve_without_wal() {
+        enum Failure {
+            Migration(migration::Migration013Failpoint),
+            Trigger(usize),
+        }
+
+        for failure in [
+            Failure::Migration(migration::Migration013Failpoint::HistoricalIsolation),
+            Failure::Migration(migration::Migration013Failpoint::MutationClock),
+            Failure::Trigger(1),
+            Failure::Trigger(9),
+            Failure::Trigger(18),
+            Failure::Migration(migration::Migration013Failpoint::SchemaVersion),
+            Failure::Migration(migration::Migration013Failpoint::ManifestValidation),
+        ] {
+            let _ = take_upgrade_events();
+            let (_root, path) = database_path("version-twelve-h1-b-failure");
+            prepare_schema_version(&path, migration::LAST_STATIC_MIGRATION_VERSION);
+            seed_version_twelve_historical_row(&path);
+            match failure {
+                Failure::Migration(failpoint) => {
+                    migration::fail_next_migration_013_at_for_test(failpoint)
+                }
+                Failure::Trigger(index) => {
+                    writer_fence_manifest::fail_trigger_install_at_for_test(index)
+                }
+            }
+            let gate = FakeGate::clear();
+
+            let error = open_coordinated_storage_connection_with_gate(&path, &gate).unwrap_err();
+
+            assert_eq!(error.code, "MIGRATION_TRANSACTION_FAILED");
+            assert_eq!(gate.inspection_calls.get(), 2);
+            assert_version_twelve_historical_data_is_unchanged(&path);
+            assert_eq!(journal_mode(&path), "delete");
+            assert_eq!(
+                take_upgrade_events(),
+                vec![
+                    "mutex",
+                    "open-before-wal",
+                    "version-read",
+                    "preflight-rm",
+                    "begin-immediate",
+                    "final-rm",
+                    "migrations",
+                    "h1-b",
+                ]
+            );
+        }
     }
 
     #[test]
@@ -521,7 +926,7 @@ mod tests {
                     applied_at TEXT NOT NULL
                 );
                 INSERT INTO schema_migration (version, name, applied_at)
-                VALUES (13, 'future', '2026-01-01T00:00:00Z');",
+                VALUES (14, 'future', '2026-01-01T00:00:00Z');",
             )
             .unwrap();
         drop(connection);
@@ -711,6 +1116,7 @@ mod tests {
                 "begin-immediate",
                 "final-rm",
                 "migrations",
+                "h1-b",
                 "commit",
                 "post-verify",
             ]
@@ -860,51 +1266,69 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn storage_upgrade_coordinator_windows_second_initializer_rereads_version_twelve() {
-        let root = tempfile::tempdir().unwrap();
-        let first =
-            super::super::StorageService::initialize_with_roots(root.path().to_path_buf(), None)
-                .unwrap();
-        let state = first.state().unwrap();
-        let before = state
-            .connection
-            .prepare("SELECT version, name, applied_at FROM schema_migration ORDER BY version")
-            .unwrap()
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        drop(state);
+    fn storage_upgrade_coordinator_windows_restored_version_twelve_reopens_through_migration_013() {
+        for repetition in 0..10 {
+            let root = tempfile::tempdir().unwrap();
+            let database_path = root.path().join(super::super::DATABASE_FILE_NAME);
+            prepare_schema_version(&database_path, migration::LAST_STATIC_MIGRATION_VERSION);
+            seed_version_twelve_historical_row(&database_path);
 
-        let second =
-            super::super::StorageService::initialize_with_roots(root.path().to_path_buf(), None)
-                .unwrap();
-        let state = second.state().unwrap();
-        let after = state
-            .connection
-            .prepare("SELECT version, name, applied_at FROM schema_migration ORDER BY version")
-            .unwrap()
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
+            let first = super::super::StorageService::initialize_with_roots(
+                root.path().to_path_buf(),
+                None,
+            )
             .unwrap();
-        assert_eq!(before, after);
-        assert_eq!(
-            before.len(),
-            connection::MAX_SUPPORTED_SCHEMA_VERSION as usize
-        );
+            let state = first.state().unwrap();
+            assert_eq!(
+                connection::read_schema_version(&state.connection).unwrap(),
+                connection::MAX_SUPPORTED_SCHEMA_VERSION,
+                "restored version-12 fixture must upgrade on repetition {repetition}"
+            );
+            assert_eq!(writer_fence_count(&state.connection), 18);
+            assert_eq!(
+                version_twelve_historical_evidence(&state.connection),
+                VersionTwelveHistoricalEvidence {
+                    state: "failed".into(),
+                    migration_disposition: Some("legacy_upsert_rebuild_required".into()),
+                    attempt_count: 3,
+                    mutation_sequence: 18,
+                    claimed_generation_id: Some("upgrade-generation".into()),
+                    last_error_code: Some("UPGRADE_OLD_ERROR".into()),
+                    last_send_disposition: Some("possibly_sent".into()),
+                    next_attempt_at: None,
+                    lease_owner: None,
+                    lease_fence_epoch: None,
+                    lease_expires_at: None,
+                }
+            );
+            let first_clock: i64 = state
+                .connection
+                .query_row(
+                    "SELECT last_sequence FROM memory_vector_sync_mutation_clock WHERE singleton=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(first_clock, 31);
+            drop(state);
+
+            let second = super::super::StorageService::initialize_with_roots(
+                root.path().to_path_buf(),
+                None,
+            )
+            .unwrap();
+            let state = second.state().unwrap();
+            let second_clock: i64 = state
+                .connection
+                .query_row(
+                    "SELECT last_sequence FROM memory_vector_sync_mutation_clock WHERE singleton=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(second_clock, first_clock);
+            assert_eq!(writer_fence_count(&state.connection), 18);
+        }
     }
 
     #[test]
@@ -925,6 +1349,7 @@ mod tests {
                 "begin-immediate",
                 "final-rm",
                 "migrations",
+                "h1-b",
                 "commit",
                 "post-verify",
                 "wal",

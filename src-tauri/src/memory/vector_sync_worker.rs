@@ -5297,7 +5297,7 @@ mod tests {
             // Set attempt_count=1 and possibly_sent via test helpers
             storage.test_set_fenced_attempt_count(1).unwrap();
             let db_path = storage.test_database_main_path().unwrap();
-            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let conn = crate::storage::open_authorized_test_connection(&db_path).unwrap();
             conn.execute(
                 "UPDATE memory_vector_sync_outbox SET last_send_disposition='possibly_sent' WHERE life_id=?1 AND memory_id=?2",
                 rusqlite::params![claim.life_id(), claim.memory_id()],
@@ -5441,7 +5441,7 @@ mod tests {
                 .unwrap();
             storage.test_set_fenced_attempt_count(3).unwrap();
             let db_path = storage.test_database_main_path().unwrap();
-            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let conn = crate::storage::open_authorized_test_connection(&db_path).unwrap();
             conn.execute(
                 "UPDATE memory_vector_sync_outbox SET last_send_disposition='definitely_not_sent' WHERE life_id=?1 AND memory_id=?2",
                 rusqlite::params![claim.life_id(), claim.memory_id()],
@@ -7175,7 +7175,7 @@ mod tests {
         let consumer =
             FencedVectorSyncSingleEventConsumer::new(&storage, &provider, &vectors, context);
         let database_path = storage.test_database_main_path().unwrap();
-        let database = rusqlite::Connection::open(&database_path).unwrap();
+        let database = crate::storage::open_authorized_test_connection(&database_path).unwrap();
         mutate(&database, &database_path, &life_id, &memory_id, &claim);
         assert_eq!(
             tauri::async_runtime::block_on(consumer.execute_claim(claim, 0)).unwrap(),

@@ -380,10 +380,14 @@ mod tests {
         }
     }
 
+    fn authorized_fixture_connection(storage: &StorageService) -> rusqlite::Connection {
+        crate::storage::open_authorized_test_connection(&storage.test_database_main_path().unwrap())
+            .unwrap()
+    }
+
     fn setup_db_connection(storage: &StorageService) -> (tempfile::TempDir, rusqlite::Connection) {
         let temp = tempfile::tempdir().unwrap();
-        let db_path = storage.test_database_main_path().unwrap();
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let conn = authorized_fixture_connection(storage);
         (temp, conn)
     }
 
@@ -432,8 +436,7 @@ mod tests {
             )
             .unwrap();
 
-        let db_path = storage.test_database_main_path().unwrap();
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let conn = authorized_fixture_connection(&storage);
 
         for i in 0..2 {
             conn.execute(
@@ -537,8 +540,7 @@ mod tests {
                 ctx.dimension(),
             )
             .unwrap();
-        let db_path = storage.test_database_main_path().unwrap();
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let conn = authorized_fixture_connection(&storage);
 
         // Insert processing rows with precise lease_expires_at timestamps.
         // Use literal ISO-8601 strings to avoid SQLite strftime formatting issues.
@@ -615,8 +617,7 @@ mod tests {
                 ctx.dimension(),
             )
             .unwrap();
-        let db_path = storage.test_database_main_path().unwrap();
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let conn = authorized_fixture_connection(&storage);
 
         conn.execute(
             "INSERT OR REPLACE INTO memory_vector_sync_outbox (life_id, memory_id, desired_action, state, attempt_count)
@@ -686,8 +687,7 @@ mod tests {
                     ctx.dimension(),
                 )
                 .unwrap();
-            let db_path = storage.test_database_main_path().unwrap();
-            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let conn = authorized_fixture_connection(&storage);
             // Insert into generation_item
             conn.execute(
                 "INSERT INTO memory_vector_generation_item (generation_id, life_id, memory_id, memory_revision, content_hash)
@@ -753,8 +753,7 @@ mod tests {
                     ctx.dimension(),
                 )
                 .unwrap();
-            let db_path = storage.test_database_main_path().unwrap();
-            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let conn = authorized_fixture_connection(&storage);
             conn.execute(
                 "INSERT INTO memory_vector_generation_item (generation_id, life_id, memory_id, memory_revision, content_hash)
                  VALUES ('gen-health', 'life', 'mem-1', 1, 'h1'), ('gen-health', 'life', 'mem-2', 1, 'h2')",
@@ -801,8 +800,7 @@ mod tests {
                     ctx.dimension(),
                 )
                 .unwrap();
-            let db_path = storage.test_database_main_path().unwrap();
-            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let conn = authorized_fixture_connection(&storage);
             conn.execute(
                 "INSERT INTO memory_vector_generation_item (generation_id, life_id, memory_id, memory_revision, content_hash)
                  VALUES ('gen-health', 'life', 'mem-1', 1, 'h1')",
@@ -888,8 +886,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        let db_path = storage.test_database_main_path().unwrap();
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let conn = authorized_fixture_connection(&storage);
 
         // Insert generation items for both gen-health and gen-other
         conn.execute(
@@ -1307,8 +1304,7 @@ mod tests {
                 ctx.dimension(),
             )
             .unwrap();
-        let db_path = storage.test_database_main_path().unwrap();
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let conn = authorized_fixture_connection(&storage);
 
         // Setup: runtime lease
         conn.execute(
@@ -1435,8 +1431,7 @@ mod tests {
                 ctx.dimension(),
             )
             .unwrap();
-        let db_path = storage.test_database_main_path().unwrap();
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let conn = authorized_fixture_connection(&storage);
 
         // Setup a real runtime lease with specific values
         conn.execute(
@@ -1459,7 +1454,7 @@ mod tests {
             tauri::async_runtime::block_on(inspect_vector_sync_health(&storage, &vs, &ctx, &clock))
                 .unwrap();
 
-        // Verify nothing changed
+        // Verify nothing changed through a separate read-only legacy connection.
         let db_path = storage.test_database_main_path().unwrap();
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         let (owner, fence, expires_at, updated_at): (String, i64, String, String) = {
@@ -1493,8 +1488,7 @@ mod tests {
             )
             .unwrap();
 
-        let db_path = storage.test_database_main_path().unwrap();
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let conn = authorized_fixture_connection(&storage);
 
         // Helper to insert an operational row
         let mut seq = 0i64;
@@ -1805,8 +1799,7 @@ mod tests {
             )
             .unwrap();
 
-        let db_path = storage.test_database_main_path().unwrap();
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let conn = authorized_fixture_connection(&storage);
 
         // Insert ONLY isolation rows
         for i in 0..3 {

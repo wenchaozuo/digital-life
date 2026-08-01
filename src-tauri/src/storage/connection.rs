@@ -4,7 +4,7 @@ use rusqlite::{functions::FunctionFlags, Connection, OptionalExtension};
 
 use super::StorageError;
 
-pub(super) const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 12;
+pub(super) const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 13;
 
 const WRITER_EPOCH_FUNCTION: &str = "digital_life_writer_epoch";
 const WRITER_EPOCH: i64 = 1;
@@ -38,6 +38,16 @@ pub(super) fn open_authorized_storage_connection_before_wal(
         database_path,
         WRITER_EPOCH_FUNCTION,
     )
+}
+
+/// Test-only access to the exact authorized before-WAL connection shape used
+/// by the upgrade coordinator. It always registers the fixed writer epoch and
+/// deliberately accepts no caller-controlled capability or bypass options.
+#[cfg(test)]
+pub(crate) fn open_authorized_test_connection(
+    database_path: &Path,
+) -> Result<Connection, StorageError> {
+    open_authorized_storage_connection_before_wal(database_path)
 }
 
 fn open_authorized_storage_connection_before_wal_with_function_name(
@@ -272,7 +282,7 @@ mod tests {
         create_schema_migration_table(&connection);
         connection
             .execute(
-                "INSERT INTO schema_migration (version, name, applied_at) VALUES (13, 'future', '2026-01-01T00:00:00Z')",
+                "INSERT INTO schema_migration (version, name, applied_at) VALUES (14, 'future', '2026-01-01T00:00:00Z')",
                 [],
             )
             .unwrap();
@@ -286,7 +296,7 @@ mod tests {
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
             .unwrap();
         assert_eq!(journal_mode, "delete");
-        assert_eq!(read_schema_version(&legacy).unwrap(), 13);
+        assert_eq!(read_schema_version(&legacy).unwrap(), 14);
         assert!(!path.with_extension("sqlite3-wal").exists());
     }
 
@@ -371,7 +381,7 @@ mod tests {
         create_schema_migration_table(&connection);
         connection
             .execute(
-                "INSERT INTO schema_migration (version, name, applied_at) VALUES (13, 'future', '2026-01-01T00:00:00Z')",
+                "INSERT INTO schema_migration (version, name, applied_at) VALUES (14, 'future', '2026-01-01T00:00:00Z')",
                 [],
             )
             .unwrap();

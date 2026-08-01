@@ -2464,7 +2464,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
     }
 
     #[test]
@@ -2504,7 +2504,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
         drop(storage);
 
         let reopened = StorageService::initialize_with_roots(data_root, None).unwrap();
@@ -2555,7 +2555,15 @@ mod tests {
         let delete: (String, Option<String>, i64, String) = state.connection.query_row(
             "SELECT state, migration_disposition, attempt_count, last_error_code FROM memory_vector_sync_outbox WHERE memory_id='legacy-delete'", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         ).unwrap();
-        assert_eq!(delete, ("pending".into(), None, 3, "DELETE_CODE".into()));
+        assert_eq!(
+            delete,
+            (
+                "failed".into(),
+                Some("legacy_upsert_rebuild_required".into()),
+                3,
+                "DELETE_CODE".into(),
+            )
+        );
         let clock: i64 = state
             .connection
             .query_row(
@@ -2728,7 +2736,7 @@ mod tests {
         for (index, row) in after.iter().enumerate() {
             let original = &before[index];
             assert_eq!(
-                (row.0, row.1, &row.2, &row.3, &row.4, row.6, &row.7, &row.8, &row.9),
+                (row.0, row.1, &row.2, &row.3, &row.4, row.6, &row.7, &row.9),
                 (
                     original.0,
                     original.1,
@@ -2737,7 +2745,6 @@ mod tests {
                     &original.4,
                     original.5,
                     &original.6,
-                    &original.7,
                     &original.8
                 )
             );
@@ -2745,19 +2752,24 @@ mod tests {
             assert_eq!(row.14, None);
             assert_eq!(row.15, None);
             assert_eq!(row.16, None);
+            let h1_b_isolated_delete =
+                row.4 == "delete" && matches!(fixtures[index].2, "pending" | "processing");
             if row.4 == "upsert" {
                 assert_eq!(row.5, "blocked");
                 assert_eq!(row.10.as_deref(), Some("legacy_upsert_rebuild_required"));
+                assert_eq!(row.8, original.7);
+            } else if h1_b_isolated_delete {
+                assert_eq!(row.5, "failed");
+                assert_eq!(row.10.as_deref(), Some("legacy_upsert_rebuild_required"));
+                assert_eq!(row.8, None);
+                assert_eq!(row.11, None);
+                assert_eq!(row.12, None);
             } else {
-                let expected = if original.4 == "delete" && fixtures[index].2 == "processing" {
-                    "pending"
-                } else {
-                    fixtures[index].2
-                };
-                assert_eq!(row.5, expected);
+                assert_eq!(row.5, fixtures[index].2);
                 assert_eq!(row.10, None);
                 assert_eq!(row.11, None);
                 assert_eq!(row.12, None);
+                assert_eq!(row.8, original.7);
             }
         }
     }
@@ -4387,8 +4399,10 @@ mod tests {
         storage
             .register_building_vector_generation("generation-a", "descriptor-a", 2)
             .unwrap();
-        let database =
-            rusqlite::Connection::open(storage.test_database_main_path().unwrap()).unwrap();
+        let database = crate::storage::open_authorized_test_connection(
+            &storage.test_database_main_path().unwrap(),
+        )
+        .unwrap();
 
         database
             .execute(
@@ -4469,8 +4483,10 @@ mod tests {
         storage
             .register_building_vector_generation("generation-a", "descriptor-a", 2)
             .unwrap();
-        let database =
-            rusqlite::Connection::open(storage.test_database_main_path().unwrap()).unwrap();
+        let database = crate::storage::open_authorized_test_connection(
+            &storage.test_database_main_path().unwrap(),
+        )
+        .unwrap();
         database
             .execute(
                 "UPDATE memory_vector_sync_outbox

@@ -1,10 +1,9 @@
-//! Static future writer-fence Trigger manifest.
+//! Static writer-fence Trigger manifest.
 //!
-//! H1-A3 defines and validates this manifest, but deliberately does not install
-//! it in a production database. H1-B is the only future phase allowed to add a
-//! registered schema upgrade for version 13.
+//! H1-A3 defined and validated this manifest. H1-B installs its exact static
+//! contents during the fixed schema-13 transaction.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, Transaction};
 
 use super::StorageError;
 
@@ -160,6 +159,25 @@ pub(super) fn writer_fence_trigger_specs() -> &'static [WriterFenceTriggerSpec] 
     WRITER_FENCE_TRIGGER_SPECS
 }
 
+/// Installs the fixed manifest into the caller-owned schema transaction. The
+/// manifest remains the sole authority for names, tables, operations, and DDL.
+pub(super) fn install_writer_fence_manifest_in_transaction(
+    transaction: &Transaction<'_>,
+) -> Result<(), StorageError> {
+    for (index, spec) in WRITER_FENCE_TRIGGER_SPECS.iter().enumerate() {
+        #[cfg(not(test))]
+        let _ = index;
+        #[cfg(test)]
+        if should_fail_trigger_install_at_for_test(index + 1) {
+            return Err(StorageError::migration_transaction_failed());
+        }
+        transaction
+            .execute_batch(spec.ddl)
+            .map_err(|_| StorageError::migration_transaction_failed())?;
+    }
+    Ok(())
+}
+
 /// Confirms that the reserved writer-fence Trigger namespace exactly matches
 /// the static manifest. This never repairs or installs schema objects.
 pub(super) fn validate_writer_fence_manifest(connection: &Connection) -> Result<(), StorageError> {
@@ -217,8 +235,37 @@ const _: fn(&Connection) -> Result<(), StorageError> = validate_writer_fence_man
 const _: fn() -> StorageError = StorageError::incompatible_database_writer;
 
 #[cfg(test)]
+thread_local! {
+    static FAIL_TRIGGER_INSTALL_AT: std::cell::Cell<Option<usize>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(super) fn fail_trigger_install_at_for_test(index: usize) {
+    FAIL_TRIGGER_INSTALL_AT.with(|fail_at| fail_at.set(Some(index)));
+}
+
+#[cfg(test)]
+fn should_fail_trigger_install_at_for_test(index: usize) -> bool {
+    FAIL_TRIGGER_INSTALL_AT.with(|fail_at| {
+        if fail_at.get() == Some(index) {
+            fail_at.set(None);
+            true
+        } else {
+            false
+        }
+    })
+}
+
+#[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::{
+        collections::BTreeSet,
+        path::{Path, PathBuf},
+    };
+
+    use rusqlite::{functions::FunctionFlags, Connection, Error};
 
     use super::*;
 
@@ -257,6 +304,165 @@ mod tests {
             .execute_batch(&format!("DROP TRIGGER {}", spec.name))
             .unwrap();
         connection.execute_batch(ddl).unwrap();
+    }
+
+    fn initialized_fenced_database() -> (tempfile::TempDir, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let storage =
+            super::super::StorageService::initialize_with_roots(root.path().to_path_buf(), None)
+                .unwrap();
+        let path = storage.test_database_main_path().unwrap();
+        drop(storage);
+        (root, path)
+    }
+
+    fn seed_protected_rows(connection: &Connection) {
+        connection
+            .execute_batch(
+                "INSERT INTO persona_template (id, name, version, persona_json)
+                 VALUES ('writer-fence-persona', 'Writer Fence', 1, '{}');
+                 INSERT INTO life_identity
+                     (id, name, created_at, version, body_id, persona_id, persona_version)
+                 VALUES
+                     ('writer-fence-life', 'Writer Fence', '2026-01-01T00:00:00.000Z', 1,
+                      'writer-fence-body', 'writer-fence-persona', 1),
+                     ('writer-fence-life-alt', 'Writer Fence Alt', '2026-01-01T00:00:00.000Z', 1,
+                      'writer-fence-body-alt', 'writer-fence-persona', 1);
+                 INSERT INTO memory_vector_sync_outbox
+                     (life_id, memory_id, desired_action, state, attempt_count, mutation_sequence)
+                 VALUES ('writer-fence-life', 'outbox-seed', 'delete', 'pending', 2, 4);
+                 UPDATE memory_vector_sync_mutation_clock
+                 SET last_sequence=4 WHERE singleton=1;
+                 INSERT INTO memory_vector_sync_runtime_lease
+                     (lease_name, owner_id, fence_epoch, expires_at)
+                 VALUES ('memory-vector-single-event-consumer', 'seed-owner', 4,
+                         '2026-02-01T00:00:00.000Z');
+                 INSERT INTO memory_vector_generation
+                     (generation_id, descriptor_hash, dimension, state)
+                 VALUES ('generation-seed', 'seed-descriptor', 3, 'building');
+                 INSERT INTO memory_vector_generation_item
+                     (generation_id, life_id, memory_id, memory_revision, content_hash)
+                 VALUES ('generation-seed', 'writer-fence-life', 'item-seed', 1, 'seed-hash');
+                 INSERT INTO memory_vector_sync_settings (life_id, enabled)
+                 VALUES ('writer-fence-life', 1);",
+            )
+            .unwrap();
+    }
+
+    fn authorized_connection(path: &Path) -> Connection {
+        super::super::connection::open_authorized_test_connection(path).unwrap()
+    }
+
+    fn protected_insert(connection: &Connection, table: &str) -> rusqlite::Result<usize> {
+        match table {
+            "memory_vector_sync_outbox" => connection.execute(
+                "INSERT INTO memory_vector_sync_outbox
+                 (life_id, memory_id, desired_action, state, attempt_count, mutation_sequence)
+                 VALUES ('writer-fence-life', 'outbox-insert', 'delete', 'pending', 0, 5)",
+                [],
+            ),
+            "memory_vector_sync_mutation_clock" => connection.execute(
+                "INSERT OR REPLACE INTO memory_vector_sync_mutation_clock (singleton, last_sequence)
+                 VALUES (1, 5)",
+                [],
+            ),
+            "memory_vector_sync_runtime_lease" => connection.execute(
+                "INSERT OR REPLACE INTO memory_vector_sync_runtime_lease
+                 (lease_name, owner_id, fence_epoch, expires_at)
+                 VALUES ('memory-vector-single-event-consumer', 'insert-owner', 5,
+                         '2026-03-01T00:00:00.000Z')",
+                [],
+            ),
+            "memory_vector_generation" => connection.execute(
+                "INSERT INTO memory_vector_generation
+                 (generation_id, descriptor_hash, dimension, state)
+                 VALUES ('generation-insert', 'insert-descriptor', 3, 'building')",
+                [],
+            ),
+            "memory_vector_generation_item" => connection.execute(
+                "INSERT INTO memory_vector_generation_item
+                 (generation_id, life_id, memory_id, memory_revision, content_hash)
+                 VALUES ('generation-seed', 'writer-fence-life', 'item-insert', 1, 'insert-hash')",
+                [],
+            ),
+            "memory_vector_sync_settings" => connection.execute(
+                "INSERT INTO memory_vector_sync_settings (life_id, enabled)
+                 VALUES ('writer-fence-life-alt', 1)",
+                [],
+            ),
+            _ => unreachable!("the protected table list is static"),
+        }
+    }
+
+    fn protected_update(connection: &Connection, table: &str) -> rusqlite::Result<usize> {
+        match table {
+            "memory_vector_sync_outbox" => connection.execute(
+                "UPDATE memory_vector_sync_outbox
+                 SET updated_at='2026-04-01T00:00:00.000Z'
+                 WHERE life_id='writer-fence-life' AND memory_id='outbox-seed'",
+                [],
+            ),
+            "memory_vector_sync_mutation_clock" => connection.execute(
+                "UPDATE memory_vector_sync_mutation_clock
+                 SET last_sequence=last_sequence+1 WHERE singleton=1",
+                [],
+            ),
+            "memory_vector_sync_runtime_lease" => connection.execute(
+                "UPDATE memory_vector_sync_runtime_lease SET owner_id='updated-owner'
+                 WHERE lease_name='memory-vector-single-event-consumer'",
+                [],
+            ),
+            "memory_vector_generation" => connection.execute(
+                "UPDATE memory_vector_generation SET descriptor_hash='updated-descriptor'
+                 WHERE generation_id='generation-seed'",
+                [],
+            ),
+            "memory_vector_generation_item" => connection.execute(
+                "UPDATE memory_vector_generation_item SET content_hash='updated-hash'
+                 WHERE generation_id='generation-seed' AND life_id='writer-fence-life'
+                   AND memory_id='item-seed'",
+                [],
+            ),
+            "memory_vector_sync_settings" => connection.execute(
+                "UPDATE memory_vector_sync_settings SET enabled=0 WHERE life_id='writer-fence-life'",
+                [],
+            ),
+            _ => unreachable!("the protected table list is static"),
+        }
+    }
+
+    fn protected_delete(connection: &Connection, table: &str) -> rusqlite::Result<usize> {
+        match table {
+            "memory_vector_sync_outbox" => connection.execute(
+                "DELETE FROM memory_vector_sync_outbox
+                 WHERE life_id='writer-fence-life' AND memory_id='outbox-seed'",
+                [],
+            ),
+            "memory_vector_sync_mutation_clock" => connection.execute(
+                "DELETE FROM memory_vector_sync_mutation_clock WHERE singleton=1",
+                [],
+            ),
+            "memory_vector_sync_runtime_lease" => connection.execute(
+                "DELETE FROM memory_vector_sync_runtime_lease
+                 WHERE lease_name='memory-vector-single-event-consumer'",
+                [],
+            ),
+            "memory_vector_generation" => connection.execute(
+                "DELETE FROM memory_vector_generation WHERE generation_id='generation-seed'",
+                [],
+            ),
+            "memory_vector_generation_item" => connection.execute(
+                "DELETE FROM memory_vector_generation_item
+                 WHERE generation_id='generation-seed' AND life_id='writer-fence-life'
+                   AND memory_id='item-seed'",
+                [],
+            ),
+            "memory_vector_sync_settings" => connection.execute(
+                "DELETE FROM memory_vector_sync_settings WHERE life_id='writer-fence-life'",
+                [],
+            ),
+            _ => unreachable!("the protected table list is static"),
+        }
     }
 
     #[test]
@@ -533,5 +739,90 @@ mod tests {
         assert_eq!(error.code, "INCOMPATIBLE_DATABASE_WRITER");
         assert!(!error.message.contains("CREATE TRIGGER"));
         assert!(!error.message.contains("\\\\"));
+    }
+
+    #[test]
+    fn writer_fence_authorized_fixture_permits_all_eighteen_operations() {
+        let (_root, path) = initialized_fenced_database();
+        let connection = authorized_connection(&path);
+        seed_protected_rows(&connection);
+
+        for table in PROTECTED_TABLES {
+            assert_eq!(
+                protected_insert(&connection, table).unwrap(),
+                1,
+                "{table} insert"
+            );
+            assert_eq!(
+                protected_update(&connection, table).unwrap(),
+                1,
+                "{table} update"
+            );
+        }
+        for table in [
+            "memory_vector_sync_outbox",
+            "memory_vector_sync_mutation_clock",
+            "memory_vector_sync_runtime_lease",
+            "memory_vector_generation_item",
+            "memory_vector_generation",
+            "memory_vector_sync_settings",
+        ] {
+            assert_eq!(
+                protected_delete(&connection, table).unwrap(),
+                1,
+                "{table} delete"
+            );
+        }
+    }
+
+    #[test]
+    fn writer_fence_raw_legacy_connection_rejects_all_eighteen_operations() {
+        let (_root, path) = initialized_fenced_database();
+        let authorized = authorized_connection(&path);
+        seed_protected_rows(&authorized);
+        drop(authorized);
+        let raw = Connection::open(&path).unwrap();
+
+        for table in PROTECTED_TABLES {
+            assert!(
+                protected_insert(&raw, table).is_err(),
+                "{table} insert must fail"
+            );
+            assert!(
+                protected_update(&raw, table).is_err(),
+                "{table} update must fail"
+            );
+            assert!(
+                protected_delete(&raw, table).is_err(),
+                "{table} delete must fail"
+            );
+        }
+    }
+
+    #[test]
+    fn writer_fence_epoch_zero_connection_is_rejected_with_the_static_code() {
+        let (_root, path) = initialized_fenced_database();
+        let authorized = authorized_connection(&path);
+        seed_protected_rows(&authorized);
+        drop(authorized);
+        let epoch_zero = Connection::open(&path).unwrap();
+        epoch_zero
+            .create_scalar_function(
+                "digital_life_writer_epoch",
+                0,
+                FunctionFlags::SQLITE_UTF8
+                    | FunctionFlags::SQLITE_DETERMINISTIC
+                    | FunctionFlags::SQLITE_INNOCUOUS,
+                |_| Ok(0_i64),
+            )
+            .unwrap();
+
+        let error = protected_update(&epoch_zero, "memory_vector_sync_outbox").unwrap_err();
+        match error {
+            Error::SqliteFailure(_, Some(message)) => {
+                assert_eq!(message, "INCOMPATIBLE_DATABASE_WRITER");
+            }
+            other => panic!("epoch-zero writer must receive the static trigger error: {other}"),
+        }
     }
 }

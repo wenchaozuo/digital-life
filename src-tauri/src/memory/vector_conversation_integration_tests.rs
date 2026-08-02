@@ -1482,7 +1482,7 @@ fn supersession_matrix_rejects_all_old_token_writes_and_clears_claimed_generatio
             );
             assert_eq!(
                 storage
-                    .finalize_fenced_vector_sync(
+                    .test_complete_claim_via_real_reserved_token(
                         claim_a,
                         claim_a.target_content_hash(),
                         None,
@@ -1495,7 +1495,7 @@ fn supersession_matrix_rejects_all_old_token_writes_and_clears_claimed_generatio
             );
             assert_eq!(
                 storage
-                    .finalize_fenced_vector_sync(
+                    .test_complete_claim_via_real_reserved_token(
                         claim_a,
                         None,
                         Some("STALE_ERR"),
@@ -1529,7 +1529,13 @@ fn supersession_matrix_rejects_all_old_token_writes_and_clears_claimed_generatio
 
             let hash = claim_b.target_content_hash().map(|s| s.to_string());
             storage
-                .finalize_fenced_vector_sync(&claim_b, hash.as_deref(), None, false, None)
+                .test_complete_claim_via_real_reserved_token(
+                    &claim_b,
+                    hash.as_deref(),
+                    None,
+                    false,
+                    None,
+                )
                 .unwrap();
         } else {
             // Cases 6 & 7 Stage 2: Claim Stage 2 mutation as worker-a, write a 2nd mutation, verify worker-a claim is superseded
@@ -1554,7 +1560,7 @@ fn supersession_matrix_rejects_all_old_token_writes_and_clears_claimed_generatio
             );
             assert_eq!(
                 storage
-                    .finalize_fenced_vector_sync(
+                    .test_complete_claim_via_real_reserved_token(
                         &claim_s2_a,
                         claim_s2_a.target_content_hash(),
                         None,
@@ -1567,7 +1573,7 @@ fn supersession_matrix_rejects_all_old_token_writes_and_clears_claimed_generatio
             );
             assert_eq!(
                 storage
-                    .finalize_fenced_vector_sync(
+                    .test_complete_claim_via_real_reserved_token(
                         &claim_s2_a,
                         None,
                         Some("STALE_ERR"),
@@ -1590,7 +1596,13 @@ fn supersession_matrix_rejects_all_old_token_writes_and_clears_claimed_generatio
 
             let hash = claim_b.target_content_hash().map(|s| s.to_string());
             storage
-                .finalize_fenced_vector_sync(&claim_b, hash.as_deref(), None, false, None)
+                .test_complete_claim_via_real_reserved_token(
+                    &claim_b,
+                    hash.as_deref(),
+                    None,
+                    false,
+                    None,
+                )
                 .unwrap();
         }
     }
@@ -1675,10 +1687,16 @@ fn concurrent_two_connections_competition_safety() {
 
         let attempt_started = storage_a.mark_fenced_attempt_started(&claim_a).unwrap();
         let success = storage_a
-            .finalize_fenced_vector_sync(&claim_a, claim_a.target_content_hash(), None, false, None)
+            .test_complete_claim_via_real_reserved_token(
+                &claim_a,
+                claim_a.target_content_hash(),
+                None,
+                false,
+                None,
+            )
             .unwrap();
         let failure = storage_a
-            .finalize_fenced_vector_sync(
+            .test_complete_claim_via_real_reserved_token(
                 &claim_a,
                 None,
                 Some("STALE_ERR"),

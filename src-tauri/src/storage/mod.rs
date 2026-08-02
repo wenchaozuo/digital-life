@@ -346,10 +346,20 @@ pub(crate) struct OutboxSyncHealthAggregate {
     pub retry_wait_count: usize,
     pub blocked_count: usize,
     pub processing_count: usize,
+    pub failed_count: usize,
+    pub migration_isolated_count: usize,
     pub expired_processing_count: usize,
     pub provider_result_unknown_count: usize,
     pub internal_invariant_count: usize,
     pub attempts_at_limit_count: usize,
+    pub attempts_over_limit_count: usize,
+    pub invalid_attempt_identity_count: usize,
+    pub expired_processing_unmarked_count: usize,
+    pub expired_processing_marked_count: usize,
+    pub legacy_processing_unproven_count: usize,
+    pub delete_replay_not_eligible_count: usize,
+    pub attempts_at_limit_processing_count: usize,
+    pub attempts_at_limit_blocked_count: usize,
     pub oldest_pending_epoch_ms: Option<i64>,
     pub oldest_retry_wait_epoch_ms: Option<i64>,
     pub oldest_blocked_epoch_ms: Option<i64>,
@@ -424,40 +434,99 @@ impl StorageService {
     ) -> Result<OutboxSyncHealthAggregate, StorageError> {
         let state = self.state()?;
         // Use strftime to convert the millis epoch to an ISO-8601 string for text comparison
-        let (pending, rwait, blocked, processing, expired, unknown, inv, att_limit,
-             oldest_pending, oldest_retry, oldest_blocked) = state.connection.query_row(
-            "SELECT
+        let (
+            pending,
+            rwait,
+            blocked,
+            processing,
+            failed,
+            expired,
+            unknown,
+            inv,
+            att_limit,
+            att_over_limit,
+            invalid_identity,
+            expired_unmarked,
+            expired_marked,
+            legacy_unproven,
+            delete_not_eligible,
+            att_limit_processing,
+            att_limit_blocked,
+            oldest_pending,
+            oldest_retry,
+            oldest_blocked,
+        ) = state
+            .connection
+            .query_row(
+                "SELECT
                 COALESCE(SUM(CASE WHEN state='pending' THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN state='retry_wait' THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN state='blocked' THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN state='processing' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN state='failed' THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN state='processing' AND lease_expires_at IS NOT NULL AND lease_expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ', ?1 / 1000.0, 'unixepoch') THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN state='blocked' AND last_error_code='PROVIDER_RESULT_UNKNOWN' THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN state='blocked' AND last_error_code='INTERNAL_INVARIANT' THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN attempt_count >= ?2 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN attempt_count > ?2 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN fenced_claim_epoch < 0 OR last_marked_claim_epoch < 0 OR last_marked_claim_epoch > fenced_claim_epoch OR (last_marked_claim_epoch > 0 AND attempt_count = 0) OR (attempt_count > 0 AND claimed_generation_id IS NULL AND NOT (fenced_claim_epoch = 0 AND last_marked_claim_epoch = 0)) THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN state='processing' AND lease_expires_at IS NOT NULL AND lease_expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ', ?1 / 1000.0, 'unixepoch') AND fenced_claim_epoch > last_marked_claim_epoch THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN state='processing' AND lease_expires_at IS NOT NULL AND lease_expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ', ?1 / 1000.0, 'unixepoch') AND fenced_claim_epoch = last_marked_claim_epoch AND fenced_claim_epoch > 0 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN state='processing' AND fenced_claim_epoch = 0 AND last_marked_claim_epoch = 0 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN desired_action='delete' AND (last_send_disposition IS NOT NULL OR attempt_count >= ?2 OR state NOT IN ('pending','retry_wait')) THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN attempt_count = ?2 AND state='processing' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN attempt_count = ?2 AND state='blocked' THEN 1 ELSE 0 END), 0),
                 MIN(CASE WHEN state='pending' THEN ROUND((julianday(created_at) - 2440587.5) * 86400000) ELSE NULL END),
                 MIN(CASE WHEN state='retry_wait' THEN ROUND((julianday(updated_at) - 2440587.5) * 86400000) ELSE NULL END),
                 MIN(CASE WHEN state='blocked' THEN ROUND((julianday(updated_at) - 2440587.5) * 86400000) ELSE NULL END)
              FROM memory_vector_sync_outbox WHERE migration_disposition IS NULL",
-            rusqlite::params![snapshot_now_millis as f64, max_attempts],
-            |row| Ok((
-                row.get::<_, i64>(0)? as usize,
-                row.get::<_, i64>(1)? as usize,
-                row.get::<_, i64>(2)? as usize,
-                row.get::<_, i64>(3)? as usize,
-                row.get::<_, i64>(4)? as usize,
-                row.get::<_, i64>(5)? as usize,
-                row.get::<_, i64>(6)? as usize,
-                row.get::<_, i64>(7)? as usize,
-                row.get::<_, Option<f64>>(8)?,
-                row.get::<_, Option<f64>>(9)?,
-                row.get::<_, Option<f64>>(10)?,
-            )),
-        ).map_err(|_| StorageError::new(
-            "VECTOR_SYNC_UNAVAILABLE",
-            "Vector sync health query failed.",
-            false,
-        ))?;
+                rusqlite::params![snapshot_now_millis as f64, max_attempts],
+                |row| Ok((
+                    row.get::<_, i64>(0)? as usize,
+                    row.get::<_, i64>(1)? as usize,
+                    row.get::<_, i64>(2)? as usize,
+                    row.get::<_, i64>(3)? as usize,
+                    row.get::<_, i64>(4)? as usize,
+                    row.get::<_, i64>(5)? as usize,
+                    row.get::<_, i64>(6)? as usize,
+                    row.get::<_, i64>(7)? as usize,
+                    row.get::<_, i64>(8)? as usize,
+                    row.get::<_, i64>(9)? as usize,
+                    row.get::<_, i64>(10)? as usize,
+                    row.get::<_, i64>(11)? as usize,
+                    row.get::<_, i64>(12)? as usize,
+                    row.get::<_, i64>(13)? as usize,
+                    row.get::<_, i64>(14)? as usize,
+                    row.get::<_, i64>(15)? as usize,
+                    row.get::<_, i64>(16)? as usize,
+                    row.get::<_, Option<f64>>(17)?,
+                    row.get::<_, Option<f64>>(18)?,
+                    row.get::<_, Option<f64>>(19)?,
+                )),
+            )
+            .map_err(|_| {
+                StorageError::new(
+                    "VECTOR_SYNC_UNAVAILABLE",
+                    "Vector sync health query failed.",
+                    false,
+                )
+            })?;
+
+        let migration_isolated_count: usize = state
+            .connection
+            .query_row(
+                "SELECT COALESCE(SUM(CASE WHEN migration_disposition IS NOT NULL THEN 1 ELSE 0 END), 0)
+                 FROM memory_vector_sync_outbox",
+                [],
+                |row| row.get::<_, i64>(0).map(|v| v as usize),
+            )
+            .map_err(|_| {
+                StorageError::new(
+                    "VECTOR_SYNC_UNAVAILABLE",
+                    "Vector sync health query failed.",
+                    false,
+                )
+            })?;
 
         let gen_items: usize = state
             .connection
@@ -479,10 +548,20 @@ impl StorageService {
             retry_wait_count: rwait,
             blocked_count: blocked,
             processing_count: processing,
+            failed_count: failed,
+            migration_isolated_count,
             expired_processing_count: expired,
             provider_result_unknown_count: unknown,
             internal_invariant_count: inv,
             attempts_at_limit_count: att_limit,
+            attempts_over_limit_count: att_over_limit,
+            invalid_attempt_identity_count: invalid_identity,
+            expired_processing_unmarked_count: expired_unmarked,
+            expired_processing_marked_count: expired_marked,
+            legacy_processing_unproven_count: legacy_unproven,
+            delete_replay_not_eligible_count: delete_not_eligible,
+            attempts_at_limit_processing_count: att_limit_processing,
+            attempts_at_limit_blocked_count: att_limit_blocked,
             oldest_pending_epoch_ms: oldest_pending.map(|v| v as i64),
             oldest_retry_wait_epoch_ms: oldest_retry.map(|v| v as i64),
             oldest_blocked_epoch_ms: oldest_blocked.map(|v| v as i64),

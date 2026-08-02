@@ -7571,4 +7571,267 @@ mod tests {
             );
         }
     }
+
+    /// ATT-I4 full run matrix: every legal action/mark/count/send combination
+    /// must converge to the frozen expected state through the real production
+    /// recovery path (expired processing + claim-epoch identity).
+    #[test]
+    fn attempt_recovery_full_run_matrix_converges_to_frozen_states() {
+        struct Case {
+            name: &'static str,
+            action: MemoryVectorSyncAction,
+            state_before: &'static str,
+            attempt: i64,
+            fenced: i64,
+            marked: i64,
+            send: Option<&'static str>,
+            error: Option<&'static str>,
+            generation: Option<&'static str>,
+            expected_state: &'static str,
+            expected_error: Option<&'static str>,
+            expected_send: Option<&'static str>,
+            expected_attempt: i64,
+            expected_generation: Option<&'static str>,
+        }
+
+        let cases = [
+            // Upsert unmarked claim, attempt 0 (ephemeral binding) → pending, ephemeral generation cleared
+            Case {
+                name: "upsert-unmarked-0",
+                action: MemoryVectorSyncAction::Upsert,
+                state_before: "processing",
+                attempt: 0,
+                fenced: 1,
+                marked: 0,
+                send: None,
+                error: None,
+                generation: Some("generation-a"),
+                expected_state: "pending",
+                expected_error: None,
+                expected_send: None,
+                expected_attempt: 0,
+                expected_generation: None,
+            },
+            // Upsert unmarked claim, attempt 1-4, definitely_not_sent → pending, keep durable generation
+            Case {
+                name: "upsert-unmarked-durable",
+                action: MemoryVectorSyncAction::Upsert,
+                state_before: "processing",
+                attempt: 2,
+                fenced: 3,
+                marked: 2,
+                send: Some("definitely_not_sent"),
+                error: Some("PROVIDER_UNAVAILABLE"),
+                generation: Some("generation-a"),
+                expected_state: "pending",
+                expected_error: Some("PROVIDER_UNAVAILABLE"),
+                expected_send: Some("definitely_not_sent"),
+                expected_attempt: 2,
+                expected_generation: Some("generation-a"),
+            },
+            // Upsert marked claim 1-5 possibly_sent → blocked PROVIDER_RESULT_UNKNOWN
+            Case {
+                name: "upsert-marked-unknown",
+                action: MemoryVectorSyncAction::Upsert,
+                state_before: "processing",
+                attempt: 2,
+                fenced: 2,
+                marked: 2,
+                send: Some("possibly_sent"),
+                error: Some("PROVIDER_RESULT_UNKNOWN"),
+                generation: Some("generation-a"),
+                expected_state: "blocked",
+                expected_error: Some("PROVIDER_RESULT_UNKNOWN"),
+                expected_send: Some("possibly_sent"),
+                expected_attempt: 2,
+                expected_generation: Some("generation-a"),
+            },
+            // Delete unmarked 0 (ephemeral binding) → pending, ephemeral generation cleared
+            Case {
+                name: "delete-unmarked-0",
+                action: MemoryVectorSyncAction::Delete,
+                state_before: "processing",
+                attempt: 0,
+                fenced: 1,
+                marked: 0,
+                send: None,
+                error: None,
+                generation: Some("generation-a"),
+                expected_state: "pending",
+                expected_error: None,
+                expected_send: None,
+                expected_attempt: 0,
+                expected_generation: None,
+            },
+            // Delete unmarked 1-4 → pending, keep durable generation
+            Case {
+                name: "delete-unmarked-durable",
+                action: MemoryVectorSyncAction::Delete,
+                state_before: "processing",
+                attempt: 3,
+                fenced: 3,
+                marked: 1,
+                send: None,
+                error: Some("LANCE_TRANSIENT"),
+                generation: Some("generation-a"),
+                expected_state: "pending",
+                expected_error: Some("LANCE_TRANSIENT"),
+                expected_send: None,
+                expected_attempt: 3,
+                expected_generation: Some("generation-a"),
+            },
+            // Delete marked 1-4 → pending (future new attempt possible)
+            Case {
+                name: "delete-marked-below-limit",
+                action: MemoryVectorSyncAction::Delete,
+                state_before: "processing",
+                attempt: 4,
+                fenced: 4,
+                marked: 4,
+                send: None,
+                error: Some("LANCE_TRANSIENT"),
+                generation: Some("generation-a"),
+                expected_state: "pending",
+                expected_error: Some("LANCE_TRANSIENT"),
+                expected_send: None,
+                expected_attempt: 4,
+                expected_generation: Some("generation-a"),
+            },
+            // Delete marked 5 → blocked MAX_ATTEMPTS
+            Case {
+                name: "delete-marked-at-limit",
+                action: MemoryVectorSyncAction::Delete,
+                state_before: "processing",
+                attempt: 5,
+                fenced: 5,
+                marked: 5,
+                send: None,
+                error: Some("LANCE_TRANSIENT"),
+                generation: Some("generation-a"),
+                expected_state: "blocked",
+                expected_error: Some("MAX_ATTEMPTS"),
+                expected_send: None,
+                expected_attempt: 5,
+                expected_generation: Some("generation-a"),
+            },
+            // Any > 5 → blocked INTERNAL_INVARIANT
+            Case {
+                name: "any-over-limit",
+                action: MemoryVectorSyncAction::Upsert,
+                state_before: "processing",
+                attempt: 6,
+                fenced: 6,
+                marked: 6,
+                send: Some("possibly_sent"),
+                error: Some("LANCE_PERMANENT"),
+                generation: Some("generation-a"),
+                expected_state: "blocked",
+                expected_error: Some("INTERNAL_INVARIANT"),
+                expected_send: Some("possibly_sent"),
+                expected_attempt: 6,
+                expected_generation: Some("generation-a"),
+            },
+            // Legacy (0,0) processing with generation binding → conservative blocked convergence
+            Case {
+                name: "legacy-zero-zero",
+                action: MemoryVectorSyncAction::Upsert,
+                state_before: "processing",
+                attempt: 1,
+                fenced: 0,
+                marked: 0,
+                send: Some("possibly_sent"),
+                error: Some("PROVIDER_RESULT_UNKNOWN"),
+                generation: Some("generation-a"),
+                expected_state: "blocked",
+                expected_error: Some("PROVIDER_RESULT_UNKNOWN"),
+                expected_send: Some("possibly_sent"),
+                expected_attempt: 1,
+                expected_generation: Some("generation-a"),
+            },
+        ];
+
+        for case in cases {
+            let (_root, storage) = storage();
+            let record = confirmed(&storage, false);
+            storage
+                .register_building_vector_generation("generation-a", "descriptor-a", 2)
+                .unwrap();
+            storage
+                .enqueue(EnqueueMemoryVectorSyncRequest {
+                    life_id: record.life_id.clone(),
+                    memory_id: record.id.clone(),
+                    desired_action: case.action,
+                })
+                .unwrap();
+            let claim = storage
+                .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-a")
+                .unwrap()
+                .unwrap();
+            assert_eq!(claim.action(), case.action);
+
+            let state = storage.state().unwrap();
+            state
+                .connection
+                .execute(
+                    "UPDATE memory_vector_sync_outbox
+                     SET state=?1, attempt_count=?2, fenced_claim_epoch=?3,
+                         last_marked_claim_epoch=?4, last_send_disposition=?5,
+                         last_error_code=?6, claimed_generation_id=?7,
+                         lease_expires_at='2000-01-01T00:00:00.000Z'
+                     WHERE id=?8",
+                    params![
+                        case.state_before,
+                        case.attempt,
+                        case.fenced,
+                        case.marked,
+                        case.send,
+                        case.error,
+                        case.generation,
+                        claim.id(),
+                    ],
+                )
+                .unwrap();
+            drop(state);
+
+            storage.test_expire_fenced_runtime_lease().unwrap();
+            let recovered = storage
+                .test_recover_expired_fenced_processing_for_generation_binding(1_700_000_000_000)
+                .unwrap();
+            assert_eq!(
+                recovered, 1,
+                "case {}: exactly one row recovered",
+                case.name
+            );
+
+            let snap = storage
+                .test_get_outbox_snapshot_detailed("life", claim.memory_id())
+                .unwrap();
+            assert_eq!(snap.state, case.expected_state, "case {}", case.name);
+            assert_eq!(
+                snap.last_error_code.as_deref(),
+                case.expected_error,
+                "case {}",
+                case.name
+            );
+            assert_eq!(
+                snap.last_send_disposition.as_deref(),
+                case.expected_send,
+                "case {}",
+                case.name
+            );
+            assert_eq!(
+                snap.attempt_count, case.expected_attempt,
+                "case {}",
+                case.name
+            );
+            assert_eq!(
+                snap.claimed_generation_id.as_deref(),
+                case.expected_generation,
+                "case {}",
+                case.name
+            );
+            assert_eq!(snap.lease_owner, None, "case {}", case.name);
+            assert_eq!(snap.lease_expires_at, None, "case {}", case.name);
+        }
+    }
 }

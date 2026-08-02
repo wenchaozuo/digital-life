@@ -27,10 +27,20 @@ pub(crate) struct VectorSyncHealthSnapshot {
     pub retry_wait_count: usize,
     pub blocked_count: usize,
     pub processing_count: usize,
+    pub failed_count: usize,
+    pub migration_isolated_count: usize,
     pub expired_processing_count: usize,
     pub provider_result_unknown_count: usize,
     pub internal_invariant_count: usize,
     pub attempts_at_limit_count: usize,
+    pub attempts_over_limit_count: usize,
+    pub invalid_attempt_identity_count: usize,
+    pub expired_processing_unmarked_count: usize,
+    pub expired_processing_marked_count: usize,
+    pub legacy_processing_unproven_count: usize,
+    pub delete_replay_not_eligible_count: usize,
+    pub attempts_at_limit_processing_count: usize,
+    pub attempts_at_limit_blocked_count: usize,
     pub oldest_pending_age_ms: Option<u64>,
     pub oldest_retry_wait_age_ms: Option<u64>,
     pub oldest_blocked_age_ms: Option<u64>,
@@ -108,10 +118,20 @@ pub(crate) async fn inspect_vector_sync_health(
         retry_wait_count,
         blocked_count,
         processing_count,
+        failed_count,
+        migration_isolated_count,
         expired_processing_count,
         provider_result_unknown_count,
         internal_invariant_count,
         attempts_at_limit_count,
+        attempts_over_limit_count,
+        invalid_attempt_identity_count,
+        expired_processing_unmarked_count,
+        expired_processing_marked_count,
+        legacy_processing_unproven_count,
+        delete_replay_not_eligible_count,
+        attempts_at_limit_processing_count,
+        attempts_at_limit_blocked_count,
         oldest_pending_epoch_ms,
         oldest_retry_wait_epoch_ms,
         oldest_blocked_epoch_ms,
@@ -153,10 +173,20 @@ pub(crate) async fn inspect_vector_sync_health(
         retry_wait_count,
         blocked_count,
         processing_count,
+        failed_count,
+        migration_isolated_count,
         expired_processing_count,
         provider_result_unknown_count,
         internal_invariant_count,
         attempts_at_limit_count,
+        attempts_over_limit_count,
+        invalid_attempt_identity_count,
+        expired_processing_unmarked_count,
+        expired_processing_marked_count,
+        legacy_processing_unproven_count,
+        delete_replay_not_eligible_count,
+        attempts_at_limit_processing_count,
+        attempts_at_limit_blocked_count,
         oldest_pending_age_ms: age_ms_at(snapshot_now_millis, oldest_pending_epoch_ms),
         oldest_retry_wait_age_ms: age_ms_at(snapshot_now_millis, oldest_retry_wait_epoch_ms),
         oldest_blocked_age_ms: age_ms_at(snapshot_now_millis, oldest_blocked_epoch_ms),
@@ -178,6 +208,46 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
     };
+
+    /// (memory_id, state, attempt, fenced, marked, generation, send, error)
+    type EpochFixture8<'a> = (
+        &'a str,
+        &'a str,
+        i64,
+        i64,
+        i64,
+        Option<&'a str>,
+        Option<&'a str>,
+        Option<&'a str>,
+    );
+
+    /// (memory_id, attempt_count, fenced_epoch, marked_epoch, generation,
+    ///  send_disposition, error_code, state)
+    type EpochRowSnapshot = (
+        String,
+        i64,
+        i64,
+        i64,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+
+    /// (memory_id, action, state, attempt, fenced, marked, generation,
+    ///  send_disposition, error_code, migration, lease_expiry)
+    type EpochFixtureRow<'a> = (
+        &'a str,
+        &'a str,
+        i64,
+        i64,
+        i64,
+        Option<&'a str>,
+        Option<&'a str>,
+        Option<&'a str>,
+        Option<&'a str>,
+        Option<&'a str>,
+    );
 
     fn test_storage() -> (tempfile::TempDir, StorageService) {
         let temp = tempfile::tempdir().unwrap();
@@ -1831,5 +1901,545 @@ mod tests {
         assert_eq!(snap.oldest_pending_age_ms, None);
         assert_eq!(snap.oldest_retry_wait_age_ms, None);
         assert_eq!(snap.oldest_blocked_age_ms, None);
+    }
+
+    #[test]
+    fn vector_sync_health_reports_extended_attempt_identity_metrics() {
+        let (_temp, storage) = test_storage();
+        let ctx = health_context();
+        storage
+            .register_building_vector_generation(
+                ctx.generation_id().as_str(),
+                ctx.descriptor_hash(),
+                ctx.dimension(),
+            )
+            .unwrap();
+
+        let conn = authorized_fixture_connection(&storage);
+
+        // helper: insert a row with explicit fields
+        let mut seq = 0i64;
+        #[allow(clippy::too_many_arguments)]
+        fn ins(
+            conn: &rusqlite::Connection,
+            seq: &mut i64,
+            mem: &str,
+            action: &str,
+            state: &str,
+            att: i64,
+            fenced_epoch: i64,
+            marked_epoch: i64,
+            gen: Option<&str>,
+            send: Option<&str>,
+            err: Option<&str>,
+            migration: Option<&str>,
+            lease_exp: Option<&str>,
+        ) {
+            *seq += 1;
+            conn.execute(
+                "INSERT OR REPLACE INTO memory_vector_sync_outbox
+                   (life_id, memory_id, desired_action, state, attempt_count,
+                    fenced_claim_epoch, last_marked_claim_epoch, claimed_generation_id,
+                    last_send_disposition, last_error_code, migration_disposition,
+                    lease_expires_at, created_at, updated_at)
+                 VALUES ('life',?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'2024-01-01T00:00:00.000Z','2024-01-01T00:00:00.000Z')",
+                rusqlite::params![mem, action, state, att, fenced_epoch, marked_epoch, gen, send, err, migration, lease_exp],
+            ).unwrap();
+            conn.execute("UPDATE memory_vector_sync_mutation_clock SET last_sequence = last_sequence + 1 WHERE singleton=1", []).unwrap();
+        }
+
+        // attempt == 5 blocked (legal exhausted)
+        ins(
+            &conn,
+            &mut seq,
+            "att5-blocked",
+            "upsert",
+            "blocked",
+            5,
+            3,
+            3,
+            Some("gen-health"),
+            Some("possibly_sent"),
+            Some("PROVIDER_RESULT_UNKNOWN"),
+            None,
+            None,
+        );
+        // attempt == 5 processing (5th attempt in flight)
+        ins(
+            &conn,
+            &mut seq,
+            "att5-proc",
+            "upsert",
+            "processing",
+            5,
+            4,
+            4,
+            Some("gen-health"),
+            Some("possibly_sent"),
+            Some("PROVIDER_RESULT_UNKNOWN"),
+            None,
+            Some("2099-01-01T00:00:00.000Z"),
+        );
+        // attempt == 6 (invalid over budget)
+        ins(
+            &conn,
+            &mut seq,
+            "att6",
+            "upsert",
+            "blocked",
+            6,
+            3,
+            3,
+            Some("gen-health"),
+            Some("possibly_sent"),
+            Some("LANCE_PERMANENT"),
+            None,
+            None,
+        );
+        // invalid identity: attempt > 0 without claimed generation
+        // (CHECK allows this: last_marked=0 with attempt>0 is valid per constraint)
+        ins(
+            &conn,
+            &mut seq,
+            "inv-epoch",
+            "upsert",
+            "processing",
+            2,
+            1,
+            0,
+            None,
+            Some("possibly_sent"),
+            Some("PROVIDER_RESULT_UNKNOWN"),
+            None,
+            Some("2099-01-01T00:00:00.000Z"),
+        );
+        // expired processing unmarked (fenced > marked)
+        ins(
+            &conn,
+            &mut seq,
+            "exp-unmarked",
+            "upsert",
+            "processing",
+            1,
+            2,
+            1,
+            Some("gen-health"),
+            Some("definitely_not_sent"),
+            None,
+            None,
+            Some("2000-01-01T00:00:00.000Z"),
+        );
+        // expired processing marked (fenced == marked > 0)
+        ins(
+            &conn,
+            &mut seq,
+            "exp-marked",
+            "upsert",
+            "processing",
+            2,
+            2,
+            2,
+            Some("gen-health"),
+            Some("possibly_sent"),
+            Some("PROVIDER_RESULT_UNKNOWN"),
+            None,
+            Some("2000-01-01T00:00:00.000Z"),
+        );
+        // legacy processing (0,0)
+        ins(
+            &conn,
+            &mut seq,
+            "legacy-proc",
+            "upsert",
+            "processing",
+            1,
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+            Some("2000-01-01T00:00:00.000Z"),
+        );
+        // delete not eligible: pending + possibly_sent
+        ins(
+            &conn,
+            &mut seq,
+            "del-unproven",
+            "delete",
+            "pending",
+            2,
+            2,
+            2,
+            Some("gen-health"),
+            Some("possibly_sent"),
+            None,
+            None,
+            None,
+        );
+        // migration isolated row (counted separately)
+        ins(
+            &conn,
+            &mut seq,
+            "iso",
+            "upsert",
+            "blocked",
+            1,
+            0,
+            0,
+            None,
+            None,
+            None,
+            Some("legacy_upsert_rebuild_required"),
+            None,
+        );
+
+        let raw_vs = crate::vector_store::InMemoryVectorStore::default();
+        tauri::async_runtime::block_on(raw_vs.create_generation(&ctx)).unwrap();
+
+        let clock = FixedHealthClock::new(1_700_000_000_000);
+        let snap = tauri::async_runtime::block_on(inspect_vector_sync_health(
+            &storage, &raw_vs, &ctx, &clock,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            snap.attempts_at_limit_count, 3,
+            "att5-blocked + att5-proc + att6 (>= 5)"
+        );
+        assert_eq!(snap.attempts_over_limit_count, 1, "att6");
+        assert_eq!(snap.attempts_at_limit_processing_count, 1);
+        assert_eq!(snap.attempts_at_limit_blocked_count, 1);
+        assert_eq!(
+            snap.invalid_attempt_identity_count, 1,
+            "inv-epoch has last_marked > fenced"
+        );
+        assert_eq!(snap.expired_processing_unmarked_count, 1, "exp-unmarked");
+        assert_eq!(snap.expired_processing_marked_count, 1, "exp-marked");
+        assert_eq!(snap.legacy_processing_unproven_count, 1, "legacy-proc");
+        assert_eq!(
+            snap.delete_replay_not_eligible_count, 1,
+            "del-unproven has possibly_sent"
+        );
+        assert_eq!(snap.migration_isolated_count, 1, "iso");
+        assert_eq!(snap.failed_count, 0);
+    }
+
+    #[test]
+    fn vector_sync_health_with_epoch_metrics_is_strictly_read_only() {
+        let (_temp, storage) = test_storage();
+        let ctx = health_context();
+        storage
+            .register_building_vector_generation(
+                ctx.generation_id().as_str(),
+                ctx.descriptor_hash(),
+                ctx.dimension(),
+            )
+            .unwrap();
+
+        let conn = authorized_fixture_connection(&storage);
+
+        // Insert a mix of epoch-bearing rows covering the extended metrics.
+        let rows: &[EpochFixture8] = &[
+            // mem, state, att, fenced, marked, gen, send, err
+            ("r1", "pending", 0, 0, 0, None, None, None),
+            (
+                "r2",
+                "processing",
+                1,
+                2,
+                1,
+                Some("gen-health"),
+                Some("definitely_not_sent"),
+                None,
+            ),
+            (
+                "r3",
+                "processing",
+                2,
+                2,
+                2,
+                Some("gen-health"),
+                Some("possibly_sent"),
+                Some("PROVIDER_RESULT_UNKNOWN"),
+            ),
+            (
+                "r4",
+                "blocked",
+                5,
+                3,
+                3,
+                Some("gen-health"),
+                Some("possibly_sent"),
+                Some("PROVIDER_RESULT_UNKNOWN"),
+            ),
+            (
+                "r5",
+                "blocked",
+                6,
+                3,
+                3,
+                Some("gen-health"),
+                Some("possibly_sent"),
+                Some("LANCE_PERMANENT"),
+            ),
+            ("r6", "processing", 1, 0, 0, None, None, None),
+            (
+                "r7",
+                "retry_wait",
+                1,
+                2,
+                2,
+                Some("gen-health"),
+                Some("definitely_not_sent"),
+                None,
+            ),
+        ];
+        for (mem, state, att, fenced, marked, gen, send, err) in rows {
+            conn.execute(
+                "INSERT OR REPLACE INTO memory_vector_sync_outbox
+                   (life_id, memory_id, desired_action, state, attempt_count,
+                    fenced_claim_epoch, last_marked_claim_epoch, claimed_generation_id,
+                    last_send_disposition, last_error_code, lease_expires_at,
+                    created_at, updated_at)
+                 VALUES ('life',?1,'upsert',?2,?3,?4,?5,?6,?7,?8,?9,'2024-01-01T00:00:00.000Z','2024-01-01T00:00:00.000Z')",
+                rusqlite::params![
+                    mem,
+                    state,
+                    att,
+                    fenced,
+                    marked,
+                    gen,
+                    send,
+                    err,
+                    if *state == "processing" {
+                        Some("2000-01-01T00:00:00.000Z")
+                    } else {
+                        None
+                    }
+                ],
+            ).unwrap();
+            conn.execute("UPDATE memory_vector_sync_mutation_clock SET last_sequence = last_sequence + 1 WHERE singleton=1", []).unwrap();
+        }
+
+        let raw_vs = crate::vector_store::InMemoryVectorStore::default();
+        tauri::async_runtime::block_on(raw_vs.create_generation(&ctx)).unwrap();
+
+        // Full before snapshot of outbox + epoch columns.
+        let before: Vec<EpochRowSnapshot> = {
+            let conn = authorized_fixture_connection(&storage);
+            let mut stmt = conn
+                .prepare(
+                    "SELECT memory_id, attempt_count, fenced_claim_epoch, last_marked_claim_epoch,
+                            claimed_generation_id, last_send_disposition, last_error_code, state
+                     FROM memory_vector_sync_outbox ORDER BY memory_id",
+                )
+                .unwrap();
+            stmt.query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                ))
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+        };
+
+        let clock = FixedHealthClock::new(1_700_000_000_000);
+        let _snap = tauri::async_runtime::block_on(inspect_vector_sync_health(
+            &storage, &raw_vs, &ctx, &clock,
+        ))
+        .unwrap();
+
+        let after: Vec<EpochRowSnapshot> = {
+            let conn = authorized_fixture_connection(&storage);
+            let mut stmt = conn
+                .prepare(
+                    "SELECT memory_id, attempt_count, fenced_claim_epoch, last_marked_claim_epoch,
+                            claimed_generation_id, last_send_disposition, last_error_code, state
+                     FROM memory_vector_sync_outbox ORDER BY memory_id",
+                )
+                .unwrap();
+            stmt.query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                ))
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+        };
+
+        assert_eq!(
+            before, after,
+            "health must not mutate outbox or epoch fields"
+        );
+    }
+
+    /// ATT-I4: a real file SQLite health snapshot can run concurrently with a
+    /// worker that claims and reserves the same outbox row, without blocking
+    /// the worker or producing a mixed-state snapshot.
+    #[test]
+    fn vector_sync_health_and_worker_run_concurrently_for_ten_rounds() {
+        for round in 0..10 {
+            let (_temp, storage_a) = test_storage();
+            let ctx = health_context();
+            storage_a
+                .register_building_vector_generation(
+                    ctx.generation_id().as_str(),
+                    ctx.descriptor_hash(),
+                    ctx.dimension(),
+                )
+                .unwrap();
+            let record = crate::storage::test_support::insert_confirmed_memory_fixture(
+                &storage_a,
+                "life",
+                "fact",
+                "concurrent health worker",
+                None,
+                0.5,
+                0.5,
+                false,
+                true,
+            );
+
+            // Claim the row, then expire its lease so recovery must run inside
+            // the next claim transaction.
+            let claim = storage_a
+                .claim_one_fenced_vector_sync(
+                    ctx.generation_id().as_str(),
+                    ctx.descriptor_hash(),
+                    ctx.dimension(),
+                    "worker-a",
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(claim.memory_id(), record.id.as_str());
+            storage_a.test_expire_fenced_runtime_lease().unwrap();
+
+            // Independent connection to the same real file SQLite.
+            let storage_b =
+                StorageService::initialize_with_roots(_temp.path().join("data"), None).unwrap();
+
+            // Worker thread on connection B: claims and reserves a fresh attempt
+            // (recovery runs inside the claim transaction).
+            let worker = {
+                let ctx = ctx.clone();
+                std::thread::spawn(move || {
+                    let claim = storage_b
+                        .claim_one_fenced_vector_sync_with_retry_cutoff(
+                            ctx.generation_id().as_str(),
+                            ctx.descriptor_hash(),
+                            ctx.dimension(),
+                            "worker-a",
+                            Some(1_700_000_000_000),
+                        )
+                        .unwrap();
+                    let claim = claim?;
+                    storage_b
+                        .test_reserve_fenced_attempt_token(&claim)
+                        .ok()
+                        .map(|_| ())
+                })
+            };
+
+            // Health thread on connection A: reads concurrently with the
+            // worker's claim/reserve on connection B.
+            let raw_vs = crate::vector_store::InMemoryVectorStore::default();
+            tauri::async_runtime::block_on(raw_vs.create_generation(&ctx)).unwrap();
+            let clock = FixedHealthClock::new(1_700_000_000_000);
+            let health = {
+                let ctx = ctx.clone();
+                let clock = clock.clone();
+                std::thread::spawn(move || {
+                    tauri::async_runtime::block_on(inspect_vector_sync_health(
+                        &storage_a, &raw_vs, &ctx, &clock,
+                    ))
+                })
+            };
+
+            let worker_result = worker.join().unwrap();
+            let health_result = health.join().unwrap();
+
+            // Health must succeed and never see impossible state.
+            let snap = health_result.unwrap();
+            assert!(snap.processing_count <= 1, "round {round}");
+            assert!(snap.attempts_at_limit_count <= 1, "round {round}");
+            let _ = worker_result;
+        }
+    }
+
+    /// ATT-I4: a compensation classification produced from an old mutation view
+    /// must never become an execution permit after a new mutation resets the
+    /// budget. The classifier itself is pure, so this proves callers cannot
+    /// treat a stale classification as current.
+    #[test]
+    fn compensation_stale_classification_is_not_an_execution_permit() {
+        use crate::memory::vector_sync_compensation::{
+            classify_compensation, CompensationSendDisposition, ExactGenerationProof,
+            VectorSyncCompensationClass, VectorSyncCompensationFacts,
+        };
+        use crate::memory::vector_sync_outbox::{MemoryVectorSyncAction, MemoryVectorSyncState};
+
+        // Old mutation view: delete, pending, 4 attempts, epochs (4,4), NULL send.
+        let old_facts = VectorSyncCompensationFacts {
+            desired_action: MemoryVectorSyncAction::Delete,
+            state: MemoryVectorSyncState::Pending,
+            attempt_count: 4,
+            fenced_claim_epoch: 4,
+            last_marked_claim_epoch: 4,
+            has_claimed_generation: true,
+            last_send_disposition: CompensationSendDisposition::None,
+            last_error_code: None,
+            migration_disposition: None,
+            has_complete_target_binding: true,
+            proof: ExactGenerationProof::Missing,
+        };
+        let old_class = classify_compensation(&old_facts);
+        assert_eq!(
+            old_class,
+            VectorSyncCompensationClass::EligibleForFencedDeleteReplay,
+            "old mutation view is eligible in isolation"
+        );
+
+        // A new mutation replaces the row with a fresh budget: count 0, epochs 0.
+        // The stale old classification must not be applied to this new row.
+        let new_facts = VectorSyncCompensationFacts {
+            desired_action: MemoryVectorSyncAction::Delete,
+            state: MemoryVectorSyncState::Pending,
+            attempt_count: 0,
+            fenced_claim_epoch: 0,
+            last_marked_claim_epoch: 0,
+            has_claimed_generation: false,
+            last_send_disposition: CompensationSendDisposition::None,
+            last_error_code: None,
+            migration_disposition: None,
+            has_complete_target_binding: true,
+            proof: ExactGenerationProof::Missing,
+        };
+        let new_class = classify_compensation(&new_facts);
+        assert_eq!(
+            new_class,
+            VectorSyncCompensationClass::NotEligible,
+            "a fresh unclaimed mutation must not be treated as a replay candidate"
+        );
+        assert_ne!(
+            old_class, new_class,
+            "stale classification must never be reused for the new mutation"
+        );
     }
 }

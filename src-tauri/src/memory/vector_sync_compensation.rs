@@ -8,7 +8,10 @@
 #![allow(dead_code)]
 
 use crate::{
-    memory::vector_sync_outbox::{MemoryVectorSyncAction, MemoryVectorSyncState},
+    memory::{
+        vector_sync_outbox::{MemoryVectorSyncAction, MemoryVectorSyncState},
+        vector_sync_worker::MAX_VECTOR_SYNC_ATTEMPTS,
+    },
     vector_store::{VectorMetadataSample, VectorStoreError, VectorStoreErrorCode},
 };
 
@@ -172,6 +175,9 @@ pub(crate) struct VectorSyncCompensationFacts<'a> {
     pub desired_action: MemoryVectorSyncAction,
     pub state: MemoryVectorSyncState,
     pub attempt_count: u32,
+    pub fenced_claim_epoch: i64,
+    pub last_marked_claim_epoch: i64,
+    pub has_claimed_generation: bool,
     pub last_send_disposition: CompensationSendDisposition,
     pub last_error_code: Option<&'a str>,
     pub migration_disposition: Option<&'a str>,
@@ -191,28 +197,66 @@ pub(crate) enum VectorSyncCompensationClass {
     MigrationIsolated,
     NotEligible,
     InvariantViolation,
+    /// An upsert whose durable evidence cannot rule out a provider send.
+    BlockedUnknownSend,
+    /// The mutation has exhausted its five-slot attempt budget.
+    AttemptsAtLimit,
+    /// A pre-schema-14 `(0,0)` processing row with unproven external effects.
+    LegacyUnproven,
+    /// A delete candidate whose safe replay cannot be proven at this stage.
+    LateDeleteUnproven,
+    /// The row is already terminal or the current mutation is already done.
+    AlreadyCurrentOrCompleted,
 }
 
 const STABLE_UNKNOWN: &str = "PROVIDER_RESULT_UNKNOWN";
 
-/// Fail-closed classification. Order: migration isolation, target binding,
-/// attempt count, action, state, disposition, error code, exact proof.
+/// Fail-closed classification. Order: migration isolation, invalid identity,
+/// legacy provenance, target binding, attempt budget, action, state,
+/// disposition, error code, exact proof.
 pub(crate) fn classify_compensation(
     facts: &VectorSyncCompensationFacts<'_>,
 ) -> VectorSyncCompensationClass {
     if facts.migration_disposition.is_some() {
         return VectorSyncCompensationClass::MigrationIsolated;
     }
+    if invalid_attempt_identity(facts) {
+        return VectorSyncCompensationClass::InvariantViolation;
+    }
+    if facts.fenced_claim_epoch == 0
+        && facts.last_marked_claim_epoch == 0
+        && facts.state == MemoryVectorSyncState::Processing
+    {
+        return VectorSyncCompensationClass::LegacyUnproven;
+    }
     if !facts.has_complete_target_binding {
         return VectorSyncCompensationClass::InvariantViolation;
     }
+    if facts.attempt_count > MAX_VECTOR_SYNC_ATTEMPTS {
+        return VectorSyncCompensationClass::InvariantViolation;
+    }
+    if facts.attempt_count == MAX_VECTOR_SYNC_ATTEMPTS {
+        return VectorSyncCompensationClass::AttemptsAtLimit;
+    }
     if facts.attempt_count == 0 {
         return VectorSyncCompensationClass::NotEligible;
+    }
+    if facts.state == MemoryVectorSyncState::Failed {
+        return VectorSyncCompensationClass::AlreadyCurrentOrCompleted;
     }
     match facts.desired_action {
         MemoryVectorSyncAction::Upsert => classify_upsert(facts),
         MemoryVectorSyncAction::Delete => classify_delete(facts),
     }
+}
+
+/// True when the durable attempt identity violates schema-14 invariants.
+fn invalid_attempt_identity(facts: &VectorSyncCompensationFacts<'_>) -> bool {
+    facts.fenced_claim_epoch < 0
+        || facts.last_marked_claim_epoch < 0
+        || facts.last_marked_claim_epoch > facts.fenced_claim_epoch
+        || (facts.last_marked_claim_epoch > 0 && facts.attempt_count == 0)
+        || (facts.attempt_count > 0 && !facts.has_claimed_generation)
 }
 
 fn classify_upsert(facts: &VectorSyncCompensationFacts<'_>) -> VectorSyncCompensationClass {
@@ -267,10 +311,10 @@ fn classify_delete(facts: &VectorSyncCompensationFacts<'_>) -> VectorSyncCompens
             VectorSyncCompensationClass::EligibleForFencedDeleteReplay
         }
         CompensationSendDisposition::PossiblySent => {
-            VectorSyncCompensationClass::InvariantViolation
+            VectorSyncCompensationClass::LateDeleteUnproven
         }
         CompensationSendDisposition::DefinitelyNotSent => {
-            VectorSyncCompensationClass::InvariantViolation
+            VectorSyncCompensationClass::LateDeleteUnproven
         }
     }
 }
@@ -640,10 +684,42 @@ mod tests {
         binding: bool,
         proof: ExactGenerationProof,
     ) -> VectorSyncCompensationFacts<'static> {
+        facts_with_epochs(
+            action,
+            state,
+            attempt,
+            2,
+            2,
+            attempt > 0,
+            send,
+            err,
+            migration,
+            binding,
+            proof,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn facts_with_epochs(
+        action: MemoryVectorSyncAction,
+        state: MemoryVectorSyncState,
+        attempt: u32,
+        fenced_claim_epoch: i64,
+        last_marked_claim_epoch: i64,
+        has_claimed_generation: bool,
+        send: CompensationSendDisposition,
+        err: Option<&'static str>,
+        migration: Option<&'static str>,
+        binding: bool,
+        proof: ExactGenerationProof,
+    ) -> VectorSyncCompensationFacts<'static> {
         VectorSyncCompensationFacts {
             desired_action: action,
             state,
             attempt_count: attempt,
+            fenced_claim_epoch,
+            last_marked_claim_epoch,
+            has_claimed_generation,
             last_send_disposition: send,
             last_error_code: err,
             migration_disposition: migration,
@@ -753,10 +829,13 @@ mod tests {
             ),
             (
                 "attempt=0",
-                facts(
+                facts_with_epochs(
                     Upsert,
                     Blocked,
                     0,
+                    0,
+                    0,
+                    false,
                     sd_ps,
                     Some("PROVIDER_RESULT_UNKNOWN"),
                     None,
@@ -847,7 +926,7 @@ mod tests {
                     true,
                     ExactGenerationProof::Exact,
                 ),
-                NotEligible,
+                AlreadyCurrentOrCompleted,
             ),
             (
                 "wrong error code",
@@ -925,10 +1004,13 @@ mod tests {
             ),
             (
                 "attempt=0",
-                facts(
+                facts_with_epochs(
                     Delete,
                     Pending,
                     0,
+                    0,
+                    0,
+                    false,
                     sd_none,
                     None,
                     None,
@@ -949,7 +1031,7 @@ mod tests {
                     true,
                     ExactGenerationProof::Missing,
                 ),
-                InvariantViolation,
+                LateDeleteUnproven,
             ),
             (
                 "send=definitely_not_sent",
@@ -963,7 +1045,7 @@ mod tests {
                     true,
                     ExactGenerationProof::Missing,
                 ),
-                InvariantViolation,
+                LateDeleteUnproven,
             ),
             (
                 "processing",
@@ -1019,7 +1101,7 @@ mod tests {
                     true,
                     ExactGenerationProof::Missing,
                 ),
-                NotEligible,
+                AlreadyCurrentOrCompleted,
             ),
             (
                 "migration isolated",
@@ -1104,7 +1186,185 @@ mod tests {
             "MigrationIsolated",
             "NotEligible",
             "InvariantViolation",
+            "BlockedUnknownSend",
+            "AttemptsAtLimit",
+            "LegacyUnproven",
+            "LateDeleteUnproven",
+            "AlreadyCurrentOrCompleted",
         ];
         assert!(variants.contains(&debug_of_enum.as_str()));
+    }
+
+    #[test]
+    fn attempt_budget_classification_is_stable() {
+        use MemoryVectorSyncAction::Delete;
+        use MemoryVectorSyncState::Pending;
+
+        // attempt == 5 is a legal exhausted budget
+        let at_limit = facts(
+            Delete,
+            Pending,
+            5,
+            sd_none(),
+            None,
+            None,
+            true,
+            ExactGenerationProof::Missing,
+        );
+        assert_eq!(
+            classify_compensation(&at_limit),
+            VectorSyncCompensationClass::AttemptsAtLimit
+        );
+
+        // attempt > 5 is an internal invariant violation
+        let over_limit = facts(
+            Delete,
+            Pending,
+            6,
+            sd_none(),
+            None,
+            None,
+            true,
+            ExactGenerationProof::Missing,
+        );
+        assert_eq!(
+            classify_compensation(&over_limit),
+            VectorSyncCompensationClass::InvariantViolation
+        );
+    }
+
+    #[test]
+    fn legacy_zero_epoch_processing_is_unproven() {
+        use MemoryVectorSyncAction::Upsert;
+        use MemoryVectorSyncState::Processing;
+        let legacy = facts_with_epochs(
+            Upsert,
+            Processing,
+            1,
+            0,
+            0,
+            true,
+            sd_ps(),
+            Some("PROVIDER_RESULT_UNKNOWN"),
+            None,
+            true,
+            ExactGenerationProof::Missing,
+        );
+        assert_eq!(
+            classify_compensation(&legacy),
+            VectorSyncCompensationClass::LegacyUnproven
+        );
+    }
+
+    #[test]
+    fn invalid_attempt_identity_fails_closed() {
+        use MemoryVectorSyncAction::Upsert;
+        use MemoryVectorSyncState::Blocked;
+
+        // last_marked > fenced is structurally invalid
+        let invalid_epochs = facts_with_epochs(
+            Upsert,
+            Blocked,
+            2,
+            1,
+            2,
+            true,
+            sd_ps(),
+            Some("PROVIDER_RESULT_UNKNOWN"),
+            None,
+            true,
+            ExactGenerationProof::Exact,
+        );
+        assert_eq!(
+            classify_compensation(&invalid_epochs),
+            VectorSyncCompensationClass::InvariantViolation
+        );
+
+        // last_marked > 0 with attempt == 0 is invalid
+        let marked_but_zero_attempts = facts_with_epochs(
+            Upsert,
+            Blocked,
+            0,
+            3,
+            3,
+            false,
+            sd_none(),
+            None,
+            None,
+            true,
+            ExactGenerationProof::Exact,
+        );
+        assert_eq!(
+            classify_compensation(&marked_but_zero_attempts),
+            VectorSyncCompensationClass::InvariantViolation
+        );
+
+        // attempt > 0 without a claimed generation is invalid
+        let attempts_without_generation = facts_with_epochs(
+            Upsert,
+            Blocked,
+            2,
+            2,
+            2,
+            false,
+            sd_ps(),
+            Some("PROVIDER_RESULT_UNKNOWN"),
+            None,
+            true,
+            ExactGenerationProof::Exact,
+        );
+        assert_eq!(
+            classify_compensation(&attempts_without_generation),
+            VectorSyncCompensationClass::InvariantViolation
+        );
+    }
+
+    #[test]
+    fn delete_unproven_replay_is_not_eligible() {
+        use MemoryVectorSyncAction::Delete;
+        use MemoryVectorSyncState::Pending;
+
+        let unproven = facts(
+            Delete,
+            Pending,
+            3,
+            sd_ps(),
+            None,
+            None,
+            true,
+            ExactGenerationProof::Missing,
+        );
+        assert_eq!(
+            classify_compensation(&unproven),
+            VectorSyncCompensationClass::LateDeleteUnproven
+        );
+    }
+
+    #[test]
+    fn terminal_failed_state_is_already_current_or_completed() {
+        use MemoryVectorSyncAction::Delete;
+        use MemoryVectorSyncState::Failed;
+        let terminal = facts(
+            Delete,
+            Failed,
+            3,
+            sd_none(),
+            None,
+            None,
+            true,
+            ExactGenerationProof::Missing,
+        );
+        assert_eq!(
+            classify_compensation(&terminal),
+            VectorSyncCompensationClass::AlreadyCurrentOrCompleted
+        );
+    }
+
+    fn sd_none() -> CompensationSendDisposition {
+        CompensationSendDisposition::None
+    }
+
+    fn sd_ps() -> CompensationSendDisposition {
+        CompensationSendDisposition::PossiblySent
     }
 }

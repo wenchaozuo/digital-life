@@ -15,6 +15,116 @@ use super::StorageService;
 
 const COLUMNS: &str = "id, life_id, memory_id, desired_action, state, attempt_count, next_attempt_at, lease_owner, lease_expires_at, last_error_code, created_at, updated_at";
 
+/// The authoritative SQLite-side Attempt budget (Attempt Policy V1).
+///
+/// An Attempt is one durably reserved external-side-effect slot for the current
+/// mutation, keyed by `(life_id, memory_id, mutation_sequence)`. The budget is
+/// deliberately not configurable: it is not read from settings, the environment,
+/// the frontend, or the worker. The worker and health modules keep their own
+/// same-valued constants for their own retry classification; unifying them is
+/// explicitly out of scope for ATT-I2.
+pub(crate) const MAX_VECTOR_SYNC_ATTEMPTS: i64 = 5;
+
+/// Proof that one Attempt slot is durably reserved for exactly one claim.
+///
+/// The token is produced only by the single authoritative reserve path after its
+/// transaction commits, so it can never describe an unreserved Attempt. It binds
+/// every identity the reservation was made under, which is what lets ATT-I3
+/// re-verify currency immediately before external I/O.
+///
+/// It deliberately has no public constructor, no `Serialize`/`Deserialize`, no
+/// `Clone`, and no `Debug`: it must not reach IPC, logs, or user-facing errors,
+/// and it carries no memory text, provider response, or credential.
+pub(crate) struct FencedAttemptToken {
+    outbox_id: i64,
+    mutation_sequence: i64,
+    action: MemoryVectorSyncAction,
+    target_revision: Option<i64>,
+    target_content_hash: Option<String>,
+    generation_id: String,
+    lease_owner: String,
+    fence_epoch: i64,
+    fenced_claim_epoch: i64,
+    attempt_ordinal: i64,
+}
+
+#[allow(dead_code)]
+impl FencedAttemptToken {
+    /// The one-based ordinal of the reserved slot, equal to the persisted
+    /// `attempt_count` at reservation time.
+    pub(crate) fn attempt_ordinal(&self) -> i64 {
+        self.attempt_ordinal
+    }
+    pub(crate) fn fenced_claim_epoch(&self) -> i64 {
+        self.fenced_claim_epoch
+    }
+    pub(crate) fn outbox_id(&self) -> i64 {
+        self.outbox_id
+    }
+    pub(crate) fn mutation_sequence(&self) -> i64 {
+        self.mutation_sequence
+    }
+    pub(crate) fn action(&self) -> MemoryVectorSyncAction {
+        self.action
+    }
+    pub(crate) fn generation_id(&self) -> &str {
+        &self.generation_id
+    }
+    pub(crate) fn lease_owner(&self) -> &str {
+        &self.lease_owner
+    }
+    pub(crate) fn fence_epoch(&self) -> i64 {
+        self.fence_epoch
+    }
+    pub(crate) fn target_revision(&self) -> Option<i64> {
+        self.target_revision
+    }
+    pub(crate) fn target_content_hash(&self) -> Option<&str> {
+        self.target_content_hash.as_deref()
+    }
+}
+
+/// The outcome of asking SQLite to reserve one Attempt slot.
+///
+/// It deliberately derives nothing: `Reserved` carries the token, and the token
+/// must not gain `Debug`/`Clone` by way of this enum.
+pub(crate) enum FencedAttemptReservation {
+    /// The slot is durably reserved. A repeated reserve for the same claim epoch
+    /// returns the same `attempt_ordinal` instead of consuming a new slot.
+    Reserved(FencedAttemptToken),
+    /// A stale owner, fence, mutation, target, generation, claim epoch, state, or
+    /// migration boundary. Never an increment, and never a claim of corruption.
+    LostLeaseOrSuperseded,
+    /// The budget for this mutation is spent, so the row was converged to
+    /// `blocked` instead of handing out a sixth slot.
+    BudgetExhausted,
+}
+
+impl FencedAttemptReservation {
+    #[cfg(test)]
+    fn token(&self) -> Option<&FencedAttemptToken> {
+        match self {
+            Self::Reserved(token) => Some(token),
+            Self::LostLeaseOrSuperseded | Self::BudgetExhausted => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn ordinal(&self) -> Option<i64> {
+        self.token().map(FencedAttemptToken::attempt_ordinal)
+    }
+
+    #[cfg(test)]
+    fn is_lost(&self) -> bool {
+        matches!(self, Self::LostLeaseOrSuperseded)
+    }
+
+    #[cfg(test)]
+    fn is_budget_exhausted(&self) -> bool {
+        matches!(self, Self::BudgetExhausted)
+    }
+}
+
 pub(super) fn enqueue_in_transaction(
     transaction: &Transaction<'_>,
     life_id: &str,
@@ -98,6 +208,7 @@ pub(super) fn enqueue_in_transaction(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)
          ON CONFLICT(life_id, memory_id) DO UPDATE SET
            desired_action = excluded.desired_action, state = 'pending', attempt_count = 0,
+           fenced_claim_epoch = 0, last_marked_claim_epoch = 0,
            next_attempt_at = NULL, lease_owner = NULL, lease_expires_at = NULL,
            lease_fence_epoch = NULL, claimed_generation_id = NULL, last_send_disposition = NULL,
            migration_disposition = NULL, mutation_sequence = excluded.mutation_sequence,
@@ -150,6 +261,10 @@ pub(crate) struct FencedVectorSyncClaim {
     dimension: usize,
     lease_owner: String,
     fence_epoch: i64,
+    /// The ordinary claim epoch this claim was granted, read back from the row
+    /// after the claiming transaction incremented it. Callers never compute or
+    /// advance it, and it is never exposed beyond the storage crate.
+    fenced_claim_epoch: i64,
 }
 
 /// Internal-only classification of the persisted binding boundary.  It is
@@ -299,6 +414,59 @@ struct GenerationBindingRow {
     lease_expires_at: Option<String>,
     last_send_disposition: Option<String>,
     last_error_code: Option<String>,
+    fenced_claim_epoch: i64,
+    last_marked_claim_epoch: i64,
+}
+
+/// The persisted Attempt-identity relationship between the two schema-14 claim
+/// epoch columns and `attempt_count`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttemptIdentityPhase {
+    /// The current claim has not reserved its Attempt slot yet.
+    ClaimUnmarked,
+    /// The current claim already reserved its Attempt slot.
+    ClaimMarked,
+    /// No ordinary claim epoch has ever been granted. A schema-13 row migrated
+    /// while `processing` lands here, and must never yield an Attempt token.
+    NeverClaimed,
+    /// A structurally impossible combination. The CHECK constraints make most of
+    /// these unreachable through SQLite, so reaching one means the row is corrupt.
+    Invalid,
+}
+
+/// Classifies the Attempt identity of one row. This is the single reader of the
+/// two claim-epoch columns' relationship, so claim, reserve, and recovery cannot
+/// disagree about what a row's epochs mean.
+fn attempt_identity_phase(
+    attempt_count: i64,
+    fenced_claim_epoch: i64,
+    last_marked_claim_epoch: i64,
+) -> AttemptIdentityPhase {
+    if attempt_count < 0 || fenced_claim_epoch < 0 || last_marked_claim_epoch < 0 {
+        return AttemptIdentityPhase::Invalid;
+    }
+    if last_marked_claim_epoch > fenced_claim_epoch {
+        return AttemptIdentityPhase::Invalid;
+    }
+    if last_marked_claim_epoch > 0 && attempt_count <= 0 {
+        return AttemptIdentityPhase::Invalid;
+    }
+    // A count beyond the budget can only come from outside the single authoritative
+    // reserve path (or a schema-13 row whose legacy worker incremented without a
+    // budget). It is never runnable and never manually retryable.
+    if attempt_count > MAX_VECTOR_SYNC_ATTEMPTS {
+        return AttemptIdentityPhase::Invalid;
+    }
+    if fenced_claim_epoch == 0 {
+        // A never-claimed row cannot have reserved an Attempt through the fenced
+        // path, so a positive attempt_count here is legacy-only evidence.
+        return AttemptIdentityPhase::NeverClaimed;
+    }
+    if last_marked_claim_epoch == fenced_claim_epoch {
+        AttemptIdentityPhase::ClaimMarked
+    } else {
+        AttemptIdentityPhase::ClaimUnmarked
+    }
 }
 
 impl GenerationBindingRow {
@@ -316,6 +484,14 @@ impl GenerationBindingRow {
     fn phase(&self) -> GenerationBindingPhase {
         generation_binding_phase(self.facts())
     }
+
+    fn attempt_identity_phase(&self) -> AttemptIdentityPhase {
+        attempt_identity_phase(
+            self.attempt_count,
+            self.fenced_claim_epoch,
+            self.last_marked_claim_epoch,
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -330,15 +506,46 @@ enum FencedBindingCurrent {
     NotCurrent,
 }
 
-type ClaimCandidate = (
-    i64,
-    i64,
-    Option<String>,
-    String,
-    Option<String>,
-    Option<i64>,
-    Option<String>,
-);
+struct ClaimCandidate {
+    id: i64,
+    attempt_count: i64,
+    claimed_generation_id: Option<String>,
+    state: String,
+    lease_owner: Option<String>,
+    lease_fence_epoch: Option<i64>,
+    lease_expires_at: Option<String>,
+    fenced_claim_epoch: i64,
+    last_marked_claim_epoch: i64,
+}
+
+fn claim_candidate_from_row(row: &Row<'_>) -> rusqlite::Result<ClaimCandidate> {
+    Ok(ClaimCandidate {
+        id: row.get(0)?,
+        attempt_count: row.get(1)?,
+        claimed_generation_id: row.get(2)?,
+        state: row.get(3)?,
+        lease_owner: row.get(4)?,
+        lease_fence_epoch: row.get(5)?,
+        lease_expires_at: row.get(6)?,
+        fenced_claim_epoch: row.get(7)?,
+        last_marked_claim_epoch: row.get(8)?,
+    })
+}
+
+/// Error codes that already describe a permanent, stable outcome. When the budget
+/// runs out, such a code is more specific than `MAX_ATTEMPTS` and is preserved.
+const PERMANENT_ERROR_CODES: &[&str] = &[
+    "PROVIDER_RESULT_UNKNOWN",
+    "AUTHENTICATION_FAILED",
+    "INVALID_REQUEST",
+    "INVALID_PROVIDER_RESPONSE",
+    "EMBEDDING_DIMENSION_MISMATCH",
+    "EMBEDDING_INVALID_VECTOR",
+    "LANCE_PERMANENT",
+    "INTERNAL_INVARIANT",
+    "MAX_ATTEMPTS",
+    "VECTOR_TARGET_BINDING_MISSING",
+];
 
 impl std::fmt::Debug for FencedVectorSyncClaim {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -350,6 +557,7 @@ impl std::fmt::Debug for FencedVectorSyncClaim {
             .field("generation_id_len", &self.generation_id.len())
             .field("dimension", &self.dimension)
             .field("fence_epoch", &self.fence_epoch)
+            .field("fenced_claim_epoch", &self.fenced_claim_epoch)
             .finish()
     }
 }
@@ -367,6 +575,9 @@ impl FencedVectorSyncClaim {
     }
     pub(crate) fn fence_epoch(&self) -> i64 {
         self.fence_epoch
+    }
+    pub(crate) fn fenced_claim_epoch(&self) -> i64 {
+        self.fenced_claim_epoch
     }
     pub(crate) fn action(&self) -> MemoryVectorSyncAction {
         self.action
@@ -523,15 +734,19 @@ impl StorageService {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| single_event_error())?;
         let fence_epoch = acquire_runtime_lease(&tx, lease_owner)?;
-        // Repair structurally invalid rows before candidate selection.  They
-        // must not remain ordinary pending/retry work merely because the
-        // candidate predicate excludes them.
-        quarantine_generation_binding_invariants_in(&tx)?;
+        // `recover_expired_fenced_processing_in` begins by repairing
+        // structurally invalid rows before candidate selection. They must not
+        // remain ordinary pending/retry work merely because the candidate
+        // predicate excludes them.
         // A malformed post-012 upsert is fail-closed without materializing its
         // current memory body.  This transition releases a generation only
         // after the shared phase classifier proves it was Ephemeral.
         quarantine_malformed_target_bindings_in(&tx)?;
         recover_expired_fenced_processing_in(&tx, retry_cutoff_millis)?;
+        // Runs after recovery, so a row that recovery just returned to `pending`
+        // with a spent budget converges in this same transaction instead of
+        // surviving as ordinary work until the next claim.
+        converge_exhausted_attempt_budget_in(&tx)?;
         let generation_ok: Option<i64> = tx.query_row(
             "SELECT 1 FROM memory_vector_generation WHERE generation_id=?1 AND descriptor_hash=?2 AND dimension=?3 AND state='building'",
             params![generation_id, descriptor_hash, dimension as i64], |row| row.get(0),
@@ -543,103 +758,131 @@ impl StorageService {
         let candidate: Option<ClaimCandidate> = match retry_cutoff_millis {
             Some(retry_cutoff_millis) => tx
                 .query_row(
+                    &format!(
                     "SELECT id, attempt_count, claimed_generation_id, state,
-                            lease_owner, lease_fence_epoch, lease_expires_at
+                            lease_owner, lease_fence_epoch, lease_expires_at,
+                            fenced_claim_epoch, last_marked_claim_epoch
                      FROM memory_vector_sync_outbox WHERE migration_disposition IS NULL AND
                       ((desired_action='upsert' AND target_revision IS NOT NULL AND target_content_hash IS NOT NULL)
                        OR (desired_action='delete' AND target_revision IS NULL AND target_content_hash IS NULL)) AND
                       (state='pending' OR (state='retry_wait' AND next_attempt_at <= strftime('%Y-%m-%dT%H:%M:%fZ', ?1 / 1000.0, 'unixepoch')))
+                      AND attempt_count < {MAX_VECTOR_SYNC_ATTEMPTS}
                       AND ((attempt_count=0 AND claimed_generation_id IS NULL)
                            OR (attempt_count>0 AND claimed_generation_id=?2))
                       AND NOT (desired_action='upsert' AND
                                (COALESCE(last_send_disposition, '')='possibly_sent' OR COALESCE(last_error_code, '')='PROVIDER_RESULT_UNKNOWN'))
-                    ORDER BY mutation_sequence ASC, id ASC LIMIT 1",
+                    ORDER BY mutation_sequence ASC, id ASC LIMIT 1"
+                    ),
                     params![retry_cutoff_millis, generation_id],
-                    |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get(1)?,
-                            row.get(2)?,
-                            row.get(3)?,
-                            row.get(4)?,
-                            row.get(5)?,
-                            row.get(6)?,
-                        ))
-                    },
+                    claim_candidate_from_row,
                 )
                 .optional()
                 .map_err(|_| single_event_error())?,
             None => tx
                 .query_row(
+                    &format!(
                     "SELECT id, attempt_count, claimed_generation_id, state,
-                            lease_owner, lease_fence_epoch, lease_expires_at
+                            lease_owner, lease_fence_epoch, lease_expires_at,
+                            fenced_claim_epoch, last_marked_claim_epoch
                      FROM memory_vector_sync_outbox WHERE migration_disposition IS NULL AND
                       ((desired_action='upsert' AND target_revision IS NOT NULL AND target_content_hash IS NOT NULL)
                        OR (desired_action='delete' AND target_revision IS NULL AND target_content_hash IS NULL)) AND
                       (state='pending' OR (state='retry_wait' AND next_attempt_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now')))
+                      AND attempt_count < {MAX_VECTOR_SYNC_ATTEMPTS}
                       AND ((attempt_count=0 AND claimed_generation_id IS NULL)
                            OR (attempt_count>0 AND claimed_generation_id=?1))
                       AND NOT (desired_action='upsert' AND
                                (COALESCE(last_send_disposition, '')='possibly_sent' OR COALESCE(last_error_code, '')='PROVIDER_RESULT_UNKNOWN'))
-                    ORDER BY mutation_sequence ASC, id ASC LIMIT 1",
+                    ORDER BY mutation_sequence ASC, id ASC LIMIT 1"
+                    ),
                     params![generation_id],
-                    |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get(1)?,
-                            row.get(2)?,
-                            row.get(3)?,
-                            row.get(4)?,
-                            row.get(5)?,
-                            row.get(6)?,
-                        ))
-                    },
+                    claim_candidate_from_row,
                 )
                 .optional()
                 .map_err(|_| single_event_error())?,
         };
-        let Some((
-            id,
-            attempt_count,
-            claimed_generation_id,
-            event_state,
-            event_lease_owner,
-            event_lease_fence_epoch,
-            event_lease_expires_at,
-        )) = candidate
-        else {
+        let Some(candidate) = candidate else {
             tx.commit().map_err(|_| single_event_error())?;
             return Ok(None);
         };
+        // The two claim-epoch columns are validated before any lease is taken, so a
+        // structurally impossible Attempt identity can never be granted a claim.
+        if matches!(
+            attempt_identity_phase(
+                candidate.attempt_count,
+                candidate.fenced_claim_epoch,
+                candidate.last_marked_claim_epoch,
+            ),
+            AttemptIdentityPhase::Invalid
+        ) {
+            block_claim_candidate_identity_in(&tx, &candidate)?;
+            tx.commit().map_err(|_| single_event_error())?;
+            return Ok(None);
+        }
+        // Fail closed rather than wrapping, saturating, or going negative. A row
+        // that can no longer take a distinct claim epoch can never again prove
+        // which claim reserved an Attempt, so it must not run.
+        if candidate.fenced_claim_epoch == i64::MAX {
+            block_claim_candidate_identity_in(&tx, &candidate)?;
+            tx.commit().map_err(|_| single_event_error())?;
+            return Ok(None);
+        }
         let changed = match generation_binding_phase(GenerationBindingFacts {
-            state: &event_state,
-            attempt_count,
-            claimed_generation_id: claimed_generation_id.as_deref(),
-            lease_owner: event_lease_owner.as_deref(),
-            lease_fence_epoch: event_lease_fence_epoch,
-            lease_expires_at: event_lease_expires_at.as_deref(),
+            state: &candidate.state,
+            attempt_count: candidate.attempt_count,
+            claimed_generation_id: candidate.claimed_generation_id.as_deref(),
+            lease_owner: candidate.lease_owner.as_deref(),
+            lease_fence_epoch: candidate.lease_fence_epoch,
+            lease_expires_at: candidate.lease_expires_at.as_deref(),
         }) {
+            // Every successful claim cycle takes a new fenced_claim_epoch, even
+            // when the owner, runtime fence, mutation, and generation are all
+            // reused. last_marked_claim_epoch is deliberately never written here:
+            // only a reservation may advance it.
             GenerationBindingPhase::Unbound => tx.execute(
                 "UPDATE memory_vector_sync_outbox SET state='processing',
                  lease_owner=?2, lease_fence_epoch=?3, claimed_generation_id=?4,
+                 fenced_claim_epoch=fenced_claim_epoch+1,
                  lease_expires_at=strftime('%Y-%m-%dT%H:%M:%fZ','now','+120 seconds'), next_attempt_at=NULL,
                  last_send_disposition=NULL,
                  updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
                  WHERE id=?1 AND migration_disposition IS NULL AND state IN ('pending','retry_wait')
-                   AND attempt_count=0 AND claimed_generation_id IS NULL",
-                params![id, lease_owner, fence_epoch, generation_id],
+                   AND attempt_count=0 AND claimed_generation_id IS NULL
+                   AND fenced_claim_epoch=?5 AND last_marked_claim_epoch=?6
+                   AND fenced_claim_epoch < 9223372036854775807",
+                params![
+                    candidate.id,
+                    lease_owner,
+                    fence_epoch,
+                    generation_id,
+                    candidate.fenced_claim_epoch,
+                    candidate.last_marked_claim_epoch,
+                ],
             ),
             GenerationBindingPhase::Durable
-                if claimed_generation_id.as_deref() == Some(generation_id) =>
+                if candidate.claimed_generation_id.as_deref() == Some(generation_id) =>
             {
                 tx.execute(
+                    &format!(
                     "UPDATE memory_vector_sync_outbox SET state='processing',
                      lease_owner=?2, lease_fence_epoch=?3,
+                     fenced_claim_epoch=fenced_claim_epoch+1,
                      lease_expires_at=strftime('%Y-%m-%dT%H:%M:%fZ','now','+120 seconds'), next_attempt_at=NULL,
                      updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
                      WHERE id=?1 AND migration_disposition IS NULL AND state IN ('pending','retry_wait')
-                       AND attempt_count>0 AND claimed_generation_id=?4",
-                    params![id, lease_owner, fence_epoch, generation_id],
+                       AND attempt_count>0 AND attempt_count < {MAX_VECTOR_SYNC_ATTEMPTS}
+                       AND claimed_generation_id=?4
+                       AND fenced_claim_epoch=?5 AND last_marked_claim_epoch=?6
+                       AND fenced_claim_epoch < 9223372036854775807"
+                    ),
+                    params![
+                        candidate.id,
+                        lease_owner,
+                        fence_epoch,
+                        generation_id,
+                        candidate.fenced_claim_epoch,
+                        candidate.last_marked_claim_epoch,
+                    ],
                 )
             }
             GenerationBindingPhase::Ephemeral
@@ -654,10 +897,12 @@ impl StorageService {
         if changed != 1 {
             return Err(single_event_error());
         }
+        // The claim carries the epoch SQLite just assigned, read back from the row
+        // inside this same transaction. Callers never compute or advance it.
         let claim = tx.query_row(
             "SELECT id, life_id, memory_id, desired_action, mutation_sequence, target_revision, target_content_hash,
-                    claimed_generation_id, lease_owner, lease_fence_epoch
-             FROM memory_vector_sync_outbox WHERE id=?1", params![id], |row| {
+                    claimed_generation_id, lease_owner, lease_fence_epoch, fenced_claim_epoch
+             FROM memory_vector_sync_outbox WHERE id=?1", params![candidate.id], |row| {
                 fenced_claim_from_row(row, descriptor_hash, dimension)
              },
         ).map_err(|_| single_event_error())?;
@@ -725,67 +970,74 @@ impl StorageService {
         Ok(current)
     }
 
-    pub(crate) fn mark_fenced_attempt_started(
+    /// The single authoritative Attempt reservation. It is the only code in the
+    /// repository that may advance `attempt_count` or `last_marked_claim_epoch`.
+    ///
+    /// Reserving is idempotent per claim epoch: the first reserve for a claim
+    /// consumes one budget slot, and every later reserve for that same claim epoch
+    /// returns the identical ordinal and an equivalent token without consuming
+    /// another slot. That is what makes a lost commit result safe to retry.
+    pub(crate) fn reserve_fenced_attempt(
         &self,
         claim: &FencedVectorSyncClaim,
-    ) -> Result<FencedAttemptStartResult, crate::storage::StorageError> {
+    ) -> Result<FencedAttemptReservation, crate::storage::StorageError> {
         let mut state = self.state()?;
         let tx = state
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| single_event_error())?;
-        let current = matches!(
-            inspect_fenced_generation_binding_in(&tx, claim)?,
-            FencedBindingCurrent::Current(_)
-        );
-        let changed = if current {
-            tx.execute(
-                "UPDATE memory_vector_sync_outbox SET attempt_count=attempt_count+1,
-                 last_send_disposition=CASE WHEN desired_action='upsert' THEN 'possibly_sent' ELSE NULL END,
-                 updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
-                 WHERE id=?1 AND mutation_sequence=?2 AND state='processing' AND lease_owner=?3
-                   AND lease_fence_epoch=?4 AND claimed_generation_id=?5
-                   AND target_revision IS ?6 AND target_content_hash IS ?7",
-                params![
-                    claim.id,
-                    claim.mutation_sequence,
-                    claim.lease_owner,
-                    claim.fence_epoch,
-                    claim.generation_id,
-                    claim.target_revision,
-                    claim.target_content_hash,
-                ],
-            )
-            .map_err(|_| single_event_error())?
-        } else {
-            0
-        };
-        let result = if changed == 1 {
-            let count: i64 = tx
-                .query_row(
-                    "SELECT attempt_count FROM memory_vector_sync_outbox
-                     WHERE id=?1 AND mutation_sequence=?2 AND state='processing' AND lease_owner=?3
-                       AND lease_fence_epoch=?4 AND claimed_generation_id=?5
-                       AND target_revision IS ?6 AND target_content_hash IS ?7",
-                    params![
-                        claim.id,
-                        claim.mutation_sequence,
-                        claim.lease_owner,
-                        claim.fence_epoch,
-                        claim.generation_id,
-                        claim.target_revision,
-                        claim.target_content_hash,
-                    ],
-                    |row| row.get(0),
-                )
-                .map_err(|_| single_event_error())?;
-            let attempt_count = u32::try_from(count).map_err(|_| single_event_error())?;
-            FencedAttemptStartResult::Started { attempt_count }
-        } else {
-            FencedAttemptStartResult::LostLeaseOrSuperseded
-        };
+        let reservation = reserve_fenced_attempt_in(&tx, claim)?;
         tx.commit().map_err(|_| single_event_error())?;
-        Ok(result)
+        // The reservation is durable at this point. The test seam below models a
+        // caller that never learns that, so the retry path can be proven.
+        #[cfg(test)]
+        if take_post_commit_reserve_fault_for_test() {
+            return Err(single_event_error());
+        }
+        Ok(reservation)
+    }
+
+    /// ATT-I3 has not started, so the worker still consumes the older
+    /// count-bearing result. This is a compatibility wrapper only: it calls the one
+    /// authoritative reserve implementation above, keeps every epoch and budget
+    /// rule, discards the rest of the token, and adds no second increment path.
+    /// The worker cannot supply a bare ordinal through it.
+    pub(crate) fn mark_fenced_attempt_started(
+        &self,
+        claim: &FencedVectorSyncClaim,
+    ) -> Result<FencedAttemptStartResult, crate::storage::StorageError> {
+        match self.reserve_fenced_attempt(claim)? {
+            FencedAttemptReservation::Reserved(token) => {
+                let attempt_count =
+                    u32::try_from(token.attempt_ordinal).map_err(|_| single_event_error())?;
+                Ok(FencedAttemptStartResult::Started { attempt_count })
+            }
+            // A spent budget is not a distinguishable outcome in the pre-ATT-I3
+            // shape, and it is not a new Attempt, so it fails closed exactly like a
+            // superseded claim.
+            FencedAttemptReservation::LostLeaseOrSuperseded
+            | FencedAttemptReservation::BudgetExhausted => {
+                Ok(FencedAttemptStartResult::LostLeaseOrSuperseded)
+            }
+        }
+    }
+
+    /// Read-only currency check for a reservation, prepared for ATT-I3's
+    /// pre-external-I/O guard. It writes nothing and renews no lease.
+    #[allow(dead_code)]
+    pub(crate) fn validate_fenced_attempt_token_current(
+        &self,
+        claim: &FencedVectorSyncClaim,
+        token: &FencedAttemptToken,
+    ) -> Result<bool, crate::storage::StorageError> {
+        let mut state = self.state()?;
+        let tx = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| single_event_error())?;
+        let current = fenced_attempt_token_current_in(&tx, claim, token)?;
+        tx.commit().map_err(|_| single_event_error())?;
+        Ok(current)
     }
 
     pub(crate) fn finalize_fenced_vector_sync(
@@ -1009,6 +1261,12 @@ impl StorageService {
         Ok(result)
     }
 
+    /// Test fixture that back-dates the Attempt budget to a chosen count.
+    ///
+    /// A positive count means slots were already reserved, so the current claim
+    /// epoch is marked to match — otherwise the fixture would describe the
+    /// impossible state "slots consumed, but no claim ever reserved one", which the
+    /// schema-14 CHECK constraints and the Attempt-identity classifier both reject.
     #[cfg(test)]
     pub(crate) fn test_set_fenced_attempt_count(
         &self,
@@ -1018,7 +1276,9 @@ impl StorageService {
         state
             .connection
             .execute(
-                "UPDATE memory_vector_sync_outbox SET attempt_count=?1",
+                "UPDATE memory_vector_sync_outbox
+                 SET attempt_count=?1,
+                     last_marked_claim_epoch=CASE WHEN ?1 > 0 THEN fenced_claim_epoch ELSE 0 END",
                 params![attempt_count],
             )
             .map_err(|_| single_event_error())?;
@@ -1419,8 +1679,13 @@ fn fenced_claim_current_in(
         && lease_is_current_at(runtime_expires_at.as_deref(), &now))
 }
 
-const GENERATION_BINDING_ROW_COLUMNS: &str = "id, desired_action, mutation_sequence, target_revision, target_content_hash, state, attempt_count, claimed_generation_id, lease_owner, lease_fence_epoch, lease_expires_at, last_send_disposition, last_error_code";
+const GENERATION_BINDING_ROW_COLUMNS: &str = "id, desired_action, mutation_sequence, target_revision, target_content_hash, state, attempt_count, claimed_generation_id, lease_owner, lease_fence_epoch, lease_expires_at, last_send_disposition, last_error_code, fenced_claim_epoch, last_marked_claim_epoch";
 const GENERATION_BINDING_ROW_IDENTITY: &str = "id=:id AND desired_action=:desired_action AND mutation_sequence=:mutation_sequence AND target_revision IS :target_revision AND target_content_hash IS :target_content_hash AND state=:current_state AND attempt_count=:attempt_count AND claimed_generation_id IS :claimed_generation_id AND lease_owner IS :lease_owner AND lease_fence_epoch IS :lease_fence_epoch AND lease_expires_at IS :lease_expires_at AND migration_disposition IS NULL";
+/// Adds the two claim-epoch columns to [`GENERATION_BINDING_ROW_IDENTITY`] for
+/// callers that must also pin the exact Attempt-identity snapshot (reserve and
+/// its idempotent guard). Kept as a distinct predicate rather than widening the
+/// shared identity string, so every other caller's CAS surface is unchanged.
+const GENERATION_BINDING_ROW_IDENTITY_WITH_ATTEMPT_EPOCHS: &str = "id=:id AND desired_action=:desired_action AND mutation_sequence=:mutation_sequence AND target_revision IS :target_revision AND target_content_hash IS :target_content_hash AND state=:current_state AND attempt_count=:attempt_count AND claimed_generation_id IS :claimed_generation_id AND lease_owner IS :lease_owner AND lease_fence_epoch IS :lease_fence_epoch AND lease_expires_at IS :lease_expires_at AND fenced_claim_epoch=:fenced_claim_epoch AND last_marked_claim_epoch=:last_marked_claim_epoch AND migration_disposition IS NULL";
 
 fn generation_binding_row_from_row(row: &Row<'_>) -> rusqlite::Result<GenerationBindingRow> {
     Ok(GenerationBindingRow {
@@ -1437,6 +1702,8 @@ fn generation_binding_row_from_row(row: &Row<'_>) -> rusqlite::Result<Generation
         lease_expires_at: row.get(10)?,
         last_send_disposition: row.get(11)?,
         last_error_code: row.get(12)?,
+        fenced_claim_epoch: row.get(13)?,
+        last_marked_claim_epoch: row.get(14)?,
     })
 }
 
@@ -1490,10 +1757,16 @@ fn block_generation_binding_scan_snapshot_in(
     tx: &Transaction<'_>,
     row: &GenerationBindingRow,
 ) -> Result<InvariantBlockOutcome, crate::storage::StorageError> {
-    if !matches!(
+    // Generation-binding corruption and Attempt-identity corruption are both
+    // INTERNAL_INVARIANT: an impossible epoch relation or an over-budget count is
+    // no more runnable than a missing durable generation.
+    let binding_invalid = matches!(
         row.phase(),
         GenerationBindingPhase::MissingAfterAttempt | GenerationBindingPhase::Invalid
-    ) {
+    );
+    let attempt_identity_invalid =
+        matches!(row.attempt_identity_phase(), AttemptIdentityPhase::Invalid);
+    if !binding_invalid && !attempt_identity_invalid {
         return Ok(InvariantBlockOutcome::NotInvariant);
     }
     let changed = tx
@@ -1546,6 +1819,13 @@ fn block_generation_binding_claim_identity_in(
             observed.phase(),
             GenerationBindingPhase::MissingAfterAttempt | GenerationBindingPhase::Invalid
         )
+        // Attempt-identity corruption is quarantined on the same footing as
+        // generation-binding corruption, so an over-budget count or an impossible
+        // epoch relation cannot stay in `processing`.
+        && !matches!(
+            observed.attempt_identity_phase(),
+            AttemptIdentityPhase::Invalid
+        )
     {
         return Ok(InvariantBlockOutcome::NotInvariant);
     }
@@ -1596,6 +1876,114 @@ fn quarantine_generation_binding_invariants_in(
         }
     }
     Ok(quarantined)
+}
+
+/// Converges every row whose Attempt budget is spent to a stable `blocked` state,
+/// exactly once, before candidate selection.
+///
+/// Only rows that could otherwise still enter ordinary execution or manual retry
+/// are considered: `pending`, `retry_wait`, and `failed`. A `processing` row with
+/// `attempt_count == MAX_VECTOR_SYNC_ATTEMPTS` is deliberately untouched — it is
+/// executing its fifth reserved Attempt, and destroying its claim here would
+/// break a live worker.
+///
+/// Attempt count, generation, mutation, target, and both claim epochs are all
+/// preserved; only the state, lease, and schedule converge. Because the CAS
+/// snapshot includes the current state, a row already `blocked` cannot be
+/// converged twice, so this never manufactures repeated drain work.
+fn converge_exhausted_attempt_budget_in(
+    tx: &Transaction<'_>,
+) -> Result<usize, crate::storage::StorageError> {
+    // The predicate is built from the compile-time budget constant, never from
+    // caller input, so this stays a fixed statement shape.
+    let rows = generation_binding_rows_in(
+        tx,
+        &format!(
+            "attempt_count >= {MAX_VECTOR_SYNC_ATTEMPTS} AND state IN ('pending','retry_wait','failed')"
+        ),
+    )?;
+    let mut converged = 0;
+    for row in rows {
+        // An identity-corrupt row (which includes attempt_count > the budget) is
+        // the invariant scan's business, not the budget's. `failed` rows are
+        // intentionally included in the budget scan but are not candidates, so
+        // repair them here as well instead of leaving an over-budget failure
+        // stranded outside ordinary claim processing.
+        if matches!(row.attempt_identity_phase(), AttemptIdentityPhase::Invalid)
+            || matches!(
+                row.phase(),
+                GenerationBindingPhase::MissingAfterAttempt | GenerationBindingPhase::Invalid
+            )
+        {
+            if matches!(
+                block_generation_binding_scan_snapshot_in(tx, &row)?,
+                InvariantBlockOutcome::Applied
+            ) {
+                converged += 1;
+            }
+            continue;
+        }
+        converged += usize::from(matches!(
+            converge_exhausted_attempt_budget_row_in(tx, &row)?,
+            InvariantBlockOutcome::Applied
+        ));
+    }
+    Ok(converged)
+}
+
+/// Returns the stable error that must remain visible when an Attempt budget is
+/// exhausted. An Unknown upsert send is the strongest outcome; otherwise a
+/// previously-classified permanent error is more useful than a generic budget
+/// marker.
+fn exhausted_attempt_budget_error_code(row: &GenerationBindingRow) -> &str {
+    if is_unknown_upsert_send(row) {
+        "PROVIDER_RESULT_UNKNOWN"
+    } else {
+        match row.last_error_code.as_deref() {
+            Some(existing) if PERMANENT_ERROR_CODES.contains(&existing) => existing,
+            _ => "MAX_ATTEMPTS",
+        }
+    }
+}
+
+/// Applies the non-invariant, at-limit convergence for one exact row snapshot.
+/// It is shared by ordinary claim processing and manual retry so a terminal
+/// budget cannot be left in a runnable state through an alternate entry point.
+fn converge_exhausted_attempt_budget_row_in(
+    tx: &Transaction<'_>,
+    row: &GenerationBindingRow,
+) -> Result<InvariantBlockOutcome, crate::storage::StorageError> {
+    let changed = tx
+        .execute(
+            &format!(
+                "UPDATE memory_vector_sync_outbox
+                 SET state='blocked', next_attempt_at=NULL, lease_owner=NULL,
+                     lease_expires_at=NULL, lease_fence_epoch=NULL,
+                     last_error_code=:last_error_code,
+                     updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE {GENERATION_BINDING_ROW_IDENTITY}"
+            ),
+            rusqlite::named_params! {
+                ":last_error_code": exhausted_attempt_budget_error_code(row),
+                ":id": row.id,
+                ":desired_action": row.desired_action.as_str(),
+                ":mutation_sequence": row.mutation_sequence,
+                ":target_revision": row.target_revision,
+                ":target_content_hash": row.target_content_hash.as_deref(),
+                ":current_state": row.state.as_str(),
+                ":attempt_count": row.attempt_count,
+                ":claimed_generation_id": row.claimed_generation_id.as_deref(),
+                ":lease_owner": row.lease_owner.as_deref(),
+                ":lease_fence_epoch": row.lease_fence_epoch,
+                ":lease_expires_at": row.lease_expires_at.as_deref(),
+            },
+        )
+        .map_err(|_| single_event_error())?;
+    Ok(if changed == 1 {
+        InvariantBlockOutcome::Applied
+    } else {
+        InvariantBlockOutcome::Superseded
+    })
 }
 
 fn quarantine_malformed_target_bindings_in(
@@ -1695,6 +2083,217 @@ fn inspect_fenced_generation_binding_in(
     }
 }
 
+// A one-shot, thread-local, default-off fault used to model "the reservation
+// committed but the caller never received the result". It is compiled only into
+// test builds, is not shared between threads, and never changes the release
+// signature or control flow of the reserve path.
+#[cfg(test)]
+thread_local! {
+    static POST_COMMIT_RESERVE_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn fail_next_reserve_after_commit_for_test() {
+    POST_COMMIT_RESERVE_FAULT.with(|fault| fault.set(true));
+}
+
+#[cfg(test)]
+fn take_post_commit_reserve_fault_for_test() -> bool {
+    POST_COMMIT_RESERVE_FAULT.with(|fault| fault.replace(false))
+}
+
+/// The authoritative in-transaction Attempt reservation.
+///
+/// Every claim identity is re-verified here before anything is written: the
+/// mutation, action, target revision/hash, generation, row lease owner/fence, both
+/// runtime and row lease currency, `state='processing'`, `migration_disposition IS
+/// NULL`, the claim's `fenced_claim_epoch`, and the relationship between the two
+/// claim epochs.
+fn reserve_fenced_attempt_in(
+    tx: &Transaction<'_>,
+    claim: &FencedVectorSyncClaim,
+) -> Result<FencedAttemptReservation, crate::storage::StorageError> {
+    // Reuses the frozen binding/lease guard, so stale owner, stale runtime fence,
+    // stale mutation, target mismatch, generation mismatch, expired lease, wrong
+    // state, and migration isolation all fail closed exactly as before.
+    let row = match inspect_fenced_generation_binding_in(tx, claim)? {
+        FencedBindingCurrent::Current(row) => row,
+        FencedBindingCurrent::NotCurrent => {
+            return Ok(FencedAttemptReservation::LostLeaseOrSuperseded)
+        }
+    };
+    // A claim describing a different claim epoch than the row currently carries is
+    // stale by definition: a newer claim cycle already superseded it.
+    if row.fenced_claim_epoch != claim.fenced_claim_epoch {
+        return Ok(FencedAttemptReservation::LostLeaseOrSuperseded);
+    }
+
+    match row.attempt_identity_phase() {
+        AttemptIdentityPhase::Invalid => {
+            block_generation_binding_claim_identity_in(tx, claim, &row)?;
+            Ok(FencedAttemptReservation::LostLeaseOrSuperseded)
+        }
+        // A live claim always holds an epoch of at least 1, so this can only mean
+        // the row was replaced by never-claimed state under us.
+        AttemptIdentityPhase::NeverClaimed => Ok(FencedAttemptReservation::LostLeaseOrSuperseded),
+        // The slot for this claim epoch is already reserved. Return the same
+        // ordinal and an equivalent token, writing nothing at all — this is the
+        // idempotent re-read that makes an unknown commit result recoverable, and
+        // it is explicitly not a sixth slot even at the budget ceiling.
+        AttemptIdentityPhase::ClaimMarked => Ok(FencedAttemptReservation::Reserved(
+            fenced_attempt_token(claim, row.attempt_count),
+        )),
+        AttemptIdentityPhase::ClaimUnmarked => {
+            if row.attempt_count >= MAX_VECTOR_SYNC_ATTEMPTS {
+                // This claim cannot take a further slot. Converge the row instead of
+                // leaving it to be claimed again.
+                block_exhausted_attempt_budget_for_claim_in(tx, claim, &row)?;
+                return Ok(FencedAttemptReservation::BudgetExhausted);
+            }
+            let changed = tx
+                .execute(
+                    &format!(
+                        "UPDATE memory_vector_sync_outbox
+                         SET attempt_count=attempt_count+1,
+                             last_marked_claim_epoch=fenced_claim_epoch,
+                             last_send_disposition=CASE WHEN desired_action='upsert' THEN 'possibly_sent' ELSE NULL END,
+                             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                         WHERE {GENERATION_BINDING_ROW_IDENTITY_WITH_ATTEMPT_EPOCHS}
+                           AND attempt_count < {MAX_VECTOR_SYNC_ATTEMPTS}
+                           AND last_marked_claim_epoch < fenced_claim_epoch"
+                    ),
+                    rusqlite::named_params! {
+                        ":id": row.id,
+                        ":desired_action": row.desired_action.as_str(),
+                        ":mutation_sequence": row.mutation_sequence,
+                        ":target_revision": row.target_revision,
+                        ":target_content_hash": row.target_content_hash.as_deref(),
+                        ":current_state": row.state.as_str(),
+                        ":attempt_count": row.attempt_count,
+                        ":claimed_generation_id": row.claimed_generation_id.as_deref(),
+                        ":lease_owner": row.lease_owner.as_deref(),
+                        ":lease_fence_epoch": row.lease_fence_epoch,
+                        ":lease_expires_at": row.lease_expires_at.as_deref(),
+                        ":fenced_claim_epoch": row.fenced_claim_epoch,
+                        ":last_marked_claim_epoch": row.last_marked_claim_epoch,
+                    },
+                )
+                .map_err(|_| single_event_error())?;
+            if changed != 1 {
+                // A concurrent writer won the CAS. No slot was consumed here.
+                return Ok(FencedAttemptReservation::LostLeaseOrSuperseded);
+            }
+            let ordinal = row
+                .attempt_count
+                .checked_add(1)
+                .ok_or_else(single_event_error)?;
+            Ok(FencedAttemptReservation::Reserved(fenced_attempt_token(
+                claim, ordinal,
+            )))
+        }
+    }
+}
+
+/// Builds the reservation proof from the claim identity plus the persisted
+/// ordinal. There is no other constructor, so a token can only describe a slot
+/// this transaction observed as reserved.
+fn fenced_attempt_token(claim: &FencedVectorSyncClaim, ordinal: i64) -> FencedAttemptToken {
+    FencedAttemptToken {
+        outbox_id: claim.id,
+        mutation_sequence: claim.mutation_sequence,
+        action: claim.action,
+        target_revision: claim.target_revision,
+        target_content_hash: claim.target_content_hash.clone(),
+        generation_id: claim.generation_id.clone(),
+        lease_owner: claim.lease_owner.clone(),
+        fence_epoch: claim.fence_epoch,
+        fenced_claim_epoch: claim.fenced_claim_epoch,
+        attempt_ordinal: ordinal,
+    }
+}
+
+/// Converges a row whose budget is spent while the current claim has not reserved
+/// a slot. Attempt count, generation, mutation, target, and both epochs are
+/// preserved; only state, lease, and schedule change.
+fn block_exhausted_attempt_budget_for_claim_in(
+    tx: &Transaction<'_>,
+    claim: &FencedVectorSyncClaim,
+    row: &GenerationBindingRow,
+) -> Result<InvariantBlockOutcome, crate::storage::StorageError> {
+    if !binding_row_has_claim_processing_lease(row, claim) {
+        return Ok(InvariantBlockOutcome::Superseded);
+    }
+    let error_code = exhausted_attempt_budget_error_code(row);
+    let changed = tx
+        .execute(
+            &format!(
+                "UPDATE memory_vector_sync_outbox
+                 SET state='blocked', next_attempt_at=NULL, lease_owner=NULL,
+                     lease_expires_at=NULL, lease_fence_epoch=NULL,
+                     last_error_code=:last_error_code,
+                     updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE {GENERATION_BINDING_ROW_IDENTITY_WITH_ATTEMPT_EPOCHS}"
+            ),
+            rusqlite::named_params! {
+                ":last_error_code": error_code,
+                ":id": row.id,
+                ":desired_action": row.desired_action.as_str(),
+                ":mutation_sequence": row.mutation_sequence,
+                ":target_revision": row.target_revision,
+                ":target_content_hash": row.target_content_hash.as_deref(),
+                ":current_state": row.state.as_str(),
+                ":attempt_count": row.attempt_count,
+                ":claimed_generation_id": row.claimed_generation_id.as_deref(),
+                ":lease_owner": row.lease_owner.as_deref(),
+                ":lease_fence_epoch": row.lease_fence_epoch,
+                ":lease_expires_at": row.lease_expires_at.as_deref(),
+                ":fenced_claim_epoch": row.fenced_claim_epoch,
+                ":last_marked_claim_epoch": row.last_marked_claim_epoch,
+            },
+        )
+        .map_err(|_| single_event_error())?;
+    Ok(if changed == 1 {
+        InvariantBlockOutcome::Applied
+    } else {
+        InvariantBlockOutcome::Superseded
+    })
+}
+
+/// Verifies that a reservation still describes the current row, including that the
+/// reserved ordinal is still the persisted `attempt_count` and that the row's
+/// `last_marked_claim_epoch` is still the token's claim epoch.
+fn fenced_attempt_token_current_in(
+    tx: &Transaction<'_>,
+    claim: &FencedVectorSyncClaim,
+    token: &FencedAttemptToken,
+) -> Result<bool, crate::storage::StorageError> {
+    // The claim and the token must describe the same reservation.
+    if token.outbox_id != claim.id
+        || token.mutation_sequence != claim.mutation_sequence
+        || token.action != claim.action
+        || token.target_revision != claim.target_revision
+        || token.target_content_hash.as_deref() != claim.target_content_hash()
+        || token.generation_id != claim.generation_id
+        || token.lease_owner != claim.lease_owner
+        || token.fence_epoch != claim.fence_epoch
+        || token.fenced_claim_epoch != claim.fenced_claim_epoch
+    {
+        return Ok(false);
+    }
+    // Reuses the frozen dual-lease, generation, state, and migration guard.
+    let row = match inspect_fenced_generation_binding_in(tx, claim)? {
+        FencedBindingCurrent::Current(row) => row,
+        FencedBindingCurrent::NotCurrent => return Ok(false),
+    };
+    Ok(row.fenced_claim_epoch == token.fenced_claim_epoch
+        && row.last_marked_claim_epoch == token.fenced_claim_epoch
+        && row.attempt_count == token.attempt_ordinal
+        && matches!(
+            row.attempt_identity_phase(),
+            AttemptIdentityPhase::ClaimMarked
+        ))
+}
+
 fn is_unknown_upsert_send(row: &GenerationBindingRow) -> bool {
     row.desired_action == "upsert"
         && (row.last_send_disposition.as_deref() == Some("possibly_sent")
@@ -1756,17 +2355,53 @@ fn recover_expired_fenced_processing_in(
                 recovered += usize::from(changed == 1);
             }
             GenerationBindingPhase::Durable if is_expired => {
-                let (next_state, error_assignment) = match (
-                    row.desired_action.as_str(),
-                    row.last_send_disposition.as_deref(),
-                ) {
-                    ("upsert", Some("possibly_sent")) => {
-                        ("blocked", "last_error_code='PROVIDER_RESULT_UNKNOWN',")
+                // Recovery never consumes or returns an Attempt. The two claim
+                // epochs are the durable witness of whether the *current* claim
+                // already reserved its slot, so they decide the outcome.
+                let (next_state, error_assignment) = if is_unknown_upsert_send(&row) {
+                    // Unknown Send outranks everything: an upsert that may already
+                    // have crossed the provider boundary is never rescheduled, and
+                    // stays visible to health as Unknown.
+                    ("blocked", "last_error_code='PROVIDER_RESULT_UNKNOWN',")
+                } else {
+                    match row.attempt_identity_phase() {
+                        // The slot for this claim was reserved, so an external call
+                        // may have happened under it.
+                        AttemptIdentityPhase::ClaimMarked => {
+                            match row.desired_action.as_str() {
+                                "delete" if row.attempt_count >= MAX_VECTOR_SYNC_ATTEMPTS => {
+                                    ("blocked", "last_error_code='MAX_ATTEMPTS',")
+                                }
+                                // A delete may return to ordinary work, but only a
+                                // new claim and a new Attempt can actually re-issue
+                                // it. This is not a late-delete safety claim and
+                                // performs no compare-and-delete.
+                                "delete" => ("pending", ""),
+                                _ => ("blocked", "last_error_code='INTERNAL_INVARIANT',"),
+                            }
+                        }
+                        // The current claim expired before reserving a slot, so no
+                        // external call could have been made under it. The durable
+                        // generation, the spent budget, the marked epoch, and the
+                        // existing send/error evidence are all preserved.
+                        AttemptIdentityPhase::ClaimUnmarked => ("pending", ""),
+                        // A schema-13 row migrated while `processing` has both
+                        // epochs at zero and therefore no schema-14 claim identity
+                        // to reason about. Keep the pre-existing conservative
+                        // legacy convergence.
+                        AttemptIdentityPhase::NeverClaimed => {
+                            match (
+                                row.desired_action.as_str(),
+                                row.last_send_disposition.as_deref(),
+                            ) {
+                                ("delete", None) => ("pending", ""),
+                                _ => ("blocked", "last_error_code='INTERNAL_INVARIANT',"),
+                            }
+                        }
+                        AttemptIdentityPhase::Invalid => {
+                            ("blocked", "last_error_code='INTERNAL_INVARIANT',")
+                        }
                     }
-                    ("upsert", _) => ("blocked", "last_error_code='INTERNAL_INVARIANT',"),
-                    ("delete", None) => ("pending", ""),
-                    ("delete", _) => ("blocked", "last_error_code='INTERNAL_INVARIANT',"),
-                    _ => ("blocked", "last_error_code='INTERNAL_INVARIANT',"),
                 };
                 let changed = tx
                     .execute(
@@ -1814,6 +2449,45 @@ fn recover_expired_fenced_processing_in(
     Ok(recovered)
 }
 
+/// Quarantines a claim candidate whose Attempt identity is corrupt or whose claim
+/// epoch can no longer advance. The CAS snapshot is the exact candidate the claim
+/// observed, so a concurrent writer that already moved the row wins instead.
+fn block_claim_candidate_identity_in(
+    tx: &Transaction<'_>,
+    candidate: &ClaimCandidate,
+) -> Result<InvariantBlockOutcome, crate::storage::StorageError> {
+    let changed = tx
+        .execute(
+            "UPDATE memory_vector_sync_outbox
+             SET state='blocked', next_attempt_at=NULL, lease_owner=NULL,
+                 lease_expires_at=NULL, lease_fence_epoch=NULL,
+                 last_error_code='INTERNAL_INVARIANT',
+                 updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE id=?1 AND state=?2 AND attempt_count=?3
+               AND claimed_generation_id IS ?4 AND lease_owner IS ?5
+               AND lease_fence_epoch IS ?6 AND lease_expires_at IS ?7
+               AND fenced_claim_epoch=?8 AND last_marked_claim_epoch=?9
+               AND migration_disposition IS NULL",
+            params![
+                candidate.id,
+                candidate.state.as_str(),
+                candidate.attempt_count,
+                candidate.claimed_generation_id.as_deref(),
+                candidate.lease_owner.as_deref(),
+                candidate.lease_fence_epoch,
+                candidate.lease_expires_at.as_deref(),
+                candidate.fenced_claim_epoch,
+                candidate.last_marked_claim_epoch,
+            ],
+        )
+        .map_err(|_| single_event_error())?;
+    Ok(if changed == 1 {
+        InvariantBlockOutcome::Applied
+    } else {
+        InvariantBlockOutcome::Superseded
+    })
+}
+
 #[allow(dead_code)]
 fn fenced_claim_from_row(
     row: &Row<'_>,
@@ -1835,6 +2509,7 @@ fn fenced_claim_from_row(
         dimension,
         lease_owner: row.get(8)?,
         fence_epoch: row.get(9)?,
+        fenced_claim_epoch: row.get(10)?,
     })
 }
 
@@ -2127,6 +2802,39 @@ impl MemoryVectorSyncOutboxRepository for StorageService {
 
         let mut retried = 0;
         for row in rows {
+            // An invalid Attempt identity is not retryable even when its
+            // generation binding happens to look complete. In particular this
+            // catches `attempt_count > MAX_VECTOR_SYNC_ATTEMPTS` in `failed` or
+            // `blocked` rows, which ordinary candidate selection never sees.
+            if matches!(row.attempt_identity_phase(), AttemptIdentityPhase::Invalid) {
+                let outcome = block_generation_binding_scan_snapshot_in(&transaction, &row)
+                    .map_err(|_| outbox_error())?;
+                retried += usize::from(matches!(outcome, InvariantBlockOutcome::Applied));
+                continue;
+            }
+            // A terminal budget is converged through the same authority used by
+            // claim processing. Manual retry may never leave a count-five row
+            // stranded in `failed`, nor turn it back into ordinary work.
+            if row.attempt_count >= MAX_VECTOR_SYNC_ATTEMPTS {
+                if row.state == "blocked" {
+                    // It is already terminal. Invalid blocked rows were handled
+                    // above, so this is not a retry and must not manufacture a
+                    // second convergence or a changed return count.
+                    continue;
+                }
+                let outcome = if matches!(
+                    row.phase(),
+                    GenerationBindingPhase::MissingAfterAttempt | GenerationBindingPhase::Invalid
+                ) {
+                    block_generation_binding_scan_snapshot_in(&transaction, &row)
+                        .map_err(|_| outbox_error())?
+                } else {
+                    converge_exhausted_attempt_budget_row_in(&transaction, &row)
+                        .map_err(|_| outbox_error())?
+                };
+                retried += usize::from(matches!(outcome, InvariantBlockOutcome::Applied));
+                continue;
+            }
             match row.phase() {
                 GenerationBindingPhase::MissingAfterAttempt | GenerationBindingPhase::Invalid => {
                     let outcome = block_generation_binding_scan_snapshot_in(&transaction, &row)
@@ -2134,9 +2842,13 @@ impl MemoryVectorSyncOutboxRepository for StorageService {
                     retried += usize::from(matches!(outcome, InvariantBlockOutcome::Applied));
                 }
                 GenerationBindingPhase::Unbound | GenerationBindingPhase::Durable => {
-                    if is_unknown_upsert_send(&row) {
+                    if is_unknown_upsert_send(&row)
+                        || row.last_error_code.as_deref() == Some("INTERNAL_INVARIANT")
+                    {
                         continue;
                     }
+                    // Manual retry may not reduce or reset the count, clear a
+                    // durable generation, or reset either claim epoch.
                     let changed = transaction
                         .execute(
                             &format!(
@@ -2425,6 +3137,96 @@ mod tests {
                 is_sensitive: sensitive,
             })
             .unwrap()
+    }
+
+    /// Reads the two schema-14 claim epochs straight from SQLite, so Attempt
+    /// identity is always asserted against persisted state rather than a mock.
+    fn attempt_epochs(storage: &StorageService, memory_id: &str) -> (i64, i64) {
+        storage
+            .state()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT fenced_claim_epoch, last_marked_claim_epoch
+                 FROM memory_vector_sync_outbox WHERE memory_id=?1",
+                params![memory_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    /// Establishes one confirmed upsert row plus a building generation, and returns
+    /// the first ordinary claim. Used by the Attempt-budget tests so each starts
+    /// from a real claimed row rather than hand-built state.
+    fn claimed_upsert(storage: &StorageService) -> FencedVectorSyncClaim {
+        confirmed(storage, false);
+        storage
+            .register_building_vector_generation("generation-a", "descriptor-a", 2)
+            .unwrap();
+        storage
+            .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-a")
+            .unwrap()
+            .unwrap()
+    }
+
+    /// Test-only structural copy. The production claim deliberately remains
+    /// non-Clone; concurrent tests need two independently-owned stale/current
+    /// views of the same persisted claim identity.
+    fn copy_fenced_claim_for_test(claim: &FencedVectorSyncClaim) -> FencedVectorSyncClaim {
+        FencedVectorSyncClaim {
+            id: claim.id,
+            life_id: claim.life_id.clone(),
+            memory_id: claim.memory_id.clone(),
+            action: claim.action,
+            mutation_sequence: claim.mutation_sequence,
+            target_revision: claim.target_revision,
+            target_content_hash: claim.target_content_hash.clone(),
+            generation_id: claim.generation_id.clone(),
+            descriptor_hash: claim.descriptor_hash.clone(),
+            dimension: claim.dimension,
+            lease_owner: claim.lease_owner.clone(),
+            fence_epoch: claim.fence_epoch,
+            fenced_claim_epoch: claim.fenced_claim_epoch,
+        }
+    }
+
+    /// Uses four real reserve/finalize/reclaim cycles to reach a valid live claim
+    /// whose next reservation is the fifth and final slot. No fixture fabricates
+    /// the budget or epoch relationship.
+    fn claim_before_final_attempt_slot(storage: &StorageService) -> FencedVectorSyncClaim {
+        let mut claim = claimed_upsert(storage);
+        for expected_ordinal in 1..MAX_VECTOR_SYNC_ATTEMPTS {
+            assert_eq!(
+                storage.reserve_fenced_attempt(&claim).unwrap().ordinal(),
+                Some(expected_ordinal)
+            );
+            assert_eq!(
+                storage
+                    .finalize_fenced_vector_failure(
+                        &claim,
+                        "PROVIDER_UNAVAILABLE",
+                        FencedFailureDecision::RetryAfter { delay_millis: 1 },
+                        Some("definitely_not_sent"),
+                        0,
+                        0,
+                    )
+                    .unwrap(),
+                FencedFailureFinalizeResult::RetryScheduled {
+                    next_attempt_at_millis: 1
+                }
+            );
+            claim = storage
+                .claim_one_fenced_vector_sync_with_retry_cutoff(
+                    "generation-a",
+                    "descriptor-a",
+                    2,
+                    "worker-a",
+                    Some(60_000),
+                )
+                .unwrap()
+                .expect("each of the first four slots can be followed by a fresh claim");
+        }
+        claim
     }
 
     fn confirmed(storage: &StorageService, sensitive: bool) -> crate::memory::MemoryRecord {
@@ -3168,6 +3970,10 @@ mod tests {
             .is_some());
     }
 
+    /// The reservation is atomic *and* idempotent per claim epoch. Repeating it on
+    /// the same claim is a re-read of the slot that claim already owns, not a new
+    /// Attempt: this replaces the pre-ATT-I2 behaviour where a second mark on one
+    /// claim consumed a second budget slot.
     #[test]
     fn mark_fenced_attempt_started_returns_the_atomic_persisted_count() {
         let (_root, storage) = storage();
@@ -3186,9 +3992,402 @@ mod tests {
         );
         assert_eq!(
             storage.mark_fenced_attempt_started(&claim).unwrap(),
-            FencedAttemptStartResult::Started { attempt_count: 2 }
+            FencedAttemptStartResult::Started { attempt_count: 1 },
+            "a repeated mark on one claim is idempotent, not a second Attempt"
         );
-        assert_eq!(storage.list("life").unwrap()[0].attempt_count, 2);
+        assert_eq!(storage.list("life").unwrap()[0].attempt_count, 1);
+        let epochs = attempt_epochs(&storage, claim.memory_id());
+        assert_eq!(
+            epochs,
+            (claim.fenced_claim_epoch(), claim.fenced_claim_epoch())
+        );
+    }
+
+    /// Matrix items 1-3: every successful ordinary claim takes a new
+    /// `fenced_claim_epoch`, including when the owner and runtime fence are reused,
+    /// and a claim never touches `last_marked_claim_epoch`.
+    #[test]
+    fn ordinary_claim_advances_fenced_claim_epoch_without_marking() {
+        let (_root, storage) = storage();
+        let first = claimed_upsert(&storage);
+        assert_eq!(first.fenced_claim_epoch(), 1);
+        assert_eq!(attempt_epochs(&storage, first.memory_id()), (1, 0));
+
+        // Release the row without reserving an Attempt, then re-claim with the same
+        // owner so the runtime lease is renewed rather than taken over.
+        assert_eq!(
+            storage
+                .finalize_fenced_vector_failure(
+                    &first,
+                    "PROVIDER_UNAVAILABLE",
+                    FencedFailureDecision::RetryAfter { delay_millis: 1 },
+                    Some("definitely_not_sent"),
+                    0,
+                    0,
+                )
+                .unwrap(),
+            FencedFailureFinalizeResult::RetryScheduled {
+                next_attempt_at_millis: 1,
+            }
+        );
+        let second = storage
+            .claim_one_fenced_vector_sync_with_retry_cutoff(
+                "generation-a",
+                "descriptor-a",
+                2,
+                "worker-a",
+                Some(60_000),
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            second.fence_epoch(),
+            first.fence_epoch(),
+            "the runtime fence is reused by the same owner"
+        );
+        assert_eq!(
+            second.fenced_claim_epoch(),
+            2,
+            "a new claim cycle must still take a new claim epoch"
+        );
+        assert_eq!(
+            attempt_epochs(&storage, second.memory_id()),
+            (2, 0),
+            "claiming must never advance last_marked_claim_epoch"
+        );
+        // The superseded claim epoch can no longer reserve anything.
+        assert!(storage.reserve_fenced_attempt(&first).unwrap().is_lost());
+        assert_eq!(attempt_epochs(&storage, second.memory_id()), (2, 0));
+    }
+
+    /// Matrix item 4: a row whose claim epoch cannot advance without overflowing
+    /// fails closed instead of wrapping, saturating, or going negative.
+    #[test]
+    fn ordinary_claim_fails_closed_when_the_claim_epoch_cannot_advance() {
+        let (_root, storage) = storage();
+        let claim = claimed_upsert(&storage);
+        // Return the row to ordinary work, then push its claim epoch to the ceiling.
+        assert_eq!(
+            storage
+                .finalize_fenced_vector_failure(
+                    &claim,
+                    "PROVIDER_UNAVAILABLE",
+                    FencedFailureDecision::RetryAfter { delay_millis: 1 },
+                    Some("definitely_not_sent"),
+                    0,
+                    0,
+                )
+                .unwrap(),
+            FencedFailureFinalizeResult::RetryScheduled {
+                next_attempt_at_millis: 1,
+            }
+        );
+        storage
+            .state()
+            .unwrap()
+            .connection
+            .execute(
+                "UPDATE memory_vector_sync_outbox SET fenced_claim_epoch=9223372036854775807",
+                [],
+            )
+            .unwrap();
+
+        assert!(storage
+            .claim_one_fenced_vector_sync_with_retry_cutoff(
+                "generation-a",
+                "descriptor-a",
+                2,
+                "worker-a",
+                Some(60_000),
+            )
+            .unwrap()
+            .is_none());
+
+        let snapshot = storage
+            .test_get_outbox_snapshot_detailed("life", claim.memory_id())
+            .unwrap();
+        assert_eq!(snapshot.state, "blocked");
+        assert_eq!(
+            snapshot.last_error_code.as_deref(),
+            Some("INTERNAL_INVARIANT")
+        );
+        assert_eq!(snapshot.lease_owner, None);
+        assert_eq!(snapshot.lease_fence_epoch, None);
+        assert_eq!(snapshot.next_attempt_at, None);
+        assert_eq!(
+            attempt_epochs(&storage, claim.memory_id()),
+            (i64::MAX, 0),
+            "a fail-closed epoch is preserved exactly, never wrapped"
+        );
+    }
+
+    /// Matrix items 5, 6, 8, 20: counts below the budget can claim and reserve; an
+    /// at-limit row converges to `blocked` exactly once and is never claimable, so a
+    /// sixth slot cannot exist.
+    #[test]
+    fn attempt_limit_allows_the_first_five_slots_and_blocks_the_sixth() {
+        let (_root, storage) = storage();
+        let mut claim = claimed_upsert(&storage);
+        let memory_id = claim.memory_id().to_owned();
+
+        for expected_ordinal in 1..=MAX_VECTOR_SYNC_ATTEMPTS {
+            let reservation = storage.reserve_fenced_attempt(&claim).unwrap();
+            assert_eq!(
+                reservation.ordinal(),
+                Some(expected_ordinal),
+                "slot {expected_ordinal} must be granted"
+            );
+            assert_eq!(
+                attempt_epochs(&storage, &memory_id),
+                (expected_ordinal, expected_ordinal),
+                "each reservation marks its own claim epoch"
+            );
+            if expected_ordinal == MAX_VECTOR_SYNC_ATTEMPTS {
+                break;
+            }
+            // Release and re-claim to obtain a fresh claim epoch for the next slot.
+            assert_eq!(
+                storage
+                    .finalize_fenced_vector_failure(
+                        &claim,
+                        "PROVIDER_UNAVAILABLE",
+                        FencedFailureDecision::RetryAfter { delay_millis: 1 },
+                        Some("definitely_not_sent"),
+                        0,
+                        0,
+                    )
+                    .unwrap(),
+                FencedFailureFinalizeResult::RetryScheduled {
+                    next_attempt_at_millis: 1,
+                }
+            );
+            claim = storage
+                .claim_one_fenced_vector_sync_with_retry_cutoff(
+                    "generation-a",
+                    "descriptor-a",
+                    2,
+                    "worker-a",
+                    Some(60_000),
+                )
+                .unwrap()
+                .expect("a count below the budget stays claimable");
+        }
+
+        // The fifth slot is reserved. Release the row so it becomes ordinary work.
+        assert_eq!(
+            storage
+                .finalize_fenced_vector_failure(
+                    &claim,
+                    "PROVIDER_UNAVAILABLE",
+                    FencedFailureDecision::RetryAfter { delay_millis: 1 },
+                    Some("definitely_not_sent"),
+                    0,
+                    0,
+                )
+                .unwrap(),
+            FencedFailureFinalizeResult::RetryScheduled {
+                next_attempt_at_millis: 1,
+            }
+        );
+
+        // The at-limit row must not be claimable, and must converge once.
+        assert!(storage
+            .claim_one_fenced_vector_sync_with_retry_cutoff(
+                "generation-a",
+                "descriptor-a",
+                2,
+                "worker-a",
+                Some(60_000),
+            )
+            .unwrap()
+            .is_none());
+        let converged = storage
+            .test_get_outbox_snapshot_detailed("life", &memory_id)
+            .unwrap();
+        assert_eq!(converged.state, "blocked");
+        assert_eq!(converged.attempt_count, MAX_VECTOR_SYNC_ATTEMPTS);
+        assert_eq!(converged.last_error_code.as_deref(), Some("MAX_ATTEMPTS"));
+        assert_eq!(converged.next_attempt_at, None);
+        assert_eq!(converged.lease_owner, None);
+        assert_eq!(converged.lease_fence_epoch, None);
+        assert_eq!(converged.lease_expires_at, None);
+        assert_eq!(
+            converged.claimed_generation_id.as_deref(),
+            Some("generation-a"),
+            "the durable generation survives budget convergence"
+        );
+        let epochs_after_convergence = attempt_epochs(&storage, &memory_id);
+        assert_eq!(
+            epochs_after_convergence,
+            (MAX_VECTOR_SYNC_ATTEMPTS, MAX_VECTOR_SYNC_ATTEMPTS),
+            "convergence preserves both claim epochs"
+        );
+
+        // A second drain must not re-process the already converged row.
+        assert!(storage
+            .claim_one_fenced_vector_sync_with_retry_cutoff(
+                "generation-a",
+                "descriptor-a",
+                2,
+                "worker-a",
+                Some(60_000),
+            )
+            .unwrap()
+            .is_none());
+        let stable = storage
+            .test_get_outbox_snapshot_detailed("life", &memory_id)
+            .unwrap();
+        assert_eq!(stable.state, "blocked");
+        assert_eq!(stable.attempt_count, MAX_VECTOR_SYNC_ATTEMPTS);
+        assert_eq!(
+            attempt_epochs(&storage, &memory_id),
+            epochs_after_convergence
+        );
+    }
+
+    /// Matrix items 7 and 12/19: a count beyond the budget is identity corruption,
+    /// while an at-limit *already marked* claim stays an idempotent re-read that
+    /// returns ordinal 5 rather than a spurious sixth Attempt.
+    #[test]
+    fn attempt_limit_treats_over_budget_as_invariant_and_keeps_the_fifth_slot_idempotent() {
+        // Over budget: INTERNAL_INVARIANT, no Provider or VectorStore permission.
+        let (_over_root, over_budget) = storage();
+        let claim = claimed_upsert(&over_budget);
+        over_budget
+            .test_set_fenced_attempt_count(MAX_VECTOR_SYNC_ATTEMPTS + 1)
+            .unwrap();
+        assert!(over_budget
+            .reserve_fenced_attempt(&claim)
+            .unwrap()
+            .is_lost());
+        let snapshot = over_budget
+            .test_get_outbox_snapshot_detailed("life", claim.memory_id())
+            .unwrap();
+        assert_eq!(snapshot.state, "blocked");
+        assert_eq!(
+            snapshot.last_error_code.as_deref(),
+            Some("INTERNAL_INVARIANT")
+        );
+        assert_eq!(
+            snapshot.attempt_count,
+            MAX_VECTOR_SYNC_ATTEMPTS + 1,
+            "quarantine must not reduce the count"
+        );
+        assert_eq!(
+            snapshot.claimed_generation_id.as_deref(),
+            Some("generation-a"),
+            "quarantine must not reset the generation"
+        );
+        assert_eq!(
+            attempt_epochs(&over_budget, claim.memory_id()),
+            (1, 1),
+            "quarantine must not reset either claim epoch"
+        );
+        // Manual retry must not reopen an identity-corrupt row.
+        over_budget.retry_failures("life").unwrap();
+        assert_eq!(
+            over_budget
+                .test_get_outbox_snapshot_detailed("life", claim.memory_id())
+                .unwrap()
+                .state,
+            "blocked"
+        );
+
+        // At limit but already marked by this very claim: idempotent ordinal 5.
+        let (_at_limit_root, at_limit_storage) = storage();
+        let claim = claimed_upsert(&at_limit_storage);
+        at_limit_storage
+            .test_set_fenced_attempt_count(MAX_VECTOR_SYNC_ATTEMPTS)
+            .unwrap();
+        let reservation = at_limit_storage.reserve_fenced_attempt(&claim).unwrap();
+        assert_eq!(
+            reservation.ordinal(),
+            Some(MAX_VECTOR_SYNC_ATTEMPTS),
+            "the fifth reserved slot re-reads as ordinal 5, not a sixth Attempt"
+        );
+        assert_eq!(
+            at_limit_storage
+                .test_get_outbox_snapshot_detailed("life", claim.memory_id())
+                .unwrap()
+                .state,
+            "processing",
+            "an idempotent re-read must not disturb a live claim"
+        );
+        assert_eq!(attempt_epochs(&at_limit_storage, claim.memory_id()), (1, 1));
+    }
+
+    /// Matrix item 20 from the reserve side: a *new* claim at the budget ceiling is
+    /// refused a sixth slot and converges instead.
+    #[test]
+    fn attempt_limit_refuses_a_sixth_slot_to_a_new_claim() {
+        let (_sixth_root, sixth_slot) = storage();
+        let claim = claimed_upsert(&sixth_slot);
+        // At the ceiling, with this claim's epoch deliberately unmarked: the row
+        // spent its budget under earlier claims.
+        sixth_slot
+            .state()
+            .unwrap()
+            .connection
+            .execute(
+                &format!(
+                    "UPDATE memory_vector_sync_outbox
+                     SET attempt_count={MAX_VECTOR_SYNC_ATTEMPTS},
+                         fenced_claim_epoch=9, last_marked_claim_epoch=8"
+                ),
+                [],
+            )
+            .unwrap();
+        // The claim must describe the row's current epoch to be considered current.
+        let claim = FencedVectorSyncClaim {
+            fenced_claim_epoch: 9,
+            ..claim
+        };
+
+        let reservation = sixth_slot.reserve_fenced_attempt(&claim).unwrap();
+        assert!(
+            reservation.is_budget_exhausted(),
+            "a new claim cannot take a sixth slot"
+        );
+        assert_eq!(reservation.ordinal(), None);
+        let snapshot = sixth_slot
+            .test_get_outbox_snapshot_detailed("life", claim.memory_id())
+            .unwrap();
+        assert_eq!(snapshot.state, "blocked");
+        assert_eq!(snapshot.attempt_count, MAX_VECTOR_SYNC_ATTEMPTS);
+        assert_eq!(snapshot.last_error_code.as_deref(), Some("MAX_ATTEMPTS"));
+        assert_eq!(
+            attempt_epochs(&sixth_slot, claim.memory_id()),
+            (9, 8),
+            "refusing a slot must not advance either epoch"
+        );
+
+        // The pre-ATT-I3 wrapper surfaces this as a fail-closed outcome.
+        let (_wrapper_root, wrapper_storage) = storage();
+        let wrapper_claim = claimed_upsert(&wrapper_storage);
+        wrapper_storage
+            .state()
+            .unwrap()
+            .connection
+            .execute(
+                &format!(
+                    "UPDATE memory_vector_sync_outbox
+                     SET attempt_count={MAX_VECTOR_SYNC_ATTEMPTS},
+                         fenced_claim_epoch=9, last_marked_claim_epoch=8"
+                ),
+                [],
+            )
+            .unwrap();
+        let wrapper_claim = FencedVectorSyncClaim {
+            fenced_claim_epoch: 9,
+            ..wrapper_claim
+        };
+        assert_eq!(
+            wrapper_storage
+                .mark_fenced_attempt_started(&wrapper_claim)
+                .unwrap(),
+            FencedAttemptStartResult::LostLeaseOrSuperseded
+        );
     }
 
     #[test]
@@ -3296,6 +4495,230 @@ mod tests {
             FencedAttemptStartResult::LostLeaseOrSuperseded
         );
         assert_eq!(storage.list("life").unwrap()[0].attempt_count, 0);
+    }
+
+    /// Matrix items 9-12, 18, 22, 23: the first reservation writes the marked epoch
+    /// and returns ordinal 1; repeating it on the same claim returns the identical
+    /// ordinal and an equivalent token; a stale claim epoch cannot reserve; and the
+    /// token guard accepts only the current reservation.
+    #[test]
+    fn reserve_fenced_attempt_is_idempotent_per_claim_epoch() {
+        let (_root, storage) = storage();
+        let claim = claimed_upsert(&storage);
+        let memory_id = claim.memory_id().to_owned();
+        assert_eq!(attempt_epochs(&storage, &memory_id), (1, 0));
+
+        let first = storage.reserve_fenced_attempt(&claim).unwrap();
+        let first_token = first.token().expect("the first reservation is granted");
+        assert_eq!(first_token.attempt_ordinal(), 1);
+        assert_eq!(first_token.fenced_claim_epoch(), 1);
+        assert_eq!(
+            attempt_epochs(&storage, &memory_id),
+            (1, 1),
+            "the first reservation marks its own claim epoch"
+        );
+        assert_eq!(
+            storage
+                .test_get_outbox_snapshot_detailed("life", &memory_id)
+                .unwrap()
+                .last_send_disposition
+                .as_deref(),
+            Some("possibly_sent"),
+            "an upsert reservation records that a send may have happened"
+        );
+
+        // The token guard accepts the reservation that is actually current.
+        assert!(storage
+            .validate_fenced_attempt_token_current(&claim, first_token)
+            .unwrap());
+
+        // Repeat the same reservation: same ordinal, equivalent token, no new slot.
+        let repeat = storage.reserve_fenced_attempt(&claim).unwrap();
+        let repeat_token = repeat.token().expect("a repeat reservation still succeeds");
+        assert_eq!(repeat_token.attempt_ordinal(), 1);
+        assert_eq!(repeat_token.fenced_claim_epoch(), 1);
+        assert_eq!(repeat_token.outbox_id(), first_token.outbox_id());
+        assert_eq!(
+            repeat_token.mutation_sequence(),
+            first_token.mutation_sequence()
+        );
+        assert_eq!(repeat_token.action(), first_token.action());
+        assert_eq!(repeat_token.generation_id(), first_token.generation_id());
+        assert_eq!(repeat_token.lease_owner(), first_token.lease_owner());
+        assert_eq!(repeat_token.fence_epoch(), first_token.fence_epoch());
+        assert_eq!(
+            repeat_token.target_revision(),
+            first_token.target_revision()
+        );
+        assert_eq!(
+            repeat_token.target_content_hash(),
+            first_token.target_content_hash()
+        );
+        assert_eq!(
+            attempt_epochs(&storage, &memory_id),
+            (1, 1),
+            "a repeated reservation advances nothing"
+        );
+        assert_eq!(
+            storage
+                .test_get_outbox_snapshot_detailed("life", &memory_id)
+                .unwrap()
+                .attempt_count,
+            1
+        );
+
+        // A claim describing a superseded claim epoch cannot reserve, and its token
+        // is no longer current.
+        let stale_epoch_claim = FencedVectorSyncClaim {
+            fenced_claim_epoch: claim.fenced_claim_epoch() - 1,
+            ..claim
+        };
+        assert!(storage
+            .reserve_fenced_attempt(&stale_epoch_claim)
+            .unwrap()
+            .is_lost());
+        assert!(!storage
+            .validate_fenced_attempt_token_current(&stale_epoch_claim, first_token)
+            .unwrap());
+        assert_eq!(attempt_epochs(&storage, &memory_id), (1, 1));
+    }
+
+    /// Matrix item 21: a reservation that committed but whose result never reached
+    /// the caller is safe to retry — the retry consumes no second slot and returns
+    /// the same ordinal and token identity.
+    #[test]
+    fn reserve_fenced_attempt_survives_an_unknown_commit_result() {
+        let (_root, storage) = storage();
+        let claim = claimed_upsert(&storage);
+        let memory_id = claim.memory_id().to_owned();
+
+        // The seam fires strictly after the reservation transaction commits, so the
+        // database really is updated while the caller only observes an error.
+        fail_next_reserve_after_commit_for_test();
+        let lost = storage.reserve_fenced_attempt(&claim);
+        assert!(
+            lost.is_err(),
+            "the caller must not learn the reservation outcome"
+        );
+        // Proof the commit really happened despite the caller's error.
+        assert_eq!(
+            attempt_epochs(&storage, &memory_id),
+            (1, 1),
+            "the reservation is durable even though its result was lost"
+        );
+        assert_eq!(
+            storage
+                .test_get_outbox_snapshot_detailed("life", &memory_id)
+                .unwrap()
+                .attempt_count,
+            1
+        );
+
+        // The caller retries with the same claim and recovers the same slot.
+        let retried = storage.reserve_fenced_attempt(&claim).unwrap();
+        assert_eq!(
+            retried.ordinal(),
+            Some(1),
+            "the retry recovers the same Attempt rather than consuming another"
+        );
+        assert_eq!(attempt_epochs(&storage, &memory_id), (1, 1));
+        assert_eq!(
+            storage
+                .test_get_outbox_snapshot_detailed("life", &memory_id)
+                .unwrap()
+                .attempt_count,
+            1,
+            "an unknown commit result must cost exactly one Attempt"
+        );
+    }
+
+    /// Matrix item 40: idempotency is a property of persisted state, so it survives
+    /// dropping the connection and reopening the database.
+    #[test]
+    fn reserve_fenced_attempt_stays_idempotent_after_reopen() {
+        let (root, first) = storage();
+        let claim = claimed_upsert(&first);
+        let memory_id = claim.memory_id().to_owned();
+        assert_eq!(
+            first.reserve_fenced_attempt(&claim).unwrap().ordinal(),
+            Some(1)
+        );
+        drop(first);
+
+        let reopened = StorageService::initialize_with_roots(root.0.join("data"), None).unwrap();
+        assert_eq!(
+            reopened.reserve_fenced_attempt(&claim).unwrap().ordinal(),
+            Some(1),
+            "a reopened database still recognizes the reserved slot"
+        );
+        assert_eq!(attempt_epochs(&reopened, &memory_id), (1, 1));
+        assert_eq!(
+            reopened
+                .test_get_outbox_snapshot_detailed("life", &memory_id)
+                .unwrap()
+                .attempt_count,
+            1
+        );
+    }
+
+    /// Matrix items 35, 36: a migration-isolated row can neither be claimed nor
+    /// reserved, and a raw unauthorized connection cannot tamper with the Attempt
+    /// columns because the writer fence rejects its writes.
+    #[test]
+    fn migration_isolated_and_raw_connections_cannot_touch_attempt_state() {
+        let (_fence_root, fenced) = storage();
+        let claim = claimed_upsert(&fenced);
+        let memory_id = claim.memory_id().to_owned();
+        assert_eq!(
+            fenced.reserve_fenced_attempt(&claim).unwrap().ordinal(),
+            Some(1)
+        );
+
+        // A raw connection has no writer-epoch capability, so the 18 writer fences
+        // reject any attempt to rewrite the count or either epoch.
+        let database_path = fenced.test_database_main_path().unwrap();
+        let raw = Connection::open(&database_path).unwrap();
+        for statement in [
+            "UPDATE memory_vector_sync_outbox SET attempt_count=0",
+            "UPDATE memory_vector_sync_outbox SET fenced_claim_epoch=99",
+            "UPDATE memory_vector_sync_outbox SET last_marked_claim_epoch=0",
+        ] {
+            assert!(
+                raw.execute(statement, []).is_err(),
+                "the writer fence must reject: {statement}"
+            );
+        }
+        drop(raw);
+        assert_eq!(attempt_epochs(&fenced, &memory_id), (1, 1));
+        assert_eq!(
+            fenced
+                .test_get_outbox_snapshot_detailed("life", &memory_id)
+                .unwrap()
+                .attempt_count,
+            1
+        );
+
+        // A migration-isolated row is outside ordinary work entirely.
+        let (_isolated_root, isolated) = storage();
+        isolated
+            .register_building_vector_generation("generation-a", "descriptor-a", 2)
+            .unwrap();
+        isolated
+            .test_insert_legacy_quarantine_fixture("life", "isolated-memory")
+            .unwrap();
+        assert!(isolated
+            .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-a")
+            .unwrap()
+            .is_none());
+        let snapshot = isolated
+            .test_get_outbox_snapshot_detailed("life", "isolated-memory")
+            .unwrap();
+        assert_eq!(
+            snapshot.migration_disposition.as_deref(),
+            Some("legacy_upsert_rebuild_required")
+        );
+        assert_eq!(snapshot.attempt_count, 0);
+        assert_eq!(attempt_epochs(&isolated, "isolated-memory"), (0, 0));
     }
 
     #[test]
@@ -3673,6 +5096,13 @@ mod tests {
         );
     }
 
+    /// Recovery of an expired claim that already reserved its Attempt slot.
+    ///
+    /// Each `attempts > 0` fixture is written as a *marked* claim
+    /// (`last_marked_claim_epoch == fenced_claim_epoch`), because that is what
+    /// having consumed a slot means under ATT-I2: an unmarked row with
+    /// `attempt_count > 0` describes a slot reserved by an *earlier* claim, which
+    /// `recover_expired_unmarked_*` covers separately.
     #[test]
     fn expired_upsert_with_possible_send_blocks() {
         let cases = [
@@ -3729,8 +5159,11 @@ mod tests {
             state
                 .connection
                 .execute(
+                    // A reserved slot implies the claim marked its own epoch, so the
+                    // fixture keeps the two claim epochs consistent with attempts.
                     "UPDATE memory_vector_sync_outbox
                      SET attempt_count=?1, last_send_disposition=?2,
+                         last_marked_claim_epoch=CASE WHEN ?1 > 0 THEN fenced_claim_epoch ELSE 0 END,
                          lease_expires_at='2000-01-01T00:00:00.000Z'",
                     params![attempts, disposition],
                 )
@@ -4751,6 +6184,591 @@ mod tests {
             assert_eq!(snapshot.lease_expires_at, None, "round {round}");
             assert_eq!(snapshot.last_error_code, None, "round {round}");
             assert_eq!(snapshot.last_send_disposition, None, "round {round}");
+        }
+    }
+
+    /// `retry_failures` is a second entry point into durable attempt state, so it
+    /// must converge an at-limit retry row and quarantine an over-budget failed row
+    /// rather than reopening either of them.
+    #[test]
+    fn retry_failures_converges_attempt_limit_and_preserves_terminal_errors() {
+        let (_root, storage) = storage();
+        let fifth_claim = claim_before_final_attempt_slot(&storage);
+        let memory_id = fifth_claim.memory_id().to_owned();
+        assert_eq!(
+            storage
+                .reserve_fenced_attempt(&fifth_claim)
+                .unwrap()
+                .ordinal(),
+            Some(MAX_VECTOR_SYNC_ATTEMPTS)
+        );
+        assert_eq!(
+            storage
+                .finalize_fenced_vector_failure(
+                    &fifth_claim,
+                    "INVALID_REQUEST",
+                    FencedFailureDecision::RetryAfter { delay_millis: 1 },
+                    Some("definitely_not_sent"),
+                    0,
+                    0,
+                )
+                .unwrap(),
+            FencedFailureFinalizeResult::RetryScheduled {
+                next_attempt_at_millis: 1
+            }
+        );
+        assert_eq!(storage.retry_failures("life").unwrap(), 1);
+        let at_limit = storage
+            .test_get_outbox_snapshot_detailed("life", &memory_id)
+            .unwrap();
+        assert_eq!(at_limit.state, "blocked");
+        assert_eq!(at_limit.attempt_count, MAX_VECTOR_SYNC_ATTEMPTS);
+        assert_eq!(
+            at_limit.last_error_code.as_deref(),
+            Some("INVALID_REQUEST"),
+            "a stable permanent error outranks MAX_ATTEMPTS"
+        );
+        assert_eq!(
+            at_limit.claimed_generation_id.as_deref(),
+            Some("generation-a")
+        );
+        assert_eq!(
+            attempt_epochs(&storage, &memory_id),
+            (
+                fifth_claim.fenced_claim_epoch(),
+                fifth_claim.fenced_claim_epoch()
+            )
+        );
+        assert_eq!(
+            storage.retry_failures("life").unwrap(),
+            0,
+            "a terminal count-five row is not converged twice"
+        );
+
+        storage
+            .enqueue(EnqueueMemoryVectorSyncRequest {
+                life_id: "life".into(),
+                memory_id: memory_id.clone(),
+                desired_action: MemoryVectorSyncAction::Upsert,
+            })
+            .unwrap();
+        let internal_claim = storage
+            .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-a")
+            .unwrap()
+            .unwrap();
+        storage.reserve_fenced_attempt(&internal_claim).unwrap();
+        storage
+            .finalize_fenced_vector_failure(
+                &internal_claim,
+                "INTERNAL_INVARIANT",
+                FencedFailureDecision::Blocked,
+                Some("definitely_not_sent"),
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(
+            storage.retry_failures("life").unwrap(),
+            0,
+            "manual retry must not reopen an INTERNAL_INVARIANT row"
+        );
+        let internal = storage
+            .test_get_outbox_snapshot_detailed("life", &memory_id)
+            .unwrap();
+        assert_eq!(internal.state, "blocked");
+        assert_eq!(internal.attempt_count, 1);
+        assert_eq!(
+            internal.last_error_code.as_deref(),
+            Some("INTERNAL_INVARIANT")
+        );
+
+        storage
+            .enqueue(EnqueueMemoryVectorSyncRequest {
+                life_id: "life".into(),
+                memory_id: memory_id.clone(),
+                desired_action: MemoryVectorSyncAction::Upsert,
+            })
+            .unwrap();
+        let over_budget_claim = storage
+            .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-a")
+            .unwrap()
+            .unwrap();
+        storage
+            .state()
+            .unwrap()
+            .connection
+            .execute(
+                "UPDATE memory_vector_sync_outbox
+                 SET state='failed', attempt_count=6,
+                     fenced_claim_epoch=?1, last_marked_claim_epoch=?1,
+                     lease_owner=NULL, lease_fence_epoch=NULL,
+                     lease_expires_at=NULL, next_attempt_at=NULL,
+                     last_error_code='PROVIDER_UNAVAILABLE'
+                 WHERE id=?2",
+                params![
+                    over_budget_claim.fenced_claim_epoch(),
+                    over_budget_claim.id()
+                ],
+            )
+            .unwrap();
+        assert_eq!(storage.retry_failures("life").unwrap(), 1);
+        let over_budget = storage
+            .test_get_outbox_snapshot_detailed("life", &memory_id)
+            .unwrap();
+        assert_eq!(over_budget.state, "blocked");
+        assert_eq!(over_budget.attempt_count, 6);
+        assert_eq!(
+            over_budget.last_error_code.as_deref(),
+            Some("INTERNAL_INVARIANT")
+        );
+    }
+
+    /// Covers recovery states that cannot be inferred from ordinary worker tests:
+    /// an unmarked durable claim, a marked delete at the fifth slot, and a schema-13
+    /// `(0, 0)` processing row that must never materialize an Attempt token.
+    #[test]
+    fn recover_expired_attempt_identity_preserves_unmarked_marked_and_legacy_evidence() {
+        {
+            let (_root, storage) = storage();
+            let first = claimed_upsert(&storage);
+            assert_eq!(
+                storage.reserve_fenced_attempt(&first).unwrap().ordinal(),
+                Some(1)
+            );
+            assert_eq!(
+                storage
+                    .finalize_fenced_vector_failure(
+                        &first,
+                        "PROVIDER_UNAVAILABLE",
+                        FencedFailureDecision::RetryAfter { delay_millis: 1 },
+                        Some("definitely_not_sent"),
+                        0,
+                        0,
+                    )
+                    .unwrap(),
+                FencedFailureFinalizeResult::RetryScheduled {
+                    next_attempt_at_millis: 1
+                }
+            );
+            let unmarked = storage
+                .claim_one_fenced_vector_sync_with_retry_cutoff(
+                    "generation-a",
+                    "descriptor-a",
+                    2,
+                    "worker-a",
+                    Some(60_000),
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(attempt_epochs(&storage, unmarked.memory_id()), (2, 1));
+            storage.test_expire_fenced_runtime_lease().unwrap();
+            assert_eq!(
+                storage
+                    .test_recover_expired_fenced_processing_for_generation_binding(
+                        1_700_000_000_000
+                    )
+                    .unwrap(),
+                1
+            );
+            let recovered = storage
+                .test_get_outbox_snapshot_detailed("life", unmarked.memory_id())
+                .unwrap();
+            assert_eq!(recovered.state, "pending");
+            assert_eq!(recovered.attempt_count, 1);
+            assert_eq!(
+                recovered.claimed_generation_id.as_deref(),
+                Some("generation-a"),
+                "an unmarked current claim must keep the earlier durable binding"
+            );
+            assert_eq!(
+                recovered.last_send_disposition.as_deref(),
+                Some("definitely_not_sent")
+            );
+            assert_eq!(
+                recovered.last_error_code.as_deref(),
+                Some("PROVIDER_UNAVAILABLE")
+            );
+            assert_eq!(attempt_epochs(&storage, unmarked.memory_id()), (2, 1));
+            assert_eq!(recovered.lease_owner, None);
+            assert_eq!(recovered.lease_fence_epoch, None);
+            assert_eq!(recovered.lease_expires_at, None);
+        }
+
+        {
+            let (_root, storage) = storage();
+            let record = confirmed(&storage, false);
+            storage
+                .enqueue(EnqueueMemoryVectorSyncRequest {
+                    life_id: record.life_id.clone(),
+                    memory_id: record.id.clone(),
+                    desired_action: MemoryVectorSyncAction::Delete,
+                })
+                .unwrap();
+            storage
+                .register_building_vector_generation("generation-a", "descriptor-a", 2)
+                .unwrap();
+            let delete = storage
+                .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-a")
+                .unwrap()
+                .unwrap();
+            storage
+                .test_set_fenced_attempt_count(MAX_VECTOR_SYNC_ATTEMPTS)
+                .unwrap();
+            storage.test_expire_fenced_runtime_lease().unwrap();
+            assert_eq!(
+                storage
+                    .test_recover_expired_fenced_processing_for_generation_binding(
+                        1_700_000_000_000
+                    )
+                    .unwrap(),
+                1
+            );
+            let recovered = storage
+                .test_get_outbox_snapshot_detailed("life", delete.memory_id())
+                .unwrap();
+            assert_eq!(recovered.state, "blocked");
+            assert_eq!(recovered.attempt_count, MAX_VECTOR_SYNC_ATTEMPTS);
+            assert_eq!(recovered.last_error_code.as_deref(), Some("MAX_ATTEMPTS"));
+            assert_eq!(recovered.last_send_disposition, None);
+            assert_eq!(
+                recovered.claimed_generation_id.as_deref(),
+                Some("generation-a")
+            );
+            assert_eq!(
+                attempt_epochs(&storage, delete.memory_id()),
+                (delete.fenced_claim_epoch(), delete.fenced_claim_epoch())
+            );
+            assert_eq!(recovered.lease_owner, None);
+            assert_eq!(recovered.lease_fence_epoch, None);
+            assert_eq!(recovered.lease_expires_at, None);
+        }
+
+        {
+            let (_root, storage) = storage();
+            let record = confirmed(&storage, false);
+            storage
+                .enqueue(EnqueueMemoryVectorSyncRequest {
+                    life_id: record.life_id.clone(),
+                    memory_id: record.id.clone(),
+                    desired_action: MemoryVectorSyncAction::Delete,
+                })
+                .unwrap();
+            storage
+                .register_building_vector_generation("generation-a", "descriptor-a", 2)
+                .unwrap();
+            let claim = storage
+                .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-a")
+                .unwrap()
+                .unwrap();
+            storage
+                .state()
+                .unwrap()
+                .connection
+                .execute(
+                    "UPDATE memory_vector_sync_outbox
+                     SET fenced_claim_epoch=0, last_marked_claim_epoch=0
+                     WHERE id=?1",
+                    params![claim.id()],
+                )
+                .unwrap();
+            let legacy_claim = FencedVectorSyncClaim {
+                fenced_claim_epoch: 0,
+                ..copy_fenced_claim_for_test(&claim)
+            };
+            assert!(
+                storage
+                    .reserve_fenced_attempt(&legacy_claim)
+                    .unwrap()
+                    .is_lost(),
+                "a schema-13 claim identity may not manufacture a token"
+            );
+            storage.test_expire_fenced_runtime_lease().unwrap();
+            assert_eq!(
+                storage
+                    .test_recover_expired_fenced_processing_for_generation_binding(
+                        1_700_000_000_000
+                    )
+                    .unwrap(),
+                1
+            );
+            let recovered = storage
+                .test_get_outbox_snapshot_detailed("life", claim.memory_id())
+                .unwrap();
+            assert_eq!(recovered.state, "pending");
+            assert_eq!(recovered.attempt_count, 0);
+            assert_eq!(recovered.claimed_generation_id, None);
+            assert_eq!(attempt_epochs(&storage, claim.memory_id()), (0, 0));
+            assert_eq!(recovered.lease_owner, None);
+            assert_eq!(recovered.lease_fence_epoch, None);
+            assert_eq!(recovered.lease_expires_at, None);
+        }
+    }
+
+    /// The final slot is contended by an old claim and a fresh claim from two
+    /// independent StorageService instances. The old claim is deliberately
+    /// superseded by lease takeover, so a single distinct claim identity may
+    /// produce the fifth token and the stale identity cannot turn it into six.
+    #[test]
+    fn attempt_claim_last_slot_competition_uses_one_token_for_ten_rounds() {
+        for round in 0..10 {
+            let (root, first) = storage();
+            let stale_claim = claim_before_final_attempt_slot(&first);
+            let memory_id = stale_claim.memory_id().to_owned();
+            assert_eq!(
+                first
+                    .test_get_outbox_snapshot_detailed("life", &memory_id)
+                    .unwrap()
+                    .attempt_count,
+                MAX_VECTOR_SYNC_ATTEMPTS - 1,
+                "round {round} must start at the final available slot"
+            );
+
+            first.test_expire_fenced_runtime_lease().unwrap();
+            let second = StorageService::initialize_with_roots(root.0.join("data"), None).unwrap();
+            let current_claim = second
+                .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-b")
+                .unwrap()
+                .expect("the final slot remains eligible after lease takeover");
+            assert!(
+                current_claim.fenced_claim_epoch() > stale_claim.fenced_claim_epoch(),
+                "round {round} must grant the new claim a distinct epoch"
+            );
+
+            let stale_for_reserve = copy_fenced_claim_for_test(&stale_claim);
+            let current_for_reserve = copy_fenced_claim_for_test(&current_claim);
+            let barrier = Arc::new(Barrier::new(2));
+            let stale_barrier = Arc::clone(&barrier);
+            let stale_thread = thread::spawn(move || {
+                stale_barrier.wait();
+                first.reserve_fenced_attempt(&stale_for_reserve)
+            });
+            let current_thread = thread::spawn(move || {
+                barrier.wait();
+                second.reserve_fenced_attempt(&current_for_reserve)
+            });
+
+            let stale_result = stale_thread.join().unwrap().unwrap();
+            let current_result = current_thread.join().unwrap().unwrap();
+            assert!(
+                stale_result.is_lost(),
+                "round {round}: a superseded claim may not reserve the last slot"
+            );
+            let token = current_result
+                .token()
+                .expect("the current claim alone receives the final token");
+            assert_eq!(token.attempt_ordinal(), MAX_VECTOR_SYNC_ATTEMPTS);
+
+            let verifier =
+                StorageService::initialize_with_roots(root.0.join("data"), None).unwrap();
+            let snapshot = verifier
+                .test_get_outbox_snapshot_detailed("life", &memory_id)
+                .unwrap();
+            assert_eq!(snapshot.state, "processing", "round {round}");
+            assert_eq!(
+                snapshot.attempt_count, MAX_VECTOR_SYNC_ATTEMPTS,
+                "round {round}: only one 4-to-5 transition is possible"
+            );
+            assert_eq!(
+                attempt_epochs(&verifier, &memory_id),
+                (
+                    current_claim.fenced_claim_epoch(),
+                    current_claim.fenced_claim_epoch()
+                ),
+                "round {round}: the unique final token is fully marked"
+            );
+            assert_eq!(
+                snapshot.claimed_generation_id.as_deref(),
+                Some("generation-a"),
+                "round {round}: final-slot contention cannot drop the durable binding"
+            );
+            assert!(
+                verifier
+                    .validate_fenced_attempt_token_current(&current_claim, token)
+                    .unwrap(),
+                "round {round}: the sole returned token must be current"
+            );
+        }
+    }
+
+    /// Recovery receives an artificial future cutoff while reserve uses the real
+    /// clock. That makes both operations contend for one row without a sleep: if
+    /// reserve wins, recovery sees a marked possibly-sent upsert and blocks it; if
+    /// recovery wins, reserve sees the released old claim and cannot increment.
+    #[test]
+    fn recover_expired_mark_competition_preserves_attempt_identity_for_ten_rounds() {
+        const FAR_FUTURE_EXPIRY: &str = "9999-12-31T23:59:59.999Z";
+        const FAR_FUTURE_CUTOFF_MILLIS: i64 = 253_402_300_799_999;
+
+        for round in 0..10 {
+            let (root, first) = storage();
+            let claim = claimed_upsert(&first);
+            let memory_id = claim.memory_id().to_owned();
+            first
+                .state()
+                .unwrap()
+                .connection
+                .execute(
+                    "UPDATE memory_vector_sync_outbox
+                     SET lease_expires_at=?1 WHERE id=?2",
+                    params![FAR_FUTURE_EXPIRY, claim.id()],
+                )
+                .unwrap();
+
+            let second = StorageService::initialize_with_roots(root.0.join("data"), None).unwrap();
+            let mark_claim = copy_fenced_claim_for_test(&claim);
+            let barrier = Arc::new(Barrier::new(2));
+            let recovery_barrier = Arc::clone(&barrier);
+            let recovery = thread::spawn(move || {
+                recovery_barrier.wait();
+                first.test_recover_expired_fenced_processing_for_generation_binding(
+                    FAR_FUTURE_CUTOFF_MILLIS,
+                )
+            });
+            let mark = thread::spawn(move || {
+                barrier.wait();
+                second.reserve_fenced_attempt(&mark_claim)
+            });
+
+            assert_eq!(recovery.join().unwrap().unwrap(), 1, "round {round}");
+            let mark_result = mark.join().unwrap().unwrap();
+            let verifier =
+                StorageService::initialize_with_roots(root.0.join("data"), None).unwrap();
+            let snapshot = verifier
+                .test_get_outbox_snapshot_detailed("life", &memory_id)
+                .unwrap();
+
+            match mark_result {
+                FencedAttemptReservation::Reserved(token) => {
+                    assert_eq!(token.attempt_ordinal(), 1, "round {round}");
+                    assert_eq!(snapshot.state, "blocked", "round {round}");
+                    assert_eq!(snapshot.attempt_count, 1, "round {round}");
+                    assert_eq!(
+                        snapshot.claimed_generation_id.as_deref(),
+                        Some("generation-a"),
+                        "round {round}: recovery must not drop a durable binding"
+                    );
+                    assert_eq!(
+                        snapshot.last_send_disposition.as_deref(),
+                        Some("possibly_sent"),
+                        "round {round}"
+                    );
+                    assert_eq!(
+                        snapshot.last_error_code.as_deref(),
+                        Some("PROVIDER_RESULT_UNKNOWN"),
+                        "round {round}: an unknown upsert must never reopen"
+                    );
+                    assert_eq!(attempt_epochs(&verifier, &memory_id), (1, 1));
+                }
+                FencedAttemptReservation::LostLeaseOrSuperseded => {
+                    assert_eq!(snapshot.state, "pending", "round {round}");
+                    assert_eq!(snapshot.attempt_count, 0, "round {round}");
+                    assert_eq!(snapshot.claimed_generation_id, None, "round {round}");
+                    assert_eq!(snapshot.last_send_disposition, None, "round {round}");
+                    assert_eq!(snapshot.last_error_code, None, "round {round}");
+                    assert_eq!(attempt_epochs(&verifier, &memory_id), (1, 0));
+                }
+                FencedAttemptReservation::BudgetExhausted => {
+                    panic!("round {round}: a zero-count claim cannot exhaust the budget")
+                }
+            }
+            assert_eq!(snapshot.lease_owner, None, "round {round}");
+            assert_eq!(snapshot.lease_fence_epoch, None, "round {round}");
+            assert_eq!(snapshot.lease_expires_at, None, "round {round}");
+        }
+    }
+
+    /// A real mutation transaction races an old reserve transaction from a second
+    /// StorageService. Whichever commits first, the new mutation is the only final
+    /// budget authority and the old claim is stale when checked after both commits.
+    #[test]
+    fn new_mutation_old_mark_race_cannot_spend_replacement_budget_for_ten_rounds() {
+        for round in 0..10 {
+            let (root, first) = storage();
+            let record = confirmed(&first, false);
+            first
+                .register_building_vector_generation("generation-a", "descriptor-a", 2)
+                .unwrap();
+            let old_claim = first
+                .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-a")
+                .unwrap()
+                .unwrap();
+            let before = first
+                .test_get_outbox_snapshot_detailed(&record.life_id, &record.id)
+                .unwrap();
+            let old_revision = before.target_revision.expect("old upsert revision");
+            let old_hash = before.target_content_hash.clone().expect("old upsert hash");
+
+            let second = StorageService::initialize_with_roots(root.0.join("data"), None).unwrap();
+            let mark_claim = copy_fenced_claim_for_test(&old_claim);
+            let barrier = Arc::new(Barrier::new(2));
+            let mark_barrier = Arc::clone(&barrier);
+            let mark = thread::spawn(move || {
+                mark_barrier.wait();
+                first.reserve_fenced_attempt(&mark_claim)
+            });
+            let life_id = record.life_id.clone();
+            let memory_id = record.id.clone();
+            let replacement = thread::spawn(move || {
+                barrier.wait();
+                MemoryRevisionService::new(&second).update_confirmed(UpdateConfirmedMemoryRequest {
+                    life_id,
+                    memory_id,
+                    expected_revision: old_revision,
+                    kind: MemoryKind::Fact,
+                    content: format!("ATT-I2 replacement content {round}"),
+                    summary: Some(format!("ATT-I2 replacement summary {round}")),
+                })
+            });
+
+            let mark_result = mark.join().unwrap().unwrap();
+            let replacement = replacement.join().unwrap().unwrap();
+            assert!(replacement.revision > old_revision, "round {round}");
+            match mark_result {
+                FencedAttemptReservation::Reserved(token) => {
+                    assert_eq!(token.attempt_ordinal(), 1, "round {round}");
+                }
+                FencedAttemptReservation::LostLeaseOrSuperseded => {}
+                FencedAttemptReservation::BudgetExhausted => {
+                    panic!("round {round}: a pre-mutation first claim cannot exhaust the budget")
+                }
+            }
+
+            let verifier =
+                StorageService::initialize_with_roots(root.0.join("data"), None).unwrap();
+            let snapshot = verifier
+                .test_get_outbox_snapshot_detailed(&record.life_id, &record.id)
+                .unwrap();
+            assert_eq!(snapshot.state, "pending", "round {round}");
+            assert!(
+                snapshot.mutation_sequence > before.mutation_sequence,
+                "round {round}: the replacement must own a new budget key"
+            );
+            assert!(
+                snapshot.target_revision.expect("replacement revision") > old_revision,
+                "round {round}"
+            );
+            assert_ne!(
+                snapshot.target_content_hash.as_deref(),
+                Some(old_hash.as_str()),
+                "round {round}"
+            );
+            assert_eq!(snapshot.attempt_count, 0, "round {round}");
+            assert_eq!(attempt_epochs(&verifier, &record.id), (0, 0));
+            assert_eq!(snapshot.claimed_generation_id, None, "round {round}");
+            assert_eq!(snapshot.last_send_disposition, None, "round {round}");
+            assert_eq!(snapshot.last_error_code, None, "round {round}");
+            assert_eq!(snapshot.lease_owner, None, "round {round}");
+            assert_eq!(snapshot.lease_fence_epoch, None, "round {round}");
+            assert_eq!(snapshot.lease_expires_at, None, "round {round}");
+            assert_eq!(snapshot.next_attempt_at, None, "round {round}");
+            assert_eq!(snapshot.migration_disposition, None, "round {round}");
+            assert!(
+                verifier
+                    .reserve_fenced_attempt(&old_claim)
+                    .unwrap()
+                    .is_lost(),
+                "round {round}: an old claim cannot spend the replacement budget"
+            );
         }
     }
 }

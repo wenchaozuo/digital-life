@@ -4530,6 +4530,14 @@ mod tests {
         assert_eq!(clock.now_utc_millis().unwrap(), 150_000);
     }
 
+    /// Retry/blocked classification is driven by the attempt count SQLite actually
+    /// persisted for the reserved slot.
+    ///
+    /// Each case starts below the Attempt budget, because ATT-I2 makes an at-limit
+    /// row converge to `blocked` before any claim or reservation happens. The
+    /// at-limit and over-limit behaviour is proven directly against SQLite in the
+    /// storage Attempt-budget tests rather than by driving the worker through a
+    /// sixth slot that can no longer exist.
     #[test]
     fn failure_finalize_uses_persisted_attempt_count_for_retry_and_blocked_outcomes() {
         for (prior_attempts, expected_result, expected_state, expected_time) in [
@@ -4553,12 +4561,6 @@ mod tests {
             ),
             (
                 4_i64,
-                FencedVectorSyncSingleEventResult::Blocked,
-                MemoryVectorSyncState::Blocked,
-                None,
-            ),
-            (
-                5_i64,
                 FencedVectorSyncSingleEventResult::Blocked,
                 MemoryVectorSyncState::Blocked,
                 None,

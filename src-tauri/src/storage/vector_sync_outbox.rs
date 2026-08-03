@@ -1808,6 +1808,40 @@ impl StorageService {
             .map_err(|_| single_event_error())
     }
 
+    /// Serializes the complete durable outbox row for one memory as a stable
+    /// string so a read-only caller can prove it never mutated the database.
+    #[cfg(test)]
+    pub(crate) fn test_outbox_row_full_line(
+        &self,
+        life_id: &str,
+        memory_id: &str,
+    ) -> Result<String, crate::storage::StorageError> {
+        let state = self.state()?;
+        let row: Vec<rusqlite::types::Value> = state
+            .connection
+            .query_row(
+                "SELECT desired_action, state, attempt_count, mutation_sequence,
+                        target_revision, target_content_hash, claimed_generation_id,
+                        fenced_claim_epoch, last_marked_claim_epoch,
+                        last_send_disposition, last_error_code, next_attempt_at,
+                        lease_owner, lease_fence_epoch, lease_expires_at,
+                        migration_disposition, created_at, updated_at
+                 FROM memory_vector_sync_outbox WHERE life_id=?1 AND memory_id=?2",
+                params![life_id, memory_id],
+                |r| {
+                    (0..18)
+                        .map(|i| r.get::<_, rusqlite::types::Value>(i))
+                        .collect::<Result<Vec<_>, _>>()
+                },
+            )
+            .map_err(|_| single_event_error())?;
+        Ok(row
+            .iter()
+            .map(|value| format!("{value:?}"))
+            .collect::<Vec<_>>()
+            .join("|"))
+    }
+
     #[cfg(test)]
     pub(crate) fn test_get_outbox_snapshot_detailed(
         &self,

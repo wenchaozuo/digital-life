@@ -26,6 +26,7 @@ use crate::{
     storage::{
         FencedAttemptReservation, FencedAttemptToken, FencedFailureDecision,
         FencedFailureFinalizeResult, FencedFinalizeResult, FencedVectorSyncClaim, StorageService,
+        MAX_VECTOR_SYNC_ATTEMPTS,
     },
     vector_store::{
         GenerationVectorRecord, LanceDbVectorStoreRegistry, VectorGenerationContext, VectorStore,
@@ -52,7 +53,6 @@ const MIN_DRAIN_LIMIT: usize = 1;
 #[allow(dead_code)]
 const MAX_DRAIN_LIMIT: usize = 32;
 const DEFAULT_LEASE_SECONDS: u32 = 120;
-pub(crate) const MAX_VECTOR_SYNC_ATTEMPTS: u32 = 5;
 const INITIAL_RETRY_SECONDS: u32 = 30;
 const MAX_RETRY_SECONDS: u32 = 3_600;
 const INITIAL_RETRY_MILLIS: u64 = (INITIAL_RETRY_SECONDS as u64) * 1_000;
@@ -90,7 +90,7 @@ pub(crate) const fn retry_delay_millis(attempt_count: u32) -> RetryDelayDecision
     if attempt_count == 0 {
         return RetryDelayDecision::InvalidOrOverflow;
     }
-    if attempt_count >= MAX_VECTOR_SYNC_ATTEMPTS {
+    if attempt_count as i64 >= MAX_VECTOR_SYNC_ATTEMPTS {
         return RetryDelayDecision::BlockedAtAttemptLimit;
     }
     let shift = attempt_count - 1;
@@ -194,7 +194,7 @@ pub(crate) const fn retry_decision(
     attempt_count: u32,
     operation: RetryOperation,
 ) -> RetryDecision {
-    let blocked_by_attempt_limit = attempt_count >= MAX_VECTOR_SYNC_ATTEMPTS;
+    let blocked_by_attempt_limit = attempt_count as i64 >= MAX_VECTOR_SYNC_ATTEMPTS;
     let stable_error_code = stable_error_code_for(error);
     let consumes_provider_slot = matches!(
         (operation, error),
@@ -1492,7 +1492,7 @@ where
         let code = failure.code.as_str();
         match failure.failure_class {
             Some(MemoryVectorSyncFailureClass::Retriable)
-                if job.attempt_count < MAX_VECTOR_SYNC_ATTEMPTS =>
+                if (job.attempt_count as i64) < MAX_VECTOR_SYNC_ATTEMPTS =>
             {
                 self.outbox
                     .mark_retry_after(
@@ -5171,7 +5171,7 @@ mod tests {
             assert_eq!(decision.disposition, RetryDisposition::Retryable);
             assert!(!decision.blocked_by_attempt_limit);
         }
-        for attempt_count in [MAX_VECTOR_SYNC_ATTEMPTS, 6, u32::MAX] {
+        for attempt_count in [MAX_VECTOR_SYNC_ATTEMPTS as u32, 6, u32::MAX] {
             let decision = retry_decision(
                 RetryErrorClass::Embedding(EmbeddingRetryClass::RateLimited),
                 EmbeddingRetrySafety::ResponseReceived,
@@ -8279,7 +8279,7 @@ mod tests {
     fn reserve_commit_unknown_restart_preserves_attempt_identity() {
         let (temp, storage_a) = test_storage();
         let data_root = temp.path().join("data");
-        let memory_id = {
+        let (memory_id, claim) = {
             confirmed(&storage_a, false);
             storage_a
                 .register_building_vector_generation("gen-b4-reserve", &"b4".repeat(32), 3)
@@ -8299,7 +8299,7 @@ mod tests {
             assert_eq!(snap.attempt_count, 1);
             assert_eq!(snap.fenced_claim_epoch, 1);
             assert_eq!(snap.last_marked_claim_epoch, 1);
-            memory_id
+            (memory_id, claim)
         };
         drop(storage_a);
 
@@ -8317,6 +8317,58 @@ mod tests {
             Some("gen-b4-reserve"),
             "generation binding persists"
         );
+
+        // The same claim re-reserves idempotently: identical ordinal, no second
+        // attempt, no new claim epoch, and no token reconstruction from a row scan.
+        let FencedAttemptReservation::Reserved(re_reserve_token) =
+            storage_b.reserve_fenced_attempt(&claim).unwrap()
+        else {
+            panic!("re-reserve after restart must stay idempotent")
+        };
+        assert_eq!(
+            re_reserve_token.attempt_ordinal(),
+            1,
+            "same ordinal returned for the same claim epoch"
+        );
+        let after_rereserve = storage_b
+            .test_get_outbox_snapshot_detailed("life", &memory_id)
+            .unwrap();
+        assert_eq!(
+            after_rereserve.attempt_count, 1,
+            "re-reserve must not consume a second attempt"
+        );
+        assert_eq!(
+            after_rereserve.fenced_claim_epoch, 1,
+            "re-reserve must not mint a new claim epoch"
+        );
+        assert_eq!(
+            after_rereserve.last_marked_claim_epoch, 1,
+            "re-reserve must not advance the marked epoch"
+        );
+
+        // Health observes the restart state without mutating it.
+        let ctx = VectorGenerationContext::new(
+            crate::vector_store::VectorGenerationId::parse("gen-b4-reserve").unwrap(),
+            "b4".repeat(32),
+            3,
+        )
+        .unwrap();
+        let raw_vs = crate::vector_store::InMemoryVectorStore::default();
+        tauri::async_runtime::block_on(raw_vs.create_generation(&ctx)).unwrap();
+        let health_before = storage_b
+            .inspect_outbox_sync_health(
+                ctx.generation_id().as_str(),
+                MAX_VECTOR_SYNC_ATTEMPTS as u32,
+                1_700_000_000_000,
+            )
+            .unwrap();
+        assert_eq!(health_before.processing_count, 1);
+        assert_eq!(health_before.invalid_attempt_identity_count, 0);
+        let after_health = storage_b
+            .test_get_outbox_snapshot_detailed("life", &memory_id)
+            .unwrap();
+        assert_eq!(after_health.attempt_count, 1, "Health is read-only");
+        assert_eq!(after_health.fenced_claim_epoch, 1, "Health is read-only");
 
         // Recovery must treat the marked row by its durable evidence.
         storage_b.test_expire_fenced_runtime_lease().unwrap();
@@ -8336,6 +8388,55 @@ mod tests {
             after_recovery.last_send_disposition.as_deref(),
             Some("possibly_sent")
         );
+
+        // The formal Worker after restart must not touch provider or Lance for a
+        // blocked Unknown row, and must not reopen it via claim/reserve/retry.
+        let provider_requests = Arc::new(AtomicUsize::new(0));
+        let lance_upserts = Arc::new(AtomicUsize::new(0));
+        let lance_deletes = Arc::new(AtomicUsize::new(0));
+        let vectors = CountingVectorStore {
+            inner: raw_vs,
+            lance_upserts: Arc::clone(&lance_upserts),
+            lance_deletes: Arc::clone(&lance_deletes),
+            current_lance_writes: Arc::new(AtomicUsize::new(0)),
+            max_concurrent_lance_writes: Arc::new(AtomicUsize::new(0)),
+        };
+        let raw_provider = crate::embedding::DeterministicEmbeddingProvider::new(3);
+        let embedding_successes = Arc::new(AtomicUsize::new(0));
+        let provider = CountingEmbeddingProvider {
+            inner: &raw_provider,
+            provider_requests: Arc::clone(&provider_requests),
+            embedding_successes: Arc::clone(&embedding_successes),
+        };
+        let consumer =
+            FencedVectorSyncSingleEventConsumer::new(&storage_b, &provider, &vectors, ctx);
+        assert_eq!(
+            tauri::async_runtime::block_on(consumer.process_one("worker-b")).unwrap(),
+            FencedVectorSyncSingleEventResult::NoEligibleEvent,
+            "blocked Unknown row is not eligible after restart"
+        );
+        assert_eq!(provider_requests.load(Ordering::SeqCst), 0, "no provider");
+        assert_eq!(lance_upserts.load(Ordering::SeqCst), 0, "no Lance upsert");
+        assert_eq!(lance_deletes.load(Ordering::SeqCst), 0, "no Lance delete");
+
+        // An ordinary claim path must not reopen the blocked Unknown row either.
+        storage_b.test_expire_fenced_runtime_lease().unwrap();
+        let reopen_claim = storage_b
+            .claim_one_fenced_vector_sync("gen-b4-reserve", &"b4".repeat(32), 3, "worker-retry")
+            .unwrap();
+        assert!(
+            reopen_claim.is_none(),
+            "blocked Unknown row cannot be re-claimed for retry"
+        );
+        let final_snap = storage_b
+            .test_get_outbox_snapshot_detailed("life", &memory_id)
+            .unwrap();
+        assert_eq!(final_snap.state, "blocked");
+        assert_eq!(final_snap.attempt_count, 1);
+        assert_eq!(
+            final_snap.last_error_code.as_deref(),
+            Some("PROVIDER_RESULT_UNKNOWN")
+        );
     }
 
     /// B4: a success finalize whose commit succeeded but whose result was lost
@@ -8351,16 +8452,17 @@ mod tests {
             .unwrap();
         let context = VectorGenerationContext::new(
             crate::vector_store::VectorGenerationId::parse("gen-b4-success").unwrap(),
-            descriptor,
+            descriptor.clone(),
             3,
         )
         .unwrap();
+        let descriptor_hash = context.descriptor_hash().to_owned();
         let provider_requests = Arc::new(AtomicUsize::new(0));
         let lance_upserts = Arc::new(AtomicUsize::new(0));
+        let lance_deletes = Arc::new(AtomicUsize::new(0));
         {
             let raw_vectors = crate::vector_store::InMemoryVectorStore::default();
             tauri::async_runtime::block_on(raw_vectors.create_generation(&context)).unwrap();
-            let lance_deletes = Arc::new(AtomicUsize::new(0));
             let vectors = CountingVectorStore {
                 inner: raw_vectors,
                 lance_upserts: Arc::clone(&lance_upserts),
@@ -8390,6 +8492,11 @@ mod tests {
             assert_eq!(provider_requests.load(Ordering::SeqCst), 1);
             assert_eq!(lance_upserts.load(Ordering::SeqCst), 1);
         }
+        let before = (
+            provider_requests.load(Ordering::SeqCst),
+            lance_upserts.load(Ordering::SeqCst),
+            lance_deletes.load(Ordering::SeqCst),
+        );
         // Simulate time passing after the crash: the runtime lease expires so
         // the reopened process can acquire it.
         storage_a.test_expire_fenced_runtime_lease().unwrap();
@@ -8403,23 +8510,78 @@ mod tests {
         );
         assert_eq!(storage_b.test_generation_item_count().unwrap(), 1);
 
-        // Claim directly to confirm the reopen path is processable and that no
-        // event is eligible after the finalized upsert.
+        // Health after restart: processing must be zero because the finalized
+        // upsert already completed its external work.
+        let health = storage_b
+            .inspect_outbox_sync_health(
+                context.generation_id().as_str(),
+                MAX_VECTOR_SYNC_ATTEMPTS as u32,
+                1_700_000_000_000,
+            )
+            .unwrap();
+        assert_eq!(
+            health.processing_count, 0,
+            "no in-flight processing after restart"
+        );
+
+        // The formal worker entry after restart must find no eligible event and
+        // must not claim, reserve, or replay any external I/O.
+        let raw_vectors = crate::vector_store::InMemoryVectorStore::default();
+        tauri::async_runtime::block_on(raw_vectors.create_generation(&context)).unwrap();
+        let vectors = CountingVectorStore {
+            inner: raw_vectors,
+            lance_upserts: Arc::clone(&lance_upserts),
+            lance_deletes: Arc::clone(&lance_deletes),
+            current_lance_writes: Arc::new(AtomicUsize::new(0)),
+            max_concurrent_lance_writes: Arc::new(AtomicUsize::new(0)),
+        };
+        let raw_provider = crate::embedding::DeterministicEmbeddingProvider::new(3);
+        let embedding_successes = Arc::new(AtomicUsize::new(0));
+        let provider = CountingEmbeddingProvider {
+            inner: &raw_provider,
+            provider_requests: Arc::clone(&provider_requests),
+            embedding_successes: Arc::clone(&embedding_successes),
+        };
+        let consumer =
+            FencedVectorSyncSingleEventConsumer::new(&storage_b, &provider, &vectors, context);
+        assert_eq!(
+            tauri::async_runtime::block_on(consumer.process_one("worker-b")).unwrap(),
+            FencedVectorSyncSingleEventResult::NoEligibleEvent,
+            "no eligible event after restart"
+        );
+        let after = (
+            provider_requests.load(Ordering::SeqCst),
+            lance_upserts.load(Ordering::SeqCst),
+            lance_deletes.load(Ordering::SeqCst),
+        );
+        assert_eq!(
+            after.0 - before.0,
+            0,
+            "provider delta must be zero after restart"
+        );
+        assert_eq!(
+            after.1 - before.1,
+            0,
+            "Lance upsert delta must be zero after restart"
+        );
+        assert_eq!(
+            after.2 - before.2,
+            0,
+            "Lance delete delta must be zero after restart"
+        );
+
+        // Claim directly to confirm no event is eligible after the finalized upsert.
+        storage_b.test_expire_fenced_runtime_lease().unwrap();
         let claim_result = storage_b.claim_one_fenced_vector_sync_with_retry_cutoff(
-            context.generation_id().as_str(),
-            context.descriptor_hash(),
-            context.dimension(),
-            "worker-b",
+            "gen-b4-success",
+            &descriptor_hash,
+            3,
+            "worker-c",
             Some(1_700_000_000_000),
         );
         assert!(
             claim_result.unwrap().is_none(),
             "no eligible event after restart"
-        );
-        assert_eq!(
-            lance_upserts.load(Ordering::SeqCst),
-            1,
-            "no new Lance upsert after restart"
         );
     }
 
@@ -8441,9 +8603,18 @@ mod tests {
         )
         .unwrap();
         let provider_requests = Arc::new(AtomicUsize::new(0));
+        let lance_upserts = Arc::new(AtomicUsize::new(0));
+        let lance_deletes = Arc::new(AtomicUsize::new(0));
         {
             let raw_vectors = crate::vector_store::InMemoryVectorStore::default();
             tauri::async_runtime::block_on(raw_vectors.create_generation(&context)).unwrap();
+            let vectors = CountingVectorStore {
+                inner: raw_vectors,
+                lance_upserts: Arc::clone(&lance_upserts),
+                lance_deletes: Arc::clone(&lance_deletes),
+                current_lance_writes: Arc::new(AtomicUsize::new(0)),
+                max_concurrent_lance_writes: Arc::new(AtomicUsize::new(0)),
+            };
             let possibly_sent = PossiblySentEmbeddingProvider {
                 inner: crate::embedding::DeterministicEmbeddingProvider::new(3),
                 requests: AtomicUsize::new(0),
@@ -8457,8 +8628,8 @@ mod tests {
             let consumer = FencedVectorSyncSingleEventConsumer::new(
                 &storage_a,
                 &provider,
-                &raw_vectors,
-                context,
+                &vectors,
+                context.clone(),
             );
             storage_a.test_fail_next_fenced_failure_finalize_after_commit();
             assert_eq!(
@@ -8467,6 +8638,13 @@ mod tests {
                 "failure finalize committed even though the caller saw a failure"
             );
         }
+        let before = (
+            provider_requests.load(Ordering::SeqCst),
+            lance_upserts.load(Ordering::SeqCst),
+            lance_deletes.load(Ordering::SeqCst),
+        );
+        assert_eq!(before.0, 1, "exactly one provider attempt before restart");
+        assert_eq!(before.1, 0, "no Lance upsert for a failed upsert");
         drop(storage_a);
 
         // Real restart.
@@ -8491,7 +8669,259 @@ mod tests {
             snap.claimed_generation_id.as_deref(),
             Some("gen-b4-failure")
         );
-        assert_eq!(provider_requests.load(Ordering::SeqCst), 1);
+
+        // Health after restart sees the terminal blocked state.
+        let health = storage_b
+            .inspect_outbox_sync_health(
+                context.generation_id().as_str(),
+                MAX_VECTOR_SYNC_ATTEMPTS as u32,
+                1_700_000_000_000,
+            )
+            .unwrap();
+        assert_eq!(health.blocked_count, 1);
+        assert_eq!(health.provider_result_unknown_count, 1);
+        assert_eq!(health.processing_count, 0);
+
+        // Expired recovery must keep the terminal evidence intact.
+        storage_b.test_expire_fenced_runtime_lease().unwrap();
+        storage_b
+            .test_recover_expired_fenced_processing_for_generation_binding(1_700_000_000_000)
+            .unwrap();
+        let after_recovery = storage_b
+            .test_get_outbox_snapshot_detailed("life", &jobs[0].memory_id)
+            .unwrap();
+        assert_eq!(after_recovery.state, "blocked");
+        assert_eq!(
+            after_recovery.last_error_code.as_deref(),
+            Some("PROVIDER_RESULT_UNKNOWN")
+        );
+        assert_eq!(after_recovery.attempt_count, 1);
+
+        // A retry claim must not reopen the blocked Unknown row.
+        storage_b.test_expire_fenced_runtime_lease().unwrap();
+        let retry_claim = storage_b
+            .claim_one_fenced_vector_sync(
+                context.generation_id().as_str(),
+                context.descriptor_hash(),
+                context.dimension(),
+                "worker-retry",
+            )
+            .unwrap();
+        assert!(
+            retry_claim.is_none(),
+            "blocked Unknown row cannot be retried after restart"
+        );
+
+        // The formal Worker after restart must not replay any external I/O.
+        storage_b.test_expire_fenced_runtime_lease().unwrap();
+        let raw_vectors = crate::vector_store::InMemoryVectorStore::default();
+        tauri::async_runtime::block_on(raw_vectors.create_generation(&context)).unwrap();
+        let vectors = CountingVectorStore {
+            inner: raw_vectors,
+            lance_upserts: Arc::clone(&lance_upserts),
+            lance_deletes: Arc::clone(&lance_deletes),
+            current_lance_writes: Arc::new(AtomicUsize::new(0)),
+            max_concurrent_lance_writes: Arc::new(AtomicUsize::new(0)),
+        };
+        let raw_provider = crate::embedding::DeterministicEmbeddingProvider::new(3);
+        let embedding_successes = Arc::new(AtomicUsize::new(0));
+        let provider = CountingEmbeddingProvider {
+            inner: &raw_provider,
+            provider_requests: Arc::clone(&provider_requests),
+            embedding_successes: Arc::clone(&embedding_successes),
+        };
+        let consumer =
+            FencedVectorSyncSingleEventConsumer::new(&storage_b, &provider, &vectors, context);
+        assert_eq!(
+            tauri::async_runtime::block_on(consumer.process_one("worker-b")).unwrap(),
+            FencedVectorSyncSingleEventResult::NoEligibleEvent,
+            "no eligible event after restart"
+        );
+        let after = (
+            provider_requests.load(Ordering::SeqCst),
+            lance_upserts.load(Ordering::SeqCst),
+            lance_deletes.load(Ordering::SeqCst),
+        );
+        assert_eq!(after.0 - before.0, 0, "no provider replay after restart");
+        assert_eq!(after.1 - before.1, 0, "no Lance upsert replay");
+        assert_eq!(after.2 - before.2, 0, "no Lance delete replay");
+        assert_eq!(
+            provider_requests.load(Ordering::SeqCst),
+            1,
+            "only the original attempt ever reached the provider"
+        );
+    }
+
+    /// B7: a real `process_one` formal worker is deterministically paused at
+    /// its post-provider token guard while Health snapshots the same real file
+    /// SQLite database. Health must stay strictly read-only and the worker must
+    /// complete exactly one external call per token.
+    #[test]
+    fn vector_sync_health_and_formal_worker_compete_for_ten_rounds() {
+        use crate::memory::vector_sync_health::{inspect_vector_sync_health, HealthClock};
+        use std::sync::mpsc;
+
+        struct B7Clock(Arc<Mutex<i64>>);
+        impl HealthClock for B7Clock {
+            fn now_utc_millis(
+                &self,
+            ) -> Result<i64, crate::memory::vector_sync_health::VectorSyncHealthError> {
+                Ok(*self.0.lock().unwrap())
+            }
+        }
+
+        for round in 0..10 {
+            let (temp, storage_a) = test_storage();
+            let data_root = temp.path().join("data");
+            let (ctx, raw_vectors) = drained_context();
+            storage_a
+                .register_building_vector_generation(
+                    ctx.generation_id().as_str(),
+                    ctx.descriptor_hash(),
+                    ctx.dimension(),
+                )
+                .unwrap();
+            let record = crate::storage::test_support::insert_confirmed_memory_fixture(
+                &storage_a,
+                "life",
+                "fact",
+                "health formal worker race",
+                None,
+                0.5,
+                0.5,
+                false,
+                true,
+            );
+            storage_a
+                .enqueue(EnqueueMemoryVectorSyncRequest {
+                    life_id: record.life_id.clone(),
+                    memory_id: record.id.clone(),
+                    desired_action: MemoryVectorSyncAction::Upsert,
+                })
+                .unwrap();
+
+            let provider_requests = Arc::new(AtomicUsize::new(0));
+            let lance_upserts = Arc::new(AtomicUsize::new(0));
+            let lance_deletes = Arc::new(AtomicUsize::new(0));
+
+            // Independent connection B for the formal worker.
+            let storage_b = StorageService::initialize_with_roots(data_root.clone(), None).unwrap();
+            let raw_vectors_b = crate::vector_store::InMemoryVectorStore::default();
+            tauri::async_runtime::block_on(raw_vectors_b.create_generation(&ctx)).unwrap();
+
+            let (paused_tx, paused_rx) = mpsc::channel::<()>();
+            let (release_tx, release_rx) = mpsc::channel::<()>();
+
+            // The worker claims, reserves, calls the provider, passes the first
+            // token guard, then blocks at AfterEmbeddingBeforeLance. The test
+            // thread runs Health exactly while the worker is blocked.
+            let worker = {
+                let ctx = ctx.clone();
+                let provider_owned: Box<dyn EmbeddingProvider> =
+                    Box::new(crate::embedding::DeterministicEmbeddingProvider::new(3));
+                let provider_requests = Arc::clone(&provider_requests);
+                let embedding_successes = Arc::new(AtomicUsize::new(0));
+                let lance_upserts = Arc::clone(&lance_upserts);
+                let lance_deletes = Arc::clone(&lance_deletes);
+                std::thread::spawn(move || {
+                    let provider = CountingEmbeddingProvider {
+                        inner: provider_owned.as_ref(),
+                        provider_requests,
+                        embedding_successes,
+                    };
+                    let vectors = CountingVectorStore {
+                        inner: raw_vectors_b,
+                        lance_upserts,
+                        lance_deletes,
+                        current_lance_writes: Arc::new(AtomicUsize::new(0)),
+                        max_concurrent_lance_writes: Arc::new(AtomicUsize::new(0)),
+                    };
+                    let consumer = FencedVectorSyncSingleEventConsumer::new(
+                        &storage_b, &provider, &vectors, ctx,
+                    );
+                    consumer.set_test_pause_hook_for_test(Some(Box::new(move |point| {
+                        if point == VectorSyncTestPausePoint::AfterEmbeddingBeforeLance {
+                            paused_tx.send(()).unwrap();
+                            release_rx.recv().unwrap();
+                        }
+                    })));
+                    let result =
+                        tauri::async_runtime::block_on(consumer.process_one("worker-b")).unwrap();
+                    consumer.set_test_pause_hook_for_test(None);
+                    result
+                })
+            };
+
+            // Wait for the worker to reach the post-provider gate, then run
+            // Health on connection A while the worker is blocked.
+            paused_rx.recv().unwrap();
+            let clock = B7Clock(Arc::new(Mutex::new(1_700_000_000_000)));
+            let health = tauri::async_runtime::block_on(inspect_vector_sync_health(
+                &storage_a,
+                &raw_vectors,
+                &ctx,
+                &clock,
+            ))
+            .unwrap();
+            // Health sees the worker's legitimate mid-flight state: exactly one
+            // in-flight processing row, and no impossible mixed identity.
+            assert_eq!(health.processing_count, 1, "round {round}");
+            assert_eq!(health.invalid_attempt_identity_count, 0, "round {round}");
+            assert_eq!(
+                health.attempts_at_limit_count, 0,
+                "round {round}: attempt 1 of 5 is not at limit"
+            );
+
+            // Health is strictly read-only while the worker is mid-flight.
+            let verifier = StorageService::initialize_with_roots(data_root, None).unwrap();
+            let snap = verifier
+                .test_get_outbox_snapshot_detailed("life", &record.id)
+                .unwrap();
+            assert_eq!(snap.state, "processing", "round {round}");
+            assert_eq!(
+                snap.attempt_count, 1,
+                "round {round}: reserve already committed"
+            );
+            assert_eq!(snap.fenced_claim_epoch, 1, "round {round}");
+            assert_eq!(snap.last_marked_claim_epoch, 1, "round {round}");
+            assert_eq!(
+                snap.claimed_generation_id.as_deref(),
+                Some(ctx.generation_id().as_str()),
+                "round {round}"
+            );
+            assert_eq!(
+                snap.last_send_disposition.as_deref(),
+                Some("possibly_sent"),
+                "round {round}: health must not clear send evidence"
+            );
+
+            // Release the worker and let it finish the finalize path.
+            release_tx.send(()).unwrap();
+            let result = worker.join().unwrap();
+            assert_eq!(
+                result,
+                FencedVectorSyncSingleEventResult::CompletedUpsert,
+                "round {round}"
+            );
+
+            // Exactly one external call per token.
+            assert_eq!(provider_requests.load(Ordering::SeqCst), 1, "round {round}");
+            assert_eq!(lance_upserts.load(Ordering::SeqCst), 1, "round {round}");
+            assert_eq!(lance_deletes.load(Ordering::SeqCst), 0, "round {round}");
+
+            // The finalize produced a complete, valid terminal state: the row
+            // is finalized (removed from the outbox) and the generation item
+            // holds the upserted record.
+            assert!(
+                verifier.list("life").unwrap().is_empty(),
+                "round {round}: upsert finalized and outbox row removed"
+            );
+            assert_eq!(
+                verifier.test_generation_item_count().unwrap(),
+                1,
+                "round {round}: exactly one generation item"
+            );
+        }
     }
 
     /// B8: real expired recovery races a real `process_one` worker on the same
@@ -8551,6 +8981,76 @@ mod tests {
             assert_eq!(snapshot.last_marked_claim_epoch, 1);
             storage_a.test_expire_fenced_runtime_lease().unwrap();
 
+            // Setup the unmarked-durable expired-processing fixture on the same
+            // connection before it is moved into the recovery thread: claimed,
+            // then shaped into fenced > marked with attempt 1..4 and a real
+            // generation binding.
+            let unmarked_record = crate::storage::test_support::insert_confirmed_memory_fixture(
+                &storage_a,
+                "life",
+                "fact",
+                "recovery worker unmarked",
+                None,
+                0.5,
+                0.5,
+                false,
+                true,
+            );
+            storage_a
+                .enqueue(EnqueueMemoryVectorSyncRequest {
+                    life_id: unmarked_record.life_id.clone(),
+                    memory_id: unmarked_record.id.clone(),
+                    desired_action: MemoryVectorSyncAction::Upsert,
+                })
+                .unwrap();
+            let unmarked_claim = storage_a
+                .claim_one_fenced_vector_sync(
+                    ctx.generation_id().as_str(),
+                    ctx.descriptor_hash(),
+                    ctx.dimension(),
+                    "worker-a",
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(unmarked_claim.memory_id(), unmarked_record.id.as_str());
+            // Shape the claimed row into the unmarked-durable form: fenced >
+            // marked, attempt 1..4, generation present. The lease stays FRESH
+            // here so the unmarked row is untouched by the marked-unknown race
+            // below; it is expired explicitly in sub-scenario 2.
+            {
+                let db_path = data_root.join("digital-life.sqlite3");
+                let conn = crate::storage::open_authorized_test_connection(&db_path).unwrap();
+                conn.execute(
+                    "UPDATE memory_vector_sync_outbox
+                     SET attempt_count=2, fenced_claim_epoch=3,
+                         last_marked_claim_epoch=1, lease_owner='worker-old',
+                         lease_fence_epoch=30,
+                         last_send_disposition='definitely_not_sent',
+                         last_error_code=NULL, next_attempt_at=NULL
+                     WHERE memory_id=?1",
+                    rusqlite::params![unmarked_record.id],
+                )
+                .unwrap();
+            }
+            let unmarked_id = unmarked_record.id.clone();
+            drop(unmarked_claim);
+
+            // The unmarked claim re-acquired the global runtime lease. Expire
+            // ONLY the runtime lease (not the unmarked row's event lease) so
+            // the marked-unknown worker on connection B can acquire it while
+            // the unmarked row stays a fresh non-expired processing row that is
+            // neither recovered nor claimable during the marked race.
+            {
+                let db_path = data_root.join("digital-life.sqlite3");
+                let conn = crate::storage::open_authorized_test_connection(&db_path).unwrap();
+                conn.execute(
+                    "UPDATE memory_vector_sync_runtime_lease
+                     SET expires_at='2000-01-01T00:00:00.000Z'",
+                    [],
+                )
+                .unwrap();
+            }
+
             // Independent connection B for the worker.
             let storage_b = StorageService::initialize_with_roots(data_root.clone(), None).unwrap();
             let provider_requests = Arc::new(AtomicUsize::new(0));
@@ -8607,7 +9107,7 @@ mod tests {
                 0,
                 "round {round}: a marked unknown upsert must never call the provider"
             );
-            let verifier = StorageService::initialize_with_roots(data_root, None).unwrap();
+            let verifier = StorageService::initialize_with_roots(data_root.clone(), None).unwrap();
             let snap = verifier
                 .test_get_outbox_snapshot_detailed("life", &record.id)
                 .unwrap();
@@ -8637,6 +9137,149 @@ mod tests {
             assert_eq!(snap.fenced_claim_epoch, 1, "round {round}");
             assert_eq!(snap.last_marked_claim_epoch, 1, "round {round}");
             let _ = (recovered, worker_result);
+
+            // ---- B8 sub-scenario 2: unmarked durable expired-processing ----
+            // The fixture (claimed, then shaped into fenced > marked with
+            // attempt 1..4 and a real generation binding) was set up before the
+            // recovery thread moved `storage_a` away. Recovery returns it to
+            // pending without consuming an attempt or dropping the generation.
+            // A new mutation then invalidates the old one, and the formal
+            // worker must not replay the old expired claim (plan A).
+            let storage_ur =
+                StorageService::initialize_with_roots(data_root.clone(), None).unwrap();
+            storage_ur.test_expire_fenced_runtime_lease().unwrap();
+            storage_ur
+                .test_recover_expired_fenced_processing_for_generation_binding(1_700_000_000_000)
+                .unwrap();
+            let unmarked_after_recovery = storage_ur
+                .test_get_outbox_snapshot_detailed("life", &unmarked_id)
+                .unwrap();
+            assert_eq!(
+                unmarked_after_recovery.state, "pending",
+                "round {round}: unmarked durable recovers to pending"
+            );
+            assert_eq!(
+                unmarked_after_recovery.attempt_count, 2,
+                "round {round}: recovery must not increment the unmarked attempt"
+            );
+            assert_eq!(
+                unmarked_after_recovery.claimed_generation_id.as_deref(),
+                Some(ctx.generation_id().as_str()),
+                "round {round}: unmarked generation preserved"
+            );
+            assert_eq!(
+                unmarked_after_recovery.fenced_claim_epoch, 3,
+                "round {round}: fenced epoch preserved"
+            );
+            assert_eq!(
+                unmarked_after_recovery.last_marked_claim_epoch, 1,
+                "round {round}: last_marked preserved"
+            );
+            assert_eq!(
+                unmarked_after_recovery.lease_owner, None,
+                "round {round}: old lease cleared"
+            );
+
+            // Plan A: a new mutation invalidates the old one. The recovered row
+            // keeps its row identity but the mutation is replaced: fresh
+            // budget, zero epochs, no generation, no send/error evidence. The
+            // target revision/hash stay the real confirmed memory binding so
+            // the fresh claim can legitimately finalize.
+            {
+                let conn = crate::storage::open_authorized_test_connection(
+                    &data_root.join("digital-life.sqlite3"),
+                )
+                .unwrap();
+                conn.execute(
+                    "UPDATE memory_vector_sync_outbox
+                     SET desired_action='upsert', state='pending', attempt_count=0,
+                         mutation_sequence=mutation_sequence+1,
+                         fenced_claim_epoch=0, last_marked_claim_epoch=0,
+                         claimed_generation_id=NULL, last_send_disposition=NULL,
+                         last_error_code=NULL, lease_owner=NULL, lease_expires_at=NULL,
+                         lease_fence_epoch=NULL, next_attempt_at=NULL
+                     WHERE memory_id=?1",
+                    rusqlite::params![unmarked_id],
+                )
+                .unwrap();
+            }
+
+            // The formal worker now runs over the new mutation. The old expired
+            // claim can never be replayed: the new mutation is a fresh pending
+            // row the worker may legitimately claim with a NEW epoch, and the
+            // old claim's epoch evidence is gone.
+            let storage_b8 =
+                StorageService::initialize_with_roots(data_root.clone(), None).unwrap();
+            let provider_calls_b8 = Arc::new(AtomicUsize::new(0));
+            let lance_upserts_b8 = Arc::new(AtomicUsize::new(0));
+            let lance_deletes_b8 = Arc::new(AtomicUsize::new(0));
+            let raw_vectors_b8 = crate::vector_store::InMemoryVectorStore::default();
+            tauri::async_runtime::block_on(raw_vectors_b8.create_generation(&ctx)).unwrap();
+            let vectors_b8 = CountingVectorStore {
+                inner: raw_vectors_b8,
+                lance_upserts: Arc::clone(&lance_upserts_b8),
+                lance_deletes: Arc::clone(&lance_deletes_b8),
+                current_lance_writes: Arc::new(AtomicUsize::new(0)),
+                max_concurrent_lance_writes: Arc::new(AtomicUsize::new(0)),
+            };
+            let raw_provider_b8 = crate::embedding::DeterministicEmbeddingProvider::new(3);
+            let embedding_successes_b8 = Arc::new(AtomicUsize::new(0));
+            let provider_b8 = CountingEmbeddingProvider {
+                inner: &raw_provider_b8,
+                provider_requests: Arc::clone(&provider_calls_b8),
+                embedding_successes: Arc::clone(&embedding_successes_b8),
+            };
+            let consumer_b8 = FencedVectorSyncSingleEventConsumer::new(
+                &storage_b8,
+                &provider_b8,
+                &vectors_b8,
+                ctx.clone(),
+            );
+            storage_b8.test_expire_fenced_runtime_lease().unwrap();
+            let worker_b8_result =
+                tauri::async_runtime::block_on(consumer_b8.process_one("worker-b8")).unwrap();
+
+            // The worker either finalized the new mutation (a legitimate fresh
+            // claim) or found nothing eligible; either way the OLD expired
+            // claim produced no external I/O. Prove the old mutation itself was
+            // never replayed: the row's claim epochs belong to the new cycle.
+            let b8_verifier =
+                StorageService::initialize_with_roots(data_root.clone(), None).unwrap();
+            if worker_b8_result == FencedVectorSyncSingleEventResult::CompletedUpsert {
+                assert_eq!(
+                    provider_calls_b8.load(Ordering::SeqCst),
+                    1,
+                    "round {round}: new mutation claimed exactly once"
+                );
+                assert_eq!(lance_upserts_b8.load(Ordering::SeqCst), 1, "round {round}");
+                assert_eq!(lance_deletes_b8.load(Ordering::SeqCst), 0, "round {round}");
+                assert!(
+                    b8_verifier
+                        .list("life")
+                        .unwrap()
+                        .iter()
+                        .all(|job| job.memory_id != unmarked_id),
+                    "round {round}: new mutation finalized"
+                );
+            } else {
+                assert_eq!(
+                    provider_calls_b8.load(Ordering::SeqCst),
+                    0,
+                    "round {round}: no I/O when nothing is eligible"
+                );
+                let new_snap = b8_verifier
+                    .test_get_outbox_snapshot_detailed("life", &unmarked_id)
+                    .unwrap();
+                assert_eq!(
+                    new_snap.attempt_count, 0,
+                    "round {round}: new mutation keeps full reset state"
+                );
+                assert_eq!(new_snap.fenced_claim_epoch, 0, "round {round}");
+                assert_eq!(new_snap.last_marked_claim_epoch, 0, "round {round}");
+                assert_eq!(new_snap.claimed_generation_id, None, "round {round}");
+                assert_eq!(new_snap.last_send_disposition, None, "round {round}");
+                assert_eq!(new_snap.last_error_code, None, "round {round}");
+            }
         }
     }
 }

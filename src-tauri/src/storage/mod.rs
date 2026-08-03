@@ -26,6 +26,7 @@ pub(crate) use llm_candidate_extraction::{
 pub(crate) use vector_sync_outbox::{
     FencedAttemptReservation, FencedAttemptToken, FencedFailureDecision,
     FencedFailureFinalizeResult, FencedFinalizeResult, FencedVectorSyncClaim,
+    MAX_VECTOR_SYNC_ATTEMPTS,
 };
 
 use std::{
@@ -469,7 +470,7 @@ impl StorageService {
                 COALESCE(SUM(CASE WHEN state='blocked' AND last_error_code='INTERNAL_INVARIANT' THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN attempt_count >= ?2 THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN attempt_count > ?2 THEN 1 ELSE 0 END), 0),
-                COALESCE(SUM(CASE WHEN attempt_count < 0 OR attempt_count > ?2 OR fenced_claim_epoch < 0 OR last_marked_claim_epoch < 0 OR last_marked_claim_epoch > fenced_claim_epoch OR (last_marked_claim_epoch > 0 AND attempt_count = 0) OR (attempt_count > 0 AND claimed_generation_id IS NULL AND NOT (fenced_claim_epoch = 0 AND last_marked_claim_epoch = 0)) THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN attempt_count < 0 OR attempt_count > ?2 OR fenced_claim_epoch < 0 OR last_marked_claim_epoch < 0 OR last_marked_claim_epoch > fenced_claim_epoch OR (last_marked_claim_epoch > 0 AND attempt_count = 0) OR (attempt_count > 0 AND claimed_generation_id IS NULL) THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN state='processing' AND lease_expires_at IS NOT NULL AND lease_expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ', ?1 / 1000.0, 'unixepoch') AND fenced_claim_epoch > last_marked_claim_epoch THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN state='processing' AND lease_expires_at IS NOT NULL AND lease_expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ', ?1 / 1000.0, 'unixepoch') AND fenced_claim_epoch = last_marked_claim_epoch AND fenced_claim_epoch > 0 THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN state='processing' AND fenced_claim_epoch = 0 AND last_marked_claim_epoch = 0 THEN 1 ELSE 0 END), 0),
@@ -1643,8 +1644,9 @@ mod tests {
                    (life_id, memory_id, desired_action, state, attempt_count,
                     mutation_sequence, target_revision, target_content_hash,
                     fenced_claim_epoch, last_marked_claim_epoch, claimed_generation_id,
-                    last_send_disposition, last_error_code)
-                 VALUES ('life-1','bs-over5','upsert','blocked',6,3,1,'h-over5',3,3,'gen-backup-restore','possibly_sent','LANCE_PERMANENT');
+                    last_send_disposition, last_error_code, lease_owner, lease_fence_epoch,
+                    lease_expires_at, next_attempt_at, created_at, updated_at)
+                 VALUES ('life-1','bs-over5','upsert','processing',6,3,1,'h-over5',3,3,'gen-backup-restore','definitely_not_sent','LANCE_PERMANENT','worker-over',30,'2000-01-01T00:00:00.000Z','2000-01-01T00:00:00.000Z','2024-01-01T00:00:00.000Z','2024-01-01T00:00:00.000Z');
                  INSERT INTO memory_vector_sync_outbox
                    (life_id, memory_id, desired_action, state, attempt_count,
                     mutation_sequence, target_revision, target_content_hash,
@@ -1662,11 +1664,26 @@ mod tests {
                     mutation_sequence, target_revision, target_content_hash,
                     fenced_claim_epoch, last_marked_claim_epoch, claimed_generation_id,
                     last_send_disposition, last_error_code)
-                 VALUES ('life-1','bs-del-marked','delete','pending',3,6,0,NULL,4,4,'gen-backup-restore',NULL,'LANCE_TRANSIENT');",
+                 VALUES ('life-1','bs-del-marked','delete','pending',3,6,0,NULL,4,4,'gen-backup-restore',NULL,'LANCE_TRANSIENT');
+                 -- unmarked durable expired processing: state=processing, expired lease,
+                 -- fenced > marked, attempt 1..4, generation present (8th required class)
+                 INSERT INTO memory_vector_sync_outbox
+                   (life_id, memory_id, desired_action, state, attempt_count,
+                    mutation_sequence, target_revision, target_content_hash,
+                    fenced_claim_epoch, last_marked_claim_epoch, claimed_generation_id,
+                    last_send_disposition, last_error_code, lease_owner, lease_fence_epoch,
+                    lease_expires_at, next_attempt_at, created_at, updated_at)
+                 VALUES ('life-1','bs-unmarked','upsert','processing',2,7,1,'h-unmarked',3,1,'gen-backup-restore','definitely_not_sent',NULL,'worker-old',30,'2000-01-01T00:00:00.000Z','2000-01-01T00:00:00.000Z','2024-01-01T00:00:00.000Z','2024-01-01T00:00:00.000Z');",
             )
             .unwrap();
             // The legal pending row (memory_id) is claimable and untouched.
         }
+        // Capture the full source rows BEFORE the Online Backup migrates the
+        // source service away from this database file.
+        let source_lines = {
+            let state = service.state().unwrap();
+            full_outbox_row_lines(&state.connection)
+        };
 
         // Health snapshot on the SOURCE before backup.
         let ctx = crate::vector_store::VectorGenerationContext::new(
@@ -1692,27 +1709,50 @@ mod tests {
 
         // The source service now points at the restored DB; reopen the backup
         // target as an INDEPENDENT database.
-        let restored_path = target.join(DATABASE_FILE_NAME);
-        assert!(restored_path.exists());
         let restored = StorageService::initialize_with_roots(target.clone(), None).unwrap();
 
-        // Schema 14 and writer fences preserved.
-        assert_eq!(
-            connection::read_schema_version(&restored.state().unwrap().connection).unwrap(),
-            connection::MAX_SUPPORTED_SCHEMA_VERSION
-        );
-        let fence_count: i64 = restored
-            .state()
-            .unwrap()
-            .connection
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_schema
-                 WHERE type='trigger' AND name GLOB 'digital_life_writer_epoch_*'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(fence_count, 18);
+        // Schema 14 and writer fences preserved. Schema version 14 is the
+        // current runtime schema; LAST_STATIC_MIGRATION_VERSION = 12 is only the
+        // ceiling of the statically-replayed migration list.
+        {
+            let restored_conn = restored.state().unwrap();
+            assert_eq!(
+                connection::read_schema_version(&restored_conn.connection).unwrap(),
+                connection::MAX_SUPPORTED_SCHEMA_VERSION,
+                "restored schema version must be 14"
+            );
+            assert_eq!(
+                super::migration::LAST_STATIC_MIGRATION_VERSION,
+                12,
+                "LAST_STATIC_MIGRATION_VERSION is 12"
+            );
+            let epoch_columns: Vec<String> = restored_conn
+                .connection
+                .prepare("PRAGMA table_info(memory_vector_sync_outbox)")
+                .unwrap()
+                .query_map([], |row| row.get(1))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            assert!(
+                epoch_columns.contains(&"fenced_claim_epoch".to_string()),
+                "fenced_claim_epoch column must exist"
+            );
+            assert!(
+                epoch_columns.contains(&"last_marked_claim_epoch".to_string()),
+                "last_marked_claim_epoch column must exist"
+            );
+            let fence_count: i64 = restored_conn
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema
+                     WHERE type='trigger' AND name GLOB 'digital_life_writer_epoch_*'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(fence_count, 18);
+        }
 
         // All 8 outbox states preserved with full epoch evidence.
         type RestoredOutboxRow = (
@@ -1748,10 +1788,8 @@ mod tests {
             .map(|r| r.unwrap())
             .collect()
         };
-        assert_eq!(rows.len(), 7, "all 6 fixtures + 1 legal pending row");
-        let find = |mem: &str| -> &RestoredOutboxRow {
-            rows.iter().find(|r| r.0 == mem).unwrap()
-        };
+        assert_eq!(rows.len(), 8, "all 7 fixtures + 1 legal pending row");
+        let find = |mem: &str| -> &RestoredOutboxRow { rows.iter().find(|r| r.0 == mem).unwrap() };
         assert_eq!(find("bs-unknown").1, "blocked");
         assert_eq!(find("bs-unknown").2, 2);
         assert_eq!(find("bs-unknown").3, 2);
@@ -1765,6 +1803,31 @@ mod tests {
         assert_eq!(find("bs-del-marked").2, 3);
         assert_eq!(find("bs-del-marked").3, 4);
         assert_eq!(find("bs-del-marked").4, 4);
+        // Unmarked durable expired-processing: state, epochs, generation preserved.
+        assert_eq!(find("bs-unmarked").1, "processing");
+        assert_eq!(find("bs-unmarked").2, 2);
+        assert_eq!(find("bs-unmarked").3, 3, "fenced > marked");
+        assert_eq!(find("bs-unmarked").4, 1, "marked preserved");
+        assert_eq!(
+            find("bs-unmarked").5.as_deref(),
+            Some("gen-backup-restore"),
+            "generation preserved for unmarked durable row"
+        );
+        assert_eq!(
+            find("bs-unmarked").6.as_deref(),
+            Some("definitely_not_sent")
+        );
+
+        // Full-field comparison (mutation clock, migration disposition, lease,
+        // created/updated) between source and restored database.
+        let restored_lines = {
+            let state = restored.state().unwrap();
+            full_outbox_row_lines(&state.connection)
+        };
+        assert_eq!(
+            restored_lines, source_lines,
+            "every outbox field must round-trip through Online Backup"
+        );
 
         // Health on the RESTORED database matches source semantics.
         let raw_vs_r = crate::vector_store::InMemoryVectorStore::default();
@@ -1797,6 +1860,30 @@ mod tests {
             restored_health.migration_isolated_count, source_health.migration_isolated_count,
             "migration-isolated count preserved"
         );
+        assert_eq!(
+            restored_health.expired_processing_unmarked_count,
+            source_health.expired_processing_unmarked_count,
+            "expired unmarked count preserved"
+        );
+        assert_eq!(
+            restored_health.expired_processing_marked_count,
+            source_health.expired_processing_marked_count,
+            "expired marked count preserved"
+        );
+        assert_eq!(
+            restored_health.legacy_processing_unproven_count,
+            source_health.legacy_processing_unproven_count,
+            "legacy count preserved"
+        );
+        assert_eq!(
+            restored_health.delete_replay_not_eligible_count,
+            source_health.delete_replay_not_eligible_count,
+            "delete replay not eligible preserved"
+        );
+        assert_eq!(
+            restored_health.expired_processing_count, source_health.expired_processing_count,
+            "expired processing preserved"
+        );
 
         // Recovery on the restored database converges by frozen rules.
         restored.test_expire_fenced_runtime_lease().unwrap();
@@ -1818,6 +1905,78 @@ mod tests {
                 .last_error_code
                 .as_deref(),
             Some("PROVIDER_RESULT_UNKNOWN")
+        );
+        // attempt=5 stays blocked.
+        assert_eq!(
+            restored
+                .test_get_outbox_snapshot_detailed("life-1", "bs-att5")
+                .unwrap()
+                .state,
+            "blocked",
+            "attempt=5 blocked stays blocked"
+        );
+        // attempt>5 becomes INTERNAL_INVARIANT.
+        assert_eq!(
+            restored
+                .test_get_outbox_snapshot_detailed("life-1", "bs-over5")
+                .unwrap()
+                .last_error_code
+                .as_deref(),
+            Some("INTERNAL_INVARIANT"),
+            "attempt>5 converges to INTERNAL_INVARIANT"
+        );
+        // Invalid identity remains invalid and is reported by Health.
+        let health_after_recovery = tauri::async_runtime::block_on(
+            crate::memory::vector_sync_health::inspect_vector_sync_health(
+                &restored, &raw_vs_r, &ctx, &clock,
+            ),
+        )
+        .unwrap();
+        assert!(
+            health_after_recovery.invalid_attempt_identity_count >= 1,
+            "invalid identity is still reported after recovery"
+        );
+        // Unmarked durable expired-processing recovers to pending, keeps its
+        // attempt budget and generation, clears the old lease.
+        let unmarked = restored
+            .test_get_outbox_snapshot_detailed("life-1", "bs-unmarked")
+            .unwrap();
+        assert_eq!(
+            unmarked.state, "pending",
+            "unmarked durable recovers to pending"
+        );
+        assert_eq!(unmarked.attempt_count, 2, "attempt is not incremented");
+        assert_eq!(
+            unmarked.claimed_generation_id.as_deref(),
+            Some("gen-backup-restore"),
+            "generation preserved"
+        );
+        assert_eq!(
+            unmarked.fenced_claim_epoch, 3,
+            "fenced epoch preserved on unmarked durable"
+        );
+        assert_eq!(
+            unmarked.last_marked_claim_epoch, 1,
+            "marked epoch preserved on unmarked durable"
+        );
+        assert_eq!(unmarked.lease_owner, None, "old lease cleared");
+        // Marked Delete count<5 is restored under the frozen rules (still a
+        // delete row with spendable budget, not replayed).
+        assert_eq!(
+            restored
+                .test_get_outbox_snapshot_detailed("life-1", "bs-del-marked")
+                .unwrap()
+                .state,
+            "pending"
+        );
+        // Migration-isolated rows do not participate in recovery.
+        assert_eq!(
+            restored
+                .test_get_outbox_snapshot_detailed("life-1", "bs-migrated")
+                .unwrap()
+                .migration_disposition
+                .as_deref(),
+            Some("legacy_upsert_rebuild_required")
         );
 
         // A legal pending row can be claimed with a fresh epoch without
@@ -1842,6 +2001,278 @@ mod tests {
                 .fenced_claim_epoch,
             claim.fenced_claim_epoch()
         );
+
+        // 6.7 Formal worker no-replay on the restored database: the Unknown,
+        // at-limit, invalid-identity, and migration-isolated rows must never
+        // reach the provider or Lance through the real worker entry, and no
+        // token may be reconstructed from the restored rows.
+        {
+            use crate::memory::vector_sync_worker::{
+                FencedVectorSyncSingleEventConsumer, FencedVectorSyncSingleEventResult,
+            };
+            use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+            use std::sync::Arc;
+
+            struct RestoredCountingProvider<'a> {
+                inner: &'a dyn crate::embedding::EmbeddingProvider,
+                requests: &'a AtomicUsize,
+            }
+            impl crate::embedding::EmbeddingProvider for RestoredCountingProvider<'_> {
+                fn model_info(&self) -> crate::embedding::EmbeddingModelInfo {
+                    self.inner.model_info()
+                }
+                fn model_name(&self) -> &str {
+                    self.inner.model_name()
+                }
+                fn vector_dimension(&self) -> Option<usize> {
+                    self.inner.vector_dimension()
+                }
+                fn max_batch_size(&self) -> usize {
+                    self.inner.max_batch_size()
+                }
+                fn embed<'a>(
+                    &'a self,
+                    request: crate::embedding::EmbeddingRequest,
+                ) -> crate::embedding::EmbeddingFuture<
+                    'a,
+                    Result<crate::embedding::EmbeddingBatch, crate::embedding::EmbeddingError>,
+                > {
+                    self.requests.fetch_add(1, AtomicOrdering::SeqCst);
+                    self.inner.embed(request)
+                }
+            }
+
+            struct RestoredCountingVectorStore<'a> {
+                inner: &'a dyn crate::vector_store::VectorStore,
+                upserts: &'a AtomicUsize,
+                deletes: &'a AtomicUsize,
+            }
+            impl crate::vector_store::VectorStore for RestoredCountingVectorStore<'_> {
+                fn upsert<'a>(
+                    &'a self,
+                    record: crate::vector_store::VectorRecord,
+                ) -> crate::vector_store::VectorStoreFuture<
+                    'a,
+                    Result<(), crate::vector_store::VectorStoreError>,
+                > {
+                    self.inner.upsert(record)
+                }
+                fn upsert_batch<'a>(
+                    &'a self,
+                    records: Vec<crate::vector_store::VectorRecord>,
+                ) -> crate::vector_store::VectorStoreFuture<
+                    'a,
+                    Result<(), crate::vector_store::VectorStoreError>,
+                > {
+                    self.inner.upsert_batch(records)
+                }
+                fn search<'a>(
+                    &'a self,
+                    query: crate::vector_store::VectorSearchQuery,
+                ) -> crate::vector_store::VectorStoreFuture<
+                    'a,
+                    Result<
+                        Vec<crate::vector_store::VectorSearchHit>,
+                        crate::vector_store::VectorStoreError,
+                    >,
+                > {
+                    self.inner.search(query)
+                }
+                fn delete<'a>(
+                    &'a self,
+                    life_id: &'a str,
+                    memory_id: &'a str,
+                ) -> crate::vector_store::VectorStoreFuture<
+                    'a,
+                    Result<usize, crate::vector_store::VectorStoreError>,
+                > {
+                    self.deletes.fetch_add(1, AtomicOrdering::SeqCst);
+                    self.inner.delete(life_id, memory_id)
+                }
+                fn delete_from_space<'a>(
+                    &'a self,
+                    life_id: &'a str,
+                    memory_id: &'a str,
+                    space: &'a crate::vector_store::VectorSpace,
+                ) -> crate::vector_store::VectorStoreFuture<
+                    'a,
+                    Result<usize, crate::vector_store::VectorStoreError>,
+                > {
+                    self.inner.delete_from_space(life_id, memory_id, space)
+                }
+                fn delete_by_life<'a>(
+                    &'a self,
+                    life_id: &'a str,
+                ) -> crate::vector_store::VectorStoreFuture<
+                    'a,
+                    Result<usize, crate::vector_store::VectorStoreError>,
+                > {
+                    self.inner.delete_by_life(life_id)
+                }
+                fn clear_space<'a>(
+                    &'a self,
+                    life_id: &'a str,
+                    space: &'a crate::vector_store::VectorSpace,
+                ) -> crate::vector_store::VectorStoreFuture<
+                    'a,
+                    Result<usize, crate::vector_store::VectorStoreError>,
+                > {
+                    self.inner.clear_space(life_id, space)
+                }
+                fn count<'a>(
+                    &'a self,
+                    life_id: &'a str,
+                    space: Option<&'a crate::vector_store::VectorSpace>,
+                ) -> crate::vector_store::VectorStoreFuture<
+                    'a,
+                    Result<usize, crate::vector_store::VectorStoreError>,
+                > {
+                    self.inner.count(life_id, space)
+                }
+                fn health_check<'a>(
+                    &'a self,
+                    life_id: &'a str,
+                ) -> crate::vector_store::VectorStoreFuture<
+                    'a,
+                    Result<(), crate::vector_store::VectorStoreError>,
+                > {
+                    self.inner.health_check(life_id)
+                }
+                fn create_generation<'a>(
+                    &'a self,
+                    context: &'a crate::vector_store::VectorGenerationContext,
+                ) -> crate::vector_store::VectorStoreFuture<
+                    'a,
+                    Result<(), crate::vector_store::VectorStoreError>,
+                > {
+                    self.inner.create_generation(context)
+                }
+                fn upsert_generation<'a>(
+                    &'a self,
+                    context: &'a crate::vector_store::VectorGenerationContext,
+                    record: crate::vector_store::GenerationVectorRecord,
+                ) -> crate::vector_store::VectorStoreFuture<
+                    'a,
+                    Result<(), crate::vector_store::VectorStoreError>,
+                > {
+                    self.upserts.fetch_add(1, AtomicOrdering::SeqCst);
+                    self.inner.upsert_generation(context, record)
+                }
+                fn delete_generation_memory<'a>(
+                    &'a self,
+                    context: &'a crate::vector_store::VectorGenerationContext,
+                    life_id: &'a str,
+                    memory_id: &'a str,
+                ) -> crate::vector_store::VectorStoreFuture<
+                    'a,
+                    Result<(), crate::vector_store::VectorStoreError>,
+                > {
+                    self.inner
+                        .delete_generation_memory(context, life_id, memory_id)
+                }
+                fn get_generation_metadata<'a>(
+                    &'a self,
+                    context: &'a crate::vector_store::VectorGenerationContext,
+                    life_id: &'a str,
+                    memory_id: &'a str,
+                ) -> crate::vector_store::VectorStoreFuture<
+                    'a,
+                    Result<
+                        Option<crate::vector_store::VectorMetadataSample>,
+                        crate::vector_store::VectorStoreError,
+                    >,
+                > {
+                    self.inner
+                        .get_generation_metadata(context, life_id, memory_id)
+                }
+            }
+
+            let provider_requests = Arc::new(AtomicUsize::new(0));
+            let lance_upserts = Arc::new(AtomicUsize::new(0));
+            let lance_deletes = Arc::new(AtomicUsize::new(0));
+            let raw_provider = crate::embedding::DeterministicEmbeddingProvider::new(gen_dim);
+            let provider = RestoredCountingProvider {
+                inner: &raw_provider,
+                requests: &provider_requests,
+            };
+            let raw_vs_worker = crate::vector_store::InMemoryVectorStore::default();
+            tauri::async_runtime::block_on(raw_vs_worker.create_generation(&ctx)).unwrap();
+            let vectors = RestoredCountingVectorStore {
+                inner: &raw_vs_worker,
+                upserts: &lance_upserts,
+                deletes: &lance_deletes,
+            };
+            let consumer = FencedVectorSyncSingleEventConsumer::new(
+                &restored,
+                &provider,
+                &vectors,
+                ctx.clone(),
+            );
+            // Drain the worker to exhaustion. Legitimate pending work may be
+            // processed; the protected rows must never be claimed or replayed.
+            restored.test_expire_fenced_runtime_lease().unwrap();
+            loop {
+                let result =
+                    tauri::async_runtime::block_on(consumer.process_one("worker-restored"))
+                        .unwrap();
+                if result == FencedVectorSyncSingleEventResult::NoEligibleEvent {
+                    break;
+                }
+            }
+            for protected in [
+                "bs-unknown",
+                "bs-att5",
+                "bs-over5",
+                "bs-invalid",
+                "bs-migrated",
+            ] {
+                let snap = restored
+                    .test_get_outbox_snapshot_detailed("life-1", protected)
+                    .unwrap();
+                assert_eq!(
+                    snap.state, "blocked",
+                    "protected row {protected} must stay blocked"
+                );
+                assert_eq!(
+                    snap.attempt_count,
+                    match protected {
+                        "bs-unknown" => 2,
+                        "bs-att5" => 5,
+                        "bs-over5" => 6,
+                        "bs-invalid" | "bs-migrated" => 1,
+                        _ => unreachable!(),
+                    },
+                    "protected row {protected} attempt untouched by the formal worker"
+                );
+            }
+        }
+    }
+
+    /// Serializes every outbox field into one line per row so a source and a
+    /// restored database can be compared field-for-field.
+    fn full_outbox_row_lines(conn: &rusqlite::Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT memory_id, desired_action, state, attempt_count, mutation_sequence,
+                        target_revision, target_content_hash, claimed_generation_id,
+                        last_send_disposition, last_error_code, next_attempt_at,
+                        lease_owner, lease_fence_epoch, lease_expires_at,
+                        migration_disposition, created_at, updated_at
+                 FROM memory_vector_sync_outbox ORDER BY memory_id",
+            )
+            .unwrap();
+        stmt.query_map([], |r| {
+            let values: Vec<String> = (0..17)
+                .map(|i| {
+                    let value: rusqlite::types::Value = r.get(i).unwrap();
+                    format!("{value:?}")
+                })
+                .collect();
+            Ok(values.join("|"))
+        })
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect()
     }
 
     /// Minimal fixed clock for health tests in the storage module.

@@ -8,10 +8,8 @@
 #![allow(dead_code)]
 
 use crate::{
-    memory::{
-        vector_sync_outbox::{MemoryVectorSyncAction, MemoryVectorSyncState},
-        vector_sync_worker::MAX_VECTOR_SYNC_ATTEMPTS,
-    },
+    memory::vector_sync_outbox::{MemoryVectorSyncAction, MemoryVectorSyncState},
+    storage::MAX_VECTOR_SYNC_ATTEMPTS,
     vector_store::{VectorMetadataSample, VectorStoreError, VectorStoreErrorCode},
 };
 
@@ -244,10 +242,10 @@ pub(crate) fn classify_compensation(
             MemoryVectorSyncAction::Delete => VectorSyncCompensationClass::LateDeleteUnproven,
         };
     }
-    if facts.attempt_count > MAX_VECTOR_SYNC_ATTEMPTS as i64 {
+    if facts.attempt_count > MAX_VECTOR_SYNC_ATTEMPTS {
         return VectorSyncCompensationClass::InvariantViolation;
     }
-    if facts.attempt_count == MAX_VECTOR_SYNC_ATTEMPTS as i64 {
+    if facts.attempt_count == MAX_VECTOR_SYNC_ATTEMPTS {
         return VectorSyncCompensationClass::AttemptsAtLimit;
     }
     if facts.attempt_count == 0 {
@@ -271,7 +269,7 @@ fn has_unknown_send_evidence(facts: &VectorSyncCompensationFacts<'_>) -> bool {
 /// True when the durable attempt identity violates schema-14 invariants.
 fn invalid_attempt_identity(facts: &VectorSyncCompensationFacts<'_>) -> bool {
     facts.attempt_count < 0
-        || facts.attempt_count > MAX_VECTOR_SYNC_ATTEMPTS as i64
+        || facts.attempt_count > MAX_VECTOR_SYNC_ATTEMPTS
         || facts.fenced_claim_epoch < 0
         || facts.last_marked_claim_epoch < 0
         || facts.last_marked_claim_epoch > facts.fenced_claim_epoch
@@ -1315,8 +1313,10 @@ mod tests {
         );
     }
 
+    /// B1: a Delete carrying Unknown Send evidence is `LateDeleteUnproven` and
+    /// can never become `EligibleForFencedDeleteReplay`, regardless of proof.
     #[test]
-    fn delete_unproven_replay_is_not_eligible() {
+    fn late_delete_unproven_never_becomes_replay_eligible() {
         use MemoryVectorSyncAction::Delete;
         use MemoryVectorSyncState::Pending;
 
@@ -1332,6 +1332,22 @@ mod tests {
         );
         assert_eq!(
             classify_compensation(&unproven),
+            VectorSyncCompensationClass::LateDeleteUnproven
+        );
+        // Even with an exact generation proof, Unknown Send evidence still
+        // cannot be turned into a replay permit.
+        let unproven_with_exact_proof = facts(
+            Delete,
+            Pending,
+            3,
+            sd_ps(),
+            None,
+            None,
+            true,
+            ExactGenerationProof::Exact,
+        );
+        assert_eq!(
+            classify_compensation(&unproven_with_exact_proof),
             VectorSyncCompensationClass::LateDeleteUnproven
         );
     }
@@ -1357,9 +1373,10 @@ mod tests {
     }
 
     /// B1: Unknown Send evidence outranks budget, terminal, proof, and
-    /// Eligible outcomes for Upsert and Delete alike.
+    /// Eligible outcomes for Upsert and Delete alike. The upsert side stays
+    /// `BlockedUnknownSend` under every stronger-looking signal.
     #[test]
-    fn unknown_send_outranks_budget_terminal_and_proof() {
+    fn blocked_unknown_send_outranks_proof_budget_and_terminal_state() {
         use MemoryVectorSyncAction::{Delete, Upsert};
         use MemoryVectorSyncState::{Blocked, Failed, Pending, Processing};
 

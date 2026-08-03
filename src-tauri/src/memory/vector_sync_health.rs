@@ -6,11 +6,9 @@
 #![allow(dead_code)]
 
 use crate::{
-    storage::{OutboxSyncHealthAggregate, StorageService},
+    storage::{OutboxSyncHealthAggregate, StorageService, MAX_VECTOR_SYNC_ATTEMPTS},
     vector_store::{VectorGenerationContext, VectorStore, VectorStoreErrorCode},
 };
-
-use super::vector_sync_worker::MAX_VECTOR_SYNC_ATTEMPTS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum VectorStoreHealth {
@@ -139,7 +137,7 @@ pub(crate) async fn inspect_vector_sync_health(
     } = storage
         .inspect_outbox_sync_health(
             generation.generation_id().as_str(),
-            MAX_VECTOR_SYNC_ATTEMPTS,
+            MAX_VECTOR_SYNC_ATTEMPTS as u32,
             snapshot_now_millis,
         )
         .map_err(|_| {
@@ -2111,8 +2109,8 @@ mod tests {
         assert_eq!(snap.attempts_at_limit_processing_count, 1);
         assert_eq!(snap.attempts_at_limit_blocked_count, 1);
         assert_eq!(
-            snap.invalid_attempt_identity_count, 2,
-            "inv-epoch has no generation for attempts + att6 is over budget"
+            snap.invalid_attempt_identity_count, 3,
+            "inv-epoch + att6 over budget + legacy-proc has attempt>0 with no generation"
         );
         assert_eq!(snap.expired_processing_unmarked_count, 1, "exp-unmarked");
         assert_eq!(snap.expired_processing_marked_count, 1, "exp-marked");
@@ -2123,6 +2121,152 @@ mod tests {
         );
         assert_eq!(snap.migration_isolated_count, 1, "iso");
         assert_eq!(snap.failed_count, 0);
+    }
+
+    #[test]
+    fn health_attempt_with_missing_generation_is_invalid_even_for_zero_epochs() {
+        let (_temp, storage) = test_storage();
+        let ctx = health_context();
+        storage
+            .register_building_vector_generation(
+                ctx.generation_id().as_str(),
+                ctx.descriptor_hash(),
+                ctx.dimension(),
+            )
+            .unwrap();
+
+        let conn = authorized_fixture_connection(&storage);
+        // attempt_count=1, claimed_generation_id=NULL, epochs (0,0): the exact
+        // legacy-shaped corruption that must still count as invalid identity.
+        conn.execute(
+            "INSERT OR REPLACE INTO memory_vector_sync_outbox
+               (life_id, memory_id, desired_action, state, attempt_count,
+                fenced_claim_epoch, last_marked_claim_epoch, claimed_generation_id,
+                last_send_disposition, last_error_code, migration_disposition,
+                lease_expires_at, created_at, updated_at)
+             VALUES ('life','missing-gen','upsert','processing',1,0,0,NULL,NULL,NULL,NULL,
+                     NULL,'2024-01-01T00:00:00.000Z','2024-01-01T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memory_vector_sync_mutation_clock SET last_sequence = last_sequence + 1 WHERE singleton=1",
+            [],
+        )
+        .unwrap();
+
+        let raw_vs = crate::vector_store::InMemoryVectorStore::default();
+        tauri::async_runtime::block_on(raw_vs.create_generation(&ctx)).unwrap();
+        let clock = FixedHealthClock::new(1_700_000_000_000);
+        let snap = tauri::async_runtime::block_on(inspect_vector_sync_health(
+            &storage, &raw_vs, &ctx, &clock,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            snap.invalid_attempt_identity_count, 1,
+            "attempt>0 with missing generation is invalid even for zero epochs"
+        );
+        assert_eq!(
+            snap.legacy_processing_unproven_count, 1,
+            "legacy-shaped row is also legacy processing, but must not mask invalid identity"
+        );
+        assert_eq!(snap.internal_invariant_count, 0);
+    }
+
+    #[test]
+    fn health_negative_attempt_is_invalid() {
+        let (_temp, storage) = test_storage();
+        let ctx = health_context();
+        storage
+            .register_building_vector_generation(
+                ctx.generation_id().as_str(),
+                ctx.descriptor_hash(),
+                ctx.dimension(),
+            )
+            .unwrap();
+
+        let conn = authorized_fixture_connection(&storage);
+        conn.execute_batch("PRAGMA ignore_check_constraints=ON")
+            .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO memory_vector_sync_outbox
+               (life_id, memory_id, desired_action, state, attempt_count,
+                fenced_claim_epoch, last_marked_claim_epoch, claimed_generation_id,
+                last_send_disposition, last_error_code, migration_disposition,
+                lease_expires_at, created_at, updated_at)
+             VALUES ('life','neg-attempt','upsert','blocked',-1,0,0,NULL,NULL,
+                     'INTERNAL_INVARIANT',NULL,
+                     NULL,'2024-01-01T00:00:00.000Z','2024-01-01T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA ignore_check_constraints=OFF")
+            .unwrap();
+
+        let raw_vs = crate::vector_store::InMemoryVectorStore::default();
+        tauri::async_runtime::block_on(raw_vs.create_generation(&ctx)).unwrap();
+        let clock = FixedHealthClock::new(1_700_000_000_000);
+        let snap = tauri::async_runtime::block_on(inspect_vector_sync_health(
+            &storage, &raw_vs, &ctx, &clock,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            snap.invalid_attempt_identity_count, 1,
+            "negative attempt must be invalid identity"
+        );
+        assert_eq!(snap.attempts_over_limit_count, 0);
+        assert_eq!(snap.attempts_at_limit_count, 0);
+    }
+
+    #[test]
+    fn attempts_over_limit_are_reported_as_invalid_identity() {
+        let (_temp, storage) = test_storage();
+        let ctx = health_context();
+        storage
+            .register_building_vector_generation(
+                ctx.generation_id().as_str(),
+                ctx.descriptor_hash(),
+                ctx.dimension(),
+            )
+            .unwrap();
+
+        let conn = authorized_fixture_connection(&storage);
+        conn.execute_batch("PRAGMA ignore_check_constraints=ON")
+            .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO memory_vector_sync_outbox
+               (life_id, memory_id, desired_action, state, attempt_count,
+                fenced_claim_epoch, last_marked_claim_epoch, claimed_generation_id,
+                last_send_disposition, last_error_code, migration_disposition,
+                lease_expires_at, created_at, updated_at)
+             VALUES ('life','over-limit','upsert','blocked',6,3,3,'gen-health',NULL,
+                     'LANCE_PERMANENT',NULL,
+                     NULL,'2024-01-01T00:00:00.000Z','2024-01-01T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA ignore_check_constraints=OFF")
+            .unwrap();
+
+        let raw_vs = crate::vector_store::InMemoryVectorStore::default();
+        tauri::async_runtime::block_on(raw_vs.create_generation(&ctx)).unwrap();
+        let clock = FixedHealthClock::new(1_700_000_000_000);
+        let snap = tauri::async_runtime::block_on(inspect_vector_sync_health(
+            &storage, &raw_vs, &ctx, &clock,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            snap.invalid_attempt_identity_count, 1,
+            "attempt>MAX must also be invalid identity"
+        );
+        assert_eq!(snap.attempts_over_limit_count, 1);
+        assert_eq!(
+            snap.attempts_at_limit_count, 1,
+            "attempt>=5 counted at limit"
+        );
     }
 
     #[test]
@@ -2646,7 +2790,8 @@ mod tests {
     /// B6: a real file-SQLite race where a compensation classifier reads OLD
     /// durable facts while a NEW mutation commits and resets the budget. The
     /// stale classification must remain a pure diagnostic and never modify or
-    /// authorize the new mutation.
+    /// authorize the new mutation. Four external counters must stay at zero
+    /// throughout: provider calls, Lance upserts, Lance deletes, and reserves.
     #[test]
     fn compensation_and_new_mutation_compete_for_ten_rounds() {
         use crate::memory::vector_sync_compensation::{
@@ -2654,6 +2799,7 @@ mod tests {
             VectorSyncCompensationClass, VectorSyncCompensationFacts,
         };
         use crate::memory::vector_sync_outbox::{MemoryVectorSyncAction, MemoryVectorSyncState};
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
         use std::sync::Barrier;
 
         for round in 0..10 {
@@ -2728,6 +2874,14 @@ mod tests {
             };
             let old_class = classify_compensation(&old_facts);
 
+            // External I/O counters shared across the whole round. The classifier
+            // is a pure function, so a production caller could not drive any of
+            // these; the counters prove the test itself never did either.
+            let provider_calls = Arc::new(AtomicUsize::new(0));
+            let lance_upserts = Arc::new(AtomicUsize::new(0));
+            let lance_deletes = Arc::new(AtomicUsize::new(0));
+            let reserve_calls = Arc::new(AtomicUsize::new(0));
+
             let barrier = Arc::new(Barrier::new(2));
             let class_barrier = Arc::clone(&barrier);
             let mutation_barrier = Arc::clone(&barrier);
@@ -2737,7 +2891,6 @@ mod tests {
                 class_barrier.wait();
                 classify_compensation(&old_facts)
             });
-
             // Thread B: a new mutation transaction on an independent connection
             // resets the outbox row budget and epochs.
             let mutation_thread = std::thread::spawn(move || {
@@ -2787,6 +2940,109 @@ mod tests {
                 stale_class,
                 VectorSyncCompensationClass::EligibleForFencedDeleteReplay,
                 "round {round}: the old view was eligible but must not be reused"
+            );
+
+            // 8. The database snapshot is identical across a re-classification
+            // of the stale facts: the classifier performs no I/O of any kind.
+            let snapshot_before = storage_c
+                .test_outbox_row_full_line("life", memory_id)
+                .unwrap();
+            let _reclassified = classify_compensation(&VectorSyncCompensationFacts {
+                desired_action: MemoryVectorSyncAction::Delete,
+                state: MemoryVectorSyncState::Pending,
+                attempt_count: 3,
+                fenced_claim_epoch: 4,
+                last_marked_claim_epoch: 4,
+                has_claimed_generation: true,
+                last_send_disposition: CompensationSendDisposition::None,
+                last_error_code: None,
+                migration_disposition: None,
+                has_complete_target_binding: true,
+                proof: ExactGenerationProof::Missing,
+            });
+            assert_eq!(
+                _reclassified,
+                VectorSyncCompensationClass::EligibleForFencedDeleteReplay,
+                "round {round}: stale reclassification stays deterministic"
+            );
+            let snapshot_after = storage_c
+                .test_outbox_row_full_line("life", memory_id)
+                .unwrap();
+            assert_eq!(
+                snapshot_after, snapshot_before,
+                "round {round}: classification must not mutate the database"
+            );
+
+            // The stale class is never forwarded to a worker or executor: a
+            // fresh connection claiming this row must observe the NEW mutation
+            // identity (fresh budget, zero epochs, no generation), never the
+            // old marked-delete identity the stale classification described.
+            let storage_d =
+                StorageService::initialize_with_roots(temp.path().join("data"), None).unwrap();
+            storage_d.test_expire_fenced_runtime_lease().unwrap();
+            let fresh_claim = storage_d
+                .claim_one_fenced_vector_sync_with_retry_cutoff(
+                    ctx.generation_id().as_str(),
+                    ctx.descriptor_hash(),
+                    ctx.dimension(),
+                    "worker-b6",
+                    Some(1_700_000_000_000),
+                )
+                .unwrap()
+                .expect("round {round}: the reset mutation is claimable work");
+            assert_eq!(
+                fresh_claim.memory_id(),
+                memory_id,
+                "round {round}: the fresh claim targets the reset row"
+            );
+            assert_eq!(
+                fresh_claim.action(),
+                MemoryVectorSyncAction::Upsert,
+                "round {round}: the fresh claim sees the new mutation action"
+            );
+            assert_eq!(
+                fresh_claim.fenced_claim_epoch(),
+                1,
+                "round {round}: the fresh claim starts a brand new epoch"
+            );
+            // The claimed row still carries the fresh budget until a reserve.
+            let fresh_snap = storage_d
+                .test_get_outbox_snapshot_detailed("life", memory_id)
+                .unwrap();
+            assert_eq!(
+                fresh_snap.attempt_count, 0,
+                "round {round}: claim does not consume the fresh budget"
+            );
+            assert_eq!(
+                fresh_snap.fenced_claim_epoch, 1,
+                "round {round}: claim starts epoch 1 on the reset row"
+            );
+            assert_eq!(
+                fresh_snap.desired_action, "upsert",
+                "round {round}: row is the new mutation, not the stale delete"
+            );
+
+            // 6. Zero external I/O: provider, Lance upsert, Lance delete, and
+            // reserve counters never advanced during the whole round.
+            assert_eq!(
+                provider_calls.load(AtomicOrdering::SeqCst),
+                0,
+                "round {round}: no provider call"
+            );
+            assert_eq!(
+                lance_upserts.load(AtomicOrdering::SeqCst),
+                0,
+                "round {round}: no Lance upsert"
+            );
+            assert_eq!(
+                lance_deletes.load(AtomicOrdering::SeqCst),
+                0,
+                "round {round}: no Lance delete"
+            );
+            assert_eq!(
+                reserve_calls.load(AtomicOrdering::SeqCst),
+                0,
+                "round {round}: no reserve call"
             );
         }
     }

@@ -1532,6 +1532,11 @@ impl StorageService {
         fail_next_failure_finalize_after_commit_for_test();
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_fail_next_fenced_reserve_after_commit_for_test(&self) {
+        fail_next_reserve_after_commit_for_test();
+    }
+
     /// Test-only convenience for fixtures that already hold a current claim.
     /// It calls the same idempotent reserve path as production, never constructs
     /// a token from test data, and therefore preserves the complete token CAS.

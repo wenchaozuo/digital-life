@@ -2111,8 +2111,8 @@ mod tests {
         assert_eq!(snap.attempts_at_limit_processing_count, 1);
         assert_eq!(snap.attempts_at_limit_blocked_count, 1);
         assert_eq!(
-            snap.invalid_attempt_identity_count, 1,
-            "inv-epoch has last_marked > fenced"
+            snap.invalid_attempt_identity_count, 2,
+            "inv-epoch has no generation for attempts + att6 is over budget"
         );
         assert_eq!(snap.expired_processing_unmarked_count, 1, "exp-unmarked");
         assert_eq!(snap.expired_processing_marked_count, 1, "exp-marked");
@@ -2290,6 +2290,185 @@ mod tests {
         );
     }
 
+    /// B3: Health must leave the complete business snapshot untouched - every
+    /// outbox column, the mutation clock, the generation item table, and the
+    /// runtime lease table, byte-for-byte before and after the health call.
+    #[test]
+    fn vector_sync_health_full_business_snapshot_is_identical() {
+        let (_temp, storage) = test_storage();
+        let ctx = health_context();
+        storage
+            .register_building_vector_generation(
+                ctx.generation_id().as_str(),
+                ctx.descriptor_hash(),
+                ctx.dimension(),
+            )
+            .unwrap();
+
+        let conn = authorized_fixture_connection(&storage);
+
+        // One legal pending row, one durable processing row, one marked
+        // unknown upsert row, and a runtime lease + generation item + clock.
+        conn.execute(
+            "INSERT OR REPLACE INTO memory_vector_sync_outbox
+               (life_id, memory_id, desired_action, state, attempt_count,
+                mutation_sequence, target_revision, target_content_hash,
+                fenced_claim_epoch, last_marked_claim_epoch, claimed_generation_id,
+                last_send_disposition, last_error_code, migration_disposition,
+                next_attempt_at, lease_owner, lease_fence_epoch, lease_expires_at,
+                created_at, updated_at)
+             VALUES ('life','full-pending','upsert','pending',0,
+                     1,1,'hash-1',
+                     0,0,NULL,
+                     NULL,NULL,NULL,
+                     NULL,NULL,NULL,NULL,
+                     '2024-01-01T00:00:00.000Z','2024-01-01T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO memory_vector_sync_outbox
+               (life_id, memory_id, desired_action, state, attempt_count,
+                mutation_sequence, target_revision, target_content_hash,
+                fenced_claim_epoch, last_marked_claim_epoch, claimed_generation_id,
+                last_send_disposition, last_error_code, migration_disposition,
+                next_attempt_at, lease_owner, lease_fence_epoch, lease_expires_at,
+                created_at, updated_at)
+             VALUES ('life','full-unknown','upsert','processing',2,
+                     2,2,'hash-2',
+                     2,2,'gen-health',
+                     'possibly_sent','PROVIDER_RESULT_UNKNOWN',NULL,
+                     NULL,'worker-a',5,'2000-01-01T00:00:00.000Z',
+                     '2024-01-01T00:00:00.000Z','2024-01-01T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO memory_vector_sync_runtime_lease
+               (lease_name, owner_id, fence_epoch, expires_at, updated_at)
+             VALUES ('memory-vector-single-event-consumer','worker-a',5,
+                     '2099-01-01T00:00:00.000Z','2024-01-01T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO memory_vector_generation_item
+               (generation_id, life_id, memory_id, memory_revision, content_hash, updated_at)
+             VALUES ('gen-health','life','full-unknown',2,'hash-2','2024-01-01T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO memory_vector_sync_mutation_clock (singleton, last_sequence)
+             VALUES (1, 42)",
+            [],
+        )
+        .unwrap();
+
+        let raw_vs = crate::vector_store::InMemoryVectorStore::default();
+        tauri::async_runtime::block_on(raw_vs.create_generation(&ctx)).unwrap();
+
+        // Full before snapshot: every outbox column, clock, generation item,
+        // and runtime lease.
+        let read_outbox_full = |conn: &rusqlite::Connection| -> Vec<String> {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id||'|'||life_id||'|'||memory_id||'|'||desired_action||'|'||state||'|'||
+                            attempt_count||'|'||mutation_sequence||'|'||
+                            COALESCE(target_revision,'-')||'|'||COALESCE(target_content_hash,'-')||'|'||
+                            fenced_claim_epoch||'|'||last_marked_claim_epoch||'|'||
+                            COALESCE(claimed_generation_id,'-')||'|'||
+                            COALESCE(last_send_disposition,'-')||'|'||
+                            COALESCE(last_error_code,'-')||'|'||
+                            COALESCE(migration_disposition,'-')||'|'||
+                            COALESCE(next_attempt_at,'-')||'|'||
+                            COALESCE(lease_owner,'-')||'|'||
+                            COALESCE(lease_fence_epoch,'-')||'|'||
+                            COALESCE(lease_expires_at,'-')||'|'||
+                            created_at||'|'||updated_at
+                     FROM memory_vector_sync_outbox ORDER BY memory_id",
+                )
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        let read_scalar = |conn: &rusqlite::Connection, sql: &str| -> String {
+            conn.query_row(sql, [], |r| r.get::<_, String>(0)).unwrap()
+        };
+        let read_count = |conn: &rusqlite::Connection, sql: &str| -> i64 {
+            conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap()
+        };
+
+        let conn_before = authorized_fixture_connection(&storage);
+        let outbox_before = read_outbox_full(&conn_before);
+        let clock_before = read_scalar(
+            &conn_before,
+            "SELECT singleton||'|'||last_sequence FROM memory_vector_sync_mutation_clock",
+        );
+        let gen_item_before = read_scalar(
+            &conn_before,
+            "SELECT generation_id||'|'||life_id||'|'||memory_id||'|'||memory_revision||'|'||content_hash||'|'||updated_at FROM memory_vector_generation_item ORDER BY memory_id",
+        );
+        let lease_before = read_scalar(
+            &conn_before,
+            "SELECT lease_name||'|'||COALESCE(owner_id,'-')||'|'||fence_epoch||'|'||COALESCE(expires_at,'-')||'|'||updated_at FROM memory_vector_sync_runtime_lease",
+        );
+        let outbox_row_count_before: i64 = read_count(
+            &conn_before,
+            "SELECT COUNT(*) FROM memory_vector_sync_outbox",
+        );
+        let gen_item_row_count_before: i64 = read_count(
+            &conn_before,
+            "SELECT COUNT(*) FROM memory_vector_generation_item",
+        );
+        drop(conn_before);
+
+        let clock = FixedHealthClock::new(1_700_000_000_000);
+        let _snap = tauri::async_runtime::block_on(inspect_vector_sync_health(
+            &storage, &raw_vs, &ctx, &clock,
+        ))
+        .unwrap();
+
+        let conn_after = authorized_fixture_connection(&storage);
+        let outbox_after = read_outbox_full(&conn_after);
+        let clock_after = read_scalar(
+            &conn_after,
+            "SELECT singleton||'|'||last_sequence FROM memory_vector_sync_mutation_clock",
+        );
+        let gen_item_after = read_scalar(
+            &conn_after,
+            "SELECT generation_id||'|'||life_id||'|'||memory_id||'|'||memory_revision||'|'||content_hash||'|'||updated_at FROM memory_vector_generation_item ORDER BY memory_id",
+        );
+        let lease_after = read_scalar(
+            &conn_after,
+            "SELECT lease_name||'|'||COALESCE(owner_id,'-')||'|'||fence_epoch||'|'||COALESCE(expires_at,'-')||'|'||updated_at FROM memory_vector_sync_runtime_lease",
+        );
+        let outbox_row_count_after: i64 = read_count(
+            &conn_after,
+            "SELECT COUNT(*) FROM memory_vector_sync_outbox",
+        );
+        let gen_item_row_count_after: i64 = read_count(
+            &conn_after,
+            "SELECT COUNT(*) FROM memory_vector_generation_item",
+        );
+        drop(conn_after);
+
+        assert_eq!(outbox_before, outbox_after, "outbox full rows unchanged");
+        assert_eq!(clock_before, clock_after, "mutation clock unchanged");
+        assert_eq!(gen_item_before, gen_item_after, "generation item unchanged");
+        assert_eq!(lease_before, lease_after, "runtime lease unchanged");
+        assert_eq!(
+            outbox_row_count_before, outbox_row_count_after,
+            "outbox row count unchanged"
+        );
+        assert_eq!(
+            gen_item_row_count_before, gen_item_row_count_after,
+            "generation item row count unchanged"
+        );
+    }
+
     /// ATT-I4: a real file SQLite health snapshot can run concurrently with a
     /// worker that claims and reserves the same outbox row, without blocking
     /// the worker or producing a mixed-state snapshot.
@@ -2379,7 +2558,28 @@ mod tests {
             let snap = health_result.unwrap();
             assert!(snap.processing_count <= 1, "round {round}");
             assert!(snap.attempts_at_limit_count <= 1, "round {round}");
-            let _ = worker_result;
+            // The worker's claim+reserve completed on connection B without
+            // being disturbed by the concurrent health read on connection A.
+            assert!(
+                worker_result.is_some(),
+                "round {round}: worker claim+reserve must succeed"
+            );
+            // Health must not have mutated the outbox row: the reserved attempt
+            // and epoch identity survive exactly as the worker left them.
+            let storage_c =
+                StorageService::initialize_with_roots(_temp.path().join("data"), None).unwrap();
+            let after = storage_c
+                .test_get_outbox_snapshot_detailed("life", &record.id)
+                .unwrap();
+            assert_eq!(after.state, "processing", "round {round}");
+            assert_eq!(after.attempt_count, 1, "round {round}");
+            assert!(after.fenced_claim_epoch >= 1, "round {round}");
+            assert!(after.last_marked_claim_epoch >= 1, "round {round}");
+            assert_eq!(
+                after.claimed_generation_id.as_deref(),
+                Some(ctx.generation_id().as_str()),
+                "round {round}"
+            );
         }
     }
 
@@ -2441,5 +2641,153 @@ mod tests {
             old_class, new_class,
             "stale classification must never be reused for the new mutation"
         );
+    }
+
+    /// B6: a real file-SQLite race where a compensation classifier reads OLD
+    /// durable facts while a NEW mutation commits and resets the budget. The
+    /// stale classification must remain a pure diagnostic and never modify or
+    /// authorize the new mutation.
+    #[test]
+    fn compensation_and_new_mutation_compete_for_ten_rounds() {
+        use crate::memory::vector_sync_compensation::{
+            classify_compensation, CompensationSendDisposition, ExactGenerationProof,
+            VectorSyncCompensationClass, VectorSyncCompensationFacts,
+        };
+        use crate::memory::vector_sync_outbox::{MemoryVectorSyncAction, MemoryVectorSyncState};
+        use std::sync::Barrier;
+
+        for round in 0..10 {
+            let (temp, storage_a) = test_storage();
+            let data_root = temp.path().join("data");
+            let ctx = health_context();
+            storage_a
+                .register_building_vector_generation(
+                    ctx.generation_id().as_str(),
+                    ctx.descriptor_hash(),
+                    ctx.dimension(),
+                )
+                .unwrap();
+            // Old mutation row: a marked delete eligible for replay.
+            let memory_id = "b6-old-mutation";
+            let conn = authorized_fixture_connection(&storage_a);
+            conn.execute(
+                "INSERT OR REPLACE INTO memory_vector_sync_outbox
+                   (life_id, memory_id, desired_action, state, attempt_count,
+                    mutation_sequence, target_revision, target_content_hash,
+                    fenced_claim_epoch, last_marked_claim_epoch, claimed_generation_id,
+                    last_send_disposition, last_error_code, created_at, updated_at)
+                 VALUES ('life',?1,'delete','pending',3,1,1,'h-old',4,4,'gen-health',NULL,NULL,
+                         '2024-01-01T00:00:00.000Z','2024-01-01T00:00:00.000Z')",
+                rusqlite::params![memory_id],
+            )
+            .unwrap();
+            conn.execute("UPDATE memory_vector_sync_mutation_clock SET last_sequence = last_sequence + 1 WHERE singleton=1", []).unwrap();
+            drop(conn);
+
+            // Read old facts exactly as a compensation caller would.
+            let old_facts = {
+                let conn = authorized_fixture_connection(&storage_a);
+                let row: (
+                    i64,
+                    i64,
+                    i64,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                ) = conn
+                    .query_row(
+                        "SELECT attempt_count, fenced_claim_epoch, last_marked_claim_epoch,
+                                claimed_generation_id, last_send_disposition, last_error_code
+                         FROM memory_vector_sync_outbox WHERE memory_id=?1",
+                        rusqlite::params![memory_id],
+                        |r| {
+                            Ok((
+                                r.get(0)?,
+                                r.get(1)?,
+                                r.get(2)?,
+                                r.get(3)?,
+                                r.get(4)?,
+                                r.get(5)?,
+                            ))
+                        },
+                    )
+                    .unwrap();
+                VectorSyncCompensationFacts {
+                    desired_action: MemoryVectorSyncAction::Delete,
+                    state: MemoryVectorSyncState::Pending,
+                    attempt_count: row.0,
+                    fenced_claim_epoch: row.1,
+                    last_marked_claim_epoch: row.2,
+                    has_claimed_generation: row.3.is_some(),
+                    last_send_disposition: CompensationSendDisposition::None,
+                    last_error_code: None,
+                    migration_disposition: None,
+                    has_complete_target_binding: true,
+                    proof: ExactGenerationProof::Missing,
+                }
+            };
+            let old_class = classify_compensation(&old_facts);
+
+            let barrier = Arc::new(Barrier::new(2));
+            let class_barrier = Arc::clone(&barrier);
+            let mutation_barrier = Arc::clone(&barrier);
+
+            // Thread A: pure classification of the OLD facts (no I/O).
+            let classify_thread = std::thread::spawn(move || {
+                class_barrier.wait();
+                classify_compensation(&old_facts)
+            });
+
+            // Thread B: a new mutation transaction on an independent connection
+            // resets the outbox row budget and epochs.
+            let mutation_thread = std::thread::spawn(move || {
+                mutation_barrier.wait();
+                let storage_b = StorageService::initialize_with_roots(data_root, None).unwrap();
+                let conn = authorized_fixture_connection(&storage_b);
+                conn.execute(
+                    "UPDATE memory_vector_sync_outbox
+                     SET desired_action='upsert', state='pending', attempt_count=0,
+                         mutation_sequence=mutation_sequence+1,
+                         target_revision=target_revision+1,
+                         fenced_claim_epoch=0, last_marked_claim_epoch=0,
+                         claimed_generation_id=NULL, last_send_disposition=NULL,
+                         last_error_code=NULL, lease_owner=NULL, lease_expires_at=NULL,
+                         lease_fence_epoch=NULL, next_attempt_at=NULL
+                     WHERE memory_id=?1",
+                    rusqlite::params![memory_id],
+                )
+                .unwrap();
+                conn.execute("UPDATE memory_vector_sync_mutation_clock SET last_sequence = last_sequence + 1 WHERE singleton=1", []).unwrap();
+                drop(conn);
+                drop(storage_b);
+            });
+
+            let stale_class = classify_thread.join().unwrap();
+            mutation_thread.join().unwrap();
+            assert_eq!(
+                stale_class, old_class,
+                "round {round}: stale classification is deterministic"
+            );
+
+            // The new mutation is the only budget authority.
+            let storage_c =
+                StorageService::initialize_with_roots(temp.path().join("data"), None).unwrap();
+            let snap = storage_c
+                .test_get_outbox_snapshot_detailed("life", memory_id)
+                .unwrap();
+            assert_eq!(snap.state, "pending", "round {round}");
+            assert_eq!(snap.attempt_count, 0, "round {round}: budget reset");
+            assert_eq!(snap.fenced_claim_epoch, 0, "round {round}");
+            assert_eq!(snap.last_marked_claim_epoch, 0, "round {round}");
+            assert_eq!(snap.claimed_generation_id, None, "round {round}");
+            assert_eq!(snap.last_send_disposition, None, "round {round}");
+            assert_eq!(snap.last_error_code, None, "round {round}");
+            assert!(snap.mutation_sequence > 1, "round {round}");
+            assert_eq!(
+                stale_class,
+                VectorSyncCompensationClass::EligibleForFencedDeleteReplay,
+                "round {round}: the old view was eligible but must not be reused"
+            );
+        }
     }
 }

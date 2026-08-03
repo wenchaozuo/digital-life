@@ -414,7 +414,7 @@ impl<'a> FencedVectorSyncSingleEventConsumer<'a> {
     }
 
     #[cfg(test)]
-    fn set_claim_observer_for_test(&self, observer: Option<TestClaimObserver<'a>>) {
+    pub(crate) fn set_claim_observer_for_test(&self, observer: Option<TestClaimObserver<'a>>) {
         *self.claim_observer_for_test.borrow_mut() = observer;
     }
 
@@ -2878,6 +2878,167 @@ mod tests {
             self.inner.sample_generation_metadata(context, limit)
         }
 
+        fn get_generation_metadata<'a>(
+            &'a self,
+            context: &'a VectorGenerationContext,
+            life_id: &'a str,
+            memory_id: &'a str,
+        ) -> VectorStoreFuture<
+            'a,
+            Result<Option<crate::vector_store::VectorMetadataSample>, VectorStoreError>,
+        > {
+            self.inner
+                .get_generation_metadata(context, life_id, memory_id)
+        }
+    }
+
+    /// Provider fake that records every embedding call into the shared
+    /// [`ExternalCallRecorder`] instead of (or in addition to) a raw counter.
+    /// The claim observer feeds the recorder's current-claim identity before
+    /// the worker calls embed, so every record is attributed to the exact
+    /// memory / mutation / claim epoch / generation being processed.
+    struct RecordingEmbeddingProvider<'a> {
+        inner: &'a dyn EmbeddingProvider,
+        recorder: &'a crate::storage::test_support::ExternalCallRecorder,
+    }
+
+    impl EmbeddingProvider for RecordingEmbeddingProvider<'_> {
+        fn model_info(&self) -> EmbeddingModelInfo {
+            self.inner.model_info()
+        }
+        fn model_name(&self) -> &str {
+            self.inner.model_name()
+        }
+        fn vector_dimension(&self) -> Option<usize> {
+            self.inner.vector_dimension()
+        }
+        fn max_batch_size(&self) -> usize {
+            self.inner.max_batch_size()
+        }
+        fn embed<'a>(
+            &'a self,
+            request: EmbeddingRequest,
+        ) -> EmbeddingFuture<'a, Result<EmbeddingBatch, EmbeddingError>> {
+            self.recorder.record_provider_embedding();
+            self.inner.embed(request)
+        }
+    }
+
+    /// Vector store fake that records every Lance upsert/delete into the shared
+    /// [`ExternalCallRecorder`], attributed to the current claim identity.
+    struct RecordingVectorStore<'a> {
+        inner: &'a dyn VectorStore,
+        recorder: &'a crate::storage::test_support::ExternalCallRecorder,
+    }
+
+    impl VectorStore for RecordingVectorStore<'_> {
+        fn upsert<'a>(
+            &'a self,
+            record: VectorRecord,
+        ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
+            self.inner.upsert(record)
+        }
+        fn upsert_batch<'a>(
+            &'a self,
+            records: Vec<VectorRecord>,
+        ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
+            self.inner.upsert_batch(records)
+        }
+        fn search<'a>(
+            &'a self,
+            query: VectorSearchQuery,
+        ) -> VectorStoreFuture<'a, Result<Vec<VectorSearchHit>, VectorStoreError>> {
+            self.inner.search(query)
+        }
+        fn delete<'a>(
+            &'a self,
+            life_id: &'a str,
+            memory_id: &'a str,
+        ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
+            self.inner.delete(life_id, memory_id)
+        }
+        fn delete_from_space<'a>(
+            &'a self,
+            life_id: &'a str,
+            memory_id: &'a str,
+            space: &'a VectorSpace,
+        ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
+            self.inner.delete_from_space(life_id, memory_id, space)
+        }
+        fn delete_by_life<'a>(
+            &'a self,
+            life_id: &'a str,
+        ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
+            self.inner.delete_by_life(life_id)
+        }
+        fn clear_space<'a>(
+            &'a self,
+            life_id: &'a str,
+            space: &'a VectorSpace,
+        ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
+            self.inner.clear_space(life_id, space)
+        }
+        fn count<'a>(
+            &'a self,
+            life_id: &'a str,
+            space: Option<&'a VectorSpace>,
+        ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
+            self.inner.count(life_id, space)
+        }
+        fn health_check<'a>(
+            &'a self,
+            life_id: &'a str,
+        ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
+            self.inner.health_check(life_id)
+        }
+        fn create_generation<'a>(
+            &'a self,
+            context: &'a VectorGenerationContext,
+        ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
+            self.inner.create_generation(context)
+        }
+        fn upsert_generation<'a>(
+            &'a self,
+            context: &'a VectorGenerationContext,
+            record: GenerationVectorRecord,
+        ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
+            self.recorder.record_lance_upsert();
+            self.inner.upsert_generation(context, record)
+        }
+        fn delete_generation_memory<'a>(
+            &'a self,
+            context: &'a VectorGenerationContext,
+            life_id: &'a str,
+            memory_id: &'a str,
+        ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
+            self.recorder.record_lance_delete();
+            self.inner
+                .delete_generation_memory(context, life_id, memory_id)
+        }
+        fn delete_generation_life<'a>(
+            &'a self,
+            context: &'a VectorGenerationContext,
+            life_id: &'a str,
+        ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
+            self.inner.delete_generation_life(context, life_id)
+        }
+        fn count_generation<'a>(
+            &'a self,
+            context: &'a VectorGenerationContext,
+            life_id: Option<&'a str>,
+        ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
+            self.inner.count_generation(context, life_id)
+        }
+        fn sample_generation_metadata<'a>(
+            &'a self,
+            context: &'a VectorGenerationContext,
+            limit: usize,
+        ) -> VectorStoreFuture<
+            'a,
+            Result<Vec<crate::vector_store::VectorMetadataSample>, VectorStoreError>,
+        > {
+            self.inner.sample_generation_metadata(context, limit)
+        }
         fn get_generation_metadata<'a>(
             &'a self,
             context: &'a VectorGenerationContext,
@@ -9035,6 +9196,67 @@ mod tests {
             let unmarked_id = unmarked_record.id.clone();
             drop(unmarked_claim);
 
+            // Capture the OLD unmarked-durable identity before any recovery or
+            // mutation: memory_id, mutation_sequence, claim epochs, generation,
+            // target binding, send/error evidence.
+            type OldUnmarkedIdentity = (
+                i64,
+                i64,
+                i64,
+                String,
+                Option<i64>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            );
+            let old_identity: OldUnmarkedIdentity = {
+                let db_path = data_root.join("digital-life.sqlite3");
+                let conn = crate::storage::open_authorized_test_connection(&db_path).unwrap();
+                let row: OldUnmarkedIdentity = conn
+                    .query_row(
+                        "SELECT attempt_count, fenced_claim_epoch, last_marked_claim_epoch,
+                                claimed_generation_id, target_revision, target_content_hash,
+                                last_send_disposition, last_error_code
+                         FROM memory_vector_sync_outbox WHERE memory_id=?1",
+                        rusqlite::params![unmarked_id],
+                        |r| {
+                            Ok((
+                                r.get(0)?,
+                                r.get(1)?,
+                                r.get(2)?,
+                                r.get(3)?,
+                                r.get(4)?,
+                                r.get(5)?,
+                                r.get(6)?,
+                                r.get(7)?,
+                            ))
+                        },
+                    )
+                    .unwrap();
+                row
+            };
+            let old_mutation_sequence: i64 = {
+                let db_path = data_root.join("digital-life.sqlite3");
+                let conn = crate::storage::open_authorized_test_connection(&db_path).unwrap();
+                conn.query_row(
+                    "SELECT mutation_sequence FROM memory_vector_sync_outbox WHERE memory_id=?1",
+                    rusqlite::params![unmarked_id],
+                    |r| r.get(0),
+                )
+                .unwrap()
+            };
+            assert_eq!(old_identity.1, 3, "round {round}: old fenced claim epoch");
+            assert_eq!(
+                old_identity.2, 1,
+                "round {round}: old last_marked claim epoch"
+            );
+            assert_eq!(old_identity.0, 2, "round {round}: old attempt count");
+            assert_eq!(
+                old_identity.3,
+                ctx.generation_id().as_str(),
+                "round {round}: old generation"
+            );
+
             // The unmarked claim re-acquired the global runtime lease. Expire
             // ONLY the runtime lease (not the unmarked row's event lease) so
             // the marked-unknown worker on connection B can acquire it while
@@ -9053,8 +9275,7 @@ mod tests {
 
             // Independent connection B for the worker.
             let storage_b = StorageService::initialize_with_roots(data_root.clone(), None).unwrap();
-            let provider_requests = Arc::new(AtomicUsize::new(0));
-            let embedding_successes = Arc::new(AtomicUsize::new(0));
+            let recorder = crate::storage::test_support::ExternalCallRecorder::default();
             let raw_vectors = crate::vector_store::InMemoryVectorStore::default();
             tauri::async_runtime::block_on(raw_vectors.create_generation(&ctx)).unwrap();
 
@@ -9073,39 +9294,57 @@ mod tests {
                 })
             };
 
-            // Real process_one on connection B.
+            // Real process_one on connection B. Every external call is recorded
+            // with the claim identity (memory_id, mutation_sequence, claim
+            // epoch, generation) the worker was processing.
             let worker = {
                 let ctx = ctx.clone();
                 let provider_owned: Box<dyn EmbeddingProvider> =
                     Box::new(crate::embedding::DeterministicEmbeddingProvider::new(3));
-                let provider_requests = Arc::clone(&provider_requests);
-                let embedding_successes = Arc::clone(&embedding_successes);
+                let recorder_for_thread = recorder.clone();
                 std::thread::spawn(move || {
                     worker_barrier.wait();
-                    let provider = CountingEmbeddingProvider {
+                    let provider = RecordingEmbeddingProvider {
                         inner: provider_owned.as_ref(),
-                        provider_requests,
-                        embedding_successes,
+                        recorder: &recorder_for_thread,
+                    };
+                    let vectors = RecordingVectorStore {
+                        inner: &raw_vectors,
+                        recorder: &recorder_for_thread,
                     };
                     let consumer = FencedVectorSyncSingleEventConsumer::new(
                         &storage_b,
                         &provider,
-                        &raw_vectors,
-                        ctx,
+                        &vectors,
+                        ctx.clone(),
                     );
-                    tauri::async_runtime::block_on(consumer.process_one("worker-b"))
+                    let recorder_for_observer = recorder_for_thread.clone();
+                    consumer.set_claim_observer_for_test(Some(Box::new(move |claim| {
+                        recorder_for_observer.set_current_claim(claim);
+                    })));
+                    let result =
+                        tauri::async_runtime::block_on(consumer.process_one("worker-b")).unwrap();
+                    consumer.set_claim_observer_for_test(None);
+                    result
                 })
             };
 
             let recovered = recovery.join().unwrap().unwrap();
-            let worker_result = worker.join().unwrap().unwrap();
+            let worker_result = worker.join().unwrap();
 
             // Marked unknown Upsert: no provider replay, blocked unknown, and
             // the attempt budget never grows beyond the single reservation.
+            // The recorder proves the marked mutation itself has 0/0/0 calls.
+            let (provider_count, upsert_count, delete_count) = recorder.counts_for(&record.id);
             assert_eq!(
-                provider_requests.load(Ordering::SeqCst),
-                0,
-                "round {round}: a marked unknown upsert must never call the provider"
+                (provider_count, upsert_count, delete_count),
+                (0, 0, 0),
+                "round {round}: marked unknown upsert must never call provider/Lance (recorded {provider_count}/{upsert_count}/{delete_count})"
+            );
+            assert_eq!(
+                worker_result,
+                FencedVectorSyncSingleEventResult::NoEligibleEvent,
+                "round {round}: marked unknown upsert is not eligible for the worker"
             );
             let verifier = StorageService::initialize_with_roots(data_root.clone(), None).unwrap();
             let snap = verifier
@@ -9136,7 +9375,7 @@ mod tests {
             );
             assert_eq!(snap.fenced_claim_epoch, 1, "round {round}");
             assert_eq!(snap.last_marked_claim_epoch, 1, "round {round}");
-            let _ = (recovered, worker_result);
+            let _ = recovered;
 
             // ---- B8 sub-scenario 2: unmarked durable expired-processing ----
             // The fixture (claimed, then shaped into fenced > marked with
@@ -9210,24 +9449,17 @@ mod tests {
             // old claim's epoch evidence is gone.
             let storage_b8 =
                 StorageService::initialize_with_roots(data_root.clone(), None).unwrap();
-            let provider_calls_b8 = Arc::new(AtomicUsize::new(0));
-            let lance_upserts_b8 = Arc::new(AtomicUsize::new(0));
-            let lance_deletes_b8 = Arc::new(AtomicUsize::new(0));
+            let recorder_b8 = crate::storage::test_support::ExternalCallRecorder::default();
             let raw_vectors_b8 = crate::vector_store::InMemoryVectorStore::default();
             tauri::async_runtime::block_on(raw_vectors_b8.create_generation(&ctx)).unwrap();
-            let vectors_b8 = CountingVectorStore {
-                inner: raw_vectors_b8,
-                lance_upserts: Arc::clone(&lance_upserts_b8),
-                lance_deletes: Arc::clone(&lance_deletes_b8),
-                current_lance_writes: Arc::new(AtomicUsize::new(0)),
-                max_concurrent_lance_writes: Arc::new(AtomicUsize::new(0)),
+            let vectors_b8 = RecordingVectorStore {
+                inner: &raw_vectors_b8,
+                recorder: &recorder_b8,
             };
             let raw_provider_b8 = crate::embedding::DeterministicEmbeddingProvider::new(3);
-            let embedding_successes_b8 = Arc::new(AtomicUsize::new(0));
-            let provider_b8 = CountingEmbeddingProvider {
+            let provider_b8 = RecordingEmbeddingProvider {
                 inner: &raw_provider_b8,
-                provider_requests: Arc::clone(&provider_calls_b8),
-                embedding_successes: Arc::clone(&embedding_successes_b8),
+                recorder: &recorder_b8,
             };
             let consumer_b8 = FencedVectorSyncSingleEventConsumer::new(
                 &storage_b8,
@@ -9235,51 +9467,139 @@ mod tests {
                 &vectors_b8,
                 ctx.clone(),
             );
+            let recorder_b8_for_observer = recorder_b8.clone();
+            consumer_b8.set_claim_observer_for_test(Some(Box::new(move |claim| {
+                recorder_b8_for_observer.set_current_claim(claim);
+            })));
             storage_b8.test_expire_fenced_runtime_lease().unwrap();
             let worker_b8_result =
                 tauri::async_runtime::block_on(consumer_b8.process_one("worker-b8")).unwrap();
+            consumer_b8.set_claim_observer_for_test(None);
 
-            // The worker either finalized the new mutation (a legitimate fresh
-            // claim) or found nothing eligible; either way the OLD expired
-            // claim produced no external I/O. Prove the old mutation itself was
-            // never replayed: the row's claim epochs belong to the new cycle.
             let b8_verifier =
                 StorageService::initialize_with_roots(data_root.clone(), None).unwrap();
-            if worker_b8_result == FencedVectorSyncSingleEventResult::CompletedUpsert {
-                assert_eq!(
-                    provider_calls_b8.load(Ordering::SeqCst),
-                    1,
-                    "round {round}: new mutation claimed exactly once"
-                );
-                assert_eq!(lance_upserts_b8.load(Ordering::SeqCst), 1, "round {round}");
-                assert_eq!(lance_deletes_b8.load(Ordering::SeqCst), 0, "round {round}");
-                assert!(
-                    b8_verifier
-                        .list("life")
-                        .unwrap()
-                        .iter()
-                        .all(|job| job.memory_id != unmarked_id),
-                    "round {round}: new mutation finalized"
-                );
-            } else {
-                assert_eq!(
-                    provider_calls_b8.load(Ordering::SeqCst),
-                    0,
-                    "round {round}: no I/O when nothing is eligible"
-                );
-                let new_snap = b8_verifier
-                    .test_get_outbox_snapshot_detailed("life", &unmarked_id)
-                    .unwrap();
-                assert_eq!(
-                    new_snap.attempt_count, 0,
-                    "round {round}: new mutation keeps full reset state"
-                );
-                assert_eq!(new_snap.fenced_claim_epoch, 0, "round {round}");
-                assert_eq!(new_snap.last_marked_claim_epoch, 0, "round {round}");
-                assert_eq!(new_snap.claimed_generation_id, None, "round {round}");
-                assert_eq!(new_snap.last_send_disposition, None, "round {round}");
-                assert_eq!(new_snap.last_error_code, None, "round {round}");
+            // Old mutation must never have any external call: its identity is
+            // the expired claim epoch 3 / old mutation_sequence / old target.
+            // The row keeps its memory_id across the new mutation, so the
+            // attribution is by mutation_sequence + claim_epoch, not memory_id.
+            let (old_p, old_u, old_d) = recorder_b8.counts_for_identity(
+                &unmarked_id,
+                old_mutation_sequence,
+                old_identity.1,
+            );
+            assert_eq!(
+                (old_p, old_u, old_d),
+                (0, 0, 0),
+                "round {round}: old mutation must never reach provider/Lance ({old_p}/{old_u}/{old_d})"
+            );
+
+            match worker_b8_result {
+                FencedVectorSyncSingleEventResult::CompletedUpsert => {
+                    // Every new call belongs to the NEW mutation identity:
+                    // new mutation_sequence, new claim_epoch, new target, and
+                    // the newly bound generation.
+                    let calls = recorder_b8.snapshot();
+                    assert_eq!(calls.len(), 2, "round {round}: one provider + one upsert");
+                    for call in &calls {
+                        assert_eq!(call.memory_id, unmarked_id, "round {round}");
+                        assert_eq!(
+                            call.mutation_sequence,
+                            old_mutation_sequence + 1,
+                            "round {round}: call uses the new mutation_sequence"
+                        );
+                        assert_eq!(
+                            call.claim_epoch, 1,
+                            "round {round}: new claim epoch (old was 3)"
+                        );
+                        assert_eq!(
+                            call.generation_id,
+                            ctx.generation_id().as_str(),
+                            "round {round}: newly bound generation"
+                        );
+                        assert_ne!(
+                            call.claim_epoch, old_identity.1,
+                            "round {round}: claim epoch differs from the old expired claim"
+                        );
+                        assert_ne!(
+                            call.mutation_sequence, old_mutation_sequence,
+                            "round {round}: mutation differs from the old mutation"
+                        );
+                    }
+                    let (new_p, new_u, new_d) =
+                        recorder_b8.counts_for_identity(&unmarked_id, old_mutation_sequence + 1, 1);
+                    assert_eq!(
+                        (new_p, new_u, new_d),
+                        (1, 1, 0),
+                        "round {round}: new mutation attribution (1 provider, 1 upsert, 0 delete)"
+                    );
+                    assert!(
+                        b8_verifier
+                            .list("life")
+                            .unwrap()
+                            .iter()
+                            .all(|job| job.memory_id != unmarked_id),
+                        "round {round}: new mutation finalized"
+                    );
+                }
+                FencedVectorSyncSingleEventResult::NoEligibleEvent => {
+                    let (new_p, new_u, new_d) =
+                        recorder_b8.counts_for_identity(&unmarked_id, old_mutation_sequence + 1, 1);
+                    assert_eq!(
+                        (new_p, new_u, new_d),
+                        (0, 0, 0),
+                        "round {round}: no external calls when nothing is eligible"
+                    );
+                    let (old_p2, old_u2, old_d2) = recorder_b8.counts_for_identity(
+                        &unmarked_id,
+                        old_mutation_sequence,
+                        old_identity.1,
+                    );
+                    assert_eq!(
+                        (old_p2, old_u2, old_d2),
+                        (0, 0, 0),
+                        "round {round}: old mutation stays call-free"
+                    );
+                    let new_snap = b8_verifier
+                        .test_get_outbox_snapshot_detailed("life", &unmarked_id)
+                        .unwrap();
+                    assert_eq!(
+                        new_snap.mutation_sequence,
+                        old_mutation_sequence + 1,
+                        "round {round}: new mutation_sequence kept"
+                    );
+                    assert_eq!(
+                        new_snap.attempt_count, 0,
+                        "round {round}: new mutation keeps full reset state"
+                    );
+                    assert_eq!(new_snap.fenced_claim_epoch, 0, "round {round}");
+                    assert_eq!(new_snap.last_marked_claim_epoch, 0, "round {round}");
+                    assert_eq!(new_snap.claimed_generation_id, None, "round {round}");
+                    assert_eq!(new_snap.last_send_disposition, None, "round {round}");
+                    assert_eq!(new_snap.last_error_code, None, "round {round}");
+                }
+                unexpected => {
+                    panic!(
+                        "round {round}: unexpected worker outcome for unmarked durable: {}",
+                        stable_worker_result_name(unexpected)
+                    );
+                }
             }
+        }
+    }
+
+    /// Stable variant name for a worker result so an unexpected-outcome panic
+    /// never depends on a Debug impl.
+    fn stable_worker_result_name(result: FencedVectorSyncSingleEventResult) -> &'static str {
+        match result {
+            FencedVectorSyncSingleEventResult::NoEligibleEvent => "NoEligibleEvent",
+            FencedVectorSyncSingleEventResult::CompletedUpsert => "CompletedUpsert",
+            FencedVectorSyncSingleEventResult::CompletedDelete => "CompletedDelete",
+            FencedVectorSyncSingleEventResult::Stale => "Stale",
+            FencedVectorSyncSingleEventResult::RetryWait => "RetryWait",
+            FencedVectorSyncSingleEventResult::Blocked => "Blocked",
+            FencedVectorSyncSingleEventResult::Failed => "Failed",
+            FencedVectorSyncSingleEventResult::LostLeaseOrSuperseded => "LostLeaseOrSuperseded",
+            FencedVectorSyncSingleEventResult::NoProgressForTest => "NoProgressForTest",
         }
     }
 }

@@ -1119,6 +1119,167 @@ pub(crate) mod test_support {
     use super::*;
     use rusqlite::params;
 
+    /// Stable identity of one external call made by a fake provider or fake
+    /// vector store while a fenced worker processed one event. This is the
+    /// test-only attribution ledger: it never reaches production logs and
+    /// never records credentials, embeddings, or provider responses.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) struct RecordedExternalCall {
+        pub operation: RecordedExternalOperation,
+        pub life_id: String,
+        pub memory_id: String,
+        pub mutation_sequence: i64,
+        pub desired_action: String,
+        pub target_revision: Option<i64>,
+        pub target_content_hash: Option<String>,
+        pub claim_epoch: i64,
+        pub generation_id: String,
+    }
+
+    /// The three external boundaries the worker can cross.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum RecordedExternalOperation {
+        ProviderEmbedding,
+        LanceUpsert,
+        LanceDelete,
+    }
+
+    /// Concurrent, reopen-safe call ledger shared between a fake provider and
+    /// a fake vector store. Each fake appends exactly one record per external
+    /// call, and the identity is taken from the claim the worker is processing
+    /// at that moment, so a later assertion can attribute every call to a
+    /// specific memory_id / mutation_sequence / claim_epoch / generation.
+    #[derive(Clone, Default)]
+    pub(crate) struct ExternalCallRecorder {
+        calls: std::sync::Arc<std::sync::Mutex<Vec<RecordedExternalCall>>>,
+        current_claim: std::sync::Arc<std::sync::Mutex<Option<RecordedExternalCall>>>,
+    }
+
+    impl ExternalCallRecorder {
+        /// Registers the claim the worker is currently processing. Called from
+        /// a test-only claim observer at claim time, before any external call.
+        pub(crate) fn set_current_claim(&self, claim: &crate::storage::FencedVectorSyncClaim) {
+            *self.current_claim.lock().unwrap() = Some(RecordedExternalCall {
+                operation: RecordedExternalOperation::ProviderEmbedding,
+                life_id: claim.life_id().to_owned(),
+                memory_id: claim.memory_id().to_owned(),
+                mutation_sequence: claim.mutation_sequence(),
+                desired_action: claim.action().as_str().to_owned(),
+                target_revision: claim.target_revision(),
+                target_content_hash: claim.target_content_hash().map(str::to_owned),
+                claim_epoch: claim.fenced_claim_epoch(),
+                generation_id: claim.generation_id().to_owned(),
+            });
+        }
+
+        /// Appends one provider-embedding call attributed to the current claim.
+        pub(crate) fn record_provider_embedding(&self) {
+            self.append(RecordedExternalOperation::ProviderEmbedding);
+        }
+
+        /// Appends one Lance upsert call attributed to the current claim.
+        pub(crate) fn record_lance_upsert(&self) {
+            self.append(RecordedExternalOperation::LanceUpsert);
+        }
+
+        /// Appends one Lance delete call attributed to the current claim.
+        pub(crate) fn record_lance_delete(&self) {
+            self.append(RecordedExternalOperation::LanceDelete);
+        }
+
+        fn append(&self, operation: RecordedExternalOperation) {
+            let identity = self
+                .current_claim
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| RecordedExternalCall {
+                    operation,
+                    life_id: String::new(),
+                    memory_id: String::new(),
+                    mutation_sequence: 0,
+                    desired_action: String::new(),
+                    target_revision: None,
+                    target_content_hash: None,
+                    claim_epoch: 0,
+                    generation_id: String::new(),
+                });
+            let mut calls = self.calls.lock().unwrap();
+            calls.push(RecordedExternalCall {
+                operation,
+                ..identity
+            });
+        }
+
+        /// All recorded calls, oldest first.
+        pub(crate) fn snapshot(&self) -> Vec<RecordedExternalCall> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        /// Number of recorded calls so far (for per-process_one slicing).
+        pub(crate) fn len(&self) -> usize {
+            self.calls.lock().unwrap().len()
+        }
+
+        /// Calls for one memory_id.
+        pub(crate) fn calls_for(&self, memory_id: &str) -> Vec<RecordedExternalCall> {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| call.memory_id == memory_id)
+                .cloned()
+                .collect()
+        }
+
+        /// (provider, lance upsert, lance delete) counts for one memory_id.
+        pub(crate) fn counts_for(&self, memory_id: &str) -> (usize, usize, usize) {
+            let mut provider = 0usize;
+            let mut upserts = 0usize;
+            let mut deletes = 0usize;
+            for call in self.calls.lock().unwrap().iter() {
+                if call.memory_id != memory_id {
+                    continue;
+                }
+                match call.operation {
+                    RecordedExternalOperation::ProviderEmbedding => provider += 1,
+                    RecordedExternalOperation::LanceUpsert => upserts += 1,
+                    RecordedExternalOperation::LanceDelete => deletes += 1,
+                }
+            }
+            (provider, upserts, deletes)
+        }
+
+        /// (provider, lance upsert, lance delete) counts for one exact claim
+        /// identity: the same memory_id, mutation_sequence, and claim_epoch.
+        /// This is what distinguishes an old expired mutation from a new
+        /// mutation that reuses the same outbox row.
+        pub(crate) fn counts_for_identity(
+            &self,
+            memory_id: &str,
+            mutation_sequence: i64,
+            claim_epoch: i64,
+        ) -> (usize, usize, usize) {
+            let mut provider = 0usize;
+            let mut upserts = 0usize;
+            let mut deletes = 0usize;
+            for call in self.calls.lock().unwrap().iter() {
+                if call.memory_id != memory_id
+                    || call.mutation_sequence != mutation_sequence
+                    || call.claim_epoch != claim_epoch
+                {
+                    continue;
+                }
+                match call.operation {
+                    RecordedExternalOperation::ProviderEmbedding => provider += 1,
+                    RecordedExternalOperation::LanceUpsert => upserts += 1,
+                    RecordedExternalOperation::LanceDelete => deletes += 1,
+                }
+            }
+            (provider, upserts, deletes)
+        }
+    }
+
     /// Minimal D-5A verification view for assertions about D-4 idempotency. It
     /// exposes counts only; no content, paths, vectors, or credentials leave the
     /// temporary test database.
@@ -2005,19 +2166,21 @@ mod tests {
         // 6.7 Formal worker no-replay on the restored database: the Unknown,
         // at-limit, invalid-identity, and migration-isolated rows must never
         // reach the provider or Lance through the real worker entry, and no
-        // token may be reconstructed from the restored rows.
+        // token may be reconstructed from the restored rows. Every external
+        // call is recorded with the claim identity (memory_id,
+        // mutation_sequence, claim_epoch, generation) the worker was holding,
+        // so the zero-call proof is per-row, not a global total.
         {
             use crate::memory::vector_sync_worker::{
                 FencedVectorSyncSingleEventConsumer, FencedVectorSyncSingleEventResult,
             };
-            use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-            use std::sync::Arc;
+            use crate::storage::test_support::ExternalCallRecorder;
 
-            struct RestoredCountingProvider<'a> {
+            struct RestoredRecordingProvider<'a> {
                 inner: &'a dyn crate::embedding::EmbeddingProvider,
-                requests: &'a AtomicUsize,
+                recorder: &'a ExternalCallRecorder,
             }
-            impl crate::embedding::EmbeddingProvider for RestoredCountingProvider<'_> {
+            impl crate::embedding::EmbeddingProvider for RestoredRecordingProvider<'_> {
                 fn model_info(&self) -> crate::embedding::EmbeddingModelInfo {
                     self.inner.model_info()
                 }
@@ -2037,17 +2200,16 @@ mod tests {
                     'a,
                     Result<crate::embedding::EmbeddingBatch, crate::embedding::EmbeddingError>,
                 > {
-                    self.requests.fetch_add(1, AtomicOrdering::SeqCst);
+                    self.recorder.record_provider_embedding();
                     self.inner.embed(request)
                 }
             }
 
-            struct RestoredCountingVectorStore<'a> {
+            struct RestoredRecordingVectorStore<'a> {
                 inner: &'a dyn crate::vector_store::VectorStore,
-                upserts: &'a AtomicUsize,
-                deletes: &'a AtomicUsize,
+                recorder: &'a ExternalCallRecorder,
             }
-            impl crate::vector_store::VectorStore for RestoredCountingVectorStore<'_> {
+            impl crate::vector_store::VectorStore for RestoredRecordingVectorStore<'_> {
                 fn upsert<'a>(
                     &'a self,
                     record: crate::vector_store::VectorRecord,
@@ -2086,7 +2248,6 @@ mod tests {
                     'a,
                     Result<usize, crate::vector_store::VectorStoreError>,
                 > {
-                    self.deletes.fetch_add(1, AtomicOrdering::SeqCst);
                     self.inner.delete(life_id, memory_id)
                 }
                 fn delete_from_space<'a>(
@@ -2155,7 +2316,7 @@ mod tests {
                     'a,
                     Result<(), crate::vector_store::VectorStoreError>,
                 > {
-                    self.upserts.fetch_add(1, AtomicOrdering::SeqCst);
+                    self.recorder.record_lance_upsert();
                     self.inner.upsert_generation(context, record)
                 }
                 fn delete_generation_memory<'a>(
@@ -2167,6 +2328,7 @@ mod tests {
                     'a,
                     Result<(), crate::vector_store::VectorStoreError>,
                 > {
+                    self.recorder.record_lance_delete();
                     self.inner
                         .delete_generation_memory(context, life_id, memory_id)
                 }
@@ -2187,20 +2349,17 @@ mod tests {
                 }
             }
 
-            let provider_requests = Arc::new(AtomicUsize::new(0));
-            let lance_upserts = Arc::new(AtomicUsize::new(0));
-            let lance_deletes = Arc::new(AtomicUsize::new(0));
+            let recorder = ExternalCallRecorder::default();
             let raw_provider = crate::embedding::DeterministicEmbeddingProvider::new(gen_dim);
-            let provider = RestoredCountingProvider {
+            let provider = RestoredRecordingProvider {
                 inner: &raw_provider,
-                requests: &provider_requests,
+                recorder: &recorder,
             };
             let raw_vs_worker = crate::vector_store::InMemoryVectorStore::default();
             tauri::async_runtime::block_on(raw_vs_worker.create_generation(&ctx)).unwrap();
-            let vectors = RestoredCountingVectorStore {
+            let vectors = RestoredRecordingVectorStore {
                 inner: &raw_vs_worker,
-                upserts: &lance_upserts,
-                deletes: &lance_deletes,
+                recorder: &recorder,
             };
             let consumer = FencedVectorSyncSingleEventConsumer::new(
                 &restored,
@@ -2208,17 +2367,60 @@ mod tests {
                 &vectors,
                 ctx.clone(),
             );
-            // Drain the worker to exhaustion. Legitimate pending work may be
-            // processed; the protected rows must never be claimed or replayed.
+            // The claim observer feeds the recorder so every external call is
+            // attributed to the exact claim (memory_id, mutation_sequence,
+            // claim_epoch, generation) the worker is processing.
+            let recorder_for_observer = recorder.clone();
+            consumer.set_claim_observer_for_test(Some(Box::new(move |claim| {
+                recorder_for_observer.set_current_claim(claim);
+            })));
+
+            // Drain the worker to exhaustion, attributing every new call slice
+            // to the memory the worker just processed. Legitimate pending work
+            // may be processed; the protected rows must never be claimed.
             restored.test_expire_fenced_runtime_lease().unwrap();
+            let mut processed: Vec<(String, String, FencedVectorSyncSingleEventResult)> =
+                Vec::new();
             loop {
+                let before = recorder.len();
                 let result =
                     tauri::async_runtime::block_on(consumer.process_one("worker-restored"))
                         .unwrap();
+                let new_calls = recorder.snapshot();
+                let new_calls = &new_calls[before..];
                 if result == FencedVectorSyncSingleEventResult::NoEligibleEvent {
+                    assert!(
+                        new_calls.is_empty(),
+                        "NoEligibleEvent must not produce external calls"
+                    );
                     break;
                 }
+                // A row that the worker legitimately refuses (Stale target,
+                // lost lease, blocked) must not produce external calls. That is
+                // itself correct no-replay evidence; it is only attributed to a
+                // memory when the worker actually crossed an external boundary.
+                if new_calls.is_empty() {
+                    continue;
+                }
+                let first = &new_calls[0];
+                assert!(
+                    new_calls
+                        .iter()
+                        .all(|call| call.memory_id == first.memory_id
+                            && call.mutation_sequence == first.mutation_sequence
+                            && call.claim_epoch == first.claim_epoch
+                            && call.generation_id == first.generation_id),
+                    "all calls in one process_one slice share the claim identity"
+                );
+                processed.push((
+                    first.memory_id.clone(),
+                    first.mutation_sequence.to_string(),
+                    result,
+                ));
             }
+            consumer.set_claim_observer_for_test(None);
+
+            // 6.7 per-row zero-call proof for the five forbidden rows.
             for protected in [
                 "bs-unknown",
                 "bs-att5",
@@ -2226,6 +2428,12 @@ mod tests {
                 "bs-invalid",
                 "bs-migrated",
             ] {
+                let (provider_count, upsert_count, delete_count) = recorder.counts_for(protected);
+                assert_eq!(
+                    (provider_count, upsert_count, delete_count),
+                    (0, 0, 0),
+                    "{protected}: {provider_count} / {upsert_count} / {delete_count} must be 0/0/0"
+                );
                 let snap = restored
                     .test_get_outbox_snapshot_detailed("life-1", protected)
                     .unwrap();
@@ -2245,6 +2453,90 @@ mod tests {
                     "protected row {protected} attempt untouched by the formal worker"
                 );
             }
+            // Invalid identity stays reported by Health and is never claimed.
+            let health_after_worker = tauri::async_runtime::block_on(
+                crate::memory::vector_sync_health::inspect_vector_sync_health(
+                    &restored, &raw_vs_r, &ctx, &clock,
+                ),
+            )
+            .unwrap();
+            assert!(
+                health_after_worker.invalid_attempt_identity_count >= 1,
+                "invalid identity remains reported"
+            );
+            // Migration-isolated row keeps its disposition.
+            assert_eq!(
+                restored
+                    .test_get_outbox_snapshot_detailed("life-1", "bs-migrated")
+                    .unwrap()
+                    .migration_disposition
+                    .as_deref(),
+                Some("legacy_upsert_rebuild_required")
+            );
+
+            // 5.1 Legitimate rows: any external calls must belong to a legal
+            // row's current mutation identity, and never to a forbidden row.
+            assert!(
+                !processed.is_empty(),
+                "the drain must process at least one legitimate row"
+            );
+            for (memory_id, mutation_sequence, result) in &processed {
+                assert!(
+                    ![
+                        "bs-unknown",
+                        "bs-att5",
+                        "bs-over5",
+                        "bs-invalid",
+                        "bs-migrated"
+                    ]
+                    .contains(&memory_id.as_str()),
+                    "a forbidden row must never be processed: {memory_id}"
+                );
+                let calls = recorder.calls_for(memory_id);
+                assert!(!calls.is_empty(), "processed row {memory_id} has records");
+                assert!(
+                    calls.iter().all(|call| {
+                        call.mutation_sequence.to_string() == *mutation_sequence
+                            && call.generation_id == gen_id
+                            && call.claim_epoch > 0
+                    }),
+                    "row {memory_id} calls carry its current mutation and a new claim epoch"
+                );
+                let (p, u, d) = recorder.counts_for(memory_id);
+                match result {
+                    FencedVectorSyncSingleEventResult::CompletedUpsert => {
+                        assert_eq!((p, u, d), (1, 1, 0), "row {memory_id} upsert attribution");
+                    }
+                    FencedVectorSyncSingleEventResult::CompletedDelete => {
+                        assert_eq!((p, u, d), (1, 0, 1), "row {memory_id} delete attribution");
+                    }
+                    other => {
+                        panic!(
+                            "unexpected processed result for row {memory_id}: {}",
+                            stable_result_name(*other)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Stable variant name for a worker result, so a failed attribution
+    /// assertion never depends on a Debug impl.
+    fn stable_result_name(
+        result: crate::memory::vector_sync_worker::FencedVectorSyncSingleEventResult,
+    ) -> &'static str {
+        use crate::memory::vector_sync_worker::FencedVectorSyncSingleEventResult;
+        match result {
+            FencedVectorSyncSingleEventResult::NoEligibleEvent => "NoEligibleEvent",
+            FencedVectorSyncSingleEventResult::CompletedUpsert => "CompletedUpsert",
+            FencedVectorSyncSingleEventResult::CompletedDelete => "CompletedDelete",
+            FencedVectorSyncSingleEventResult::Stale => "Stale",
+            FencedVectorSyncSingleEventResult::RetryWait => "RetryWait",
+            FencedVectorSyncSingleEventResult::Blocked => "Blocked",
+            FencedVectorSyncSingleEventResult::Failed => "Failed",
+            FencedVectorSyncSingleEventResult::LostLeaseOrSuperseded => "LostLeaseOrSuperseded",
+            FencedVectorSyncSingleEventResult::NoProgressForTest => "NoProgressForTest",
         }
     }
 

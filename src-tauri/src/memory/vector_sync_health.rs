@@ -453,6 +453,40 @@ mod tests {
             .unwrap()
     }
 
+    /// Asserts that no SQLite WAL or SHM residue remains in a directory tree
+    /// after every connection has been dropped. The main database file is
+    /// allowed; only the sidecar journal files are rejected.
+    fn assert_no_wal_shm_residue(root: &std::path::Path) {
+        let mut residue: Vec<String> = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(_) => continue,
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.ends_with("-wal")
+                    || name.ends_with("-shm")
+                    || name.ends_with(".sqlite3-wal")
+                    || name.ends_with(".sqlite3-shm")
+                {
+                    residue.push(path.display().to_string());
+                }
+            }
+        }
+        assert!(
+            residue.is_empty(),
+            "SQLite WAL/SHM residue after connections are dropped: {}",
+            residue.join(", ")
+        );
+    }
+
     fn setup_db_connection(storage: &StorageService) -> (tempfile::TempDir, rusqlite::Connection) {
         let temp = tempfile::tempdir().unwrap();
         let conn = authorized_fixture_connection(storage);
@@ -2893,9 +2927,11 @@ mod tests {
             });
             // Thread B: a new mutation transaction on an independent connection
             // resets the outbox row budget and epochs.
+            let data_root_for_thread = data_root.clone();
             let mutation_thread = std::thread::spawn(move || {
                 mutation_barrier.wait();
-                let storage_b = StorageService::initialize_with_roots(data_root, None).unwrap();
+                let storage_b =
+                    StorageService::initialize_with_roots(data_root_for_thread, None).unwrap();
                 let conn = authorized_fixture_connection(&storage_b);
                 conn.execute(
                     "UPDATE memory_vector_sync_outbox
@@ -3044,6 +3080,13 @@ mod tests {
                 0,
                 "round {round}: no reserve call"
             );
+
+            // Resource closure: all storage services dropped, threads joined,
+            // and no SQLite WAL/SHM residue survives.
+            drop(storage_d);
+            drop(storage_c);
+            drop(storage_a);
+            assert_no_wal_shm_residue(&data_root);
         }
     }
 }

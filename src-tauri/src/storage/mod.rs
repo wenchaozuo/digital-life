@@ -1126,14 +1126,7 @@ pub(crate) mod test_support {
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub(crate) struct RecordedExternalCall {
         pub operation: RecordedExternalOperation,
-        pub life_id: String,
-        pub memory_id: String,
-        pub mutation_sequence: i64,
-        pub desired_action: String,
-        pub target_revision: Option<i64>,
-        pub target_content_hash: Option<String>,
-        pub claim_epoch: i64,
-        pub generation_id: String,
+        pub context: RecordedClaimContext,
     }
 
     /// The three external boundaries the worker can cross.
@@ -1144,23 +1137,196 @@ pub(crate) mod test_support {
         LanceDelete,
     }
 
-    /// Concurrent, reopen-safe call ledger shared between a fake provider and
-    /// a fake vector store. Each fake appends exactly one record per external
-    /// call, and the identity is taken from the claim the worker is processing
-    /// at that moment, so a later assertion can attribute every call to a
-    /// specific memory_id / mutation_sequence / claim_epoch / generation.
-    #[derive(Clone, Default)]
-    pub(crate) struct ExternalCallRecorder {
-        calls: std::sync::Arc<std::sync::Mutex<Vec<RecordedExternalCall>>>,
-        current_claim: std::sync::Arc<std::sync::Mutex<Option<RecordedExternalCall>>>,
+    /// The durable claim identity one worker was processing when an external
+    /// call was made. `worker_instance_id` separates concurrent workers that
+    /// share the same append-only log, so one worker's identity can never be
+    /// overwritten by another worker.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) struct RecordedClaimContext {
+        pub worker_instance_id: u64,
+        pub life_id: String,
+        pub memory_id: String,
+        pub mutation_sequence: i64,
+        pub desired_action: String,
+        pub target_revision: Option<i64>,
+        pub target_content_hash: Option<String>,
+        pub claim_epoch: i64,
+        pub generation_id: String,
     }
 
-    impl ExternalCallRecorder {
-        /// Registers the claim the worker is currently processing. Called from
-        /// a test-only claim observer at claim time, before any external call.
+    /// Append-only, reopen-safe call ledger shared by every worker of one test
+    /// scenario. It stores only the recorded calls and the count of calls that
+    /// arrived without a bound claim context (which must always be zero).
+    #[derive(Clone, Default)]
+    pub(crate) struct ExternalCallLog {
+        calls: std::sync::Arc<std::sync::Mutex<Vec<RecordedExternalCall>>>,
+        unbound_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        next_worker_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl ExternalCallLog {
+        /// All recorded calls, oldest first.
+        pub(crate) fn snapshot(&self) -> Vec<RecordedExternalCall> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        /// Number of recorded calls so far (for per-process_one slicing).
+        pub(crate) fn len(&self) -> usize {
+            self.calls.lock().unwrap().len()
+        }
+
+        /// Calls whose claim context matches one memory_id.
+        pub(crate) fn calls_for_memory(&self, memory_id: &str) -> Vec<RecordedExternalCall> {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| call.context.memory_id == memory_id)
+                .cloned()
+                .collect()
+        }
+
+        /// Calls whose claim context matches one memory_id + mutation_sequence.
+        pub(crate) fn calls_for_mutation(
+            &self,
+            memory_id: &str,
+            mutation_sequence: i64,
+        ) -> Vec<RecordedExternalCall> {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| {
+                    call.context.memory_id == memory_id
+                        && call.context.mutation_sequence == mutation_sequence
+                })
+                .cloned()
+                .collect()
+        }
+
+        /// Calls whose claim context matches memory_id + mutation_sequence +
+        /// claim_epoch (one exact claim).
+        pub(crate) fn calls_for_claim(
+            &self,
+            memory_id: &str,
+            mutation_sequence: i64,
+            claim_epoch: i64,
+        ) -> Vec<RecordedExternalCall> {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| {
+                    call.context.memory_id == memory_id
+                        && call.context.mutation_sequence == mutation_sequence
+                        && call.context.claim_epoch == claim_epoch
+                })
+                .cloned()
+                .collect()
+        }
+
+        /// (ProviderEmbedding, LanceUpsert, LanceDelete) counts for one
+        /// memory_id + mutation_sequence.
+        pub(crate) fn counts_for_mutation(
+            &self,
+            memory_id: &str,
+            mutation_sequence: i64,
+        ) -> (usize, usize, usize) {
+            self.counts(self.calls_for_mutation(memory_id, mutation_sequence).iter())
+        }
+
+        /// (ProviderEmbedding, LanceUpsert, LanceDelete) counts for one exact
+        /// claim (memory_id + mutation_sequence + claim_epoch).
+        pub(crate) fn counts_for_claim(
+            &self,
+            memory_id: &str,
+            mutation_sequence: i64,
+            claim_epoch: i64,
+        ) -> (usize, usize, usize) {
+            self.counts(
+                self.calls_for_claim(memory_id, mutation_sequence, claim_epoch)
+                    .iter(),
+            )
+        }
+
+        /// External calls observed without a bound claim context. Must be zero
+        /// at the end of every B5/B8 scenario and the 300-scenario gate.
+        pub(crate) fn unbound_call_count(&self) -> usize {
+            self.unbound_calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn counts<'a>(
+            &self,
+            calls: impl Iterator<Item = &'a RecordedExternalCall>,
+        ) -> (usize, usize, usize) {
+            let mut provider = 0usize;
+            let mut upserts = 0usize;
+            let mut deletes = 0usize;
+            for call in calls {
+                match call.operation {
+                    RecordedExternalOperation::ProviderEmbedding => provider += 1,
+                    RecordedExternalOperation::LanceUpsert => upserts += 1,
+                    RecordedExternalOperation::LanceDelete => deletes += 1,
+                }
+            }
+            (provider, upserts, deletes)
+        }
+
+        fn record(&self, operation: RecordedExternalOperation, context: RecordedClaimContext) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(RecordedExternalCall { operation, context });
+        }
+
+        fn mark_unbound(&self) {
+            self.unbound_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn allocate_worker_id(&self) -> u64 {
+            self.next_worker_id
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// Per-worker attribution context. Every real test worker owns its own
+    /// `current` slot, so two workers sharing one [`ExternalCallLog`] can never
+    /// overwrite each other's identity. The log itself is the only shared
+    /// state. Async may migrate a future across threads, so attribution never
+    /// relies on thread ids.
+    #[derive(Clone)]
+    pub(crate) struct WorkerCallContext {
+        log: ExternalCallLog,
+        current: std::sync::Arc<std::sync::Mutex<Option<RecordedClaimContext>>>,
+        worker_instance_id: u64,
+    }
+
+    impl WorkerCallContext {
+        /// Creates a per-worker context bound to a shared log.
+        pub(crate) fn new(log: ExternalCallLog) -> Self {
+            let worker_instance_id = log.allocate_worker_id();
+            Self {
+                log,
+                current: std::sync::Arc::new(std::sync::Mutex::new(None)),
+                worker_instance_id,
+            }
+        }
+
+        pub(crate) fn worker_instance_id(&self) -> u64 {
+            self.worker_instance_id
+        }
+
+        /// True when no claim identity is currently bound.
+        pub(crate) fn is_empty(&self) -> bool {
+            self.current.lock().unwrap().is_none()
+        }
+
+        /// Registers the claim this worker is processing. Called from the
+        /// test-only claim observer before any external call.
         pub(crate) fn set_current_claim(&self, claim: &crate::storage::FencedVectorSyncClaim) {
-            *self.current_claim.lock().unwrap() = Some(RecordedExternalCall {
-                operation: RecordedExternalOperation::ProviderEmbedding,
+            *self.current.lock().unwrap() = Some(RecordedClaimContext {
+                worker_instance_id: self.worker_instance_id,
                 life_id: claim.life_id().to_owned(),
                 memory_id: claim.memory_id().to_owned(),
                 mutation_sequence: claim.mutation_sequence(),
@@ -1172,111 +1338,60 @@ pub(crate) mod test_support {
             });
         }
 
-        /// Appends one provider-embedding call attributed to the current claim.
+        /// Clears the bound identity. Called by the RAII scope on every exit
+        /// path (normal return, error, and panic unwind).
+        pub(crate) fn clear_current(&self) {
+            *self.current.lock().unwrap() = None;
+        }
+
+        /// Appends one provider-embedding call attributed to this worker's
+        /// bound claim. Without a bound claim this records an unbound call and
+        /// fails the test immediately.
         pub(crate) fn record_provider_embedding(&self) {
-            self.append(RecordedExternalOperation::ProviderEmbedding);
+            self.record(RecordedExternalOperation::ProviderEmbedding);
         }
 
-        /// Appends one Lance upsert call attributed to the current claim.
+        /// Appends one Lance upsert call attributed to this worker's claim.
         pub(crate) fn record_lance_upsert(&self) {
-            self.append(RecordedExternalOperation::LanceUpsert);
+            self.record(RecordedExternalOperation::LanceUpsert);
         }
 
-        /// Appends one Lance delete call attributed to the current claim.
+        /// Appends one Lance delete call attributed to this worker's claim.
         pub(crate) fn record_lance_delete(&self) {
-            self.append(RecordedExternalOperation::LanceDelete);
+            self.record(RecordedExternalOperation::LanceDelete);
         }
 
-        fn append(&self, operation: RecordedExternalOperation) {
-            let identity = self
-                .current_claim
-                .lock()
-                .unwrap()
-                .clone()
-                .unwrap_or_else(|| RecordedExternalCall {
-                    operation,
-                    life_id: String::new(),
-                    memory_id: String::new(),
-                    mutation_sequence: 0,
-                    desired_action: String::new(),
-                    target_revision: None,
-                    target_content_hash: None,
-                    claim_epoch: 0,
-                    generation_id: String::new(),
-                });
-            let mut calls = self.calls.lock().unwrap();
-            calls.push(RecordedExternalCall {
-                operation,
-                ..identity
-            });
+        fn record(&self, operation: RecordedExternalOperation) {
+            let Some(context) = self.current.lock().unwrap().clone() else {
+                self.log.mark_unbound();
+                panic!("test recorder observed external call without bound claim context");
+            };
+            self.log.record(operation, context);
         }
+    }
 
-        /// All recorded calls, oldest first.
-        pub(crate) fn snapshot(&self) -> Vec<RecordedExternalCall> {
-            self.calls.lock().unwrap().clone()
+    /// RAII scope around one formal `process_one` invocation. It asserts the
+    /// worker context is empty on entry and guarantees it is empty again on
+    /// every exit path: normal return, error return, guard failure, and panic
+    /// unwind (via `Drop`).
+    pub(crate) struct WorkerCallContextScope {
+        context: WorkerCallContext,
+    }
+
+    impl WorkerCallContextScope {
+        pub(crate) fn new(context: WorkerCallContext) -> Self {
+            assert!(
+                context.is_empty(),
+                "worker context must be empty before process_one (worker {})",
+                context.worker_instance_id()
+            );
+            Self { context }
         }
+    }
 
-        /// Number of recorded calls so far (for per-process_one slicing).
-        pub(crate) fn len(&self) -> usize {
-            self.calls.lock().unwrap().len()
-        }
-
-        /// Calls for one memory_id.
-        pub(crate) fn calls_for(&self, memory_id: &str) -> Vec<RecordedExternalCall> {
-            self.calls
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|call| call.memory_id == memory_id)
-                .cloned()
-                .collect()
-        }
-
-        /// (provider, lance upsert, lance delete) counts for one memory_id.
-        pub(crate) fn counts_for(&self, memory_id: &str) -> (usize, usize, usize) {
-            let mut provider = 0usize;
-            let mut upserts = 0usize;
-            let mut deletes = 0usize;
-            for call in self.calls.lock().unwrap().iter() {
-                if call.memory_id != memory_id {
-                    continue;
-                }
-                match call.operation {
-                    RecordedExternalOperation::ProviderEmbedding => provider += 1,
-                    RecordedExternalOperation::LanceUpsert => upserts += 1,
-                    RecordedExternalOperation::LanceDelete => deletes += 1,
-                }
-            }
-            (provider, upserts, deletes)
-        }
-
-        /// (provider, lance upsert, lance delete) counts for one exact claim
-        /// identity: the same memory_id, mutation_sequence, and claim_epoch.
-        /// This is what distinguishes an old expired mutation from a new
-        /// mutation that reuses the same outbox row.
-        pub(crate) fn counts_for_identity(
-            &self,
-            memory_id: &str,
-            mutation_sequence: i64,
-            claim_epoch: i64,
-        ) -> (usize, usize, usize) {
-            let mut provider = 0usize;
-            let mut upserts = 0usize;
-            let mut deletes = 0usize;
-            for call in self.calls.lock().unwrap().iter() {
-                if call.memory_id != memory_id
-                    || call.mutation_sequence != mutation_sequence
-                    || call.claim_epoch != claim_epoch
-                {
-                    continue;
-                }
-                match call.operation {
-                    RecordedExternalOperation::ProviderEmbedding => provider += 1,
-                    RecordedExternalOperation::LanceUpsert => upserts += 1,
-                    RecordedExternalOperation::LanceDelete => deletes += 1,
-                }
-            }
-            (provider, upserts, deletes)
+    impl Drop for WorkerCallContextScope {
+        fn drop(&mut self) {
+            self.context.clear_current();
         }
     }
 
@@ -1825,7 +1940,7 @@ mod tests {
                     mutation_sequence, target_revision, target_content_hash,
                     fenced_claim_epoch, last_marked_claim_epoch, claimed_generation_id,
                     last_send_disposition, last_error_code)
-                 VALUES ('life-1','bs-del-marked','delete','pending',3,6,0,NULL,4,4,'gen-backup-restore',NULL,'LANCE_TRANSIENT');
+                 VALUES ('life-1','bs-del-marked','delete','pending',3,6,NULL,NULL,4,4,'gen-backup-restore',NULL,'LANCE_TRANSIENT');
                  -- unmarked durable expired processing: state=processing, expired lease,
                  -- fenced > marked, attempt 1..4, generation present (8th required class)
                  INSERT INTO memory_vector_sync_outbox
@@ -2174,11 +2289,11 @@ mod tests {
             use crate::memory::vector_sync_worker::{
                 FencedVectorSyncSingleEventConsumer, FencedVectorSyncSingleEventResult,
             };
-            use crate::storage::test_support::ExternalCallRecorder;
+            use crate::storage::test_support::WorkerCallContext;
 
             struct RestoredRecordingProvider<'a> {
                 inner: &'a dyn crate::embedding::EmbeddingProvider,
-                recorder: &'a ExternalCallRecorder,
+                context: &'a WorkerCallContext,
             }
             impl crate::embedding::EmbeddingProvider for RestoredRecordingProvider<'_> {
                 fn model_info(&self) -> crate::embedding::EmbeddingModelInfo {
@@ -2200,14 +2315,14 @@ mod tests {
                     'a,
                     Result<crate::embedding::EmbeddingBatch, crate::embedding::EmbeddingError>,
                 > {
-                    self.recorder.record_provider_embedding();
+                    self.context.record_provider_embedding();
                     self.inner.embed(request)
                 }
             }
 
             struct RestoredRecordingVectorStore<'a> {
                 inner: &'a dyn crate::vector_store::VectorStore,
-                recorder: &'a ExternalCallRecorder,
+                context: &'a WorkerCallContext,
             }
             impl crate::vector_store::VectorStore for RestoredRecordingVectorStore<'_> {
                 fn upsert<'a>(
@@ -2316,7 +2431,7 @@ mod tests {
                     'a,
                     Result<(), crate::vector_store::VectorStoreError>,
                 > {
-                    self.recorder.record_lance_upsert();
+                    self.context.record_lance_upsert();
                     self.inner.upsert_generation(context, record)
                 }
                 fn delete_generation_memory<'a>(
@@ -2328,7 +2443,7 @@ mod tests {
                     'a,
                     Result<(), crate::vector_store::VectorStoreError>,
                 > {
-                    self.recorder.record_lance_delete();
+                    self.context.record_lance_delete();
                     self.inner
                         .delete_generation_memory(context, life_id, memory_id)
                 }
@@ -2349,17 +2464,79 @@ mod tests {
                 }
             }
 
-            let recorder = ExternalCallRecorder::default();
+            // Capture the full identity of every forbidden row BEFORE the
+            // formal worker runs: memory_id, mutation_sequence, desired_action,
+            // target revision/hash, attempt, epochs, generation, state, error,
+            // migration disposition. Zero-call proofs below are keyed on the
+            // captured mutation_sequence so a never-granted claim cannot fake
+            // a zero through a nonexistent claim epoch.
+            type ForbiddenRowIdentity = (
+                String,
+                i64,
+                String,
+                Option<i64>,
+                Option<String>,
+                i64,
+                i64,
+                i64,
+                Option<String>,
+                String,
+                Option<String>,
+                Option<String>,
+            );
+            let mut forbidden_identities: Vec<(String, ForbiddenRowIdentity)> = Vec::new();
+            for protected in [
+                "bs-unknown",
+                "bs-att5",
+                "bs-over5",
+                "bs-invalid",
+                "bs-migrated",
+            ] {
+                let identity: ForbiddenRowIdentity = restored
+                    .state()
+                    .unwrap()
+                    .connection
+                    .query_row(
+                        "SELECT memory_id, mutation_sequence, desired_action,
+                                target_revision, target_content_hash, attempt_count,
+                                fenced_claim_epoch, last_marked_claim_epoch,
+                                claimed_generation_id, state, last_error_code,
+                                migration_disposition
+                         FROM memory_vector_sync_outbox WHERE life_id='life-1' AND memory_id=?1",
+                        rusqlite::params![protected],
+                        |r| {
+                            Ok((
+                                r.get(0)?,
+                                r.get(1)?,
+                                r.get(2)?,
+                                r.get(3)?,
+                                r.get(4)?,
+                                r.get(5)?,
+                                r.get(6)?,
+                                r.get(7)?,
+                                r.get(8)?,
+                                r.get(9)?,
+                                r.get(10)?,
+                                r.get(11)?,
+                            ))
+                        },
+                    )
+                    .unwrap();
+                forbidden_identities.push((protected.to_owned(), identity));
+            }
+
+            let log = crate::storage::test_support::ExternalCallLog::default();
+            let worker_context = crate::storage::test_support::WorkerCallContext::new(log.clone());
             let raw_provider = crate::embedding::DeterministicEmbeddingProvider::new(gen_dim);
             let provider = RestoredRecordingProvider {
                 inner: &raw_provider,
-                recorder: &recorder,
+                context: &worker_context,
             };
             let raw_vs_worker = crate::vector_store::InMemoryVectorStore::default();
             tauri::async_runtime::block_on(raw_vs_worker.create_generation(&ctx)).unwrap();
             let vectors = RestoredRecordingVectorStore {
                 inner: &raw_vs_worker,
-                recorder: &recorder,
+                context: &worker_context,
             };
             let consumer = FencedVectorSyncSingleEventConsumer::new(
                 &restored,
@@ -2367,26 +2544,37 @@ mod tests {
                 &vectors,
                 ctx.clone(),
             );
-            // The claim observer feeds the recorder so every external call is
-            // attributed to the exact claim (memory_id, mutation_sequence,
-            // claim_epoch, generation) the worker is processing.
-            let recorder_for_observer = recorder.clone();
+            // The claim observer feeds THIS worker's context so every external
+            // call is attributed to the exact worker / memory / mutation /
+            // claim epoch / generation being processed. A call without a bound
+            // claim fails the test.
+            let worker_context_for_observer = worker_context.clone();
             consumer.set_claim_observer_for_test(Some(Box::new(move |claim| {
-                recorder_for_observer.set_current_claim(claim);
+                worker_context_for_observer.set_current_claim(claim);
             })));
 
             // Drain the worker to exhaustion, attributing every new call slice
-            // to the memory the worker just processed. Legitimate pending work
-            // may be processed; the protected rows must never be claimed.
+            // to the memory the worker just processed. Each process_one runs
+            // inside a RAII scope that clears the worker context on every exit
+            // path. Legitimate pending work may be processed; the protected
+            // rows must never be claimed.
             restored.test_expire_fenced_runtime_lease().unwrap();
-            let mut processed: Vec<(String, String, FencedVectorSyncSingleEventResult)> =
+            let mut processed: Vec<(String, i64, i64, FencedVectorSyncSingleEventResult)> =
                 Vec::new();
             loop {
-                let before = recorder.len();
+                let before = log.len();
+                let scope = crate::storage::test_support::WorkerCallContextScope::new(
+                    worker_context.clone(),
+                );
                 let result =
                     tauri::async_runtime::block_on(consumer.process_one("worker-restored"))
                         .unwrap();
-                let new_calls = recorder.snapshot();
+                drop(scope);
+                assert!(
+                    worker_context.is_empty(),
+                    "worker context must be empty after process_one"
+                );
+                let new_calls = log.snapshot();
                 let new_calls = &new_calls[before..];
                 if result == FencedVectorSyncSingleEventResult::NoEligibleEvent {
                     assert!(
@@ -2404,35 +2592,42 @@ mod tests {
                 }
                 let first = &new_calls[0];
                 assert!(
-                    new_calls
-                        .iter()
-                        .all(|call| call.memory_id == first.memory_id
-                            && call.mutation_sequence == first.mutation_sequence
-                            && call.claim_epoch == first.claim_epoch
-                            && call.generation_id == first.generation_id),
+                    new_calls.iter().all(|call| {
+                        call.context.worker_instance_id == worker_context.worker_instance_id()
+                            && call.context.memory_id == first.context.memory_id
+                            && call.context.mutation_sequence == first.context.mutation_sequence
+                            && call.context.claim_epoch == first.context.claim_epoch
+                            && call.context.target_revision == first.context.target_revision
+                            && call.context.target_content_hash == first.context.target_content_hash
+                            && call.context.generation_id == first.context.generation_id
+                    }),
                     "all calls in one process_one slice share the claim identity"
                 );
                 processed.push((
-                    first.memory_id.clone(),
-                    first.mutation_sequence.to_string(),
+                    first.context.memory_id.clone(),
+                    first.context.mutation_sequence,
+                    first.context.claim_epoch,
                     result,
                 ));
             }
             consumer.set_claim_observer_for_test(None);
 
-            // 6.7 per-row zero-call proof for the five forbidden rows.
-            for protected in [
-                "bs-unknown",
-                "bs-att5",
-                "bs-over5",
-                "bs-invalid",
-                "bs-migrated",
-            ] {
-                let (provider_count, upsert_count, delete_count) = recorder.counts_for(protected);
+            assert_eq!(
+                log.unbound_call_count(),
+                0,
+                "no external call may arrive without a bound claim context"
+            );
+
+            // 6.7 per-row zero-call proof for the five forbidden rows, keyed on
+            // each row's captured mutation identity.
+            for (protected, identity) in &forbidden_identities {
+                let (provider_count, upsert_count, delete_count) =
+                    log.counts_for_mutation(protected, identity.1);
                 assert_eq!(
                     (provider_count, upsert_count, delete_count),
                     (0, 0, 0),
-                    "{protected}: {provider_count} / {upsert_count} / {delete_count} must be 0/0/0"
+                    "{protected}: {provider_count} / {upsert_count} / {delete_count} must be 0/0/0 for mutation {}",
+                    identity.1
                 );
                 let snap = restored
                     .test_get_outbox_snapshot_detailed("life-1", protected)
@@ -2443,7 +2638,7 @@ mod tests {
                 );
                 assert_eq!(
                     snap.attempt_count,
-                    match protected {
+                    match protected.as_str() {
                         "bs-unknown" => 2,
                         "bs-att5" => 5,
                         "bs-over5" => 6,
@@ -2451,6 +2646,10 @@ mod tests {
                         _ => unreachable!(),
                     },
                     "protected row {protected} attempt untouched by the formal worker"
+                );
+                assert_eq!(
+                    snap.mutation_sequence, identity.1,
+                    "protected row {protected} mutation_sequence unchanged"
                 );
             }
             // Invalid identity stays reported by Health and is never claimed.
@@ -2474,13 +2673,15 @@ mod tests {
                 Some("legacy_upsert_rebuild_required")
             );
 
-            // 5.1 Legitimate rows: any external calls must belong to a legal
-            // row's current mutation identity, and never to a forbidden row.
+            // 5.1 Legitimate rows: every processed event is attributed by its
+            // exact claim (mutation_sequence + claim_epoch), and never to a
+            // forbidden row. An upsert completes with 1/1/0 and a delete with
+            // 0/0/1 (a delete never calls the provider).
             assert!(
                 !processed.is_empty(),
                 "the drain must process at least one legitimate row"
             );
-            for (memory_id, mutation_sequence, result) in &processed {
+            for (memory_id, mutation_sequence, claim_epoch, result) in &processed {
                 assert!(
                     ![
                         "bs-unknown",
@@ -2492,23 +2693,30 @@ mod tests {
                     .contains(&memory_id.as_str()),
                     "a forbidden row must never be processed: {memory_id}"
                 );
-                let calls = recorder.calls_for(memory_id);
-                assert!(!calls.is_empty(), "processed row {memory_id} has records");
+                let calls = log.calls_for_claim(memory_id, *mutation_sequence, *claim_epoch);
+                assert!(
+                    !calls.is_empty(),
+                    "processed row {memory_id} has records for its claim"
+                );
                 assert!(
                     calls.iter().all(|call| {
-                        call.mutation_sequence.to_string() == *mutation_sequence
-                            && call.generation_id == gen_id
-                            && call.claim_epoch > 0
+                        call.context.worker_instance_id == worker_context.worker_instance_id()
+                            && call.context.generation_id == gen_id
+                            && call.context.claim_epoch == *claim_epoch
                     }),
                     "row {memory_id} calls carry its current mutation and a new claim epoch"
                 );
-                let (p, u, d) = recorder.counts_for(memory_id);
+                let (p, u, d) = log.counts_for_claim(memory_id, *mutation_sequence, *claim_epoch);
                 match result {
                     FencedVectorSyncSingleEventResult::CompletedUpsert => {
                         assert_eq!((p, u, d), (1, 1, 0), "row {memory_id} upsert attribution");
                     }
                     FencedVectorSyncSingleEventResult::CompletedDelete => {
-                        assert_eq!((p, u, d), (1, 0, 1), "row {memory_id} delete attribution");
+                        assert_eq!(
+                            (p, u, d),
+                            (0, 0, 1),
+                            "row {memory_id} delete attribution (provider must be 0)"
+                        );
                     }
                     other => {
                         panic!(

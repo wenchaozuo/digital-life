@@ -9307,40 +9307,77 @@ mod tests {
                 .unwrap();
             assert_eq!(snapshot.attempt_count, 1);
             assert_eq!(snapshot.last_marked_claim_epoch, 1);
-            // Capture the OLD marked-unknown identity before the race:
-            // memory_id, mutation_sequence, claim epoch, generation, target,
-            // attempt count. The zero-call proof below is keyed on this exact
-            // claim identity.
-            let marked_old_mutation_sequence: i64 = {
+            // Capture the complete OLD marked-unknown identity before the race:
+            // life, memory, mutation, action, target, claim epoch,
+            // last_marked, attempt, generation, send, error. The zero-call
+            // proof below is keyed on this exact claim identity, and the
+            // post-race row must match it field-for-field.
+            type MarkedOldIdentity = (
+                String,
+                String,
+                i64,
+                String,
+                Option<i64>,
+                Option<String>,
+                i64,
+                i64,
+                i64,
+                String,
+                Option<String>,
+                Option<String>,
+            );
+            let marked_old: MarkedOldIdentity = {
                 let db_path = data_root.join("digital-life.sqlite3");
                 let conn = crate::storage::open_authorized_test_connection(&db_path).unwrap();
-                conn.query_row(
-                    "SELECT mutation_sequence FROM memory_vector_sync_outbox WHERE memory_id=?1",
-                    rusqlite::params![record.id],
-                    |r| r.get(0),
-                )
-                .unwrap()
+                let row: MarkedOldIdentity = conn
+                    .query_row(
+                        "SELECT life_id, memory_id, mutation_sequence, desired_action,
+                                target_revision, target_content_hash,
+                                fenced_claim_epoch, last_marked_claim_epoch,
+                                attempt_count, claimed_generation_id,
+                                last_send_disposition, last_error_code
+                         FROM memory_vector_sync_outbox WHERE memory_id=?1",
+                        rusqlite::params![record.id],
+                        |r| {
+                            Ok((
+                                r.get(0)?,
+                                r.get(1)?,
+                                r.get(2)?,
+                                r.get(3)?,
+                                r.get(4)?,
+                                r.get(5)?,
+                                r.get(6)?,
+                                r.get(7)?,
+                                r.get(8)?,
+                                r.get(9)?,
+                                r.get(10)?,
+                                r.get(11)?,
+                            ))
+                        },
+                    )
+                    .unwrap();
+                row
             };
-            let marked_old_claim_epoch: i64 = {
-                let db_path = data_root.join("digital-life.sqlite3");
-                let conn = crate::storage::open_authorized_test_connection(&db_path).unwrap();
-                conn.query_row(
-                    "SELECT fenced_claim_epoch FROM memory_vector_sync_outbox WHERE memory_id=?1",
-                    rusqlite::params![record.id],
-                    |r| r.get(0),
-                )
-                .unwrap()
-            };
-            let marked_old_target: (Option<i64>, Option<String>) = {
-                let db_path = data_root.join("digital-life.sqlite3");
-                let conn = crate::storage::open_authorized_test_connection(&db_path).unwrap();
-                conn.query_row(
-                    "SELECT target_revision, target_content_hash FROM memory_vector_sync_outbox WHERE memory_id=?1",
-                    rusqlite::params![record.id],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .unwrap()
-            };
+            let marked_old_mutation_sequence = marked_old.2;
+            let marked_old_claim_epoch = marked_old.6;
+            // Pre-race contract: upsert, marked (claim==last_marked>0),
+            // attempt>0, generation present, unknown evidence present.
+            assert_eq!(marked_old.3, "upsert", "round {round}: marked old action");
+            assert_eq!(
+                marked_old.6, marked_old.7,
+                "round {round}: marked old claim epoch == last_marked"
+            );
+            assert!(marked_old.6 > 0, "round {round}: marked old epoch > 0");
+            assert!(marked_old.8 > 0, "round {round}: marked old attempt > 0");
+            assert!(
+                !marked_old.9.is_empty(),
+                "round {round}: marked old generation present"
+            );
+            assert!(
+                marked_old.10.as_deref() == Some("possibly_sent")
+                    || marked_old.11.as_deref() == Some("PROVIDER_RESULT_UNKNOWN"),
+                "round {round}: marked old unknown evidence present"
+            );
             storage_a.test_expire_fenced_runtime_lease().unwrap();
 
             // Setup the unmarked-durable expired-processing fixture on the same
@@ -9398,9 +9435,13 @@ mod tests {
             drop(unmarked_claim);
 
             // Capture the OLD unmarked-durable identity before any recovery or
-            // mutation: memory_id, mutation_sequence, claim epochs, generation,
-            // target binding, send/error evidence.
+            // mutation: life, memory, mutation, action, attempt, claim epochs,
+            // generation, target binding, send/error evidence.
             type OldUnmarkedIdentity = (
+                String,
+                String,
+                i64,
+                String,
                 i64,
                 i64,
                 i64,
@@ -9415,7 +9456,8 @@ mod tests {
                 let conn = crate::storage::open_authorized_test_connection(&db_path).unwrap();
                 let row: OldUnmarkedIdentity = conn
                     .query_row(
-                        "SELECT attempt_count, fenced_claim_epoch, last_marked_claim_epoch,
+                        "SELECT life_id, memory_id, mutation_sequence, desired_action,
+                                attempt_count, fenced_claim_epoch, last_marked_claim_epoch,
                                 claimed_generation_id, target_revision, target_content_hash,
                                 last_send_disposition, last_error_code
                          FROM memory_vector_sync_outbox WHERE memory_id=?1",
@@ -9430,6 +9472,10 @@ mod tests {
                                 r.get(5)?,
                                 r.get(6)?,
                                 r.get(7)?,
+                                r.get(8)?,
+                                r.get(9)?,
+                                r.get(10)?,
+                                r.get(11)?,
                             ))
                         },
                     )
@@ -9446,14 +9492,14 @@ mod tests {
                 )
                 .unwrap()
             };
-            assert_eq!(old_identity.1, 3, "round {round}: old fenced claim epoch");
+            assert_eq!(old_identity.5, 3, "round {round}: old fenced claim epoch");
             assert_eq!(
-                old_identity.2, 1,
+                old_identity.6, 1,
                 "round {round}: old last_marked claim epoch"
             );
-            assert_eq!(old_identity.0, 2, "round {round}: old attempt count");
+            assert_eq!(old_identity.4, 2, "round {round}: old attempt count");
             assert_eq!(
-                old_identity.3,
+                old_identity.7,
                 ctx.generation_id().as_str(),
                 "round {round}: old generation"
             );
@@ -9579,30 +9625,47 @@ mod tests {
                 Some("PROVIDER_RESULT_UNKNOWN"),
                 "round {round}"
             );
+            // Full old-identity closure: the post-race row keeps life, memory,
+            // mutation, action, target, epochs, attempt, generation, and send
+            // evidence exactly as captured before the race.
             assert_eq!(
-                snap.attempt_count, 1,
-                "round {round}: recovery/worker must not add an attempt"
+                snap.mutation_sequence, marked_old.2,
+                "round {round}: mutation sequence preserved"
             );
             assert_eq!(
-                snap.claimed_generation_id.as_deref(),
-                Some(ctx.generation_id().as_str()),
-                "round {round}: durable generation preserved"
+                snap.desired_action, marked_old.3,
+                "round {round}: action preserved"
             );
             assert_eq!(
-                snap.target_revision, marked_old_target.0,
+                snap.target_revision, marked_old.4,
                 "round {round}: target revision preserved"
             );
             assert_eq!(
-                snap.target_content_hash, marked_old_target.1,
+                snap.target_content_hash, marked_old.5,
                 "round {round}: target content hash preserved"
             );
             assert_eq!(
-                snap.last_send_disposition.as_deref(),
-                Some("possibly_sent"),
-                "round {round}: unknown evidence preserved"
+                snap.attempt_count, marked_old.8,
+                "round {round}: attempt not increased"
             );
-            assert_eq!(snap.fenced_claim_epoch, 1, "round {round}");
-            assert_eq!(snap.last_marked_claim_epoch, 1, "round {round}");
+            assert_eq!(
+                snap.claimed_generation_id.as_deref(),
+                Some(marked_old.9.as_str()),
+                "round {round}: generation preserved"
+            );
+            assert_eq!(
+                snap.last_send_disposition.as_deref(),
+                marked_old.10.as_deref(),
+                "round {round}: send evidence preserved"
+            );
+            assert_eq!(
+                snap.fenced_claim_epoch, marked_old.6,
+                "round {round}: claim epoch unchanged"
+            );
+            assert_eq!(
+                snap.last_marked_claim_epoch, marked_old.7,
+                "round {round}: last_marked unchanged"
+            );
             let _ = recovered;
 
             // ---- B8 sub-scenario 2: unmarked durable expired-processing ----
@@ -9626,25 +9689,53 @@ mod tests {
                 "round {round}: unmarked durable recovers to pending"
             );
             assert_eq!(
-                unmarked_after_recovery.attempt_count, 2,
+                unmarked_after_recovery.attempt_count, old_identity.4,
                 "round {round}: recovery must not increment the unmarked attempt"
             );
             assert_eq!(
                 unmarked_after_recovery.claimed_generation_id.as_deref(),
-                Some(ctx.generation_id().as_str()),
+                Some(old_identity.7.as_str()),
                 "round {round}: unmarked generation preserved"
             );
             assert_eq!(
-                unmarked_after_recovery.fenced_claim_epoch, 3,
+                unmarked_after_recovery.fenced_claim_epoch, old_identity.5,
                 "round {round}: fenced epoch preserved"
             );
             assert_eq!(
-                unmarked_after_recovery.last_marked_claim_epoch, 1,
+                unmarked_after_recovery.last_marked_claim_epoch, old_identity.6,
                 "round {round}: last_marked preserved"
             );
             assert_eq!(
                 unmarked_after_recovery.lease_owner, None,
                 "round {round}: old lease cleared"
+            );
+            // Explicit target re-check after recovery: the target binding must
+            // be unchanged from the pre-recovery old identity.
+            assert_eq!(
+                unmarked_after_recovery.target_revision, old_identity.8,
+                "round {round}: target revision preserved through recovery"
+            );
+            assert_eq!(
+                unmarked_after_recovery.target_content_hash, old_identity.9,
+                "round {round}: target content hash preserved through recovery"
+            );
+            assert_eq!(
+                unmarked_after_recovery.desired_action, old_identity.3,
+                "round {round}: action preserved through recovery"
+            );
+            assert_eq!(
+                unmarked_after_recovery.mutation_sequence, old_mutation_sequence,
+                "round {round}: mutation sequence preserved through recovery"
+            );
+            assert_eq!(
+                unmarked_after_recovery.last_send_disposition.as_deref(),
+                old_identity.10.as_deref(),
+                "round {round}: send evidence preserved through recovery"
+            );
+            assert_eq!(
+                unmarked_after_recovery.last_error_code.as_deref(),
+                old_identity.11.as_deref(),
+                "round {round}: error evidence preserved through recovery"
             );
 
             // Plan A: a new mutation invalidates the old one. The recovered row
@@ -9755,7 +9846,7 @@ mod tests {
             // The row keeps its memory_id across the new mutation, so the
             // attribution is by mutation_sequence + claim_epoch, not memory_id.
             let (old_p, old_u, old_d) =
-                log_b8.counts_for_claim(&unmarked_id, old_mutation_sequence, old_identity.1);
+                log_b8.counts_for_claim(&unmarked_id, old_mutation_sequence, old_identity.5);
             assert_eq!(
                 (old_p, old_u, old_d),
                 (0, 0, 0),
@@ -9793,7 +9884,7 @@ mod tests {
                             "round {round}: newly bound generation"
                         );
                         assert_ne!(
-                            call.context.claim_epoch, old_identity.1,
+                            call.context.claim_epoch, old_identity.5,
                             "round {round}: claim epoch differs from the old expired claim"
                         );
                         assert_ne!(
@@ -9828,7 +9919,7 @@ mod tests {
                     let (old_p2, old_u2, old_d2) = log_b8.counts_for_claim(
                         &unmarked_id,
                         old_mutation_sequence,
-                        old_identity.1,
+                        old_identity.5,
                     );
                     assert_eq!(
                         (old_p2, old_u2, old_d2),
@@ -9909,11 +10000,19 @@ mod tests {
     /// worker_instance_id / memory / mutation / claim epoch. Both workers run
     /// real `process_one` invocations through real Recording Provider and
     /// Recording VectorStore entries.
+    ///
+    /// The overlap is deterministic: worker A claims and binds its context,
+    /// then blocks at the BeforeEmbedding gate (before any external call).
+    /// Worker B claims, binds its own context, and completes its real
+    /// provider + upsert calls. The main thread then verifies A is still
+    /// paused with A's identity while B's records carry B's identity, and
+    /// only then releases A to complete its own real calls.
     #[test]
     fn external_call_recorder_worker_context_isolation_keeps_two_workers_isolated() {
         use crate::storage::test_support::{
             ExternalCallLog, WorkerCallContext, WorkerCallContextScope,
         };
+        use std::sync::mpsc;
 
         let log = ExternalCallLog::default();
         let context_a = WorkerCallContext::new(log.clone());
@@ -9969,8 +10068,14 @@ mod tests {
             true,
         );
 
-        // Run both workers concurrently: A claims+records while B claims and
-        // records on its own database, both appending to the shared log.
+        // Deterministic overlap via mpsc: A notifies "A bound and paused" at
+        // the BeforeEmbedding gate and waits for release; B notifies after its
+        // own real calls and finishes.
+        let (a_paused_tx, a_paused_rx) = mpsc::channel::<()>();
+        let (release_a_tx, release_a_rx) = mpsc::channel::<()>();
+        let (b_done_tx, b_done_rx) = mpsc::channel::<()>();
+        let (release_b_tx, release_b_rx) = mpsc::channel::<()>();
+
         let worker_a = {
             let ctx = ctx_a.clone();
             let context = context_a.clone();
@@ -9994,9 +10099,21 @@ mod tests {
                 consumer.set_claim_observer_for_test(Some(Box::new(move |claim| {
                     observer_context.set_current_claim(claim);
                 })));
+                // Pause AFTER the claim observer bound A's context and BEFORE
+                // the provider call: A is deterministically mid-claim with its
+                // identity bound while B runs.
+                let paused_tx = a_paused_tx.clone();
+                let release_rx = release_a_rx;
+                consumer.set_test_pause_hook_for_test(Some(Box::new(move |point| {
+                    if point == VectorSyncTestPausePoint::BeforeEmbedding {
+                        paused_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                    }
+                })));
                 let result =
                     tauri::async_runtime::block_on(consumer.process_one("worker-a")).unwrap();
                 consumer.set_claim_observer_for_test(None);
+                consumer.set_test_pause_hook_for_test(None);
                 drop(scope);
                 result
             })
@@ -10027,10 +10144,71 @@ mod tests {
                 let result =
                     tauri::async_runtime::block_on(consumer.process_one("worker-b")).unwrap();
                 consumer.set_claim_observer_for_test(None);
+                // Notify while B's context is still bound (scope not yet
+                // dropped) so the main thread can inspect B's identity, then
+                // wait for the main thread to finish its inspection.
+                b_done_tx.send(()).unwrap();
+                release_b_rx.recv().unwrap();
                 drop(scope);
                 result
             })
         };
+
+        // 1. Wait until A has claimed and bound its context, paused before
+        //    any external call.
+        a_paused_rx.recv().unwrap();
+        // 2. Wait until B has completed its own real provider+upsert calls.
+        b_done_rx.recv().unwrap();
+
+        // A is still paused with A's identity bound; B finished with B's
+        // identity. B's records must never have overwritten A's context.
+        let a_identity = context_a
+            .current_identity()
+            .expect("worker A context must still be bound while paused");
+        let b_identity = context_b
+            .current_identity()
+            .expect("worker B context must be bound after its claims");
+        assert_eq!(
+            a_identity.worker_instance_id,
+            context_a.worker_instance_id(),
+            "A context holds A worker id"
+        );
+        assert_eq!(
+            a_identity.memory_id, record_a.id,
+            "A context holds A memory"
+        );
+        assert_eq!(
+            b_identity.worker_instance_id,
+            context_b.worker_instance_id(),
+            "B context holds B worker id"
+        );
+        assert_eq!(
+            b_identity.memory_id, record_b.id,
+            "B context holds B memory"
+        );
+        // B's calls carry B identity; A's calls must not exist yet (A paused
+        // before its provider call).
+        let b_calls = log.calls_for_memory(&record_b.id);
+        assert_eq!(b_calls.len(), 2, "worker B: provider + upsert recorded");
+        assert!(
+            b_calls.iter().all(|call| {
+                call.context.worker_instance_id == context_b.worker_instance_id()
+                    && call.context.memory_id == record_b.id
+                    && call.context.mutation_sequence == b_identity.mutation_sequence
+                    && call.context.claim_epoch == b_identity.claim_epoch
+                    && call.context.target_revision == b_identity.target_revision
+                    && call.context.target_content_hash == b_identity.target_content_hash
+            }),
+            "B's recorded calls carry B's full claim identity"
+        );
+        assert!(
+            log.calls_for_memory(&record_a.id).is_empty(),
+            "worker A must not have recorded anything while paused"
+        );
+
+        // 3. Release workers A and B to complete their own real calls.
+        release_a_tx.send(()).unwrap();
+        release_b_tx.send(()).unwrap();
 
         let result_a = worker_a.join().unwrap();
         let result_b = worker_b.join().unwrap();
@@ -10052,7 +10230,9 @@ mod tests {
             a_calls.iter().all(|call| {
                 call.context.worker_instance_id == context_a.worker_instance_id()
                     && call.context.memory_id == record_a.id
-                    && call.context.claim_epoch == 1
+                    && call.context.claim_epoch == a_identity.claim_epoch
+                    && call.context.mutation_sequence == a_identity.mutation_sequence
+                    && call.context.target_revision == a_identity.target_revision
             }),
             "worker A calls keep A identity"
         );
@@ -10060,16 +10240,30 @@ mod tests {
             b_calls.iter().all(|call| {
                 call.context.worker_instance_id == context_b.worker_instance_id()
                     && call.context.memory_id == record_b.id
-                    && call.context.claim_epoch == 1
+                    && call.context.claim_epoch == b_identity.claim_epoch
+                    && call.context.mutation_sequence == b_identity.mutation_sequence
+                    && call.context.target_revision == b_identity.target_revision
             }),
             "worker B calls keep B identity"
         );
         // Each worker's counts are keyed on its own mutation+claim.
-        let mut_a = log.calls_for_claim(&record_a.id, 1, 1);
-        let mut_b = log.calls_for_claim(&record_b.id, 1, 1);
-        assert_eq!(mut_a.len(), 2, "A: provider+upsert on mutation 1/claim 1");
-        assert_eq!(mut_b.len(), 2, "B: provider+upsert on mutation 1/claim 1");
-        let _ = (data_root_a, data_root_b);
+        let mut_a = log.calls_for_claim(
+            &record_a.id,
+            a_identity.mutation_sequence,
+            a_identity.claim_epoch,
+        );
+        let mut_b = log.calls_for_claim(
+            &record_b.id,
+            b_identity.mutation_sequence,
+            b_identity.claim_epoch,
+        );
+        assert_eq!(mut_a.len(), 2, "A: provider+upsert on its claim");
+        assert_eq!(mut_b.len(), 2, "B: provider+upsert on its claim");
+
+        // Resource closure for the dual-worker test. storage_a and storage_b
+        // were moved into the worker threads and dropped when they ended.
+        assert_no_wal_shm_residue(&data_root_a);
+        assert_no_wal_shm_residue(&data_root_b);
     }
 
     /// 10.1 Provider failure: the provider is called exactly once, the fake

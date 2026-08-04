@@ -1322,6 +1322,13 @@ pub(crate) mod test_support {
             self.current.lock().unwrap().is_none()
         }
 
+        /// Clone of the currently bound claim identity, if any. Test-only
+        /// inspection so assertions can verify which identity a worker is
+        /// holding while another worker runs concurrently.
+        pub(crate) fn current_identity(&self) -> Option<RecordedClaimContext> {
+            self.current.lock().unwrap().clone()
+        }
+
         /// Registers the claim this worker is processing. Called from the
         /// test-only claim observer before any external call.
         pub(crate) fn set_current_claim(&self, claim: &crate::storage::FencedVectorSyncClaim) {
@@ -2469,22 +2476,11 @@ mod tests {
             // target revision/hash, attempt, epochs, generation, state, error,
             // migration disposition. Zero-call proofs below are keyed on the
             // captured mutation_sequence so a never-granted claim cannot fake
-            // a zero through a nonexistent claim epoch.
-            type ForbiddenRowIdentity = (
-                String,
-                i64,
-                String,
-                Option<i64>,
-                Option<String>,
-                i64,
-                i64,
-                i64,
-                Option<String>,
-                String,
-                Option<String>,
-                Option<String>,
-            );
-            let mut forbidden_identities: Vec<(String, ForbiddenRowIdentity)> = Vec::new();
+            // a zero through a nonexistent claim epoch. This is the
+            // post-recovery / pre-drain full-field snapshot: the five rows have
+            // already converged to their frozen states and must stay identical
+            // through the formal drain.
+            let mut forbidden_snapshots: Vec<(String, AttemptRowSnapshot)> = Vec::new();
             for protected in [
                 "bs-unknown",
                 "bs-att5",
@@ -2492,37 +2488,44 @@ mod tests {
                 "bs-invalid",
                 "bs-migrated",
             ] {
-                let identity: ForbiddenRowIdentity = restored
-                    .state()
-                    .unwrap()
-                    .connection
-                    .query_row(
-                        "SELECT memory_id, mutation_sequence, desired_action,
-                                target_revision, target_content_hash, attempt_count,
-                                fenced_claim_epoch, last_marked_claim_epoch,
-                                claimed_generation_id, state, last_error_code,
-                                migration_disposition
-                         FROM memory_vector_sync_outbox WHERE life_id='life-1' AND memory_id=?1",
-                        rusqlite::params![protected],
-                        |r| {
-                            Ok((
-                                r.get(0)?,
-                                r.get(1)?,
-                                r.get(2)?,
-                                r.get(3)?,
-                                r.get(4)?,
-                                r.get(5)?,
-                                r.get(6)?,
-                                r.get(7)?,
-                                r.get(8)?,
-                                r.get(9)?,
-                                r.get(10)?,
-                                r.get(11)?,
-                            ))
-                        },
-                    )
-                    .unwrap();
-                forbidden_identities.push((protected.to_owned(), identity));
+                let state = restored.state().unwrap();
+                let snapshot = read_attempt_row_snapshot(&state.connection, "life-1", protected);
+                drop(state);
+                // Pre-drain snapshot must already be in the frozen state.
+                match protected {
+                    "bs-unknown" => {
+                        assert_eq!(snapshot.state, "blocked", "bs-unknown pre-drain blocked");
+                        assert_eq!(
+                            snapshot.last_error_code.as_deref(),
+                            Some("PROVIDER_RESULT_UNKNOWN"),
+                            "bs-unknown pre-drain unknown"
+                        );
+                    }
+                    "bs-att5" => {
+                        assert_eq!(snapshot.state, "blocked", "bs-att5 pre-drain blocked");
+                        assert_eq!(snapshot.attempt_count, 5, "bs-att5 pre-drain attempt 5");
+                    }
+                    "bs-over5" => {
+                        assert_eq!(snapshot.state, "blocked", "bs-over5 pre-drain blocked");
+                        assert_eq!(
+                            snapshot.last_error_code.as_deref(),
+                            Some("INTERNAL_INVARIANT"),
+                            "bs-over5 pre-drain invariant"
+                        );
+                        assert!(snapshot.attempt_count > 5, "bs-over5 pre-drain attempt>5");
+                    }
+                    "bs-invalid" => {
+                        assert_eq!(snapshot.state, "blocked", "bs-invalid pre-drain blocked");
+                    }
+                    "bs-migrated" => {
+                        assert!(
+                            snapshot.migration_disposition.is_some(),
+                            "bs-migrated pre-drain disposition"
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+                forbidden_snapshots.push((protected.to_owned(), snapshot));
             }
 
             let log = crate::storage::test_support::ExternalCallLog::default();
@@ -2547,22 +2550,45 @@ mod tests {
             // The claim observer feeds THIS worker's context so every external
             // call is attributed to the exact worker / memory / mutation /
             // claim epoch / generation being processed. A call without a bound
-            // claim fails the test.
+            // claim fails the test. The same observer also records the real
+            // claim identity (life, memory, mutation, action, target, epoch,
+            // generation) so the drain can cross-check the call log against
+            // what the worker actually claimed.
+            let observed_claim =
+                std::sync::Arc::new(std::sync::Mutex::new(None::<ObservedClaimIdentity>));
+            let observed_claim_for_observer = std::sync::Arc::clone(&observed_claim);
             let worker_context_for_observer = worker_context.clone();
             consumer.set_claim_observer_for_test(Some(Box::new(move |claim| {
                 worker_context_for_observer.set_current_claim(claim);
+                *observed_claim_for_observer.lock().unwrap() = Some(ObservedClaimIdentity {
+                    worker_instance_id: worker_context_for_observer.worker_instance_id(),
+                    life_id: claim.life_id().to_owned(),
+                    memory_id: claim.memory_id().to_owned(),
+                    mutation_sequence: claim.mutation_sequence(),
+                    desired_action: claim.action().as_str().to_owned(),
+                    target_revision: claim.target_revision(),
+                    target_content_hash: claim.target_content_hash().map(str::to_owned),
+                    claim_epoch: claim.fenced_claim_epoch(),
+                    generation_id: claim.generation_id().to_owned(),
+                });
             })));
 
             // Drain the worker to exhaustion, attributing every new call slice
             // to the memory the worker just processed. Each process_one runs
             // inside a RAII scope that clears the worker context on every exit
             // path. Legitimate pending work may be processed; the protected
-            // rows must never be claimed.
+            // rows must never be claimed. The claim observer captures the real
+            // claim identity (never hand-constructed) and the saw_* flags
+            // prove both the upsert and delete branches actually executed.
             restored.test_expire_fenced_runtime_lease().unwrap();
-            let mut processed: Vec<(String, i64, i64, FencedVectorSyncSingleEventResult)> =
+            let mut processed: Vec<(ObservedClaimIdentity, FencedVectorSyncSingleEventResult)> =
                 Vec::new();
-            loop {
+            let mut saw_completed_upsert = false;
+            let mut saw_completed_delete = false;
+            let max_drain_iterations = 32usize;
+            for _drain_iteration in 0..max_drain_iterations {
                 let before = log.len();
+                *observed_claim.lock().unwrap() = None;
                 let scope = crate::storage::test_support::WorkerCallContextScope::new(
                     worker_context.clone(),
                 );
@@ -2576,39 +2602,79 @@ mod tests {
                 );
                 let new_calls = log.snapshot();
                 let new_calls = &new_calls[before..];
-                if result == FencedVectorSyncSingleEventResult::NoEligibleEvent {
-                    assert!(
-                        new_calls.is_empty(),
-                        "NoEligibleEvent must not produce external calls"
-                    );
-                    break;
+                match result {
+                    FencedVectorSyncSingleEventResult::NoEligibleEvent => {
+                        assert!(
+                            new_calls.is_empty(),
+                            "NoEligibleEvent must not produce external calls"
+                        );
+                        // NoEligibleEvent may only end the drain after every
+                        // expected legitimate upsert/delete completed.
+                        assert!(
+                            saw_completed_upsert,
+                            "drain must observe at least one CompletedUpsert"
+                        );
+                        assert!(
+                            saw_completed_delete,
+                            "drain must observe at least one CompletedDelete"
+                        );
+                        break;
+                    }
+                    FencedVectorSyncSingleEventResult::CompletedUpsert => {
+                        saw_completed_upsert = true;
+                    }
+                    FencedVectorSyncSingleEventResult::CompletedDelete => {
+                        saw_completed_delete = true;
+                    }
+                    // A row the worker legitimately refuses (Stale target,
+                    // lost lease, blocked) must not produce external calls and
+                    // is not a drain outcome.
+                    other if new_calls.is_empty() => {
+                        assert_eq!(
+                            other,
+                            FencedVectorSyncSingleEventResult::LostLeaseOrSuperseded,
+                            "unexpected zero-call outcome: {}",
+                            stable_result_name(other)
+                        );
+                        continue;
+                    }
+                    other => {
+                        panic!(
+                            "unexpected drain outcome with calls: {}",
+                            stable_result_name(other)
+                        );
+                    }
                 }
-                // A row that the worker legitimately refuses (Stale target,
-                // lost lease, blocked) must not produce external calls. That is
-                // itself correct no-replay evidence; it is only attributed to a
-                // memory when the worker actually crossed an external boundary.
-                if new_calls.is_empty() {
-                    continue;
-                }
-                let first = &new_calls[0];
+                assert!(
+                    !new_calls.is_empty(),
+                    "a completed event must produce recorded calls"
+                );
+                // The real claim identity captured by the observer must match
+                // every call in this slice field-by-field.
+                let identity = observed_claim
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .expect("observer must have captured the real claim identity");
                 assert!(
                     new_calls.iter().all(|call| {
-                        call.context.worker_instance_id == worker_context.worker_instance_id()
-                            && call.context.memory_id == first.context.memory_id
-                            && call.context.mutation_sequence == first.context.mutation_sequence
-                            && call.context.claim_epoch == first.context.claim_epoch
-                            && call.context.target_revision == first.context.target_revision
-                            && call.context.target_content_hash == first.context.target_content_hash
-                            && call.context.generation_id == first.context.generation_id
+                        call.context.worker_instance_id == identity.worker_instance_id
+                            && call.context.life_id == identity.life_id
+                            && call.context.memory_id == identity.memory_id
+                            && call.context.mutation_sequence == identity.mutation_sequence
+                            && call.context.desired_action == identity.desired_action
+                            && call.context.claim_epoch == identity.claim_epoch
+                            && call.context.target_revision == identity.target_revision
+                            && call.context.target_content_hash == identity.target_content_hash
+                            && call.context.generation_id == identity.generation_id
                     }),
-                    "all calls in one process_one slice share the claim identity"
+                    "all calls in one process_one slice match the observed claim identity"
                 );
-                processed.push((
-                    first.context.memory_id.clone(),
-                    first.context.mutation_sequence,
-                    first.context.claim_epoch,
-                    result,
-                ));
+                assert!(
+                    identity.claim_epoch > 0,
+                    "observed claim must carry a positive claim epoch"
+                );
+                processed.push((identity, result));
             }
             consumer.set_claim_observer_for_test(None);
 
@@ -2619,37 +2685,27 @@ mod tests {
             );
 
             // 6.7 per-row zero-call proof for the five forbidden rows, keyed on
-            // each row's captured mutation identity.
-            for (protected, identity) in &forbidden_identities {
+            // each row's captured mutation identity, plus full-field identity:
+            // the post-drain snapshot must equal the pre-drain snapshot
+            // field-for-field (life, memory, mutation, action, target, state,
+            // attempt, epochs, generation, send/error, migration, schedule,
+            // lease, created/updated).
+            for (protected, pre_snapshot) in &forbidden_snapshots {
                 let (provider_count, upsert_count, delete_count) =
-                    log.counts_for_mutation(protected, identity.1);
+                    log.counts_for_mutation(protected, pre_snapshot.mutation_sequence);
                 assert_eq!(
                     (provider_count, upsert_count, delete_count),
                     (0, 0, 0),
                     "{protected}: {provider_count} / {upsert_count} / {delete_count} must be 0/0/0 for mutation {}",
-                    identity.1
+                    pre_snapshot.mutation_sequence
                 );
-                let snap = restored
-                    .test_get_outbox_snapshot_detailed("life-1", protected)
-                    .unwrap();
+                let state = restored.state().unwrap();
+                let post_snapshot =
+                    read_attempt_row_snapshot(&state.connection, "life-1", protected);
+                drop(state);
                 assert_eq!(
-                    snap.state, "blocked",
-                    "protected row {protected} must stay blocked"
-                );
-                assert_eq!(
-                    snap.attempt_count,
-                    match protected.as_str() {
-                        "bs-unknown" => 2,
-                        "bs-att5" => 5,
-                        "bs-over5" => 6,
-                        "bs-invalid" | "bs-migrated" => 1,
-                        _ => unreachable!(),
-                    },
-                    "protected row {protected} attempt untouched by the formal worker"
-                );
-                assert_eq!(
-                    snap.mutation_sequence, identity.1,
-                    "protected row {protected} mutation_sequence unchanged"
+                    post_snapshot, *pre_snapshot,
+                    "protected row {protected} full identity must be unchanged by the formal drain"
                 );
             }
             // Invalid identity stays reported by Health and is never claimed.
@@ -2674,14 +2730,15 @@ mod tests {
             );
 
             // 5.1 Legitimate rows: every processed event is attributed by its
-            // exact claim (mutation_sequence + claim_epoch), and never to a
-            // forbidden row. An upsert completes with 1/1/0 and a delete with
-            // 0/0/1 (a delete never calls the provider).
+            // exact observed claim identity (life/memory/mutation/action/
+            // target/epoch/generation from the real claim observer), and never
+            // to a forbidden row. An upsert completes with 1/1/0 and a delete
+            // with 0/0/1 (a delete never calls the provider).
             assert!(
                 !processed.is_empty(),
                 "the drain must process at least one legitimate row"
             );
-            for (memory_id, mutation_sequence, claim_epoch, result) in &processed {
+            for (identity, result) in &processed {
                 assert!(
                     ![
                         "bs-unknown",
@@ -2690,43 +2747,163 @@ mod tests {
                         "bs-invalid",
                         "bs-migrated"
                     ]
-                    .contains(&memory_id.as_str()),
-                    "a forbidden row must never be processed: {memory_id}"
+                    .contains(&identity.memory_id.as_str()),
+                    "a forbidden row must never be processed: {}",
+                    identity.memory_id
                 );
-                let calls = log.calls_for_claim(memory_id, *mutation_sequence, *claim_epoch);
+                let calls = log.calls_for_claim(
+                    &identity.memory_id,
+                    identity.mutation_sequence,
+                    identity.claim_epoch,
+                );
                 assert!(
                     !calls.is_empty(),
-                    "processed row {memory_id} has records for its claim"
+                    "processed row {} has records for its claim",
+                    identity.memory_id
                 );
                 assert!(
                     calls.iter().all(|call| {
-                        call.context.worker_instance_id == worker_context.worker_instance_id()
-                            && call.context.generation_id == gen_id
-                            && call.context.claim_epoch == *claim_epoch
+                        call.context.worker_instance_id == identity.worker_instance_id
+                            && call.context.life_id == identity.life_id
+                            && call.context.memory_id == identity.memory_id
+                            && call.context.mutation_sequence == identity.mutation_sequence
+                            && call.context.desired_action == identity.desired_action
+                            && call.context.target_revision == identity.target_revision
+                            && call.context.target_content_hash == identity.target_content_hash
+                            && call.context.claim_epoch == identity.claim_epoch
+                            && call.context.generation_id == identity.generation_id
                     }),
-                    "row {memory_id} calls carry its current mutation and a new claim epoch"
+                    "row {} calls carry the full observed claim identity",
+                    identity.memory_id
                 );
-                let (p, u, d) = log.counts_for_claim(memory_id, *mutation_sequence, *claim_epoch);
+                let (p, u, d) = log.counts_for_claim(
+                    &identity.memory_id,
+                    identity.mutation_sequence,
+                    identity.claim_epoch,
+                );
                 match result {
                     FencedVectorSyncSingleEventResult::CompletedUpsert => {
-                        assert_eq!((p, u, d), (1, 1, 0), "row {memory_id} upsert attribution");
+                        assert_eq!(
+                            identity.desired_action, "upsert",
+                            "row {} upsert action",
+                            identity.memory_id
+                        );
+                        assert_eq!(
+                            (p, u, d),
+                            (1, 1, 0),
+                            "row {} upsert attribution",
+                            identity.memory_id
+                        );
                     }
                     FencedVectorSyncSingleEventResult::CompletedDelete => {
                         assert_eq!(
+                            identity.desired_action, "delete",
+                            "row {} delete action",
+                            identity.memory_id
+                        );
+                        assert_eq!(
                             (p, u, d),
                             (0, 0, 1),
-                            "row {memory_id} delete attribution (provider must be 0)"
+                            "row {} delete attribution (provider must be 0)",
+                            identity.memory_id
                         );
                     }
                     other => {
                         panic!(
-                            "unexpected processed result for row {memory_id}: {}",
+                            "unexpected processed result for row {}: {}",
+                            identity.memory_id,
                             stable_result_name(*other)
                         );
                     }
                 }
             }
         }
+    }
+
+    /// The real claim identity a worker observer captured during one
+    /// `process_one`. It is sourced from the actual claim granted by SQLite,
+    /// never hand-constructed, and is cross-checked field-by-field against the
+    /// recorded external calls.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct ObservedClaimIdentity {
+        worker_instance_id: u64,
+        life_id: String,
+        memory_id: String,
+        mutation_sequence: i64,
+        desired_action: String,
+        target_revision: Option<i64>,
+        target_content_hash: Option<String>,
+        claim_epoch: i64,
+        generation_id: String,
+    }
+
+    /// Test-only full-field snapshot of one outbox row, read with a single
+    /// query. Used to prove that the formal worker drain leaves the five
+    /// forbidden rows byte-for-byte identical (pre-drain vs post-drain).
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct AttemptRowSnapshot {
+        life_id: String,
+        memory_id: String,
+        mutation_sequence: i64,
+        desired_action: String,
+        target_revision: Option<i64>,
+        target_content_hash: Option<String>,
+        state: String,
+        attempt_count: i64,
+        fenced_claim_epoch: i64,
+        last_marked_claim_epoch: i64,
+        claimed_generation_id: Option<String>,
+        last_send_disposition: Option<String>,
+        last_error_code: Option<String>,
+        migration_disposition: Option<String>,
+        next_attempt_at: Option<String>,
+        lease_owner: Option<String>,
+        lease_fence_epoch: Option<i64>,
+        lease_expires_at: Option<String>,
+        created_at: String,
+        updated_at: String,
+    }
+
+    fn read_attempt_row_snapshot(
+        conn: &rusqlite::Connection,
+        life_id: &str,
+        memory_id: &str,
+    ) -> AttemptRowSnapshot {
+        conn.query_row(
+            "SELECT life_id, memory_id, mutation_sequence, desired_action,
+                    target_revision, target_content_hash, state, attempt_count,
+                    fenced_claim_epoch, last_marked_claim_epoch, claimed_generation_id,
+                    last_send_disposition, last_error_code, migration_disposition,
+                    next_attempt_at, lease_owner, lease_fence_epoch, lease_expires_at,
+                    created_at, updated_at
+             FROM memory_vector_sync_outbox WHERE life_id=?1 AND memory_id=?2",
+            rusqlite::params![life_id, memory_id],
+            |r| {
+                Ok(AttemptRowSnapshot {
+                    life_id: r.get(0)?,
+                    memory_id: r.get(1)?,
+                    mutation_sequence: r.get(2)?,
+                    desired_action: r.get(3)?,
+                    target_revision: r.get(4)?,
+                    target_content_hash: r.get(5)?,
+                    state: r.get(6)?,
+                    attempt_count: r.get(7)?,
+                    fenced_claim_epoch: r.get(8)?,
+                    last_marked_claim_epoch: r.get(9)?,
+                    claimed_generation_id: r.get(10)?,
+                    last_send_disposition: r.get(11)?,
+                    last_error_code: r.get(12)?,
+                    migration_disposition: r.get(13)?,
+                    next_attempt_at: r.get(14)?,
+                    lease_owner: r.get(15)?,
+                    lease_fence_epoch: r.get(16)?,
+                    lease_expires_at: r.get(17)?,
+                    created_at: r.get(18)?,
+                    updated_at: r.get(19)?,
+                })
+            },
+        )
+        .unwrap()
     }
 
     /// Stable variant name for a worker result, so a failed attribution

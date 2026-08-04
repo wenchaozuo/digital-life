@@ -25,6 +25,25 @@ const COLUMNS: &str = "id, life_id, memory_id, desired_action, state, attempt_co
 /// explicitly out of scope for ATT-I2.
 pub(crate) const MAX_VECTOR_SYNC_ATTEMPTS: i64 = 5;
 
+/// Canonical SQLite predicate for a Delete whose current mutation has crossed
+/// an external boundary without a durable result. Such a row is a
+/// `LateDeleteUnproven` candidate: ordinary claim, retry, reserve, and worker
+/// paths must not replay it.
+pub(super) const DELETE_UNKNOWN_EVIDENCE_SQL: &str = "desired_action='delete' AND (COALESCE(last_send_disposition, '')='possibly_sent' OR COALESCE(last_error_code, '')='PROVIDER_RESULT_UNKNOWN')";
+
+/// The Rust counterpart of [`DELETE_UNKNOWN_EVIDENCE_SQL`]. Keep this narrow:
+/// `definitely_not_sent` is explicit evidence that the Delete did not cross the
+/// external boundary and is therefore not an Unknown Delete witness.
+pub(crate) fn is_delete_unknown_evidence(
+    desired_action: &str,
+    last_send_disposition: Option<&str>,
+    last_error_code: Option<&str>,
+) -> bool {
+    desired_action == "delete"
+        && (last_send_disposition == Some("possibly_sent")
+            || last_error_code == Some("PROVIDER_RESULT_UNKNOWN"))
+}
+
 /// Proof that one Attempt slot is durably reserved for exactly one claim.
 ///
 /// The token is produced only by the single authoritative reserve path after its
@@ -135,6 +154,16 @@ pub(crate) enum FencedAttemptReservation {
     /// The budget for this mutation is spent, so the row was converged to
     /// `blocked` instead of handing out a sixth slot.
     BudgetExhausted,
+}
+
+/// Outcome of durably recording the Delete external-call witness for a current
+/// token. The witness is intentionally a distinct transition from reservation:
+/// a token that loses currency before this point must not manufacture unknown
+/// Delete evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FencedDeleteWitnessResult {
+    Marked,
+    LostLeaseOrSuperseded,
 }
 
 impl FencedAttemptReservation {
@@ -820,8 +849,9 @@ impl StorageService {
                       AND attempt_count < {MAX_VECTOR_SYNC_ATTEMPTS}
                       AND ((attempt_count=0 AND claimed_generation_id IS NULL)
                            OR (attempt_count>0 AND claimed_generation_id=?2))
-                      AND NOT (desired_action='upsert' AND
-                               (COALESCE(last_send_disposition, '')='possibly_sent' OR COALESCE(last_error_code, '')='PROVIDER_RESULT_UNKNOWN'))
+                       AND NOT (desired_action='upsert' AND
+                                (COALESCE(last_send_disposition, '')='possibly_sent' OR COALESCE(last_error_code, '')='PROVIDER_RESULT_UNKNOWN'))
+                       AND NOT ({DELETE_UNKNOWN_EVIDENCE_SQL})
                     ORDER BY mutation_sequence ASC, id ASC LIMIT 1"
                     ),
                     params![retry_cutoff_millis, generation_id],
@@ -842,8 +872,9 @@ impl StorageService {
                       AND attempt_count < {MAX_VECTOR_SYNC_ATTEMPTS}
                       AND ((attempt_count=0 AND claimed_generation_id IS NULL)
                            OR (attempt_count>0 AND claimed_generation_id=?1))
-                      AND NOT (desired_action='upsert' AND
-                               (COALESCE(last_send_disposition, '')='possibly_sent' OR COALESCE(last_error_code, '')='PROVIDER_RESULT_UNKNOWN'))
+                       AND NOT (desired_action='upsert' AND
+                                (COALESCE(last_send_disposition, '')='possibly_sent' OR COALESCE(last_error_code, '')='PROVIDER_RESULT_UNKNOWN'))
+                       AND NOT ({DELETE_UNKNOWN_EVIDENCE_SQL})
                     ORDER BY mutation_sequence ASC, id ASC LIMIT 1"
                     ),
                     params![generation_id],
@@ -1090,6 +1121,106 @@ impl StorageService {
         let current = fenced_attempt_token_current_in(&tx, &claim, token)?;
         tx.commit().map_err(|_| single_event_error())?;
         Ok(current)
+    }
+
+    /// Persists the Delete external-call witness after the first Token Guard but
+    /// before Lance is invoked. The complete token CAS prevents an old Attempt
+    /// from marking a newer mutation or claim epoch as unproven.
+    pub(crate) fn mark_fenced_delete_send_witness(
+        &self,
+        token: &FencedAttemptToken,
+    ) -> Result<FencedDeleteWitnessResult, crate::storage::StorageError> {
+        if token.action != MemoryVectorSyncAction::Delete {
+            return Ok(FencedDeleteWitnessResult::LostLeaseOrSuperseded);
+        }
+        let mut state = self.state()?;
+        let tx = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| single_event_error())?;
+        let current_now = authoritative_utc_millis_now_in(&tx)?;
+        let changed = tx
+            .execute(
+                &format!(
+                    "UPDATE memory_vector_sync_outbox
+                     SET last_send_disposition='possibly_sent',
+                         updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                     WHERE {FENCED_ATTEMPT_TOKEN_FINALIZE_IDENTITY}"
+                ),
+                rusqlite::named_params! {
+                    ":current_now": current_now.as_str(),
+                    ":id": token.outbox_id,
+                    ":desired_action": token.action.as_str(),
+                    ":mutation_sequence": token.mutation_sequence,
+                    ":target_revision": token.target_revision,
+                    ":target_content_hash": token.target_content_hash.as_deref(),
+                    ":claimed_generation_id": token.generation_id.as_str(),
+                    ":generation_id": token.generation_id.as_str(),
+                    ":descriptor_hash": token.descriptor_hash.as_str(),
+                    ":dimension": token.dimension as i64,
+                    ":lease_owner": token.lease_owner.as_str(),
+                    ":lease_fence_epoch": token.fence_epoch,
+                    ":fenced_claim_epoch": token.fenced_claim_epoch,
+                    ":attempt_ordinal": token.attempt_ordinal,
+                },
+            )
+            .map_err(|_| single_event_error())?;
+        tx.commit().map_err(|_| single_event_error())?;
+        #[cfg(test)]
+        if changed == 1 && take_post_commit_delete_witness_fault_for_test() {
+            return Err(single_event_error());
+        }
+        Ok(if changed == 1 {
+            FencedDeleteWitnessResult::Marked
+        } else {
+            FencedDeleteWitnessResult::LostLeaseOrSuperseded
+        })
+    }
+
+    /// Re-reads SQLite after an indeterminate Delete-witness commit result. It
+    /// has no write path and cannot re-authorize the in-memory token.
+    pub(crate) fn fenced_delete_send_witness_is_persisted(
+        &self,
+        token: &FencedAttemptToken,
+    ) -> Result<bool, crate::storage::StorageError> {
+        if token.action != MemoryVectorSyncAction::Delete {
+            return Ok(false);
+        }
+        let mut state = self.state()?;
+        let tx = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(|_| single_event_error())?;
+        let current_now = authoritative_utc_millis_now_in(&tx)?;
+        let persisted: Option<i64> = tx
+            .query_row(
+                &format!(
+                    "SELECT 1 FROM memory_vector_sync_outbox
+                     WHERE {FENCED_ATTEMPT_TOKEN_FINALIZE_IDENTITY}
+                       AND last_send_disposition='possibly_sent'"
+                ),
+                rusqlite::named_params! {
+                    ":current_now": current_now.as_str(),
+                    ":id": token.outbox_id,
+                    ":desired_action": token.action.as_str(),
+                    ":mutation_sequence": token.mutation_sequence,
+                    ":target_revision": token.target_revision,
+                    ":target_content_hash": token.target_content_hash.as_deref(),
+                    ":claimed_generation_id": token.generation_id.as_str(),
+                    ":generation_id": token.generation_id.as_str(),
+                    ":descriptor_hash": token.descriptor_hash.as_str(),
+                    ":dimension": token.dimension as i64,
+                    ":lease_owner": token.lease_owner.as_str(),
+                    ":lease_fence_epoch": token.fence_epoch,
+                    ":fenced_claim_epoch": token.fenced_claim_epoch,
+                    ":attempt_ordinal": token.attempt_ordinal,
+                },
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| single_event_error())?;
+        tx.commit().map_err(|_| single_event_error())?;
+        Ok(persisted.is_some())
     }
 
     /// Commits a successful external Attempt only when the exact token remains
@@ -1535,6 +1666,11 @@ impl StorageService {
     #[cfg(test)]
     pub(crate) fn test_fail_next_fenced_reserve_after_commit_for_test(&self) {
         fail_next_reserve_after_commit_for_test();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_fail_next_fenced_delete_witness_after_commit(&self) {
+        fail_next_delete_witness_after_commit_for_test();
     }
 
     /// Test-only convenience for fixtures that already hold a current claim.
@@ -2401,7 +2537,7 @@ fn converge_exhausted_attempt_budget_in(
 /// previously-classified permanent error is more useful than a generic budget
 /// marker.
 fn exhausted_attempt_budget_error_code(row: &GenerationBindingRow) -> &str {
-    if is_unknown_upsert_send(row) {
+    if is_unknown_upsert_send(row) || is_delete_unknown_row(row) {
         "PROVIDER_RESULT_UNKNOWN"
     } else {
         match row.last_error_code.as_deref() {
@@ -2592,6 +2728,7 @@ fn inspect_fenced_generation_binding_in(
 #[cfg(test)]
 thread_local! {
     static POST_COMMIT_RESERVE_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static POST_COMMIT_DELETE_WITNESS_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static POST_COMMIT_SUCCESS_FINALIZE_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static POST_COMMIT_FAILURE_FINALIZE_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -2604,6 +2741,16 @@ fn fail_next_reserve_after_commit_for_test() {
 #[cfg(test)]
 fn take_post_commit_reserve_fault_for_test() -> bool {
     POST_COMMIT_RESERVE_FAULT.with(|fault| fault.replace(false))
+}
+
+#[cfg(test)]
+fn fail_next_delete_witness_after_commit_for_test() {
+    POST_COMMIT_DELETE_WITNESS_FAULT.with(|fault| fault.set(true));
+}
+
+#[cfg(test)]
+fn take_post_commit_delete_witness_fault_for_test() -> bool {
+    POST_COMMIT_DELETE_WITNESS_FAULT.with(|fault| fault.replace(false))
 }
 
 #[cfg(test)]
@@ -2651,6 +2798,12 @@ fn reserve_fenced_attempt_in(
     if row.fenced_claim_epoch != claim.fenced_claim_epoch {
         return Ok(FencedAttemptReservation::LostLeaseOrSuperseded);
     }
+    // Claim selection rejects this state, but reservation remains a defensive
+    // production boundary for direct callers and races. It must never consume a
+    // slot, clear evidence, or mint a capability for an unproven Delete.
+    if is_delete_unknown_row(&row) {
+        return Ok(FencedAttemptReservation::LostLeaseOrSuperseded);
+    }
 
     match row.attempt_identity_phase() {
         AttemptIdentityPhase::Invalid => {
@@ -2680,7 +2833,7 @@ fn reserve_fenced_attempt_in(
                         "UPDATE memory_vector_sync_outbox
                          SET attempt_count=attempt_count+1,
                              last_marked_claim_epoch=fenced_claim_epoch,
-                             last_send_disposition=CASE WHEN desired_action='upsert' THEN 'possibly_sent' ELSE NULL END,
+                             last_send_disposition=CASE WHEN desired_action='upsert' THEN 'possibly_sent' ELSE last_send_disposition END,
                              updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
                          WHERE {GENERATION_BINDING_ROW_IDENTITY_WITH_ATTEMPT_EPOCHS}
                            AND attempt_count < {MAX_VECTOR_SYNC_ATTEMPTS}
@@ -2825,8 +2978,26 @@ fn fenced_attempt_token_current_in(
 
 fn is_unknown_upsert_send(row: &GenerationBindingRow) -> bool {
     row.desired_action == "upsert"
-        && (row.last_send_disposition.as_deref() == Some("possibly_sent")
-            || row.last_error_code.as_deref() == Some("PROVIDER_RESULT_UNKNOWN"))
+        && has_unknown_external_send_evidence(
+            row.last_send_disposition.as_deref(),
+            row.last_error_code.as_deref(),
+        )
+}
+
+fn is_delete_unknown_row(row: &GenerationBindingRow) -> bool {
+    is_delete_unknown_evidence(
+        row.desired_action.as_str(),
+        row.last_send_disposition.as_deref(),
+        row.last_error_code.as_deref(),
+    )
+}
+
+fn has_unknown_external_send_evidence(
+    last_send_disposition: Option<&str>,
+    last_error_code: Option<&str>,
+) -> bool {
+    last_send_disposition == Some("possibly_sent")
+        || last_error_code == Some("PROVIDER_RESULT_UNKNOWN")
 }
 
 /// Recovers only expired fenced processing rows. An upsert with a durable
@@ -2892,6 +3063,11 @@ fn recover_expired_fenced_processing_in(
                     // have crossed the provider boundary is never rescheduled, and
                     // stays visible to health as Unknown.
                     ("blocked", "last_error_code='PROVIDER_RESULT_UNKNOWN',")
+                } else if is_delete_unknown_row(&row) {
+                    // A Delete witness is never a replay permit. Preserve the
+                    // original send/error evidence while releasing the expired
+                    // lease into a stable non-claimable state.
+                    ("blocked", "")
                 } else {
                     match row.attempt_identity_phase() {
                         // The slot for this claim was reserved, so an external call
@@ -3305,6 +3481,7 @@ impl MemoryVectorSyncOutboxRepository for StorageService {
                 }
                 GenerationBindingPhase::Unbound | GenerationBindingPhase::Durable => {
                     if is_unknown_upsert_send(&row)
+                        || is_delete_unknown_row(&row)
                         || row.last_error_code.as_deref() == Some("INTERNAL_INVARIANT")
                     {
                         continue;
@@ -5864,6 +6041,106 @@ mod tests {
     /// having consumed a slot means under ATT-I2: an unmarked row with
     /// `attempt_count > 0` describes a slot reserved by an *earlier* claim, which
     /// `recover_expired_unmarked_*` covers separately.
+    #[test]
+    fn delete_unknown_is_rejected_by_claim_reserve_recovery_and_retry() {
+        let (_root, storage) = storage();
+        let record = confirmed(&storage, false);
+        storage
+            .enqueue(EnqueueMemoryVectorSyncRequest {
+                life_id: record.life_id.clone(),
+                memory_id: record.id.clone(),
+                desired_action: MemoryVectorSyncAction::Delete,
+            })
+            .unwrap();
+        storage
+            .register_building_vector_generation("generation-a", "descriptor-a", 2)
+            .unwrap();
+        let claim = storage
+            .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-a")
+            .unwrap()
+            .unwrap();
+        let token = reserve_token(&storage, &claim);
+        assert_eq!(
+            storage.mark_fenced_delete_send_witness(&token).unwrap(),
+            FencedDeleteWitnessResult::Marked
+        );
+
+        let witnessed = storage
+            .test_get_outbox_snapshot_detailed("life", &record.id)
+            .unwrap();
+        assert_eq!(
+            witnessed.last_send_disposition.as_deref(),
+            Some("possibly_sent")
+        );
+
+        // Reserve is independently fail-closed even though this direct test call
+        // bypasses ordinary candidate selection.
+        assert!(matches!(
+            storage.reserve_fenced_attempt(&claim).unwrap(),
+            FencedAttemptReservation::LostLeaseOrSuperseded
+        ));
+        assert_eq!(
+            storage
+                .test_get_outbox_snapshot_detailed("life", &record.id)
+                .unwrap(),
+            witnessed,
+            "reserve must retain the Delete witness and all Attempt identity"
+        );
+
+        {
+            let state = storage.state().unwrap();
+            state
+                .connection
+                .execute(
+                    "UPDATE memory_vector_sync_outbox
+                     SET lease_expires_at='2000-01-01T00:00:00.000Z'
+                     WHERE life_id=?1 AND memory_id=?2",
+                    params![record.life_id, record.id],
+                )
+                .unwrap();
+        }
+        storage.test_expire_fenced_runtime_lease().unwrap();
+        assert!(storage
+            .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-b")
+            .unwrap()
+            .is_none());
+
+        let recovered = storage
+            .test_get_outbox_snapshot_detailed("life", &record.id)
+            .unwrap();
+        assert_eq!(recovered.state, "blocked");
+        assert_eq!(recovered.attempt_count, witnessed.attempt_count);
+        assert_eq!(
+            recovered.claimed_generation_id, witnessed.claimed_generation_id,
+            "recovery must retain the durable generation"
+        );
+        assert_eq!(recovered.fenced_claim_epoch, witnessed.fenced_claim_epoch);
+        assert_eq!(
+            recovered.last_marked_claim_epoch,
+            witnessed.last_marked_claim_epoch
+        );
+        assert_eq!(
+            recovered.last_send_disposition, witnessed.last_send_disposition,
+            "recovery must not clear Unknown Delete evidence"
+        );
+        assert_eq!(
+            (
+                recovered.lease_owner,
+                recovered.lease_fence_epoch,
+                recovered.lease_expires_at
+            ),
+            (None, None, None)
+        );
+        assert_eq!(storage.retry_failures("life").unwrap(), 0);
+        assert_eq!(
+            storage
+                .inspect_outbox_sync_health("generation-a", MAX_VECTOR_SYNC_ATTEMPTS as u32, 0)
+                .unwrap()
+                .delete_replay_not_eligible_count,
+            1
+        );
+    }
+
     #[test]
     fn expired_upsert_with_possible_send_blocks() {
         let cases = [

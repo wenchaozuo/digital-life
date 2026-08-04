@@ -24,9 +24,9 @@ use crate::{
     },
     secrets::{SecretStore, WindowsCredentialSecretStore},
     storage::{
-        FencedAttemptReservation, FencedAttemptToken, FencedFailureDecision,
-        FencedFailureFinalizeResult, FencedFinalizeResult, FencedVectorSyncClaim, StorageService,
-        MAX_VECTOR_SYNC_ATTEMPTS,
+        FencedAttemptReservation, FencedAttemptToken, FencedDeleteWitnessResult,
+        FencedFailureDecision, FencedFailureFinalizeResult, FencedFinalizeResult,
+        FencedVectorSyncClaim, StorageService, MAX_VECTOR_SYNC_ATTEMPTS,
     },
     vector_store::{
         GenerationVectorRecord, LanceDbVectorStoreRegistry, VectorGenerationContext, VectorStore,
@@ -281,6 +281,7 @@ const fn retryable_error(error: RetryErrorClass) -> bool {
 pub(crate) enum VectorSyncTestPausePoint {
     BeforeEmbedding,
     BeforeDelete,
+    AfterDeleteWitnessBeforeLance,
     AfterEmbeddingBeforeLance,
     AfterProviderFailureBeforeFinalize,
     AfterLanceBeforeFinalize,
@@ -548,6 +549,37 @@ impl<'a> FencedVectorSyncSingleEventConsumer<'a> {
                 {
                     return Ok(FencedVectorSyncSingleEventResult::LostLeaseOrSuperseded);
                 }
+                match self.storage.mark_fenced_delete_send_witness(&token) {
+                    Ok(FencedDeleteWitnessResult::Marked) => {}
+                    Ok(FencedDeleteWitnessResult::LostLeaseOrSuperseded) => {
+                        return Ok(FencedVectorSyncSingleEventResult::LostLeaseOrSuperseded)
+                    }
+                    Err(_) => {
+                        // A commit result can be lost after the witness transaction
+                        // succeeds. Re-read SQLite only; this in-memory token must
+                        // never continue to Lance or retry marking.
+                        let _persisted = self
+                            .storage
+                            .fenced_delete_send_witness_is_persisted(&token)
+                            .map_err(|_| {
+                                worker_error(MemoryVectorSyncWorkerErrorCode::OutboxUnavailable)
+                            })?;
+                        return Ok(FencedVectorSyncSingleEventResult::LostLeaseOrSuperseded);
+                    }
+                }
+                #[cfg(test)]
+                self.check_test_pause_point(
+                    VectorSyncTestPausePoint::AfterDeleteWitnessBeforeLance,
+                );
+                if !self
+                    .storage
+                    .validate_fenced_attempt_token_current(&token)
+                    .map_err(|_| worker_error(MemoryVectorSyncWorkerErrorCode::OutboxUnavailable))?
+                {
+                    // The witness remains durable even though this token may no
+                    // longer cross the Delete boundary.
+                    return Ok(FencedVectorSyncSingleEventResult::LostLeaseOrSuperseded);
+                }
                 let outcome = self
                     .vectors
                     .delete_generation_memory(&self.generation, token.life_id(), token.memory_id())
@@ -576,7 +608,7 @@ impl<'a> FencedVectorSyncSingleEventConsumer<'a> {
                         },
                         EmbeddingRetrySafety::ResponseReceived,
                         RetryOperation::Delete,
-                        None,
+                        Some("possibly_sent"),
                         retry_cutoff,
                     ),
                 }
@@ -827,18 +859,26 @@ impl<'a> FencedVectorSyncSingleEventConsumer<'a> {
         let attempt_count = u32::try_from(token.attempt_ordinal())
             .map_err(|_| worker_error(MemoryVectorSyncWorkerErrorCode::OutboxUnavailable))?;
         let retry = retry_decision(error, retry_safety, attempt_count, operation);
-        let failure_decision = match retry.disposition {
-            RetryDisposition::Retryable => match retry_delay_millis(attempt_count) {
-                RetryDelayDecision::RetryAfter { delay_millis } => {
-                    FencedFailureDecision::RetryAfter { delay_millis }
-                }
-                RetryDelayDecision::BlockedAtAttemptLimit
-                | RetryDelayDecision::InvalidOrOverflow => FencedFailureDecision::Blocked,
-            },
-            RetryDisposition::Blocked | RetryDisposition::ProviderResultUnknown => {
+        let failure_decision =
+            if operation == RetryOperation::Delete && send_disposition == Some("possibly_sent") {
+                // The Delete call may have taken effect. Without a stronger
+                // VectorStore result contract, ordinary RetryWait would be a replay
+                // permit, so converge through the durable no-replay state instead.
                 FencedFailureDecision::Blocked
-            }
-        };
+            } else {
+                match retry.disposition {
+                    RetryDisposition::Retryable => match retry_delay_millis(attempt_count) {
+                        RetryDelayDecision::RetryAfter { delay_millis } => {
+                            FencedFailureDecision::RetryAfter { delay_millis }
+                        }
+                        RetryDelayDecision::BlockedAtAttemptLimit
+                        | RetryDelayDecision::InvalidOrOverflow => FencedFailureDecision::Blocked,
+                    },
+                    RetryDisposition::Blocked | RetryDisposition::ProviderResultUnknown => {
+                        FencedFailureDecision::Blocked
+                    }
+                }
+            };
         let clock_now = match failure_decision {
             FencedFailureDecision::RetryAfter { .. } => self.retry_clock.now_utc_millis().ok(),
             FencedFailureDecision::Blocked => Some(retry_cutoff),
@@ -3920,6 +3960,604 @@ mod tests {
     }
 
     #[test]
+    fn delete_witness_commit_unknown_never_calls_lance_or_replays_after_restart() {
+        let (temp, storage) = test_storage();
+        let record = confirmed(&storage, false);
+        let descriptor = "u".repeat(64);
+        storage
+            .register_building_vector_generation("gen-delete-witness-unknown", &descriptor, 3)
+            .unwrap();
+        storage
+            .enqueue(EnqueueMemoryVectorSyncRequest {
+                life_id: record.life_id.clone(),
+                memory_id: record.id.clone(),
+                desired_action: MemoryVectorSyncAction::Delete,
+            })
+            .unwrap();
+        let context = VectorGenerationContext::new(
+            crate::vector_store::VectorGenerationId::parse("gen-delete-witness-unknown").unwrap(),
+            descriptor,
+            3,
+        )
+        .unwrap();
+        let raw_vectors = crate::vector_store::InMemoryVectorStore::default();
+        tauri::async_runtime::block_on(raw_vectors.create_generation(&context)).unwrap();
+        let lance_upserts = Arc::new(AtomicUsize::new(0));
+        let lance_deletes = Arc::new(AtomicUsize::new(0));
+        let current_lance_writes = Arc::new(AtomicUsize::new(0));
+        let max_concurrent_lance_writes = Arc::new(AtomicUsize::new(0));
+        let vectors = CountingVectorStore {
+            inner: raw_vectors,
+            lance_upserts: Arc::clone(&lance_upserts),
+            lance_deletes: Arc::clone(&lance_deletes),
+            current_lance_writes: Arc::clone(&current_lance_writes),
+            max_concurrent_lance_writes: Arc::clone(&max_concurrent_lance_writes),
+        };
+        let raw_provider = crate::embedding::DeterministicEmbeddingProvider::new(3);
+        let provider_requests = Arc::new(AtomicUsize::new(0));
+        let embedding_successes = Arc::new(AtomicUsize::new(0));
+        let provider = CountingEmbeddingProvider {
+            inner: &raw_provider,
+            provider_requests: Arc::clone(&provider_requests),
+            embedding_successes: Arc::clone(&embedding_successes),
+        };
+        let consumer = FencedVectorSyncSingleEventConsumer::new(
+            &storage,
+            &provider,
+            &vectors,
+            context.clone(),
+        );
+
+        // The write transaction actually commits, but the caller sees an
+        // indeterminate result. This Attempt must only re-read SQLite and must
+        // never cross the Lance boundary with its in-memory token.
+        storage.test_fail_next_fenced_delete_witness_after_commit();
+        assert_eq!(
+            tauri::async_runtime::block_on(consumer.process_one("worker-a")).unwrap(),
+            FencedVectorSyncSingleEventResult::LostLeaseOrSuperseded
+        );
+        assert_eq!(provider_requests.load(Ordering::SeqCst), 0);
+        assert_eq!(embedding_successes.load(Ordering::SeqCst), 0);
+        assert_eq!(lance_upserts.load(Ordering::SeqCst), 0);
+        assert_eq!(lance_deletes.load(Ordering::SeqCst), 0);
+        let marked = storage
+            .test_get_outbox_snapshot_detailed(&record.life_id, &record.id)
+            .unwrap();
+        assert_eq!(marked.state, "processing");
+        assert_eq!(marked.attempt_count, 1);
+        assert_eq!(
+            marked.last_send_disposition.as_deref(),
+            Some("possibly_sent")
+        );
+
+        // Expiry only releases the lease into the non-replayable state. It
+        // cannot erase the witness or recreate ordinary pending work.
+        storage.test_expire_fenced_runtime_lease().unwrap();
+        storage
+            .test_recover_expired_fenced_processing_for_generation_binding(i64::MAX)
+            .unwrap();
+        let recovered = storage
+            .test_get_outbox_snapshot_detailed(&record.life_id, &record.id)
+            .unwrap();
+        assert_eq!(recovered.state, "blocked");
+        assert_eq!(recovered.attempt_count, 1);
+        assert_eq!(
+            recovered.last_send_disposition.as_deref(),
+            Some("possibly_sent")
+        );
+        assert_eq!(recovered.lease_owner, None);
+        assert_eq!(recovered.lease_fence_epoch, None);
+        assert_eq!(recovered.lease_expires_at, None);
+        assert_eq!(
+            tauri::async_runtime::block_on(consumer.process_one("worker-a")).unwrap(),
+            FencedVectorSyncSingleEventResult::NoEligibleEvent
+        );
+        assert_eq!(lance_deletes.load(Ordering::SeqCst), 0);
+
+        // A fresh StorageService over the same file is the restart proof: the
+        // durable witness still denies a formal worker any external I/O.
+        drop(consumer);
+        drop(vectors);
+        drop(provider);
+        drop(raw_provider);
+        drop(storage);
+        let restarted =
+            StorageService::initialize_with_roots(temp.path().join("data"), None).unwrap();
+        let restarted_vectors = crate::vector_store::InMemoryVectorStore::default();
+        tauri::async_runtime::block_on(restarted_vectors.create_generation(&context)).unwrap();
+        let restarted_raw_provider = crate::embedding::DeterministicEmbeddingProvider::new(3);
+        let restarted_provider = CountingEmbeddingProvider {
+            inner: &restarted_raw_provider,
+            provider_requests: Arc::clone(&provider_requests),
+            embedding_successes: Arc::clone(&embedding_successes),
+        };
+        let restarted_consumer = FencedVectorSyncSingleEventConsumer::new(
+            &restarted,
+            &restarted_provider,
+            &restarted_vectors,
+            context.clone(),
+        );
+        restarted.test_expire_fenced_runtime_lease().unwrap();
+        assert!(restarted
+            .claim_one_fenced_vector_sync(
+                context.generation_id().as_str(),
+                context.descriptor_hash(),
+                context.dimension(),
+                "worker-restarted-direct",
+            )
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            tauri::async_runtime::block_on(
+                restarted_consumer.process_one("worker-restarted-direct")
+            )
+            .unwrap(),
+            FencedVectorSyncSingleEventResult::NoEligibleEvent
+        );
+        assert_eq!(provider_requests.load(Ordering::SeqCst), 0);
+        assert_eq!(lance_upserts.load(Ordering::SeqCst), 0);
+        assert_eq!(lance_deletes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn delete_witness_survives_second_token_guard_loss_without_lance() {
+        let (_temp, storage) = test_storage();
+        let record = confirmed(&storage, false);
+        let descriptor = "z".repeat(64);
+        storage
+            .register_building_vector_generation("gen-delete-second-guard", &descriptor, 3)
+            .unwrap();
+        storage
+            .enqueue(EnqueueMemoryVectorSyncRequest {
+                life_id: record.life_id.clone(),
+                memory_id: record.id.clone(),
+                desired_action: MemoryVectorSyncAction::Delete,
+            })
+            .unwrap();
+        let context = VectorGenerationContext::new(
+            crate::vector_store::VectorGenerationId::parse("gen-delete-second-guard").unwrap(),
+            descriptor,
+            3,
+        )
+        .unwrap();
+        let raw_vectors = crate::vector_store::InMemoryVectorStore::default();
+        tauri::async_runtime::block_on(raw_vectors.create_generation(&context)).unwrap();
+        let lance_upserts = Arc::new(AtomicUsize::new(0));
+        let lance_deletes = Arc::new(AtomicUsize::new(0));
+        let vectors = CountingVectorStore {
+            inner: raw_vectors,
+            lance_upserts: Arc::clone(&lance_upserts),
+            lance_deletes: Arc::clone(&lance_deletes),
+            current_lance_writes: Arc::new(AtomicUsize::new(0)),
+            max_concurrent_lance_writes: Arc::new(AtomicUsize::new(0)),
+        };
+        let raw_provider = crate::embedding::DeterministicEmbeddingProvider::new(3);
+        let provider_requests = Arc::new(AtomicUsize::new(0));
+        let embedding_successes = Arc::new(AtomicUsize::new(0));
+        let provider = CountingEmbeddingProvider {
+            inner: &raw_provider,
+            provider_requests: Arc::clone(&provider_requests),
+            embedding_successes: Arc::clone(&embedding_successes),
+        };
+        let consumer =
+            FencedVectorSyncSingleEventConsumer::new(&storage, &provider, &vectors, context);
+        consumer.set_test_pause_hook_for_test(Some(Box::new(|point| {
+            if point == VectorSyncTestPausePoint::AfterDeleteWitnessBeforeLance {
+                storage.test_expire_fenced_runtime_lease().unwrap();
+            }
+        })));
+        assert_eq!(
+            tauri::async_runtime::block_on(consumer.process_one("worker-second-guard")).unwrap(),
+            FencedVectorSyncSingleEventResult::LostLeaseOrSuperseded
+        );
+        consumer.set_test_pause_hook_for_test(None);
+        assert_eq!(provider_requests.load(Ordering::SeqCst), 0);
+        assert_eq!(embedding_successes.load(Ordering::SeqCst), 0);
+        assert_eq!(lance_upserts.load(Ordering::SeqCst), 0);
+        assert_eq!(lance_deletes.load(Ordering::SeqCst), 0);
+        let snapshot = storage
+            .test_get_outbox_snapshot_detailed(&record.life_id, &record.id)
+            .unwrap();
+        assert_eq!(snapshot.state, "processing");
+        assert_eq!(snapshot.attempt_count, 1);
+        assert_eq!(
+            snapshot.claimed_generation_id.as_deref(),
+            Some("gen-delete-second-guard")
+        );
+        assert_eq!(
+            snapshot.last_send_disposition.as_deref(),
+            Some("possibly_sent")
+        );
+        assert_eq!(snapshot.last_error_code, None);
+    }
+
+    #[test]
+    fn delete_success_finalize_commit_unknown_is_not_replayed_after_restart() {
+        let (temp, storage) = test_storage();
+        let record = confirmed(&storage, false);
+        let descriptor = "v".repeat(64);
+        storage
+            .register_building_vector_generation("gen-delete-finalize-unknown", &descriptor, 3)
+            .unwrap();
+        storage
+            .enqueue(EnqueueMemoryVectorSyncRequest {
+                life_id: record.life_id.clone(),
+                memory_id: record.id.clone(),
+                desired_action: MemoryVectorSyncAction::Delete,
+            })
+            .unwrap();
+        let context = VectorGenerationContext::new(
+            crate::vector_store::VectorGenerationId::parse("gen-delete-finalize-unknown").unwrap(),
+            descriptor,
+            3,
+        )
+        .unwrap();
+        let raw_vectors = crate::vector_store::InMemoryVectorStore::default();
+        tauri::async_runtime::block_on(raw_vectors.create_generation(&context)).unwrap();
+        let lance_upserts = Arc::new(AtomicUsize::new(0));
+        let lance_deletes = Arc::new(AtomicUsize::new(0));
+        let current_lance_writes = Arc::new(AtomicUsize::new(0));
+        let max_concurrent_lance_writes = Arc::new(AtomicUsize::new(0));
+        let vectors = CountingVectorStore {
+            inner: raw_vectors,
+            lance_upserts: Arc::clone(&lance_upserts),
+            lance_deletes: Arc::clone(&lance_deletes),
+            current_lance_writes: Arc::clone(&current_lance_writes),
+            max_concurrent_lance_writes: Arc::clone(&max_concurrent_lance_writes),
+        };
+        let raw_provider = crate::embedding::DeterministicEmbeddingProvider::new(3);
+        let provider_requests = Arc::new(AtomicUsize::new(0));
+        let embedding_successes = Arc::new(AtomicUsize::new(0));
+        let provider = CountingEmbeddingProvider {
+            inner: &raw_provider,
+            provider_requests: Arc::clone(&provider_requests),
+            embedding_successes: Arc::clone(&embedding_successes),
+        };
+        let consumer = FencedVectorSyncSingleEventConsumer::new(
+            &storage,
+            &provider,
+            &vectors,
+            context.clone(),
+        );
+        storage.test_fail_next_fenced_success_finalize_after_commit();
+        assert_eq!(
+            tauri::async_runtime::block_on(consumer.process_one("worker-a")).unwrap(),
+            FencedVectorSyncSingleEventResult::CompletedDelete
+        );
+        assert_eq!(provider_requests.load(Ordering::SeqCst), 0);
+        assert_eq!(lance_upserts.load(Ordering::SeqCst), 0);
+        assert_eq!(lance_deletes.load(Ordering::SeqCst), 1);
+        assert!(storage.list(&record.life_id).unwrap().is_empty());
+
+        drop(consumer);
+        drop(vectors);
+        drop(provider);
+        drop(raw_provider);
+        drop(storage);
+        let restarted =
+            StorageService::initialize_with_roots(temp.path().join("data"), None).unwrap();
+        let restarted_vectors = crate::vector_store::InMemoryVectorStore::default();
+        tauri::async_runtime::block_on(restarted_vectors.create_generation(&context)).unwrap();
+        let restarted_raw_provider = crate::embedding::DeterministicEmbeddingProvider::new(3);
+        let restarted_provider = CountingEmbeddingProvider {
+            inner: &restarted_raw_provider,
+            provider_requests: Arc::clone(&provider_requests),
+            embedding_successes: Arc::clone(&embedding_successes),
+        };
+        let restarted_consumer = FencedVectorSyncSingleEventConsumer::new(
+            &restarted,
+            &restarted_provider,
+            &restarted_vectors,
+            context,
+        );
+        restarted.test_expire_fenced_runtime_lease().unwrap();
+        assert_eq!(
+            tauri::async_runtime::block_on(
+                restarted_consumer.process_one("worker-restarted-direct")
+            )
+            .unwrap(),
+            FencedVectorSyncSingleEventResult::NoEligibleEvent
+        );
+        assert_eq!(provider_requests.load(Ordering::SeqCst), 0);
+        assert_eq!(lance_upserts.load(Ordering::SeqCst), 0);
+        assert_eq!(lance_deletes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn pending_delete_unknown_evidence_forms_have_zero_formal_worker_io() {
+        for (label, send_disposition, error_code) in [
+            ("possibly-sent", Some("possibly_sent"), None),
+            (
+                "provider-result-unknown",
+                None,
+                Some("PROVIDER_RESULT_UNKNOWN"),
+            ),
+        ] {
+            let (temp, storage) = test_storage();
+            let record = confirmed(&storage, false);
+            let descriptor = "w".repeat(64);
+            storage
+                .register_building_vector_generation("gen-delete-unknown-pending", &descriptor, 3)
+                .unwrap();
+            storage
+                .enqueue(EnqueueMemoryVectorSyncRequest {
+                    life_id: record.life_id.clone(),
+                    memory_id: record.id.clone(),
+                    desired_action: MemoryVectorSyncAction::Delete,
+                })
+                .unwrap();
+            let context = VectorGenerationContext::new(
+                crate::vector_store::VectorGenerationId::parse("gen-delete-unknown-pending")
+                    .unwrap(),
+                descriptor,
+                3,
+            )
+            .unwrap();
+            {
+                let db_path = temp
+                    .path()
+                    .join("data")
+                    .join(crate::storage::DATABASE_FILE_NAME);
+                let conn = crate::storage::open_authorized_test_connection(&db_path).unwrap();
+                conn.execute(
+                    "UPDATE memory_vector_sync_outbox
+                     SET state='pending', attempt_count=2,
+                         claimed_generation_id=?1, fenced_claim_epoch=2,
+                         last_marked_claim_epoch=2, last_send_disposition=?2,
+                         last_error_code=?3
+                     WHERE life_id=?4 AND memory_id=?5 AND desired_action='delete'",
+                    rusqlite::params![
+                        context.generation_id().as_str(),
+                        send_disposition,
+                        error_code,
+                        record.life_id,
+                        record.id,
+                    ],
+                )
+                .unwrap();
+            }
+            let before = storage
+                .test_get_outbox_snapshot_detailed(&record.life_id, &record.id)
+                .unwrap();
+            let health = storage
+                .inspect_outbox_sync_health(
+                    context.generation_id().as_str(),
+                    crate::storage::MAX_VECTOR_SYNC_ATTEMPTS as u32,
+                    1_700_000_000_000,
+                )
+                .unwrap();
+            assert_eq!(
+                health.delete_replay_not_eligible_count, 1,
+                "{label}: Health uses the same Delete Unknown predicate"
+            );
+
+            let raw_vectors = crate::vector_store::InMemoryVectorStore::default();
+            tauri::async_runtime::block_on(raw_vectors.create_generation(&context)).unwrap();
+            let lance_upserts = Arc::new(AtomicUsize::new(0));
+            let lance_deletes = Arc::new(AtomicUsize::new(0));
+            let current_lance_writes = Arc::new(AtomicUsize::new(0));
+            let max_concurrent_lance_writes = Arc::new(AtomicUsize::new(0));
+            let vectors = CountingVectorStore {
+                inner: raw_vectors,
+                lance_upserts: Arc::clone(&lance_upserts),
+                lance_deletes: Arc::clone(&lance_deletes),
+                current_lance_writes: Arc::clone(&current_lance_writes),
+                max_concurrent_lance_writes: Arc::clone(&max_concurrent_lance_writes),
+            };
+            let raw_provider = crate::embedding::DeterministicEmbeddingProvider::new(3);
+            let provider_requests = Arc::new(AtomicUsize::new(0));
+            let embedding_successes = Arc::new(AtomicUsize::new(0));
+            let provider = CountingEmbeddingProvider {
+                inner: &raw_provider,
+                provider_requests: Arc::clone(&provider_requests),
+                embedding_successes: Arc::clone(&embedding_successes),
+            };
+            let consumer =
+                FencedVectorSyncSingleEventConsumer::new(&storage, &provider, &vectors, context);
+            assert_eq!(
+                tauri::async_runtime::block_on(consumer.process_one("worker-pending")).unwrap(),
+                FencedVectorSyncSingleEventResult::NoEligibleEvent,
+                "{label}: formal claim must reject the row"
+            );
+            let after_worker = storage
+                .test_get_outbox_snapshot_detailed(&record.life_id, &record.id)
+                .unwrap();
+            assert_same_outbox_row!(before, after_worker);
+            assert_eq!(provider_requests.load(Ordering::SeqCst), 0, "{label}");
+            assert_eq!(embedding_successes.load(Ordering::SeqCst), 0, "{label}");
+            assert_eq!(lance_upserts.load(Ordering::SeqCst), 0, "{label}");
+            assert_eq!(lance_deletes.load(Ordering::SeqCst), 0, "{label}");
+
+            // A manual Retry entry point must not turn either evidence form
+            // back into ordinary pending work.
+            {
+                let db_path = temp
+                    .path()
+                    .join("data")
+                    .join(crate::storage::DATABASE_FILE_NAME);
+                let conn = crate::storage::open_authorized_test_connection(&db_path).unwrap();
+                conn.execute(
+                    "UPDATE memory_vector_sync_outbox SET state='blocked', next_attempt_at=NULL
+                     WHERE life_id=?1 AND memory_id=?2",
+                    rusqlite::params![record.life_id, record.id],
+                )
+                .unwrap();
+            }
+            let blocked_before_retry = storage
+                .test_get_outbox_snapshot_detailed(&record.life_id, &record.id)
+                .unwrap();
+            assert_eq!(
+                storage.retry_failures(&record.life_id).unwrap(),
+                0,
+                "{label}"
+            );
+            let after_retry = storage
+                .test_get_outbox_snapshot_detailed(&record.life_id, &record.id)
+                .unwrap();
+            assert_same_outbox_row!(blocked_before_retry, after_retry);
+            assert_eq!(
+                tauri::async_runtime::block_on(consumer.process_one("worker-pending")).unwrap(),
+                FencedVectorSyncSingleEventResult::NoEligibleEvent,
+                "{label}: retry must not make the row claimable"
+            );
+            assert_eq!(provider_requests.load(Ordering::SeqCst), 0, "{label}");
+            assert_eq!(lance_upserts.load(Ordering::SeqCst), 0, "{label}");
+            assert_eq!(lance_deletes.load(Ordering::SeqCst), 0, "{label}");
+        }
+    }
+
+    #[test]
+    fn delete_unknown_recovery_retry_and_formal_worker_compete_for_ten_rounds() {
+        use std::sync::Barrier;
+
+        for round in 0..10 {
+            let (temp, storage_a) = test_storage();
+            let data_root = temp.path().join("data");
+            let record = confirmed(&storage_a, false);
+            let descriptor = "x".repeat(64);
+            storage_a
+                .register_building_vector_generation("gen-delete-unknown-race", &descriptor, 3)
+                .unwrap();
+            storage_a
+                .enqueue(EnqueueMemoryVectorSyncRequest {
+                    life_id: record.life_id.clone(),
+                    memory_id: record.id.clone(),
+                    desired_action: MemoryVectorSyncAction::Delete,
+                })
+                .unwrap();
+            let context = VectorGenerationContext::new(
+                crate::vector_store::VectorGenerationId::parse("gen-delete-unknown-race").unwrap(),
+                descriptor,
+                3,
+            )
+            .unwrap();
+            let claim = storage_a
+                .claim_one_fenced_vector_sync(
+                    context.generation_id().as_str(),
+                    context.descriptor_hash(),
+                    context.dimension(),
+                    "seed-worker",
+                )
+                .unwrap()
+                .unwrap();
+            let token = match storage_a.reserve_fenced_attempt(&claim).unwrap() {
+                FencedAttemptReservation::Reserved(token) => token,
+                _ => panic!("round {round}: seed Delete reservation was not granted"),
+            };
+            assert_eq!(
+                storage_a.mark_fenced_delete_send_witness(&token).unwrap(),
+                FencedDeleteWitnessResult::Marked
+            );
+            storage_a.test_expire_fenced_runtime_lease().unwrap();
+
+            let recovery_storage =
+                StorageService::initialize_with_roots(data_root.clone(), None).unwrap();
+            let worker_storage =
+                StorageService::initialize_with_roots(data_root.clone(), None).unwrap();
+            let barrier = Arc::new(Barrier::new(4));
+            let recovery_barrier = Arc::clone(&barrier);
+            let recovery = thread::spawn(move || {
+                recovery_barrier.wait();
+                recovery_storage.test_recover_expired_fenced_processing_for_generation_binding(
+                    1_700_000_000_000,
+                )
+            });
+            let retry_barrier = Arc::clone(&barrier);
+            let retry = thread::spawn(move || {
+                retry_barrier.wait();
+                storage_a.retry_failures("life")
+            });
+            let provider_requests = Arc::new(AtomicUsize::new(0));
+            let embedding_successes = Arc::new(AtomicUsize::new(0));
+            let lance_upserts = Arc::new(AtomicUsize::new(0));
+            let lance_deletes = Arc::new(AtomicUsize::new(0));
+            let worker_provider_requests = Arc::clone(&provider_requests);
+            let worker_embedding_successes = Arc::clone(&embedding_successes);
+            let worker_lance_upserts = Arc::clone(&lance_upserts);
+            let worker_lance_deletes = Arc::clone(&lance_deletes);
+            let worker_barrier = Arc::clone(&barrier);
+            let worker_context = context.clone();
+            let worker = thread::spawn(move || {
+                let raw_vectors = crate::vector_store::InMemoryVectorStore::default();
+                tauri::async_runtime::block_on(raw_vectors.create_generation(&worker_context))
+                    .unwrap();
+                let vectors = CountingVectorStore {
+                    inner: raw_vectors,
+                    lance_upserts: worker_lance_upserts,
+                    lance_deletes: worker_lance_deletes,
+                    current_lance_writes: Arc::new(AtomicUsize::new(0)),
+                    max_concurrent_lance_writes: Arc::new(AtomicUsize::new(0)),
+                };
+                let raw_provider = crate::embedding::DeterministicEmbeddingProvider::new(3);
+                let provider = CountingEmbeddingProvider {
+                    inner: &raw_provider,
+                    provider_requests: worker_provider_requests,
+                    embedding_successes: worker_embedding_successes,
+                };
+                let consumer = FencedVectorSyncSingleEventConsumer::new(
+                    &worker_storage,
+                    &provider,
+                    &vectors,
+                    worker_context,
+                );
+                worker_barrier.wait();
+                tauri::async_runtime::block_on(consumer.process_one("race-worker"))
+            });
+            barrier.wait();
+
+            recovery.join().unwrap().unwrap();
+            assert_eq!(retry.join().unwrap().unwrap(), 0, "round {round}: retry");
+            assert_eq!(
+                worker.join().unwrap().unwrap(),
+                FencedVectorSyncSingleEventResult::NoEligibleEvent,
+                "round {round}: formal worker"
+            );
+            assert_eq!(provider_requests.load(Ordering::SeqCst), 0, "round {round}");
+            assert_eq!(
+                embedding_successes.load(Ordering::SeqCst),
+                0,
+                "round {round}"
+            );
+            assert_eq!(lance_upserts.load(Ordering::SeqCst), 0, "round {round}");
+            assert_eq!(lance_deletes.load(Ordering::SeqCst), 0, "round {round}");
+
+            let verifier = StorageService::initialize_with_roots(data_root, None).unwrap();
+            let snapshot = verifier
+                .test_get_outbox_snapshot_detailed(&record.life_id, &record.id)
+                .unwrap();
+            assert_eq!(snapshot.state, "blocked", "round {round}");
+            assert_eq!(snapshot.attempt_count, 1, "round {round}");
+            assert_eq!(snapshot.fenced_claim_epoch, 1, "round {round}");
+            assert_eq!(snapshot.last_marked_claim_epoch, 1, "round {round}");
+            assert_eq!(
+                snapshot.claimed_generation_id.as_deref(),
+                Some("gen-delete-unknown-race"),
+                "round {round}"
+            );
+            assert_eq!(
+                snapshot.last_send_disposition.as_deref(),
+                Some("possibly_sent"),
+                "round {round}"
+            );
+            assert_eq!(snapshot.lease_owner, None, "round {round}");
+            assert_eq!(snapshot.lease_fence_epoch, None, "round {round}");
+            assert_eq!(snapshot.lease_expires_at, None, "round {round}");
+            assert_eq!(
+                verifier
+                    .inspect_outbox_sync_health(
+                        context.generation_id().as_str(),
+                        crate::storage::MAX_VECTOR_SYNC_ATTEMPTS as u32,
+                        1_700_000_000_000,
+                    )
+                    .unwrap()
+                    .delete_replay_not_eligible_count,
+                1,
+                "round {round}: health"
+            );
+        }
+    }
+
+    #[test]
     fn delete_success_finalize_loss_leaves_sqlite_uncompleted() {
         let (temp, storage) = test_storage();
         let record = confirmed(&storage, false);
@@ -4010,7 +4648,10 @@ mod tests {
         assert_eq!(snapshot.desired_action, "delete");
         assert_eq!(snapshot.state, "processing");
         assert_eq!(snapshot.attempt_count, 1);
-        assert_eq!(snapshot.last_send_disposition, None);
+        assert_eq!(
+            snapshot.last_send_disposition.as_deref(),
+            Some("possibly_sent")
+        );
         assert_eq!(
             snapshot.claimed_generation_id.as_deref(),
             Some("gen-delete-finalize")
@@ -7053,12 +7694,13 @@ mod tests {
         let report =
             tauri::async_runtime::block_on(drain_fenced_vector_sync(&consumer, "lance-del-tr", 1))
                 .unwrap();
-        assert_eq!(report.retry_scheduled, 1);
+        assert_eq!(report.blocked, 1);
+        assert_eq!(report.retry_scheduled, 0);
         assert_eq!(provider_requests.load(Ordering::SeqCst), 0);
 
         let row = storage.test_fenced_outbox_failure_snapshot().unwrap();
         assert_eq!(row.0, 1);
-        assert_eq!(row.1, None);
+        assert_eq!(row.1.as_deref(), Some("possibly_sent"));
         assert_eq!(row.2, "LANCE_TRANSIENT");
     }
 
@@ -8192,7 +8834,7 @@ mod tests {
 
             let row = storage.test_fenced_outbox_failure_snapshot().unwrap();
             assert_eq!(row.0, 1);
-            assert_eq!(row.1, None);
+            assert_eq!(row.1.as_deref(), Some("possibly_sent"));
             assert_eq!(row.2, "LANCE_PERMANENT");
             let jobs = storage.list("life").unwrap();
             assert_eq!(jobs[0].state, MemoryVectorSyncState::Blocked);

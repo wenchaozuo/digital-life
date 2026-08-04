@@ -9,7 +9,7 @@
 
 use crate::{
     memory::vector_sync_outbox::{MemoryVectorSyncAction, MemoryVectorSyncState},
-    storage::MAX_VECTOR_SYNC_ATTEMPTS,
+    storage::{is_delete_unknown_evidence, MAX_VECTOR_SYNC_ATTEMPTS},
     vector_store::{VectorMetadataSample, VectorStoreError, VectorStoreErrorCode},
 };
 
@@ -236,11 +236,15 @@ pub(crate) fn classify_compensation(
     // Unknown Send evidence outranks every budget, terminal, and eligible
     // classification: a possibly-sent result or a PROVIDER_RESULT_UNKNOWN
     // error can never be automatically compensated or replayed.
+    if is_delete_unknown_evidence(
+        facts.desired_action.as_str(),
+        compensation_send_disposition_value(facts.last_send_disposition),
+        facts.last_error_code,
+    ) {
+        return VectorSyncCompensationClass::LateDeleteUnproven;
+    }
     if has_unknown_send_evidence(facts) {
-        return match facts.desired_action {
-            MemoryVectorSyncAction::Upsert => VectorSyncCompensationClass::BlockedUnknownSend,
-            MemoryVectorSyncAction::Delete => VectorSyncCompensationClass::LateDeleteUnproven,
-        };
+        return VectorSyncCompensationClass::BlockedUnknownSend;
     }
     if facts.attempt_count > MAX_VECTOR_SYNC_ATTEMPTS {
         return VectorSyncCompensationClass::InvariantViolation;
@@ -264,6 +268,16 @@ pub(crate) fn classify_compensation(
 fn has_unknown_send_evidence(facts: &VectorSyncCompensationFacts<'_>) -> bool {
     facts.last_send_disposition == CompensationSendDisposition::PossiblySent
         || facts.last_error_code == Some(STABLE_UNKNOWN)
+}
+
+fn compensation_send_disposition_value(
+    disposition: CompensationSendDisposition,
+) -> Option<&'static str> {
+    match disposition {
+        CompensationSendDisposition::None => None,
+        CompensationSendDisposition::DefinitelyNotSent => Some("definitely_not_sent"),
+        CompensationSendDisposition::PossiblySent => Some("possibly_sent"),
+    }
 }
 
 /// True when the durable attempt identity violates schema-14 invariants.
@@ -308,7 +322,7 @@ fn classify_delete(facts: &VectorSyncCompensationFacts<'_>) -> VectorSyncCompens
             VectorSyncCompensationClass::LateDeleteUnproven
         }
         CompensationSendDisposition::DefinitelyNotSent => {
-            VectorSyncCompensationClass::LateDeleteUnproven
+            VectorSyncCompensationClass::EligibleForFencedDeleteReplay
         }
     }
 }
@@ -1039,7 +1053,7 @@ mod tests {
                     true,
                     ExactGenerationProof::Missing,
                 ),
-                LateDeleteUnproven,
+                EligibleForFencedDeleteReplay,
             ),
             (
                 "processing",

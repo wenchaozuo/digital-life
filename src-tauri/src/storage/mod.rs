@@ -24,9 +24,9 @@ pub(crate) use llm_candidate_extraction::{
     trigger_candidate_extraction, LlmCandidateExtractionCoordinator,
 };
 pub(crate) use vector_sync_outbox::{
-    FencedAttemptReservation, FencedAttemptToken, FencedFailureDecision,
-    FencedFailureFinalizeResult, FencedFinalizeResult, FencedVectorSyncClaim,
-    MAX_VECTOR_SYNC_ATTEMPTS,
+    is_delete_unknown_evidence, FencedAttemptReservation, FencedAttemptToken,
+    FencedDeleteWitnessResult, FencedFailureDecision, FencedFailureFinalizeResult,
+    FencedFinalizeResult, FencedVectorSyncClaim, MAX_VECTOR_SYNC_ATTEMPTS,
 };
 
 use std::{
@@ -459,6 +459,7 @@ impl StorageService {
         ) = state
             .connection
             .query_row(
+                &format!(
                 "SELECT
                 COALESCE(SUM(CASE WHEN state='pending' THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN state='retry_wait' THEN 1 ELSE 0 END), 0),
@@ -474,13 +475,15 @@ impl StorageService {
                 COALESCE(SUM(CASE WHEN state='processing' AND lease_expires_at IS NOT NULL AND lease_expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ', ?1 / 1000.0, 'unixepoch') AND fenced_claim_epoch > last_marked_claim_epoch THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN state='processing' AND lease_expires_at IS NOT NULL AND lease_expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ', ?1 / 1000.0, 'unixepoch') AND fenced_claim_epoch = last_marked_claim_epoch AND fenced_claim_epoch > 0 THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN state='processing' AND fenced_claim_epoch = 0 AND last_marked_claim_epoch = 0 THEN 1 ELSE 0 END), 0),
-                COALESCE(SUM(CASE WHEN desired_action='delete' AND (last_send_disposition IS NOT NULL OR attempt_count >= ?2 OR state NOT IN ('pending','retry_wait')) THEN 1 ELSE 0 END), 0),
+                 COALESCE(SUM(CASE WHEN {} THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN attempt_count = ?2 AND state='processing' THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN attempt_count = ?2 AND state='blocked' THEN 1 ELSE 0 END), 0),
                 MIN(CASE WHEN state='pending' THEN ROUND((julianday(created_at) - 2440587.5) * 86400000) ELSE NULL END),
                 MIN(CASE WHEN state='retry_wait' THEN ROUND((julianday(updated_at) - 2440587.5) * 86400000) ELSE NULL END),
                 MIN(CASE WHEN state='blocked' THEN ROUND((julianday(updated_at) - 2440587.5) * 86400000) ELSE NULL END)
              FROM memory_vector_sync_outbox WHERE migration_disposition IS NULL",
+                vector_sync_outbox::DELETE_UNKNOWN_EVIDENCE_SQL
+                ),
                 rusqlite::params![snapshot_now_millis as f64, max_attempts],
                 |row| Ok((
                     row.get::<_, i64>(0)? as usize,
@@ -2951,6 +2954,172 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// File-SQLite Online Backup/Restore must preserve every Delete Unknown
+    /// form and the restored production entry points must keep all of them out
+    /// of ordinary worker replay.
+    #[test]
+    fn backup_restore_preserves_delete_unknown_non_replayable_forms() {
+        use crate::{
+            memory::{
+                vector_sync_outbox::MemoryVectorSyncOutboxRepository,
+                vector_sync_worker::{
+                    FencedVectorSyncSingleEventConsumer, FencedVectorSyncSingleEventResult,
+                },
+            },
+            vector_store::{
+                InMemoryVectorStore, VectorGenerationContext, VectorGenerationId, VectorStore,
+            },
+        };
+
+        let root = TestRoot::new("backup-restore-delete-unknown");
+        let service = seeded_service(&root.0);
+        let (generation_id, descriptor, dimension) =
+            ("gen-backup-delete-unknown", "backup-delete-desc", 3);
+        service
+            .register_building_vector_generation(generation_id, descriptor, dimension)
+            .unwrap();
+        {
+            let state = service.state().unwrap();
+            state
+                .connection
+                .execute_batch(
+                    "INSERT INTO memory_vector_sync_outbox
+                       (life_id,memory_id,desired_action,state,attempt_count,mutation_sequence,
+                        target_revision,target_content_hash,fenced_claim_epoch,last_marked_claim_epoch,
+                        claimed_generation_id,last_send_disposition,last_error_code,created_at,updated_at)
+                     VALUES
+                       ('life-1','br-del-pending-send','delete','pending',2,1,NULL,NULL,2,2,
+                        'gen-backup-delete-unknown','possibly_sent',NULL,'2024-01-01T00:00:00.000Z','2024-01-01T00:00:00.000Z'),
+                       ('life-1','br-del-pending-provider','delete','pending',3,2,NULL,NULL,3,3,
+                        'gen-backup-delete-unknown',NULL,'PROVIDER_RESULT_UNKNOWN','2024-01-01T00:00:00.000Z','2024-01-01T00:00:00.000Z'),
+                       ('life-1','br-del-marked-expired','delete','processing',1,3,NULL,NULL,4,4,
+                        'gen-backup-delete-unknown','possibly_sent',NULL,'2024-01-01T00:00:00.000Z','2024-01-01T00:00:00.000Z'),
+                       ('life-1','br-del-retry-unknown','delete','retry_wait',4,4,NULL,NULL,5,5,
+                        'gen-backup-delete-unknown',NULL,'PROVIDER_RESULT_UNKNOWN','2024-01-01T00:00:00.000Z','2024-01-01T00:00:00.000Z');
+                     UPDATE memory_vector_sync_outbox
+                        SET lease_owner='backup-old-worker', lease_fence_epoch=8,
+                            lease_expires_at='2000-01-01T00:00:00.000Z'
+                      WHERE memory_id='br-del-marked-expired';",
+                )
+                .unwrap();
+        }
+        let source_lines = {
+            let state = service.state().unwrap();
+            full_outbox_row_lines(&state.connection)
+        };
+        let target = root.0.join("restored-delete-unknown");
+        assert!(
+            service.migrate_location(target.to_str().unwrap()).success,
+            "Online Backup/Restore must complete"
+        );
+        let restored = StorageService::initialize_with_roots(target, None).unwrap();
+        let restored_lines = {
+            let state = restored.state().unwrap();
+            full_outbox_row_lines(&state.connection)
+        };
+        assert_eq!(
+            restored_lines, source_lines,
+            "full Delete evidence round-trips"
+        );
+
+        let context = VectorGenerationContext::new(
+            VectorGenerationId::parse(generation_id).unwrap(),
+            descriptor,
+            dimension,
+        )
+        .unwrap();
+        let vectors = InMemoryVectorStore::default();
+        tauri::async_runtime::block_on(vectors.create_generation(&context)).unwrap();
+        let health_before = restored
+            .inspect_outbox_sync_health(
+                generation_id,
+                MAX_VECTOR_SYNC_ATTEMPTS as u32,
+                1_700_000_000_000,
+            )
+            .unwrap();
+        assert_eq!(health_before.delete_replay_not_eligible_count, 4);
+
+        restored.test_expire_fenced_runtime_lease().unwrap();
+        assert_eq!(
+            restored
+                .test_recover_expired_fenced_processing_for_generation_binding(1_700_000_000_000)
+                .unwrap(),
+            1,
+            "only the marked expired Delete needs recovery"
+        );
+        assert_eq!(restored.retry_failures("life-1").unwrap(), 0);
+        let protected_after_recovery: Vec<_> = [
+            "br-del-pending-send",
+            "br-del-pending-provider",
+            "br-del-marked-expired",
+            "br-del-retry-unknown",
+        ]
+        .into_iter()
+        .map(|memory_id| {
+            restored
+                .test_get_outbox_snapshot_detailed("life-1", memory_id)
+                .unwrap()
+        })
+        .collect();
+        assert_eq!(protected_after_recovery[2].state, "blocked");
+        assert_eq!(protected_after_recovery[2].lease_owner, None);
+        assert_eq!(protected_after_recovery[2].lease_fence_epoch, None);
+        assert_eq!(protected_after_recovery[2].lease_expires_at, None);
+        assert_eq!(
+            protected_after_recovery[2].last_send_disposition.as_deref(),
+            Some("possibly_sent")
+        );
+        assert_eq!(protected_after_recovery[3].state, "retry_wait");
+        assert_eq!(
+            protected_after_recovery[3].last_error_code.as_deref(),
+            Some("PROVIDER_RESULT_UNKNOWN")
+        );
+
+        let provider = crate::embedding::DeterministicEmbeddingProvider::new(dimension);
+        let consumer =
+            FencedVectorSyncSingleEventConsumer::new(&restored, &provider, &vectors, context);
+        for owner in [
+            "backup-worker-a",
+            "backup-worker-a",
+            "backup-worker-a",
+            "backup-worker-a",
+        ] {
+            assert_eq!(
+                tauri::async_runtime::block_on(consumer.process_one(owner)).unwrap(),
+                FencedVectorSyncSingleEventResult::NoEligibleEvent,
+                "restored Delete Unknown row must never enter ordinary worker"
+            );
+        }
+        for (index, memory_id) in [
+            "br-del-pending-send",
+            "br-del-pending-provider",
+            "br-del-marked-expired",
+            "br-del-retry-unknown",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                restored
+                    .test_get_outbox_snapshot_detailed("life-1", memory_id)
+                    .unwrap(),
+                protected_after_recovery[index],
+                "{memory_id}: formal worker does not mutate restored evidence"
+            );
+        }
+        assert_eq!(
+            restored
+                .inspect_outbox_sync_health(
+                    generation_id,
+                    MAX_VECTOR_SYNC_ATTEMPTS as u32,
+                    1_700_000_000_000,
+                )
+                .unwrap()
+                .delete_replay_not_eligible_count,
+            4
+        );
     }
 
     /// The real claim identity a worker observer captured during one

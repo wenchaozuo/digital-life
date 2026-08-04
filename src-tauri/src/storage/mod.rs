@@ -2581,14 +2581,46 @@ mod tests {
             // claim identity (never hand-constructed) and the saw_* flags
             // prove both the upsert and delete branches actually executed.
             restored.test_expire_fenced_runtime_lease().unwrap();
-            let mut processed: Vec<(ObservedClaimIdentity, FencedVectorSyncSingleEventResult)> =
-                Vec::new();
+            let mut processed: Vec<(
+                ObservedClaimIdentity,
+                LegalPreClaimIdentity,
+                FencedVectorSyncSingleEventResult,
+            )> = Vec::new();
             let mut saw_completed_upsert = false;
             let mut saw_completed_delete = false;
+            let mut drain_terminated = false;
             let max_drain_iterations = 32usize;
             for _drain_iteration in 0..max_drain_iterations {
                 let before = log.len();
                 *observed_claim.lock().unwrap() = None;
+                // Read the current DB identity of every still-eligible legal
+                // row BEFORE the worker claims, so the observed claim and the
+                // recorder calls can be cross-checked against the pre-claim DB
+                // authority (life/memory/mutation/action/target/state/attempt/
+                // epochs/generation/migration).
+                let mut pre_claim_rows: Vec<LegalPreClaimIdentity> = Vec::new();
+                {
+                    let conn = restored.state().unwrap();
+                    let mut stmt = conn
+                        .connection
+                        .prepare(
+                            "SELECT memory_id FROM memory_vector_sync_outbox
+                             WHERE life_id='life-1'
+                               AND migration_disposition IS NULL
+                               AND state IN ('pending','retry_wait','processing')",
+                        )
+                        .unwrap();
+                    let candidate_memories: Vec<String> = stmt
+                        .query_map([], |r| r.get::<_, String>(0))
+                        .unwrap()
+                        .map(|r| r.unwrap())
+                        .collect();
+                    drop(stmt);
+                    for memory in candidate_memories {
+                        pre_claim_rows
+                            .push(read_legal_pre_claim_identity(&conn.connection, &memory));
+                    }
+                }
                 let scope = crate::storage::test_support::WorkerCallContextScope::new(
                     worker_context.clone(),
                 );
@@ -2618,6 +2650,7 @@ mod tests {
                             saw_completed_delete,
                             "drain must observe at least one CompletedDelete"
                         );
+                        drain_terminated = true;
                         break;
                     }
                     FencedVectorSyncSingleEventResult::CompletedUpsert => {
@@ -2674,9 +2707,67 @@ mod tests {
                     identity.claim_epoch > 0,
                     "observed claim must carry a positive claim epoch"
                 );
-                processed.push((identity, result));
+                // F5-2: cross-check the observer against the pre-claim DB row
+                // identity for the memory the worker actually claimed.
+                let pre_claim = pre_claim_rows
+                    .iter()
+                    .find(|row| row.memory_id == identity.memory_id)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "no pre-claim DB identity recorded for claimed memory {}",
+                            identity.memory_id
+                        )
+                    });
+                assert_eq!(
+                    identity.life_id, pre_claim.life_id,
+                    "observer life matches pre-claim DB life"
+                );
+                assert_eq!(
+                    identity.memory_id, pre_claim.memory_id,
+                    "observer memory matches pre-claim DB memory"
+                );
+                assert_eq!(
+                    identity.mutation_sequence, pre_claim.mutation_sequence,
+                    "observer mutation matches pre-claim DB mutation"
+                );
+                assert_eq!(
+                    identity.desired_action, pre_claim.desired_action,
+                    "observer action matches pre-claim DB action"
+                );
+                assert_eq!(
+                    identity.target_revision, pre_claim.target_revision,
+                    "observer target revision matches pre-claim DB target"
+                );
+                assert_eq!(
+                    identity.target_content_hash, pre_claim.target_content_hash,
+                    "observer target hash matches pre-claim DB target hash"
+                );
+                assert_eq!(
+                    pre_claim.migration_disposition, None,
+                    "legal claim row is not migration-isolated"
+                );
+                // Claim epoch is granted by advancing the fenced claim epoch.
+                assert_eq!(
+                    identity.claim_epoch,
+                    pre_claim.fenced_claim_epoch + 1,
+                    "observer claim epoch must be pre-claim fenced epoch + 1"
+                );
+                processed.push((identity, pre_claim.clone(), result));
             }
             consumer.set_claim_observer_for_test(None);
+
+            assert!(
+                drain_terminated,
+                "formal restore drain exceeded the bounded iteration budget without a legal NoEligibleEvent termination"
+            );
+            assert!(
+                saw_completed_upsert,
+                "drain must have executed a CompletedUpsert"
+            );
+            assert!(
+                saw_completed_delete,
+                "drain must have executed a CompletedDelete"
+            );
 
             assert_eq!(
                 log.unbound_call_count(),
@@ -2738,7 +2829,7 @@ mod tests {
                 !processed.is_empty(),
                 "the drain must process at least one legitimate row"
             );
-            for (identity, result) in &processed {
+            for (identity, pre_claim, result) in &processed {
                 assert!(
                     ![
                         "bs-unknown",
@@ -2789,6 +2880,16 @@ mod tests {
                             identity.memory_id
                         );
                         assert_eq!(
+                            pre_claim.desired_action, "upsert",
+                            "row {} pre-claim DB action is upsert",
+                            identity.memory_id
+                        );
+                        assert_eq!(
+                            pre_claim.migration_disposition, None,
+                            "row {} pre-claim DB is not migration-isolated",
+                            identity.memory_id
+                        );
+                        assert_eq!(
                             (p, u, d),
                             (1, 1, 0),
                             "row {} upsert attribution",
@@ -2799,6 +2900,38 @@ mod tests {
                         assert_eq!(
                             identity.desired_action, "delete",
                             "row {} delete action",
+                            identity.memory_id
+                        );
+                        // F5-2: Delete pre-claim DB target must be explicitly
+                        // NULL/NULL (not just the observer's NULLs).
+                        assert_eq!(
+                            pre_claim.desired_action, "delete",
+                            "row {} pre-claim DB action is delete",
+                            identity.memory_id
+                        );
+                        assert_eq!(
+                            pre_claim.target_revision, None,
+                            "row {} pre-claim DB target revision must be NULL",
+                            identity.memory_id
+                        );
+                        assert_eq!(
+                            pre_claim.target_content_hash, None,
+                            "row {} pre-claim DB target content hash must be NULL",
+                            identity.memory_id
+                        );
+                        assert!(
+                            pre_claim.attempt_count < 5,
+                            "row {} pre-claim DB attempt below budget",
+                            identity.memory_id
+                        );
+                        assert!(
+                            pre_claim.claimed_generation_id.is_some(),
+                            "row {} pre-claim DB generation present",
+                            identity.memory_id
+                        );
+                        assert_eq!(
+                            pre_claim.migration_disposition, None,
+                            "row {} pre-claim DB not migration-isolated",
                             identity.memory_id
                         );
                         assert_eq!(
@@ -2900,6 +3033,58 @@ mod tests {
                     lease_expires_at: r.get(17)?,
                     created_at: r.get(18)?,
                     updated_at: r.get(19)?,
+                })
+            },
+        )
+        .unwrap()
+    }
+
+    /// Test-only identity of a legitimate outbox row read from the database
+    /// BEFORE the formal worker claims it. It is never hand-constructed from
+    /// fixture expectations; it is the pre-claim DB authority against which
+    /// the worker's observed claim identity and the recorder calls are
+    /// cross-checked.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct LegalPreClaimIdentity {
+        life_id: String,
+        memory_id: String,
+        mutation_sequence: i64,
+        desired_action: String,
+        target_revision: Option<i64>,
+        target_content_hash: Option<String>,
+        state: String,
+        attempt_count: i64,
+        fenced_claim_epoch: i64,
+        last_marked_claim_epoch: i64,
+        claimed_generation_id: Option<String>,
+        migration_disposition: Option<String>,
+    }
+
+    fn read_legal_pre_claim_identity(
+        conn: &rusqlite::Connection,
+        memory_id: &str,
+    ) -> LegalPreClaimIdentity {
+        conn.query_row(
+            "SELECT life_id, memory_id, mutation_sequence, desired_action,
+                    target_revision, target_content_hash, state, attempt_count,
+                    fenced_claim_epoch, last_marked_claim_epoch, claimed_generation_id,
+                    migration_disposition
+             FROM memory_vector_sync_outbox WHERE memory_id=?1",
+            rusqlite::params![memory_id],
+            |r| {
+                Ok(LegalPreClaimIdentity {
+                    life_id: r.get(0)?,
+                    memory_id: r.get(1)?,
+                    mutation_sequence: r.get(2)?,
+                    desired_action: r.get(3)?,
+                    target_revision: r.get(4)?,
+                    target_content_hash: r.get(5)?,
+                    state: r.get(6)?,
+                    attempt_count: r.get(7)?,
+                    fenced_claim_epoch: r.get(8)?,
+                    last_marked_claim_epoch: r.get(9)?,
+                    claimed_generation_id: r.get(10)?,
+                    migration_disposition: r.get(11)?,
                 })
             },
         )

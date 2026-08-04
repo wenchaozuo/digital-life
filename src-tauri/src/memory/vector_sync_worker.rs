@@ -2074,6 +2074,34 @@ mod tests {
         (temp, storage)
     }
 
+    /// Storage variant with a caller-supplied life id, so a test can create
+    /// two fixtures whose life_ids are provably distinct.
+    fn test_storage_with_life(life_id: &str) -> (tempfile::TempDir, StorageService) {
+        let temp = tempfile::tempdir().unwrap();
+        let storage =
+            StorageService::initialize_with_roots(temp.path().join("data"), None).unwrap();
+        storage
+            .save_persona(PersonaTemplateRecord {
+                id: "persona".into(),
+                name: "Persona".into(),
+                version: 1,
+                persona_json: "{\"id\":\"persona\"}".into(),
+            })
+            .unwrap();
+        storage
+            .save_life(LifeIdentityRecord {
+                id: life_id.into(),
+                name: life_id.into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                version: 1,
+                body_id: "body".into(),
+                persona_id: "persona".into(),
+                persona_version: 1,
+            })
+            .unwrap();
+        (temp, storage)
+    }
+
     fn confirmed(storage: &StorageService, sensitive: bool) -> super::super::MemoryRecord {
         crate::storage::test_support::insert_confirmed_memory_fixture(
             storage,
@@ -9309,9 +9337,10 @@ mod tests {
             assert_eq!(snapshot.last_marked_claim_epoch, 1);
             // Capture the complete OLD marked-unknown identity before the race:
             // life, memory, mutation, action, target, claim epoch,
-            // last_marked, attempt, generation, send, error. The zero-call
-            // proof below is keyed on this exact claim identity, and the
-            // post-race row must match it field-for-field.
+            // last_marked, attempt, generation, send, error, lease. The
+            // zero-call proof below is keyed on this exact claim identity, and
+            // the post-race row must match it field-for-field (with lease
+            // cleared by recovery as the frozen contract dictates).
             type MarkedOldIdentity = (
                 String,
                 String,
@@ -9325,6 +9354,9 @@ mod tests {
                 String,
                 Option<String>,
                 Option<String>,
+                Option<String>,
+                Option<i64>,
+                Option<String>,
             );
             let marked_old: MarkedOldIdentity = {
                 let db_path = data_root.join("digital-life.sqlite3");
@@ -9335,7 +9367,8 @@ mod tests {
                                 target_revision, target_content_hash,
                                 fenced_claim_epoch, last_marked_claim_epoch,
                                 attempt_count, claimed_generation_id,
-                                last_send_disposition, last_error_code
+                                last_send_disposition, last_error_code,
+                                lease_owner, lease_fence_epoch, lease_expires_at
                          FROM memory_vector_sync_outbox WHERE memory_id=?1",
                         rusqlite::params![record.id],
                         |r| {
@@ -9352,6 +9385,9 @@ mod tests {
                                 r.get(9)?,
                                 r.get(10)?,
                                 r.get(11)?,
+                                r.get(12)?,
+                                r.get(13)?,
+                                r.get(14)?,
                             ))
                         },
                     )
@@ -9436,7 +9472,7 @@ mod tests {
 
             // Capture the OLD unmarked-durable identity before any recovery or
             // mutation: life, memory, mutation, action, attempt, claim epochs,
-            // generation, target binding, send/error evidence.
+            // generation, target binding, send/error, and lease evidence.
             type OldUnmarkedIdentity = (
                 String,
                 String,
@@ -9450,6 +9486,9 @@ mod tests {
                 Option<String>,
                 Option<String>,
                 Option<String>,
+                Option<String>,
+                Option<i64>,
+                Option<String>,
             );
             let old_identity: OldUnmarkedIdentity = {
                 let db_path = data_root.join("digital-life.sqlite3");
@@ -9459,7 +9498,8 @@ mod tests {
                         "SELECT life_id, memory_id, mutation_sequence, desired_action,
                                 attempt_count, fenced_claim_epoch, last_marked_claim_epoch,
                                 claimed_generation_id, target_revision, target_content_hash,
-                                last_send_disposition, last_error_code
+                                last_send_disposition, last_error_code,
+                                lease_owner, lease_fence_epoch, lease_expires_at
                          FROM memory_vector_sync_outbox WHERE memory_id=?1",
                         rusqlite::params![unmarked_id],
                         |r| {
@@ -9476,6 +9516,9 @@ mod tests {
                                 r.get(9)?,
                                 r.get(10)?,
                                 r.get(11)?,
+                                r.get(12)?,
+                                r.get(13)?,
+                                r.get(14)?,
                             ))
                         },
                     )
@@ -9666,6 +9709,39 @@ mod tests {
                 snap.last_marked_claim_epoch, marked_old.7,
                 "round {round}: last_marked unchanged"
             );
+            // Life and memory must also be unchanged (F5-4), and recovery must
+            // have cleared the old lease (frozen recovery contract).
+            let marked_post_row: (String, String, Option<String>, Option<i64>, Option<String>) = {
+                let db_path = data_root.join("digital-life.sqlite3");
+                let conn = crate::storage::open_authorized_test_connection(&db_path).unwrap();
+                conn.query_row(
+                    "SELECT life_id, memory_id, lease_owner, lease_fence_epoch, lease_expires_at
+                     FROM memory_vector_sync_outbox WHERE memory_id=?1",
+                    rusqlite::params![record.id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .unwrap()
+            };
+            assert_eq!(
+                marked_post_row.0, marked_old.0,
+                "round {round}: marked life unchanged"
+            );
+            assert_eq!(
+                marked_post_row.1, marked_old.1,
+                "round {round}: marked memory unchanged"
+            );
+            assert_eq!(
+                marked_post_row.2, None,
+                "round {round}: recovery clears marked lease owner"
+            );
+            assert_eq!(
+                marked_post_row.3, None,
+                "round {round}: recovery clears marked lease fence"
+            );
+            assert_eq!(
+                marked_post_row.4, None,
+                "round {round}: recovery clears marked lease expiry"
+            );
             let _ = recovered;
 
             // ---- B8 sub-scenario 2: unmarked durable expired-processing ----
@@ -9707,7 +9783,15 @@ mod tests {
             );
             assert_eq!(
                 unmarked_after_recovery.lease_owner, None,
-                "round {round}: old lease cleared"
+                "round {round}: old lease owner cleared"
+            );
+            assert_eq!(
+                unmarked_after_recovery.lease_fence_epoch, None,
+                "round {round}: old lease fence cleared"
+            );
+            assert_eq!(
+                unmarked_after_recovery.lease_expires_at, None,
+                "round {round}: old lease expiry cleared"
             );
             // Explicit target re-check after recovery: the target binding must
             // be unchanged from the pre-recovery old identity.
@@ -9856,12 +9940,29 @@ mod tests {
             match worker_b8_result {
                 FencedVectorSyncSingleEventResult::CompletedUpsert => {
                     // Every new call belongs to the NEW mutation identity,
-                    // proven jointly by mutation_sequence + claim_epoch +
-                    // target revision/hash (+ newly bound generation).
+                    // proven jointly by worker_instance_id + life + memory +
+                    // mutation_sequence + claim_epoch + target revision/hash
+                    // (+ newly bound generation).
                     let calls = log_b8.snapshot();
                     assert_eq!(calls.len(), 2, "round {round}: one provider + one upsert");
                     for call in &calls {
-                        assert_eq!(call.context.memory_id, unmarked_id, "round {round}");
+                        assert_eq!(
+                            call.context.worker_instance_id,
+                            worker_context_b8.worker_instance_id(),
+                            "round {round}: call carries the new worker id"
+                        );
+                        assert_eq!(
+                            call.context.life_id, old_identity.0,
+                            "round {round}: call carries the life id"
+                        );
+                        assert_eq!(
+                            call.context.memory_id, unmarked_id,
+                            "round {round}: call uses the new memory id"
+                        );
+                        assert_eq!(
+                            call.context.desired_action, "upsert",
+                            "round {round}: call action is upsert"
+                        );
                         assert_eq!(
                             call.context.mutation_sequence, new_mutation_sequence,
                             "round {round}: call uses the new mutation_sequence"
@@ -10023,10 +10124,18 @@ mod tests {
             "two workers must have distinct instance ids"
         );
 
-        // Worker A on database A, Worker B on database B: two real upserts.
-        let (temp_a, storage_a) = test_storage();
+        // Worker A on database A, Worker B on database B: two real upserts
+        // with provably distinct life ids, generations, and target hashes so
+        // a cross-worker identity mismatch cannot hide behind identical
+        // life/generation fields.
+        let (temp_a, storage_a) = test_storage_with_life("life-a");
         let data_root_a = temp_a.path().join("data");
-        let (ctx_a, _) = drained_context();
+        let ctx_a = VectorGenerationContext::new(
+            crate::vector_store::VectorGenerationId::parse("gen-iso-a").unwrap(),
+            "iso-a-desc",
+            3,
+        )
+        .unwrap();
         storage_a
             .register_building_vector_generation(
                 ctx_a.generation_id().as_str(),
@@ -10036,9 +10145,9 @@ mod tests {
             .unwrap();
         let record_a = crate::storage::test_support::insert_confirmed_memory_fixture(
             &storage_a,
-            "life",
+            "life-a",
             "fact",
-            "worker a isolation",
+            "worker a isolation content A",
             None,
             0.5,
             0.5,
@@ -10046,9 +10155,14 @@ mod tests {
             true,
         );
 
-        let (temp_b, storage_b) = test_storage();
+        let (temp_b, storage_b) = test_storage_with_life("life-b");
         let data_root_b = temp_b.path().join("data");
-        let (ctx_b, _) = drained_context();
+        let ctx_b = VectorGenerationContext::new(
+            crate::vector_store::VectorGenerationId::parse("gen-iso-b").unwrap(),
+            "iso-b-desc",
+            3,
+        )
+        .unwrap();
         storage_b
             .register_building_vector_generation(
                 ctx_b.generation_id().as_str(),
@@ -10058,14 +10172,29 @@ mod tests {
             .unwrap();
         let record_b = crate::storage::test_support::insert_confirmed_memory_fixture(
             &storage_b,
-            "life",
+            "life-b",
             "fact",
-            "worker b isolation",
+            "worker b isolation content B",
             None,
             0.5,
             0.5,
             false,
             true,
+        );
+
+        // Assert the fixtures are provably distinct in every identity field.
+        assert_ne!(
+            record_a.life_id, record_b.life_id,
+            "life_a must differ from life_b"
+        );
+        assert_ne!(
+            record_a.id, record_b.id,
+            "memory_a must differ from memory_b"
+        );
+        assert_ne!(
+            ctx_a.generation_id().as_str(),
+            ctx_b.generation_id().as_str(),
+            "generation_a must differ from generation_b"
         );
 
         // Deterministic overlap via mpsc: A notifies "A bound and paused" at
@@ -10168,23 +10297,55 @@ mod tests {
         let b_identity = context_b
             .current_identity()
             .expect("worker B context must be bound after its claims");
+        // Full A identity while paused: worker/life/memory/mutation/action/
+        // target revision/hash/claim epoch/generation all match A.
         assert_eq!(
             a_identity.worker_instance_id,
             context_a.worker_instance_id(),
             "A context holds A worker id"
         );
+        assert_eq!(a_identity.life_id, "life-a", "A context holds A life");
         assert_eq!(
             a_identity.memory_id, record_a.id,
             "A context holds A memory"
         );
         assert_eq!(
+            a_identity.desired_action, "upsert",
+            "A context action upsert"
+        );
+        assert_eq!(
+            a_identity.generation_id,
+            ctx_a.generation_id().as_str(),
+            "A context holds A generation"
+        );
+        assert_ne!(
+            a_identity.target_content_hash.as_deref(),
+            b_identity.target_content_hash.as_deref(),
+            "A target hash must differ from B target hash"
+        );
+        assert_ne!(
+            a_identity.life_id, b_identity.life_id,
+            "A life must differ from B life"
+        );
+        // Full B identity while its scope is still bound.
+        assert_eq!(
             b_identity.worker_instance_id,
             context_b.worker_instance_id(),
             "B context holds B worker id"
         );
+        assert_eq!(b_identity.life_id, "life-b", "B context holds B life");
         assert_eq!(
             b_identity.memory_id, record_b.id,
             "B context holds B memory"
+        );
+        assert_eq!(
+            b_identity.desired_action, "upsert",
+            "B context action upsert"
+        );
+        assert_eq!(
+            b_identity.generation_id,
+            ctx_b.generation_id().as_str(),
+            "B context holds B generation"
         );
         // B's calls carry B identity; A's calls must not exist yet (A paused
         // before its provider call).
@@ -10193,17 +10354,28 @@ mod tests {
         assert!(
             b_calls.iter().all(|call| {
                 call.context.worker_instance_id == context_b.worker_instance_id()
+                    && call.context.life_id == "life-b"
                     && call.context.memory_id == record_b.id
+                    && call.context.desired_action == "upsert"
                     && call.context.mutation_sequence == b_identity.mutation_sequence
                     && call.context.claim_epoch == b_identity.claim_epoch
                     && call.context.target_revision == b_identity.target_revision
                     && call.context.target_content_hash == b_identity.target_content_hash
+                    && call.context.generation_id == b_identity.generation_id
             }),
             "B's recorded calls carry B's full claim identity"
         );
         assert!(
             log.calls_for_memory(&record_a.id).is_empty(),
             "worker A must not have recorded anything while paused"
+        );
+        // Re-read A's context to confirm B's run never overwrote it.
+        let a_identity_again = context_a
+            .current_identity()
+            .expect("worker A context still bound after B ran");
+        assert_eq!(
+            a_identity_again, a_identity,
+            "A context must be unchanged by B's run"
         );
 
         // 3. Release workers A and B to complete their own real calls.
@@ -10221,7 +10393,7 @@ mod tests {
         assert_eq!(log.unbound_call_count(), 0);
 
         // Worker A's calls carry A's identity (memory record_a, mutation of
-        // record_a, claim epoch 1, worker A id); worker B's calls carry B's.
+        // record_a, claim epoch A, worker A id); worker B's calls carry B's.
         let a_calls = log.calls_for_memory(&record_a.id);
         let b_calls = log.calls_for_memory(&record_b.id);
         assert_eq!(a_calls.len(), 2, "worker A: provider + upsert");
@@ -10229,22 +10401,50 @@ mod tests {
         assert!(
             a_calls.iter().all(|call| {
                 call.context.worker_instance_id == context_a.worker_instance_id()
+                    && call.context.life_id == "life-a"
                     && call.context.memory_id == record_a.id
+                    && call.context.desired_action == "upsert"
                     && call.context.claim_epoch == a_identity.claim_epoch
                     && call.context.mutation_sequence == a_identity.mutation_sequence
                     && call.context.target_revision == a_identity.target_revision
+                    && call.context.target_content_hash == a_identity.target_content_hash
+                    && call.context.generation_id == a_identity.generation_id
             }),
             "worker A calls keep A identity"
         );
         assert!(
             b_calls.iter().all(|call| {
                 call.context.worker_instance_id == context_b.worker_instance_id()
+                    && call.context.life_id == "life-b"
                     && call.context.memory_id == record_b.id
+                    && call.context.desired_action == "upsert"
                     && call.context.claim_epoch == b_identity.claim_epoch
                     && call.context.mutation_sequence == b_identity.mutation_sequence
                     && call.context.target_revision == b_identity.target_revision
+                    && call.context.target_content_hash == b_identity.target_content_hash
+                    && call.context.generation_id == b_identity.generation_id
             }),
             "worker B calls keep B identity"
+        );
+        // Explicit cross-mismatch: no A record may carry B identity and vice
+        // versa.
+        assert!(
+            a_calls.iter().all(|call| {
+                call.context.worker_instance_id != context_b.worker_instance_id()
+                    && call.context.memory_id != record_b.id
+                    && call.context.target_content_hash.as_deref()
+                        != b_identity.target_content_hash.as_deref()
+            }),
+            "A records must not carry B worker id / memory / target hash"
+        );
+        assert!(
+            b_calls.iter().all(|call| {
+                call.context.worker_instance_id != context_a.worker_instance_id()
+                    && call.context.memory_id != record_a.id
+                    && call.context.target_content_hash.as_deref()
+                        != a_identity.target_content_hash.as_deref()
+            }),
+            "B records must not carry A worker id / memory / target hash"
         );
         // Each worker's counts are keyed on its own mutation+claim.
         let mut_a = log.calls_for_claim(

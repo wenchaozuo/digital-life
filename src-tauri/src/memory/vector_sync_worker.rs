@@ -9760,6 +9760,27 @@ mod tests {
             let unmarked_after_recovery = storage_ur
                 .test_get_outbox_snapshot_detailed("life", &unmarked_id)
                 .unwrap();
+            // F6-2: directly read the post-recovery row's life_id and
+            // memory_id from the database and compare them field-for-field
+            // against the pre-recovery old identity.
+            let unmarked_post_life_memory: (String, String) = {
+                let db_path = data_root.join("digital-life.sqlite3");
+                let conn = crate::storage::open_authorized_test_connection(&db_path).unwrap();
+                conn.query_row(
+                    "SELECT life_id, memory_id FROM memory_vector_sync_outbox WHERE memory_id=?1",
+                    rusqlite::params![unmarked_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
+            };
+            assert_eq!(
+                unmarked_post_life_memory.0, old_identity.0,
+                "round {round}: recovery preserves unmarked life_id"
+            );
+            assert_eq!(
+                unmarked_post_life_memory.1, old_identity.1,
+                "round {round}: recovery preserves unmarked memory_id"
+            );
             assert_eq!(
                 unmarked_after_recovery.state, "pending",
                 "round {round}: unmarked durable recovers to pending"
@@ -10270,14 +10291,21 @@ mod tests {
                 consumer.set_claim_observer_for_test(Some(Box::new(move |claim| {
                     observer_context.set_current_claim(claim);
                 })));
+                // Pause at the post-Lance, pre-finalize test-only gate: B has
+                // completed its real provider + Lance Upsert calls, its
+                // context is still bound, and its outbox row still exists in
+                // the database, so the main thread can read B's paused DB
+                // identity directly.
+                consumer.set_test_pause_hook_for_test(Some(Box::new(move |point| {
+                    if point == VectorSyncTestPausePoint::AfterLanceBeforeFinalize {
+                        b_done_tx.send(()).unwrap();
+                        release_b_rx.recv().unwrap();
+                    }
+                })));
                 let result =
                     tauri::async_runtime::block_on(consumer.process_one("worker-b")).unwrap();
+                consumer.set_test_pause_hook_for_test(None);
                 consumer.set_claim_observer_for_test(None);
-                // Notify while B's context is still bound (scope not yet
-                // dropped) so the main thread can inspect B's identity, then
-                // wait for the main thread to finish its inspection.
-                b_done_tx.send(()).unwrap();
-                release_b_rx.recv().unwrap();
                 drop(scope);
                 result
             })
@@ -10286,67 +10314,136 @@ mod tests {
         // 1. Wait until A has claimed and bound its context, paused before
         //    any external call.
         a_paused_rx.recv().unwrap();
-        // 2. Wait until B has completed its own real provider+upsert calls.
+        // 2. Wait until B has completed its real provider + upsert calls and
+        //    is paused at the post-Lance, pre-finalize gate (row still in DB).
         b_done_rx.recv().unwrap();
 
-        // A is still paused with A's identity bound; B finished with B's
-        // identity. B's records must never have overwritten A's context.
+        // A is still paused with A's identity bound; B is paused at the
+        // post-Lance pre-finalize gate with B's identity bound. Both outbox
+        // rows still exist in their own databases, so we read each worker's
+        // paused DB identity independently and cross-check it against the
+        // bound context field-by-field.
         let a_identity = context_a
             .current_identity()
             .expect("worker A context must still be bound while paused");
         let b_identity = context_b
             .current_identity()
             .expect("worker B context must be bound after its claims");
-        // Full A identity while paused: worker/life/memory/mutation/action/
-        // target revision/hash/claim epoch/generation all match A.
+        let a_db = read_paused_worker_db_identity(&data_root_a, &record_a.id);
+        let b_db = read_paused_worker_db_identity(&data_root_b, &record_b.id);
+
+        // Full A identity while paused: every field must match the independent
+        // A database row, not just fixture expectations.
         assert_eq!(
             a_identity.worker_instance_id,
             context_a.worker_instance_id(),
             "A context holds A worker id"
         );
-        assert_eq!(a_identity.life_id, "life-a", "A context holds A life");
         assert_eq!(
-            a_identity.memory_id, record_a.id,
-            "A context holds A memory"
+            a_identity.life_id, a_db.life_id,
+            "A context life == A db life"
         );
         assert_eq!(
-            a_identity.desired_action, "upsert",
-            "A context action upsert"
+            a_identity.memory_id, a_db.memory_id,
+            "A context memory == A db memory"
+        );
+        assert_eq!(
+            a_identity.mutation_sequence, a_db.mutation_sequence,
+            "A context mutation == A db mutation"
+        );
+        assert_eq!(
+            a_identity.desired_action, a_db.desired_action,
+            "A context action == A db action"
+        );
+        assert_eq!(
+            a_identity.target_revision, a_db.target_revision,
+            "A context target revision == A db target revision"
+        );
+        assert_eq!(
+            a_identity.target_content_hash, a_db.target_content_hash,
+            "A context target hash == A db target hash"
+        );
+        assert_eq!(
+            a_identity.claim_epoch, a_db.fenced_claim_epoch,
+            "A context claim epoch == A db fenced claim epoch"
         );
         assert_eq!(
             a_identity.generation_id,
-            ctx_a.generation_id().as_str(),
-            "A context holds A generation"
+            a_db.claimed_generation_id.as_deref().unwrap_or(""),
+            "A context generation == A db generation"
         );
-        assert_ne!(
-            a_identity.target_content_hash.as_deref(),
-            b_identity.target_content_hash.as_deref(),
-            "A target hash must differ from B target hash"
+        assert_eq!(a_identity.desired_action, "upsert", "A action upsert");
+        assert!(a_identity.claim_epoch > 0, "A claim epoch > 0");
+        assert!(!a_identity.generation_id.is_empty(), "A generation present");
+        assert!(
+            log.calls_for_memory(&record_a.id).is_empty(),
+            "worker A must not have recorded anything while paused"
         );
-        assert_ne!(
-            a_identity.life_id, b_identity.life_id,
-            "A life must differ from B life"
+        assert_eq!(
+            log.counts_for_mutation(&record_a.id, a_db.mutation_sequence),
+            (0, 0, 0),
+            "A paused: no provider / upsert / delete recorded"
         );
-        // Full B identity while its scope is still bound.
+
+        // Full B identity while paused at the post-Lance pre-finalize gate:
+        // every field must match the independent B database row.
         assert_eq!(
             b_identity.worker_instance_id,
             context_b.worker_instance_id(),
             "B context holds B worker id"
         );
-        assert_eq!(b_identity.life_id, "life-b", "B context holds B life");
         assert_eq!(
-            b_identity.memory_id, record_b.id,
-            "B context holds B memory"
+            b_identity.life_id, b_db.life_id,
+            "B context life == B db life"
         );
         assert_eq!(
-            b_identity.desired_action, "upsert",
-            "B context action upsert"
+            b_identity.memory_id, b_db.memory_id,
+            "B context memory == B db memory"
+        );
+        assert_eq!(
+            b_identity.mutation_sequence, b_db.mutation_sequence,
+            "B context mutation == B db mutation"
+        );
+        assert_eq!(
+            b_identity.desired_action, b_db.desired_action,
+            "B context action == B db action"
+        );
+        assert_eq!(
+            b_identity.target_revision, b_db.target_revision,
+            "B context target revision == B db target revision"
+        );
+        assert_eq!(
+            b_identity.target_content_hash, b_db.target_content_hash,
+            "B context target hash == B db target hash"
+        );
+        assert_eq!(
+            b_identity.claim_epoch, b_db.fenced_claim_epoch,
+            "B context claim epoch == B db fenced claim epoch"
         );
         assert_eq!(
             b_identity.generation_id,
-            ctx_b.generation_id().as_str(),
-            "B context holds B generation"
+            b_db.claimed_generation_id.as_deref().unwrap_or(""),
+            "B context generation == B db generation"
         );
+        assert_eq!(b_identity.desired_action, "upsert", "B action upsert");
+        assert!(b_identity.claim_epoch > 0, "B claim epoch > 0");
+        assert!(!b_identity.generation_id.is_empty(), "B generation present");
+
+        // Independent DB identities of A and B must be distinct in the
+        // fields that the isolation test relies on.
+        assert_ne!(a_db.life_id, b_db.life_id, "A db life != B db life");
+        assert_ne!(a_db.memory_id, b_db.memory_id, "A db memory != B db memory");
+        assert_ne!(
+            a_db.target_content_hash.as_deref(),
+            b_db.target_content_hash.as_deref(),
+            "A db target hash != B db target hash"
+        );
+        assert_ne!(
+            a_db.claimed_generation_id.as_deref(),
+            b_db.claimed_generation_id.as_deref(),
+            "A db generation != B db generation"
+        );
+
         // B's calls carry B identity; A's calls must not exist yet (A paused
         // before its provider call).
         let b_calls = log.calls_for_memory(&record_b.id);
@@ -10354,14 +10451,15 @@ mod tests {
         assert!(
             b_calls.iter().all(|call| {
                 call.context.worker_instance_id == context_b.worker_instance_id()
-                    && call.context.life_id == "life-b"
-                    && call.context.memory_id == record_b.id
-                    && call.context.desired_action == "upsert"
-                    && call.context.mutation_sequence == b_identity.mutation_sequence
-                    && call.context.claim_epoch == b_identity.claim_epoch
-                    && call.context.target_revision == b_identity.target_revision
-                    && call.context.target_content_hash == b_identity.target_content_hash
-                    && call.context.generation_id == b_identity.generation_id
+                    && call.context.life_id == b_db.life_id
+                    && call.context.memory_id == b_db.memory_id
+                    && call.context.desired_action == b_db.desired_action
+                    && call.context.mutation_sequence == b_db.mutation_sequence
+                    && call.context.claim_epoch == b_db.fenced_claim_epoch
+                    && call.context.target_revision == b_db.target_revision
+                    && call.context.target_content_hash == b_db.target_content_hash
+                    && call.context.generation_id
+                        == b_db.claimed_generation_id.as_deref().unwrap_or("")
             }),
             "B's recorded calls carry B's full claim identity"
         );
@@ -10401,50 +10499,56 @@ mod tests {
         assert!(
             a_calls.iter().all(|call| {
                 call.context.worker_instance_id == context_a.worker_instance_id()
-                    && call.context.life_id == "life-a"
-                    && call.context.memory_id == record_a.id
-                    && call.context.desired_action == "upsert"
-                    && call.context.claim_epoch == a_identity.claim_epoch
-                    && call.context.mutation_sequence == a_identity.mutation_sequence
-                    && call.context.target_revision == a_identity.target_revision
-                    && call.context.target_content_hash == a_identity.target_content_hash
-                    && call.context.generation_id == a_identity.generation_id
+                    && call.context.life_id == a_db.life_id
+                    && call.context.memory_id == a_db.memory_id
+                    && call.context.desired_action == a_db.desired_action
+                    && call.context.claim_epoch == a_db.fenced_claim_epoch
+                    && call.context.mutation_sequence == a_db.mutation_sequence
+                    && call.context.target_revision == a_db.target_revision
+                    && call.context.target_content_hash == a_db.target_content_hash
+                    && call.context.generation_id
+                        == a_db.claimed_generation_id.as_deref().unwrap_or("")
             }),
-            "worker A calls keep A identity"
+            "worker A calls keep A identity (matched to A db)"
         );
         assert!(
             b_calls.iter().all(|call| {
                 call.context.worker_instance_id == context_b.worker_instance_id()
-                    && call.context.life_id == "life-b"
-                    && call.context.memory_id == record_b.id
-                    && call.context.desired_action == "upsert"
-                    && call.context.claim_epoch == b_identity.claim_epoch
-                    && call.context.mutation_sequence == b_identity.mutation_sequence
-                    && call.context.target_revision == b_identity.target_revision
-                    && call.context.target_content_hash == b_identity.target_content_hash
-                    && call.context.generation_id == b_identity.generation_id
+                    && call.context.life_id == b_db.life_id
+                    && call.context.memory_id == b_db.memory_id
+                    && call.context.desired_action == b_db.desired_action
+                    && call.context.claim_epoch == b_db.fenced_claim_epoch
+                    && call.context.mutation_sequence == b_db.mutation_sequence
+                    && call.context.target_revision == b_db.target_revision
+                    && call.context.target_content_hash == b_db.target_content_hash
+                    && call.context.generation_id
+                        == b_db.claimed_generation_id.as_deref().unwrap_or("")
             }),
-            "worker B calls keep B identity"
+            "worker B calls keep B identity (matched to B db)"
         );
         // Explicit cross-mismatch: no A record may carry B identity and vice
-        // versa.
+        // versa, including the generation field.
         assert!(
             a_calls.iter().all(|call| {
                 call.context.worker_instance_id != context_b.worker_instance_id()
-                    && call.context.memory_id != record_b.id
+                    && call.context.memory_id != b_db.memory_id
                     && call.context.target_content_hash.as_deref()
-                        != b_identity.target_content_hash.as_deref()
+                        != b_db.target_content_hash.as_deref()
+                    && call.context.generation_id
+                        != b_db.claimed_generation_id.as_deref().unwrap_or("")
             }),
-            "A records must not carry B worker id / memory / target hash"
+            "A records must not carry B worker id / memory / target hash / generation"
         );
         assert!(
             b_calls.iter().all(|call| {
                 call.context.worker_instance_id != context_a.worker_instance_id()
-                    && call.context.memory_id != record_a.id
+                    && call.context.memory_id != a_db.memory_id
                     && call.context.target_content_hash.as_deref()
-                        != a_identity.target_content_hash.as_deref()
+                        != a_db.target_content_hash.as_deref()
+                    && call.context.generation_id
+                        != a_db.claimed_generation_id.as_deref().unwrap_or("")
             }),
-            "B records must not carry A worker id / memory / target hash"
+            "B records must not carry A worker id / memory / target hash / generation"
         );
         // Each worker's counts are keyed on its own mutation+claim.
         let mut_a = log.calls_for_claim(
@@ -11076,6 +11180,54 @@ mod tests {
             "SELECT fenced_claim_epoch FROM memory_vector_sync_outbox WHERE memory_id=?1",
             rusqlite::params![memory_id],
             |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Test-only read-only identity of a worker's currently processing outbox
+    /// row, read directly from that worker's SQLite database AFTER it has
+    /// claimed and bound its context but before finalize. It is never
+    /// hand-constructed from fixture expectations; it is the independent DB
+    /// authority against which the worker's context identity is cross-checked.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct PausedWorkerDbIdentity {
+        life_id: String,
+        memory_id: String,
+        mutation_sequence: i64,
+        desired_action: String,
+        target_revision: Option<i64>,
+        target_content_hash: Option<String>,
+        fenced_claim_epoch: i64,
+        claimed_generation_id: Option<String>,
+    }
+
+    /// Reads the paused worker's DB identity for one memory (test-only).
+    fn read_paused_worker_db_identity(
+        data_root: &std::path::Path,
+        memory_id: &str,
+    ) -> PausedWorkerDbIdentity {
+        let conn = crate::storage::open_authorized_test_connection(
+            &data_root.join("digital-life.sqlite3"),
+        )
+        .unwrap();
+        conn.query_row(
+            "SELECT life_id, memory_id, mutation_sequence, desired_action,
+                    target_revision, target_content_hash, fenced_claim_epoch,
+                    claimed_generation_id
+             FROM memory_vector_sync_outbox WHERE memory_id=?1",
+            rusqlite::params![memory_id],
+            |r| {
+                Ok(PausedWorkerDbIdentity {
+                    life_id: r.get(0)?,
+                    memory_id: r.get(1)?,
+                    mutation_sequence: r.get(2)?,
+                    desired_action: r.get(3)?,
+                    target_revision: r.get(4)?,
+                    target_content_hash: r.get(5)?,
+                    fenced_claim_epoch: r.get(6)?,
+                    claimed_generation_id: r.get(7)?,
+                })
+            },
         )
         .unwrap()
     }

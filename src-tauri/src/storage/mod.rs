@@ -3,6 +3,7 @@ mod candidate_memory;
 mod connection;
 mod conversation;
 pub(crate) mod deterministic_candidate_extraction;
+mod late_delete_resolution;
 mod llm_candidate_extraction;
 mod location;
 mod memory;

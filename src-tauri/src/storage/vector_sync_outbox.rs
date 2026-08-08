@@ -11,7 +11,7 @@ use crate::memory::{
     },
 };
 
-use super::StorageService;
+use super::{late_delete_resolution, StorageService};
 
 const COLUMNS: &str = "id, life_id, memory_id, desired_action, state, attempt_count, next_attempt_at, lease_owner, lease_expires_at, last_error_code, created_at, updated_at";
 
@@ -268,10 +268,23 @@ pub(super) fn enqueue_in_transaction(
             |row| row.get(0),
         )
         .map_err(|_| outbox_error())?;
+    // This one SQLite timestamp is shared by the supersede and the new outbox
+    // mutation.  The enclosing transaction makes an unresolved old Late Delete
+    // impossible to observe alongside the replacement mutation.
+    let transaction_now = late_delete_resolution::authoritative_utc_millis_now_in(transaction)
+        .map_err(|_| outbox_error())?;
+    late_delete_resolution::supersede_for_new_mutation_in(
+        transaction,
+        life_id,
+        memory_id,
+        sequence,
+        &transaction_now,
+    )
+    .map_err(|_| outbox_error())?;
     transaction
         .execute(
-            "INSERT INTO memory_vector_sync_outbox (life_id, memory_id, desired_action, mutation_sequence, target_revision, target_content_hash, migration_disposition)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)
+            "INSERT INTO memory_vector_sync_outbox (life_id, memory_id, desired_action, mutation_sequence, target_revision, target_content_hash, migration_disposition, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?7)
          ON CONFLICT(life_id, memory_id) DO UPDATE SET
            desired_action = excluded.desired_action, state = 'pending', attempt_count = 0,
            fenced_claim_epoch = 0, last_marked_claim_epoch = 0,
@@ -279,8 +292,8 @@ pub(super) fn enqueue_in_transaction(
            lease_fence_epoch = NULL, claimed_generation_id = NULL, last_send_disposition = NULL,
            migration_disposition = NULL, mutation_sequence = excluded.mutation_sequence,
            target_revision = excluded.target_revision, target_content_hash = excluded.target_content_hash,
-           last_error_code = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
-            params![life_id, memory_id, action.as_str(), sequence, target_revision, target_content_hash],
+           last_error_code = NULL, updated_at = excluded.updated_at",
+            params![life_id, memory_id, action.as_str(), sequence, target_revision, target_content_hash, transaction_now],
         )
         .map_err(|_| outbox_error())?;
     Ok(())
@@ -1673,6 +1686,11 @@ impl StorageService {
         fail_next_delete_witness_after_commit_for_test();
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_fail_next_enqueue_after_commit(&self) {
+        fail_next_enqueue_after_commit_for_test();
+    }
+
     /// Test-only convenience for fixtures that already hold a current claim.
     /// It calls the same idempotent reserve path as production, never constructs
     /// a token from test data, and therefore preserves the complete token CAS.
@@ -2731,6 +2749,7 @@ thread_local! {
     static POST_COMMIT_DELETE_WITNESS_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static POST_COMMIT_SUCCESS_FINALIZE_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static POST_COMMIT_FAILURE_FINALIZE_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static POST_COMMIT_ENQUEUE_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -2771,6 +2790,16 @@ fn fail_next_failure_finalize_after_commit_for_test() {
 #[cfg(test)]
 fn take_post_commit_failure_finalize_fault_for_test() -> bool {
     POST_COMMIT_FAILURE_FINALIZE_FAULT.with(|fault| fault.replace(false))
+}
+
+#[cfg(test)]
+fn fail_next_enqueue_after_commit_for_test() {
+    POST_COMMIT_ENQUEUE_FAULT.with(|fault| fault.set(true));
+}
+
+#[cfg(test)]
+fn take_post_commit_enqueue_fault_for_test() -> bool {
+    POST_COMMIT_ENQUEUE_FAULT.with(|fault| fault.replace(false))
 }
 
 /// The authoritative in-transaction Attempt reservation.
@@ -3245,6 +3274,10 @@ impl MemoryVectorSyncOutboxRepository for StorageService {
         )?;
         let job = load_job(&transaction, &request.life_id, &request.memory_id)?;
         transaction.commit().map_err(|_| outbox_error())?;
+        #[cfg(test)]
+        if take_post_commit_enqueue_fault_for_test() {
+            return Err(outbox_error());
+        }
         Ok(job)
     }
 

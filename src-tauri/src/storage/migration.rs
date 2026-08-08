@@ -1584,7 +1584,7 @@ mod transaction_tests {
             let backup = Backup::new(&connection, &mut destination).unwrap();
             backup.run_to_completion(5, Duration::ZERO, None).unwrap();
         }
-        {
+        let caller_result = {
             let mut connection = Connection::open(&path).unwrap();
             connection
                 .create_scalar_function(
@@ -1596,10 +1596,24 @@ mod transaction_tests {
                     |_| Ok(1_i64),
                 )
                 .unwrap();
-            apply_late_delete_resolution_upgrade(&mut connection);
-            // Simulate the caller losing the commit acknowledgement: it does
-            // not inspect the completed operation before dropping the handle.
-        }
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            assert_eq!(
+                apply_late_delete_resolution_schema_upgrade(&transaction).unwrap(),
+                LateDeleteResolutionSchemaUpgrade::Applied
+            );
+            transaction.commit().unwrap();
+            Err::<(), StorageError>(StorageError::new(
+                "MIGRATION_COMMIT_RESULT_UNKNOWN",
+                "Test-only simulation of a lost commit acknowledgement.",
+                true,
+            ))
+        };
+        assert_eq!(
+            caller_result.unwrap_err().code,
+            "MIGRATION_COMMIT_RESULT_UNKNOWN"
+        );
         let reopened = Connection::open(&path).unwrap();
         assert_eq!(
             schema_version(&reopened),
@@ -1612,7 +1626,8 @@ mod transaction_tests {
     }
 
     #[test]
-    fn late_delete_resolution_schema_15_validator_rejects_a_weakened_resolution_budget_check() {
+    fn late_delete_resolution_schema_validation_schema_15_validator_rejects_a_weakened_resolution_budget_check(
+    ) {
         let mut connection = version_fourteen_connection();
         apply_late_delete_resolution_upgrade(&mut connection);
         connection

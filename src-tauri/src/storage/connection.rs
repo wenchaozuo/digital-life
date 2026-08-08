@@ -4,7 +4,7 @@ use rusqlite::{functions::FunctionFlags, Connection, OptionalExtension};
 
 use super::StorageError;
 
-pub(super) const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 14;
+pub(super) const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 15;
 
 const WRITER_EPOCH_FUNCTION: &str = "digital_life_writer_epoch";
 const WRITER_EPOCH: i64 = 1;
@@ -282,7 +282,7 @@ mod tests {
         create_schema_migration_table(&connection);
         connection
             .execute(
-            "INSERT INTO schema_migration (version, name, applied_at) VALUES (15, 'future', '2026-01-01T00:00:00Z')",
+            "INSERT INTO schema_migration (version, name, applied_at) VALUES (16, 'future', '2026-01-01T00:00:00Z')",
                 [],
             )
             .unwrap();
@@ -296,7 +296,7 @@ mod tests {
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
             .unwrap();
         assert_eq!(journal_mode, "delete");
-        assert_eq!(read_schema_version(&legacy).unwrap(), 15);
+        assert_eq!(read_schema_version(&legacy).unwrap(), 16);
         assert!(!path.with_extension("sqlite3-wal").exists());
     }
 
@@ -381,7 +381,7 @@ mod tests {
         create_schema_migration_table(&connection);
         connection
             .execute(
-            "INSERT INTO schema_migration (version, name, applied_at) VALUES (15, 'future', '2026-01-01T00:00:00Z')",
+            "INSERT INTO schema_migration (version, name, applied_at) VALUES (16, 'future', '2026-01-01T00:00:00Z')",
                 [],
             )
             .unwrap();

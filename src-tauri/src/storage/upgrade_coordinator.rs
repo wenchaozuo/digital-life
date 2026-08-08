@@ -86,6 +86,7 @@ fn open_after_mutex<G: StorageUpgradeGate>(
     if version == connection::MAX_SUPPORTED_SCHEMA_VERSION {
         record_upgrade_event("schema-14");
         migration::validate_attempt_claim_identity_schema(&connection)?;
+        migration::validate_late_delete_resolution_schema(&connection)?;
         record_upgrade_event("manifest");
         writer_fence_manifest::validate_writer_fence_manifest(&connection)?;
         record_upgrade_event("post-verify");
@@ -139,6 +140,11 @@ fn open_after_mutex<G: StorageUpgradeGate>(
     record_upgrade_event("att-i1");
     let attempt_upgrade = migration::apply_attempt_claim_identity_schema_upgrade(&transaction)?;
     if attempt_upgrade != migration::AttemptClaimIdentitySchemaUpgrade::Applied {
+        return Err(StorageError::migration_version_invariant_failed());
+    }
+
+    let late_delete_upgrade = migration::apply_late_delete_resolution_schema_upgrade(&transaction)?;
+    if late_delete_upgrade != migration::LateDeleteResolutionSchemaUpgrade::Applied {
         return Err(StorageError::migration_version_invariant_failed());
     }
 
@@ -464,6 +470,10 @@ mod tests {
                 migration::apply_attempt_claim_identity_schema_upgrade(&transaction).unwrap(),
                 migration::AttemptClaimIdentitySchemaUpgrade::Applied
             );
+            assert_eq!(
+                migration::apply_late_delete_resolution_schema_upgrade(&transaction).unwrap(),
+                migration::LateDeleteResolutionSchemaUpgrade::Applied
+            );
         }
         transaction.commit().unwrap();
         connection
@@ -770,7 +780,7 @@ mod tests {
                 .unwrap(),
             (0, 0)
         );
-        assert_eq!(writer_fence_count(&connection), 18);
+        assert_eq!(writer_fence_count(&connection), 24);
         assert_eq!(
             take_upgrade_events(),
             vec![
@@ -1043,7 +1053,8 @@ mod tests {
             connection::MAX_SUPPORTED_SCHEMA_VERSION
         );
         migration::validate_attempt_claim_identity_schema(&state.connection).unwrap();
-        assert_eq!(writer_fence_count(&state.connection), 18);
+        migration::validate_late_delete_resolution_schema(&state.connection).unwrap();
+        assert_eq!(writer_fence_count(&state.connection), 24);
         assert_eq!(
             take_upgrade_events(),
             vec![
@@ -1079,8 +1090,9 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(writer_fence_count, 18);
+        assert_eq!(writer_fence_count, 24);
         migration::validate_attempt_claim_identity_schema(&connection).unwrap();
+        migration::validate_late_delete_resolution_schema(&connection).unwrap();
         assert_eq!(gate.inspection_calls.get(), 2);
     }
 
@@ -1287,7 +1299,7 @@ mod tests {
                     applied_at TEXT NOT NULL
                 );
                 INSERT INTO schema_migration (version, name, applied_at)
-                VALUES (15, 'future', '2026-01-01T00:00:00Z');",
+                VALUES (16, 'future', '2026-01-01T00:00:00Z');",
             )
             .unwrap();
         drop(connection);
@@ -1317,7 +1329,7 @@ mod tests {
                     applied_at TEXT NOT NULL
                 );
                 INSERT INTO schema_migration (version, name, applied_at)
-                VALUES (15, 'future', '2026-01-01T00:00:00Z')",
+                VALUES (16, 'future', '2026-01-01T00:00:00Z')",
             )
             .unwrap();
         drop(connection);
@@ -1540,7 +1552,8 @@ mod tests {
                 connection::MAX_SUPPORTED_SCHEMA_VERSION
             );
             migration::validate_attempt_claim_identity_schema(&connection).unwrap();
-            assert_eq!(writer_fence_count(&connection), 18);
+            migration::validate_late_delete_resolution_schema(&connection).unwrap();
+            assert_eq!(writer_fence_count(&connection), 24);
             assert_eq!(journal_mode(&path), "delete");
             assert_eq!(
                 take_upgrade_events(),
@@ -1762,7 +1775,7 @@ mod tests {
                 "version-13 competition repetition {repetition}"
             );
             migration::validate_attempt_claim_identity_schema(&state.connection).unwrap();
-            assert_eq!(writer_fence_count(&state.connection), 18);
+            assert_eq!(writer_fence_count(&state.connection), 24);
         }
     }
 
@@ -1786,8 +1799,9 @@ mod tests {
                 connection::MAX_SUPPORTED_SCHEMA_VERSION,
                 "restored version-12 fixture must upgrade on repetition {repetition}"
             );
-            assert_eq!(writer_fence_count(&state.connection), 18);
+            assert_eq!(writer_fence_count(&state.connection), 24);
             migration::validate_attempt_claim_identity_schema(&state.connection).unwrap();
+            migration::validate_late_delete_resolution_schema(&state.connection).unwrap();
             assert_eq!(
                 state
                     .connection
@@ -1843,7 +1857,7 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(second_clock, first_clock);
-            assert_eq!(writer_fence_count(&state.connection), 18);
+            assert_eq!(writer_fence_count(&state.connection), 24);
             migration::validate_attempt_claim_identity_schema(&state.connection).unwrap();
         }
     }
@@ -1895,7 +1909,7 @@ mod tests {
                     .unwrap(),
                 (0, 0)
             );
-            assert_eq!(writer_fence_count(&state.connection), 18);
+            assert_eq!(writer_fence_count(&state.connection), 24);
             migration::validate_attempt_claim_identity_schema(&state.connection).unwrap();
         }
     }

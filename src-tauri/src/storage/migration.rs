@@ -8,6 +8,51 @@ pub(super) const LAST_STATIC_MIGRATION_VERSION: i64 = 12;
 const WRITER_FENCE_MIGRATION_NAME: &str = "013_historical_outbox_isolation_and_writer_fence";
 pub(super) const ATTEMPT_CLAIM_IDENTITY_SCHEMA_VERSION: i64 = 14;
 const ATTEMPT_CLAIM_IDENTITY_MIGRATION_NAME: &str = "014_vector_sync_attempt_claim_identity";
+pub(super) const LATE_DELETE_RESOLUTION_SCHEMA_VERSION: i64 = 15;
+const LATE_DELETE_RESOLUTION_MIGRATION_NAME: &str = "015_vector_sync_late_delete_resolution";
+const CREATE_LATE_DELETE_RESOLUTION_TABLE_SQL: &str = "CREATE TABLE memory_vector_late_delete_resolution (
+    resolution_id INTEGER PRIMARY KEY,
+    outbox_id INTEGER NOT NULL,
+    life_id TEXT NOT NULL,
+    memory_id TEXT NOT NULL,
+    mutation_sequence INTEGER NOT NULL CHECK (mutation_sequence > 0),
+    claimed_generation_id TEXT NOT NULL CHECK (claimed_generation_id <> ''),
+    embedding_descriptor_id TEXT NOT NULL CHECK (embedding_descriptor_id <> ''),
+    embedding_dimension INTEGER NOT NULL CHECK (embedding_dimension > 0),
+    captured_generation_state TEXT NOT NULL CHECK (captured_generation_state IN ('building','active','retired','failed')),
+    witness_attempt_ordinal INTEGER NOT NULL CHECK (witness_attempt_ordinal BETWEEN 1 AND 5),
+    witness_claim_epoch INTEGER NOT NULL CHECK (witness_claim_epoch > 0),
+    witness_marked_claim_epoch INTEGER NOT NULL CHECK (witness_marked_claim_epoch > 0 AND witness_marked_claim_epoch <= witness_claim_epoch),
+    witness_send_disposition TEXT NULL CHECK (witness_send_disposition IS NULL OR witness_send_disposition = 'possibly_sent'),
+    witness_error_code TEXT NULL CHECK (witness_error_code IS NULL OR witness_error_code = 'PROVIDER_RESULT_UNKNOWN'),
+    state TEXT NOT NULL CHECK (state IN ('pending','claimed','processing','unknown','retry_wait','exhausted','waiting_rebuild','blocked','resolved_absent','resolved_deleted','resolved_rebuilt','superseded')),
+    resolution_count INTEGER NOT NULL DEFAULT 0 CHECK (resolution_count BETWEEN 0 AND 3),
+    resolution_epoch INTEGER NOT NULL DEFAULT 0 CHECK (resolution_epoch >= 0),
+    last_reserved_resolution_epoch INTEGER NOT NULL DEFAULT 0 CHECK (last_reserved_resolution_epoch >= 0 AND last_reserved_resolution_epoch <= resolution_epoch AND ((resolution_count = 0 AND last_reserved_resolution_epoch = 0) OR (resolution_count > 0 AND last_reserved_resolution_epoch > 0))),
+    lease_owner TEXT NULL,
+    lease_fence_epoch INTEGER NULL,
+    lease_expires_at TEXT NULL,
+    next_attempt_at TEXT NULL CHECK ((state = 'retry_wait' AND next_attempt_at IS NOT NULL) OR (state <> 'retry_wait' AND next_attempt_at IS NULL)),
+    last_resolution_disposition TEXT NULL CHECK (last_resolution_disposition IS NULL OR last_resolution_disposition IN ('query_absent','query_present','query_unknown','delete_started','delete_absent','delete_deleted','identity_mismatch','delete_unknown','finalize_unknown','waiting_rebuild','resolved_rebuilt','superseded')),
+    last_disposition_epoch INTEGER NOT NULL DEFAULT 0 CHECK (last_disposition_epoch >= 0 AND last_disposition_epoch <= resolution_epoch),
+    last_error_code TEXT NULL,
+    resolved_at TEXT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(life_id, memory_id, mutation_sequence),
+    CHECK (witness_send_disposition = 'possibly_sent' OR witness_error_code = 'PROVIDER_RESULT_UNKNOWN'),
+    CHECK ((lease_owner IS NULL AND lease_fence_epoch IS NULL AND lease_expires_at IS NULL) OR (lease_owner IS NOT NULL AND lease_owner <> '' AND lease_fence_epoch > 0 AND lease_expires_at IS NOT NULL)),
+    CHECK ((state IN ('resolved_absent','resolved_deleted','resolved_rebuilt','superseded') AND resolved_at IS NOT NULL) OR (state NOT IN ('resolved_absent','resolved_deleted','resolved_rebuilt','superseded') AND resolved_at IS NULL))
+)";
+const CREATE_LATE_DELETE_RUNTIME_LEASE_TABLE_SQL: &str = "CREATE TABLE memory_vector_late_delete_runtime_lease (
+    lease_name TEXT PRIMARY KEY CHECK (lease_name = 'memory-vector-late-delete-resolver'),
+    lease_owner TEXT NULL,
+    lease_fence_epoch INTEGER NOT NULL DEFAULT 0 CHECK (lease_fence_epoch >= 0),
+    lease_expires_at TEXT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK ((lease_owner IS NULL AND lease_expires_at IS NULL) OR (lease_owner IS NOT NULL AND lease_owner <> '' AND lease_fence_epoch > 0 AND lease_expires_at IS NOT NULL))
+)";
 #[cfg(test)]
 const FENCED_CLAIM_EPOCH_COLUMN_DDL: &str =
     "fenced_claim_epoch INTEGER NOT NULL DEFAULT 0 CHECK (fenced_claim_epoch >= 0)";
@@ -18,6 +63,7 @@ const ADD_LAST_MARKED_CLAIM_EPOCH_COLUMN_SQL: &str = "ALTER TABLE memory_vector_
 const NORMALIZED_FENCED_CLAIM_EPOCH_COLUMN_DDL: &str =
     "fenced_claim_epochintegernotnulldefault0check(fenced_claim_epoch>=0)";
 const NORMALIZED_LAST_MARKED_CLAIM_EPOCH_COLUMN_DDL: &str = "last_marked_claim_epochintegernotnulldefault0check(last_marked_claim_epoch>=0andlast_marked_claim_epoch<=fenced_claim_epochand(last_marked_claim_epoch=0orattempt_count>0))";
+type SchemaColumn = (String, String, i64, Option<String>, i64);
 
 /// The fixed H1-B schema phase is applied exactly once after static migrations
 /// 1 through 12 have completed in the caller-owned transaction.
@@ -30,6 +76,11 @@ pub(super) enum WriterFenceSchemaUpgrade {
 /// writer-fence phase in the caller-owned transaction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum AttemptClaimIdentitySchemaUpgrade {
+    Applied,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum LateDeleteResolutionSchemaUpgrade {
     Applied,
 }
 
@@ -152,6 +203,315 @@ pub(super) fn apply_attempt_claim_identity_schema_upgrade(
     }
     writer_fence_manifest::validate_writer_fence_manifest(transaction)?;
     Ok(AttemptClaimIdentitySchemaUpgrade::Applied)
+}
+
+/// Fixed LD-I1 extension. It accepts only an exact Schema 14 transaction and
+/// stores the historical Delete-Unknown identity independently of the ordinary
+/// outbox so later outbox deletion cannot erase the diagnostic authority.
+pub(super) fn apply_late_delete_resolution_schema_upgrade(
+    transaction: &Transaction<'_>,
+) -> Result<LateDeleteResolutionSchemaUpgrade, StorageError> {
+    if connection::read_schema_version(transaction)? != ATTEMPT_CLAIM_IDENTITY_SCHEMA_VERSION {
+        return Err(StorageError::migration_version_invariant_failed());
+    }
+    for (failpoint, sql) in [
+        (Migration015Failpoint::ResolutionTable, CREATE_LATE_DELETE_RESOLUTION_TABLE_SQL),
+        (Migration015Failpoint::RuntimeLeaseTable, CREATE_LATE_DELETE_RUNTIME_LEASE_TABLE_SQL),
+        (Migration015Failpoint::IdentityIndex, "CREATE UNIQUE INDEX memory_vector_late_delete_resolution_identity_idx ON memory_vector_late_delete_resolution(life_id, memory_id, mutation_sequence)"),
+        (Migration015Failpoint::OutboxIndex, "CREATE INDEX memory_vector_late_delete_resolution_outbox_idx ON memory_vector_late_delete_resolution(outbox_id)"),
+        (Migration015Failpoint::CandidateIndex, "CREATE INDEX memory_vector_late_delete_resolution_candidate_idx ON memory_vector_late_delete_resolution(state, next_attempt_at, resolution_count, lease_expires_at, resolution_id)"),
+        (Migration015Failpoint::DiagnosticIndex, "CREATE INDEX memory_vector_late_delete_resolution_life_memory_state_idx ON memory_vector_late_delete_resolution(life_id, memory_id, state)"),
+    ] {
+        #[cfg(not(test))]
+        let _ = failpoint;
+        #[cfg(test)]
+        if should_fail_migration_015_at_for_test(failpoint) {
+            return Err(StorageError::migration_transaction_failed());
+        }
+        transaction.execute_batch(sql).map_err(|_| StorageError::migration_transaction_failed())?;
+    }
+    #[cfg(test)]
+    if should_fail_migration_015_at_for_test(Migration015Failpoint::RuntimeLeaseRow) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    let migration_now: String = transaction
+        .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |row| {
+            row.get(0)
+        })
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    transaction
+        .execute(
+            "INSERT INTO memory_vector_late_delete_runtime_lease
+         (lease_name, lease_owner, lease_fence_epoch, lease_expires_at, created_at, updated_at)
+         VALUES ('memory-vector-late-delete-resolver', NULL, 0, NULL, ?1, ?1)",
+            [&migration_now],
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    #[cfg(test)]
+    if should_fail_migration_015_at_for_test(Migration015Failpoint::Backfill) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    transaction.execute(
+        "INSERT INTO memory_vector_late_delete_resolution
+         (outbox_id, life_id, memory_id, mutation_sequence, claimed_generation_id,
+          embedding_descriptor_id, embedding_dimension, captured_generation_state,
+          witness_attempt_ordinal, witness_claim_epoch, witness_marked_claim_epoch,
+          witness_send_disposition, witness_error_code, state, created_at, updated_at)
+         SELECT o.id, o.life_id, o.memory_id, o.mutation_sequence, o.claimed_generation_id,
+                g.descriptor_hash, g.dimension, g.state,
+                o.attempt_count, o.fenced_claim_epoch, o.last_marked_claim_epoch,
+                o.last_send_disposition, o.last_error_code, 'pending', ?1, ?1
+         FROM memory_vector_sync_outbox AS o
+         JOIN memory_vector_generation AS g ON g.generation_id=o.claimed_generation_id
+         WHERE o.desired_action='delete'
+           AND (o.last_send_disposition='possibly_sent' OR o.last_error_code='PROVIDER_RESULT_UNKNOWN')
+           AND o.mutation_sequence > 0
+           AND o.attempt_count BETWEEN 1 AND 5
+           AND o.fenced_claim_epoch > 0
+           AND o.last_marked_claim_epoch > 0
+           AND o.last_marked_claim_epoch <= o.fenced_claim_epoch
+           AND o.claimed_generation_id IS NOT NULL AND o.claimed_generation_id <> ''
+           AND o.target_revision IS NULL AND o.target_content_hash IS NULL
+           AND o.migration_disposition IS NULL
+           AND g.descriptor_hash <> '' AND g.dimension > 0
+           AND g.state IN ('building','active','retired','failed')",
+        [&migration_now],
+    ).map_err(|_| StorageError::migration_transaction_failed())?;
+    writer_fence_manifest::install_late_delete_writer_fence_manifest_in_transaction(transaction)?;
+    #[cfg(test)]
+    if should_fail_migration_015_at_for_test(Migration015Failpoint::SchemaValidation) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    validate_late_delete_resolution_schema_objects(transaction)?;
+    #[cfg(test)]
+    if should_fail_migration_015_at_for_test(Migration015Failpoint::ManifestValidation) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    writer_fence_manifest::validate_writer_fence_manifest_for_schema(
+        transaction,
+        LATE_DELETE_RESOLUTION_SCHEMA_VERSION,
+    )?;
+    // Insert the version only after every table, index, backfill, trigger and
+    // both validators have succeeded.
+    #[cfg(test)]
+    if should_fail_migration_015_at_for_test(Migration015Failpoint::SchemaVersion) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    transaction.execute(
+        "INSERT INTO schema_migration (version, name, applied_at) VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        params![LATE_DELETE_RESOLUTION_SCHEMA_VERSION, LATE_DELETE_RESOLUTION_MIGRATION_NAME],
+    ).map_err(|_| StorageError::migration_transaction_failed())?;
+    Ok(LateDeleteResolutionSchemaUpgrade::Applied)
+}
+
+pub(super) fn validate_late_delete_resolution_schema(
+    connection: &Connection,
+) -> Result<(), StorageError> {
+    if connection::read_schema_version(connection)? != LATE_DELETE_RESOLUTION_SCHEMA_VERSION {
+        return Err(StorageError::migration_version_invariant_failed());
+    }
+    validate_late_delete_resolution_schema_objects(connection)
+}
+
+fn validate_late_delete_resolution_schema_objects(
+    connection: &Connection,
+) -> Result<(), StorageError> {
+    let expected = [
+        "resolution_id",
+        "outbox_id",
+        "life_id",
+        "memory_id",
+        "mutation_sequence",
+        "claimed_generation_id",
+        "embedding_descriptor_id",
+        "embedding_dimension",
+        "captured_generation_state",
+        "witness_attempt_ordinal",
+        "witness_claim_epoch",
+        "witness_marked_claim_epoch",
+        "witness_send_disposition",
+        "witness_error_code",
+        "state",
+        "resolution_count",
+        "resolution_epoch",
+        "last_reserved_resolution_epoch",
+        "lease_owner",
+        "lease_fence_epoch",
+        "lease_expires_at",
+        "next_attempt_at",
+        "last_resolution_disposition",
+        "last_disposition_epoch",
+        "last_error_code",
+        "resolved_at",
+        "created_at",
+        "updated_at",
+    ];
+    let columns = |table: &str| -> Result<Vec<SchemaColumn>, StorageError> {
+        let mut stmt = connection
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .map_err(|_| StorageError::migration_transaction_failed())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })
+            .map_err(|_| StorageError::migration_transaction_failed())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|_| StorageError::migration_transaction_failed())
+    };
+    let resolution_columns = columns("memory_vector_late_delete_resolution")?;
+    if resolution_columns
+        .iter()
+        .map(|c| c.0.as_str())
+        .collect::<Vec<_>>()
+        != expected
+    {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    let resolution_types = [
+        "INTEGER", "INTEGER", "TEXT", "TEXT", "INTEGER", "TEXT", "TEXT", "INTEGER", "TEXT",
+        "INTEGER", "INTEGER", "INTEGER", "TEXT", "TEXT", "TEXT", "INTEGER", "INTEGER", "INTEGER",
+        "TEXT", "INTEGER", "TEXT", "TEXT", "TEXT", "INTEGER", "TEXT", "TEXT", "TEXT", "TEXT",
+    ];
+    let resolution_not_null = [
+        0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1,
+    ];
+    let resolution_defaults = [
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some("0"),
+        Some("0"),
+        Some("0"),
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some("0"),
+        None,
+        None,
+        None,
+        None,
+    ];
+    for (index, column) in resolution_columns.iter().enumerate() {
+        if column.1 != resolution_types[index]
+            || column.2 != resolution_not_null[index]
+            || column.3.as_deref() != resolution_defaults[index]
+            || column.4 != if index == 0 { 1 } else { 0 }
+        {
+            return Err(StorageError::migration_transaction_failed());
+        }
+    }
+    let lease_columns = columns("memory_vector_late_delete_runtime_lease")?;
+    if lease_columns
+        .iter()
+        .map(|c| c.0.as_str())
+        .collect::<Vec<_>>()
+        != [
+            "lease_name",
+            "lease_owner",
+            "lease_fence_epoch",
+            "lease_expires_at",
+            "created_at",
+            "updated_at",
+        ]
+    {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    let lease_types = ["TEXT", "TEXT", "INTEGER", "TEXT", "TEXT", "TEXT"];
+    let lease_not_null = [0, 0, 1, 0, 1, 1];
+    let lease_defaults = [None, None, Some("0"), None, None, None];
+    for (index, column) in lease_columns.iter().enumerate() {
+        if column.1 != lease_types[index]
+            || column.2 != lease_not_null[index]
+            || column.3.as_deref() != lease_defaults[index]
+            || column.4 != if index == 0 { 1 } else { 0 }
+        {
+            return Err(StorageError::migration_transaction_failed());
+        }
+    }
+    let resolution_sql: String = connection.query_row("SELECT sql FROM sqlite_schema WHERE type='table' AND name='memory_vector_late_delete_resolution'", [], |row| row.get(0)).map_err(|_| StorageError::migration_transaction_failed())?;
+    if normalize_schema_fragment(&resolution_sql)
+        != normalize_schema_fragment(CREATE_LATE_DELETE_RESOLUTION_TABLE_SQL)
+    {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    let runtime_lease_sql: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='table' AND name='memory_vector_late_delete_runtime_lease'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    if normalize_schema_fragment(&runtime_lease_sql)
+        != normalize_schema_fragment(CREATE_LATE_DELETE_RUNTIME_LEASE_TABLE_SQL)
+    {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    let expected_indexes = [
+        "memory_vector_late_delete_resolution_identity_idx",
+        "memory_vector_late_delete_resolution_outbox_idx",
+        "memory_vector_late_delete_resolution_candidate_idx",
+        "memory_vector_late_delete_resolution_life_memory_state_idx",
+    ];
+    let expected_index_columns = [
+        ["life_id", "memory_id", "mutation_sequence"].as_slice(),
+        ["outbox_id"].as_slice(),
+        [
+            "state",
+            "next_attempt_at",
+            "resolution_count",
+            "lease_expires_at",
+            "resolution_id",
+        ]
+        .as_slice(),
+        ["life_id", "memory_id", "state"].as_slice(),
+    ];
+    for (position, name) in expected_indexes.iter().enumerate() {
+        let mut statement = connection
+            .prepare(&format!("PRAGMA index_info({name})"))
+            .map_err(|_| StorageError::migration_transaction_failed())?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(2))
+            .map_err(|_| StorageError::migration_transaction_failed())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| StorageError::migration_transaction_failed())?;
+        if columns.iter().map(String::as_str).collect::<Vec<_>>()
+            != expected_index_columns[position]
+        {
+            return Err(StorageError::migration_transaction_failed());
+        }
+    }
+    let foreign_keys: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_list('memory_vector_late_delete_resolution')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    let singleton: i64 = connection.query_row("SELECT COUNT(*) FROM memory_vector_late_delete_runtime_lease WHERE lease_name='memory-vector-late-delete-resolver' AND lease_owner IS NULL AND lease_fence_epoch=0 AND lease_expires_at IS NULL", [], |row| row.get(0)).map_err(|_| StorageError::migration_transaction_failed())?;
+    if foreign_keys != 0 || singleton != 1 {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    Ok(())
 }
 
 /// Validates the exact ATT-I1 outbox column definitions from SQLite's own
@@ -341,7 +701,7 @@ pub(super) fn verify_schema_after_upgrade(
         return Err(StorageError::migration_version_invariant_failed());
     }
 
-    if expected_schema_version == ATTEMPT_CLAIM_IDENTITY_SCHEMA_VERSION {
+    if expected_schema_version >= ATTEMPT_CLAIM_IDENTITY_SCHEMA_VERSION {
         #[cfg(test)]
         if should_fail_post_commit_verification_at_for_test(
             PostCommitVerificationFailpoint::AttemptClaimIdentitySchema,
@@ -349,6 +709,9 @@ pub(super) fn verify_schema_after_upgrade(
             return Err(StorageError::migration_post_commit_verification_failed());
         }
         validate_attempt_claim_identity_schema(connection)?;
+    }
+    if expected_schema_version == LATE_DELETE_RESOLUTION_SCHEMA_VERSION {
+        validate_late_delete_resolution_schema(connection)?;
     }
     if expected_schema_version >= writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION {
         #[cfg(test)]
@@ -453,11 +816,51 @@ pub(super) enum Migration014Failpoint {
     ManifestValidation,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Migration015Failpoint {
+    ResolutionTable,
+    RuntimeLeaseTable,
+    IdentityIndex,
+    OutboxIndex,
+    CandidateIndex,
+    DiagnosticIndex,
+    RuntimeLeaseRow,
+    Backfill,
+    SchemaValidation,
+    ManifestValidation,
+    SchemaVersion,
+}
+
 #[cfg(test)]
 thread_local! {
     static MIGRATION_014_FAILPOINT: std::cell::Cell<Option<Migration014Failpoint>> = const {
         std::cell::Cell::new(None)
     };
+}
+
+#[cfg(test)]
+thread_local! {
+    static MIGRATION_015_FAILPOINT: std::cell::Cell<Option<Migration015Failpoint>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(super) fn fail_next_migration_015_at_for_test(failpoint: Migration015Failpoint) {
+    MIGRATION_015_FAILPOINT.with(|next| next.set(Some(failpoint)));
+}
+
+#[cfg(test)]
+fn should_fail_migration_015_at_for_test(failpoint: Migration015Failpoint) -> bool {
+    MIGRATION_015_FAILPOINT.with(|next| {
+        if next.get() == Some(failpoint) {
+            next.set(None);
+            true
+        } else {
+            false
+        }
+    })
 }
 
 #[cfg(test)]
@@ -663,8 +1066,11 @@ pub fn verify_database(
         ));
     }
 
-    if expected_schema_version == ATTEMPT_CLAIM_IDENTITY_SCHEMA_VERSION {
+    if expected_schema_version >= ATTEMPT_CLAIM_IDENTITY_SCHEMA_VERSION {
         validate_attempt_claim_identity_schema(connection)?;
+    }
+    if expected_schema_version == LATE_DELETE_RESOLUTION_SCHEMA_VERSION {
+        validate_late_delete_resolution_schema(connection)?;
     }
     if expected_schema_version >= writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION {
         writer_fence_manifest::validate_writer_fence_manifest(connection)?;
@@ -742,6 +1148,17 @@ mod transaction_tests {
     use rusqlite::{functions::FunctionFlags, params, Connection, TransactionBehavior};
 
     use super::*;
+
+    type LateDeleteResolutionWitnessRow = (
+        String,
+        i64,
+        i64,
+        i64,
+        Option<String>,
+        Option<String>,
+        String,
+        i64,
+    );
 
     const TEST_MIGRATIONS: &[(i64, &str, &str)] = &[
         (
@@ -945,6 +1362,27 @@ mod transaction_tests {
         transaction.commit().unwrap();
     }
 
+    fn version_fourteen_connection() -> Connection {
+        let mut connection = version_thirteen_connection();
+        apply_attempt_claim_identity_upgrade(&mut connection);
+        assert_eq!(
+            schema_version(&connection),
+            ATTEMPT_CLAIM_IDENTITY_SCHEMA_VERSION
+        );
+        connection
+    }
+
+    fn apply_late_delete_resolution_upgrade(connection: &mut Connection) {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert_eq!(
+            apply_late_delete_resolution_schema_upgrade(&transaction).unwrap(),
+            LateDeleteResolutionSchemaUpgrade::Applied
+        );
+        transaction.commit().unwrap();
+    }
+
     fn attempt_epoch_values(connection: &Connection, life_id: &str, memory_id: &str) -> (i64, i64) {
         connection
             .query_row(
@@ -954,6 +1392,248 @@ mod transaction_tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn migration_015_backfill_captures_only_complete_canonical_delete_unknown_evidence() {
+        let mut connection = version_fourteen_connection();
+        connection
+            .execute_batch(
+                "INSERT INTO memory_vector_generation (generation_id, descriptor_hash, dimension, state)
+                 VALUES ('ld-generation', 'ld-descriptor', 384, 'retired');
+                 INSERT INTO memory_vector_sync_outbox
+                   (life_id, memory_id, desired_action, state, attempt_count, mutation_sequence,
+                    claimed_generation_id, fenced_claim_epoch, last_marked_claim_epoch,
+                    last_send_disposition, last_error_code)
+                 VALUES
+                   ('ld-life', 'possibly-sent', 'delete', 'blocked', 2, 41,
+                    'ld-generation', 9, 8, 'possibly_sent', NULL),
+                   ('ld-life', 'provider-unknown', 'delete', 'retry_wait', 3, 42,
+                    'ld-generation', 10, 10, NULL, 'PROVIDER_RESULT_UNKNOWN'),
+                   ('ld-life', 'both-witnesses', 'delete', 'processing', 4, 43,
+                    'ld-generation', 11, 10, 'possibly_sent', 'PROVIDER_RESULT_UNKNOWN'),
+                   ('ld-life', 'ordinary-delete', 'delete', 'blocked', 2, 44,
+                    'ld-generation', 12, 11, NULL, 'TEMPORARY_FAILURE'),
+                   ('ld-life', 'unknown-upsert', 'upsert', 'blocked', 2, 45,
+                    'ld-generation', 13, 12, 'possibly_sent', NULL),
+                   ('ld-life', 'bad-attempt', 'delete', 'blocked', 6, 46,
+                    'ld-generation', 14, 13, 'possibly_sent', NULL);"
+            )
+            .unwrap();
+
+        apply_late_delete_resolution_upgrade(&mut connection);
+        validate_late_delete_resolution_schema(&connection).unwrap();
+        assert_eq!(
+            schema_version(&connection),
+            LATE_DELETE_RESOLUTION_SCHEMA_VERSION
+        );
+        assert_eq!(writer_fence_count(&connection), 24);
+        let rows: Vec<LateDeleteResolutionWitnessRow> = connection
+            .prepare(
+                "SELECT memory_id, witness_attempt_ordinal, witness_claim_epoch,
+                        witness_marked_claim_epoch, witness_send_disposition, witness_error_code,
+                        embedding_descriptor_id, embedding_dimension
+                 FROM memory_vector_late_delete_resolution ORDER BY mutation_sequence",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[0],
+            (
+                "possibly-sent".into(),
+                2,
+                9,
+                8,
+                Some("possibly_sent".into()),
+                None,
+                "ld-descriptor".into(),
+                384
+            )
+        );
+        assert_eq!(
+            rows[1],
+            (
+                "provider-unknown".into(),
+                3,
+                10,
+                10,
+                None,
+                Some("PROVIDER_RESULT_UNKNOWN".into()),
+                "ld-descriptor".into(),
+                384
+            )
+        );
+        assert_eq!(
+            rows[2],
+            (
+                "both-witnesses".into(),
+                4,
+                11,
+                10,
+                Some("possibly_sent".into()),
+                Some("PROVIDER_RESULT_UNKNOWN".into()),
+                "ld-descriptor".into(),
+                384
+            )
+        );
+        let timestamps: i64 = connection.query_row(
+            "SELECT COUNT(DISTINCT created_at || '|' || updated_at) FROM memory_vector_late_delete_resolution",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(timestamps, 1);
+        assert_eq!(
+            connection
+                .execute(
+                    "DELETE FROM memory_vector_sync_outbox WHERE memory_id='possibly-sent'",
+                    []
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(connection.query_row("SELECT COUNT(*) FROM memory_vector_late_delete_resolution WHERE memory_id='possibly-sent'", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+    }
+
+    #[test]
+    fn migration_015_failpoints_rollback_to_an_unchanged_schema_fourteen() {
+        for failpoint in [
+            Migration015Failpoint::ResolutionTable,
+            Migration015Failpoint::RuntimeLeaseTable,
+            Migration015Failpoint::IdentityIndex,
+            Migration015Failpoint::OutboxIndex,
+            Migration015Failpoint::CandidateIndex,
+            Migration015Failpoint::DiagnosticIndex,
+            Migration015Failpoint::RuntimeLeaseRow,
+            Migration015Failpoint::Backfill,
+            Migration015Failpoint::SchemaValidation,
+            Migration015Failpoint::ManifestValidation,
+            Migration015Failpoint::SchemaVersion,
+        ] {
+            let mut connection = version_fourteen_connection();
+            fail_next_migration_015_at_for_test(failpoint);
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let error = apply_late_delete_resolution_schema_upgrade(&transaction).unwrap_err();
+            assert_eq!(error.code, "MIGRATION_TRANSACTION_FAILED");
+            drop(transaction);
+            assert_eq!(
+                schema_version(&connection),
+                ATTEMPT_CLAIM_IDENTITY_SCHEMA_VERSION
+            );
+            for table in [
+                "memory_vector_late_delete_resolution",
+                "memory_vector_late_delete_runtime_lease",
+            ] {
+                assert_eq!(connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)", [table], |row| row.get::<_, i64>(0)).unwrap(), 0, "{table} must be rolled back");
+            }
+            assert_eq!(writer_fence_count(&connection), 18);
+        }
+    }
+
+    #[test]
+    fn migration_015_each_late_delete_writer_fence_failure_rolls_back_all_schema_objects() {
+        for trigger_index in 19..=24 {
+            let mut connection = version_fourteen_connection();
+            writer_fence_manifest::fail_trigger_install_at_for_test(trigger_index);
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let error = apply_late_delete_resolution_schema_upgrade(&transaction).unwrap_err();
+            assert_eq!(error.code, "MIGRATION_TRANSACTION_FAILED");
+            drop(transaction);
+            assert_eq!(
+                schema_version(&connection),
+                ATTEMPT_CLAIM_IDENTITY_SCHEMA_VERSION
+            );
+            assert_eq!(writer_fence_count(&connection), 18);
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_schema WHERE name IN ('memory_vector_late_delete_resolution', 'memory_vector_late_delete_runtime_lease')",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn migration_015_commit_unknown_reopen_observes_only_a_complete_schema_fifteen() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("migration-015-commit-unknown.sqlite3");
+        {
+            let connection = version_fourteen_connection();
+            let mut destination = Connection::open(&path).unwrap();
+            let backup = Backup::new(&connection, &mut destination).unwrap();
+            backup.run_to_completion(5, Duration::ZERO, None).unwrap();
+        }
+        {
+            let mut connection = Connection::open(&path).unwrap();
+            connection
+                .create_scalar_function(
+                    "digital_life_writer_epoch",
+                    0,
+                    FunctionFlags::SQLITE_UTF8
+                        | FunctionFlags::SQLITE_DETERMINISTIC
+                        | FunctionFlags::SQLITE_INNOCUOUS,
+                    |_| Ok(1_i64),
+                )
+                .unwrap();
+            apply_late_delete_resolution_upgrade(&mut connection);
+            // Simulate the caller losing the commit acknowledgement: it does
+            // not inspect the completed operation before dropping the handle.
+        }
+        let reopened = Connection::open(&path).unwrap();
+        assert_eq!(
+            schema_version(&reopened),
+            LATE_DELETE_RESOLUTION_SCHEMA_VERSION
+        );
+        validate_late_delete_resolution_schema(&reopened).unwrap();
+        writer_fence_manifest::validate_writer_fence_manifest(&reopened).unwrap();
+        let trigger_count = writer_fence_count(&reopened);
+        assert_eq!(trigger_count, 24);
+    }
+
+    #[test]
+    fn late_delete_resolution_schema_15_validator_rejects_a_weakened_resolution_budget_check() {
+        let mut connection = version_fourteen_connection();
+        apply_late_delete_resolution_upgrade(&mut connection);
+        connection
+            .pragma_update(None, "writable_schema", "ON")
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE sqlite_schema
+                 SET sql=replace(sql, 'resolution_count BETWEEN 0 AND 3', 'resolution_count BETWEEN 0 AND 4')
+                 WHERE type='table' AND name='memory_vector_late_delete_resolution'",
+                [],
+            )
+            .unwrap();
+        connection
+            .pragma_update(None, "writable_schema", "OFF")
+            .unwrap();
+        connection
+            .pragma_update(None, "schema_version", 9_001_i64)
+            .unwrap();
+        let error = validate_late_delete_resolution_schema(&connection).unwrap_err();
+        assert_eq!(error.code, "MIGRATION_TRANSACTION_FAILED");
     }
 
     /// Reads the three columns the version-14 identity CHECK spans, so a
@@ -1109,7 +1789,7 @@ mod transaction_tests {
     fn migration_transaction_rejects_targets_outside_the_h1_a3_contract() {
         let mut connection = transaction_connection();
         let transaction = connection.transaction().unwrap();
-        for target in [0, writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION, 15] {
+        for target in [0, writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION, 16] {
             let error =
                 apply_pending_migrations_in_transaction(&transaction, 0, target).unwrap_err();
             assert_eq!(error.code, "MIGRATION_VERSION_INVARIANT_FAILED");

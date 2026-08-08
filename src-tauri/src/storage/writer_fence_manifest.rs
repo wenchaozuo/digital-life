@@ -8,7 +8,9 @@ use rusqlite::{Connection, Transaction};
 use super::StorageError;
 
 pub(super) const WRITER_FENCE_SCHEMA_VERSION: i64 = 13;
+pub(super) const LATE_DELETE_WRITER_FENCE_SCHEMA_VERSION: i64 = 15;
 const WRITER_FENCE_TRIGGER_PREFIX: &str = "digital_life_writer_epoch_";
+const HISTORICAL_WRITER_FENCE_TRIGGER_COUNT: usize = 18;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(super) enum WriterFenceOperation {
@@ -153,10 +155,50 @@ const WRITER_FENCE_TRIGGER_SPECS: &[WriterFenceTriggerSpec] = &[
         Delete,
         "DELETE"
     ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_memory_vector_late_delete_resolution_insert",
+        "memory_vector_late_delete_resolution",
+        Insert,
+        "INSERT"
+    ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_memory_vector_late_delete_resolution_update",
+        "memory_vector_late_delete_resolution",
+        Update,
+        "UPDATE"
+    ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_memory_vector_late_delete_resolution_delete",
+        "memory_vector_late_delete_resolution",
+        Delete,
+        "DELETE"
+    ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_memory_vector_late_delete_runtime_lease_insert",
+        "memory_vector_late_delete_runtime_lease",
+        Insert,
+        "INSERT"
+    ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_memory_vector_late_delete_runtime_lease_update",
+        "memory_vector_late_delete_runtime_lease",
+        Update,
+        "UPDATE"
+    ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_memory_vector_late_delete_runtime_lease_delete",
+        "memory_vector_late_delete_runtime_lease",
+        Delete,
+        "DELETE"
+    ),
 ];
 
 pub(super) fn writer_fence_trigger_specs() -> &'static [WriterFenceTriggerSpec] {
-    WRITER_FENCE_TRIGGER_SPECS
+    &WRITER_FENCE_TRIGGER_SPECS[..HISTORICAL_WRITER_FENCE_TRIGGER_COUNT]
+}
+
+pub(super) fn late_delete_writer_fence_trigger_specs() -> &'static [WriterFenceTriggerSpec] {
+    &WRITER_FENCE_TRIGGER_SPECS[HISTORICAL_WRITER_FENCE_TRIGGER_COUNT..]
 }
 
 /// Installs the fixed manifest into the caller-owned schema transaction. The
@@ -164,7 +206,7 @@ pub(super) fn writer_fence_trigger_specs() -> &'static [WriterFenceTriggerSpec] 
 pub(super) fn install_writer_fence_manifest_in_transaction(
     transaction: &Transaction<'_>,
 ) -> Result<(), StorageError> {
-    for (index, spec) in WRITER_FENCE_TRIGGER_SPECS.iter().enumerate() {
+    for (index, spec) in writer_fence_trigger_specs().iter().enumerate() {
         #[cfg(not(test))]
         let _ = index;
         #[cfg(test)]
@@ -178,9 +220,41 @@ pub(super) fn install_writer_fence_manifest_in_transaction(
     Ok(())
 }
 
+pub(super) fn install_late_delete_writer_fence_manifest_in_transaction(
+    transaction: &Transaction<'_>,
+) -> Result<(), StorageError> {
+    for (index, spec) in late_delete_writer_fence_trigger_specs().iter().enumerate() {
+        #[cfg(not(test))]
+        let _ = index;
+        #[cfg(test)]
+        if should_fail_trigger_install_at_for_test(
+            HISTORICAL_WRITER_FENCE_TRIGGER_COUNT + index + 1,
+        ) {
+            return Err(StorageError::migration_transaction_failed());
+        }
+        transaction
+            .execute_batch(spec.ddl)
+            .map_err(|_| StorageError::migration_transaction_failed())?;
+    }
+    Ok(())
+}
+
 /// Confirms that the reserved writer-fence Trigger namespace exactly matches
 /// the static manifest. This never repairs or installs schema objects.
 pub(super) fn validate_writer_fence_manifest(connection: &Connection) -> Result<(), StorageError> {
+    validate_writer_fence_manifest_for_schema(
+        connection,
+        super::connection::read_schema_version(connection)?,
+    )
+}
+
+/// Validates against an explicitly supplied schema version.  Migration 015
+/// uses this before recording version 15, so a version row can never be the
+/// thing that makes an incomplete six-trigger extension appear valid.
+pub(super) fn validate_writer_fence_manifest_for_schema(
+    connection: &Connection,
+    schema_version: i64,
+) -> Result<(), StorageError> {
     let mut statement = connection
         .prepare("SELECT type, name, tbl_name, sql FROM sqlite_schema")
         .map_err(|_| StorageError::writer_fence_manifest_mismatch())?;
@@ -195,7 +269,12 @@ pub(super) fn validate_writer_fence_manifest(connection: &Connection) -> Result<
         })
         .map_err(|_| StorageError::writer_fence_manifest_mismatch())?;
 
-    let mut found = [false; 18];
+    let expected = if schema_version >= LATE_DELETE_WRITER_FENCE_SCHEMA_VERSION {
+        WRITER_FENCE_TRIGGER_SPECS
+    } else {
+        writer_fence_trigger_specs()
+    };
+    let mut found = vec![false; expected.len()];
     for row in rows {
         let (object_type, name, table, sql) =
             row.map_err(|_| StorageError::writer_fence_manifest_mismatch())?;
@@ -206,17 +285,17 @@ pub(super) fn validate_writer_fence_manifest(connection: &Connection) -> Result<
             continue;
         }
 
-        let Some((index, expected)) = WRITER_FENCE_TRIGGER_SPECS
+        let Some((index, expected_spec)) = expected
             .iter()
             .enumerate()
-            .find(|(_, expected)| expected.name == name)
+            .find(|(_, expected_spec)| expected_spec.name == name)
         else {
             return Err(StorageError::writer_fence_manifest_mismatch());
         };
 
         if object_type != "trigger"
-            || table.as_deref() != Some(expected.table)
-            || sql.as_deref() != Some(expected.ddl)
+            || table.as_deref() != Some(expected_spec.table)
+            || sql.as_deref() != Some(expected_spec.ddl)
         {
             return Err(StorageError::writer_fence_manifest_mismatch());
         }
@@ -488,6 +567,30 @@ mod tests {
             "UPDATE memory_vector_sync_outbox
              SET last_marked_claim_epoch=0
              WHERE life_id='writer-fence-life' AND memory_id='outbox-seed'",
+            [],
+        )
+    }
+
+    fn late_delete_resolution_insert(connection: &Connection) -> rusqlite::Result<usize> {
+        connection.execute(
+            "INSERT INTO memory_vector_late_delete_resolution
+             (outbox_id, life_id, memory_id, mutation_sequence, claimed_generation_id,
+              embedding_descriptor_id, embedding_dimension, captured_generation_state,
+              witness_attempt_ordinal, witness_claim_epoch, witness_marked_claim_epoch,
+              witness_send_disposition, state, created_at, updated_at)
+             VALUES (991, 'writer-fence-life', 'late-resolution', 991, 'generation-seed',
+                     'seed-descriptor', 3, 'building', 1, 1, 1, 'possibly_sent',
+                     'pending', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')",
+            [],
+        )
+    }
+
+    fn late_delete_runtime_lease_insert(connection: &Connection) -> rusqlite::Result<usize> {
+        connection.execute(
+            "INSERT INTO memory_vector_late_delete_runtime_lease
+             (lease_name, lease_owner, lease_fence_epoch, lease_expires_at, created_at, updated_at)
+             VALUES ('memory-vector-late-delete-resolver', NULL, 0, NULL,
+                     '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')",
             [],
         )
     }
@@ -832,6 +935,47 @@ mod tests {
                 protected_delete(&raw, table).is_err(),
                 "{table} delete must fail"
             );
+        }
+    }
+
+    #[test]
+    fn schema_15_writer_fence_has_exactly_twenty_four_specs_and_protects_late_delete_tables() {
+        let (_root, path) = initialized_fenced_database();
+        let authorized = authorized_connection(&path);
+        validate_writer_fence_manifest(&authorized).unwrap();
+        assert_eq!(writer_fence_trigger_specs().len(), 18);
+        assert_eq!(late_delete_writer_fence_trigger_specs().len(), 6);
+        assert_eq!(WRITER_FENCE_TRIGGER_SPECS.len(), 24);
+        let resolution_id = late_delete_resolution_insert(&authorized).unwrap();
+        assert_eq!(resolution_id, 1);
+        assert_eq!(authorized.execute("UPDATE memory_vector_late_delete_resolution SET updated_at='2026-01-02T00:00:00.000Z' WHERE memory_id='late-resolution'", []).unwrap(), 1);
+        assert_eq!(authorized.execute("DELETE FROM memory_vector_late_delete_resolution WHERE memory_id='late-resolution'", []).unwrap(), 1);
+        assert_eq!(authorized.execute("UPDATE memory_vector_late_delete_runtime_lease SET updated_at='2026-01-02T00:00:00.000Z' WHERE lease_name='memory-vector-late-delete-resolver'", []).unwrap(), 1);
+        assert_eq!(authorized.execute("DELETE FROM memory_vector_late_delete_runtime_lease WHERE lease_name='memory-vector-late-delete-resolver'", []).unwrap(), 1);
+        assert_eq!(late_delete_runtime_lease_insert(&authorized).unwrap(), 1);
+        assert_eq!(late_delete_resolution_insert(&authorized).unwrap(), 1);
+        drop(authorized);
+
+        let raw = Connection::open(&path).unwrap();
+        raw.create_scalar_function(
+            "digital_life_writer_epoch",
+            0,
+            FunctionFlags::SQLITE_UTF8
+                | FunctionFlags::SQLITE_DETERMINISTIC
+                | FunctionFlags::SQLITE_INNOCUOUS,
+            |_| Ok(0_i64),
+        )
+        .unwrap();
+        for (operation, result) in [
+            ("resolution insert", late_delete_resolution_insert(&raw)),
+            ("resolution update", raw.execute("UPDATE memory_vector_late_delete_resolution SET updated_at='2026-01-03T00:00:00.000Z'", [])),
+            ("resolution delete", raw.execute("DELETE FROM memory_vector_late_delete_resolution", [])),
+            ("runtime lease insert", late_delete_runtime_lease_insert(&raw)),
+            ("runtime lease update", raw.execute("UPDATE memory_vector_late_delete_runtime_lease SET updated_at='2026-01-03T00:00:00.000Z'", [])),
+            ("runtime lease delete", raw.execute("DELETE FROM memory_vector_late_delete_runtime_lease", [])),
+        ] {
+            let error = result.expect_err("raw Schema-15 DML must be stopped by its writer-fence trigger");
+            assert!(error.to_string().contains("INCOMPATIBLE_DATABASE_WRITER"), "{operation}: {error}");
         }
     }
 

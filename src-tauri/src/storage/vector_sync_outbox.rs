@@ -3934,7 +3934,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
     }
 
     #[test]
@@ -3974,7 +3974,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
         drop(storage);
 
         let reopened = StorageService::initialize_with_roots(data_root, None).unwrap();

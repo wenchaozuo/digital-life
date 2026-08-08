@@ -1843,8 +1843,9 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(writer_fence_count, 18);
+        assert_eq!(writer_fence_count, 24);
         migration::validate_attempt_claim_identity_schema(&state.connection).unwrap();
+        migration::validate_late_delete_resolution_schema(&state.connection).unwrap();
         assert_eq!(
             state
                 .connection
@@ -2037,7 +2038,7 @@ mod tests {
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert_eq!(fence_count, 18);
+            assert_eq!(fence_count, 24);
         }
 
         // All 8 outbox states preserved with full epoch evidence.

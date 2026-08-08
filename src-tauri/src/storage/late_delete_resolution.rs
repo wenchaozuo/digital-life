@@ -885,34 +885,61 @@ mod tests {
 
     #[test]
     fn late_delete_resolution_superseded_new_mutation_atomic_commit_unknown_mutation() {
-        let (_root, storage) = storage();
-        let memory = super::super::test_support::insert_confirmed_memory_fixture(
-            &storage,
-            "life",
-            "fact",
-            "late delete",
-            None,
-            0.5,
-            0.5,
-            false,
-            true,
-        );
-        seed_resolution(&storage, "life", &memory.id, 1);
-        storage.test_fail_next_enqueue_after_commit();
-        let unknown_commit = <StorageService as MemoryVectorSyncOutboxRepository>::enqueue(
-            &storage,
-            EnqueueMemoryVectorSyncRequest {
-                life_id: "life".into(),
-                memory_id: memory.id.clone(),
-                desired_action: MemoryVectorSyncAction::Delete,
-            },
-        );
-        assert!(
-            unknown_commit.is_err(),
-            "the simulated caller sees an unknown commit"
-        );
-        let state = storage.state().unwrap();
-        let (resolution_state, disposition, resolution_updated_at, outbox_updated_at, outbox_sequence): (
+        for _ in 0..10 {
+            let (_root, storage) = storage();
+            let memory = super::super::test_support::insert_confirmed_memory_fixture(
+                &storage,
+                "life",
+                "fact",
+                "late delete",
+                None,
+                0.5,
+                0.5,
+                false,
+                true,
+            );
+            seed_resolution(&storage, "life", &memory.id, 1);
+            let lease = storage
+                .acquire_late_delete_runtime_lease("resolver-a")
+                .unwrap()
+                .unwrap();
+            let claim = match storage.claim_one_late_delete_resolution(&lease).unwrap() {
+                LateDeleteResolutionClaimResult::Claimed(claim) => claim,
+                LateDeleteResolutionClaimResult::NoEligibleResolution => {
+                    panic!("candidate must claim")
+                }
+            };
+            let token = match storage.reserve_late_delete_resolution(&claim).unwrap() {
+                LateDeleteResolutionReservation::Reserved(token) => token,
+                _ => panic!("claim must reserve exactly one resolution slot"),
+            };
+            assert!(storage
+                .late_delete_resolution_token_is_current(&token)
+                .unwrap());
+            storage.test_fail_next_enqueue_after_commit();
+            let unknown_commit = <StorageService as MemoryVectorSyncOutboxRepository>::enqueue(
+                &storage,
+                EnqueueMemoryVectorSyncRequest {
+                    life_id: "life".into(),
+                    memory_id: memory.id.clone(),
+                    desired_action: MemoryVectorSyncAction::Delete,
+                },
+            );
+            assert!(
+                unknown_commit.is_err(),
+                "the simulated caller sees an unknown commit"
+            );
+            assert!(!storage
+                .late_delete_resolution_token_is_current(&token)
+                .unwrap());
+            assert_eq!(
+                storage
+                    .finalize_late_delete_resolution_deleted(&token)
+                    .unwrap(),
+                LateDeleteResolutionFinalizeResult::LostLeaseOrSuperseded
+            );
+            let state = storage.state().unwrap();
+            let (resolution_state, disposition, resolution_updated_at, outbox_updated_at, outbox_sequence): (
             String,
             String,
             String,
@@ -929,10 +956,11 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )
             .unwrap();
-        assert_eq!(resolution_state, "superseded");
-        assert_eq!(disposition, "superseded");
-        assert_eq!(resolution_updated_at, outbox_updated_at);
-        assert_eq!(outbox_sequence, 2);
+            assert_eq!(resolution_state, "superseded");
+            assert_eq!(disposition, "superseded");
+            assert_eq!(resolution_updated_at, outbox_updated_at);
+            assert_eq!(outbox_sequence, 2);
+        }
     }
 
     #[test]

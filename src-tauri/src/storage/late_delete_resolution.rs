@@ -47,6 +47,8 @@ pub(crate) struct LateDeleteResolutionClaim {
     witness_attempt_ordinal: i64,
     witness_claim_epoch: i64,
     witness_marked_claim_epoch: i64,
+    witness_send_disposition: Option<String>,
+    witness_error_code: Option<String>,
     lease_owner: String,
     runtime_fence_epoch: i64,
     resolution_epoch: i64,
@@ -71,6 +73,8 @@ pub(crate) struct LateDeleteResolutionToken {
     witness_attempt_ordinal: i64,
     witness_claim_epoch: i64,
     witness_marked_claim_epoch: i64,
+    witness_send_disposition: Option<String>,
+    witness_error_code: Option<String>,
     lease_owner: String,
     runtime_fence_epoch: i64,
     resolution_epoch: i64,
@@ -162,12 +166,15 @@ struct ResolutionRow {
     witness_attempt_ordinal: i64,
     witness_claim_epoch: i64,
     witness_marked_claim_epoch: i64,
+    witness_send_disposition: Option<String>,
+    witness_error_code: Option<String>,
     state: String,
     resolution_count: i64,
     resolution_epoch: i64,
     last_reserved_resolution_epoch: i64,
     lease_owner: Option<String>,
     lease_fence_epoch: Option<i64>,
+    lease_expires_at: Option<String>,
 }
 
 fn storage_error(error: impl std::fmt::Display) -> StorageError {
@@ -368,6 +375,8 @@ impl StorageService {
             witness_attempt_ordinal: row.witness_attempt_ordinal,
             witness_claim_epoch: row.witness_claim_epoch,
             witness_marked_claim_epoch: row.witness_marked_claim_epoch,
+            witness_send_disposition: row.witness_send_disposition,
+            witness_error_code: row.witness_error_code,
             lease_owner: lease.owner.clone(),
             runtime_fence_epoch: lease.fence_epoch,
             resolution_epoch: row.resolution_epoch + 1,
@@ -451,6 +460,8 @@ impl StorageService {
             witness_attempt_ordinal: row.witness_attempt_ordinal,
             witness_claim_epoch: row.witness_claim_epoch,
             witness_marked_claim_epoch: row.witness_marked_claim_epoch,
+            witness_send_disposition: row.witness_send_disposition,
+            witness_error_code: row.witness_error_code,
             lease_owner: claim.lease_owner.clone(),
             runtime_fence_epoch: claim.runtime_fence_epoch,
             resolution_epoch: row.resolution_epoch,
@@ -637,8 +648,9 @@ impl StorageService {
                  resolved_at=CASE WHEN ?7 THEN ?8 ELSE NULL END, updated_at=?8
              WHERE resolution_id=?1 AND state='processing' AND resolution_epoch=?9
                AND resolution_count=?10 AND last_reserved_resolution_epoch=?9
-               AND lease_owner=?11 AND lease_fence_epoch=?12 AND lease_expires_at > ?8",
-            params![token.resolution_id, target_state, disposition.as_str(), error_code, target_state != "processing", next_attempt_at, terminal, now, token.resolution_epoch, token.resolution_ordinal, token.lease_owner, token.runtime_fence_epoch],
+                AND lease_owner=?11 AND lease_fence_epoch=?12 AND lease_expires_at > ?8
+                AND witness_send_disposition IS ?13 AND witness_error_code IS ?14",
+            params![token.resolution_id, target_state, disposition.as_str(), error_code, target_state != "processing", next_attempt_at, terminal, now, token.resolution_epoch, token.resolution_ordinal, token.lease_owner, token.runtime_fence_epoch, token.witness_send_disposition, token.witness_error_code],
         ).map_err(storage_error)?;
         tx.commit().map_err(storage_error)?;
         Ok(if changed == 1 {
@@ -685,7 +697,7 @@ fn select_next_candidate_in(
     tx.query_row(&format!("{RESOLUTION_SELECT_SQL} WHERE state IN ('pending','unknown','retry_wait') AND (state <> 'retry_wait' OR next_attempt_at <= ?1) AND (lease_owner IS NULL OR lease_expires_at <= ?1) ORDER BY mutation_sequence, resolution_id LIMIT 1"), [now], resolution_row).optional().map_err(storage_error)
 }
 
-const RESOLUTION_SELECT_SQL: &str = "SELECT resolution_id,outbox_id,life_id,memory_id,mutation_sequence,claimed_generation_id,embedding_descriptor_id,embedding_dimension,captured_generation_state,witness_attempt_ordinal,witness_claim_epoch,witness_marked_claim_epoch,state,resolution_count,resolution_epoch,last_reserved_resolution_epoch,lease_owner,lease_fence_epoch FROM memory_vector_late_delete_resolution";
+const RESOLUTION_SELECT_SQL: &str = "SELECT resolution_id,outbox_id,life_id,memory_id,mutation_sequence,claimed_generation_id,embedding_descriptor_id,embedding_dimension,captured_generation_state,witness_attempt_ordinal,witness_claim_epoch,witness_marked_claim_epoch,witness_send_disposition,witness_error_code,state,resolution_count,resolution_epoch,last_reserved_resolution_epoch,lease_owner,lease_fence_epoch,lease_expires_at FROM memory_vector_late_delete_resolution";
 
 fn resolution_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ResolutionRow> {
     Ok(ResolutionRow {
@@ -701,12 +713,15 @@ fn resolution_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ResolutionRow> {
         witness_attempt_ordinal: row.get(9)?,
         witness_claim_epoch: row.get(10)?,
         witness_marked_claim_epoch: row.get(11)?,
-        state: row.get(12)?,
-        resolution_count: row.get(13)?,
-        resolution_epoch: row.get(14)?,
-        last_reserved_resolution_epoch: row.get(15)?,
-        lease_owner: row.get(16)?,
-        lease_fence_epoch: row.get(17)?,
+        witness_send_disposition: row.get(12)?,
+        witness_error_code: row.get(13)?,
+        state: row.get(14)?,
+        resolution_count: row.get(15)?,
+        resolution_epoch: row.get(16)?,
+        last_reserved_resolution_epoch: row.get(17)?,
+        lease_owner: row.get(18)?,
+        lease_fence_epoch: row.get(19)?,
+        lease_expires_at: row.get(20)?,
     })
 }
 
@@ -723,6 +738,8 @@ fn claim_matches_row(claim: &LateDeleteResolutionClaim, row: &ResolutionRow) -> 
         && row.witness_attempt_ordinal == claim.witness_attempt_ordinal
         && row.witness_claim_epoch == claim.witness_claim_epoch
         && row.witness_marked_claim_epoch == claim.witness_marked_claim_epoch
+        && row.witness_send_disposition == claim.witness_send_disposition
+        && row.witness_error_code == claim.witness_error_code
         && row.lease_owner.as_deref() == Some(claim.lease_owner.as_str())
         && row.lease_fence_epoch == Some(claim.runtime_fence_epoch)
         && row.resolution_epoch == claim.resolution_epoch
@@ -758,8 +775,14 @@ fn token_is_current_in(
         && row.witness_attempt_ordinal == token.witness_attempt_ordinal
         && row.witness_claim_epoch == token.witness_claim_epoch
         && row.witness_marked_claim_epoch == token.witness_marked_claim_epoch
+        && row.witness_send_disposition == token.witness_send_disposition
+        && row.witness_error_code == token.witness_error_code
         && row.lease_owner.as_deref() == Some(token.lease_owner.as_str())
         && row.lease_fence_epoch == Some(token.runtime_fence_epoch)
+        && row
+            .lease_expires_at
+            .as_deref()
+            .is_some_and(|expires| expires > now)
         && row.resolution_epoch == token.resolution_epoch
         && row.resolution_count == token.resolution_ordinal
         && row.last_reserved_resolution_epoch == token.resolution_epoch)
@@ -777,7 +800,12 @@ mod tests {
         EnqueueMemoryVectorSyncRequest, MemoryVectorSyncAction, MemoryVectorSyncOutboxRepository,
     };
     use crate::storage::{LifeIdentityRecord, PersonaTemplateRecord};
-    use std::{fs, path::PathBuf};
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::{mpsc, Arc, Barrier},
+        thread,
+    };
 
     struct TestRoot(PathBuf);
 
@@ -835,6 +863,207 @@ mod tests {
                      'possibly_sent',NULL,'pending','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z')",
             params![life_id, memory_id, sequence],
         ).unwrap();
+    }
+
+    fn reserved_token(storage: &StorageService) -> Box<LateDeleteResolutionToken> {
+        let lease = storage
+            .acquire_late_delete_runtime_lease("resolver-a")
+            .unwrap()
+            .unwrap();
+        let claim = match storage.claim_one_late_delete_resolution(&lease).unwrap() {
+            LateDeleteResolutionClaimResult::Claimed(claim) => claim,
+            LateDeleteResolutionClaimResult::NoEligibleResolution => panic!("candidate must claim"),
+        };
+        match storage.reserve_late_delete_resolution(&claim).unwrap() {
+            LateDeleteResolutionReservation::Reserved(token) => token,
+            _ => panic!("claim must reserve"),
+        }
+    }
+
+    #[test]
+    fn late_delete_resolution_witness_identity_mismatch_and_row_lease_expiry_reject_token_cas() {
+        for (send, error, expiry) in [
+            (None, Some("PROVIDER_RESULT_UNKNOWN"), false),
+            (
+                Some("possibly_sent"),
+                Some("PROVIDER_RESULT_UNKNOWN"),
+                false,
+            ),
+            (Some("possibly_sent"), None, true),
+        ] {
+            let (_root, storage) = storage();
+            seed_resolution(&storage, "life", "memory", 1);
+            let token = reserved_token(&storage);
+            if expiry {
+                storage.state().unwrap().connection.execute("UPDATE memory_vector_late_delete_resolution SET lease_expires_at='2020-01-01T00:00:00.000Z' WHERE memory_id='memory'", []).unwrap();
+            } else {
+                storage.state().unwrap().connection.execute("UPDATE memory_vector_late_delete_resolution SET witness_send_disposition=?1, witness_error_code=?2 WHERE memory_id='memory'", params![send, error]).unwrap();
+            }
+            assert!(!storage
+                .late_delete_resolution_token_is_current(&token)
+                .unwrap());
+            assert_eq!(
+                storage
+                    .finalize_late_delete_resolution_absent(&token)
+                    .unwrap(),
+                LateDeleteResolutionFinalizeResult::LostLeaseOrSuperseded
+            );
+            assert_eq!(
+                storage
+                    .finalize_late_delete_resolution_deleted(&token)
+                    .unwrap(),
+                LateDeleteResolutionFinalizeResult::LostLeaseOrSuperseded
+            );
+            assert_eq!(
+                storage
+                    .finalize_late_delete_resolution_unknown(
+                        &token,
+                        LateDeleteResolutionDisposition::FinalizeUnknown,
+                        "UNKNOWN"
+                    )
+                    .unwrap(),
+                LateDeleteResolutionFinalizeResult::LostLeaseOrSuperseded
+            );
+        }
+    }
+
+    #[test]
+    fn late_delete_resolution_resolver_new_mutation_real_two_storage_service_concurrency() {
+        for _ in 0..10 {
+            let (root, service_a) = storage();
+            let memory = super::super::test_support::insert_confirmed_memory_fixture(
+                &service_a,
+                "life",
+                "fact",
+                "late delete",
+                None,
+                0.5,
+                0.5,
+                false,
+                true,
+            );
+            seed_resolution(&service_a, "life", &memory.id, 1);
+            let service_b =
+                StorageService::initialize_with_roots(root.0.join("data"), None).unwrap();
+            let barrier = Arc::new(Barrier::new(2));
+            let (committed_tx, committed_rx) = mpsc::channel();
+            let memory_id = memory.id.clone();
+            let resolver_barrier = Arc::clone(&barrier);
+            let resolver = thread::spawn(move || {
+                let token = reserved_token(&service_a);
+                resolver_barrier.wait();
+                committed_rx.recv().unwrap();
+                (
+                    service_a
+                        .late_delete_resolution_token_is_current(&token)
+                        .unwrap(),
+                    service_a
+                        .finalize_late_delete_resolution_deleted(&token)
+                        .unwrap(),
+                )
+            });
+            let mutation_barrier = Arc::clone(&barrier);
+            let mutation = thread::spawn(move || {
+                mutation_barrier.wait();
+                <StorageService as MemoryVectorSyncOutboxRepository>::enqueue(
+                    &service_b,
+                    EnqueueMemoryVectorSyncRequest {
+                        life_id: "life".into(),
+                        memory_id,
+                        desired_action: MemoryVectorSyncAction::Delete,
+                    },
+                )
+                .unwrap();
+                committed_tx.send(()).unwrap();
+            });
+            mutation.join().unwrap();
+            let (current, finalize) = resolver.join().unwrap();
+            assert!(!current);
+            assert_eq!(
+                finalize,
+                LateDeleteResolutionFinalizeResult::LostLeaseOrSuperseded
+            );
+        }
+    }
+
+    #[test]
+    fn late_delete_resolution_two_resolver_real_two_storage_service_runtime_takeover() {
+        for _ in 0..10 {
+            let (root, service_a) = storage();
+            seed_resolution(&service_a, "life", "memory", 1);
+            let service_b =
+                StorageService::initialize_with_roots(root.0.join("data"), None).unwrap();
+            let (a_ready_tx, a_ready_rx) = mpsc::channel();
+            let (b_done_tx, b_done_rx) = mpsc::channel();
+            let owner_a = thread::spawn(move || {
+                let lease = service_a
+                    .acquire_late_delete_runtime_lease("owner-a")
+                    .unwrap()
+                    .unwrap();
+                let claim = match service_a.claim_one_late_delete_resolution(&lease).unwrap() {
+                    LateDeleteResolutionClaimResult::Claimed(claim) => claim,
+                    LateDeleteResolutionClaimResult::NoEligibleResolution => panic!("A must claim"),
+                };
+                let token = match service_a.reserve_late_delete_resolution(&claim).unwrap() {
+                    LateDeleteResolutionReservation::Reserved(token) => token,
+                    _ => panic!("A must reserve"),
+                };
+                a_ready_tx.send(()).unwrap();
+                b_done_rx.recv().unwrap();
+                (service_a, lease, token)
+            });
+            let owner_b = thread::spawn(move || {
+                a_ready_rx.recv().unwrap();
+                assert!(service_b
+                    .acquire_late_delete_runtime_lease("owner-b")
+                    .unwrap()
+                    .is_none());
+                b_done_tx.send(()).unwrap();
+                service_b
+            });
+            let (service_a, old_lease, old_token) = owner_a.join().unwrap();
+            let service_b = owner_b.join().unwrap();
+            service_a.state().unwrap().connection.execute(
+                "UPDATE memory_vector_late_delete_runtime_lease SET lease_expires_at='2020-01-01T00:00:00.000Z' WHERE lease_name='memory-vector-late-delete-resolver'", [],
+            ).unwrap();
+            service_a.state().unwrap().connection.execute(
+                "UPDATE memory_vector_late_delete_resolution SET lease_expires_at='2020-01-01T00:00:00.000Z' WHERE memory_id='memory'", [],
+            ).unwrap();
+            let lease_b = service_b
+                .acquire_late_delete_runtime_lease("owner-b")
+                .unwrap()
+                .unwrap();
+            assert!(lease_b.fence_epoch() > old_lease.fence_epoch());
+            assert_eq!(
+                service_b.recover_expired_late_delete_resolutions().unwrap(),
+                1
+            );
+            let claim_b = match service_b
+                .claim_one_late_delete_resolution(&lease_b)
+                .unwrap()
+            {
+                LateDeleteResolutionClaimResult::Claimed(claim) => claim,
+                LateDeleteResolutionClaimResult::NoEligibleResolution => {
+                    panic!("B must claim after takeover")
+                }
+            };
+            let token_b = match service_b.reserve_late_delete_resolution(&claim_b).unwrap() {
+                LateDeleteResolutionReservation::Reserved(token) => token,
+                _ => panic!("B must reserve after takeover"),
+            };
+            assert!(!service_a
+                .late_delete_resolution_token_is_current(&old_token)
+                .unwrap());
+            assert_eq!(
+                service_a
+                    .finalize_late_delete_resolution_deleted(&old_token)
+                    .unwrap(),
+                LateDeleteResolutionFinalizeResult::LostLeaseOrSuperseded
+            );
+            assert!(service_b
+                .late_delete_resolution_token_is_current(&token_b)
+                .unwrap());
+        }
     }
 
     #[test]

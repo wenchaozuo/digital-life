@@ -297,6 +297,17 @@ pub struct VectorMetadataSample {
     pub dimension: usize,
 }
 
+/// Result of one atomic, full-identity conditional generation delete.
+///
+/// This is intentionally a vector-store primitive only. It carries no
+/// resolver state and is not serialized through IPC.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConditionalGenerationDeleteOutcome {
+    Deleted,
+    Absent,
+    IdentityMismatch,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
 pub struct VectorSpace {
@@ -532,6 +543,32 @@ pub trait VectorStore: Send + Sync {
         memory_id: &'a str,
     ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
         let _ = (context, life_id, memory_id);
+        Box::pin(async {
+            Err(VectorStoreError::new(
+                VectorStoreErrorCode::StoreUnavailable,
+                "Generation-aware storage is unavailable for this vector store.",
+                false,
+            ))
+        })
+    }
+
+    /// Deletes one generation record only when its complete current identity
+    /// still matches the supplied revision and canonical content hash.
+    fn delete_generation_memory_if_matches<'a>(
+        &'a self,
+        context: &'a VectorGenerationContext,
+        life_id: &'a str,
+        memory_id: &'a str,
+        expected_revision: i64,
+        expected_content_hash: &'a str,
+    ) -> VectorStoreFuture<'a, Result<ConditionalGenerationDeleteOutcome, VectorStoreError>> {
+        let _ = (
+            context,
+            life_id,
+            memory_id,
+            expected_revision,
+            expected_content_hash,
+        );
         Box::pin(async {
             Err(VectorStoreError::new(
                 VectorStoreErrorCode::StoreUnavailable,

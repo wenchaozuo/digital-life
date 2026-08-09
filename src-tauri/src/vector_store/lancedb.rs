@@ -17,9 +17,10 @@ use lancedb::{
 };
 
 use super::{
-    validate_identifier, GenerationVectorRecord, VectorGenerationContext, VectorGenerationId,
-    VectorMetadataSample, VectorRecord, VectorSearchHit, VectorSearchQuery, VectorSpace,
-    VectorStore, VectorStoreError, VectorStoreErrorCode, VectorStoreFuture,
+    validate_hash, validate_identifier, ConditionalGenerationDeleteOutcome, GenerationVectorRecord,
+    VectorGenerationContext, VectorGenerationId, VectorMetadataSample, VectorRecord,
+    VectorSearchHit, VectorSearchQuery, VectorSpace, VectorStore, VectorStoreError,
+    VectorStoreErrorCode, VectorStoreFuture,
 };
 
 const TABLE_PREFIX: &str = "vs_";
@@ -619,6 +620,96 @@ impl LanceDbVectorStore {
             .await
             .map_err(|_| delete_failed())?;
         Ok(())
+    }
+
+    async fn delete_generation_memory_if_matches_inner(
+        &self,
+        context: &VectorGenerationContext,
+        life_id: &str,
+        memory_id: &str,
+        expected_revision: i64,
+        expected_content_hash: &str,
+    ) -> Result<ConditionalGenerationDeleteOutcome, VectorStoreError> {
+        // This one guard remains live through exact requery, validation, full
+        // predicate Delete, and the postcondition requery.
+        let _guard = self.mutation_lock.lock().await;
+        self.delete_generation_memory_if_matches_under_lock(
+            context,
+            life_id,
+            memory_id,
+            expected_revision,
+            expected_content_hash,
+        )
+        .await
+    }
+
+    async fn delete_generation_memory_if_matches_under_lock(
+        &self,
+        context: &VectorGenerationContext,
+        life_id: &str,
+        memory_id: &str,
+        expected_revision: i64,
+        expected_content_hash: &str,
+    ) -> Result<ConditionalGenerationDeleteOutcome, VectorStoreError> {
+        validate_identifier(life_id, "Life ID")?;
+        validate_identifier(memory_id, "Memory ID")?;
+        validate_hash(expected_content_hash, "Content hash")?;
+        if expected_revision < 0 {
+            return Err(VectorStoreError::new(
+                VectorStoreErrorCode::RecordInvalid,
+                "The expected memory revision is invalid.",
+                false,
+            ));
+        }
+        let current = self
+            .get_generation_metadata_inner(context, life_id, memory_id)
+            .await?;
+        let Some(current) = current else {
+            return Ok(ConditionalGenerationDeleteOutcome::Absent);
+        };
+        if current.generation_id != context.generation_id().as_str()
+            || current.life_id != life_id
+            || current.memory_id != memory_id
+            || current.descriptor_hash != context.descriptor_hash()
+            || current.dimension != context.dimension()
+        {
+            return Err(corrupt());
+        }
+        if current.memory_revision != expected_revision
+            || current.content_hash != expected_content_hash
+        {
+            return Ok(ConditionalGenerationDeleteOutcome::IdentityMismatch);
+        }
+        let table = match self.open_generation_table(context).await {
+            Ok(table) => table,
+            Err(error) if error.code == VectorStoreErrorCode::GenerationNotFound => {
+                return Ok(ConditionalGenerationDeleteOutcome::Absent)
+            }
+            Err(error) => return Err(error),
+        };
+        let predicate = format!(
+            "generation_id = {} AND life_id = {} AND memory_id = {} \
+             AND memory_revision = {} AND content_hash = {} \
+             AND descriptor_hash = {} AND dimension = {}",
+            sql_literal(context.generation_id().as_str()),
+            sql_literal(life_id),
+            sql_literal(memory_id),
+            expected_revision,
+            sql_literal(expected_content_hash),
+            sql_literal(context.descriptor_hash()),
+            context.dimension(),
+        );
+        table
+            .delete(&predicate)
+            .await
+            .map_err(|_| delete_failed())?;
+        match self
+            .get_generation_metadata_inner(context, life_id, memory_id)
+            .await?
+        {
+            None => Ok(ConditionalGenerationDeleteOutcome::Deleted),
+            Some(_) => Err(delete_failed()),
+        }
     }
 
     async fn delete_generation_life_inner(
@@ -1247,6 +1338,26 @@ impl VectorStore for LanceDbVectorStore {
         })
     }
 
+    fn delete_generation_memory_if_matches<'a>(
+        &'a self,
+        context: &'a VectorGenerationContext,
+        life_id: &'a str,
+        memory_id: &'a str,
+        expected_revision: i64,
+        expected_content_hash: &'a str,
+    ) -> VectorStoreFuture<'a, Result<ConditionalGenerationDeleteOutcome, VectorStoreError>> {
+        Box::pin(async move {
+            self.delete_generation_memory_if_matches_inner(
+                context,
+                life_id,
+                memory_id,
+                expected_revision,
+                expected_content_hash,
+            )
+            .await
+        })
+    }
+
     fn delete_generation_life<'a>(
         &'a self,
         context: &'a VectorGenerationContext,
@@ -1401,7 +1512,10 @@ fn column_string<'a>(
 mod tests {
     use super::*;
     use crate::vector_store::InMemoryVectorStore;
-    use std::sync::Arc;
+    use std::{
+        sync::{mpsc, Arc},
+        thread,
+    };
 
     fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
         tauri::async_runtime::block_on(future)
@@ -1735,6 +1849,23 @@ mod tests {
         let table = store.open_generation_table(context).await.unwrap();
         let (_, batch) = LanceDbVectorStore::generation_records_batch(records, context).unwrap();
         table.add(vec![batch]).execute().await.unwrap();
+    }
+
+    async fn append_generation_dimension_corruption(
+        store: &LanceDbVectorStore,
+        context: &VectorGenerationContext,
+    ) {
+        let table = store.open_generation_table(context).await.unwrap();
+        let record = gen_record(context, "life", "mem", 4, vec![1.0, 0.0]);
+        let (schema, batch) =
+            LanceDbVectorStore::generation_records_batch(&[record], context).unwrap();
+        let mut columns = batch.columns().to_vec();
+        columns[6] = Arc::new(Int32Array::from(vec![context.dimension() as i32 + 1]));
+        table
+            .add(vec![RecordBatch::try_new(schema, columns).unwrap()])
+            .execute()
+            .await
+            .unwrap();
     }
 
     #[test]
@@ -2228,7 +2359,7 @@ mod tests {
     }
 
     #[test]
-    fn get_generation_metadata_after_delete() {
+    fn delete_generation_memory_generation_metadata_after_delete() {
         block_on(async {
             let temp = tempfile::tempdir().unwrap();
             let store = LanceDbVectorStore::open(temp.path()).await.unwrap();
@@ -2266,5 +2397,210 @@ mod tests {
                 .expect("updated record must exist");
             assert_eq!(meta.memory_revision, 2);
         });
+    }
+
+    #[test]
+    fn conditional_delete_absent_and_deleted_trait_object_contract() {
+        block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let store = LanceDbVectorStore::open(temp.path()).await.unwrap();
+            let ctx = gen_context("conditional-delete", 2);
+            assert_eq!(
+                store
+                    .delete_generation_memory_if_matches(&ctx, "life", "mem", 4, "content-mem")
+                    .await
+                    .unwrap(),
+                ConditionalGenerationDeleteOutcome::Absent
+            );
+            store.create_generation(&ctx).await.unwrap();
+            store
+                .upsert_generation(&ctx, gen_record(&ctx, "life", "mem", 4, vec![1.0, 0.0]))
+                .await
+                .unwrap();
+            let trait_store: &dyn VectorStore = &store;
+            assert_eq!(
+                trait_store
+                    .delete_generation_memory_if_matches(&ctx, "life", "mem", 4, "content-mem")
+                    .await
+                    .unwrap(),
+                ConditionalGenerationDeleteOutcome::Deleted
+            );
+            assert!(store
+                .get_generation_metadata(&ctx, "life", "mem")
+                .await
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                store
+                    .delete_generation_memory_if_matches(&ctx, "life", "mem", 4, "content-mem")
+                    .await
+                    .unwrap(),
+                ConditionalGenerationDeleteOutcome::Absent
+            );
+        });
+    }
+
+    #[test]
+    fn conditional_delete_identity_mismatch_keeps_lance_record() {
+        block_on(async {
+            for (revision, hash) in [(5, "content-mem"), (4, "other-hash")] {
+                let temp = tempfile::tempdir().unwrap();
+                let store = LanceDbVectorStore::open(temp.path()).await.unwrap();
+                let ctx = gen_context("conditional-mismatch", 2);
+                store.create_generation(&ctx).await.unwrap();
+                store
+                    .upsert_generation(&ctx, gen_record(&ctx, "life", "mem", 4, vec![1.0, 0.0]))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    store
+                        .delete_generation_memory_if_matches(&ctx, "life", "mem", revision, hash)
+                        .await
+                        .unwrap(),
+                    ConditionalGenerationDeleteOutcome::IdentityMismatch
+                );
+                let current = store
+                    .get_generation_metadata(&ctx, "life", "mem")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    (current.memory_revision, current.content_hash.as_str()),
+                    (4, "content-mem")
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn conditional_delete_descriptor_and_dimension_corruption_fail_closed() {
+        block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let store = LanceDbVectorStore::open(temp.path()).await.unwrap();
+            let ctx = gen_context("conditional-descriptor-corrupt", 2);
+            store.create_generation(&ctx).await.unwrap();
+            let mut record = gen_record(&ctx, "life", "mem", 4, vec![1.0, 0.0]);
+            record.descriptor_hash = "other-descriptor".into();
+            append_generation_records(&store, &ctx, &[record]).await;
+            assert_eq!(
+                store
+                    .delete_generation_memory_if_matches(&ctx, "life", "mem", 4, "content-mem")
+                    .await
+                    .unwrap_err()
+                    .code,
+                VectorStoreErrorCode::GenerationCorrupt
+            );
+            assert!(store
+                .get_generation_metadata(&ctx, "life", "mem")
+                .await
+                .unwrap()
+                .is_some());
+
+            let temp = tempfile::tempdir().unwrap();
+            let store = LanceDbVectorStore::open(temp.path()).await.unwrap();
+            let ctx = gen_context("conditional-dimension-corrupt", 2);
+            store.create_generation(&ctx).await.unwrap();
+            append_generation_dimension_corruption(&store, &ctx).await;
+            assert_eq!(
+                store
+                    .delete_generation_memory_if_matches(&ctx, "life", "mem", 4, "content-mem")
+                    .await
+                    .unwrap_err()
+                    .code,
+                VectorStoreErrorCode::GenerationCorrupt
+            );
+            assert!(store
+                .get_generation_metadata(&ctx, "life", "mem")
+                .await
+                .unwrap()
+                .is_some());
+        });
+    }
+
+    #[test]
+    fn conditional_delete_race_new_mutation_first_preserves_new_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(block_on(LanceDbVectorStore::open(temp.path())).unwrap());
+        let ctx = gen_context("conditional-race-first", 2);
+        block_on(store.create_generation(&ctx)).unwrap();
+        block_on(store.upsert_generation(&ctx, gen_record(&ctx, "life", "mem", 4, vec![1.0, 0.0])))
+            .unwrap();
+        let stale = block_on(store.get_generation_metadata(&ctx, "life", "mem"))
+            .unwrap()
+            .unwrap();
+        let guard = block_on(store.mutation_lock.lock());
+        let (started_tx, started_rx) = mpsc::channel();
+        let update_store = Arc::clone(&store);
+        let update_context = ctx.clone();
+        let update = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            block_on(update_store.upsert_generation(
+                &update_context,
+                gen_record(&update_context, "life", "mem", 5, vec![0.0, 1.0]),
+            ))
+        });
+        started_rx.recv().unwrap();
+        drop(guard);
+        update.join().unwrap().unwrap();
+        assert_eq!(
+            block_on(store.delete_generation_memory_if_matches(
+                &ctx,
+                "life",
+                "mem",
+                stale.memory_revision,
+                &stale.content_hash,
+            ))
+            .unwrap(),
+            ConditionalGenerationDeleteOutcome::IdentityMismatch
+        );
+        let current = block_on(store.get_generation_metadata(&ctx, "life", "mem"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (current.memory_revision, current.content_hash.as_str()),
+            (5, "content-mem")
+        );
+    }
+
+    #[test]
+    fn conditional_delete_race_delete_first_allows_later_new_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(block_on(LanceDbVectorStore::open(temp.path())).unwrap());
+        let ctx = gen_context("conditional-race-delete", 2);
+        block_on(store.create_generation(&ctx)).unwrap();
+        block_on(store.upsert_generation(&ctx, gen_record(&ctx, "life", "mem", 4, vec![1.0, 0.0])))
+            .unwrap();
+        let guard = block_on(store.mutation_lock.lock());
+        let (started_tx, started_rx) = mpsc::channel();
+        let update_store = Arc::clone(&store);
+        let update_context = ctx.clone();
+        let update = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            block_on(update_store.upsert_generation(
+                &update_context,
+                gen_record(&update_context, "life", "mem", 5, vec![0.0, 1.0]),
+            ))
+        });
+        started_rx.recv().unwrap();
+        assert_eq!(
+            block_on(store.delete_generation_memory_if_matches_under_lock(
+                &ctx,
+                "life",
+                "mem",
+                4,
+                "content-mem",
+            ))
+            .unwrap(),
+            ConditionalGenerationDeleteOutcome::Deleted
+        );
+        drop(guard);
+        update.join().unwrap().unwrap();
+        let current = block_on(store.get_generation_metadata(&ctx, "life", "mem"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (current.memory_revision, current.content_hash.as_str()),
+            (5, "content-mem")
+        );
     }
 }

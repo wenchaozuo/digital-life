@@ -4,9 +4,10 @@ use std::{
 };
 
 use super::{
-    validate_identifier, GenerationVectorRecord, VectorGenerationContext, VectorGenerationId,
-    VectorMetadataSample, VectorRecord, VectorSearchHit, VectorSearchQuery, VectorSpace,
-    VectorStore, VectorStoreError, VectorStoreErrorCode, VectorStoreFuture,
+    validate_hash, validate_identifier, ConditionalGenerationDeleteOutcome, GenerationVectorRecord,
+    VectorGenerationContext, VectorGenerationId, VectorMetadataSample, VectorRecord,
+    VectorSearchHit, VectorSearchQuery, VectorSpace, VectorStore, VectorStoreError,
+    VectorStoreErrorCode, VectorStoreFuture,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -353,6 +354,86 @@ impl VectorStore for InMemoryVectorStore {
                 })?
                 .remove(&key);
             Ok(())
+        })
+    }
+
+    fn delete_generation_memory_if_matches<'a>(
+        &'a self,
+        context: &'a VectorGenerationContext,
+        life_id: &'a str,
+        memory_id: &'a str,
+        expected_revision: i64,
+        expected_content_hash: &'a str,
+    ) -> VectorStoreFuture<'a, Result<ConditionalGenerationDeleteOutcome, VectorStoreError>> {
+        Box::pin(async move {
+            validate_identifier(life_id, "Life ID")?;
+            validate_identifier(memory_id, "Memory ID")?;
+            validate_hash(expected_content_hash, "Content hash")?;
+            if expected_revision < 0 {
+                return Err(VectorStoreError::new(
+                    VectorStoreErrorCode::RecordInvalid,
+                    "The expected memory revision is invalid.",
+                    false,
+                ));
+            }
+            let generation = self.generations.read().map_err(|_| {
+                VectorStoreError::new(
+                    VectorStoreErrorCode::StoreUnavailable,
+                    "The in-memory vector store is unavailable.",
+                    true,
+                )
+            })?;
+            match generation.get(context.generation_id().as_str()) {
+                None => return Ok(ConditionalGenerationDeleteOutcome::Absent),
+                Some(meta)
+                    if meta.descriptor_hash != context.descriptor_hash()
+                        || meta.dimension != context.dimension() =>
+                {
+                    return Err(VectorStoreError::new(
+                        VectorStoreErrorCode::GenerationCorrupt,
+                        "The vector generation is corrupt.",
+                        true,
+                    ));
+                }
+                Some(_) => {}
+            }
+            drop(generation);
+            let key = GenerationRecordKey {
+                generation_id: context.generation_id().as_str().to_owned(),
+                life_id: life_id.to_owned(),
+                memory_id: memory_id.to_owned(),
+            };
+            // The one write guard covers lookup, every identity comparison,
+            // and removal; no read-then-write TOCTOU window exists here.
+            let mut records = self.generation_records.write().map_err(|_| {
+                VectorStoreError::new(
+                    VectorStoreErrorCode::StoreUnavailable,
+                    "The in-memory vector store is unavailable.",
+                    true,
+                )
+            })?;
+            let Some(record) = records.get(&key) else {
+                return Ok(ConditionalGenerationDeleteOutcome::Absent);
+            };
+            if record.generation_id() != context.generation_id()
+                || record.life_id() != life_id
+                || record.memory_id() != memory_id
+                || record.descriptor_hash() != context.descriptor_hash()
+                || record.dimension() != context.dimension()
+            {
+                return Err(VectorStoreError::new(
+                    VectorStoreErrorCode::GenerationCorrupt,
+                    "The vector generation is corrupt.",
+                    true,
+                ));
+            }
+            if record.memory_revision() != expected_revision
+                || record.content_hash() != expected_content_hash
+            {
+                return Ok(ConditionalGenerationDeleteOutcome::IdentityMismatch);
+            }
+            let _ = records.remove(&key);
+            Ok(ConditionalGenerationDeleteOutcome::Deleted)
         })
     }
 
@@ -871,7 +952,7 @@ mod tests {
     }
 
     #[test]
-    fn get_generation_metadata_after_delete() {
+    fn delete_generation_memory_generation_metadata_after_delete() {
         let store = InMemoryVectorStore::new();
         let ctx = gen_context("after-delete");
         let rec = gen_record(&ctx, "life", "mem", 1, "hash");
@@ -896,5 +977,93 @@ mod tests {
             .expect("updated record must exist");
         assert_eq!(meta.memory_revision, 2);
         assert_eq!(meta.content_hash, "hash-2");
+    }
+
+    #[test]
+    fn conditional_delete_absent_and_deleted_trait_object_contract() {
+        let store = InMemoryVectorStore::new();
+        let ctx = gen_context("conditional-delete");
+        assert_eq!(
+            block_on(store.delete_generation_memory_if_matches(&ctx, "life", "mem", 4, "hash-a"))
+                .unwrap(),
+            ConditionalGenerationDeleteOutcome::Absent
+        );
+        block_on(store.create_generation(&ctx)).unwrap();
+        block_on(store.upsert_generation(&ctx, gen_record(&ctx, "life", "mem", 4, "hash-a")))
+            .unwrap();
+        let trait_store: &dyn VectorStore = &store;
+        assert_eq!(
+            block_on(
+                trait_store.delete_generation_memory_if_matches(&ctx, "life", "mem", 4, "hash-a")
+            )
+            .unwrap(),
+            ConditionalGenerationDeleteOutcome::Deleted
+        );
+        assert!(block_on(store.get_generation_metadata(&ctx, "life", "mem"))
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            block_on(store.delete_generation_memory_if_matches(&ctx, "life", "mem", 4, "hash-a"))
+                .unwrap(),
+            ConditionalGenerationDeleteOutcome::Absent
+        );
+    }
+
+    #[test]
+    fn conditional_delete_identity_mismatch_keeps_in_memory_record() {
+        for (revision, hash) in [(5, "hash-a"), (4, "hash-b")] {
+            let store = InMemoryVectorStore::new();
+            let ctx = gen_context("conditional-mismatch");
+            block_on(store.create_generation(&ctx)).unwrap();
+            block_on(store.upsert_generation(&ctx, gen_record(&ctx, "life", "mem", 4, "hash-a")))
+                .unwrap();
+            assert_eq!(
+                block_on(
+                    store.delete_generation_memory_if_matches(&ctx, "life", "mem", revision, hash)
+                )
+                .unwrap(),
+                ConditionalGenerationDeleteOutcome::IdentityMismatch
+            );
+            let current = block_on(store.get_generation_metadata(&ctx, "life", "mem"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                (current.memory_revision, current.content_hash.as_str()),
+                (4, "hash-a")
+            );
+        }
+    }
+
+    #[test]
+    fn conditional_delete_descriptor_and_dimension_corruption_fail_closed() {
+        for corrupt_descriptor in [true, false] {
+            let store = InMemoryVectorStore::new();
+            let ctx = gen_context("conditional-corrupt");
+            block_on(store.create_generation(&ctx)).unwrap();
+            block_on(store.upsert_generation(&ctx, gen_record(&ctx, "life", "mem", 4, "hash-a")))
+                .unwrap();
+            let key = GenerationRecordKey {
+                generation_id: ctx.generation_id().as_str().to_owned(),
+                life_id: "life".into(),
+                memory_id: "mem".into(),
+            };
+            let mut records = store.generation_records.write().unwrap();
+            let record = records.get_mut(&key).unwrap();
+            if corrupt_descriptor {
+                record.descriptor_hash = "other-descriptor".into();
+            } else {
+                record.vector = vec![0.1, 0.2];
+            }
+            drop(records);
+            assert_eq!(
+                block_on(
+                    store.delete_generation_memory_if_matches(&ctx, "life", "mem", 4, "hash-a")
+                )
+                .unwrap_err()
+                .code,
+                VectorStoreErrorCode::GenerationCorrupt
+            );
+            assert!(store.generation_records.read().unwrap().contains_key(&key));
+        }
     }
 }

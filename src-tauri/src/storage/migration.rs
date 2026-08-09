@@ -385,18 +385,90 @@ pub(super) fn apply_late_delete_generation_authority_schema_upgrade(
              updated_at=?1",
         params![migration16_now],
     ).map_err(|_| StorageError::migration_transaction_failed())?;
+    // Schema 15 stores the claimed generation id with the Delete-Unknown
+    // witness, but the descriptor contract itself still lives in the
+    // generation table.  A missing or malformed contract cannot be invented
+    // for a historical Resolution.  Reject the whole upgrade rather than
+    // allowing the old SELECT filters to silently omit a canonical witness.
+    let unconstructable_historical_rows: i64 = transaction
+        .query_row(
+            &format!(
+                "SELECT COUNT(*)
+                   FROM (SELECT * FROM memory_vector_sync_outbox WHERE {predicate}) AS o
+              LEFT JOIN memory_vector_late_delete_resolution AS r
+                     ON r.life_id=o.life_id
+                    AND r.memory_id=o.memory_id
+                    AND r.mutation_sequence=o.mutation_sequence
+              LEFT JOIN memory_vector_generation AS g
+                     ON g.generation_id=o.claimed_generation_id
+                  WHERE r.resolution_id IS NULL
+                    AND (o.mutation_sequence<=0
+                      OR o.attempt_count NOT BETWEEN 1 AND 5
+                      OR o.fenced_claim_epoch<=0
+                      OR o.last_marked_claim_epoch<=0
+                      OR o.last_marked_claim_epoch>o.fenced_claim_epoch
+                      OR o.claimed_generation_id IS NULL
+                      OR o.claimed_generation_id=''
+                      OR g.generation_id IS NULL
+                      OR g.descriptor_hash=''
+                      OR g.dimension<=0
+                      OR g.state NOT IN ('building','active','retired','failed'))"
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    if unconstructable_historical_rows != 0 {
+        return Err(StorageError::migration_transaction_failed());
+    }
     transaction.execute(
         &format!("INSERT INTO memory_vector_late_delete_resolution
           (outbox_id,life_id,memory_id,mutation_sequence,claimed_generation_id,embedding_descriptor_id,embedding_dimension,captured_generation_state,witness_attempt_ordinal,witness_claim_epoch,witness_marked_claim_epoch,witness_send_disposition,witness_error_code,witness_age_anchor_at,captured_generation_authority_epoch,state,last_resolution_disposition,last_disposition_epoch,created_at,updated_at)
-          SELECT o.id,o.life_id,o.memory_id,o.mutation_sequence,o.claimed_generation_id,g.descriptor_hash,g.dimension,g.state,o.attempt_count,o.fenced_claim_epoch,o.last_marked_claim_epoch,o.last_send_disposition,o.last_error_code,?1,0,'waiting_rebuild','waiting_rebuild',0,?1,?1
-          FROM memory_vector_sync_outbox o JOIN memory_vector_generation g ON g.generation_id=o.claimed_generation_id
-          WHERE {predicate} AND o.mutation_sequence>0 AND o.attempt_count BETWEEN 1 AND 5
+          SELECT o.id,o.life_id,o.memory_id,o.mutation_sequence,o.claimed_generation_id,g.descriptor_hash,g.dimension,g.state,o.attempt_count,o.fenced_claim_epoch,o.last_marked_claim_epoch,o.last_send_disposition,CASE WHEN o.last_error_code='PROVIDER_RESULT_UNKNOWN' THEN o.last_error_code ELSE NULL END,?1,0,'waiting_rebuild','waiting_rebuild',0,?1,?1
+          FROM (SELECT * FROM memory_vector_sync_outbox WHERE {predicate}) AS o
+          JOIN memory_vector_generation g ON g.generation_id=o.claimed_generation_id
+          WHERE o.mutation_sequence>0 AND o.attempt_count BETWEEN 1 AND 5
             AND o.fenced_claim_epoch>0 AND o.last_marked_claim_epoch>0 AND o.last_marked_claim_epoch<=o.fenced_claim_epoch
-            AND o.claimed_generation_id IS NOT NULL AND o.claimed_generation_id<>'' AND o.target_revision IS NULL AND o.target_content_hash IS NULL AND o.migration_disposition IS NULL
+            AND o.claimed_generation_id IS NOT NULL AND o.claimed_generation_id<>''
             AND g.descriptor_hash<>'' AND g.dimension>0 AND g.state IN ('building','active','retired','failed')
             AND NOT EXISTS (SELECT 1 FROM memory_vector_late_delete_resolution r WHERE r.life_id=o.life_id AND r.memory_id=o.memory_id AND r.mutation_sequence=o.mutation_sequence)"),
         params![migration16_now],
     ).map_err(|_| StorageError::migration_transaction_failed())?;
+    let uncovered_historical_rows: i64 = transaction
+        .query_row(
+            &format!(
+                "SELECT COUNT(*)
+                   FROM (SELECT * FROM memory_vector_sync_outbox WHERE {predicate}) AS o
+                  WHERE NOT EXISTS (
+                        SELECT 1
+                          FROM memory_vector_late_delete_resolution AS r
+                         WHERE r.outbox_id=o.id
+                           AND r.life_id=o.life_id
+                           AND r.memory_id=o.memory_id
+                           AND r.mutation_sequence=o.mutation_sequence
+                           AND r.claimed_generation_id<>''
+                           AND r.embedding_descriptor_id<>''
+                           AND r.embedding_dimension>0
+                           AND r.captured_generation_state IN ('building','active','retired','failed')
+                           AND r.witness_attempt_ordinal BETWEEN 1 AND 5
+                           AND r.witness_claim_epoch>0
+                           AND r.witness_marked_claim_epoch>0
+                           AND r.witness_marked_claim_epoch<=r.witness_claim_epoch
+                           AND (r.witness_send_disposition='possibly_sent'
+                                OR r.witness_error_code='PROVIDER_RESULT_UNKNOWN')
+                           AND r.witness_age_anchor_at=?1
+                           AND r.captured_generation_authority_epoch=0
+                           AND r.state IN ('waiting_rebuild','resolved_absent',
+                                           'resolved_deleted','resolved_rebuilt','superseded')
+                    )"
+            ),
+            params![migration16_now],
+            |row| row.get(0),
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    if uncovered_historical_rows != 0 {
+        return Err(StorageError::migration_transaction_failed());
+    }
     for sql in [
         GENERATION_SEMANTIC_DELETE_TRIGGER_SQL,
         GENERATION_SEMANTIC_IDENTITY_TRIGGER_SQL,
@@ -1744,6 +1816,245 @@ mod transaction_tests {
             outbox_and_resolution_anchor.1
         );
         assert_eq!(outbox_and_resolution_anchor.2, 0);
+    }
+
+    fn assert_migration_016_rolled_back_to_schema_15(connection: &Connection) {
+        assert_eq!(
+            schema_version(connection),
+            LATE_DELETE_RESOLUTION_SCHEMA_VERSION
+        );
+        let schema_16_columns: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('memory_vector_sync_outbox')
+                 WHERE name='delete_witness_at'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(schema_16_columns, 0);
+        assert_eq!(writer_fence_count(connection), 24);
+    }
+
+    #[test]
+    fn migration_016_historical_canonical_unknown_missing_resolution() {
+        let mut connection = version_fourteen_connection();
+        apply_late_delete_resolution_upgrade(&mut connection);
+        connection
+            .execute_batch(
+                "INSERT INTO memory_vector_generation
+                   (generation_id,descriptor_hash,dimension,state)
+                 VALUES ('historical-generation','descriptor-historical',768,'retired');
+                 INSERT INTO memory_vector_sync_outbox
+                   (life_id,memory_id,desired_action,state,attempt_count,mutation_sequence,
+                    target_revision,target_content_hash,claimed_generation_id,
+                    fenced_claim_epoch,last_marked_claim_epoch,last_send_disposition,
+                    last_error_code,migration_disposition)
+                 VALUES ('historical-life','missing-resolution','delete','blocked',2,71,
+                         9,'legacy-target','historical-generation',7,6,'possibly_sent',
+                         'TEMPORARY_FAILURE','legacy_upsert_rebuild_required');",
+            )
+            .unwrap();
+
+        apply_late_delete_generation_authority_upgrade(&mut connection);
+        let row: (String, i64, String, String, String, Option<String>) = connection
+            .query_row(
+                "SELECT r.state,r.captured_generation_authority_epoch,
+                        r.witness_age_anchor_at,o.delete_witness_at,
+                        r.embedding_descriptor_id,r.witness_error_code
+                   FROM memory_vector_late_delete_resolution AS r
+                   JOIN memory_vector_sync_outbox AS o ON o.id=r.outbox_id
+                  WHERE r.life_id='historical-life' AND r.memory_id='missing-resolution'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(row.0, "waiting_rebuild");
+        assert_eq!(row.1, 0);
+        assert_eq!(row.2, row.3);
+        assert_eq!(row.4, "descriptor-historical");
+        assert_eq!(
+            row.5, None,
+            "non-canonical error detail is not copied into the witness"
+        );
+    }
+
+    #[test]
+    fn migration_016_historical_canonical_unknown_missing_generation() {
+        let mut connection = version_fourteen_connection();
+        connection
+            .execute_batch(
+                "INSERT INTO memory_vector_generation
+                   (generation_id,descriptor_hash,dimension,state)
+                 VALUES ('existing-generation','descriptor-existing',32,'active');
+                 INSERT INTO memory_vector_sync_outbox
+                   (life_id,memory_id,desired_action,state,attempt_count,mutation_sequence,
+                    claimed_generation_id,fenced_claim_epoch,last_marked_claim_epoch,
+                    last_send_disposition)
+                 VALUES ('coverage-life','existing-resolution','delete','blocked',1,81,
+                         'existing-generation',1,1,'possibly_sent');",
+            )
+            .unwrap();
+        apply_late_delete_resolution_upgrade(&mut connection);
+        connection
+            .execute_batch(
+                "INSERT INTO memory_vector_sync_outbox
+                   (life_id,memory_id,desired_action,state,attempt_count,mutation_sequence,
+                    claimed_generation_id,fenced_claim_epoch,last_marked_claim_epoch,
+                    last_send_disposition)
+                 VALUES
+                   ('coverage-life','valid-missing-resolution','delete','blocked',2,82,
+                    'existing-generation',2,2,'possibly_sent'),
+                   ('coverage-life','missing-generation','delete','blocked',2,83,
+                    'gone-generation',3,3,'possibly_sent'),
+                   ('coverage-life','ordinary-delete','delete','blocked',2,84,
+                    'existing-generation',4,4,NULL),
+                   ('coverage-life','unknown-upsert','upsert','blocked',2,85,
+                    'existing-generation',5,5,'possibly_sent');",
+            )
+            .unwrap();
+
+        let error = {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            apply_late_delete_generation_authority_schema_upgrade(&transaction).unwrap_err()
+        };
+        assert_eq!(error.code, "MIGRATION_TRANSACTION_FAILED");
+        assert_migration_016_rolled_back_to_schema_15(&connection);
+        let resolution_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM memory_vector_late_delete_resolution
+                 WHERE life_id='coverage-life'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            resolution_count, 1,
+            "the valid missing row must not be partially backfilled"
+        );
+    }
+
+    #[test]
+    fn migration_016_historical_canonical_unknown_generation_identity_mismatch_stays_waiting_rebuild(
+    ) {
+        let mut connection = version_fourteen_connection();
+        apply_late_delete_resolution_upgrade(&mut connection);
+        // Schema 15 has no descriptor/dimension/state snapshot on the outbox.
+        // A Generation whose present contract differs from the historical
+        // caller expectation can therefore only supply the required SQL shape;
+        // it must never turn this historical witness back into authority.
+        connection
+            .execute_batch(
+                "INSERT INTO memory_vector_generation
+                   (generation_id,descriptor_hash,dimension,state)
+                 VALUES ('mismatch-generation','current-descriptor',1536,'failed');
+                 INSERT INTO memory_vector_sync_outbox
+                   (life_id,memory_id,desired_action,state,attempt_count,mutation_sequence,
+                    claimed_generation_id,fenced_claim_epoch,last_marked_claim_epoch,
+                    last_error_code)
+                 VALUES ('mismatch-life','mismatch-row','delete','blocked',3,86,
+                         'mismatch-generation',8,7,'PROVIDER_RESULT_UNKNOWN');",
+            )
+            .unwrap();
+
+        apply_late_delete_generation_authority_upgrade(&mut connection);
+        let row: (String, i64, String, i64, String) = connection
+            .query_row(
+                "SELECT state,captured_generation_authority_epoch,
+                        embedding_descriptor_id,embedding_dimension,captured_generation_state
+                   FROM memory_vector_late_delete_resolution
+                  WHERE life_id='mismatch-life' AND memory_id='mismatch-row'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(row.0, "waiting_rebuild");
+        assert_eq!(row.1, 0);
+        assert_eq!(
+            (row.2, row.3, row.4),
+            ("current-descriptor".into(), 1536, "failed".into())
+        );
+    }
+
+    #[test]
+    fn migration_016_historical_canonical_unknown_incomplete_attempt_witness_rolls_back() {
+        let mut connection = version_fourteen_connection();
+        apply_late_delete_resolution_upgrade(&mut connection);
+        connection
+            .execute_batch(
+                "INSERT INTO memory_vector_generation
+                   (generation_id,descriptor_hash,dimension,state)
+                 VALUES ('incomplete-generation','descriptor-incomplete',64,'active');
+                 INSERT INTO memory_vector_sync_outbox
+                   (life_id,memory_id,desired_action,state,attempt_count,mutation_sequence,
+                    claimed_generation_id,fenced_claim_epoch,last_marked_claim_epoch,
+                    last_send_disposition)
+                 VALUES ('incomplete-life','too-many-attempts','delete','blocked',6,87,
+                         'incomplete-generation',9,9,'possibly_sent');",
+            )
+            .unwrap();
+
+        let error = {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            apply_late_delete_generation_authority_schema_upgrade(&transaction).unwrap_err()
+        };
+        assert_eq!(error.code, "MIGRATION_TRANSACTION_FAILED");
+        assert_migration_016_rolled_back_to_schema_15(&connection);
+    }
+
+    #[test]
+    fn migration_016_historical_canonical_unknown_postcondition() {
+        let mut connection = version_fourteen_connection();
+        connection
+            .execute_batch(
+                "INSERT INTO memory_vector_generation
+                   (generation_id,descriptor_hash,dimension,state)
+                 VALUES ('postcondition-generation','descriptor-postcondition',16,'building');
+                 INSERT INTO memory_vector_sync_outbox
+                   (life_id,memory_id,desired_action,state,attempt_count,mutation_sequence,
+                    claimed_generation_id,fenced_claim_epoch,last_marked_claim_epoch,
+                    last_send_disposition)
+                 VALUES ('postcondition-life','wrong-outbox','delete','blocked',1,91,
+                         'postcondition-generation',1,1,'possibly_sent');",
+            )
+            .unwrap();
+        apply_late_delete_resolution_upgrade(&mut connection);
+        connection
+            .execute(
+                "UPDATE memory_vector_late_delete_resolution SET outbox_id=999999
+                 WHERE life_id='postcondition-life' AND memory_id='wrong-outbox'",
+                [],
+            )
+            .unwrap();
+
+        let error = {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            apply_late_delete_generation_authority_schema_upgrade(&transaction).unwrap_err()
+        };
+        assert_eq!(error.code, "MIGRATION_TRANSACTION_FAILED");
+        assert_migration_016_rolled_back_to_schema_15(&connection);
     }
 
     fn attempt_epoch_values(connection: &Connection, life_id: &str, memory_id: &str) -> (i64, i64) {

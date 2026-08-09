@@ -738,7 +738,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_upgrade_coordinator_version_thirteen_upgrades_attempt_identity_without_replaying_historical_isolation(
+    fn storage_upgrade_coordinator_version_thirteen_canonical_unknown_without_generation_fails_closed(
     ) {
         let _ = take_upgrade_events();
         let (_root, path) = database_path("current-schema-no-repeat");
@@ -760,12 +760,14 @@ mod tests {
         drop(authorized);
         let gate = FakeGate::clear();
 
-        let connection = open_coordinated_storage_connection_with_gate(&path, &gate).unwrap();
+        let error = open_coordinated_storage_connection_with_gate(&path, &gate).unwrap_err();
 
+        assert_eq!(error.code, "MIGRATION_TRANSACTION_FAILED");
         assert_eq!(gate.inspection_calls.get(), 2);
+        let connection = Connection::open(&path).unwrap();
         assert_eq!(
             connection::read_schema_version(&connection).unwrap(),
-            connection::MAX_SUPPORTED_SCHEMA_VERSION
+            writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION
         );
         assert_eq!(
             connection
@@ -806,19 +808,9 @@ mod tests {
                 Some("possibly_sent".into()),
             )
         );
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT fenced_claim_epoch, last_marked_claim_epoch
-                     FROM memory_vector_sync_outbox
-                     WHERE life_id='current-life' AND memory_id='current-memory'",
-                    [],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-                )
-                .unwrap(),
-            (0, 0)
-        );
-        assert_eq!(writer_fence_count(&connection), 24);
+        assert_eq!(attempt_identity_column_count(&connection), 0);
+        assert_eq!(writer_fence_count(&connection), 18);
+        assert_eq!(journal_mode(&path), "delete");
         assert_eq!(
             take_upgrade_events(),
             vec![
@@ -829,9 +821,6 @@ mod tests {
                 "begin-immediate",
                 "final-rm",
                 "att-i1",
-                "commit",
-                "post-verify",
-                "wal",
             ]
         );
     }
@@ -1831,84 +1820,27 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn storage_upgrade_coordinator_windows_restored_version_twelve_reopens_through_migration_014() {
+    fn storage_upgrade_coordinator_windows_restored_version_twelve_canonical_unknown_without_attempt_witness_fails_closed(
+    ) {
         for repetition in 0..10 {
             let root = tempfile::tempdir().unwrap();
             let database_path = root.path().join(super::super::DATABASE_FILE_NAME);
             prepare_schema_version(&database_path, migration::LAST_STATIC_MIGRATION_VERSION);
             seed_version_twelve_historical_row(&database_path);
 
-            let first = super::super::StorageService::initialize_with_roots(
+            let error = match super::super::StorageService::initialize_with_roots(
                 root.path().to_path_buf(),
                 None,
-            )
-            .unwrap();
-            let state = first.state().unwrap();
+            ) {
+                Ok(_) => panic!("an unconstructable historical witness must not publish storage"),
+                Err(error) => error,
+            };
             assert_eq!(
-                connection::read_schema_version(&state.connection).unwrap(),
-                connection::MAX_SUPPORTED_SCHEMA_VERSION,
-                "restored version-12 fixture must upgrade on repetition {repetition}"
+                error.code, "MIGRATION_TRANSACTION_FAILED",
+                "restored version-12 fixture must fail closed on repetition {repetition}"
             );
-            assert_eq!(writer_fence_count(&state.connection), 24);
-            migration::validate_attempt_claim_identity_schema(&state.connection).unwrap();
-            migration::validate_late_delete_generation_authority_schema(&state.connection).unwrap();
-            assert_eq!(
-                state
-                    .connection
-                    .query_row(
-                        "SELECT fenced_claim_epoch, last_marked_claim_epoch
-                         FROM memory_vector_sync_outbox
-                         WHERE life_id='upgrade-life' AND memory_id='upgrade-memory'",
-                        [],
-                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-                    )
-                    .unwrap(),
-                (0, 0)
-            );
-            assert_eq!(
-                version_twelve_historical_evidence(&state.connection),
-                VersionTwelveHistoricalEvidence {
-                    state: "failed".into(),
-                    migration_disposition: Some("legacy_upsert_rebuild_required".into()),
-                    attempt_count: 3,
-                    mutation_sequence: 18,
-                    claimed_generation_id: Some("upgrade-generation".into()),
-                    last_error_code: Some("UPGRADE_OLD_ERROR".into()),
-                    last_send_disposition: Some("possibly_sent".into()),
-                    next_attempt_at: None,
-                    lease_owner: None,
-                    lease_fence_epoch: None,
-                    lease_expires_at: None,
-                }
-            );
-            let first_clock: i64 = state
-                .connection
-                .query_row(
-                    "SELECT last_sequence FROM memory_vector_sync_mutation_clock WHERE singleton=1",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(first_clock, 31);
-            drop(state);
-
-            let second = super::super::StorageService::initialize_with_roots(
-                root.path().to_path_buf(),
-                None,
-            )
-            .unwrap();
-            let state = second.state().unwrap();
-            let second_clock: i64 = state
-                .connection
-                .query_row(
-                    "SELECT last_sequence FROM memory_vector_sync_mutation_clock WHERE singleton=1",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(second_clock, first_clock);
-            assert_eq!(writer_fence_count(&state.connection), 24);
-            migration::validate_attempt_claim_identity_schema(&state.connection).unwrap();
+            assert_version_twelve_historical_data_is_unchanged(&database_path);
+            assert_eq!(journal_mode(&database_path), "delete");
         }
     }
 
@@ -2028,7 +1960,7 @@ mod tests {
                  VALUES ('commit-life', 'commit-row', 'delete', 'failed',
                          'legacy_upsert_rebuild_required', 5, 7654, 21,
                          'commit-target-hash', 'commit-generation',
-                         'COMMIT_BOUNDARY_ERROR', 'possibly_sent',
+                         'COMMIT_BOUNDARY_ERROR', 'definitely_not_sent',
                          '2026-10-01T00:00:00.000Z', 'commit-owner', 31,
                          '2026-10-02T00:00:00.000Z');
                  UPDATE memory_vector_sync_mutation_clock

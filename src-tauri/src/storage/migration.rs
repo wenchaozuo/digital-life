@@ -352,15 +352,34 @@ pub(super) fn apply_late_delete_generation_authority_schema_upgrade(
     if connection::read_schema_version(transaction)? != LATE_DELETE_RESOLUTION_SCHEMA_VERSION {
         return Err(StorageError::migration_version_invariant_failed());
     }
-    for sql in [
-        ADD_DELETE_WITNESS_AT_SQL,
-        ADD_WITNESS_AGE_ANCHOR_AT_SQL,
-        ADD_CAPTURED_GENERATION_AUTHORITY_EPOCH_SQL,
-        ADD_GENERATION_AUTHORITY_EPOCH_SQL,
+    for (failpoint, sql) in [
+        (
+            Some(Migration016Failpoint::AfterOutboxSchema),
+            ADD_DELETE_WITNESS_AT_SQL,
+        ),
+        (None, ADD_WITNESS_AGE_ANCHOR_AT_SQL),
+        (
+            Some(Migration016Failpoint::AfterResolutionSchema),
+            ADD_CAPTURED_GENERATION_AUTHORITY_EPOCH_SQL,
+        ),
+        (
+            Some(Migration016Failpoint::AfterGenerationSchema),
+            ADD_GENERATION_AUTHORITY_EPOCH_SQL,
+        ),
     ] {
+        #[cfg(not(test))]
+        let _ = failpoint;
         transaction
             .execute_batch(sql)
             .map_err(|_| StorageError::migration_transaction_failed())?;
+        // Test-only failpoints fire AFTER the schema phase completes (points
+        // A, B, C), inside the same transaction so the ALTER rolls back.
+        #[cfg(test)]
+        if let Some(failpoint) = failpoint {
+            if should_fail_migration_016_at_for_test(failpoint) {
+                return Err(StorageError::migration_transaction_failed());
+            }
+        }
     }
     let migration16_now: String = transaction
         .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |row| {
@@ -389,6 +408,12 @@ pub(super) fn apply_late_delete_generation_authority_schema_upgrade(
              updated_at=?1",
         params![migration16_now],
     ).map_err(|_| StorageError::migration_transaction_failed())?;
+    // Failure Point D: after the historical nonterminal Resolution
+    // convergence UPDATE, before the canonical-coverage analysis.
+    #[cfg(test)]
+    if should_fail_migration_016_at_for_test(Migration016Failpoint::AfterResolutionConvergence) {
+        return Err(StorageError::migration_transaction_failed());
+    }
     // Schema 15 stores the claimed generation id with the Delete-Unknown
     // witness, but the descriptor contract itself still lives in the
     // generation table.  A missing or malformed contract cannot be invented
@@ -438,6 +463,13 @@ pub(super) fn apply_late_delete_generation_authority_schema_upgrade(
             AND NOT EXISTS (SELECT 1 FROM memory_vector_late_delete_resolution r WHERE r.life_id=o.life_id AND r.memory_id=o.memory_id AND r.mutation_sequence=o.mutation_sequence)"),
         params![migration16_now],
     ).map_err(|_| StorageError::migration_transaction_failed())?;
+    // Failure Point E: after the historical canonical Unknown backfill INSERT
+    // and before the coverage postcondition.
+    #[cfg(test)]
+    if should_fail_migration_016_at_for_test(Migration016Failpoint::AfterHistoricalCoverageBackfill)
+    {
+        return Err(StorageError::migration_transaction_failed());
+    }
     let uncovered_historical_rows: i64 = transaction
         .query_row(
             &format!(
@@ -481,6 +513,20 @@ pub(super) fn apply_late_delete_generation_authority_schema_upgrade(
         transaction
             .execute_batch(sql)
             .map_err(|_| StorageError::migration_transaction_failed())?;
+        // Failure Point F: after the first semantic trigger is installed and
+        // before the remaining triggers, proving no partial trigger set can
+        // survive a rollback.
+        #[cfg(test)]
+        if should_fail_migration_016_at_for_test(Migration016Failpoint::AfterFirstSemanticTrigger) {
+            return Err(StorageError::migration_transaction_failed());
+        }
+    }
+    // Failure Point G: after every migration step and the object validator,
+    // immediately before the schema_migration version row insert, proving
+    // validator success is not commit success.
+    #[cfg(test)]
+    if should_fail_migration_016_at_for_test(Migration016Failpoint::PreCommit) {
+        return Err(StorageError::migration_transaction_failed());
     }
     transaction
         .execute(
@@ -1191,6 +1237,63 @@ pub(super) fn fail_next_migration_014_at_for_test(failpoint: Migration014Failpoi
 #[cfg(test)]
 fn should_fail_migration_014_at_for_test(failpoint: Migration014Failpoint) -> bool {
     MIGRATION_014_FAILPOINT.with(|next| {
+        if next.get() == Some(failpoint) {
+            next.set(None);
+            true
+        } else {
+            false
+        }
+    })
+}
+
+/// Test-only failpoints for Migration016 (`apply_late_delete_generation_authority_schema_upgrade`).
+/// Each variant corresponds to a phase of the single-transaction upgrade. The
+/// failpoint returns `MIGRATION_TRANSACTION_FAILED` from inside the transaction,
+/// so the whole upgrade (DDL, backfills, triggers, validators, version row)
+/// rolls back as one atomic unit. `PreCommit` is consumed just before the
+/// version row insert, proving that validator success is not commit success.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Migration016Failpoint {
+    /// After `memory_vector_sync_outbox.delete_witness_at` has been added and
+    /// before any further ALTER (Failure Point A).
+    AfterOutboxSchema,
+    /// After the Resolution schema columns
+    /// (`witness_age_anchor_at`, `captured_generation_authority_epoch`) have
+    /// been added (Failure Point B).
+    AfterResolutionSchema,
+    /// After `memory_vector_generation.authority_epoch` has been added
+    /// (Failure Point C).
+    AfterGenerationSchema,
+    /// After the historical nonterminal Resolution convergence UPDATE has run
+    /// (Failure Point D).
+    AfterResolutionConvergence,
+    /// After the historical canonical Unknown Resolution backfill INSERT and
+    /// before the coverage postcondition check (Failure Point E).
+    AfterHistoricalCoverageBackfill,
+    /// After the first/second Generation semantic trigger has been installed
+    /// and before the third (Failure Point F).
+    AfterFirstSemanticTrigger,
+    /// After every migration step and validator, immediately before the
+    /// schema_migration version row insert (Failure Point G).
+    PreCommit,
+}
+
+#[cfg(test)]
+thread_local! {
+    static MIGRATION_016_FAILPOINT: std::cell::Cell<Option<Migration016Failpoint>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(super) fn fail_next_migration_016_at_for_test(failpoint: Migration016Failpoint) {
+    MIGRATION_016_FAILPOINT.with(|next| next.set(Some(failpoint)));
+}
+
+#[cfg(test)]
+fn should_fail_migration_016_at_for_test(failpoint: Migration016Failpoint) -> bool {
+    MIGRATION_016_FAILPOINT.with(|next| {
         if next.get() == Some(failpoint) {
             next.set(None);
             true

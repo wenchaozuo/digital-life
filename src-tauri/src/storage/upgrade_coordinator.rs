@@ -468,10 +468,11 @@ mod tests {
         assert!(
             version == migration::LAST_STATIC_MIGRATION_VERSION
                 || version == writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION
+                || version == migration::LATE_DELETE_RESOLUTION_SCHEMA_VERSION
                 || version == connection::MAX_SUPPORTED_SCHEMA_VERSION
         );
         let mut connection = Connection::open(path).unwrap();
-        if version == connection::MAX_SUPPORTED_SCHEMA_VERSION {
+        if version >= writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION {
             connection
                 .create_scalar_function(
                     "digital_life_writer_epoch",
@@ -498,15 +499,19 @@ mod tests {
                 migration::WriterFenceSchemaUpgrade::Applied
             );
         }
-        if version == connection::MAX_SUPPORTED_SCHEMA_VERSION {
+        if version >= migration::ATTEMPT_CLAIM_IDENTITY_SCHEMA_VERSION {
             assert_eq!(
                 migration::apply_attempt_claim_identity_schema_upgrade(&transaction).unwrap(),
                 migration::AttemptClaimIdentitySchemaUpgrade::Applied
             );
+        }
+        if version >= migration::LATE_DELETE_RESOLUTION_SCHEMA_VERSION {
             assert_eq!(
                 migration::apply_late_delete_resolution_schema_upgrade(&transaction).unwrap(),
                 migration::LateDeleteResolutionSchemaUpgrade::Applied
             );
+        }
+        if version == connection::MAX_SUPPORTED_SCHEMA_VERSION {
             assert_eq!(
                 migration::apply_late_delete_generation_authority_schema_upgrade(&transaction)
                     .unwrap(),
@@ -2098,5 +2103,379 @@ mod tests {
                 "publish",
             ]
         );
+    }
+
+    /// Seeds a version-15 database with a historical Delete-Unknown outbox row
+    /// and a nonterminal pending Resolution, so Migration016 has data to
+    /// converge / backfill in every phase.
+    fn seed_schema_fifteen_historical_fixture(path: &Path) {
+        let connection = Connection::open(path).unwrap();
+        connection
+            .create_scalar_function(
+                "digital_life_writer_epoch",
+                0,
+                FunctionFlags::SQLITE_UTF8
+                    | FunctionFlags::SQLITE_DETERMINISTIC
+                    | FunctionFlags::SQLITE_INNOCUOUS,
+                |_| Ok(1_i64),
+            )
+            .unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO memory_vector_generation
+                   (generation_id,descriptor_hash,dimension,state)
+                 VALUES ('hist-generation','hist-descriptor',32,'active');
+                 INSERT INTO memory_vector_sync_outbox
+                   (life_id,memory_id,desired_action,state,attempt_count,mutation_sequence,
+                    target_revision,target_content_hash,claimed_generation_id,
+                    fenced_claim_epoch,last_marked_claim_epoch,last_send_disposition,
+                    last_error_code)
+                 VALUES ('hist-life','hist-delete-unknown','delete','blocked',2,101,
+                         7,'hist-target','hist-generation',3,3,'possibly_sent',
+                         'PROVIDER_RESULT_UNKNOWN');
+                 INSERT INTO memory_vector_late_delete_resolution
+                   (outbox_id,life_id,memory_id,mutation_sequence,claimed_generation_id,
+                    embedding_descriptor_id,embedding_dimension,captured_generation_state,
+                    witness_attempt_ordinal,witness_claim_epoch,witness_marked_claim_epoch,
+                    witness_send_disposition,state,resolution_count,resolution_epoch,
+                    last_reserved_resolution_epoch,created_at,updated_at)
+                 SELECT id,'hist-life',memory_id,mutation_sequence,claimed_generation_id,
+                        'hist-descriptor',32,'active',attempt_count,fenced_claim_epoch,
+                        last_marked_claim_epoch,last_send_disposition,'pending',1,1,1,
+                        '2026-07-01T00:00:00.000Z','2026-07-01T00:00:00.000Z'
+                   FROM memory_vector_sync_outbox
+                  WHERE life_id='hist-life' AND memory_id='hist-delete-unknown';",
+            )
+            .unwrap();
+    }
+
+    /// Asserts a rolled-back Migration016 leaves the file as a complete,
+    /// precise Schema 15 world: no Schema16 columns, no Schema16 semantic
+    /// triggers, writer fence still 24, and the historical fixture untouched.
+    fn assert_schema_fifteen_world(path: &Path) {
+        let connection = Connection::open(path).unwrap();
+        assert_eq!(
+            connection::read_schema_version(&connection).unwrap(),
+            migration::LATE_DELETE_RESOLUTION_SCHEMA_VERSION
+        );
+        migration::validate_late_delete_resolution_schema(&connection).unwrap();
+        for (table, column) in [
+            ("memory_vector_sync_outbox", "delete_witness_at"),
+            (
+                "memory_vector_late_delete_resolution",
+                "witness_age_anchor_at",
+            ),
+            (
+                "memory_vector_late_delete_resolution",
+                "captured_generation_authority_epoch",
+            ),
+            ("memory_vector_generation", "authority_epoch"),
+        ] {
+            let column_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name=?2",
+                    rusqlite::params![table, column],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                column_count, 0,
+                "schema-16 column {table}.{column} must not survive a rollback"
+            );
+        }
+        let semantic_trigger_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type='trigger' AND name GLOB 'memory_vector_generation_semantic_*'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            semantic_trigger_count, 0,
+            "no schema-16 semantic trigger may survive a rollback"
+        );
+        assert_eq!(writer_fence_count(&connection), 24);
+        // Historical fixture untouched.
+        let (state, attempt, disposition): (String, i64, Option<String>) = connection
+            .query_row(
+                "SELECT o.state, o.attempt_count, o.last_send_disposition
+                 FROM memory_vector_sync_outbox o WHERE o.memory_id='hist-delete-unknown'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "blocked");
+        assert_eq!(attempt, 2);
+        assert_eq!(disposition.as_deref(), Some("possibly_sent"));
+        let resolution_state: String = connection
+            .query_row(
+                "SELECT state FROM memory_vector_late_delete_resolution
+                 WHERE memory_id='hist-delete-unknown'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(resolution_state, "pending");
+        assert_eq!(journal_mode(path), "delete");
+    }
+
+    /// Runs the real coordinator upgrade on a version-15 file with the given
+    /// Migration016 failpoint armed, then verifies the whole transaction
+    /// rolled back to a complete Schema 15 world.
+    fn run_migration_016_failpoint_rolls_back(
+        name: &str,
+        failpoint: migration::Migration016Failpoint,
+    ) {
+        let _ = take_upgrade_events();
+        let (_root, path) = database_path(name);
+        prepare_schema_version(&path, migration::LATE_DELETE_RESOLUTION_SCHEMA_VERSION);
+        seed_schema_fifteen_historical_fixture(&path);
+        let gate = FakeGate::clear();
+        migration::fail_next_migration_016_at_for_test(failpoint);
+
+        let error = open_coordinated_storage_connection_with_gate(&path, &gate).unwrap_err();
+        assert_eq!(error.code, "MIGRATION_TRANSACTION_FAILED");
+        assert_schema_fifteen_world(&path);
+    }
+
+    #[test]
+    fn migration_016_failure_injection_outbox_schema_rolls_back() {
+        run_migration_016_failpoint_rolls_back(
+            "migration-016-failpoint-outbox-schema",
+            migration::Migration016Failpoint::AfterOutboxSchema,
+        );
+    }
+
+    #[test]
+    fn migration_016_failure_injection_resolution_schema_rolls_back() {
+        run_migration_016_failpoint_rolls_back(
+            "migration-016-failpoint-resolution-schema",
+            migration::Migration016Failpoint::AfterResolutionSchema,
+        );
+    }
+
+    #[test]
+    fn migration_016_failure_injection_generation_backfill_rolls_back() {
+        run_migration_016_failpoint_rolls_back(
+            "migration-016-failpoint-generation-schema",
+            migration::Migration016Failpoint::AfterGenerationSchema,
+        );
+    }
+
+    #[test]
+    fn migration_016_failure_injection_resolution_convergence_rolls_back() {
+        run_migration_016_failpoint_rolls_back(
+            "migration-016-failpoint-resolution-convergence",
+            migration::Migration016Failpoint::AfterResolutionConvergence,
+        );
+    }
+
+    #[test]
+    fn migration_016_failure_injection_historical_coverage_rolls_back() {
+        run_migration_016_failpoint_rolls_back(
+            "migration-016-failpoint-historical-coverage",
+            migration::Migration016Failpoint::AfterHistoricalCoverageBackfill,
+        );
+    }
+
+    #[test]
+    fn migration_016_failure_injection_semantic_trigger_rolls_back() {
+        run_migration_016_failpoint_rolls_back(
+            "migration-016-failpoint-semantic-trigger",
+            migration::Migration016Failpoint::AfterFirstSemanticTrigger,
+        );
+    }
+
+    #[test]
+    fn migration_016_failure_injection_final_precommit_rolls_back() {
+        run_migration_016_failpoint_rolls_back(
+            "migration-016-failpoint-precommit",
+            migration::Migration016Failpoint::PreCommit,
+        );
+    }
+
+    #[test]
+    fn migration_016_commit_failure_rolls_back() {
+        let _ = take_upgrade_events();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(super::super::DATABASE_FILE_NAME);
+        prepare_schema_version(&path, migration::LATE_DELETE_RESOLUTION_SCHEMA_VERSION);
+        seed_schema_fifteen_historical_fixture(&path);
+        assert_eq!(journal_mode(&path), "delete");
+
+        // Hold a reader transaction so the coordinator's real COMMIT fails
+        // with a lock; the caller sees a genuine commit failure, not a
+        // pre-commit early return.
+        let mut reader = Connection::open(&path).unwrap();
+        let reader_transaction = reader.transaction().unwrap();
+        reader_transaction
+            .query_row(
+                "SELECT COUNT(*) FROM memory_vector_sync_outbox",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+
+        let error = match open_coordinated_storage_connection_with_gate(&path, &FakeGate::clear()) {
+            Ok(_) => panic!("a real commit failure must fail the migration"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "MIGRATION_TRANSACTION_FAILED");
+
+        drop(reader_transaction);
+
+        assert_schema_fifteen_world(&path);
+        assert!(!path.with_extension("sqlite3-wal").exists());
+    }
+
+    /// Commit-result-unknown after a real Migration016 commit: the caller
+    /// receives `MIGRATION_POST_COMMIT_VERIFICATION_FAILED` after the
+    /// transaction committed, so the only durable state is the WHOLE Schema 16
+    /// world (never a partial schema-15.5).
+    #[test]
+    fn migration_016_commit_result_unknown_reopens_whole_new_world() {
+        let _ = take_upgrade_events();
+        let (_root, path) = database_path("migration-016-commit-unknown-new-world");
+        prepare_schema_version(&path, migration::LATE_DELETE_RESOLUTION_SCHEMA_VERSION);
+        seed_schema_fifteen_historical_fixture(&path);
+        let gate = FakeGate::clear();
+        migration::fail_next_post_commit_verification_for_test();
+
+        let error = open_coordinated_storage_connection_with_gate(&path, &gate).unwrap_err();
+        assert_eq!(error.code, "MIGRATION_POST_COMMIT_VERIFICATION_FAILED");
+        assert_eq!(
+            take_upgrade_events(),
+            vec![
+                "mutex",
+                "open-before-wal",
+                "version-read",
+                "preflight-rm",
+                "begin-immediate",
+                "final-rm",
+                "commit",
+                "post-verify",
+            ]
+        );
+
+        // Reopen from disk: the commit already happened, so the world must be
+        // the complete Schema 16 world.
+        let connection = Connection::open(&path).unwrap();
+        assert_eq!(
+            connection::read_schema_version(&connection).unwrap(),
+            connection::MAX_SUPPORTED_SCHEMA_VERSION
+        );
+        migration::validate_late_delete_generation_authority_schema(&connection).unwrap();
+        for (table, column) in [
+            ("memory_vector_sync_outbox", "delete_witness_at"),
+            (
+                "memory_vector_late_delete_resolution",
+                "witness_age_anchor_at",
+            ),
+            (
+                "memory_vector_late_delete_resolution",
+                "captured_generation_authority_epoch",
+            ),
+            ("memory_vector_generation", "authority_epoch"),
+        ] {
+            let column_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name=?2",
+                    rusqlite::params![table, column],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(column_count, 1, "{table}.{column} must exist");
+        }
+        let semantic_trigger_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type='trigger' AND name GLOB 'memory_vector_generation_semantic_*'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(semantic_trigger_count, 3);
+        assert_eq!(writer_fence_count(&connection), 24);
+        // Historical data semantics in the new world.
+        let outbox_witness: Option<String> = connection
+            .query_row(
+                "SELECT delete_witness_at FROM memory_vector_sync_outbox
+                 WHERE memory_id='hist-delete-unknown'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            outbox_witness.is_some() && !outbox_witness.as_deref().unwrap().is_empty(),
+            "historical Delete-Unknown must carry delete_witness_at"
+        );
+        let (resolution_state, captured_epoch): (String, i64) = connection
+            .query_row(
+                "SELECT state, captured_generation_authority_epoch
+                 FROM memory_vector_late_delete_resolution
+                 WHERE memory_id='hist-delete-unknown'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(resolution_state, "waiting_rebuild");
+        assert_eq!(captured_epoch, 0);
+        let generation_authority_epoch: i64 = connection
+            .query_row(
+                "SELECT authority_epoch FROM memory_vector_generation
+                 WHERE generation_id='hist-generation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(generation_authority_epoch, 1);
+        // Historical canonical coverage postcondition holds: the outbox row
+        // still has a matching canonical Resolution.
+        let covered: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM memory_vector_sync_outbox o
+                 WHERE o.memory_id='hist-delete-unknown' AND EXISTS (
+                     SELECT 1 FROM memory_vector_late_delete_resolution r
+                      WHERE r.outbox_id=o.id AND r.state IN
+                            ('waiting_rebuild','resolved_absent','resolved_deleted',
+                             'resolved_rebuilt','superseded')
+                        AND r.claimed_generation_id<>''
+                        AND r.embedding_descriptor_id<>''
+                        AND r.captured_generation_state IN ('building','active','retired','failed')
+                        AND r.witness_attempt_ordinal BETWEEN 1 AND 5
+                        AND r.witness_claim_epoch>0
+                        AND r.witness_marked_claim_epoch>0
+                        AND r.witness_marked_claim_epoch<=r.witness_claim_epoch
+                        AND (r.witness_send_disposition='possibly_sent'
+                             OR r.witness_error_code='PROVIDER_RESULT_UNKNOWN')
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(covered, 1);
+        assert_eq!(journal_mode(&path), "delete");
+    }
+
+    /// Commit-result-unknown after a real Migration016 rollback: the caller
+    /// sees an unknown outcome, reopens, and must find the WHOLE Schema 15
+    /// world (no schema-15.5 residue).
+    #[test]
+    fn migration_016_commit_result_unknown_reopens_whole_old_world() {
+        let _ = take_upgrade_events();
+        let (_root, path) = database_path("migration-016-commit-unknown-old-world");
+        prepare_schema_version(&path, migration::LATE_DELETE_RESOLUTION_SCHEMA_VERSION);
+        seed_schema_fifteen_historical_fixture(&path);
+        let gate = FakeGate::clear();
+        migration::fail_next_migration_016_at_for_test(
+            migration::Migration016Failpoint::AfterOutboxSchema,
+        );
+
+        let error = open_coordinated_storage_connection_with_gate(&path, &gate).unwrap_err();
+        assert_eq!(error.code, "MIGRATION_TRANSACTION_FAILED");
+        // Reopen from disk and check the whole old world (validators included).
+        assert_schema_fifteen_world(&path);
+        assert!(!path.with_extension("sqlite3-wal").exists());
     }
 }

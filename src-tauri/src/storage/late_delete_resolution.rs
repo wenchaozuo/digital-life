@@ -170,6 +170,26 @@ thread_local! {
     static DELETE_STARTED_BEFORE_COMMIT_FAULT: Cell<bool> = const { Cell::new(false) };
     static DELETE_STARTED_AFTER_COMMIT_FAULT: Cell<bool> = const { Cell::new(false) };
     static QUERY_PERMIT_AFTER_COMMIT_FAULT: Cell<bool> = const { Cell::new(false) };
+    static DELETE_STARTED_COMMIT_ATTEMPT_COUNT: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Records every real DeleteStarted-issuance `transaction.commit()` attempt.
+/// The pre-commit fault branch returns before this helper, so a pre-commit
+/// failure is observably a zero-attempt failure while a real commit failure or
+/// a post-commit result loss is observably a one-attempt failure.
+#[cfg(test)]
+fn record_delete_started_commit_attempt_for_test() {
+    DELETE_STARTED_COMMIT_ATTEMPT_COUNT.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(test)]
+pub(crate) fn reset_delete_started_commit_attempt_count_for_test() {
+    DELETE_STARTED_COMMIT_ATTEMPT_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn delete_started_commit_attempt_count_for_test() -> usize {
+    DELETE_STARTED_COMMIT_ATTEMPT_COUNT.with(|count| count.get())
 }
 
 /// Result of atomically claiming the next candidate under a runtime lease.
@@ -781,7 +801,14 @@ impl StorageService {
                 true,
             ));
         }
-        tx.commit().map_err(storage_error)?;
+        // The real SQLite COMMIT attempt is recorded just before the call so a
+        // test can prove a genuine commit was attempted (and not skipped by the
+        // pre-commit fault branch above). In release builds this helper compiles
+        // out and the call is byte-for-byte the previous `tx.commit()`.
+        #[cfg(test)]
+        record_delete_started_commit_attempt_for_test();
+        let commit_result = tx.commit();
+        commit_result.map_err(storage_error)?;
         #[cfg(test)]
         if DELETE_STARTED_AFTER_COMMIT_FAULT.with(|fault| fault.replace(false)) {
             return Err(StorageError::new(
@@ -1347,6 +1374,37 @@ mod tests {
             .unwrap();
     }
 
+    /// The exact SQLite authoritative `now` minus 24 hours, sampled in the same
+    /// timestamp format the 24-hour guard compares. `now >= this` is guaranteed
+    /// by wall-clock monotonicity, so the guard's strict `<` is deterministically
+    /// false at the exact equality boundary without any sleep.
+    fn authoritative_anchor_exactly_24h_in_the_past(storage: &StorageService) -> String {
+        storage
+            .state()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now','-24 hours')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// Issues one real DeleteStarted permit (count=1, current-epoch delete_started)
+    /// and returns the durable resolution id with the permit dropped.
+    fn issue_delete_started_permit(storage: &StorageService) -> i64 {
+        let present =
+            acknowledge_query_present_for_test(*reserved_query_permit(storage), 7, "hash-7");
+        let permit = match storage.issue_late_delete_permit(present).unwrap() {
+            LateDeleteDeletePermitIssuance::Issued(permit) => permit,
+            _ => panic!("a definite DeleteStarted commit must issue one permit"),
+        };
+        let resolution_id = permit.token.resolution_id();
+        drop(permit);
+        resolution_id
+    }
+
     #[test]
     fn late_delete_query_permit_and_delete_permit_are_issued_only_after_definite_commits() {
         let (_root, storage) = storage();
@@ -1423,6 +1481,7 @@ mod tests {
         let resolution_id = query_permit.token.resolution_id();
         let present = acknowledge_query_present_for_test(*query_permit, 7, "hash-7");
         DELETE_STARTED_AFTER_COMMIT_FAULT.with(|fault| fault.set(true));
+        reset_delete_started_commit_attempt_count_for_test();
         let error = match storage.issue_late_delete_permit(present) {
             Err(error) => error,
             Ok(_) => panic!("post-commit result loss must not return a Delete permit"),
@@ -1430,6 +1489,11 @@ mod tests {
         assert_eq!(
             error.code,
             "LATE_DELETE_DELETE_STARTED_COMMIT_RESULT_UNKNOWN"
+        );
+        assert_eq!(
+            delete_started_commit_attempt_count_for_test(),
+            1,
+            "a genuine COMMIT was attempted before the outcome was hidden"
         );
         assert_eq!(
             storage
@@ -1447,11 +1511,17 @@ mod tests {
         let resolution_id = query_permit.token.resolution_id();
         let present = acknowledge_query_present_for_test(*query_permit, 7, "hash-7");
         DELETE_STARTED_BEFORE_COMMIT_FAULT.with(|fault| fault.set(true));
+        reset_delete_started_commit_attempt_count_for_test();
         let error = match storage.issue_late_delete_permit(present) {
             Err(error) => error,
             Ok(_) => panic!("pre-commit failure must not return a Delete permit"),
         };
         assert_eq!(error.code, "LATE_DELETE_DELETE_STARTED_COMMIT_FAILED");
+        assert_eq!(
+            delete_started_commit_attempt_count_for_test(),
+            0,
+            "a pre-commit failure never reaches the real COMMIT"
+        );
         assert_eq!(
             storage
                 .reconcile_late_delete_started(resolution_id)
@@ -2017,5 +2087,386 @@ mod tests {
                 LateDeleteResolutionClaimResult::Claimed(_)
             ));
         }
+    }
+
+    /// BLOCKER-1A: at the exact authoritative boundary `now == anchor + 24h` the
+    /// strict `<` guard must not issue a Delete permit. The anchor is derived
+    /// from the same SQLite authoritative clock (`strftime(...,'now','-24 hours')`),
+    /// so the guard sees an exact equality, not "obviously expired".
+    #[test]
+    fn late_delete_delete_started_24h_issuance_exact_boundary_blocks_permit() {
+        let (_root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let query_permit = reserved_query_permit(&storage);
+        let mut token = query_permit.token;
+        let anchor = authoritative_anchor_exactly_24h_in_the_past(&storage);
+        token.witness_age_anchor_at = anchor.clone();
+        storage
+            .state()
+            .unwrap()
+            .connection
+            .execute(
+                "UPDATE memory_vector_late_delete_resolution
+                 SET witness_age_anchor_at=?1
+                 WHERE life_id='life' AND memory_id='memory'",
+                [&anchor],
+            )
+            .unwrap();
+        let present =
+            acknowledge_query_present_for_test(LateDeleteQueryPermit { token }, 7, "hash-7");
+        assert!(matches!(
+            storage.issue_late_delete_permit(present).unwrap(),
+            LateDeleteDeletePermitIssuance::WaitingRebuild
+        ));
+        let row: (String, String, i64, i64, Option<String>, Option<String>) = storage
+            .state()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT state,last_resolution_disposition,resolution_count,resolution_epoch,lease_owner,lease_expires_at
+                 FROM memory_vector_late_delete_resolution WHERE life_id='life' AND memory_id='memory'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                "waiting_rebuild".into(),
+                "waiting_rebuild".into(),
+                1,
+                1,
+                None,
+                None
+            )
+        );
+    }
+
+    /// BLOCKER-1B: a durable current-epoch delete_started whose witness anchor
+    /// is exactly 24h in the past must recover to waiting_rebuild (the 24h guard
+    /// executes), not to unknown/delete_unknown, and must not consume a new
+    /// ordinal or leak a capability.
+    #[test]
+    fn late_delete_delete_started_24h_recovery_exact_boundary_waiting_rebuild() {
+        let (_root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let resolution_id = issue_delete_started_permit(&storage);
+        let anchor = authoritative_anchor_exactly_24h_in_the_past(&storage);
+        storage
+            .state()
+            .unwrap()
+            .connection
+            .execute(
+                "UPDATE memory_vector_late_delete_resolution
+                 SET witness_age_anchor_at=?1 WHERE resolution_id=?2",
+                params![anchor, resolution_id],
+            )
+            .unwrap();
+        expire_resolution_lease(&storage);
+        assert_eq!(
+            storage.recover_expired_late_delete_resolutions().unwrap(),
+            1
+        );
+        let row: (String, String, i64, i64, Option<String>, Option<i64>, Option<String>) = storage
+            .state()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT state,last_resolution_disposition,resolution_count,resolution_epoch,lease_owner,lease_fence_epoch,lease_expires_at
+                 FROM memory_vector_late_delete_resolution WHERE resolution_id=?1",
+                [resolution_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                "waiting_rebuild".into(),
+                "waiting_rebuild".into(),
+                1,
+                1,
+                None,
+                None,
+                None
+            )
+        );
+    }
+
+    /// BLOCKER-3B: the same durable delete_started recovery well beyond 24h must
+    /// also converge to waiting_rebuild through the delete_started branch's own
+    /// 24h guard (not merely because some other predicate happened to block).
+    #[test]
+    fn late_delete_delete_started_24h_recovery_beyond_boundary_waiting_rebuild() {
+        let (_root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let resolution_id = issue_delete_started_permit(&storage);
+        storage
+            .state()
+            .unwrap()
+            .connection
+            .execute(
+                "UPDATE memory_vector_late_delete_resolution
+                 SET witness_age_anchor_at='2000-01-01T00:00:00.000Z'
+                 WHERE resolution_id=?1",
+                [resolution_id],
+            )
+            .unwrap();
+        expire_resolution_lease(&storage);
+        assert_eq!(
+            storage.recover_expired_late_delete_resolutions().unwrap(),
+            1
+        );
+        let row: (String, String, i64, i64, Option<String>, Option<i64>, Option<String>) = storage
+            .state()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT state,last_resolution_disposition,resolution_count,resolution_epoch,lease_owner,lease_fence_epoch,lease_expires_at
+                 FROM memory_vector_late_delete_resolution WHERE resolution_id=?1",
+                [resolution_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                "waiting_rebuild".into(),
+                "waiting_rebuild".into(),
+                1,
+                1,
+                None,
+                None,
+                None
+            )
+        );
+    }
+
+    /// BLOCKER-2: a real SQLite COMMIT failure. All issuance SQL completes, the
+    /// real `transaction.commit()` is invoked exactly once and returns a genuine
+    /// `SQLITE_BUSY` (a reader's SHARED lock denies the EXCLUSIVE promotion),
+    /// the caller receives a known database failure, and the whole transaction
+    /// rolls back so no current-epoch delete_started is ever persisted.
+    #[test]
+    fn late_delete_delete_started_commit_failure_real_commit_attempt_rolls_back() {
+        let (root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let query_permit = reserved_query_permit(&storage);
+        let resolution_id = query_permit.token.resolution_id();
+        let present = acknowledge_query_present_for_test(*query_permit, 7, "hash-7");
+        let database_path = storage.state().unwrap().database_path.clone();
+
+        // The storage database is WAL by default, and in WAL a reader never
+        // blocks a writer's COMMIT. Switch the throwaway test DB to the
+        // rollback-journal mode the rest of the codebase uses for genuine
+        // commit-failure evidence, then let a second connection's plain read
+        // transaction hold the SHARED lock that denies COMMIT its EXCLUSIVE
+        // promotion. This is real SQLite lock arbitration, not a simulated error.
+        storage
+            .state()
+            .unwrap()
+            .connection
+            .pragma_update(None, "journal_mode", "DELETE")
+            .unwrap();
+        storage
+            .state()
+            .unwrap()
+            .connection
+            .busy_timeout(std::time::Duration::from_millis(0))
+            .unwrap();
+        let mut reader = rusqlite::Connection::open(&database_path).unwrap();
+        let reader_transaction = reader.transaction().unwrap();
+        let _count: i64 = reader_transaction
+            .query_row(
+                "SELECT COUNT(*) FROM memory_vector_late_delete_resolution",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        reset_delete_started_commit_attempt_count_for_test();
+        let error = match storage.issue_late_delete_permit(present) {
+            Err(error) => error,
+            Ok(_) => panic!("a genuine SQLite COMMIT failure must not return a Delete permit"),
+        };
+        assert_eq!(error.code, "LATE_DELETE_RESOLUTION_DATABASE_ERROR");
+        assert_eq!(
+            delete_started_commit_attempt_count_for_test(),
+            1,
+            "the real COMMIT was attempted exactly once"
+        );
+
+        drop(reader_transaction);
+        drop(reader);
+        drop(storage);
+
+        // Reopen from disk with a fresh connection: the issuance transaction
+        // fully rolled back, so current-epoch delete_started was not persisted.
+        let reopened = StorageService::initialize_with_roots(root.0.join("data"), None).unwrap();
+        assert_eq!(
+            reopened
+                .reconcile_late_delete_started(resolution_id)
+                .unwrap(),
+            LateDeleteStartedDurableState::NotCurrentEpochDeleteStarted
+        );
+        let row: (String, Option<String>, i64, i64, i64) = reopened
+            .state()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT state,last_resolution_disposition,resolution_count,last_disposition_epoch,resolution_epoch
+                 FROM memory_vector_late_delete_resolution WHERE resolution_id=?1",
+                [resolution_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            ("processing".into(), None, 1, 0, 1),
+            "only the pre-issuance durable state survives a known commit failure"
+        );
+    }
+
+    /// BLOCKER-3A: a durable current-epoch delete_started with resolution_count=2
+    /// and a current generation authority recovers to unknown/delete_unknown,
+    /// preserves the count and epoch, clears the row lease, and does not mint a
+    /// new ordinal; only a future claim+reserve cycle may produce ordinal 3.
+    #[test]
+    fn late_delete_delete_started_recovery_count_two_converges_delete_unknown_without_new_ordinal()
+    {
+        let (_root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let resolution_id = issue_delete_started_permit(&storage);
+        storage
+            .state()
+            .unwrap()
+            .connection
+            .execute(
+                "UPDATE memory_vector_late_delete_resolution
+                 SET resolution_count=2 WHERE resolution_id=?1",
+                [resolution_id],
+            )
+            .unwrap();
+        expire_resolution_lease(&storage);
+        assert_eq!(
+            storage.recover_expired_late_delete_resolutions().unwrap(),
+            1
+        );
+        let row: (String, String, i64, i64, i64) = storage
+            .state()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT state,last_resolution_disposition,resolution_count,resolution_epoch,last_disposition_epoch
+                 FROM memory_vector_late_delete_resolution WHERE resolution_id=?1",
+                [resolution_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("unknown".into(), "delete_unknown".into(), 2, 1, 1));
+        let lease_row: (Option<String>, Option<i64>, Option<String>) = storage
+            .state()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT lease_owner,lease_fence_epoch,lease_expires_at
+                 FROM memory_vector_late_delete_resolution WHERE resolution_id=?1",
+                [resolution_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(lease_row, (None, None, None));
+        // A future claim+reserve cycle is what produces ordinal 3, never Recovery.
+        storage
+            .state()
+            .unwrap()
+            .connection
+            .execute(
+                "UPDATE memory_vector_late_delete_runtime_lease
+                 SET lease_expires_at='2020-01-01T00:00:00.000Z'
+                 WHERE lease_name=?1",
+                [RUNTIME_LEASE_NAME],
+            )
+            .unwrap();
+        let lease = storage
+            .acquire_late_delete_runtime_lease("resolver-b")
+            .unwrap()
+            .unwrap();
+        let claim = match storage.claim_one_late_delete_resolution(&lease).unwrap() {
+            LateDeleteResolutionClaimResult::Claimed(claim) => claim,
+            LateDeleteResolutionClaimResult::NoEligibleResolution => {
+                panic!("an unknown candidate must be claimable")
+            }
+        };
+        let token = match storage.reserve_late_delete_resolution(&claim).unwrap() {
+            LateDeleteResolutionReservation::Reserved(token) => token,
+            _ => panic!("claim must reserve the next ordinal"),
+        };
+        assert_eq!(token.resolution_ordinal(), 3);
+        assert!(storage
+            .late_delete_resolution_token_is_current(&token)
+            .unwrap());
+    }
+
+    /// BLOCKER-3C: a terminal superseded row that retains residual
+    /// delete_started historical evidence plus an expired lease must never be
+    /// reopened by Recovery. Recovery is gated on state='processing', so the
+    /// superseded terminal state stays byte-for-byte untouched.
+    #[test]
+    fn late_delete_delete_started_recovery_superseded_residual_delete_started_stays_terminal() {
+        let (_root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let resolution_id = issue_delete_started_permit(&storage);
+        let resolved_at: String = storage
+            .state()
+            .unwrap()
+            .connection
+            .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        // Schema16-legal terminal fixture: superseded state with a residual
+        // delete_started disposition/epoch history and an expired row lease.
+        storage
+            .state()
+            .unwrap()
+            .connection
+            .execute(
+                "UPDATE memory_vector_late_delete_resolution
+                 SET state='superseded', resolved_at=?2,
+                     lease_expires_at='2020-01-01T00:00:00.000Z'
+                 WHERE resolution_id=?1",
+                params![resolution_id, resolved_at],
+            )
+            .unwrap();
+        let row: (String, String, i64, i64, Option<String>, Option<i64>, Option<String>) = storage
+            .state()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT state,last_resolution_disposition,resolution_count,resolution_epoch,lease_owner,lease_fence_epoch,lease_expires_at
+                 FROM memory_vector_late_delete_resolution WHERE resolution_id=?1",
+                [resolution_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, "superseded");
+        assert_eq!(row.1, "delete_started");
+        assert_eq!(
+            storage.recover_expired_late_delete_resolutions().unwrap(),
+            0,
+            "Recovery must not reopen a superseded terminal row"
+        );
+        let after: (String, String, i64, i64, Option<String>, Option<i64>, Option<String>) = storage
+            .state()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT state,last_resolution_disposition,resolution_count,resolution_epoch,lease_owner,lease_fence_epoch,lease_expires_at
+                 FROM memory_vector_late_delete_resolution WHERE resolution_id=?1",
+                [resolution_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+            )
+            .unwrap();
+        assert_eq!(row, after);
     }
 }

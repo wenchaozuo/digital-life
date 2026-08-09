@@ -171,6 +171,7 @@ thread_local! {
     static DELETE_STARTED_AFTER_COMMIT_FAULT: Cell<bool> = const { Cell::new(false) };
     static QUERY_PERMIT_AFTER_COMMIT_FAULT: Cell<bool> = const { Cell::new(false) };
     static DELETE_STARTED_COMMIT_ATTEMPT_COUNT: Cell<usize> = const { Cell::new(0) };
+    static AUTHORITATIVE_NOW_OVERRIDE_FOR_TEST: Cell<Option<String>> = const { Cell::new(None) };
 }
 
 /// Records every real DeleteStarted-issuance `transaction.commit()` attempt.
@@ -190,6 +191,20 @@ pub(crate) fn reset_delete_started_commit_attempt_count_for_test() {
 #[cfg(test)]
 pub(crate) fn delete_started_commit_attempt_count_for_test() -> usize {
     DELETE_STARTED_COMMIT_ATTEMPT_COUNT.with(|count| count.get())
+}
+
+/// Freezes the authoritative-now that the production 24-hour comparator receives
+/// as `?1`. The frozen value is always taken from the SQLite clock first and the
+/// override is one-shot: the next `authoritative_utc_millis_now_in` call returns
+/// it and then the seam resets, so no other call site can be affected.
+#[cfg(test)]
+pub(crate) fn arm_authoritative_now_override_for_test(frozen_now: &str) {
+    AUTHORITATIVE_NOW_OVERRIDE_FOR_TEST.with(|slot| slot.set(Some(frozen_now.to_string())));
+}
+
+#[cfg(test)]
+pub(crate) fn clear_authoritative_now_override_for_test() {
+    AUTHORITATIVE_NOW_OVERRIDE_FOR_TEST.with(|slot| slot.set(None));
 }
 
 /// Result of atomically claiming the next candidate under a runtime lease.
@@ -287,6 +302,15 @@ fn storage_error(error: impl std::fmt::Display) -> StorageError {
 pub(super) fn authoritative_utc_millis_now_in(
     transaction: &Transaction<'_>,
 ) -> Result<String, StorageError> {
+    // Test-only authoritative-time override: a test freezes a value already
+    // taken from this same SQLite clock so the production comparator's `?1` is
+    // bit-for-bit equal to `witness_age_anchor_at + 24h`. The override is
+    // consumed by the first call (one-shot), and in release builds this branch
+    // compiles out entirely, leaving the original SQLite authoritative-now path.
+    #[cfg(test)]
+    if let Some(frozen_now) = AUTHORITATIVE_NOW_OVERRIDE_FOR_TEST.with(|slot| slot.take()) {
+        return Ok(frozen_now);
+    }
     transaction
         .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", [], |row| {
             row.get(0)
@@ -1374,21 +1398,82 @@ mod tests {
             .unwrap();
     }
 
-    /// The exact SQLite authoritative `now` minus 24 hours, sampled in the same
-    /// timestamp format the 24-hour guard compares. `now >= this` is guaranteed
-    /// by wall-clock monotonicity, so the guard's strict `<` is deterministically
-    /// false at the exact equality boundary without any sleep.
-    fn authoritative_anchor_exactly_24h_in_the_past(storage: &StorageService) -> String {
-        storage
+    /// Freezes the authoritative-now that the production comparator will receive.
+    /// The frozen value is read once from the SQLite clock, the anchor is derived
+    /// from that same frozen value via SQLite's own date arithmetic (`-24 hours`),
+    /// and the one-shot override is armed so the comparator's `?1` equals
+    /// `witness_age_anchor_at + 24h` exactly (never `>=`).
+    ///
+    /// Returns `(anchor, frozen_now)`: the anchor to write into the row, and the
+    /// exact authoritative timestamp the production comparator will receive.
+    fn freeze_exact_24h_boundary(storage: &StorageService) -> (String, String) {
+        let frozen_now: String = storage
+            .state()
+            .unwrap()
+            .connection
+            .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let anchor: String = storage
             .state()
             .unwrap()
             .connection
             .query_row(
-                "SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now','-24 hours')",
-                [],
+                "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', ?1, '-24 hours')",
+                [&frozen_now],
                 |row| row.get(0),
             )
+            .unwrap();
+        arm_authoritative_now_override_for_test(&frozen_now);
+        (anchor, frozen_now)
+    }
+
+    /// Same as [`freeze_exact_24h_boundary`] but with the anchor one second
+    /// older, so the boundary `anchor + 24h` sits exactly one second *above* the
+    /// frozen `now`: the strict `<` must then allow issuance.
+    fn freeze_exact_24h_boundary_minus_1s(storage: &StorageService) -> (String, String) {
+        let frozen_now: String = storage
+            .state()
             .unwrap()
+            .connection
+            .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let anchor: String = storage
+            .state()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', ?1, '-24 hours', '+1 second')",
+                [&frozen_now],
+                |row| row.get(0),
+            )
+            .unwrap();
+        arm_authoritative_now_override_for_test(&frozen_now);
+        (anchor, frozen_now)
+    }
+
+    /// Proves through SQLite itself that the frozen authoritative `now` is the
+    /// exact `+24 hours` of the stored anchor, returning `1` (true).
+    fn assert_sqlite_exact_24h_equality(
+        storage: &StorageService,
+        frozen_now: &str,
+        resolution_id: i64,
+    ) {
+        let equal: bool = storage
+            .state()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT ?1 = strftime('%Y-%m-%dT%H:%M:%fZ', witness_age_anchor_at, '+24 hours')
+                 FROM memory_vector_late_delete_resolution WHERE resolution_id=?2",
+                params![frozen_now, resolution_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(equal, "frozen authoritative now must equal anchor + 24h");
     }
 
     /// Issues one real DeleteStarted permit (count=1, current-epoch delete_started)
@@ -2090,16 +2175,18 @@ mod tests {
     }
 
     /// BLOCKER-1A: at the exact authoritative boundary `now == anchor + 24h` the
-    /// strict `<` guard must not issue a Delete permit. The anchor is derived
-    /// from the same SQLite authoritative clock (`strftime(...,'now','-24 hours')`),
-    /// so the guard sees an exact equality, not "obviously expired".
+    /// strict `<` guard must not issue a Delete permit. The authoritative now the
+    /// comparator receives is frozen to the very timestamp the anchor was derived
+    /// from, and SQLite itself proves `frozen_now == anchor + 24h`.
     #[test]
-    fn late_delete_delete_started_24h_issuance_exact_boundary_blocks_permit() {
+    fn late_delete_delete_started_exact_24h_issuance_blocks_permit() {
         let (_root, storage) = storage();
         seed_resolution(&storage, "life", "memory", 1);
         let query_permit = reserved_query_permit(&storage);
         let mut token = query_permit.token;
-        let anchor = authoritative_anchor_exactly_24h_in_the_past(&storage);
+        let resolution_id = token.resolution_id();
+        clear_authoritative_now_override_for_test();
+        let (anchor, frozen_now) = freeze_exact_24h_boundary(&storage);
         token.witness_age_anchor_at = anchor.clone();
         storage
             .state()
@@ -2112,6 +2199,7 @@ mod tests {
                 [&anchor],
             )
             .unwrap();
+        assert_sqlite_exact_24h_equality(&storage, &frozen_now, resolution_id);
         let present =
             acknowledge_query_present_for_test(LateDeleteQueryPermit { token }, 7, "hash-7");
         assert!(matches!(
@@ -2142,16 +2230,64 @@ mod tests {
         );
     }
 
+    /// Adjacency: when the boundary `anchor + 24h` sits exactly one second above
+    /// the frozen `now`, the strict `<` must still allow issuance (so the failure
+    /// is not caused by `<=`).
+    #[test]
+    fn late_delete_delete_started_exact_24h_adjacent_second_below_issuance_allowed() {
+        let (_root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let query_permit = reserved_query_permit(&storage);
+        let mut token = query_permit.token;
+        clear_authoritative_now_override_for_test();
+        let (anchor, frozen_now) = freeze_exact_24h_boundary_minus_1s(&storage);
+        token.witness_age_anchor_at = anchor.clone();
+        storage
+            .state()
+            .unwrap()
+            .connection
+            .execute(
+                "UPDATE memory_vector_late_delete_resolution
+                 SET witness_age_anchor_at=?1
+                 WHERE life_id='life' AND memory_id='memory'",
+                [&anchor],
+            )
+            .unwrap();
+        let one_second_above_is_boundary: bool = storage
+            .state()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', ?1, '+1 second')
+                        = strftime('%Y-%m-%dT%H:%M:%fZ', witness_age_anchor_at, '+24 hours')
+                 FROM memory_vector_late_delete_resolution WHERE life_id='life' AND memory_id='memory'",
+                [&frozen_now],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            one_second_above_is_boundary,
+            "frozen now + 1s must equal anchor + 24h"
+        );
+        let present =
+            acknowledge_query_present_for_test(LateDeleteQueryPermit { token }, 7, "hash-7");
+        assert!(matches!(
+            storage.issue_late_delete_permit(present).unwrap(),
+            LateDeleteDeletePermitIssuance::Issued(_)
+        ));
+    }
+
     /// BLOCKER-1B: a durable current-epoch delete_started whose witness anchor
     /// is exactly 24h in the past must recover to waiting_rebuild (the 24h guard
     /// executes), not to unknown/delete_unknown, and must not consume a new
     /// ordinal or leak a capability.
     #[test]
-    fn late_delete_delete_started_24h_recovery_exact_boundary_waiting_rebuild() {
+    fn late_delete_delete_started_exact_24h_recovery_waiting_rebuild() {
         let (_root, storage) = storage();
         seed_resolution(&storage, "life", "memory", 1);
         let resolution_id = issue_delete_started_permit(&storage);
-        let anchor = authoritative_anchor_exactly_24h_in_the_past(&storage);
+        clear_authoritative_now_override_for_test();
+        let (anchor, frozen_now) = freeze_exact_24h_boundary(&storage);
         storage
             .state()
             .unwrap()
@@ -2162,6 +2298,7 @@ mod tests {
                 params![anchor, resolution_id],
             )
             .unwrap();
+        assert_sqlite_exact_24h_equality(&storage, &frozen_now, resolution_id);
         expire_resolution_lease(&storage);
         assert_eq!(
             storage.recover_expired_late_delete_resolutions().unwrap(),

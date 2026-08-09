@@ -93,6 +93,10 @@ const ADD_LAST_MARKED_CLAIM_EPOCH_COLUMN_SQL: &str = "ALTER TABLE memory_vector_
 const NORMALIZED_FENCED_CLAIM_EPOCH_COLUMN_DDL: &str =
     "fenced_claim_epochintegernotnulldefault0check(fenced_claim_epoch>=0)";
 const NORMALIZED_LAST_MARKED_CLAIM_EPOCH_COLUMN_DDL: &str = "last_marked_claim_epochintegernotnulldefault0check(last_marked_claim_epoch>=0andlast_marked_claim_epoch<=fenced_claim_epochand(last_marked_claim_epoch=0orattempt_count>0))";
+const NORMALIZED_CAPTURED_GENERATION_AUTHORITY_EPOCH_COLUMN_DDL: &str =
+    "captured_generation_authority_epochintegernotnulldefault0check(captured_generation_authority_epoch>=0)";
+const NORMALIZED_GENERATION_AUTHORITY_EPOCH_COLUMN_DDL: &str =
+    "authority_epochintegernotnulldefault1check(authority_epoch>=1)";
 type SchemaColumn = (String, String, i64, Option<String>, i64);
 
 /// The fixed H1-B schema phase is applied exactly once after static migrations
@@ -547,6 +551,40 @@ fn validate_late_delete_generation_authority_schema_objects(
             .optional()
             .map_err(|_| StorageError::migration_transaction_failed())?;
         if !matches!(found.as_ref(), Some((ty, nn, default)) if ty == declared_type && *nn == not_null && default.as_deref() == default_value)
+        {
+            return Err(StorageError::migration_transaction_failed());
+        }
+    }
+    // `table_info` deliberately does not expose CHECK expressions. Reuse the
+    // existing SQLite-schema normalization path to prove that Schema 16 still
+    // carries the two frozen authority-epoch domains in its actual table DDL.
+    for (table, expected_definition) in [
+        (
+            "memory_vector_late_delete_resolution",
+            NORMALIZED_CAPTURED_GENERATION_AUTHORITY_EPOCH_COLUMN_DDL,
+        ),
+        (
+            "memory_vector_generation",
+            NORMALIZED_GENERATION_AUTHORITY_EPOCH_COLUMN_DDL,
+        ),
+    ] {
+        let table_sql: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type='table' AND name=?1",
+                [table],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| StorageError::migration_transaction_failed())?;
+        let definitions = table_sql
+            .as_deref()
+            .and_then(normalized_top_level_column_definitions)
+            .ok_or_else(StorageError::migration_transaction_failed)?;
+        if definitions
+            .iter()
+            .filter(|definition| definition.as_str() == expected_definition)
+            .count()
+            != 1
         {
             return Err(StorageError::migration_transaction_failed());
         }
@@ -1684,6 +1722,100 @@ mod transaction_tests {
             LateDeleteGenerationAuthoritySchemaUpgrade::Applied
         );
         transaction.commit().unwrap();
+    }
+
+    fn schema_sixteen_connection() -> Connection {
+        let mut connection = version_fourteen_connection();
+        apply_late_delete_resolution_upgrade(&mut connection);
+        apply_late_delete_generation_authority_upgrade(&mut connection);
+        assert_eq!(
+            schema_version(&connection),
+            LATE_DELETE_GENERATION_AUTHORITY_SCHEMA_VERSION
+        );
+        connection
+    }
+
+    /// Rewrites SQLite's persisted DDL only in this test fixture, then bumps
+    /// SQLite's schema cookie so later PRAGMAs and validator reads observe a
+    /// real weakened Schema-16 definition rather than a helper string.
+    fn weaken_schema_sixteen_table_definition(
+        connection: &Connection,
+        table: &str,
+        expected_fragment: &str,
+        replacement: &str,
+    ) {
+        let original: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type='table' AND name=?1",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(original.contains(expected_fragment));
+        let weakened = original.replacen(expected_fragment, replacement, 1);
+        assert_ne!(weakened, original);
+        let sqlite_schema_version: i64 = connection
+            .query_row("PRAGMA schema_version", [], |row| row.get(0))
+            .unwrap();
+        connection
+            .execute_batch("PRAGMA writable_schema=ON")
+            .unwrap();
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE sqlite_schema SET sql=?1 WHERE type='table' AND name=?2",
+                    params![weakened, table],
+                )
+                .unwrap(),
+            1
+        );
+        connection
+            .pragma_update(None, "schema_version", sqlite_schema_version + 1)
+            .unwrap();
+        connection
+            .execute_batch("PRAGMA writable_schema=OFF")
+            .unwrap();
+        assert_eq!(
+            schema_version(connection),
+            LATE_DELETE_GENERATION_AUTHORITY_SCHEMA_VERSION,
+            "a weakened database can still claim Schema 16"
+        );
+    }
+
+    #[test]
+    fn schema_16_authority_epoch_domains_accept_frozen_ddl() {
+        let connection = schema_sixteen_connection();
+        validate_late_delete_generation_authority_schema(&connection).unwrap();
+    }
+
+    #[test]
+    fn schema_16_authority_epoch_domain_rejects_removed_and_weakened_check() {
+        for replacement in ["", "CHECK (authority_epoch >= 0)"] {
+            let connection = schema_sixteen_connection();
+            weaken_schema_sixteen_table_definition(
+                &connection,
+                "memory_vector_generation",
+                "CHECK (authority_epoch >= 1)",
+                replacement,
+            );
+            let error = validate_late_delete_generation_authority_schema(&connection).unwrap_err();
+            assert_eq!(error.code, "MIGRATION_TRANSACTION_FAILED");
+        }
+    }
+
+    #[test]
+    fn schema_16_captured_generation_authority_epoch_domain_rejects_removed_and_weakened_check() {
+        for replacement in ["", "CHECK (captured_generation_authority_epoch >= -1)"] {
+            let connection = schema_sixteen_connection();
+            weaken_schema_sixteen_table_definition(
+                &connection,
+                "memory_vector_late_delete_resolution",
+                "CHECK (captured_generation_authority_epoch >= 0)",
+                replacement,
+            );
+            let error = validate_late_delete_generation_authority_schema(&connection).unwrap_err();
+            assert_eq!(error.code, "MIGRATION_TRANSACTION_FAILED");
+        }
     }
 
     #[test]

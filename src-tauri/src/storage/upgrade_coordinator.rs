@@ -170,9 +170,18 @@ fn open_after_mutex<G: StorageUpgradeGate>(
     }
 
     record_upgrade_event("commit");
-    transaction
-        .commit()
-        .map_err(|_| StorageError::migration_transaction_failed())?;
+    // The real SQLite COMMIT attempt. The attempt is recorded BEFORE the call
+    // so a test can prove the commit was genuinely attempted; the result is
+    // then captured and, when a test-only visibility-loss hook is armed, the
+    // real outcome is hidden from the caller (commit-result-unknown).
+    #[cfg(test)]
+    record_commit_attempt_for_test();
+    let commit_result = transaction.commit();
+    #[cfg(test)]
+    if take_hide_commit_outcome_for_test() {
+        return Err(StorageError::migration_post_commit_verification_failed());
+    }
+    commit_result.map_err(|_| StorageError::migration_transaction_failed())?;
 
     record_upgrade_event("post-verify");
     migration::verify_schema_after_upgrade(&connection, connection::MAX_SUPPORTED_SCHEMA_VERSION)?;
@@ -187,6 +196,41 @@ thread_local! {
     static STORAGE_UPGRADE_EVENTS: std::cell::RefCell<Vec<&'static str>> = const {
         std::cell::RefCell::new(Vec::new())
     };
+}
+
+// Test-only seam for the "commit outcome cannot be trusted" category. It
+// records every real COMMIT attempt in the upgrade coordinator and, when
+// armed, hides the real commit result from the caller after the real
+// `tx.commit()` has been attempted. The caller then receives the same
+// unknown-outcome error category as the new-world case and must reopen the
+// database to learn which world actually persisted.
+#[cfg(test)]
+thread_local! {
+    static COMMIT_ATTEMPT_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static HIDE_COMMIT_OUTCOME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn record_commit_attempt_for_test() {
+    COMMIT_ATTEMPT_COUNT.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(test)]
+fn take_hide_commit_outcome_for_test() -> bool {
+    HIDE_COMMIT_OUTCOME.with(|hide| hide.replace(false))
+}
+
+/// Arms the test-only visibility-loss hook: after the real COMMIT attempt, the
+/// real result is discarded and the caller receives the unknown-outcome error.
+#[cfg(test)]
+pub(super) fn hide_next_commit_outcome_for_test() {
+    HIDE_COMMIT_OUTCOME.with(|hide| hide.set(true));
+}
+
+/// Number of real COMMIT attempts observed so far on this thread.
+#[cfg(test)]
+pub(super) fn commit_attempt_count_for_test() -> usize {
+    COMMIT_ATTEMPT_COUNT.with(|count| count.get())
 }
 
 #[cfg(test)]
@@ -2458,8 +2502,12 @@ mod tests {
         assert_eq!(journal_mode(&path), "delete");
     }
 
-    /// Commit-result-unknown after a real Migration016 rollback: the caller
-    /// sees an unknown outcome, reopens, and must find the WHOLE Schema 15
+    /// Commit-result-unknown after a REAL Migration016 COMMIT attempt whose
+    /// outcome is hidden from the caller. The same deterministic SQLite lock
+    /// used by the known-commit-failure test makes the real COMMIT attempt
+    /// fail (so no Schema16 world forms), and the test-only visibility-loss
+    /// seam hides that real outcome from the caller, who receives the
+    /// unknown-outcome error category. Reopen must reveal the WHOLE Schema 15
     /// world (no schema-15.5 residue).
     #[test]
     fn migration_016_commit_result_unknown_reopens_whole_old_world() {
@@ -2467,13 +2515,39 @@ mod tests {
         let (_root, path) = database_path("migration-016-commit-unknown-old-world");
         prepare_schema_version(&path, migration::LATE_DELETE_RESOLUTION_SCHEMA_VERSION);
         seed_schema_fifteen_historical_fixture(&path);
-        let gate = FakeGate::clear();
-        migration::fail_next_migration_016_at_for_test(
-            migration::Migration016Failpoint::AfterOutboxSchema,
+        assert_eq!(journal_mode(&path), "delete");
+
+        // Hold a reader transaction so the coordinator's real COMMIT attempt
+        // cannot succeed; the underlying world stays Schema 15.
+        let mut reader = Connection::open(&path).unwrap();
+        let reader_transaction = reader.transaction().unwrap();
+        reader_transaction
+            .query_row(
+                "SELECT COUNT(*) FROM memory_vector_sync_outbox",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+
+        // Arm the visibility-loss seam: the real COMMIT is attempted, its
+        // real (failed) outcome is hidden from the caller, and the caller
+        // receives the unknown-outcome category.
+        hide_next_commit_outcome_for_test();
+        let error =
+            open_coordinated_storage_connection_with_gate(&path, &FakeGate::clear()).unwrap_err();
+        assert_eq!(
+            error.code, "MIGRATION_POST_COMMIT_VERIFICATION_FAILED",
+            "the caller receives the commit-outcome-unknown category"
+        );
+        // Exactly one real COMMIT attempt happened, and it was not replayed.
+        assert_eq!(
+            commit_attempt_count_for_test(),
+            1,
+            "exactly one real COMMIT attempt"
         );
 
-        let error = open_coordinated_storage_connection_with_gate(&path, &gate).unwrap_err();
-        assert_eq!(error.code, "MIGRATION_TRANSACTION_FAILED");
+        drop(reader_transaction);
+
         // Reopen from disk and check the whole old world (validators included).
         assert_schema_fifteen_world(&path);
         assert!(!path.with_extension("sqlite3-wal").exists());

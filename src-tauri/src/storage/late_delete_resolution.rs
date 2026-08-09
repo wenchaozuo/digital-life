@@ -11,6 +11,9 @@ use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 
 use super::{StorageError, StorageService};
 
+#[cfg(test)]
+use std::cell::Cell;
+
 const RUNTIME_LEASE_NAME: &str = "memory-vector-late-delete-resolver";
 const RUNTIME_LEASE_SECONDS: i64 = 120;
 pub(crate) const MAX_LATE_DELETE_RESOLUTIONS: i64 = 3;
@@ -100,6 +103,75 @@ impl LateDeleteResolutionToken {
     }
 }
 
+/// Sealed, linear permission to perform exactly one future exact Query for a
+/// newly and definitely reserved resolution ordinal. It owns the complete
+/// token; no partial fencing snapshot can be reconstructed into this permit.
+pub(crate) struct LateDeleteQueryPermit {
+    token: Box<LateDeleteResolutionToken>,
+}
+
+/// Sealed result of one exact Query which found the full expected identity.
+/// S1 deliberately has no production constructor: S3 must consume a
+/// [`LateDeleteQueryPermit`] after the real external Query.
+pub(crate) struct PresentPostQueryCapability {
+    token: Box<LateDeleteResolutionToken>,
+    revision: i64,
+    content_hash: String,
+}
+
+/// Sealed, linear permission for exactly one future conditional Delete. It is
+/// produced only after the dedicated `delete_started` transaction definitely
+/// commits, and intentionally has no row/token constructor.
+pub(crate) struct LateDeleteDeletePermit {
+    token: Box<LateDeleteResolutionToken>,
+    revision: i64,
+    content_hash: String,
+}
+
+/// M2-specific reservation result. The frozen LD-I2 reservation API remains
+/// unchanged and cannot be used to reconstruct a QueryPermit.
+pub(crate) enum LateDeleteQueryReservation {
+    Reserved(Box<LateDeleteQueryPermit>),
+    AlreadyReserved { resolution_ordinal: i64 },
+    LostLeaseOrSuperseded,
+    ResolutionLimitReached,
+}
+
+/// Outcome of the only durable `delete_started` issuance path.
+pub(crate) enum LateDeleteDeletePermitIssuance {
+    Issued(Box<LateDeleteDeletePermit>),
+    LostLeaseOrSuperseded,
+    WaitingRebuild,
+}
+
+/// Read-only durable classification for a commit-result-unknown caller. It
+/// intentionally contains no capability and can never recreate one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LateDeleteStartedDurableState {
+    CurrentEpochDeleteStarted,
+    NotCurrentEpochDeleteStarted,
+}
+
+#[cfg(test)]
+pub(crate) fn acknowledge_query_present_for_test(
+    permit: LateDeleteQueryPermit,
+    revision: i64,
+    content_hash: &str,
+) -> PresentPostQueryCapability {
+    PresentPostQueryCapability {
+        token: permit.token,
+        revision,
+        content_hash: content_hash.into(),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static DELETE_STARTED_BEFORE_COMMIT_FAULT: Cell<bool> = const { Cell::new(false) };
+    static DELETE_STARTED_AFTER_COMMIT_FAULT: Cell<bool> = const { Cell::new(false) };
+    static QUERY_PERMIT_AFTER_COMMIT_FAULT: Cell<bool> = const { Cell::new(false) };
+}
+
 /// Result of atomically claiming the next candidate under a runtime lease.
 pub(crate) enum LateDeleteResolutionClaimResult {
     Claimed(Box<LateDeleteResolutionClaim>),
@@ -178,6 +250,7 @@ struct ResolutionRow {
     resolution_count: i64,
     resolution_epoch: i64,
     last_reserved_resolution_epoch: i64,
+    last_disposition_epoch: i64,
     lease_owner: Option<String>,
     lease_fence_epoch: Option<i64>,
     lease_expires_at: Option<String>,
@@ -553,6 +626,40 @@ impl StorageService {
         Ok(LateDeleteResolutionReservation::Reserved(Box::new(token)))
     }
 
+    /// Reserves exactly one ordinal and returns its linear Query capability.
+    /// The established LD-I2 reservation API above intentionally remains
+    /// unchanged; this narrow wrapper is the only M2 entrypoint that may mint
+    /// a Query permit after a definite SQLite commit.
+    pub(crate) fn reserve_late_delete_resolution_for_query(
+        &self,
+        claim: &LateDeleteResolutionClaim,
+    ) -> Result<LateDeleteQueryReservation, StorageError> {
+        match self.reserve_late_delete_resolution(claim)? {
+            LateDeleteResolutionReservation::Reserved(token) => {
+                #[cfg(test)]
+                if QUERY_PERMIT_AFTER_COMMIT_FAULT.with(|fault| fault.replace(false)) {
+                    return Err(StorageError::new(
+                        "LATE_DELETE_QUERY_RESERVATION_COMMIT_RESULT_UNKNOWN",
+                        "test-only post-commit result loss; no Query permit is returned",
+                        true,
+                    ));
+                }
+                Ok(LateDeleteQueryReservation::Reserved(Box::new(
+                    LateDeleteQueryPermit { token },
+                )))
+            }
+            LateDeleteResolutionReservation::AlreadyReserved { resolution_ordinal } => {
+                Ok(LateDeleteQueryReservation::AlreadyReserved { resolution_ordinal })
+            }
+            LateDeleteResolutionReservation::LostLeaseOrSuperseded => {
+                Ok(LateDeleteQueryReservation::LostLeaseOrSuperseded)
+            }
+            LateDeleteResolutionReservation::ResolutionLimitReached => {
+                Ok(LateDeleteQueryReservation::ResolutionLimitReached)
+            }
+        }
+    }
+
     /// Read-only currency guard immediately before any resolver external I/O.
     pub(crate) fn late_delete_resolution_token_is_current(
         &self,
@@ -574,7 +681,152 @@ impl StorageService {
         token: &LateDeleteResolutionToken,
         disposition: LateDeleteResolutionDisposition,
     ) -> Result<LateDeleteResolutionFinalizeResult, StorageError> {
+        if matches!(disposition, LateDeleteResolutionDisposition::DeleteStarted) {
+            return Err(StorageError::new(
+                "LATE_DELETE_DELETE_STARTED_REQUIRES_PERMIT",
+                "delete_started may only be committed by issue_late_delete_permit",
+                false,
+            ));
+        }
         self.transition_late_delete_resolution(token, "processing", disposition, None, None)
+    }
+
+    /// Durably records the DeleteStarted boundary and mints the one linear
+    /// Delete capability only after that exact transaction commits. A caller
+    /// which cannot determine the commit result receives no capability.
+    pub(crate) fn issue_late_delete_permit(
+        &self,
+        present: PresentPostQueryCapability,
+    ) -> Result<LateDeleteDeletePermitIssuance, StorageError> {
+        let PresentPostQueryCapability {
+            token,
+            revision,
+            content_hash,
+        } = present;
+        let mut state = self.state()?;
+        let tx = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        let now = authoritative_utc_millis_now_in(&tx)?;
+        if !token_is_current_in(&tx, &token, &now)? {
+            tx.commit().map_err(storage_error)?;
+            return Ok(LateDeleteDeletePermitIssuance::LostLeaseOrSuperseded);
+        }
+        let row = load_resolution_in(&tx, token.resolution_id)?;
+        let Some(row) = row else {
+            tx.commit().map_err(storage_error)?;
+            return Ok(LateDeleteDeletePermitIssuance::LostLeaseOrSuperseded);
+        };
+        if !resolution_authority_is_current_in(&tx, &row, &now)? {
+            converge_waiting_rebuild_in(&tx, row.resolution_id, &now)?;
+            tx.commit().map_err(storage_error)?;
+            return Ok(LateDeleteDeletePermitIssuance::WaitingRebuild);
+        }
+        if row.last_disposition_epoch >= row.resolution_epoch {
+            tx.commit().map_err(storage_error)?;
+            return Ok(LateDeleteDeletePermitIssuance::LostLeaseOrSuperseded);
+        }
+        let changed = tx
+            .execute(
+                "UPDATE memory_vector_late_delete_resolution
+             SET last_resolution_disposition='delete_started',
+                 last_disposition_epoch=resolution_epoch, updated_at=?2
+             WHERE resolution_id=?1 AND outbox_id=?3 AND life_id=?4 AND memory_id=?5
+               AND mutation_sequence=?6 AND state='processing'
+               AND resolution_epoch=?7 AND resolution_count=?8
+               AND last_reserved_resolution_epoch=?7
+               AND last_disposition_epoch < resolution_epoch
+               AND lease_owner=?9 AND lease_fence_epoch=?10 AND lease_expires_at > ?2
+               AND claimed_generation_id=?11 AND embedding_descriptor_id=?12
+               AND embedding_dimension=?13 AND captured_generation_state=?14
+               AND witness_attempt_ordinal=?15 AND witness_claim_epoch=?16
+               AND witness_marked_claim_epoch=?17
+               AND witness_send_disposition IS ?18 AND witness_error_code IS ?19
+               AND witness_age_anchor_at=?20 AND captured_generation_authority_epoch=?21",
+                params![
+                    token.resolution_id,
+                    now,
+                    token.outbox_id,
+                    token.life_id,
+                    token.memory_id,
+                    token.mutation_sequence,
+                    token.resolution_epoch,
+                    token.resolution_ordinal,
+                    token.lease_owner,
+                    token.runtime_fence_epoch,
+                    token.claimed_generation_id,
+                    token.embedding_descriptor_id,
+                    token.embedding_dimension,
+                    token.captured_generation_state,
+                    token.witness_attempt_ordinal,
+                    token.witness_claim_epoch,
+                    token.witness_marked_claim_epoch,
+                    token.witness_send_disposition,
+                    token.witness_error_code,
+                    token.witness_age_anchor_at,
+                    token.captured_generation_authority_epoch,
+                ],
+            )
+            .map_err(storage_error)?;
+        if changed != 1 {
+            tx.commit().map_err(storage_error)?;
+            return Ok(LateDeleteDeletePermitIssuance::LostLeaseOrSuperseded);
+        }
+        #[cfg(test)]
+        if DELETE_STARTED_BEFORE_COMMIT_FAULT.with(|fault| fault.replace(false)) {
+            return Err(StorageError::new(
+                "LATE_DELETE_DELETE_STARTED_COMMIT_FAILED",
+                "test-only pre-commit failure; no Delete permit is returned",
+                true,
+            ));
+        }
+        tx.commit().map_err(storage_error)?;
+        #[cfg(test)]
+        if DELETE_STARTED_AFTER_COMMIT_FAULT.with(|fault| fault.replace(false)) {
+            return Err(StorageError::new(
+                "LATE_DELETE_DELETE_STARTED_COMMIT_RESULT_UNKNOWN",
+                "test-only post-commit result loss; no Delete permit is returned",
+                true,
+            ));
+        }
+        Ok(LateDeleteDeletePermitIssuance::Issued(Box::new(
+            LateDeleteDeletePermit {
+                token,
+                revision,
+                content_hash,
+            },
+        )))
+    }
+
+    /// Reconciles only durable state after a caller has lost the result of the
+    /// DeleteStarted commit. It intentionally cannot recreate a capability.
+    pub(crate) fn reconcile_late_delete_started(
+        &self,
+        resolution_id: i64,
+    ) -> Result<LateDeleteStartedDurableState, StorageError> {
+        let mut state = self.state()?;
+        let tx = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(storage_error)?;
+        let current: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM memory_vector_late_delete_resolution
+             WHERE resolution_id=?1 AND state='processing'
+               AND last_resolution_disposition='delete_started'
+               AND last_disposition_epoch=resolution_epoch
+               AND last_reserved_resolution_epoch=resolution_epoch)",
+                [resolution_id],
+                |row| row.get(0),
+            )
+            .map_err(storage_error)?;
+        tx.commit().map_err(storage_error)?;
+        Ok(if current {
+            LateDeleteStartedDurableState::CurrentEpochDeleteStarted
+        } else {
+            LateDeleteStartedDurableState::NotCurrentEpochDeleteStarted
+        })
     }
 
     pub(crate) fn finalize_late_delete_resolution_absent(
@@ -673,14 +925,65 @@ impl StorageService {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(storage_error)?;
         let now = authoritative_utc_millis_now_in(&tx)?;
-        let changed = tx.execute(
+        // DeleteStarted is a durable external-I/O boundary.  It must not fall
+        // through the ordinary expired-processing rule, which would otherwise
+        // produce a generic finalization outcome and blur the recovery proof.
+        let delete_started_rows = {
+            let mut statement = tx
+                .prepare(&format!(
+                    "{RESOLUTION_SELECT_SQL} WHERE state='processing'
+                     AND last_resolution_disposition='delete_started'
+                     AND last_disposition_epoch=resolution_epoch
+                     AND last_reserved_resolution_epoch=resolution_epoch
+                     AND lease_expires_at <= ?1"
+                ))
+                .map_err(storage_error)?;
+            let rows = statement
+                .query_map([&now], resolution_row)
+                .map_err(storage_error)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(storage_error)?;
+            rows
+        };
+        let mut changed = 0;
+        for row in delete_started_rows {
+            if row.resolution_count >= MAX_LATE_DELETE_RESOLUTIONS {
+                block_limit_in(&tx, row.resolution_id, &now)?;
+                changed += 1;
+            } else if !resolution_authority_is_current_in(&tx, &row, &now)? {
+                converge_waiting_rebuild_in(&tx, row.resolution_id, &now)?;
+                changed += 1;
+            } else {
+                changed += tx
+                    .execute(
+                        "UPDATE memory_vector_late_delete_resolution
+                     SET state='unknown', last_resolution_disposition='delete_unknown',
+                         last_disposition_epoch=resolution_epoch,
+                         last_error_code='LATE_DELETE_DELETE_STARTED_RECOVERY',
+                         lease_owner=NULL, lease_fence_epoch=NULL, lease_expires_at=NULL,
+                         next_attempt_at=NULL, updated_at=?2
+                     WHERE resolution_id=?1 AND state='processing'
+                       AND last_resolution_disposition='delete_started'
+                       AND last_disposition_epoch=resolution_epoch
+                       AND last_reserved_resolution_epoch=resolution_epoch
+                       AND lease_expires_at <= ?2",
+                        params![row.resolution_id, now],
+                    )
+                    .map_err(storage_error)?;
+            }
+        }
+        changed += tx.execute(
             "UPDATE memory_vector_late_delete_resolution
              SET state=CASE WHEN resolution_count >= ?1 THEN 'waiting_rebuild' WHEN state='claimed' THEN 'pending' ELSE 'unknown' END,
                  last_resolution_disposition=CASE WHEN resolution_count >= ?1 THEN 'waiting_rebuild' ELSE 'finalize_unknown' END,
                  last_disposition_epoch=resolution_epoch, last_error_code=CASE WHEN resolution_count >= ?1 THEN 'LATE_DELETE_RESOLUTION_LIMIT_REACHED' ELSE 'LATE_DELETE_RESOLUTION_LEASE_EXPIRED' END,
                  lease_owner=NULL, lease_fence_epoch=NULL, lease_expires_at=NULL,
                  next_attempt_at=NULL, updated_at=?2
-             WHERE state IN ('claimed','processing') AND lease_expires_at <= ?2",
+             WHERE state IN ('claimed','processing') AND lease_expires_at <= ?2
+               AND NOT (state='processing'
+                        AND last_resolution_disposition='delete_started'
+                        AND last_disposition_epoch=resolution_epoch
+                        AND last_reserved_resolution_epoch=resolution_epoch)",
             params![MAX_LATE_DELETE_RESOLUTIONS, now],
         ).map_err(storage_error)?;
         tx.commit().map_err(storage_error)?;
@@ -779,7 +1082,7 @@ fn select_next_candidate_in(
     tx.query_row(&format!("{RESOLUTION_SELECT_SQL} WHERE state IN ('pending','unknown','retry_wait') AND (state <> 'retry_wait' OR next_attempt_at <= ?1) AND (lease_owner IS NULL OR lease_expires_at <= ?1) ORDER BY mutation_sequence, resolution_id LIMIT 1"), [now], resolution_row).optional().map_err(storage_error)
 }
 
-const RESOLUTION_SELECT_SQL: &str = "SELECT resolution_id,outbox_id,life_id,memory_id,mutation_sequence,claimed_generation_id,embedding_descriptor_id,embedding_dimension,captured_generation_state,witness_attempt_ordinal,witness_claim_epoch,witness_marked_claim_epoch,witness_send_disposition,witness_error_code,witness_age_anchor_at,captured_generation_authority_epoch,state,resolution_count,resolution_epoch,last_reserved_resolution_epoch,lease_owner,lease_fence_epoch,lease_expires_at FROM memory_vector_late_delete_resolution";
+const RESOLUTION_SELECT_SQL: &str = "SELECT resolution_id,outbox_id,life_id,memory_id,mutation_sequence,claimed_generation_id,embedding_descriptor_id,embedding_dimension,captured_generation_state,witness_attempt_ordinal,witness_claim_epoch,witness_marked_claim_epoch,witness_send_disposition,witness_error_code,witness_age_anchor_at,captured_generation_authority_epoch,state,resolution_count,resolution_epoch,last_reserved_resolution_epoch,last_disposition_epoch,lease_owner,lease_fence_epoch,lease_expires_at FROM memory_vector_late_delete_resolution";
 
 fn resolution_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ResolutionRow> {
     Ok(ResolutionRow {
@@ -803,9 +1106,10 @@ fn resolution_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ResolutionRow> {
         resolution_count: row.get(17)?,
         resolution_epoch: row.get(18)?,
         last_reserved_resolution_epoch: row.get(19)?,
-        lease_owner: row.get(20)?,
-        lease_fence_epoch: row.get(21)?,
-        lease_expires_at: row.get(22)?,
+        last_disposition_epoch: row.get(20)?,
+        lease_owner: row.get(21)?,
+        lease_fence_epoch: row.get(22)?,
+        lease_expires_at: row.get(23)?,
     })
 }
 
@@ -1009,6 +1313,269 @@ mod tests {
             LateDeleteResolutionReservation::Reserved(token) => token,
             _ => panic!("claim must reserve"),
         }
+    }
+
+    fn reserved_query_permit(storage: &StorageService) -> Box<LateDeleteQueryPermit> {
+        let lease = storage
+            .acquire_late_delete_runtime_lease("resolver-a")
+            .unwrap()
+            .unwrap();
+        let claim = match storage.claim_one_late_delete_resolution(&lease).unwrap() {
+            LateDeleteResolutionClaimResult::Claimed(claim) => claim,
+            LateDeleteResolutionClaimResult::NoEligibleResolution => panic!("candidate must claim"),
+        };
+        match storage
+            .reserve_late_delete_resolution_for_query(&claim)
+            .unwrap()
+        {
+            LateDeleteQueryReservation::Reserved(permit) => permit,
+            _ => panic!("claim must reserve one Query permit"),
+        }
+    }
+
+    fn expire_resolution_lease(storage: &StorageService) {
+        storage
+            .state()
+            .unwrap()
+            .connection
+            .execute(
+                "UPDATE memory_vector_late_delete_resolution
+                 SET lease_expires_at='2020-01-01T00:00:00.000Z'
+                 WHERE life_id='life' AND memory_id='memory'",
+                [],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn late_delete_query_permit_and_delete_permit_are_issued_only_after_definite_commits() {
+        let (_root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let query_permit = reserved_query_permit(&storage);
+        let present = acknowledge_query_present_for_test(*query_permit, 7, "hash-7");
+        let delete_permit = match storage.issue_late_delete_permit(present).unwrap() {
+            LateDeleteDeletePermitIssuance::Issued(permit) => permit,
+            _ => panic!("definite DeleteStarted commit must issue one permit"),
+        };
+        assert_eq!(delete_permit.token.resolution_ordinal(), 1);
+        assert_eq!(delete_permit.revision, 7);
+        assert_eq!(delete_permit.content_hash, "hash-7");
+        assert_eq!(
+            storage
+                .reconcile_late_delete_started(delete_permit.token.resolution_id())
+                .unwrap(),
+            LateDeleteStartedDurableState::CurrentEpochDeleteStarted
+        );
+        let row: (String, String, i64, i64) = storage
+            .state()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT state,last_resolution_disposition,resolution_count,last_disposition_epoch
+                 FROM memory_vector_late_delete_resolution WHERE resolution_id=?1",
+                [delete_permit.token.resolution_id()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("processing".into(), "delete_started".into(), 1, 1));
+    }
+
+    #[test]
+    fn late_delete_query_permit_commit_unknown_returns_zero_permit() {
+        let (_root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let lease = storage
+            .acquire_late_delete_runtime_lease("resolver-a")
+            .unwrap()
+            .unwrap();
+        let claim = match storage.claim_one_late_delete_resolution(&lease).unwrap() {
+            LateDeleteResolutionClaimResult::Claimed(claim) => claim,
+            LateDeleteResolutionClaimResult::NoEligibleResolution => panic!("candidate must claim"),
+        };
+        QUERY_PERMIT_AFTER_COMMIT_FAULT.with(|fault| fault.set(true));
+        let error = match storage.reserve_late_delete_resolution_for_query(&claim) {
+            Err(error) => error,
+            Ok(_) => panic!("post-commit result loss must not return a Query permit"),
+        };
+        assert_eq!(
+            error.code,
+            "LATE_DELETE_QUERY_RESERVATION_COMMIT_RESULT_UNKNOWN"
+        );
+        let row: (String, i64, i64) = storage
+            .state()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT state,resolution_count,last_reserved_resolution_epoch
+                 FROM memory_vector_late_delete_resolution WHERE life_id='life' AND memory_id='memory'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("processing".into(), 1, 1));
+    }
+
+    #[test]
+    fn late_delete_delete_started_commit_unknown_reconciles_without_recreating_permit() {
+        let (_root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let query_permit = reserved_query_permit(&storage);
+        let resolution_id = query_permit.token.resolution_id();
+        let present = acknowledge_query_present_for_test(*query_permit, 7, "hash-7");
+        DELETE_STARTED_AFTER_COMMIT_FAULT.with(|fault| fault.set(true));
+        let error = match storage.issue_late_delete_permit(present) {
+            Err(error) => error,
+            Ok(_) => panic!("post-commit result loss must not return a Delete permit"),
+        };
+        assert_eq!(
+            error.code,
+            "LATE_DELETE_DELETE_STARTED_COMMIT_RESULT_UNKNOWN"
+        );
+        assert_eq!(
+            storage
+                .reconcile_late_delete_started(resolution_id)
+                .unwrap(),
+            LateDeleteStartedDurableState::CurrentEpochDeleteStarted
+        );
+    }
+
+    #[test]
+    fn late_delete_delete_permit_pre_commit_failure_returns_zero_permit() {
+        let (_root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let query_permit = reserved_query_permit(&storage);
+        let resolution_id = query_permit.token.resolution_id();
+        let present = acknowledge_query_present_for_test(*query_permit, 7, "hash-7");
+        DELETE_STARTED_BEFORE_COMMIT_FAULT.with(|fault| fault.set(true));
+        let error = match storage.issue_late_delete_permit(present) {
+            Err(error) => error,
+            Ok(_) => panic!("pre-commit failure must not return a Delete permit"),
+        };
+        assert_eq!(error.code, "LATE_DELETE_DELETE_STARTED_COMMIT_FAILED");
+        assert_eq!(
+            storage
+                .reconcile_late_delete_started(resolution_id)
+                .unwrap(),
+            LateDeleteStartedDurableState::NotCurrentEpochDeleteStarted
+        );
+    }
+
+    #[test]
+    fn late_delete_delete_started_24h_converges_waiting_rebuild() {
+        // The Query capability may outlive the 24-hour anchor. Model that
+        // passage only in this storage-local test by aging the same captured
+        // witness held by both the row and the already-issued Query permit.
+        let (_root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let query_permit = reserved_query_permit(&storage);
+        let mut token = query_permit.token;
+        token.witness_age_anchor_at = "2000-01-01T00:00:00.000Z".into();
+        storage
+            .state()
+            .unwrap()
+            .connection
+            .execute(
+                "UPDATE memory_vector_late_delete_resolution
+                 SET witness_age_anchor_at='2000-01-01T00:00:00.000Z'
+                 WHERE life_id='life' AND memory_id='memory'",
+                [],
+            )
+            .unwrap();
+        let present =
+            acknowledge_query_present_for_test(LateDeleteQueryPermit { token }, 7, "hash-7");
+        assert!(matches!(
+            storage.issue_late_delete_permit(present).unwrap(),
+            LateDeleteDeletePermitIssuance::WaitingRebuild
+        ));
+    }
+
+    #[test]
+    fn late_delete_delete_started_generation_authority_converges_waiting_rebuild() {
+        let (_root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let present =
+            acknowledge_query_present_for_test(*reserved_query_permit(&storage), 7, "hash-7");
+        storage
+            .state()
+            .unwrap()
+            .connection
+            .execute(
+                "UPDATE memory_vector_generation
+                 SET state='retired',authority_epoch=2 WHERE generation_id='generation-a'",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            storage.issue_late_delete_permit(present).unwrap(),
+            LateDeleteDeletePermitIssuance::WaitingRebuild
+        ));
+    }
+
+    #[test]
+    fn late_delete_delete_started_recovery_preserves_count_and_only_uses_delete_unknown_when_authoritative(
+    ) {
+        let (_root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let present =
+            acknowledge_query_present_for_test(*reserved_query_permit(&storage), 7, "hash-7");
+        let permit = match storage.issue_late_delete_permit(present).unwrap() {
+            LateDeleteDeletePermitIssuance::Issued(permit) => permit,
+            _ => panic!("must issue before recovery"),
+        };
+        let resolution_id = permit.token.resolution_id();
+        drop(permit);
+        expire_resolution_lease(&storage);
+        assert_eq!(
+            storage.recover_expired_late_delete_resolutions().unwrap(),
+            1
+        );
+        let row: (String, String, i64, Option<String>) = storage.state().unwrap().connection.query_row(
+            "SELECT state,last_resolution_disposition,resolution_count,lease_owner FROM memory_vector_late_delete_resolution WHERE resolution_id=?1",
+            [resolution_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).unwrap();
+        assert_eq!(row, ("unknown".into(), "delete_unknown".into(), 1, None));
+    }
+
+    #[test]
+    fn late_delete_delete_started_recovery_limit_and_authority_failure_wait_for_rebuild() {
+        for sql in [
+            "UPDATE memory_vector_late_delete_resolution SET resolution_count=3 WHERE life_id='life' AND memory_id='memory'",
+            "UPDATE memory_vector_generation SET state='retired',authority_epoch=2 WHERE generation_id='generation-a'",
+        ] {
+            let (_root, storage) = storage();
+            seed_resolution(&storage, "life", "memory", 1);
+            let present = acknowledge_query_present_for_test(*reserved_query_permit(&storage), 7, "hash-7");
+            let permit = match storage.issue_late_delete_permit(present).unwrap() {
+                LateDeleteDeletePermitIssuance::Issued(permit) => permit,
+                _ => panic!("must issue before recovery"),
+            };
+            drop(permit);
+            storage.state().unwrap().connection.execute(sql, []).unwrap();
+            expire_resolution_lease(&storage);
+            assert_eq!(storage.recover_expired_late_delete_resolutions().unwrap(), 1);
+            let row: (String, String) = storage.state().unwrap().connection.query_row(
+                "SELECT state,last_resolution_disposition FROM memory_vector_late_delete_resolution WHERE life_id='life' AND memory_id='memory'",
+                [], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+            assert_eq!(row, ("waiting_rebuild".into(), "waiting_rebuild".into()));
+        }
+    }
+
+    #[test]
+    fn late_delete_delete_started_recovery_leaves_generic_expired_processing_semantics_unchanged() {
+        let (_root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let token = reserved_token(&storage);
+        expire_resolution_lease(&storage);
+        assert_eq!(
+            storage.recover_expired_late_delete_resolutions().unwrap(),
+            1
+        );
+        let row: (String, String) = storage.state().unwrap().connection.query_row(
+            "SELECT state,last_resolution_disposition FROM memory_vector_late_delete_resolution WHERE resolution_id=?1",
+            [token.resolution_id()], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(row, ("unknown".into(), "finalize_unknown".into()));
     }
 
     #[test]
@@ -1217,15 +1784,13 @@ mod tests {
         assert!(storage
             .late_delete_resolution_token_is_current(&token)
             .unwrap());
-        assert_eq!(
-            storage
-                .mark_late_delete_resolution_disposition(
-                    &token,
-                    LateDeleteResolutionDisposition::DeleteStarted
-                )
-                .unwrap(),
-            LateDeleteResolutionFinalizeResult::Applied
-        );
+        let error = storage
+            .mark_late_delete_resolution_disposition(
+                &token,
+                LateDeleteResolutionDisposition::DeleteStarted,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "LATE_DELETE_DELETE_STARTED_REQUIRES_PERMIT");
         assert_eq!(
             storage
                 .finalize_late_delete_resolution_deleted(&token)

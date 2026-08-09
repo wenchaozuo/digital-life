@@ -167,7 +167,7 @@ mod tests {
                     0
                 ))
                 .unwrap(),
-            15
+            super::super::connection::MAX_SUPPORTED_SCHEMA_VERSION
         );
         drop(storage);
         let reopened = StorageService::initialize_with_roots(data_root, None).unwrap();

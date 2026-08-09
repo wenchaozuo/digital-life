@@ -2,8 +2,8 @@
 //!
 //! The coordinator is the only production path that combines the Windows
 //! process gate with SQLite's transaction boundary and installs the fixed
-//! version-13 writer-fence and version-14 attempt-identity schema only within
-//! that transaction.
+//! version-13 writer-fence through version-16 late-delete generation-authority
+//! schema only within that transaction.
 
 use std::path::Path;
 
@@ -84,11 +84,11 @@ fn open_after_mutex<G: StorageUpgradeGate>(
     }
 
     if version == connection::MAX_SUPPORTED_SCHEMA_VERSION {
-        record_upgrade_event("schema-14");
-        migration::validate_attempt_claim_identity_schema(&connection)?;
-        migration::validate_late_delete_resolution_schema(&connection)?;
+        record_upgrade_event("schema-16");
         record_upgrade_event("manifest");
         writer_fence_manifest::validate_writer_fence_manifest(&connection)?;
+        migration::validate_attempt_claim_identity_schema(&connection)?;
+        migration::validate_late_delete_generation_authority_schema(&connection)?;
         record_upgrade_event("post-verify");
         migration::verify_schema_after_upgrade(
             &connection,
@@ -122,11 +122,12 @@ fn open_after_mutex<G: StorageUpgradeGate>(
         UpgradeOccupancy::Occupied => return Err(StorageError::upgrade_quiescence_not_reached()),
     }
 
-    if version <= migration::LAST_STATIC_MIGRATION_VERSION {
+    let mut upgraded_version = version;
+    if upgraded_version <= migration::LAST_STATIC_MIGRATION_VERSION {
         record_upgrade_event("migrations");
         migration::apply_pending_migrations_in_transaction(
             &transaction,
-            version,
+            upgraded_version,
             connection::MAX_SUPPORTED_SCHEMA_VERSION,
         )?;
         record_upgrade_event("h1-b");
@@ -135,16 +136,36 @@ fn open_after_mutex<G: StorageUpgradeGate>(
         if writer_fence_upgrade != migration::WriterFenceSchemaUpgrade::Applied {
             return Err(StorageError::migration_version_invariant_failed());
         }
+        upgraded_version = writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION;
     }
 
-    record_upgrade_event("att-i1");
-    let attempt_upgrade = migration::apply_attempt_claim_identity_schema_upgrade(&transaction)?;
-    if attempt_upgrade != migration::AttemptClaimIdentitySchemaUpgrade::Applied {
+    if upgraded_version == writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION {
+        record_upgrade_event("att-i1");
+        let attempt_upgrade = migration::apply_attempt_claim_identity_schema_upgrade(&transaction)?;
+        if attempt_upgrade != migration::AttemptClaimIdentitySchemaUpgrade::Applied {
+            return Err(StorageError::migration_version_invariant_failed());
+        }
+        upgraded_version = migration::ATTEMPT_CLAIM_IDENTITY_SCHEMA_VERSION;
+    }
+
+    if upgraded_version == migration::ATTEMPT_CLAIM_IDENTITY_SCHEMA_VERSION {
+        let late_delete_upgrade =
+            migration::apply_late_delete_resolution_schema_upgrade(&transaction)?;
+        if late_delete_upgrade != migration::LateDeleteResolutionSchemaUpgrade::Applied {
+            return Err(StorageError::migration_version_invariant_failed());
+        }
+        upgraded_version = migration::LATE_DELETE_RESOLUTION_SCHEMA_VERSION;
+    }
+
+    if upgraded_version != migration::LATE_DELETE_RESOLUTION_SCHEMA_VERSION {
         return Err(StorageError::migration_version_invariant_failed());
     }
 
-    let late_delete_upgrade = migration::apply_late_delete_resolution_schema_upgrade(&transaction)?;
-    if late_delete_upgrade != migration::LateDeleteResolutionSchemaUpgrade::Applied {
+    let generation_authority_upgrade =
+        migration::apply_late_delete_generation_authority_schema_upgrade(&transaction)?;
+    if generation_authority_upgrade
+        != migration::LateDeleteGenerationAuthoritySchemaUpgrade::Applied
+    {
         return Err(StorageError::migration_version_invariant_failed());
     }
 
@@ -203,7 +224,7 @@ mod tests {
         time::Duration,
     };
 
-    use rusqlite::{Connection, TransactionBehavior};
+    use rusqlite::{functions::FunctionFlags, Connection, TransactionBehavior};
 
     use super::*;
 
@@ -450,6 +471,18 @@ mod tests {
                 || version == connection::MAX_SUPPORTED_SCHEMA_VERSION
         );
         let mut connection = Connection::open(path).unwrap();
+        if version == connection::MAX_SUPPORTED_SCHEMA_VERSION {
+            connection
+                .create_scalar_function(
+                    "digital_life_writer_epoch",
+                    0,
+                    FunctionFlags::SQLITE_UTF8
+                        | FunctionFlags::SQLITE_DETERMINISTIC
+                        | FunctionFlags::SQLITE_INNOCUOUS,
+                    |_| Ok(1_i64),
+                )
+                .unwrap();
+        }
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .unwrap();
@@ -473,6 +506,11 @@ mod tests {
             assert_eq!(
                 migration::apply_late_delete_resolution_schema_upgrade(&transaction).unwrap(),
                 migration::LateDeleteResolutionSchemaUpgrade::Applied
+            );
+            assert_eq!(
+                migration::apply_late_delete_generation_authority_schema_upgrade(&transaction)
+                    .unwrap(),
+                migration::LateDeleteGenerationAuthoritySchemaUpgrade::Applied
             );
         }
         transaction.commit().unwrap();
@@ -689,7 +727,7 @@ mod tests {
                 "mutex",
                 "open-before-wal",
                 "version-read",
-                "schema-14",
+                "schema-16",
                 "manifest",
                 "post-verify",
                 "wal",
@@ -887,12 +925,18 @@ mod tests {
 
             let error = open_coordinated_storage_connection_with_gate(&path, &gate).unwrap_err();
 
-            assert_eq!(error.code, "ATTEMPT_CLAIM_IDENTITY_SCHEMA_INVALID");
+            assert_eq!(error.code, "WRITER_FENCE_MANIFEST_MISSING");
             assert_eq!(gate.inspection_calls.get(), 0);
             assert_eq!(journal_mode(&path), "delete");
             assert_eq!(
                 take_upgrade_events(),
-                vec!["mutex", "open-before-wal", "version-read", "schema-14"]
+                vec![
+                    "mutex",
+                    "open-before-wal",
+                    "version-read",
+                    "schema-16",
+                    "manifest"
+                ]
             );
         }
     }
@@ -963,7 +1007,7 @@ mod tests {
                     "mutex",
                     "open-before-wal",
                     "version-read",
-                    "schema-14",
+                    "schema-16",
                     "manifest"
                 ]
             );
@@ -999,7 +1043,7 @@ mod tests {
                 "mutex",
                 "open-before-wal",
                 "version-read",
-                "schema-14",
+                "schema-16",
                 "manifest"
             ]
         );
@@ -1028,11 +1072,17 @@ mod tests {
             Err(error) => error,
         };
 
-        assert_eq!(error.code, "ATTEMPT_CLAIM_IDENTITY_SCHEMA_INVALID");
+        assert_eq!(error.code, "WRITER_FENCE_MANIFEST_MISSING");
         assert_eq!(journal_mode(&path), "delete");
         assert_eq!(
             take_upgrade_events(),
-            vec!["mutex", "open-before-wal", "version-read", "schema-14"]
+            vec![
+                "mutex",
+                "open-before-wal",
+                "version-read",
+                "schema-16",
+                "manifest"
+            ]
         );
     }
 
@@ -1053,7 +1103,7 @@ mod tests {
             connection::MAX_SUPPORTED_SCHEMA_VERSION
         );
         migration::validate_attempt_claim_identity_schema(&state.connection).unwrap();
-        migration::validate_late_delete_resolution_schema(&state.connection).unwrap();
+        migration::validate_late_delete_generation_authority_schema(&state.connection).unwrap();
         assert_eq!(writer_fence_count(&state.connection), 24);
         assert_eq!(
             take_upgrade_events(),
@@ -1061,7 +1111,7 @@ mod tests {
                 "mutex",
                 "open-before-wal",
                 "version-read",
-                "schema-14",
+                "schema-16",
                 "manifest",
                 "post-verify",
                 "wal",
@@ -1092,7 +1142,7 @@ mod tests {
             .unwrap();
         assert_eq!(writer_fence_count, 24);
         migration::validate_attempt_claim_identity_schema(&connection).unwrap();
-        migration::validate_late_delete_resolution_schema(&connection).unwrap();
+        migration::validate_late_delete_generation_authority_schema(&connection).unwrap();
         assert_eq!(gate.inspection_calls.get(), 2);
     }
 
@@ -1299,7 +1349,7 @@ mod tests {
                     applied_at TEXT NOT NULL
                 );
                 INSERT INTO schema_migration (version, name, applied_at)
-                VALUES (16, 'future', '2026-01-01T00:00:00Z');",
+                VALUES (17, 'future', '2026-01-01T00:00:00Z');",
             )
             .unwrap();
         drop(connection);
@@ -1329,7 +1379,7 @@ mod tests {
                     applied_at TEXT NOT NULL
                 );
                 INSERT INTO schema_migration (version, name, applied_at)
-                VALUES (16, 'future', '2026-01-01T00:00:00Z')",
+                VALUES (17, 'future', '2026-01-01T00:00:00Z')",
             )
             .unwrap();
         drop(connection);
@@ -1552,7 +1602,7 @@ mod tests {
                 connection::MAX_SUPPORTED_SCHEMA_VERSION
             );
             migration::validate_attempt_claim_identity_schema(&connection).unwrap();
-            migration::validate_late_delete_resolution_schema(&connection).unwrap();
+            migration::validate_late_delete_generation_authority_schema(&connection).unwrap();
             assert_eq!(writer_fence_count(&connection), 24);
             assert_eq!(journal_mode(&path), "delete");
             assert_eq!(
@@ -1801,7 +1851,7 @@ mod tests {
             );
             assert_eq!(writer_fence_count(&state.connection), 24);
             migration::validate_attempt_claim_identity_schema(&state.connection).unwrap();
-            migration::validate_late_delete_resolution_schema(&state.connection).unwrap();
+            migration::validate_late_delete_generation_authority_schema(&state.connection).unwrap();
             assert_eq!(
                 state
                     .connection

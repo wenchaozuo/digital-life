@@ -417,8 +417,8 @@ mod tests {
                  VALUES ('memory-vector-single-event-consumer', 'seed-owner', 4,
                          '2026-02-01T00:00:00.000Z');
                  INSERT INTO memory_vector_generation
-                     (generation_id, descriptor_hash, dimension, state)
-                 VALUES ('generation-seed', 'seed-descriptor', 3, 'building');
+                     (generation_id, descriptor_hash, dimension, state, authority_epoch)
+                 VALUES ('generation-seed', 'seed-descriptor', 3, 'building', 1);
                  INSERT INTO memory_vector_generation_item
                      (generation_id, life_id, memory_id, memory_revision, content_hash)
                  VALUES ('generation-seed', 'writer-fence-life', 'item-seed', 1, 'seed-hash');
@@ -492,7 +492,7 @@ mod tests {
                 [],
             ),
             "memory_vector_generation" => connection.execute(
-                "UPDATE memory_vector_generation SET descriptor_hash='updated-descriptor'
+                "UPDATE memory_vector_generation SET state='active', authority_epoch=authority_epoch+1
                  WHERE generation_id='generation-seed'",
                 [],
             ),
@@ -577,10 +577,12 @@ mod tests {
              (outbox_id, life_id, memory_id, mutation_sequence, claimed_generation_id,
               embedding_descriptor_id, embedding_dimension, captured_generation_state,
               witness_attempt_ordinal, witness_claim_epoch, witness_marked_claim_epoch,
-              witness_send_disposition, state, created_at, updated_at)
+              witness_send_disposition, witness_age_anchor_at, captured_generation_authority_epoch,
+              state, created_at, updated_at)
              VALUES (991, 'writer-fence-life', 'late-resolution', 991, 'generation-seed',
                      'seed-descriptor', 3, 'building', 1, 1, 1, 'possibly_sent',
-                     'pending', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')",
+                     '2026-01-01T00:00:00.000Z', 1, 'pending',
+                     '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')",
             [],
         )
     }
@@ -881,6 +883,18 @@ mod tests {
     }
 
     #[test]
+    fn generation_semantic_errors_are_static_and_deidentified() {
+        for error in [
+            StorageError::generation_authority_delete_forbidden(),
+            StorageError::generation_identity_immutable(),
+        ] {
+            assert!(!error.recoverable);
+            assert!(!error.message.contains("CREATE TRIGGER"));
+            assert!(!error.message.contains("\\\\"));
+        }
+    }
+
+    #[test]
     fn writer_fence_authorized_fixture_permits_all_eighteen_operations() {
         let (_root, path) = initialized_fenced_database();
         let connection = authorized_connection(&path);
@@ -903,7 +917,6 @@ mod tests {
             "memory_vector_sync_mutation_clock",
             "memory_vector_sync_runtime_lease",
             "memory_vector_generation_item",
-            "memory_vector_generation",
             "memory_vector_sync_settings",
         ] {
             assert_eq!(
@@ -912,6 +925,10 @@ mod tests {
                 "{table} delete"
             );
         }
+        let delete_error = protected_delete(&connection, "memory_vector_generation").unwrap_err();
+        assert!(delete_error
+            .to_string()
+            .contains("GENERATION_AUTHORITY_DELETE_FORBIDDEN"));
     }
 
     #[test]
@@ -1001,6 +1018,57 @@ mod tests {
             &epoch_zero,
             "memory_vector_sync_outbox",
         ));
+    }
+
+    #[test]
+    fn schema_16_generation_identity_immutable_generation_delete_denied_late_delete_resolution_runtime_create_captured_generation_authority_late_delete_24h_semantic_guards_are_orthogonal_to_the_twenty_four_writer_fence_triggers(
+    ) {
+        let (_root, path) = initialized_fenced_database();
+        let authorized = authorized_connection(&path);
+        seed_protected_rows(&authorized);
+        assert_eq!(WRITER_FENCE_TRIGGER_SPECS.len(), 24);
+        let reserved: i64 = authorized.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type='trigger' AND name LIKE 'digital_life_writer_epoch_%'", [], |r| r.get(0)).unwrap();
+        assert_eq!(reserved, 24);
+        for name in [
+            "memory_vector_generation_semantic_delete_guard",
+            "memory_vector_generation_semantic_identity_guard",
+            "memory_vector_generation_semantic_epoch_guard",
+        ] {
+            assert!(!name.starts_with(WRITER_FENCE_TRIGGER_PREFIX));
+            assert_eq!(
+                authorized
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_schema WHERE type='trigger' AND name=?1",
+                        [name],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                1
+            );
+        }
+        assert!(authorized.execute("UPDATE memory_vector_generation SET generation_id='other' WHERE generation_id='generation-seed'", []).unwrap_err().to_string().contains("GENERATION_IDENTITY_IMMUTABLE"));
+        assert!(authorized.execute("UPDATE memory_vector_generation SET descriptor_hash='other' WHERE generation_id='generation-seed'", []).unwrap_err().to_string().contains("GENERATION_IDENTITY_IMMUTABLE"));
+        assert!(authorized.execute("UPDATE memory_vector_generation SET dimension=4 WHERE generation_id='generation-seed'", []).unwrap_err().to_string().contains("GENERATION_IDENTITY_IMMUTABLE"));
+        assert!(authorized.execute("UPDATE memory_vector_generation SET state='active' WHERE generation_id='generation-seed'", []).unwrap_err().to_string().contains("GENERATION_AUTHORITY_EPOCH_INVALID"));
+        assert_eq!(authorized.execute("UPDATE memory_vector_generation SET state='active', authority_epoch=2 WHERE generation_id='generation-seed' AND authority_epoch=1", []).unwrap(), 1);
+        drop(authorized);
+        let stale = Connection::open(&path).unwrap();
+        stale
+            .create_scalar_function(
+                "digital_life_writer_epoch",
+                0,
+                FunctionFlags::SQLITE_UTF8
+                    | FunctionFlags::SQLITE_DETERMINISTIC
+                    | FunctionFlags::SQLITE_INNOCUOUS,
+                |_| Ok(0_i64),
+            )
+            .unwrap();
+        expect_static_incompatible_writer(stale.execute("UPDATE memory_vector_generation SET state='retired', authority_epoch=3 WHERE generation_id='generation-seed'", []));
+        expect_static_incompatible_writer(protected_delete(&stale, "memory_vector_generation"));
+        drop(stale);
+        let raw = Connection::open(&path).unwrap();
+        assert!(protected_delete(&raw, "memory_vector_generation").is_err());
+        assert_eq!(raw.query_row("SELECT COUNT(*) FROM memory_vector_generation WHERE generation_id='generation-seed'", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
     }
 
     #[test]

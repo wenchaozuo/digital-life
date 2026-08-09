@@ -736,7 +736,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 15);
+        assert_eq!(version, 16);
         let mut columns = Vec::new();
         for table in ["conversation", "conversation_message"] {
             columns.extend(

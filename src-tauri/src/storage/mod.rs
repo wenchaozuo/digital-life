@@ -167,6 +167,24 @@ impl StorageError {
         )
     }
 
+    #[allow(dead_code)] // Semantic SQL has no production DELETE entry point in M1.
+    pub(crate) fn generation_authority_delete_forbidden() -> Self {
+        Self::new(
+            "GENERATION_AUTHORITY_DELETE_FORBIDDEN",
+            "The generation authority row cannot be deleted.",
+            false,
+        )
+    }
+
+    #[allow(dead_code)] // Semantic SQL has no production identity-mutation entry point in M1.
+    pub(crate) fn generation_identity_immutable() -> Self {
+        Self::new(
+            "GENERATION_IDENTITY_IMMUTABLE",
+            "The generation identity cannot be modified.",
+            false,
+        )
+    }
+
     pub(super) fn legacy_writer_detected() -> Self {
         Self::new(
             "LEGACY_WRITER_DETECTED",
@@ -1802,7 +1820,7 @@ mod tests {
     }
 
     #[test]
-    fn backup_preserves_schema_fourteen_attempt_identity_and_writer_fence() {
+    fn backup_preserves_schema_sixteen_attempt_identity_and_writer_fence() {
         let root = TestRoot::new("migration-authorized-reopen");
         let service = seeded_service(&root.0);
         {
@@ -1846,7 +1864,7 @@ mod tests {
             .unwrap();
         assert_eq!(writer_fence_count, 24);
         migration::validate_attempt_claim_identity_schema(&state.connection).unwrap();
-        migration::validate_late_delete_resolution_schema(&state.connection).unwrap();
+        migration::validate_late_delete_generation_authority_schema(&state.connection).unwrap();
         assert_eq!(
             state
                 .connection

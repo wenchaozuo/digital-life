@@ -540,7 +540,7 @@ mod tests {
             .unwrap()
             .map(Result::unwrap)
             .collect();
-        assert_eq!(version, 15);
+        assert_eq!(version, 16);
         assert_eq!(profile_count, 0);
         assert!(!columns.iter().any(|column| {
             let column = column.to_ascii_lowercase();
@@ -590,7 +590,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 15);
+        assert_eq!(version, 16);
         assert_eq!(migration_count, 1);
 
         state
@@ -741,7 +741,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 15);
+        assert_eq!(version, 16);
     }
 
     #[test]
@@ -1263,7 +1263,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 15);
+        assert_eq!(version, 16);
     }
 
     #[test]
@@ -1408,7 +1408,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 15);
+        assert_eq!(version, 16);
     }
 
     #[test]

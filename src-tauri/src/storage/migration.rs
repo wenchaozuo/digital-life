@@ -10,6 +10,36 @@ pub(super) const ATTEMPT_CLAIM_IDENTITY_SCHEMA_VERSION: i64 = 14;
 const ATTEMPT_CLAIM_IDENTITY_MIGRATION_NAME: &str = "014_vector_sync_attempt_claim_identity";
 pub(super) const LATE_DELETE_RESOLUTION_SCHEMA_VERSION: i64 = 15;
 const LATE_DELETE_RESOLUTION_MIGRATION_NAME: &str = "015_vector_sync_late_delete_resolution";
+pub(super) const LATE_DELETE_GENERATION_AUTHORITY_SCHEMA_VERSION: i64 = 16;
+const LATE_DELETE_GENERATION_AUTHORITY_MIGRATION_NAME: &str =
+    "016_late_delete_generation_authority";
+const ADD_DELETE_WITNESS_AT_SQL: &str =
+    "ALTER TABLE memory_vector_sync_outbox ADD COLUMN delete_witness_at TEXT NULL";
+const ADD_WITNESS_AGE_ANCHOR_AT_SQL: &str = "ALTER TABLE memory_vector_late_delete_resolution ADD COLUMN witness_age_anchor_at TEXT NOT NULL DEFAULT ''";
+const ADD_CAPTURED_GENERATION_AUTHORITY_EPOCH_SQL: &str = "ALTER TABLE memory_vector_late_delete_resolution ADD COLUMN captured_generation_authority_epoch INTEGER NOT NULL DEFAULT 0 CHECK (captured_generation_authority_epoch >= 0)";
+const ADD_GENERATION_AUTHORITY_EPOCH_SQL: &str = "ALTER TABLE memory_vector_generation ADD COLUMN authority_epoch INTEGER NOT NULL DEFAULT 1 CHECK (authority_epoch >= 1)";
+const GENERATION_SEMANTIC_DELETE_TRIGGER_SQL: &str =
+    "CREATE TRIGGER memory_vector_generation_semantic_delete_guard
+BEFORE DELETE ON memory_vector_generation
+WHEN digital_life_writer_epoch() IS 1
+BEGIN
+    SELECT RAISE(ROLLBACK, 'GENERATION_AUTHORITY_DELETE_FORBIDDEN');
+END";
+const GENERATION_SEMANTIC_IDENTITY_TRIGGER_SQL: &str =
+    "CREATE TRIGGER memory_vector_generation_semantic_identity_guard
+BEFORE UPDATE OF generation_id, descriptor_hash, dimension ON memory_vector_generation
+WHEN digital_life_writer_epoch() IS 1
+BEGIN
+    SELECT RAISE(ROLLBACK, 'GENERATION_IDENTITY_IMMUTABLE');
+END";
+const GENERATION_SEMANTIC_EPOCH_TRIGGER_SQL: &str = "CREATE TRIGGER memory_vector_generation_semantic_epoch_guard
+BEFORE UPDATE ON memory_vector_generation
+WHEN digital_life_writer_epoch() IS 1
+ AND ((NEW.state <> OLD.state AND (OLD.authority_epoch = 9223372036854775807 OR NEW.authority_epoch <> OLD.authority_epoch + 1))
+   OR (NEW.state = OLD.state AND NEW.authority_epoch <> OLD.authority_epoch))
+BEGIN
+    SELECT RAISE(ROLLBACK, 'GENERATION_AUTHORITY_EPOCH_INVALID');
+END";
 const CREATE_LATE_DELETE_RESOLUTION_TABLE_SQL: &str = "CREATE TABLE memory_vector_late_delete_resolution (
     resolution_id INTEGER PRIMARY KEY,
     outbox_id INTEGER NOT NULL,
@@ -81,6 +111,11 @@ pub(super) enum AttemptClaimIdentitySchemaUpgrade {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum LateDeleteResolutionSchemaUpgrade {
+    Applied,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum LateDeleteGenerationAuthoritySchemaUpgrade {
     Applied,
 }
 
@@ -302,6 +337,178 @@ pub(super) fn apply_late_delete_resolution_schema_upgrade(
         params![LATE_DELETE_RESOLUTION_SCHEMA_VERSION, LATE_DELETE_RESOLUTION_MIGRATION_NAME],
     ).map_err(|_| StorageError::migration_transaction_failed())?;
     Ok(LateDeleteResolutionSchemaUpgrade::Applied)
+}
+
+/// Fixed LD-I3-M1 extension.  The migration reads SQLite time once, carries it
+/// through every conservative historical anchor, and only installs semantic
+/// triggers after the data shape has been made complete.
+pub(super) fn apply_late_delete_generation_authority_schema_upgrade(
+    transaction: &Transaction<'_>,
+) -> Result<LateDeleteGenerationAuthoritySchemaUpgrade, StorageError> {
+    if connection::read_schema_version(transaction)? != LATE_DELETE_RESOLUTION_SCHEMA_VERSION {
+        return Err(StorageError::migration_version_invariant_failed());
+    }
+    for sql in [
+        ADD_DELETE_WITNESS_AT_SQL,
+        ADD_WITNESS_AGE_ANCHOR_AT_SQL,
+        ADD_CAPTURED_GENERATION_AUTHORITY_EPOCH_SQL,
+        ADD_GENERATION_AUTHORITY_EPOCH_SQL,
+    ] {
+        transaction
+            .execute_batch(sql)
+            .map_err(|_| StorageError::migration_transaction_failed())?;
+    }
+    let migration16_now: String = transaction
+        .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |row| {
+            row.get(0)
+        })
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    let predicate = super::vector_sync_outbox::DELETE_UNKNOWN_EVIDENCE_SQL;
+    // SQLite parameters cannot name a SQL predicate; keep the frozen literal
+    // only in the statement assembled from this crate-private constant.
+    transaction
+        .execute(
+            &format!("UPDATE memory_vector_sync_outbox SET delete_witness_at=?1 WHERE {predicate}"),
+            params![migration16_now],
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    transaction.execute(
+        "UPDATE memory_vector_late_delete_resolution
+         SET witness_age_anchor_at=?1, captured_generation_authority_epoch=0,
+             state=CASE WHEN state IN ('pending','claimed','processing','unknown','retry_wait','exhausted','waiting_rebuild','blocked') THEN 'waiting_rebuild' ELSE state END,
+             last_resolution_disposition=CASE WHEN state IN ('pending','claimed','processing','unknown','retry_wait','exhausted','waiting_rebuild','blocked') THEN 'waiting_rebuild' ELSE last_resolution_disposition END,
+             last_disposition_epoch=CASE WHEN state IN ('pending','claimed','processing','unknown','retry_wait','exhausted','waiting_rebuild','blocked') THEN resolution_epoch ELSE last_disposition_epoch END,
+             lease_owner=CASE WHEN state IN ('pending','claimed','processing','unknown','retry_wait','exhausted','waiting_rebuild','blocked') THEN NULL ELSE lease_owner END,
+             lease_fence_epoch=CASE WHEN state IN ('pending','claimed','processing','unknown','retry_wait','exhausted','waiting_rebuild','blocked') THEN NULL ELSE lease_fence_epoch END,
+             lease_expires_at=CASE WHEN state IN ('pending','claimed','processing','unknown','retry_wait','exhausted','waiting_rebuild','blocked') THEN NULL ELSE lease_expires_at END,
+             next_attempt_at=CASE WHEN state IN ('pending','claimed','processing','unknown','retry_wait','exhausted','waiting_rebuild','blocked') THEN NULL ELSE next_attempt_at END,
+             updated_at=?1",
+        params![migration16_now],
+    ).map_err(|_| StorageError::migration_transaction_failed())?;
+    transaction.execute(
+        &format!("INSERT INTO memory_vector_late_delete_resolution
+          (outbox_id,life_id,memory_id,mutation_sequence,claimed_generation_id,embedding_descriptor_id,embedding_dimension,captured_generation_state,witness_attempt_ordinal,witness_claim_epoch,witness_marked_claim_epoch,witness_send_disposition,witness_error_code,witness_age_anchor_at,captured_generation_authority_epoch,state,last_resolution_disposition,last_disposition_epoch,created_at,updated_at)
+          SELECT o.id,o.life_id,o.memory_id,o.mutation_sequence,o.claimed_generation_id,g.descriptor_hash,g.dimension,g.state,o.attempt_count,o.fenced_claim_epoch,o.last_marked_claim_epoch,o.last_send_disposition,o.last_error_code,?1,0,'waiting_rebuild','waiting_rebuild',0,?1,?1
+          FROM memory_vector_sync_outbox o JOIN memory_vector_generation g ON g.generation_id=o.claimed_generation_id
+          WHERE {predicate} AND o.mutation_sequence>0 AND o.attempt_count BETWEEN 1 AND 5
+            AND o.fenced_claim_epoch>0 AND o.last_marked_claim_epoch>0 AND o.last_marked_claim_epoch<=o.fenced_claim_epoch
+            AND o.claimed_generation_id IS NOT NULL AND o.claimed_generation_id<>'' AND o.target_revision IS NULL AND o.target_content_hash IS NULL AND o.migration_disposition IS NULL
+            AND g.descriptor_hash<>'' AND g.dimension>0 AND g.state IN ('building','active','retired','failed')
+            AND NOT EXISTS (SELECT 1 FROM memory_vector_late_delete_resolution r WHERE r.life_id=o.life_id AND r.memory_id=o.memory_id AND r.mutation_sequence=o.mutation_sequence)"),
+        params![migration16_now],
+    ).map_err(|_| StorageError::migration_transaction_failed())?;
+    for sql in [
+        GENERATION_SEMANTIC_DELETE_TRIGGER_SQL,
+        GENERATION_SEMANTIC_IDENTITY_TRIGGER_SQL,
+        GENERATION_SEMANTIC_EPOCH_TRIGGER_SQL,
+    ] {
+        transaction
+            .execute_batch(sql)
+            .map_err(|_| StorageError::migration_transaction_failed())?;
+    }
+    transaction
+        .execute(
+            "INSERT INTO schema_migration (version,name,applied_at) VALUES (?1,?2,?3)",
+            params![
+                LATE_DELETE_GENERATION_AUTHORITY_SCHEMA_VERSION,
+                LATE_DELETE_GENERATION_AUTHORITY_MIGRATION_NAME,
+                migration16_now
+            ],
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    validate_late_delete_generation_authority_schema_objects(transaction)?;
+    Ok(LateDeleteGenerationAuthoritySchemaUpgrade::Applied)
+}
+
+pub(super) fn validate_late_delete_generation_authority_schema(
+    connection: &Connection,
+) -> Result<(), StorageError> {
+    if connection::read_schema_version(connection)?
+        != LATE_DELETE_GENERATION_AUTHORITY_SCHEMA_VERSION
+    {
+        return Err(StorageError::migration_version_invariant_failed());
+    }
+    validate_late_delete_generation_authority_schema_objects(connection)
+}
+
+fn validate_late_delete_generation_authority_schema_objects(
+    connection: &Connection,
+) -> Result<(), StorageError> {
+    for (table, column, declared_type, not_null, default_value) in [
+        (
+            "memory_vector_sync_outbox",
+            "delete_witness_at",
+            "TEXT",
+            0,
+            None,
+        ),
+        (
+            "memory_vector_late_delete_resolution",
+            "witness_age_anchor_at",
+            "TEXT",
+            1,
+            Some("''"),
+        ),
+        (
+            "memory_vector_late_delete_resolution",
+            "captured_generation_authority_epoch",
+            "INTEGER",
+            1,
+            Some("0"),
+        ),
+        (
+            "memory_vector_generation",
+            "authority_epoch",
+            "INTEGER",
+            1,
+            Some("1"),
+        ),
+    ] {
+        let found: Option<(String, i64, Option<String>)> = connection
+            .query_row(
+                &format!(
+                    "SELECT type, \"notnull\", dflt_value FROM pragma_table_info('{table}') WHERE name='{column}'"
+                ),
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .map_err(|_| StorageError::migration_transaction_failed())?;
+        if !matches!(found.as_ref(), Some((ty, nn, default)) if ty == declared_type && *nn == not_null && default.as_deref() == default_value)
+        {
+            return Err(StorageError::migration_transaction_failed());
+        }
+    }
+    for (name, sql) in [
+        (
+            "memory_vector_generation_semantic_delete_guard",
+            GENERATION_SEMANTIC_DELETE_TRIGGER_SQL,
+        ),
+        (
+            "memory_vector_generation_semantic_identity_guard",
+            GENERATION_SEMANTIC_IDENTITY_TRIGGER_SQL,
+        ),
+        (
+            "memory_vector_generation_semantic_epoch_guard",
+            GENERATION_SEMANTIC_EPOCH_TRIGGER_SQL,
+        ),
+    ] {
+        let actual: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?1",
+                [name],
+                |r| r.get(0),
+            )
+            .map_err(|_| StorageError::migration_transaction_failed())?;
+        if normalize_schema_fragment(&actual) != normalize_schema_fragment(sql) {
+            return Err(StorageError::migration_transaction_failed());
+        }
+    }
+    writer_fence_manifest::validate_writer_fence_manifest_for_schema(
+        connection,
+        LATE_DELETE_RESOLUTION_SCHEMA_VERSION,
+    )?;
+    Ok(())
 }
 
 pub(super) fn validate_late_delete_resolution_schema(
@@ -712,6 +919,9 @@ pub(super) fn verify_schema_after_upgrade(
     }
     if expected_schema_version == LATE_DELETE_RESOLUTION_SCHEMA_VERSION {
         validate_late_delete_resolution_schema(connection)?;
+    }
+    if expected_schema_version == LATE_DELETE_GENERATION_AUTHORITY_SCHEMA_VERSION {
+        validate_late_delete_generation_authority_schema(connection)?;
     }
     if expected_schema_version >= writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION {
         #[cfg(test)]
@@ -1383,6 +1593,159 @@ mod transaction_tests {
         transaction.commit().unwrap();
     }
 
+    fn apply_late_delete_generation_authority_upgrade(connection: &mut Connection) {
+        connection
+            .create_scalar_function(
+                "digital_life_writer_epoch",
+                0,
+                rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                    | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC
+                    | rusqlite::functions::FunctionFlags::SQLITE_INNOCUOUS,
+                |_| Ok(1_i64),
+            )
+            .unwrap();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert_eq!(
+            apply_late_delete_generation_authority_schema_upgrade(&transaction).unwrap(),
+            LateDeleteGenerationAuthoritySchemaUpgrade::Applied
+        );
+        transaction.commit().unwrap();
+    }
+
+    #[test]
+    fn migration_016_schema_16_delete_witness_at_witness_age_anchor_and_generation_authority_epoch_are_complete(
+    ) {
+        let mut connection = version_fourteen_connection();
+        apply_late_delete_resolution_upgrade(&mut connection);
+        apply_late_delete_generation_authority_upgrade(&mut connection);
+        assert_eq!(
+            schema_version(&connection),
+            LATE_DELETE_GENERATION_AUTHORITY_SCHEMA_VERSION
+        );
+        validate_late_delete_generation_authority_schema(&connection).unwrap();
+    }
+
+    #[test]
+    fn migration_016_historical_nonterminal_and_terminal_resolutions_keep_a_single_conservative_anchor(
+    ) {
+        let mut connection = version_fourteen_connection();
+        connection
+            .execute_batch(
+                "INSERT INTO memory_vector_generation (generation_id,descriptor_hash,dimension,state)
+                 VALUES ('generation-a','descriptor-a',2,'active');
+                 INSERT INTO memory_vector_sync_outbox
+                   (life_id,memory_id,desired_action,state,attempt_count,mutation_sequence,
+                    claimed_generation_id,fenced_claim_epoch,last_marked_claim_epoch,
+                    last_send_disposition)
+                 VALUES ('life','historical-outbox','delete','blocked',1,1,
+                         'generation-a',1,1,'possibly_sent');",
+            )
+            .unwrap();
+        apply_late_delete_resolution_upgrade(&mut connection);
+
+        let nonterminal = [
+            "pending",
+            "claimed",
+            "processing",
+            "unknown",
+            "retry_wait",
+            "exhausted",
+            "waiting_rebuild",
+            "blocked",
+        ];
+        let terminal = [
+            "resolved_absent",
+            "resolved_deleted",
+            "resolved_rebuilt",
+            "superseded",
+        ];
+        for (offset, state) in nonterminal.iter().chain(terminal.iter()).enumerate() {
+            let leased = matches!(*state, "claimed" | "processing");
+            let retry_wait = *state == "retry_wait";
+            let is_terminal = terminal.contains(state);
+            connection
+                .execute(
+                    "INSERT INTO memory_vector_late_delete_resolution
+                     (outbox_id,life_id,memory_id,mutation_sequence,claimed_generation_id,
+                      embedding_descriptor_id,embedding_dimension,captured_generation_state,
+                      witness_attempt_ordinal,witness_claim_epoch,witness_marked_claim_epoch,
+                      witness_send_disposition,witness_error_code,state,resolution_count,
+                      resolution_epoch,last_reserved_resolution_epoch,lease_owner,
+                      lease_fence_epoch,lease_expires_at,next_attempt_at,resolved_at,created_at,updated_at)
+                     VALUES (?1,'historic',?2,?3,'generation-a','descriptor-a',2,'active',1,1,1,
+                             'possibly_sent',NULL,?4,1,1,1,?5,?6,?7,?8,?9,
+                             '2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z')",
+                    params![
+                        1_000_i64 + offset as i64,
+                        format!("historic-{offset}"),
+                        100_i64 + offset as i64,
+                        *state,
+                        leased.then_some("owner-a"),
+                        leased.then_some(1_i64),
+                        leased.then_some("2099-01-01T00:00:00.000Z"),
+                        retry_wait.then_some("2099-01-01T00:00:00.000Z"),
+                        is_terminal.then_some("2026-01-01T00:00:00.000Z"),
+                    ],
+                )
+                .unwrap();
+        }
+
+        apply_late_delete_generation_authority_upgrade(&mut connection);
+        validate_late_delete_generation_authority_schema(&connection).unwrap();
+        let nonterminal_waiting: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM memory_vector_late_delete_resolution
+                 WHERE life_id='historic' AND state='waiting_rebuild'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(nonterminal_waiting, 8);
+        let terminal_preserved: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM memory_vector_late_delete_resolution
+                 WHERE life_id='historic' AND state IN
+                   ('resolved_absent','resolved_deleted','resolved_rebuilt','superseded')
+                   AND resolved_at IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(terminal_preserved, 4);
+        let anchors_and_epochs: (i64, i64, i64) = connection
+            .query_row(
+                "SELECT COUNT(DISTINCT witness_age_anchor_at),
+                        COUNT(*) FILTER (WHERE captured_generation_authority_epoch=0),
+                        COUNT(*) FILTER (WHERE lease_owner IS NULL
+                                         AND lease_fence_epoch IS NULL
+                                         AND lease_expires_at IS NULL)
+                 FROM memory_vector_late_delete_resolution WHERE life_id='historic'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(anchors_and_epochs, (1, 12, 12));
+        let outbox_and_resolution_anchor: (String, String, i64) = connection
+            .query_row(
+                "SELECT o.delete_witness_at,r.witness_age_anchor_at,
+                        r.captured_generation_authority_epoch
+                 FROM memory_vector_sync_outbox o
+                 JOIN memory_vector_late_delete_resolution r
+                   ON r.outbox_id=o.id
+                 WHERE o.life_id='life' AND o.memory_id='historical-outbox'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            outbox_and_resolution_anchor.0,
+            outbox_and_resolution_anchor.1
+        );
+        assert_eq!(outbox_and_resolution_anchor.2, 0);
+    }
+
     fn attempt_epoch_values(connection: &Connection, life_id: &str, memory_id: &str) -> (i64, i64) {
         connection
             .query_row(
@@ -1804,7 +2167,7 @@ mod transaction_tests {
     fn migration_transaction_rejects_targets_outside_the_h1_a3_contract() {
         let mut connection = transaction_connection();
         let transaction = connection.transaction().unwrap();
-        for target in [0, writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION, 16] {
+        for target in [0, writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION, 17] {
             let error =
                 apply_pending_migrations_in_transaction(&transaction, 0, target).unwrap_err();
             assert_eq!(error.code, "MIGRATION_VERSION_INVARIANT_FAILED");

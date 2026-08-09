@@ -49,6 +49,8 @@ pub(crate) struct LateDeleteResolutionClaim {
     witness_marked_claim_epoch: i64,
     witness_send_disposition: Option<String>,
     witness_error_code: Option<String>,
+    witness_age_anchor_at: String,
+    captured_generation_authority_epoch: i64,
     lease_owner: String,
     runtime_fence_epoch: i64,
     resolution_epoch: i64,
@@ -75,6 +77,8 @@ pub(crate) struct LateDeleteResolutionToken {
     witness_marked_claim_epoch: i64,
     witness_send_disposition: Option<String>,
     witness_error_code: Option<String>,
+    witness_age_anchor_at: String,
+    captured_generation_authority_epoch: i64,
     lease_owner: String,
     runtime_fence_epoch: i64,
     resolution_epoch: i64,
@@ -168,6 +172,8 @@ struct ResolutionRow {
     witness_marked_claim_epoch: i64,
     witness_send_disposition: Option<String>,
     witness_error_code: Option<String>,
+    witness_age_anchor_at: String,
+    captured_generation_authority_epoch: i64,
     state: String,
     resolution_count: i64,
     resolution_epoch: i64,
@@ -193,6 +199,68 @@ pub(super) fn authoritative_utc_millis_now_in(
             row.get(0)
         })
         .map_err(storage_error)
+}
+
+/// Creates the durable Resolution in the same SQLite transaction that first
+/// persists canonical Delete-Unknown evidence.  A missing generation cannot
+/// supply the immutable descriptor identity required by a Resolution, so that
+/// case aborts the caller-owned transaction rather than committing executable
+/// Unknown evidence without a durable Resolution.
+pub(super) fn ensure_runtime_resolution_for_delete_unknown_in(
+    tx: &Transaction<'_>,
+    outbox_id: i64,
+) -> Result<(), StorageError> {
+    let changed = tx.execute(
+        "INSERT INTO memory_vector_late_delete_resolution
+         (outbox_id,life_id,memory_id,mutation_sequence,claimed_generation_id,
+          embedding_descriptor_id,embedding_dimension,captured_generation_state,
+          witness_attempt_ordinal,witness_claim_epoch,witness_marked_claim_epoch,
+          witness_send_disposition,witness_error_code,witness_age_anchor_at,
+          captured_generation_authority_epoch,state,last_resolution_disposition,
+          last_disposition_epoch,created_at,updated_at)
+          SELECT o.id,o.life_id,o.memory_id,o.mutation_sequence,o.claimed_generation_id,
+                 g.descriptor_hash,g.dimension,g.state,
+                o.attempt_count,o.fenced_claim_epoch,o.last_marked_claim_epoch,
+                o.last_send_disposition,
+                CASE WHEN o.last_error_code='PROVIDER_RESULT_UNKNOWN'
+                     THEN o.last_error_code ELSE NULL END,
+                o.delete_witness_at,
+                 g.authority_epoch,
+                 'pending',NULL,
+                0,o.delete_witness_at,o.delete_witness_at
+           FROM memory_vector_sync_outbox o
+           JOIN memory_vector_generation g
+             ON g.generation_id=o.claimed_generation_id
+          WHERE o.id=?1 AND o.desired_action='delete'
+            AND (o.last_send_disposition='possibly_sent' OR o.last_error_code='PROVIDER_RESULT_UNKNOWN')
+            AND o.delete_witness_at IS NOT NULL AND o.mutation_sequence>0
+            AND o.attempt_count BETWEEN 1 AND 5 AND o.fenced_claim_epoch>0
+            AND o.last_marked_claim_epoch>0 AND o.last_marked_claim_epoch<=o.fenced_claim_epoch
+            AND o.claimed_generation_id IS NOT NULL AND o.claimed_generation_id<>''
+             AND o.target_revision IS NULL AND o.target_content_hash IS NULL AND o.migration_disposition IS NULL
+             AND g.descriptor_hash<>'' AND g.dimension>0
+             AND g.state IN ('building','active','retired','failed') AND g.authority_epoch>=1
+          ON CONFLICT(life_id,memory_id,mutation_sequence) DO NOTHING",
+        [outbox_id],
+    ).map_err(storage_error)?;
+    let resolution_exists: bool = tx
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM memory_vector_late_delete_resolution
+                 WHERE outbox_id=?1
+             )",
+            [outbox_id],
+            |row| row.get(0),
+        )
+        .map_err(storage_error)?;
+    if changed == 0 && !resolution_exists {
+        return Err(StorageError::new(
+            "LATE_DELETE_RESOLUTION_INVARIANT_VIOLATION",
+            "canonical Delete-Unknown cannot commit without a durable Resolution",
+            true,
+        ));
+    }
+    Ok(())
 }
 
 /// Supersede every older non-terminal resolution for the same memory before a
@@ -328,6 +396,11 @@ impl StorageService {
             tx.commit().map_err(storage_error)?;
             return Ok(LateDeleteResolutionClaimResult::NoEligibleResolution);
         };
+        if !resolution_authority_is_current_in(&tx, &row, &now)? {
+            converge_waiting_rebuild_in(&tx, row.resolution_id, &now)?;
+            tx.commit().map_err(storage_error)?;
+            return Ok(LateDeleteResolutionClaimResult::NoEligibleResolution);
+        }
         if row.resolution_count > MAX_LATE_DELETE_RESOLUTIONS {
             return Err(StorageError::new(
                 "LATE_DELETE_RESOLUTION_LIMIT_VIOLATION",
@@ -377,6 +450,8 @@ impl StorageService {
             witness_marked_claim_epoch: row.witness_marked_claim_epoch,
             witness_send_disposition: row.witness_send_disposition,
             witness_error_code: row.witness_error_code,
+            witness_age_anchor_at: row.witness_age_anchor_at,
+            captured_generation_authority_epoch: row.captured_generation_authority_epoch,
             lease_owner: lease.owner.clone(),
             runtime_fence_epoch: lease.fence_epoch,
             resolution_epoch: row.resolution_epoch + 1,
@@ -402,6 +477,11 @@ impl StorageService {
             return Ok(LateDeleteResolutionReservation::LostLeaseOrSuperseded);
         };
         if !claim_matches_row(claim, &row) || !runtime_lease_matches_in(&tx, claim, &now)? {
+            tx.commit().map_err(storage_error)?;
+            return Ok(LateDeleteResolutionReservation::LostLeaseOrSuperseded);
+        }
+        if !resolution_authority_is_current_in(&tx, &row, &now)? {
+            converge_waiting_rebuild_in(&tx, row.resolution_id, &now)?;
             tx.commit().map_err(storage_error)?;
             return Ok(LateDeleteResolutionReservation::LostLeaseOrSuperseded);
         }
@@ -462,6 +542,8 @@ impl StorageService {
             witness_marked_claim_epoch: row.witness_marked_claim_epoch,
             witness_send_disposition: row.witness_send_disposition,
             witness_error_code: row.witness_error_code,
+            witness_age_anchor_at: row.witness_age_anchor_at,
+            captured_generation_authority_epoch: row.captured_generation_authority_epoch,
             lease_owner: claim.lease_owner.clone(),
             runtime_fence_epoch: claim.runtime_fence_epoch,
             resolution_epoch: row.resolution_epoch,
@@ -697,7 +779,7 @@ fn select_next_candidate_in(
     tx.query_row(&format!("{RESOLUTION_SELECT_SQL} WHERE state IN ('pending','unknown','retry_wait') AND (state <> 'retry_wait' OR next_attempt_at <= ?1) AND (lease_owner IS NULL OR lease_expires_at <= ?1) ORDER BY mutation_sequence, resolution_id LIMIT 1"), [now], resolution_row).optional().map_err(storage_error)
 }
 
-const RESOLUTION_SELECT_SQL: &str = "SELECT resolution_id,outbox_id,life_id,memory_id,mutation_sequence,claimed_generation_id,embedding_descriptor_id,embedding_dimension,captured_generation_state,witness_attempt_ordinal,witness_claim_epoch,witness_marked_claim_epoch,witness_send_disposition,witness_error_code,state,resolution_count,resolution_epoch,last_reserved_resolution_epoch,lease_owner,lease_fence_epoch,lease_expires_at FROM memory_vector_late_delete_resolution";
+const RESOLUTION_SELECT_SQL: &str = "SELECT resolution_id,outbox_id,life_id,memory_id,mutation_sequence,claimed_generation_id,embedding_descriptor_id,embedding_dimension,captured_generation_state,witness_attempt_ordinal,witness_claim_epoch,witness_marked_claim_epoch,witness_send_disposition,witness_error_code,witness_age_anchor_at,captured_generation_authority_epoch,state,resolution_count,resolution_epoch,last_reserved_resolution_epoch,lease_owner,lease_fence_epoch,lease_expires_at FROM memory_vector_late_delete_resolution";
 
 fn resolution_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ResolutionRow> {
     Ok(ResolutionRow {
@@ -715,13 +797,15 @@ fn resolution_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ResolutionRow> {
         witness_marked_claim_epoch: row.get(11)?,
         witness_send_disposition: row.get(12)?,
         witness_error_code: row.get(13)?,
-        state: row.get(14)?,
-        resolution_count: row.get(15)?,
-        resolution_epoch: row.get(16)?,
-        last_reserved_resolution_epoch: row.get(17)?,
-        lease_owner: row.get(18)?,
-        lease_fence_epoch: row.get(19)?,
-        lease_expires_at: row.get(20)?,
+        witness_age_anchor_at: row.get(14)?,
+        captured_generation_authority_epoch: row.get(15)?,
+        state: row.get(16)?,
+        resolution_count: row.get(17)?,
+        resolution_epoch: row.get(18)?,
+        last_reserved_resolution_epoch: row.get(19)?,
+        lease_owner: row.get(20)?,
+        lease_fence_epoch: row.get(21)?,
+        lease_expires_at: row.get(22)?,
     })
 }
 
@@ -740,6 +824,8 @@ fn claim_matches_row(claim: &LateDeleteResolutionClaim, row: &ResolutionRow) -> 
         && row.witness_marked_claim_epoch == claim.witness_marked_claim_epoch
         && row.witness_send_disposition == claim.witness_send_disposition
         && row.witness_error_code == claim.witness_error_code
+        && row.witness_age_anchor_at == claim.witness_age_anchor_at
+        && row.captured_generation_authority_epoch == claim.captured_generation_authority_epoch
         && row.lease_owner.as_deref() == Some(claim.lease_owner.as_str())
         && row.lease_fence_epoch == Some(claim.runtime_fence_epoch)
         && row.resolution_epoch == claim.resolution_epoch
@@ -777,6 +863,8 @@ fn token_is_current_in(
         && row.witness_marked_claim_epoch == token.witness_marked_claim_epoch
         && row.witness_send_disposition == token.witness_send_disposition
         && row.witness_error_code == token.witness_error_code
+        && row.witness_age_anchor_at == token.witness_age_anchor_at
+        && row.captured_generation_authority_epoch == token.captured_generation_authority_epoch
         && row.lease_owner.as_deref() == Some(token.lease_owner.as_str())
         && row.lease_fence_epoch == Some(token.runtime_fence_epoch)
         && row
@@ -786,6 +874,43 @@ fn token_is_current_in(
         && row.resolution_epoch == token.resolution_epoch
         && row.resolution_count == token.resolution_ordinal
         && row.last_reserved_resolution_epoch == token.resolution_epoch)
+}
+
+fn resolution_authority_is_current_in(
+    tx: &Transaction<'_>,
+    row: &ResolutionRow,
+    now: &str,
+) -> Result<bool, StorageError> {
+    if row.captured_generation_authority_epoch <= 0 {
+        return Ok(false);
+    }
+    let before_fallback: bool = tx
+        .query_row(
+            "SELECT ?1 < strftime('%Y-%m-%dT%H:%M:%fZ', ?2, '+24 hours')",
+            params![now, row.witness_age_anchor_at],
+            |r| r.get(0),
+        )
+        .map_err(storage_error)?;
+    if !before_fallback {
+        return Ok(false);
+    }
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM memory_vector_generation WHERE generation_id=?1 AND descriptor_hash=?2 AND dimension=?3 AND state=?4 AND authority_epoch=?5)",
+        params![row.claimed_generation_id,row.embedding_descriptor_id,row.embedding_dimension,row.captured_generation_state,row.captured_generation_authority_epoch],
+        |r| r.get(0),
+    ).map_err(storage_error)
+}
+
+fn converge_waiting_rebuild_in(
+    tx: &Transaction<'_>,
+    resolution_id: i64,
+    now: &str,
+) -> Result<(), StorageError> {
+    tx.execute(
+        "UPDATE memory_vector_late_delete_resolution SET state='waiting_rebuild', last_resolution_disposition='waiting_rebuild', last_disposition_epoch=resolution_epoch, lease_owner=NULL, lease_fence_epoch=NULL, lease_expires_at=NULL, next_attempt_at=NULL, updated_at=?2 WHERE resolution_id=?1",
+        params![resolution_id, now],
+    ).map_err(storage_error)?;
+    Ok(())
 }
 
 fn block_limit_in(tx: &Transaction<'_>, resolution_id: i64, now: &str) -> Result<(), StorageError> {
@@ -853,16 +978,22 @@ mod tests {
 
     fn seed_resolution(storage: &StorageService, life_id: &str, memory_id: &str, sequence: i64) {
         let state = storage.state().unwrap();
-        state.connection.execute(
-            "INSERT INTO memory_vector_late_delete_resolution
+        state.connection.execute("INSERT INTO memory_vector_generation (generation_id,descriptor_hash,dimension,state,authority_epoch) VALUES ('generation-a','descriptor-a',2,'active',1) ON CONFLICT(generation_id) DO NOTHING", []).unwrap();
+        state
+            .connection
+            .execute(
+                "INSERT INTO memory_vector_late_delete_resolution
              (outbox_id,life_id,memory_id,mutation_sequence,claimed_generation_id,
               embedding_descriptor_id,embedding_dimension,captured_generation_state,
               witness_attempt_ordinal,witness_claim_epoch,witness_marked_claim_epoch,
-              witness_send_disposition,witness_error_code,state,created_at,updated_at)
+              witness_send_disposition,witness_error_code,witness_age_anchor_at,
+              captured_generation_authority_epoch,state,created_at,updated_at)
              VALUES (17,?1,?2,?3,'generation-a','descriptor-a',2,'active',1,1,1,
-                     'possibly_sent',NULL,'pending','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z')",
-            params![life_id, memory_id, sequence],
-        ).unwrap();
+                     'possibly_sent',NULL,'2099-01-01T00:00:00.000Z',1,
+                     'pending','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z')",
+                params![life_id, memory_id, sequence],
+            )
+            .unwrap();
     }
 
     fn reserved_token(storage: &StorageService) -> Box<LateDeleteResolutionToken> {
@@ -1110,6 +1241,90 @@ mod tests {
             [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
         ).unwrap();
         assert_eq!(row, ("resolved_deleted".to_string(), 1, None, None));
+    }
+
+    #[test]
+    fn captured_generation_authority_epoch_change_between_claim_and_reserve_returns_no_token_without_consuming_ordinal(
+    ) {
+        let (_root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let lease = storage
+            .acquire_late_delete_runtime_lease("resolver-a")
+            .unwrap()
+            .unwrap();
+        let claim = match storage.claim_one_late_delete_resolution(&lease).unwrap() {
+            LateDeleteResolutionClaimResult::Claimed(claim) => claim,
+            LateDeleteResolutionClaimResult::NoEligibleResolution => panic!("candidate must claim"),
+        };
+
+        storage
+            .state()
+            .unwrap()
+            .connection
+            .execute(
+                "UPDATE memory_vector_generation
+                 SET state='retired', authority_epoch=authority_epoch+1
+                 WHERE generation_id='generation-a'",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            storage.reserve_late_delete_resolution(&claim).unwrap(),
+            LateDeleteResolutionReservation::LostLeaseOrSuperseded
+        ));
+        let row: (String, i64, Option<String>) = storage
+            .state()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT state,resolution_count,lease_owner
+                 FROM memory_vector_late_delete_resolution
+                 WHERE life_id='life' AND memory_id='memory'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("waiting_rebuild".to_string(), 0, None));
+    }
+
+    #[test]
+    fn late_delete_24h_authority_guard_converges_before_the_third_resolution_budget_slot() {
+        let (_root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        storage
+            .state()
+            .unwrap()
+            .connection
+            .execute(
+                "UPDATE memory_vector_late_delete_resolution
+                 SET witness_age_anchor_at='2000-01-01T00:00:00.000Z',
+                     resolution_count=2, resolution_epoch=2,
+                     last_reserved_resolution_epoch=2
+                 WHERE life_id='life' AND memory_id='memory'",
+                [],
+            )
+            .unwrap();
+        let lease = storage
+            .acquire_late_delete_runtime_lease("resolver-a")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            storage.claim_one_late_delete_resolution(&lease).unwrap(),
+            LateDeleteResolutionClaimResult::NoEligibleResolution
+        ));
+        let row: (String, i64, Option<String>) = storage
+            .state()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT state,resolution_count,lease_owner
+                 FROM memory_vector_late_delete_resolution
+                 WHERE life_id='life' AND memory_id='memory'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("waiting_rebuild".to_string(), 2, None));
     }
 
     #[test]

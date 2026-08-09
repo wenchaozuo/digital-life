@@ -747,8 +747,8 @@ impl StorageService {
         }
         let state = self.state()?;
         state.connection.execute(
-            "INSERT INTO memory_vector_generation (generation_id, descriptor_hash, dimension, state)
-             VALUES (?1, ?2, ?3, 'building')
+            "INSERT INTO memory_vector_generation (generation_id, descriptor_hash, dimension, state, authority_epoch)
+             VALUES (?1, ?2, ?3, 'building', 1)
              ON CONFLICT(generation_id) DO NOTHING",
             params![generation_id, descriptor_hash, dimension as i64],
         ).map_err(|_| single_event_error())?;
@@ -1156,12 +1156,14 @@ impl StorageService {
             .execute(
                 &format!(
                     "UPDATE memory_vector_sync_outbox
-                     SET last_send_disposition='possibly_sent',
-                         updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                         SET last_send_disposition='possibly_sent',
+                         delete_witness_at=CASE WHEN delete_witness_at IS NULL THEN :delete_witness_at ELSE delete_witness_at END,
+                         updated_at=:delete_witness_at
                      WHERE {FENCED_ATTEMPT_TOKEN_FINALIZE_IDENTITY}"
                 ),
                 rusqlite::named_params! {
                     ":current_now": current_now.as_str(),
+                    ":delete_witness_at": current_now.as_str(),
                     ":id": token.outbox_id,
                     ":desired_action": token.action.as_str(),
                     ":mutation_sequence": token.mutation_sequence,
@@ -1178,6 +1180,13 @@ impl StorageService {
                 },
             )
             .map_err(|_| single_event_error())?;
+        if changed == 1 {
+            late_delete_resolution::ensure_runtime_resolution_for_delete_unknown_in(
+                &tx,
+                token.outbox_id,
+            )
+            .map_err(|_| single_event_error())?;
+        }
         tx.commit().map_err(|_| single_event_error())?;
         #[cfg(test)]
         if changed == 1 && take_post_commit_delete_witness_fault_for_test() {
@@ -1210,7 +1219,8 @@ impl StorageService {
                 &format!(
                     "SELECT 1 FROM memory_vector_sync_outbox
                      WHERE {FENCED_ATTEMPT_TOKEN_FINALIZE_IDENTITY}
-                       AND last_send_disposition='possibly_sent'"
+                       AND last_send_disposition='possibly_sent'
+                       AND delete_witness_at IS NOT NULL"
                 ),
                 rusqlite::named_params! {
                     ":current_now": current_now.as_str(),
@@ -1453,6 +1463,44 @@ impl StorageService {
                 FencedFailureFinalizeResult::LostLeaseOrSuperseded
             }
         };
+        if token.action == MemoryVectorSyncAction::Delete {
+            let canonical_unknown: bool = tx
+                .query_row(
+                    &format!(
+                        "SELECT EXISTS(
+                             SELECT 1 FROM memory_vector_sync_outbox
+                             WHERE id=:id AND {DELETE_UNKNOWN_EVIDENCE_SQL}
+                         )"
+                    ),
+                    rusqlite::named_params! { ":id": token.outbox_id },
+                    |row| row.get(0),
+                )
+                .map_err(|_| single_event_error())?;
+            if canonical_unknown {
+                let has_witness_anchor: bool = tx
+                    .query_row(
+                        "SELECT EXISTS(
+                             SELECT 1 FROM memory_vector_sync_outbox
+                             WHERE id=?1 AND delete_witness_at IS NOT NULL
+                         )",
+                        [token.outbox_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| single_event_error())?;
+                if !has_witness_anchor {
+                    return Err(crate::storage::StorageError::new(
+                        "LATE_DELETE_RESOLUTION_INVARIANT_VIOLATION",
+                        "canonical Delete-Unknown requires a durable pre-send witness",
+                        true,
+                    ));
+                }
+                late_delete_resolution::ensure_runtime_resolution_for_delete_unknown_in(
+                    &tx,
+                    token.outbox_id,
+                )
+                .map_err(|_| single_event_error())?;
+            }
+        }
         tx.commit().map_err(|_| single_event_error())?;
         #[cfg(test)]
         if !matches!(result, FencedFailureFinalizeResult::LostLeaseOrSuperseded)
@@ -2015,7 +2063,7 @@ impl StorageService {
             "SELECT id, desired_action, mutation_sequence, target_revision, target_content_hash,
                     state, attempt_count, lease_owner, lease_fence_epoch, lease_expires_at, claimed_generation_id,
                     (claimed_generation_id IS NULL), migration_disposition, last_error_code, last_send_disposition, next_attempt_at,
-                    fenced_claim_epoch, last_marked_claim_epoch, updated_at
+                    fenced_claim_epoch, last_marked_claim_epoch, delete_witness_at, updated_at
              FROM memory_vector_sync_outbox WHERE life_id=?1 AND memory_id=?2",
             params![life_id, memory_id],
             |r| {
@@ -2039,6 +2087,7 @@ impl StorageService {
                     r.get(16)?,
                     r.get(17)?,
                     r.get(18)?,
+                    r.get(19)?,
                 ))
             },
         ).map_err(|_| single_event_error())?;
@@ -2062,7 +2111,8 @@ impl StorageService {
             next_attempt_at: row.15,
             fenced_claim_epoch: row.16,
             last_marked_claim_epoch: row.17,
-            updated_at: row.18,
+            delete_witness_at: row.18,
+            updated_at: row.19,
         })
     }
 
@@ -2145,6 +2195,7 @@ pub(crate) struct OutboxSnapshotDetailed {
     pub next_attempt_at: Option<String>,
     pub fenced_claim_epoch: i64,
     pub last_marked_claim_epoch: i64,
+    pub delete_witness_at: Option<String>,
     pub updated_at: String,
 }
 
@@ -3967,7 +4018,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 15);
+        assert_eq!(version, 16);
     }
 
     #[test]
@@ -4007,7 +4058,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 15);
+        assert_eq!(version, 16);
         drop(storage);
 
         let reopened = StorageService::initialize_with_roots(data_root, None).unwrap();
@@ -6105,6 +6156,37 @@ mod tests {
             witnessed.last_send_disposition.as_deref(),
             Some("possibly_sent")
         );
+        let witness_anchor = witnessed
+            .delete_witness_at
+            .as_deref()
+            .expect("Delete witness must carry its durable time anchor");
+        let resolution: (String, i64, String, i64, String) = storage
+            .state()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT r.witness_age_anchor_at,r.captured_generation_authority_epoch,
+                        r.state,g.authority_epoch,o.delete_witness_at
+                 FROM memory_vector_late_delete_resolution r
+                 JOIN memory_vector_sync_outbox o ON o.id=r.outbox_id
+                 JOIN memory_vector_generation g ON g.generation_id=r.claimed_generation_id
+                 WHERE r.outbox_id=?1",
+                [witnessed.id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(resolution.0, witness_anchor);
+        assert_eq!(resolution.4, witness_anchor);
+        assert_eq!(resolution.1, resolution.3);
+        assert_eq!(resolution.2, "pending");
 
         // Reserve is independently fail-closed even though this direct test call
         // bypasses ordinary candidate selection.
@@ -6157,6 +6239,10 @@ mod tests {
             "recovery must not clear Unknown Delete evidence"
         );
         assert_eq!(
+            recovered.delete_witness_at, witnessed.delete_witness_at,
+            "recovery must not replace the original Delete witness time anchor"
+        );
+        assert_eq!(
             (
                 recovered.lease_owner,
                 recovered.lease_fence_epoch,
@@ -6172,6 +6258,120 @@ mod tests {
                 .delete_replay_not_eligible_count,
             1
         );
+    }
+
+    #[test]
+    fn delete_witness_commit_unknown_persists_runtime_resolution_anchor_and_captured_generation_authority(
+    ) {
+        let (root, storage) = storage();
+        let record = confirmed(&storage, false);
+        storage
+            .enqueue(EnqueueMemoryVectorSyncRequest {
+                life_id: record.life_id.clone(),
+                memory_id: record.id.clone(),
+                desired_action: MemoryVectorSyncAction::Delete,
+            })
+            .unwrap();
+        storage
+            .register_building_vector_generation("generation-a", "descriptor-a", 2)
+            .unwrap();
+        let claim = storage
+            .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-a")
+            .unwrap()
+            .unwrap();
+        let token = reserve_token(&storage, &claim);
+
+        storage.test_fail_next_fenced_delete_witness_after_commit();
+        assert!(storage.mark_fenced_delete_send_witness(&token).is_err());
+        assert!(storage
+            .fenced_delete_send_witness_is_persisted(&token)
+            .unwrap());
+
+        let reopened = StorageService::initialize_with_roots(root.0.join("data"), None).unwrap();
+        let witnessed = reopened
+            .test_get_outbox_snapshot_detailed(&record.life_id, &record.id)
+            .unwrap();
+        let witness_anchor = witnessed.delete_witness_at.clone().unwrap();
+        let row: (String, i64, String, i64, String) = reopened
+            .state()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT r.witness_age_anchor_at,r.captured_generation_authority_epoch,
+                        r.state,g.authority_epoch,o.delete_witness_at
+                 FROM memory_vector_late_delete_resolution r
+                 JOIN memory_vector_sync_outbox o ON o.id=r.outbox_id
+                 JOIN memory_vector_generation g ON g.generation_id=r.claimed_generation_id
+                 WHERE r.outbox_id=?1",
+                [witnessed.id],
+                |db_row| {
+                    Ok((
+                        db_row.get(0)?,
+                        db_row.get(1)?,
+                        db_row.get(2)?,
+                        db_row.get(3)?,
+                        db_row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(row.0, witness_anchor);
+        assert_eq!(row.4, witness_anchor);
+        assert_eq!(row.1, row.3);
+        assert_eq!(row.2, "pending");
+    }
+
+    #[test]
+    fn delete_unknown_failure_finalize_without_a_pre_send_witness_rolls_back_fail_closed() {
+        let (_root, storage) = storage();
+        let record = confirmed(&storage, false);
+        storage
+            .enqueue(EnqueueMemoryVectorSyncRequest {
+                life_id: record.life_id.clone(),
+                memory_id: record.id.clone(),
+                desired_action: MemoryVectorSyncAction::Delete,
+            })
+            .unwrap();
+        storage
+            .register_building_vector_generation("generation-a", "descriptor-a", 2)
+            .unwrap();
+        let claim = storage
+            .claim_one_fenced_vector_sync("generation-a", "descriptor-a", 2, "worker-a")
+            .unwrap()
+            .unwrap();
+        let token = reserve_token(&storage, &claim);
+        let before = storage
+            .test_get_outbox_snapshot_detailed(&record.life_id, &record.id)
+            .unwrap();
+
+        assert!(storage
+            .finalize_fenced_vector_failure(
+                &token,
+                "PROVIDER_RESULT_UNKNOWN",
+                FencedFailureDecision::Blocked,
+                None,
+                0,
+                0,
+            )
+            .is_err());
+        assert_eq!(
+            storage
+                .test_get_outbox_snapshot_detailed(&record.life_id, &record.id)
+                .unwrap(),
+            before,
+            "no canonical Delete-Unknown row may commit without the pre-send witness"
+        );
+        let resolution_count: i64 = storage
+            .state()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM memory_vector_late_delete_resolution WHERE outbox_id=?1",
+                [before.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(resolution_count, 0);
     }
 
     #[test]
@@ -6331,7 +6531,7 @@ mod tests {
             .unwrap()
             .connection
             .execute(
-                "UPDATE memory_vector_generation SET state='active' WHERE generation_id='generation-a'",
+                "UPDATE memory_vector_generation SET state='active', authority_epoch=authority_epoch+1 WHERE generation_id='generation-a'",
                 [],
             )
             .unwrap();

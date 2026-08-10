@@ -24,6 +24,15 @@ pub(crate) use connection::open_authorized_test_connection;
 pub(crate) use llm_candidate_extraction::{
     trigger_candidate_extraction, LlmCandidateExtractionCoordinator,
 };
+// Opaque H1 capabilities are re-exported only for the future private S3
+// orchestrator; their constructors and the raw resolution token stay private.
+#[allow(unused_imports)]
+pub(crate) use late_delete_resolution::{
+    AbsentPostQueryCapability, CorruptPostQueryCapability, FailedPostQueryCapability,
+    LateDeleteDeletePermitIssuance, LateDeleteQueryHandoffOutcome, LateDeleteQueryPermit,
+    LateDeleteQueryReservation, LateDeleteResolutionClaimResult, LateDeleteResolutionFinalizeResult,
+    LateDeleteRuntimeLease, PresentPostQueryCapability,
+};
 pub(crate) use vector_sync_outbox::{
     is_delete_unknown_evidence, FencedAttemptReservation, FencedAttemptToken,
     FencedDeleteWitnessResult, FencedFailureDecision, FencedFailureFinalizeResult,

@@ -10,6 +10,10 @@
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 
 use super::{StorageError, StorageService};
+use crate::vector_store::{
+    validate_hash, VectorGenerationContext, VectorMetadataSample, VectorStore, VectorStoreError,
+    VectorStoreErrorCode,
+};
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -110,6 +114,21 @@ pub(crate) struct LateDeleteQueryPermit {
     token: Box<LateDeleteResolutionToken>,
 }
 
+/// Opaque, linear outcomes of the one storage-owned public VectorStore query.
+/// Every variant owns the permit's token, so the ordinal cannot be queried again.
+pub(crate) enum LateDeleteQueryHandoffOutcome {
+    LostLeaseOrSuperseded,
+    Absent(AbsentPostQueryCapability),
+    Present(PresentPostQueryCapability),
+    Failure(FailedPostQueryCapability),
+    Corrupt(CorruptPostQueryCapability),
+}
+
+/// Sealed result of one exact Query returning no metadata.
+pub(crate) struct AbsentPostQueryCapability {
+    token: Box<LateDeleteResolutionToken>,
+}
+
 /// Sealed result of one exact Query which found the full expected identity.
 /// S1 deliberately has no production constructor: S3 must consume a
 /// [`LateDeleteQueryPermit`] after the real external Query.
@@ -117,6 +136,18 @@ pub(crate) struct PresentPostQueryCapability {
     token: Box<LateDeleteResolutionToken>,
     revision: i64,
     content_hash: String,
+}
+
+/// Sealed result of one exact Query whose external failure is not corruption.
+pub(crate) struct FailedPostQueryCapability {
+    token: Box<LateDeleteResolutionToken>,
+    error: VectorStoreError,
+}
+
+/// Sealed result of one exact Query that produced structural corruption.
+pub(crate) struct CorruptPostQueryCapability {
+    token: Box<LateDeleteResolutionToken>,
+    error_code: &'static str,
 }
 
 /// Sealed, linear permission for exactly one future conditional Delete. It is
@@ -150,6 +181,123 @@ pub(crate) enum LateDeleteDeletePermitIssuance {
 pub(crate) enum LateDeleteStartedDurableState {
     CurrentEpochDeleteStarted,
     NotCurrentEpochDeleteStarted,
+}
+
+impl LateDeleteQueryPermit {
+    /// Consumes this definite reservation's sole Query authority and performs
+    /// the only public exact VectorStore query for its ordinal. The SQLite
+    /// currency guard completes before the await, so no SQLite transaction or
+    /// guard crosses external I/O.
+    pub(crate) async fn execute_exact_query_once(
+        self: Box<Self>,
+        storage: &StorageService,
+        context: &VectorGenerationContext,
+        vector_store: &dyn VectorStore,
+    ) -> Result<LateDeleteQueryHandoffOutcome, StorageError> {
+        let token = self.token;
+        if !context_matches_query_token(&token, context) {
+            return Err(StorageError::new(
+                "LATE_DELETE_QUERY_CONTEXT_MISMATCH",
+                "the vector generation context does not match the late delete query authority",
+                false,
+            ));
+        }
+        if !storage.late_delete_resolution_token_is_current(&token)? {
+            return Ok(LateDeleteQueryHandoffOutcome::LostLeaseOrSuperseded);
+        }
+
+        match vector_store
+            .get_generation_metadata(context, &token.life_id, &token.memory_id)
+            .await
+        {
+            Ok(None) => Ok(LateDeleteQueryHandoffOutcome::Absent(
+                AbsentPostQueryCapability { token },
+            )),
+            Ok(Some(sample)) => {
+                if let Some(error_code) = query_sample_corruption_code(&token, context, &sample) {
+                    Ok(LateDeleteQueryHandoffOutcome::Corrupt(
+                        CorruptPostQueryCapability { token, error_code },
+                    ))
+                } else {
+                    Ok(LateDeleteQueryHandoffOutcome::Present(
+                        PresentPostQueryCapability {
+                            token,
+                            revision: sample.memory_revision,
+                            content_hash: sample.content_hash,
+                        },
+                    ))
+                }
+            }
+            Err(error) if query_error_is_corruption(error.code) => Ok(
+                LateDeleteQueryHandoffOutcome::Corrupt(CorruptPostQueryCapability {
+                    token,
+                    error_code: "LATE_DELETE_QUERY_CORRUPT",
+                }),
+            ),
+            Err(error) => Ok(LateDeleteQueryHandoffOutcome::Failure(
+                FailedPostQueryCapability { token, error },
+            )),
+        }
+    }
+}
+
+fn context_matches_query_token(
+    token: &LateDeleteResolutionToken,
+    context: &VectorGenerationContext,
+) -> bool {
+    context.generation_id().as_str() == token.claimed_generation_id
+        && context.descriptor_hash() == token.embedding_descriptor_id
+        && context.dimension() == token.embedding_dimension as usize
+}
+
+fn query_sample_corruption_code(
+    token: &LateDeleteResolutionToken,
+    context: &VectorGenerationContext,
+    sample: &VectorMetadataSample,
+) -> Option<&'static str> {
+    if sample.generation_id != token.claimed_generation_id
+        || sample.generation_id != context.generation_id().as_str()
+    {
+        return Some("LATE_DELETE_QUERY_GENERATION_MISMATCH");
+    }
+    if sample.life_id != token.life_id {
+        return Some("LATE_DELETE_QUERY_LIFE_MISMATCH");
+    }
+    if sample.memory_id != token.memory_id {
+        return Some("LATE_DELETE_QUERY_MEMORY_MISMATCH");
+    }
+    if sample.descriptor_hash != token.embedding_descriptor_id
+        || sample.descriptor_hash != context.descriptor_hash()
+    {
+        return Some("LATE_DELETE_QUERY_DESCRIPTOR_MISMATCH");
+    }
+    if sample.dimension != token.embedding_dimension as usize
+        || sample.dimension != context.dimension()
+    {
+        return Some("LATE_DELETE_QUERY_DIMENSION_MISMATCH");
+    }
+    if sample.memory_revision <= 0 {
+        return Some("LATE_DELETE_QUERY_INVALID_REVISION");
+    }
+    if validate_hash(&sample.content_hash, "Content hash").is_err() {
+        return Some("LATE_DELETE_QUERY_INVALID_CONTENT_HASH");
+    }
+    None
+}
+
+fn query_error_is_corruption(code: VectorStoreErrorCode) -> bool {
+    !matches!(
+        code,
+        VectorStoreErrorCode::StoreUnavailable | VectorStoreErrorCode::GenerationNotFound
+    )
+}
+
+fn query_failure_error_code(error: &VectorStoreError) -> &'static str {
+    match error.code {
+        VectorStoreErrorCode::StoreUnavailable => "LATE_DELETE_QUERY_STORE_UNAVAILABLE",
+        VectorStoreErrorCode::GenerationNotFound => "LATE_DELETE_QUERY_GENERATION_NOT_FOUND",
+        _ => "LATE_DELETE_QUERY_UNKNOWN",
+    }
 }
 
 #[cfg(test)]
@@ -893,6 +1041,37 @@ impl StorageService {
         )
     }
 
+    /// Consumes the sealed Query=None outcome before using the frozen CAS
+    /// finalizer. Callers never receive its token back.
+    pub(crate) fn finalize_late_delete_query_absent(
+        &self,
+        absent: AbsentPostQueryCapability,
+    ) -> Result<LateDeleteResolutionFinalizeResult, StorageError> {
+        self.finalize_late_delete_resolution_absent(&absent.token)
+    }
+
+    /// Consumes one non-corrupt Query failure and converges it to the only
+    /// allowed same-ordinal state: unknown/query_unknown.
+    pub(crate) fn finalize_late_delete_query_failure(
+        &self,
+        failure: FailedPostQueryCapability,
+    ) -> Result<LateDeleteResolutionFinalizeResult, StorageError> {
+        self.finalize_late_delete_resolution_unknown(
+            &failure.token,
+            LateDeleteResolutionDisposition::QueryUnknown,
+            query_failure_error_code(&failure.error),
+        )
+    }
+
+    /// Consumes one structurally corrupt Query observation and prevents a
+    /// DeleteStarted transition for that ordinal.
+    pub(crate) fn finalize_late_delete_query_corrupt(
+        &self,
+        corrupt: CorruptPostQueryCapability,
+    ) -> Result<LateDeleteResolutionFinalizeResult, StorageError> {
+        self.finalize_late_delete_resolution_waiting_rebuild(&corrupt.token, corrupt.error_code)
+    }
+
     pub(crate) fn finalize_late_delete_resolution_deleted(
         &self,
         token: &LateDeleteResolutionToken,
@@ -1280,10 +1459,17 @@ mod tests {
         EnqueueMemoryVectorSyncRequest, MemoryVectorSyncAction, MemoryVectorSyncOutboxRepository,
     };
     use crate::storage::{LifeIdentityRecord, PersonaTemplateRecord};
+    use crate::vector_store::{
+        VectorGenerationId, VectorRecord, VectorSearchHit, VectorSearchQuery, VectorSpace,
+        VectorStoreFuture,
+    };
     use std::{
         fs,
         path::PathBuf,
-        sync::{mpsc, Arc, Barrier},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            mpsc, Arc, Barrier,
+        },
         thread,
     };
 
@@ -1381,6 +1567,135 @@ mod tests {
         {
             LateDeleteQueryReservation::Reserved(permit) => permit,
             _ => panic!("claim must reserve one Query permit"),
+        }
+    }
+
+    #[derive(Clone)]
+    struct ScriptedQueryStore {
+        result: Result<Option<VectorMetadataSample>, VectorStoreError>,
+        query_count: Arc<AtomicUsize>,
+    }
+
+    impl ScriptedQueryStore {
+        fn new(result: Result<Option<VectorMetadataSample>, VectorStoreError>) -> Self {
+            Self {
+                result,
+                query_count: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn query_count(&self) -> usize {
+            self.query_count.load(Ordering::SeqCst)
+        }
+
+        fn unsupported<T>() -> Result<T, VectorStoreError> {
+            Err(VectorStoreError::new(
+                VectorStoreErrorCode::StoreUnavailable,
+                "scripted query store only supports generation metadata",
+                false,
+            ))
+        }
+    }
+
+    impl VectorStore for ScriptedQueryStore {
+        fn upsert<'a>(
+            &'a self,
+            _record: VectorRecord,
+        ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
+            Box::pin(async { Self::unsupported() })
+        }
+
+        fn upsert_batch<'a>(
+            &'a self,
+            _records: Vec<VectorRecord>,
+        ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
+            Box::pin(async { Self::unsupported() })
+        }
+
+        fn search<'a>(
+            &'a self,
+            _query: VectorSearchQuery,
+        ) -> VectorStoreFuture<'a, Result<Vec<VectorSearchHit>, VectorStoreError>> {
+            Box::pin(async { Self::unsupported() })
+        }
+
+        fn delete<'a>(
+            &'a self,
+            _life_id: &'a str,
+            _memory_id: &'a str,
+        ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
+            Box::pin(async { Self::unsupported() })
+        }
+
+        fn delete_from_space<'a>(
+            &'a self,
+            _life_id: &'a str,
+            _memory_id: &'a str,
+            _space: &'a VectorSpace,
+        ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
+            Box::pin(async { Self::unsupported() })
+        }
+
+        fn delete_by_life<'a>(
+            &'a self,
+            _life_id: &'a str,
+        ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
+            Box::pin(async { Self::unsupported() })
+        }
+
+        fn clear_space<'a>(
+            &'a self,
+            _life_id: &'a str,
+            _space: &'a VectorSpace,
+        ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
+            Box::pin(async { Self::unsupported() })
+        }
+
+        fn count<'a>(
+            &'a self,
+            _life_id: &'a str,
+            _space: Option<&'a VectorSpace>,
+        ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
+            Box::pin(async { Self::unsupported() })
+        }
+
+        fn health_check<'a>(
+            &'a self,
+            _life_id: &'a str,
+        ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
+            Box::pin(async { Self::unsupported() })
+        }
+
+        fn get_generation_metadata<'a>(
+            &'a self,
+            _context: &'a VectorGenerationContext,
+            _life_id: &'a str,
+            _memory_id: &'a str,
+        ) -> VectorStoreFuture<'a, Result<Option<VectorMetadataSample>, VectorStoreError>> {
+            self.query_count.fetch_add(1, Ordering::SeqCst);
+            let result = self.result.clone();
+            Box::pin(async move { result })
+        }
+    }
+
+    fn query_context() -> VectorGenerationContext {
+        VectorGenerationContext::new(
+            VectorGenerationId::parse("generation-a").unwrap(),
+            "descriptor-a",
+            2,
+        )
+        .unwrap()
+    }
+
+    fn valid_query_sample() -> VectorMetadataSample {
+        VectorMetadataSample {
+            generation_id: "generation-a".into(),
+            life_id: "life".into(),
+            memory_id: "memory".into(),
+            memory_revision: 7,
+            content_hash: "hash-7".into(),
+            descriptor_hash: "descriptor-a".into(),
+            dimension: 2,
         }
     }
 
@@ -2605,5 +2920,223 @@ mod tests {
             )
             .unwrap();
         assert_eq!(row, after);
+    }
+
+    fn query_resolution_state(storage: &StorageService) -> (String, String) {
+        storage
+            .state()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT state,last_resolution_disposition FROM memory_vector_late_delete_resolution WHERE life_id='life' AND memory_id='memory'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn late_delete_query_handoff_present_consumes_permit_and_observation() {
+        let (_root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let store = ScriptedQueryStore::new(Ok(Some(valid_query_sample())));
+        let outcome = tauri::async_runtime::block_on(
+            reserved_query_permit(&storage).execute_exact_query_once(
+                &storage,
+                &query_context(),
+                &store,
+            ),
+        )
+        .unwrap();
+        let present = match outcome {
+            LateDeleteQueryHandoffOutcome::Present(present) => present,
+            _ => panic!("a valid exact query must yield Present"),
+        };
+        assert_eq!(store.query_count(), 1);
+        assert_eq!(present.revision, 7);
+        assert_eq!(present.content_hash, "hash-7");
+        assert!(matches!(
+            storage.issue_late_delete_permit(present).unwrap(),
+            LateDeleteDeletePermitIssuance::Issued(_)
+        ));
+    }
+
+    #[test]
+    fn late_delete_query_handoff_absent_finalizes_without_delete_capability() {
+        let (_root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let store = ScriptedQueryStore::new(Ok(None));
+        let outcome = tauri::async_runtime::block_on(
+            reserved_query_permit(&storage).execute_exact_query_once(
+                &storage,
+                &query_context(),
+                &store,
+            ),
+        )
+        .unwrap();
+        let absent = match outcome {
+            LateDeleteQueryHandoffOutcome::Absent(absent) => absent,
+            _ => panic!("Query=None must yield Absent"),
+        };
+        assert_eq!(store.query_count(), 1);
+        assert_eq!(
+            storage.finalize_late_delete_query_absent(absent).unwrap(),
+            LateDeleteResolutionFinalizeResult::Applied
+        );
+        assert_eq!(
+            query_resolution_state(&storage),
+            ("resolved_absent".into(), "query_absent".into())
+        );
+    }
+
+    #[test]
+    fn late_delete_query_handoff_failure_finalizes_unknown_without_retry() {
+        let (_root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let store = ScriptedQueryStore::new(Err(VectorStoreError::new(
+            VectorStoreErrorCode::StoreUnavailable,
+            "injected ordinary query failure",
+            true,
+        )));
+        let outcome = tauri::async_runtime::block_on(
+            reserved_query_permit(&storage).execute_exact_query_once(
+                &storage,
+                &query_context(),
+                &store,
+            ),
+        )
+        .unwrap();
+        let failure = match outcome {
+            LateDeleteQueryHandoffOutcome::Failure(failure) => failure,
+            _ => panic!("ordinary query error must yield Failure"),
+        };
+        assert_eq!(store.query_count(), 1);
+        assert_eq!(
+            storage.finalize_late_delete_query_failure(failure).unwrap(),
+            LateDeleteResolutionFinalizeResult::Applied
+        );
+        assert_eq!(
+            query_resolution_state(&storage),
+            ("unknown".into(), "query_unknown".into())
+        );
+    }
+
+    #[test]
+    fn late_delete_query_handoff_corrupt_finalizes_waiting_rebuild() {
+        let (_root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let store = ScriptedQueryStore::new(Err(VectorStoreError::new(
+            VectorStoreErrorCode::GenerationCorrupt,
+            "injected corrupt generation",
+            false,
+        )));
+        let outcome = tauri::async_runtime::block_on(
+            reserved_query_permit(&storage).execute_exact_query_once(
+                &storage,
+                &query_context(),
+                &store,
+            ),
+        )
+        .unwrap();
+        let corrupt = match outcome {
+            LateDeleteQueryHandoffOutcome::Corrupt(corrupt) => corrupt,
+            _ => panic!("GenerationCorrupt must yield Corrupt"),
+        };
+        assert_eq!(store.query_count(), 1);
+        assert_eq!(
+            storage.finalize_late_delete_query_corrupt(corrupt).unwrap(),
+            LateDeleteResolutionFinalizeResult::Applied
+        );
+        assert_eq!(
+            query_resolution_state(&storage),
+            ("waiting_rebuild".into(), "waiting_rebuild".into())
+        );
+    }
+
+    #[test]
+    fn late_delete_query_handoff_corrupt_rejects_invalid_exact_samples() {
+        let mut samples = Vec::new();
+        let mut generation = valid_query_sample();
+        generation.generation_id = "other-generation".into();
+        samples.push(generation);
+        let mut life = valid_query_sample();
+        life.life_id = "other-life".into();
+        samples.push(life);
+        let mut memory = valid_query_sample();
+        memory.memory_id = "other-memory".into();
+        samples.push(memory);
+        let mut descriptor = valid_query_sample();
+        descriptor.descriptor_hash = "other-descriptor".into();
+        samples.push(descriptor);
+        let mut dimension = valid_query_sample();
+        dimension.dimension = 3;
+        samples.push(dimension);
+        let mut revision = valid_query_sample();
+        revision.memory_revision = 0;
+        samples.push(revision);
+        let mut hash = valid_query_sample();
+        hash.content_hash = "bad hash".into();
+        samples.push(hash);
+
+        for sample in samples {
+            let (_root, storage) = storage();
+            seed_resolution(&storage, "life", "memory", 1);
+            let store = ScriptedQueryStore::new(Ok(Some(sample)));
+            let outcome = tauri::async_runtime::block_on(
+                reserved_query_permit(&storage).execute_exact_query_once(
+                    &storage,
+                    &query_context(),
+                    &store,
+                ),
+            )
+            .unwrap();
+            assert!(matches!(outcome, LateDeleteQueryHandoffOutcome::Corrupt(_)));
+            assert_eq!(store.query_count(), 1);
+        }
+    }
+
+    #[test]
+    fn late_delete_query_handoff_context_mismatch_consumes_without_query() {
+        let (_root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let store = ScriptedQueryStore::new(Ok(Some(valid_query_sample())));
+        let mismatched_context = VectorGenerationContext::new(
+            VectorGenerationId::parse("generation-a").unwrap(),
+            "other-descriptor",
+            2,
+        )
+        .unwrap();
+        let error = match tauri::async_runtime::block_on(
+            reserved_query_permit(&storage).execute_exact_query_once(
+                &storage,
+                &mismatched_context,
+                &store,
+            ),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("a context mismatch must not produce a handoff outcome"),
+        };
+        assert_eq!(error.code, "LATE_DELETE_QUERY_CONTEXT_MISMATCH");
+        assert_eq!(store.query_count(), 0);
+    }
+
+    #[test]
+    fn late_delete_query_handoff_lost_authority_consumes_without_query() {
+        let (_root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let permit = reserved_query_permit(&storage);
+        expire_resolution_lease(&storage);
+        let store = ScriptedQueryStore::new(Ok(Some(valid_query_sample())));
+        let outcome = tauri::async_runtime::block_on(permit.execute_exact_query_once(
+            &storage,
+            &query_context(),
+            &store,
+        ))
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            LateDeleteQueryHandoffOutcome::LostLeaseOrSuperseded
+        ));
+        assert_eq!(store.query_count(), 0);
     }
 }

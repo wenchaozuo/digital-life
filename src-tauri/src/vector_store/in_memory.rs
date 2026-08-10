@@ -40,6 +40,13 @@ struct GenerationMeta {
     dimension: usize,
 }
 
+#[cfg(test)]
+#[derive(Clone)]
+struct ConditionalDeleteTestHook {
+    entered_atomic_section: std::sync::Arc<std::sync::Barrier>,
+    release_atomic_section: std::sync::Arc<std::sync::Barrier>,
+}
+
 /// Deterministic, non-persistent implementation for tests and development.
 /// It is exported only in test/debug builds and is never selected by default.
 #[derive(Default)]
@@ -47,6 +54,8 @@ pub struct InMemoryVectorStore {
     records: RwLock<HashMap<RecordKey, VectorRecord>>,
     generations: RwLock<HashMap<String, GenerationMeta>>,
     generation_records: RwLock<HashMap<GenerationRecordKey, GenerationVectorRecord>>,
+    #[cfg(test)]
+    conditional_delete_after_atomic_locks: std::sync::Mutex<Option<ConditionalDeleteTestHook>>,
 }
 
 impl InMemoryVectorStore {
@@ -397,14 +406,13 @@ impl VectorStore for InMemoryVectorStore {
                 }
                 Some(_) => {}
             }
-            drop(generation);
             let key = GenerationRecordKey {
                 generation_id: context.generation_id().as_str().to_owned(),
                 life_id: life_id.to_owned(),
                 memory_id: memory_id.to_owned(),
             };
-            // The one write guard covers lookup, every identity comparison,
-            // and removal; no read-then-write TOCTOU window exists here.
+            // The global generation-before-records lock order is held through
+            // validation, lookup, comparison, removal, and postcondition.
             let mut records = self.generation_records.write().map_err(|_| {
                 VectorStoreError::new(
                     VectorStoreErrorCode::StoreUnavailable,
@@ -412,6 +420,16 @@ impl VectorStore for InMemoryVectorStore {
                     true,
                 )
             })?;
+            #[cfg(test)]
+            if let Some(hook) = self
+                .conditional_delete_after_atomic_locks
+                .lock()
+                .unwrap()
+                .clone()
+            {
+                hook.entered_atomic_section.wait();
+                hook.release_atomic_section.wait();
+            }
             let Some(record) = records.get(&key) else {
                 return Ok(ConditionalGenerationDeleteOutcome::Absent);
             };
@@ -432,7 +450,13 @@ impl VectorStore for InMemoryVectorStore {
             {
                 return Ok(ConditionalGenerationDeleteOutcome::IdentityMismatch);
             }
-            let _ = records.remove(&key);
+            if records.remove(&key).is_none() || records.contains_key(&key) {
+                return Err(VectorStoreError::new(
+                    VectorStoreErrorCode::GenerationCorrupt,
+                    "The vector generation is corrupt.",
+                    true,
+                ));
+            }
             Ok(ConditionalGenerationDeleteOutcome::Deleted)
         })
     }
@@ -645,6 +669,7 @@ impl InMemoryVectorStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{sync::Arc, thread};
 
     fn block_on<T>(future: VectorStoreFuture<'_, T>) -> T {
         tauri::async_runtime::block_on(future)
@@ -1065,5 +1090,43 @@ mod tests {
             );
             assert!(store.generation_records.read().unwrap().contains_key(&key));
         }
+    }
+
+    #[test]
+    fn conditional_delete_in_memory_atomic_postcondition() {
+        let store = Arc::new(InMemoryVectorStore::new());
+        let ctx = gen_context("conditional-atomic");
+        block_on(store.create_generation(&ctx)).unwrap();
+        block_on(store.upsert_generation(&ctx, gen_record(&ctx, "life", "mem", 4, "hash-a")))
+            .unwrap();
+        let entered_atomic_section = Arc::new(std::sync::Barrier::new(2));
+        let release_atomic_section = Arc::new(std::sync::Barrier::new(2));
+        *store.conditional_delete_after_atomic_locks.lock().unwrap() =
+            Some(ConditionalDeleteTestHook {
+                entered_atomic_section: Arc::clone(&entered_atomic_section),
+                release_atomic_section: Arc::clone(&release_atomic_section),
+            });
+        let delete_store = Arc::clone(&store);
+        let delete_context = ctx.clone();
+        let delete = thread::spawn(move || {
+            tauri::async_runtime::block_on(delete_store.delete_generation_memory_if_matches(
+                &delete_context,
+                "life",
+                "mem",
+                4,
+                "hash-a",
+            ))
+        });
+        entered_atomic_section.wait();
+        assert!(store.generations.try_write().is_err());
+        assert!(store.generation_records.try_write().is_err());
+        release_atomic_section.wait();
+        assert_eq!(
+            delete.join().unwrap().unwrap(),
+            ConditionalGenerationDeleteOutcome::Deleted
+        );
+        assert!(block_on(store.get_generation_metadata(&ctx, "life", "mem"))
+            .unwrap()
+            .is_none());
     }
 }

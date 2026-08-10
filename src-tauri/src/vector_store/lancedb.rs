@@ -1868,6 +1868,25 @@ mod tests {
             .unwrap();
     }
 
+    /// Test-only low-level Lance inspection: counts the exact
+    /// `generation_id + life_id + memory_id` predicate rows directly from the
+    /// Lance table, independent of the public metadata/health queries.
+    async fn count_generation_memory_rows(
+        store: &LanceDbVectorStore,
+        context: &VectorGenerationContext,
+        life: &str,
+        memory: &str,
+    ) -> usize {
+        let table = store.open_generation_table(context).await.unwrap();
+        let predicate = format!(
+            "generation_id = {} AND life_id = {} AND memory_id = {}",
+            sql_literal(context.generation_id().as_str()),
+            sql_literal(life),
+            sql_literal(memory)
+        );
+        table.count_rows(Some(predicate)).await.unwrap()
+    }
+
     #[test]
     fn generation_create_upsert_delete_count_sample_and_health_are_idempotent() {
         block_on(async {
@@ -2514,6 +2533,47 @@ mod tests {
                 .await
                 .unwrap()
                 .is_some());
+        });
+    }
+
+    /// BLOCKER-2: a real Lance duplicate of the exact identity key
+    /// `generation + life + memory`. The conditional delete must fail closed with
+    /// `GenerationCorrupt` at its internal exact requery and must delete zero
+    /// rows (both duplicate rows survive).
+    #[test]
+    fn conditional_delete_duplicate_identity_returns_generation_corrupt_without_delete() {
+        block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let store = LanceDbVectorStore::open(temp.path()).await.unwrap();
+            let ctx = gen_context("conditional-duplicate-identity", 2);
+            store.create_generation(&ctx).await.unwrap();
+
+            // Two real Lance rows with an identical exact identity key, appended
+            // through the low-level table fixture so the production upsert
+            // dedup semantics cannot hide the duplicate.
+            let row_a = gen_record(&ctx, "life", "mem", 4, vec![1.0, 0.0]);
+            let row_b = gen_record(&ctx, "life", "mem", 4, vec![0.0, 1.0]);
+            append_generation_records(&store, &ctx, &[row_a, row_b]).await;
+
+            let before = count_generation_memory_rows(&store, &ctx, "life", "mem").await;
+            assert_eq!(before, 2, "the duplicate fixture must place two rows");
+
+            // Call through the real trait-object conditional primitive with a
+            // fully valid expected identity, so the internal exact requery is
+            // what detects the 2+ rows and fails closed.
+            let trait_store: &dyn VectorStore = &store;
+            let error = trait_store
+                .delete_generation_memory_if_matches(&ctx, "life", "mem", 4, "content-mem")
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, VectorStoreErrorCode::GenerationCorrupt);
+
+            let after = count_generation_memory_rows(&store, &ctx, "life", "mem").await;
+            assert_eq!(
+                after, before,
+                "conditional delete on a duplicate identity must perform zero deletions"
+            );
+            assert_eq!(after, 2);
         });
     }
 

@@ -35,8 +35,7 @@ pub(crate) use late_delete_resolution::{
     LateDeletePostDeleteFinalizeResult, LateDeleteQueryHandoffOutcome, LateDeleteQueryPermit,
     LateDeleteQueryReservation, LateDeleteResolutionClaim, LateDeleteResolutionClaimResult,
     LateDeleteResolutionFinalizeResult, LateDeleteRuntimeLease,
-    LateDeleteStartedCommitUnknownReconcileResult, PreDeleteCorruptCapability,
-    PresentPostQueryCapability,
+    LateDeleteStartedCommitUnknownNoPermit, PreDeleteCorruptCapability, PresentPostQueryCapability,
 };
 pub(crate) use vector_sync_outbox::{
     is_delete_unknown_evidence, FencedAttemptReservation, FencedAttemptToken,

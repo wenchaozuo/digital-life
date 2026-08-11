@@ -222,16 +222,17 @@ pub(crate) enum LateDeleteDeletePermitRunnerIssuance {
     Issued(Box<LateDeleteDeletePermit>),
     LostLeaseOrSuperseded,
     WaitingRebuild,
-    CommitUnknownRecoveryRequired(LateDeleteStartedCommitUnknownReconcileResult),
+    CommitUnknownRecoveryRequired(LateDeleteStartedCommitUnknownNoPermit),
 }
 
 /// Read-only classification of an exact consumed Present capability after the
-/// DeleteStarted COMMIT result is unknown.
+/// DeleteStarted COMMIT result is unknown. The type name carries the binding
+/// guarantee: a commit-unknown reconciliation never produces a DeletePermit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum LateDeleteStartedCommitUnknownReconcileResult {
-    DeleteStartedDurableNoPermit,
-    PreIssuanceDurableNoPermit,
-    LostLeaseOrSupersededNoPermit,
+pub(crate) enum LateDeleteStartedCommitUnknownNoPermit {
+    DeleteStartedDurable,
+    PreIssuanceDurable,
+    LostLeaseOrSuperseded,
 }
 
 enum LateDeleteDeletePermitIssuanceCore {
@@ -1299,7 +1300,7 @@ impl StorageService {
     fn reconcile_late_delete_started_exact_token(
         &self,
         token: &LateDeleteResolutionToken,
-    ) -> Result<LateDeleteStartedCommitUnknownReconcileResult, StorageError> {
+    ) -> Result<LateDeleteStartedCommitUnknownNoPermit, StorageError> {
         #[cfg(test)]
         if DELETE_STARTED_RECONCILE_READ_FAILURE.with(|fault| fault.replace(false)) {
             return Err(StorageError::new(
@@ -1336,7 +1337,7 @@ impl StorageService {
                         .is_some_and(|owner| owner == token.lease_owner)
                     && row.lease_fence_epoch == Some(token.runtime_fence_epoch) =>
             {
-                LateDeleteStartedCommitUnknownReconcileResult::DeleteStartedDurableNoPermit
+                LateDeleteStartedCommitUnknownNoPermit::DeleteStartedDurable
             }
             (Some(row), _)
                 if token_matches_row_without_liveness(token, &row)
@@ -1349,9 +1350,9 @@ impl StorageService {
                         .is_some_and(|owner| owner == token.lease_owner)
                     && row.lease_fence_epoch == Some(token.runtime_fence_epoch) =>
             {
-                LateDeleteStartedCommitUnknownReconcileResult::PreIssuanceDurableNoPermit
+                LateDeleteStartedCommitUnknownNoPermit::PreIssuanceDurable
             }
-            _ => LateDeleteStartedCommitUnknownReconcileResult::LostLeaseOrSupersededNoPermit,
+            _ => LateDeleteStartedCommitUnknownNoPermit::LostLeaseOrSuperseded,
         };
         tx.commit().map_err(storage_error)?;
         Ok(result)
@@ -4439,11 +4440,11 @@ mod tests {
         for (before_commit, expected) in [
             (
                 false,
-                LateDeleteStartedCommitUnknownReconcileResult::DeleteStartedDurableNoPermit,
+                LateDeleteStartedCommitUnknownNoPermit::DeleteStartedDurable,
             ),
             (
                 true,
-                LateDeleteStartedCommitUnknownReconcileResult::PreIssuanceDurableNoPermit,
+                LateDeleteStartedCommitUnknownNoPermit::PreIssuanceDurable,
             ),
         ] {
             let (_root, storage) = storage();
@@ -4527,7 +4528,7 @@ mod tests {
             storage
                 .reconcile_late_delete_started_exact_token(&token)
                 .unwrap(),
-            LateDeleteStartedCommitUnknownReconcileResult::LostLeaseOrSupersededNoPermit
+            LateDeleteStartedCommitUnknownNoPermit::LostLeaseOrSuperseded
         );
         let row: (String, String, i64) = service_b
             .state()

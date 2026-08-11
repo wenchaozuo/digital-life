@@ -2,17 +2,17 @@
 
 //! Durable, fenced resolution of Deletes whose external result is unknown.
 //!
-//! This module intentionally has no worker, provider, or vector-store dependency.
-//! It is a storage-only capability: callers can obtain a token only after SQLite
-//! has reserved a bounded resolution slot, and every subsequent transition is a
-//! compare-and-swap against that token.
+//! This module has no worker or concrete vector-store dependency. It owns narrow
+//! trait-level Query and conditional-Delete capability bridges: callers can
+//! obtain a token only after SQLite has reserved a bounded resolution slot, and
+//! every subsequent transition is a compare-and-swap against that token.
 
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 
 use super::{StorageError, StorageService};
 use crate::vector_store::{
-    validate_hash, VectorGenerationContext, VectorMetadataSample, VectorStore, VectorStoreError,
-    VectorStoreErrorCode,
+    validate_hash, ConditionalGenerationDeleteOutcome, VectorGenerationContext, VectorGenerationId,
+    VectorMetadataSample, VectorStore, VectorStoreError, VectorStoreErrorCode,
 };
 
 #[cfg(test)]
@@ -159,6 +159,47 @@ pub(crate) struct LateDeleteDeletePermit {
     content_hash: String,
 }
 
+pub(crate) enum LateDeleteDeleteHandoffOutcome {
+    LostLeaseOrSuperseded,
+    PreDeleteCorrupt(PreDeleteCorruptCapability),
+    Deleted(DeletedPostDeleteCapability),
+    Absent(AbsentPostDeleteCapability),
+    IdentityMismatch(IdentityMismatchPostDeleteCapability),
+    Failure(FailedPostDeleteCapability),
+}
+
+pub(crate) struct PreDeleteCorruptCapability {
+    token: Box<LateDeleteResolutionToken>,
+}
+
+pub(crate) struct DeletedPostDeleteCapability {
+    token: Box<LateDeleteResolutionToken>,
+}
+
+pub(crate) struct AbsentPostDeleteCapability {
+    token: Box<LateDeleteResolutionToken>,
+}
+
+pub(crate) struct IdentityMismatchPostDeleteCapability {
+    token: Box<LateDeleteResolutionToken>,
+}
+
+pub(crate) struct FailedPostDeleteCapability {
+    token: Box<LateDeleteResolutionToken>,
+    error_code: VectorStoreErrorCode,
+}
+
+/// The only outcomes of consuming a typed post-Delete capability.  A caller
+/// cannot retry the capability after either kind of commit uncertainty: the
+/// storage-owned reconciliation has already examined the durable row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LateDeletePostDeleteFinalizeResult {
+    Applied,
+    LostLeaseOrSuperseded,
+    ReconciledExpectedDisposition,
+    CommitUnknownStillDeleteStarted,
+}
+
 /// M2-specific reservation result. The frozen LD-I2 reservation API remains
 /// unchanged and cannot be used to reconstruct a QueryPermit.
 pub(crate) enum LateDeleteQueryReservation {
@@ -236,6 +277,77 @@ impl LateDeleteQueryPermit {
             ),
             Err(error) => Ok(LateDeleteQueryHandoffOutcome::Failure(
                 FailedPostQueryCapability { token, error },
+            )),
+        }
+    }
+}
+
+impl LateDeleteDeletePermit {
+    /// Consumes the only DeleteStarted capability for this ordinal. Its full
+    /// expected identity stays sealed inside storage across the sole external
+    /// conditional Delete call.
+    pub(crate) async fn execute_conditional_delete_once(
+        self: Box<Self>,
+        storage: &StorageService,
+        vector_store: &dyn VectorStore,
+    ) -> Result<LateDeleteDeleteHandoffOutcome, StorageError> {
+        let LateDeleteDeletePermit {
+            token,
+            revision,
+            content_hash,
+        } = *self;
+        if !storage.late_delete_delete_permit_is_current(&token)? {
+            return Ok(LateDeleteDeleteHandoffOutcome::LostLeaseOrSuperseded);
+        }
+        let generation_id = match VectorGenerationId::parse(&token.claimed_generation_id) {
+            Ok(generation_id) => generation_id,
+            Err(_) => {
+                return Ok(LateDeleteDeleteHandoffOutcome::PreDeleteCorrupt(
+                    PreDeleteCorruptCapability { token },
+                ))
+            }
+        };
+        let context = match VectorGenerationContext::new(
+            generation_id,
+            token.embedding_descriptor_id.clone(),
+            token.embedding_dimension as usize,
+        ) {
+            Ok(context) if revision > 0 && validate_hash(&content_hash, "Content hash").is_ok() => {
+                context
+            }
+            _ => {
+                return Ok(LateDeleteDeleteHandoffOutcome::PreDeleteCorrupt(
+                    PreDeleteCorruptCapability { token },
+                ))
+            }
+        };
+
+        match vector_store
+            .delete_generation_memory_if_matches(
+                &context,
+                &token.life_id,
+                &token.memory_id,
+                revision,
+                &content_hash,
+            )
+            .await
+        {
+            Ok(ConditionalGenerationDeleteOutcome::Deleted) => Ok(
+                LateDeleteDeleteHandoffOutcome::Deleted(DeletedPostDeleteCapability { token }),
+            ),
+            Ok(ConditionalGenerationDeleteOutcome::Absent) => Ok(
+                LateDeleteDeleteHandoffOutcome::Absent(AbsentPostDeleteCapability { token }),
+            ),
+            Ok(ConditionalGenerationDeleteOutcome::IdentityMismatch) => {
+                Ok(LateDeleteDeleteHandoffOutcome::IdentityMismatch(
+                    IdentityMismatchPostDeleteCapability { token },
+                ))
+            }
+            Err(error) => Ok(LateDeleteDeleteHandoffOutcome::Failure(
+                FailedPostDeleteCapability {
+                    token,
+                    error_code: error.code,
+                },
             )),
         }
     }
@@ -319,6 +431,10 @@ thread_local! {
     static DELETE_STARTED_AFTER_COMMIT_FAULT: Cell<bool> = const { Cell::new(false) };
     static QUERY_PERMIT_AFTER_COMMIT_FAULT: Cell<bool> = const { Cell::new(false) };
     static DELETE_STARTED_COMMIT_ATTEMPT_COUNT: Cell<usize> = const { Cell::new(0) };
+    static POST_DELETE_FINALIZE_BEFORE_COMMIT_FAILURE: Cell<bool> = const { Cell::new(false) };
+    static POST_DELETE_FINALIZE_BEFORE_COMMIT_UNKNOWN: Cell<bool> = const { Cell::new(false) };
+    static POST_DELETE_FINALIZE_AFTER_COMMIT_UNKNOWN: Cell<bool> = const { Cell::new(false) };
+    static POST_DELETE_FINALIZE_COMMIT_ATTEMPT_COUNT: Cell<usize> = const { Cell::new(0) };
     static AUTHORITATIVE_NOW_OVERRIDE_FOR_TEST: Cell<Option<String>> = const { Cell::new(None) };
 }
 
@@ -339,6 +455,24 @@ pub(crate) fn reset_delete_started_commit_attempt_count_for_test() {
 #[cfg(test)]
 pub(crate) fn delete_started_commit_attempt_count_for_test() -> usize {
     DELETE_STARTED_COMMIT_ATTEMPT_COUNT.with(|count| count.get())
+}
+
+#[cfg(test)]
+fn record_post_delete_finalize_commit_attempt_for_test() {
+    POST_DELETE_FINALIZE_COMMIT_ATTEMPT_COUNT.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(test)]
+fn reset_post_delete_finalize_faults_for_test() {
+    POST_DELETE_FINALIZE_BEFORE_COMMIT_FAILURE.with(|fault| fault.set(false));
+    POST_DELETE_FINALIZE_BEFORE_COMMIT_UNKNOWN.with(|fault| fault.set(false));
+    POST_DELETE_FINALIZE_AFTER_COMMIT_UNKNOWN.with(|fault| fault.set(false));
+    POST_DELETE_FINALIZE_COMMIT_ATTEMPT_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn post_delete_finalize_commit_attempt_count_for_test() -> usize {
+    POST_DELETE_FINALIZE_COMMIT_ATTEMPT_COUNT.with(Cell::get)
 }
 
 /// Freezes the authoritative-now that the production 24-hour comparator receives
@@ -868,6 +1002,40 @@ impl StorageService {
         Ok(current)
     }
 
+    /// Read-only guard immediately before the one external conditional Delete.
+    /// Unlike the generic token guard this also proves that the durable source
+    /// boundary is the current epoch's DeleteStarted transition.
+    fn late_delete_delete_permit_is_current(
+        &self,
+        token: &LateDeleteResolutionToken,
+    ) -> Result<bool, StorageError> {
+        let mut state = self.state()?;
+        let tx = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(storage_error)?;
+        let now = authoritative_utc_millis_now_in(&tx)?;
+        let current = token_is_current_in(&tx, token, &now)?
+            && tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM memory_vector_late_delete_resolution
+                     WHERE resolution_id=?1 AND state='processing'
+                       AND resolution_epoch=?2 AND resolution_count=?3
+                       AND last_reserved_resolution_epoch=?2
+                       AND last_resolution_disposition='delete_started'
+                       AND last_disposition_epoch=?2)",
+                    params![
+                        token.resolution_id,
+                        token.resolution_epoch,
+                        token.resolution_ordinal
+                    ],
+                    |row| row.get(0),
+                )
+                .map_err(storage_error)?;
+        tx.commit().map_err(storage_error)?;
+        Ok(current)
+    }
+
     pub(crate) fn mark_late_delete_resolution_disposition(
         &self,
         token: &LateDeleteResolutionToken,
@@ -1085,6 +1253,66 @@ impl StorageService {
         )
     }
 
+    pub(crate) fn finalize_deleted_post_delete(
+        &self,
+        deleted: DeletedPostDeleteCapability,
+    ) -> Result<LateDeletePostDeleteFinalizeResult, StorageError> {
+        self.transition_post_delete(
+            &deleted.token,
+            "resolved_deleted",
+            LateDeleteResolutionDisposition::DeleteDeleted,
+            None,
+        )
+    }
+
+    pub(crate) fn finalize_absent_post_delete(
+        &self,
+        absent: AbsentPostDeleteCapability,
+    ) -> Result<LateDeletePostDeleteFinalizeResult, StorageError> {
+        self.transition_post_delete(
+            &absent.token,
+            "resolved_deleted",
+            LateDeleteResolutionDisposition::DeleteAbsent,
+            None,
+        )
+    }
+
+    pub(crate) fn finalize_identity_mismatch_post_delete(
+        &self,
+        mismatch: IdentityMismatchPostDeleteCapability,
+    ) -> Result<LateDeletePostDeleteFinalizeResult, StorageError> {
+        self.transition_post_delete(
+            &mismatch.token,
+            "waiting_rebuild",
+            LateDeleteResolutionDisposition::IdentityMismatch,
+            Some("LATE_DELETE_IDENTITY_MISMATCH"),
+        )
+    }
+
+    pub(crate) fn finalize_failed_post_delete(
+        &self,
+        failure: FailedPostDeleteCapability,
+    ) -> Result<LateDeletePostDeleteFinalizeResult, StorageError> {
+        self.transition_post_delete(
+            &failure.token,
+            "unknown",
+            LateDeleteResolutionDisposition::DeleteUnknown,
+            Some(delete_failure_error_code(failure.error_code)),
+        )
+    }
+
+    pub(crate) fn finalize_pre_delete_corrupt(
+        &self,
+        corrupt: PreDeleteCorruptCapability,
+    ) -> Result<LateDeletePostDeleteFinalizeResult, StorageError> {
+        self.transition_post_delete(
+            &corrupt.token,
+            "waiting_rebuild",
+            LateDeleteResolutionDisposition::WaitingRebuild,
+            Some("LATE_DELETE_PRE_DELETE_CORRUPT"),
+        )
+    }
+
     pub(crate) fn finalize_late_delete_resolution_unknown(
         &self,
         token: &LateDeleteResolutionToken,
@@ -1273,6 +1501,211 @@ impl StorageService {
         } else {
             LateDeleteResolutionFinalizeResult::LostLeaseOrSuperseded
         })
+    }
+
+    fn transition_post_delete(
+        &self,
+        token: &LateDeleteResolutionToken,
+        target_state: &str,
+        disposition: LateDeleteResolutionDisposition,
+        error_code: Option<&str>,
+    ) -> Result<LateDeletePostDeleteFinalizeResult, StorageError> {
+        let mut state = self.state()?;
+        let tx = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        let now = authoritative_utc_millis_now_in(&tx)?;
+        if !token_is_current_in(&tx, token, &now)? {
+            tx.commit().map_err(storage_error)?;
+            return Ok(LateDeletePostDeleteFinalizeResult::LostLeaseOrSuperseded);
+        }
+        let terminal = matches!(target_state, "resolved_deleted");
+        let changed = tx
+            .execute(
+                "UPDATE memory_vector_late_delete_resolution
+             SET state=?2, last_resolution_disposition=?3, last_disposition_epoch=resolution_epoch,
+                 last_error_code=?4, lease_owner=CASE WHEN ?5 THEN NULL ELSE lease_owner END,
+                 lease_fence_epoch=CASE WHEN ?5 THEN NULL ELSE lease_fence_epoch END,
+                 lease_expires_at=CASE WHEN ?5 THEN NULL ELSE lease_expires_at END,
+                 next_attempt_at=NULL, resolved_at=CASE WHEN ?5 THEN ?6 ELSE NULL END, updated_at=?6
+             WHERE resolution_id=?1 AND outbox_id=?7 AND life_id=?8 AND memory_id=?9
+               AND mutation_sequence=?10 AND claimed_generation_id=?11
+               AND embedding_descriptor_id=?12 AND embedding_dimension=?13
+               AND captured_generation_authority_epoch=?14 AND state='processing'
+               AND resolution_epoch=?15 AND resolution_count=?16
+               AND last_reserved_resolution_epoch=?15
+               AND last_resolution_disposition='delete_started' AND last_disposition_epoch=?15
+               AND lease_owner=?17 AND lease_fence_epoch=?18 AND lease_expires_at > ?6
+               AND witness_attempt_ordinal=?19 AND witness_claim_epoch=?20
+               AND witness_marked_claim_epoch=?21 AND witness_send_disposition IS ?22
+               AND witness_error_code IS ?23 AND witness_age_anchor_at=?24",
+                params![
+                    token.resolution_id,
+                    target_state,
+                    disposition.as_str(),
+                    error_code,
+                    terminal,
+                    now,
+                    token.outbox_id,
+                    token.life_id,
+                    token.memory_id,
+                    token.mutation_sequence,
+                    token.claimed_generation_id,
+                    token.embedding_descriptor_id,
+                    token.embedding_dimension,
+                    token.captured_generation_authority_epoch,
+                    token.resolution_epoch,
+                    token.resolution_ordinal,
+                    token.lease_owner,
+                    token.runtime_fence_epoch,
+                    token.witness_attempt_ordinal,
+                    token.witness_claim_epoch,
+                    token.witness_marked_claim_epoch,
+                    token.witness_send_disposition,
+                    token.witness_error_code,
+                    token.witness_age_anchor_at
+                ],
+            )
+            .map_err(storage_error)?;
+        #[cfg(test)]
+        if POST_DELETE_FINALIZE_BEFORE_COMMIT_FAILURE.with(|fault| fault.replace(false)) {
+            return Err(StorageError::new(
+                "LATE_DELETE_POST_DELETE_FINALIZE_COMMIT_FAILED",
+                "test-only known pre-commit finalizer failure",
+                true,
+            ));
+        }
+        #[cfg(test)]
+        if POST_DELETE_FINALIZE_BEFORE_COMMIT_UNKNOWN.with(|fault| fault.replace(false)) {
+            drop(tx);
+            drop(state);
+            return self.reconcile_post_delete_commit_unknown(token, target_state, disposition);
+        }
+        // A post-commit result loss must never retry the SQLite write.  The
+        // typed capability is already consumed, so this is followed only by
+        // the readonly durable-world classification below.
+        #[cfg(test)]
+        record_post_delete_finalize_commit_attempt_for_test();
+        tx.commit().map_err(storage_error)?;
+        #[cfg(test)]
+        if POST_DELETE_FINALIZE_AFTER_COMMIT_UNKNOWN.with(|fault| fault.replace(false)) {
+            drop(state);
+            return self.reconcile_post_delete_commit_unknown(token, target_state, disposition);
+        }
+        Ok(if changed == 1 {
+            LateDeletePostDeleteFinalizeResult::Applied
+        } else {
+            LateDeletePostDeleteFinalizeResult::LostLeaseOrSuperseded
+        })
+    }
+
+    /// Inspects the one durable row after a terminal COMMIT result is unknown.
+    /// It deliberately performs no mutation, claim, reservation, or capability
+    /// construction: once a post-Delete capability is consumed, recovery owns
+    /// every unresolved case.
+    fn reconcile_post_delete_commit_unknown(
+        &self,
+        token: &LateDeleteResolutionToken,
+        target_state: &str,
+        disposition: LateDeleteResolutionDisposition,
+    ) -> Result<LateDeletePostDeleteFinalizeResult, StorageError> {
+        let state = self.state()?;
+        let row: Option<(
+            String,
+            String,
+            i64,
+            i64,
+            i64,
+            i64,
+            Option<String>,
+            Option<i64>,
+        )> = state
+            .connection
+            .query_row(
+                "SELECT state,last_resolution_disposition,last_disposition_epoch,
+                        resolution_epoch,last_reserved_resolution_epoch,resolution_count,
+                        lease_owner,lease_fence_epoch
+                 FROM memory_vector_late_delete_resolution
+                 WHERE resolution_id=?1 AND outbox_id=?2 AND life_id=?3 AND memory_id=?4
+                   AND mutation_sequence=?5 AND claimed_generation_id=?6
+                   AND embedding_descriptor_id=?7 AND embedding_dimension=?8
+                   AND captured_generation_authority_epoch=?9
+                   AND witness_attempt_ordinal=?10 AND witness_claim_epoch=?11
+                   AND witness_marked_claim_epoch=?12 AND witness_send_disposition IS ?13
+                   AND witness_error_code IS ?14 AND witness_age_anchor_at=?15",
+                params![
+                    token.resolution_id,
+                    token.outbox_id,
+                    token.life_id,
+                    token.memory_id,
+                    token.mutation_sequence,
+                    token.claimed_generation_id,
+                    token.embedding_descriptor_id,
+                    token.embedding_dimension,
+                    token.captured_generation_authority_epoch,
+                    token.witness_attempt_ordinal,
+                    token.witness_claim_epoch,
+                    token.witness_marked_claim_epoch,
+                    token.witness_send_disposition,
+                    token.witness_error_code,
+                    token.witness_age_anchor_at,
+                ],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(storage_error)?;
+        let Some((
+            state,
+            last_disposition,
+            last_disposition_epoch,
+            resolution_epoch,
+            last_reserved_resolution_epoch,
+            resolution_count,
+            lease_owner,
+            lease_fence_epoch,
+        )) = row
+        else {
+            return Ok(LateDeletePostDeleteFinalizeResult::LostLeaseOrSuperseded);
+        };
+        if state == target_state
+            && last_disposition == disposition.as_str()
+            && last_disposition_epoch == token.resolution_epoch
+            && resolution_epoch == token.resolution_epoch
+            && resolution_count == token.resolution_ordinal
+        {
+            return Ok(LateDeletePostDeleteFinalizeResult::ReconciledExpectedDisposition);
+        }
+        if state == "processing"
+            && last_disposition == "delete_started"
+            && last_disposition_epoch == token.resolution_epoch
+            && resolution_epoch == token.resolution_epoch
+            && last_reserved_resolution_epoch == token.resolution_epoch
+            && resolution_count == token.resolution_ordinal
+            && lease_owner.as_deref() == Some(&token.lease_owner)
+            && lease_fence_epoch == Some(token.runtime_fence_epoch)
+        {
+            return Ok(LateDeletePostDeleteFinalizeResult::CommitUnknownStillDeleteStarted);
+        }
+        Ok(LateDeletePostDeleteFinalizeResult::LostLeaseOrSuperseded)
+    }
+}
+
+fn delete_failure_error_code(code: VectorStoreErrorCode) -> &'static str {
+    match code {
+        VectorStoreErrorCode::StoreUnavailable => "LATE_DELETE_STORE_UNAVAILABLE",
+        _ => "LATE_DELETE_CONDITIONAL_DELETE_UNKNOWN",
     }
 }
 
@@ -1465,11 +1898,13 @@ mod tests {
     };
     use std::{
         fs,
+        future::Future,
         path::PathBuf,
         sync::{
             atomic::{AtomicUsize, Ordering},
             mpsc, Arc, Barrier,
         },
+        task::{Context, Poll, Wake, Waker},
         thread,
     };
 
@@ -1570,10 +2005,22 @@ mod tests {
         }
     }
 
+    fn issued_delete_permit(storage: &StorageService) -> Box<LateDeleteDeletePermit> {
+        let present =
+            acknowledge_query_present_for_test(*reserved_query_permit(storage), 7, "hash-7");
+        match storage.issue_late_delete_permit(present).unwrap() {
+            LateDeleteDeletePermitIssuance::Issued(permit) => permit,
+            _ => panic!("a definite DeleteStarted commit must issue one permit"),
+        }
+    }
+
     #[derive(Clone)]
     struct ScriptedQueryStore {
         result: Result<Option<VectorMetadataSample>, VectorStoreError>,
         query_count: Arc<AtomicUsize>,
+        delete_result: Result<ConditionalGenerationDeleteOutcome, VectorStoreError>,
+        delete_count: Arc<AtomicUsize>,
+        delete_started: Option<mpsc::Sender<()>>,
     }
 
     impl ScriptedQueryStore {
@@ -1581,11 +2028,35 @@ mod tests {
             Self {
                 result,
                 query_count: Arc::new(AtomicUsize::new(0)),
+                delete_result: Err(VectorStoreError::new(
+                    VectorStoreErrorCode::StoreUnavailable,
+                    "scripted query store has no delete result",
+                    false,
+                )),
+                delete_count: Arc::new(AtomicUsize::new(0)),
+                delete_started: None,
             }
+        }
+
+        fn with_delete_result(
+            mut self,
+            result: Result<ConditionalGenerationDeleteOutcome, VectorStoreError>,
+        ) -> Self {
+            self.delete_result = result;
+            self
+        }
+
+        fn with_pending_delete(mut self, started: mpsc::Sender<()>) -> Self {
+            self.delete_started = Some(started);
+            self
         }
 
         fn query_count(&self) -> usize {
             self.query_count.load(Ordering::SeqCst)
+        }
+
+        fn delete_count(&self) -> usize {
+            self.delete_count.load(Ordering::SeqCst)
         }
 
         fn unsupported<T>() -> Result<T, VectorStoreError> {
@@ -1595,6 +2066,12 @@ mod tests {
                 false,
             ))
         }
+    }
+
+    struct NoopWake;
+
+    impl Wake for NoopWake {
+        fn wake(self: Arc<Self>) {}
     }
 
     impl VectorStore for ScriptedQueryStore {
@@ -1674,6 +2151,29 @@ mod tests {
         ) -> VectorStoreFuture<'a, Result<Option<VectorMetadataSample>, VectorStoreError>> {
             self.query_count.fetch_add(1, Ordering::SeqCst);
             let result = self.result.clone();
+            Box::pin(async move { result })
+        }
+
+        fn delete_generation_memory_if_matches<'a>(
+            &'a self,
+            _context: &'a VectorGenerationContext,
+            _life_id: &'a str,
+            _memory_id: &'a str,
+            _expected_revision: i64,
+            _expected_content_hash: &'a str,
+        ) -> VectorStoreFuture<'a, Result<ConditionalGenerationDeleteOutcome, VectorStoreError>>
+        {
+            self.delete_count.fetch_add(1, Ordering::SeqCst);
+            if let Some(started) = self.delete_started.clone() {
+                return Box::pin(async move {
+                    started.send(()).unwrap();
+                    std::future::pending::<
+                        Result<ConditionalGenerationDeleteOutcome, VectorStoreError>,
+                    >()
+                    .await
+                });
+            }
+            let result = self.delete_result.clone();
             Box::pin(async move { result })
         }
     }
@@ -3138,5 +3638,514 @@ mod tests {
             LateDeleteQueryHandoffOutcome::LostLeaseOrSuperseded
         ));
         assert_eq!(store.query_count(), 0);
+    }
+
+    #[test]
+    fn late_delete_delete_handoff_maps_all_conditional_outcomes_once() {
+        let cases = [
+            (
+                Ok(ConditionalGenerationDeleteOutcome::Deleted),
+                "resolved_deleted",
+                "delete_deleted",
+            ),
+            (
+                Ok(ConditionalGenerationDeleteOutcome::Absent),
+                "resolved_deleted",
+                "delete_absent",
+            ),
+            (
+                Ok(ConditionalGenerationDeleteOutcome::IdentityMismatch),
+                "waiting_rebuild",
+                "identity_mismatch",
+            ),
+            (
+                Err(VectorStoreError::new(
+                    VectorStoreErrorCode::StoreUnavailable,
+                    "injected delete failure",
+                    true,
+                )),
+                "unknown",
+                "delete_unknown",
+            ),
+        ];
+        for (delete_result, expected_state, expected_disposition) in cases {
+            let (_root, storage) = storage();
+            seed_resolution(&storage, "life", "memory", 1);
+            let store = ScriptedQueryStore::new(Ok(Some(valid_query_sample())))
+                .with_delete_result(delete_result);
+            let outcome = tauri::async_runtime::block_on(
+                issued_delete_permit(&storage).execute_conditional_delete_once(&storage, &store),
+            )
+            .unwrap();
+            let result = match outcome {
+                LateDeleteDeleteHandoffOutcome::Deleted(capability) => {
+                    storage.finalize_deleted_post_delete(capability).unwrap()
+                }
+                LateDeleteDeleteHandoffOutcome::Absent(capability) => {
+                    storage.finalize_absent_post_delete(capability).unwrap()
+                }
+                LateDeleteDeleteHandoffOutcome::IdentityMismatch(capability) => storage
+                    .finalize_identity_mismatch_post_delete(capability)
+                    .unwrap(),
+                LateDeleteDeleteHandoffOutcome::Failure(capability) => {
+                    storage.finalize_failed_post_delete(capability).unwrap()
+                }
+                _ => panic!("a scripted conditional result must produce its typed capability"),
+            };
+            assert_eq!(result, LateDeletePostDeleteFinalizeResult::Applied);
+            assert_eq!(store.delete_count(), 1);
+            assert_eq!(
+                query_resolution_state(&storage),
+                (expected_state.into(), expected_disposition.into())
+            );
+        }
+    }
+
+    #[test]
+    fn late_delete_delete_handoff_pre_delete_corrupt_and_lost_authority_make_zero_calls() {
+        let (_root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let permit = issued_delete_permit(&storage);
+        let LateDeleteDeletePermit {
+            token,
+            content_hash,
+            ..
+        } = *permit;
+        let corrupt_permit = Box::new(LateDeleteDeletePermit {
+            token,
+            revision: 0,
+            content_hash,
+        });
+        let store = ScriptedQueryStore::new(Ok(Some(valid_query_sample())))
+            .with_delete_result(Ok(ConditionalGenerationDeleteOutcome::Deleted));
+        let outcome = tauri::async_runtime::block_on(
+            corrupt_permit.execute_conditional_delete_once(&storage, &store),
+        )
+        .unwrap();
+        let corrupt = match outcome {
+            LateDeleteDeleteHandoffOutcome::PreDeleteCorrupt(capability) => capability,
+            _ => panic!("invalid permit context must be pre-delete corruption"),
+        };
+        assert_eq!(store.delete_count(), 0);
+        assert_eq!(
+            storage.finalize_pre_delete_corrupt(corrupt).unwrap(),
+            LateDeletePostDeleteFinalizeResult::Applied
+        );
+        assert_eq!(
+            query_resolution_state(&storage),
+            ("waiting_rebuild".into(), "waiting_rebuild".into())
+        );
+    }
+
+    #[test]
+    fn late_delete_post_delete_commit_unknown_reconciles_expected_terminal_without_replay() {
+        reset_post_delete_finalize_faults_for_test();
+        let (_root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let store = ScriptedQueryStore::new(Ok(Some(valid_query_sample())))
+            .with_delete_result(Ok(ConditionalGenerationDeleteOutcome::Deleted));
+        let deleted = match tauri::async_runtime::block_on(
+            issued_delete_permit(&storage).execute_conditional_delete_once(&storage, &store),
+        )
+        .unwrap()
+        {
+            LateDeleteDeleteHandoffOutcome::Deleted(capability) => capability,
+            _ => panic!("scripted delete must yield the sealed deleted capability"),
+        };
+        POST_DELETE_FINALIZE_AFTER_COMMIT_UNKNOWN.with(|fault| fault.set(true));
+        assert_eq!(
+            storage.finalize_deleted_post_delete(deleted).unwrap(),
+            LateDeletePostDeleteFinalizeResult::ReconciledExpectedDisposition
+        );
+        assert_eq!(post_delete_finalize_commit_attempt_count_for_test(), 1);
+        assert_eq!(store.delete_count(), 1);
+        assert_eq!(
+            query_resolution_state(&storage),
+            ("resolved_deleted".into(), "delete_deleted".into())
+        );
+    }
+
+    #[test]
+    fn late_delete_post_delete_commit_unknown_still_delete_started_leaves_recovery_owner() {
+        reset_post_delete_finalize_faults_for_test();
+        let (_root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let store = ScriptedQueryStore::new(Ok(Some(valid_query_sample())))
+            .with_delete_result(Ok(ConditionalGenerationDeleteOutcome::Deleted));
+        let deleted = match tauri::async_runtime::block_on(
+            issued_delete_permit(&storage).execute_conditional_delete_once(&storage, &store),
+        )
+        .unwrap()
+        {
+            LateDeleteDeleteHandoffOutcome::Deleted(capability) => capability,
+            _ => panic!("scripted delete must yield the sealed deleted capability"),
+        };
+        POST_DELETE_FINALIZE_BEFORE_COMMIT_UNKNOWN.with(|fault| fault.set(true));
+        assert_eq!(
+            storage.finalize_deleted_post_delete(deleted).unwrap(),
+            LateDeletePostDeleteFinalizeResult::CommitUnknownStillDeleteStarted
+        );
+        assert_eq!(post_delete_finalize_commit_attempt_count_for_test(), 0);
+        assert_eq!(store.delete_count(), 1);
+        assert_eq!(
+            query_resolution_state(&storage),
+            ("processing".into(), "delete_started".into())
+        );
+        expire_resolution_lease(&storage);
+        assert_eq!(
+            storage.recover_expired_late_delete_resolutions().unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn late_delete_post_delete_reconcile_superseded_never_overwrites_new_mutation() {
+        let (root, storage) = storage();
+        let memory = super::super::test_support::insert_confirmed_memory_fixture(
+            &storage,
+            "life",
+            "fact",
+            "late delete",
+            None,
+            0.5,
+            0.5,
+            false,
+            true,
+        );
+        seed_resolution(&storage, "life", &memory.id, 1);
+        let store = ScriptedQueryStore::new(Ok(Some(valid_query_sample())))
+            .with_delete_result(Ok(ConditionalGenerationDeleteOutcome::Deleted));
+        let deleted = match tauri::async_runtime::block_on(
+            issued_delete_permit(&storage).execute_conditional_delete_once(&storage, &store),
+        )
+        .unwrap()
+        {
+            LateDeleteDeleteHandoffOutcome::Deleted(capability) => capability,
+            _ => panic!("scripted delete must yield the sealed deleted capability"),
+        };
+        let DeletedPostDeleteCapability { token } = deleted;
+        let service_b = StorageService::initialize_with_roots(root.0.join("data"), None).unwrap();
+        <StorageService as MemoryVectorSyncOutboxRepository>::enqueue(
+            &service_b,
+            EnqueueMemoryVectorSyncRequest {
+                life_id: "life".into(),
+                memory_id: memory.id.clone(),
+                desired_action: MemoryVectorSyncAction::Delete,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            storage
+                .reconcile_post_delete_commit_unknown(
+                    &token,
+                    "resolved_deleted",
+                    LateDeleteResolutionDisposition::DeleteDeleted,
+                )
+                .unwrap(),
+            LateDeletePostDeleteFinalizeResult::LostLeaseOrSuperseded
+        );
+        assert_eq!(store.delete_count(), 1);
+        let row: (String, String, i64) = service_b
+            .state()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT r.state,r.last_resolution_disposition,o.mutation_sequence
+             FROM memory_vector_late_delete_resolution r
+             JOIN memory_vector_sync_outbox o ON o.life_id=r.life_id AND o.memory_id=r.memory_id
+             WHERE r.life_id='life' AND r.memory_id=?1",
+                [&memory.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("superseded".into(), "superseded".into(), 2));
+    }
+
+    #[test]
+    fn late_delete_post_delete_known_failure_consumes_capability_without_retry() {
+        reset_post_delete_finalize_faults_for_test();
+        let (_root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let store = ScriptedQueryStore::new(Ok(Some(valid_query_sample())))
+            .with_delete_result(Ok(ConditionalGenerationDeleteOutcome::Deleted));
+        let deleted = match tauri::async_runtime::block_on(
+            issued_delete_permit(&storage).execute_conditional_delete_once(&storage, &store),
+        )
+        .unwrap()
+        {
+            LateDeleteDeleteHandoffOutcome::Deleted(capability) => capability,
+            _ => panic!("scripted delete must yield the sealed deleted capability"),
+        };
+        POST_DELETE_FINALIZE_BEFORE_COMMIT_FAILURE.with(|fault| fault.set(true));
+        let error = storage.finalize_deleted_post_delete(deleted).unwrap_err();
+        assert_eq!(error.code, "LATE_DELETE_POST_DELETE_FINALIZE_COMMIT_FAILED");
+        assert_eq!(post_delete_finalize_commit_attempt_count_for_test(), 0);
+        assert_eq!(store.delete_count(), 1);
+        assert_eq!(
+            query_resolution_state(&storage),
+            ("processing".into(), "delete_started".into())
+        );
+    }
+
+    #[test]
+    fn late_delete_post_delete_cancellation_consumes_delete_permit_during_external_delete() {
+        let (_root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let (started_tx, started_rx) = mpsc::channel();
+        let store =
+            ScriptedQueryStore::new(Ok(Some(valid_query_sample()))).with_pending_delete(started_tx);
+        let waker = Waker::from(Arc::new(NoopWake));
+        let mut context = Context::from_waker(&waker);
+        let mut future = Box::pin(
+            issued_delete_permit(&storage).execute_conditional_delete_once(&storage, &store),
+        );
+        assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
+        started_rx.recv().unwrap();
+        assert_eq!(store.delete_count(), 1);
+        drop(future);
+        assert_eq!(
+            query_resolution_state(&storage),
+            ("processing".into(), "delete_started".into())
+        );
+        expire_resolution_lease(&storage);
+        assert_eq!(
+            storage.recover_expired_late_delete_resolutions().unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn late_delete_post_delete_crash_a_restart_has_no_delete_permit_reconstruction() {
+        let (root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        drop(issued_delete_permit(&storage));
+        let database_root = root.0.join("data");
+        drop(storage);
+        let reopened = StorageService::initialize_with_roots(database_root, None).unwrap();
+        assert_eq!(
+            query_resolution_state(&reopened),
+            ("processing".into(), "delete_started".into())
+        );
+        expire_resolution_lease(&reopened);
+        assert_eq!(
+            reopened.recover_expired_late_delete_resolutions().unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn late_delete_post_delete_crash_b_restart_after_started_delete_has_no_replay() {
+        let (root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let (started_tx, started_rx) = mpsc::channel();
+        let store =
+            ScriptedQueryStore::new(Ok(Some(valid_query_sample()))).with_pending_delete(started_tx);
+        let waker = Waker::from(Arc::new(NoopWake));
+        let mut context = Context::from_waker(&waker);
+        let mut future = Box::pin(
+            issued_delete_permit(&storage).execute_conditional_delete_once(&storage, &store),
+        );
+        assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
+        started_rx.recv().unwrap();
+        assert_eq!(store.delete_count(), 1);
+        drop(future);
+        let database_root = root.0.join("data");
+        drop(storage);
+        let reopened = StorageService::initialize_with_roots(database_root, None).unwrap();
+        assert_eq!(
+            query_resolution_state(&reopened),
+            ("processing".into(), "delete_started".into())
+        );
+        expire_resolution_lease(&reopened);
+        assert_eq!(
+            reopened.recover_expired_late_delete_resolutions().unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn late_delete_post_delete_crash_c_restart_drops_known_outcome_without_finalize() {
+        let (root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let store = ScriptedQueryStore::new(Ok(Some(valid_query_sample())))
+            .with_delete_result(Ok(ConditionalGenerationDeleteOutcome::Deleted));
+        let capability = tauri::async_runtime::block_on(
+            issued_delete_permit(&storage).execute_conditional_delete_once(&storage, &store),
+        )
+        .unwrap();
+        assert!(matches!(
+            capability,
+            LateDeleteDeleteHandoffOutcome::Deleted(_)
+        ));
+        assert_eq!(store.delete_count(), 1);
+        drop(capability);
+        let database_root = root.0.join("data");
+        drop(storage);
+        let reopened = StorageService::initialize_with_roots(database_root, None).unwrap();
+        assert_eq!(
+            query_resolution_state(&reopened),
+            ("processing".into(), "delete_started".into())
+        );
+        expire_resolution_lease(&reopened);
+        assert_eq!(
+            reopened.recover_expired_late_delete_resolutions().unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn late_delete_post_delete_new_mutation_race_old_finalizer_loses_without_overwrite() {
+        for _ in 0..10 {
+            let (root, service_a) = storage();
+            let memory = super::super::test_support::insert_confirmed_memory_fixture(
+                &service_a,
+                "life",
+                "fact",
+                "late delete",
+                None,
+                0.5,
+                0.5,
+                false,
+                true,
+            );
+            seed_resolution(&service_a, "life", &memory.id, 1);
+            let service_b =
+                StorageService::initialize_with_roots(root.0.join("data"), None).unwrap();
+            let barrier = Arc::new(Barrier::new(2));
+            let (capability_ready_tx, capability_ready_rx) = mpsc::channel();
+            let (mutation_done_tx, mutation_done_rx) = mpsc::channel();
+            let store = ScriptedQueryStore::new(Ok(Some(valid_query_sample())))
+                .with_delete_result(Ok(ConditionalGenerationDeleteOutcome::Deleted));
+            let old_barrier = Arc::clone(&barrier);
+            let old_finalizer = thread::spawn(move || {
+                let capability = match tauri::async_runtime::block_on(
+                    issued_delete_permit(&service_a)
+                        .execute_conditional_delete_once(&service_a, &store),
+                )
+                .unwrap()
+                {
+                    LateDeleteDeleteHandoffOutcome::Deleted(capability) => capability,
+                    _ => panic!("scripted delete must yield a deleted capability"),
+                };
+                capability_ready_tx.send(()).unwrap();
+                old_barrier.wait();
+                mutation_done_rx.recv().unwrap();
+                let result = service_a.finalize_deleted_post_delete(capability).unwrap();
+                (result, store.delete_count())
+            });
+            let mutation_barrier = Arc::clone(&barrier);
+            let memory_id = memory.id.clone();
+            let mutation = thread::spawn(move || {
+                capability_ready_rx.recv().unwrap();
+                mutation_barrier.wait();
+                <StorageService as MemoryVectorSyncOutboxRepository>::enqueue(
+                    &service_b,
+                    EnqueueMemoryVectorSyncRequest {
+                        life_id: "life".into(),
+                        memory_id,
+                        desired_action: MemoryVectorSyncAction::Delete,
+                    },
+                )
+                .unwrap();
+                mutation_done_tx.send(()).unwrap();
+                service_b
+            });
+            let service_b = mutation.join().unwrap();
+            let (finalize, delete_count) = old_finalizer.join().unwrap();
+            assert_eq!(
+                finalize,
+                LateDeletePostDeleteFinalizeResult::LostLeaseOrSuperseded
+            );
+            assert_eq!(delete_count, 1);
+            let row: (String, String, i64) = service_b
+                .state()
+                .unwrap()
+                .connection
+                .query_row(
+                    "SELECT r.state,r.last_resolution_disposition,o.mutation_sequence
+                 FROM memory_vector_late_delete_resolution r
+                 JOIN memory_vector_sync_outbox o ON o.life_id=r.life_id AND o.memory_id=r.memory_id
+                 WHERE r.life_id='life' AND r.memory_id=?1",
+                    [&memory.id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(row, ("superseded".into(), "superseded".into(), 2));
+        }
+    }
+
+    #[test]
+    fn late_delete_post_delete_finalizer_first_allows_later_new_mutation() {
+        for _ in 0..10 {
+            let (root, service_a) = storage();
+            let memory = super::super::test_support::insert_confirmed_memory_fixture(
+                &service_a,
+                "life",
+                "fact",
+                "late delete",
+                None,
+                0.5,
+                0.5,
+                false,
+                true,
+            );
+            seed_resolution(&service_a, "life", &memory.id, 1);
+            let service_b =
+                StorageService::initialize_with_roots(root.0.join("data"), None).unwrap();
+            let barrier = Arc::new(Barrier::new(2));
+            let (finalized_tx, finalized_rx) = mpsc::channel();
+            let store = ScriptedQueryStore::new(Ok(Some(valid_query_sample())))
+                .with_delete_result(Ok(ConditionalGenerationDeleteOutcome::Deleted));
+            let finalizer_barrier = Arc::clone(&barrier);
+            let finalizer = thread::spawn(move || {
+                let capability = match tauri::async_runtime::block_on(
+                    issued_delete_permit(&service_a)
+                        .execute_conditional_delete_once(&service_a, &store),
+                )
+                .unwrap()
+                {
+                    LateDeleteDeleteHandoffOutcome::Deleted(capability) => capability,
+                    _ => panic!("scripted delete must yield a deleted capability"),
+                };
+                finalizer_barrier.wait();
+                let result = service_a.finalize_deleted_post_delete(capability).unwrap();
+                finalized_tx.send(()).unwrap();
+                (result, store.delete_count())
+            });
+            let mutation_barrier = Arc::clone(&barrier);
+            let memory_id = memory.id.clone();
+            let mutation = thread::spawn(move || {
+                mutation_barrier.wait();
+                finalized_rx.recv().unwrap();
+                <StorageService as MemoryVectorSyncOutboxRepository>::enqueue(
+                    &service_b,
+                    EnqueueMemoryVectorSyncRequest {
+                        life_id: "life".into(),
+                        memory_id,
+                        desired_action: MemoryVectorSyncAction::Delete,
+                    },
+                )
+                .unwrap();
+                service_b
+            });
+            let service_b = mutation.join().unwrap();
+            let (finalize, delete_count) = finalizer.join().unwrap();
+            assert_eq!(finalize, LateDeletePostDeleteFinalizeResult::Applied);
+            assert_eq!(delete_count, 1);
+            let row: (String, String, i64) = service_b
+                .state()
+                .unwrap()
+                .connection
+                .query_row(
+                    "SELECT r.state,r.last_resolution_disposition,o.mutation_sequence
+                 FROM memory_vector_late_delete_resolution r
+                 JOIN memory_vector_sync_outbox o ON o.life_id=r.life_id AND o.memory_id=r.memory_id
+                 WHERE r.life_id='life' AND r.memory_id=?1",
+                    [&memory.id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(row, ("resolved_deleted".into(), "delete_deleted".into(), 2));
+        }
     }
 }

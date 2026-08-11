@@ -28,10 +28,13 @@ pub(crate) use llm_candidate_extraction::{
 // orchestrator; their constructors and the raw resolution token stay private.
 #[allow(unused_imports)]
 pub(crate) use late_delete_resolution::{
-    AbsentPostQueryCapability, CorruptPostQueryCapability, FailedPostQueryCapability,
-    LateDeleteDeletePermitIssuance, LateDeleteQueryHandoffOutcome, LateDeleteQueryPermit,
-    LateDeleteQueryReservation, LateDeleteResolutionClaimResult, LateDeleteResolutionFinalizeResult,
-    LateDeleteRuntimeLease, PresentPostQueryCapability,
+    AbsentPostDeleteCapability, AbsentPostQueryCapability, CorruptPostQueryCapability,
+    DeletedPostDeleteCapability, FailedPostDeleteCapability, FailedPostQueryCapability,
+    IdentityMismatchPostDeleteCapability, LateDeleteDeleteHandoffOutcome, LateDeleteDeletePermit,
+    LateDeleteDeletePermitIssuance, LateDeletePostDeleteFinalizeResult,
+    LateDeleteQueryHandoffOutcome, LateDeleteQueryPermit, LateDeleteQueryReservation,
+    LateDeleteResolutionClaimResult, LateDeleteResolutionFinalizeResult, LateDeleteRuntimeLease,
+    PreDeleteCorruptCapability, PresentPostQueryCapability,
 };
 pub(crate) use vector_sync_outbox::{
     is_delete_unknown_evidence, FencedAttemptReservation, FencedAttemptToken,

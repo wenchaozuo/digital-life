@@ -573,6 +573,20 @@ struct ResolutionRow {
     lease_expires_at: Option<String>,
 }
 
+/// One durable post-Delete resolution row read by the read-only commit-result-
+/// unknown reconciliation. A private shape alias only: the field order and
+/// Option nesting are unchanged.
+type PostDeleteCommitUnknownRow = (
+    String,
+    String,
+    i64,
+    i64,
+    i64,
+    i64,
+    Option<String>,
+    Option<i64>,
+);
+
 fn storage_error(error: impl std::fmt::Display) -> StorageError {
     StorageError::new(
         "LATE_DELETE_RESOLUTION_DATABASE_ERROR",
@@ -1611,16 +1625,7 @@ impl StorageService {
         disposition: LateDeleteResolutionDisposition,
     ) -> Result<LateDeletePostDeleteFinalizeResult, StorageError> {
         let state = self.state()?;
-        let row: Option<(
-            String,
-            String,
-            i64,
-            i64,
-            i64,
-            i64,
-            Option<String>,
-            Option<i64>,
-        )> = state
+        let row: Option<PostDeleteCommitUnknownRow> = state
             .connection
             .query_row(
                 "SELECT state,last_resolution_disposition,last_disposition_epoch,
@@ -1904,7 +1909,7 @@ mod tests {
             atomic::{AtomicUsize, Ordering},
             mpsc, Arc, Barrier,
         },
-        task::{Context, Poll, Wake, Waker},
+        task::{Context, Poll, Waker},
         thread,
     };
 
@@ -2066,12 +2071,6 @@ mod tests {
                 false,
             ))
         }
-    }
-
-    struct NoopWake;
-
-    impl Wake for NoopWake {
-        fn wake(self: Arc<Self>) {}
     }
 
     impl VectorStore for ScriptedQueryStore {
@@ -3894,8 +3893,8 @@ mod tests {
         let (started_tx, started_rx) = mpsc::channel();
         let store =
             ScriptedQueryStore::new(Ok(Some(valid_query_sample()))).with_pending_delete(started_tx);
-        let waker = Waker::from(Arc::new(NoopWake));
-        let mut context = Context::from_waker(&waker);
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
         let mut future = Box::pin(
             issued_delete_permit(&storage).execute_conditional_delete_once(&storage, &store),
         );
@@ -3940,8 +3939,8 @@ mod tests {
         let (started_tx, started_rx) = mpsc::channel();
         let store =
             ScriptedQueryStore::new(Ok(Some(valid_query_sample()))).with_pending_delete(started_tx);
-        let waker = Waker::from(Arc::new(NoopWake));
-        let mut context = Context::from_waker(&waker);
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
         let mut future = Box::pin(
             issued_delete_permit(&storage).execute_conditional_delete_once(&storage, &store),
         );

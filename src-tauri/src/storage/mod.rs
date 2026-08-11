@@ -31,10 +31,12 @@ pub(crate) use late_delete_resolution::{
     AbsentPostDeleteCapability, AbsentPostQueryCapability, CorruptPostQueryCapability,
     DeletedPostDeleteCapability, FailedPostDeleteCapability, FailedPostQueryCapability,
     IdentityMismatchPostDeleteCapability, LateDeleteDeleteHandoffOutcome, LateDeleteDeletePermit,
-    LateDeleteDeletePermitIssuance, LateDeletePostDeleteFinalizeResult,
-    LateDeleteQueryHandoffOutcome, LateDeleteQueryPermit, LateDeleteQueryReservation,
-    LateDeleteResolutionClaimResult, LateDeleteResolutionFinalizeResult, LateDeleteRuntimeLease,
-    PreDeleteCorruptCapability, PresentPostQueryCapability,
+    LateDeleteDeletePermitIssuance, LateDeleteDeletePermitRunnerIssuance,
+    LateDeletePostDeleteFinalizeResult, LateDeleteQueryHandoffOutcome, LateDeleteQueryPermit,
+    LateDeleteQueryReservation, LateDeleteResolutionClaim, LateDeleteResolutionClaimResult,
+    LateDeleteResolutionFinalizeResult, LateDeleteRuntimeLease,
+    LateDeleteStartedCommitUnknownReconcileResult, PreDeleteCorruptCapability,
+    PresentPostQueryCapability,
 };
 pub(crate) use vector_sync_outbox::{
     is_delete_unknown_evidence, FencedAttemptReservation, FencedAttemptToken,

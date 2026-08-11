@@ -216,6 +216,33 @@ pub(crate) enum LateDeleteDeletePermitIssuance {
     WaitingRebuild,
 }
 
+/// Runner-facing issuance result. Commit uncertainty is fully classified inside
+/// storage and never carries a token or a capability to the caller.
+pub(crate) enum LateDeleteDeletePermitRunnerIssuance {
+    Issued(Box<LateDeleteDeletePermit>),
+    LostLeaseOrSuperseded,
+    WaitingRebuild,
+    CommitUnknownRecoveryRequired(LateDeleteStartedCommitUnknownReconcileResult),
+}
+
+/// Read-only classification of an exact consumed Present capability after the
+/// DeleteStarted COMMIT result is unknown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LateDeleteStartedCommitUnknownReconcileResult {
+    DeleteStartedDurableNoPermit,
+    PreIssuanceDurableNoPermit,
+    LostLeaseOrSupersededNoPermit,
+}
+
+enum LateDeleteDeletePermitIssuanceCore {
+    Issued(Box<LateDeleteDeletePermit>),
+    LostLeaseOrSuperseded,
+    WaitingRebuild,
+    CommitUnknown {
+        token: Box<LateDeleteResolutionToken>,
+    },
+}
+
 /// Read-only durable classification for a commit-result-unknown caller. It
 /// intentionally contains no capability and can never recreate one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -225,6 +252,42 @@ pub(crate) enum LateDeleteStartedDurableState {
 }
 
 impl LateDeleteQueryPermit {
+    /// Runner-facing opaque Query surface. The generation context is derived
+    /// only from the sealed permit and the existing H1 bridge remains the sole
+    /// implementation that can invoke the public VectorStore Query.
+    pub(crate) async fn execute_exact_query_once_opaque(
+        self: Box<Self>,
+        storage: &StorageService,
+        vector_store: &dyn VectorStore,
+    ) -> Result<LateDeleteQueryHandoffOutcome, StorageError> {
+        let token = self.token;
+        let context = VectorGenerationId::parse(&token.claimed_generation_id)
+            .ok()
+            .and_then(|generation_id| {
+                usize::try_from(token.embedding_dimension)
+                    .ok()
+                    .and_then(|dimension| {
+                        VectorGenerationContext::new(
+                            generation_id,
+                            token.embedding_descriptor_id.clone(),
+                            dimension,
+                        )
+                        .ok()
+                    })
+            });
+        let Some(context) = context else {
+            return Ok(LateDeleteQueryHandoffOutcome::Corrupt(
+                CorruptPostQueryCapability {
+                    token,
+                    error_code: "LATE_DELETE_QUERY_CONTEXT_CORRUPT",
+                },
+            ));
+        };
+        Box::new(LateDeleteQueryPermit { token })
+            .execute_exact_query_once(storage, &context, vector_store)
+            .await
+    }
+
     /// Consumes this definite reservation's sole Query authority and performs
     /// the only public exact VectorStore query for its ordinal. The SQLite
     /// currency guard completes before the await, so no SQLite transaction or
@@ -428,6 +491,8 @@ pub(crate) fn acknowledge_query_present_for_test(
 #[cfg(test)]
 thread_local! {
     static DELETE_STARTED_BEFORE_COMMIT_FAULT: Cell<bool> = const { Cell::new(false) };
+    static DELETE_STARTED_BEFORE_COMMIT_UNKNOWN_FAULT: Cell<bool> = const { Cell::new(false) };
+    static DELETE_STARTED_RECONCILE_READ_FAILURE: Cell<bool> = const { Cell::new(false) };
     static DELETE_STARTED_AFTER_COMMIT_FAULT: Cell<bool> = const { Cell::new(false) };
     static QUERY_PERMIT_AFTER_COMMIT_FAULT: Cell<bool> = const { Cell::new(false) };
     static DELETE_STARTED_COMMIT_ATTEMPT_COUNT: Cell<usize> = const { Cell::new(0) };
@@ -1072,6 +1137,53 @@ impl StorageService {
         &self,
         present: PresentPostQueryCapability,
     ) -> Result<LateDeleteDeletePermitIssuance, StorageError> {
+        match self.issue_late_delete_permit_core(present)? {
+            LateDeleteDeletePermitIssuanceCore::Issued(permit) => {
+                Ok(LateDeleteDeletePermitIssuance::Issued(permit))
+            }
+            LateDeleteDeletePermitIssuanceCore::LostLeaseOrSuperseded => {
+                Ok(LateDeleteDeletePermitIssuance::LostLeaseOrSuperseded)
+            }
+            LateDeleteDeletePermitIssuanceCore::WaitingRebuild => {
+                Ok(LateDeleteDeletePermitIssuance::WaitingRebuild)
+            }
+            LateDeleteDeletePermitIssuanceCore::CommitUnknown { .. } => Err(StorageError::new(
+                "LATE_DELETE_DELETE_STARTED_COMMIT_RESULT_UNKNOWN",
+                "DeleteStarted commit result is unknown; no Delete permit is returned",
+                true,
+            )),
+        }
+    }
+
+    /// Consumes Present and makes a runner-safe issuance decision. The commit
+    /// unknown branch is reconciled immediately with the sealed token and
+    /// deliberately exposes neither that token nor a permit.
+    pub(crate) fn issue_late_delete_permit_for_runner(
+        &self,
+        present: PresentPostQueryCapability,
+    ) -> Result<LateDeleteDeletePermitRunnerIssuance, StorageError> {
+        match self.issue_late_delete_permit_core(present)? {
+            LateDeleteDeletePermitIssuanceCore::Issued(permit) => {
+                Ok(LateDeleteDeletePermitRunnerIssuance::Issued(permit))
+            }
+            LateDeleteDeletePermitIssuanceCore::LostLeaseOrSuperseded => {
+                Ok(LateDeleteDeletePermitRunnerIssuance::LostLeaseOrSuperseded)
+            }
+            LateDeleteDeletePermitIssuanceCore::WaitingRebuild => {
+                Ok(LateDeleteDeletePermitRunnerIssuance::WaitingRebuild)
+            }
+            LateDeleteDeletePermitIssuanceCore::CommitUnknown { token } => Ok(
+                LateDeleteDeletePermitRunnerIssuance::CommitUnknownRecoveryRequired(
+                    self.reconcile_late_delete_started_exact_token(&token)?,
+                ),
+            ),
+        }
+    }
+
+    fn issue_late_delete_permit_core(
+        &self,
+        present: PresentPostQueryCapability,
+    ) -> Result<LateDeleteDeletePermitIssuanceCore, StorageError> {
         let PresentPostQueryCapability {
             token,
             revision,
@@ -1085,21 +1197,21 @@ impl StorageService {
         let now = authoritative_utc_millis_now_in(&tx)?;
         if !token_is_current_in(&tx, &token, &now)? {
             tx.commit().map_err(storage_error)?;
-            return Ok(LateDeleteDeletePermitIssuance::LostLeaseOrSuperseded);
+            return Ok(LateDeleteDeletePermitIssuanceCore::LostLeaseOrSuperseded);
         }
         let row = load_resolution_in(&tx, token.resolution_id)?;
         let Some(row) = row else {
             tx.commit().map_err(storage_error)?;
-            return Ok(LateDeleteDeletePermitIssuance::LostLeaseOrSuperseded);
+            return Ok(LateDeleteDeletePermitIssuanceCore::LostLeaseOrSuperseded);
         };
         if !resolution_authority_is_current_in(&tx, &row, &now)? {
             converge_waiting_rebuild_in(&tx, row.resolution_id, &now)?;
             tx.commit().map_err(storage_error)?;
-            return Ok(LateDeleteDeletePermitIssuance::WaitingRebuild);
+            return Ok(LateDeleteDeletePermitIssuanceCore::WaitingRebuild);
         }
         if row.last_disposition_epoch >= row.resolution_epoch {
             tx.commit().map_err(storage_error)?;
-            return Ok(LateDeleteDeletePermitIssuance::LostLeaseOrSuperseded);
+            return Ok(LateDeleteDeletePermitIssuanceCore::LostLeaseOrSuperseded);
         }
         let changed = tx
             .execute(
@@ -1145,7 +1257,7 @@ impl StorageService {
             .map_err(storage_error)?;
         if changed != 1 {
             tx.commit().map_err(storage_error)?;
-            return Ok(LateDeleteDeletePermitIssuance::LostLeaseOrSuperseded);
+            return Ok(LateDeleteDeletePermitIssuanceCore::LostLeaseOrSuperseded);
         }
         #[cfg(test)]
         if DELETE_STARTED_BEFORE_COMMIT_FAULT.with(|fault| fault.replace(false)) {
@@ -1154,6 +1266,11 @@ impl StorageService {
                 "test-only pre-commit failure; no Delete permit is returned",
                 true,
             ));
+        }
+        #[cfg(test)]
+        if DELETE_STARTED_BEFORE_COMMIT_UNKNOWN_FAULT.with(|fault| fault.replace(false)) {
+            drop(tx);
+            return Ok(LateDeleteDeletePermitIssuanceCore::CommitUnknown { token });
         }
         // The real SQLite COMMIT attempt is recorded just before the call so a
         // test can prove a genuine commit was attempted (and not skipped by the
@@ -1165,19 +1282,79 @@ impl StorageService {
         commit_result.map_err(storage_error)?;
         #[cfg(test)]
         if DELETE_STARTED_AFTER_COMMIT_FAULT.with(|fault| fault.replace(false)) {
-            return Err(StorageError::new(
-                "LATE_DELETE_DELETE_STARTED_COMMIT_RESULT_UNKNOWN",
-                "test-only post-commit result loss; no Delete permit is returned",
-                true,
-            ));
+            return Ok(LateDeleteDeletePermitIssuanceCore::CommitUnknown { token });
         }
-        Ok(LateDeleteDeletePermitIssuance::Issued(Box::new(
+        Ok(LateDeleteDeletePermitIssuanceCore::Issued(Box::new(
             LateDeleteDeletePermit {
                 token,
                 revision,
                 content_hash,
             },
         )))
+    }
+
+    /// Reconciles the exact consumed Present capability after a DeleteStarted
+    /// commit result is unknown. This is intentionally SELECT-only and neither
+    /// recreates a capability nor treats a bare resolution id as authority.
+    fn reconcile_late_delete_started_exact_token(
+        &self,
+        token: &LateDeleteResolutionToken,
+    ) -> Result<LateDeleteStartedCommitUnknownReconcileResult, StorageError> {
+        #[cfg(test)]
+        if DELETE_STARTED_RECONCILE_READ_FAILURE.with(|fault| fault.replace(false)) {
+            return Err(StorageError::new(
+                "LATE_DELETE_DELETE_STARTED_RECONCILE_READ_FAILED",
+                "test-only readonly reconciliation failure",
+                true,
+            ));
+        }
+        let mut state = self.state()?;
+        let tx = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(storage_error)?;
+        let row = load_resolution_in(&tx, token.resolution_id)?;
+        let last_disposition = tx
+            .query_row(
+                "SELECT last_resolution_disposition
+                 FROM memory_vector_late_delete_resolution WHERE resolution_id=?1",
+                [token.resolution_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(storage_error)?
+            .flatten();
+        let result = match (row, last_disposition.as_deref()) {
+            (Some(row), Some("delete_started"))
+                if token_matches_row_without_liveness(token, &row)
+                    && row.state == "processing"
+                    && row.last_reserved_resolution_epoch == token.resolution_epoch
+                    && row.last_disposition_epoch == token.resolution_epoch
+                    && row
+                        .lease_owner
+                        .as_deref()
+                        .is_some_and(|owner| owner == token.lease_owner)
+                    && row.lease_fence_epoch == Some(token.runtime_fence_epoch) =>
+            {
+                LateDeleteStartedCommitUnknownReconcileResult::DeleteStartedDurableNoPermit
+            }
+            (Some(row), _)
+                if token_matches_row_without_liveness(token, &row)
+                    && row.state == "processing"
+                    && row.last_reserved_resolution_epoch == token.resolution_epoch
+                    && row.last_disposition_epoch < token.resolution_epoch
+                    && row
+                        .lease_owner
+                        .as_deref()
+                        .is_some_and(|owner| owner == token.lease_owner)
+                    && row.lease_fence_epoch == Some(token.runtime_fence_epoch) =>
+            {
+                LateDeleteStartedCommitUnknownReconcileResult::PreIssuanceDurableNoPermit
+            }
+            _ => LateDeleteStartedCommitUnknownReconcileResult::LostLeaseOrSupersededNoPermit,
+        };
+        tx.commit().map_err(storage_error)?;
+        Ok(result)
     }
 
     /// Reconciles only durable state after a caller has lost the result of the
@@ -1846,6 +2023,36 @@ fn token_is_current_in(
         && row.resolution_epoch == token.resolution_epoch
         && row.resolution_count == token.resolution_ordinal
         && row.last_reserved_resolution_epoch == token.resolution_epoch)
+}
+
+/// Exact token/row identity comparison for readonly commit-unknown
+/// reconciliation. Liveness is intentionally evaluated by the caller's
+/// classification rather than granting any authority from this predicate.
+fn token_matches_row_without_liveness(
+    token: &LateDeleteResolutionToken,
+    row: &ResolutionRow,
+) -> bool {
+    matches!(token.desired_action, LateDeleteAction::Delete)
+        && token.target_revision.is_none()
+        && token.target_content_hash.is_none()
+        && row.resolution_id == token.resolution_id
+        && row.outbox_id == token.outbox_id
+        && row.life_id == token.life_id
+        && row.memory_id == token.memory_id
+        && row.mutation_sequence == token.mutation_sequence
+        && row.claimed_generation_id == token.claimed_generation_id
+        && row.embedding_descriptor_id == token.embedding_descriptor_id
+        && row.embedding_dimension == token.embedding_dimension
+        && row.captured_generation_state == token.captured_generation_state
+        && row.witness_attempt_ordinal == token.witness_attempt_ordinal
+        && row.witness_claim_epoch == token.witness_claim_epoch
+        && row.witness_marked_claim_epoch == token.witness_marked_claim_epoch
+        && row.witness_send_disposition == token.witness_send_disposition
+        && row.witness_error_code == token.witness_error_code
+        && row.witness_age_anchor_at == token.witness_age_anchor_at
+        && row.captured_generation_authority_epoch == token.captured_generation_authority_epoch
+        && row.resolution_epoch == token.resolution_epoch
+        && row.resolution_count == token.resolution_ordinal
 }
 
 fn resolution_authority_is_current_in(
@@ -4146,5 +4353,243 @@ mod tests {
                 .unwrap();
             assert_eq!(row, ("resolved_deleted".into(), "delete_deleted".into(), 2));
         }
+    }
+
+    #[test]
+    fn late_delete_opaque_query_delegates_once_without_caller_context() {
+        let (_root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let store = ScriptedQueryStore::new(Ok(Some(valid_query_sample())));
+        let outcome = tauri::async_runtime::block_on(
+            reserved_query_permit(&storage).execute_exact_query_once_opaque(&storage, &store),
+        )
+        .unwrap();
+        let present = match outcome {
+            LateDeleteQueryHandoffOutcome::Present(present) => present,
+            _ => panic!("opaque Query must preserve the H1 Present outcome"),
+        };
+        assert_eq!(store.query_count(), 1);
+        assert!(matches!(
+            storage
+                .issue_late_delete_permit_for_runner(present)
+                .unwrap(),
+            LateDeleteDeletePermitRunnerIssuance::Issued(_)
+        ));
+    }
+
+    #[test]
+    fn late_delete_opaque_query_context_corrupt_consumes_without_query() {
+        let (_root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let permit = reserved_query_permit(&storage);
+        let LateDeleteQueryPermit { mut token } = *permit;
+        storage
+            .state()
+            .unwrap()
+            .connection
+            .execute(
+                "UPDATE memory_vector_late_delete_resolution
+                 SET claimed_generation_id='not a generation id'
+                 WHERE life_id='life' AND memory_id='memory'",
+                [],
+            )
+            .unwrap();
+        token.claimed_generation_id = "not a generation id".into();
+        let store = ScriptedQueryStore::new(Ok(Some(valid_query_sample())));
+        let corrupt = match tauri::async_runtime::block_on(
+            Box::new(LateDeleteQueryPermit { token })
+                .execute_exact_query_once_opaque(&storage, &store),
+        )
+        .unwrap()
+        {
+            LateDeleteQueryHandoffOutcome::Corrupt(corrupt) => corrupt,
+            _ => panic!("internal context corruption must be opaque Corrupt"),
+        };
+        assert_eq!(store.query_count(), 0);
+        assert_eq!(
+            storage.finalize_late_delete_query_corrupt(corrupt).unwrap(),
+            LateDeleteResolutionFinalizeResult::Applied
+        );
+        let code: Option<String> = storage.state().unwrap().connection.query_row(
+            "SELECT last_error_code FROM memory_vector_late_delete_resolution WHERE life_id='life' AND memory_id='memory'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(code.as_deref(), Some("LATE_DELETE_QUERY_CONTEXT_CORRUPT"));
+    }
+
+    #[test]
+    fn late_delete_opaque_query_lost_authority_makes_zero_queries() {
+        let (_root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let permit = reserved_query_permit(&storage);
+        expire_resolution_lease(&storage);
+        let store = ScriptedQueryStore::new(Ok(Some(valid_query_sample())));
+        assert!(matches!(
+            tauri::async_runtime::block_on(
+                permit.execute_exact_query_once_opaque(&storage, &store)
+            )
+            .unwrap(),
+            LateDeleteQueryHandoffOutcome::LostLeaseOrSuperseded
+        ));
+        assert_eq!(store.query_count(), 0);
+    }
+
+    #[test]
+    fn late_delete_runner_issuance_commit_unknown_never_mints_a_permit() {
+        for (before_commit, expected) in [
+            (
+                false,
+                LateDeleteStartedCommitUnknownReconcileResult::DeleteStartedDurableNoPermit,
+            ),
+            (
+                true,
+                LateDeleteStartedCommitUnknownReconcileResult::PreIssuanceDurableNoPermit,
+            ),
+        ] {
+            let (_root, storage) = storage();
+            seed_resolution(&storage, "life", "memory", 1);
+            let present =
+                acknowledge_query_present_for_test(*reserved_query_permit(&storage), 7, "hash-7");
+            if before_commit {
+                DELETE_STARTED_BEFORE_COMMIT_UNKNOWN_FAULT.with(|fault| fault.set(true));
+            } else {
+                DELETE_STARTED_AFTER_COMMIT_FAULT.with(|fault| fault.set(true));
+            }
+            assert!(matches!(
+                storage.issue_late_delete_permit_for_runner(present).unwrap(),
+                LateDeleteDeletePermitRunnerIssuance::CommitUnknownRecoveryRequired(result)
+                    if result == expected
+            ));
+            let row: (String, Option<String>) = storage.state().unwrap().connection.query_row(
+                "SELECT state,last_resolution_disposition FROM memory_vector_late_delete_resolution WHERE life_id='life' AND memory_id='memory'",
+                [], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+            assert_eq!(
+                row,
+                if before_commit {
+                    ("processing".into(), None)
+                } else {
+                    ("processing".into(), Some("delete_started".into()))
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn late_delete_runner_facade_dry_run_keeps_claim_opaque() {
+        fn accepts_only_facade_claim(_claim: Box<crate::storage::LateDeleteResolutionClaim>) {}
+        let (_root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let lease = storage
+            .acquire_late_delete_runtime_lease("facade-owner")
+            .unwrap()
+            .unwrap();
+        let claim = match storage.claim_one_late_delete_resolution(&lease).unwrap() {
+            LateDeleteResolutionClaimResult::Claimed(claim) => claim,
+            _ => panic!("fixture must return an opaque claim"),
+        };
+        accepts_only_facade_claim(claim);
+    }
+
+    #[test]
+    fn late_delete_runner_issuance_unknown_superseded_is_no_permit_no_replay() {
+        let (root, storage) = storage();
+        let memory = super::super::test_support::insert_confirmed_memory_fixture(
+            &storage,
+            "life",
+            "fact",
+            "late delete",
+            None,
+            0.5,
+            0.5,
+            false,
+            true,
+        );
+        seed_resolution(&storage, "life", &memory.id, 1);
+        let present =
+            acknowledge_query_present_for_test(*reserved_query_permit(&storage), 7, "hash-7");
+        DELETE_STARTED_AFTER_COMMIT_FAULT.with(|fault| fault.set(true));
+        let token = match storage.issue_late_delete_permit_core(present).unwrap() {
+            LateDeleteDeletePermitIssuanceCore::CommitUnknown { token } => token,
+            _ => panic!("test seam must produce commit uncertainty"),
+        };
+        let service_b = StorageService::initialize_with_roots(root.0.join("data"), None).unwrap();
+        <StorageService as MemoryVectorSyncOutboxRepository>::enqueue(
+            &service_b,
+            EnqueueMemoryVectorSyncRequest {
+                life_id: "life".into(),
+                memory_id: memory.id.clone(),
+                desired_action: MemoryVectorSyncAction::Delete,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            storage
+                .reconcile_late_delete_started_exact_token(&token)
+                .unwrap(),
+            LateDeleteStartedCommitUnknownReconcileResult::LostLeaseOrSupersededNoPermit
+        );
+        let row: (String, String, i64) = service_b
+            .state()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT r.state,r.last_resolution_disposition,o.mutation_sequence
+             FROM memory_vector_late_delete_resolution r
+             JOIN memory_vector_sync_outbox o ON o.life_id=r.life_id AND o.memory_id=r.memory_id
+             WHERE r.life_id='life' AND r.memory_id=?1",
+                [&memory.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("superseded".into(), "superseded".into(), 2));
+    }
+
+    #[test]
+    fn late_delete_runner_issuance_unknown_read_failure_never_mints_a_permit() {
+        let (_root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let present =
+            acknowledge_query_present_for_test(*reserved_query_permit(&storage), 7, "hash-7");
+        DELETE_STARTED_AFTER_COMMIT_FAULT.with(|fault| fault.set(true));
+        DELETE_STARTED_RECONCILE_READ_FAILURE.with(|fault| fault.set(true));
+        let error = match storage.issue_late_delete_permit_for_runner(present) {
+            Err(error) => error,
+            Ok(_) => panic!("read reconciliation failure must not issue a permit"),
+        };
+        assert_eq!(
+            error.code,
+            "LATE_DELETE_DELETE_STARTED_RECONCILE_READ_FAILED"
+        );
+        assert_eq!(
+            query_resolution_state(&storage),
+            ("processing".into(), "delete_started".into())
+        );
+    }
+
+    #[test]
+    fn late_delete_runner_issuance_unknown_cancel_before_reconcile_restarts_via_recovery() {
+        let (root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let present =
+            acknowledge_query_present_for_test(*reserved_query_permit(&storage), 7, "hash-7");
+        DELETE_STARTED_AFTER_COMMIT_FAULT.with(|fault| fault.set(true));
+        let token = match storage.issue_late_delete_permit_core(present).unwrap() {
+            LateDeleteDeletePermitIssuanceCore::CommitUnknown { token } => token,
+            _ => panic!("test seam must produce commit uncertainty"),
+        };
+        drop(token);
+        let database_root = root.0.join("data");
+        drop(storage);
+        let reopened = StorageService::initialize_with_roots(database_root, None).unwrap();
+        assert_eq!(
+            query_resolution_state(&reopened),
+            ("processing".into(), "delete_started".into())
+        );
+        expire_resolution_lease(&reopened);
+        assert_eq!(
+            reopened.recover_expired_late_delete_resolutions().unwrap(),
+            1
+        );
     }
 }

@@ -16,7 +16,7 @@ pub use registry::{
     LanceDbVectorStoreRegistryErrorCode, DEFAULT_MAX_CACHED_STORES,
 };
 
-use std::{future::Future, pin::Pin};
+use std::{future::Future, pin::Pin, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +27,18 @@ pub const MAX_CONTENT_HASH_BYTES: usize = 128;
 pub const MAX_GENERATION_ID_BYTES: usize = 64;
 
 pub type VectorStoreFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Resolves one already-existing derived index for a sealed generation identity.
+///
+/// This is deliberately a store provider rather than a late-delete capability:
+/// the caller receives no generation identity or authority from it, and the
+/// provider has no create or legacy-fallback operation.
+pub(crate) trait ExistingGenerationVectorStoreProvider: Send + Sync {
+    fn existing_for_generation<'a>(
+        &'a self,
+        generation_id: &'a VectorGenerationId,
+    ) -> VectorStoreFuture<'a, Result<Arc<dyn VectorStore>, VectorStoreError>>;
+}
 
 /// Controlled generation directory identity. Rejects path traversal and device names.
 #[derive(Clone, PartialEq, Eq, Hash)]

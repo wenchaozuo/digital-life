@@ -11,8 +11,9 @@ use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 
 use super::{StorageError, StorageService};
 use crate::vector_store::{
-    validate_hash, ConditionalGenerationDeleteOutcome, VectorGenerationContext, VectorGenerationId,
-    VectorMetadataSample, VectorStore, VectorStoreError, VectorStoreErrorCode,
+    validate_hash, ConditionalGenerationDeleteOutcome, ExistingGenerationVectorStoreProvider,
+    VectorGenerationContext, VectorGenerationId, VectorMetadataSample, VectorStore,
+    VectorStoreError, VectorStoreErrorCode,
 };
 
 #[cfg(test)]
@@ -170,6 +171,7 @@ pub(crate) enum LateDeleteDeleteHandoffOutcome {
 
 pub(crate) struct PreDeleteCorruptCapability {
     token: Box<LateDeleteResolutionToken>,
+    error_code: &'static str,
 }
 
 pub(crate) struct DeletedPostDeleteCapability {
@@ -253,6 +255,48 @@ pub(crate) enum LateDeleteStartedDurableState {
 }
 
 impl LateDeleteQueryPermit {
+    /// Resolves the sealed generation through an existing-only provider before
+    /// delegating the sole Query to the frozen H1 bridge.
+    pub(crate) async fn execute_exact_query_once_with_provider(
+        self: Box<Self>,
+        storage: &StorageService,
+        provider: &dyn ExistingGenerationVectorStoreProvider,
+    ) -> Result<LateDeleteQueryHandoffOutcome, StorageError> {
+        let token = self.token;
+        let context = match context_from_query_token(&token) {
+            Some(context) => context,
+            None => return Ok(query_context_corrupt(token)),
+        };
+        if !storage.late_delete_resolution_token_is_current(&token)? {
+            return Ok(LateDeleteQueryHandoffOutcome::LostLeaseOrSuperseded);
+        }
+        match provider
+            .existing_for_generation(context.generation_id())
+            .await
+        {
+            Ok(store) => {
+                Box::new(LateDeleteQueryPermit { token })
+                    .execute_exact_query_once(storage, &context, store.as_ref())
+                    .await
+            }
+            Err(error) if error.code == VectorStoreErrorCode::GenerationNotFound => Ok(
+                LateDeleteQueryHandoffOutcome::Corrupt(CorruptPostQueryCapability {
+                    token,
+                    error_code: "LATE_DELETE_QUERY_GENERATION_STORE_MISSING",
+                }),
+            ),
+            Err(error) if query_error_is_corruption(error.code) => Ok(
+                LateDeleteQueryHandoffOutcome::Corrupt(CorruptPostQueryCapability {
+                    token,
+                    error_code: "LATE_DELETE_QUERY_CORRUPT",
+                }),
+            ),
+            Err(error) => Ok(LateDeleteQueryHandoffOutcome::Failure(
+                FailedPostQueryCapability { token, error },
+            )),
+        }
+    }
+
     /// Runner-facing opaque Query surface. The generation context is derived
     /// only from the sealed permit and the existing H1 bridge remains the sole
     /// implementation that can invoke the public VectorStore Query.
@@ -262,27 +306,8 @@ impl LateDeleteQueryPermit {
         vector_store: &dyn VectorStore,
     ) -> Result<LateDeleteQueryHandoffOutcome, StorageError> {
         let token = self.token;
-        let context = VectorGenerationId::parse(&token.claimed_generation_id)
-            .ok()
-            .and_then(|generation_id| {
-                usize::try_from(token.embedding_dimension)
-                    .ok()
-                    .and_then(|dimension| {
-                        VectorGenerationContext::new(
-                            generation_id,
-                            token.embedding_descriptor_id.clone(),
-                            dimension,
-                        )
-                        .ok()
-                    })
-            });
-        let Some(context) = context else {
-            return Ok(LateDeleteQueryHandoffOutcome::Corrupt(
-                CorruptPostQueryCapability {
-                    token,
-                    error_code: "LATE_DELETE_QUERY_CONTEXT_CORRUPT",
-                },
-            ));
+        let Some(context) = context_from_query_token(&token) else {
+            return Ok(query_context_corrupt(token));
         };
         Box::new(LateDeleteQueryPermit { token })
             .execute_exact_query_once(storage, &context, vector_store)
@@ -347,6 +372,45 @@ impl LateDeleteQueryPermit {
 }
 
 impl LateDeleteDeletePermit {
+    /// Resolves the sealed generation through an existing-only provider before
+    /// delegating the sole conditional Delete to the frozen H2 bridge.
+    pub(crate) async fn execute_conditional_delete_once_with_provider(
+        self: Box<Self>,
+        storage: &StorageService,
+        provider: &dyn ExistingGenerationVectorStoreProvider,
+    ) -> Result<LateDeleteDeleteHandoffOutcome, StorageError> {
+        let LateDeleteDeletePermit {
+            token,
+            revision,
+            content_hash,
+        } = *self;
+        if !storage.late_delete_delete_permit_is_current(&token)? {
+            return Ok(LateDeleteDeleteHandoffOutcome::LostLeaseOrSuperseded);
+        }
+        let context = match delete_context_from_token(&token, revision, &content_hash) {
+            Some(context) => context,
+            None => return Ok(pre_delete_corrupt(token, "LATE_DELETE_PRE_DELETE_CORRUPT")),
+        };
+        match provider
+            .existing_for_generation(context.generation_id())
+            .await
+        {
+            Ok(store) => {
+                Box::new(LateDeleteDeletePermit {
+                    token,
+                    revision,
+                    content_hash,
+                })
+                .execute_conditional_delete_once(storage, store.as_ref())
+                .await
+            }
+            Err(error) => Ok(pre_delete_corrupt(
+                token,
+                provider_pre_delete_error_code(error.code),
+            )),
+        }
+    }
+
     /// Consumes the only DeleteStarted capability for this ordinal. Its full
     /// expected identity stays sealed inside storage across the sole external
     /// conditional Delete call.
@@ -365,11 +429,7 @@ impl LateDeleteDeletePermit {
         }
         let generation_id = match VectorGenerationId::parse(&token.claimed_generation_id) {
             Ok(generation_id) => generation_id,
-            Err(_) => {
-                return Ok(LateDeleteDeleteHandoffOutcome::PreDeleteCorrupt(
-                    PreDeleteCorruptCapability { token },
-                ))
-            }
+            Err(_) => return Ok(pre_delete_corrupt(token, "LATE_DELETE_PRE_DELETE_CORRUPT")),
         };
         let context = match VectorGenerationContext::new(
             generation_id,
@@ -379,11 +439,7 @@ impl LateDeleteDeletePermit {
             Ok(context) if revision > 0 && validate_hash(&content_hash, "Content hash").is_ok() => {
                 context
             }
-            _ => {
-                return Ok(LateDeleteDeleteHandoffOutcome::PreDeleteCorrupt(
-                    PreDeleteCorruptCapability { token },
-                ))
-            }
+            _ => return Ok(pre_delete_corrupt(token, "LATE_DELETE_PRE_DELETE_CORRUPT")),
         };
 
         match vector_store
@@ -414,6 +470,68 @@ impl LateDeleteDeletePermit {
                 },
             )),
         }
+    }
+}
+
+fn context_from_query_token(token: &LateDeleteResolutionToken) -> Option<VectorGenerationContext> {
+    VectorGenerationId::parse(&token.claimed_generation_id)
+        .ok()
+        .and_then(|generation_id| {
+            usize::try_from(token.embedding_dimension)
+                .ok()
+                .and_then(|dimension| {
+                    VectorGenerationContext::new(
+                        generation_id,
+                        token.embedding_descriptor_id.clone(),
+                        dimension,
+                    )
+                    .ok()
+                })
+        })
+}
+
+fn query_context_corrupt(token: Box<LateDeleteResolutionToken>) -> LateDeleteQueryHandoffOutcome {
+    LateDeleteQueryHandoffOutcome::Corrupt(CorruptPostQueryCapability {
+        token,
+        error_code: "LATE_DELETE_QUERY_CONTEXT_CORRUPT",
+    })
+}
+
+fn delete_context_from_token(
+    token: &LateDeleteResolutionToken,
+    revision: i64,
+    content_hash: &str,
+) -> Option<VectorGenerationContext> {
+    let generation_id = VectorGenerationId::parse(&token.claimed_generation_id).ok()?;
+    let dimension = usize::try_from(token.embedding_dimension).ok()?;
+    let context = VectorGenerationContext::new(
+        generation_id,
+        token.embedding_descriptor_id.clone(),
+        dimension,
+    )
+    .ok()?;
+    (revision > 0 && validate_hash(content_hash, "Content hash").is_ok()).then_some(context)
+}
+
+fn pre_delete_corrupt(
+    token: Box<LateDeleteResolutionToken>,
+    error_code: &'static str,
+) -> LateDeleteDeleteHandoffOutcome {
+    LateDeleteDeleteHandoffOutcome::PreDeleteCorrupt(PreDeleteCorruptCapability {
+        token,
+        error_code,
+    })
+}
+
+fn provider_pre_delete_error_code(code: VectorStoreErrorCode) -> &'static str {
+    match code {
+        VectorStoreErrorCode::GenerationNotFound => {
+            "LATE_DELETE_PRE_DELETE_GENERATION_STORE_MISSING"
+        }
+        VectorStoreErrorCode::StoreUnavailable => {
+            "LATE_DELETE_PRE_DELETE_GENERATION_STORE_UNAVAILABLE"
+        }
+        _ => "LATE_DELETE_PRE_DELETE_GENERATION_STORE_CORRUPT",
     }
 }
 
@@ -1501,7 +1619,7 @@ impl StorageService {
             &corrupt.token,
             "waiting_rebuild",
             LateDeleteResolutionDisposition::WaitingRebuild,
-            Some("LATE_DELETE_PRE_DELETE_CORRUPT"),
+            Some(corrupt.error_code),
         )
     }
 
@@ -2106,8 +2224,8 @@ mod tests {
     };
     use crate::storage::{LifeIdentityRecord, PersonaTemplateRecord};
     use crate::vector_store::{
-        VectorGenerationId, VectorRecord, VectorSearchHit, VectorSearchQuery, VectorSpace,
-        VectorStoreFuture,
+        ExistingGenerationVectorStoreProvider, VectorGenerationId, VectorRecord, VectorSearchHit,
+        VectorSearchQuery, VectorSpace, VectorStoreFuture,
     };
     use std::{
         fs,
@@ -2115,7 +2233,7 @@ mod tests {
         path::PathBuf,
         sync::{
             atomic::{AtomicUsize, Ordering},
-            mpsc, Arc, Barrier,
+            mpsc, Arc, Barrier, Mutex,
         },
         task::{Context, Poll, Waker},
         thread,
@@ -2382,6 +2500,121 @@ mod tests {
             }
             let result = self.delete_result.clone();
             Box::pin(async move { result })
+        }
+    }
+
+    #[derive(Clone)]
+    enum ProviderResult {
+        Existing(Arc<dyn VectorStore>),
+        Error(VectorStoreError),
+        PendingExisting {
+            store: Arc<dyn VectorStore>,
+            gate: Arc<PendingProviderGate>,
+            started: mpsc::Sender<()>,
+        },
+    }
+
+    struct PendingProviderGate {
+        released: std::sync::atomic::AtomicBool,
+        announced: std::sync::atomic::AtomicBool,
+    }
+
+    impl PendingProviderGate {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                released: std::sync::atomic::AtomicBool::new(false),
+                announced: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+
+        fn release(&self) {
+            self.released.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct FakeExistingGenerationProvider {
+        result: ProviderResult,
+        resolve_count: AtomicUsize,
+        requested_generation: Mutex<Option<String>>,
+    }
+
+    impl FakeExistingGenerationProvider {
+        fn existing(store: Arc<dyn VectorStore>) -> Self {
+            Self {
+                result: ProviderResult::Existing(store),
+                resolve_count: AtomicUsize::new(0),
+                requested_generation: Mutex::new(None),
+            }
+        }
+
+        fn error(code: VectorStoreErrorCode) -> Self {
+            Self {
+                result: ProviderResult::Error(VectorStoreError::new(
+                    code,
+                    "test provider resolution failed",
+                    true,
+                )),
+                resolve_count: AtomicUsize::new(0),
+                requested_generation: Mutex::new(None),
+            }
+        }
+
+        fn pending_existing(
+            store: Arc<dyn VectorStore>,
+            gate: Arc<PendingProviderGate>,
+            started: mpsc::Sender<()>,
+        ) -> Self {
+            Self {
+                result: ProviderResult::PendingExisting {
+                    store,
+                    gate,
+                    started,
+                },
+                resolve_count: AtomicUsize::new(0),
+                requested_generation: Mutex::new(None),
+            }
+        }
+
+        fn resolve_count(&self) -> usize {
+            self.resolve_count.load(Ordering::SeqCst)
+        }
+
+        fn requested_generation(&self) -> Option<String> {
+            self.requested_generation.lock().unwrap().clone()
+        }
+    }
+
+    impl ExistingGenerationVectorStoreProvider for FakeExistingGenerationProvider {
+        fn existing_for_generation<'a>(
+            &'a self,
+            generation_id: &'a VectorGenerationId,
+        ) -> VectorStoreFuture<'a, Result<Arc<dyn VectorStore>, VectorStoreError>> {
+            self.resolve_count.fetch_add(1, Ordering::SeqCst);
+            *self.requested_generation.lock().unwrap() = Some(generation_id.as_str().to_string());
+            let result = self.result.clone();
+            Box::pin(async move {
+                match result {
+                    ProviderResult::Existing(store) => Ok(store),
+                    ProviderResult::Error(error) => Err(error),
+                    ProviderResult::PendingExisting {
+                        store,
+                        gate,
+                        started,
+                    } => {
+                        std::future::poll_fn(move |_| {
+                            if !gate.announced.swap(true, Ordering::SeqCst) {
+                                started.send(()).unwrap();
+                            }
+                            if gate.released.load(Ordering::SeqCst) {
+                                Poll::Ready(Ok(Arc::clone(&store)))
+                            } else {
+                                Poll::Pending
+                            }
+                        })
+                        .await
+                    }
+                }
+            })
         }
     }
 
@@ -4433,6 +4666,271 @@ mod tests {
             LateDeleteQueryHandoffOutcome::LostLeaseOrSuperseded
         ));
         assert_eq!(store.query_count(), 0);
+    }
+
+    #[test]
+    fn late_delete_provider_query_uses_sealed_generation_once() {
+        let (_root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let scripted = Arc::new(ScriptedQueryStore::new(Ok(Some(valid_query_sample()))));
+        let store: Arc<dyn VectorStore> = scripted.clone();
+        let provider = FakeExistingGenerationProvider::existing(Arc::clone(&store));
+        let present = match tauri::async_runtime::block_on(
+            reserved_query_permit(&storage)
+                .execute_exact_query_once_with_provider(&storage, &provider),
+        )
+        .unwrap()
+        {
+            LateDeleteQueryHandoffOutcome::Present(present) => present,
+            _ => panic!("existing generation provider must delegate one Query"),
+        };
+        assert_eq!(provider.resolve_count(), 1);
+        assert_eq!(scripted.query_count(), 1);
+        assert_eq!(
+            provider.requested_generation().as_deref(),
+            Some("generation-a")
+        );
+        assert!(matches!(
+            storage.issue_late_delete_permit(present).unwrap(),
+            LateDeleteDeletePermitIssuance::Issued(_)
+        ));
+    }
+
+    #[test]
+    fn late_delete_provider_query_errors_are_typed_without_query() {
+        for (code, expected_state, expected_disposition, expected_error) in [
+            (
+                VectorStoreErrorCode::GenerationNotFound,
+                "waiting_rebuild",
+                "waiting_rebuild",
+                "LATE_DELETE_QUERY_GENERATION_STORE_MISSING",
+            ),
+            (
+                VectorStoreErrorCode::StoreUnavailable,
+                "unknown",
+                "query_unknown",
+                "LATE_DELETE_QUERY_STORE_UNAVAILABLE",
+            ),
+            (
+                VectorStoreErrorCode::GenerationCorrupt,
+                "waiting_rebuild",
+                "waiting_rebuild",
+                "LATE_DELETE_QUERY_CORRUPT",
+            ),
+        ] {
+            let (_root, storage) = storage();
+            seed_resolution(&storage, "life", "memory", 1);
+            let provider = FakeExistingGenerationProvider::error(code);
+            let outcome = tauri::async_runtime::block_on(
+                reserved_query_permit(&storage)
+                    .execute_exact_query_once_with_provider(&storage, &provider),
+            )
+            .unwrap();
+            match outcome {
+                LateDeleteQueryHandoffOutcome::Corrupt(capability) => {
+                    assert_eq!(
+                        storage
+                            .finalize_late_delete_query_corrupt(capability)
+                            .unwrap(),
+                        LateDeleteResolutionFinalizeResult::Applied
+                    );
+                }
+                LateDeleteQueryHandoffOutcome::Failure(capability) => {
+                    assert_eq!(
+                        storage
+                            .finalize_late_delete_query_failure(capability)
+                            .unwrap(),
+                        LateDeleteResolutionFinalizeResult::Applied
+                    );
+                }
+                _ => panic!("provider failure must not query"),
+            }
+            let row: (String, String, Option<String>) = storage.state().unwrap().connection.query_row(
+                "SELECT state,last_resolution_disposition,last_error_code FROM memory_vector_late_delete_resolution WHERE life_id='life' AND memory_id='memory'",
+                [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).unwrap();
+            assert_eq!(
+                row,
+                (
+                    expected_state.into(),
+                    expected_disposition.into(),
+                    Some(expected_error.into())
+                )
+            );
+            assert_eq!(provider.resolve_count(), 1);
+        }
+    }
+
+    #[test]
+    fn late_delete_provider_query_stale_before_resolution_is_zero_io() {
+        let (_root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let permit = reserved_query_permit(&storage);
+        expire_resolution_lease(&storage);
+        let provider =
+            FakeExistingGenerationProvider::error(VectorStoreErrorCode::StoreUnavailable);
+        assert!(matches!(
+            tauri::async_runtime::block_on(
+                permit.execute_exact_query_once_with_provider(&storage, &provider)
+            )
+            .unwrap(),
+            LateDeleteQueryHandoffOutcome::LostLeaseOrSuperseded
+        ));
+        assert_eq!(provider.resolve_count(), 0);
+    }
+
+    #[test]
+    fn late_delete_provider_query_rechecks_after_resolution_await() {
+        let (_root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let scripted = Arc::new(ScriptedQueryStore::new(Ok(Some(valid_query_sample()))));
+        let store: Arc<dyn VectorStore> = scripted.clone();
+        let gate = PendingProviderGate::new();
+        let (started_tx, started_rx) = mpsc::channel();
+        let provider =
+            FakeExistingGenerationProvider::pending_existing(store, Arc::clone(&gate), started_tx);
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        let mut future = Box::pin(
+            reserved_query_permit(&storage)
+                .execute_exact_query_once_with_provider(&storage, &provider),
+        );
+        assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
+        started_rx.recv().unwrap();
+        expire_resolution_lease(&storage);
+        gate.release();
+        assert!(matches!(
+            future.as_mut().poll(&mut context),
+            Poll::Ready(Ok(LateDeleteQueryHandoffOutcome::LostLeaseOrSuperseded))
+        ));
+        assert_eq!(scripted.query_count(), 0);
+    }
+
+    #[test]
+    fn late_delete_provider_delete_uses_sealed_generation_once() {
+        let (_root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let scripted = Arc::new(
+            ScriptedQueryStore::new(Ok(Some(valid_query_sample())))
+                .with_delete_result(Ok(ConditionalGenerationDeleteOutcome::Deleted)),
+        );
+        let store: Arc<dyn VectorStore> = scripted.clone();
+        let provider = FakeExistingGenerationProvider::existing(store);
+        let deleted = match tauri::async_runtime::block_on(
+            issued_delete_permit(&storage)
+                .execute_conditional_delete_once_with_provider(&storage, &provider),
+        )
+        .unwrap()
+        {
+            LateDeleteDeleteHandoffOutcome::Deleted(deleted) => deleted,
+            _ => panic!("existing generation provider must delegate one Delete"),
+        };
+        assert_eq!(provider.resolve_count(), 1);
+        assert_eq!(scripted.delete_count(), 1);
+        assert_eq!(
+            provider.requested_generation().as_deref(),
+            Some("generation-a")
+        );
+        assert_eq!(
+            storage.finalize_deleted_post_delete(deleted).unwrap(),
+            LateDeletePostDeleteFinalizeResult::Applied
+        );
+    }
+
+    #[test]
+    fn late_delete_provider_delete_errors_are_pre_delete_corrupt_without_delete() {
+        for (code, expected_error) in [
+            (
+                VectorStoreErrorCode::GenerationNotFound,
+                "LATE_DELETE_PRE_DELETE_GENERATION_STORE_MISSING",
+            ),
+            (
+                VectorStoreErrorCode::StoreUnavailable,
+                "LATE_DELETE_PRE_DELETE_GENERATION_STORE_UNAVAILABLE",
+            ),
+            (
+                VectorStoreErrorCode::GenerationCorrupt,
+                "LATE_DELETE_PRE_DELETE_GENERATION_STORE_CORRUPT",
+            ),
+        ] {
+            let (_root, storage) = storage();
+            seed_resolution(&storage, "life", "memory", 1);
+            let provider = FakeExistingGenerationProvider::error(code);
+            let corrupt = match tauri::async_runtime::block_on(
+                issued_delete_permit(&storage)
+                    .execute_conditional_delete_once_with_provider(&storage, &provider),
+            )
+            .unwrap()
+            {
+                LateDeleteDeleteHandoffOutcome::PreDeleteCorrupt(corrupt) => corrupt,
+                _ => panic!("provider failure must block Delete"),
+            };
+            assert_eq!(
+                storage.finalize_pre_delete_corrupt(corrupt).unwrap(),
+                LateDeletePostDeleteFinalizeResult::Applied
+            );
+            let row: (String, String, Option<String>) = storage.state().unwrap().connection.query_row(
+                "SELECT state,last_resolution_disposition,last_error_code FROM memory_vector_late_delete_resolution WHERE life_id='life' AND memory_id='memory'",
+                [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).unwrap();
+            assert_eq!(
+                row,
+                (
+                    "waiting_rebuild".into(),
+                    "waiting_rebuild".into(),
+                    Some(expected_error.into())
+                )
+            );
+            assert_eq!(provider.resolve_count(), 1);
+        }
+    }
+
+    #[test]
+    fn late_delete_provider_delete_stale_before_resolution_is_zero_io() {
+        let (_root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let permit = issued_delete_permit(&storage);
+        expire_resolution_lease(&storage);
+        let provider =
+            FakeExistingGenerationProvider::error(VectorStoreErrorCode::StoreUnavailable);
+        assert!(matches!(
+            tauri::async_runtime::block_on(
+                permit.execute_conditional_delete_once_with_provider(&storage, &provider)
+            )
+            .unwrap(),
+            LateDeleteDeleteHandoffOutcome::LostLeaseOrSuperseded
+        ));
+        assert_eq!(provider.resolve_count(), 0);
+    }
+
+    #[test]
+    fn late_delete_provider_delete_rechecks_after_resolution_await() {
+        let (_root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let scripted = Arc::new(
+            ScriptedQueryStore::new(Ok(Some(valid_query_sample())))
+                .with_delete_result(Ok(ConditionalGenerationDeleteOutcome::Deleted)),
+        );
+        let store: Arc<dyn VectorStore> = scripted.clone();
+        let gate = PendingProviderGate::new();
+        let (started_tx, started_rx) = mpsc::channel();
+        let provider =
+            FakeExistingGenerationProvider::pending_existing(store, Arc::clone(&gate), started_tx);
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        let mut future = Box::pin(
+            issued_delete_permit(&storage)
+                .execute_conditional_delete_once_with_provider(&storage, &provider),
+        );
+        assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
+        started_rx.recv().unwrap();
+        expire_resolution_lease(&storage);
+        gate.release();
+        assert!(matches!(
+            future.as_mut().poll(&mut context),
+            Poll::Ready(Ok(LateDeleteDeleteHandoffOutcome::LostLeaseOrSuperseded))
+        ));
+        assert_eq!(scripted.delete_count(), 0);
     }
 
     #[test]

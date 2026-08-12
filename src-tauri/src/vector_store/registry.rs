@@ -9,8 +9,8 @@ use std::{
 use serde::Serialize;
 
 use super::{
-    generation_store_root, LanceDbVectorStore, VectorGenerationId, VectorStoreError,
-    VectorStoreErrorCode,
+    generation_store_root, ExistingGenerationVectorStoreProvider, LanceDbVectorStore,
+    VectorGenerationId, VectorStore, VectorStoreError, VectorStoreErrorCode, VectorStoreFuture,
 };
 
 pub const DEFAULT_MAX_CACHED_STORES: usize = 4;
@@ -49,6 +49,14 @@ pub struct LanceDbVectorStoreRegistry {
     stores: Mutex<VecDeque<CachedStore>>,
 }
 
+/// A registry provider permanently bound to one canonical data-root snapshot.
+/// It can only resolve an already-existing generation directory.
+#[allow(dead_code)] // The S3 runner is intentionally not wired in DB1.
+pub(crate) struct BoundExistingGenerationVectorStoreProvider<'a> {
+    registry: &'a LanceDbVectorStoreRegistry,
+    data_root: PathBuf,
+}
+
 impl Default for LanceDbVectorStoreRegistry {
     fn default() -> Self {
         Self::new(DEFAULT_MAX_CACHED_STORES).expect("default registry capacity is valid")
@@ -65,6 +73,26 @@ impl LanceDbVectorStoreRegistry {
         Ok(Self {
             capacity,
             stores: Mutex::new(VecDeque::new()),
+        })
+    }
+
+    /// Binds an existing-generation-only provider to the caller's canonical
+    /// data-root identity. This never creates a vector directory.
+    #[allow(dead_code)] // The S3 runner is intentionally not wired in DB1.
+    pub(crate) fn bind_existing_generation_provider(
+        &self,
+        data_root: &Path,
+    ) -> Result<BoundExistingGenerationVectorStoreProvider<'_>, VectorStoreError> {
+        let data_root = root_identity(data_root).map_err(|_| {
+            VectorStoreError::new(
+                VectorStoreErrorCode::StoreUnavailable,
+                "The derived vector store is unavailable.",
+                true,
+            )
+        })?;
+        Ok(BoundExistingGenerationVectorStoreProvider {
+            registry: self,
+            data_root,
         })
     }
 
@@ -349,6 +377,36 @@ impl LanceDbVectorStoreRegistry {
     }
 }
 
+impl ExistingGenerationVectorStoreProvider for BoundExistingGenerationVectorStoreProvider<'_> {
+    fn existing_for_generation<'a>(
+        &'a self,
+        generation_id: &'a VectorGenerationId,
+    ) -> VectorStoreFuture<'a, Result<Arc<dyn VectorStore>, VectorStoreError>> {
+        Box::pin(async move {
+            match self
+                .registry
+                .existing_generation_store(&self.data_root, generation_id)
+                .await
+            {
+                Ok(Some(store)) => {
+                    let store: Arc<dyn VectorStore> = store;
+                    Ok(store)
+                }
+                Ok(None) => Err(VectorStoreError::new(
+                    VectorStoreErrorCode::GenerationNotFound,
+                    "The requested vector generation does not exist.",
+                    false,
+                )),
+                Err(_) => Err(VectorStoreError::new(
+                    VectorStoreErrorCode::StoreUnavailable,
+                    "The derived vector store is unavailable.",
+                    true,
+                )),
+            }
+        })
+    }
+}
+
 fn generation_registry_key(
     data_root: &Path,
     generation_id: &VectorGenerationId,
@@ -424,7 +482,10 @@ fn error(code: LanceDbVectorStoreRegistryErrorCode) -> LanceDbVectorStoreRegistr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vector_store::{GenerationVectorRecord, VectorGenerationContext, VectorStore};
+    use crate::vector_store::{
+        ExistingGenerationVectorStoreProvider, GenerationVectorRecord, VectorGenerationContext,
+        VectorStore,
+    };
     use std::sync::Arc;
 
     #[test]
@@ -589,6 +650,39 @@ mod tests {
                 .await
                 .unwrap();
             assert!(!generation_root.exists());
+        });
+    }
+
+    #[test]
+    fn bound_existing_generation_provider_opens_only_the_requested_generation() {
+        tauri::async_runtime::block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let registry = LanceDbVectorStoreRegistry::default();
+            let g1 = VectorGenerationId::parse("generation-one").unwrap();
+            let g2 = VectorGenerationId::parse("generation-two").unwrap();
+            let context = VectorGenerationContext::new(g2.clone(), "descriptor-two", 2).unwrap();
+            let g2_store = registry
+                .generation_store_for_write(temp.path(), &g2)
+                .await
+                .unwrap();
+            g2_store.create_generation(&context).await.unwrap();
+            let legacy = temp.path().join("vectors").join("lancedb");
+            std::fs::create_dir_all(&legacy).unwrap();
+
+            let provider = registry
+                .bind_existing_generation_provider(temp.path())
+                .unwrap();
+            assert!(provider.existing_for_generation(&g2).await.is_ok());
+            let missing = match provider.existing_for_generation(&g1).await {
+                Err(error) => error,
+                Ok(_) => panic!("a missing generation must not resolve a store"),
+            };
+            assert_eq!(missing.code, VectorStoreErrorCode::GenerationNotFound);
+            assert!(
+                legacy.is_dir(),
+                "legacy path is neither opened nor replaced"
+            );
+            assert!(!generation_store_root(temp.path(), &g1).exists());
         });
     }
 }

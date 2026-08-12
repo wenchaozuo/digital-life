@@ -2224,8 +2224,10 @@ mod tests {
     };
     use crate::storage::{LifeIdentityRecord, PersonaTemplateRecord};
     use crate::vector_store::{
-        ExistingGenerationVectorStoreProvider, VectorGenerationId, VectorRecord, VectorSearchHit,
-        VectorSearchQuery, VectorSpace, VectorStoreFuture,
+        generation_store_root, ExistingGenerationVectorStoreProvider, GenerationVectorRecord,
+        LanceDbVectorStore, LanceDbVectorStoreRegistry, VectorGenerationContext,
+        VectorGenerationId, VectorRecord, VectorSearchHit, VectorSearchQuery, VectorSpace,
+        VectorStoreFuture,
     };
     use std::{
         fs,
@@ -2301,6 +2303,71 @@ mod tests {
                 params![life_id, memory_id, sequence],
             )
             .unwrap();
+    }
+
+    /// Seeds a durable resolution whose claimed generation (and its SQLite
+    /// generation row) is fully caller-chosen, so a test can capture an exact
+    /// generation in the sealed permit.
+    fn seed_resolution_for_generation(
+        storage: &StorageService,
+        life_id: &str,
+        memory_id: &str,
+        sequence: i64,
+        generation_id: &str,
+        descriptor: &str,
+        dimension: i64,
+    ) {
+        let state = storage.state().unwrap();
+        state
+            .connection
+            .execute(
+                "INSERT INTO memory_vector_generation (generation_id,descriptor_hash,dimension,state,authority_epoch) VALUES (?1,?2,?3,'active',1) ON CONFLICT(generation_id) DO NOTHING",
+                params![generation_id, descriptor, dimension],
+            )
+            .unwrap();
+        state
+            .connection
+            .execute(
+                "INSERT INTO memory_vector_late_delete_resolution
+             (outbox_id,life_id,memory_id,mutation_sequence,claimed_generation_id,
+              embedding_descriptor_id,embedding_dimension,captured_generation_state,
+              witness_attempt_ordinal,witness_claim_epoch,witness_marked_claim_epoch,
+              witness_send_disposition,witness_error_code,witness_age_anchor_at,
+              captured_generation_authority_epoch,state,created_at,updated_at)
+             VALUES (17,?1,?2,?3,?4,?5,?6,'active',1,1,1,
+                     'possibly_sent',NULL,'2099-01-01T00:00:00.000Z',1,
+                     'pending','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z')",
+                params![
+                    life_id,
+                    memory_id,
+                    sequence,
+                    generation_id,
+                    descriptor,
+                    dimension
+                ],
+            )
+            .unwrap();
+    }
+
+    /// Writes one recognizable legacy-space row at the target life/memory key so
+    /// a provider-backed operation can prove it never falls back to legacy.
+    async fn seed_legacy_conflicting_record(
+        registry: &LanceDbVectorStoreRegistry,
+        data_root: &std::path::Path,
+    ) -> Arc<LanceDbVectorStore> {
+        let legacy = registry.store_for_write(data_root).await.unwrap();
+        legacy
+            .upsert(VectorRecord {
+                life_id: "life".into(),
+                memory_id: "memory".into(),
+                embedding_model: "embedding-model".into(),
+                dimension: 2,
+                vector: vec![1.0, 0.0],
+                content_hash: "content-legacy".into(),
+            })
+            .await
+            .unwrap();
+        legacy
     }
 
     fn reserved_token(storage: &StorageService) -> Box<LateDeleteResolutionToken> {
@@ -5090,5 +5157,243 @@ mod tests {
             reopened.recover_expired_late_delete_resolutions().unwrap(),
             1
         );
+    }
+
+    /// DB1 Evidence A: the provider resolve body has genuinely entered (R_Q = 1)
+    /// and is still pending when the provider-backed Query future is dropped.
+    /// No external Query ever happens (Q = 0), there is no retry, and the
+    /// durable resolution is left untouched.
+    #[test]
+    fn late_delete_provider_query_drop_after_resolve_entered_keeps_q_zero() {
+        let (_root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let scripted = Arc::new(ScriptedQueryStore::new(Ok(Some(valid_query_sample()))));
+        let store: Arc<dyn VectorStore> = scripted.clone();
+        let gate = PendingProviderGate::new();
+        let (started_tx, started_rx) = mpsc::channel();
+        let provider =
+            FakeExistingGenerationProvider::pending_existing(store, Arc::clone(&gate), started_tx);
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        let mut future = Box::pin(
+            reserved_query_permit(&storage)
+                .execute_exact_query_once_with_provider(&storage, &provider),
+        );
+
+        // The provider resolve body must execute (resolve entered) and remain
+        // pending. R_Q increments synchronously when the resolve is called.
+        assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
+        started_rx.recv().unwrap();
+        assert_eq!(provider.resolve_count(), 1);
+        assert_eq!(
+            provider.requested_generation().as_deref(),
+            Some("generation-a")
+        );
+        assert_eq!(scripted.query_count(), 0);
+
+        // Cancel/drop the provider-backed Query future without releasing the gate.
+        drop(future);
+
+        // Exactly one resolve was entered and zero external Queries happened;
+        // no retry, no fallback, no silent finalize.
+        assert_eq!(provider.resolve_count(), 1);
+        assert_eq!(scripted.query_count(), 0);
+        let row: (String, Option<String>, i64, i64) = storage
+            .state()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT state,last_resolution_disposition,resolution_count,last_disposition_epoch
+                 FROM memory_vector_late_delete_resolution WHERE life_id='life' AND memory_id='memory'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("processing".into(), None, 1, 0));
+    }
+
+    /// DB1 Evidence B: real G1/G2 Lance generation stores with distinguishable
+    /// data at the same life/memory key. The sealed permit captures G2 through
+    /// the durable SQLite resolution, and the provider-backed Query routes to
+    /// the real G2 store (Present with G2's revision/hash), never G1 or legacy.
+    #[test]
+    fn late_delete_provider_lance_routes_sealed_g2_not_g1_or_legacy() {
+        tauri::async_runtime::block_on(async {
+            let (root, storage) = storage();
+            let data_root = root.0.join("data");
+            let registry = LanceDbVectorStoreRegistry::default();
+            let g1 = VectorGenerationId::parse("generation-a").unwrap();
+            let g2 = VectorGenerationId::parse("generation-b").unwrap();
+            let g1_ctx = VectorGenerationContext::new(g1.clone(), "descriptor-a", 2).unwrap();
+            let g2_ctx = VectorGenerationContext::new(g2.clone(), "descriptor-b", 2).unwrap();
+
+            let g1_store = registry
+                .generation_store_for_write(&data_root, &g1)
+                .await
+                .unwrap();
+            g1_store.create_generation(&g1_ctx).await.unwrap();
+            g1_store
+                .upsert_generation(
+                    &g1_ctx,
+                    GenerationVectorRecord::try_new(
+                        g1.clone(),
+                        "life",
+                        "memory",
+                        5,
+                        "content-g1",
+                        "descriptor-a",
+                        vec![1.0, 0.0],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            let g2_store = registry
+                .generation_store_for_write(&data_root, &g2)
+                .await
+                .unwrap();
+            g2_store.create_generation(&g2_ctx).await.unwrap();
+            g2_store
+                .upsert_generation(
+                    &g2_ctx,
+                    GenerationVectorRecord::try_new(
+                        g2.clone(),
+                        "life",
+                        "memory",
+                        7,
+                        "content-g2",
+                        "descriptor-b",
+                        vec![0.0, 1.0],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            let legacy = seed_legacy_conflicting_record(&registry, &data_root).await;
+            let legacy_space = VectorSpace {
+                embedding_model: "embedding-model".into(),
+                dimension: 2,
+            };
+            assert_eq!(legacy.count("life", Some(&legacy_space)).await.unwrap(), 1);
+
+            // The durable SQLite resolution captures G2; the provider-backed
+            // call derives the generation only from the sealed permit.
+            seed_resolution_for_generation(
+                &storage,
+                "life",
+                "memory",
+                1,
+                "generation-b",
+                "descriptor-b",
+                2,
+            );
+            let provider = registry
+                .bind_existing_generation_provider(&data_root)
+                .unwrap();
+            let present = match reserved_query_permit(&storage)
+                .execute_exact_query_once_with_provider(&storage, &provider)
+                .await
+                .unwrap()
+            {
+                LateDeleteQueryHandoffOutcome::Present(present) => present,
+                _ => panic!("sealed G2 must route to a real Present result"),
+            };
+            assert_eq!(present.revision, 7);
+            assert_eq!(present.content_hash, "content-g2");
+
+            // G1 and legacy still hold their own conflicting rows untouched;
+            // the routed result proves they were never opened or used.
+            let g1_sample = g1_store
+                .get_generation_metadata(&g1_ctx, "life", "memory")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(g1_sample.memory_revision, 5);
+            assert_eq!(g1_sample.content_hash, "content-g1");
+            assert_eq!(legacy.count("life", Some(&legacy_space)).await.unwrap(), 1);
+        });
+    }
+
+    /// DB1 Evidence C: a legacy store exists with a recognizable row, the
+    /// captured generation directory is absent, and the provider-backed Query
+    /// maps GenerationNotFound to a Corrupt capability, finalizes waiting_rebuild
+    /// with LATE_DELETE_QUERY_GENERATION_STORE_MISSING, performs no external
+    /// Query, leaves legacy untouched, and never creates the generation directory.
+    #[test]
+    fn late_delete_provider_missing_generation_never_falls_back_to_legacy() {
+        tauri::async_runtime::block_on(async {
+            let (root, storage) = storage();
+            let data_root = root.0.join("data");
+            let registry = LanceDbVectorStoreRegistry::default();
+            let g_missing = VectorGenerationId::parse("generation-missing").unwrap();
+            let legacy_space = VectorSpace {
+                embedding_model: "embedding-model".into(),
+                dimension: 2,
+            };
+
+            let legacy = seed_legacy_conflicting_record(&registry, &data_root).await;
+            assert_eq!(legacy.count("life", Some(&legacy_space)).await.unwrap(), 1);
+            assert!(
+                !generation_store_root(&data_root, &g_missing).exists(),
+                "the captured generation directory must be absent before the operation"
+            );
+
+            seed_resolution_for_generation(
+                &storage,
+                "life",
+                "memory",
+                1,
+                "generation-missing",
+                "descriptor-missing",
+                2,
+            );
+            let provider = registry
+                .bind_existing_generation_provider(&data_root)
+                .unwrap();
+            let corrupt = match reserved_query_permit(&storage)
+                .execute_exact_query_once_with_provider(&storage, &provider)
+                .await
+                .unwrap()
+            {
+                LateDeleteQueryHandoffOutcome::Corrupt(corrupt) => corrupt,
+                _ => panic!("a missing generation must map to Corrupt"),
+            };
+            assert_eq!(
+                corrupt.error_code,
+                "LATE_DELETE_QUERY_GENERATION_STORE_MISSING"
+            );
+            assert_eq!(
+                storage.finalize_late_delete_query_corrupt(corrupt).unwrap(),
+                LateDeleteResolutionFinalizeResult::Applied
+            );
+            let row: (String, String, Option<String>) = storage
+                .state()
+                .unwrap()
+                .connection
+                .query_row(
+                    "SELECT state,last_resolution_disposition,last_error_code FROM memory_vector_late_delete_resolution WHERE life_id='life' AND memory_id='memory'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                row,
+                (
+                    "waiting_rebuild".into(),
+                    "waiting_rebuild".into(),
+                    Some("LATE_DELETE_QUERY_GENERATION_STORE_MISSING".into())
+                )
+            );
+
+            // Legacy is unchanged and the missing generation directory still
+            // does not exist after the provider-backed operation.
+            assert_eq!(legacy.count("life", Some(&legacy_space)).await.unwrap(), 1);
+            assert!(
+                !generation_store_root(&data_root, &g_missing).exists(),
+                "existing-only provider must not create the missing generation directory"
+            );
+        });
     }
 }

@@ -1154,6 +1154,8 @@ pub(crate) mod test_support {
     use super::*;
     use rusqlite::params;
 
+    pub(crate) use super::late_delete_resolution::LateDeleteTestHarness;
+
     /// Stable identity of one external call made by a fake provider or fake
     /// vector store while a fenced worker processed one event. This is the
     /// test-only attribution ledger: it never reaches production logs and

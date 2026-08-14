@@ -17,7 +17,7 @@ use crate::vector_store::{
 };
 
 #[cfg(test)]
-use std::cell::Cell;
+use std::{cell::Cell, marker::PhantomData, rc::Rc};
 
 const RUNTIME_LEASE_NAME: &str = "memory-vector-late-delete-resolver";
 const RUNTIME_LEASE_SECONDS: i64 = 120;
@@ -620,6 +620,140 @@ thread_local! {
     static POST_DELETE_FINALIZE_AFTER_COMMIT_UNKNOWN: Cell<bool> = const { Cell::new(false) };
     static POST_DELETE_FINALIZE_COMMIT_ATTEMPT_COUNT: Cell<usize> = const { Cell::new(0) };
     static AUTHORITATIVE_NOW_OVERRIDE_FOR_TEST: Cell<Option<String>> = const { Cell::new(None) };
+}
+
+/// Narrow same-crate test support for the sealed late-delete path.
+///
+/// It arms at most one existing thread-local fault and never exposes a raw
+/// fault flag, database connection, token, or row identity. The `Rc` marker
+/// deliberately keeps it bound to the test thread that owns those fault cells.
+#[cfg(test)]
+pub(crate) struct LateDeleteTestHarness<'a> {
+    storage: &'a StorageService,
+    armed: bool,
+    _not_send_sync: PhantomData<Rc<()>>,
+}
+
+#[cfg(test)]
+impl<'a> LateDeleteTestHarness<'a> {
+    pub(crate) fn new(storage: &'a StorageService) -> Self {
+        Self {
+            storage,
+            armed: false,
+            _not_send_sync: PhantomData,
+        }
+    }
+
+    pub(crate) fn arm_reserve_after_commit_unknown(&mut self) -> Result<(), StorageError> {
+        self.arm(|| QUERY_PERMIT_AFTER_COMMIT_FAULT.with(|fault| fault.set(true)))
+    }
+
+    pub(crate) fn arm_delete_started_before_commit_unknown(&mut self) -> Result<(), StorageError> {
+        self.arm(|| DELETE_STARTED_BEFORE_COMMIT_UNKNOWN_FAULT.with(|fault| fault.set(true)))
+    }
+
+    pub(crate) fn arm_delete_started_after_commit_unknown(&mut self) -> Result<(), StorageError> {
+        self.arm(|| DELETE_STARTED_AFTER_COMMIT_FAULT.with(|fault| fault.set(true)))
+    }
+
+    pub(crate) fn arm_post_delete_before_commit_unknown(&mut self) -> Result<(), StorageError> {
+        self.arm(|| POST_DELETE_FINALIZE_BEFORE_COMMIT_UNKNOWN.with(|fault| fault.set(true)))
+    }
+
+    pub(crate) fn arm_post_delete_after_commit_unknown(&mut self) -> Result<(), StorageError> {
+        self.arm(|| POST_DELETE_FINALIZE_AFTER_COMMIT_UNKNOWN.with(|fault| fault.set(true)))
+    }
+
+    /// Atomically expires the runtime lease and exactly one matching nonterminal
+    /// resolution lease. Repeating the operation is idempotent for that same
+    /// fixture; missing or ambiguous fixtures fail closed.
+    pub(crate) fn expire_leases_for_recovery(&self) -> Result<(), StorageError> {
+        let mut state = self.storage.state()?;
+        let tx = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        let targets = tx
+            .prepare(
+                "SELECT r.resolution_id,r.lease_owner,r.lease_fence_epoch
+                 FROM memory_vector_late_delete_resolution r
+                 JOIN memory_vector_late_delete_runtime_lease l
+                   ON l.lease_name=?1
+                  AND l.lease_owner=r.lease_owner
+                  AND l.lease_fence_epoch=r.lease_fence_epoch
+                 WHERE r.state NOT IN ('resolved_absent','resolved_deleted','resolved_rebuilt','superseded')
+                   AND r.lease_owner IS NOT NULL
+                   AND r.lease_fence_epoch IS NOT NULL
+                   AND r.lease_expires_at IS NOT NULL",
+            )
+            .map_err(storage_error)?
+            .query_map([RUNTIME_LEASE_NAME], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(storage_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage_error)?;
+        let [(resolution_id, owner, fence_epoch)] = targets.as_slice() else {
+            return Err(StorageError::new(
+                "LATE_DELETE_TEST_HARNESS_LEASE_TARGET_INVALID",
+                "The late delete recovery fixture must have exactly one leased resolution.",
+                false,
+            ));
+        };
+        let expired_at = "2000-01-01T00:00:00.000Z";
+        let runtime_changed = tx
+            .execute(
+                "UPDATE memory_vector_late_delete_runtime_lease
+                 SET lease_expires_at=?1
+                 WHERE lease_name=?2 AND lease_owner=?3 AND lease_fence_epoch=?4",
+                params![expired_at, RUNTIME_LEASE_NAME, owner, fence_epoch],
+            )
+            .map_err(storage_error)?;
+        let resolution_changed = tx
+            .execute(
+                "UPDATE memory_vector_late_delete_resolution
+                 SET lease_expires_at=?1
+                 WHERE resolution_id=?2 AND lease_owner=?3 AND lease_fence_epoch=?4",
+                params![expired_at, resolution_id, owner, fence_epoch],
+            )
+            .map_err(storage_error)?;
+        if runtime_changed != 1 || resolution_changed != 1 {
+            return Err(StorageError::new(
+                "LATE_DELETE_TEST_HARNESS_LEASE_TARGET_INVALID",
+                "The late delete recovery fixture could not be expired atomically.",
+                false,
+            ));
+        }
+        tx.commit().map_err(storage_error)
+    }
+
+    fn arm(&mut self, arm: impl FnOnce()) -> Result<(), StorageError> {
+        if self.armed {
+            return Err(StorageError::new(
+                "LATE_DELETE_TEST_HARNESS_FAULT_ALREADY_ARMED",
+                "A late delete test fault is already armed.",
+                false,
+            ));
+        }
+        arm();
+        self.armed = true;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl Drop for LateDeleteTestHarness<'_> {
+    fn drop(&mut self) {
+        QUERY_PERMIT_AFTER_COMMIT_FAULT.with(|fault| fault.set(false));
+        DELETE_STARTED_BEFORE_COMMIT_UNKNOWN_FAULT.with(|fault| fault.set(false));
+        DELETE_STARTED_AFTER_COMMIT_FAULT.with(|fault| fault.set(false));
+        POST_DELETE_FINALIZE_BEFORE_COMMIT_UNKNOWN.with(|fault| fault.set(false));
+        POST_DELETE_FINALIZE_AFTER_COMMIT_UNKNOWN.with(|fault| fault.set(false));
+    }
 }
 
 /// Records every real DeleteStarted-issuance `transaction.commit()` attempt.
@@ -2222,6 +2356,7 @@ mod tests {
     use crate::memory::vector_sync_outbox::{
         EnqueueMemoryVectorSyncRequest, MemoryVectorSyncAction, MemoryVectorSyncOutboxRepository,
     };
+    use crate::storage::test_support::LateDeleteTestHarness as TestHarness;
     use crate::storage::{LifeIdentityRecord, PersonaTemplateRecord};
     use crate::vector_store::{
         generation_store_root, ExistingGenerationVectorStoreProvider, GenerationVectorRecord,
@@ -5395,5 +5530,194 @@ mod tests {
                 "existing-only provider must not create the missing generation directory"
             );
         });
+    }
+
+    #[test]
+    fn late_delete_test_harness_reserve_after_commit_unknown_uses_existing_seam() {
+        let (_root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let lease = storage
+            .acquire_late_delete_runtime_lease("resolver-a")
+            .unwrap()
+            .unwrap();
+        let claim = match storage.claim_one_late_delete_resolution(&lease).unwrap() {
+            LateDeleteResolutionClaimResult::Claimed(claim) => claim,
+            LateDeleteResolutionClaimResult::NoEligibleResolution => panic!("fixture must claim"),
+        };
+        let mut harness = TestHarness::new(&storage);
+        harness.arm_reserve_after_commit_unknown().unwrap();
+
+        let error = match storage.reserve_late_delete_resolution_for_query(&claim) {
+            Err(error) => error,
+            Ok(_) => panic!("the armed seam must hide the post-commit result"),
+        };
+        assert_eq!(
+            error.code,
+            "LATE_DELETE_QUERY_RESERVATION_COMMIT_RESULT_UNKNOWN"
+        );
+    }
+
+    #[test]
+    fn late_delete_test_harness_delete_started_unknowns_keep_runner_permit_zero() {
+        for before_commit in [true, false] {
+            let (_root, storage) = storage();
+            seed_resolution(&storage, "life", "memory", 1);
+            let present =
+                acknowledge_query_present_for_test(*reserved_query_permit(&storage), 7, "hash-7");
+            let mut harness = TestHarness::new(&storage);
+            if before_commit {
+                harness.arm_delete_started_before_commit_unknown().unwrap();
+            } else {
+                harness.arm_delete_started_after_commit_unknown().unwrap();
+            }
+
+            assert!(matches!(
+                storage.issue_late_delete_permit_for_runner(present).unwrap(),
+                LateDeleteDeletePermitRunnerIssuance::CommitUnknownRecoveryRequired(result)
+                    if result == if before_commit {
+                        LateDeleteStartedCommitUnknownNoPermit::PreIssuanceDurable
+                    } else {
+                        LateDeleteStartedCommitUnknownNoPermit::DeleteStartedDurable
+                    }
+            ));
+        }
+    }
+
+    #[test]
+    fn late_delete_test_harness_post_delete_unknowns_use_existing_reconciliation() {
+        for before_commit in [true, false] {
+            let (_root, storage) = storage();
+            seed_resolution(&storage, "life", "memory", 1);
+            let store = ScriptedQueryStore::new(Ok(Some(valid_query_sample())))
+                .with_delete_result(Ok(ConditionalGenerationDeleteOutcome::Deleted));
+            let deleted = match tauri::async_runtime::block_on(
+                issued_delete_permit(&storage).execute_conditional_delete_once(&storage, &store),
+            )
+            .unwrap()
+            {
+                LateDeleteDeleteHandoffOutcome::Deleted(capability) => capability,
+                _ => panic!("fixture must produce a deleted capability"),
+            };
+            let mut harness = TestHarness::new(&storage);
+            if before_commit {
+                harness.arm_post_delete_before_commit_unknown().unwrap();
+            } else {
+                harness.arm_post_delete_after_commit_unknown().unwrap();
+            }
+
+            assert_eq!(
+                storage.finalize_deleted_post_delete(deleted).unwrap(),
+                if before_commit {
+                    LateDeletePostDeleteFinalizeResult::CommitUnknownStillDeleteStarted
+                } else {
+                    LateDeletePostDeleteFinalizeResult::ReconciledExpectedDisposition
+                }
+            );
+            assert_eq!(
+                store.delete_count(),
+                1,
+                "finalization must not replay Delete"
+            );
+        }
+    }
+
+    #[test]
+    fn late_delete_test_harness_drop_clears_unconsumed_fault_and_refuses_second_arm() {
+        let (_root, storage) = storage();
+        {
+            let mut harness = TestHarness::new(&storage);
+            harness.arm_reserve_after_commit_unknown().unwrap();
+            assert_eq!(
+                harness
+                    .arm_delete_started_after_commit_unknown()
+                    .unwrap_err()
+                    .code,
+                "LATE_DELETE_TEST_HARNESS_FAULT_ALREADY_ARMED"
+            );
+        }
+        seed_resolution(&storage, "life", "memory", 1);
+        let lease = storage
+            .acquire_late_delete_runtime_lease("resolver-a")
+            .unwrap()
+            .unwrap();
+        let claim = match storage.claim_one_late_delete_resolution(&lease).unwrap() {
+            LateDeleteResolutionClaimResult::Claimed(claim) => claim,
+            LateDeleteResolutionClaimResult::NoEligibleResolution => panic!("fixture must claim"),
+        };
+        assert!(matches!(
+            storage
+                .reserve_late_delete_resolution_for_query(&claim)
+                .unwrap(),
+            LateDeleteQueryReservation::Reserved(_)
+        ));
+    }
+
+    #[test]
+    fn late_delete_test_harness_expires_one_fixture_and_recovery_uses_existing_path() {
+        let (_root, storage) = storage();
+        seed_resolution(&storage, "life", "memory", 1);
+        let permit = reserved_query_permit(&storage);
+        let harness = TestHarness::new(&storage);
+        harness.expire_leases_for_recovery().unwrap();
+        harness.expire_leases_for_recovery().unwrap();
+        drop(permit);
+
+        assert_eq!(
+            storage.recover_expired_late_delete_resolutions().unwrap(),
+            1,
+            "the existing recovery path must consume the atomically expired fixture"
+        );
+    }
+
+    #[test]
+    fn late_delete_test_harness_ambiguous_lease_fixture_fails_closed_without_changes() {
+        let (_root, storage) = storage();
+        seed_resolution(&storage, "life", "memory-a", 1);
+        let _permit = reserved_query_permit(&storage);
+        seed_resolution(&storage, "life", "memory-b", 2);
+        let before = {
+            let state = storage.state().unwrap();
+            state
+                .connection
+                .execute(
+                    "UPDATE memory_vector_late_delete_resolution
+                     SET state='processing',lease_owner='resolver-a',lease_fence_epoch=(
+                           SELECT lease_fence_epoch FROM memory_vector_late_delete_runtime_lease
+                           WHERE lease_name=?1
+                         ),lease_expires_at='2099-01-01T00:00:00.000Z'
+                     WHERE life_id='life' AND memory_id='memory-b'",
+                    [RUNTIME_LEASE_NAME],
+                )
+                .unwrap();
+            state
+                .connection
+                .query_row(
+                    "SELECT count(*) FROM memory_vector_late_delete_resolution
+                     WHERE lease_expires_at='2000-01-01T00:00:00.000Z'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+        };
+        let harness = TestHarness::new(&storage);
+        assert_eq!(
+            harness.expire_leases_for_recovery().unwrap_err().code,
+            "LATE_DELETE_TEST_HARNESS_LEASE_TARGET_INVALID"
+        );
+        let after: i64 = storage
+            .state()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT count(*) FROM memory_vector_late_delete_resolution
+                 WHERE lease_expires_at='2000-01-01T00:00:00.000Z'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            after, before,
+            "ambiguous fixtures must leave leases unchanged"
+        );
     }
 }

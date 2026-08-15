@@ -188,12 +188,16 @@ mod tests {
             VectorSearchQuery, VectorSpace, VectorStore, VectorStoreErrorCode, VectorStoreFuture,
         },
     };
+    use futures::task::noop_waker;
     use std::{
         collections::VecDeque,
+        future::Future,
+        pin::Pin,
         sync::{
             atomic::{AtomicUsize, Ordering},
-            Arc, Mutex,
+            mpsc, Arc, Mutex,
         },
+        task::{Context, Poll},
     };
 
     fn storage() -> (tempfile::TempDir, StorageService) {
@@ -683,5 +687,733 @@ mod tests {
                 ("resolved_deleted".into(), Some("delete_deleted".into()))
             );
         });
+    }
+
+    struct GateFuture<T> {
+        rx: Arc<Mutex<mpsc::Receiver<T>>>,
+    }
+
+    impl<T> Future for GateFuture<T> {
+        type Output = T;
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            match self.rx.lock().unwrap().try_recv() {
+                Ok(value) => Poll::Ready(value),
+                Err(mpsc::TryRecvError::Empty) => Poll::Pending,
+                Err(mpsc::TryRecvError::Disconnected) => panic!("gate sender disconnected"),
+            }
+        }
+    }
+
+    struct CrashAProvider {
+        query_store: Arc<dyn VectorStore>,
+        entered_tx: mpsc::Sender<()>,
+        delete_store_rx: Arc<Mutex<mpsc::Receiver<Result<Arc<dyn VectorStore>, VectorStoreError>>>>,
+        resolves: AtomicUsize,
+    }
+
+    impl ExistingGenerationVectorStoreProvider for CrashAProvider {
+        fn existing_for_generation<'a>(
+            &'a self,
+            _generation: &'a VectorGenerationId,
+        ) -> VectorStoreFuture<'a, Result<Arc<dyn VectorStore>, VectorStoreError>> {
+            let ordinal = self.resolves.fetch_add(1, Ordering::SeqCst);
+            if ordinal == 0 {
+                let store = Arc::clone(&self.query_store);
+                Box::pin(async move { Ok(store) })
+            } else {
+                let _ = self.entered_tx.send(());
+                let rx = Arc::clone(&self.delete_store_rx);
+                Box::pin(GateFuture { rx })
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct CrashBStore {
+        query: Result<Option<VectorMetadataSample>, VectorStoreError>,
+        entered_tx: mpsc::Sender<()>,
+        finish_rx: Arc<
+            Mutex<mpsc::Receiver<Result<ConditionalGenerationDeleteOutcome, VectorStoreError>>>,
+        >,
+        query_count: Arc<AtomicUsize>,
+        delete_count: Arc<AtomicUsize>,
+    }
+
+    impl CrashBStore {
+        fn new(
+            query: Result<Option<VectorMetadataSample>, VectorStoreError>,
+            entered_tx: mpsc::Sender<()>,
+            finish_rx: mpsc::Receiver<Result<ConditionalGenerationDeleteOutcome, VectorStoreError>>,
+        ) -> Self {
+            Self {
+                query,
+                entered_tx,
+                finish_rx: Arc::new(Mutex::new(finish_rx)),
+                query_count: Arc::new(AtomicUsize::new(0)),
+                delete_count: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl VectorStore for CrashBStore {
+        fn upsert<'a>(
+            &'a self,
+            _record: VectorRecord,
+        ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
+            Box::pin(async { ScriptedStore::unsupported() })
+        }
+        fn upsert_batch<'a>(
+            &'a self,
+            _records: Vec<VectorRecord>,
+        ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
+            Box::pin(async { ScriptedStore::unsupported() })
+        }
+        fn search<'a>(
+            &'a self,
+            _query: VectorSearchQuery,
+        ) -> VectorStoreFuture<'a, Result<Vec<VectorSearchHit>, VectorStoreError>> {
+            Box::pin(async { ScriptedStore::unsupported() })
+        }
+        fn delete<'a>(
+            &'a self,
+            _life_id: &'a str,
+            _memory_id: &'a str,
+        ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
+            Box::pin(async { ScriptedStore::unsupported() })
+        }
+        fn delete_from_space<'a>(
+            &'a self,
+            _life_id: &'a str,
+            _memory_id: &'a str,
+            _space: &'a VectorSpace,
+        ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
+            Box::pin(async { ScriptedStore::unsupported() })
+        }
+        fn delete_by_life<'a>(
+            &'a self,
+            _life_id: &'a str,
+        ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
+            Box::pin(async { ScriptedStore::unsupported() })
+        }
+        fn clear_space<'a>(
+            &'a self,
+            _life_id: &'a str,
+            _space: &'a VectorSpace,
+        ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
+            Box::pin(async { ScriptedStore::unsupported() })
+        }
+        fn count<'a>(
+            &'a self,
+            _life_id: &'a str,
+            _space: Option<&'a VectorSpace>,
+        ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
+            Box::pin(async { ScriptedStore::unsupported() })
+        }
+        fn health_check<'a>(
+            &'a self,
+            _life_id: &'a str,
+        ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
+            Box::pin(async { ScriptedStore::unsupported() })
+        }
+        fn get_generation_metadata<'a>(
+            &'a self,
+            _context: &'a VectorGenerationContext,
+            _life_id: &'a str,
+            _memory_id: &'a str,
+        ) -> VectorStoreFuture<'a, Result<Option<VectorMetadataSample>, VectorStoreError>> {
+            self.query_count.fetch_add(1, Ordering::SeqCst);
+            let result = self.query.clone();
+            Box::pin(async move { result })
+        }
+        fn delete_generation_memory_if_matches<'a>(
+            &'a self,
+            _context: &'a VectorGenerationContext,
+            _life_id: &'a str,
+            _memory_id: &'a str,
+            _revision: i64,
+            _hash: &'a str,
+        ) -> VectorStoreFuture<'a, Result<ConditionalGenerationDeleteOutcome, VectorStoreError>>
+        {
+            self.delete_count.fetch_add(1, Ordering::SeqCst);
+            let _ = self.entered_tx.send(());
+            let rx = Arc::clone(&self.finish_rx);
+            Box::pin(GateFuture { rx })
+        }
+    }
+
+    #[derive(Clone)]
+    struct CrashCStore {
+        query: Result<Option<VectorMetadataSample>, VectorStoreError>,
+        side_effect_count: Arc<AtomicUsize>,
+        side_effect_done_tx: mpsc::Sender<()>,
+        finish_rx: Arc<
+            Mutex<mpsc::Receiver<Result<ConditionalGenerationDeleteOutcome, VectorStoreError>>>,
+        >,
+        query_count: Arc<AtomicUsize>,
+    }
+
+    impl CrashCStore {
+        fn new(
+            query: Result<Option<VectorMetadataSample>, VectorStoreError>,
+            side_effect_done_tx: mpsc::Sender<()>,
+            finish_rx: mpsc::Receiver<Result<ConditionalGenerationDeleteOutcome, VectorStoreError>>,
+        ) -> Self {
+            Self {
+                query,
+                side_effect_count: Arc::new(AtomicUsize::new(0)),
+                side_effect_done_tx,
+                finish_rx: Arc::new(Mutex::new(finish_rx)),
+                query_count: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl VectorStore for CrashCStore {
+        fn upsert<'a>(
+            &'a self,
+            _record: VectorRecord,
+        ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
+            Box::pin(async { ScriptedStore::unsupported() })
+        }
+        fn upsert_batch<'a>(
+            &'a self,
+            _records: Vec<VectorRecord>,
+        ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
+            Box::pin(async { ScriptedStore::unsupported() })
+        }
+        fn search<'a>(
+            &'a self,
+            _query: VectorSearchQuery,
+        ) -> VectorStoreFuture<'a, Result<Vec<VectorSearchHit>, VectorStoreError>> {
+            Box::pin(async { ScriptedStore::unsupported() })
+        }
+        fn delete<'a>(
+            &'a self,
+            _life_id: &'a str,
+            _memory_id: &'a str,
+        ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
+            Box::pin(async { ScriptedStore::unsupported() })
+        }
+        fn delete_from_space<'a>(
+            &'a self,
+            _life_id: &'a str,
+            _memory_id: &'a str,
+            _space: &'a VectorSpace,
+        ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
+            Box::pin(async { ScriptedStore::unsupported() })
+        }
+        fn delete_by_life<'a>(
+            &'a self,
+            _life_id: &'a str,
+        ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
+            Box::pin(async { ScriptedStore::unsupported() })
+        }
+        fn clear_space<'a>(
+            &'a self,
+            _life_id: &'a str,
+            _space: &'a VectorSpace,
+        ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
+            Box::pin(async { ScriptedStore::unsupported() })
+        }
+        fn count<'a>(
+            &'a self,
+            _life_id: &'a str,
+            _space: Option<&'a VectorSpace>,
+        ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
+            Box::pin(async { ScriptedStore::unsupported() })
+        }
+        fn health_check<'a>(
+            &'a self,
+            _life_id: &'a str,
+        ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
+            Box::pin(async { ScriptedStore::unsupported() })
+        }
+        fn get_generation_metadata<'a>(
+            &'a self,
+            _context: &'a VectorGenerationContext,
+            _life_id: &'a str,
+            _memory_id: &'a str,
+        ) -> VectorStoreFuture<'a, Result<Option<VectorMetadataSample>, VectorStoreError>> {
+            self.query_count.fetch_add(1, Ordering::SeqCst);
+            let result = self.query.clone();
+            Box::pin(async move { result })
+        }
+        fn delete_generation_memory_if_matches<'a>(
+            &'a self,
+            _context: &'a VectorGenerationContext,
+            _life_id: &'a str,
+            _memory_id: &'a str,
+            _revision: i64,
+            _hash: &'a str,
+        ) -> VectorStoreFuture<'a, Result<ConditionalGenerationDeleteOutcome, VectorStoreError>>
+        {
+            self.side_effect_count.fetch_add(1, Ordering::SeqCst);
+            let _ = self.side_effect_done_tx.send(());
+            let rx = Arc::clone(&self.finish_rx);
+            Box::pin(GateFuture { rx })
+        }
+    }
+
+    struct SuspendingProvider {
+        store: Arc<dyn VectorStore>,
+        entered_tx: mpsc::Sender<()>,
+        resume_rx: Arc<Mutex<mpsc::Receiver<Result<Arc<dyn VectorStore>, VectorStoreError>>>>,
+        resolves: AtomicUsize,
+    }
+
+    impl ExistingGenerationVectorStoreProvider for SuspendingProvider {
+        fn existing_for_generation<'a>(
+            &'a self,
+            _generation: &'a VectorGenerationId,
+        ) -> VectorStoreFuture<'a, Result<Arc<dyn VectorStore>, VectorStoreError>> {
+            self.resolves.fetch_add(1, Ordering::SeqCst);
+            let _ = self.entered_tx.send(());
+            let rx = Arc::clone(&self.resume_rx);
+            Box::pin(GateFuture { rx })
+        }
+    }
+
+    struct GatedDeleteStore {
+        inner: Arc<InMemoryVectorStore>,
+        entered_tx: mpsc::Sender<()>,
+        resume_rx: Arc<Mutex<mpsc::Receiver<()>>>,
+    }
+
+    impl VectorStore for GatedDeleteStore {
+        fn upsert<'a>(
+            &'a self,
+            record: VectorRecord,
+        ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
+            self.inner.upsert(record)
+        }
+        fn upsert_batch<'a>(
+            &'a self,
+            records: Vec<VectorRecord>,
+        ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
+            self.inner.upsert_batch(records)
+        }
+        fn search<'a>(
+            &'a self,
+            query: VectorSearchQuery,
+        ) -> VectorStoreFuture<'a, Result<Vec<VectorSearchHit>, VectorStoreError>> {
+            self.inner.search(query)
+        }
+        fn delete<'a>(
+            &'a self,
+            life_id: &'a str,
+            memory_id: &'a str,
+        ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
+            self.inner.delete(life_id, memory_id)
+        }
+        fn delete_from_space<'a>(
+            &'a self,
+            life_id: &'a str,
+            memory_id: &'a str,
+            space: &'a VectorSpace,
+        ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
+            self.inner.delete_from_space(life_id, memory_id, space)
+        }
+        fn delete_by_life<'a>(
+            &'a self,
+            life_id: &'a str,
+        ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
+            self.inner.delete_by_life(life_id)
+        }
+        fn clear_space<'a>(
+            &'a self,
+            life_id: &'a str,
+            space: &'a VectorSpace,
+        ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
+            self.inner.clear_space(life_id, space)
+        }
+        fn count<'a>(
+            &'a self,
+            life_id: &'a str,
+            space: Option<&'a VectorSpace>,
+        ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
+            self.inner.count(life_id, space)
+        }
+        fn health_check<'a>(
+            &'a self,
+            life_id: &'a str,
+        ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
+            self.inner.health_check(life_id)
+        }
+        fn get_generation_metadata<'a>(
+            &'a self,
+            context: &'a VectorGenerationContext,
+            life_id: &'a str,
+            memory_id: &'a str,
+        ) -> VectorStoreFuture<'a, Result<Option<VectorMetadataSample>, VectorStoreError>> {
+            self.inner
+                .get_generation_metadata(context, life_id, memory_id)
+        }
+        fn delete_generation_memory_if_matches<'a>(
+            &'a self,
+            context: &'a VectorGenerationContext,
+            life_id: &'a str,
+            memory_id: &'a str,
+            revision: i64,
+            hash: &'a str,
+        ) -> VectorStoreFuture<'a, Result<ConditionalGenerationDeleteOutcome, VectorStoreError>>
+        {
+            let _ = self.entered_tx.send(());
+            let rx = Arc::clone(&self.resume_rx);
+            let inner = Arc::clone(&self.inner);
+            let life_id = life_id.to_string();
+            let memory_id = memory_id.to_string();
+            let hash = hash.to_string();
+            let context = context.clone();
+            Box::pin(async move {
+                GateFuture { rx }.await;
+                inner
+                    .delete_generation_memory_if_matches(
+                        &context, &life_id, &memory_id, revision, &hash,
+                    )
+                    .await
+            })
+        }
+    }
+
+    #[test]
+    fn late_delete_resolution_runner_crash_a_before_delete_keeps_d_zero_and_recovers() {
+        let (_root, storage) = storage();
+        let memory_id = seed_resolution(&storage);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (_dummy_tx, delete_store_rx) = mpsc::channel();
+        let scripted = Arc::new(ScriptedStore::new(
+            Ok(Some(sample(&memory_id))),
+            Ok(ConditionalGenerationDeleteOutcome::Deleted),
+        ));
+        let provider = CrashAProvider {
+            query_store: Arc::clone(&scripted) as Arc<dyn VectorStore>,
+            entered_tx,
+            delete_store_rx: Arc::new(Mutex::new(delete_store_rx)),
+            resolves: AtomicUsize::new(0),
+        };
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut runner_future = Box::pin(run_one_late_delete(&storage, &provider, "runner-a"));
+        assert!(matches!(
+            runner_future.as_mut().poll(&mut cx),
+            Poll::Pending
+        ));
+        entered_rx.recv().unwrap();
+
+        assert_eq!(scripted.query_count.load(Ordering::SeqCst), 1);
+        assert_eq!(scripted.delete_count.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.resolves.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            resolution_state(&storage),
+            ("processing".into(), Some("delete_started".into()))
+        );
+
+        drop(runner_future);
+
+        LateDeleteTestHarness::new(&storage)
+            .expire_leases_for_recovery()
+            .unwrap();
+
+        let ordinal2_store = Arc::new(ScriptedStore::new(
+            Ok(Some(sample(&memory_id))),
+            Ok(ConditionalGenerationDeleteOutcome::Deleted),
+        ));
+        let ordinal2_provider = ScriptedProvider::new([
+            Ok(Arc::clone(&ordinal2_store) as Arc<dyn VectorStore>),
+            Ok(Arc::clone(&ordinal2_store) as Arc<dyn VectorStore>),
+        ]);
+
+        let end = tauri::async_runtime::block_on(run_one_late_delete(
+            &storage,
+            &ordinal2_provider,
+            "runner-b",
+        ))
+        .unwrap();
+
+        assert_eq!(end, LateDeleteRunEnd::Processed { recovered: 1 });
+        assert_eq!(ordinal2_store.query_count.load(Ordering::SeqCst), 1);
+        assert_eq!(ordinal2_store.delete_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            resolution_state(&storage),
+            ("resolved_deleted".into(), Some("delete_deleted".into()))
+        );
+    }
+
+    #[test]
+    fn late_delete_resolution_runner_crash_b_after_delete_entered_never_replays() {
+        let (_root, storage) = storage();
+        let memory_id = seed_resolution(&storage);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (_dummy_tx, finish_rx) = mpsc::channel();
+        let crash_store = Arc::new(CrashBStore::new(
+            Ok(Some(sample(&memory_id))),
+            entered_tx,
+            finish_rx,
+        ));
+        let provider = ScriptedProvider::new([
+            Ok(Arc::clone(&crash_store) as Arc<dyn VectorStore>),
+            Ok(Arc::clone(&crash_store) as Arc<dyn VectorStore>),
+        ]);
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut runner_future = Box::pin(run_one_late_delete(&storage, &provider, "runner-a"));
+        assert!(matches!(
+            runner_future.as_mut().poll(&mut cx),
+            Poll::Pending
+        ));
+        entered_rx.recv().unwrap();
+
+        assert_eq!(crash_store.query_count.load(Ordering::SeqCst), 1);
+        assert_eq!(crash_store.delete_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            resolution_state(&storage),
+            ("processing".into(), Some("delete_started".into()))
+        );
+
+        drop(runner_future);
+
+        assert_eq!(crash_store.delete_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn late_delete_resolution_runner_crash_c_after_side_effect_does_not_redelete() {
+        let (_root, storage) = storage();
+        let memory_id = seed_resolution(&storage);
+        let (side_effect_done_tx, side_effect_done_rx) = mpsc::channel();
+        let (_dummy_tx, finish_rx) = mpsc::channel();
+        let crash_store = Arc::new(CrashCStore::new(
+            Ok(Some(sample(&memory_id))),
+            side_effect_done_tx,
+            finish_rx,
+        ));
+        let provider = ScriptedProvider::new([
+            Ok(Arc::clone(&crash_store) as Arc<dyn VectorStore>),
+            Ok(Arc::clone(&crash_store) as Arc<dyn VectorStore>),
+        ]);
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut runner_future = Box::pin(run_one_late_delete(&storage, &provider, "runner-a"));
+        assert!(matches!(
+            runner_future.as_mut().poll(&mut cx),
+            Poll::Pending
+        ));
+        side_effect_done_rx.recv().unwrap();
+
+        assert_eq!(crash_store.side_effect_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            resolution_state(&storage),
+            ("processing".into(), Some("delete_started".into()))
+        );
+
+        drop(runner_future);
+
+        LateDeleteTestHarness::new(&storage)
+            .expire_leases_for_recovery()
+            .unwrap();
+
+        let ordinal2_store = Arc::new(ScriptedStore::new(
+            Ok(None),
+            Ok(ConditionalGenerationDeleteOutcome::Deleted),
+        ));
+        let ordinal2_provider =
+            ScriptedProvider::new([Ok(Arc::clone(&ordinal2_store) as Arc<dyn VectorStore>)]);
+
+        let end = tauri::async_runtime::block_on(run_one_late_delete(
+            &storage,
+            &ordinal2_provider,
+            "runner-b",
+        ))
+        .unwrap();
+
+        assert_eq!(end, LateDeleteRunEnd::Processed { recovered: 1 });
+        assert_eq!(ordinal2_store.query_count.load(Ordering::SeqCst), 1);
+        assert_eq!(ordinal2_store.delete_count.load(Ordering::SeqCst), 0);
+        assert_eq!(crash_store.side_effect_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            resolution_state(&storage),
+            ("resolved_absent".into(), Some("query_absent".into()))
+        );
+    }
+
+    #[test]
+    fn late_delete_resolution_runner_resolution_budget_exhaustion_waits_for_rebuild() {
+        let (_root, storage) = storage();
+        let _memory_id = seed_resolution(&storage);
+
+        for _ordinal in 1..=3 {
+            let provider =
+                ScriptedProvider::new([Err(runner_error(VectorStoreErrorCode::StoreUnavailable))]);
+            let end = tauri::async_runtime::block_on(run_one_late_delete(
+                &storage, &provider, "runner-a",
+            ))
+            .unwrap();
+            assert!(matches!(end, LateDeleteRunEnd::Processed { .. }));
+            assert_eq!(
+                resolution_state(&storage),
+                ("unknown".into(), Some("query_unknown".into()))
+            );
+        }
+
+        let scripted = Arc::new(ScriptedStore::new(
+            Ok(None),
+            Ok(ConditionalGenerationDeleteOutcome::Deleted),
+        ));
+        let provider = ScriptedProvider::new([Ok(scripted.clone() as Arc<dyn VectorStore>)]);
+        let end =
+            tauri::async_runtime::block_on(run_one_late_delete(&storage, &provider, "runner-b"))
+                .unwrap();
+
+        assert_eq!(end, LateDeleteRunEnd::NoWork { recovered: 0 });
+        assert_eq!(scripted.query_count.load(Ordering::SeqCst), 0);
+        assert_eq!(scripted.delete_count.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            resolution_state(&storage),
+            ("waiting_rebuild".into(), Some("waiting_rebuild".into()))
+        );
+    }
+
+    #[test]
+    fn late_delete_resolution_runner_superseded_before_query_io_keeps_qd_zero() {
+        let (_root, storage) = storage();
+        let memory_id = seed_resolution(&storage);
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let scripted = Arc::new(ScriptedStore::new(
+            Ok(Some(sample(&memory_id))),
+            Ok(ConditionalGenerationDeleteOutcome::Deleted),
+        ));
+        let store: Arc<dyn VectorStore> = scripted.clone();
+        let provider = SuspendingProvider {
+            store: Arc::clone(&store),
+            entered_tx,
+            resume_rx: Arc::new(Mutex::new(resume_rx)),
+            resolves: AtomicUsize::new(0),
+        };
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut runner_future = Box::pin(run_one_late_delete(&storage, &provider, "runner-a"));
+        assert!(matches!(
+            runner_future.as_mut().poll(&mut cx),
+            Poll::Pending
+        ));
+        entered_rx.recv().unwrap();
+
+        <StorageService as MemoryVectorSyncOutboxRepository>::enqueue(
+            &storage,
+            EnqueueMemoryVectorSyncRequest {
+                life_id: "life".into(),
+                memory_id: memory_id.clone(),
+                desired_action: MemoryVectorSyncAction::Delete,
+            },
+        )
+        .unwrap();
+
+        resume_tx.send(Ok(store)).unwrap();
+        assert!(matches!(
+            runner_future.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(_))
+        ));
+
+        assert_eq!(scripted.query_count.load(Ordering::SeqCst), 0);
+        assert_eq!(scripted.delete_count.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.resolves.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            resolution_state(&storage),
+            ("superseded".into(), Some("superseded".into()))
+        );
+    }
+
+    #[test]
+    fn late_delete_resolution_runner_same_generation_newer_vector_survives() {
+        let (_root, storage) = storage();
+        let memory_id = seed_resolution(&storage);
+        let vector_context = context();
+        let in_memory = Arc::new(InMemoryVectorStore::default());
+
+        tauri::async_runtime::block_on(in_memory.create_generation(&vector_context)).unwrap();
+        tauri::async_runtime::block_on(
+            in_memory.upsert_generation(
+                &vector_context,
+                GenerationVectorRecord::try_new(
+                    VectorGenerationId::parse("generation-a").unwrap(),
+                    "life",
+                    &memory_id,
+                    7,
+                    "hash-7",
+                    "descriptor-a",
+                    vec![1.0, 0.0],
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+
+        let gated_store = Arc::new(GatedDeleteStore {
+            inner: Arc::clone(&in_memory),
+            entered_tx,
+            resume_rx: Arc::new(Mutex::new(resume_rx)),
+        });
+
+        let provider = ScriptedProvider::new([
+            Ok(Arc::clone(&gated_store) as Arc<dyn VectorStore>),
+            Ok(Arc::clone(&gated_store) as Arc<dyn VectorStore>),
+        ]);
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut runner_future = Box::pin(run_one_late_delete(&storage, &provider, "runner-a"));
+        assert!(matches!(
+            runner_future.as_mut().poll(&mut cx),
+            Poll::Pending
+        ));
+        entered_rx.recv().unwrap();
+
+        tauri::async_runtime::block_on(
+            in_memory.upsert_generation(
+                &vector_context,
+                GenerationVectorRecord::try_new(
+                    VectorGenerationId::parse("generation-a").unwrap(),
+                    "life",
+                    &memory_id,
+                    8,
+                    "hash-8",
+                    "descriptor-a",
+                    vec![0.0, 1.0],
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+
+        resume_tx.send(()).unwrap();
+        assert!(matches!(
+            runner_future.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(_))
+        ));
+
+        assert_eq!(
+            resolution_state(&storage),
+            ("waiting_rebuild".into(), Some("identity_mismatch".into()))
+        );
+
+        let surviving_sample = tauri::async_runtime::block_on(in_memory.get_generation_metadata(
+            &vector_context,
+            "life",
+            &memory_id,
+        ))
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(surviving_sample.memory_revision, 8);
+        assert_eq!(surviving_sample.content_hash, "hash-8");
     }
 }

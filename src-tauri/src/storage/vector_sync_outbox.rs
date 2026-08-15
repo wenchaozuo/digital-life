@@ -3,6 +3,7 @@ use sha2::{Digest, Sha256};
 
 use crate::memory::{
     candidate_service::contains_prohibited_content,
+    existing_generation_binding::ExistingGenerationBindingError,
     vector_sync_outbox::{
         ClaimMemoryVectorSyncLeaseRequest, ClaimMemoryVectorSyncRequest,
         EnqueueMemoryVectorSyncRequest, MemoryVectorSyncAction, MemoryVectorSyncJob,
@@ -10,6 +11,7 @@ use crate::memory::{
         MemoryVectorSyncOutboxRepository, MemoryVectorSyncState,
     },
 };
+use crate::vector_store::{VectorGenerationContext, VectorGenerationId};
 
 use super::{late_delete_resolution, StorageService};
 
@@ -732,8 +734,166 @@ impl std::ops::Not for FencedAttemptStartResult {
     }
 }
 
+/// Sealed authority proof representing a unique `building` candidate in SQLite.
+///
+/// It deliberately has no `Clone`, no `Copy`, no `Debug`, no `Serialize`, no `Deserialize`,
+/// and no raw scalar getters to ensure the caller cannot extract generation scalars or
+/// bypass authority rechecks.
+pub(crate) struct ExistingBuildingGenerationAuthority {
+    generation_id: String,
+    descriptor_hash: String,
+    dimension: usize,
+    authority_epoch: i64,
+}
+
+impl ExistingBuildingGenerationAuthority {
+    /// Verifies that the expected descriptor hash and expected dimension match the candidate authority.
+    pub(crate) fn verify_descriptor_and_dimension(
+        &self,
+        expected_descriptor_hash: &str,
+        expected_dimension: usize,
+    ) -> Result<(), ExistingGenerationBindingError> {
+        if self.descriptor_hash != expected_descriptor_hash || self.dimension != expected_dimension
+        {
+            return Err(ExistingGenerationBindingError::generation_binding_mismatch());
+        }
+        Ok(())
+    }
+
+    /// Performs the exact authority recheck against authoritative SQLite storage
+    /// and produces the sealed VectorGenerationContext only on exact match.
+    pub(crate) fn verify_current_and_seal(
+        self,
+        storage: &StorageService,
+    ) -> Result<VectorGenerationContext, ExistingGenerationBindingError> {
+        let state = storage
+            .state()
+            .map_err(|_| ExistingGenerationBindingError::generation_binding_stale())?;
+
+        let matches: bool = state
+            .connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM memory_vector_generation
+                    WHERE generation_id = ?1
+                      AND descriptor_hash = ?2
+                      AND dimension = ?3
+                      AND state = 'building'
+                      AND authority_epoch = ?4
+                )",
+                params![
+                    self.generation_id,
+                    self.descriptor_hash,
+                    self.dimension as i64,
+                    self.authority_epoch,
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|_| ExistingGenerationBindingError::generation_binding_stale())?;
+
+        if !matches {
+            return Err(ExistingGenerationBindingError::generation_binding_stale());
+        }
+
+        let generation_id = VectorGenerationId::parse(&self.generation_id)
+            .map_err(|_| ExistingGenerationBindingError::invalid_generation_metadata())?;
+
+        VectorGenerationContext::new(generation_id, self.descriptor_hash, self.dimension)
+            .map_err(|_| ExistingGenerationBindingError::invalid_generation_metadata())
+    }
+}
+
 #[allow(dead_code)]
 impl StorageService {
+    /// Loads the unique building generation candidate from SQLite generation authority.
+    ///
+    /// Evaluates `SELECT ... FROM memory_vector_generation WHERE state = 'building' LIMIT 2`:
+    /// - 0 rows -> `D9D2_NO_EXISTING_GENERATION`
+    /// - 1 row -> validates metadata -> `ExistingBuildingGenerationAuthority`
+    /// - 2 rows -> `D9D2_AMBIGUOUS_EXISTING_GENERATION`
+    pub(crate) fn load_existing_building_generation_candidate(
+        &self,
+    ) -> Result<ExistingBuildingGenerationAuthority, ExistingGenerationBindingError> {
+        let state = self
+            .state()
+            .map_err(|_| ExistingGenerationBindingError::no_existing_generation())?;
+
+        let mut stmt = state
+            .connection
+            .prepare(
+                "SELECT generation_id, descriptor_hash, dimension, state, authority_epoch
+                 FROM memory_vector_generation
+                 WHERE state = 'building'
+                 LIMIT 2",
+            )
+            .map_err(|_| ExistingGenerationBindingError::no_existing_generation())?;
+
+        let mut rows = stmt
+            .query([])
+            .map_err(|_| ExistingGenerationBindingError::no_existing_generation())?;
+
+        let first = rows
+            .next()
+            .map_err(|_| ExistingGenerationBindingError::no_existing_generation())?;
+
+        let Some(first_row) = first else {
+            return Err(ExistingGenerationBindingError::no_existing_generation());
+        };
+
+        let gen_id_raw: String = first_row
+            .get(0)
+            .map_err(|_| ExistingGenerationBindingError::invalid_generation_metadata())?;
+        let descriptor_hash: String = first_row
+            .get(1)
+            .map_err(|_| ExistingGenerationBindingError::invalid_generation_metadata())?;
+        let dimension_raw: i64 = first_row
+            .get(2)
+            .map_err(|_| ExistingGenerationBindingError::invalid_generation_metadata())?;
+        let state_raw: String = first_row
+            .get(3)
+            .map_err(|_| ExistingGenerationBindingError::invalid_generation_metadata())?;
+        let authority_epoch: i64 = first_row
+            .get(4)
+            .map_err(|_| ExistingGenerationBindingError::invalid_generation_metadata())?;
+
+        // Check if there is an ambiguous 2nd row
+        let second = rows
+            .next()
+            .map_err(|_| ExistingGenerationBindingError::no_existing_generation())?;
+
+        if second.is_some() {
+            return Err(ExistingGenerationBindingError::ambiguous_existing_generation());
+        }
+
+        // Validate metadata of candidate row
+        if state_raw != "building" {
+            return Err(ExistingGenerationBindingError::invalid_generation_metadata());
+        }
+        if authority_epoch <= 0 {
+            return Err(ExistingGenerationBindingError::invalid_generation_metadata());
+        }
+        if dimension_raw <= 0 || dimension_raw > crate::embedding::MAX_VECTOR_DIMENSION as i64 {
+            return Err(ExistingGenerationBindingError::invalid_generation_metadata());
+        }
+        if descriptor_hash.len() != 64
+            || !descriptor_hash
+                .chars()
+                .all(|c| matches!(c, '0'..='9' | 'a'..='f'))
+        {
+            return Err(ExistingGenerationBindingError::invalid_generation_metadata());
+        }
+        if VectorGenerationId::parse(&gen_id_raw).is_err() {
+            return Err(ExistingGenerationBindingError::invalid_generation_metadata());
+        }
+
+        Ok(ExistingBuildingGenerationAuthority {
+            generation_id: gen_id_raw,
+            descriptor_hash,
+            dimension: dimension_raw as usize,
+            authority_epoch,
+        })
+    }
+
     /// D-9D1 creates only explicit, non-active generations.  Activation and
     /// rebuild orchestration remain D-9D3 responsibilities.
     pub(crate) fn register_building_vector_generation(

@@ -13,6 +13,8 @@ pub mod candidate_confirmation_commands;
 pub mod candidate_service;
 pub mod context_builder;
 pub mod extraction_commands;
+#[allow(dead_code)] // Internal runner wiring awaits the future memory scheduler.
+mod late_delete_resolution_runner;
 pub mod management;
 pub mod retrieval;
 pub mod retrieval_router;

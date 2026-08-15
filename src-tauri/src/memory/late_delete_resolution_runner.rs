@@ -689,6 +689,11 @@ mod tests {
         });
     }
 
+    /// Shared gate that delivers a pending replacement store for a
+    /// suspended generation resolution (crash / supersede cut points).
+    type PendingStoreDelivery =
+        Arc<Mutex<mpsc::Receiver<Result<Arc<dyn VectorStore>, VectorStoreError>>>>;
+
     struct GateFuture<T> {
         rx: Arc<Mutex<mpsc::Receiver<T>>>,
     }
@@ -708,7 +713,7 @@ mod tests {
     struct CrashAProvider {
         query_store: Arc<dyn VectorStore>,
         entered_tx: mpsc::Sender<()>,
-        delete_store_rx: Arc<Mutex<mpsc::Receiver<Result<Arc<dyn VectorStore>, VectorStoreError>>>>,
+        delete_store_rx: PendingStoreDelivery,
         resolves: AtomicUsize,
     }
 
@@ -958,7 +963,7 @@ mod tests {
     struct SuspendingProvider {
         store: Arc<dyn VectorStore>,
         entered_tx: mpsc::Sender<()>,
-        resume_rx: Arc<Mutex<mpsc::Receiver<Result<Arc<dyn VectorStore>, VectorStoreError>>>>,
+        resume_rx: PendingStoreDelivery,
         resolves: AtomicUsize,
     }
 

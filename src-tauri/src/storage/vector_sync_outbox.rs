@@ -3897,6 +3897,44 @@ fn legacy_claims_are_disabled() -> bool {
 }
 
 #[cfg(test)]
+pub struct ExistingGenerationBindingReadObservationToken {
+    total_changes_before: u64,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExistingGenerationBindingObservationResult {
+    Unchanged,
+    Mutated,
+}
+
+#[cfg(test)]
+impl StorageService {
+    pub fn begin_existing_generation_binding_read_observation_for_test(
+        &self,
+    ) -> Result<ExistingGenerationBindingReadObservationToken, crate::storage::StorageError> {
+        let state = self.state()?;
+        let total_changes_before = state.connection.total_changes();
+        Ok(ExistingGenerationBindingReadObservationToken {
+            total_changes_before,
+        })
+    }
+
+    pub fn finish_existing_generation_binding_read_observation_for_test(
+        &self,
+        token: ExistingGenerationBindingReadObservationToken,
+    ) -> Result<ExistingGenerationBindingObservationResult, crate::storage::StorageError> {
+        let state = self.state()?;
+        let total_changes_after = state.connection.total_changes();
+        if total_changes_after == token.total_changes_before {
+            Ok(ExistingGenerationBindingObservationResult::Unchanged)
+        } else {
+            Ok(ExistingGenerationBindingObservationResult::Mutated)
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{

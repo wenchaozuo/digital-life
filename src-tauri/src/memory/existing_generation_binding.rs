@@ -1,8 +1,8 @@
 //! D-9D2 Existing Generation Binding Read Bridge.
 //!
 //! Provides a sealed, read-only, non-IPC bridge from authoritative SQLite
-//! generation metadata and active embedding provider configuration to a sealed
-//! [`ExistingVectorGenerationBinding`].
+//! generation metadata, active embedding provider configuration, and managed
+//! LanceDB vector store registry to an owned, sealed [`ExistingGenerationFencedExecution`].
 //!
 //! This module adheres strictly to the following invariants:
 //! - Authority source is strictly SQLite `memory_vector_generation` where `state = 'building'`.
@@ -13,17 +13,25 @@
 //! - Exact currentness recheck verifies generation authority and authority epoch before sealing.
 //! - The resulting types have private fields, no `Clone`, no `Debug`, no `Serialize`/`Deserialize`,
 //!   no IPC exposure, no raw scalar getters, and no split getters.
-//! - Consumption is strictly atomic and consuming via `into_fenced_consumer`.
+//! - Execution is strictly owned and bounded per-drain; provider and store lifetimes are scoped
+//!   to the drain execution and never leak or escape.
+//! - Matching vector store is acquired strictly via canonical `active_data_root`, managed registry,
+//!   and sealed private generation ID. Arbitrary store injection is impossible.
 //! - Absolutely NO generation creation, registration, activation, switching, retirement, or mutation.
 
-use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
+use std::sync::Arc;
+
+use sha2::{Digest, Sha256};
 
 use crate::{
     embedding::{EmbeddingProvider, MAX_VECTOR_DIMENSION, PROTOCOL_VERSION},
     memory::{
         vector_index::MEMORY_INDEX_FORMAT_VERSION,
-        vector_sync_worker::FencedVectorSyncSingleEventConsumer,
+        vector_sync_worker::{
+            drain_fenced_vector_sync, FencedVectorSyncSingleEventConsumer,
+            MemoryVectorSyncWorkerError, VectorSyncDrainReport,
+        },
     },
     model::{
         profile::{ModelProfileRepository, ModelProviderKind},
@@ -37,7 +45,10 @@ use crate::{
     },
     secrets::SecretStore,
     storage::{ExistingBuildingGenerationAuthority, StorageService},
-    vector_store::{VectorGenerationContext, VectorStore},
+    vector_store::{
+        ExistingGenerationVectorStoreProvider, LanceDbVectorStoreRegistry, VectorGenerationContext,
+        VectorStore,
+    },
 };
 
 /// Fixed redacted error codes for D-9D2 generation binding read bridge.
@@ -167,18 +178,72 @@ pub(crate) struct ExistingVectorGenerationBinding<'a> {
 }
 
 impl<'a> ExistingVectorGenerationBinding<'a> {
-    /// Controlled atomic consumer for `ExistingVectorGenerationBinding`.
+    /// Consumes the intermediate binding by value to construct an owned, sealed
+    /// [`ExistingGenerationFencedExecution`] using canonical storage root and managed registry.
     ///
-    /// Consumes `self` by value and constructs the sealed `FencedVectorSyncSingleEventConsumer`.
-    /// Neither `VectorGenerationContext` nor `EmbeddingProvider` can escape or be decoupled.
+    /// The exact matching store is acquired from the managed registry using the private
+    /// sealed generation identifier. Neither provider, store, nor context can escape.
     #[allow(dead_code)]
-    pub(crate) fn into_fenced_consumer(
+    pub(crate) async fn into_fenced_execution<'s>(
         self,
-        storage: &'a StorageService,
-        vectors: &'a dyn VectorStore,
-    ) -> FencedVectorSyncSingleEventConsumer<'a> {
-        let embedding: &'a dyn EmbeddingProvider = Box::leak(self.provider.into_provider());
-        FencedVectorSyncSingleEventConsumer::new(storage, embedding, vectors, self.context)
+        storage: &'s StorageService,
+        registry: &LanceDbVectorStoreRegistry,
+    ) -> Result<ExistingGenerationFencedExecution<'s, 'a>, ExistingGenerationBindingError> {
+        let data_root = storage
+            .active_data_root()
+            .map_err(|_| ExistingGenerationBindingError::existing_vector_store_unavailable())?;
+        let store_provider = registry
+            .bind_existing_generation_provider(&data_root)
+            .map_err(|_| ExistingGenerationBindingError::existing_vector_store_unavailable())?;
+        let store = store_provider
+            .existing_for_generation(self.context.generation_id())
+            .await
+            .map_err(|_| ExistingGenerationBindingError::existing_vector_store_unavailable())?;
+        Ok(ExistingGenerationFencedExecution {
+            storage,
+            context: self.context,
+            provider: self.provider,
+            store,
+        })
+    }
+}
+
+/// Opaque, sealed execution capability for bounded vector sync drain.
+///
+/// Strictly holds owned generation context, owned resolved embedding provider,
+/// and exact matching existing-generation vector store.
+///
+/// Deliberately has NO `Clone`, NO `Copy`, NO `Debug`, NO `Serialize`, NO `Deserialize`,
+/// NO IPC exposure, NO raw scalar getters, NO split getters, and NO generic callbacks.
+#[allow(dead_code)]
+pub(crate) struct ExistingGenerationFencedExecution<'storage, 'provider> {
+    storage: &'storage StorageService,
+    context: VectorGenerationContext,
+    provider: ResolvedEmbeddingProvider<'provider>,
+    store: Arc<dyn VectorStore>,
+}
+
+#[allow(dead_code)]
+impl<'storage, 'provider> ExistingGenerationFencedExecution<'storage, 'provider> {
+    /// Executes a bounded, fenced drain over the owned generation context.
+    ///
+    /// Consumes `self` by value, ensuring that the provider and store lifetimes
+    /// are strictly bound to this single drain invocation.
+    pub(crate) async fn drain_bounded(
+        self,
+        lease_owner: &str,
+        limit: usize,
+    ) -> Result<VectorSyncDrainReport, MemoryVectorSyncWorkerError> {
+        let ExistingGenerationFencedExecution {
+            storage,
+            context,
+            provider,
+            store,
+        } = self;
+        let embedding = provider.provider();
+        let consumer =
+            FencedVectorSyncSingleEventConsumer::new(storage, embedding, store.as_ref(), context);
+        drain_fenced_vector_sync(&consumer, lease_owner, limit).await
     }
 }
 
@@ -304,7 +369,7 @@ pub(crate) fn verify_provider_facts(
     Ok(profile_dimension)
 }
 
-/// Resolves the existing vector generation binding from SQLite generation authority and active model runtime.
+/// Resolves the intermediate existing vector generation binding from SQLite generation authority and active model runtime.
 #[allow(dead_code)]
 pub(crate) fn resolve_existing_generation_binding<'a, R, S>(
     storage: &StorageService,
@@ -358,9 +423,33 @@ where
     })
 }
 
+/// Resolves the owned, sealed [`ExistingGenerationFencedExecution`] from authoritative services.
+///
+/// Caller supplies ONLY canonical authority services:
+/// - `&StorageService`
+/// - `&ModelRuntimeService`
+/// - `&LanceDbVectorStoreRegistry`
+///
+/// The caller cannot supply arbitrary generation IDs, contexts, providers, stores, or filesystem paths.
+#[allow(dead_code)]
+pub(crate) async fn resolve_existing_generation_fenced_execution<'storage, 'runtime, R, S>(
+    storage: &'storage StorageService,
+    runtime: &'runtime ModelRuntimeService<'runtime, R, S>,
+    registry: &LanceDbVectorStoreRegistry,
+) -> Result<ExistingGenerationFencedExecution<'storage, 'runtime>, ExistingGenerationBindingError>
+where
+    R: ModelProfileRepository,
+    S: SecretStore + ?Sized,
+{
+    let binding = resolve_existing_generation_binding(storage, runtime)?;
+    binding.into_fenced_execution(storage, registry).await
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
+    use std::sync::Arc;
     use std::time::Duration;
 
     use rusqlite::params;
@@ -372,7 +461,6 @@ mod tests {
             EmbeddingBatch, EmbeddingError, EmbeddingErrorCode, EmbeddingFuture,
             EmbeddingModelInfo, EmbeddingRequest,
         },
-        memory::vector_sync_worker::FencedVectorSyncSingleEventResult,
         model::{
             profile::{
                 CreateModelProfileRequest, ModelProfileService, ModelProviderKind, ModelPurpose,
@@ -381,9 +469,12 @@ mod tests {
             runtime::{ModelRuntimeCoordinator, ModelRuntimeService},
             transport::url_policy::validate_and_normalize_url,
         },
-        secrets::{InMemorySecretStore, SecretIdentifier, SecretPurpose, SecretValue},
-        storage::open_authorized_test_connection,
-        vector_store::InMemoryVectorStore,
+        secrets::{
+            InMemorySecretStore, SecretIdentifier, SecretPurpose, SecretStatus, SecretStoreError,
+            SecretValue,
+        },
+        storage::{open_authorized_test_connection, ExistingGenerationBindingObservationResult},
+        vector_store::{LanceDbVectorStore, VectorGenerationId},
     };
 
     fn test_storage() -> (TempDir, StorageService) {
@@ -449,6 +540,19 @@ mod tests {
         .unwrap();
     }
 
+    async fn setup_pre_existing_lance_store(
+        storage: &StorageService,
+        registry: &LanceDbVectorStoreRegistry,
+        generation_id: &str,
+    ) -> Arc<LanceDbVectorStore> {
+        let data_root = storage.active_data_root().unwrap();
+        let gen_id = VectorGenerationId::parse(generation_id).unwrap();
+        registry
+            .generation_store_for_write(&data_root, &gen_id)
+            .await
+            .unwrap()
+    }
+
     struct MockEmbeddingProviderWithoutDimension;
 
     impl EmbeddingProvider for MockEmbeddingProviderWithoutDimension {
@@ -476,6 +580,53 @@ mod tests {
                     EmbeddingErrorCode::InvalidRequest,
                 ))
             })
+        }
+    }
+
+    struct TrackingSecretStore {
+        inner: InMemorySecretStore,
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl TrackingSecretStore {
+        fn new() -> (Self, Arc<AtomicUsize>) {
+            let reads = Arc::new(AtomicUsize::new(0));
+            (
+                Self {
+                    inner: InMemorySecretStore::new(),
+                    reads: Arc::clone(&reads),
+                },
+                reads,
+            )
+        }
+    }
+
+    impl SecretStore for TrackingSecretStore {
+        fn set_secret(
+            &self,
+            identifier: &SecretIdentifier,
+            value: SecretValue,
+        ) -> Result<SecretStatus, SecretStoreError> {
+            self.inner.set_secret(identifier, value)
+        }
+
+        fn get_secret(
+            &self,
+            identifier: &SecretIdentifier,
+        ) -> Result<SecretValue, SecretStoreError> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.inner.get_secret(identifier)
+        }
+
+        fn has_secret(&self, identifier: &SecretIdentifier) -> Result<bool, SecretStoreError> {
+            self.inner.has_secret(identifier)
+        }
+
+        fn delete_secret(
+            &self,
+            identifier: &SecretIdentifier,
+        ) -> Result<SecretStatus, SecretStoreError> {
+            self.inner.delete_secret(identifier)
         }
     }
 
@@ -918,51 +1069,6 @@ mod tests {
     }
 
     #[test]
-    fn d9d2_existing_generation_binding_sealed_consuming_api() {
-        let (_dir, storage) = test_storage();
-        let secrets = InMemorySecretStore::new();
-        let profile_id = create_test_profile(
-            &storage,
-            &secrets,
-            "https://api.openai.com/v1",
-            "text-embedding-3-small",
-            1536,
-        );
-
-        let target = validate_and_normalize_url("https://api.openai.com/v1").unwrap();
-        let canonical_desc = compute_canonical_generation_descriptor(
-            &ModelProviderKind::OpenaiCompatible,
-            &profile_id,
-            &target,
-            "text-embedding-3-small",
-            1536,
-        )
-        .unwrap();
-
-        insert_generation_fixture(
-            &storage,
-            "generation-1",
-            &canonical_desc,
-            1536,
-            "building",
-            1,
-        );
-
-        let coordinator = ModelRuntimeCoordinator::new(Duration::from_secs(5));
-        let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
-
-        let binding = resolve_existing_generation_binding(&storage, &runtime).unwrap();
-
-        // Binding is consumed by value into the sealed FencedVectorSyncSingleEventConsumer
-        let vectors = InMemoryVectorStore::new();
-        let consumer = binding.into_fenced_consumer(&storage, &vectors);
-
-        // Verify consumer can process events without leaking context or provider
-        let res = tauri::async_runtime::block_on(consumer.process_one("test-worker-1")).unwrap();
-        assert_eq!(res, FencedVectorSyncSingleEventResult::NoEligibleEvent);
-    }
-
-    #[test]
     fn d9d2_existing_generation_binding_zero_building_returns_no_existing_generation() {
         let (_dir, storage) = test_storage();
         let secrets = InMemorySecretStore::new();
@@ -976,8 +1082,11 @@ mod tests {
 
         let coordinator = ModelRuntimeCoordinator::new(Duration::from_secs(5));
         let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
+        let registry = LanceDbVectorStoreRegistry::default();
 
-        let res = resolve_existing_generation_binding(&storage, &runtime);
+        let res = tauri::async_runtime::block_on(resolve_existing_generation_fenced_execution(
+            &storage, &runtime, &registry,
+        ));
         let err = match res {
             Err(e) => e,
             Ok(_) => panic!("expected NoExistingGeneration error"),
@@ -1019,20 +1128,26 @@ mod tests {
             1,
         );
 
+        let registry = LanceDbVectorStoreRegistry::default();
+        let _pre_created = tauri::async_runtime::block_on(setup_pre_existing_lance_store(
+            &storage,
+            &registry,
+            "generation-1",
+        ));
+
         let coordinator = ModelRuntimeCoordinator::new(Duration::from_secs(5));
         let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
 
-        let res = resolve_existing_generation_binding(&storage, &runtime);
-        assert!(res.is_ok());
+        let execution = tauri::async_runtime::block_on(
+            resolve_existing_generation_fenced_execution(&storage, &runtime, &registry),
+        )
+        .unwrap();
 
-        let binding = match res {
-            Ok(b) => b,
-            Err(_) => panic!("expected successful binding"),
-        };
-        let vectors = InMemoryVectorStore::new();
-        let consumer = binding.into_fenced_consumer(&storage, &vectors);
-        let res = tauri::async_runtime::block_on(consumer.process_one("test-worker-2")).unwrap();
-        assert_eq!(res, FencedVectorSyncSingleEventResult::NoEligibleEvent);
+        let report =
+            tauri::async_runtime::block_on(execution.drain_bounded("test-worker-1", 32)).unwrap();
+
+        assert_eq!(report.processed, 0);
+        assert!(report.stopped_no_eligible);
     }
 
     #[test]
@@ -1066,8 +1181,11 @@ mod tests {
 
         let coordinator = ModelRuntimeCoordinator::new(Duration::from_secs(5));
         let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
+        let registry = LanceDbVectorStoreRegistry::default();
 
-        let res = resolve_existing_generation_binding(&storage, &runtime);
+        let res = tauri::async_runtime::block_on(resolve_existing_generation_fenced_execution(
+            &storage, &runtime, &registry,
+        ));
         let err = match res {
             Err(e) => e,
             Ok(_) => panic!("expected AmbiguousExistingGeneration error"),
@@ -1097,8 +1215,11 @@ mod tests {
 
         let coordinator = ModelRuntimeCoordinator::new(Duration::from_secs(5));
         let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
+        let registry = LanceDbVectorStoreRegistry::default();
 
-        let res = resolve_existing_generation_binding(&storage, &runtime);
+        let res = tauri::async_runtime::block_on(resolve_existing_generation_fenced_execution(
+            &storage, &runtime, &registry,
+        ));
         let err = match res {
             Err(e) => e,
             Ok(_) => panic!("expected NoExistingGeneration error"),
@@ -1124,9 +1245,12 @@ mod tests {
             );
             let coordinator = ModelRuntimeCoordinator::new(Duration::from_secs(5));
             let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
+            let registry = LanceDbVectorStoreRegistry::default();
 
             insert_generation_fixture(&storage, "invalid/id", &"a".repeat(64), 1536, "building", 1);
-            let err = match resolve_existing_generation_binding(&storage, &runtime) {
+            let err = match tauri::async_runtime::block_on(
+                resolve_existing_generation_fenced_execution(&storage, &runtime, &registry),
+            ) {
                 Err(e) => e,
                 Ok(_) => panic!("expected error"),
             };
@@ -1149,9 +1273,12 @@ mod tests {
             );
             let coordinator = ModelRuntimeCoordinator::new(Duration::from_secs(5));
             let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
+            let registry = LanceDbVectorStoreRegistry::default();
 
             insert_generation_fixture(&storage, "gen-1", &"a".repeat(63), 1536, "building", 1);
-            let err = match resolve_existing_generation_binding(&storage, &runtime) {
+            let err = match tauri::async_runtime::block_on(
+                resolve_existing_generation_fenced_execution(&storage, &runtime, &registry),
+            ) {
                 Err(e) => e,
                 Ok(_) => panic!("expected error"),
             };
@@ -1174,6 +1301,7 @@ mod tests {
             );
             let coordinator = ModelRuntimeCoordinator::new(Duration::from_secs(5));
             let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
+            let registry = LanceDbVectorStoreRegistry::default();
 
             insert_generation_fixture(
                 &storage,
@@ -1183,7 +1311,9 @@ mod tests {
                 "building",
                 1,
             );
-            let err = match resolve_existing_generation_binding(&storage, &runtime) {
+            let err = match tauri::async_runtime::block_on(
+                resolve_existing_generation_fenced_execution(&storage, &runtime, &registry),
+            ) {
                 Err(e) => e,
                 Ok(_) => panic!("expected error"),
             };
@@ -1206,6 +1336,7 @@ mod tests {
             );
             let coordinator = ModelRuntimeCoordinator::new(Duration::from_secs(5));
             let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
+            let registry = LanceDbVectorStoreRegistry::default();
 
             insert_generation_fixture(
                 &storage,
@@ -1215,7 +1346,9 @@ mod tests {
                 "building",
                 1,
             );
-            let err = match resolve_existing_generation_binding(&storage, &runtime) {
+            let err = match tauri::async_runtime::block_on(
+                resolve_existing_generation_fenced_execution(&storage, &runtime, &registry),
+            ) {
                 Err(e) => e,
                 Ok(_) => panic!("expected error"),
             };
@@ -1251,8 +1384,11 @@ mod tests {
 
             let coordinator = ModelRuntimeCoordinator::new(Duration::from_secs(5));
             let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
+            let registry = LanceDbVectorStoreRegistry::default();
 
-            let err = match resolve_existing_generation_binding(&storage, &runtime) {
+            let err = match tauri::async_runtime::block_on(
+                resolve_existing_generation_fenced_execution(&storage, &runtime, &registry),
+            ) {
                 Err(e) => e,
                 Ok(_) => panic!("expected error"),
             };
@@ -1295,8 +1431,11 @@ mod tests {
 
             let coordinator = ModelRuntimeCoordinator::new(Duration::from_secs(5));
             let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
+            let registry = LanceDbVectorStoreRegistry::default();
 
-            let err = match resolve_existing_generation_binding(&storage, &runtime) {
+            let err = match tauri::async_runtime::block_on(
+                resolve_existing_generation_fenced_execution(&storage, &runtime, &registry),
+            ) {
                 Err(e) => e,
                 Ok(_) => panic!("expected error"),
             };
@@ -1322,8 +1461,11 @@ mod tests {
         let secrets = InMemorySecretStore::new();
         let coordinator = ModelRuntimeCoordinator::new(Duration::from_secs(5));
         let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
+        let registry = LanceDbVectorStoreRegistry::default();
 
-        let err = match resolve_existing_generation_binding(&storage, &runtime) {
+        let err = match tauri::async_runtime::block_on(
+            resolve_existing_generation_fenced_execution(&storage, &runtime, &registry),
+        ) {
             Err(e) => e,
             Ok(_) => panic!("expected error"),
         };
@@ -1364,11 +1506,23 @@ mod tests {
             1,
         );
 
+        let registry = LanceDbVectorStoreRegistry::default();
+        let _pre_created = tauri::async_runtime::block_on(setup_pre_existing_lance_store(
+            &storage,
+            &registry,
+            "generation-1",
+        ));
+
         let coordinator = ModelRuntimeCoordinator::new(Duration::from_secs(5));
         let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
 
         // Valid initially
-        assert!(resolve_existing_generation_binding(&storage, &runtime).is_ok());
+        assert!(
+            tauri::async_runtime::block_on(resolve_existing_generation_fenced_execution(
+                &storage, &runtime, &registry
+            ))
+            .is_ok()
+        );
 
         // Rotate active profile to new profile with different model name
         let _new_id = create_test_profile(
@@ -1380,7 +1534,9 @@ mod tests {
         );
 
         // Resolving again must fail closed with GenerationBindingMismatch
-        let err = match resolve_existing_generation_binding(&storage, &runtime) {
+        let err = match tauri::async_runtime::block_on(
+            resolve_existing_generation_fenced_execution(&storage, &runtime, &registry),
+        ) {
             Err(e) => e,
             Ok(_) => panic!("expected error"),
         };
@@ -1539,7 +1695,7 @@ mod tests {
 
     #[test]
     fn d9d2_existing_generation_binding_read_only_matrix_zero_mutations() {
-        // Subcase 1: Successful resolution -> zero SQLite mutations
+        // Subcase 1: Successful resolution -> same-connection zero SQLite mutations
         {
             let (_dir, storage) = test_storage();
             let secrets = InMemorySecretStore::new();
@@ -1570,39 +1726,36 @@ mod tests {
                 1,
             );
 
+            let registry = LanceDbVectorStoreRegistry::default();
+            let _pre_created = tauri::async_runtime::block_on(setup_pre_existing_lance_store(
+                &storage,
+                &registry,
+                "generation-1",
+            ));
+
             let coordinator = ModelRuntimeCoordinator::new(Duration::from_secs(5));
             let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
 
-            let conn = open_authorized_test_connection(&storage.test_database_main_path().unwrap())
-                .unwrap();
-            let data_version_before: i64 = conn
-                .query_row("PRAGMA data_version", [], |r| r.get(0))
-                .unwrap();
-            let total_changes_before: i64 = conn
-                .query_row("SELECT total_changes()", [], |r| r.get(0))
+            let token = storage
+                .begin_existing_generation_binding_read_observation_for_test()
                 .unwrap();
 
-            let res = resolve_existing_generation_binding(&storage, &runtime);
+            let res = tauri::async_runtime::block_on(resolve_existing_generation_fenced_execution(
+                &storage, &runtime, &registry,
+            ));
             assert!(res.is_ok());
 
-            let data_version_after: i64 = conn
-                .query_row("PRAGMA data_version", [], |r| r.get(0))
+            let obs = storage
+                .finish_existing_generation_binding_read_observation_for_test(token)
                 .unwrap();
-            let total_changes_after: i64 = conn
-                .query_row("SELECT total_changes()", [], |r| r.get(0))
-                .unwrap();
-
             assert_eq!(
-                data_version_before, data_version_after,
-                "Read bridge must not modify SQLite data_version on success"
-            );
-            assert_eq!(
-                total_changes_before, total_changes_after,
-                "Read bridge must not execute SQLite mutations on success"
+                obs,
+                ExistingGenerationBindingObservationResult::Unchanged,
+                "Read bridge resolution must perform zero SQLite mutations on same connection"
             );
         }
 
-        // Subcase 2: Zero building candidate -> zero SQLite mutations
+        // Subcase 2: Zero building candidate -> same-connection zero SQLite mutations
         {
             let (_dir, storage) = test_storage();
             let secrets = InMemorySecretStore::new();
@@ -1616,30 +1769,23 @@ mod tests {
 
             let coordinator = ModelRuntimeCoordinator::new(Duration::from_secs(5));
             let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
+            let registry = LanceDbVectorStoreRegistry::default();
 
-            let conn = open_authorized_test_connection(&storage.test_database_main_path().unwrap())
-                .unwrap();
-            let data_version_before: i64 = conn
-                .query_row("PRAGMA data_version", [], |r| r.get(0))
-                .unwrap();
-            let total_changes_before: i64 = conn
-                .query_row("SELECT total_changes()", [], |r| r.get(0))
+            let token = storage
+                .begin_existing_generation_binding_read_observation_for_test()
                 .unwrap();
 
-            let _ = resolve_existing_generation_binding(&storage, &runtime);
+            let _ = tauri::async_runtime::block_on(resolve_existing_generation_fenced_execution(
+                &storage, &runtime, &registry,
+            ));
 
-            let data_version_after: i64 = conn
-                .query_row("PRAGMA data_version", [], |r| r.get(0))
+            let obs = storage
+                .finish_existing_generation_binding_read_observation_for_test(token)
                 .unwrap();
-            let total_changes_after: i64 = conn
-                .query_row("SELECT total_changes()", [], |r| r.get(0))
-                .unwrap();
-
-            assert_eq!(data_version_before, data_version_after);
-            assert_eq!(total_changes_before, total_changes_after);
+            assert_eq!(obs, ExistingGenerationBindingObservationResult::Unchanged);
         }
 
-        // Subcase 3: Ambiguous building candidate -> zero SQLite mutations
+        // Subcase 3: Ambiguous building candidate -> same-connection zero SQLite mutations
         {
             let (_dir, storage) = test_storage();
             let secrets = InMemorySecretStore::new();
@@ -1670,30 +1816,23 @@ mod tests {
 
             let coordinator = ModelRuntimeCoordinator::new(Duration::from_secs(5));
             let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
+            let registry = LanceDbVectorStoreRegistry::default();
 
-            let conn = open_authorized_test_connection(&storage.test_database_main_path().unwrap())
-                .unwrap();
-            let data_version_before: i64 = conn
-                .query_row("PRAGMA data_version", [], |r| r.get(0))
-                .unwrap();
-            let total_changes_before: i64 = conn
-                .query_row("SELECT total_changes()", [], |r| r.get(0))
+            let token = storage
+                .begin_existing_generation_binding_read_observation_for_test()
                 .unwrap();
 
-            let _ = resolve_existing_generation_binding(&storage, &runtime);
+            let _ = tauri::async_runtime::block_on(resolve_existing_generation_fenced_execution(
+                &storage, &runtime, &registry,
+            ));
 
-            let data_version_after: i64 = conn
-                .query_row("PRAGMA data_version", [], |r| r.get(0))
+            let obs = storage
+                .finish_existing_generation_binding_read_observation_for_test(token)
                 .unwrap();
-            let total_changes_after: i64 = conn
-                .query_row("SELECT total_changes()", [], |r| r.get(0))
-                .unwrap();
-
-            assert_eq!(data_version_before, data_version_after);
-            assert_eq!(total_changes_before, total_changes_after);
+            assert_eq!(obs, ExistingGenerationBindingObservationResult::Unchanged);
         }
 
-        // Subcase 4: Binding mismatch -> zero SQLite mutations
+        // Subcase 4: Binding mismatch -> same-connection zero SQLite mutations
         {
             let (_dir, storage) = test_storage();
             let secrets = InMemorySecretStore::new();
@@ -1716,27 +1855,804 @@ mod tests {
 
             let coordinator = ModelRuntimeCoordinator::new(Duration::from_secs(5));
             let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
+            let registry = LanceDbVectorStoreRegistry::default();
 
+            let token = storage
+                .begin_existing_generation_binding_read_observation_for_test()
+                .unwrap();
+
+            let _ = tauri::async_runtime::block_on(resolve_existing_generation_fenced_execution(
+                &storage, &runtime, &registry,
+            ));
+
+            let obs = storage
+                .finish_existing_generation_binding_read_observation_for_test(token)
+                .unwrap();
+            assert_eq!(obs, ExistingGenerationBindingObservationResult::Unchanged);
+        }
+
+        // Subcase 5: Stale epoch -> same-connection zero SQLite mutations
+        {
+            let (_dir, storage) = test_storage();
+            let secrets = InMemorySecretStore::new();
+            let profile_id = create_test_profile(
+                &storage,
+                &secrets,
+                "https://api.openai.com/v1",
+                "text-embedding-3-small",
+                1536,
+            );
+
+            let target = validate_and_normalize_url("https://api.openai.com/v1").unwrap();
+            let canonical_desc = compute_canonical_generation_descriptor(
+                &ModelProviderKind::OpenaiCompatible,
+                &profile_id,
+                &target,
+                "text-embedding-3-small",
+                1536,
+            )
+            .unwrap();
+
+            insert_generation_fixture(
+                &storage,
+                "generation-1",
+                &canonical_desc,
+                1536,
+                "building",
+                1,
+            );
+
+            let authority = storage
+                .load_existing_building_generation_candidate()
+                .unwrap();
+
+            // Direct mutation on raw connection to advance epoch with valid state
             let conn = open_authorized_test_connection(&storage.test_database_main_path().unwrap())
                 .unwrap();
-            let data_version_before: i64 = conn
-                .query_row("PRAGMA data_version", [], |r| r.get(0))
-                .unwrap();
-            let total_changes_before: i64 = conn
-                .query_row("SELECT total_changes()", [], |r| r.get(0))
+            conn.execute(
+                "UPDATE memory_vector_generation SET state='active', authority_epoch=2 WHERE generation_id='generation-1' AND authority_epoch=1",
+                [],
+            )
+            .unwrap();
+
+            let token = storage
+                .begin_existing_generation_binding_read_observation_for_test()
                 .unwrap();
 
-            let _ = resolve_existing_generation_binding(&storage, &runtime);
+            let _ = authority.verify_current_and_seal(&storage);
 
-            let data_version_after: i64 = conn
-                .query_row("PRAGMA data_version", [], |r| r.get(0))
+            let obs = storage
+                .finish_existing_generation_binding_read_observation_for_test(token)
                 .unwrap();
-            let total_changes_after: i64 = conn
-                .query_row("SELECT total_changes()", [], |r| r.get(0))
-                .unwrap();
-
-            assert_eq!(data_version_before, data_version_after);
-            assert_eq!(total_changes_before, total_changes_after);
+            assert_eq!(obs, ExistingGenerationBindingObservationResult::Unchanged);
         }
+
+        // Subcase 6: Existing store missing -> same-connection zero SQLite mutations
+        {
+            let (_dir, storage) = test_storage();
+            let secrets = InMemorySecretStore::new();
+            let profile_id = create_test_profile(
+                &storage,
+                &secrets,
+                "https://api.openai.com/v1",
+                "text-embedding-3-small",
+                1536,
+            );
+
+            let target = validate_and_normalize_url("https://api.openai.com/v1").unwrap();
+            let canonical_desc = compute_canonical_generation_descriptor(
+                &ModelProviderKind::OpenaiCompatible,
+                &profile_id,
+                &target,
+                "text-embedding-3-small",
+                1536,
+            )
+            .unwrap();
+
+            insert_generation_fixture(
+                &storage,
+                "generation-missing",
+                &canonical_desc,
+                1536,
+                "building",
+                1,
+            );
+
+            let coordinator = ModelRuntimeCoordinator::new(Duration::from_secs(5));
+            let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
+            let registry = LanceDbVectorStoreRegistry::default();
+
+            let token = storage
+                .begin_existing_generation_binding_read_observation_for_test()
+                .unwrap();
+
+            let res = tauri::async_runtime::block_on(resolve_existing_generation_fenced_execution(
+                &storage, &runtime, &registry,
+            ));
+            assert!(res.is_err());
+
+            let obs = storage
+                .finish_existing_generation_binding_read_observation_for_test(token)
+                .unwrap();
+            assert_eq!(obs, ExistingGenerationBindingObservationResult::Unchanged);
+        }
+    }
+
+    #[test]
+    fn d9d2_existing_generation_binding_owned_execution_drop_behavior() {
+        // Case 1: Execution created then dropped without drain -> store Arc dropped
+        {
+            let (_dir, storage) = test_storage();
+            let secrets = InMemorySecretStore::new();
+            let profile_id = create_test_profile(
+                &storage,
+                &secrets,
+                "https://api.openai.com/v1",
+                "text-embedding-3-small",
+                1536,
+            );
+
+            let target = validate_and_normalize_url("https://api.openai.com/v1").unwrap();
+            let canonical_desc = compute_canonical_generation_descriptor(
+                &ModelProviderKind::OpenaiCompatible,
+                &profile_id,
+                &target,
+                "text-embedding-3-small",
+                1536,
+            )
+            .unwrap();
+
+            insert_generation_fixture(
+                &storage,
+                "generation-drop-1",
+                &canonical_desc,
+                1536,
+                "building",
+                1,
+            );
+
+            let registry = LanceDbVectorStoreRegistry::default();
+            let store = tauri::async_runtime::block_on(setup_pre_existing_lance_store(
+                &storage,
+                &registry,
+                "generation-drop-1",
+            ));
+
+            let coordinator = ModelRuntimeCoordinator::new(Duration::from_secs(5));
+            let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
+
+            let execution = tauri::async_runtime::block_on(
+                resolve_existing_generation_fenced_execution(&storage, &runtime, &registry),
+            )
+            .unwrap();
+
+            // Count is 3: store local variable + registry cached store + execution.store
+            assert_eq!(Arc::strong_count(&store), 3);
+            drop(execution);
+            // Count drops to 2: store local variable + registry cached store
+            assert_eq!(
+                Arc::strong_count(&store),
+                2,
+                "Execution must decrement store reference count on drop"
+            );
+        }
+
+        // Case 2: Empty drain -> execution consumed and store Arc dropped
+        {
+            let (_dir, storage) = test_storage();
+            let secrets = InMemorySecretStore::new();
+            let profile_id = create_test_profile(
+                &storage,
+                &secrets,
+                "https://api.openai.com/v1",
+                "text-embedding-3-small",
+                1536,
+            );
+
+            let target = validate_and_normalize_url("https://api.openai.com/v1").unwrap();
+            let canonical_desc = compute_canonical_generation_descriptor(
+                &ModelProviderKind::OpenaiCompatible,
+                &profile_id,
+                &target,
+                "text-embedding-3-small",
+                1536,
+            )
+            .unwrap();
+
+            insert_generation_fixture(
+                &storage,
+                "generation-drop-2",
+                &canonical_desc,
+                1536,
+                "building",
+                1,
+            );
+
+            let registry = LanceDbVectorStoreRegistry::default();
+            let store = tauri::async_runtime::block_on(setup_pre_existing_lance_store(
+                &storage,
+                &registry,
+                "generation-drop-2",
+            ));
+
+            let coordinator = ModelRuntimeCoordinator::new(Duration::from_secs(5));
+            let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
+
+            let execution = tauri::async_runtime::block_on(
+                resolve_existing_generation_fenced_execution(&storage, &runtime, &registry),
+            )
+            .unwrap();
+
+            assert_eq!(Arc::strong_count(&store), 3);
+
+            let report =
+                tauri::async_runtime::block_on(execution.drain_bounded("test-worker-drop", 32))
+                    .unwrap();
+            assert_eq!(report.processed, 0);
+            assert_eq!(
+                Arc::strong_count(&store),
+                2,
+                "Execution must decrement store reference count after drain execution"
+            );
+        }
+
+        // Case 3: Drain returns error -> execution consumed and store Arc dropped
+        {
+            let (_dir, storage) = test_storage();
+            let secrets = InMemorySecretStore::new();
+            let profile_id = create_test_profile(
+                &storage,
+                &secrets,
+                "https://api.openai.com/v1",
+                "text-embedding-3-small",
+                1536,
+            );
+
+            let target = validate_and_normalize_url("https://api.openai.com/v1").unwrap();
+            let canonical_desc = compute_canonical_generation_descriptor(
+                &ModelProviderKind::OpenaiCompatible,
+                &profile_id,
+                &target,
+                "text-embedding-3-small",
+                1536,
+            )
+            .unwrap();
+
+            insert_generation_fixture(
+                &storage,
+                "generation-drop-3",
+                &canonical_desc,
+                1536,
+                "building",
+                1,
+            );
+
+            let registry = LanceDbVectorStoreRegistry::default();
+            let store = tauri::async_runtime::block_on(setup_pre_existing_lance_store(
+                &storage,
+                &registry,
+                "generation-drop-3",
+            ));
+
+            let coordinator = ModelRuntimeCoordinator::new(Duration::from_secs(5));
+            let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
+
+            let execution = tauri::async_runtime::block_on(
+                resolve_existing_generation_fenced_execution(&storage, &runtime, &registry),
+            )
+            .unwrap();
+
+            assert_eq!(Arc::strong_count(&store), 3);
+
+            // Limit 0 is invalid and returns error
+            let err =
+                tauri::async_runtime::block_on(execution.drain_bounded("test-worker-drop", 0));
+            assert!(err.is_err());
+            assert_eq!(
+                Arc::strong_count(&store),
+                2,
+                "Execution must decrement store reference count when drain returns error"
+            );
+        }
+    }
+
+    #[test]
+    fn d9d2_existing_generation_binding_matching_store_resolution_success() {
+        let (_dir, storage) = test_storage();
+        let secrets = InMemorySecretStore::new();
+        let profile_id = create_test_profile(
+            &storage,
+            &secrets,
+            "https://api.openai.com/v1",
+            "text-embedding-3-small",
+            1536,
+        );
+
+        let target = validate_and_normalize_url("https://api.openai.com/v1").unwrap();
+        let canonical_desc = compute_canonical_generation_descriptor(
+            &ModelProviderKind::OpenaiCompatible,
+            &profile_id,
+            &target,
+            "text-embedding-3-small",
+            1536,
+        )
+        .unwrap();
+
+        insert_generation_fixture(
+            &storage,
+            "generation-match-1",
+            &canonical_desc,
+            1536,
+            "building",
+            1,
+        );
+
+        let registry = LanceDbVectorStoreRegistry::default();
+        let _pre_created = tauri::async_runtime::block_on(setup_pre_existing_lance_store(
+            &storage,
+            &registry,
+            "generation-match-1",
+        ));
+
+        let coordinator = ModelRuntimeCoordinator::new(Duration::from_secs(5));
+        let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
+
+        let execution = tauri::async_runtime::block_on(
+            resolve_existing_generation_fenced_execution(&storage, &runtime, &registry),
+        )
+        .unwrap();
+
+        let report =
+            tauri::async_runtime::block_on(execution.drain_bounded("test-worker-match", 10))
+                .unwrap();
+
+        assert_eq!(report.requested_limit, 10);
+        assert_eq!(report.processed, 0);
+        assert!(report.stopped_no_eligible);
+    }
+
+    #[test]
+    fn d9d2_existing_generation_binding_missing_directory_fails_closed_no_create() {
+        let (_dir, storage) = test_storage();
+        let secrets = InMemorySecretStore::new();
+        let profile_id = create_test_profile(
+            &storage,
+            &secrets,
+            "https://api.openai.com/v1",
+            "text-embedding-3-small",
+            1536,
+        );
+
+        let target = validate_and_normalize_url("https://api.openai.com/v1").unwrap();
+        let canonical_desc = compute_canonical_generation_descriptor(
+            &ModelProviderKind::OpenaiCompatible,
+            &profile_id,
+            &target,
+            "text-embedding-3-small",
+            1536,
+        )
+        .unwrap();
+
+        insert_generation_fixture(
+            &storage,
+            "gen-uncreated",
+            &canonical_desc,
+            1536,
+            "building",
+            1,
+        );
+
+        let data_root = storage.active_data_root().unwrap();
+        let gen_dir = data_root
+            .join("vectors")
+            .join("generations")
+            .join("gen-uncreated");
+        assert!(
+            !gen_dir.exists(),
+            "Generation directory must not exist before test"
+        );
+
+        let coordinator = ModelRuntimeCoordinator::new(Duration::from_secs(5));
+        let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
+        let registry = LanceDbVectorStoreRegistry::default();
+
+        let res = tauri::async_runtime::block_on(resolve_existing_generation_fenced_execution(
+            &storage, &runtime, &registry,
+        ));
+
+        let err = match res {
+            Err(e) => e,
+            Ok(_) => panic!("expected existing_vector_store_unavailable error"),
+        };
+        assert_eq!(
+            err.code(),
+            ExistingGenerationBindingErrorCode::ExistingVectorStoreUnavailable
+        );
+
+        assert!(
+            !gen_dir.exists(),
+            "Resolver must fail closed without creating missing generation directory"
+        );
+    }
+
+    #[test]
+    fn d9d2_existing_generation_binding_invalid_store_path_fails_closed() {
+        let (_dir, storage) = test_storage();
+        let secrets = InMemorySecretStore::new();
+        let profile_id = create_test_profile(
+            &storage,
+            &secrets,
+            "https://api.openai.com/v1",
+            "text-embedding-3-small",
+            1536,
+        );
+
+        let target = validate_and_normalize_url("https://api.openai.com/v1").unwrap();
+        let canonical_desc = compute_canonical_generation_descriptor(
+            &ModelProviderKind::OpenaiCompatible,
+            &profile_id,
+            &target,
+            "text-embedding-3-small",
+            1536,
+        )
+        .unwrap();
+
+        insert_generation_fixture(
+            &storage,
+            "gen-file-path",
+            &canonical_desc,
+            1536,
+            "building",
+            1,
+        );
+
+        // Create a regular file at the generation directory path instead of a directory
+        let data_root = storage.active_data_root().unwrap();
+        let gen_parent = data_root.join("vectors").join("generations");
+        std::fs::create_dir_all(&gen_parent).unwrap();
+        std::fs::write(gen_parent.join("gen-file-path"), b"not a directory").unwrap();
+
+        let coordinator = ModelRuntimeCoordinator::new(Duration::from_secs(5));
+        let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
+        let registry = LanceDbVectorStoreRegistry::default();
+
+        let res = tauri::async_runtime::block_on(resolve_existing_generation_fenced_execution(
+            &storage, &runtime, &registry,
+        ));
+
+        let err = match res {
+            Err(e) => e,
+            Ok(_) => panic!("expected existing_vector_store_unavailable error"),
+        };
+        assert_eq!(
+            err.code(),
+            ExistingGenerationBindingErrorCode::ExistingVectorStoreUnavailable
+        );
+    }
+
+    #[test]
+    fn d9d2_existing_generation_binding_bounded_drain_limits() {
+        let (_dir, storage) = test_storage();
+        let secrets = InMemorySecretStore::new();
+        let profile_id = create_test_profile(
+            &storage,
+            &secrets,
+            "https://api.openai.com/v1",
+            "text-embedding-3-small",
+            1536,
+        );
+
+        let target = validate_and_normalize_url("https://api.openai.com/v1").unwrap();
+        let canonical_desc = compute_canonical_generation_descriptor(
+            &ModelProviderKind::OpenaiCompatible,
+            &profile_id,
+            &target,
+            "text-embedding-3-small",
+            1536,
+        )
+        .unwrap();
+
+        insert_generation_fixture(
+            &storage,
+            "generation-limits",
+            &canonical_desc,
+            1536,
+            "building",
+            1,
+        );
+
+        let registry = LanceDbVectorStoreRegistry::default();
+        let _pre_created = tauri::async_runtime::block_on(setup_pre_existing_lance_store(
+            &storage,
+            &registry,
+            "generation-limits",
+        ));
+
+        let coordinator = ModelRuntimeCoordinator::new(Duration::from_secs(5));
+        let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
+
+        // Limit = 1 (using same worker owner so lease is renewed cleanly)
+        let exec1 = tauri::async_runtime::block_on(resolve_existing_generation_fenced_execution(
+            &storage, &runtime, &registry,
+        ))
+        .unwrap();
+        let rep1 =
+            tauri::async_runtime::block_on(exec1.drain_bounded("test-worker-limits", 1)).unwrap();
+        assert_eq!(rep1.requested_limit, 1);
+
+        // Limit = 3
+        let exec3 = tauri::async_runtime::block_on(resolve_existing_generation_fenced_execution(
+            &storage, &runtime, &registry,
+        ))
+        .unwrap();
+        let rep3 =
+            tauri::async_runtime::block_on(exec3.drain_bounded("test-worker-limits", 3)).unwrap();
+        assert_eq!(rep3.requested_limit, 3);
+
+        // Limit = 32
+        let exec32 = tauri::async_runtime::block_on(resolve_existing_generation_fenced_execution(
+            &storage, &runtime, &registry,
+        ))
+        .unwrap();
+        let rep32 =
+            tauri::async_runtime::block_on(exec32.drain_bounded("test-worker-limits", 32)).unwrap();
+        assert_eq!(rep32.requested_limit, 32);
+
+        // Limit = 0 (invalid)
+        let exec0 = tauri::async_runtime::block_on(resolve_existing_generation_fenced_execution(
+            &storage, &runtime, &registry,
+        ))
+        .unwrap();
+        assert!(
+            tauri::async_runtime::block_on(exec0.drain_bounded("test-worker-limits", 0)).is_err()
+        );
+
+        // Limit = 33 (invalid)
+        let exec33 = tauri::async_runtime::block_on(resolve_existing_generation_fenced_execution(
+            &storage, &runtime, &registry,
+        ))
+        .unwrap();
+        assert!(
+            tauri::async_runtime::block_on(exec33.drain_bounded("test-worker-limits", 33)).is_err()
+        );
+    }
+
+    #[test]
+    fn d9d2_existing_generation_binding_retry_g1_current_g2_stability() {
+        let (_dir, storage) = test_storage();
+        let secrets = InMemorySecretStore::new();
+        let profile_id = create_test_profile(
+            &storage,
+            &secrets,
+            "https://api.openai.com/v1",
+            "text-embedding-3-small",
+            1536,
+        );
+
+        let target = validate_and_normalize_url("https://api.openai.com/v1").unwrap();
+        let canonical_desc = compute_canonical_generation_descriptor(
+            &ModelProviderKind::OpenaiCompatible,
+            &profile_id,
+            &target,
+            "text-embedding-3-small",
+            1536,
+        )
+        .unwrap();
+
+        // Current building generation in SQLite is G2
+        insert_generation_fixture(
+            &storage,
+            "generation-2",
+            &canonical_desc,
+            1536,
+            "building",
+            1,
+        );
+
+        // Insert retry outbox row previously claimed by G1 (migration_disposition is NULL)
+        let conn =
+            open_authorized_test_connection(&storage.test_database_main_path().unwrap()).unwrap();
+        conn.execute(
+            "INSERT INTO memory_vector_sync_outbox (
+                life_id, memory_id, desired_action, state, attempt_count,
+                claimed_generation_id, mutation_sequence, target_revision,
+                target_content_hash, migration_disposition, created_at, updated_at
+            ) VALUES (
+                'life-1', 'mem-1', 'upsert', 'retry_wait', 1,
+                'generation-1', 1, 1,
+                'hash-1', NULL, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'
+            )",
+            [],
+        )
+        .unwrap();
+
+        let registry = LanceDbVectorStoreRegistry::default();
+        let _pre_created = tauri::async_runtime::block_on(setup_pre_existing_lance_store(
+            &storage,
+            &registry,
+            "generation-2",
+        ));
+
+        let coordinator = ModelRuntimeCoordinator::new(Duration::from_secs(5));
+        let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
+
+        let execution = tauri::async_runtime::block_on(
+            resolve_existing_generation_fenced_execution(&storage, &runtime, &registry),
+        )
+        .unwrap();
+
+        let report =
+            tauri::async_runtime::block_on(execution.drain_bounded("test-worker-retry", 32))
+                .unwrap();
+
+        // G1 retry row must not be processed or claimed by G2 execution
+        assert_eq!(report.processed, 0);
+        assert!(report.stopped_no_eligible);
+
+        // Verify outbox row remains unchanged
+        let (claimed_gen, attempt_cnt, st): (Option<String>, i64, String) = conn
+            .query_row(
+                "SELECT claimed_generation_id, attempt_count, state FROM memory_vector_sync_outbox WHERE memory_id='mem-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(claimed_gen.as_deref(), Some("generation-1"));
+        assert_eq!(attempt_cnt, 1);
+        assert_eq!(st, "retry_wait");
+    }
+
+    #[test]
+    fn d9d2_existing_generation_binding_credential_timing_no_preflight() {
+        let (_dir, storage) = test_storage();
+        let (secrets, read_counter) = TrackingSecretStore::new();
+
+        // Setup profile with credential in tracking store
+        let created = ModelProfileService::new(&storage)
+            .create(CreateModelProfileRequest {
+                purpose: ModelPurpose::Embedding,
+                provider_kind: ModelProviderKind::OpenaiCompatible,
+                display_name: "Test Embedding Profile".into(),
+                base_url: "https://api.openai.com/v1".into(),
+                model_name: "text-embedding-3-small".into(),
+                temperature: None,
+                max_tokens: None,
+                embedding_dimension: Some(1536),
+            })
+            .unwrap();
+        ModelProfileService::new(&storage)
+            .set_active(SetActiveModelProfileRequest {
+                purpose: ModelPurpose::Embedding,
+                profile_id: created.id.clone(),
+            })
+            .unwrap();
+        secrets
+            .set_secret(
+                &SecretIdentifier::new(SecretPurpose::EmbeddingModelApiKey, &created.id).unwrap(),
+                SecretValue::new("tracking-api-key".into()).unwrap(),
+            )
+            .unwrap();
+
+        let target = validate_and_normalize_url("https://api.openai.com/v1").unwrap();
+        let canonical_desc = compute_canonical_generation_descriptor(
+            &ModelProviderKind::OpenaiCompatible,
+            &created.id,
+            &target,
+            "text-embedding-3-small",
+            1536,
+        )
+        .unwrap();
+
+        insert_generation_fixture(
+            &storage,
+            "generation-cred",
+            &canonical_desc,
+            1536,
+            "building",
+            1,
+        );
+
+        let registry = LanceDbVectorStoreRegistry::default();
+        let _pre_created = tauri::async_runtime::block_on(setup_pre_existing_lance_store(
+            &storage,
+            &registry,
+            "generation-cred",
+        ));
+
+        let coordinator = ModelRuntimeCoordinator::new(Duration::from_secs(5));
+        let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
+
+        // 1. Resolution: Credential reads MUST be 0
+        let execution = tauri::async_runtime::block_on(
+            resolve_existing_generation_fenced_execution(&storage, &runtime, &registry),
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_counter.load(Ordering::SeqCst),
+            0,
+            "Execution construction must not read credentials"
+        );
+
+        // 2. Empty drain: Credential reads MUST be 0
+        let report =
+            tauri::async_runtime::block_on(execution.drain_bounded("test-worker-cred", 32))
+                .unwrap();
+
+        assert_eq!(report.processed, 0);
+        assert_eq!(
+            read_counter.load(Ordering::SeqCst),
+            0,
+            "Empty drain must not read credentials"
+        );
+    }
+
+    #[test]
+    fn d9d2_existing_generation_binding_live_dry_run_composition() {
+        let (_dir, storage) = test_storage();
+        let secrets = InMemorySecretStore::new();
+        let profile_id = create_test_profile(
+            &storage,
+            &secrets,
+            "https://api.openai.com/v1",
+            "text-embedding-3-small",
+            1536,
+        );
+
+        let target = validate_and_normalize_url("https://api.openai.com/v1").unwrap();
+        let canonical_desc = compute_canonical_generation_descriptor(
+            &ModelProviderKind::OpenaiCompatible,
+            &profile_id,
+            &target,
+            "text-embedding-3-small",
+            1536,
+        )
+        .unwrap();
+
+        insert_generation_fixture(
+            &storage,
+            "generation-dry-run",
+            &canonical_desc,
+            1536,
+            "building",
+            1,
+        );
+
+        let registry = LanceDbVectorStoreRegistry::default();
+        let _pre_created = tauri::async_runtime::block_on(setup_pre_existing_lance_store(
+            &storage,
+            &registry,
+            "generation-dry-run",
+        ));
+
+        let coordinator = ModelRuntimeCoordinator::new(Duration::from_secs(5));
+        let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
+
+        // Measure same-connection SQLite mutations
+        let token = storage
+            .begin_existing_generation_binding_read_observation_for_test()
+            .unwrap();
+
+        // 1. Dry run resolution
+        let execution = tauri::async_runtime::block_on(
+            resolve_existing_generation_fenced_execution(&storage, &runtime, &registry),
+        )
+        .unwrap();
+
+        let obs = storage
+            .finish_existing_generation_binding_read_observation_for_test(token)
+            .unwrap();
+        assert_eq!(
+            obs,
+            ExistingGenerationBindingObservationResult::Unchanged,
+            "Dry run resolution must not mutate SQLite"
+        );
+
+        // 2. Dry run drain
+        let report =
+            tauri::async_runtime::block_on(execution.drain_bounded("dry-run-worker", 32)).unwrap();
+
+        assert_eq!(report.processed, 0);
+        assert!(report.stopped_no_eligible);
     }
 }

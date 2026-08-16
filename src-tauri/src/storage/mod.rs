@@ -43,6 +43,11 @@ pub(crate) use vector_sync_outbox::{
     FencedFailureFinalizeResult, FencedFinalizeResult, FencedVectorSyncClaim,
     MAX_VECTOR_SYNC_ATTEMPTS,
 };
+#[allow(unused_imports)]
+#[cfg(test)]
+pub(crate) use vector_sync_outbox::{
+    ExistingGenerationBindingObservationResult, ExistingGenerationBindingReadObservationToken,
+};
 
 use std::{
     fmt::Display,

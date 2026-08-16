@@ -13,7 +13,7 @@
 //! - Exact currentness recheck verifies generation authority and authority epoch before sealing.
 //! - The resulting types have private fields, no `Clone`, no `Debug`, no `Serialize`/`Deserialize`,
 //!   no IPC exposure, no raw scalar getters, and no split getters.
-//! - Consumption is strictly atomic and consuming via `consume_for_fenced_execution`.
+//! - Consumption is strictly atomic and consuming via `into_fenced_consumer`.
 //! - Absolutely NO generation creation, registration, activation, switching, retirement, or mutation.
 
 use sha2::{Digest, Sha256};
@@ -21,7 +21,10 @@ use std::fmt::Write as _;
 
 use crate::{
     embedding::{EmbeddingProvider, MAX_VECTOR_DIMENSION, PROTOCOL_VERSION},
-    memory::vector_index::MEMORY_INDEX_FORMAT_VERSION,
+    memory::{
+        vector_index::MEMORY_INDEX_FORMAT_VERSION,
+        vector_sync_worker::FencedVectorSyncSingleEventConsumer,
+    },
     model::{
         profile::{ModelProfileRepository, ModelProviderKind},
         runtime::{
@@ -34,7 +37,7 @@ use crate::{
     },
     secrets::SecretStore,
     storage::{ExistingBuildingGenerationAuthority, StorageService},
-    vector_store::VectorGenerationContext,
+    vector_store::{VectorGenerationContext, VectorStore},
 };
 
 /// Fixed redacted error codes for D-9D2 generation binding read bridge.
@@ -157,7 +160,7 @@ impl std::error::Error for ExistingGenerationBindingError {}
 /// Sealed binding combining authoritative generation context and active embedding provider.
 ///
 /// Deliberately has NO `Clone`, NO `Copy`, NO `Debug`, NO `Serialize`, NO `Deserialize`,
-/// NO IPC exposure, NO raw scalar getters, and NO split getters.
+/// NO IPC exposure, NO raw scalar getters, NO split getters, and NO generic callbacks.
 pub(crate) struct ExistingVectorGenerationBinding<'a> {
     context: VectorGenerationContext,
     provider: ResolvedEmbeddingProvider<'a>,
@@ -166,14 +169,16 @@ pub(crate) struct ExistingVectorGenerationBinding<'a> {
 impl<'a> ExistingVectorGenerationBinding<'a> {
     /// Controlled atomic consumer for `ExistingVectorGenerationBinding`.
     ///
-    /// Consumes `self` by value as an opaque bundle, ensuring callers cannot
-    /// extract, clone, or decouple `VectorGenerationContext` and `dyn EmbeddingProvider`.
+    /// Consumes `self` by value and constructs the sealed `FencedVectorSyncSingleEventConsumer`.
+    /// Neither `VectorGenerationContext` nor `EmbeddingProvider` can escape or be decoupled.
     #[allow(dead_code)]
-    pub(crate) fn consume_for_fenced_execution<F, R>(self, consumer: F) -> R
-    where
-        F: FnOnce(&VectorGenerationContext, &dyn EmbeddingProvider) -> R,
-    {
-        consumer(&self.context, self.provider.provider())
+    pub(crate) fn into_fenced_consumer(
+        self,
+        storage: &'a StorageService,
+        vectors: &'a dyn VectorStore,
+    ) -> FencedVectorSyncSingleEventConsumer<'a> {
+        let embedding: &'a dyn EmbeddingProvider = Box::leak(self.provider.into_provider());
+        FencedVectorSyncSingleEventConsumer::new(storage, embedding, vectors, self.context)
     }
 }
 
@@ -367,6 +372,7 @@ mod tests {
             EmbeddingBatch, EmbeddingError, EmbeddingErrorCode, EmbeddingFuture,
             EmbeddingModelInfo, EmbeddingRequest,
         },
+        memory::vector_sync_worker::FencedVectorSyncSingleEventResult,
         model::{
             profile::{
                 CreateModelProfileRequest, ModelProfileService, ModelProviderKind, ModelPurpose,
@@ -377,6 +383,7 @@ mod tests {
         },
         secrets::{InMemorySecretStore, SecretIdentifier, SecretPurpose, SecretValue},
         storage::open_authorized_test_connection,
+        vector_store::InMemoryVectorStore,
     };
 
     fn test_storage() -> (TempDir, StorageService) {
@@ -946,15 +953,13 @@ mod tests {
 
         let binding = resolve_existing_generation_binding(&storage, &runtime).unwrap();
 
-        // Binding is consumed as an atomic bundle
-        let consumed_result = binding.consume_for_fenced_execution(|ctx, prov| {
-            assert_eq!(ctx.dimension(), 1536);
-            assert_eq!(ctx.descriptor_hash(), canonical_desc);
-            assert_eq!(prov.model_info().model_name, "text-embedding-3-small");
-            "consumption_success"
-        });
+        // Binding is consumed by value into the sealed FencedVectorSyncSingleEventConsumer
+        let vectors = InMemoryVectorStore::new();
+        let consumer = binding.into_fenced_consumer(&storage, &vectors);
 
-        assert_eq!(consumed_result, "consumption_success");
+        // Verify consumer can process events without leaking context or provider
+        let res = tauri::async_runtime::block_on(consumer.process_one("test-worker-1")).unwrap();
+        assert_eq!(res, FencedVectorSyncSingleEventResult::NoEligibleEvent);
     }
 
     #[test]
@@ -1024,10 +1029,10 @@ mod tests {
             Ok(b) => b,
             Err(_) => panic!("expected successful binding"),
         };
-        binding.consume_for_fenced_execution(|ctx, _prov| {
-            assert_eq!(ctx.dimension(), 1536);
-            assert_eq!(ctx.descriptor_hash(), canonical_desc);
-        });
+        let vectors = InMemoryVectorStore::new();
+        let consumer = binding.into_fenced_consumer(&storage, &vectors);
+        let res = tauri::async_runtime::block_on(consumer.process_one("test-worker-2")).unwrap();
+        assert_eq!(res, FencedVectorSyncSingleEventResult::NoEligibleEvent);
     }
 
     #[test]

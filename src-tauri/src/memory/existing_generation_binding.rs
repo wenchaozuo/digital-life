@@ -12,7 +12,8 @@
 //! - All metadata comparisons (profile, provider model info, dimension, descriptor hash) are exact.
 //! - Exact currentness recheck verifies generation authority and authority epoch before sealing.
 //! - The resulting types have private fields, no `Clone`, no `Debug`, no `Serialize`/`Deserialize`,
-//!   no IPC exposure, and no raw scalar getters.
+//!   no IPC exposure, no raw scalar getters, and no split getters.
+//! - Consumption is strictly atomic and consuming via `consume_for_fenced_execution`.
 //! - Absolutely NO generation creation, registration, activation, switching, retirement, or mutation.
 
 use sha2::{Digest, Sha256};
@@ -25,7 +26,7 @@ use crate::{
         profile::{ModelProfileRepository, ModelProviderKind},
         runtime::{
             ModelRuntimeErrorCode, ModelRuntimePurpose, ModelRuntimeService,
-            ResolvedEmbeddingProvider,
+            ResolvedEmbeddingProvider, ResolvedModelProfile,
         },
         transport::url_policy::{
             validate_and_normalize_url, TransportTargetKind, ValidatedTransportTarget,
@@ -131,7 +132,6 @@ impl ExistingGenerationBindingError {
         Self::new(ExistingGenerationBindingErrorCode::GenerationBindingStale)
     }
 
-    #[allow(dead_code)]
     pub(crate) const fn existing_vector_store_unavailable() -> Self {
         Self::new(ExistingGenerationBindingErrorCode::ExistingVectorStoreUnavailable)
     }
@@ -157,24 +157,70 @@ impl std::error::Error for ExistingGenerationBindingError {}
 /// Sealed binding combining authoritative generation context and active embedding provider.
 ///
 /// Deliberately has NO `Clone`, NO `Copy`, NO `Debug`, NO `Serialize`, NO `Deserialize`,
-/// NO IPC exposure, and NO raw scalar getters.
+/// NO IPC exposure, NO raw scalar getters, and NO split getters.
 pub(crate) struct ExistingVectorGenerationBinding<'a> {
     context: VectorGenerationContext,
     provider: ResolvedEmbeddingProvider<'a>,
 }
 
 impl<'a> ExistingVectorGenerationBinding<'a> {
-    /// Private access to the generation context for future fenced consumer construction.
+    /// Controlled atomic consumer for `ExistingVectorGenerationBinding`.
+    ///
+    /// Consumes `self` by value as an opaque bundle, ensuring callers cannot
+    /// extract, clone, or decouple `VectorGenerationContext` and `dyn EmbeddingProvider`.
     #[allow(dead_code)]
-    pub(crate) fn generation_context(&self) -> &VectorGenerationContext {
-        &self.context
+    pub(crate) fn consume_for_fenced_execution<F, R>(self, consumer: F) -> R
+    where
+        F: FnOnce(&VectorGenerationContext, &dyn EmbeddingProvider) -> R,
+    {
+        consumer(&self.context, self.provider.provider())
     }
+}
 
-    /// Private access to the embedding provider for future fenced operations.
-    #[allow(dead_code)]
-    pub(crate) fn provider(&self) -> &dyn EmbeddingProvider {
-        self.provider.provider()
+/// Pure raw calculation of the generation descriptor digest according to `D9D2_GENERATION_DESCRIPTOR_V1`.
+#[allow(dead_code)]
+pub(crate) fn compute_canonical_generation_descriptor_raw(
+    domain_separator: &str,
+    memory_index_format_version: &str,
+    protocol_version: &str,
+    embedding_kind: &str,
+    document_kind: &str,
+    provider_kind_wire: &str,
+    profile_id: &str,
+    transport_target_kind: &str,
+    host_ascii: &str,
+    effective_port: u16,
+    base_path_segments: &[&str],
+    endpoint_kind: &str,
+    trimmed_model_name: &str,
+    dimension: usize,
+) -> String {
+    let mut hasher = Sha256::new();
+
+    hash_length_prefixed(&mut hasher, domain_separator);
+    hash_length_prefixed(&mut hasher, memory_index_format_version);
+    hash_length_prefixed(&mut hasher, protocol_version);
+    hash_length_prefixed(&mut hasher, embedding_kind);
+    hash_length_prefixed(&mut hasher, document_kind);
+    hash_length_prefixed(&mut hasher, provider_kind_wire);
+    hash_length_prefixed(&mut hasher, profile_id);
+    hash_length_prefixed(&mut hasher, transport_target_kind);
+    hash_length_prefixed(&mut hasher, host_ascii);
+    hasher.update(effective_port.to_be_bytes());
+    hasher.update((base_path_segments.len() as u64).to_be_bytes());
+    for segment in base_path_segments {
+        hash_length_prefixed(&mut hasher, segment);
     }
+    hash_length_prefixed(&mut hasher, endpoint_kind);
+    hash_length_prefixed(&mut hasher, trimmed_model_name);
+    hasher.update((dimension as u64).to_be_bytes());
+
+    let digest = hasher.finalize();
+    let mut result = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(result, "{byte:02x}");
+    }
+    result
 }
 
 /// Computes the canonical generation descriptor digest according to `D9D2_GENERATION_DESCRIPTOR_V1`.
@@ -186,57 +232,71 @@ pub(crate) fn compute_canonical_generation_descriptor(
     model_name: &str,
     dimension: usize,
 ) -> Result<String, ExistingGenerationBindingError> {
-    let mut hasher = Sha256::new();
-
-    // LP("digital-life-vector-generation-descriptor-v1")
-    hash_length_prefixed(&mut hasher, "digital-life-vector-generation-descriptor-v1");
-    // LP(MEMORY_INDEX_FORMAT_VERSION)
-    hash_length_prefixed(&mut hasher, MEMORY_INDEX_FORMAT_VERSION);
-    // LP(PROTOCOL_VERSION)
-    hash_length_prefixed(&mut hasher, PROTOCOL_VERSION);
-    // LP("embedding")
-    hash_length_prefixed(&mut hasher, "embedding");
-    // LP("document")
-    hash_length_prefixed(&mut hasher, "document");
-    // LP(provider_kind_wire)
-    hash_length_prefixed(&mut hasher, provider_kind.as_str());
-    // LP(profile_id)
-    hash_length_prefixed(&mut hasher, profile_id);
-    // LP(transport_target_kind)
     let target_kind_str = match transport_target.kind() {
         TransportTargetKind::RemoteHttps => "remote_https",
         TransportTargetKind::LoopbackHttp => "loopback_http",
     };
-    hash_length_prefixed(&mut hasher, target_kind_str);
-    // LP(host_ascii)
-    hash_length_prefixed(&mut hasher, transport_target.host_ascii());
-    // U16_BE(effective_port)
-    hasher.update(transport_target.port().to_be_bytes());
-    // U64_BE(base_path_segment_count)
-    let segments_count = transport_target.base_path().segments().len() as u64;
-    hasher.update(segments_count.to_be_bytes());
-    // each LP(base_path_segment)
-    for segment in transport_target.base_path().segments() {
-        hash_length_prefixed(&mut hasher, segment);
-    }
-    // LP("embeddings")
-    hash_length_prefixed(&mut hasher, "embeddings");
-    // LP(trimmed_model_name)
-    hash_length_prefixed(&mut hasher, model_name.trim());
-    // U64_BE(dimension)
-    hasher.update((dimension as u64).to_be_bytes());
+    let segments: Vec<&str> = transport_target.base_path().segments().collect();
 
-    let digest = hasher.finalize();
-    let mut result = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        let _ = write!(result, "{byte:02x}");
-    }
-    Ok(result)
+    Ok(compute_canonical_generation_descriptor_raw(
+        "digital-life-vector-generation-descriptor-v1",
+        MEMORY_INDEX_FORMAT_VERSION,
+        PROTOCOL_VERSION,
+        "embedding",
+        "document",
+        provider_kind.as_str(),
+        profile_id,
+        target_kind_str,
+        transport_target.host_ascii(),
+        transport_target.port(),
+        &segments,
+        "embeddings",
+        model_name.trim(),
+        dimension,
+    ))
 }
 
 fn hash_length_prefixed(hasher: &mut Sha256, s: &str) {
     hasher.update((s.len() as u64).to_be_bytes());
     hasher.update(s.as_bytes());
+}
+
+/// Verifies exact compatibility of active profile and embedding provider facts.
+///
+/// Returns the verified dimension on exact match.
+/// Fails closed with `D9D2_GENERATION_PROVIDER_MISMATCH` if provider dimension is `None`
+/// or if any dimension/purpose/model fact differs.
+pub(crate) fn verify_provider_facts(
+    profile: &ResolvedModelProfile,
+    provider: &dyn EmbeddingProvider,
+) -> Result<usize, ExistingGenerationBindingError> {
+    if profile.purpose != ModelRuntimePurpose::Embedding {
+        return Err(ExistingGenerationBindingError::generation_provider_mismatch());
+    }
+
+    let profile_dimension = match profile.embedding_dimension {
+        Some(dim) if dim > 0 && dim <= MAX_VECTOR_DIMENSION as u32 => dim as usize,
+        _ => return Err(ExistingGenerationBindingError::generation_provider_mismatch()),
+    };
+
+    let provider_model_info = provider.model_info();
+    match provider_model_info.dimension {
+        Some(prov_dim) => {
+            if prov_dim != profile_dimension {
+                return Err(ExistingGenerationBindingError::generation_provider_mismatch());
+            }
+        }
+        None => {
+            // Provider dimension must be exact. Fail closed on None.
+            return Err(ExistingGenerationBindingError::generation_provider_mismatch());
+        }
+    }
+
+    if provider_model_info.model_name.trim() != profile.model_name.trim() {
+        return Err(ExistingGenerationBindingError::generation_provider_mismatch());
+    }
+
+    Ok(profile_dimension)
 }
 
 /// Resolves the existing vector generation binding from SQLite generation authority and active model runtime.
@@ -263,27 +323,9 @@ where
             _ => ExistingGenerationBindingError::generation_provider_unavailable(),
         })?;
 
-    // 3. Inspect profile facts
+    // 3. Inspect profile facts and enforce triple exact dimension check
     let profile = &resolved_provider.profile;
-    if profile.purpose != ModelRuntimePurpose::Embedding {
-        return Err(ExistingGenerationBindingError::generation_provider_mismatch());
-    }
-
-    let profile_dimension = match profile.embedding_dimension {
-        Some(dim) if dim > 0 && dim <= MAX_VECTOR_DIMENSION as u32 => dim as usize,
-        _ => return Err(ExistingGenerationBindingError::generation_provider_mismatch()),
-    };
-
-    let provider_model_info = resolved_provider.provider().model_info();
-    if let Some(prov_dim) = provider_model_info.dimension {
-        if prov_dim != profile_dimension {
-            return Err(ExistingGenerationBindingError::generation_provider_mismatch());
-        }
-    }
-
-    if provider_model_info.model_name.trim() != profile.model_name.trim() {
-        return Err(ExistingGenerationBindingError::generation_provider_mismatch());
-    }
+    let profile_dimension = verify_provider_facts(profile, resolved_provider.provider())?;
 
     // 4. Transport normalization
     let transport_target = validate_and_normalize_url(&profile.base_url)
@@ -313,6 +355,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
     use std::time::Duration;
 
     use rusqlite::params;
@@ -320,6 +363,10 @@ mod tests {
 
     use super::*;
     use crate::{
+        embedding::{
+            EmbeddingBatch, EmbeddingError, EmbeddingErrorCode, EmbeddingFuture,
+            EmbeddingModelInfo, EmbeddingRequest,
+        },
         model::{
             profile::{
                 CreateModelProfileRequest, ModelProfileService, ModelProviderKind, ModelPurpose,
@@ -395,6 +442,36 @@ mod tests {
         .unwrap();
     }
 
+    struct MockEmbeddingProviderWithoutDimension;
+
+    impl EmbeddingProvider for MockEmbeddingProviderWithoutDimension {
+        fn model_info(&self) -> EmbeddingModelInfo {
+            EmbeddingModelInfo {
+                model_name: "text-embedding-3-small".into(),
+                dimension: None,
+            }
+        }
+        fn model_name(&self) -> &str {
+            "text-embedding-3-small"
+        }
+        fn vector_dimension(&self) -> Option<usize> {
+            None
+        }
+        fn max_batch_size(&self) -> usize {
+            1
+        }
+        fn embed<'a>(
+            &'a self,
+            _request: EmbeddingRequest,
+        ) -> EmbeddingFuture<'a, Result<EmbeddingBatch, EmbeddingError>> {
+            Box::pin(async {
+                Err(EmbeddingError::definitely_not_sent(
+                    EmbeddingErrorCode::InvalidRequest,
+                ))
+            })
+        }
+    }
+
     #[test]
     fn d9d2_existing_generation_binding_golden_descriptor_vectors() {
         let target_a = validate_and_normalize_url("https://api.openai.com/v1").unwrap();
@@ -407,10 +484,15 @@ mod tests {
         )
         .unwrap();
 
+        // 1. Exact hardcoded literal golden SHA-256 digest
+        assert_eq!(
+            desc_a,
+            "b9b5e4d839faa4a74a0c2b302ecddeb8a474f416909c704327029f948c3d91b6"
+        );
         assert_eq!(desc_a.len(), 64);
         assert!(desc_a.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')));
 
-        // Golden vector stability: deterministic digest
+        // 2. Golden vector stability: whitespace trimming produces identical digest
         let desc_a_again = compute_canonical_generation_descriptor(
             &ModelProviderKind::OpenaiCompatible,
             "profile-openai",
@@ -424,7 +506,7 @@ mod tests {
             "Trimming model name must produce identical digest"
         );
 
-        // Field change 1: Profile ID change
+        // 3. Profile ID change produces different digest
         let desc_b = compute_canonical_generation_descriptor(
             &ModelProviderKind::OpenaiCompatible,
             "profile-other",
@@ -438,7 +520,7 @@ mod tests {
             "Profile ID change must produce different digest"
         );
 
-        // Field change 2: Path segmentation difference
+        // 4. Path segmentation difference produces different digest
         let target_seg1 = validate_and_normalize_url("http://127.0.0.1:8000/v1/sub").unwrap();
         let target_seg2 = validate_and_normalize_url("http://127.0.0.1:8000/v1sub").unwrap();
         let desc_seg1 = compute_canonical_generation_descriptor(
@@ -462,7 +544,7 @@ mod tests {
             "Path segmentation difference must produce different digest"
         );
 
-        // Field change 3: Dimension difference
+        // 5. Dimension difference produces different digest
         let desc_dim = compute_canonical_generation_descriptor(
             &ModelProviderKind::OpenaiCompatible,
             "profile-openai",
@@ -475,6 +557,404 @@ mod tests {
             desc_a, desc_dim,
             "Dimension difference must produce different digest"
         );
+    }
+
+    #[test]
+    fn d9d2_existing_generation_binding_descriptor_field_matrix() {
+        let base_digest = compute_canonical_generation_descriptor_raw(
+            "digital-life-vector-generation-descriptor-v1",
+            "memory-index-v1",
+            "openai-compatible-embedding-v1",
+            "embedding",
+            "document",
+            "openai_compatible",
+            "profile-openai",
+            "remote_https",
+            "api.openai.com",
+            443,
+            &["v1"],
+            "embeddings",
+            "text-embedding-3-small",
+            1536,
+        );
+
+        assert_eq!(
+            base_digest,
+            "b9b5e4d839faa4a74a0c2b302ecddeb8a474f416909c704327029f948c3d91b6"
+        );
+
+        // Matrix covering every individual field and constant
+        let variations = vec![
+            (
+                "domain_separator",
+                compute_canonical_generation_descriptor_raw(
+                    "other-domain-separator",
+                    "memory-index-v1",
+                    "openai-compatible-embedding-v1",
+                    "embedding",
+                    "document",
+                    "openai_compatible",
+                    "profile-openai",
+                    "remote_https",
+                    "api.openai.com",
+                    443,
+                    &["v1"],
+                    "embeddings",
+                    "text-embedding-3-small",
+                    1536,
+                ),
+            ),
+            (
+                "memory_index_format_version",
+                compute_canonical_generation_descriptor_raw(
+                    "digital-life-vector-generation-descriptor-v1",
+                    "memory-index-v2",
+                    "openai-compatible-embedding-v1",
+                    "embedding",
+                    "document",
+                    "openai_compatible",
+                    "profile-openai",
+                    "remote_https",
+                    "api.openai.com",
+                    443,
+                    &["v1"],
+                    "embeddings",
+                    "text-embedding-3-small",
+                    1536,
+                ),
+            ),
+            (
+                "protocol_version",
+                compute_canonical_generation_descriptor_raw(
+                    "digital-life-vector-generation-descriptor-v1",
+                    "memory-index-v1",
+                    "openai-compatible-embedding-v2",
+                    "embedding",
+                    "document",
+                    "openai_compatible",
+                    "profile-openai",
+                    "remote_https",
+                    "api.openai.com",
+                    443,
+                    &["v1"],
+                    "embeddings",
+                    "text-embedding-3-small",
+                    1536,
+                ),
+            ),
+            (
+                "embedding_kind",
+                compute_canonical_generation_descriptor_raw(
+                    "digital-life-vector-generation-descriptor-v1",
+                    "memory-index-v1",
+                    "openai-compatible-embedding-v1",
+                    "chat",
+                    "document",
+                    "openai_compatible",
+                    "profile-openai",
+                    "remote_https",
+                    "api.openai.com",
+                    443,
+                    &["v1"],
+                    "embeddings",
+                    "text-embedding-3-small",
+                    1536,
+                ),
+            ),
+            (
+                "document_kind",
+                compute_canonical_generation_descriptor_raw(
+                    "digital-life-vector-generation-descriptor-v1",
+                    "memory-index-v1",
+                    "openai-compatible-embedding-v1",
+                    "embedding",
+                    "query",
+                    "openai_compatible",
+                    "profile-openai",
+                    "remote_https",
+                    "api.openai.com",
+                    443,
+                    &["v1"],
+                    "embeddings",
+                    "text-embedding-3-small",
+                    1536,
+                ),
+            ),
+            (
+                "provider_kind_wire",
+                compute_canonical_generation_descriptor_raw(
+                    "digital-life-vector-generation-descriptor-v1",
+                    "memory-index-v1",
+                    "openai-compatible-embedding-v1",
+                    "embedding",
+                    "document",
+                    "custom_provider",
+                    "profile-openai",
+                    "remote_https",
+                    "api.openai.com",
+                    443,
+                    &["v1"],
+                    "embeddings",
+                    "text-embedding-3-small",
+                    1536,
+                ),
+            ),
+            (
+                "profile_id",
+                compute_canonical_generation_descriptor_raw(
+                    "digital-life-vector-generation-descriptor-v1",
+                    "memory-index-v1",
+                    "openai-compatible-embedding-v1",
+                    "embedding",
+                    "document",
+                    "openai_compatible",
+                    "profile-different",
+                    "remote_https",
+                    "api.openai.com",
+                    443,
+                    &["v1"],
+                    "embeddings",
+                    "text-embedding-3-small",
+                    1536,
+                ),
+            ),
+            (
+                "transport_target_kind",
+                compute_canonical_generation_descriptor_raw(
+                    "digital-life-vector-generation-descriptor-v1",
+                    "memory-index-v1",
+                    "openai-compatible-embedding-v1",
+                    "embedding",
+                    "document",
+                    "openai_compatible",
+                    "profile-openai",
+                    "loopback_http",
+                    "api.openai.com",
+                    443,
+                    &["v1"],
+                    "embeddings",
+                    "text-embedding-3-small",
+                    1536,
+                ),
+            ),
+            (
+                "host_ascii",
+                compute_canonical_generation_descriptor_raw(
+                    "digital-life-vector-generation-descriptor-v1",
+                    "memory-index-v1",
+                    "openai-compatible-embedding-v1",
+                    "embedding",
+                    "document",
+                    "openai_compatible",
+                    "profile-openai",
+                    "remote_https",
+                    "api.custom.com",
+                    443,
+                    &["v1"],
+                    "embeddings",
+                    "text-embedding-3-small",
+                    1536,
+                ),
+            ),
+            (
+                "effective_port",
+                compute_canonical_generation_descriptor_raw(
+                    "digital-life-vector-generation-descriptor-v1",
+                    "memory-index-v1",
+                    "openai-compatible-embedding-v1",
+                    "embedding",
+                    "document",
+                    "openai_compatible",
+                    "profile-openai",
+                    "remote_https",
+                    "api.openai.com",
+                    8443,
+                    &["v1"],
+                    "embeddings",
+                    "text-embedding-3-small",
+                    1536,
+                ),
+            ),
+            (
+                "base_path_segments_count",
+                compute_canonical_generation_descriptor_raw(
+                    "digital-life-vector-generation-descriptor-v1",
+                    "memory-index-v1",
+                    "openai-compatible-embedding-v1",
+                    "embedding",
+                    "document",
+                    "openai_compatible",
+                    "profile-openai",
+                    "remote_https",
+                    "api.openai.com",
+                    443,
+                    &["v1", "extra"],
+                    "embeddings",
+                    "text-embedding-3-small",
+                    1536,
+                ),
+            ),
+            (
+                "base_path_segments_value",
+                compute_canonical_generation_descriptor_raw(
+                    "digital-life-vector-generation-descriptor-v1",
+                    "memory-index-v1",
+                    "openai-compatible-embedding-v1",
+                    "embedding",
+                    "document",
+                    "openai_compatible",
+                    "profile-openai",
+                    "remote_https",
+                    "api.openai.com",
+                    443,
+                    &["v2"],
+                    "embeddings",
+                    "text-embedding-3-small",
+                    1536,
+                ),
+            ),
+            (
+                "endpoint_kind",
+                compute_canonical_generation_descriptor_raw(
+                    "digital-life-vector-generation-descriptor-v1",
+                    "memory-index-v1",
+                    "openai-compatible-embedding-v1",
+                    "embedding",
+                    "document",
+                    "openai_compatible",
+                    "profile-openai",
+                    "remote_https",
+                    "api.openai.com",
+                    443,
+                    &["v1"],
+                    "vectors",
+                    "text-embedding-3-small",
+                    1536,
+                ),
+            ),
+            (
+                "model_name",
+                compute_canonical_generation_descriptor_raw(
+                    "digital-life-vector-generation-descriptor-v1",
+                    "memory-index-v1",
+                    "openai-compatible-embedding-v1",
+                    "embedding",
+                    "document",
+                    "openai_compatible",
+                    "profile-openai",
+                    "remote_https",
+                    "api.openai.com",
+                    443,
+                    &["v1"],
+                    "embeddings",
+                    "text-embedding-3-large",
+                    1536,
+                ),
+            ),
+            (
+                "dimension",
+                compute_canonical_generation_descriptor_raw(
+                    "digital-life-vector-generation-descriptor-v1",
+                    "memory-index-v1",
+                    "openai-compatible-embedding-v1",
+                    "embedding",
+                    "document",
+                    "openai_compatible",
+                    "profile-openai",
+                    "remote_https",
+                    "api.openai.com",
+                    443,
+                    &["v1"],
+                    "embeddings",
+                    "text-embedding-3-small",
+                    3072,
+                ),
+            ),
+        ];
+
+        for (field_name, varied_digest) in variations {
+            assert_ne!(
+                base_digest, varied_digest,
+                "Field change in '{field_name}' must produce distinct digest"
+            );
+        }
+    }
+
+    #[test]
+    fn d9d2_existing_generation_binding_provider_dimension_none_fails_closed() {
+        let (_dir, storage) = test_storage();
+        let secrets = InMemorySecretStore::new();
+        let _profile_id = create_test_profile(
+            &storage,
+            &secrets,
+            "https://api.openai.com/v1",
+            "text-embedding-3-small",
+            1536,
+        );
+
+        let coordinator = ModelRuntimeCoordinator::new(Duration::from_secs(5));
+        let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
+        let resolved = runtime.resolve_active_embedding_provider().unwrap();
+
+        // When provider model_info dimension is None -> must fail closed
+        let mock_provider = MockEmbeddingProviderWithoutDimension;
+        let res = verify_provider_facts(&resolved.profile, &mock_provider);
+        assert!(res.is_err());
+        let err = match res {
+            Err(e) => e,
+            Ok(_) => panic!("expected provider mismatch error on None dimension"),
+        };
+        assert_eq!(
+            err.code(),
+            ExistingGenerationBindingErrorCode::GenerationProviderMismatch
+        );
+    }
+
+    #[test]
+    fn d9d2_existing_generation_binding_sealed_consuming_api() {
+        let (_dir, storage) = test_storage();
+        let secrets = InMemorySecretStore::new();
+        let profile_id = create_test_profile(
+            &storage,
+            &secrets,
+            "https://api.openai.com/v1",
+            "text-embedding-3-small",
+            1536,
+        );
+
+        let target = validate_and_normalize_url("https://api.openai.com/v1").unwrap();
+        let canonical_desc = compute_canonical_generation_descriptor(
+            &ModelProviderKind::OpenaiCompatible,
+            &profile_id,
+            &target,
+            "text-embedding-3-small",
+            1536,
+        )
+        .unwrap();
+
+        insert_generation_fixture(
+            &storage,
+            "generation-1",
+            &canonical_desc,
+            1536,
+            "building",
+            1,
+        );
+
+        let coordinator = ModelRuntimeCoordinator::new(Duration::from_secs(5));
+        let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
+
+        let binding = resolve_existing_generation_binding(&storage, &runtime).unwrap();
+
+        // Binding is consumed as an atomic bundle
+        let consumed_result = binding.consume_for_fenced_execution(|ctx, prov| {
+            assert_eq!(ctx.dimension(), 1536);
+            assert_eq!(ctx.descriptor_hash(), canonical_desc);
+            assert_eq!(prov.model_info().model_name, "text-embedding-3-small");
+            "consumption_success"
+        });
+
+        assert_eq!(consumed_result, "consumption_success");
     }
 
     #[test]
@@ -492,22 +972,7 @@ mod tests {
         let coordinator = ModelRuntimeCoordinator::new(Duration::from_secs(5));
         let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
 
-        let conn =
-            open_authorized_test_connection(&storage.test_database_main_path().unwrap()).unwrap();
-        let version_before: i64 = conn
-            .query_row("PRAGMA data_version", [], |r| r.get(0))
-            .unwrap();
-
         let res = resolve_existing_generation_binding(&storage, &runtime);
-
-        let version_after: i64 = conn
-            .query_row("PRAGMA data_version", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(
-            version_before, version_after,
-            "Resolver must not mutate SQLite"
-        );
-
         let err = match res {
             Err(e) => e,
             Ok(_) => panic!("expected NoExistingGeneration error"),
@@ -552,32 +1017,17 @@ mod tests {
         let coordinator = ModelRuntimeCoordinator::new(Duration::from_secs(5));
         let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
 
-        let conn =
-            open_authorized_test_connection(&storage.test_database_main_path().unwrap()).unwrap();
-        let version_before: i64 = conn
-            .query_row("PRAGMA data_version", [], |r| r.get(0))
-            .unwrap();
-
         let res = resolve_existing_generation_binding(&storage, &runtime);
-
-        let version_after: i64 = conn
-            .query_row("PRAGMA data_version", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(
-            version_before, version_after,
-            "Resolver must not mutate SQLite"
-        );
-
         assert!(res.is_ok());
+
         let binding = match res {
             Ok(b) => b,
             Err(_) => panic!("expected successful binding"),
         };
-        assert_eq!(binding.generation_context().dimension(), 1536);
-        assert_eq!(
-            binding.generation_context().descriptor_hash(),
-            canonical_desc
-        );
+        binding.consume_for_fenced_execution(|ctx, _prov| {
+            assert_eq!(ctx.dimension(), 1536);
+            assert_eq!(ctx.descriptor_hash(), canonical_desc);
+        });
     }
 
     #[test]
@@ -612,22 +1062,7 @@ mod tests {
         let coordinator = ModelRuntimeCoordinator::new(Duration::from_secs(5));
         let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
 
-        let conn =
-            open_authorized_test_connection(&storage.test_database_main_path().unwrap()).unwrap();
-        let version_before: i64 = conn
-            .query_row("PRAGMA data_version", [], |r| r.get(0))
-            .unwrap();
-
         let res = resolve_existing_generation_binding(&storage, &runtime);
-
-        let version_after: i64 = conn
-            .query_row("PRAGMA data_version", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(
-            version_before, version_after,
-            "Resolver must not mutate SQLite"
-        );
-
         let err = match res {
             Err(e) => e,
             Ok(_) => panic!("expected AmbiguousExistingGeneration error"),
@@ -951,119 +1386,352 @@ mod tests {
     }
 
     #[test]
-    fn d9d2_existing_generation_binding_concurrency_stale_detection() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let storage_a =
-            StorageService::initialize_with_roots(temp_dir.path().join("data"), None).unwrap();
-        let storage_b =
-            StorageService::initialize_with_roots(temp_dir.path().join("data"), None).unwrap();
-        let secrets = InMemorySecretStore::new();
+    fn d9d2_existing_generation_binding_deterministic_concurrent_stale_barrier() {
+        // Scenario 1: Epoch advancement concurrently detected via deterministic channel synchronization
+        {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let storage_a =
+                StorageService::initialize_with_roots(temp_dir.path().join("data"), None).unwrap();
+            let storage_b =
+                StorageService::initialize_with_roots(temp_dir.path().join("data"), None).unwrap();
+            let secrets = InMemorySecretStore::new();
 
-        let profile_id = create_test_profile(
-            &storage_a,
-            &secrets,
-            "https://api.openai.com/v1",
-            "text-embedding-3-small",
-            1536,
-        );
+            let profile_id = create_test_profile(
+                &storage_a,
+                &secrets,
+                "https://api.openai.com/v1",
+                "text-embedding-3-small",
+                1536,
+            );
 
-        let target = validate_and_normalize_url("https://api.openai.com/v1").unwrap();
-        let canonical_desc = compute_canonical_generation_descriptor(
-            &ModelProviderKind::OpenaiCompatible,
-            &profile_id,
-            &target,
-            "text-embedding-3-small",
-            1536,
-        )
-        .unwrap();
-
-        insert_generation_fixture(
-            &storage_a,
-            "generation-1",
-            &canonical_desc,
-            1536,
-            "building",
-            1,
-        );
-
-        // Connection A loads candidate authority
-        let authority = storage_a
-            .load_existing_building_generation_candidate()
-            .unwrap();
-        assert!(authority
-            .verify_descriptor_and_dimension(&canonical_desc, 1536)
-            .is_ok());
-
-        // Connection B updates authority in SQLite (transitioning to active and advancing epoch)
-        let conn_b =
-            open_authorized_test_connection(&storage_b.test_database_main_path().unwrap()).unwrap();
-        conn_b
-            .execute(
-                "UPDATE memory_vector_generation SET state='active', authority_epoch=2 WHERE generation_id='generation-1' AND authority_epoch=1",
-                [],
+            let target = validate_and_normalize_url("https://api.openai.com/v1").unwrap();
+            let canonical_desc = compute_canonical_generation_descriptor(
+                &ModelProviderKind::OpenaiCompatible,
+                &profile_id,
+                &target,
+                "text-embedding-3-small",
+                1536,
             )
             .unwrap();
 
-        // Connection A attempts exact recheck and seal -> must detect stale epoch
-        let err = match authority.verify_current_and_seal(&storage_a) {
-            Err(e) => e,
-            Ok(_) => panic!("expected stale error"),
-        };
-        assert_eq!(
-            err.code(),
-            ExistingGenerationBindingErrorCode::GenerationBindingStale
-        );
+            insert_generation_fixture(
+                &storage_a,
+                "generation-1",
+                &canonical_desc,
+                1536,
+                "building",
+                1,
+            );
+
+            let (tx_a_to_b, rx_b_from_a) = mpsc::sync_channel::<()>(0);
+            let (tx_b_to_a, rx_a_from_b) = mpsc::sync_channel::<()>(0);
+
+            let handle_b = std::thread::spawn(move || {
+                // Wait for Thread A to load candidate authority
+                rx_b_from_a.recv().unwrap();
+
+                // Mutate epoch in independent connection B and commit
+                let conn_b =
+                    open_authorized_test_connection(&storage_b.test_database_main_path().unwrap())
+                        .unwrap();
+                conn_b
+                    .execute(
+                        "UPDATE memory_vector_generation SET state='active', authority_epoch=2 WHERE generation_id='generation-1' AND authority_epoch=1",
+                        [],
+                    )
+                    .unwrap();
+
+                // Signal Thread A to resume recheck
+                tx_b_to_a.send(()).unwrap();
+            });
+
+            // Thread A: Loads candidate authority
+            let authority = storage_a
+                .load_existing_building_generation_candidate()
+                .unwrap();
+            assert!(authority
+                .verify_descriptor_and_dimension(&canonical_desc, 1536)
+                .is_ok());
+
+            // Signal Thread B to mutate authority
+            tx_a_to_b.send(()).unwrap();
+
+            // Wait for Thread B to complete mutation
+            rx_a_from_b.recv().unwrap();
+            handle_b.join().unwrap();
+
+            // Thread A: Exact recheck must detect stale epoch and fail closed
+            let err = match authority.verify_current_and_seal(&storage_a) {
+                Err(e) => e,
+                Ok(_) => panic!("expected stale error"),
+            };
+            assert_eq!(
+                err.code(),
+                ExistingGenerationBindingErrorCode::GenerationBindingStale
+            );
+        }
+
+        // Scenario 2: State transition to retired concurrently detected
+        {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let storage_a =
+                StorageService::initialize_with_roots(temp_dir.path().join("data"), None).unwrap();
+            let storage_b =
+                StorageService::initialize_with_roots(temp_dir.path().join("data"), None).unwrap();
+            let secrets = InMemorySecretStore::new();
+
+            let profile_id = create_test_profile(
+                &storage_a,
+                &secrets,
+                "https://api.openai.com/v1",
+                "text-embedding-3-small",
+                1536,
+            );
+
+            let target = validate_and_normalize_url("https://api.openai.com/v1").unwrap();
+            let canonical_desc = compute_canonical_generation_descriptor(
+                &ModelProviderKind::OpenaiCompatible,
+                &profile_id,
+                &target,
+                "text-embedding-3-small",
+                1536,
+            )
+            .unwrap();
+
+            insert_generation_fixture(
+                &storage_a,
+                "generation-1",
+                &canonical_desc,
+                1536,
+                "building",
+                1,
+            );
+
+            let authority = storage_a
+                .load_existing_building_generation_candidate()
+                .unwrap();
+
+            let conn_b =
+                open_authorized_test_connection(&storage_b.test_database_main_path().unwrap())
+                    .unwrap();
+            conn_b
+                .execute(
+                    "UPDATE memory_vector_generation SET state='retired', authority_epoch=2 WHERE generation_id='generation-1' AND authority_epoch=1",
+                    [],
+                )
+                .unwrap();
+
+            let err = match authority.verify_current_and_seal(&storage_a) {
+                Err(e) => e,
+                Ok(_) => panic!("expected stale error on retirement"),
+            };
+            assert_eq!(
+                err.code(),
+                ExistingGenerationBindingErrorCode::GenerationBindingStale
+            );
+        }
     }
 
     #[test]
-    fn d9d2_existing_generation_binding_read_only_guarantee_total_changes() {
-        let (_dir, storage) = test_storage();
-        let secrets = InMemorySecretStore::new();
-        let profile_id = create_test_profile(
-            &storage,
-            &secrets,
-            "https://api.openai.com/v1",
-            "text-embedding-3-small",
-            1536,
-        );
+    fn d9d2_existing_generation_binding_read_only_matrix_zero_mutations() {
+        // Subcase 1: Successful resolution -> zero SQLite mutations
+        {
+            let (_dir, storage) = test_storage();
+            let secrets = InMemorySecretStore::new();
+            let profile_id = create_test_profile(
+                &storage,
+                &secrets,
+                "https://api.openai.com/v1",
+                "text-embedding-3-small",
+                1536,
+            );
 
-        let target = validate_and_normalize_url("https://api.openai.com/v1").unwrap();
-        let canonical_desc = compute_canonical_generation_descriptor(
-            &ModelProviderKind::OpenaiCompatible,
-            &profile_id,
-            &target,
-            "text-embedding-3-small",
-            1536,
-        )
-        .unwrap();
-
-        insert_generation_fixture(
-            &storage,
-            "generation-1",
-            &canonical_desc,
-            1536,
-            "building",
-            1,
-        );
-
-        let coordinator = ModelRuntimeCoordinator::new(Duration::from_secs(5));
-        let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
-
-        let conn =
-            open_authorized_test_connection(&storage.test_database_main_path().unwrap()).unwrap();
-        let version_before: i64 = conn
-            .query_row("PRAGMA data_version", [], |r| r.get(0))
+            let target = validate_and_normalize_url("https://api.openai.com/v1").unwrap();
+            let canonical_desc = compute_canonical_generation_descriptor(
+                &ModelProviderKind::OpenaiCompatible,
+                &profile_id,
+                &target,
+                "text-embedding-3-small",
+                1536,
+            )
             .unwrap();
 
-        let res = resolve_existing_generation_binding(&storage, &runtime);
-        assert!(res.is_ok());
+            insert_generation_fixture(
+                &storage,
+                "generation-1",
+                &canonical_desc,
+                1536,
+                "building",
+                1,
+            );
 
-        let version_after: i64 = conn
-            .query_row("PRAGMA data_version", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(
-            version_before, version_after,
-            "Read bridge must execute 0 SQLite mutations"
-        );
+            let coordinator = ModelRuntimeCoordinator::new(Duration::from_secs(5));
+            let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
+
+            let conn = open_authorized_test_connection(&storage.test_database_main_path().unwrap())
+                .unwrap();
+            let data_version_before: i64 = conn
+                .query_row("PRAGMA data_version", [], |r| r.get(0))
+                .unwrap();
+            let total_changes_before: i64 = conn
+                .query_row("SELECT total_changes()", [], |r| r.get(0))
+                .unwrap();
+
+            let res = resolve_existing_generation_binding(&storage, &runtime);
+            assert!(res.is_ok());
+
+            let data_version_after: i64 = conn
+                .query_row("PRAGMA data_version", [], |r| r.get(0))
+                .unwrap();
+            let total_changes_after: i64 = conn
+                .query_row("SELECT total_changes()", [], |r| r.get(0))
+                .unwrap();
+
+            assert_eq!(
+                data_version_before, data_version_after,
+                "Read bridge must not modify SQLite data_version on success"
+            );
+            assert_eq!(
+                total_changes_before, total_changes_after,
+                "Read bridge must not execute SQLite mutations on success"
+            );
+        }
+
+        // Subcase 2: Zero building candidate -> zero SQLite mutations
+        {
+            let (_dir, storage) = test_storage();
+            let secrets = InMemorySecretStore::new();
+            create_test_profile(
+                &storage,
+                &secrets,
+                "https://api.openai.com/v1",
+                "text-embedding-3-small",
+                1536,
+            );
+
+            let coordinator = ModelRuntimeCoordinator::new(Duration::from_secs(5));
+            let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
+
+            let conn = open_authorized_test_connection(&storage.test_database_main_path().unwrap())
+                .unwrap();
+            let data_version_before: i64 = conn
+                .query_row("PRAGMA data_version", [], |r| r.get(0))
+                .unwrap();
+            let total_changes_before: i64 = conn
+                .query_row("SELECT total_changes()", [], |r| r.get(0))
+                .unwrap();
+
+            let _ = resolve_existing_generation_binding(&storage, &runtime);
+
+            let data_version_after: i64 = conn
+                .query_row("PRAGMA data_version", [], |r| r.get(0))
+                .unwrap();
+            let total_changes_after: i64 = conn
+                .query_row("SELECT total_changes()", [], |r| r.get(0))
+                .unwrap();
+
+            assert_eq!(data_version_before, data_version_after);
+            assert_eq!(total_changes_before, total_changes_after);
+        }
+
+        // Subcase 3: Ambiguous building candidate -> zero SQLite mutations
+        {
+            let (_dir, storage) = test_storage();
+            let secrets = InMemorySecretStore::new();
+            create_test_profile(
+                &storage,
+                &secrets,
+                "https://api.openai.com/v1",
+                "text-embedding-3-small",
+                1536,
+            );
+
+            insert_generation_fixture(
+                &storage,
+                "generation-1",
+                &"a".repeat(64),
+                1536,
+                "building",
+                1,
+            );
+            insert_generation_fixture(
+                &storage,
+                "generation-2",
+                &"b".repeat(64),
+                1536,
+                "building",
+                1,
+            );
+
+            let coordinator = ModelRuntimeCoordinator::new(Duration::from_secs(5));
+            let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
+
+            let conn = open_authorized_test_connection(&storage.test_database_main_path().unwrap())
+                .unwrap();
+            let data_version_before: i64 = conn
+                .query_row("PRAGMA data_version", [], |r| r.get(0))
+                .unwrap();
+            let total_changes_before: i64 = conn
+                .query_row("SELECT total_changes()", [], |r| r.get(0))
+                .unwrap();
+
+            let _ = resolve_existing_generation_binding(&storage, &runtime);
+
+            let data_version_after: i64 = conn
+                .query_row("PRAGMA data_version", [], |r| r.get(0))
+                .unwrap();
+            let total_changes_after: i64 = conn
+                .query_row("SELECT total_changes()", [], |r| r.get(0))
+                .unwrap();
+
+            assert_eq!(data_version_before, data_version_after);
+            assert_eq!(total_changes_before, total_changes_after);
+        }
+
+        // Subcase 4: Binding mismatch -> zero SQLite mutations
+        {
+            let (_dir, storage) = test_storage();
+            let secrets = InMemorySecretStore::new();
+            create_test_profile(
+                &storage,
+                &secrets,
+                "https://api.openai.com/v1",
+                "text-embedding-3-small",
+                1536,
+            );
+
+            insert_generation_fixture(
+                &storage,
+                "generation-1",
+                &"0".repeat(64),
+                1536,
+                "building",
+                1,
+            );
+
+            let coordinator = ModelRuntimeCoordinator::new(Duration::from_secs(5));
+            let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
+
+            let conn = open_authorized_test_connection(&storage.test_database_main_path().unwrap())
+                .unwrap();
+            let data_version_before: i64 = conn
+                .query_row("PRAGMA data_version", [], |r| r.get(0))
+                .unwrap();
+            let total_changes_before: i64 = conn
+                .query_row("SELECT total_changes()", [], |r| r.get(0))
+                .unwrap();
+
+            let _ = resolve_existing_generation_binding(&storage, &runtime);
+
+            let data_version_after: i64 = conn
+                .query_row("PRAGMA data_version", [], |r| r.get(0))
+                .unwrap();
+            let total_changes_after: i64 = conn
+                .query_row("SELECT total_changes()", [], |r| r.get(0))
+                .unwrap();
+
+            assert_eq!(data_version_before, data_version_after);
+            assert_eq!(total_changes_before, total_changes_after);
+        }
     }
 }

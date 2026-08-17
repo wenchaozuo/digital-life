@@ -2,7 +2,9 @@ use std::{fs, path::Path, time::Duration};
 
 use rusqlite::{backup::Backup, params, Connection, OptionalExtension, Transaction};
 
-use super::{connection, writer_fence_manifest, StorageError, MIGRATIONS};
+use super::{
+    connection, generation_lifecycle_authority, writer_fence_manifest, StorageError, MIGRATIONS,
+};
 
 pub(super) const LAST_STATIC_MIGRATION_VERSION: i64 = 12;
 const WRITER_FENCE_MIGRATION_NAME: &str = "013_historical_outbox_isolation_and_writer_fence";
@@ -13,6 +15,33 @@ const LATE_DELETE_RESOLUTION_MIGRATION_NAME: &str = "015_vector_sync_late_delete
 pub(super) const LATE_DELETE_GENERATION_AUTHORITY_SCHEMA_VERSION: i64 = 16;
 const LATE_DELETE_GENERATION_AUTHORITY_MIGRATION_NAME: &str =
     "016_late_delete_generation_authority";
+pub(super) const GENERATION_LIFECYCLE_SCHEMA_VERSION: i64 = 17;
+const GENERATION_LIFECYCLE_MIGRATION_NAME: &str = "017_vector_generation_lifecycle_cutover";
+const ADD_CLAIMED_GENERATION_AUTHORITY_EPOCH_SQL: &str = "ALTER TABLE memory_vector_sync_outbox ADD COLUMN claimed_generation_authority_epoch INTEGER NULL CHECK (claimed_generation_authority_epoch IS NULL OR claimed_generation_authority_epoch >= 1)";
+const CREATE_GENERATION_AUTHORITY_TABLE_SQL: &str =
+    "CREATE TABLE memory_vector_generation_authority (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    active_generation_id TEXT NULL UNIQUE,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (active_generation_id) REFERENCES memory_vector_generation(generation_id)
+)";
+const CREATE_GENERATION_BINDING_TABLE_SQL: &str = "CREATE TABLE memory_vector_generation_binding (
+    generation_id TEXT PRIMARY KEY,
+    descriptor_version TEXT NOT NULL,
+    embedding_profile_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (generation_id) REFERENCES memory_vector_generation(generation_id)
+)";
+const CREATE_GENERATION_STORE_WITNESS_TABLE_SQL: &str = "CREATE TABLE memory_vector_generation_store_witness (
+    generation_id TEXT PRIMARY KEY,
+    create_operation_id TEXT NULL UNIQUE,
+    state TEXT NOT NULL CHECK (state IN ('unverified', 'absent', 'create_started', 'ready', 'uncertain', 'deleted')),
+    last_error_code TEXT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (generation_id) REFERENCES memory_vector_generation(generation_id)
+)";
+const CREATE_REBUILD_TABLES_AND_GUARDS_SQL: &str =
+    include_str!("migrations/017_vector_generation_lifecycle_cutover.sql");
 const ADD_DELETE_WITNESS_AT_SQL: &str =
     "ALTER TABLE memory_vector_sync_outbox ADD COLUMN delete_witness_at TEXT NULL";
 const ADD_WITNESS_AGE_ANCHOR_AT_SQL: &str = "ALTER TABLE memory_vector_late_delete_resolution ADD COLUMN witness_age_anchor_at TEXT NOT NULL DEFAULT ''";
@@ -37,6 +66,14 @@ BEFORE UPDATE ON memory_vector_generation
 WHEN digital_life_writer_epoch() IS 1
  AND ((NEW.state <> OLD.state AND (OLD.authority_epoch = 9223372036854775807 OR NEW.authority_epoch <> OLD.authority_epoch + 1))
    OR (NEW.state = OLD.state AND NEW.authority_epoch <> OLD.authority_epoch))
+BEGIN
+    SELECT RAISE(ROLLBACK, 'GENERATION_AUTHORITY_EPOCH_INVALID');
+END";
+const GENERATION_SEMANTIC_EPOCH_TRIGGER_SCHEMA_SEVENTEEN_SQL: &str =
+    "CREATE TRIGGER memory_vector_generation_semantic_epoch_guard
+BEFORE UPDATE ON memory_vector_generation
+WHEN digital_life_writer_epoch() IS 1
+ AND (OLD.authority_epoch = 9223372036854775807 OR NEW.authority_epoch <> OLD.authority_epoch + 1)
 BEGIN
     SELECT RAISE(ROLLBACK, 'GENERATION_AUTHORITY_EPOCH_INVALID');
 END";
@@ -120,6 +157,11 @@ pub(super) enum LateDeleteResolutionSchemaUpgrade {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum LateDeleteGenerationAuthoritySchemaUpgrade {
+    Applied,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum GenerationLifecycleSchemaUpgrade {
     Applied,
 }
 
@@ -551,6 +593,291 @@ pub(super) fn validate_late_delete_generation_authority_schema(
         return Err(StorageError::migration_version_invariant_failed());
     }
     validate_late_delete_generation_authority_schema_objects(connection)
+}
+
+/// Schema-17 is a single caller-owned transaction.  The schema is deliberately
+/// programmatic, like Schema 13--16, because legacy validation and conservative
+/// backfill must occur in the same transaction as DDL and writer-fence install.
+pub(super) fn apply_generation_lifecycle_schema_upgrade(
+    transaction: &Transaction<'_>,
+) -> Result<GenerationLifecycleSchemaUpgrade, StorageError> {
+    if connection::read_schema_version(transaction)?
+        != LATE_DELETE_GENERATION_AUTHORITY_SCHEMA_VERSION
+    {
+        return Err(StorageError::migration_version_invariant_failed());
+    }
+    #[cfg(test)]
+    if should_fail_migration_017_at_for_test(Migration017Failpoint::BeforeAuthorityTable) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+
+    // Never repair an ambiguous Schema-16 generation world.  In particular,
+    // historical claimed rows retain their unavailable epoch (NULL) below.
+    let invalid_legacy_generation_count: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM memory_vector_generation
+              WHERE generation_id='' OR descriptor_hash='' OR dimension<=0
+                 OR authority_epoch<1 OR state NOT IN ('building','active','retired','failed')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    let active_count: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM memory_vector_generation WHERE state='active'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    let building_count: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM memory_vector_generation WHERE state='building'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    if invalid_legacy_generation_count != 0 || active_count > 1 || building_count > 1 {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    let now: String = transaction
+        .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |row| {
+            row.get(0)
+        })
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    transaction
+        .execute_batch(CREATE_GENERATION_AUTHORITY_TABLE_SQL)
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    transaction
+        .execute(
+            "INSERT INTO memory_vector_generation_authority (singleton,active_generation_id,updated_at)
+             SELECT 1,(SELECT generation_id FROM memory_vector_generation WHERE state='active'),?1",
+            [now.as_str()],
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    #[cfg(test)]
+    if should_fail_migration_017_at_for_test(Migration017Failpoint::AfterAuthorityObjects) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+
+    transaction
+        .execute_batch(ADD_CLAIMED_GENERATION_AUTHORITY_EPOCH_SQL)
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    #[cfg(test)]
+    if should_fail_migration_017_at_for_test(Migration017Failpoint::AfterOutboxTransformation) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+
+    transaction
+        .execute_batch(CREATE_GENERATION_BINDING_TABLE_SQL)
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    transaction
+        .execute_batch(CREATE_GENERATION_STORE_WITNESS_TABLE_SQL)
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    // Schema 16 contains a descriptor hash but no profile identity.  The
+    // immutable sentinel explicitly records that absence; it does not infer a
+    // profile or claim any external store is ready.
+    transaction
+        .execute(
+            "INSERT INTO memory_vector_generation_binding
+             (generation_id,descriptor_version,embedding_profile_id,created_at)
+             SELECT generation_id,descriptor_hash,?1,?2 FROM memory_vector_generation",
+            params![
+                generation_lifecycle_authority::legacy_unverified_embedding_profile(),
+                now
+            ],
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    transaction
+        .execute(
+            "INSERT INTO memory_vector_generation_store_witness
+             (generation_id,create_operation_id,state,last_error_code,updated_at)
+             SELECT generation_id,NULL,'unverified',NULL,?1 FROM memory_vector_generation",
+            [now.as_str()],
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    transaction
+        .execute_batch(CREATE_REBUILD_TABLES_AND_GUARDS_SQL)
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    // Schema 17 adds a state-preserving authority-epoch CAS. Its exact +1
+    // preimage remains mandatory; only the Schema-16 same-state prohibition
+    // is replaced within this atomic upgrade.
+    transaction
+        .execute_batch("DROP TRIGGER memory_vector_generation_semantic_epoch_guard")
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    transaction
+        .execute_batch(GENERATION_SEMANTIC_EPOCH_TRIGGER_SCHEMA_SEVENTEEN_SQL)
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    #[cfg(test)]
+    if should_fail_migration_017_at_for_test(Migration017Failpoint::AfterIndexesAndGuards) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+
+    writer_fence_manifest::install_generation_lifecycle_writer_fence_manifest_in_transaction(
+        transaction,
+    )?;
+    validate_generation_lifecycle_schema_objects(transaction)?;
+    #[cfg(test)]
+    if should_fail_migration_017_at_for_test(Migration017Failpoint::BeforeFinalization) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    transaction
+        .execute(
+            "INSERT INTO schema_migration (version,name,applied_at) VALUES (?1,?2,?3)",
+            params![
+                GENERATION_LIFECYCLE_SCHEMA_VERSION,
+                GENERATION_LIFECYCLE_MIGRATION_NAME,
+                now
+            ],
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    #[cfg(test)]
+    if should_fail_migration_017_at_for_test(Migration017Failpoint::PreCommit) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    validate_generation_lifecycle_schema_objects(transaction)?;
+    Ok(GenerationLifecycleSchemaUpgrade::Applied)
+}
+
+pub(super) fn validate_generation_lifecycle_schema(
+    connection: &Connection,
+) -> Result<(), StorageError> {
+    if connection::read_schema_version(connection)? != GENERATION_LIFECYCLE_SCHEMA_VERSION {
+        return Err(StorageError::migration_version_invariant_failed());
+    }
+    validate_generation_lifecycle_schema_objects(connection)
+}
+
+fn validate_generation_lifecycle_schema_objects(
+    connection: &Connection,
+) -> Result<(), StorageError> {
+    for table in [
+        "memory_vector_generation_authority",
+        "memory_vector_generation_binding",
+        "memory_vector_generation_store_witness",
+        "memory_vector_generation_rebuild_job",
+        "memory_vector_generation_rebuild_item",
+        "memory_vector_generation_rebuild_resolution",
+    ] {
+        let exists: Option<i64> = connection
+            .query_row(
+                "SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1",
+                [table],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| StorageError::migration_transaction_failed())?;
+        if exists.is_none() {
+            return Err(StorageError::migration_transaction_failed());
+        }
+    }
+    for (table, declaration) in [
+        ("memory_vector_sync_outbox", "claimed_generation_authority_epochintegernullcheck(claimed_generation_authority_epochisnullorclaimed_generation_authority_epoch>=1)"),
+        ("memory_vector_generation_authority", "singletonintegerprimarykeycheck(singleton=1)"),
+        ("memory_vector_generation_authority", "active_generation_idtextnullunique"),
+        ("memory_vector_generation_binding", "embedding_profile_idtextnotnull"),
+        ("memory_vector_generation_store_witness", "statetextnotnullcheck(statein('unverified','absent','create_started','ready','uncertain','deleted'))"),
+        ("memory_vector_generation_rebuild_job", "statustextnotnullcheck(statusin('registered','snapshotting','bulk_building','catching_up','verifying','ready','completed','failed','cancelled'))"),
+        ("memory_vector_generation_rebuild_item", "io_phasetextnotnullcheck(io_phasein('not_started','reserved','embedding_started','vector_write_started','finalized'))"),
+        ("memory_vector_generation_rebuild_resolution", "dispositiontextnotnullcheck(dispositionin('resolved_by_rebuild','legacy_rebuild_resolved','failed_generation_requeued'))"),
+    ] {
+        let sql: String = connection
+            .query_row("SELECT sql FROM sqlite_schema WHERE type='table' AND name=?1", [table], |row| row.get(0))
+            .map_err(|_| StorageError::migration_transaction_failed())?;
+        let definitions = normalized_top_level_column_definitions(&sql)
+            .ok_or_else(StorageError::migration_transaction_failed)?;
+        if definitions.iter().filter(|value| value.as_str() == declaration).count() != 1 {
+            return Err(StorageError::migration_transaction_failed());
+        }
+    }
+    for index in [
+        "memory_vector_generation_one_active",
+        "memory_vector_generation_one_building",
+        "memory_vector_generation_rebuild_job_one_nonterminal",
+    ] {
+        let exists: Option<i64> = connection
+            .query_row(
+                "SELECT 1 FROM sqlite_schema WHERE type='index' AND name=?1",
+                [index],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| StorageError::migration_transaction_failed())?;
+        if exists.is_none() {
+            return Err(StorageError::migration_transaction_failed());
+        }
+    }
+    for trigger in [
+        "memory_vector_generation_authority_active_insert_guard",
+        "memory_vector_generation_authority_active_update_guard",
+        "memory_vector_generation_active_pointer_state_guard",
+        "memory_vector_generation_binding_immutable_update_guard",
+        "memory_vector_generation_binding_immutable_delete_guard",
+    ] {
+        let exists: Option<i64> = connection
+            .query_row(
+                "SELECT 1 FROM sqlite_schema WHERE type='trigger' AND name=?1",
+                [trigger],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| StorageError::migration_transaction_failed())?;
+        if exists.is_none() {
+            return Err(StorageError::migration_transaction_failed());
+        }
+    }
+    let epoch_trigger_sql: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='memory_vector_generation_semantic_epoch_guard'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    if normalize_schema_fragment(&epoch_trigger_sql)
+        != normalize_schema_fragment(GENERATION_SEMANTIC_EPOCH_TRIGGER_SCHEMA_SEVENTEEN_SQL)
+    {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    let invalid_pointer_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM memory_vector_generation_authority a
+              LEFT JOIN memory_vector_generation g ON g.generation_id=a.active_generation_id
+              WHERE a.singleton<>1 OR (a.active_generation_id IS NOT NULL AND (g.generation_id IS NULL OR g.state<>'active'))",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    if invalid_pointer_count != 0 {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    let authority_row_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM memory_vector_generation_authority WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    let active_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM memory_vector_generation WHERE state='active'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    let building_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM memory_vector_generation WHERE state='building'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    if authority_row_count != 1 || active_count > 1 || building_count > 1 {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    writer_fence_manifest::validate_writer_fence_manifest_for_schema(
+        connection,
+        GENERATION_LIFECYCLE_SCHEMA_VERSION,
+    )?;
+    Ok(())
 }
 
 fn validate_late_delete_generation_authority_schema_objects(
@@ -1079,6 +1406,9 @@ pub(super) fn verify_schema_after_upgrade(
     if expected_schema_version == LATE_DELETE_GENERATION_AUTHORITY_SCHEMA_VERSION {
         validate_late_delete_generation_authority_schema(connection)?;
     }
+    if expected_schema_version == GENERATION_LIFECYCLE_SCHEMA_VERSION {
+        validate_generation_lifecycle_schema(connection)?;
+    }
     if expected_schema_version >= writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION {
         #[cfg(test)]
         if should_fail_post_commit_verification_at_for_test(
@@ -1237,6 +1567,42 @@ pub(super) fn fail_next_migration_014_at_for_test(failpoint: Migration014Failpoi
 #[cfg(test)]
 fn should_fail_migration_014_at_for_test(failpoint: Migration014Failpoint) -> bool {
     MIGRATION_014_FAILPOINT.with(|next| {
+        if next.get() == Some(failpoint) {
+            next.set(None);
+            true
+        } else {
+            false
+        }
+    })
+}
+
+/// Test-only failure points for the single Schema-17 migration transaction.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Migration017Failpoint {
+    BeforeAuthorityTable,
+    AfterAuthorityObjects,
+    AfterOutboxTransformation,
+    AfterIndexesAndGuards,
+    BeforeFinalization,
+    PreCommit,
+}
+
+#[cfg(test)]
+thread_local! {
+    static MIGRATION_017_FAILPOINT: std::cell::Cell<Option<Migration017Failpoint>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(super) fn fail_next_migration_017_at_for_test(failpoint: Migration017Failpoint) {
+    MIGRATION_017_FAILPOINT.with(|next| next.set(Some(failpoint)));
+}
+
+#[cfg(test)]
+fn should_fail_migration_017_at_for_test(failpoint: Migration017Failpoint) -> bool {
+    MIGRATION_017_FAILPOINT.with(|next| {
         if next.get() == Some(failpoint) {
             next.set(None);
             true
@@ -1836,6 +2202,242 @@ mod transaction_tests {
             LATE_DELETE_GENERATION_AUTHORITY_SCHEMA_VERSION
         );
         connection
+    }
+
+    fn apply_generation_lifecycle_upgrade(connection: &mut Connection) {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert_eq!(
+            apply_generation_lifecycle_schema_upgrade(&transaction).unwrap(),
+            GenerationLifecycleSchemaUpgrade::Applied
+        );
+        transaction.commit().unwrap();
+    }
+
+    #[test]
+    fn migration_017_upgrades_schema_sixteen_with_zero_active_pointer_and_unverified_witness() {
+        let mut connection = schema_sixteen_connection();
+        insert_historical_row(
+            &connection,
+            HistoricalRowFixture {
+                life_id: "migration-017-life",
+                memory_id: "migration-017-historical-row",
+                desired_action: "upsert",
+                state: "pending",
+                migration_disposition: None,
+                attempt_count: 0,
+                mutation_sequence: 1,
+                target_revision: Some(1),
+                target_content_hash: Some("migration-017-content"),
+                claimed_generation_id: None,
+                last_error_code: None,
+                last_send_disposition: None,
+                next_attempt_at: None,
+                lease_owner: None,
+                lease_fence_epoch: None,
+                lease_expires_at: None,
+            },
+        );
+        connection
+            .execute(
+                "INSERT INTO memory_vector_generation
+                 (generation_id,descriptor_hash,dimension,state,authority_epoch)
+                 VALUES ('generation-building','descriptor-building',8,'building',1)",
+                [],
+            )
+            .unwrap();
+        apply_generation_lifecycle_upgrade(&mut connection);
+        assert_eq!(
+            schema_version(&connection),
+            GENERATION_LIFECYCLE_SCHEMA_VERSION
+        );
+        validate_generation_lifecycle_schema(&connection).unwrap();
+        let pointer: Option<String> = connection
+            .query_row(
+                "SELECT active_generation_id FROM memory_vector_generation_authority WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pointer, None);
+        let witness: (Option<String>, String) = connection
+            .query_row(
+                "SELECT create_operation_id,state FROM memory_vector_generation_store_witness
+                 WHERE generation_id='generation-building'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(witness, (None, "unverified".to_string()));
+        let epoch: Option<i64> = connection
+            .query_row(
+                "SELECT claimed_generation_authority_epoch FROM memory_vector_sync_outbox
+                 WHERE life_id='migration-017-life' AND memory_id='migration-017-historical-row'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap()
+            .flatten();
+        assert_eq!(epoch, None);
+    }
+
+    #[test]
+    fn migration_017_single_active_initializes_pointer() {
+        let mut connection = schema_sixteen_connection();
+        connection
+            .execute(
+                "INSERT INTO memory_vector_generation
+                 (generation_id,descriptor_hash,dimension,state,authority_epoch)
+                 VALUES ('generation-active','descriptor-active',8,'active',1)",
+                [],
+            )
+            .unwrap();
+        apply_generation_lifecycle_upgrade(&mut connection);
+        let pointer: Option<String> = connection
+            .query_row(
+                "SELECT active_generation_id FROM memory_vector_generation_authority WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pointer.as_deref(), Some("generation-active"));
+    }
+
+    #[test]
+    fn migration_017_duplicate_building_fails_closed_without_schema_seventeen_objects() {
+        let mut connection = schema_sixteen_connection();
+        connection
+            .execute_batch(
+                "INSERT INTO memory_vector_generation (generation_id,descriptor_hash,dimension,state,authority_epoch)
+                 VALUES ('generation-a','descriptor-a',8,'building',1);
+                 INSERT INTO memory_vector_generation (generation_id,descriptor_hash,dimension,state,authority_epoch)
+                 VALUES ('generation-b','descriptor-b',8,'building',1)",
+            )
+            .unwrap();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let error = apply_generation_lifecycle_schema_upgrade(&transaction).unwrap_err();
+        assert_eq!(error.code, "MIGRATION_TRANSACTION_FAILED");
+        drop(transaction);
+        assert_eq!(
+            schema_version(&connection),
+            LATE_DELETE_GENERATION_AUTHORITY_SCHEMA_VERSION
+        );
+        let table: Option<String> = connection
+            .query_row(
+                "SELECT name FROM sqlite_schema WHERE type='table' AND name='memory_vector_generation_authority'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert_eq!(table, None);
+    }
+
+    #[test]
+    fn migration_017_duplicate_active_fails_closed_without_schema_seventeen_objects() {
+        let mut connection = schema_sixteen_connection();
+        connection
+            .execute_batch(
+                "INSERT INTO memory_vector_generation (generation_id,descriptor_hash,dimension,state,authority_epoch)
+                 VALUES ('generation-a','descriptor-a',8,'active',1);
+                 INSERT INTO memory_vector_generation (generation_id,descriptor_hash,dimension,state,authority_epoch)
+                 VALUES ('generation-b','descriptor-b',8,'active',1)",
+            )
+            .unwrap();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let error = apply_generation_lifecycle_schema_upgrade(&transaction).unwrap_err();
+        assert_eq!(error.code, "MIGRATION_TRANSACTION_FAILED");
+        drop(transaction);
+        assert_eq!(
+            schema_version(&connection),
+            LATE_DELETE_GENERATION_AUTHORITY_SCHEMA_VERSION
+        );
+        let table: Option<String> = connection
+            .query_row(
+                "SELECT name FROM sqlite_schema WHERE type='table' AND name='memory_vector_generation_authority'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert_eq!(table, None);
+    }
+
+    #[test]
+    fn migration_017_invalid_legacy_lifecycle_fails_closed_without_schema_seventeen_objects() {
+        let mut connection = schema_sixteen_connection();
+        // This corruption seam is test-only: Schema 16 normally rejects the
+        // value, while the migration must still fail closed if a damaged file
+        // reaches the upgrade boundary.
+        connection
+            .execute_batch(
+                "PRAGMA ignore_check_constraints=ON;
+                 INSERT INTO memory_vector_generation (generation_id,descriptor_hash,dimension,state,authority_epoch)
+                 VALUES ('generation-corrupt','descriptor-corrupt',8,'corrupt',1);
+                 PRAGMA ignore_check_constraints=OFF;",
+            )
+            .unwrap();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let error = apply_generation_lifecycle_schema_upgrade(&transaction).unwrap_err();
+        assert_eq!(error.code, "MIGRATION_TRANSACTION_FAILED");
+        drop(transaction);
+        assert_eq!(
+            schema_version(&connection),
+            LATE_DELETE_GENERATION_AUTHORITY_SCHEMA_VERSION
+        );
+        let table: Option<String> = connection
+            .query_row(
+                "SELECT name FROM sqlite_schema WHERE type='table' AND name='memory_vector_generation_authority'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert_eq!(table, None);
+    }
+
+    #[test]
+    fn migration_017_failpoints_roll_back_to_schema_sixteen() {
+        for failpoint in [
+            Migration017Failpoint::BeforeAuthorityTable,
+            Migration017Failpoint::AfterAuthorityObjects,
+            Migration017Failpoint::AfterOutboxTransformation,
+            Migration017Failpoint::AfterIndexesAndGuards,
+            Migration017Failpoint::BeforeFinalization,
+            Migration017Failpoint::PreCommit,
+        ] {
+            let mut connection = schema_sixteen_connection();
+            fail_next_migration_017_at_for_test(failpoint);
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let error = apply_generation_lifecycle_schema_upgrade(&transaction).unwrap_err();
+            assert_eq!(error.code, "MIGRATION_TRANSACTION_FAILED");
+            drop(transaction);
+            assert_eq!(
+                schema_version(&connection),
+                LATE_DELETE_GENERATION_AUTHORITY_SCHEMA_VERSION
+            );
+            let schema_seventeen_table_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE type='table'
+                     AND name IN ('memory_vector_generation_authority','memory_vector_generation_binding',
+                                  'memory_vector_generation_store_witness','memory_vector_generation_rebuild_job',
+                                  'memory_vector_generation_rebuild_item','memory_vector_generation_rebuild_resolution')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(schema_seventeen_table_count, 0, "{failpoint:?}");
+        }
     }
 
     /// Rewrites SQLite's persisted DDL only in this test fixture, then bumps

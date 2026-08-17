@@ -84,11 +84,11 @@ fn open_after_mutex<G: StorageUpgradeGate>(
     }
 
     if version == connection::MAX_SUPPORTED_SCHEMA_VERSION {
-        record_upgrade_event("schema-16");
+        record_upgrade_event("schema-17");
         record_upgrade_event("manifest");
         writer_fence_manifest::validate_writer_fence_manifest(&connection)?;
         migration::validate_attempt_claim_identity_schema(&connection)?;
-        migration::validate_late_delete_generation_authority_schema(&connection)?;
+        migration::validate_generation_lifecycle_schema(&connection)?;
         record_upgrade_event("post-verify");
         migration::verify_schema_after_upgrade(
             &connection,
@@ -157,15 +157,22 @@ fn open_after_mutex<G: StorageUpgradeGate>(
         upgraded_version = migration::LATE_DELETE_RESOLUTION_SCHEMA_VERSION;
     }
 
-    if upgraded_version != migration::LATE_DELETE_RESOLUTION_SCHEMA_VERSION {
-        return Err(StorageError::migration_version_invariant_failed());
+    if upgraded_version == migration::LATE_DELETE_RESOLUTION_SCHEMA_VERSION {
+        let generation_authority_upgrade =
+            migration::apply_late_delete_generation_authority_schema_upgrade(&transaction)?;
+        if generation_authority_upgrade
+            != migration::LateDeleteGenerationAuthoritySchemaUpgrade::Applied
+        {
+            return Err(StorageError::migration_version_invariant_failed());
+        }
+        upgraded_version = migration::LATE_DELETE_GENERATION_AUTHORITY_SCHEMA_VERSION;
     }
 
-    let generation_authority_upgrade =
-        migration::apply_late_delete_generation_authority_schema_upgrade(&transaction)?;
-    if generation_authority_upgrade
-        != migration::LateDeleteGenerationAuthoritySchemaUpgrade::Applied
-    {
+    if upgraded_version != migration::LATE_DELETE_GENERATION_AUTHORITY_SCHEMA_VERSION {
+        return Err(StorageError::migration_version_invariant_failed());
+    }
+    let lifecycle_upgrade = migration::apply_generation_lifecycle_schema_upgrade(&transaction)?;
+    if lifecycle_upgrade != migration::GenerationLifecycleSchemaUpgrade::Applied {
         return Err(StorageError::migration_version_invariant_failed());
     }
 
@@ -560,6 +567,10 @@ mod tests {
                 migration::apply_late_delete_generation_authority_schema_upgrade(&transaction)
                     .unwrap(),
                 migration::LateDeleteGenerationAuthoritySchemaUpgrade::Applied
+            );
+            assert_eq!(
+                migration::apply_generation_lifecycle_schema_upgrade(&transaction).unwrap(),
+                migration::GenerationLifecycleSchemaUpgrade::Applied
             );
         }
         transaction.commit().unwrap();
@@ -1141,15 +1152,15 @@ mod tests {
             connection::MAX_SUPPORTED_SCHEMA_VERSION
         );
         migration::validate_attempt_claim_identity_schema(&state.connection).unwrap();
-        migration::validate_late_delete_generation_authority_schema(&state.connection).unwrap();
-        assert_eq!(writer_fence_count(&state.connection), 24);
+        migration::validate_generation_lifecycle_schema(&state.connection).unwrap();
+        assert_eq!(writer_fence_count(&state.connection), 42);
         assert_eq!(
             take_upgrade_events(),
             vec![
                 "mutex",
                 "open-before-wal",
                 "version-read",
-                "schema-16",
+                "schema-17",
                 "manifest",
                 "post-verify",
                 "wal",
@@ -1178,9 +1189,9 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(writer_fence_count, 24);
+        assert_eq!(writer_fence_count, 42);
         migration::validate_attempt_claim_identity_schema(&connection).unwrap();
-        migration::validate_late_delete_generation_authority_schema(&connection).unwrap();
+        migration::validate_generation_lifecycle_schema(&connection).unwrap();
         assert_eq!(gate.inspection_calls.get(), 2);
     }
 

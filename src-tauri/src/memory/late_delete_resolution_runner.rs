@@ -961,7 +961,6 @@ mod tests {
     }
 
     struct SuspendingProvider {
-        store: Arc<dyn VectorStore>,
         entered_tx: mpsc::Sender<()>,
         resume_rx: PendingStoreDelivery,
         resolves: AtomicUsize,
@@ -1294,7 +1293,6 @@ mod tests {
         ));
         let store: Arc<dyn VectorStore> = scripted.clone();
         let provider = SuspendingProvider {
-            store: Arc::clone(&store),
             entered_tx,
             resume_rx: Arc::new(Mutex::new(resume_rx)),
             resolves: AtomicUsize::new(0),

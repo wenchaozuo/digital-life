@@ -52,7 +52,6 @@ use crate::{
 };
 
 /// Fixed redacted error codes for D-9D2 generation binding read bridge.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ExistingGenerationBindingErrorCode {
     NoExistingGeneration,
@@ -108,7 +107,6 @@ pub(crate) struct ExistingGenerationBindingError {
     code: ExistingGenerationBindingErrorCode,
 }
 
-#[allow(dead_code)]
 impl ExistingGenerationBindingError {
     pub(crate) const fn new(code: ExistingGenerationBindingErrorCode) -> Self {
         Self { code }
@@ -183,7 +181,6 @@ impl<'a> ExistingVectorGenerationBinding<'a> {
     ///
     /// The exact matching store is acquired from the managed registry using the private
     /// sealed generation identifier. Neither provider, store, nor context can escape.
-    #[allow(dead_code)]
     pub(crate) async fn into_fenced_execution<'s>(
         self,
         storage: &'s StorageService,
@@ -215,7 +212,6 @@ impl<'a> ExistingVectorGenerationBinding<'a> {
 ///
 /// Deliberately has NO `Clone`, NO `Copy`, NO `Debug`, NO `Serialize`, NO `Deserialize`,
 /// NO IPC exposure, NO raw scalar getters, NO split getters, and NO generic callbacks.
-#[allow(dead_code)]
 pub(crate) struct ExistingGenerationFencedExecution<'storage, 'provider> {
     storage: &'storage StorageService,
     context: VectorGenerationContext,
@@ -223,7 +219,6 @@ pub(crate) struct ExistingGenerationFencedExecution<'storage, 'provider> {
     store: Arc<dyn VectorStore>,
 }
 
-#[allow(dead_code)]
 impl<'storage, 'provider> ExistingGenerationFencedExecution<'storage, 'provider> {
     /// Executes a bounded, fenced drain over the owned generation context.
     ///
@@ -248,7 +243,6 @@ impl<'storage, 'provider> ExistingGenerationFencedExecution<'storage, 'provider>
 }
 
 /// Pure raw calculation of the generation descriptor digest according to `D9D2_GENERATION_DESCRIPTOR_V1`.
-#[allow(dead_code)]
 pub(crate) fn compute_canonical_generation_descriptor_raw(
     domain_separator: &str,
     memory_index_format_version: &str,
@@ -294,7 +288,6 @@ pub(crate) fn compute_canonical_generation_descriptor_raw(
 }
 
 /// Computes the canonical generation descriptor digest according to `D9D2_GENERATION_DESCRIPTOR_V1`.
-#[allow(dead_code)]
 pub(crate) fn compute_canonical_generation_descriptor(
     provider_kind: &ModelProviderKind,
     profile_id: &str,
@@ -370,7 +363,6 @@ pub(crate) fn verify_provider_facts(
 }
 
 /// Resolves the intermediate existing vector generation binding from SQLite generation authority and active model runtime.
-#[allow(dead_code)]
 pub(crate) fn resolve_existing_generation_binding<'a, R, S>(
     storage: &StorageService,
     runtime: &'a ModelRuntimeService<'a, R, S>,
@@ -431,7 +423,6 @@ where
 /// - `&LanceDbVectorStoreRegistry`
 ///
 /// The caller cannot supply arbitrary generation IDs, contexts, providers, stores, or filesystem paths.
-#[allow(dead_code)]
 pub(crate) async fn resolve_existing_generation_fenced_execution<'storage, 'runtime, R, S>(
     storage: &'storage StorageService,
     runtime: &'runtime ModelRuntimeService<'runtime, R, S>,
@@ -484,7 +475,10 @@ mod tests {
         (temp_dir, service)
     }
 
-    fn store_credential(secrets: &InMemorySecretStore, profile_id: &str) {
+    fn store_credential<S>(secrets: &S, profile_id: &str)
+    where
+        S: SecretStore + ?Sized,
+    {
         secrets
             .set_secret(
                 &SecretIdentifier::new(SecretPurpose::EmbeddingModelApiKey, profile_id).unwrap(),
@@ -493,13 +487,16 @@ mod tests {
             .unwrap();
     }
 
-    fn create_test_profile(
+    fn create_test_profile<S>(
         storage: &StorageService,
-        secrets: &InMemorySecretStore,
+        secrets: &S,
         base_url: &str,
         model_name: &str,
         dimension: u32,
-    ) -> String {
+    ) -> String
+    where
+        S: SecretStore + ?Sized,
+    {
         let created = ModelProfileService::new(storage)
             .create(CreateModelProfileRequest {
                 purpose: ModelPurpose::Embedding,
@@ -1355,6 +1352,74 @@ mod tests {
             assert_eq!(
                 err.code(),
                 ExistingGenerationBindingErrorCode::InvalidGenerationMetadata
+            );
+        }
+    }
+
+    #[test]
+    fn d9d2_existing_generation_binding_invalid_authority_epoch_stops_before_provider_or_store() {
+        for authority_epoch in [0_i64, -1_i64] {
+            let (_dir, storage) = test_storage();
+            let (secrets, provider_resolution_count) = TrackingSecretStore::new();
+            create_test_profile(
+                &storage,
+                &secrets,
+                "https://api.openai.com/v1",
+                "text-embedding-3-small",
+                1536,
+            );
+            let registry = LanceDbVectorStoreRegistry::default();
+            let data_root = storage.active_data_root().unwrap();
+            let expected_store_root = data_root
+                .join("vectors")
+                .join("generations")
+                .join("invalid-authority-epoch")
+                .join("lancedb");
+            assert!(
+                !expected_store_root.exists(),
+                "the fixture starts without an existing generation store"
+            );
+
+            let conn = open_authorized_test_connection(&storage.test_database_main_path().unwrap())
+                .unwrap();
+            conn.execute_batch("PRAGMA ignore_check_constraints = ON;")
+                .unwrap();
+            conn.execute(
+                "INSERT INTO memory_vector_generation (generation_id, descriptor_hash, dimension, state, authority_epoch)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    "invalid-authority-epoch",
+                    "a".repeat(64),
+                    1536_i64,
+                    "building",
+                    authority_epoch
+                ],
+            )
+            .unwrap();
+            conn.execute_batch("PRAGMA ignore_check_constraints = OFF;")
+                .unwrap();
+
+            let coordinator = ModelRuntimeCoordinator::new(Duration::from_secs(5));
+            let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
+            let err = match tauri::async_runtime::block_on(
+                resolve_existing_generation_fenced_execution(&storage, &runtime, &registry),
+            ) {
+                Err(error) => error,
+                Ok(_) => panic!("authority epoch corruption must fail closed"),
+            };
+
+            assert_eq!(
+                err.code(),
+                ExistingGenerationBindingErrorCode::InvalidGenerationMetadata
+            );
+            assert_eq!(
+                provider_resolution_count.load(Ordering::SeqCst),
+                0,
+                "invalid authority epoch must stop before provider resolution"
+            );
+            assert!(
+                !expected_store_root.exists(),
+                "invalid authority epoch must stop before existing-store resolution"
             );
         }
     }

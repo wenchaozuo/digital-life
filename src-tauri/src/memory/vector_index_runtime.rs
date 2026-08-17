@@ -658,6 +658,9 @@ async fn run_job(app: AppHandle, job_id: VectorIndexJobId, life_id: String) {
         );
         return;
     }
+    let composition_gate =
+        app.state::<super::vector_sync_stage_runtime::FencedVectorSyncCompositionGate>();
+    let _composition_guard = composition_gate.acquire().await;
     let storage = app.state::<StorageService>();
     let secrets = app.state::<WindowsCredentialSecretStore>();
     let model_runtime = app.state::<ModelRuntimeCoordinator>();

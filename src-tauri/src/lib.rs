@@ -25,6 +25,9 @@ pub fn run() {
             app.manage(conversation::ConversationCognitionCoordinator::default());
             app.manage(vector_store::LanceDbVectorStoreRegistry::default());
             app.manage(
+                memory::vector_sync_stage_runtime::FencedVectorSyncCompositionGate::default(),
+            );
+            app.manage(
                 memory::vector_index_runtime::MemoryVectorIndexRuntimeCoordinator::default(),
             );
             app.manage(memory::vector_sync_worker::MemoryVectorSyncWorkerCoordinator::default());
@@ -70,7 +73,8 @@ pub fn run() {
             memory::vector_sync_worker::get_memory_vector_sync_settings,
             memory::vector_sync_worker::set_memory_vector_sync_enabled,
             memory::vector_sync_worker::get_memory_vector_sync_status,
-            memory::vector_sync_worker::start_memory_vector_sync,
+            memory::vector_sync_stage_runtime::start_fenced_vector_sync_drain,
+            memory::vector_sync_stage_runtime::run_late_delete_resolution_once,
             memory::vector_sync_worker::pause_memory_vector_sync,
             memory::vector_sync_worker::retry_memory_vector_sync_failures,
             secrets::save_api_credential,

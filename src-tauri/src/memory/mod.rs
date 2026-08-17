@@ -14,7 +14,6 @@ pub mod candidate_service;
 pub mod context_builder;
 pub mod existing_generation_binding;
 pub mod extraction_commands;
-#[allow(dead_code)] // Internal runner wiring awaits the future memory scheduler.
 mod late_delete_resolution_runner;
 pub mod management;
 pub mod retrieval;
@@ -26,6 +25,7 @@ pub mod vector_index_runtime;
 mod vector_sync_compensation;
 pub mod vector_sync_health;
 pub mod vector_sync_outbox;
+pub mod vector_sync_stage_runtime;
 pub mod vector_sync_worker;
 
 #[cfg(test)]

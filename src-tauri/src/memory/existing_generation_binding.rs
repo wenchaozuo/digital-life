@@ -44,12 +44,16 @@ use crate::{
         },
     },
     secrets::SecretStore,
-    storage::{ExistingBuildingGenerationAuthority, StorageService},
+    storage::{ActiveGenerationAuthority, ExistingBuildingGenerationAuthority, StorageService},
     vector_store::{
         ExistingGenerationVectorStoreProvider, LanceDbVectorStoreRegistry, VectorGenerationContext,
         VectorStore,
     },
 };
+
+/// Frozen persisted protocol identifier for a canonical D9 generation binding.
+/// This is distinct from the hash domain separator used by descriptor hashing.
+pub(crate) const D9D2_GENERATION_DESCRIPTOR_VERSION: &str = "D9D2_GENERATION_DESCRIPTOR_V1";
 
 /// Fixed redacted error codes for D-9D2 generation binding read bridge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -217,6 +221,36 @@ pub(crate) struct ExistingGenerationFencedExecution<'storage, 'provider> {
     context: VectorGenerationContext,
     provider: ResolvedEmbeddingProvider<'provider>,
     store: Arc<dyn VectorStore>,
+}
+
+/// Sealed ordinary-execution capability for the Schema-17 active generation.
+/// Unlike the retained D9D2 building bridge, this capability starts at the
+/// singleton active pointer and carries its exact lifecycle epoch through the
+/// worker's SQLite fences.
+pub(crate) struct ActiveGenerationFencedExecution<'storage, 'provider> {
+    storage: &'storage StorageService,
+    context: VectorGenerationContext,
+    authority_epoch: i64,
+    provider: ResolvedEmbeddingProvider<'provider>,
+    store: Arc<dyn VectorStore>,
+}
+
+impl<'storage, 'provider> ActiveGenerationFencedExecution<'storage, 'provider> {
+    pub(crate) async fn drain_bounded(
+        self,
+        lease_owner: &str,
+        limit: usize,
+    ) -> Result<VectorSyncDrainReport, MemoryVectorSyncWorkerError> {
+        let embedding = self.provider.provider();
+        let consumer = FencedVectorSyncSingleEventConsumer::new_active_generation(
+            self.storage,
+            embedding,
+            self.store.as_ref(),
+            self.context,
+            self.authority_epoch,
+        );
+        drain_fenced_vector_sync(&consumer, lease_owner, limit).await
+    }
 }
 
 impl<'storage, 'provider> ExistingGenerationFencedExecution<'storage, 'provider> {
@@ -462,6 +496,54 @@ where
     binding.into_fenced_execution(storage, registry).await
 }
 
+/// Resolves the only capability used by ordinary production Vector Sync after
+/// Schema 17.  The immutable binding supplies the profile id; the process-wide
+/// active profile is deliberately not consulted.
+pub(crate) async fn resolve_active_generation_fenced_execution<'storage, 'runtime, R, S>(
+    storage: &'storage StorageService,
+    runtime: &'runtime ModelRuntimeService<'runtime, R, S>,
+    registry: &LanceDbVectorStoreRegistry,
+) -> Result<ActiveGenerationFencedExecution<'storage, 'runtime>, ExistingGenerationBindingError>
+where
+    R: ModelProfileRepository,
+    S: SecretStore + ?Sized,
+{
+    let authority: ActiveGenerationAuthority = storage.load_active_generation_authority()?;
+    let resolved_provider = runtime
+        .resolve_embedding_provider(authority.bound_embedding_profile_id())
+        .map_err(|_| ExistingGenerationBindingError::generation_provider_unavailable())?;
+    let profile = &resolved_provider.profile;
+    let profile_dimension = verify_provider_facts(profile, resolved_provider.provider())?;
+    let transport_target = validate_and_normalize_url(&profile.base_url)
+        .map_err(|_| ExistingGenerationBindingError::generation_provider_mismatch())?;
+    let descriptor = compute_canonical_generation_descriptor(
+        &profile.provider_kind,
+        &profile.profile_id,
+        &transport_target,
+        &profile.model_name,
+        profile_dimension,
+    )?;
+    authority.verify_descriptor_and_dimension(&descriptor, profile_dimension)?;
+    let (context, authority_epoch) = authority.verify_current_and_seal(storage)?;
+    let data_root = storage
+        .active_data_root()
+        .map_err(|_| ExistingGenerationBindingError::existing_vector_store_unavailable())?;
+    let store_provider = registry
+        .bind_existing_generation_provider(&data_root)
+        .map_err(|_| ExistingGenerationBindingError::existing_vector_store_unavailable())?;
+    let store = store_provider
+        .existing_for_generation(context.generation_id())
+        .await
+        .map_err(|_| ExistingGenerationBindingError::existing_vector_store_unavailable())?;
+    Ok(ActiveGenerationFencedExecution {
+        storage,
+        context,
+        authority_epoch,
+        provider: resolved_provider,
+        store,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -574,6 +656,115 @@ mod tests {
             .generation_store_for_write(&data_root, &gen_id)
             .await
             .unwrap()
+    }
+
+    fn install_active_generation_fixture(
+        storage: &StorageService,
+        generation_id: &str,
+        descriptor_hash: &str,
+        dimension: usize,
+        profile_id: &str,
+        descriptor_version: &str,
+        witness_state: &str,
+    ) {
+        insert_generation_fixture(
+            storage,
+            generation_id,
+            descriptor_hash,
+            dimension,
+            "active",
+            1,
+        );
+        let conn =
+            open_authorized_test_connection(&storage.test_database_main_path().unwrap()).unwrap();
+        conn.execute(
+            "INSERT INTO memory_vector_generation_binding
+             (generation_id,descriptor_version,embedding_profile_id,created_at)
+             VALUES (?1,?2,?3,'2026-01-01T00:00:00.000Z')",
+            params![generation_id, descriptor_version, profile_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO memory_vector_generation_store_witness
+             (generation_id,create_operation_id,state,last_error_code,updated_at)
+             VALUES (?1,NULL,?2,NULL,'2026-01-01T00:00:00.000Z')",
+            params![generation_id, witness_state],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memory_vector_generation_authority
+             SET active_generation_id=?1,updated_at='2026-01-01T00:00:00.000Z'
+             WHERE singleton=1",
+            [generation_id],
+        )
+        .unwrap();
+    }
+
+    fn canonical_test_descriptor(profile_id: &str, dimension: usize) -> String {
+        compute_canonical_generation_descriptor(
+            &ModelProviderKind::OpenaiCompatible,
+            profile_id,
+            &validate_and_normalize_url("https://api.openai.com/v1").unwrap(),
+            "text-embedding-3-small",
+            dimension,
+        )
+        .unwrap()
+    }
+
+    fn insert_outbox_fixture(
+        storage: &StorageService,
+        memory_id: &str,
+        state: &str,
+        attempt_count: i64,
+        generation_id: Option<&str>,
+        authority_epoch: Option<i64>,
+    ) {
+        let conn =
+            open_authorized_test_connection(&storage.test_database_main_path().unwrap()).unwrap();
+        conn.execute(
+            "INSERT INTO memory_vector_sync_outbox
+             (life_id,memory_id,desired_action,state,attempt_count,mutation_sequence,
+              claimed_generation_id,claimed_generation_authority_epoch,created_at,updated_at)
+             VALUES ('d9d3-b-life',?1,'delete',?2,?3,1,?4,?5,
+                     '2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z')",
+            params![
+                memory_id,
+                state,
+                attempt_count,
+                generation_id,
+                authority_epoch
+            ],
+        )
+        .unwrap();
+    }
+
+    fn insert_upsert_outbox_fixture(
+        storage: &StorageService,
+        memory_id: &str,
+        state: &str,
+        attempt_count: i64,
+        generation_id: Option<&str>,
+        authority_epoch: Option<i64>,
+    ) {
+        let conn =
+            open_authorized_test_connection(&storage.test_database_main_path().unwrap()).unwrap();
+        conn.execute(
+            "INSERT INTO memory_vector_sync_outbox
+             (life_id,memory_id,desired_action,state,attempt_count,mutation_sequence,
+              target_revision,target_content_hash,claimed_generation_id,
+              claimed_generation_authority_epoch,next_attempt_at,created_at,updated_at)
+             VALUES ('d9d3-b-life',?1,'upsert',?2,?3,1,1,'d9d3-b-content',?4,?5,
+                     CASE WHEN ?2='retry_wait' THEN '1970-01-01T00:00:00.000Z' ELSE NULL END,
+                     '2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z')",
+            params![
+                memory_id,
+                state,
+                attempt_count,
+                generation_id,
+                authority_epoch
+            ],
+        )
+        .unwrap();
     }
 
     struct MockEmbeddingProviderWithoutDimension;
@@ -1172,6 +1363,722 @@ mod tests {
 
         assert_eq!(report.processed, 0);
         assert!(report.stopped_no_eligible);
+    }
+
+    #[test]
+    fn d9d3_b_active_authority_loader_matrix_fails_closed_and_accepts_exact_ready_binding() {
+        let (_dir, storage) = test_storage();
+        let secrets = InMemorySecretStore::new();
+        let profile_id = create_test_profile(
+            &storage,
+            &secrets,
+            "https://api.openai.com/v1",
+            "text-embedding-3-small",
+            1536,
+        );
+        let descriptor = canonical_test_descriptor(&profile_id, 1536);
+
+        // A1: the Schema17 singleton starts with no active pointer.
+        assert!(storage.load_active_generation_authority().is_err());
+
+        // A7: an active pointer without immutable binding or witness is never authority.
+        insert_generation_fixture(&storage, "active-matrix", &descriptor, 1536, "active", 1);
+        let conn =
+            open_authorized_test_connection(&storage.test_database_main_path().unwrap()).unwrap();
+        conn.execute(
+            "UPDATE memory_vector_generation_authority SET active_generation_id='active-matrix' WHERE singleton=1",
+            [],
+        )
+        .unwrap();
+        assert!(storage.load_active_generation_authority().is_err());
+
+        conn.execute(
+            "INSERT INTO memory_vector_generation_binding (generation_id,descriptor_version,embedding_profile_id,created_at)
+             VALUES ('active-matrix',?1,?2,'2026-01-01T00:00:00.000Z')",
+            params![D9D2_GENERATION_DESCRIPTOR_VERSION, profile_id],
+        )
+        .unwrap();
+        for witness in [
+            "unverified",
+            "absent",
+            "create_started",
+            "uncertain",
+            "deleted",
+        ] {
+            conn.execute(
+                "INSERT INTO memory_vector_generation_store_witness
+                 (generation_id,create_operation_id,state,last_error_code,updated_at)
+                 VALUES ('active-matrix',NULL,?1,NULL,'2026-01-01T00:00:00.000Z')
+                 ON CONFLICT(generation_id) DO UPDATE SET state=excluded.state",
+                [witness],
+            )
+            .unwrap();
+            assert!(
+                storage.load_active_generation_authority().is_err(),
+                "{witness}"
+            );
+        }
+        conn.execute(
+            "UPDATE memory_vector_generation_store_witness SET state='ready' WHERE generation_id='active-matrix'",
+            [],
+        )
+        .unwrap();
+        assert!(storage.load_active_generation_authority().is_ok());
+    }
+
+    #[test]
+    fn d9d3_b_active_resolver_uses_bound_profile_not_global_profile_and_requires_existing_store() {
+        let (_dir, storage) = test_storage();
+        let secrets = InMemorySecretStore::new();
+        let profile_a = create_test_profile(
+            &storage,
+            &secrets,
+            "https://api.openai.com/v1",
+            "text-embedding-3-small",
+            1536,
+        );
+        let profile_b = create_test_profile(
+            &storage,
+            &secrets,
+            "https://api.openai.com/v1",
+            "text-embedding-3-small",
+            768,
+        );
+        let descriptor = canonical_test_descriptor(&profile_a, 1536);
+        install_active_generation_fixture(
+            &storage,
+            "active-bound-profile",
+            &descriptor,
+            1536,
+            &profile_a,
+            D9D2_GENERATION_DESCRIPTOR_VERSION,
+            "ready",
+        );
+        let registry = LanceDbVectorStoreRegistry::default();
+        let coordinator = ModelRuntimeCoordinator::new(Duration::from_secs(5));
+        let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
+        // The global profile is B; before an exact existing store exists, B must
+        // not be used as a fallback and resolution fails closed.
+        assert_ne!(profile_a, profile_b);
+        assert!(
+            tauri::async_runtime::block_on(resolve_active_generation_fenced_execution(
+                &storage, &runtime, &registry,
+            ))
+            .is_err()
+        );
+        let _store = tauri::async_runtime::block_on(setup_pre_existing_lance_store(
+            &storage,
+            &registry,
+            "active-bound-profile",
+        ));
+        let execution = tauri::async_runtime::block_on(resolve_active_generation_fenced_execution(
+            &storage, &runtime, &registry,
+        ));
+        assert!(execution.is_ok());
+    }
+
+    #[test]
+    fn d9d3_b_active_claim_persists_generation_and_epoch_atomically() {
+        let (_dir, storage) = test_storage();
+        let secrets = InMemorySecretStore::new();
+        let profile = create_test_profile(
+            &storage,
+            &secrets,
+            "https://api.openai.com/v1",
+            "text-embedding-3-small",
+            1536,
+        );
+        let descriptor = canonical_test_descriptor(&profile, 1536);
+        install_active_generation_fixture(
+            &storage,
+            "active-claim",
+            &descriptor,
+            1536,
+            &profile,
+            D9D2_GENERATION_DESCRIPTOR_VERSION,
+            "ready",
+        );
+        insert_outbox_fixture(&storage, "active-claim-memory", "pending", 0, None, None);
+        let claim = storage
+            .claim_one_active_fenced_vector_sync_with_retry_cutoff(
+                "active-claim",
+                &descriptor,
+                1536,
+                1,
+                "active-claim-worker",
+                Some(0),
+            )
+            .unwrap();
+        assert!(claim.is_some());
+        let conn =
+            open_authorized_test_connection(&storage.test_database_main_path().unwrap()).unwrap();
+        let persisted: (Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT claimed_generation_id,claimed_generation_authority_epoch
+                 FROM memory_vector_sync_outbox WHERE memory_id='active-claim-memory'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(persisted, (Some("active-claim".into()), Some(1)));
+    }
+
+    #[test]
+    fn d9d3_b_historical_null_epoch_cannot_be_claimed_or_rebound() {
+        let (_dir, storage) = test_storage();
+        let secrets = InMemorySecretStore::new();
+        let profile = create_test_profile(
+            &storage,
+            &secrets,
+            "https://api.openai.com/v1",
+            "text-embedding-3-small",
+            1536,
+        );
+        let descriptor = canonical_test_descriptor(&profile, 1536);
+        install_active_generation_fixture(
+            &storage,
+            "active-historical",
+            &descriptor,
+            1536,
+            &profile,
+            D9D2_GENERATION_DESCRIPTOR_VERSION,
+            "ready",
+        );
+        insert_outbox_fixture(
+            &storage,
+            "historical-null-epoch",
+            "retry_wait",
+            1,
+            Some("active-historical"),
+            None,
+        );
+        assert!(storage
+            .claim_one_active_fenced_vector_sync_with_retry_cutoff(
+                "active-historical",
+                &descriptor,
+                1536,
+                1,
+                "historical-worker",
+                Some(0),
+            )
+            .unwrap()
+            .is_none());
+        let conn =
+            open_authorized_test_connection(&storage.test_database_main_path().unwrap()).unwrap();
+        let persisted: (i64, Option<i64>) = conn
+            .query_row(
+                "SELECT attempt_count,claimed_generation_authority_epoch
+             FROM memory_vector_sync_outbox WHERE memory_id='historical-null-epoch'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(persisted, (1, None));
+    }
+
+    #[test]
+    fn d9d3_b_stale_active_authority_cannot_reserve_attempt() {
+        let (_dir, storage) = test_storage();
+        let secrets = InMemorySecretStore::new();
+        let profile = create_test_profile(
+            &storage,
+            &secrets,
+            "https://api.openai.com/v1",
+            "text-embedding-3-small",
+            1536,
+        );
+        let descriptor = canonical_test_descriptor(&profile, 1536);
+        install_active_generation_fixture(
+            &storage,
+            "active-stale",
+            &descriptor,
+            1536,
+            &profile,
+            D9D2_GENERATION_DESCRIPTOR_VERSION,
+            "ready",
+        );
+        insert_outbox_fixture(&storage, "stale-reservation", "pending", 0, None, None);
+        let claim = storage
+            .claim_one_active_fenced_vector_sync_with_retry_cutoff(
+                "active-stale",
+                &descriptor,
+                1536,
+                1,
+                "stale-worker",
+                Some(0),
+            )
+            .unwrap()
+            .unwrap();
+        let conn =
+            open_authorized_test_connection(&storage.test_database_main_path().unwrap()).unwrap();
+        conn.execute(
+            "UPDATE memory_vector_generation_authority SET active_generation_id=NULL WHERE singleton=1",
+            [],
+        )
+        .unwrap();
+        assert!(matches!(
+            storage.reserve_fenced_attempt(&claim).unwrap(),
+            crate::storage::FencedAttemptReservation::LostLeaseOrSuperseded
+        ));
+        let attempts: i64 = conn.query_row(
+            "SELECT attempt_count FROM memory_vector_sync_outbox WHERE memory_id='stale-reservation'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(attempts, 0);
+    }
+
+    #[test]
+    fn d9d3_b_stale_active_token_cannot_success_or_failure_finalize_or_mark_delete_witness() {
+        let make_active = |storage: &StorageService, generation_id: &str, profile: &str| {
+            let descriptor = canonical_test_descriptor(profile, 1536);
+            install_active_generation_fixture(
+                storage,
+                generation_id,
+                &descriptor,
+                1536,
+                profile,
+                D9D2_GENERATION_DESCRIPTOR_VERSION,
+                "ready",
+            );
+            descriptor
+        };
+
+        // A stale Upsert token cannot create a generation item or delete its
+        // outbox row as a successful completion.
+        {
+            let (_dir, storage) = test_storage();
+            let secrets = InMemorySecretStore::new();
+            let profile = create_test_profile(
+                &storage,
+                &secrets,
+                "https://api.openai.com/v1",
+                "text-embedding-3-small",
+                1536,
+            );
+            let descriptor = make_active(&storage, "stale-success", &profile);
+            insert_upsert_outbox_fixture(
+                &storage,
+                "stale-success-memory",
+                "pending",
+                0,
+                None,
+                None,
+            );
+            let claim = storage
+                .claim_one_active_fenced_vector_sync_with_retry_cutoff(
+                    "stale-success",
+                    &descriptor,
+                    1536,
+                    1,
+                    "stale-success-worker",
+                    Some(0),
+                )
+                .unwrap()
+                .unwrap();
+            let token = match storage.reserve_fenced_attempt(&claim).unwrap() {
+                crate::storage::FencedAttemptReservation::Reserved(token) => token,
+                _ => panic!("expected reserved token"),
+            };
+            let conn = open_authorized_test_connection(&storage.test_database_main_path().unwrap())
+                .unwrap();
+            conn.execute(
+                "UPDATE memory_vector_generation_authority SET active_generation_id=NULL WHERE singleton=1",
+                [],
+            )
+            .unwrap();
+            assert_eq!(
+                storage.finalize_fenced_vector_sync(&token).unwrap(),
+                crate::storage::FencedFinalizeResult::LostLeaseOrSuperseded
+            );
+            let item_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM memory_vector_generation_item WHERE generation_id='stale-success'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let outbox_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM memory_vector_sync_outbox WHERE memory_id='stale-success-memory'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(item_count, 0);
+            assert_eq!(outbox_count, 1);
+        }
+
+        // A stale Upsert token cannot create a retry that could later run under
+        // another authority world.
+        {
+            let (_dir, storage) = test_storage();
+            let secrets = InMemorySecretStore::new();
+            let profile = create_test_profile(
+                &storage,
+                &secrets,
+                "https://api.openai.com/v1",
+                "text-embedding-3-small",
+                1536,
+            );
+            let descriptor = make_active(&storage, "stale-failure", &profile);
+            insert_upsert_outbox_fixture(
+                &storage,
+                "stale-failure-memory",
+                "pending",
+                0,
+                None,
+                None,
+            );
+            let claim = storage
+                .claim_one_active_fenced_vector_sync_with_retry_cutoff(
+                    "stale-failure",
+                    &descriptor,
+                    1536,
+                    1,
+                    "stale-failure-worker",
+                    Some(0),
+                )
+                .unwrap()
+                .unwrap();
+            let token = match storage.reserve_fenced_attempt(&claim).unwrap() {
+                crate::storage::FencedAttemptReservation::Reserved(token) => token,
+                _ => panic!("expected reserved token"),
+            };
+            let conn = open_authorized_test_connection(&storage.test_database_main_path().unwrap())
+                .unwrap();
+            conn.execute(
+                "UPDATE memory_vector_generation_authority SET active_generation_id=NULL WHERE singleton=1",
+                [],
+            )
+            .unwrap();
+            assert_eq!(
+                storage
+                    .finalize_fenced_vector_failure(
+                        &token,
+                        "PROVIDER_UNAVAILABLE",
+                        crate::storage::FencedFailureDecision::RetryAfter { delay_millis: 1 },
+                        Some("definitely_not_sent"),
+                        0,
+                        0,
+                    )
+                    .unwrap(),
+                crate::storage::FencedFailureFinalizeResult::LostLeaseOrSuperseded
+            );
+            let state: String = conn
+                .query_row(
+                    "SELECT state FROM memory_vector_sync_outbox WHERE memory_id='stale-failure-memory'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(state, "processing");
+        }
+
+        // A stale Delete token cannot write a pre-send witness or create a
+        // Late Delete resolution anchor.
+        {
+            let (_dir, storage) = test_storage();
+            let secrets = InMemorySecretStore::new();
+            let profile = create_test_profile(
+                &storage,
+                &secrets,
+                "https://api.openai.com/v1",
+                "text-embedding-3-small",
+                1536,
+            );
+            let descriptor = make_active(&storage, "stale-delete", &profile);
+            insert_outbox_fixture(&storage, "stale-delete-memory", "pending", 0, None, None);
+            let claim = storage
+                .claim_one_active_fenced_vector_sync_with_retry_cutoff(
+                    "stale-delete",
+                    &descriptor,
+                    1536,
+                    1,
+                    "stale-delete-worker",
+                    Some(0),
+                )
+                .unwrap()
+                .unwrap();
+            let token = match storage.reserve_fenced_attempt(&claim).unwrap() {
+                crate::storage::FencedAttemptReservation::Reserved(token) => token,
+                _ => panic!("expected reserved token"),
+            };
+            let conn = open_authorized_test_connection(&storage.test_database_main_path().unwrap())
+                .unwrap();
+            conn.execute(
+                "UPDATE memory_vector_generation_authority SET active_generation_id=NULL WHERE singleton=1",
+                [],
+            )
+            .unwrap();
+            assert_eq!(
+                storage.mark_fenced_delete_send_witness(&token).unwrap(),
+                crate::storage::FencedDeleteWitnessResult::LostLeaseOrSuperseded
+            );
+            let witness: (Option<String>, Option<String>) = conn
+                .query_row(
+                    "SELECT last_send_disposition,delete_witness_at
+                     FROM memory_vector_sync_outbox WHERE memory_id='stale-delete-memory'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            let resolutions: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM memory_vector_late_delete_resolution",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(witness, (None, None));
+            assert_eq!(resolutions, 0);
+        }
+    }
+
+    #[test]
+    fn d9d3_b_durable_retry_requires_exact_active_generation_and_epoch() {
+        fn setup() -> (tempfile::TempDir, StorageService, String, String) {
+            let (dir, storage) = test_storage();
+            let secrets = InMemorySecretStore::new();
+            let profile = create_test_profile(
+                &storage,
+                &secrets,
+                "https://api.openai.com/v1",
+                "text-embedding-3-small",
+                1536,
+            );
+            let descriptor = canonical_test_descriptor(&profile, 1536);
+            install_active_generation_fixture(
+                &storage,
+                "retry-g1",
+                &descriptor,
+                1536,
+                &profile,
+                D9D2_GENERATION_DESCRIPTOR_VERSION,
+                "ready",
+            );
+            insert_upsert_outbox_fixture(
+                &storage,
+                "durable-retry",
+                "retry_wait",
+                1,
+                Some("retry-g1"),
+                Some(1),
+            );
+            (dir, storage, profile, descriptor)
+        }
+
+        // The one exact current world is eligible.
+        {
+            let (_dir, storage, _profile, descriptor) = setup();
+            assert!(storage
+                .claim_one_active_fenced_vector_sync_with_retry_cutoff(
+                    "retry-g1",
+                    &descriptor,
+                    1536,
+                    1,
+                    "retry-exact",
+                    Some(0),
+                )
+                .unwrap()
+                .is_some());
+        }
+
+        // Schema-17 forbids an active generation from changing epoch in place;
+        // even an attempted active claim at G@E+1 cannot repair or rebind G@E.
+        {
+            let (_dir, storage, _profile, descriptor) = setup();
+            assert!(storage
+                .claim_one_active_fenced_vector_sync_with_retry_cutoff(
+                    "retry-g1",
+                    &descriptor,
+                    1536,
+                    2,
+                    "retry-newer-epoch",
+                    Some(0),
+                )
+                .unwrap()
+                .is_none());
+        }
+
+        // A different active generation cannot take over G1's durable retry.
+        {
+            let (_dir, storage, profile, descriptor) = setup();
+            let conn = open_authorized_test_connection(&storage.test_database_main_path().unwrap())
+                .unwrap();
+            conn.execute(
+                "UPDATE memory_vector_generation_authority SET active_generation_id=NULL WHERE singleton=1",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE memory_vector_generation
+                 SET state='retired', authority_epoch=2 WHERE generation_id='retry-g1'",
+                [],
+            )
+            .unwrap();
+            install_active_generation_fixture(
+                &storage,
+                "retry-g2",
+                &descriptor,
+                1536,
+                &profile,
+                D9D2_GENERATION_DESCRIPTOR_VERSION,
+                "ready",
+            );
+            assert!(storage
+                .claim_one_active_fenced_vector_sync_with_retry_cutoff(
+                    "retry-g2",
+                    &descriptor,
+                    1536,
+                    1,
+                    "retry-g2",
+                    Some(0),
+                )
+                .unwrap()
+                .is_none());
+        }
+
+        // A retired old generation is never current, even if its descriptor
+        // remains unchanged. `failed` is not a legal successor of `active` in
+        // Schema-17, so it cannot be a stale active-retry world.
+        for state in ["retired"] {
+            let (_dir, storage, _profile, descriptor) = setup();
+            let conn = open_authorized_test_connection(&storage.test_database_main_path().unwrap())
+                .unwrap();
+            conn.execute(
+                "UPDATE memory_vector_generation_authority SET active_generation_id=NULL WHERE singleton=1",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE memory_vector_generation
+                 SET state=?1, authority_epoch=2 WHERE generation_id='retry-g1'",
+                [state],
+            )
+            .unwrap();
+            assert!(storage
+                .claim_one_active_fenced_vector_sync_with_retry_cutoff(
+                    "retry-g1",
+                    &descriptor,
+                    1536,
+                    1,
+                    state,
+                    Some(0),
+                )
+                .unwrap()
+                .is_none());
+        }
+
+        // No active pointer is likewise a non-current authority world.
+        {
+            let (_dir, storage, _profile, descriptor) = setup();
+            let conn = open_authorized_test_connection(&storage.test_database_main_path().unwrap())
+                .unwrap();
+            conn.execute(
+                "UPDATE memory_vector_generation_authority SET active_generation_id=NULL WHERE singleton=1",
+                [],
+            )
+            .unwrap();
+            assert!(storage
+                .claim_one_active_fenced_vector_sync_with_retry_cutoff(
+                    "retry-g1",
+                    &descriptor,
+                    1536,
+                    1,
+                    "retry-pointer-moved",
+                    Some(0),
+                )
+                .unwrap()
+                .is_none());
+            let pair: (Option<String>, Option<i64>) = conn
+                .query_row(
+                    "SELECT claimed_generation_id,claimed_generation_authority_epoch
+                     FROM memory_vector_sync_outbox WHERE memory_id='durable-retry'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(pair, (Some("retry-g1".into()), Some(1)));
+        }
+    }
+
+    #[test]
+    fn d9d3_b_two_storage_service_authority_race_rejects_reserved_old_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage_a =
+            StorageService::initialize_with_roots(dir.path().join("data"), None).unwrap();
+        let storage_b =
+            StorageService::initialize_with_roots(dir.path().join("data"), None).unwrap();
+        let secrets = InMemorySecretStore::new();
+        let profile = create_test_profile(
+            &storage_a,
+            &secrets,
+            "https://api.openai.com/v1",
+            "text-embedding-3-small",
+            1536,
+        );
+        let descriptor = canonical_test_descriptor(&profile, 1536);
+        install_active_generation_fixture(
+            &storage_a,
+            "race-g1",
+            &descriptor,
+            1536,
+            &profile,
+            D9D2_GENERATION_DESCRIPTOR_VERSION,
+            "ready",
+        );
+        insert_upsert_outbox_fixture(&storage_a, "race-memory", "pending", 0, None, None);
+        let claim = storage_a
+            .claim_one_active_fenced_vector_sync_with_retry_cutoff(
+                "race-g1",
+                &descriptor,
+                1536,
+                1,
+                "race-a",
+                Some(0),
+            )
+            .unwrap()
+            .unwrap();
+        let token = match storage_a.reserve_fenced_attempt(&claim).unwrap() {
+            crate::storage::FencedAttemptReservation::Reserved(token) => token,
+            _ => panic!("expected reserved token"),
+        };
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let barrier_b = std::sync::Arc::clone(&barrier);
+        let (changed_tx, changed_rx) = std::sync::mpsc::channel();
+        let changer = std::thread::spawn(move || {
+            barrier_b.wait();
+            let conn =
+                open_authorized_test_connection(&storage_b.test_database_main_path().unwrap())
+                    .unwrap();
+            conn.execute(
+                "UPDATE memory_vector_generation_authority SET active_generation_id=NULL WHERE singleton=1",
+                [],
+            )
+            .unwrap();
+            changed_tx.send(()).unwrap();
+        });
+        barrier.wait();
+        changed_rx.recv().unwrap();
+        changer.join().unwrap();
+        assert_eq!(
+            storage_a.finalize_fenced_vector_sync(&token).unwrap(),
+            crate::storage::FencedFinalizeResult::LostLeaseOrSuperseded
+        );
+        let conn =
+            open_authorized_test_connection(&storage_a.test_database_main_path().unwrap()).unwrap();
+        let final_state: (String, i64, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT state,attempt_count,claimed_generation_id,claimed_generation_authority_epoch
+                 FROM memory_vector_sync_outbox WHERE memory_id='race-memory'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            final_state,
+            ("processing".into(), 1, Some("race-g1".into()), Some(1))
+        );
     }
 
     #[test]

@@ -301,6 +301,7 @@ pub(crate) struct FencedVectorSyncSingleEventConsumer<'a> {
     embedding: &'a dyn EmbeddingProvider,
     vectors: &'a dyn VectorStore,
     generation: VectorGenerationContext,
+    generation_authority_epoch: Option<i64>,
     retry_clock: Box<dyn RetryClock>,
     #[cfg(test)]
     force_stale_result_for_test: std::cell::Cell<bool>,
@@ -355,6 +356,7 @@ impl<'a> FencedVectorSyncSingleEventConsumer<'a> {
             embedding,
             vectors,
             generation,
+            generation_authority_epoch: None,
             retry_clock: Box::new(SystemRetryClock),
             #[cfg(test)]
             force_stale_result_for_test: std::cell::Cell::new(false),
@@ -377,6 +379,18 @@ impl<'a> FencedVectorSyncSingleEventConsumer<'a> {
             #[cfg(test)]
             process_one_invocations_for_test: std::cell::Cell::new(0),
         }
+    }
+
+    pub(crate) fn new_active_generation(
+        storage: &'a StorageService,
+        embedding: &'a dyn EmbeddingProvider,
+        vectors: &'a dyn VectorStore,
+        generation: VectorGenerationContext,
+        authority_epoch: i64,
+    ) -> Self {
+        let mut consumer = Self::new(storage, embedding, vectors, generation);
+        consumer.generation_authority_epoch = Some(authority_epoch);
+        consumer
     }
 
     #[cfg(test)]
@@ -491,16 +505,26 @@ impl<'a> FencedVectorSyncSingleEventConsumer<'a> {
             }
             return Ok(forced);
         }
-        let claim = self
-            .storage
-            .claim_one_fenced_vector_sync_with_retry_cutoff(
+        let claim = match self.generation_authority_epoch {
+            Some(authority_epoch) => self
+                .storage
+                .claim_one_active_fenced_vector_sync_with_retry_cutoff(
+                    self.generation.generation_id().as_str(),
+                    self.generation.descriptor_hash(),
+                    self.generation.dimension(),
+                    authority_epoch,
+                    lease_owner,
+                    Some(retry_cutoff),
+                ),
+            None => self.storage.claim_one_fenced_vector_sync_with_retry_cutoff(
                 self.generation.generation_id().as_str(),
                 self.generation.descriptor_hash(),
                 self.generation.dimension(),
                 lease_owner,
                 Some(retry_cutoff),
-            )
-            .map_err(|_| worker_error(MemoryVectorSyncWorkerErrorCode::OutboxUnavailable))?;
+            ),
+        }
+        .map_err(|_| worker_error(MemoryVectorSyncWorkerErrorCode::OutboxUnavailable))?;
         let Some(claim) = claim else {
             return Ok(FencedVectorSyncSingleEventResult::NoEligibleEvent);
         };
@@ -2156,6 +2180,47 @@ mod tests {
         )
     }
 
+    fn install_active_generation_authority_for_worker_test(
+        storage: &StorageService,
+        generation_id: &str,
+        descriptor_hash: &str,
+        dimension: usize,
+    ) {
+        let conn = crate::storage::open_authorized_test_connection(
+            &storage.test_database_main_path().unwrap(),
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO memory_vector_generation
+             (generation_id, descriptor_hash, dimension, state, authority_epoch)
+             VALUES (?1, ?2, ?3, 'active', 1)",
+            rusqlite::params![generation_id, descriptor_hash, dimension as i64],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO memory_vector_generation_binding
+             (generation_id, descriptor_version, embedding_profile_id, created_at)
+             VALUES (?1, 'D9D2_GENERATION_DESCRIPTOR_V1', 'worker-test-profile',
+                     '2026-01-01T00:00:00.000Z')",
+            [generation_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO memory_vector_generation_store_witness
+             (generation_id, create_operation_id, state, last_error_code, updated_at)
+             VALUES (?1, NULL, 'ready', NULL, '2026-01-01T00:00:00.000Z')",
+            [generation_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memory_vector_generation_authority
+             SET active_generation_id=?1, updated_at='2026-01-01T00:00:00.000Z'
+             WHERE singleton=1",
+            [generation_id],
+        )
+        .unwrap();
+    }
+
     fn activate_profile(storage: &StorageService, base_url: &str) -> String {
         let service = ModelProfileService::new(storage);
         let profile = service
@@ -3532,6 +3597,149 @@ mod tests {
                 Some("possibly_sent")
             );
         }
+    }
+
+    #[test]
+    fn d9d3_b_stale_active_authority_after_reservation_stops_before_provider() {
+        let (temp, storage) = test_storage();
+        let record = confirmed(&storage, false);
+        let descriptor = "d".repeat(64);
+        install_active_generation_authority_for_worker_test(
+            &storage,
+            "d9d3-pre-provider",
+            &descriptor,
+            3,
+        );
+        let context = VectorGenerationContext::new(
+            crate::vector_store::VectorGenerationId::parse("d9d3-pre-provider").unwrap(),
+            descriptor,
+            3,
+        )
+        .unwrap();
+        let raw_vectors = tauri::async_runtime::block_on(
+            crate::vector_store::LanceDbVectorStore::open(temp.path().join("lance")),
+        )
+        .unwrap();
+        tauri::async_runtime::block_on(raw_vectors.create_generation(&context)).unwrap();
+        let lance_upserts = Arc::new(AtomicUsize::new(0));
+        let lance_deletes = Arc::new(AtomicUsize::new(0));
+        let current_lance_writes = Arc::new(AtomicUsize::new(0));
+        let max_concurrent_lance_writes = Arc::new(AtomicUsize::new(0));
+        let vectors = CountingVectorStore {
+            inner: raw_vectors,
+            lance_upserts: Arc::clone(&lance_upserts),
+            lance_deletes: Arc::clone(&lance_deletes),
+            current_lance_writes,
+            max_concurrent_lance_writes,
+        };
+        let raw_provider = crate::embedding::DeterministicEmbeddingProvider::new(3);
+        let provider_requests = Arc::new(AtomicUsize::new(0));
+        let embedding_successes = Arc::new(AtomicUsize::new(0));
+        let provider = CountingEmbeddingProvider {
+            inner: &raw_provider,
+            provider_requests: Arc::clone(&provider_requests),
+            embedding_successes,
+        };
+        let database_path = storage.test_database_main_path().unwrap();
+        let consumer = FencedVectorSyncSingleEventConsumer::new_active_generation(
+            &storage, &provider, &vectors, context, 1,
+        );
+        consumer.set_test_pause_hook_for_test(Some(Box::new(move |point| {
+            if point == VectorSyncTestPausePoint::BeforeEmbedding {
+                let conn = crate::storage::open_authorized_test_connection(&database_path).unwrap();
+                conn.execute(
+                    "UPDATE memory_vector_generation_authority
+                     SET active_generation_id=NULL WHERE singleton=1",
+                    [],
+                )
+                .unwrap();
+            }
+        })));
+
+        assert_eq!(
+            tauri::async_runtime::block_on(consumer.process_one("d9d3-worker")).unwrap(),
+            FencedVectorSyncSingleEventResult::LostLeaseOrSuperseded
+        );
+        consumer.set_test_pause_hook_for_test(None);
+        assert_eq!(provider_requests.load(Ordering::SeqCst), 0);
+        assert_eq!(lance_upserts.load(Ordering::SeqCst), 0);
+        assert_eq!(lance_deletes.load(Ordering::SeqCst), 0);
+        let snapshot = storage
+            .test_get_outbox_snapshot_detailed(&record.life_id, &record.id)
+            .unwrap();
+        assert_eq!(
+            snapshot.attempt_count, 1,
+            "reserved Attempt is never refunded"
+        );
+        assert_eq!(snapshot.state, "processing");
+    }
+
+    #[test]
+    fn d9d3_b_active_authority_stale_after_provider_stops_before_lance() {
+        let (temp, storage) = test_storage();
+        let _record = confirmed(&storage, false);
+        let descriptor = "e".repeat(64);
+        install_active_generation_authority_for_worker_test(
+            &storage,
+            "d9d3-provider-lance",
+            &descriptor,
+            3,
+        );
+        let context = VectorGenerationContext::new(
+            crate::vector_store::VectorGenerationId::parse("d9d3-provider-lance").unwrap(),
+            descriptor,
+            3,
+        )
+        .unwrap();
+        let raw_vectors = tauri::async_runtime::block_on(
+            crate::vector_store::LanceDbVectorStore::open(temp.path().join("lance")),
+        )
+        .unwrap();
+        tauri::async_runtime::block_on(raw_vectors.create_generation(&context)).unwrap();
+        let lance_upserts = Arc::new(AtomicUsize::new(0));
+        let lance_deletes = Arc::new(AtomicUsize::new(0));
+        let current_lance_writes = Arc::new(AtomicUsize::new(0));
+        let max_concurrent_lance_writes = Arc::new(AtomicUsize::new(0));
+        let vectors = CountingVectorStore {
+            inner: raw_vectors,
+            lance_upserts: Arc::clone(&lance_upserts),
+            lance_deletes: Arc::clone(&lance_deletes),
+            current_lance_writes,
+            max_concurrent_lance_writes,
+        };
+        let raw_provider = crate::embedding::DeterministicEmbeddingProvider::new(3);
+        let provider_requests = Arc::new(AtomicUsize::new(0));
+        let embedding_successes = Arc::new(AtomicUsize::new(0));
+        let provider = CountingEmbeddingProvider {
+            inner: &raw_provider,
+            provider_requests: Arc::clone(&provider_requests),
+            embedding_successes: Arc::clone(&embedding_successes),
+        };
+        let database_path = storage.test_database_main_path().unwrap();
+        let consumer = FencedVectorSyncSingleEventConsumer::new_active_generation(
+            &storage, &provider, &vectors, context, 1,
+        );
+        consumer.set_test_pause_hook_for_test(Some(Box::new(move |point| {
+            if point == VectorSyncTestPausePoint::AfterEmbeddingBeforeLance {
+                let conn = crate::storage::open_authorized_test_connection(&database_path).unwrap();
+                conn.execute(
+                    "UPDATE memory_vector_generation_authority
+                     SET active_generation_id=NULL WHERE singleton=1",
+                    [],
+                )
+                .unwrap();
+            }
+        })));
+
+        assert_eq!(
+            tauri::async_runtime::block_on(consumer.process_one("d9d3-worker")).unwrap(),
+            FencedVectorSyncSingleEventResult::LostLeaseOrSuperseded
+        );
+        consumer.set_test_pause_hook_for_test(None);
+        assert_eq!(provider_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(embedding_successes.load(Ordering::SeqCst), 1);
+        assert_eq!(lance_upserts.load(Ordering::SeqCst), 0);
+        assert_eq!(lance_deletes.load(Ordering::SeqCst), 0);
     }
 
     #[test]

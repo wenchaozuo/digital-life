@@ -65,6 +65,7 @@ pub(crate) struct FencedAttemptToken {
     target_revision: Option<i64>,
     target_content_hash: Option<String>,
     generation_id: String,
+    generation_authority_epoch: Option<i64>,
     descriptor_hash: String,
     dimension: usize,
     lease_owner: String,
@@ -133,6 +134,7 @@ impl FencedAttemptToken {
             target_revision: self.target_revision,
             target_content_hash: self.target_content_hash.clone(),
             generation_id: self.generation_id.clone(),
+            generation_authority_epoch: self.generation_authority_epoch,
             descriptor_hash: self.descriptor_hash.clone(),
             dimension: self.dimension,
             lease_owner: self.lease_owner.clone(),
@@ -291,7 +293,7 @@ pub(super) fn enqueue_in_transaction(
            desired_action = excluded.desired_action, state = 'pending', attempt_count = 0,
            fenced_claim_epoch = 0, last_marked_claim_epoch = 0,
            next_attempt_at = NULL, lease_owner = NULL, lease_expires_at = NULL,
-           lease_fence_epoch = NULL, claimed_generation_id = NULL, last_send_disposition = NULL,
+           lease_fence_epoch = NULL, claimed_generation_id = NULL, claimed_generation_authority_epoch = NULL, last_send_disposition = NULL,
            migration_disposition = NULL, mutation_sequence = excluded.mutation_sequence,
            target_revision = excluded.target_revision, target_content_hash = excluded.target_content_hash,
            last_error_code = NULL, updated_at = excluded.updated_at",
@@ -338,6 +340,7 @@ pub(crate) struct FencedVectorSyncClaim {
     target_revision: Option<i64>,
     target_content_hash: Option<String>,
     generation_id: String,
+    generation_authority_epoch: Option<i64>,
     descriptor_hash: String,
     dimension: usize,
     lease_owner: String,
@@ -365,6 +368,7 @@ struct GenerationBindingFacts<'a> {
     state: &'a str,
     attempt_count: i64,
     claimed_generation_id: Option<&'a str>,
+    claimed_generation_authority_epoch: Option<i64>,
     lease_owner: Option<&'a str>,
     lease_fence_epoch: Option<i64>,
     lease_expires_at: Option<&'a str>,
@@ -378,8 +382,19 @@ fn generation_binding_phase(facts: GenerationBindingFacts<'_>) -> GenerationBind
     let has_valid_generation = facts
         .claimed_generation_id
         .is_some_and(|generation_id| !generation_id.is_empty());
+    // The frozen D9D2 building bridge intentionally predates the active
+    // authority epoch, so its durable identity is `(generation_id, NULL)`.
+    // Schema-17 ordinary execution remains exact-pair-only: the active claim
+    // selector and token predicates require `Some(epoch >= 1)`, while their
+    // legacy branch separately requires `state='building'`.  Keeping that
+    // structural distinction here preserves frozen building no-replay tests
+    // without allowing a historical NULL epoch to bind to an active generation.
+    let paired_generation = has_valid_generation
+        && facts
+            .claimed_generation_authority_epoch
+            .is_none_or(|epoch| epoch >= 1);
     if facts.attempt_count > 0 {
-        return if has_valid_generation {
+        return if paired_generation {
             GenerationBindingPhase::Durable
         } else if facts.claimed_generation_id.is_none() {
             GenerationBindingPhase::MissingAfterAttempt
@@ -394,7 +409,7 @@ fn generation_binding_phase(facts: GenerationBindingFacts<'_>) -> GenerationBind
     let has_no_lease = facts.lease_owner.is_none()
         && facts.lease_fence_epoch.is_none()
         && facts.lease_expires_at.is_none();
-    if facts.claimed_generation_id.is_none() {
+    if facts.claimed_generation_id.is_none() && facts.claimed_generation_authority_epoch.is_none() {
         return if has_no_lease
             && matches!(facts.state, "pending" | "retry_wait" | "blocked" | "failed")
         {
@@ -405,7 +420,7 @@ fn generation_binding_phase(facts: GenerationBindingFacts<'_>) -> GenerationBind
     }
 
     if facts.state == "processing"
-        && has_valid_generation
+        && paired_generation
         && facts
             .lease_owner
             .is_some_and(|owner| !owner.trim().is_empty())
@@ -490,6 +505,7 @@ struct GenerationBindingRow {
     state: String,
     attempt_count: i64,
     claimed_generation_id: Option<String>,
+    claimed_generation_authority_epoch: Option<i64>,
     lease_owner: Option<String>,
     lease_fence_epoch: Option<i64>,
     lease_expires_at: Option<String>,
@@ -556,6 +572,7 @@ impl GenerationBindingRow {
             state: &self.state,
             attempt_count: self.attempt_count,
             claimed_generation_id: self.claimed_generation_id.as_deref(),
+            claimed_generation_authority_epoch: self.claimed_generation_authority_epoch,
             lease_owner: self.lease_owner.as_deref(),
             lease_fence_epoch: self.lease_fence_epoch,
             lease_expires_at: self.lease_expires_at.as_deref(),
@@ -591,6 +608,7 @@ struct ClaimCandidate {
     id: i64,
     attempt_count: i64,
     claimed_generation_id: Option<String>,
+    claimed_generation_authority_epoch: Option<i64>,
     state: String,
     lease_owner: Option<String>,
     lease_fence_epoch: Option<i64>,
@@ -604,12 +622,13 @@ fn claim_candidate_from_row(row: &Row<'_>) -> rusqlite::Result<ClaimCandidate> {
         id: row.get(0)?,
         attempt_count: row.get(1)?,
         claimed_generation_id: row.get(2)?,
-        state: row.get(3)?,
-        lease_owner: row.get(4)?,
-        lease_fence_epoch: row.get(5)?,
-        lease_expires_at: row.get(6)?,
-        fenced_claim_epoch: row.get(7)?,
-        last_marked_claim_epoch: row.get(8)?,
+        claimed_generation_authority_epoch: row.get(3)?,
+        state: row.get(4)?,
+        lease_owner: row.get(5)?,
+        lease_fence_epoch: row.get(6)?,
+        lease_expires_at: row.get(7)?,
+        fenced_claim_epoch: row.get(8)?,
+        last_marked_claim_epoch: row.get(9)?,
     })
 }
 
@@ -746,6 +765,81 @@ pub(crate) struct ExistingBuildingGenerationAuthority {
     authority_epoch: i64,
 }
 
+/// Opaque proof of the one active generation selected by the Schema-17
+/// singleton authority row.  It deliberately remains storage-owned: callers
+/// can validate and consume it, but cannot manufacture it from scalars.
+pub(crate) struct ActiveGenerationAuthority {
+    generation_id: String,
+    descriptor_hash: String,
+    dimension: usize,
+    authority_epoch: i64,
+    embedding_profile_id: String,
+}
+
+impl ActiveGenerationAuthority {
+    pub(crate) fn bound_embedding_profile_id(&self) -> &str {
+        &self.embedding_profile_id
+    }
+
+    pub(crate) fn verify_descriptor_and_dimension(
+        &self,
+        descriptor_hash: &str,
+        dimension: usize,
+    ) -> Result<(), ExistingGenerationBindingError> {
+        if self.descriptor_hash != descriptor_hash || self.dimension != dimension {
+            return Err(ExistingGenerationBindingError::generation_binding_mismatch());
+        }
+        Ok(())
+    }
+
+    /// Rechecks every persisted active-authority fact immediately before the
+    /// context is sealed for execution.  This is intentionally a read-only
+    /// capability transition; B never changes the pointer or lifecycle state.
+    pub(crate) fn verify_current_and_seal(
+        self,
+        storage: &StorageService,
+    ) -> Result<(VectorGenerationContext, i64), ExistingGenerationBindingError> {
+        let state = storage
+            .state()
+            .map_err(|_| ExistingGenerationBindingError::generation_binding_stale())?;
+        let current: bool = state
+            .connection
+            .query_row(
+                "SELECT EXISTS(
+                SELECT 1
+                FROM memory_vector_generation_authority a
+                JOIN memory_vector_generation g ON g.generation_id=a.active_generation_id
+                JOIN memory_vector_generation_binding b ON b.generation_id=g.generation_id
+                JOIN memory_vector_generation_store_witness w ON w.generation_id=g.generation_id
+                WHERE a.singleton=1 AND a.active_generation_id=?1
+                  AND g.descriptor_hash=?2 AND g.dimension=?3
+                  AND g.state='active' AND g.authority_epoch=?4
+                  AND b.descriptor_version=?5 AND b.embedding_profile_id=?6
+                  AND w.state='ready'
+            )",
+                params![
+                    self.generation_id,
+                    self.descriptor_hash,
+                    self.dimension as i64,
+                    self.authority_epoch,
+                    crate::memory::existing_generation_binding::D9D2_GENERATION_DESCRIPTOR_VERSION,
+                    self.embedding_profile_id
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|_| ExistingGenerationBindingError::generation_binding_stale())?;
+        if !current {
+            return Err(ExistingGenerationBindingError::generation_binding_stale());
+        }
+        let generation_id = VectorGenerationId::parse(&self.generation_id)
+            .map_err(|_| ExistingGenerationBindingError::invalid_generation_metadata())?;
+        let context =
+            VectorGenerationContext::new(generation_id, self.descriptor_hash, self.dimension)
+                .map_err(|_| ExistingGenerationBindingError::invalid_generation_metadata())?;
+        Ok((context, self.authority_epoch))
+    }
+}
+
 impl ExistingBuildingGenerationAuthority {
     /// Verifies that the expected descriptor hash and expected dimension match the candidate authority.
     pub(crate) fn verify_descriptor_and_dimension(
@@ -805,6 +899,58 @@ impl ExistingBuildingGenerationAuthority {
 
 #[allow(dead_code)]
 impl StorageService {
+    /// Loads exactly the active generation selected by the singleton pointer.
+    /// Every join is exact and mandatory, so malformed, historical, or
+    /// non-ready state fails closed before provider resolution or store access.
+    pub(crate) fn load_active_generation_authority(
+        &self,
+    ) -> Result<ActiveGenerationAuthority, ExistingGenerationBindingError> {
+        let state = self
+            .state()
+            .map_err(|_| ExistingGenerationBindingError::no_existing_generation())?;
+        let row: Option<(String, String, i64, String, i64, String)> = state.connection.query_row(
+            "SELECT g.generation_id,g.descriptor_hash,g.dimension,g.state,g.authority_epoch,b.embedding_profile_id
+             FROM memory_vector_generation_authority a
+             JOIN memory_vector_generation g ON g.generation_id=a.active_generation_id
+             JOIN memory_vector_generation_binding b ON b.generation_id=g.generation_id
+             JOIN memory_vector_generation_store_witness w ON w.generation_id=g.generation_id
+             WHERE a.singleton=1 AND a.active_generation_id IS NOT NULL
+               AND g.state='active' AND g.authority_epoch>=1
+               AND b.descriptor_version=?1 AND trim(b.embedding_profile_id)<>''
+               AND w.state='ready'",
+            [crate::memory::existing_generation_binding::D9D2_GENERATION_DESCRIPTOR_VERSION],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+        ).optional().map_err(|_| ExistingGenerationBindingError::no_existing_generation())?;
+        let Some((
+            generation_id,
+            descriptor_hash,
+            dimension,
+            generation_state,
+            authority_epoch,
+            embedding_profile_id,
+        )) = row
+        else {
+            return Err(ExistingGenerationBindingError::no_existing_generation());
+        };
+        if generation_state != "active"
+            || authority_epoch < 1
+            || dimension <= 0
+            || dimension > crate::embedding::MAX_VECTOR_DIMENSION as i64
+            || VectorGenerationId::parse(&generation_id).is_err()
+            || descriptor_hash.trim().is_empty()
+            || embedding_profile_id.trim().is_empty()
+        {
+            return Err(ExistingGenerationBindingError::invalid_generation_metadata());
+        }
+        Ok(ActiveGenerationAuthority {
+            generation_id,
+            descriptor_hash,
+            dimension: dimension as usize,
+            authority_epoch,
+            embedding_profile_id,
+        })
+    }
+
     /// Loads the unique building generation candidate from SQLite generation authority.
     ///
     /// Evaluates `SELECT ... FROM memory_vector_generation WHERE state = 'building' LIMIT 2`:
@@ -972,12 +1118,53 @@ impl StorageService {
         lease_owner: &str,
         retry_cutoff_millis: Option<i64>,
     ) -> Result<Option<FencedVectorSyncClaim>, crate::storage::StorageError> {
+        self.claim_one_fenced_vector_sync_with_authority_epoch(
+            generation_id,
+            descriptor_hash,
+            dimension,
+            lease_owner,
+            retry_cutoff_millis,
+            None,
+        )
+    }
+
+    /// Schema-17 ordinary claim path. The active resolver is the only
+    /// production caller; the epoch is persisted together with the generation.
+    pub(crate) fn claim_one_active_fenced_vector_sync_with_retry_cutoff(
+        &self,
+        generation_id: &str,
+        descriptor_hash: &str,
+        dimension: usize,
+        authority_epoch: i64,
+        lease_owner: &str,
+        retry_cutoff_millis: Option<i64>,
+    ) -> Result<Option<FencedVectorSyncClaim>, crate::storage::StorageError> {
+        self.claim_one_fenced_vector_sync_with_authority_epoch(
+            generation_id,
+            descriptor_hash,
+            dimension,
+            lease_owner,
+            retry_cutoff_millis,
+            Some(authority_epoch),
+        )
+    }
+
+    fn claim_one_fenced_vector_sync_with_authority_epoch(
+        &self,
+        generation_id: &str,
+        descriptor_hash: &str,
+        dimension: usize,
+        lease_owner: &str,
+        retry_cutoff_millis: Option<i64>,
+        authority_epoch: Option<i64>,
+    ) -> Result<Option<FencedVectorSyncClaim>, crate::storage::StorageError> {
         if generation_id.is_empty()
             || descriptor_hash.is_empty()
             || dimension == 0
             || lease_owner.is_empty()
             || lease_owner.len() > 128
             || retry_cutoff_millis.is_some_and(|value| value < 0)
+            || authority_epoch.is_some_and(|epoch| epoch < 1)
         {
             return Err(single_event_error());
         }
@@ -1000,10 +1187,18 @@ impl StorageService {
         // with a spent budget converges in this same transaction instead of
         // surviving as ordinary work until the next claim.
         converge_exhausted_attempt_budget_in(&tx)?;
-        let generation_ok: Option<i64> = tx.query_row(
-            "SELECT 1 FROM memory_vector_generation WHERE generation_id=?1 AND descriptor_hash=?2 AND dimension=?3 AND state='building'",
-            params![generation_id, descriptor_hash, dimension as i64], |row| row.get(0),
-        ).optional().map_err(|_| single_event_error())?;
+        let generation_ok: Option<i64> = match authority_epoch {
+            Some(epoch) => tx.query_row(
+                "SELECT 1 FROM memory_vector_generation_authority a JOIN memory_vector_generation g ON g.generation_id=a.active_generation_id
+                 WHERE a.singleton=1 AND a.active_generation_id=?1 AND g.descriptor_hash=?2 AND g.dimension=?3
+                   AND g.state='active' AND g.authority_epoch=?4",
+                params![generation_id, descriptor_hash, dimension as i64, epoch], |row| row.get(0),
+            ).optional().map_err(|_| single_event_error())?,
+            None => tx.query_row(
+                "SELECT 1 FROM memory_vector_generation WHERE generation_id=?1 AND descriptor_hash=?2 AND dimension=?3 AND state='building'",
+                params![generation_id, descriptor_hash, dimension as i64], |row| row.get(0),
+            ).optional().map_err(|_| single_event_error())?,
+        };
         if generation_ok.is_none() {
             tx.commit().map_err(|_| single_event_error())?;
             return Ok(None);
@@ -1012,7 +1207,7 @@ impl StorageService {
             Some(retry_cutoff_millis) => tx
                 .query_row(
                     &format!(
-                    "SELECT id, attempt_count, claimed_generation_id, state,
+                    "SELECT id, attempt_count, claimed_generation_id, claimed_generation_authority_epoch, state,
                             lease_owner, lease_fence_epoch, lease_expires_at,
                             fenced_claim_epoch, last_marked_claim_epoch
                      FROM memory_vector_sync_outbox WHERE migration_disposition IS NULL AND
@@ -1020,14 +1215,16 @@ impl StorageService {
                        OR (desired_action='delete' AND target_revision IS NULL AND target_content_hash IS NULL)) AND
                       (state='pending' OR (state='retry_wait' AND next_attempt_at <= strftime('%Y-%m-%dT%H:%M:%fZ', ?1 / 1000.0, 'unixepoch')))
                       AND attempt_count < {MAX_VECTOR_SYNC_ATTEMPTS}
-                      AND ((attempt_count=0 AND claimed_generation_id IS NULL)
-                           OR (attempt_count>0 AND claimed_generation_id=?2))
+                      AND ((attempt_count=0 AND claimed_generation_id IS NULL AND claimed_generation_authority_epoch IS NULL)
+                           OR (attempt_count>0 AND claimed_generation_id=?2
+                               AND ((?3 IS NULL AND claimed_generation_authority_epoch IS NULL)
+                                    OR claimed_generation_authority_epoch=?3)))
                        AND NOT (desired_action='upsert' AND
                                 (COALESCE(last_send_disposition, '')='possibly_sent' OR COALESCE(last_error_code, '')='PROVIDER_RESULT_UNKNOWN'))
                        AND NOT ({DELETE_UNKNOWN_EVIDENCE_SQL})
                     ORDER BY mutation_sequence ASC, id ASC LIMIT 1"
                     ),
-                    params![retry_cutoff_millis, generation_id],
+                    params![retry_cutoff_millis, generation_id, authority_epoch],
                     claim_candidate_from_row,
                 )
                 .optional()
@@ -1035,7 +1232,7 @@ impl StorageService {
             None => tx
                 .query_row(
                     &format!(
-                    "SELECT id, attempt_count, claimed_generation_id, state,
+                    "SELECT id, attempt_count, claimed_generation_id, claimed_generation_authority_epoch, state,
                             lease_owner, lease_fence_epoch, lease_expires_at,
                             fenced_claim_epoch, last_marked_claim_epoch
                      FROM memory_vector_sync_outbox WHERE migration_disposition IS NULL AND
@@ -1043,14 +1240,16 @@ impl StorageService {
                        OR (desired_action='delete' AND target_revision IS NULL AND target_content_hash IS NULL)) AND
                       (state='pending' OR (state='retry_wait' AND next_attempt_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now')))
                       AND attempt_count < {MAX_VECTOR_SYNC_ATTEMPTS}
-                      AND ((attempt_count=0 AND claimed_generation_id IS NULL)
-                           OR (attempt_count>0 AND claimed_generation_id=?1))
+                      AND ((attempt_count=0 AND claimed_generation_id IS NULL AND claimed_generation_authority_epoch IS NULL)
+                           OR (attempt_count>0 AND claimed_generation_id=?1
+                               AND ((?2 IS NULL AND claimed_generation_authority_epoch IS NULL)
+                                    OR claimed_generation_authority_epoch=?2)))
                        AND NOT (desired_action='upsert' AND
                                 (COALESCE(last_send_disposition, '')='possibly_sent' OR COALESCE(last_error_code, '')='PROVIDER_RESULT_UNKNOWN'))
                        AND NOT ({DELETE_UNKNOWN_EVIDENCE_SQL})
                     ORDER BY mutation_sequence ASC, id ASC LIMIT 1"
                     ),
-                    params![generation_id],
+                    params![generation_id, authority_epoch],
                     claim_candidate_from_row,
                 )
                 .optional()
@@ -1086,6 +1285,7 @@ impl StorageService {
             state: &candidate.state,
             attempt_count: candidate.attempt_count,
             claimed_generation_id: candidate.claimed_generation_id.as_deref(),
+            claimed_generation_authority_epoch: candidate.claimed_generation_authority_epoch,
             lease_owner: candidate.lease_owner.as_deref(),
             lease_fence_epoch: candidate.lease_fence_epoch,
             lease_expires_at: candidate.lease_expires_at.as_deref(),
@@ -1096,26 +1296,28 @@ impl StorageService {
             // only a reservation may advance it.
             GenerationBindingPhase::Unbound => tx.execute(
                 "UPDATE memory_vector_sync_outbox SET state='processing',
-                 lease_owner=?2, lease_fence_epoch=?3, claimed_generation_id=?4,
+                 lease_owner=?2, lease_fence_epoch=?3, claimed_generation_id=?4, claimed_generation_authority_epoch=?5,
                  fenced_claim_epoch=fenced_claim_epoch+1,
                  lease_expires_at=strftime('%Y-%m-%dT%H:%M:%fZ','now','+120 seconds'), next_attempt_at=NULL,
                  last_send_disposition=NULL,
                  updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
                  WHERE id=?1 AND migration_disposition IS NULL AND state IN ('pending','retry_wait')
-                   AND attempt_count=0 AND claimed_generation_id IS NULL
-                   AND fenced_claim_epoch=?5 AND last_marked_claim_epoch=?6
+                   AND attempt_count=0 AND claimed_generation_id IS NULL AND claimed_generation_authority_epoch IS NULL
+                   AND fenced_claim_epoch=?6 AND last_marked_claim_epoch=?7
                    AND fenced_claim_epoch < 9223372036854775807",
                 params![
                     candidate.id,
                     lease_owner,
                     fence_epoch,
                     generation_id,
+                    authority_epoch,
                     candidate.fenced_claim_epoch,
                     candidate.last_marked_claim_epoch,
                 ],
             ),
             GenerationBindingPhase::Durable
-                if candidate.claimed_generation_id.as_deref() == Some(generation_id) =>
+                if candidate.claimed_generation_id.as_deref() == Some(generation_id)
+                    && candidate.claimed_generation_authority_epoch == authority_epoch =>
             {
                 tx.execute(
                     &format!(
@@ -1126,8 +1328,8 @@ impl StorageService {
                      updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
                      WHERE id=?1 AND migration_disposition IS NULL AND state IN ('pending','retry_wait')
                        AND attempt_count>0 AND attempt_count < {MAX_VECTOR_SYNC_ATTEMPTS}
-                       AND claimed_generation_id=?4
-                       AND fenced_claim_epoch=?5 AND last_marked_claim_epoch=?6
+                       AND claimed_generation_id=?4 AND claimed_generation_authority_epoch IS ?5
+                       AND fenced_claim_epoch=?6 AND last_marked_claim_epoch=?7
                        AND fenced_claim_epoch < 9223372036854775807"
                     ),
                     params![
@@ -1135,6 +1337,7 @@ impl StorageService {
                         lease_owner,
                         fence_epoch,
                         generation_id,
+                        authority_epoch,
                         candidate.fenced_claim_epoch,
                         candidate.last_marked_claim_epoch,
                     ],
@@ -1156,7 +1359,7 @@ impl StorageService {
         // inside this same transaction. Callers never compute or advance it.
         let claim = tx.query_row(
             "SELECT id, life_id, memory_id, desired_action, mutation_sequence, target_revision, target_content_hash,
-                    claimed_generation_id, lease_owner, lease_fence_epoch, fenced_claim_epoch
+                    claimed_generation_id, claimed_generation_authority_epoch, lease_owner, lease_fence_epoch, fenced_claim_epoch
              FROM memory_vector_sync_outbox WHERE id=?1", params![candidate.id], |row| {
                 fenced_claim_from_row(row, descriptor_hash, dimension)
              },
@@ -1330,6 +1533,7 @@ impl StorageService {
                     ":target_revision": token.target_revision,
                     ":target_content_hash": token.target_content_hash.as_deref(),
                     ":claimed_generation_id": token.generation_id.as_str(),
+                    ":generation_authority_epoch": token.generation_authority_epoch,
                     ":generation_id": token.generation_id.as_str(),
                     ":descriptor_hash": token.descriptor_hash.as_str(),
                     ":dimension": token.dimension as i64,
@@ -1390,6 +1594,7 @@ impl StorageService {
                     ":target_revision": token.target_revision,
                     ":target_content_hash": token.target_content_hash.as_deref(),
                     ":claimed_generation_id": token.generation_id.as_str(),
+                    ":generation_authority_epoch": token.generation_authority_epoch,
                     ":generation_id": token.generation_id.as_str(),
                     ":descriptor_hash": token.descriptor_hash.as_str(),
                     ":dimension": token.dimension as i64,
@@ -1453,6 +1658,7 @@ impl StorageService {
                             ":target_revision": Some(target_revision),
                             ":target_content_hash": token.target_content_hash.as_deref(),
                             ":claimed_generation_id": token.generation_id.as_str(),
+                            ":generation_authority_epoch": token.generation_authority_epoch,
                             ":generation_id": token.generation_id.as_str(),
                             ":descriptor_hash": token.descriptor_hash.as_str(),
                             ":dimension": token.dimension as i64,
@@ -1486,6 +1692,7 @@ impl StorageService {
                         ":target_revision": token.target_revision,
                         ":target_content_hash": token.target_content_hash.as_deref(),
                         ":claimed_generation_id": token.generation_id.as_str(),
+                        ":generation_authority_epoch": token.generation_authority_epoch,
                         ":generation_id": token.generation_id.as_str(),
                         ":descriptor_hash": token.descriptor_hash.as_str(),
                         ":dimension": token.dimension as i64,
@@ -1568,6 +1775,7 @@ impl StorageService {
                         ":target_revision": token.target_revision,
                         ":target_content_hash": token.target_content_hash.as_deref(),
                         ":claimed_generation_id": token.generation_id.as_str(),
+                        ":generation_authority_epoch": token.generation_authority_epoch,
                         ":generation_id": token.generation_id.as_str(),
                         ":descriptor_hash": token.descriptor_hash.as_str(),
                         ":dimension": token.dimension as i64,
@@ -1607,6 +1815,7 @@ impl StorageService {
                         ":target_revision": token.target_revision,
                         ":target_content_hash": token.target_content_hash.as_deref(),
                         ":claimed_generation_id": token.generation_id.as_str(),
+                        ":generation_authority_epoch": token.generation_authority_epoch,
                         ":generation_id": token.generation_id.as_str(),
                         ":descriptor_hash": token.descriptor_hash.as_str(),
                         ":dimension": token.dimension as i64,
@@ -1704,7 +1913,7 @@ impl StorageService {
                     "UPDATE memory_vector_sync_outbox
                      SET state='blocked', next_attempt_at=NULL, lease_owner=NULL,
                          lease_expires_at=NULL, lease_fence_epoch=NULL,
-                         claimed_generation_id=NULL, last_error_code='VECTOR_TARGET_STALE',
+                         claimed_generation_id=NULL, claimed_generation_authority_epoch=NULL, last_error_code='VECTOR_TARGET_STALE',
                          last_send_disposition=NULL,
                          updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
                      WHERE {GENERATION_BINDING_CLAIM_IDENTITY}"
@@ -2036,7 +2245,7 @@ impl StorageService {
                 .execute(
                     "UPDATE memory_vector_sync_outbox
                  SET state=?1, lease_owner=NULL, lease_expires_at=NULL, lease_fence_epoch=NULL,
-                     claimed_generation_id=NULL, next_attempt_at=NULL
+                     claimed_generation_id=NULL, claimed_generation_authority_epoch=NULL, next_attempt_at=NULL
                  WHERE id=?2 AND mutation_sequence=?3 AND state='processing' AND attempt_count=0
                    AND claimed_generation_id=?4 AND lease_owner=?5 AND lease_fence_epoch=?6
                    AND lease_expires_at=?7 AND migration_disposition IS NULL",
@@ -2310,7 +2519,7 @@ impl StorageService {
              ON CONFLICT(life_id, memory_id) DO UPDATE SET
                desired_action='upsert', state='blocked', attempt_count=0, mutation_sequence=?3,
                target_revision=NULL, target_content_hash=NULL, migration_disposition='legacy_upsert_rebuild_required',
-               lease_owner=NULL, lease_expires_at=NULL, lease_fence_epoch=NULL, claimed_generation_id=NULL,
+               lease_owner=NULL, lease_expires_at=NULL, lease_fence_epoch=NULL, claimed_generation_id=NULL, claimed_generation_authority_epoch=NULL,
                updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')",
             params![life_id, memory_id, sequence],
         ).map_err(|_| single_event_error())?;
@@ -2428,11 +2637,16 @@ fn fenced_claim_current_in(
               WHERE o.id=?1 AND o.desired_action=?2 AND o.mutation_sequence=?3
                 AND o.state='processing' AND o.lease_owner=?4 AND o.lease_fence_epoch=?5
                 AND o.claimed_generation_id=?6
+                AND o.claimed_generation_authority_epoch IS ?11
                 AND o.target_revision IS ?7 AND o.target_content_hash IS ?8
                 AND o.migration_disposition IS NULL
-                AND g.descriptor_hash=?9 AND g.dimension=?10 AND g.state='building'
+                AND g.descriptor_hash=?9 AND g.dimension=?10
+                AND ((?11 IS NULL AND g.state='building')
+                     OR (?11 IS NOT NULL AND g.state='active' AND g.authority_epoch=?11
+                         AND EXISTS (SELECT 1 FROM memory_vector_generation_authority a
+                                     WHERE a.singleton=1 AND a.active_generation_id=g.generation_id)))
                  AND r.owner_id=?4 AND r.fence_epoch=?5
-                 AND o.fenced_claim_epoch=?11",
+                 AND o.fenced_claim_epoch=?12",
             params![
                 claim.id,
                 claim.action.as_str(),
@@ -2444,6 +2658,7 @@ fn fenced_claim_current_in(
                 claim.target_content_hash,
                 claim.descriptor_hash,
                 claim.dimension as i64,
+                claim.generation_authority_epoch,
                 claim.fenced_claim_epoch,
             ],
             |row| Ok((row.get(0)?, row.get(1)?)),
@@ -2457,7 +2672,7 @@ fn fenced_claim_current_in(
         && lease_is_current_at(runtime_expires_at.as_deref(), &now))
 }
 
-const GENERATION_BINDING_ROW_COLUMNS: &str = "id, desired_action, mutation_sequence, target_revision, target_content_hash, state, attempt_count, claimed_generation_id, lease_owner, lease_fence_epoch, lease_expires_at, last_send_disposition, last_error_code, fenced_claim_epoch, last_marked_claim_epoch";
+const GENERATION_BINDING_ROW_COLUMNS: &str = "id, desired_action, mutation_sequence, target_revision, target_content_hash, state, attempt_count, claimed_generation_id, claimed_generation_authority_epoch, lease_owner, lease_fence_epoch, lease_expires_at, last_send_disposition, last_error_code, fenced_claim_epoch, last_marked_claim_epoch";
 const GENERATION_BINDING_ROW_IDENTITY: &str = "id=:id AND desired_action=:desired_action AND mutation_sequence=:mutation_sequence AND target_revision IS :target_revision AND target_content_hash IS :target_content_hash AND state=:current_state AND attempt_count=:attempt_count AND claimed_generation_id IS :claimed_generation_id AND lease_owner IS :lease_owner AND lease_fence_epoch IS :lease_fence_epoch AND lease_expires_at IS :lease_expires_at AND migration_disposition IS NULL";
 /// Exact identity for an operation that is authorized by a
 /// [`FencedVectorSyncClaim`]. Unlike a general row-snapshot CAS, this must pin
@@ -2468,7 +2683,7 @@ const GENERATION_BINDING_CLAIM_IDENTITY: &str = "id=:id AND desired_action=:desi
 /// It carries the full token identity, the persisted reservation ordinal and
 /// marked claim epoch, both live leases, and the explicit building generation.
 /// Unlike the older claim identity, it cannot authorize a pre-Attempt row.
-const FENCED_ATTEMPT_TOKEN_FINALIZE_IDENTITY: &str = "id=:id AND desired_action=:desired_action AND mutation_sequence=:mutation_sequence AND target_revision IS :target_revision AND target_content_hash IS :target_content_hash AND state='processing' AND attempt_count=:attempt_ordinal AND claimed_generation_id=:claimed_generation_id AND lease_owner=:lease_owner AND lease_fence_epoch=:lease_fence_epoch AND fenced_claim_epoch=:fenced_claim_epoch AND last_marked_claim_epoch=:fenced_claim_epoch AND migration_disposition IS NULL AND lease_expires_at > :current_now AND EXISTS (SELECT 1 FROM memory_vector_sync_runtime_lease WHERE lease_name='memory-vector-single-event-consumer' AND owner_id=:lease_owner AND fence_epoch=:lease_fence_epoch AND expires_at > :current_now) AND EXISTS (SELECT 1 FROM memory_vector_generation WHERE generation_id=:generation_id AND descriptor_hash=:descriptor_hash AND dimension=:dimension AND state='building')";
+const FENCED_ATTEMPT_TOKEN_FINALIZE_IDENTITY: &str = "id=:id AND desired_action=:desired_action AND mutation_sequence=:mutation_sequence AND target_revision IS :target_revision AND target_content_hash IS :target_content_hash AND state='processing' AND attempt_count=:attempt_ordinal AND claimed_generation_id=:claimed_generation_id AND lease_owner=:lease_owner AND lease_fence_epoch=:lease_fence_epoch AND fenced_claim_epoch=:fenced_claim_epoch AND last_marked_claim_epoch=:fenced_claim_epoch AND migration_disposition IS NULL AND lease_expires_at > :current_now AND EXISTS (SELECT 1 FROM memory_vector_sync_runtime_lease WHERE lease_name='memory-vector-single-event-consumer' AND owner_id=:lease_owner AND fence_epoch=:lease_fence_epoch AND expires_at > :current_now) AND ((:generation_authority_epoch IS NULL AND claimed_generation_authority_epoch IS NULL AND EXISTS (SELECT 1 FROM memory_vector_generation WHERE generation_id=:generation_id AND descriptor_hash=:descriptor_hash AND dimension=:dimension AND state='building')) OR (:generation_authority_epoch IS NOT NULL AND claimed_generation_authority_epoch=:generation_authority_epoch AND EXISTS (SELECT 1 FROM memory_vector_generation_authority a JOIN memory_vector_generation g ON g.generation_id=a.active_generation_id WHERE a.singleton=1 AND a.active_generation_id=:generation_id AND g.descriptor_hash=:descriptor_hash AND g.dimension=:dimension AND g.state='active' AND g.authority_epoch=:generation_authority_epoch)))";
 /// Adds the two claim-epoch columns to [`GENERATION_BINDING_ROW_IDENTITY`] for
 /// callers that must also pin the exact Attempt-identity snapshot (reserve and
 /// its idempotent guard). Kept as a distinct predicate rather than widening the
@@ -2494,6 +2709,7 @@ fn delete_fenced_attempt_outbox_in(
                 ":target_revision": token.target_revision,
                 ":target_content_hash": token.target_content_hash.as_deref(),
                 ":claimed_generation_id": token.generation_id.as_str(),
+                ":generation_authority_epoch": token.generation_authority_epoch,
                 ":generation_id": token.generation_id.as_str(),
                 ":descriptor_hash": token.descriptor_hash.as_str(),
                 ":dimension": token.dimension as i64,
@@ -2521,13 +2737,14 @@ fn generation_binding_row_from_row(row: &Row<'_>) -> rusqlite::Result<Generation
         state: row.get(5)?,
         attempt_count: row.get(6)?,
         claimed_generation_id: row.get(7)?,
-        lease_owner: row.get(8)?,
-        lease_fence_epoch: row.get(9)?,
-        lease_expires_at: row.get(10)?,
-        last_send_disposition: row.get(11)?,
-        last_error_code: row.get(12)?,
-        fenced_claim_epoch: row.get(13)?,
-        last_marked_claim_epoch: row.get(14)?,
+        claimed_generation_authority_epoch: row.get(8)?,
+        lease_owner: row.get(9)?,
+        lease_fence_epoch: row.get(10)?,
+        lease_expires_at: row.get(11)?,
+        last_send_disposition: row.get(12)?,
+        last_error_code: row.get(13)?,
+        fenced_claim_epoch: row.get(14)?,
+        last_marked_claim_epoch: row.get(15)?,
     })
 }
 
@@ -2839,7 +3056,7 @@ fn quarantine_malformed_target_bindings_in(
             | GenerationBindingPhase::Durable => {
                 let clear_ephemeral = matches!(row.phase(), GenerationBindingPhase::Ephemeral);
                 let assignment = if clear_ephemeral {
-                    "claimed_generation_id=NULL,"
+                    "claimed_generation_id=NULL, claimed_generation_authority_epoch=NULL,"
                 } else {
                     ""
                 };
@@ -2892,10 +3109,13 @@ fn inspect_fenced_generation_binding_read_only_in(
     let phase = row.phase();
     let matches_claim_generation =
         row.claimed_generation_id.as_deref() == Some(claim.generation_id());
+    let matches_claim_epoch =
+        row.claimed_generation_authority_epoch == claim.generation_authority_epoch;
     if matches!(
         phase,
         GenerationBindingPhase::MissingAfterAttempt | GenerationBindingPhase::Invalid
     ) || !matches_claim_generation
+        || !matches_claim_epoch
         || !fenced_claim_current_in(tx, claim)?
     {
         return Ok(FencedBindingCurrent::NotCurrent);
@@ -2929,10 +3149,13 @@ fn inspect_fenced_generation_binding_in(
     let phase = row.phase();
     let matches_claim_generation =
         row.claimed_generation_id.as_deref() == Some(claim.generation_id());
+    let matches_claim_epoch =
+        row.claimed_generation_authority_epoch == claim.generation_authority_epoch;
     let must_quarantine = matches!(
         phase,
         GenerationBindingPhase::MissingAfterAttempt | GenerationBindingPhase::Invalid
-    ) || !matches_claim_generation;
+    ) || !matches_claim_generation
+        || !matches_claim_epoch;
     if must_quarantine {
         let _ = block_generation_binding_claim_identity_in(tx, claim, &row)?;
         return Ok(FencedBindingCurrent::NotCurrent);
@@ -3124,6 +3347,7 @@ fn fenced_attempt_token(claim: &FencedVectorSyncClaim, ordinal: i64) -> FencedAt
         target_revision: claim.target_revision,
         target_content_hash: claim.target_content_hash.clone(),
         generation_id: claim.generation_id.clone(),
+        generation_authority_epoch: claim.generation_authority_epoch,
         descriptor_hash: claim.descriptor_hash.clone(),
         dimension: claim.dimension,
         lease_owner: claim.lease_owner.clone(),
@@ -3271,7 +3495,7 @@ fn recover_expired_fenced_processing_in(
                             "UPDATE memory_vector_sync_outbox
                              SET state='pending', next_attempt_at=NULL,
                                  lease_owner=NULL, lease_expires_at=NULL,
-                                 lease_fence_epoch=NULL, claimed_generation_id=NULL,
+                                 lease_fence_epoch=NULL, claimed_generation_id=NULL, claimed_generation_authority_epoch=NULL,
                                  updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
                              WHERE {GENERATION_BINDING_ROW_IDENTITY}
                                AND lease_expires_at <= :recovery_now"
@@ -3450,11 +3674,12 @@ fn fenced_claim_from_row(
         target_revision: row.get(5)?,
         target_content_hash: row.get(6)?,
         generation_id: row.get(7)?,
+        generation_authority_epoch: row.get(8)?,
         descriptor_hash: descriptor_hash.to_owned(),
         dimension,
-        lease_owner: row.get(8)?,
-        fence_epoch: row.get(9)?,
-        fenced_claim_epoch: row.get(10)?,
+        lease_owner: row.get(9)?,
+        fence_epoch: row.get(10)?,
+        fenced_claim_epoch: row.get(11)?,
     })
 }
 
@@ -4059,6 +4284,7 @@ mod tests {
             target_revision: claim.target_revision,
             target_content_hash: claim.target_content_hash.clone(),
             generation_id: claim.generation_id.clone(),
+            generation_authority_epoch: claim.generation_authority_epoch,
             descriptor_hash: claim.descriptor_hash.clone(),
             dimension: claim.dimension,
             lease_owner: claim.lease_owner.clone(),
@@ -6751,6 +6977,7 @@ mod tests {
                 state,
                 attempt_count,
                 claimed_generation_id,
+                claimed_generation_authority_epoch: claimed_generation_id.map(|_| 1),
                 lease_owner,
                 lease_fence_epoch,
                 lease_expires_at,

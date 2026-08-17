@@ -16,7 +16,7 @@ use crate::{
 };
 
 use super::{
-    existing_generation_binding::resolve_existing_generation_fenced_execution,
+    existing_generation_binding::resolve_active_generation_fenced_execution,
     late_delete_resolution_runner::{run_one_late_delete_from_app, LateDeleteRunEnd},
     vector_sync_worker::VectorSyncDrainReport,
 };
@@ -171,7 +171,7 @@ where
     let report = {
         let _guard = gate.acquire().await;
         let runtime = ModelRuntimeService::new(storage, secrets, model_runtime);
-        let execution = resolve_existing_generation_fenced_execution(storage, &runtime, registry)
+        let execution = resolve_active_generation_fenced_execution(storage, &runtime, registry)
             .await
             .map_err(map_binding_error)?;
         execution

@@ -2,6 +2,8 @@
 
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 
+use crate::memory::existing_generation_binding::D9D2_GENERATION_DESCRIPTOR_VERSION;
+
 use super::{late_delete_resolution, StorageError, StorageService};
 
 const LEGACY_UNVERIFIED_EMBEDDING_PROFILE: &str = "schema16-profile-unverified";
@@ -53,7 +55,6 @@ pub(crate) struct GenerationAuthorityRegistration<'a> {
     pub(crate) generation_id: &'a str,
     pub(crate) descriptor_hash: &'a str,
     pub(crate) dimension: usize,
-    pub(crate) descriptor_version: &'a str,
     pub(crate) embedding_profile_id: &'a str,
     pub(crate) create_operation_id: &'a str,
     pub(crate) job_id: &'a str,
@@ -107,7 +108,6 @@ fn valid(registration: &GenerationAuthorityRegistration<'_>) -> bool {
     valid_nonempty(registration.generation_id)
         && valid_nonempty(registration.descriptor_hash)
         && registration.dimension > 0
-        && valid_nonempty(registration.descriptor_version)
         && valid_nonempty(registration.embedding_profile_id)
         && valid_nonempty(registration.create_operation_id)
         && valid_nonempty(registration.job_id)
@@ -172,7 +172,7 @@ impl StorageService {
         if fail(RegistrationFault::AfterGeneration) {
             return Err(invalid());
         }
-        transaction.execute("INSERT INTO memory_vector_generation_binding (generation_id,descriptor_version,embedding_profile_id,created_at) VALUES (?1,?2,?3,?4)", params![registration.generation_id, registration.descriptor_version, registration.embedding_profile_id, now]).map_err(|_| invalid())?;
+        transaction.execute("INSERT INTO memory_vector_generation_binding (generation_id,descriptor_version,embedding_profile_id,created_at) VALUES (?1,?2,?3,?4)", params![registration.generation_id, D9D2_GENERATION_DESCRIPTOR_VERSION, registration.embedding_profile_id, now]).map_err(|_| invalid())?;
         #[cfg(test)]
         if fail(RegistrationFault::AfterBinding) {
             return Err(invalid());
@@ -210,7 +210,7 @@ impl StorageService {
         let state = self.state()?;
         let exact: Option<i64> = state.connection.query_row(
             "SELECT 1 FROM memory_vector_generation g JOIN memory_vector_generation_binding b ON b.generation_id=g.generation_id JOIN memory_vector_generation_store_witness w ON w.generation_id=g.generation_id JOIN memory_vector_generation_rebuild_job j ON j.generation_id=g.generation_id WHERE g.generation_id=?1 AND g.descriptor_hash=?2 AND g.dimension=?3 AND g.state='building' AND g.authority_epoch=1 AND b.descriptor_version=?4 AND b.embedding_profile_id=?5 AND w.create_operation_id=?6 AND w.state='create_started' AND j.job_id=?7 AND j.request_id=?8 AND j.source_active_generation_id IS ?9 AND j.source_active_authority_epoch IS ?10 AND j.candidate_authority_epoch=1 AND j.status='registered'",
-            params![registration.generation_id, registration.descriptor_hash, registration.dimension as i64, registration.descriptor_version, registration.embedding_profile_id, registration.create_operation_id, registration.job_id, registration.request_id, registration.source_active_generation_id, registration.source_active_authority_epoch],
+            params![registration.generation_id, registration.descriptor_hash, registration.dimension as i64, D9D2_GENERATION_DESCRIPTOR_VERSION, registration.embedding_profile_id, registration.create_operation_id, registration.job_id, registration.request_id, registration.source_active_generation_id, registration.source_active_authority_epoch],
             |row| row.get(0),
         ).optional().map_err(|_| invalid())?;
         if exact.is_some() {
@@ -305,7 +305,6 @@ mod tests {
             generation_id: g,
             descriptor_hash: "descriptor-a",
             dimension: 8,
-            descriptor_version: "descriptor-version-a",
             embedding_profile_id: "profile-a",
             create_operation_id: op,
             job_id: job,
@@ -325,6 +324,16 @@ mod tests {
         a.register_generation_lifecycle_authority(reg("g", "op", "job", "req"))
             .unwrap();
         assert_eq!(count(&a, "g"), 4);
+        let state = a.state().unwrap();
+        let descriptor_version: String = state
+            .connection
+            .query_row(
+                "SELECT descriptor_version FROM memory_vector_generation_binding WHERE generation_id='g'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(descriptor_version, D9D2_GENERATION_DESCRIPTOR_VERSION);
     }
     #[test]
     fn generation_lifecycle_authority_registration_faults_rollback() {
@@ -384,6 +393,26 @@ mod tests {
             .execute(
                 "DELETE FROM memory_vector_generation_rebuild_job WHERE generation_id='g'",
                 [],
+            )
+            .unwrap();
+        assert_eq!(
+            a.classify_generation_registration_commit(reg("g", "op", "job", "req"))
+                .unwrap(),
+            GenerationAuthorityCommitClassification::RecoveryRequired
+        );
+    }
+
+    #[test]
+    fn generation_lifecycle_authority_noncanonical_binding_never_classifies_committed() {
+        let (_r, a, _b) = pair("generation-noncanonical-version");
+        a.register_generation_lifecycle_authority(reg("g", "op", "job", "req"))
+            .unwrap();
+        a.state()
+            .unwrap()
+            .connection
+            .execute_batch(
+                "DROP TRIGGER memory_vector_generation_binding_immutable_update_guard;
+                 UPDATE memory_vector_generation_binding SET descriptor_version='descriptor-v1' WHERE generation_id='g'",
             )
             .unwrap();
         assert_eq!(

@@ -73,7 +73,13 @@ const GENERATION_SEMANTIC_EPOCH_TRIGGER_SCHEMA_SEVENTEEN_SQL: &str =
     "CREATE TRIGGER memory_vector_generation_semantic_epoch_guard
 BEFORE UPDATE ON memory_vector_generation
 WHEN digital_life_writer_epoch() IS 1
- AND (OLD.authority_epoch = 9223372036854775807 OR NEW.authority_epoch <> OLD.authority_epoch + 1)
+ AND ((NEW.state = OLD.state AND NEW.authority_epoch <> OLD.authority_epoch)
+   OR (NEW.state <> OLD.state AND
+       (OLD.authority_epoch = 9223372036854775807
+        OR NEW.authority_epoch <> OLD.authority_epoch + 1
+        OR (OLD.state = 'building' AND NEW.state NOT IN ('active','failed'))
+        OR (OLD.state = 'active' AND NEW.state <> 'retired')
+        OR OLD.state NOT IN ('building','active'))))
 BEGIN
     SELECT RAISE(ROLLBACK, 'GENERATION_AUTHORITY_EPOCH_INVALID');
 END";

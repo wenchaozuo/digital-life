@@ -1,8 +1,4 @@
-//! Schema-17 storage-owned generation lifecycle authority primitives.
-//!
-//! This module deliberately establishes durable authority only.  It neither
-//! obtains a vector store nor starts any rebuild, embedding, catch-up, or
-//! promotion execution.
+//! Storage-owned Schema-17 generation lifecycle authority.
 
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 
@@ -24,13 +20,34 @@ pub(crate) enum GenerationAuthorityCasResult {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RebuildJobRegistrationResult {
-    Registered,
-    Conflict,
+pub(crate) enum GenerationLifecycleState {
+    Building,
+    Active,
+    Failed,
+    Retired,
 }
 
-/// Input to the sole Schema-17 generation registration transaction.  It does
-/// not permit a caller to select lifecycle state or a pointer/epoch mutation.
+impl GenerationLifecycleState {
+    fn sql(self) -> &'static str {
+        match self {
+            Self::Building => "building",
+            Self::Active => "active",
+            Self::Failed => "failed",
+            Self::Retired => "retired",
+        }
+    }
+
+    fn allows(self, next: Self) -> bool {
+        matches!(
+            (self, next),
+            (Self::Building, Self::Active)
+                | (Self::Building, Self::Failed)
+                | (Self::Active, Self::Retired)
+        )
+    }
+}
+
+/// All durable identities required for one atomic generation registration.
 #[derive(Clone, Debug)]
 pub(crate) struct GenerationAuthorityRegistration<'a> {
     pub(crate) generation_id: &'a str,
@@ -39,42 +56,38 @@ pub(crate) struct GenerationAuthorityRegistration<'a> {
     pub(crate) descriptor_version: &'a str,
     pub(crate) embedding_profile_id: &'a str,
     pub(crate) create_operation_id: &'a str,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct RebuildJobRegistration<'a> {
     pub(crate) job_id: &'a str,
     pub(crate) request_id: &'a str,
-    pub(crate) generation_id: &'a str,
     pub(crate) source_active_generation_id: Option<&'a str>,
     pub(crate) source_active_authority_epoch: Option<i64>,
-    pub(crate) candidate_authority_epoch: i64,
 }
 
 #[cfg(test)]
 thread_local! {
-    static REGISTRATION_COMMIT_FAULT: std::cell::Cell<Option<RegistrationCommitFault>> = const {
-        std::cell::Cell::new(None)
-    };
+    static REGISTRATION_FAULT: std::cell::Cell<Option<RegistrationFault>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RegistrationCommitFault {
+pub(crate) enum RegistrationFault {
+    AfterGeneration,
+    AfterBinding,
+    AfterWitness,
+    AfterJob,
     BeforeCommit,
-    AfterCommitOutcomeUnknown,
+    AfterCommitUnknown,
 }
 
 #[cfg(test)]
-pub(crate) fn arm_registration_commit_fault_for_test(fault: RegistrationCommitFault) {
-    REGISTRATION_COMMIT_FAULT.with(|next| next.set(Some(fault)));
+pub(crate) fn arm_registration_fault_for_test(fault: RegistrationFault) {
+    REGISTRATION_FAULT.with(|next| next.set(Some(fault)));
 }
 
 fn valid_nonempty(value: &str) -> bool {
     !value.trim().is_empty() && value.len() <= 512
 }
 
-fn lifecycle_error() -> StorageError {
+fn invalid() -> StorageError {
     StorageError::new(
         "GENERATION_LIFECYCLE_AUTHORITY_INVALID",
         "Generation lifecycle authority operation is invalid.",
@@ -82,7 +95,7 @@ fn lifecycle_error() -> StorageError {
     )
 }
 
-fn commit_unknown_error() -> StorageError {
+fn commit_unknown() -> StorageError {
     StorageError::new(
         "GENERATION_AUTHORITY_COMMIT_RESULT_UNKNOWN",
         "Generation authority commit result is unknown; classify before any retry.",
@@ -90,193 +103,149 @@ fn commit_unknown_error() -> StorageError {
     )
 }
 
-fn valid_registration(registration: &GenerationAuthorityRegistration<'_>) -> bool {
+fn valid(registration: &GenerationAuthorityRegistration<'_>) -> bool {
     valid_nonempty(registration.generation_id)
         && valid_nonempty(registration.descriptor_hash)
         && registration.dimension > 0
         && valid_nonempty(registration.descriptor_version)
         && valid_nonempty(registration.embedding_profile_id)
         && valid_nonempty(registration.create_operation_id)
+        && valid_nonempty(registration.job_id)
+        && valid_nonempty(registration.request_id)
+        && match (
+            registration.source_active_generation_id,
+            registration.source_active_authority_epoch,
+        ) {
+            (None, None) => true,
+            (Some(id), Some(epoch)) => valid_nonempty(id) && epoch >= 1,
+            _ => false,
+        }
+}
+
+#[cfg(test)]
+fn fail(fault: RegistrationFault) -> bool {
+    REGISTRATION_FAULT.with(|next| {
+        if next.get() == Some(fault) {
+            next.set(None);
+            true
+        } else {
+            false
+        }
+    })
 }
 
 impl StorageService {
-    /// Registers a non-active generation and its immutable Schema-17 authority
-    /// records as one transaction.  The store witness is `create_started`, not
-    /// `ready`: no external store operation occurs in this group.
+    /// Atomically writes generation, immutable binding, create-started witness,
+    /// and the initial registered rebuild job. No external I/O occurs here.
     pub(crate) fn register_generation_lifecycle_authority(
         &self,
         registration: GenerationAuthorityRegistration<'_>,
     ) -> Result<(), StorageError> {
-        if !valid_registration(&registration) {
-            return Err(lifecycle_error());
+        if !valid(&registration) {
+            return Err(invalid());
         }
         let mut state = self.state()?;
         let transaction = state
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|_| lifecycle_error())?;
-        let now = late_delete_resolution::authoritative_utc_millis_now_in(&transaction)
-            .map_err(|_| lifecycle_error())?;
-        transaction
-            .execute(
-                "INSERT INTO memory_vector_generation
-                 (generation_id, descriptor_hash, dimension, state, authority_epoch)
-                 VALUES (?1, ?2, ?3, 'building', 1)",
-                params![
-                    registration.generation_id,
-                    registration.descriptor_hash,
-                    registration.dimension as i64
-                ],
-            )
-            .map_err(|_| lifecycle_error())?;
-        transaction
-            .execute(
-                "INSERT INTO memory_vector_generation_binding
-                 (generation_id, descriptor_version, embedding_profile_id, created_at)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    registration.generation_id,
-                    registration.descriptor_version,
-                    registration.embedding_profile_id,
-                    now
-                ],
-            )
-            .map_err(|_| lifecycle_error())?;
-        transaction
-            .execute(
-                "INSERT INTO memory_vector_generation_store_witness
-                 (generation_id, create_operation_id, state, last_error_code, updated_at)
-                 VALUES (?1, ?2, 'create_started', NULL, ?3)",
-                params![
-                    registration.generation_id,
-                    registration.create_operation_id,
-                    now
-                ],
-            )
-            .map_err(|_| lifecycle_error())?;
-
-        #[cfg(test)]
-        if REGISTRATION_COMMIT_FAULT.with(|fault| {
-            fault
-                .get()
-                .is_some_and(|value| value == RegistrationCommitFault::BeforeCommit)
-                .then(|| fault.set(None))
-                .is_some()
-        }) {
-            return Err(commit_unknown_error());
+            .map_err(|_| invalid())?;
+        if let (Some(source), Some(epoch)) = (
+            registration.source_active_generation_id,
+            registration.source_active_authority_epoch,
+        ) {
+            let exists: Option<i64> = transaction
+                .query_row(
+                    "SELECT 1 FROM memory_vector_generation WHERE generation_id=?1 AND state='active' AND authority_epoch=?2",
+                    params![source, epoch],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|_| invalid())?;
+            if exists.is_none() {
+                return Err(invalid());
+            }
         }
-
-        transaction.commit().map_err(|_| lifecycle_error())?;
-
+        let now = late_delete_resolution::authoritative_utc_millis_now_in(&transaction)
+            .map_err(|_| invalid())?;
+        transaction.execute("INSERT INTO memory_vector_generation (generation_id,descriptor_hash,dimension,state,authority_epoch) VALUES (?1,?2,?3,'building',1)", params![registration.generation_id, registration.descriptor_hash, registration.dimension as i64]).map_err(|_| invalid())?;
         #[cfg(test)]
-        if REGISTRATION_COMMIT_FAULT.with(|fault| {
-            fault
-                .get()
-                .is_some_and(|value| value == RegistrationCommitFault::AfterCommitOutcomeUnknown)
-                .then(|| fault.set(None))
-                .is_some()
-        }) {
-            return Err(commit_unknown_error());
+        if fail(RegistrationFault::AfterGeneration) {
+            return Err(invalid());
+        }
+        transaction.execute("INSERT INTO memory_vector_generation_binding (generation_id,descriptor_version,embedding_profile_id,created_at) VALUES (?1,?2,?3,?4)", params![registration.generation_id, registration.descriptor_version, registration.embedding_profile_id, now]).map_err(|_| invalid())?;
+        #[cfg(test)]
+        if fail(RegistrationFault::AfterBinding) {
+            return Err(invalid());
+        }
+        transaction.execute("INSERT INTO memory_vector_generation_store_witness (generation_id,create_operation_id,state,last_error_code,updated_at) VALUES (?1,?2,'create_started',NULL,?3)", params![registration.generation_id, registration.create_operation_id, now]).map_err(|_| invalid())?;
+        #[cfg(test)]
+        if fail(RegistrationFault::AfterWitness) {
+            return Err(invalid());
+        }
+        transaction.execute("INSERT INTO memory_vector_generation_rebuild_job (job_id,request_id,generation_id,source_active_generation_id,source_active_authority_epoch,candidate_authority_epoch,status,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,1,'registered',?6,?6)", params![registration.job_id, registration.request_id, registration.generation_id, registration.source_active_generation_id, registration.source_active_authority_epoch, now]).map_err(|_| invalid())?;
+        #[cfg(test)]
+        if fail(RegistrationFault::AfterJob) {
+            return Err(invalid());
+        }
+        #[cfg(test)]
+        if fail(RegistrationFault::BeforeCommit) {
+            return Err(commit_unknown());
+        }
+        transaction.commit().map_err(|_| invalid())?;
+        #[cfg(test)]
+        if fail(RegistrationFault::AfterCommitUnknown) {
+            return Err(commit_unknown());
         }
         Ok(())
     }
 
-    /// Read-only exact-witness classification for a registration whose COMMIT
-    /// result was lost.  It never retries or repairs an authority write.
+    /// Read-only classification; no retry, repair, or replay is possible here.
     pub(crate) fn classify_generation_registration_commit(
         &self,
         registration: GenerationAuthorityRegistration<'_>,
     ) -> Result<GenerationAuthorityCommitClassification, StorageError> {
-        if !valid_registration(&registration) {
-            return Err(lifecycle_error());
+        if !valid(&registration) {
+            return Err(invalid());
         }
         let state = self.state()?;
-        let exact: Option<i64> = state
-            .connection
-            .query_row(
-                "SELECT 1
-                   FROM memory_vector_generation g
-                   JOIN memory_vector_generation_binding b ON b.generation_id=g.generation_id
-                   JOIN memory_vector_generation_store_witness w ON w.generation_id=g.generation_id
-                  WHERE g.generation_id=?1 AND g.descriptor_hash=?2 AND g.dimension=?3
-                    AND g.state='building' AND g.authority_epoch=1
-                    AND b.descriptor_version=?4 AND b.embedding_profile_id=?5
-                    AND w.create_operation_id=?6 AND w.state='create_started'",
-                params![
-                    registration.generation_id,
-                    registration.descriptor_hash,
-                    registration.dimension as i64,
-                    registration.descriptor_version,
-                    registration.embedding_profile_id,
-                    registration.create_operation_id,
-                ],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|_| lifecycle_error())?;
+        let exact: Option<i64> = state.connection.query_row(
+            "SELECT 1 FROM memory_vector_generation g JOIN memory_vector_generation_binding b ON b.generation_id=g.generation_id JOIN memory_vector_generation_store_witness w ON w.generation_id=g.generation_id JOIN memory_vector_generation_rebuild_job j ON j.generation_id=g.generation_id WHERE g.generation_id=?1 AND g.descriptor_hash=?2 AND g.dimension=?3 AND g.state='building' AND g.authority_epoch=1 AND b.descriptor_version=?4 AND b.embedding_profile_id=?5 AND w.create_operation_id=?6 AND w.state='create_started' AND j.job_id=?7 AND j.request_id=?8 AND j.source_active_generation_id IS ?9 AND j.source_active_authority_epoch IS ?10 AND j.candidate_authority_epoch=1 AND j.status='registered'",
+            params![registration.generation_id, registration.descriptor_hash, registration.dimension as i64, registration.descriptor_version, registration.embedding_profile_id, registration.create_operation_id, registration.job_id, registration.request_id, registration.source_active_generation_id, registration.source_active_authority_epoch],
+            |row| row.get(0),
+        ).optional().map_err(|_| invalid())?;
         if exact.is_some() {
             return Ok(GenerationAuthorityCommitClassification::Committed);
         }
-        let witness_count: i64 = state
-            .connection
-            .query_row(
-                "SELECT COUNT(*) FROM memory_vector_generation_store_witness
-                  WHERE create_operation_id=?1 OR generation_id=?2",
-                params![registration.create_operation_id, registration.generation_id],
-                |row| row.get(0),
-            )
-            .map_err(|_| lifecycle_error())?;
-        let generation_count: i64 = state
-            .connection
-            .query_row(
-                "SELECT COUNT(*) FROM memory_vector_generation WHERE generation_id=?1",
-                [registration.generation_id],
-                |row| row.get(0),
-            )
-            .map_err(|_| lifecycle_error())?;
-        Ok(if witness_count == 0 && generation_count == 0 {
+        let count: i64 = state.connection.query_row(
+            "SELECT (SELECT COUNT(*) FROM memory_vector_generation WHERE generation_id=?1) + (SELECT COUNT(*) FROM memory_vector_generation_binding WHERE generation_id=?1) + (SELECT COUNT(*) FROM memory_vector_generation_store_witness WHERE generation_id=?1 OR create_operation_id=?2) + (SELECT COUNT(*) FROM memory_vector_generation_rebuild_job WHERE generation_id=?1 OR job_id=?3 OR request_id=?4)",
+            params![registration.generation_id, registration.create_operation_id, registration.job_id, registration.request_id], |row| row.get(0),
+        ).map_err(|_| invalid())?;
+        Ok(if count == 0 {
             GenerationAuthorityCommitClassification::NotCommitted
         } else {
             GenerationAuthorityCommitClassification::RecoveryRequired
         })
     }
 
-    /// CASes the singleton pointer to an already-active generation.  This
-    /// deliberately does not alter generation state, so it is not promotion.
+    /// Pointer-only CAS; it requires an active target at the exact epoch.
     pub(crate) fn compare_and_set_active_generation_pointer(
         &self,
-        expected_active_generation_id: Option<&str>,
+        expected: Option<&str>,
         generation_id: &str,
-        expected_authority_epoch: i64,
+        epoch: i64,
     ) -> Result<GenerationAuthorityCasResult, StorageError> {
-        if !valid_nonempty(generation_id) || expected_authority_epoch < 1 {
-            return Err(lifecycle_error());
+        if !valid_nonempty(generation_id) || epoch < 1 {
+            return Err(invalid());
         }
         let mut state = self.state()?;
         let transaction = state
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|_| lifecycle_error())?;
+            .map_err(|_| invalid())?;
         let now = late_delete_resolution::authoritative_utc_millis_now_in(&transaction)
-            .map_err(|_| lifecycle_error())?;
-        let changed = transaction
-            .execute(
-                "UPDATE memory_vector_generation_authority
-                    SET active_generation_id=?1, updated_at=?2
-                  WHERE singleton=1 AND active_generation_id IS ?3
-                    AND EXISTS (
-                        SELECT 1 FROM memory_vector_generation
-                         WHERE generation_id=?1 AND state='active' AND authority_epoch=?4
-                    )",
-                params![
-                    generation_id,
-                    now,
-                    expected_active_generation_id,
-                    expected_authority_epoch
-                ],
-            )
-            .map_err(|_| lifecycle_error())?;
-        transaction.commit().map_err(|_| lifecycle_error())?;
+            .map_err(|_| invalid())?;
+        let changed = transaction.execute("UPDATE memory_vector_generation_authority SET active_generation_id=?1,updated_at=?2 WHERE singleton=1 AND active_generation_id IS ?3 AND EXISTS (SELECT 1 FROM memory_vector_generation WHERE generation_id=?1 AND state='active' AND authority_epoch=?4)", params![generation_id, now, expected, epoch]).map_err(|_| invalid())?;
+        transaction.commit().map_err(|_| invalid())?;
         Ok(if changed == 1 {
             GenerationAuthorityCasResult::Applied
         } else {
@@ -284,85 +253,24 @@ impl StorageService {
         })
     }
 
-    /// Advances only a per-generation authority epoch after an exact preimage
-    /// check.  No lifecycle state transition is accepted or performed here.
-    pub(crate) fn compare_and_advance_generation_authority_epoch(
+    /// Applies one exact frozen lifecycle transition and increments epoch once.
+    pub(crate) fn compare_and_transition_generation_authority(
         &self,
         generation_id: &str,
-        expected_authority_epoch: i64,
+        expected: GenerationLifecycleState,
+        epoch: i64,
+        next: GenerationLifecycleState,
     ) -> Result<GenerationAuthorityCasResult, StorageError> {
-        if !valid_nonempty(generation_id) || expected_authority_epoch < 1 {
-            return Err(lifecycle_error());
+        if !valid_nonempty(generation_id) || epoch < 1 || !expected.allows(next) {
+            return Err(invalid());
         }
         let state = self.state()?;
-        let changed = state
-            .connection
-            .execute(
-                "UPDATE memory_vector_generation
-                    SET authority_epoch=authority_epoch+1
-                  WHERE generation_id=?1 AND authority_epoch=?2
-                    AND state IN ('building', 'active', 'retired', 'failed')",
-                params![generation_id, expected_authority_epoch],
-            )
-            .map_err(|_| lifecycle_error())?;
+        let changed = state.connection.execute("UPDATE memory_vector_generation SET state=?4,authority_epoch=authority_epoch+1 WHERE generation_id=?1 AND state=?2 AND authority_epoch=?3", params![generation_id, expected.sql(), epoch, next.sql()]).map_err(|_| invalid())?;
         Ok(if changed == 1 {
             GenerationAuthorityCasResult::Applied
         } else {
             GenerationAuthorityCasResult::StaleOrConflict
         })
-    }
-
-    /// Registers the sole nonterminal rebuild-job authority record.  It starts
-    /// no work; the enforced `registered` state is only durable intent.
-    pub(crate) fn register_generation_rebuild_job(
-        &self,
-        registration: RebuildJobRegistration<'_>,
-    ) -> Result<RebuildJobRegistrationResult, StorageError> {
-        if !valid_nonempty(registration.job_id)
-            || !valid_nonempty(registration.request_id)
-            || !valid_nonempty(registration.generation_id)
-            || registration.candidate_authority_epoch < 1
-            || registration
-                .source_active_authority_epoch
-                .is_some_and(|epoch| epoch < 1)
-            || registration
-                .source_active_generation_id
-                .is_some_and(|id| !valid_nonempty(id))
-        {
-            return Err(lifecycle_error());
-        }
-        let mut state = self.state()?;
-        let transaction = state
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|_| lifecycle_error())?;
-        let now = late_delete_resolution::authoritative_utc_millis_now_in(&transaction)
-            .map_err(|_| lifecycle_error())?;
-        let result = transaction.execute(
-            "INSERT INTO memory_vector_generation_rebuild_job
-             (job_id,request_id,generation_id,source_active_generation_id,source_active_authority_epoch,
-              candidate_authority_epoch,status,created_at,updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,'registered',?7,?7)",
-            params![
-                registration.job_id,
-                registration.request_id,
-                registration.generation_id,
-                registration.source_active_generation_id,
-                registration.source_active_authority_epoch,
-                registration.candidate_authority_epoch,
-                now
-            ],
-        );
-        match result {
-            Ok(1) => {
-                transaction.commit().map_err(|_| lifecycle_error())?;
-                Ok(RebuildJobRegistrationResult::Registered)
-            }
-            Ok(_) | Err(_) => {
-                drop(transaction);
-                Ok(RebuildJobRegistrationResult::Conflict)
-            }
-        }
     }
 }
 
@@ -372,270 +280,281 @@ pub(super) fn legacy_unverified_embedding_profile() -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use rusqlite::{functions::FunctionFlags, Connection};
     use std::{
         sync::{mpsc, Arc, Barrier},
         thread,
     };
-
-    use rusqlite::{functions::FunctionFlags, Connection};
     use tempfile::TempDir;
 
-    use super::*;
-
-    fn storage_pair(label: &str) -> (TempDir, Arc<StorageService>, Arc<StorageService>) {
+    fn pair(label: &str) -> (TempDir, Arc<StorageService>, Arc<StorageService>) {
         let root = tempfile::Builder::new().prefix(label).tempdir().unwrap();
-        let data_root = root.path().join("data");
-        let first =
-            Arc::new(StorageService::initialize_with_roots(data_root.clone(), None).unwrap());
-        let second = Arc::new(StorageService::initialize_with_roots(data_root, None).unwrap());
+        let path = root.path().join("data");
+        let first = Arc::new(StorageService::initialize_with_roots(path.clone(), None).unwrap());
+        let second = Arc::new(StorageService::initialize_with_roots(path, None).unwrap());
         (root, first, second)
     }
-
-    fn registration<'a>(
-        generation_id: &'a str,
-        operation_id: &'a str,
+    fn reg<'a>(
+        g: &'a str,
+        op: &'a str,
+        job: &'a str,
+        req: &'a str,
     ) -> GenerationAuthorityRegistration<'a> {
         GenerationAuthorityRegistration {
-            generation_id,
+            generation_id: g,
             descriptor_hash: "descriptor-a",
             dimension: 8,
             descriptor_version: "descriptor-version-a",
             embedding_profile_id: "profile-a",
-            create_operation_id: operation_id,
+            create_operation_id: op,
+            job_id: job,
+            request_id: req,
+            source_active_generation_id: None,
+            source_active_authority_epoch: None,
         }
+    }
+    fn count(s: &StorageService, g: &str) -> i64 {
+        let state = s.state().unwrap();
+        state.connection.query_row("SELECT (SELECT COUNT(*) FROM memory_vector_generation WHERE generation_id=?1)+(SELECT COUNT(*) FROM memory_vector_generation_binding WHERE generation_id=?1)+(SELECT COUNT(*) FROM memory_vector_generation_store_witness WHERE generation_id=?1)+(SELECT COUNT(*) FROM memory_vector_generation_rebuild_job WHERE generation_id=?1)",[g],|r|r.get(0)).unwrap()
     }
 
     #[test]
-    fn generation_lifecycle_authority_commit_unknown_before_commit_is_not_committed() {
-        let (_root, first, _second) = storage_pair("generation-commit-before");
-        arm_registration_commit_fault_for_test(RegistrationCommitFault::BeforeCommit);
-        let error = first
-            .register_generation_lifecycle_authority(registration("generation-a", "operation-a"))
-            .unwrap_err();
-        assert_eq!(error.code, "GENERATION_AUTHORITY_COMMIT_RESULT_UNKNOWN");
-        assert_eq!(
-            first
-                .classify_generation_registration_commit(registration(
-                    "generation-a",
-                    "operation-a"
-                ))
-                .unwrap(),
-            GenerationAuthorityCommitClassification::NotCommitted
-        );
+    fn generation_lifecycle_authority_registration_atomic_complete() {
+        let (_r, a, _b) = pair("generation-atomic");
+        a.register_generation_lifecycle_authority(reg("g", "op", "job", "req"))
+            .unwrap();
+        assert_eq!(count(&a, "g"), 4);
     }
-
+    #[test]
+    fn generation_lifecycle_authority_registration_faults_rollback() {
+        for (i, f) in [
+            RegistrationFault::AfterGeneration,
+            RegistrationFault::AfterBinding,
+            RegistrationFault::AfterWitness,
+            RegistrationFault::AfterJob,
+            RegistrationFault::BeforeCommit,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (_r, a, _b) = pair("generation-fault");
+            let g = format!("g{i}");
+            let op = format!("op{i}");
+            let job = format!("job{i}");
+            let req = format!("req{i}");
+            arm_registration_fault_for_test(f);
+            assert!(a
+                .register_generation_lifecycle_authority(reg(&g, &op, &job, &req))
+                .is_err());
+            assert_eq!(count(&a, &g), 0);
+            assert_eq!(
+                a.classify_generation_registration_commit(reg(&g, &op, &job, &req))
+                    .unwrap(),
+                GenerationAuthorityCommitClassification::NotCommitted
+            );
+        }
+    }
     #[test]
     fn generation_lifecycle_authority_commit_unknown_after_real_commit_is_committed_without_replay()
     {
-        let (_root, first, _second) = storage_pair("generation-commit-after");
-        arm_registration_commit_fault_for_test(RegistrationCommitFault::AfterCommitOutcomeUnknown);
-        let error = first
-            .register_generation_lifecycle_authority(registration("generation-a", "operation-a"))
-            .unwrap_err();
-        assert_eq!(error.code, "GENERATION_AUTHORITY_COMMIT_RESULT_UNKNOWN");
+        let (_r, a, _b) = pair("generation-unknown");
+        arm_registration_fault_for_test(RegistrationFault::AfterCommitUnknown);
         assert_eq!(
-            first
-                .classify_generation_registration_commit(registration(
-                    "generation-a",
-                    "operation-a"
-                ))
+            a.register_generation_lifecycle_authority(reg("g", "op", "job", "req"))
+                .unwrap_err()
+                .code,
+            "GENERATION_AUTHORITY_COMMIT_RESULT_UNKNOWN"
+        );
+        assert_eq!(
+            a.classify_generation_registration_commit(reg("g", "op", "job", "req"))
                 .unwrap(),
             GenerationAuthorityCommitClassification::Committed
         );
-        assert!(first
-            .register_generation_lifecycle_authority(registration("generation-a", "operation-a"))
-            .is_err());
-        let state = first.state().unwrap();
-        let count: i64 = state
-            .connection
-            .query_row(
-                "SELECT COUNT(*) FROM memory_vector_generation_store_witness WHERE create_operation_id='operation-a'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(count(&a, "g"), 4);
     }
-
     #[test]
     fn generation_lifecycle_authority_commit_unknown_mixed_witness_requires_recovery() {
-        let (_root, first, _second) = storage_pair("generation-commit-mixed");
-        first
-            .register_generation_lifecycle_authority(registration("generation-a", "operation-a"))
+        let (_r, a, _b) = pair("generation-mixed");
+        a.register_generation_lifecycle_authority(reg("g", "op", "job", "req"))
             .unwrap();
-        first
-            .state()
+        a.state()
             .unwrap()
             .connection
             .execute(
-                "UPDATE memory_vector_generation_store_witness SET state='unverified' WHERE generation_id='generation-a'",
+                "DELETE FROM memory_vector_generation_rebuild_job WHERE generation_id='g'",
                 [],
             )
             .unwrap();
         assert_eq!(
-            first
-                .classify_generation_registration_commit(registration(
-                    "generation-a",
-                    "operation-a"
-                ))
+            a.classify_generation_registration_commit(reg("g", "op", "job", "req"))
                 .unwrap(),
             GenerationAuthorityCommitClassification::RecoveryRequired
         );
     }
-
+    #[test]
+    fn generation_lifecycle_transition_guard_enforces_exact_state_machine() {
+        let (_r, a, _b) = pair("generation-guard");
+        a.register_generation_lifecycle_authority(reg("g", "op", "job", "req"))
+            .unwrap();
+        {
+            let s = a.state().unwrap();
+            for sql in ["UPDATE memory_vector_generation SET authority_epoch=2 WHERE generation_id='g'","UPDATE memory_vector_generation SET state='failed' WHERE generation_id='g'","UPDATE memory_vector_generation SET state='failed',authority_epoch=3 WHERE generation_id='g'","UPDATE memory_vector_generation SET state='retired',authority_epoch=2 WHERE generation_id='g'"] {assert!(s.connection.execute(sql,[]).is_err(),"{sql}");}
+        }
+        assert_eq!(
+            a.compare_and_transition_generation_authority(
+                "g",
+                GenerationLifecycleState::Building,
+                1,
+                GenerationLifecycleState::Failed
+            )
+            .unwrap(),
+            GenerationAuthorityCasResult::Applied
+        );
+        let state = a.state().unwrap();
+        let row:(String,i64)=state.connection.query_row("SELECT state,authority_epoch FROM memory_vector_generation WHERE generation_id='g'",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(row, ("failed".into(), 2));
+    }
+    #[test]
+    fn generation_lifecycle_transition_accepts_active_to_retired() {
+        let (_r, a, _b) = pair("generation-retired");
+        a.register_generation_lifecycle_authority(reg("g", "op", "job", "req"))
+            .unwrap();
+        assert_eq!(
+            a.compare_and_transition_generation_authority(
+                "g",
+                GenerationLifecycleState::Building,
+                1,
+                GenerationLifecycleState::Active
+            )
+            .unwrap(),
+            GenerationAuthorityCasResult::Applied
+        );
+        assert_eq!(
+            a.compare_and_transition_generation_authority(
+                "g",
+                GenerationLifecycleState::Active,
+                2,
+                GenerationLifecycleState::Retired
+            )
+            .unwrap(),
+            GenerationAuthorityCasResult::Applied
+        );
+    }
     #[test]
     fn two_connection_cas_active_pointer_has_one_winner() {
-        let (_root, first, second) = storage_pair("generation-pointer-race");
-        first
-            .state()
-            .unwrap()
-            .connection
-            .execute(
-                "INSERT INTO memory_vector_generation
-                 (generation_id,descriptor_hash,dimension,state,authority_epoch)
-                 VALUES ('generation-active','descriptor-active',8,'active',1)",
-                [],
-            )
-            .unwrap();
-        let barrier = Arc::new(Barrier::new(2));
-        let (sender, receiver) = mpsc::channel();
-        for storage in [first, second] {
-            let barrier = Arc::clone(&barrier);
-            let sender = sender.clone();
+        let (_r, a, b) = pair("pointer-race");
+        a.state().unwrap().connection.execute("INSERT INTO memory_vector_generation (generation_id,descriptor_hash,dimension,state,authority_epoch) VALUES ('active','d',8,'active',1)",[]).unwrap();
+        let gate = Arc::new(Barrier::new(2));
+        let (tx, rx) = mpsc::channel();
+        for s in [a, b] {
+            let gate = gate.clone();
+            let tx = tx.clone();
             thread::spawn(move || {
-                barrier.wait();
-                sender
-                    .send(storage.compare_and_set_active_generation_pointer(
-                        None,
-                        "generation-active",
-                        1,
-                    ))
+                gate.wait();
+                tx.send(s.compare_and_set_active_generation_pointer(None, "active", 1))
                     .unwrap();
             });
         }
-        drop(sender);
-        let results: Vec<_> = receiver.into_iter().map(Result::unwrap).collect();
+        drop(tx);
+        let r: Vec<_> = rx.into_iter().map(Result::unwrap).collect();
         assert_eq!(
-            results
-                .iter()
-                .filter(|result| **result == GenerationAuthorityCasResult::Applied)
+            r.iter()
+                .filter(|x| **x == GenerationAuthorityCasResult::Applied)
                 .count(),
             1
         );
         assert_eq!(
-            results
-                .iter()
-                .filter(|result| **result == GenerationAuthorityCasResult::StaleOrConflict)
+            r.iter()
+                .filter(|x| **x == GenerationAuthorityCasResult::StaleOrConflict)
                 .count(),
             1
         );
     }
-
     #[test]
-    fn two_connection_cas_generation_authority_epoch_has_one_winner() {
-        let (_root, first, second) = storage_pair("generation-epoch-race");
-        first
-            .register_generation_lifecycle_authority(registration("generation-a", "operation-a"))
+    fn two_connection_generation_lifecycle_transition_has_one_winner() {
+        let (_r, a, b) = pair("transition-race");
+        a.register_generation_lifecycle_authority(reg("g", "op", "job", "req"))
             .unwrap();
-        let barrier = Arc::new(Barrier::new(2));
-        let (sender, receiver) = mpsc::channel();
-        for storage in [first, second] {
-            let barrier = Arc::clone(&barrier);
-            let sender = sender.clone();
+        let gate = Arc::new(Barrier::new(2));
+        let (tx, rx) = mpsc::channel();
+        for s in [a.clone(), b] {
+            let gate = gate.clone();
+            let tx = tx.clone();
             thread::spawn(move || {
-                barrier.wait();
-                sender
-                    .send(storage.compare_and_advance_generation_authority_epoch("generation-a", 1))
-                    .unwrap();
+                gate.wait();
+                tx.send(s.compare_and_transition_generation_authority(
+                    "g",
+                    GenerationLifecycleState::Building,
+                    1,
+                    GenerationLifecycleState::Failed,
+                ))
+                .unwrap();
             });
         }
-        drop(sender);
-        let results: Vec<_> = receiver.into_iter().map(Result::unwrap).collect();
+        drop(tx);
+        let r: Vec<_> = rx.into_iter().map(Result::unwrap).collect();
         assert_eq!(
-            results
-                .iter()
-                .filter(|result| **result == GenerationAuthorityCasResult::Applied)
+            r.iter()
+                .filter(|x| **x == GenerationAuthorityCasResult::Applied)
                 .count(),
             1
         );
         assert_eq!(
-            results
-                .iter()
-                .filter(|result| **result == GenerationAuthorityCasResult::StaleOrConflict)
+            r.iter()
+                .filter(|x| **x == GenerationAuthorityCasResult::StaleOrConflict)
                 .count(),
             1
         );
+        let state = a.state().unwrap();
+        let row:(String,i64)=state.connection.query_row("SELECT state,authority_epoch FROM memory_vector_generation WHERE generation_id='g'",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(row, ("failed".into(), 2));
     }
-
     #[test]
-    fn two_connection_generation_lifecycle_job_singleton_has_one_winner() {
-        let (_root, first, second) = storage_pair("generation-job-race");
-        first
-            .register_generation_lifecycle_authority(registration("generation-a", "operation-a"))
-            .unwrap();
-        let barrier = Arc::new(Barrier::new(2));
-        let (sender, receiver) = mpsc::channel();
-        for (storage, job_id, request_id) in [
-            (first, "job-a", "request-a"),
-            (second, "job-b", "request-b"),
+    fn two_connection_generation_lifecycle_registration_has_one_complete_winner() {
+        let (_r, a, b) = pair("registration-race");
+        let gate = Arc::new(Barrier::new(2));
+        let (tx, rx) = mpsc::channel();
+        for (s, g, op, job, req) in [
+            (a.clone(), "ga", "opa", "joba", "reqa"),
+            (b, "gb", "opb", "jobb", "reqb"),
         ] {
-            let barrier = Arc::clone(&barrier);
-            let sender = sender.clone();
+            let gate = gate.clone();
+            let tx = tx.clone();
             thread::spawn(move || {
-                barrier.wait();
-                sender
-                    .send(
-                        storage.register_generation_rebuild_job(RebuildJobRegistration {
-                            job_id,
-                            request_id,
-                            generation_id: "generation-a",
-                            source_active_generation_id: None,
-                            source_active_authority_epoch: None,
-                            candidate_authority_epoch: 1,
-                        }),
-                    )
+                gate.wait();
+                tx.send(s.register_generation_lifecycle_authority(reg(g, op, job, req)))
                     .unwrap();
             });
         }
-        drop(sender);
-        let results: Vec<_> = receiver.into_iter().map(Result::unwrap).collect();
-        assert_eq!(
-            results
-                .iter()
-                .filter(|result| **result == RebuildJobRegistrationResult::Registered)
-                .count(),
-            1
-        );
-        assert_eq!(
-            results
-                .iter()
-                .filter(|result| **result == RebuildJobRegistrationResult::Conflict)
-                .count(),
-            1
-        );
+        drop(tx);
+        let r: Vec<_> = rx.into_iter().collect();
+        assert_eq!(r.iter().filter(|x| x.is_ok()).count(), 1);
+        assert_eq!(r.iter().filter(|x| x.is_err()).count(), 1);
+        assert!([count(&a, "ga"), count(&a, "gb")].contains(&4));
+        assert!([count(&a, "ga"), count(&a, "gb")].contains(&0));
     }
-
     #[test]
     fn generation_lifecycle_writer_fence_rejects_old_writer_authority_mutation() {
-        let (_root, first, _second) = storage_pair("generation-writer-fence");
-        let database_path = first.state().unwrap().database_path.clone();
-        let old_writer = Connection::open(database_path).unwrap();
-        old_writer
-            .create_scalar_function(
-                "digital_life_writer_epoch",
-                0,
-                FunctionFlags::SQLITE_UTF8
-                    | FunctionFlags::SQLITE_DETERMINISTIC
-                    | FunctionFlags::SQLITE_INNOCUOUS,
-                |_| Ok(0_i64),
-            )
-            .unwrap();
-        let error = old_writer
+        let (_r, a, _b) = pair("writer-fence");
+        let path = a.state().unwrap().database_path.clone();
+        let old = Connection::open(path).unwrap();
+        old.create_scalar_function(
+            "digital_life_writer_epoch",
+            0,
+            FunctionFlags::SQLITE_UTF8
+                | FunctionFlags::SQLITE_DETERMINISTIC
+                | FunctionFlags::SQLITE_INNOCUOUS,
+            |_| Ok(0_i64),
+        )
+        .unwrap();
+        assert!(old
             .execute(
-                "UPDATE memory_vector_generation_authority SET updated_at='old-writer' WHERE singleton=1",
-                [],
+                "UPDATE memory_vector_generation_authority SET updated_at='old' WHERE singleton=1",
+                []
             )
-            .unwrap_err();
-        assert!(error.to_string().contains("INCOMPATIBLE_DATABASE_WRITER"));
+            .unwrap_err()
+            .to_string()
+            .contains("INCOMPATIBLE_DATABASE_WRITER"));
     }
 }

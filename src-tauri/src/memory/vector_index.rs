@@ -574,10 +574,7 @@ fn validate_eligible_memory(
 }
 
 fn selected_index_text(memory: &MemoryRecord) -> Result<&str, MemoryIndexError> {
-    let text = memory
-        .summary
-        .as_deref()
-        .filter(|summary| !summary.trim().is_empty())
+    let text = canonical_index_text(memory.summary.as_deref(), &memory.content)
         .unwrap_or(memory.content.as_str());
     if text.trim().is_empty() {
         return Err(MemoryIndexError::new(
@@ -590,15 +587,41 @@ fn selected_index_text(memory: &MemoryRecord) -> Result<&str, MemoryIndexError> 
 }
 
 fn content_hash(memory: &MemoryRecord, selected_text: &str) -> String {
+    canonical_memory_index_hash(
+        memory.kind.as_str(),
+        selected_text,
+        &memory.content,
+        memory.summary.as_deref(),
+    )
+}
+
+/// Selects the same authoritative text used by ordinary vector sync. The
+/// returned slice preserves stored bytes; callers that persist a temporary
+/// document may trim the selected value without changing the frozen hash
+/// input.
+pub(crate) fn canonical_index_text<'a>(
+    summary: Option<&'a str>,
+    content: &'a str,
+) -> Option<&'a str> {
+    summary
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| (!content.trim().is_empty()).then_some(content))
+}
+
+/// The single canonical memory-index hash authority. Field order, framing,
+/// domain separator, and bytes intentionally match ordinary vector sync.
+pub(crate) fn canonical_memory_index_hash(
+    kind: &str,
+    selected_text: &str,
+    content: &str,
+    summary: Option<&str>,
+) -> String {
     let mut hasher = Sha256::new();
     hash_field(&mut hasher, MEMORY_INDEX_FORMAT_VERSION.as_bytes());
-    hash_field(&mut hasher, memory.kind.as_str().as_bytes());
+    hash_field(&mut hasher, kind.as_bytes());
     hash_field(&mut hasher, selected_text.as_bytes());
-    hash_field(&mut hasher, memory.content.as_bytes());
-    hash_field(
-        &mut hasher,
-        memory.summary.as_deref().unwrap_or_default().as_bytes(),
-    );
+    hash_field(&mut hasher, content.as_bytes());
+    hash_field(&mut hasher, summary.unwrap_or_default().as_bytes());
     let digest = hasher.finalize();
     let mut result = String::with_capacity(digest.len() * 2);
     for byte in digest {

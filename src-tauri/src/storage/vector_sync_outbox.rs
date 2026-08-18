@@ -1,9 +1,7 @@
-use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
-use sha2::{Digest, Sha256};
-
 use crate::memory::{
     candidate_service::contains_prohibited_content,
     existing_generation_binding::ExistingGenerationBindingError,
+    vector_index::canonical_memory_index_hash,
     vector_sync_outbox::{
         ClaimMemoryVectorSyncLeaseRequest, ClaimMemoryVectorSyncRequest,
         EnqueueMemoryVectorSyncRequest, MemoryVectorSyncAction, MemoryVectorSyncJob,
@@ -12,6 +10,7 @@ use crate::memory::{
     },
 };
 use crate::vector_store::{VectorGenerationContext, VectorGenerationId};
+use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 
 use super::{late_delete_resolution, StorageService};
 
@@ -309,22 +308,7 @@ fn canonical_content_hash(
     summary: Option<&str>,
     selected: &str,
 ) -> String {
-    let mut hasher = Sha256::new();
-    for field in [
-        b"memory-index-v1".as_slice(),
-        kind.as_bytes(),
-        selected.as_bytes(),
-        content.as_bytes(),
-        summary.unwrap_or_default().as_bytes(),
-    ] {
-        hasher.update((field.len() as u64).to_be_bytes());
-        hasher.update(field);
-    }
-    hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    canonical_memory_index_hash(kind, selected, content, summary)
 }
 
 /// Private capability returned only after the global runtime lease and the

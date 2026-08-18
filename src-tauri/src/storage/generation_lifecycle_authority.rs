@@ -59,8 +59,6 @@ pub(crate) struct GenerationAuthorityRegistration<'a> {
     pub(crate) create_operation_id: &'a str,
     pub(crate) job_id: &'a str,
     pub(crate) request_id: &'a str,
-    pub(crate) source_active_generation_id: Option<&'a str>,
-    pub(crate) source_active_authority_epoch: Option<i64>,
 }
 
 #[cfg(test)]
@@ -112,14 +110,6 @@ fn valid(registration: &GenerationAuthorityRegistration<'_>) -> bool {
         && valid_nonempty(registration.create_operation_id)
         && valid_nonempty(registration.job_id)
         && valid_nonempty(registration.request_id)
-        && match (
-            registration.source_active_generation_id,
-            registration.source_active_authority_epoch,
-        ) {
-            (None, None) => true,
-            (Some(id), Some(epoch)) => valid_nonempty(id) && epoch >= 1,
-            _ => false,
-        }
 }
 
 #[cfg(test)]
@@ -149,22 +139,38 @@ impl StorageService {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| invalid())?;
-        if let (Some(source), Some(epoch)) = (
-            registration.source_active_generation_id,
-            registration.source_active_authority_epoch,
-        ) {
-            let exists: Option<i64> = transaction
-                .query_row(
-                    "SELECT 1 FROM memory_vector_generation WHERE generation_id=?1 AND state='active' AND authority_epoch=?2",
-                    params![source, epoch],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|_| invalid())?;
-            if exists.is_none() {
-                return Err(invalid());
-            }
-        }
+        // Capture source authority from the singleton pointer while this
+        // IMMEDIATE transaction owns the writer slot. A caller cannot select
+        // an arbitrary source generation/epoch pair; NULL is the only legal
+        // bootstrap world.
+        let source: Option<(String, i64)> = transaction
+            .query_row(
+                "SELECT a.active_generation_id,g.state,g.authority_epoch,
+                        EXISTS(SELECT 1 FROM memory_vector_generation WHERE state='active')
+                 FROM memory_vector_generation_authority a
+                 LEFT JOIN memory_vector_generation g
+                   ON g.generation_id=a.active_generation_id
+                 WHERE a.singleton=1",
+                [],
+                |row| {
+                    let generation_id: Option<String> = row.get(0)?;
+                    let state: Option<String> = row.get(1)?;
+                    let epoch: Option<i64> = row.get(2)?;
+                    let has_active_generation: bool = row.get(3)?;
+                    match generation_id {
+                        None if !has_active_generation => Ok(None),
+                        None => Err(rusqlite::Error::InvalidQuery),
+                        Some(generation_id)
+                            if state.as_deref() == Some("active")
+                                && epoch.is_some_and(|value| value >= 1) =>
+                        {
+                            Ok(Some((generation_id, epoch.expect("checked above"))))
+                        }
+                        Some(_) => Err(rusqlite::Error::InvalidQuery),
+                    }
+                },
+            )
+            .map_err(|_| invalid())?;
         let now = late_delete_resolution::authoritative_utc_millis_now_in(&transaction)
             .map_err(|_| invalid())?;
         transaction.execute("INSERT INTO memory_vector_generation (generation_id,descriptor_hash,dimension,state,authority_epoch) VALUES (?1,?2,?3,'building',1)", params![registration.generation_id, registration.descriptor_hash, registration.dimension as i64]).map_err(|_| invalid())?;
@@ -182,7 +188,11 @@ impl StorageService {
         if fail(RegistrationFault::AfterWitness) {
             return Err(invalid());
         }
-        transaction.execute("INSERT INTO memory_vector_generation_rebuild_job (job_id,request_id,generation_id,source_active_generation_id,source_active_authority_epoch,candidate_authority_epoch,status,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,1,'registered',?6,?6)", params![registration.job_id, registration.request_id, registration.generation_id, registration.source_active_generation_id, registration.source_active_authority_epoch, now]).map_err(|_| invalid())?;
+        let (source_generation_id, source_authority_epoch) = source
+            .as_ref()
+            .map(|(generation_id, epoch)| (Some(generation_id.as_str()), Some(*epoch)))
+            .unwrap_or((None, None));
+        transaction.execute("INSERT INTO memory_vector_generation_rebuild_job (job_id,request_id,generation_id,source_active_generation_id,source_active_authority_epoch,candidate_authority_epoch,status,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,1,'registered',?6,?6)", params![registration.job_id, registration.request_id, registration.generation_id, source_generation_id, source_authority_epoch, now]).map_err(|_| invalid())?;
         #[cfg(test)]
         if fail(RegistrationFault::AfterJob) {
             return Err(invalid());
@@ -191,7 +201,7 @@ impl StorageService {
         if fail(RegistrationFault::BeforeCommit) {
             return Err(commit_unknown());
         }
-        transaction.commit().map_err(|_| invalid())?;
+        transaction.commit().map_err(|_| commit_unknown())?;
         #[cfg(test)]
         if fail(RegistrationFault::AfterCommitUnknown) {
             return Err(commit_unknown());
@@ -209,8 +219,8 @@ impl StorageService {
         }
         let state = self.state()?;
         let exact: Option<i64> = state.connection.query_row(
-            "SELECT 1 FROM memory_vector_generation g JOIN memory_vector_generation_binding b ON b.generation_id=g.generation_id JOIN memory_vector_generation_store_witness w ON w.generation_id=g.generation_id JOIN memory_vector_generation_rebuild_job j ON j.generation_id=g.generation_id WHERE g.generation_id=?1 AND g.descriptor_hash=?2 AND g.dimension=?3 AND g.state='building' AND g.authority_epoch=1 AND b.descriptor_version=?4 AND b.embedding_profile_id=?5 AND w.create_operation_id=?6 AND w.state='create_started' AND j.job_id=?7 AND j.request_id=?8 AND j.source_active_generation_id IS ?9 AND j.source_active_authority_epoch IS ?10 AND j.candidate_authority_epoch=1 AND j.status='registered'",
-            params![registration.generation_id, registration.descriptor_hash, registration.dimension as i64, D9D2_GENERATION_DESCRIPTOR_VERSION, registration.embedding_profile_id, registration.create_operation_id, registration.job_id, registration.request_id, registration.source_active_generation_id, registration.source_active_authority_epoch],
+            "SELECT 1 FROM memory_vector_generation g JOIN memory_vector_generation_binding b ON b.generation_id=g.generation_id JOIN memory_vector_generation_store_witness w ON w.generation_id=g.generation_id JOIN memory_vector_generation_rebuild_job j ON j.generation_id=g.generation_id WHERE g.generation_id=?1 AND g.descriptor_hash=?2 AND g.dimension=?3 AND g.state='building' AND g.authority_epoch=1 AND b.descriptor_version=?4 AND b.embedding_profile_id=?5 AND w.create_operation_id=?6 AND w.state='create_started' AND j.job_id=?7 AND j.request_id=?8 AND j.candidate_authority_epoch=1 AND j.status='registered'",
+            params![registration.generation_id, registration.descriptor_hash, registration.dimension as i64, D9D2_GENERATION_DESCRIPTOR_VERSION, registration.embedding_profile_id, registration.create_operation_id, registration.job_id, registration.request_id],
             |row| row.get(0),
         ).optional().map_err(|_| invalid())?;
         if exact.is_some() {
@@ -309,8 +319,6 @@ mod tests {
             create_operation_id: op,
             job_id: job,
             request_id: req,
-            source_active_generation_id: None,
-            source_active_authority_epoch: None,
         }
     }
     fn count(s: &StorageService, g: &str) -> i64 {

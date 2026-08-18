@@ -12,7 +12,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager, State};
+use tauri::State;
 
 use crate::{
     model::{
@@ -571,27 +571,6 @@ where
     }
 }
 
-struct RuntimeObserver<'a> {
-    jobs: &'a MemoryVectorIndexRuntimeCoordinator,
-    job_id: VectorIndexJobId,
-    cancel: Arc<AtomicBool>,
-}
-
-impl MemoryRebuildObserver for RuntimeObserver<'_> {
-    fn is_cancelled(&self) -> bool {
-        self.cancel.load(Ordering::Acquire)
-    }
-
-    fn on_model_resolved(&self, embedding_model: &str, dimension: usize) {
-        self.jobs
-            .update_profile(&self.job_id, embedding_model.to_string(), dimension);
-    }
-
-    fn on_progress(&self, progress: MemoryRebuildProgress) {
-        self.jobs.update_progress(&self.job_id, progress);
-    }
-}
-
 #[tauri::command]
 pub async fn get_memory_vector_index_status(
     storage: State<'_, StorageService>,
@@ -612,21 +591,6 @@ pub async fn get_memory_vector_index_status(
 }
 
 #[tauri::command]
-pub fn start_memory_vector_index_rebuild(
-    app: AppHandle,
-    jobs: State<'_, MemoryVectorIndexRuntimeCoordinator>,
-    request: StartMemoryVectorIndexRebuildRequest,
-) -> Result<VectorIndexJobId, VectorIndexRuntimeError> {
-    let life_id = request.life_id;
-    let job_id = jobs.start_job(life_id.clone())?;
-    let spawned_job_id = job_id.clone();
-    tauri::async_runtime::spawn(async move {
-        run_job(app, spawned_job_id, life_id).await;
-    });
-    Ok(job_id)
-}
-
-#[tauri::command]
 pub fn get_memory_vector_index_job(
     jobs: State<'_, MemoryVectorIndexRuntimeCoordinator>,
     request: MemoryVectorIndexJobRequest,
@@ -640,53 +604,6 @@ pub fn cancel_memory_vector_index_job(
     request: MemoryVectorIndexJobRequest,
 ) -> Result<VectorIndexJobResult, VectorIndexRuntimeError> {
     jobs.cancel_job(&request.job_id)
-}
-
-async fn run_job(app: AppHandle, job_id: VectorIndexJobId, life_id: String) {
-    let jobs = app.state::<MemoryVectorIndexRuntimeCoordinator>();
-    jobs.update_status(&job_id, VectorIndexJobStatus::ResolvingProfile);
-    let cancel = match jobs.cancellation(&job_id) {
-        Ok(cancel) => cancel,
-        Err(_) => return,
-    };
-    if cancel.load(Ordering::Acquire) {
-        jobs.finish(
-            &job_id,
-            VectorIndexJobStatus::Cancelled,
-            None,
-            Some(runtime_error(VectorIndexRuntimeErrorCode::RebuildCancelled)),
-        );
-        return;
-    }
-    let composition_gate =
-        app.state::<super::vector_sync_stage_runtime::FencedVectorSyncCompositionGate>();
-    let _composition_guard = composition_gate.acquire().await;
-    let storage = app.state::<StorageService>();
-    let secrets = app.state::<WindowsCredentialSecretStore>();
-    let model_runtime = app.state::<ModelRuntimeCoordinator>();
-    let service = MemoryVectorIndexRuntimeService::new(
-        storage.inner(),
-        storage.inner(),
-        secrets.inner(),
-        storage.inner(),
-        model_runtime.inner(),
-    );
-    let observer = RuntimeObserver {
-        jobs: jobs.inner(),
-        job_id: job_id.clone(),
-        cancel,
-    };
-    let result = service.rebuild(&life_id, &observer).await;
-    match result {
-        Ok(report) => {
-            jobs.update_profile(&job_id, report.embedding_model.clone(), report.dimension);
-            jobs.finish(&job_id, VectorIndexJobStatus::Completed, Some(report), None);
-        }
-        Err(error) if error.code == VectorIndexRuntimeErrorCode::RebuildCancelled => {
-            jobs.finish(&job_id, VectorIndexJobStatus::Cancelled, None, Some(error))
-        }
-        Err(error) => jobs.finish(&job_id, VectorIndexJobStatus::Failed, None, Some(error)),
-    }
 }
 
 fn count_eligible<R: MemoryVectorIndexRepository + ?Sized>(

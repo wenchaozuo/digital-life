@@ -29,6 +29,15 @@ pub struct FencedVectorSyncCompositionGate {
     gate: Mutex<()>,
 }
 
+/// The sole composition guard is intentionally shareable with staged,
+/// private lifecycle phases. A phase must receive this guard from its future
+/// full-pipeline orchestrator; it must not acquire and release a partial gate
+/// around a live building job. The private field brands the guard to this
+/// gate instead of accepting an arbitrary `MutexGuard<()>`.
+pub(crate) struct FencedVectorSyncCompositionGuard<'a> {
+    _guard: MutexGuard<'a, ()>,
+}
+
 impl Default for FencedVectorSyncCompositionGate {
     fn default() -> Self {
         Self {
@@ -38,8 +47,10 @@ impl Default for FencedVectorSyncCompositionGate {
 }
 
 impl FencedVectorSyncCompositionGate {
-    pub(crate) async fn acquire(&self) -> MutexGuard<'_, ()> {
-        self.gate.lock().await
+    pub(crate) async fn acquire(&self) -> FencedVectorSyncCompositionGuard<'_> {
+        FencedVectorSyncCompositionGuard {
+            _guard: self.gate.lock().await,
+        }
     }
 }
 

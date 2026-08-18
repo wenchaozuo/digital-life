@@ -4,6 +4,7 @@ mod connection;
 mod conversation;
 pub(crate) mod deterministic_candidate_extraction;
 mod generation_lifecycle_authority;
+mod generation_rebuild;
 mod late_delete_resolution;
 mod llm_candidate_extraction;
 mod location;
@@ -27,6 +28,13 @@ pub(crate) use llm_candidate_extraction::{
 };
 // Opaque H1 capabilities are re-exported only for the future private S3
 // orchestrator; their constructors and the raw resolution token stay private.
+pub(crate) use generation_lifecycle_authority::{
+    GenerationAuthorityCommitClassification, GenerationAuthorityRegistration,
+};
+pub(crate) use generation_rebuild::{
+    GenerationRebuildFinalizeOutcome, GenerationRebuildItemRecord, GenerationRebuildJobRecord,
+    GenerationRebuildLease,
+};
 #[allow(unused_imports)]
 pub(crate) use late_delete_resolution::{
     AbsentPostDeleteCapability, AbsentPostQueryCapability, CorruptPostQueryCapability,

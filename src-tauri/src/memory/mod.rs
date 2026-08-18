@@ -20,6 +20,7 @@ pub mod retrieval;
 pub mod retrieval_router;
 pub mod retrieval_runtime;
 pub mod revisions;
+pub(crate) mod vector_generation_rebuild;
 pub mod vector_index;
 pub mod vector_index_runtime;
 mod vector_sync_compensation;

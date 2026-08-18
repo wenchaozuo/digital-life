@@ -67,7 +67,6 @@ pub fn run() {
             memory::management::set_memory_sensitive,
             memory::management::delete_memory_permanently,
             memory::vector_index_runtime::get_memory_vector_index_status,
-            memory::vector_index_runtime::start_memory_vector_index_rebuild,
             memory::vector_index_runtime::get_memory_vector_index_job,
             memory::vector_index_runtime::cancel_memory_vector_index_job,
             memory::vector_sync_worker::get_memory_vector_sync_settings,

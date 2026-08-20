@@ -107,6 +107,19 @@ impl GenerationRebuildCError {
         )
     }
 
+    /// A promotion commit-result-unknown world that the exact classifier judged
+    /// RecoveryRequired.  This is a deliberately distinct, sealed internal
+    /// classification: the outer lifecycle owner must NOT run the ordinary
+    /// failed-generation compensation or derive safety from `job.status` alone;
+    /// it must re-read the durable promotion state and reclassify exactly.
+    fn promotion_recovery_required(message: &'static str) -> Self {
+        Self::new(
+            "GENERATION_REBUILD_PROMOTION_RECOVERY_REQUIRED",
+            message,
+            false,
+        )
+    }
+
     fn cancelled() -> Self {
         Self::new(
             "GENERATION_REBUILD_CANCELLED",
@@ -469,6 +482,14 @@ where
                 continue;
             }
             Err(error) if error.code == "GENERATION_REBUILD_PROMOTION_COMMIT_RESULT_UNKNOWN" => {
+                // Test-only seam: after the real promotion COMMIT succeeded but
+                // before the exact classification, corrupt one outbox-resolution
+                // fact so a mixed world is observed while the job row still says
+                // `completed`.
+                #[cfg(test)]
+                storage
+                    .inject_promotion_recovery_corruption_if_armed(&job.job_id)
+                    .unwrap();
                 match storage
                     .classify_generation_rebuild_promotion_commit(
                         &job.job_id,
@@ -487,7 +508,13 @@ where
                     }
                     GenerationRebuildPromotionCommitClassification::NotCommitted => continue,
                     GenerationRebuildPromotionCommitClassification::RecoveryRequired => {
-                        return Err(GenerationRebuildCError::storage(error));
+                        // Surface a sealed, unambiguous classification to the
+                        // outer lifecycle owner.  The promotion may have actually
+                        // committed, so this failure MUST NOT be routed into the
+                        // ordinary failed-generation compensation path.
+                        return Err(GenerationRebuildCError::promotion_recovery_required(
+                            "The generation promotion left a mixed durable world; exact reclassification is required before the composition guard may be released.",
+                        ));
                     }
                 }
             }
@@ -1756,7 +1783,8 @@ mod tests {
     use crate::{
         memory::vector_sync_stage_runtime::{
             fail_next_outer_compensation_for_test, run_vector_generation_rebuild_guarded,
-            set_outer_compensation_failure_signal_for_test, FencedVectorSyncCompositionGate,
+            set_outer_compensation_failure_signal_for_test,
+            set_promotion_recovery_entered_signal_for_test, FencedVectorSyncCompositionGate,
         },
         model::{
             profile::{
@@ -3089,13 +3117,22 @@ mod tests {
 
             // Restore the outbox resolution (the promotion-only evidence set is
             // complete again) and prove the committed classification returns.
+            // The restored row must carry the exact promotion-completion
+            // timestamp, matching the classifier's operation-time invariant.
             let connection = open_authorized_test_connection(&database).unwrap();
+            let completed_at: String = connection
+                .query_row(
+                    "SELECT completed_at FROM memory_vector_generation_rebuild_job WHERE job_id=?1",
+                    [job.job_id.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
             connection
                 .execute(
                     "INSERT INTO memory_vector_generation_rebuild_resolution
                      (job_id,source_kind,source_row_id,life_id,memory_id,mutation_sequence,source_generation_id,source_generation_authority_epoch,disposition,replacement_mutation_sequence,created_at)
-                     VALUES (?1,'outbox',?2,'life-a','memory-c',2,NULL,NULL,'legacy_rebuild_resolved',NULL,'2026-01-01T00:00:00.000Z')",
-                    rusqlite::params![job.job_id.as_str(), outbox_id],
+                     VALUES (?1,'outbox',?2,'life-a','memory-c',2,NULL,NULL,'legacy_rebuild_resolved',NULL,?3)",
+                    rusqlite::params![job.job_id.as_str(), outbox_id, completed_at],
                 )
                 .unwrap();
             drop(connection);
@@ -3307,6 +3344,345 @@ mod tests {
             let current_job = storage.load_generation_rebuild_job("job-a").unwrap();
             assert_eq!(current_job.status, "cancelled");
             assert_eq!(current_job.generation_state, "failed");
+        });
+    }
+
+    #[test]
+    fn d9d3_d_f2_recovery_required_holds_gate_until_exact_committed_restored() {
+        tauri::async_runtime::block_on(async {
+            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            C_STORE_CREATE_CALLS.store(0, Ordering::SeqCst);
+            C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
+            let (_root, storage, _profiles, secrets, coordinator, registry, server) =
+                full_fixture(ServerBehavior::Success(3));
+            let database = storage.test_database_main_path().unwrap();
+            // The orchestrator resolves its embedding provider from the storage
+            // repository, so register a real profile that points at the mock
+            // embedding server and make it active.
+            let profile = ModelProfileService::new(&storage)
+                .create(CreateModelProfileRequest {
+                    purpose: ModelPurpose::Embedding,
+                    provider_kind: ModelProviderKind::OpenaiCompatible,
+                    display_name: "D9D3-F2 recovery embedding profile".into(),
+                    base_url: server.base_url.clone(),
+                    model_name: "embedding-model".into(),
+                    temperature: None,
+                    max_tokens: None,
+                    embedding_dimension: Some(3),
+                })
+                .unwrap();
+            ModelProfileService::new(&storage)
+                .set_active(SetActiveModelProfileRequest {
+                    purpose: ModelPurpose::Embedding,
+                    profile_id: profile.id.clone(),
+                })
+                .unwrap();
+            secrets
+                .set_secret(
+                    &SecretIdentifier::new(SecretPurpose::EmbeddingModelApiKey, &profile.id)
+                        .unwrap(),
+                    SecretValue::new("d9d3-f2-recovery-key".into()).unwrap(),
+                )
+                .unwrap();
+            // Seed one covered outbox Delete and one Late Delete row so the
+            // promotion writes real resolution evidence (the injected corruption
+            // needs a resolution row to corrupt).
+            {
+                let connection = open_authorized_test_connection(&database).unwrap();
+                connection
+                    .execute_batch(
+                        "INSERT INTO memory_vector_generation (generation_id,descriptor_hash,dimension,state,authority_epoch)
+                         VALUES ('source-g1','source-descriptor',3,'active',7);
+                         UPDATE memory_vector_generation_authority SET active_generation_id='source-g1' WHERE singleton=1;
+                         UPDATE memory_vector_sync_mutation_clock SET last_sequence=2 WHERE singleton=1;
+                         INSERT INTO memory_vector_sync_outbox (life_id,memory_id,desired_action,mutation_sequence,target_revision,target_content_hash,migration_disposition)
+                         VALUES ('life-a','memory-c','delete',2,NULL,NULL,NULL);
+                         INSERT INTO memory_vector_late_delete_resolution
+                           (outbox_id,life_id,memory_id,mutation_sequence,claimed_generation_id,embedding_descriptor_id,embedding_dimension,captured_generation_state,
+                            witness_attempt_ordinal,witness_claim_epoch,witness_marked_claim_epoch,witness_send_disposition,witness_age_anchor_at,captured_generation_authority_epoch,state,created_at,updated_at)
+                         SELECT o.id,'life-a','memory-c',2,'source-g1','source-descriptor',3,'active',1,7,7,'possibly_sent','2026-01-01T00:00:00.000Z',7,'pending','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z'
+                         FROM memory_vector_sync_outbox o WHERE o.memory_id='memory-c';",
+                    )
+                    .unwrap();
+                drop(connection);
+            }
+
+            let gate = Arc::new(FencedVectorSyncCompositionGate::default());
+            let guard = gate.acquire().await;
+
+            // The promotion really commits, but the D layer observes a controlled
+            // mixed postimage (after COMMIT, before classification) and must
+            // surface a sealed PromotionRecoveryRequired classification.
+            arm_promotion_fault_for_test(PromotionFault::AfterCommitUnknown);
+            crate::storage::arm_promotion_recovery_corruption_for_test();
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            set_promotion_recovery_entered_signal_for_test(entered_tx);
+            let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+            let competitor_gate = Arc::clone(&gate);
+            let competitor = std::thread::spawn(move || {
+                tauri::async_runtime::block_on(async move {
+                    let _competitor_guard = competitor_gate.acquire().await;
+                    acquired_tx.send(()).unwrap();
+                })
+            });
+
+            let pipeline_result = std::thread::scope(|scope| {
+                let pipeline = scope.spawn(|| {
+                    tauri::async_runtime::block_on(run_vector_generation_rebuild_guarded(
+                        &storage,
+                        &secrets,
+                        &coordinator,
+                        &registry,
+                        &guard,
+                        "request-a",
+                        Duration::from_secs(10),
+                    ))
+                });
+
+                // The outer owner entered the promotion-recovery fail-closed path.
+                entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                std::thread::yield_now();
+                assert!(
+                    acquired_rx.try_recv().is_err(),
+                    "a competitor must not acquire the gate while the promotion world is mixed"
+                );
+                let job = storage
+                    .load_generation_rebuild_job_by_request("request-a")
+                    .unwrap()
+                    .expect("the committed job must exist");
+                assert_eq!(
+                    job.status, "completed",
+                    "the job row still says completed even though the world is mixed"
+                );
+                let operation_id = job
+                    .promotion_operation_id
+                    .clone()
+                    .expect("promotion identity");
+                let target = job.promotion_sequence.expect("promotion sequence");
+                assert!(
+                    matches!(
+                        storage
+                            .classify_generation_rebuild_promotion_commit(
+                                &job.job_id,
+                                &operation_id,
+                                target,
+                            )
+                            .unwrap(),
+                        GenerationRebuildPromotionCommitClassification::RecoveryRequired
+                    ),
+                    "the mixed world must still classify as RecoveryRequired"
+                );
+
+                // No failed-generation compensation may have run against the
+                // possibly-active G2: it is still active at the promoted epoch.
+                let connection = open_authorized_test_connection(&database).unwrap();
+                let generation_state: (String, i64) = connection
+                    .query_row(
+                        "SELECT state, authority_epoch FROM memory_vector_generation
+                         WHERE generation_id=(SELECT generation_id FROM memory_vector_generation_rebuild_job WHERE job_id=?1)",
+                        [job.job_id.as_str()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                assert_eq!(generation_state.0, "active");
+                assert_eq!(generation_state.1, 2);
+
+                // Restore the exact committed postimage (clear the injected
+                // replacement sequence).  The outer owner may then reclassify
+                // exact Committed and the pipeline scope may end.
+                connection
+                    .execute(
+                        "UPDATE memory_vector_generation_rebuild_resolution
+                         SET replacement_mutation_sequence=NULL
+                         WHERE job_id=?1 AND source_kind='outbox'",
+                        [job.job_id.as_str()],
+                    )
+                    .unwrap();
+                drop(connection);
+
+                let result = pipeline.join().unwrap();
+                assert!(
+                    result.is_err(),
+                    "the pipeline reports the recovery-required failure"
+                );
+                result
+            });
+
+            // Only after the exact committed image is proven may the guard be
+            // released; the competitor then acquires.
+            drop(guard);
+            acquired_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            competitor.join().unwrap();
+            assert!(pipeline_result.is_err());
+        });
+    }
+
+    #[test]
+    fn d9d3_d_f2_committed_classifier_rejects_resolution_tuple_corruptions() {
+        tauri::async_runtime::block_on(async {
+            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            C_STORE_CREATE_CALLS.store(0, Ordering::SeqCst);
+            C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
+            let (_root, storage, profiles, secrets, coordinator, registry, _server) =
+                full_fixture(ServerBehavior::Success(3));
+            let database = storage.test_database_main_path().unwrap();
+            {
+                let connection = open_authorized_test_connection(&database).unwrap();
+                connection
+                    .execute_batch(
+                        "INSERT INTO memory_vector_generation (generation_id,descriptor_hash,dimension,state,authority_epoch)
+                         VALUES ('source-g1','source-descriptor',3,'active',7);
+                         UPDATE memory_vector_generation_authority SET active_generation_id='source-g1' WHERE singleton=1;
+                         UPDATE memory_vector_sync_mutation_clock SET last_sequence=2 WHERE singleton=1;
+                         INSERT INTO memory_vector_sync_outbox (life_id,memory_id,desired_action,mutation_sequence,target_revision,target_content_hash,migration_disposition)
+                         VALUES ('life-a','memory-c','delete',2,NULL,NULL,NULL);
+                         INSERT INTO memory_vector_late_delete_resolution
+                           (outbox_id,life_id,memory_id,mutation_sequence,claimed_generation_id,embedding_descriptor_id,embedding_dimension,captured_generation_state,
+                            witness_attempt_ordinal,witness_claim_epoch,witness_marked_claim_epoch,witness_send_disposition,witness_age_anchor_at,captured_generation_authority_epoch,state,created_at,updated_at)
+                         SELECT o.id,'life-a','memory-c',2,'source-g1','source-descriptor',3,'active',1,7,7,'possibly_sent','2026-01-01T00:00:00.000Z',7,'pending','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z'
+                         FROM memory_vector_sync_outbox o WHERE o.memory_id='memory-c';",
+                    )
+                    .unwrap();
+                drop(connection);
+            }
+            let runtime = runtime_fixture(&profiles, &secrets, &coordinator);
+            let gate = FencedVectorSyncCompositionGate::default();
+            let guard = gate.acquire().await;
+            let handoff = run_generation_rebuild_c(
+                &storage,
+                &runtime,
+                &registry,
+                "request-a",
+                "owner-a",
+                &guard,
+            )
+            .await
+            .unwrap();
+            arm_promotion_fault_for_test(PromotionFault::AfterCommitUnknown);
+            let _completed = run_generation_rebuild_d(
+                &storage,
+                &runtime,
+                &registry,
+                &handoff,
+                "owner-a",
+                std::time::Instant::now() + Duration::from_secs(10),
+                &guard,
+            )
+            .await
+            .unwrap();
+            let job = storage
+                .load_generation_rebuild_job(&handoff.job_id)
+                .unwrap();
+            assert_eq!(job.status, "completed");
+            let job_id = job.job_id.clone();
+            let operation_id = job.promotion_operation_id.clone().unwrap();
+            let target = job.promotion_sequence.unwrap();
+
+            let connection = open_authorized_test_connection(&database).unwrap();
+            let completed_at: String = connection
+                .query_row(
+                    "SELECT completed_at FROM memory_vector_generation_rebuild_job WHERE job_id=?1",
+                    [job_id.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let classify = || {
+                storage
+                    .classify_generation_rebuild_promotion_commit(&job_id, &operation_id, target)
+                    .unwrap()
+            };
+            use GenerationRebuildPromotionCommitClassification as C;
+            assert_eq!(classify(), C::Committed);
+
+            // Attack 1: wrong outbox resolution disposition (failed_generation_requeued
+            // must never masquerade as promotion completion evidence).
+            connection
+                .execute(
+                    "UPDATE memory_vector_generation_rebuild_resolution
+                     SET disposition='failed_generation_requeued'
+                     WHERE job_id=?1 AND source_kind='outbox'",
+                    [job_id.as_str()],
+                )
+                .unwrap();
+            assert_eq!(classify(), C::RecoveryRequired);
+            connection
+                .execute(
+                    "UPDATE memory_vector_generation_rebuild_resolution
+                     SET disposition='legacy_rebuild_resolved'
+                     WHERE job_id=?1 AND source_kind='outbox'",
+                    [job_id.as_str()],
+                )
+                .unwrap();
+            assert_eq!(classify(), C::Committed);
+
+            // Attack 2: illegal non-NULL replacement_mutation_sequence on a
+            // promotion-owned resolution.
+            connection
+                .execute(
+                    "UPDATE memory_vector_generation_rebuild_resolution
+                     SET replacement_mutation_sequence=999
+                     WHERE job_id=?1 AND source_kind='outbox'",
+                    [job_id.as_str()],
+                )
+                .unwrap();
+            assert_eq!(classify(), C::RecoveryRequired);
+            connection
+                .execute(
+                    "UPDATE memory_vector_generation_rebuild_resolution
+                     SET replacement_mutation_sequence=NULL
+                     WHERE job_id=?1 AND source_kind='outbox'",
+                    [job_id.as_str()],
+                )
+                .unwrap();
+            assert_eq!(classify(), C::Committed);
+
+            // Attack 3: delete the selected Late Delete resolution while its LD
+            // row stays resolved_rebuilt (the two-way proof must catch it).
+            connection
+                .execute(
+                    "DELETE FROM memory_vector_generation_rebuild_resolution
+                     WHERE job_id=?1 AND source_kind='late_delete'",
+                    [job_id.as_str()],
+                )
+                .unwrap();
+            assert_eq!(classify(), C::RecoveryRequired);
+            // Restore the exact committed LD resolution reconstructed solely from
+            // frozen Schema18 facts (proving the two-way evidence is rebuildable).
+            connection
+                .execute(
+                    "INSERT INTO memory_vector_generation_rebuild_resolution
+                     (job_id,source_kind,source_row_id,life_id,memory_id,mutation_sequence,source_generation_id,source_generation_authority_epoch,disposition,replacement_mutation_sequence,created_at)
+                     SELECT ?1,'late_delete',ld.resolution_id,ld.life_id,ld.memory_id,ld.mutation_sequence,
+                            ld.claimed_generation_id,ld.captured_generation_authority_epoch,
+                            'resolved_by_rebuild',NULL,?2
+                     FROM memory_vector_late_delete_resolution ld
+                     WHERE ld.life_id='life-a' AND ld.memory_id='memory-c'",
+                    rusqlite::params![job_id.as_str(), completed_at.as_str()],
+                )
+                .unwrap();
+            assert_eq!(classify(), C::Committed);
+
+            // Attack 4: corrupt a Late Delete resolution tuple (source generation
+            // authority epoch and disposition) away from its source LD row.
+            connection
+                .execute(
+                    "UPDATE memory_vector_generation_rebuild_resolution
+                     SET source_generation_authority_epoch=1, disposition='legacy_rebuild_resolved'
+                     WHERE job_id=?1 AND source_kind='late_delete'",
+                    [job_id.as_str()],
+                )
+                .unwrap();
+            assert_eq!(classify(), C::RecoveryRequired);
+            connection
+                .execute(
+                    "UPDATE memory_vector_generation_rebuild_resolution
+                     SET source_generation_authority_epoch=7, disposition='resolved_by_rebuild'
+                     WHERE job_id=?1 AND source_kind='late_delete'",
+                    [job_id.as_str()],
+                )
+                .unwrap();
+            assert_eq!(classify(), C::Committed);
+            drop(connection);
         });
     }
 }

@@ -294,15 +294,95 @@ where
     }
     .await;
     if let Err(ref error) = result {
-        // The failed pipeline must not release the composition guard while the
-        // candidate generation is still nonterminal.  Compensation is retried
-        // and classified against durable SQLite state while this very scope
-        // still holds the guard; the scope ends only after the world is
-        // durably terminal (job failed/cancelled/completed or G2 durably
-        // failed).  Nobody else can acquire the gate during that window.
-        ensure_durably_terminal_after_failure(storage, request_id, &owner, error).await;
+        if error.code == "GENERATION_REBUILD_PROMOTION_RECOVERY_REQUIRED" {
+            // A mixed promotion world: `job.status` may say `completed` while
+            // pointer/generations/resolutions disagree.  The composition guard
+            // must stay held, no failed-generation compensation may run against
+            // a possibly-active G2, and safety is only proven by an exact
+            // durable postimage classification.
+            ensure_promotion_recovery_classified(storage, request_id, error).await;
+        } else {
+            // The failed pipeline must not release the composition guard while the
+            // candidate generation is still nonterminal.  Compensation is retried
+            // and classified against durable SQLite state while this very scope
+            // still holds the guard; the scope ends only after the world is
+            // durably terminal (job failed/cancelled/completed or G2 durably
+            // failed).  Nobody else can acquire the gate during that window.
+            ensure_durably_terminal_after_failure(storage, request_id, &owner, error).await;
+        }
     }
     result
+}
+
+/// Holds the composition guard through an exact promotion-recovery
+/// reclassification.  A `RecoveryRequired` promotion world may have actually
+/// committed, so the outer owner never runs the ordinary failed-generation
+/// compensation and never infers safety from `job.status` alone.  This loop
+/// returns only when the durable world is exactly Committed again (or has been
+/// moved to a proven failed/cancelled terminal state by another exact
+/// operation); a persistently mixed world parks fail-closed with the guard
+/// retained, which is preferable to releasing authority into an unclassified
+/// world.
+async fn ensure_promotion_recovery_classified(
+    storage: &StorageService,
+    request_id: &str,
+    _error: &super::vector_generation_rebuild::GenerationRebuildCError,
+) {
+    #[cfg(test)]
+    if let Some(tx) = PROMOTION_RECOVERY_ENTERED_SIGNAL.lock().unwrap().take() {
+        let _ = tx.send(());
+    }
+    let mut attempt: u32 = 0;
+    loop {
+        attempt = attempt.saturating_add(1);
+        match storage.load_generation_rebuild_job_by_request(request_id) {
+            Ok(job) => {
+                let proven_terminal = job
+                    .as_ref()
+                    .is_none_or(|job| matches!(job.status.as_str(), "failed" | "cancelled"));
+                if proven_terminal {
+                    // Another exact durable operation already moved the world to
+                    // a proven failed/cancelled terminal state; the scope may end.
+                    return;
+                }
+                if let Some(job) = job {
+                    if let (Some(operation_id), Some(target)) = (
+                        job.promotion_operation_id.as_deref(),
+                        job.promotion_sequence.or(job.caught_up_sequence),
+                    ) {
+                        match storage.classify_generation_rebuild_promotion_commit(
+                            &job.job_id,
+                            operation_id,
+                            target,
+                        ) {
+                            Ok(crate::storage::GenerationRebuildPromotionCommitClassification::Committed) => {
+                                // The exact durable postimage is proven again;
+                                // releasing the guard is now legal.
+                                return;
+                            }
+                            Ok(
+                                crate::storage::GenerationRebuildPromotionCommitClassification::NotCommitted
+                                | crate::storage::GenerationRebuildPromotionCommitClassification::RecoveryRequired,
+                            )
+                            | Err(_) => {
+                                // Still mixed/ambiguous or unreadable: remain
+                                // fail-closed.  Never silently transform into a
+                                // hidden promotion retry or a blind compensation.
+                            }
+                        }
+                    }
+                    // Else: a completed job with no promotion identity, or a
+                    // nonterminal job, in a promotion-recovery world -> fail-closed.
+                }
+            }
+            Err(_) => {
+                // Durable read failed while the guard is held: keep the guard and
+                // retry; the scope must not end while the world is mixed.
+            }
+        }
+        let backoff_millis = u64::from(attempt.min(40)) * 5;
+        tokio::time::sleep(std::time::Duration::from_millis(backoff_millis)).await;
+    }
 }
 
 /// Retries/classifies the failed-generation compensation while the composition
@@ -391,6 +471,18 @@ pub(super) fn fail_next_outer_compensation_for_test() {
 #[cfg(test)]
 pub(super) fn set_outer_compensation_failure_signal_for_test(sender: std::sync::mpsc::Sender<()>) {
     *OUTER_COMPENSATION_FAILURE_SIGNAL.lock().unwrap() = Some(sender);
+}
+
+#[cfg(test)]
+static PROMOTION_RECOVERY_ENTERED_SIGNAL: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>> =
+    std::sync::Mutex::new(None);
+
+/// Test-only channel: notified just after the outer lifecycle owner entered the
+/// promotion-recovery fail-closed path (the composition guard is still held and
+/// no compensation has run).
+#[cfg(test)]
+pub(super) fn set_promotion_recovery_entered_signal_for_test(sender: std::sync::mpsc::Sender<()>) {
+    *PROMOTION_RECOVERY_ENTERED_SIGNAL.lock().unwrap() = Some(sender);
 }
 
 #[cfg(test)]

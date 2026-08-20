@@ -32,7 +32,9 @@ pub(crate) use generation_lifecycle_authority::{
     GenerationAuthorityCommitClassification, GenerationAuthorityRegistration,
 };
 #[cfg(test)]
-pub(crate) use generation_rebuild::{arm_promotion_fault_for_test, PromotionFault};
+pub(crate) use generation_rebuild::{
+    arm_promotion_fault_for_test, arm_promotion_recovery_corruption_for_test, PromotionFault,
+};
 pub(crate) use generation_rebuild::{
     GenerationRebuildCatchupItemRecord, GenerationRebuildFinalizeOutcome,
     GenerationRebuildItemRecord, GenerationRebuildJobRecord, GenerationRebuildLease,

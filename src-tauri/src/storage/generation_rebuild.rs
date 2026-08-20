@@ -69,6 +69,24 @@ fn promotion_commit_unknown() -> StorageError {
     )
 }
 
+#[cfg(test)]
+static ARM_PROMOTION_RECOVERY_CORRUPTION: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+
+/// Test-only seam: after a promotion COMMIT has succeeded but before the D
+/// layer classifies the unknown result, one exact outbox-resolution fact is
+/// corrupted (an illegal non-NULL `replacement_mutation_sequence`) so the
+/// classifier observes a deterministic mixed world and returns
+/// RecoveryRequired while the job row still says `completed`.
+#[cfg(test)]
+pub(crate) fn arm_promotion_recovery_corruption_for_test() {
+    *ARM_PROMOTION_RECOVERY_CORRUPTION.lock().unwrap() = true;
+}
+
+#[cfg(test)]
+pub(crate) fn take_promotion_recovery_corruption_armed() -> bool {
+    std::mem::take(&mut *ARM_PROMOTION_RECOVERY_CORRUPTION.lock().unwrap())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GenerationRebuildJobRecord {
     pub(crate) job_id: String,
@@ -2074,11 +2092,14 @@ impl StorageService {
                          WHERE o.migration_disposition IS NULL
                            AND o.mutation_sequence>0
                            AND o.mutation_sequence<=j.promotion_sequence)
-                     -- Every covered outbox item (disposition-NULL outbox row with
-                     -- an applied+finalized catch-up attempt) must carry exactly
-                     -- the outbox resolution the promotion writes.  The catch-up
-                     -- items persist after the promotion deletes the outbox rows,
-                     -- so they remain the authoritative evidence set.
+                     -- Every covered outbox item (a disposition-NULL outbox row with
+                     -- an applied+finalized catch-up attempt through the promotion
+                     -- sequence) must carry its EXACT legal outbox resolution: the
+                     -- promotion only writes outbox resolutions with a NULL
+                     -- replacement sequence, a disposition consistent with the
+                     -- captured source-generation epoch (legacy when NULL,
+                     -- resolved_by_rebuild when present), and the promotion's own
+                     -- authoritative completion timestamp.
                      AND NOT EXISTS (
                          SELECT 1 FROM memory_vector_generation_rebuild_catchup_item c
                          WHERE c.job_id=j.job_id
@@ -2092,33 +2113,99 @@ impl StorageService {
                                  AND r.life_id=c.life_id
                                  AND r.memory_id=c.memory_id
                                  AND r.mutation_sequence=c.mutation_sequence
+                                 AND r.replacement_mutation_sequence IS NULL
+                                 AND ((r.disposition='legacy_rebuild_resolved'
+                                       AND r.source_generation_authority_epoch IS NULL)
+                                      OR (r.disposition='resolved_by_rebuild'
+                                          AND r.source_generation_authority_epoch IS NOT NULL))
+                                 AND r.created_at=j.completed_at
                            )
                      )
-                     -- No outbox resolution may exist without its covered catch-up
-                     -- item (no orphan or invention of promotion evidence).
+                     -- No outbox resolution may be orphaned, invented, or carry a
+                     -- third semantic: every outbox resolution for this job must
+                     -- map back to exactly one covered catch-up item and its exact
+                     -- promotion tuple (NULL replacement, legal disposition
+                     -- matching its epoch, promotion timestamp).
                      AND NOT EXISTS (
                          SELECT 1 FROM memory_vector_generation_rebuild_resolution r
                          WHERE r.job_id=j.job_id AND r.source_kind='outbox'
-                           AND NOT EXISTS (
-                               SELECT 1 FROM memory_vector_generation_rebuild_catchup_item c
-                               WHERE c.job_id=j.job_id
-                                 AND c.source_outbox_id=r.source_row_id
-                                 AND c.life_id=r.life_id
-                                 AND c.memory_id=r.memory_id
-                                 AND c.mutation_sequence=r.mutation_sequence
-                                 AND c.state='applied' AND c.io_phase='finalized'
+                           AND (
+                               r.replacement_mutation_sequence IS NOT NULL
+                               OR r.disposition NOT IN
+                                  ('legacy_rebuild_resolved','resolved_by_rebuild')
+                               OR (r.disposition='legacy_rebuild_resolved'
+                                   AND r.source_generation_authority_epoch IS NOT NULL)
+                               OR (r.disposition='resolved_by_rebuild'
+                                   AND r.source_generation_authority_epoch IS NULL)
+                               OR r.created_at IS NOT j.completed_at
+                               OR NOT EXISTS (
+                                   SELECT 1 FROM memory_vector_generation_rebuild_catchup_item c
+                                   WHERE c.job_id=j.job_id
+                                     AND c.source_outbox_id=r.source_row_id
+                                     AND c.life_id=r.life_id
+                                     AND c.memory_id=r.memory_id
+                                     AND c.mutation_sequence=r.mutation_sequence
+                                     AND c.state='applied' AND c.io_phase='finalized'
+                               )
                            )
                      )
-                     -- Every late-delete resolution the promotion wrote must have
-                     -- its selected Late Delete row in the terminal resolved_rebuilt
-                     -- state (no mutated-away or resurrected LD evidence).
+                     -- Every late-delete resolution this promotion wrote must be an
+                     -- exact tuple over its source Late Delete row: same
+                     -- life/memory/mutation identity, the captured source
+                     -- generation and epoch copied verbatim, disposition
+                     -- resolved_by_rebuild, NULL replacement, the promotion
+                     -- completion timestamp, and the source LD row held terminal
+                     -- resolved_rebuilt with released lease and cleared retry.
                      AND NOT EXISTS (
                          SELECT 1 FROM memory_vector_generation_rebuild_resolution r
                          WHERE r.job_id=j.job_id AND r.source_kind='late_delete'
+                           AND (
+                               r.replacement_mutation_sequence IS NOT NULL
+                               OR r.disposition <> 'resolved_by_rebuild'
+                               OR r.created_at IS NOT j.completed_at
+                               OR NOT EXISTS (
+                                   SELECT 1 FROM memory_vector_late_delete_resolution ld
+                                   WHERE ld.resolution_id=r.source_row_id
+                                     AND ld.life_id=r.life_id
+                                     AND ld.memory_id=r.memory_id
+                                     AND ld.mutation_sequence=r.mutation_sequence
+                                     AND ld.claimed_generation_id IS r.source_generation_id
+                                     AND ld.captured_generation_authority_epoch
+                                         IS r.source_generation_authority_epoch
+                                     AND ld.state='resolved_rebuilt'
+                                     AND ld.last_resolution_disposition='resolved_rebuilt'
+                                     AND ld.resolved_at IS NOT NULL
+                                     AND ld.lease_owner IS NULL
+                                     AND ld.lease_fence_epoch IS NULL
+                                     AND ld.lease_expires_at IS NULL
+                                     AND ld.next_attempt_at IS NULL
+                               )
+                           )
+                     )
+                     -- Two-way Late Delete proof (converse): a Late Delete row
+                     -- terminalized by THIS promotion (its promotion completion
+                     -- timestamp is the only durable marker of that ownership, and
+                     -- nothing else writes resolved_rebuilt at that instant) must
+                     -- still carry its exact late-delete resolution.  Removing a
+                     -- selected resolution is therefore a mixed image even though
+                     -- the LD row remains resolved_rebuilt.
+                     AND NOT EXISTS (
+                         SELECT 1 FROM memory_vector_late_delete_resolution ld
+                         WHERE ld.state='resolved_rebuilt'
+                           AND ld.resolved_at=j.completed_at
                            AND NOT EXISTS (
-                               SELECT 1 FROM memory_vector_late_delete_resolution ld
-                               WHERE ld.resolution_id=r.source_row_id
-                                 AND ld.state='resolved_rebuilt'
+                               SELECT 1 FROM memory_vector_generation_rebuild_resolution r
+                               WHERE r.job_id=j.job_id
+                                 AND r.source_kind='late_delete'
+                                 AND r.source_row_id=ld.resolution_id
+                                 AND r.life_id=ld.life_id
+                                 AND r.memory_id=ld.memory_id
+                                 AND r.mutation_sequence=ld.mutation_sequence
+                                 AND r.disposition='resolved_by_rebuild'
+                                 AND r.replacement_mutation_sequence IS NULL
+                                 AND r.source_generation_id IS ld.claimed_generation_id
+                                 AND r.source_generation_authority_epoch
+                                     IS ld.captured_generation_authority_epoch
                            )
                      )
                    )",
@@ -2177,6 +2264,34 @@ impl StorageService {
             (true, false) => GenerationRebuildPromotionCommitClassification::NotCommitted,
             _ => GenerationRebuildPromotionCommitClassification::RecoveryRequired,
         })
+    }
+
+    /// Test-only seam used by the D layer before classifying a promotion
+    /// commit-result-unknown: when armed, corrupts exactly one outbox
+    /// resolution tuple (an illegal non-NULL `replacement_mutation_sequence`)
+    /// so a genuinely committed promotion presents a deterministic mixed world
+    /// to the classifier.  The exact committed image can be restored by the
+    /// test by clearing that field.
+    #[cfg(test)]
+    pub(crate) fn inject_promotion_recovery_corruption_if_armed(
+        &self,
+        job_id: &str,
+    ) -> Result<(), StorageError> {
+        if !take_promotion_recovery_corruption_armed() {
+            return Ok(());
+        }
+        let state = self.state()?;
+        state
+            .connection
+            .execute(
+                "UPDATE memory_vector_generation_rebuild_resolution
+                 SET replacement_mutation_sequence=999
+                 WHERE job_id=?1 AND source_kind='outbox'
+                   AND replacement_mutation_sequence IS NULL",
+                [job_id],
+            )
+            .map_err(|_| unavailable())?;
+        Ok(())
     }
 }
 

@@ -2708,11 +2708,14 @@ mod transaction_tests {
     fn d9d3_d_f1_schema18_weakened_delete_cross_field_check_fails_closed() {
         let mut connection = schema_seventeen_connection();
         apply_generation_catchup_attempt_upgrade(&mut connection);
-        let weakened = CREATE_REBUILD_CATCHUP_ATTEMPT_TABLE_SQL.replace(
+        // The persisted SQL file is normalized before string surgery so the
+        // weakening is robust to the working-tree line ending (CRLF checkout).
+        let normalized_ddl = CREATE_REBUILD_CATCHUP_ATTEMPT_TABLE_SQL.replace("\r\n", "\n");
+        let weakened = normalized_ddl.replace(
             "CHECK ((desired_action='upsert' AND target_revision IS NOT NULL AND target_revision>0 AND target_content_hash IS NOT NULL AND target_content_hash<>'')\n        OR (desired_action='delete' AND target_revision IS NULL AND target_content_hash IS NULL AND canonical_document IS NULL))",
             "CHECK (desired_action IN ('upsert','delete'))",
         );
-        assert_ne!(weakened, CREATE_REBUILD_CATCHUP_ATTEMPT_TABLE_SQL);
+        assert_ne!(weakened, normalized_ddl);
         let schema_cookie: i64 = connection
             .query_row("PRAGMA schema_version", [], |r| r.get(0))
             .unwrap();

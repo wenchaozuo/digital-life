@@ -1754,11 +1754,15 @@ mod tests {
     use tokio::sync::Notify;
 
     use crate::{
-        memory::vector_sync_stage_runtime::FencedVectorSyncCompositionGate,
+        memory::vector_sync_stage_runtime::{
+            fail_next_outer_compensation_for_test, run_vector_generation_rebuild_guarded,
+            set_outer_compensation_failure_signal_for_test, FencedVectorSyncCompositionGate,
+        },
         model::{
             profile::{
-                ActiveModelProfile, DeleteModelProfileResult, ModelProfile, ModelProfileError,
-                ModelProfileRepository, ModelProviderKind, ModelPurpose,
+                ActiveModelProfile, CreateModelProfileRequest, DeleteModelProfileResult,
+                ModelProfile, ModelProfileError, ModelProfileRepository, ModelProfileService,
+                ModelProviderKind, ModelPurpose, SetActiveModelProfileRequest,
             },
             runtime::{ModelRuntimeCoordinator, ModelRuntimeService},
         },
@@ -2970,6 +2974,301 @@ mod tests {
             assert_eq!(current_job.generation_state, "failed");
             assert_eq!(current_item.state, "uncertain");
             assert_eq!(current_item.canonical_document, None);
+        });
+    }
+
+    #[test]
+    fn d9d3_d_f1_promotion_classifier_rejects_missing_or_resurrected_resolution_evidence() {
+        tauri::async_runtime::block_on(async {
+            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            C_STORE_CREATE_CALLS.store(0, Ordering::SeqCst);
+            C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
+            let (_root, storage, profiles, secrets, coordinator, registry, _server) =
+                full_fixture(ServerBehavior::Success(3));
+            let database = storage.test_database_main_path().unwrap();
+            let outbox_id: i64;
+            {
+                let connection = open_authorized_test_connection(&database).unwrap();
+                connection
+                    .execute_batch(
+                        "INSERT INTO memory_vector_generation (generation_id,descriptor_hash,dimension,state,authority_epoch)
+                         VALUES ('source-g1','source-descriptor',3,'active',7);
+                         UPDATE memory_vector_generation_authority SET active_generation_id='source-g1' WHERE singleton=1;
+                         UPDATE memory_vector_sync_mutation_clock SET last_sequence=2 WHERE singleton=1;
+                         INSERT INTO memory_vector_sync_outbox (life_id,memory_id,desired_action,mutation_sequence,target_revision,target_content_hash,migration_disposition)
+                         VALUES ('life-a','memory-c','delete',2,NULL,NULL,NULL);
+                         INSERT INTO memory_vector_late_delete_resolution
+                           (outbox_id,life_id,memory_id,mutation_sequence,claimed_generation_id,embedding_descriptor_id,embedding_dimension,captured_generation_state,
+                            witness_attempt_ordinal,witness_claim_epoch,witness_marked_claim_epoch,witness_send_disposition,witness_age_anchor_at,captured_generation_authority_epoch,state,created_at,updated_at)
+                         SELECT o.id,'life-a','memory-c',2,'source-g1','source-descriptor',3,'active',1,7,7,'possibly_sent','2026-01-01T00:00:00.000Z',7,'pending','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z'
+                         FROM memory_vector_sync_outbox o WHERE o.memory_id='memory-c';",
+                    )
+                    .unwrap();
+                outbox_id = connection
+                    .query_row(
+                        "SELECT id FROM memory_vector_sync_outbox WHERE memory_id='memory-c'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                drop(connection);
+            }
+
+            let runtime = runtime_fixture(&profiles, &secrets, &coordinator);
+            let gate = FencedVectorSyncCompositionGate::default();
+            let guard = gate.acquire().await;
+            let handoff = run_generation_rebuild_c(
+                &storage,
+                &runtime,
+                &registry,
+                "request-a",
+                "owner-a",
+                &guard,
+            )
+            .await
+            .unwrap();
+            arm_promotion_fault_for_test(PromotionFault::AfterCommitUnknown);
+            // D reclassifies the unknown commit against durable state and
+            // returns the completed job; the promotion really committed.
+            let _completed = run_generation_rebuild_d(
+                &storage,
+                &runtime,
+                &registry,
+                &handoff,
+                "owner-a",
+                std::time::Instant::now() + Duration::from_secs(10),
+                &guard,
+            )
+            .await
+            .unwrap();
+            let job = storage
+                .load_generation_rebuild_job(&handoff.job_id)
+                .unwrap();
+            assert_eq!(job.status, "completed");
+            let operation_id = job
+                .promotion_operation_id
+                .clone()
+                .expect("promotion identity");
+            let target = job.promotion_sequence.expect("promotion sequence");
+
+            // The otherwise complete postimage classifies as Committed.
+            assert_eq!(
+                storage
+                    .classify_generation_rebuild_promotion_commit(
+                        &job.job_id,
+                        &operation_id,
+                        target,
+                    )
+                    .unwrap(),
+                GenerationRebuildPromotionCommitClassification::Committed
+            );
+
+            // Corrupt exactly one promotion-resolution fact: delete the outbox
+            // resolution evidence.  The classifier must fail closed without
+            // retrying or guessing.
+            let connection = open_authorized_test_connection(&database).unwrap();
+            let removed = connection
+                .execute(
+                    "DELETE FROM memory_vector_generation_rebuild_resolution
+                     WHERE job_id=?1 AND source_kind='outbox'",
+                    [job.job_id.as_str()],
+                )
+                .unwrap();
+            assert!(removed >= 1);
+            drop(connection);
+            assert_eq!(
+                storage
+                    .classify_generation_rebuild_promotion_commit(
+                        &job.job_id,
+                        &operation_id,
+                        target,
+                    )
+                    .unwrap(),
+                GenerationRebuildPromotionCommitClassification::RecoveryRequired
+            );
+
+            // Restore the outbox resolution (the promotion-only evidence set is
+            // complete again) and prove the committed classification returns.
+            let connection = open_authorized_test_connection(&database).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO memory_vector_generation_rebuild_resolution
+                     (job_id,source_kind,source_row_id,life_id,memory_id,mutation_sequence,source_generation_id,source_generation_authority_epoch,disposition,replacement_mutation_sequence,created_at)
+                     VALUES (?1,'outbox',?2,'life-a','memory-c',2,NULL,NULL,'legacy_rebuild_resolved',NULL,'2026-01-01T00:00:00.000Z')",
+                    rusqlite::params![job.job_id.as_str(), outbox_id],
+                )
+                .unwrap();
+            drop(connection);
+            assert_eq!(
+                storage
+                    .classify_generation_rebuild_promotion_commit(
+                        &job.job_id,
+                        &operation_id,
+                        target,
+                    )
+                    .unwrap(),
+                GenerationRebuildPromotionCommitClassification::Committed
+            );
+
+            // Corrupt a second promotion-resolution fact: resurrect the selected
+            // Late Delete row out of its terminal resolved_rebuilt state.
+            let connection = open_authorized_test_connection(&database).unwrap();
+            let resurrected = connection
+                .execute(
+                    "UPDATE memory_vector_late_delete_resolution
+                     SET state='pending',resolved_at=NULL
+                     WHERE life_id='life-a' AND memory_id='memory-c'",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(resurrected, 1);
+            drop(connection);
+            assert_eq!(
+                storage
+                    .classify_generation_rebuild_promotion_commit(
+                        &job.job_id,
+                        &operation_id,
+                        target,
+                    )
+                    .unwrap(),
+                GenerationRebuildPromotionCommitClassification::RecoveryRequired
+            );
+        });
+    }
+
+    #[test]
+    fn d9d3_d_f1_failed_compensation_never_releases_guard_while_g2_nonterminal() {
+        tauri::async_runtime::block_on(async {
+            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            C_STORE_CREATE_CALLS.store(0, Ordering::SeqCst);
+            C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
+            let (_root, storage, _profiles, secrets, coordinator, registry, server) =
+                full_fixture(ServerBehavior::Success(3));
+            // The orchestrator resolves its embedding provider from the storage
+            // repository, so register a real profile that points at the mock
+            // embedding server and make it active.
+            let profile = ModelProfileService::new(&storage)
+                .create(CreateModelProfileRequest {
+                    purpose: ModelPurpose::Embedding,
+                    provider_kind: ModelProviderKind::OpenaiCompatible,
+                    display_name: "D9D3-F1 compensated embedding profile".into(),
+                    base_url: server.base_url.clone(),
+                    model_name: "embedding-model".into(),
+                    temperature: None,
+                    max_tokens: None,
+                    embedding_dimension: Some(3),
+                })
+                .unwrap();
+            ModelProfileService::new(&storage)
+                .set_active(SetActiveModelProfileRequest {
+                    purpose: ModelPurpose::Embedding,
+                    profile_id: profile.id.clone(),
+                })
+                .unwrap();
+            secrets
+                .set_secret(
+                    &SecretIdentifier::new(SecretPurpose::EmbeddingModelApiKey, &profile.id)
+                        .unwrap(),
+                    SecretValue::new("d9d3-f1-compensation-key".into()).unwrap(),
+                )
+                .unwrap();
+            let gate = Arc::new(FencedVectorSyncCompositionGate::default());
+            let guard = gate.acquire().await;
+            let database = storage.test_database_main_path().unwrap();
+
+            arm_promotion_fault_for_test(PromotionFault::BeforeCommit);
+            fail_next_outer_compensation_for_test();
+            let (first_failure_tx, first_failure_rx) = std::sync::mpsc::channel();
+            set_outer_compensation_failure_signal_for_test(first_failure_tx);
+            let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+            let competitor_gate = Arc::clone(&gate);
+
+            // The competitor lives outside the scope: it blocks on the
+            // composition gate and must stay blocked until the original guard
+            // is released explicitly after the pipeline reaches terminal state.
+            let competitor = std::thread::spawn(move || {
+                tauri::async_runtime::block_on(async move {
+                    let _competitor_guard = competitor_gate.acquire().await;
+                    acquired_tx.send(()).unwrap();
+                })
+            });
+
+            let pipeline_result = std::thread::scope(|scope| {
+                let pipeline = scope.spawn(|| {
+                    tauri::async_runtime::block_on(run_vector_generation_rebuild_guarded(
+                        &storage,
+                        &secrets,
+                        &coordinator,
+                        &registry,
+                        &guard,
+                        "request-a",
+                        Duration::from_secs(10),
+                    ))
+                });
+
+                // Wait until the first compensation attempt has failed while the
+                // guard is still held; the job must still be nonterminal and the
+                // competitor must remain blocked.
+                first_failure_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+                std::thread::yield_now();
+                assert!(
+                    acquired_rx.try_recv().is_err(),
+                    "a competitor must not acquire the gate while the candidate is nonterminal"
+                );
+                let job = storage
+                    .load_generation_rebuild_job_by_request("request-a")
+                    .unwrap()
+                    .expect("the job must exist while awaiting durable terminal state");
+                assert!(
+                    matches!(
+                        job.status.as_str(),
+                        "registered"
+                            | "snapshotting"
+                            | "bulk_building"
+                            | "catching_up"
+                            | "verifying"
+                            | "ready"
+                    ),
+                    "the job must still be nonterminal after the first compensation failure"
+                );
+
+                // Let the pipeline finish; it reports the original failure.  The
+                // retried compensation has now made the world durably terminal.
+                let result = pipeline.join().unwrap();
+                assert!(
+                    result.is_err(),
+                    "the pipeline must report its original failure"
+                );
+                let job = storage
+                    .load_generation_rebuild_job_by_request("request-a")
+                    .unwrap()
+                    .expect("job must exist after compensation");
+                assert_eq!(job.status, "failed");
+                result
+            });
+
+            // Only after durable terminal state is confirmed may the original
+            // guard be released; the competitor then acquires the gate.
+            drop(guard);
+            acquired_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            competitor.join().unwrap();
+            assert!(pipeline_result.is_err());
+            let job = storage
+                .load_generation_rebuild_job_by_request("request-a")
+                .unwrap()
+                .expect("the failed job must persist");
+            let connection = open_authorized_test_connection(&database).unwrap();
+            let generation_state: (String, i64) = connection
+                .query_row(
+                    "SELECT state, authority_epoch FROM memory_vector_generation WHERE generation_id=?1",
+                    [job.generation_id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(generation_state.0, "failed");
+            drop(connection);
         });
     }
 

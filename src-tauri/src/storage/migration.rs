@@ -45,8 +45,20 @@ const CREATE_GENERATION_STORE_WITNESS_TABLE_SQL: &str = "CREATE TABLE memory_vec
 )";
 const CREATE_REBUILD_TABLES_AND_GUARDS_SQL: &str =
     include_str!("migrations/017_vector_generation_lifecycle_cutover.sql");
+/// Schema 18 Phase A: the dedicated catch-up Attempt table.  Kept as a
+/// separate fixed file so the AfterTable failpoint represents a genuinely
+/// distinct durable boundary inside the caller-owned transaction.
 const CREATE_REBUILD_CATCHUP_ATTEMPT_TABLE_SQL: &str =
-    include_str!("migrations/018_vector_generation_catchup_attempt_identity.sql");
+    include_str!("migrations/018_vector_generation_catchup_attempt_identity.table.sql");
+/// Schema 18 Phase B part 1: the immutable identity trigger over the frozen
+/// catch-up identity fields.  Validated by exact normalized SQL equality, so a
+/// correct trigger name with a weakened body fails closed.
+const CREATE_REBUILD_CATCHUP_ATTEMPT_IDENTITY_TRIGGER_SQL: &str =
+    include_str!("migrations/018_vector_generation_catchup_attempt_identity.identity_trigger.sql");
+/// Schema 18 Phase B part 2: the supersede guard over the state domain, proving
+/// unknown external work is never discarded as a harmless supersession.
+const CREATE_REBUILD_CATCHUP_ATTEMPT_SUPERSEDE_TRIGGER_SQL: &str =
+    include_str!("migrations/018_vector_generation_catchup_attempt_identity.supersede_trigger.sql");
 const ADD_DELETE_WITNESS_AT_SQL: &str =
     "ALTER TABLE memory_vector_sync_outbox ADD COLUMN delete_witness_at TEXT NULL";
 const ADD_WITNESS_AGE_ANCHOR_AT_SQL: &str = "ALTER TABLE memory_vector_late_delete_resolution ADD COLUMN witness_age_anchor_at TEXT NOT NULL DEFAULT ''";
@@ -899,12 +911,17 @@ fn validate_generation_lifecycle_schema_objects(
 /// Schema 18 adds the D-stage attempt authority without changing Schema 17's
 /// snapshot item meaning. The caller owns the transaction and records version
 /// 18 only after table, semantic guards, writer fences, and validation agree.
+/// The phases below all execute inside that single caller-owned transaction;
+/// each failpoint proves its phase really happened before the rollback.
 pub(super) fn apply_generation_catchup_attempt_schema_upgrade(
     transaction: &Transaction<'_>,
 ) -> Result<GenerationCatchupAttemptSchemaUpgrade, StorageError> {
     if connection::read_schema_version(transaction)? != GENERATION_LIFECYCLE_SCHEMA_VERSION {
         return Err(StorageError::migration_version_invariant_failed());
     }
+    // Phase A: create the catch-up table. This is a genuinely distinct durable
+    // boundary: the AfterTable failpoint fires before any semantic trigger or
+    // writer fence exists inside the transaction.
     transaction
         .execute_batch(CREATE_REBUILD_CATCHUP_ATTEMPT_TABLE_SQL)
         .map_err(|_| StorageError::migration_transaction_failed())?;
@@ -912,10 +929,20 @@ pub(super) fn apply_generation_catchup_attempt_schema_upgrade(
     if should_fail_migration_018_at_for_test(Migration018Failpoint::AfterTable) {
         return Err(StorageError::migration_transaction_failed());
     }
+    // Phase B: install the exact semantic guards. The AfterSemanticGuards
+    // failpoint fires only after both triggers exist and before any writer
+    // fence is installed.
+    transaction
+        .execute_batch(CREATE_REBUILD_CATCHUP_ATTEMPT_IDENTITY_TRIGGER_SQL)
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    transaction
+        .execute_batch(CREATE_REBUILD_CATCHUP_ATTEMPT_SUPERSEDE_TRIGGER_SQL)
+        .map_err(|_| StorageError::migration_transaction_failed())?;
     #[cfg(test)]
     if should_fail_migration_018_at_for_test(Migration018Failpoint::AfterSemanticGuards) {
         return Err(StorageError::migration_transaction_failed());
     }
+    // Phase C: install the Schema 18 writer fences for the catch-up table.
     writer_fence_manifest::install_generation_catchup_writer_fence_manifest_in_transaction(
         transaction,
     )?;
@@ -923,11 +950,14 @@ pub(super) fn apply_generation_catchup_attempt_schema_upgrade(
     if should_fail_migration_018_at_for_test(Migration018Failpoint::AfterWriterFences) {
         return Err(StorageError::migration_transaction_failed());
     }
+    // Phase D: validate the complete object set (table, triggers, fences)
+    // before the version boundary.
     validate_generation_catchup_attempt_schema_objects(transaction)?;
     #[cfg(test)]
     if should_fail_migration_018_at_for_test(Migration018Failpoint::BeforeSchemaVersion) {
         return Err(StorageError::migration_transaction_failed());
     }
+    // Phase E: write the schema_migration version 18 row.
     transaction.execute(
         "INSERT INTO schema_migration (version,name,applied_at) VALUES (?1,?2,strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
         params![GENERATION_CATCHUP_ATTEMPT_SCHEMA_VERSION, GENERATION_CATCHUP_ATTEMPT_MIGRATION_NAME],
@@ -952,40 +982,83 @@ pub(super) fn validate_generation_catchup_attempt_schema(
 fn validate_generation_catchup_attempt_schema_objects(
     connection: &Connection,
 ) -> Result<(), StorageError> {
+    // The frozen domains and cross-field semantics are proven from SQLite's own
+    // persisted DDL.  A normalized full-statement comparison is used instead of
+    // `PRAGMA table_info`, which does not represent CHECK expressions, table
+    // constraints (PRIMARY KEY / UNIQUE / FOREIGN KEY), or trigger bodies.
     let table_sql: String = connection.query_row(
         "SELECT sql FROM sqlite_schema WHERE type='table' AND name='memory_vector_generation_rebuild_catchup_item'",
         [], |row| row.get(0),
     ).map_err(|_| StorageError::migration_transaction_failed())?;
-    let normalized = normalize_schema_fragment(&table_sql);
-    for required in [
-        "job_idtextnotnull",
-        "source_outbox_idintegernotnull",
-        "life_idtextnotnull",
-        "memory_idtextnotnull",
-        "mutation_sequenceintegernotnullcheck(mutation_sequence>0)",
-        "desired_actiontextnotnullcheck(desired_actionin('upsert','delete'))",
-        "primarykey(job_id,source_outbox_id,mutation_sequence)",
-        "unique(job_id,life_id,memory_id,mutation_sequence)",
-        "foreignkey(job_id)referencesmemory_vector_generation_rebuild_job(job_id)",
-        "attempt_countintegernotnulldefault0check(attempt_countbetween0and5)",
+    if normalize_schema_fragment(&table_sql)
+        != normalize_schema_fragment(CREATE_REBUILD_CATCHUP_ATTEMPT_TABLE_SQL)
+    {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    // Independent table-info checks for the NOT NULL / type / default shape of
+    // the identity and attempt columns (the CHECK expressions themselves are
+    // already proven by the full normalized statement comparison above).
+    for (column, declared_type, not_null, default_value) in [
+        ("job_id", "TEXT", 1, None),
+        ("source_outbox_id", "INTEGER", 1, None),
+        ("life_id", "TEXT", 1, None),
+        ("memory_id", "TEXT", 1, None),
+        ("mutation_sequence", "INTEGER", 1, None),
+        ("desired_action", "TEXT", 1, None),
+        ("state", "TEXT", 1, None),
+        ("io_phase", "TEXT", 1, None),
+        ("attempt_count", "INTEGER", 1, Some("0")),
+        ("attempt_fence", "INTEGER", 1, Some("0")),
     ] {
-        if !normalized.contains(required) {
+        let found: Option<(String, i64, Option<String>)> = connection
+            .query_row(
+                "SELECT type, \"notnull\", dflt_value FROM pragma_table_info('memory_vector_generation_rebuild_catchup_item') WHERE name=?1",
+                [column],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|_| StorageError::migration_transaction_failed())?;
+        if !matches!(found.as_ref(), Some((ty, nn, default)) if ty == declared_type && *nn == not_null && default.as_deref() == default_value)
+        {
             return Err(StorageError::migration_transaction_failed());
         }
     }
-    for trigger in [
-        "memory_vector_generation_rebuild_catchup_identity_immutable",
-        "memory_vector_generation_rebuild_catchup_supersede_guard",
+    let foreign_key: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_list('memory_vector_generation_rebuild_catchup_item')
+             WHERE \"table\"='memory_vector_generation_rebuild_job' AND \"from\"='job_id' AND \"to\"='job_id'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    if foreign_key != 1 {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    // The semantic trigger bodies are authority-bearing: only existence is not
+    // enough.  Each frozen trigger SQL must match exactly, so a correct name
+    // with a weakened or empty body is rejected without any repair.
+    for (name, expected_sql) in [
+        (
+            "memory_vector_generation_rebuild_catchup_identity_immutable",
+            CREATE_REBUILD_CATCHUP_ATTEMPT_IDENTITY_TRIGGER_SQL,
+        ),
+        (
+            "memory_vector_generation_rebuild_catchup_supersede_guard",
+            CREATE_REBUILD_CATCHUP_ATTEMPT_SUPERSEDE_TRIGGER_SQL,
+        ),
     ] {
-        let present: Option<i64> = connection
+        let actual: Option<String> = connection
             .query_row(
-                "SELECT 1 FROM sqlite_schema WHERE type='trigger' AND name=?1",
-                [trigger],
+                "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?1",
+                [name],
                 |row| row.get(0),
             )
             .optional()
             .map_err(|_| StorageError::migration_transaction_failed())?;
-        if present.is_none() {
+        let Some(actual) = actual else {
+            return Err(StorageError::migration_transaction_failed());
+        };
+        if normalize_schema_fragment(&actual) != normalize_schema_fragment(expected_sql) {
             return Err(StorageError::migration_transaction_failed());
         }
     }
@@ -2467,12 +2540,62 @@ mod transaction_tests {
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .unwrap();
+            let error = apply_generation_catchup_attempt_schema_upgrade(&transaction).unwrap_err();
+            assert_eq!(error.code, "MIGRATION_TRANSACTION_FAILED");
+
+            // Demonstrate the phases are genuinely distinct: each failpoint
+            // fires after its own durable boundary has been reached inside the
+            // caller-owned transaction (the rollback happens only on drop).
+            let table_count: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='memory_vector_generation_rebuild_catchup_item'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let guard_count: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE type='trigger' AND name IN ('memory_vector_generation_rebuild_catchup_identity_immutable','memory_vector_generation_rebuild_catchup_supersede_guard')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let fence_count: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE type='trigger' AND name LIKE 'digital_life_writer_epoch_memory_vector_generation_rebuild_catchup_item_%'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let version_eighteen_rows: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migration WHERE version=18",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let (expected_table, expected_guards, expected_fences, expected_version) = match point {
+                // Phase A boundary: table exists, no semantic guards, no fences.
+                Migration018Failpoint::AfterTable => (1, 0, 0, 0),
+                // Phase B boundary: table + both semantic guards, no fences.
+                Migration018Failpoint::AfterSemanticGuards => (1, 2, 0, 0),
+                // Phase C boundary: table + guards + all three Schema18 fences,
+                // but the version boundary is not yet written.
+                Migration018Failpoint::AfterWriterFences => (1, 2, 3, 0),
+                // Phase D boundary: validated objects, version row not yet written.
+                Migration018Failpoint::BeforeSchemaVersion => (1, 2, 3, 0),
+                // Phase E boundary: the version-18 row exists inside the
+                // transaction but is rolled back with it.
+                Migration018Failpoint::PreCommit => (1, 2, 3, 1),
+            };
+            assert_eq!(table_count, expected_table, "{point:?} table phase");
+            assert_eq!(guard_count, expected_guards, "{point:?} guard phase");
+            assert_eq!(fence_count, expected_fences, "{point:?} fence phase");
             assert_eq!(
-                apply_generation_catchup_attempt_schema_upgrade(&transaction)
-                    .unwrap_err()
-                    .code,
-                "MIGRATION_TRANSACTION_FAILED"
+                version_eighteen_rows, expected_version,
+                "{point:?} version phase"
             );
+
             drop(transaction);
             assert_eq!(
                 schema_version(&connection),
@@ -2482,7 +2605,10 @@ mod transaction_tests {
                 "SELECT COUNT(*) FROM sqlite_schema WHERE name LIKE 'memory_vector_generation_rebuild_catchup%' OR name LIKE 'digital_life_writer_epoch_memory_vector_generation_rebuild_catchup%'",
                 [], |row| row.get(0),
             ).unwrap();
-            assert_eq!(objects, 0);
+            assert_eq!(
+                objects, 0,
+                "{point:?} must roll back to the exact Schema17 preimage"
+            );
             validate_generation_lifecycle_schema(&connection).unwrap();
         }
     }
@@ -2518,6 +2644,151 @@ mod transaction_tests {
         assert!(connection.execute_batch("UPDATE memory_vector_generation_rebuild_catchup_item SET desired_action='delete' WHERE job_id='job' AND source_outbox_id=42 AND mutation_sequence=100").is_err());
         connection.execute_batch("UPDATE memory_vector_generation_rebuild_catchup_item SET state='uncertain',io_phase='embedding_started',last_send_disposition='possibly_sent' WHERE job_id='job' AND source_outbox_id=42 AND mutation_sequence=100").unwrap();
         assert!(connection.execute_batch("UPDATE memory_vector_generation_rebuild_catchup_item SET state='superseded' WHERE job_id='job' AND source_outbox_id=42 AND mutation_sequence=100").is_err());
+    }
+
+    #[test]
+    fn d9d3_d_f1_schema18_weakened_identity_trigger_body_fails_closed_without_repair() {
+        let mut connection = schema_seventeen_connection();
+        apply_generation_catchup_attempt_upgrade(&mut connection);
+        connection
+            .execute_batch(
+                "DROP TRIGGER memory_vector_generation_rebuild_catchup_identity_immutable;
+                 CREATE TRIGGER memory_vector_generation_rebuild_catchup_identity_immutable
+                 BEFORE UPDATE OF job_id, source_outbox_id, life_id, memory_id, mutation_sequence,
+                                  desired_action, target_revision, target_content_hash
+                 ON memory_vector_generation_rebuild_catchup_item
+                 BEGIN
+                     SELECT 1;
+                 END;",
+            )
+            .unwrap();
+
+        let error = validate_generation_catchup_attempt_schema(&connection).unwrap_err();
+        assert_eq!(error.code, "MIGRATION_TRANSACTION_FAILED");
+        // Fails closed without repair: the weakened trigger is still there.
+        let weakened: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='memory_vector_generation_rebuild_catchup_identity_immutable'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(weakened.contains("SELECT 1;"));
+    }
+
+    #[test]
+    fn d9d3_d_f1_schema18_weakened_supersede_guard_body_fails_closed_without_repair() {
+        let mut connection = schema_seventeen_connection();
+        apply_generation_catchup_attempt_upgrade(&mut connection);
+        connection
+            .execute_batch(
+                "DROP TRIGGER memory_vector_generation_rebuild_catchup_supersede_guard;
+                 CREATE TRIGGER memory_vector_generation_rebuild_catchup_supersede_guard
+                 BEFORE UPDATE OF state ON memory_vector_generation_rebuild_catchup_item
+                 WHEN NEW.state='superseded'
+                 BEGIN
+                     SELECT 1;
+                 END;",
+            )
+            .unwrap();
+
+        let error = validate_generation_catchup_attempt_schema(&connection).unwrap_err();
+        assert_eq!(error.code, "MIGRATION_TRANSACTION_FAILED");
+        let weakened: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='memory_vector_generation_rebuild_catchup_supersede_guard'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(weakened.contains("SELECT 1;"));
+    }
+
+    #[test]
+    fn d9d3_d_f1_schema18_weakened_delete_cross_field_check_fails_closed() {
+        let mut connection = schema_seventeen_connection();
+        apply_generation_catchup_attempt_upgrade(&mut connection);
+        let weakened = CREATE_REBUILD_CATCHUP_ATTEMPT_TABLE_SQL.replace(
+            "CHECK ((desired_action='upsert' AND target_revision IS NOT NULL AND target_revision>0 AND target_content_hash IS NOT NULL AND target_content_hash<>'')\n        OR (desired_action='delete' AND target_revision IS NULL AND target_content_hash IS NULL AND canonical_document IS NULL))",
+            "CHECK (desired_action IN ('upsert','delete'))",
+        );
+        assert_ne!(weakened, CREATE_REBUILD_CATCHUP_ATTEMPT_TABLE_SQL);
+        let schema_cookie: i64 = connection
+            .query_row("PRAGMA schema_version", [], |r| r.get(0))
+            .unwrap();
+        connection
+            .execute_batch("PRAGMA writable_schema=ON")
+            .unwrap();
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE sqlite_schema SET sql=?1 WHERE type='table' AND name='memory_vector_generation_rebuild_catchup_item'",
+                    [&weakened],
+                )
+                .unwrap(),
+            1
+        );
+        connection
+            .pragma_update(None, "schema_version", schema_cookie + 1)
+            .unwrap();
+        connection
+            .execute_batch("PRAGMA writable_schema=OFF")
+            .unwrap();
+
+        let error = validate_generation_catchup_attempt_schema(&connection).unwrap_err();
+        assert_eq!(error.code, "MIGRATION_TRANSACTION_FAILED");
+        // No repair: the weakened DDL is still present in the database.
+        let remaining: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type='table' AND name='memory_vector_generation_rebuild_catchup_item'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(remaining.contains("CHECK (desired_action IN ('upsert','delete'))"));
+    }
+
+    #[test]
+    fn d9d3_d_f1_schema18_weakened_attempt_count_domain_fails_closed() {
+        let mut connection = schema_seventeen_connection();
+        apply_generation_catchup_attempt_upgrade(&mut connection);
+        let weakened = CREATE_REBUILD_CATCHUP_ATTEMPT_TABLE_SQL.replace(
+            "attempt_count BETWEEN 0 AND 5",
+            "attempt_count BETWEEN 0 AND 9",
+        );
+        assert_ne!(weakened, CREATE_REBUILD_CATCHUP_ATTEMPT_TABLE_SQL);
+        let schema_cookie: i64 = connection
+            .query_row("PRAGMA schema_version", [], |r| r.get(0))
+            .unwrap();
+        connection
+            .execute_batch("PRAGMA writable_schema=ON")
+            .unwrap();
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE sqlite_schema SET sql=?1 WHERE type='table' AND name='memory_vector_generation_rebuild_catchup_item'",
+                    [&weakened],
+                )
+                .unwrap(),
+            1
+        );
+        connection
+            .pragma_update(None, "schema_version", schema_cookie + 1)
+            .unwrap();
+        connection
+            .execute_batch("PRAGMA writable_schema=OFF")
+            .unwrap();
+
+        let error = validate_generation_catchup_attempt_schema(&connection).unwrap_err();
+        assert_eq!(error.code, "MIGRATION_TRANSACTION_FAILED");
+        let remaining: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type='table' AND name='memory_vector_generation_rebuild_catchup_item'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(remaining.contains("attempt_count BETWEEN 0 AND 9"));
     }
 
     #[test]

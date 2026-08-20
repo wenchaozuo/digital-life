@@ -1895,9 +1895,11 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(writer_fence_count, 24);
+        assert_eq!(writer_fence_count, 45);
         migration::validate_attempt_claim_identity_schema(&state.connection).unwrap();
-        migration::validate_late_delete_generation_authority_schema(&state.connection).unwrap();
+        // The database is at Schema 18; validate the exact Schema-18 catch-up
+        // authority (which also proves the full 45-trigger writer fence).
+        migration::validate_generation_catchup_attempt_schema(&state.connection).unwrap();
         assert_eq!(
             state
                 .connection

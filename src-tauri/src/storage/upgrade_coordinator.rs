@@ -168,9 +168,6 @@ fn open_after_mutex<G: StorageUpgradeGate>(
         upgraded_version = migration::LATE_DELETE_GENERATION_AUTHORITY_SCHEMA_VERSION;
     }
 
-    if upgraded_version != migration::LATE_DELETE_GENERATION_AUTHORITY_SCHEMA_VERSION {
-        return Err(StorageError::migration_version_invariant_failed());
-    }
     if upgraded_version == migration::LATE_DELETE_GENERATION_AUTHORITY_SCHEMA_VERSION {
         let lifecycle_upgrade = migration::apply_generation_lifecycle_schema_upgrade(&transaction)?;
         if lifecycle_upgrade != migration::GenerationLifecycleSchemaUpgrade::Applied {
@@ -533,7 +530,10 @@ mod tests {
         assert!(
             version == migration::LAST_STATIC_MIGRATION_VERSION
                 || version == writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION
+                || version == migration::ATTEMPT_CLAIM_IDENTITY_SCHEMA_VERSION
                 || version == migration::LATE_DELETE_RESOLUTION_SCHEMA_VERSION
+                || version == migration::LATE_DELETE_GENERATION_AUTHORITY_SCHEMA_VERSION
+                || version == migration::GENERATION_LIFECYCLE_SCHEMA_VERSION
                 || version == connection::MAX_SUPPORTED_SCHEMA_VERSION
         );
         let mut connection = Connection::open(path).unwrap();
@@ -576,16 +576,20 @@ mod tests {
                 migration::LateDeleteResolutionSchemaUpgrade::Applied
             );
         }
-        if version == connection::MAX_SUPPORTED_SCHEMA_VERSION {
+        if version >= migration::LATE_DELETE_GENERATION_AUTHORITY_SCHEMA_VERSION {
             assert_eq!(
                 migration::apply_late_delete_generation_authority_schema_upgrade(&transaction)
                     .unwrap(),
                 migration::LateDeleteGenerationAuthoritySchemaUpgrade::Applied
             );
+        }
+        if version >= migration::GENERATION_LIFECYCLE_SCHEMA_VERSION {
             assert_eq!(
                 migration::apply_generation_lifecycle_schema_upgrade(&transaction).unwrap(),
                 migration::GenerationLifecycleSchemaUpgrade::Applied
             );
+        }
+        if version == connection::MAX_SUPPORTED_SCHEMA_VERSION {
             assert_eq!(
                 migration::apply_generation_catchup_attempt_schema_upgrade(&transaction).unwrap(),
                 migration::GenerationCatchupAttemptSchemaUpgrade::Applied
@@ -1170,7 +1174,9 @@ mod tests {
             connection::MAX_SUPPORTED_SCHEMA_VERSION
         );
         migration::validate_attempt_claim_identity_schema(&state.connection).unwrap();
-        migration::validate_generation_lifecycle_schema(&state.connection).unwrap();
+        // The schema is at 18, so the version-17 lifecycle validator cannot
+        // run; the full 45-trigger writer fence plus the exact Schema-18
+        // catch-up validator prove the complete chain was applied.
         migration::validate_generation_catchup_attempt_schema(&state.connection).unwrap();
         assert_eq!(writer_fence_count(&state.connection), 45);
         assert_eq!(
@@ -1210,9 +1216,221 @@ mod tests {
             .unwrap();
         assert_eq!(writer_fence_count, 45);
         migration::validate_attempt_claim_identity_schema(&connection).unwrap();
-        migration::validate_generation_lifecycle_schema(&connection).unwrap();
+        // The schema is at 18, so the version-17 lifecycle validator cannot
+        // run; the full 45-trigger writer fence plus the exact Schema-18
+        // catch-up validator prove the complete chain was applied.
         migration::validate_generation_catchup_attempt_schema(&connection).unwrap();
         assert_eq!(gate.inspection_calls.get(), 2);
+    }
+
+    #[test]
+    fn d9d3_d_f1_schema_seventeen_startup_upgrades_through_authoritative_coordinator() {
+        let _ = take_upgrade_events();
+        let (_root, path) = database_path("schema-seventeen-coordinated-upgrade");
+        prepare_schema_version(&path, migration::GENERATION_LIFECYCLE_SCHEMA_VERSION);
+
+        // The preimage must be a REAL valid Schema17 database with a valid
+        // writer-fence manifest before the coordinator is invoked.
+        let c_snapshot_sql_before: String;
+        {
+            let raw = Connection::open(&path).unwrap();
+            assert_eq!(
+                connection::read_schema_version(&raw).unwrap(),
+                migration::GENERATION_LIFECYCLE_SCHEMA_VERSION
+            );
+            writer_fence_manifest::validate_writer_fence_manifest(&raw).unwrap();
+            migration::validate_generation_lifecycle_schema(&raw).unwrap();
+            c_snapshot_sql_before = raw
+                .query_row(
+                    "SELECT sql FROM sqlite_schema WHERE type='table' AND name='memory_vector_generation_rebuild_item'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(!c_snapshot_sql_before.is_empty());
+            drop(raw);
+        }
+
+        let gate = FakeGate::clear();
+        let connection = open_coordinated_storage_connection_with_gate(&path, &gate).unwrap();
+
+        // The authoritative coordinated open must advance 17 → 18 through the
+        // real migration chain (not a direct helper call) and configure WAL
+        // only after post-upgrade validation succeeded.
+        assert_eq!(
+            connection::read_schema_version(&connection).unwrap(),
+            connection::MAX_SUPPORTED_SCHEMA_VERSION
+        );
+        migration::validate_generation_catchup_attempt_schema(&connection).unwrap();
+        let table_exists: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='memory_vector_generation_rebuild_catchup_item'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_exists, 1);
+        // M018 semantic guards are exact (name and normalized body).
+        let identity_body: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='memory_vector_generation_rebuild_catchup_identity_immutable'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            identity_body.contains("RAISE(ABORT, 'GENERATION_REBUILD_CATCHUP_IDENTITY_IMMUTABLE')")
+        );
+        let supersede_body: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='memory_vector_generation_rebuild_catchup_supersede_guard'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            supersede_body.contains("RAISE(ABORT, 'GENERATION_REBUILD_CATCHUP_SUPERSEDE_UNSAFE')")
+        );
+        // The three Schema18 writer fences are installed alongside the 45
+        // earlier writer fences.
+        let writer_fence_total: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type='trigger' AND name GLOB 'digital_life_writer_epoch_*'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(writer_fence_total, 45);
+
+        // C snapshot table semantics are unchanged by the 17→18 upgrade.
+        let c_snapshot_sql_after: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type='table' AND name='memory_vector_generation_rebuild_item'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            c_snapshot_sql_after, c_snapshot_sql_before,
+            "the C snapshot table DDL must be byte-for-byte identical"
+        );
+
+        // Post-upgrade verification passed (the open succeeded) and WAL was
+        // configured only after that validation.
+        assert_eq!(journal_mode(&path), "wal");
+        assert!(path.with_extension("sqlite3-wal").exists());
+        assert_eq!(
+            take_upgrade_events(),
+            vec![
+                "mutex",
+                "open-before-wal",
+                "version-read",
+                "preflight-rm",
+                "begin-immediate",
+                "final-rm",
+                "commit",
+                "post-verify",
+                "wal",
+            ]
+        );
+    }
+
+    #[test]
+    fn d9d3_d_f1_schema_sixteen_startup_still_upgrades_to_eighteen() {
+        let _ = take_upgrade_events();
+        let (_root, path) = database_path("schema-sixteen-coordinated-upgrade");
+        prepare_schema_version(
+            &path,
+            migration::LATE_DELETE_GENERATION_AUTHORITY_SCHEMA_VERSION,
+        );
+        {
+            let raw = Connection::open(&path).unwrap();
+            assert_eq!(
+                connection::read_schema_version(&raw).unwrap(),
+                migration::LATE_DELETE_GENERATION_AUTHORITY_SCHEMA_VERSION
+            );
+            writer_fence_manifest::validate_writer_fence_manifest(&raw).unwrap();
+            drop(raw);
+        }
+
+        let gate = FakeGate::clear();
+        let connection = open_coordinated_storage_connection_with_gate(&path, &gate).unwrap();
+        assert_eq!(
+            connection::read_schema_version(&connection).unwrap(),
+            connection::MAX_SUPPORTED_SCHEMA_VERSION
+        );
+        migration::validate_generation_catchup_attempt_schema(&connection).unwrap();
+        assert_eq!(journal_mode(&path), "wal");
+    }
+
+    #[test]
+    fn d9d3_d_f1_schema_eighteen_reopen_validates_without_migration() {
+        let _ = take_upgrade_events();
+        let (_root, path) = database_path("schema-eighteen-reopen");
+        prepare_schema_version(&path, connection::MAX_SUPPORTED_SCHEMA_VERSION);
+        let gate = FakeGate::clear();
+
+        let connection = open_coordinated_storage_connection_with_gate(&path, &gate).unwrap();
+        assert_eq!(
+            connection::read_schema_version(&connection).unwrap(),
+            connection::MAX_SUPPORTED_SCHEMA_VERSION
+        );
+        migration::validate_generation_catchup_attempt_schema(&connection).unwrap();
+        assert_eq!(journal_mode(&path), "wal");
+        assert_eq!(
+            take_upgrade_events(),
+            vec![
+                "mutex",
+                "open-before-wal",
+                "version-read",
+                "schema-current",
+                "manifest",
+                "post-verify",
+                "wal",
+            ]
+        );
+    }
+
+    #[test]
+    fn d9d3_d_f1_schema_seventeen_failpoints_roll_back_to_exact_schema_seventeen_preimage() {
+        for point in [
+            migration::Migration018Failpoint::AfterTable,
+            migration::Migration018Failpoint::AfterSemanticGuards,
+            migration::Migration018Failpoint::AfterWriterFences,
+            migration::Migration018Failpoint::BeforeSchemaVersion,
+            migration::Migration018Failpoint::PreCommit,
+        ] {
+            let _ = take_upgrade_events();
+            let (_root, path) = database_path("schema-seventeen-migration-018-failure");
+            prepare_schema_version(&path, migration::GENERATION_LIFECYCLE_SCHEMA_VERSION);
+            let gate = FakeGate::clear();
+            migration::fail_next_migration_018_at_for_test(point);
+
+            let error = open_coordinated_storage_connection_with_gate(&path, &gate).unwrap_err();
+            assert_eq!(error.code, "MIGRATION_TRANSACTION_FAILED");
+
+            // The caller-owned upgrade transaction rolled back to the exact
+            // Schema17 preimage: version 17, no catch-up objects, no Schema18
+            // writer fences, and the Schema17 validator still succeeds.
+            let raw = Connection::open(&path).unwrap();
+            assert_eq!(
+                connection::read_schema_version(&raw).unwrap(),
+                migration::GENERATION_LIFECYCLE_SCHEMA_VERSION
+            );
+            let objects: i64 = raw
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE name LIKE 'memory_vector_generation_rebuild_catchup%' OR name LIKE 'digital_life_writer_epoch_memory_vector_generation_rebuild_catchup%'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                objects, 0,
+                "{point:?} did not roll back to the Schema17 preimage"
+            );
+            migration::validate_generation_lifecycle_schema(&raw).unwrap();
+            assert_eq!(journal_mode(&path), "delete");
+        }
     }
 
     #[test]
@@ -1418,7 +1636,7 @@ mod tests {
                     applied_at TEXT NOT NULL
                 );
                 INSERT INTO schema_migration (version, name, applied_at)
-                VALUES (17, 'future', '2026-01-01T00:00:00Z');",
+                VALUES (19, 'future', '2026-01-01T00:00:00Z');",
             )
             .unwrap();
         drop(connection);
@@ -1448,7 +1666,7 @@ mod tests {
                     applied_at TEXT NOT NULL
                 );
                 INSERT INTO schema_migration (version, name, applied_at)
-                VALUES (17, 'future', '2026-01-01T00:00:00Z')",
+                VALUES (19, 'future', '2026-01-01T00:00:00Z')",
             )
             .unwrap();
         drop(connection);

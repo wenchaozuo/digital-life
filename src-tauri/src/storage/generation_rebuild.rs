@@ -22,11 +22,7 @@ const GENERATION_REBUILD_LEASE_SECONDS: i64 = 120;
 static REBUILD_ATTEMPT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
-thread_local! {
-    static PROMOTION_FAULT: std::cell::Cell<Option<PromotionFault>> = const {
-        std::cell::Cell::new(None)
-    };
-}
+static PROMOTION_FAULT: std::sync::Mutex<Option<PromotionFault>> = std::sync::Mutex::new(None);
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42,19 +38,18 @@ pub(crate) enum PromotionFault {
 
 #[cfg(test)]
 pub(crate) fn arm_promotion_fault_for_test(fault: PromotionFault) {
-    PROMOTION_FAULT.with(|next| next.set(Some(fault)));
+    *PROMOTION_FAULT.lock().unwrap() = Some(fault);
 }
 
 #[cfg(test)]
 fn fail_promotion(fault: PromotionFault) -> bool {
-    PROMOTION_FAULT.with(|next| {
-        if next.get() == Some(fault) {
-            next.set(None);
-            true
-        } else {
-            false
-        }
-    })
+    let mut armed = PROMOTION_FAULT.lock().unwrap();
+    if *armed == Some(fault) {
+        *armed = None;
+        true
+    } else {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -2079,7 +2074,54 @@ impl StorageService {
                          WHERE o.migration_disposition IS NULL
                            AND o.mutation_sequence>0
                            AND o.mutation_sequence<=j.promotion_sequence)
-                  )",
+                     -- Every covered outbox item (disposition-NULL outbox row with
+                     -- an applied+finalized catch-up attempt) must carry exactly
+                     -- the outbox resolution the promotion writes.  The catch-up
+                     -- items persist after the promotion deletes the outbox rows,
+                     -- so they remain the authoritative evidence set.
+                     AND NOT EXISTS (
+                         SELECT 1 FROM memory_vector_generation_rebuild_catchup_item c
+                         WHERE c.job_id=j.job_id
+                           AND c.mutation_sequence>0
+                           AND c.mutation_sequence<=j.promotion_sequence
+                           AND c.state='applied' AND c.io_phase='finalized'
+                           AND NOT EXISTS (
+                               SELECT 1 FROM memory_vector_generation_rebuild_resolution r
+                               WHERE r.job_id=j.job_id AND r.source_kind='outbox'
+                                 AND r.source_row_id=c.source_outbox_id
+                                 AND r.life_id=c.life_id
+                                 AND r.memory_id=c.memory_id
+                                 AND r.mutation_sequence=c.mutation_sequence
+                           )
+                     )
+                     -- No outbox resolution may exist without its covered catch-up
+                     -- item (no orphan or invention of promotion evidence).
+                     AND NOT EXISTS (
+                         SELECT 1 FROM memory_vector_generation_rebuild_resolution r
+                         WHERE r.job_id=j.job_id AND r.source_kind='outbox'
+                           AND NOT EXISTS (
+                               SELECT 1 FROM memory_vector_generation_rebuild_catchup_item c
+                               WHERE c.job_id=j.job_id
+                                 AND c.source_outbox_id=r.source_row_id
+                                 AND c.life_id=r.life_id
+                                 AND c.memory_id=r.memory_id
+                                 AND c.mutation_sequence=r.mutation_sequence
+                                 AND c.state='applied' AND c.io_phase='finalized'
+                           )
+                     )
+                     -- Every late-delete resolution the promotion wrote must have
+                     -- its selected Late Delete row in the terminal resolved_rebuilt
+                     -- state (no mutated-away or resurrected LD evidence).
+                     AND NOT EXISTS (
+                         SELECT 1 FROM memory_vector_generation_rebuild_resolution r
+                         WHERE r.job_id=j.job_id AND r.source_kind='late_delete'
+                           AND NOT EXISTS (
+                               SELECT 1 FROM memory_vector_late_delete_resolution ld
+                               WHERE ld.resolution_id=r.source_row_id
+                                 AND ld.state='resolved_rebuilt'
+                           )
+                     )
+                   )",
                 params![
                     job_id,
                     operation_id,
@@ -2089,6 +2131,15 @@ impl StorageService {
                 |row| row.get(0),
             )
             .map_err(|_| unavailable())?;
+
+        // The preimage must prove the promotion-only side effects did not
+        // partially persist: the job is still ready, carries no promotion
+        // identity, the candidate generation is still building at its candidate
+        // epoch, the pointer still names the source (or NULL for a bootstrap),
+        // and no rebuild resolution row (outbox or late-delete) exists for this
+        // job.  A late-delete row can only be terminal via this promotion when a
+        // resolution row exists, so the absence of resolution rows also proves no
+        // selected Late Delete row was changed to resolved_rebuilt by it.
         let pre: bool = connection
             .query_row(
                 "SELECT EXISTS(

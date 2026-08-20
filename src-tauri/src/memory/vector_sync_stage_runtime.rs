@@ -11,7 +11,7 @@ use tokio::sync::{Mutex, MutexGuard};
 use crate::{
     model::runtime::{ModelRuntimeCoordinator, ModelRuntimeService},
     secrets::{SecretStore, WindowsCredentialSecretStore},
-    storage::StorageService,
+    storage::{StorageError, StorageService},
     vector_store::LanceDbVectorStoreRegistry,
 };
 
@@ -199,7 +199,7 @@ pub fn cancel_vector_generation_rebuild(
         })
 }
 
-async fn run_vector_generation_rebuild<S>(
+pub(crate) async fn run_vector_generation_rebuild<S>(
     storage: &StorageService,
     secrets: &S,
     model_runtime: &ModelRuntimeCoordinator,
@@ -215,6 +215,37 @@ where
     S: SecretStore + ?Sized,
 {
     let guard = gate.acquire().await;
+    run_vector_generation_rebuild_guarded(
+        storage,
+        secrets,
+        model_runtime,
+        registry,
+        &guard,
+        request_id,
+        timeout,
+    )
+    .await
+}
+
+/// The full pipeline body runs while the caller-owned composition guard is
+/// held.  The guard is a dependency of this function, not something this
+/// function acquires and releases around a live candidate: the caller decides
+/// when the guard may be released after the candidate is durably terminal.
+pub(crate) async fn run_vector_generation_rebuild_guarded<'a, S>(
+    storage: &StorageService,
+    secrets: &S,
+    model_runtime: &ModelRuntimeCoordinator,
+    registry: &LanceDbVectorStoreRegistry,
+    guard: &FencedVectorSyncCompositionGuard<'a>,
+    request_id: &str,
+    timeout: std::time::Duration,
+) -> Result<
+    crate::storage::GenerationRebuildJobRecord,
+    super::vector_generation_rebuild::GenerationRebuildCError,
+>
+where
+    S: SecretStore + ?Sized,
+{
     let deadline = std::time::Instant::now() + timeout;
     let runtime = ModelRuntimeService::new(storage, secrets, model_runtime);
     let owner = format!("generation-rebuild-{request_id}");
@@ -235,7 +266,7 @@ where
                     ),
                 );
             }
-            match run_generation_rebuild_c(storage, &runtime, registry, request_id, &owner, &guard)
+            match run_generation_rebuild_c(storage, &runtime, registry, request_id, &owner, guard)
                 .await
             {
                 Ok(handoff) => break handoff,
@@ -257,26 +288,119 @@ where
             }
         };
         run_generation_rebuild_d(
-            storage, &runtime, registry, &handoff, &owner, deadline, &guard,
+            storage, &runtime, registry, &handoff, &owner, deadline, guard,
         )
         .await
     }
     .await;
     if let Err(ref error) = result {
-        if let Ok(Some(job)) = storage.load_nonterminal_generation_rebuild_job() {
-            if let Ok(Some(lease)) =
-                storage.acquire_generation_rebuild_job_lease(&job.job_id, &owner)
-            {
-                let _ = storage.fail_generation_rebuild(
-                    &job.job_id,
-                    &lease,
-                    &error.code,
-                    job.candidate_authority_epoch,
-                );
-            }
-        }
+        // The failed pipeline must not release the composition guard while the
+        // candidate generation is still nonterminal.  Compensation is retried
+        // and classified against durable SQLite state while this very scope
+        // still holds the guard; the scope ends only after the world is
+        // durably terminal (job failed/cancelled/completed or G2 durably
+        // failed).  Nobody else can acquire the gate during that window.
+        ensure_durably_terminal_after_failure(storage, request_id, &owner, error).await;
     }
     result
+}
+
+/// Retries/classifies the failed-generation compensation while the composition
+/// guard is held.  This function never returns while the job is nonterminal, so
+/// the caller scope cannot end (and the guard cannot release) with a live
+/// nonterminal G2.
+async fn ensure_durably_terminal_after_failure(
+    storage: &StorageService,
+    request_id: &str,
+    owner: &str,
+    error: &super::vector_generation_rebuild::GenerationRebuildCError,
+) {
+    let mut attempt: u32 = 0;
+    loop {
+        attempt = attempt.saturating_add(1);
+        match storage.load_generation_rebuild_job_by_request(request_id) {
+            Ok(job) => {
+                let terminal = job.as_ref().is_none_or(|job| {
+                    matches!(job.status.as_str(), "failed" | "cancelled" | "completed")
+                });
+                if terminal {
+                    // The durable world is already terminal even if this local
+                    // compensation result was lost; the scope may end.
+                    return;
+                }
+                if let Some(job) = job {
+                    if let Ok(Some(lease)) =
+                        storage.acquire_generation_rebuild_job_lease(&job.job_id, owner)
+                    {
+                        let forced_failure = take_fail_next_outer_compensation();
+                        let outcome = if forced_failure {
+                            #[cfg(test)]
+                            if let Some(tx) =
+                                OUTER_COMPENSATION_FAILURE_SIGNAL.lock().unwrap().take()
+                            {
+                                let _ = tx.send(());
+                            }
+                            Err(StorageError::new(
+                                "D9D3_D_F1_TRANSIENT_COMPENSATION_FAILURE",
+                                "A transient compensation failure was injected by the test seam.",
+                                true,
+                            ))
+                        } else {
+                            storage.fail_generation_rebuild(
+                                &job.job_id,
+                                &lease,
+                                &error.code,
+                                job.candidate_authority_epoch,
+                            )
+                        };
+                        // The cleanup result is deliberately not discarded: the
+                        // next loop iteration re-inspects the durable job state
+                        // and only ends this scope once the world is terminal.
+                        let _ = outcome;
+                    }
+                }
+            }
+            Err(_) => {
+                // A durable read failed while the guard is held: keep the guard
+                // and retry.  The scope must not end while the candidate is
+                // nonterminal, so a persistent storage failure parks the
+                // pipeline fail-closed rather than releasing the gate.
+            }
+        }
+        let backoff_millis = u64::from(attempt.min(40)) * 5;
+        tokio::time::sleep(std::time::Duration::from_millis(backoff_millis)).await;
+    }
+}
+
+#[cfg(test)]
+static FAIL_NEXT_OUTER_COMPENSATION: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+#[cfg(test)]
+static OUTER_COMPENSATION_FAILURE_SIGNAL: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>> =
+    std::sync::Mutex::new(None);
+
+/// Test-only seam: the next compensation attempt performed by the full-pipeline
+/// owner (after C/D failed) fails with a transient error, then the loop retries
+/// while the same composition guard is held.
+#[cfg(test)]
+pub(super) fn fail_next_outer_compensation_for_test() {
+    *FAIL_NEXT_OUTER_COMPENSATION.lock().unwrap() = true;
+}
+
+/// Test-only channel: notified when the injected transient compensation failure
+/// has just occurred (the guard is still held and the job is still nonterminal).
+#[cfg(test)]
+pub(super) fn set_outer_compensation_failure_signal_for_test(sender: std::sync::mpsc::Sender<()>) {
+    *OUTER_COMPENSATION_FAILURE_SIGNAL.lock().unwrap() = Some(sender);
+}
+
+#[cfg(test)]
+fn take_fail_next_outer_compensation() -> bool {
+    std::mem::take(&mut *FAIL_NEXT_OUTER_COMPENSATION.lock().unwrap())
+}
+
+#[cfg(not(test))]
+fn take_fail_next_outer_compensation() -> bool {
+    false
 }
 
 impl From<VectorSyncDrainReport> for FencedVectorSyncDrainResult {

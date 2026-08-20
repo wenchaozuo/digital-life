@@ -644,7 +644,7 @@ mod tests {
             "memory_vector_generation" => connection.execute(
                 "INSERT INTO memory_vector_generation
                  (generation_id, descriptor_hash, dimension, state)
-                 VALUES ('generation-insert', 'insert-descriptor', 3, 'building')",
+                 VALUES ('generation-insert', 'insert-descriptor', 3, 'failed')",
                 [],
             ),
             "memory_vector_generation_item" => connection.execute(

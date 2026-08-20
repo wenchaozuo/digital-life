@@ -17,6 +17,9 @@ const LATE_DELETE_GENERATION_AUTHORITY_MIGRATION_NAME: &str =
     "016_late_delete_generation_authority";
 pub(super) const GENERATION_LIFECYCLE_SCHEMA_VERSION: i64 = 17;
 const GENERATION_LIFECYCLE_MIGRATION_NAME: &str = "017_vector_generation_lifecycle_cutover";
+pub(super) const GENERATION_CATCHUP_ATTEMPT_SCHEMA_VERSION: i64 = 18;
+const GENERATION_CATCHUP_ATTEMPT_MIGRATION_NAME: &str =
+    "018_vector_generation_catchup_attempt_identity";
 const ADD_CLAIMED_GENERATION_AUTHORITY_EPOCH_SQL: &str = "ALTER TABLE memory_vector_sync_outbox ADD COLUMN claimed_generation_authority_epoch INTEGER NULL CHECK (claimed_generation_authority_epoch IS NULL OR claimed_generation_authority_epoch >= 1)";
 const CREATE_GENERATION_AUTHORITY_TABLE_SQL: &str =
     "CREATE TABLE memory_vector_generation_authority (
@@ -42,6 +45,8 @@ const CREATE_GENERATION_STORE_WITNESS_TABLE_SQL: &str = "CREATE TABLE memory_vec
 )";
 const CREATE_REBUILD_TABLES_AND_GUARDS_SQL: &str =
     include_str!("migrations/017_vector_generation_lifecycle_cutover.sql");
+const CREATE_REBUILD_CATCHUP_ATTEMPT_TABLE_SQL: &str =
+    include_str!("migrations/018_vector_generation_catchup_attempt_identity.sql");
 const ADD_DELETE_WITNESS_AT_SQL: &str =
     "ALTER TABLE memory_vector_sync_outbox ADD COLUMN delete_witness_at TEXT NULL";
 const ADD_WITNESS_AGE_ANCHOR_AT_SQL: &str = "ALTER TABLE memory_vector_late_delete_resolution ADD COLUMN witness_age_anchor_at TEXT NOT NULL DEFAULT ''";
@@ -168,6 +173,11 @@ pub(super) enum LateDeleteGenerationAuthoritySchemaUpgrade {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum GenerationLifecycleSchemaUpgrade {
+    Applied,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum GenerationCatchupAttemptSchemaUpgrade {
     Applied,
 }
 
@@ -886,6 +896,105 @@ fn validate_generation_lifecycle_schema_objects(
     Ok(())
 }
 
+/// Schema 18 adds the D-stage attempt authority without changing Schema 17's
+/// snapshot item meaning. The caller owns the transaction and records version
+/// 18 only after table, semantic guards, writer fences, and validation agree.
+pub(super) fn apply_generation_catchup_attempt_schema_upgrade(
+    transaction: &Transaction<'_>,
+) -> Result<GenerationCatchupAttemptSchemaUpgrade, StorageError> {
+    if connection::read_schema_version(transaction)? != GENERATION_LIFECYCLE_SCHEMA_VERSION {
+        return Err(StorageError::migration_version_invariant_failed());
+    }
+    transaction
+        .execute_batch(CREATE_REBUILD_CATCHUP_ATTEMPT_TABLE_SQL)
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    #[cfg(test)]
+    if should_fail_migration_018_at_for_test(Migration018Failpoint::AfterTable) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    #[cfg(test)]
+    if should_fail_migration_018_at_for_test(Migration018Failpoint::AfterSemanticGuards) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    writer_fence_manifest::install_generation_catchup_writer_fence_manifest_in_transaction(
+        transaction,
+    )?;
+    #[cfg(test)]
+    if should_fail_migration_018_at_for_test(Migration018Failpoint::AfterWriterFences) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    validate_generation_catchup_attempt_schema_objects(transaction)?;
+    #[cfg(test)]
+    if should_fail_migration_018_at_for_test(Migration018Failpoint::BeforeSchemaVersion) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    transaction.execute(
+        "INSERT INTO schema_migration (version,name,applied_at) VALUES (?1,?2,strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        params![GENERATION_CATCHUP_ATTEMPT_SCHEMA_VERSION, GENERATION_CATCHUP_ATTEMPT_MIGRATION_NAME],
+    ).map_err(|_| StorageError::migration_transaction_failed())?;
+    #[cfg(test)]
+    if should_fail_migration_018_at_for_test(Migration018Failpoint::PreCommit) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    validate_generation_catchup_attempt_schema(transaction)?;
+    Ok(GenerationCatchupAttemptSchemaUpgrade::Applied)
+}
+
+pub(super) fn validate_generation_catchup_attempt_schema(
+    connection: &Connection,
+) -> Result<(), StorageError> {
+    if connection::read_schema_version(connection)? != GENERATION_CATCHUP_ATTEMPT_SCHEMA_VERSION {
+        return Err(StorageError::migration_version_invariant_failed());
+    }
+    validate_generation_catchup_attempt_schema_objects(connection)
+}
+
+fn validate_generation_catchup_attempt_schema_objects(
+    connection: &Connection,
+) -> Result<(), StorageError> {
+    let table_sql: String = connection.query_row(
+        "SELECT sql FROM sqlite_schema WHERE type='table' AND name='memory_vector_generation_rebuild_catchup_item'",
+        [], |row| row.get(0),
+    ).map_err(|_| StorageError::migration_transaction_failed())?;
+    let normalized = normalize_schema_fragment(&table_sql);
+    for required in [
+        "job_idtextnotnull",
+        "source_outbox_idintegernotnull",
+        "life_idtextnotnull",
+        "memory_idtextnotnull",
+        "mutation_sequenceintegernotnullcheck(mutation_sequence>0)",
+        "desired_actiontextnotnullcheck(desired_actionin('upsert','delete'))",
+        "primarykey(job_id,source_outbox_id,mutation_sequence)",
+        "unique(job_id,life_id,memory_id,mutation_sequence)",
+        "foreignkey(job_id)referencesmemory_vector_generation_rebuild_job(job_id)",
+        "attempt_countintegernotnulldefault0check(attempt_countbetween0and5)",
+    ] {
+        if !normalized.contains(required) {
+            return Err(StorageError::migration_transaction_failed());
+        }
+    }
+    for trigger in [
+        "memory_vector_generation_rebuild_catchup_identity_immutable",
+        "memory_vector_generation_rebuild_catchup_supersede_guard",
+    ] {
+        let present: Option<i64> = connection
+            .query_row(
+                "SELECT 1 FROM sqlite_schema WHERE type='trigger' AND name=?1",
+                [trigger],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| StorageError::migration_transaction_failed())?;
+        if present.is_none() {
+            return Err(StorageError::migration_transaction_failed());
+        }
+    }
+    writer_fence_manifest::validate_writer_fence_manifest_for_schema(
+        connection,
+        GENERATION_CATCHUP_ATTEMPT_SCHEMA_VERSION,
+    )
+}
+
 fn validate_late_delete_generation_authority_schema_objects(
     connection: &Connection,
 ) -> Result<(), StorageError> {
@@ -1415,6 +1524,9 @@ pub(super) fn verify_schema_after_upgrade(
     if expected_schema_version == GENERATION_LIFECYCLE_SCHEMA_VERSION {
         validate_generation_lifecycle_schema(connection)?;
     }
+    if expected_schema_version == GENERATION_CATCHUP_ATTEMPT_SCHEMA_VERSION {
+        validate_generation_catchup_attempt_schema(connection)?;
+    }
     if expected_schema_version >= writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION {
         #[cfg(test)]
         if should_fail_post_commit_verification_at_for_test(
@@ -1609,6 +1721,41 @@ pub(super) fn fail_next_migration_017_at_for_test(failpoint: Migration017Failpoi
 #[cfg(test)]
 fn should_fail_migration_017_at_for_test(failpoint: Migration017Failpoint) -> bool {
     MIGRATION_017_FAILPOINT.with(|next| {
+        if next.get() == Some(failpoint) {
+            next.set(None);
+            true
+        } else {
+            false
+        }
+    })
+}
+
+/// Test-only failure points for the single Schema-18 migration transaction.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Migration018Failpoint {
+    AfterTable,
+    AfterSemanticGuards,
+    AfterWriterFences,
+    BeforeSchemaVersion,
+    PreCommit,
+}
+
+#[cfg(test)]
+thread_local! {
+    static MIGRATION_018_FAILPOINT: std::cell::Cell<Option<Migration018Failpoint>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(super) fn fail_next_migration_018_at_for_test(failpoint: Migration018Failpoint) {
+    MIGRATION_018_FAILPOINT.with(|next| next.set(Some(failpoint)));
+}
+
+#[cfg(test)]
+fn should_fail_migration_018_at_for_test(failpoint: Migration018Failpoint) -> bool {
+    MIGRATION_018_FAILPOINT.with(|next| {
         if next.get() == Some(failpoint) {
             next.set(None);
             true
@@ -2219,6 +2366,158 @@ mod transaction_tests {
             GenerationLifecycleSchemaUpgrade::Applied
         );
         transaction.commit().unwrap();
+    }
+
+    fn schema_seventeen_connection() -> Connection {
+        let mut connection = schema_sixteen_connection();
+        apply_generation_lifecycle_upgrade(&mut connection);
+        assert_eq!(
+            schema_version(&connection),
+            GENERATION_LIFECYCLE_SCHEMA_VERSION
+        );
+        connection
+    }
+
+    fn apply_generation_catchup_attempt_upgrade(connection: &mut Connection) {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert_eq!(
+            apply_generation_catchup_attempt_schema_upgrade(&transaction).unwrap(),
+            GenerationCatchupAttemptSchemaUpgrade::Applied
+        );
+        transaction.commit().unwrap();
+    }
+
+    #[test]
+    fn migration_018_schema_seventeen_to_eighteen_is_atomic_and_preserves_c_snapshot_schema() {
+        let mut connection = schema_seventeen_connection();
+        let c_snapshot_sql: String = connection.query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='table' AND name='memory_vector_generation_rebuild_item'",
+            [], |row| row.get(0),
+        ).unwrap();
+        apply_generation_catchup_attempt_upgrade(&mut connection);
+        assert_eq!(
+            schema_version(&connection),
+            GENERATION_CATCHUP_ATTEMPT_SCHEMA_VERSION
+        );
+        validate_generation_catchup_attempt_schema(&connection).unwrap();
+        let table_exists: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='memory_vector_generation_rebuild_catchup_item'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(table_exists, 1);
+        let c_snapshot_after: String = connection.query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='table' AND name='memory_vector_generation_rebuild_item'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(c_snapshot_after, c_snapshot_sql);
+        assert_eq!(
+            writer_fence_manifest::generation_catchup_writer_fence_trigger_specs().len(),
+            3
+        );
+        writer_fence_manifest::validate_writer_fence_manifest_for_schema(
+            &connection,
+            GENERATION_CATCHUP_ATTEMPT_SCHEMA_VERSION,
+        )
+        .unwrap();
+        let writer_fence_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type='trigger' AND name GLOB 'digital_life_writer_epoch_*'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(writer_fence_count, 45);
+    }
+
+    #[test]
+    fn migration_018_schema18_missing_catchup_trigger_fails_validation_without_repair() {
+        let mut connection = schema_seventeen_connection();
+        apply_generation_catchup_attempt_upgrade(&mut connection);
+        let missing = writer_fence_manifest::generation_catchup_writer_fence_trigger_specs()[0];
+        connection
+            .execute_batch(&format!("DROP TRIGGER {}", missing.name))
+            .unwrap();
+
+        let error = validate_generation_catchup_attempt_schema(&connection).unwrap_err();
+        assert_eq!(error.code, "WRITER_FENCE_MANIFEST_MISSING");
+        let remaining: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type='trigger' AND name=?1",
+                [missing.name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn migration_018_failpoints_roll_back_to_exact_schema_seventeen_preimage() {
+        for point in [
+            Migration018Failpoint::AfterTable,
+            Migration018Failpoint::AfterSemanticGuards,
+            Migration018Failpoint::AfterWriterFences,
+            Migration018Failpoint::BeforeSchemaVersion,
+            Migration018Failpoint::PreCommit,
+        ] {
+            let mut connection = schema_seventeen_connection();
+            fail_next_migration_018_at_for_test(point);
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            assert_eq!(
+                apply_generation_catchup_attempt_schema_upgrade(&transaction)
+                    .unwrap_err()
+                    .code,
+                "MIGRATION_TRANSACTION_FAILED"
+            );
+            drop(transaction);
+            assert_eq!(
+                schema_version(&connection),
+                GENERATION_LIFECYCLE_SCHEMA_VERSION
+            );
+            let objects: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE name LIKE 'memory_vector_generation_rebuild_catchup%' OR name LIKE 'digital_life_writer_epoch_memory_vector_generation_rebuild_catchup%'",
+                [], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(objects, 0);
+            validate_generation_lifecycle_schema(&connection).unwrap();
+        }
+    }
+
+    #[test]
+    fn migration_018_catchup_table_enforces_action_attempt_and_immutable_identity() {
+        let mut connection = schema_seventeen_connection();
+        apply_generation_catchup_attempt_upgrade(&mut connection);
+        connection
+            .pragma_update(None, "foreign_keys", "OFF")
+            .unwrap();
+        let valid = "INSERT INTO memory_vector_generation_rebuild_catchup_item
+            (job_id,source_outbox_id,life_id,memory_id,mutation_sequence,desired_action,target_revision,target_content_hash,canonical_document,state,io_phase,updated_at)
+            VALUES ('job',42,'life','memory',100,'upsert',1,'hash','payload','pending','not_started','now')";
+        connection.execute_batch(valid).unwrap();
+        for invalid in [
+            "INSERT INTO memory_vector_generation_rebuild_catchup_item (job_id,source_outbox_id,life_id,memory_id,mutation_sequence,desired_action,target_revision,target_content_hash,canonical_document,state,io_phase,updated_at) VALUES ('a',1,'l','m',0,'upsert',1,'h','p','pending','not_started','now')",
+            "INSERT INTO memory_vector_generation_rebuild_catchup_item (job_id,source_outbox_id,life_id,memory_id,mutation_sequence,desired_action,target_revision,target_content_hash,canonical_document,state,io_phase,updated_at) VALUES ('a',2,'l','n',1,'upsert',NULL,'h','p','pending','not_started','now')",
+            "INSERT INTO memory_vector_generation_rebuild_catchup_item (job_id,source_outbox_id,life_id,memory_id,mutation_sequence,desired_action,target_revision,target_content_hash,canonical_document,state,io_phase,updated_at) VALUES ('a',3,'l','o',1,'delete',1,NULL,NULL,'pending','not_started','now')",
+            "INSERT INTO memory_vector_generation_rebuild_catchup_item (job_id,source_outbox_id,life_id,memory_id,mutation_sequence,desired_action,target_revision,target_content_hash,canonical_document,state,io_phase,attempt_count,updated_at) VALUES ('a',31,'l','o-hash',1,'delete',NULL,'hash',NULL,'pending','not_started',0,'now')",
+            "INSERT INTO memory_vector_generation_rebuild_catchup_item (job_id,source_outbox_id,life_id,memory_id,mutation_sequence,desired_action,target_revision,target_content_hash,canonical_document,state,io_phase,attempt_count,updated_at) VALUES ('a',4,'l','p',1,'delete',NULL,NULL,'payload','pending','not_started',0,'now')",
+            "INSERT INTO memory_vector_generation_rebuild_catchup_item (job_id,source_outbox_id,life_id,memory_id,mutation_sequence,desired_action,target_revision,target_content_hash,canonical_document,state,io_phase,attempt_count,updated_at) VALUES ('a',5,'l','q',1,'delete',NULL,NULL,NULL,'pending','not_started',6,'now')",
+            "INSERT INTO memory_vector_generation_rebuild_catchup_item (job_id,source_outbox_id,life_id,memory_id,mutation_sequence,desired_action,target_revision,target_content_hash,canonical_document,state,io_phase,attempt_count,updated_at) VALUES ('a',6,'l','r',1,'merge',1,'hash','payload','pending','not_started',0,'now')",
+        ] { assert!(connection.execute_batch(invalid).is_err()); }
+        assert!(connection.execute_batch(valid).is_err());
+        connection.execute_batch("INSERT INTO memory_vector_generation_rebuild_catchup_item
+            (job_id,source_outbox_id,life_id,memory_id,mutation_sequence,desired_action,target_revision,target_content_hash,canonical_document,state,io_phase,updated_at)
+            VALUES ('job',42,'life','memory',103,'upsert',2,'hash-103','payload-103','pending','not_started','now')").unwrap();
+        assert!(connection.execute_batch("INSERT INTO memory_vector_generation_rebuild_catchup_item
+            (job_id,source_outbox_id,life_id,memory_id,mutation_sequence,desired_action,target_revision,target_content_hash,canonical_document,state,io_phase,updated_at)
+            VALUES ('job',43,'life','memory',103,'upsert',2,'hash-103','payload-103','pending','not_started','now')").is_err());
+        assert!(connection.execute_batch("UPDATE memory_vector_generation_rebuild_catchup_item SET mutation_sequence=103 WHERE job_id='job' AND source_outbox_id=42 AND mutation_sequence=100").is_err());
+        assert!(connection.execute_batch("UPDATE memory_vector_generation_rebuild_catchup_item SET desired_action='delete' WHERE job_id='job' AND source_outbox_id=42 AND mutation_sequence=100").is_err());
+        connection.execute_batch("UPDATE memory_vector_generation_rebuild_catchup_item SET state='uncertain',io_phase='embedding_started',last_send_disposition='possibly_sent' WHERE job_id='job' AND source_outbox_id=42 AND mutation_sequence=100").unwrap();
+        assert!(connection.execute_batch("UPDATE memory_vector_generation_rebuild_catchup_item SET state='superseded' WHERE job_id='job' AND source_outbox_id=42 AND mutation_sequence=100").is_err());
     }
 
     #[test]

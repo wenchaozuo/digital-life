@@ -18,6 +18,7 @@ use crate::{
 use super::{
     existing_generation_binding::resolve_active_generation_fenced_execution,
     late_delete_resolution_runner::{run_one_late_delete_from_app, LateDeleteRunEnd},
+    vector_generation_rebuild::{run_generation_rebuild_c, run_generation_rebuild_d},
     vector_sync_worker::VectorSyncDrainReport,
 };
 
@@ -74,6 +75,208 @@ pub struct FencedVectorSyncDrainResult {
     pub failed: usize,
     pub stopped_no_eligible: bool,
     pub stopped_lost_lease: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartVectorGenerationRebuildRequest {
+    pub request_id: String,
+    pub timeout_millis: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VectorGenerationRebuildStatus {
+    pub job_id: String,
+    pub status: String,
+    pub snapshot_sequence: Option<i64>,
+    pub caught_up_sequence: Option<i64>,
+    pub promotion_sequence: Option<i64>,
+    pub cancel_requested: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum VectorGenerationRebuildErrorCode {
+    Unavailable,
+    Conflict,
+    Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VectorGenerationRebuildError {
+    pub code: VectorGenerationRebuildErrorCode,
+    pub message: &'static str,
+    pub recoverable: bool,
+}
+
+fn rebuild_status(
+    job: crate::storage::GenerationRebuildJobRecord,
+) -> VectorGenerationRebuildStatus {
+    VectorGenerationRebuildStatus {
+        job_id: job.job_id,
+        status: job.status,
+        snapshot_sequence: job.snapshot_sequence,
+        caught_up_sequence: job.caught_up_sequence,
+        promotion_sequence: job.promotion_sequence,
+        cancel_requested: job.cancel_requested,
+    }
+}
+
+fn map_rebuild_error(
+    error: super::vector_generation_rebuild::GenerationRebuildCError,
+) -> VectorGenerationRebuildError {
+    let code = if error.code.contains("CONFLICT") {
+        VectorGenerationRebuildErrorCode::Conflict
+    } else if error.recoverable {
+        VectorGenerationRebuildErrorCode::Unavailable
+    } else {
+        VectorGenerationRebuildErrorCode::Failed
+    };
+    VectorGenerationRebuildError {
+        code,
+        message: "The vector generation rebuild could not complete.",
+        recoverable: error.recoverable,
+    }
+}
+
+#[tauri::command]
+pub fn start_vector_generation_rebuild(
+    storage: State<'_, StorageService>,
+    secrets: State<'_, WindowsCredentialSecretStore>,
+    model_runtime: State<'_, ModelRuntimeCoordinator>,
+    registry: State<'_, LanceDbVectorStoreRegistry>,
+    gate: State<'_, FencedVectorSyncCompositionGate>,
+    request: StartVectorGenerationRebuildRequest,
+) -> Result<VectorGenerationRebuildStatus, VectorGenerationRebuildError> {
+    if request.timeout_millis == 0 || request.request_id.trim().is_empty() {
+        return Err(VectorGenerationRebuildError {
+            code: VectorGenerationRebuildErrorCode::Failed,
+            message: "The rebuild request is invalid.",
+            recoverable: false,
+        });
+    }
+    tauri::async_runtime::block_on(run_vector_generation_rebuild(
+        storage.inner(),
+        secrets.inner(),
+        model_runtime.inner(),
+        registry.inner(),
+        gate.inner(),
+        &request.request_id,
+        std::time::Duration::from_millis(request.timeout_millis),
+    ))
+    .map(rebuild_status)
+    .map_err(map_rebuild_error)
+}
+
+#[tauri::command]
+pub fn get_vector_generation_rebuild_job(
+    storage: State<'_, StorageService>,
+    job_id: String,
+) -> Result<VectorGenerationRebuildStatus, VectorGenerationRebuildError> {
+    storage
+        .load_generation_rebuild_job(&job_id)
+        .map(rebuild_status)
+        .map_err(|_| VectorGenerationRebuildError {
+            code: VectorGenerationRebuildErrorCode::Unavailable,
+            message: "The vector generation rebuild is unavailable.",
+            recoverable: true,
+        })
+}
+
+#[tauri::command]
+pub fn cancel_vector_generation_rebuild(
+    storage: State<'_, StorageService>,
+    job_id: String,
+) -> Result<(), VectorGenerationRebuildError> {
+    storage
+        .request_generation_rebuild_cancel(&job_id)
+        .map_err(|_| VectorGenerationRebuildError {
+            code: VectorGenerationRebuildErrorCode::Unavailable,
+            message: "The vector generation rebuild is unavailable.",
+            recoverable: true,
+        })
+}
+
+async fn run_vector_generation_rebuild<S>(
+    storage: &StorageService,
+    secrets: &S,
+    model_runtime: &ModelRuntimeCoordinator,
+    registry: &LanceDbVectorStoreRegistry,
+    gate: &FencedVectorSyncCompositionGate,
+    request_id: &str,
+    timeout: std::time::Duration,
+) -> Result<
+    crate::storage::GenerationRebuildJobRecord,
+    super::vector_generation_rebuild::GenerationRebuildCError,
+>
+where
+    S: SecretStore + ?Sized,
+{
+    let guard = gate.acquire().await;
+    let deadline = std::time::Instant::now() + timeout;
+    let runtime = ModelRuntimeService::new(storage, secrets, model_runtime);
+    let owner = format!("generation-rebuild-{request_id}");
+    let result = async {
+        if let Some(job) = storage
+            .load_generation_rebuild_job_by_request(request_id)
+            .map_err(super::vector_generation_rebuild::GenerationRebuildCError::storage)?
+        {
+            if job.status == "completed" {
+                return Ok(job);
+            }
+        }
+        let handoff = loop {
+            if std::time::Instant::now() >= deadline {
+                return Err(
+                    super::vector_generation_rebuild::GenerationRebuildCError::failed(
+                        "The generation rebuild deadline elapsed at a safe boundary.",
+                    ),
+                );
+            }
+            match run_generation_rebuild_c(storage, &runtime, registry, request_id, &owner, &guard)
+                .await
+            {
+                Ok(handoff) => break handoff,
+                Err(error) if error.recoverable => {
+                    let terminal = storage
+                        .load_generation_rebuild_job_by_request(request_id)
+                        .map_err(
+                            super::vector_generation_rebuild::GenerationRebuildCError::storage,
+                        )?
+                        .is_none_or(|job| {
+                            matches!(job.status.as_str(), "failed" | "cancelled" | "completed")
+                        });
+                    if terminal {
+                        return Err(error);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        run_generation_rebuild_d(
+            storage, &runtime, registry, &handoff, &owner, deadline, &guard,
+        )
+        .await
+    }
+    .await;
+    if let Err(ref error) = result {
+        if let Ok(Some(job)) = storage.load_nonterminal_generation_rebuild_job() {
+            if let Ok(Some(lease)) =
+                storage.acquire_generation_rebuild_job_lease(&job.job_id, &owner)
+            {
+                let _ = storage.fail_generation_rebuild(
+                    &job.job_id,
+                    &lease,
+                    &error.code,
+                    job.candidate_authority_epoch,
+                );
+            }
+        }
+    }
+    result
 }
 
 impl From<VectorSyncDrainReport> for FencedVectorSyncDrainResult {
@@ -403,6 +606,56 @@ mod tests {
         assert!(
             rebuild_source.contains("let _composition_guard = composition_gate.acquire().await")
         );
+    }
+
+    #[test]
+    fn d9d3_d_production_rebuild_ipc_routes_are_registered_and_redacted() {
+        let library_source = include_str!("../lib.rs");
+        for route in [
+            "vector_sync_stage_runtime::start_vector_generation_rebuild",
+            "vector_sync_stage_runtime::get_vector_generation_rebuild_job",
+            "vector_sync_stage_runtime::cancel_vector_generation_rebuild",
+        ] {
+            assert!(
+                library_source.contains(route),
+                "missing registered route: {route}"
+            );
+        }
+
+        let stage_source = include_str!("vector_sync_stage_runtime.rs");
+        for signature in [
+            "pub fn start_vector_generation_rebuild(",
+            "pub fn get_vector_generation_rebuild_job(",
+            "pub fn cancel_vector_generation_rebuild(",
+        ] {
+            assert!(
+                stage_source.contains(signature),
+                "missing IPC signature: {signature}"
+            );
+        }
+        assert!(stage_source.contains("request.timeout_millis == 0"));
+        assert!(stage_source.contains("request.request_id.trim().is_empty()"));
+
+        let serialized = serde_json::to_value(VectorGenerationRebuildStatus {
+            job_id: "job-a".into(),
+            status: "completed".into(),
+            snapshot_sequence: Some(11),
+            caught_up_sequence: Some(11),
+            promotion_sequence: Some(12),
+            cancel_requested: false,
+        })
+        .unwrap();
+        let fields = serialized.as_object().unwrap();
+        assert_eq!(fields.len(), 6);
+        for forbidden in [
+            "generationId",
+            "provider",
+            "storePath",
+            "descriptorHash",
+            "apiKey",
+        ] {
+            assert!(!fields.contains_key(forbidden), "IPC leaked {forbidden}");
+        }
     }
 
     #[test]

@@ -2152,6 +2152,22 @@ fn runtime_lease_is_current_in(
     tx.query_row("SELECT EXISTS(SELECT 1 FROM memory_vector_late_delete_runtime_lease WHERE lease_name=?1 AND lease_owner=?2 AND lease_fence_epoch=?3 AND lease_expires_at > ?4)", params![RUNTIME_LEASE_NAME, lease.owner, lease.fence_epoch, now], |row| row.get(0)).map_err(storage_error)
 }
 
+pub(crate) fn assert_runtime_lease_current_in(
+    tx: &Transaction<'_>,
+    lease: &LateDeleteRuntimeLease,
+    now: &str,
+) -> Result<(), StorageError> {
+    if runtime_lease_is_current_in(tx, lease, now)? {
+        Ok(())
+    } else {
+        Err(StorageError::new(
+            "LATE_DELETE_RUNTIME_LEASE_LOST",
+            "The late-delete runtime lease is no longer current.",
+            true,
+        ))
+    }
+}
+
 fn runtime_lease_matches_in(
     tx: &Transaction<'_>,
     claim: &LateDeleteResolutionClaim,

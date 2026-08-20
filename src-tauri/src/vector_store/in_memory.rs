@@ -555,6 +555,42 @@ impl VectorStore for InMemoryVectorStore {
         })
     }
 
+    fn list_generation_metadata<'a>(
+        &'a self,
+        context: &'a VectorGenerationContext,
+    ) -> VectorStoreFuture<'a, Result<Vec<VectorMetadataSample>, VectorStoreError>> {
+        Box::pin(async move {
+            self.validate_existing_generation(context)?;
+            let gen = context.generation_id().as_str();
+            let records = self.generation_records.read().map_err(|_| {
+                VectorStoreError::new(
+                    VectorStoreErrorCode::StoreUnavailable,
+                    "The in-memory vector store is unavailable.",
+                    true,
+                )
+            })?;
+            let mut samples = records
+                .values()
+                .filter(|record| record.generation_id().as_str() == gen)
+                .map(|record| VectorMetadataSample {
+                    generation_id: record.generation_id().as_str().to_owned(),
+                    life_id: record.life_id().to_owned(),
+                    memory_id: record.memory_id().to_owned(),
+                    memory_revision: record.memory_revision(),
+                    content_hash: record.content_hash().to_owned(),
+                    descriptor_hash: record.descriptor_hash().to_owned(),
+                    dimension: record.dimension(),
+                })
+                .collect::<Vec<_>>();
+            samples.sort_by(|left, right| {
+                left.life_id
+                    .cmp(&right.life_id)
+                    .then_with(|| left.memory_id.cmp(&right.memory_id))
+            });
+            Ok(samples)
+        })
+    }
+
     fn health_check_generation<'a>(
         &'a self,
         context: &'a VectorGenerationContext,

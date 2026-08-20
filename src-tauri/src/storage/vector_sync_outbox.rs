@@ -4426,7 +4426,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 16);
+        assert_eq!(version, 18);
     }
 
     #[test]
@@ -4466,7 +4466,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 16);
+        assert_eq!(version, 18);
         drop(storage);
 
         let reopened = StorageService::initialize_with_roots(data_root, None).unwrap();
@@ -7106,9 +7106,6 @@ mod tests {
         let record = confirmed(&storage, false);
         storage
             .register_building_vector_generation("generation-a", "descriptor-a", 2)
-            .unwrap();
-        storage
-            .register_building_vector_generation("generation-b", "descriptor-a", 2)
             .unwrap();
 
         let first = storage

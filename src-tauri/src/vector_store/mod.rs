@@ -635,6 +635,23 @@ pub trait VectorStore: Send + Sync {
         })
     }
 
+    /// Returns every metadata row for one generation.  This is deliberately
+    /// separate from the bounded diagnostic sample API: promotion proof must
+    /// not turn a truncated sample into an exact-set assertion.
+    fn list_generation_metadata<'a>(
+        &'a self,
+        context: &'a VectorGenerationContext,
+    ) -> VectorStoreFuture<'a, Result<Vec<VectorMetadataSample>, VectorStoreError>> {
+        let _ = context;
+        Box::pin(async {
+            Err(VectorStoreError::new(
+                VectorStoreErrorCode::StoreUnavailable,
+                "Generation-aware storage is unavailable for this vector store.",
+                false,
+            ))
+        })
+    }
+
     fn health_check_generation<'a>(
         &'a self,
         context: &'a VectorGenerationContext,

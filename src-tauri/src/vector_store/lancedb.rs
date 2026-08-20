@@ -834,6 +834,68 @@ impl LanceDbVectorStore {
         Ok(samples)
     }
 
+    async fn list_generation_metadata_inner(
+        &self,
+        context: &VectorGenerationContext,
+    ) -> Result<Vec<VectorMetadataSample>, VectorStoreError> {
+        let table = self.open_generation_table(context).await?;
+        let filter = format!(
+            "generation_id = {}",
+            sql_literal(context.generation_id().as_str())
+        );
+        let batches = table
+            .query()
+            .only_if(filter)
+            .select(Select::columns(&[
+                "generation_id",
+                "life_id",
+                "memory_id",
+                "memory_revision",
+                "content_hash",
+                "descriptor_hash",
+                "dimension",
+            ]))
+            .execute()
+            .await
+            .map_err(|_| read_failed())?
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|_| read_failed())?;
+        let mut samples = Vec::new();
+        for batch in batches {
+            let generation_ids = column_string(&batch, "generation_id")?;
+            let life_ids = column_string(&batch, "life_id")?;
+            let memory_ids = column_string(&batch, "memory_id")?;
+            let revisions = batch
+                .column_by_name("memory_revision")
+                .and_then(|a| a.as_any().downcast_ref::<Int64Array>())
+                .ok_or_else(read_failed)?;
+            let content_hashes = column_string(&batch, "content_hash")?;
+            let descriptor_hashes = column_string(&batch, "descriptor_hash")?;
+            let dimensions = batch
+                .column_by_name("dimension")
+                .and_then(|a| a.as_any().downcast_ref::<Int32Array>())
+                .ok_or_else(read_failed)?;
+            for row in 0..batch.num_rows() {
+                samples.push(VectorMetadataSample {
+                    generation_id: generation_ids.value(row).to_owned(),
+                    life_id: life_ids.value(row).to_owned(),
+                    memory_id: memory_ids.value(row).to_owned(),
+                    memory_revision: revisions.value(row),
+                    content_hash: content_hashes.value(row).to_owned(),
+                    descriptor_hash: descriptor_hashes.value(row).to_owned(),
+                    dimension: dimensions.value(row) as usize,
+                });
+            }
+        }
+        samples.sort_by(|left, right| {
+            left.life_id
+                .cmp(&right.life_id)
+                .then_with(|| left.memory_id.cmp(&right.memory_id))
+        });
+        Ok(samples)
+    }
+
     async fn health_check_generation_inner(
         &self,
         context: &VectorGenerationContext,
@@ -1380,6 +1442,13 @@ impl VectorStore for LanceDbVectorStore {
         limit: usize,
     ) -> VectorStoreFuture<'a, Result<Vec<VectorMetadataSample>, VectorStoreError>> {
         Box::pin(async move { self.sample_generation_metadata_inner(context, limit).await })
+    }
+
+    fn list_generation_metadata<'a>(
+        &'a self,
+        context: &'a VectorGenerationContext,
+    ) -> VectorStoreFuture<'a, Result<Vec<VectorMetadataSample>, VectorStoreError>> {
+        Box::pin(async move { self.list_generation_metadata_inner(context).await })
     }
 
     fn health_check_generation<'a>(

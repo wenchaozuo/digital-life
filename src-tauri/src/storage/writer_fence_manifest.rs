@@ -10,9 +10,11 @@ use super::StorageError;
 pub(super) const WRITER_FENCE_SCHEMA_VERSION: i64 = 13;
 pub(super) const LATE_DELETE_WRITER_FENCE_SCHEMA_VERSION: i64 = 15;
 pub(super) const GENERATION_LIFECYCLE_WRITER_FENCE_SCHEMA_VERSION: i64 = 17;
+pub(super) const GENERATION_CATCHUP_WRITER_FENCE_SCHEMA_VERSION: i64 = 18;
 const WRITER_FENCE_TRIGGER_PREFIX: &str = "digital_life_writer_epoch_";
 const HISTORICAL_WRITER_FENCE_TRIGGER_COUNT: usize = 18;
 const LATE_DELETE_WRITER_FENCE_TRIGGER_COUNT: usize = 24;
+const GENERATION_LIFECYCLE_WRITER_FENCE_TRIGGER_COUNT: usize = 42;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(super) enum WriterFenceOperation {
@@ -301,6 +303,24 @@ const WRITER_FENCE_TRIGGER_SPECS: &[WriterFenceTriggerSpec] = &[
         Delete,
         "DELETE"
     ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_memory_vector_generation_rebuild_catchup_item_insert",
+        "memory_vector_generation_rebuild_catchup_item",
+        Insert,
+        "INSERT"
+    ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_memory_vector_generation_rebuild_catchup_item_update",
+        "memory_vector_generation_rebuild_catchup_item",
+        Update,
+        "UPDATE"
+    ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_memory_vector_generation_rebuild_catchup_item_delete",
+        "memory_vector_generation_rebuild_catchup_item",
+        Delete,
+        "DELETE"
+    ),
 ];
 
 pub(super) fn writer_fence_trigger_specs() -> &'static [WriterFenceTriggerSpec] {
@@ -314,7 +334,34 @@ pub(super) fn late_delete_writer_fence_trigger_specs() -> &'static [WriterFenceT
 
 pub(super) fn generation_lifecycle_writer_fence_trigger_specs() -> &'static [WriterFenceTriggerSpec]
 {
-    &WRITER_FENCE_TRIGGER_SPECS[LATE_DELETE_WRITER_FENCE_TRIGGER_COUNT..]
+    &WRITER_FENCE_TRIGGER_SPECS
+        [LATE_DELETE_WRITER_FENCE_TRIGGER_COUNT..GENERATION_LIFECYCLE_WRITER_FENCE_TRIGGER_COUNT]
+}
+
+pub(super) fn generation_catchup_writer_fence_trigger_specs() -> &'static [WriterFenceTriggerSpec] {
+    &WRITER_FENCE_TRIGGER_SPECS[GENERATION_LIFECYCLE_WRITER_FENCE_TRIGGER_COUNT..]
+}
+
+pub(super) fn install_generation_catchup_writer_fence_manifest_in_transaction(
+    transaction: &Transaction<'_>,
+) -> Result<(), StorageError> {
+    for (index, spec) in generation_catchup_writer_fence_trigger_specs()
+        .iter()
+        .enumerate()
+    {
+        #[cfg(not(test))]
+        let _ = index;
+        #[cfg(test)]
+        if should_fail_trigger_install_at_for_test(
+            GENERATION_LIFECYCLE_WRITER_FENCE_TRIGGER_COUNT + index + 1,
+        ) {
+            return Err(StorageError::migration_transaction_failed());
+        }
+        transaction
+            .execute_batch(spec.ddl)
+            .map_err(|_| StorageError::migration_transaction_failed())?;
+    }
+    Ok(())
 }
 
 /// Installs the fixed manifest into the caller-owned schema transaction. The
@@ -407,8 +454,10 @@ pub(super) fn validate_writer_fence_manifest_for_schema(
         })
         .map_err(|_| StorageError::writer_fence_manifest_mismatch())?;
 
-    let expected = if schema_version >= GENERATION_LIFECYCLE_WRITER_FENCE_SCHEMA_VERSION {
+    let expected = if schema_version >= GENERATION_CATCHUP_WRITER_FENCE_SCHEMA_VERSION {
         WRITER_FENCE_TRIGGER_SPECS
+    } else if schema_version >= GENERATION_LIFECYCLE_WRITER_FENCE_SCHEMA_VERSION {
+        &WRITER_FENCE_TRIGGER_SPECS[..GENERATION_LIFECYCLE_WRITER_FENCE_TRIGGER_COUNT]
     } else if schema_version >= LATE_DELETE_WRITER_FENCE_SCHEMA_VERSION {
         &WRITER_FENCE_TRIGGER_SPECS[..LATE_DELETE_WRITER_FENCE_TRIGGER_COUNT]
     } else {
@@ -1103,7 +1152,7 @@ mod tests {
         assert_eq!(writer_fence_trigger_specs().len(), 18);
         assert_eq!(late_delete_writer_fence_trigger_specs().len(), 6);
         assert_eq!(generation_lifecycle_writer_fence_trigger_specs().len(), 18);
-        assert_eq!(WRITER_FENCE_TRIGGER_SPECS.len(), 42);
+        assert_eq!(WRITER_FENCE_TRIGGER_SPECS.len(), 45);
         let resolution_id = late_delete_resolution_insert(&authorized).unwrap();
         assert_eq!(resolution_id, 1);
         assert_eq!(authorized.execute("UPDATE memory_vector_late_delete_resolution SET updated_at='2026-01-02T00:00:00.000Z' WHERE memory_id='late-resolution'", []).unwrap(), 1);
@@ -1162,14 +1211,14 @@ mod tests {
     }
 
     #[test]
-    fn schema_16_generation_identity_immutable_generation_delete_denied_late_delete_resolution_runtime_create_captured_generation_authority_late_delete_24h_semantic_guards_are_orthogonal_to_the_twenty_four_writer_fence_triggers(
+    fn schema_18_generation_identity_immutable_generation_delete_denied_late_delete_resolution_runtime_create_captured_generation_authority_late_delete_24h_semantic_guards_are_orthogonal_to_the_forty_five_writer_fence_triggers(
     ) {
         let (_root, path) = initialized_fenced_database();
         let authorized = authorized_connection(&path);
         seed_protected_rows(&authorized);
-        assert_eq!(WRITER_FENCE_TRIGGER_SPECS.len(), 42);
+        assert_eq!(WRITER_FENCE_TRIGGER_SPECS.len(), 45);
         let reserved: i64 = authorized.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type='trigger' AND name LIKE 'digital_life_writer_epoch_%'", [], |r| r.get(0)).unwrap();
-        assert_eq!(reserved, 24);
+        assert_eq!(reserved, 45);
         for name in [
             "memory_vector_generation_semantic_delete_guard",
             "memory_vector_generation_semantic_identity_guard",

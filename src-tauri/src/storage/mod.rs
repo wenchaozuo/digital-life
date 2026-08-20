@@ -31,9 +31,12 @@ pub(crate) use llm_candidate_extraction::{
 pub(crate) use generation_lifecycle_authority::{
     GenerationAuthorityCommitClassification, GenerationAuthorityRegistration,
 };
+#[cfg(test)]
+pub(crate) use generation_rebuild::{arm_promotion_fault_for_test, PromotionFault};
 pub(crate) use generation_rebuild::{
-    GenerationRebuildFinalizeOutcome, GenerationRebuildItemRecord, GenerationRebuildJobRecord,
-    GenerationRebuildLease,
+    GenerationRebuildCatchupItemRecord, GenerationRebuildFinalizeOutcome,
+    GenerationRebuildItemRecord, GenerationRebuildJobRecord, GenerationRebuildLease,
+    GenerationRebuildPromotionCommitClassification,
 };
 #[allow(unused_imports)]
 pub(crate) use late_delete_resolution::{

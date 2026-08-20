@@ -27,8 +27,10 @@ use crate::{
     secrets::SecretStore,
     storage::{
         GenerationAuthorityCommitClassification, GenerationAuthorityRegistration,
-        GenerationRebuildFinalizeOutcome, GenerationRebuildItemRecord, GenerationRebuildJobRecord,
-        GenerationRebuildLease, StorageError, StorageService,
+        GenerationRebuildCatchupItemRecord, GenerationRebuildFinalizeOutcome,
+        GenerationRebuildItemRecord, GenerationRebuildJobRecord, GenerationRebuildLease,
+        GenerationRebuildPromotionCommitClassification, LateDeleteRuntimeLease, StorageError,
+        StorageService,
     },
     vector_store::{
         GenerationVectorRecord, LanceDbVectorStore, LanceDbVectorStoreRegistry,
@@ -73,7 +75,7 @@ impl GenerationRebuildCError {
         }
     }
 
-    fn storage(error: StorageError) -> Self {
+    pub(crate) fn storage(error: StorageError) -> Self {
         Self::new(error.code, error.message, error.recoverable)
     }
 
@@ -81,11 +83,19 @@ impl GenerationRebuildCError {
         Self::new("D9D3_C_CONFLICT", message, true)
     }
 
+    fn target_changed() -> Self {
+        Self::new(
+            "GENERATION_REBUILD_CATCHUP_TARGET_CHANGED",
+            "The catch-up target changed before external I/O; the newer mutation will be materialized.",
+            true,
+        )
+    }
+
     fn invalid(message: &'static str) -> Self {
         Self::new("D9D3_C_INVALID", message, false)
     }
 
-    fn failed(message: &'static str) -> Self {
+    pub(crate) fn failed(message: &'static str) -> Self {
         Self::new("D9D3_C_FAILED", message, false)
     }
 
@@ -142,7 +152,7 @@ where
         register_new_job(storage, runtime, request_id).map_err(GenerationRebuildCError::storage)?
     };
 
-    if job.status == "catching_up" {
+    if matches!(job.status.as_str(), "catching_up" | "verifying" | "ready") {
         return handoff_from_job(&job);
     }
     if matches!(job.status.as_str(), "failed" | "cancelled" | "completed") {
@@ -150,12 +160,6 @@ where
             "The persisted generation rebuild is already terminal.",
         ));
     }
-    if job.status == "ready" {
-        return Err(GenerationRebuildCError::conflict(
-            "The C phase cannot resume a promotion-ready job.",
-        ));
-    }
-
     let mut lease = storage
         .acquire_generation_rebuild_job_lease(&job.job_id, lease_owner)
         .map_err(GenerationRebuildCError::storage)?
@@ -184,7 +188,7 @@ where
         job = storage
             .load_generation_rebuild_job(&job.job_id)
             .map_err(GenerationRebuildCError::storage)?;
-        if job.status == "catching_up" {
+        if matches!(job.status.as_str(), "catching_up" | "verifying" | "ready") {
             return handoff_from_job(&job);
         }
         if job.status != "bulk_building" {
@@ -230,6 +234,726 @@ where
         )
         .await?;
     }
+}
+
+/// Runs D under the guard already acquired by the full lifecycle owner.  The
+/// catch-up table, not the C snapshot table, is the durable authority for any
+/// post-snapshot attempt.
+pub(crate) async fn run_generation_rebuild_d<'a, R, S>(
+    storage: &'a StorageService,
+    runtime: &'a ModelRuntimeService<'a, R, S>,
+    registry: &'a LanceDbVectorStoreRegistry,
+    handoff: &GenerationRebuildCHandoff,
+    lease_owner: &str,
+    deadline: std::time::Instant,
+    _composition_guard: &FencedVectorSyncCompositionGuard<'_>,
+) -> Result<GenerationRebuildJobRecord, GenerationRebuildCError>
+where
+    R: ModelProfileRepository,
+    S: SecretStore + ?Sized,
+{
+    let mut job = storage
+        .load_generation_rebuild_job(&handoff.job_id)
+        .map_err(GenerationRebuildCError::storage)?;
+    if job.status == "completed" {
+        return Ok(job);
+    }
+    if !matches!(job.status.as_str(), "catching_up" | "verifying" | "ready") {
+        return Err(GenerationRebuildCError::conflict(
+            "The persisted rebuild is not catch-up or promotion eligible.",
+        ));
+    }
+    let mut lease = storage
+        .acquire_generation_rebuild_job_lease(&job.job_id, lease_owner)
+        .map_err(GenerationRebuildCError::storage)?
+        .ok_or_else(|| {
+            GenerationRebuildCError::conflict("The persisted generation rebuild lease is held.")
+        })?;
+    let context = generation_context(&job)?;
+    let store = ensure_generation_store(storage, registry, &job, &lease, &context).await?;
+    let late_delete_owner = format!("generation-rebuild-late-delete-{}", job.job_id);
+    let mut late_delete_lease: Option<LateDeleteRuntimeLease> = None;
+    let promotion_operation_id = next_identity("generation-promotion");
+
+    loop {
+        job = storage
+            .load_generation_rebuild_job(&handoff.job_id)
+            .map_err(GenerationRebuildCError::storage)?;
+        if job.status == "completed" {
+            return Ok(job);
+        }
+        if std::time::Instant::now() >= deadline {
+            storage
+                .fail_generation_rebuild(
+                    &job.job_id,
+                    &lease,
+                    "GENERATION_REBUILD_DEADLINE_ELAPSED",
+                    job.candidate_authority_epoch,
+                )
+                .map_err(GenerationRebuildCError::storage)?;
+            return Err(GenerationRebuildCError::failed(
+                "The generation rebuild deadline elapsed at a safe boundary.",
+            ));
+        }
+        if is_cancel_requested(storage, &job.job_id)? {
+            storage
+                .cancel_generation_rebuild(&job.job_id, &lease, job.candidate_authority_epoch)
+                .map_err(GenerationRebuildCError::storage)?;
+            return Err(GenerationRebuildCError::cancelled());
+        }
+        lease = renew_generation_rebuild_lease(storage, &job.job_id, lease_owner)?;
+        if job.status == "catching_up" {
+            let target = storage
+                .generation_rebuild_mutation_clock()
+                .map_err(GenerationRebuildCError::storage)?;
+            if let Err(error) =
+                storage.materialize_generation_rebuild_catchup(&job.job_id, &lease, target)
+            {
+                if error.code == "GENERATION_REBUILD_CATCHUP_RESULT_UNKNOWN" {
+                    let error_code = error.code.clone();
+                    storage
+                        .fail_generation_rebuild(
+                            &job.job_id,
+                            &lease,
+                            &error_code,
+                            job.candidate_authority_epoch,
+                        )
+                        .map_err(GenerationRebuildCError::storage)?;
+                    return Err(GenerationRebuildCError::storage(error));
+                }
+                return Err(GenerationRebuildCError::storage(error));
+            }
+            let mut transient = false;
+            while let Some(item) = storage
+                .reserve_next_generation_rebuild_catchup_item(&job.job_id, &lease)
+                .map_err(GenerationRebuildCError::storage)?
+            {
+                match process_catchup_item(
+                    storage,
+                    runtime,
+                    &store,
+                    &context,
+                    &job,
+                    &item,
+                    &mut lease,
+                    lease_owner,
+                    deadline,
+                )
+                .await
+                {
+                    Ok(()) => {}
+                    Err(error) if error.recoverable => {
+                        let current = storage
+                            .load_generation_rebuild_job(&job.job_id)
+                            .map_err(GenerationRebuildCError::storage)?;
+                        if current.status == "failed" || current.status == "cancelled" {
+                            return Err(error);
+                        }
+                        transient = true;
+                        break;
+                    }
+                    Err(error) => {
+                        let current = storage
+                            .load_generation_rebuild_job(&job.job_id)
+                            .map_err(GenerationRebuildCError::storage)?;
+                        if matches!(
+                            current.status.as_str(),
+                            "catching_up" | "verifying" | "ready"
+                        ) {
+                            storage
+                                .fail_generation_rebuild(
+                                    &job.job_id,
+                                    &lease,
+                                    &error.code,
+                                    current.candidate_authority_epoch,
+                                )
+                                .map_err(GenerationRebuildCError::storage)?;
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            if transient {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                continue;
+            }
+            assert_catchup_payload_lifecycle(storage, &job.job_id)?;
+            if !storage
+                .advance_generation_rebuild_catchup(&job.job_id, &lease, target)
+                .map_err(GenerationRebuildCError::storage)?
+            {
+                continue;
+            }
+        }
+
+        job = storage
+            .load_generation_rebuild_job(&job.job_id)
+            .map_err(GenerationRebuildCError::storage)?;
+        if job.status == "verifying" {
+            let target = job.caught_up_sequence.ok_or_else(|| {
+                GenerationRebuildCError::conflict("The catch-up proof has no target.")
+            })?;
+            match verify_generation_rebuild_lance_set(storage, &store, &context, &job).await {
+                Ok(()) => {}
+                Err(error) if error.recoverable => {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    continue;
+                }
+                Err(error) => {
+                    storage
+                        .fail_generation_rebuild(
+                            &job.job_id,
+                            &lease,
+                            &error.code,
+                            job.candidate_authority_epoch,
+                        )
+                        .map_err(GenerationRebuildCError::storage)?;
+                    return Err(error);
+                }
+            }
+            match storage.mark_generation_rebuild_ready(&job.job_id, &lease, target) {
+                Ok(()) => {}
+                Err(error) if error.code == "GENERATION_REBUILD_MUTATION_RACE" => continue,
+                Err(error) => return Err(GenerationRebuildCError::storage(error)),
+            }
+            continue;
+        }
+        if job.status != "ready" {
+            continue;
+        }
+
+        let target = job.caught_up_sequence.ok_or_else(|| {
+            GenerationRebuildCError::conflict("The promotion target is unavailable.")
+        })?;
+        match verify_generation_rebuild_lance_set(storage, &store, &context, &job).await {
+            Ok(()) => {}
+            Err(error) if error.recoverable => {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                continue;
+            }
+            Err(error) => {
+                storage
+                    .fail_generation_rebuild(
+                        &job.job_id,
+                        &lease,
+                        &error.code,
+                        job.candidate_authority_epoch,
+                    )
+                    .map_err(GenerationRebuildCError::storage)?;
+                return Err(error);
+            }
+        }
+        if late_delete_lease.is_none() {
+            late_delete_lease = storage
+                .acquire_late_delete_runtime_lease(&late_delete_owner)
+                .map_err(GenerationRebuildCError::storage)?;
+            if late_delete_lease.is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            continue;
+        }
+        let current_late_delete_lease = late_delete_lease
+            .as_ref()
+            .expect("late-delete lease was acquired above");
+        match storage.promote_generation_rebuild(
+            &job.job_id,
+            &lease,
+            current_late_delete_lease,
+            target,
+            &promotion_operation_id,
+        ) {
+            Ok(()) => {}
+            Err(error) if error.code == "GENERATION_REBUILD_MUTATION_RACE" => {
+                let _ = storage.release_late_delete_runtime_lease(current_late_delete_lease);
+                late_delete_lease = None;
+                continue;
+            }
+            Err(error) if error.code == "GENERATION_REBUILD_PROMOTION_COMMIT_RESULT_UNKNOWN" => {
+                match storage
+                    .classify_generation_rebuild_promotion_commit(
+                        &job.job_id,
+                        &promotion_operation_id,
+                        target,
+                    )
+                    .map_err(GenerationRebuildCError::storage)?
+                {
+                    GenerationRebuildPromotionCommitClassification::Committed => {
+                        let completed = storage
+                            .load_generation_rebuild_job(&job.job_id)
+                            .map_err(GenerationRebuildCError::storage)?;
+                        let _ =
+                            storage.release_late_delete_runtime_lease(current_late_delete_lease);
+                        return Ok(completed);
+                    }
+                    GenerationRebuildPromotionCommitClassification::NotCommitted => continue,
+                    GenerationRebuildPromotionCommitClassification::RecoveryRequired => {
+                        return Err(GenerationRebuildCError::storage(error));
+                    }
+                }
+            }
+            Err(error) => return Err(GenerationRebuildCError::storage(error)),
+        }
+        let completed = storage
+            .load_generation_rebuild_job(&job.job_id)
+            .map_err(GenerationRebuildCError::storage)?;
+        let _ = storage.release_late_delete_runtime_lease(current_late_delete_lease);
+        return Ok(completed);
+    }
+}
+
+async fn process_catchup_item<'a, R, S>(
+    storage: &'a StorageService,
+    runtime: &'a ModelRuntimeService<'a, R, S>,
+    store: &std::sync::Arc<LanceDbVectorStore>,
+    context: &VectorGenerationContext,
+    job: &GenerationRebuildJobRecord,
+    item: &GenerationRebuildCatchupItemRecord,
+    lease: &mut GenerationRebuildLease,
+    _lease_owner: &str,
+    deadline: std::time::Instant,
+) -> Result<(), GenerationRebuildCError>
+where
+    R: ModelProfileRepository,
+    S: SecretStore + ?Sized,
+{
+    if item.desired_action == "delete" {
+        if item.io_phase == "vector_write_started" {
+            return recover_catchup_delete(storage, store, context, job, item, lease).await;
+        }
+        if item.io_phase != "reserved" {
+            return Err(GenerationRebuildCError::conflict(
+                "The catch-up Delete attempt phase is invalid.",
+            ));
+        }
+        if !storage
+            .generation_rebuild_catchup_item_is_current(item)
+            .map_err(GenerationRebuildCError::storage)?
+        {
+            return Err(GenerationRebuildCError::target_changed());
+        }
+        storage
+            .mark_generation_rebuild_catchup_phase(item, lease, "vector_write_started")
+            .map_err(GenerationRebuildCError::storage)?;
+        if !storage
+            .generation_rebuild_catchup_item_is_current(item)
+            .map_err(GenerationRebuildCError::storage)?
+        {
+            storage
+                .mark_generation_rebuild_catchup_delete_definitely_not_sent(
+                    item,
+                    lease,
+                    "GENERATION_REBUILD_CATCHUP_TARGET_CHANGED",
+                )
+                .map_err(GenerationRebuildCError::storage)?;
+            return Err(GenerationRebuildCError::target_changed());
+        }
+        if std::time::Instant::now() >= deadline {
+            storage
+                .fail_generation_rebuild_after_catchup_unknown(
+                    item,
+                    lease,
+                    "GENERATION_REBUILD_DEADLINE_AFTER_DELETE_RESERVATION",
+                    job.candidate_authority_epoch,
+                )
+                .map_err(GenerationRebuildCError::storage)?;
+            return Err(GenerationRebuildCError::unknown());
+        }
+        let delete_result = store
+            .delete_generation_memory(context, &item.life_id, &item.memory_id)
+            .await;
+        return match delete_result {
+            Ok(()) => recover_catchup_delete(storage, store, context, job, item, lease).await,
+            Err(_) => recover_catchup_delete(storage, store, context, job, item, lease).await,
+        };
+    }
+
+    if item.desired_action != "upsert" {
+        return Err(GenerationRebuildCError::invalid(
+            "The catch-up desired action is invalid.",
+        ));
+    }
+    if item.io_phase == "embedding_started" {
+        storage
+            .fail_generation_rebuild_after_catchup_unknown(
+                item,
+                lease,
+                "GENERATION_REBUILD_CATCHUP_EMBEDDING_RESULT_UNKNOWN",
+                job.candidate_authority_epoch,
+            )
+            .map_err(GenerationRebuildCError::storage)?;
+        return Err(GenerationRebuildCError::unknown());
+    }
+    if item.io_phase == "vector_write_started" {
+        return recover_catchup_upsert(storage, store, context, job, item, lease).await;
+    }
+    if item.io_phase != "reserved" {
+        return Err(GenerationRebuildCError::conflict(
+            "The catch-up Upsert attempt phase is invalid.",
+        ));
+    }
+    let document = item.canonical_document.as_deref().ok_or_else(|| {
+        GenerationRebuildCError::conflict("The catch-up Upsert document is unavailable.")
+    })?;
+    if !storage
+        .generation_rebuild_catchup_item_is_current(item)
+        .map_err(GenerationRebuildCError::storage)?
+    {
+        return Err(GenerationRebuildCError::target_changed());
+    }
+    storage
+        .mark_generation_rebuild_catchup_phase(item, lease, "embedding_started")
+        .map_err(GenerationRebuildCError::storage)?;
+    let resolved = match resolve_bound_provider(runtime, job) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            storage
+                .mark_generation_rebuild_catchup_embedding_definitely_not_sent(
+                    item,
+                    lease,
+                    "GENERATION_REBUILD_PROVIDER_RESOLUTION_FAILED",
+                )
+                .map_err(GenerationRebuildCError::storage)?;
+            if !error.recoverable {
+                storage
+                    .fail_generation_rebuild(
+                        &job.job_id,
+                        lease,
+                        "GENERATION_REBUILD_PROVIDER_RESOLUTION_FAILED",
+                        job.candidate_authority_epoch,
+                    )
+                    .map_err(GenerationRebuildCError::storage)?;
+            }
+            return Err(error);
+        }
+    };
+    if !storage
+        .generation_rebuild_catchup_item_is_current(item)
+        .map_err(GenerationRebuildCError::storage)?
+    {
+        storage
+            .mark_generation_rebuild_catchup_embedding_definitely_not_sent(
+                item,
+                lease,
+                "GENERATION_REBUILD_CATCHUP_TARGET_CHANGED",
+            )
+            .map_err(GenerationRebuildCError::storage)?;
+        return Err(GenerationRebuildCError::target_changed());
+    }
+    let embedding = resolved
+        .provider()
+        .embed(EmbeddingRequest {
+            texts: vec![document.to_owned()],
+            purpose: EmbeddingPurpose::Document,
+        })
+        .await;
+    drop(resolved);
+    let batch = match embedding {
+        Ok(batch) => batch,
+        Err(error) => return handle_catchup_embedding_error(storage, job, item, lease, error),
+    };
+    if batch.len() != 1 || batch.dimension() != job.dimension {
+        storage
+            .mark_generation_rebuild_catchup_embedding_response_failure(
+                item,
+                lease,
+                "GENERATION_REBUILD_CATCHUP_EMBEDDING_DIMENSION_MISMATCH",
+            )
+            .map_err(GenerationRebuildCError::storage)?;
+        storage
+            .fail_generation_rebuild(
+                &job.job_id,
+                lease,
+                "GENERATION_REBUILD_CATCHUP_EMBEDDING_DIMENSION_MISMATCH",
+                job.candidate_authority_epoch,
+            )
+            .map_err(GenerationRebuildCError::storage)?;
+        return Err(GenerationRebuildCError::failed(
+            "The catch-up embedding dimension is invalid.",
+        ));
+    }
+    if std::time::Instant::now() >= deadline || is_cancel_requested(storage, &job.job_id)? {
+        storage
+            .mark_generation_rebuild_catchup_embedding_response_failure(
+                item,
+                lease,
+                "GENERATION_REBUILD_CATCHUP_CANCELLED_BEFORE_VECTOR_WRITE",
+            )
+            .map_err(GenerationRebuildCError::storage)?;
+        let current = storage
+            .load_generation_rebuild_job(&job.job_id)
+            .map_err(GenerationRebuildCError::storage)?;
+        storage
+            .cancel_generation_rebuild(&job.job_id, lease, current.candidate_authority_epoch)
+            .map_err(GenerationRebuildCError::storage)?;
+        return Err(GenerationRebuildCError::cancelled());
+    }
+    let vector = batch
+        .into_vectors()
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            GenerationRebuildCError::failed("The catch-up embedding response is empty.")
+        })?
+        .into_values();
+    let record = GenerationVectorRecord::try_new(
+        context.generation_id().clone(),
+        item.life_id.clone(),
+        item.memory_id.clone(),
+        item.target_revision.ok_or_else(|| {
+            GenerationRebuildCError::conflict("The catch-up revision is unavailable.")
+        })?,
+        item.target_content_hash.clone().ok_or_else(|| {
+            GenerationRebuildCError::conflict("The catch-up hash is unavailable.")
+        })?,
+        context.descriptor_hash().to_owned(),
+        vector,
+    )
+    .map_err(|_| GenerationRebuildCError::failed("The catch-up vector is invalid."))?;
+    storage
+        .mark_generation_rebuild_catchup_phase(item, lease, "vector_write_started")
+        .map_err(GenerationRebuildCError::storage)?;
+    match store.upsert_generation(context, record).await {
+        Ok(()) => recover_catchup_upsert(storage, store, context, job, item, lease).await,
+        Err(_) => recover_catchup_upsert(storage, store, context, job, item, lease).await,
+    }
+}
+
+async fn recover_catchup_delete(
+    storage: &StorageService,
+    store: &std::sync::Arc<LanceDbVectorStore>,
+    context: &VectorGenerationContext,
+    job: &GenerationRebuildJobRecord,
+    item: &GenerationRebuildCatchupItemRecord,
+    lease: &GenerationRebuildLease,
+) -> Result<(), GenerationRebuildCError> {
+    let metadata = match store
+        .get_generation_metadata(context, &item.life_id, &item.memory_id)
+        .await
+    {
+        Ok(metadata) => metadata,
+        Err(_) => {
+            storage
+                .fail_generation_rebuild_after_catchup_unknown(
+                    item,
+                    lease,
+                    "GENERATION_REBUILD_CATCHUP_DELETE_RESULT_UNKNOWN",
+                    job.candidate_authority_epoch,
+                )
+                .map_err(GenerationRebuildCError::storage)?;
+            return Err(GenerationRebuildCError::unknown());
+        }
+    };
+    if metadata.is_some() {
+        storage
+            .fail_generation_rebuild_after_catchup_unknown(
+                item,
+                lease,
+                "GENERATION_REBUILD_CATCHUP_DELETE_REMAINS_PRESENT",
+                job.candidate_authority_epoch,
+            )
+            .map_err(GenerationRebuildCError::storage)?;
+        return Err(GenerationRebuildCError::unknown());
+    }
+    storage
+        .write_generation_rebuild_catchup_metadata(job, item, lease)
+        .map_err(GenerationRebuildCError::storage)?;
+    storage
+        .finalize_generation_rebuild_catchup_item(job, item, lease)
+        .map_err(GenerationRebuildCError::storage)?;
+    Ok(())
+}
+
+async fn recover_catchup_upsert(
+    storage: &StorageService,
+    store: &std::sync::Arc<LanceDbVectorStore>,
+    context: &VectorGenerationContext,
+    job: &GenerationRebuildJobRecord,
+    item: &GenerationRebuildCatchupItemRecord,
+    lease: &GenerationRebuildLease,
+) -> Result<(), GenerationRebuildCError> {
+    let metadata = store
+        .get_generation_metadata(context, &item.life_id, &item.memory_id)
+        .await;
+    match metadata {
+        Ok(Some(sample)) if catchup_metadata_matches(&sample, job, item, context) => {
+            storage
+                .write_generation_rebuild_catchup_metadata(job, item, lease)
+                .map_err(GenerationRebuildCError::storage)?;
+            storage
+                .finalize_generation_rebuild_catchup_item(job, item, lease)
+                .map_err(GenerationRebuildCError::storage)?;
+            Ok(())
+        }
+        Ok(Some(_)) | Ok(None) | Err(_) => {
+            storage
+                .fail_generation_rebuild_after_catchup_unknown(
+                    item,
+                    lease,
+                    "GENERATION_REBUILD_CATCHUP_VECTOR_WRITE_RESULT_UNKNOWN",
+                    job.candidate_authority_epoch,
+                )
+                .map_err(GenerationRebuildCError::storage)?;
+            Err(GenerationRebuildCError::unknown())
+        }
+    }
+}
+
+fn handle_catchup_embedding_error(
+    storage: &StorageService,
+    job: &GenerationRebuildJobRecord,
+    item: &GenerationRebuildCatchupItemRecord,
+    lease: &GenerationRebuildLease,
+    error: crate::embedding::EmbeddingError,
+) -> Result<(), GenerationRebuildCError> {
+    let code = embedding_error_code(error.code());
+    match error.retry_safety() {
+        EmbeddingRetrySafety::DefinitelyNotSent => {
+            storage
+                .mark_generation_rebuild_catchup_embedding_definitely_not_sent(item, lease, code)
+                .map_err(GenerationRebuildCError::storage)?;
+            Err(GenerationRebuildCError::new(
+                "GENERATION_REBUILD_PROVIDER_UNAVAILABLE",
+                "The catch-up embedding request was definitely not sent.",
+                true,
+            ))
+        }
+        EmbeddingRetrySafety::ResponseReceived if error.is_recoverable() => {
+            storage
+                .mark_generation_rebuild_catchup_embedding_response_failure(item, lease, code)
+                .map_err(GenerationRebuildCError::storage)?;
+            Err(GenerationRebuildCError::new(
+                "GENERATION_REBUILD_PROVIDER_UNAVAILABLE",
+                "The catch-up embedding provider returned a recoverable result.",
+                true,
+            ))
+        }
+        EmbeddingRetrySafety::ResponseReceived => {
+            storage
+                .mark_generation_rebuild_catchup_embedding_response_failure(item, lease, code)
+                .map_err(GenerationRebuildCError::storage)?;
+            storage
+                .fail_generation_rebuild(&job.job_id, lease, code, job.candidate_authority_epoch)
+                .map_err(GenerationRebuildCError::storage)?;
+            Err(GenerationRebuildCError::failed(
+                "The catch-up embedding provider returned a non-recoverable result.",
+            ))
+        }
+        EmbeddingRetrySafety::PossiblySent => {
+            storage
+                .fail_generation_rebuild_after_catchup_unknown(
+                    item,
+                    lease,
+                    code,
+                    job.candidate_authority_epoch,
+                )
+                .map_err(GenerationRebuildCError::storage)?;
+            Err(GenerationRebuildCError::unknown())
+        }
+    }
+}
+
+fn catchup_metadata_matches(
+    sample: &VectorMetadataSample,
+    job: &GenerationRebuildJobRecord,
+    item: &GenerationRebuildCatchupItemRecord,
+    context: &VectorGenerationContext,
+) -> bool {
+    sample.generation_id == context.generation_id().as_str()
+        && sample.life_id == item.life_id
+        && sample.memory_id == item.memory_id
+        && sample.memory_revision == item.target_revision.unwrap_or_default()
+        && sample.content_hash == item.target_content_hash.as_deref().unwrap_or_default()
+        && sample.descriptor_hash == context.descriptor_hash()
+        && sample.dimension == job.dimension
+}
+
+async fn verify_generation_rebuild_lance_set(
+    storage: &StorageService,
+    store: &std::sync::Arc<LanceDbVectorStore>,
+    context: &VectorGenerationContext,
+    job: &GenerationRebuildJobRecord,
+) -> Result<(), GenerationRebuildCError> {
+    let expected = storage
+        .list_generation_rebuild_generation_items(&job.generation_id)
+        .map_err(GenerationRebuildCError::storage)?;
+    let actual = store.list_generation_metadata(context).await.map_err(|_| {
+        GenerationRebuildCError::new(
+            "GENERATION_REBUILD_LANCE_SET_UNAVAILABLE",
+            "The candidate Lance set could not be read exactly.",
+            true,
+        )
+    })?;
+    let mut expected_map = std::collections::BTreeMap::new();
+    for item in expected {
+        expected_map.insert(
+            (item.life_id, item.memory_id),
+            (item.memory_revision, item.content_hash),
+        );
+    }
+    let mut actual_map = std::collections::BTreeMap::new();
+    for sample in actual {
+        if sample.generation_id != job.generation_id
+            || sample.descriptor_hash != job.descriptor_hash
+            || sample.dimension != job.dimension
+        {
+            return Err(GenerationRebuildCError::failed(
+                "The candidate Lance set contains incompatible metadata.",
+            ));
+        }
+        if actual_map
+            .insert(
+                (sample.life_id, sample.memory_id),
+                (sample.memory_revision, sample.content_hash),
+            )
+            .is_some()
+        {
+            return Err(GenerationRebuildCError::failed(
+                "The candidate Lance set contains duplicate metadata identities.",
+            ));
+        }
+    }
+    if expected_map != actual_map {
+        return Err(GenerationRebuildCError::failed(
+            "The candidate Lance set is not the exact SQLite eligible set.",
+        ));
+    }
+    Ok(())
+}
+
+fn assert_catchup_payload_lifecycle(
+    storage: &StorageService,
+    job_id: &str,
+) -> Result<(), GenerationRebuildCError> {
+    let items = storage
+        .list_generation_rebuild_catchup_items(job_id)
+        .map_err(GenerationRebuildCError::storage)?;
+    for item in items {
+        let terminal = matches!(item.state.as_str(), "applied" | "superseded" | "uncertain");
+        if terminal && item.canonical_document.is_some() {
+            return Err(GenerationRebuildCError::failed(
+                "A terminal catch-up item retained sensitive canonical payload.",
+            ));
+        }
+        if item.desired_action == "delete" && item.canonical_document.is_some() {
+            return Err(GenerationRebuildCError::failed(
+                "A catch-up Delete retained a canonical payload.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn renew_generation_rebuild_lease(
+    storage: &StorageService,
+    job_id: &str,
+    owner: &str,
+) -> Result<GenerationRebuildLease, GenerationRebuildCError> {
+    storage
+        .acquire_generation_rebuild_job_lease(job_id, owner)
+        .map_err(GenerationRebuildCError::storage)?
+        .ok_or_else(|| {
+            GenerationRebuildCError::conflict("The persisted generation rebuild lease expired.")
+        })
 }
 
 fn validate_control_input(
@@ -549,7 +1273,7 @@ fn cancel_if_requested(
 fn handoff_from_job(
     job: &GenerationRebuildJobRecord,
 ) -> Result<GenerationRebuildCHandoff, GenerationRebuildCError> {
-    if job.status != "catching_up" {
+    if !matches!(job.status.as_str(), "catching_up" | "verifying" | "ready") {
         return Err(GenerationRebuildCError::conflict(
             "The C phase did not reach its durable catching-up handoff.",
         ));
@@ -1040,7 +1764,8 @@ mod tests {
         },
         secrets::{InMemorySecretStore, SecretIdentifier, SecretPurpose, SecretStore, SecretValue},
         storage::{
-            open_authorized_test_connection, GenerationAuthorityRegistration, StorageService,
+            arm_promotion_fault_for_test, open_authorized_test_connection,
+            GenerationAuthorityRegistration, PromotionFault, StorageService,
         },
         vector_store::{
             LanceDbVectorStore, LanceDbVectorStoreRegistry, VectorGenerationContext,
@@ -1153,6 +1878,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum ServerBehavior {
         Success(usize),
+        SuccessThenClose(usize, usize),
         CloseAfterRequest,
     }
 
@@ -1210,10 +1936,20 @@ mod tests {
             }
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    request_counter.fetch_add(1, Ordering::SeqCst);
+                    let request_number = request_counter.fetch_add(1, Ordering::SeqCst) + 1;
                     stream.set_nonblocking(false).unwrap();
                     read_http_request(&mut stream);
-                    if let ServerBehavior::Success(dimension) = behavior {
+                    let dimension = match behavior {
+                        ServerBehavior::Success(dimension) => Some(dimension),
+                        ServerBehavior::SuccessThenClose(dimension, successful_requests)
+                            if request_number <= successful_requests =>
+                        {
+                            Some(dimension)
+                        }
+                        ServerBehavior::SuccessThenClose(_, _)
+                        | ServerBehavior::CloseAfterRequest => None,
+                    };
+                    if let Some(dimension) = dimension {
                         let values = (0..dimension)
                             .map(|index| format!("0.{}", index + 1))
                             .collect::<Vec<_>>()
@@ -1550,6 +2286,309 @@ mod tests {
     }
 
     #[test]
+    fn d9d3_d_catchup_empty_target_promotes_exact_bootstrap_set() {
+        tauri::async_runtime::block_on(async {
+            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            C_STORE_CREATE_CALLS.store(0, Ordering::SeqCst);
+            C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
+            let (_root, storage, profiles, secrets, coordinator, registry, _server) =
+                full_fixture(ServerBehavior::Success(3));
+            let runtime = runtime_fixture(&profiles, &secrets, &coordinator);
+            let gate = FencedVectorSyncCompositionGate::default();
+            let guard = gate.acquire().await;
+            let handoff = run_generation_rebuild_c(
+                &storage,
+                &runtime,
+                &registry,
+                "request-a",
+                "owner-a",
+                &guard,
+            )
+            .await
+            .unwrap();
+            arm_promotion_fault_for_test(PromotionFault::AfterCommitUnknown);
+            let completed = run_generation_rebuild_d(
+                &storage,
+                &runtime,
+                &registry,
+                &handoff,
+                "owner-a",
+                std::time::Instant::now() + Duration::from_secs(5),
+                &guard,
+            )
+            .await
+            .unwrap();
+            assert_eq!(completed.status, "completed");
+            assert_eq!(completed.promotion_sequence, Some(0));
+            assert_eq!(completed.promotion_operation_id.is_some(), true);
+            let (pointer, state, epoch) =
+                pointer_and_generation_state(&storage, &completed.generation_id);
+            assert_eq!(pointer.as_deref(), Some(completed.generation_id.as_str()));
+            assert_eq!(state, "active");
+            assert_eq!(epoch, completed.candidate_authority_epoch + 1);
+            assert_eq!(generation_item_count(&storage, &completed.generation_id), 1);
+        });
+    }
+
+    #[test]
+    fn d9d3_d_catchup_upsert_and_delete_prove_current_sqlite_and_lance_sets() {
+        tauri::async_runtime::block_on(async {
+            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            C_STORE_CREATE_CALLS.store(0, Ordering::SeqCst);
+            C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
+            let (_root, storage, profiles, secrets, coordinator, registry, server) =
+                full_fixture(ServerBehavior::Success(3));
+            let runtime = runtime_fixture(&profiles, &secrets, &coordinator);
+            let gate = FencedVectorSyncCompositionGate::default();
+            let guard = gate.acquire().await;
+            let handoff = run_generation_rebuild_c(
+                &storage,
+                &runtime,
+                &registry,
+                "request-a",
+                "owner-a",
+                &guard,
+            )
+            .await
+            .unwrap();
+
+            let new_content = "catch-up content";
+            let new_summary = Some("catch-up summary");
+            let new_hash = crate::memory::vector_index::canonical_memory_index_hash(
+                "fact",
+                new_summary.unwrap(),
+                new_content,
+                new_summary,
+            );
+            let database = storage.test_database_main_path().unwrap();
+            let connection = open_authorized_test_connection(&database).unwrap();
+            connection
+                .execute_batch(
+                    "UPDATE memory_record SET status='candidate' WHERE id='memory-a';
+                     INSERT INTO memory_record
+                       (id,life_id,kind,status,content,summary,source_type,source_ref,source_created_at,
+                        importance,confidence,is_sensitive,created_at,updated_at,confirmed_at,revision)
+                     VALUES ('memory-b','life-a','fact','confirmed','catch-up content','catch-up summary',
+                             'manual',NULL,'2026-08-18T00:00:00.000Z',0.5,0.8,0,
+                             '2026-08-18T00:00:00.000Z','2026-08-18T00:00:00.000Z',
+                             '2026-08-18T00:00:00.000Z',1);
+                     UPDATE memory_vector_sync_mutation_clock SET last_sequence=2 WHERE singleton=1;",
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO memory_vector_sync_outbox
+                       (life_id,memory_id,desired_action,mutation_sequence,target_revision,target_content_hash,migration_disposition)
+                     VALUES (?1,?2,'upsert',1,1,?3,NULL)",
+                    rusqlite::params!["life-a", "memory-b", new_hash],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO memory_vector_sync_outbox
+                       (life_id,memory_id,desired_action,mutation_sequence,target_revision,target_content_hash,migration_disposition)
+                     VALUES ('life-a','memory-a','delete',2,NULL,NULL,NULL)",
+                    [],
+                )
+                .unwrap();
+            drop(connection);
+
+            let completed = run_generation_rebuild_d(
+                &storage,
+                &runtime,
+                &registry,
+                &handoff,
+                "owner-a",
+                std::time::Instant::now() + Duration::from_secs(15),
+                &guard,
+            )
+            .await
+            .unwrap();
+            assert_eq!(completed.status, "completed");
+            assert_eq!(server.request_count(), 2);
+            assert_eq!(generation_item_count(&storage, &completed.generation_id), 1);
+            let pointer = pointer_and_generation_state(&storage, &completed.generation_id).0;
+            assert_eq!(pointer.as_deref(), Some(completed.generation_id.as_str()));
+        });
+    }
+
+    #[test]
+    fn d9d3_d_promotion_stage_faults_rollback_to_exact_g1_preimage() {
+        tauri::async_runtime::block_on(async {
+            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            for fault in [
+                PromotionFault::AfterPointerTransientNull,
+                PromotionFault::AfterSourceRetired,
+                PromotionFault::AfterCandidateActivated,
+                PromotionFault::AfterFinalPointer,
+                PromotionFault::AfterResolutions,
+                PromotionFault::BeforeCommit,
+            ] {
+                let (_root, storage, profiles, secrets, coordinator, registry, _server) =
+                    full_fixture(ServerBehavior::Success(3));
+                let database = storage.test_database_main_path().unwrap();
+                let connection = open_authorized_test_connection(&database).unwrap();
+                connection
+                    .execute_batch(
+                        "INSERT INTO memory_vector_generation
+                           (generation_id,descriptor_hash,dimension,state,authority_epoch)
+                         VALUES ('source-g1','source-descriptor',3,'active',7);
+                         UPDATE memory_vector_generation_authority
+                         SET active_generation_id='source-g1'
+                         WHERE singleton=1;",
+                    )
+                    .unwrap();
+                drop(connection);
+
+                let runtime = runtime_fixture(&profiles, &secrets, &coordinator);
+                let gate = FencedVectorSyncCompositionGate::default();
+                let guard = gate.acquire().await;
+                let handoff = run_generation_rebuild_c(
+                    &storage,
+                    &runtime,
+                    &registry,
+                    "request-a",
+                    "owner-a",
+                    &guard,
+                )
+                .await
+                .unwrap();
+                arm_promotion_fault_for_test(fault);
+                let error = run_generation_rebuild_d(
+                    &storage,
+                    &runtime,
+                    &registry,
+                    &handoff,
+                    "owner-a",
+                    std::time::Instant::now() + Duration::from_secs(5),
+                    &guard,
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(error.code, "GENERATION_REBUILD_PROMOTION_FAULT");
+
+                let job = storage
+                    .load_generation_rebuild_job(&handoff.job_id)
+                    .unwrap();
+                assert_eq!(job.status, "ready");
+                assert_eq!(job.promotion_operation_id, None);
+                assert_eq!(job.promotion_sequence, None);
+                assert_eq!(
+                    pointer_and_generation_state(&storage, "source-g1"),
+                    (Some("source-g1".into()), "active".into(), 7)
+                );
+                assert_eq!(
+                    pointer_and_generation_state(&storage, &handoff.generation_id),
+                    (Some("source-g1".into()), "building".into(), 1)
+                );
+                let resolution_count: i64 = open_authorized_test_connection(&database)
+                    .unwrap()
+                    .query_row(
+                        "SELECT COUNT(*) FROM memory_vector_generation_rebuild_resolution
+                         WHERE job_id=?1",
+                        [&handoff.job_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(resolution_count, 0);
+            }
+        });
+    }
+
+    #[test]
+    fn d9d3_d_catchup_possibly_sent_fails_g2_without_replay() {
+        tauri::async_runtime::block_on(async {
+            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            C_STORE_CREATE_CALLS.store(0, Ordering::SeqCst);
+            C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
+            let (_root, storage, profiles, secrets, coordinator, registry, server) =
+                full_fixture(ServerBehavior::SuccessThenClose(3, 1));
+            let runtime = runtime_fixture(&profiles, &secrets, &coordinator);
+            let gate = FencedVectorSyncCompositionGate::default();
+            let guard = gate.acquire().await;
+            let handoff = run_generation_rebuild_c(
+                &storage,
+                &runtime,
+                &registry,
+                "request-a",
+                "owner-a",
+                &guard,
+            )
+            .await
+            .unwrap();
+
+            let new_content = "catch-up failure content";
+            let new_summary = Some("catch-up failure summary");
+            let new_hash = crate::memory::vector_index::canonical_memory_index_hash(
+                "fact",
+                new_summary.unwrap(),
+                new_content,
+                new_summary,
+            );
+            let database = storage.test_database_main_path().unwrap();
+            let connection = open_authorized_test_connection(&database).unwrap();
+            connection
+                .execute_batch(
+                    "INSERT INTO memory_record
+                       (id,life_id,kind,status,content,summary,source_type,source_ref,source_created_at,
+                        importance,confidence,is_sensitive,created_at,updated_at,confirmed_at,revision)
+                     VALUES ('memory-b','life-a','fact','confirmed','catch-up failure content',
+                             'catch-up failure summary','manual',NULL,'2026-08-18T00:00:00.000Z',
+                             0.5,0.8,0,'2026-08-18T00:00:00.000Z','2026-08-18T00:00:00.000Z',
+                             '2026-08-18T00:00:00.000Z',1);
+                     UPDATE memory_vector_sync_mutation_clock SET last_sequence=1 WHERE singleton=1;
+                     ",
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO memory_vector_sync_outbox
+                       (life_id,memory_id,desired_action,mutation_sequence,target_revision,target_content_hash,migration_disposition)
+                     VALUES ('life-a','memory-b','upsert',1,1,?1,NULL)",
+                    rusqlite::params![new_hash],
+                )
+                .unwrap();
+            drop(connection);
+
+            let error = run_generation_rebuild_d(
+                &storage,
+                &runtime,
+                &registry,
+                &handoff,
+                "owner-a",
+                std::time::Instant::now() + Duration::from_secs(5),
+                &guard,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code, "GENERATION_REBUILD_PROVIDER_RESULT_UNKNOWN");
+            assert!(error.recoverable);
+            assert_eq!(server.request_count(), 2);
+
+            let job = storage
+                .load_generation_rebuild_job(&handoff.job_id)
+                .unwrap();
+            assert_eq!(job.status, "failed");
+            assert_eq!(job.generation_state, "failed");
+            assert_eq!(
+                pointer_and_generation_state(&storage, &job.generation_id).0,
+                None
+            );
+            let item = storage
+                .list_generation_rebuild_catchup_items(&handoff.job_id)
+                .unwrap()
+                .into_iter()
+                .find(|item| item.mutation_sequence == 1)
+                .unwrap();
+            assert_eq!(item.state, "uncertain");
+            assert_eq!(item.io_phase, "embedding_started");
+            assert_eq!(item.last_send_disposition.as_deref(), Some("possibly_sent"));
+            assert_eq!(item.canonical_document, None);
+            assert_eq!(item.attempt_count, 1);
+        });
+    }
+
+    #[test]
     fn d9d3_c_f1_composition_guard_survives_error_return_until_outer_drop() {
         tauri::async_runtime::block_on(async {
             let (_root, storage, profiles, secrets, coordinator, registry, _server) =
@@ -1784,6 +2823,7 @@ mod tests {
     #[test]
     fn d9d3_c_f1_provider_possibly_sent_has_no_second_provider_call() {
         tauri::async_runtime::block_on(async {
+            let _counter_lock = COUNTER_LOCK.lock().unwrap();
             let (_root, storage, profiles, secrets, coordinator, registry, server) =
                 full_fixture(ServerBehavior::CloseAfterRequest);
             let runtime = runtime_fixture(&profiles, &secrets, &coordinator);

@@ -170,19 +170,39 @@ pub fn start_vector_generation_rebuild(
     .map_err(map_rebuild_error)
 }
 
+/// Shared status-resolution used by the production `get` IPC command.  A
+/// persisted `completed` job is only reported as `completed` after the exact
+/// promotion postimage classifies `Committed`; a mixed/invalid/unreadable
+/// completed world returns the redacted Unavailable error surface (never a
+/// false `completed`, and never any generation/epoch/resolution authority).
+pub(crate) fn resolve_generation_rebuild_status(
+    storage: &StorageService,
+    job_id: &str,
+) -> Result<VectorGenerationRebuildStatus, VectorGenerationRebuildError> {
+    let unavailable = || VectorGenerationRebuildError {
+        code: VectorGenerationRebuildErrorCode::Unavailable,
+        message: "The vector generation rebuild is unavailable.",
+        recoverable: true,
+    };
+    let job = storage
+        .load_generation_rebuild_job(job_id)
+        .map_err(|_| unavailable())?;
+    if job.status == "completed" {
+        match super::vector_generation_rebuild::classify_completed_generation_rebuild(storage, &job)
+        {
+            Ok(super::vector_generation_rebuild::CompletedRebuildClassification::Committed) => {}
+            _ => return Err(unavailable()),
+        }
+    }
+    Ok(rebuild_status(job))
+}
+
 #[tauri::command]
 pub fn get_vector_generation_rebuild_job(
     storage: State<'_, StorageService>,
     job_id: String,
 ) -> Result<VectorGenerationRebuildStatus, VectorGenerationRebuildError> {
-    storage
-        .load_generation_rebuild_job(&job_id)
-        .map(rebuild_status)
-        .map_err(|_| VectorGenerationRebuildError {
-            code: VectorGenerationRebuildErrorCode::Unavailable,
-            message: "The vector generation rebuild is unavailable.",
-            recoverable: true,
-        })
+    resolve_generation_rebuild_status(storage.inner(), &job_id)
 }
 
 #[tauri::command]
@@ -255,7 +275,27 @@ where
             .map_err(super::vector_generation_rebuild::GenerationRebuildCError::storage)?
         {
             if job.status == "completed" {
-                return Ok(job);
+                // A persisted `completed` row is not completion authority.
+                // Restart/resume must acquire the gate (already held here) and
+                // exact-classify the promotion before returning success.  A
+                // mixed world routes back to the fail-closed recovery path.
+                return match super::vector_generation_rebuild::
+                    classify_completed_generation_rebuild(storage, &job)
+                {
+                    Ok(
+                        super::vector_generation_rebuild::CompletedRebuildClassification::Committed,
+                    ) => Ok(job),
+                    Ok(
+                        super::vector_generation_rebuild::CompletedRebuildClassification::RecoveryRequired,
+                    ) => Err(
+                        super::vector_generation_rebuild::GenerationRebuildCError::promotion_recovery_required(
+                            "A persisted completed rebuild is not an exact committed promotion.",
+                        ),
+                    ),
+                    Err(error) => Err(
+                        super::vector_generation_rebuild::GenerationRebuildCError::storage(error),
+                    ),
+                };
             }
         }
         let handoff = loop {
@@ -300,16 +340,32 @@ where
             // must stay held, no failed-generation compensation may run against
             // a possibly-active G2, and safety is only proven by an exact
             // durable postimage classification.
-            ensure_promotion_recovery_classified(storage, request_id, error).await;
-        } else {
-            // The failed pipeline must not release the composition guard while the
-            // candidate generation is still nonterminal.  Compensation is retried
-            // and classified against durable SQLite state while this very scope
-            // still holds the guard; the scope ends only after the world is
-            // durably terminal (job failed/cancelled/completed or G2 durably
-            // failed).  Nobody else can acquire the gate during that window.
-            ensure_durably_terminal_after_failure(storage, request_id, &owner, error).await;
+            ensure_promotion_recovery_classified(storage, request_id).await;
+            // The recovery loop returns only when the durable world is exactly
+            // Committed again (or proven failed/cancelled by another exact
+            // operation).  Resolve the authoritative outcome; once Committed is
+            // proven, this resumed request may return authoritative completion.
+            return match storage.load_generation_rebuild_job_by_request(request_id) {
+                Ok(Some(job)) if job.status == "completed" => Ok(job),
+                Ok(Some(_)) => {
+                    Err(super::vector_generation_rebuild::GenerationRebuildCError::failed(
+                        "The generation rebuild was terminated before exact completion.",
+                    ))
+                }
+                _ => Err(
+                    super::vector_generation_rebuild::GenerationRebuildCError::promotion_recovery_required(
+                        "The promotion recovery world could not be resolved to an authoritative outcome.",
+                    ),
+                ),
+            };
         }
+        // The failed pipeline must not release the composition guard while the
+        // candidate generation is still nonterminal.  Compensation is retried
+        // and classified against durable SQLite state while this very scope
+        // still holds the guard; the scope ends only after the world is
+        // durably terminal (job failed/cancelled, or an exactly Committed
+        // completed job).  Nobody else can acquire the gate during that window.
+        ensure_durably_terminal_after_failure(storage, request_id, &owner, error).await;
     }
     result
 }
@@ -320,14 +376,12 @@ where
 /// compensation and never infers safety from `job.status` alone.  This loop
 /// returns only when the durable world is exactly Committed again (or has been
 /// moved to a proven failed/cancelled terminal state by another exact
-/// operation); a persistently mixed world parks fail-closed with the guard
-/// retained, which is preferable to releasing authority into an unclassified
-/// world.
-async fn ensure_promotion_recovery_classified(
-    storage: &StorageService,
-    request_id: &str,
-    _error: &super::vector_generation_rebuild::GenerationRebuildCError,
-) {
+/// operation).  Absence of the durable job record is NOT treated as terminal:
+/// once promotion recovery has begun, a missing job proves none of
+/// Committed/failed/cancelled, so the composition guard stays held.  A
+/// persistently mixed world parks fail-closed with the guard retained, which is
+/// preferable to releasing authority into an unclassified world.
+async fn ensure_promotion_recovery_classified(storage: &StorageService, request_id: &str) {
     #[cfg(test)]
     if let Some(tx) = PROMOTION_RECOVERY_ENTERED_SIGNAL.lock().unwrap().take() {
         let _ = tx.send(());
@@ -335,45 +389,54 @@ async fn ensure_promotion_recovery_classified(
     let mut attempt: u32 = 0;
     loop {
         attempt = attempt.saturating_add(1);
+        // Test-only seam: simulate the durable job lookup becoming missing for
+        // one iteration so the fail-closed job-absence branch is exercised.
+        let hide_job = take_promotion_recovery_hide_job();
+        if hide_job {
+            #[cfg(test)]
+            if let Some(tx) = PROMOTION_RECOVERY_MISSING_SIGNAL.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            // A missing durable job in a known PROMOTION_RECOVERY_REQUIRED world
+            // is not proof of Committed, failed, or cancelled: fail closed and
+            // keep the gate.  No replacement job, no new generation, no
+            // compensation.
+            let backoff_millis = u64::from(attempt.min(40)) * 5;
+            tokio::time::sleep(std::time::Duration::from_millis(backoff_millis)).await;
+            continue;
+        }
         match storage.load_generation_rebuild_job_by_request(request_id) {
-            Ok(job) => {
-                let proven_terminal = job
-                    .as_ref()
-                    .is_none_or(|job| matches!(job.status.as_str(), "failed" | "cancelled"));
-                if proven_terminal {
+            Ok(Some(job)) => {
+                if matches!(job.status.as_str(), "failed" | "cancelled") {
                     // Another exact durable operation already moved the world to
                     // a proven failed/cancelled terminal state; the scope may end.
                     return;
                 }
-                if let Some(job) = job {
-                    if let (Some(operation_id), Some(target)) = (
-                        job.promotion_operation_id.as_deref(),
-                        job.promotion_sequence.or(job.caught_up_sequence),
-                    ) {
-                        match storage.classify_generation_rebuild_promotion_commit(
-                            &job.job_id,
-                            operation_id,
-                            target,
-                        ) {
-                            Ok(crate::storage::GenerationRebuildPromotionCommitClassification::Committed) => {
-                                // The exact durable postimage is proven again;
-                                // releasing the guard is now legal.
-                                return;
-                            }
-                            Ok(
-                                crate::storage::GenerationRebuildPromotionCommitClassification::NotCommitted
-                                | crate::storage::GenerationRebuildPromotionCommitClassification::RecoveryRequired,
-                            )
-                            | Err(_) => {
-                                // Still mixed/ambiguous or unreadable: remain
-                                // fail-closed.  Never silently transform into a
-                                // hidden promotion retry or a blind compensation.
-                            }
+                if job.status == "completed" {
+                    match super::vector_generation_rebuild::
+                        classify_completed_generation_rebuild(storage, &job)
+                    {
+                        Ok(
+                            super::vector_generation_rebuild::CompletedRebuildClassification::Committed,
+                        ) => {
+                            // The exact durable postimage is proven again;
+                            // releasing the guard is now legal.
+                            return;
+                        }
+                        _ => {
+                            // Still mixed/ambiguous or unreadable: fail closed.
                         }
                     }
-                    // Else: a completed job with no promotion identity, or a
-                    // nonterminal job, in a promotion-recovery world -> fail-closed.
                 }
+                // Else: a non-completed / non-failed job in a promotion-recovery
+                // world -> fail closed (never a hidden promotion retry and never
+                // a blind compensation).
+            }
+            Ok(None) => {
+                // The durable job record disappeared on a known
+                // PROMOTION_RECOVERY_REQUIRED world: absence is not proof of
+                // Committed, failed, or cancelled.  Fail closed and retain the
+                // composition guard.
             }
             Err(_) => {
                 // Durable read failed while the guard is held: keep the guard and
@@ -399,46 +462,61 @@ async fn ensure_durably_terminal_after_failure(
     loop {
         attempt = attempt.saturating_add(1);
         match storage.load_generation_rebuild_job_by_request(request_id) {
-            Ok(job) => {
-                let terminal = job.as_ref().is_none_or(|job| {
-                    matches!(job.status.as_str(), "failed" | "cancelled" | "completed")
-                });
-                if terminal {
-                    // The durable world is already terminal even if this local
-                    // compensation result was lost; the scope may end.
-                    return;
-                }
-                if let Some(job) = job {
-                    if let Ok(Some(lease)) =
-                        storage.acquire_generation_rebuild_job_lease(&job.job_id, owner)
-                    {
-                        let forced_failure = take_fail_next_outer_compensation();
-                        let outcome = if forced_failure {
-                            #[cfg(test)]
-                            if let Some(tx) =
-                                OUTER_COMPENSATION_FAILURE_SIGNAL.lock().unwrap().take()
-                            {
-                                let _ = tx.send(());
-                            }
-                            Err(StorageError::new(
-                                "D9D3_D_F1_TRANSIENT_COMPENSATION_FAILURE",
-                                "A transient compensation failure was injected by the test seam.",
-                                true,
-                            ))
-                        } else {
-                            storage.fail_generation_rebuild(
-                                &job.job_id,
-                                &lease,
-                                &error.code,
-                                job.candidate_authority_epoch,
-                            )
-                        };
-                        // The cleanup result is deliberately not discarded: the
-                        // next loop iteration re-inspects the durable job state
-                        // and only ends this scope once the world is terminal.
-                        let _ = outcome;
+            Ok(Some(job)) if matches!(job.status.as_str(), "failed" | "cancelled") => {
+                // The durable world is already proven terminal even if this
+                // local compensation result was lost; the scope may end.
+                return;
+            }
+            Ok(Some(job)) if job.status == "completed" => {
+                // `completed` is not completion authority.  An ordinary failure
+                // may only release the guard after the exact classifier proves
+                // Committed; a mixed completed world delegates to the fail-closed
+                // promotion-recovery path.
+                match super::vector_generation_rebuild::classify_completed_generation_rebuild(
+                    storage, &job,
+                ) {
+                    Ok(
+                        super::vector_generation_rebuild::CompletedRebuildClassification::Committed,
+                    ) => return,
+                    _ => {
+                        ensure_promotion_recovery_classified(storage, request_id).await;
+                        return;
                     }
                 }
+            }
+            Ok(Some(job)) => {
+                if let Ok(Some(lease)) =
+                    storage.acquire_generation_rebuild_job_lease(&job.job_id, owner)
+                {
+                    let forced_failure = take_fail_next_outer_compensation();
+                    let outcome = if forced_failure {
+                        #[cfg(test)]
+                        if let Some(tx) = OUTER_COMPENSATION_FAILURE_SIGNAL.lock().unwrap().take() {
+                            let _ = tx.send(());
+                        }
+                        Err(StorageError::new(
+                            "D9D3_D_F1_TRANSIENT_COMPENSATION_FAILURE",
+                            "A transient compensation failure was injected by the test seam.",
+                            true,
+                        ))
+                    } else {
+                        storage.fail_generation_rebuild(
+                            &job.job_id,
+                            &lease,
+                            &error.code,
+                            job.candidate_authority_epoch,
+                        )
+                    };
+                    // The cleanup result is deliberately not discarded: the
+                    // next loop iteration re-inspects the durable job state
+                    // and only ends this scope once the world is terminal.
+                    let _ = outcome;
+                }
+            }
+            Ok(None) => {
+                // Ordinary failure with no durable job: there is nothing
+                // nonterminal to compensate, so the scope may end.
+                return;
             }
             Err(_) => {
                 // A durable read failed while the guard is held: keep the guard
@@ -483,6 +561,37 @@ static PROMOTION_RECOVERY_ENTERED_SIGNAL: std::sync::Mutex<Option<std::sync::mps
 #[cfg(test)]
 pub(super) fn set_promotion_recovery_entered_signal_for_test(sender: std::sync::mpsc::Sender<()>) {
     *PROMOTION_RECOVERY_ENTERED_SIGNAL.lock().unwrap() = Some(sender);
+}
+
+#[cfg(test)]
+static PROMOTION_RECOVERY_HIDE_JOB_ON_READ: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+#[cfg(test)]
+static PROMOTION_RECOVERY_MISSING_SIGNAL: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>> =
+    std::sync::Mutex::new(None);
+
+/// Test-only seam: the next promotion-recovery iteration treats the durable job
+/// lookup as missing, proving that job absence is fail-closed (the composition
+/// guard is retained, never a terminal release).
+#[cfg(test)]
+pub(super) fn arm_promotion_recovery_hide_job_for_test() {
+    *PROMOTION_RECOVERY_HIDE_JOB_ON_READ.lock().unwrap() = true;
+}
+
+/// Test-only channel: notified just after the promotion-recovery loop observed a
+/// missing/unavailable job and chose to fail closed (the guard is still held).
+#[cfg(test)]
+pub(super) fn set_promotion_recovery_missing_signal_for_test(sender: std::sync::mpsc::Sender<()>) {
+    *PROMOTION_RECOVERY_MISSING_SIGNAL.lock().unwrap() = Some(sender);
+}
+
+#[cfg(test)]
+fn take_promotion_recovery_hide_job() -> bool {
+    std::mem::take(&mut *PROMOTION_RECOVERY_HIDE_JOB_ON_READ.lock().unwrap())
+}
+
+#[cfg(not(test))]
+fn take_promotion_recovery_hide_job() -> bool {
+    false
 }
 
 #[cfg(test)]

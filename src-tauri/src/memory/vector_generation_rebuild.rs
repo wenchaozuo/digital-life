@@ -112,7 +112,7 @@ impl GenerationRebuildCError {
     /// classification: the outer lifecycle owner must NOT run the ordinary
     /// failed-generation compensation or derive safety from `job.status` alone;
     /// it must re-read the durable promotion state and reclassify exactly.
-    fn promotion_recovery_required(message: &'static str) -> Self {
+    pub(crate) fn promotion_recovery_required(message: &'static str) -> Self {
         Self::new(
             "GENERATION_REBUILD_PROMOTION_RECOVERY_REQUIRED",
             message,
@@ -126,6 +126,56 @@ impl GenerationRebuildCError {
             "The persisted generation rebuild was cancelled.",
             true,
         )
+    }
+}
+
+/// Exact completion authority for a persisted `completed` job.
+///
+/// `job.status = 'completed'` is NOT completion authority by itself.  The
+/// promotion identity (a non-empty `promotion_operation_id` and a valid
+/// `promotion_sequence`) must exist and the exact durable postimage classifier
+/// must return `Committed`.  Anything else — missing or invalid promotion
+/// identity, `NotCommitted` on an already-completed row, `RecoveryRequired`,
+/// or a classifier read failure — is a fail-closed `RecoveryRequired`, never a
+/// success.  `caught_up_sequence` is never substituted for a missing
+/// `promotion_sequence` on a completed job.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CompletedRebuildClassification {
+    Committed,
+    RecoveryRequired,
+}
+
+pub(crate) fn classify_completed_generation_rebuild(
+    storage: &StorageService,
+    job: &GenerationRebuildJobRecord,
+) -> Result<CompletedRebuildClassification, StorageError> {
+    if job.status != "completed" {
+        return Ok(CompletedRebuildClassification::RecoveryRequired);
+    }
+    let Some(promotion_operation_id) = job.promotion_operation_id.as_deref() else {
+        return Ok(CompletedRebuildClassification::RecoveryRequired);
+    };
+    let Some(promotion_sequence) = job.promotion_sequence else {
+        return Ok(CompletedRebuildClassification::RecoveryRequired);
+    };
+    if promotion_operation_id.trim().is_empty() || promotion_sequence < 0 {
+        return Ok(CompletedRebuildClassification::RecoveryRequired);
+    }
+    match storage.classify_generation_rebuild_promotion_commit(
+        &job.job_id,
+        promotion_operation_id,
+        promotion_sequence,
+    ) {
+        Ok(GenerationRebuildPromotionCommitClassification::Committed) => {
+            Ok(CompletedRebuildClassification::Committed)
+        }
+        // `NotCommitted` on a persisted completed row is itself inconsistent
+        // (a completed job is never retried), so it collapses to fail-closed.
+        Ok(
+            GenerationRebuildPromotionCommitClassification::RecoveryRequired
+            | GenerationRebuildPromotionCommitClassification::NotCommitted,
+        )
+        | Err(_) => Ok(CompletedRebuildClassification::RecoveryRequired),
     }
 }
 
@@ -249,6 +299,26 @@ where
     }
 }
 
+/// Shared D-layer resolution for an observed `completed` job: only an exact
+/// Committed classification authorizes `Ok(job)`; a mixed/invalid/read-failed
+/// world becomes the sealed `GENERATION_REBUILD_PROMOTION_RECOVERY_REQUIRED`
+/// classification so the full lifecycle owner runs the fail-closed recovery
+/// path instead of returning success from a `completed` row alone.
+fn completed_d_outcome(
+    storage: &StorageService,
+    job: GenerationRebuildJobRecord,
+) -> Result<GenerationRebuildJobRecord, GenerationRebuildCError> {
+    match classify_completed_generation_rebuild(storage, &job) {
+        Ok(CompletedRebuildClassification::Committed) => Ok(job),
+        Ok(CompletedRebuildClassification::RecoveryRequired) => {
+            Err(GenerationRebuildCError::promotion_recovery_required(
+                "A persisted completed rebuild is not an exact committed promotion.",
+            ))
+        }
+        Err(error) => Err(GenerationRebuildCError::storage(error)),
+    }
+}
+
 /// Runs D under the guard already acquired by the full lifecycle owner.  The
 /// catch-up table, not the C snapshot table, is the durable authority for any
 /// post-snapshot attempt.
@@ -269,7 +339,7 @@ where
         .load_generation_rebuild_job(&handoff.job_id)
         .map_err(GenerationRebuildCError::storage)?;
     if job.status == "completed" {
-        return Ok(job);
+        return completed_d_outcome(storage, job);
     }
     if !matches!(job.status.as_str(), "catching_up" | "verifying" | "ready") {
         return Err(GenerationRebuildCError::conflict(
@@ -293,7 +363,10 @@ where
             .load_generation_rebuild_job(&handoff.job_id)
             .map_err(GenerationRebuildCError::storage)?;
         if job.status == "completed" {
-            return Ok(job);
+            // The loop may observe `completed` right after a promotion COMMIT
+            // succeeded while its result had not yet been observed; only an
+            // exact Committed classification permits returning the job.
+            return completed_d_outcome(storage, job);
         }
         if std::time::Instant::now() >= deadline {
             storage
@@ -1782,9 +1855,12 @@ mod tests {
 
     use crate::{
         memory::vector_sync_stage_runtime::{
-            fail_next_outer_compensation_for_test, run_vector_generation_rebuild_guarded,
+            arm_promotion_recovery_hide_job_for_test, fail_next_outer_compensation_for_test,
+            resolve_generation_rebuild_status, run_vector_generation_rebuild_guarded,
             set_outer_compensation_failure_signal_for_test,
-            set_promotion_recovery_entered_signal_for_test, FencedVectorSyncCompositionGate,
+            set_promotion_recovery_entered_signal_for_test,
+            set_promotion_recovery_missing_signal_for_test, FencedVectorSyncCompositionGate,
+            VectorGenerationRebuildErrorCode,
         },
         model::{
             profile::{
@@ -3501,10 +3577,14 @@ mod tests {
                 drop(connection);
 
                 let result = pipeline.join().unwrap();
+                // After the exact Committed postimage is proven again, the
+                // pipeline returns the authoritative completed job.
                 assert!(
-                    result.is_err(),
-                    "the pipeline reports the recovery-required failure"
+                    result.is_ok(),
+                    "the pipeline must resolve to Ok once exact Committed"
                 );
+                let completed = result.as_ref().expect("authoritative completion");
+                assert_eq!(completed.status, "completed");
                 result
             });
 
@@ -3513,7 +3593,10 @@ mod tests {
             drop(guard);
             acquired_rx.recv_timeout(Duration::from_secs(10)).unwrap();
             competitor.join().unwrap();
-            assert!(pipeline_result.is_err());
+            assert!(
+                pipeline_result.is_ok(),
+                "the pipeline returns authoritative completion"
+            );
         });
     }
 
@@ -3683,6 +3766,604 @@ mod tests {
                 .unwrap();
             assert_eq!(classify(), C::Committed);
             drop(connection);
+        });
+    }
+
+    /// Registers a real storage-backed embedding profile pointing at the mock
+    /// server and makes it active, so the production orchestrator (which
+    /// resolves providers from the storage repository) can run the C/D phases.
+    fn register_storage_embedding_profile(
+        storage: &StorageService,
+        secrets: &InMemorySecretStore,
+        server: &EmbeddingServer,
+    ) {
+        let profile = ModelProfileService::new(storage)
+            .create(CreateModelProfileRequest {
+                purpose: ModelPurpose::Embedding,
+                provider_kind: ModelProviderKind::OpenaiCompatible,
+                display_name: "D9D3-F3 embedding profile".into(),
+                base_url: server.base_url.clone(),
+                model_name: "embedding-model".into(),
+                temperature: None,
+                max_tokens: None,
+                embedding_dimension: Some(3),
+            })
+            .unwrap();
+        ModelProfileService::new(storage)
+            .set_active(SetActiveModelProfileRequest {
+                purpose: ModelPurpose::Embedding,
+                profile_id: profile.id.clone(),
+            })
+            .unwrap();
+        secrets
+            .set_secret(
+                &SecretIdentifier::new(SecretPurpose::EmbeddingModelApiKey, &profile.id).unwrap(),
+                SecretValue::new("d9d3-f3-profile-key".into()).unwrap(),
+            )
+            .unwrap();
+    }
+
+    /// Seeds a covered outbox Delete and one Late Delete row so a promotion
+    /// writes real outbox + Late Delete resolution evidence (used by the F2/F3
+    /// mixed-world scenarios that need a corruptable resolution row).
+    fn seed_recovery_postimage(storage: &StorageService, database: &std::path::Path) {
+        let connection = open_authorized_test_connection(database).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO memory_vector_generation (generation_id,descriptor_hash,dimension,state,authority_epoch)
+                 VALUES ('source-g1','source-descriptor',3,'active',7);
+                 UPDATE memory_vector_generation_authority SET active_generation_id='source-g1' WHERE singleton=1;
+                 UPDATE memory_vector_sync_mutation_clock SET last_sequence=2 WHERE singleton=1;
+                 INSERT INTO memory_vector_sync_outbox (life_id,memory_id,desired_action,mutation_sequence,target_revision,target_content_hash,migration_disposition)
+                 VALUES ('life-a','memory-c','delete',2,NULL,NULL,NULL);
+                 INSERT INTO memory_vector_late_delete_resolution
+                   (outbox_id,life_id,memory_id,mutation_sequence,claimed_generation_id,embedding_descriptor_id,embedding_dimension,captured_generation_state,
+                    witness_attempt_ordinal,witness_claim_epoch,witness_marked_claim_epoch,witness_send_disposition,witness_age_anchor_at,captured_generation_authority_epoch,state,created_at,updated_at)
+                 SELECT o.id,'life-a','memory-c',2,'source-g1','source-descriptor',3,'active',1,7,7,'possibly_sent','2026-01-01T00:00:00.000Z',7,'pending','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z'
+                 FROM memory_vector_sync_outbox o WHERE o.memory_id='memory-c';",
+            )
+            .unwrap();
+        drop(connection);
+    }
+
+    /// Drives C then D (direct storage/memory phases) so a real promotion
+    /// commits; with the corruption seam armed the D layer observes a
+    /// deterministic mixed postimage and returns the sealed
+    /// GENERATION_REBUILD_PROMOTION_RECOVERY_REQUIRED classification while the
+    /// job row stays `completed`.
+    async fn commit_mixed_promotion_through_d(
+        storage: &StorageService,
+        profiles: &TestProfileRepository,
+        secrets: &InMemorySecretStore,
+        coordinator: &ModelRuntimeCoordinator,
+        registry: &LanceDbVectorStoreRegistry,
+        guard: &FencedVectorSyncCompositionGuard<'_>,
+    ) -> (std::string::String, std::string::String) {
+        let runtime = runtime_fixture(profiles, secrets, coordinator);
+        let handoff =
+            run_generation_rebuild_c(storage, &runtime, registry, "request-a", "owner-a", guard)
+                .await
+                .unwrap();
+        arm_promotion_fault_for_test(PromotionFault::AfterCommitUnknown);
+        let error = run_generation_rebuild_d(
+            storage,
+            &runtime,
+            registry,
+            &handoff,
+            "owner-a",
+            std::time::Instant::now() + Duration::from_secs(10),
+            guard,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "GENERATION_REBUILD_PROMOTION_RECOVERY_REQUIRED");
+        let job = storage
+            .load_generation_rebuild_job(&handoff.job_id)
+            .unwrap();
+        assert_eq!(job.status, "completed");
+        (job.job_id, job.generation_id)
+    }
+
+    #[test]
+    fn d9d3_d_f3_restart_does_not_trust_completed_mixed_world() {
+        tauri::async_runtime::block_on(async {
+            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            C_STORE_CREATE_CALLS.store(0, Ordering::SeqCst);
+            C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
+            let (_root, storage, profiles, secrets, coordinator, registry, server) =
+                full_fixture(ServerBehavior::Success(3));
+            let database = storage.test_database_main_path().unwrap();
+
+            // Phase 1 (original runtime/gate scope): seed, then a real promotion
+            // really commits while the D layer observes the controlled mixed
+            // postimage; the job row persists as `completed`.  The original gate
+            // scope then ends (the process-local gate does not survive death).
+            seed_recovery_postimage(&storage, &database);
+            crate::storage::arm_promotion_recovery_corruption_for_test();
+            let (job_id, generation_id) = {
+                let gate = FencedVectorSyncCompositionGate::default();
+                let guard = gate.acquire().await;
+                commit_mixed_promotion_through_d(
+                    &storage,
+                    &profiles,
+                    &secrets,
+                    &coordinator,
+                    &registry,
+                    &guard,
+                )
+                .await
+            };
+
+            // Phase 2 (new process/gate): the same request resumes through the
+            // production full-pipeline entry.  It must NOT trust the completed
+            // row: exact classification stays RecoveryRequired, the NEW gate is
+            // held (fail-closed), and no failed-generation compensation runs.
+            let gate2 = Arc::new(FencedVectorSyncCompositionGate::default());
+            let guard2 = gate2.acquire().await;
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            set_promotion_recovery_entered_signal_for_test(entered_tx);
+            let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+            let competitor_gate = Arc::clone(&gate2);
+            let competitor = std::thread::spawn(move || {
+                tauri::async_runtime::block_on(async move {
+                    let _competitor_guard = competitor_gate.acquire().await;
+                    acquired_tx.send(()).unwrap();
+                })
+            });
+
+            let pipeline_result = std::thread::scope(|scope| {
+                let pipeline = scope.spawn(|| {
+                    tauri::async_runtime::block_on(run_vector_generation_rebuild_guarded(
+                        &storage,
+                        &secrets,
+                        &coordinator,
+                        &registry,
+                        &guard2,
+                        "request-a",
+                        Duration::from_secs(10),
+                    ))
+                });
+
+                entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                std::thread::yield_now();
+                assert!(
+                    acquired_rx.try_recv().is_err(),
+                    "a competitor on the NEW gate must stay blocked while the world is mixed"
+                );
+                let job = storage
+                    .load_generation_rebuild_job_by_request("request-a")
+                    .unwrap()
+                    .expect("the completed job must exist");
+                assert_eq!(job.status, "completed");
+                assert_eq!(job.generation_id, generation_id);
+                let operation_id = job.promotion_operation_id.clone().unwrap();
+                let target = job.promotion_sequence.unwrap();
+                assert!(matches!(
+                    storage
+                        .classify_generation_rebuild_promotion_commit(
+                            &job.job_id,
+                            &operation_id,
+                            target,
+                        )
+                        .unwrap(),
+                    GenerationRebuildPromotionCommitClassification::RecoveryRequired
+                ));
+                // No failed-generation compensation: the possibly-active G2 is
+                // still active at the promoted epoch.
+                let connection = open_authorized_test_connection(&database).unwrap();
+                let generation_state: (String, i64) = connection
+                    .query_row(
+                        "SELECT state, authority_epoch FROM memory_vector_generation
+                         WHERE generation_id=?1",
+                        [generation_id.as_str()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                assert_eq!(generation_state.0, "active");
+
+                // Test cleanup: restore the exact committed postimage.  Exact
+                // reclassification now permits the resumed call to finish with
+                // authoritative completion.
+                connection
+                    .execute(
+                        "UPDATE memory_vector_generation_rebuild_resolution
+                         SET replacement_mutation_sequence=NULL
+                         WHERE job_id=?1 AND source_kind='outbox'",
+                        [job_id.as_str()],
+                    )
+                    .unwrap();
+                drop(connection);
+
+                let result = pipeline.join().unwrap();
+                let completed = result
+                    .as_ref()
+                    .expect("authoritative completion after exact Committed");
+                assert_eq!(completed.status, "completed");
+                assert_eq!(completed.job_id, job_id);
+                result
+            });
+
+            drop(guard2);
+            acquired_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            competitor.join().unwrap();
+            assert!(pipeline_result.is_ok());
+        });
+    }
+
+    #[test]
+    fn d9d3_d_f3_exact_completed_resume_returns_success() {
+        tauri::async_runtime::block_on(async {
+            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            C_STORE_CREATE_CALLS.store(0, Ordering::SeqCst);
+            C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
+            let (_root, storage, profiles, secrets, coordinator, registry, server) =
+                full_fixture(ServerBehavior::Success(3));
+            let database = storage.test_database_main_path().unwrap();
+
+            // Persist an EXACT completed promotion (no corruption seam armed).
+            seed_recovery_postimage(&storage, &database);
+            let (job_id, generation_id, operation_id_first) = {
+                let gate = FencedVectorSyncCompositionGate::default();
+                let guard = gate.acquire().await;
+                let runtime = runtime_fixture(&profiles, &secrets, &coordinator);
+                let handoff = run_generation_rebuild_c(
+                    &storage,
+                    &runtime,
+                    &registry,
+                    "request-a",
+                    "owner-a",
+                    &guard,
+                )
+                .await
+                .unwrap();
+                arm_promotion_fault_for_test(PromotionFault::AfterCommitUnknown);
+                let completed = run_generation_rebuild_d(
+                    &storage,
+                    &runtime,
+                    &registry,
+                    &handoff,
+                    "owner-a",
+                    std::time::Instant::now() + Duration::from_secs(10),
+                    &guard,
+                )
+                .await
+                .unwrap();
+                assert_eq!(completed.status, "completed");
+                (
+                    completed.job_id.clone(),
+                    completed.generation_id.clone(),
+                    completed.promotion_operation_id.clone(),
+                )
+            };
+
+            // Simulate a new process/gate: resume the SAME request through the
+            // production full-pipeline entry.  Exact classification returns the
+            // existing completed job idempotently: no new generation, no new
+            // promotion, no new Attempt.
+            let gate2 = Arc::new(FencedVectorSyncCompositionGate::default());
+            let guard2 = gate2.acquire().await;
+            let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+            let competitor_gate = Arc::clone(&gate2);
+            let competitor = std::thread::spawn(move || {
+                tauri::async_runtime::block_on(async move {
+                    let _competitor_guard = competitor_gate.acquire().await;
+                    acquired_tx.send(()).unwrap();
+                })
+            });
+
+            let pipeline_result = std::thread::scope(|scope| {
+                let pipeline = scope.spawn(|| {
+                    tauri::async_runtime::block_on(run_vector_generation_rebuild_guarded(
+                        &storage,
+                        &secrets,
+                        &coordinator,
+                        &registry,
+                        &guard2,
+                        "request-a",
+                        Duration::from_secs(10),
+                    ))
+                });
+                pipeline.join().unwrap()
+            });
+
+            let resumed = pipeline_result.expect("exact Committed resume returns success");
+            assert_eq!(resumed.status, "completed");
+            assert_eq!(resumed.job_id, job_id);
+            assert_eq!(resumed.generation_id, generation_id);
+            assert_eq!(
+                resumed.promotion_operation_id, operation_id_first,
+                "no promotion replay on exact resume"
+            );
+
+            // No new generation, no new Attempt, no new resolution for the job.
+            let connection = open_authorized_test_connection(&database).unwrap();
+            let generation_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM memory_vector_generation WHERE generation_id=?1",
+                    [generation_id.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(generation_count, 1);
+            let catchup_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM memory_vector_generation_rebuild_catchup_item WHERE job_id=?1",
+                    [job_id.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(catchup_count, 1);
+            drop(connection);
+
+            drop(guard2);
+            acquired_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            competitor.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn d9d3_d_f3_d_internal_completed_bypass_is_closed() {
+        tauri::async_runtime::block_on(async {
+            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            C_STORE_CREATE_CALLS.store(0, Ordering::SeqCst);
+            C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
+            let (_root, storage, profiles, secrets, coordinator, registry, _server) =
+                full_fixture(ServerBehavior::Success(3));
+            let database = storage.test_database_main_path().unwrap();
+            seed_recovery_postimage(&storage, &database);
+            crate::storage::arm_promotion_recovery_corruption_for_test();
+            let runtime = runtime_fixture(&profiles, &secrets, &coordinator);
+            let gate = FencedVectorSyncCompositionGate::default();
+            let guard = gate.acquire().await;
+            let handoff = run_generation_rebuild_c(
+                &storage,
+                &runtime,
+                &registry,
+                "request-a",
+                "owner-a",
+                &guard,
+            )
+            .await
+            .unwrap();
+            arm_promotion_fault_for_test(PromotionFault::AfterCommitUnknown);
+            let first = run_generation_rebuild_d(
+                &storage,
+                &runtime,
+                &registry,
+                &handoff,
+                "owner-a",
+                std::time::Instant::now() + Duration::from_secs(10),
+                &guard,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(first.code, "GENERATION_REBUILD_PROMOTION_RECOVERY_REQUIRED");
+            let job = storage
+                .load_generation_rebuild_job(&handoff.job_id)
+                .unwrap();
+            assert_eq!(job.status, "completed");
+            let operation_id = job.promotion_operation_id.clone().unwrap();
+
+            // The D internal completed fast-path must NOT return the mixed job.
+            let second = run_generation_rebuild_d(
+                &storage,
+                &runtime,
+                &registry,
+                &handoff,
+                "owner-a",
+                std::time::Instant::now() + Duration::from_secs(10),
+                &guard,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                second.code,
+                "GENERATION_REBUILD_PROMOTION_RECOVERY_REQUIRED"
+            );
+
+            // Restore the exact committed postimage; D then returns the existing
+            // completed job without any promotion replay.
+            let connection = open_authorized_test_connection(&database).unwrap();
+            connection
+                .execute(
+                    "UPDATE memory_vector_generation_rebuild_resolution
+                     SET replacement_mutation_sequence=NULL
+                     WHERE job_id=?1 AND source_kind='outbox'",
+                    [job.job_id.as_str()],
+                )
+                .unwrap();
+            drop(connection);
+            let resumed = run_generation_rebuild_d(
+                &storage,
+                &runtime,
+                &registry,
+                &handoff,
+                "owner-a",
+                std::time::Instant::now() + Duration::from_secs(10),
+                &guard,
+            )
+            .await
+            .unwrap();
+            assert_eq!(resumed.status, "completed");
+            assert_eq!(resumed.job_id, job.job_id);
+            assert_eq!(
+                resumed.promotion_operation_id.as_deref(),
+                Some(operation_id.as_str())
+            );
+        });
+    }
+
+    #[test]
+    fn d9d3_d_f3_status_ipc_never_reports_completed_for_mixed_world() {
+        tauri::async_runtime::block_on(async {
+            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            C_STORE_CREATE_CALLS.store(0, Ordering::SeqCst);
+            C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
+            let (_root, storage, profiles, secrets, coordinator, registry, _server) =
+                full_fixture(ServerBehavior::Success(3));
+            let database = storage.test_database_main_path().unwrap();
+            seed_recovery_postimage(&storage, &database);
+            let runtime = runtime_fixture(&profiles, &secrets, &coordinator);
+            let gate = FencedVectorSyncCompositionGate::default();
+            let guard = gate.acquire().await;
+            let handoff = run_generation_rebuild_c(
+                &storage,
+                &runtime,
+                &registry,
+                "request-a",
+                "owner-a",
+                &guard,
+            )
+            .await
+            .unwrap();
+            arm_promotion_fault_for_test(PromotionFault::AfterCommitUnknown);
+            let completed = run_generation_rebuild_d(
+                &storage,
+                &runtime,
+                &registry,
+                &handoff,
+                "owner-a",
+                std::time::Instant::now() + Duration::from_secs(10),
+                &guard,
+            )
+            .await
+            .unwrap();
+            assert_eq!(completed.status, "completed");
+            let job_id = completed.job_id.clone();
+
+            // Exact completed world: the shared status helper reports completed.
+            let status = resolve_generation_rebuild_status(&storage, &job_id).unwrap();
+            assert_eq!(status.status, "completed");
+
+            // Corrupt one resolution tuple -> a mixed completed world; the status
+            // helper MUST NOT report completed, only the redacted error surface,
+            // and never any authority details.
+            let connection = open_authorized_test_connection(&database).unwrap();
+            connection
+                .execute(
+                    "UPDATE memory_vector_generation_rebuild_resolution
+                     SET replacement_mutation_sequence=999
+                     WHERE job_id=?1 AND source_kind='outbox'",
+                    [job_id.as_str()],
+                )
+                .unwrap();
+            drop(connection);
+            let error = resolve_generation_rebuild_status(&storage, &job_id).unwrap_err();
+            assert_eq!(error.code, VectorGenerationRebuildErrorCode::Unavailable);
+            assert_eq!(
+                error.message,
+                "The vector generation rebuild is unavailable."
+            );
+
+            // Restore the exact postimage: completed again.
+            let connection = open_authorized_test_connection(&database).unwrap();
+            connection
+                .execute(
+                    "UPDATE memory_vector_generation_rebuild_resolution
+                     SET replacement_mutation_sequence=NULL
+                     WHERE job_id=?1 AND source_kind='outbox'",
+                    [job_id.as_str()],
+                )
+                .unwrap();
+            drop(connection);
+            let restored = resolve_generation_rebuild_status(&storage, &job_id).unwrap();
+            assert_eq!(restored.status, "completed");
+        });
+    }
+
+    #[test]
+    fn d9d3_d_f3_missing_job_during_recovery_stays_fail_closed() {
+        tauri::async_runtime::block_on(async {
+            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            C_STORE_CREATE_CALLS.store(0, Ordering::SeqCst);
+            C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
+            let (_root, storage, profiles, secrets, coordinator, registry, server) =
+                full_fixture(ServerBehavior::Success(3));
+            let database = storage.test_database_main_path().unwrap();
+
+            // Phase 1: real promotion commits while the D layer observes the
+            // mixed postimage; the job persists as `completed`.
+            seed_recovery_postimage(&storage, &database);
+            crate::storage::arm_promotion_recovery_corruption_for_test();
+            let job_id = {
+                let gate = FencedVectorSyncCompositionGate::default();
+                let guard = gate.acquire().await;
+                commit_mixed_promotion_through_d(
+                    &storage,
+                    &profiles,
+                    &secrets,
+                    &coordinator,
+                    &registry,
+                    &guard,
+                )
+                .await
+                .0
+            };
+
+            // Phase 2 (new gate/process): resume; the promotion-recovery loop
+            // first observes the durable job as missing and must NOT treat that
+            // absence as a terminal success release.
+            let gate2 = Arc::new(FencedVectorSyncCompositionGate::default());
+            let guard2 = gate2.acquire().await;
+            arm_promotion_recovery_hide_job_for_test();
+            let (missing_tx, missing_rx) = std::sync::mpsc::channel();
+            set_promotion_recovery_missing_signal_for_test(missing_tx);
+            let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+            let competitor_gate = Arc::clone(&gate2);
+            let competitor = std::thread::spawn(move || {
+                tauri::async_runtime::block_on(async move {
+                    let _competitor_guard = competitor_gate.acquire().await;
+                    acquired_tx.send(()).unwrap();
+                })
+            });
+
+            let pipeline_result = std::thread::scope(|scope| {
+                let pipeline = scope.spawn(|| {
+                    tauri::async_runtime::block_on(run_vector_generation_rebuild_guarded(
+                        &storage,
+                        &secrets,
+                        &coordinator,
+                        &registry,
+                        &guard2,
+                        "request-a",
+                        Duration::from_secs(10),
+                    ))
+                });
+
+                // The recovery loop observed the missing/unavailable job and
+                // failed closed: the NEW composition gate is still held.
+                missing_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                std::thread::yield_now();
+                assert!(
+                    acquired_rx.try_recv().is_err(),
+                    "a competitor must stay blocked while the recovery job is missing"
+                );
+
+                // Restore the exact committed postimage; the recovered world can
+                // then resolve to authoritative completion and the gate releases.
+                let connection = open_authorized_test_connection(&database).unwrap();
+                connection
+                    .execute(
+                        "UPDATE memory_vector_generation_rebuild_resolution
+                         SET replacement_mutation_sequence=NULL
+                         WHERE job_id=?1 AND source_kind='outbox'",
+                        [job_id.as_str()],
+                    )
+                    .unwrap();
+                drop(connection);
+
+                let result = pipeline.join().unwrap();
+                let completed = result
+                    .as_ref()
+                    .expect("authoritative completion after restore");
+                assert_eq!(completed.status, "completed");
+                result
+            });
+
+            drop(guard2);
+            acquired_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            competitor.join().unwrap();
+            assert!(pipeline_result.is_ok());
         });
     }
 }

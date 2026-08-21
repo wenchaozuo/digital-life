@@ -359,17 +359,15 @@ where
             return handoff_from_job(&completed);
         };
 
-        process_item(
+        let processing = GenerationRebuildItemContext::new(
             storage,
             runtime,
             &store,
             &context,
             &job,
-            &item,
-            &mut lease,
             lease_owner,
-        )
-        .await?;
+        );
+        process_item(&processing, &item, &mut lease).await?;
     }
 }
 
@@ -488,19 +486,15 @@ where
                 .reserve_next_generation_rebuild_catchup_item(&job.job_id, &lease)
                 .map_err(GenerationRebuildCError::storage)?
             {
-                match process_catchup_item(
+                let processing = GenerationRebuildItemContext::new(
                     storage,
                     runtime,
                     &store,
                     &context,
                     &job,
-                    &item,
-                    &mut lease,
                     lease_owner,
-                    deadline,
-                )
-                .await
-                {
+                );
+                match process_catchup_item(&processing, &item, &mut lease, deadline).await {
                     Ok(()) => {}
                     Err(error) if error.recoverable => {
                         let current = storage
@@ -677,21 +671,59 @@ where
     }
 }
 
-async fn process_catchup_item<'a, R, S>(
+struct GenerationRebuildItemContext<'a, R, S>
+where
+    R: ModelProfileRepository,
+    S: SecretStore + ?Sized,
+{
     storage: &'a StorageService,
     runtime: &'a ModelRuntimeService<'a, R, S>,
-    store: &std::sync::Arc<LanceDbVectorStore>,
-    context: &VectorGenerationContext,
-    job: &GenerationRebuildJobRecord,
+    store: &'a std::sync::Arc<LanceDbVectorStore>,
+    context: &'a VectorGenerationContext,
+    job: &'a GenerationRebuildJobRecord,
+    lease_owner: &'a str,
+}
+
+impl<'a, R, S> GenerationRebuildItemContext<'a, R, S>
+where
+    R: ModelProfileRepository,
+    S: SecretStore + ?Sized,
+{
+    fn new(
+        storage: &'a StorageService,
+        runtime: &'a ModelRuntimeService<'a, R, S>,
+        store: &'a std::sync::Arc<LanceDbVectorStore>,
+        context: &'a VectorGenerationContext,
+        job: &'a GenerationRebuildJobRecord,
+        lease_owner: &'a str,
+    ) -> Self {
+        Self {
+            storage,
+            runtime,
+            store,
+            context,
+            job,
+            lease_owner,
+        }
+    }
+}
+
+async fn process_catchup_item<'a, R, S>(
+    processing: &GenerationRebuildItemContext<'a, R, S>,
     item: &GenerationRebuildCatchupItemRecord,
     lease: &mut GenerationRebuildLease,
-    _lease_owner: &str,
     deadline: std::time::Instant,
 ) -> Result<(), GenerationRebuildCError>
 where
     R: ModelProfileRepository,
     S: SecretStore + ?Sized,
 {
+    let storage = processing.storage;
+    let runtime = processing.runtime;
+    let store = processing.store;
+    let context = processing.context;
+    let job = processing.job;
+
     if item.desired_action == "delete" {
         if item.io_phase == "vector_write_started" {
             return recover_catchup_delete(storage, store, context, job, item, lease).await;
@@ -1467,38 +1499,27 @@ fn handoff_from_job(
 }
 
 async fn process_item<'a, R, S>(
-    storage: &'a StorageService,
-    runtime: &'a ModelRuntimeService<'a, R, S>,
-    store: &std::sync::Arc<LanceDbVectorStore>,
-    context: &VectorGenerationContext,
-    job: &GenerationRebuildJobRecord,
+    processing: &GenerationRebuildItemContext<'a, R, S>,
     item: &GenerationRebuildItemRecord,
     lease: &mut GenerationRebuildLease,
-    lease_owner: &str,
 ) -> Result<(), GenerationRebuildCError>
 where
     R: ModelProfileRepository,
     S: SecretStore + ?Sized,
 {
+    let storage = processing.storage;
+    let store = processing.store;
+    let context = processing.context;
+    let job = processing.job;
+    let lease_owner = processing.lease_owner;
+
     if item.state != "processing" {
         return Err(GenerationRebuildCError::conflict(
             "The reserved rebuild item is not processing.",
         ));
     }
     match item.io_phase.as_str() {
-        "reserved" => {
-            process_reserved_item(
-                storage,
-                runtime,
-                store,
-                context,
-                job,
-                item,
-                lease,
-                lease_owner,
-            )
-            .await
-        }
+        "reserved" => process_reserved_item(processing, item, lease).await,
         "embedding_started" => {
             storage
                 .fail_generation_rebuild_after_unknown(
@@ -1532,19 +1553,21 @@ where
 }
 
 async fn process_reserved_item<'a, R, S>(
-    storage: &'a StorageService,
-    runtime: &'a ModelRuntimeService<'a, R, S>,
-    store: &std::sync::Arc<LanceDbVectorStore>,
-    context: &VectorGenerationContext,
-    job: &GenerationRebuildJobRecord,
+    processing: &GenerationRebuildItemContext<'a, R, S>,
     item: &GenerationRebuildItemRecord,
     lease: &mut GenerationRebuildLease,
-    lease_owner: &str,
 ) -> Result<(), GenerationRebuildCError>
 where
     R: ModelProfileRepository,
     S: SecretStore + ?Sized,
 {
+    let storage = processing.storage;
+    let runtime = processing.runtime;
+    let store = processing.store;
+    let context = processing.context;
+    let job = processing.job;
+    let lease_owner = processing.lease_owner;
+
     let document = item.canonical_document.as_deref().ok_or_else(|| {
         GenerationRebuildCError::conflict("The persisted rebuild item has no canonical document.")
     })?;
@@ -1921,7 +1944,7 @@ mod tests {
         sync::{
             atomic::{AtomicBool, AtomicUsize, Ordering},
             mpsc::{self, Receiver, Sender},
-            Arc, Mutex,
+            Arc,
         },
         thread::{self, JoinHandle},
         time::Duration,
@@ -1961,7 +1984,35 @@ mod tests {
 
     use super::{set_c_after_snapshot_hook_for_test, set_d_before_promotion_hook_for_test};
 
-    static COUNTER_LOCK: Mutex<()> = Mutex::new(());
+    static COUNTER_LOCK_HELD: AtomicBool = AtomicBool::new(false);
+
+    struct TestCounterLock;
+
+    struct TestCounterLease;
+
+    impl TestCounterLock {
+        const fn new() -> Self {
+            Self
+        }
+
+        fn lock(&self) -> TestCounterLease {
+            while COUNTER_LOCK_HELD
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
+                thread::yield_now();
+            }
+            TestCounterLease
+        }
+    }
+
+    impl Drop for TestCounterLease {
+        fn drop(&mut self) {
+            COUNTER_LOCK_HELD.store(false, Ordering::Release);
+        }
+    }
+
+    static COUNTER_LOCK: TestCounterLock = TestCounterLock::new();
 
     struct TestProfileRepository {
         profile: ModelProfile,
@@ -2562,7 +2613,7 @@ mod tests {
     #[test]
     fn d9d3_e_isolated_filesystem_live_dry_run() {
         tauri::async_runtime::block_on(async {
-            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            let _counter_lease = COUNTER_LOCK.lock();
             C_STORE_CREATE_CALLS.store(0, Ordering::SeqCst);
             C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
             let (root, storage, _profiles, secrets, coordinator, registry, server) =
@@ -2680,7 +2731,7 @@ mod tests {
     #[test]
     fn d9d3_e_g1_to_g2_full_cutover_and_post_promotion_sync() {
         tauri::async_runtime::block_on(async {
-            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            let _counter_lease = COUNTER_LOCK.lock();
             C_STORE_CREATE_CALLS.store(0, Ordering::SeqCst);
             C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
             let (_root, storage, _profiles, secrets, coordinator, registry, server) =
@@ -2781,7 +2832,7 @@ mod tests {
     #[test]
     fn d9d3_e_post_snapshot_concurrent_mutation_catches_up() {
         tauri::async_runtime::block_on(async {
-            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            let _counter_lease = COUNTER_LOCK.lock();
             C_STORE_CREATE_CALLS.store(0, Ordering::SeqCst);
             C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
             let (_root, storage, _profiles, secrets, coordinator, registry, server) =
@@ -2833,7 +2884,7 @@ mod tests {
     #[test]
     fn d9d3_e_promotion_mutation_race_never_promotes_stale_t() {
         tauri::async_runtime::block_on(async {
-            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            let _counter_lease = COUNTER_LOCK.lock();
             C_STORE_CREATE_CALLS.store(0, Ordering::SeqCst);
             C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
             let (_root, storage, _profiles, secrets, coordinator, registry, server) =
@@ -2917,7 +2968,7 @@ mod tests {
     #[test]
     fn d9d3_e_late_delete_resolved_by_rebuild_without_generalizing_ld() {
         tauri::async_runtime::block_on(async {
-            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            let _counter_lease = COUNTER_LOCK.lock();
             C_STORE_CREATE_CALLS.store(0, Ordering::SeqCst);
             C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
             let (_root, storage, _profiles, secrets, coordinator, registry, server) =
@@ -3002,7 +3053,7 @@ mod tests {
     #[test]
     fn d9d3_e_failed_g2_preserves_g1_and_requeues_without_rebind() {
         tauri::async_runtime::block_on(async {
-            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            let _counter_lease = COUNTER_LOCK.lock();
             C_STORE_CREATE_CALLS.store(0, Ordering::SeqCst);
             C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
             let (_root, storage, _profiles, secrets, coordinator, registry, server) =
@@ -3122,7 +3173,7 @@ mod tests {
     #[test]
     fn d9d3_c_f1_direct_c_happy_path_retains_outer_guard_and_handoffs_exact_snapshot() {
         tauri::async_runtime::block_on(async {
-            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            let _counter_lease = COUNTER_LOCK.lock();
             C_STORE_CREATE_CALLS.store(0, Ordering::SeqCst);
             C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
             let (_root, storage, profiles, secrets, coordinator, registry, server) =
@@ -3213,7 +3264,7 @@ mod tests {
     #[test]
     fn d9d3_d_catchup_empty_target_promotes_exact_bootstrap_set() {
         tauri::async_runtime::block_on(async {
-            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            let _counter_lease = COUNTER_LOCK.lock();
             C_STORE_CREATE_CALLS.store(0, Ordering::SeqCst);
             C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
             let (_root, storage, profiles, secrets, coordinator, registry, _server) =
@@ -3245,7 +3296,7 @@ mod tests {
             .unwrap();
             assert_eq!(completed.status, "completed");
             assert_eq!(completed.promotion_sequence, Some(0));
-            assert_eq!(completed.promotion_operation_id.is_some(), true);
+            assert!(completed.promotion_operation_id.is_some());
             let (pointer, state, epoch) =
                 pointer_and_generation_state(&storage, &completed.generation_id);
             assert_eq!(pointer.as_deref(), Some(completed.generation_id.as_str()));
@@ -3258,7 +3309,7 @@ mod tests {
     #[test]
     fn d9d3_d_catchup_upsert_and_delete_prove_current_sqlite_and_lance_sets() {
         tauri::async_runtime::block_on(async {
-            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            let _counter_lease = COUNTER_LOCK.lock();
             C_STORE_CREATE_CALLS.store(0, Ordering::SeqCst);
             C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
             let (_root, storage, profiles, secrets, coordinator, registry, server) =
@@ -3278,12 +3329,12 @@ mod tests {
             .unwrap();
 
             let new_content = "catch-up content";
-            let new_summary = Some("catch-up summary");
+            let new_summary = "catch-up summary";
             let new_hash = crate::memory::vector_index::canonical_memory_index_hash(
                 "fact",
-                new_summary.unwrap(),
-                new_content,
                 new_summary,
+                new_content,
+                Some(new_summary),
             );
             let database = storage.test_database_main_path().unwrap();
             let connection = open_authorized_test_connection(&database).unwrap();
@@ -3340,7 +3391,7 @@ mod tests {
     #[test]
     fn d9d3_d_promotion_stage_faults_rollback_to_exact_g1_preimage() {
         tauri::async_runtime::block_on(async {
-            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            let _counter_lease = COUNTER_LOCK.lock();
             for fault in [
                 PromotionFault::AfterPointerTransientNull,
                 PromotionFault::AfterSourceRetired,
@@ -3423,7 +3474,7 @@ mod tests {
     #[test]
     fn d9d3_d_catchup_possibly_sent_fails_g2_without_replay() {
         tauri::async_runtime::block_on(async {
-            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            let _counter_lease = COUNTER_LOCK.lock();
             C_STORE_CREATE_CALLS.store(0, Ordering::SeqCst);
             C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
             let (_root, storage, profiles, secrets, coordinator, registry, server) =
@@ -3443,12 +3494,12 @@ mod tests {
             .unwrap();
 
             let new_content = "catch-up failure content";
-            let new_summary = Some("catch-up failure summary");
+            let new_summary = "catch-up failure summary";
             let new_hash = crate::memory::vector_index::canonical_memory_index_hash(
                 "fact",
-                new_summary.unwrap(),
-                new_content,
                 new_summary,
+                new_content,
+                Some(new_summary),
             );
             let database = storage.test_database_main_path().unwrap();
             let connection = open_authorized_test_connection(&database).unwrap();
@@ -3548,7 +3599,7 @@ mod tests {
     #[test]
     fn d9d3_c_f1_store_unknown_exact_existing_skips_duplicate_create() {
         tauri::async_runtime::block_on(async {
-            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            let _counter_lease = COUNTER_LOCK.lock();
             let (_root, storage, registry, job, lease, context) =
                 register_store_fixture("d9d3-c-f1-store-exact", "descriptor-a");
             let data_root = storage.active_data_root().unwrap();
@@ -3586,7 +3637,7 @@ mod tests {
     #[test]
     fn d9d3_c_f1_store_unknown_mismatch_fails_closed_without_create() {
         tauri::async_runtime::block_on(async {
-            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            let _counter_lease = COUNTER_LOCK.lock();
             let (_root, storage, registry, job, lease, context) =
                 register_store_fixture("d9d3-c-f1-store-mismatch", "descriptor-a");
             let wrong_context = VectorGenerationContext::new(
@@ -3633,7 +3684,7 @@ mod tests {
     #[test]
     fn d9d3_c_f1_store_unknown_absent_uses_the_single_create_operation() {
         tauri::async_runtime::block_on(async {
-            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            let _counter_lease = COUNTER_LOCK.lock();
             let (_root, storage, registry, job, lease, context) =
                 register_store_fixture("d9d3-c-f1-store-absent", "descriptor-a");
             C_STORE_CREATE_CALLS.store(0, Ordering::SeqCst);
@@ -3655,7 +3706,7 @@ mod tests {
     #[test]
     fn d9d3_c_f1_recoverable_provider_resolution_preserves_attempt_and_resumes_same_job() {
         tauri::async_runtime::block_on(async {
-            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            let _counter_lease = COUNTER_LOCK.lock();
             C_STORE_CREATE_CALLS.store(0, Ordering::SeqCst);
             C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
             let (_root, storage, profiles, secrets, coordinator, registry, server) =
@@ -3748,7 +3799,7 @@ mod tests {
     #[test]
     fn d9d3_c_f1_provider_possibly_sent_has_no_second_provider_call() {
         tauri::async_runtime::block_on(async {
-            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            let _counter_lease = COUNTER_LOCK.lock();
             let (_root, storage, profiles, secrets, coordinator, registry, server) =
                 full_fixture(ServerBehavior::CloseAfterRequest);
             let runtime = runtime_fixture(&profiles, &secrets, &coordinator);
@@ -3791,7 +3842,7 @@ mod tests {
     #[test]
     fn d9d3_c_f1_vector_write_exact_recovery_finalizes_without_replay() {
         tauri::async_runtime::block_on(async {
-            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            let _counter_lease = COUNTER_LOCK.lock();
             C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
             C_VECTOR_METADATA_READ_CALLS.store(0, Ordering::SeqCst);
             let (_root, storage, _registry, _job, mut lease, context, store, reserved) =
@@ -3827,12 +3878,11 @@ mod tests {
             let secrets = InMemorySecretStore::new();
             let coordinator = ModelRuntimeCoordinator::default();
             let runtime = runtime_fixture(&profiles, &secrets, &coordinator);
+            let processing = GenerationRebuildItemContext::new(
+                &storage, &runtime, &store, &context, &job, "owner-a",
+            );
 
-            process_item(
-                &storage, &runtime, &store, &context, &job, &item, &mut lease, "owner-a",
-            )
-            .await
-            .unwrap();
+            process_item(&processing, &item, &mut lease).await.unwrap();
 
             let current_job = storage.load_generation_rebuild_job("job-a").unwrap();
             let current_item = storage
@@ -3855,7 +3905,7 @@ mod tests {
     #[test]
     fn d9d3_c_f1_vector_write_unclassifiable_fails_without_blind_replay() {
         tauri::async_runtime::block_on(async {
-            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            let _counter_lease = COUNTER_LOCK.lock();
             C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
             C_VECTOR_METADATA_READ_CALLS.store(0, Ordering::SeqCst);
             let (_root, storage, _registry, _job, mut lease, context, store, reserved) =
@@ -3875,12 +3925,13 @@ mod tests {
             let secrets = InMemorySecretStore::new();
             let coordinator = ModelRuntimeCoordinator::default();
             let runtime = runtime_fixture(&profiles, &secrets, &coordinator);
+            let processing = GenerationRebuildItemContext::new(
+                &storage, &runtime, &store, &context, &job, "owner-a",
+            );
 
-            let error = process_item(
-                &storage, &runtime, &store, &context, &job, &item, &mut lease, "owner-a",
-            )
-            .await
-            .unwrap_err();
+            let error = process_item(&processing, &item, &mut lease)
+                .await
+                .unwrap_err();
             assert_eq!(error.code, "GENERATION_REBUILD_PROVIDER_RESULT_UNKNOWN");
             assert_eq!(C_VECTOR_METADATA_READ_CALLS.load(Ordering::SeqCst), 1);
             assert_eq!(C_VECTOR_UPSERT_CALLS.load(Ordering::SeqCst), 0);
@@ -3901,7 +3952,7 @@ mod tests {
     #[test]
     fn d9d3_d_f1_promotion_classifier_rejects_missing_or_resurrected_resolution_evidence() {
         tauri::async_runtime::block_on(async {
-            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            let _counter_lease = COUNTER_LOCK.lock();
             C_STORE_CREATE_CALLS.store(0, Ordering::SeqCst);
             C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
             let (_root, storage, profiles, secrets, coordinator, registry, _server) =
@@ -4069,7 +4120,7 @@ mod tests {
     #[test]
     fn d9d3_d_f1_failed_compensation_never_releases_guard_while_g2_nonterminal() {
         tauri::async_runtime::block_on(async {
-            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            let _counter_lease = COUNTER_LOCK.lock();
             C_STORE_CREATE_CALLS.store(0, Ordering::SeqCst);
             C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
             let (_root, storage, _profiles, secrets, coordinator, registry, server) =
@@ -4205,7 +4256,7 @@ mod tests {
     #[test]
     fn d9d3_c_f1_cancel_before_next_external_io_makes_zero_provider_or_lance_calls() {
         tauri::async_runtime::block_on(async {
-            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            let _counter_lease = COUNTER_LOCK.lock();
             C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
             C_VECTOR_METADATA_READ_CALLS.store(0, Ordering::SeqCst);
             let (_root, storage, _registry, _job, mut lease, context, store, reserved) =
@@ -4224,12 +4275,13 @@ mod tests {
             let runtime = runtime_fixture(&profiles, &secrets, &coordinator);
             storage.request_generation_rebuild_cancel("job-a").unwrap();
             let job = storage.load_generation_rebuild_job("job-a").unwrap();
+            let processing = GenerationRebuildItemContext::new(
+                &storage, &runtime, &store, &context, &job, "owner-a",
+            );
 
-            let error = process_item(
-                &storage, &runtime, &store, &context, &job, &reserved, &mut lease, "owner-a",
-            )
-            .await
-            .unwrap_err();
+            let error = process_item(&processing, &reserved, &mut lease)
+                .await
+                .unwrap_err();
             assert_eq!(error.code, "GENERATION_REBUILD_CANCELLED");
             assert_eq!(server.request_count(), 0);
             assert_eq!(C_VECTOR_UPSERT_CALLS.load(Ordering::SeqCst), 0);
@@ -4243,7 +4295,7 @@ mod tests {
     #[test]
     fn d9d3_d_f2_recovery_required_holds_gate_until_exact_committed_restored() {
         tauri::async_runtime::block_on(async {
-            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            let _counter_lease = COUNTER_LOCK.lock();
             C_STORE_CREATE_CALLS.store(0, Ordering::SeqCst);
             C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
             let (_root, storage, _profiles, secrets, coordinator, registry, server) =
@@ -4420,7 +4472,7 @@ mod tests {
     #[test]
     fn d9d3_d_f2_committed_classifier_rejects_resolution_tuple_corruptions() {
         tauri::async_runtime::block_on(async {
-            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            let _counter_lease = COUNTER_LOCK.lock();
             C_STORE_CREATE_CALLS.store(0, Ordering::SeqCst);
             C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
             let (_root, storage, profiles, secrets, coordinator, registry, _server) =
@@ -4684,7 +4736,7 @@ mod tests {
     #[test]
     fn d9d3_d_f3_restart_does_not_trust_completed_mixed_world() {
         tauri::async_runtime::block_on(async {
-            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            let _counter_lease = COUNTER_LOCK.lock();
             C_STORE_CREATE_CALLS.store(0, Ordering::SeqCst);
             C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
             let (_root, storage, profiles, secrets, coordinator, registry, _server) =
@@ -4810,7 +4862,7 @@ mod tests {
     #[test]
     fn d9d3_d_f3_exact_completed_resume_returns_success() {
         tauri::async_runtime::block_on(async {
-            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            let _counter_lease = COUNTER_LOCK.lock();
             C_STORE_CREATE_CALLS.store(0, Ordering::SeqCst);
             C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
             let (_root, storage, profiles, secrets, coordinator, registry, _server) =
@@ -4921,7 +4973,7 @@ mod tests {
     #[test]
     fn d9d3_d_f3_d_internal_completed_bypass_is_closed() {
         tauri::async_runtime::block_on(async {
-            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            let _counter_lease = COUNTER_LOCK.lock();
             C_STORE_CREATE_CALLS.store(0, Ordering::SeqCst);
             C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
             let (_root, storage, profiles, secrets, coordinator, registry, _server) =
@@ -5013,7 +5065,7 @@ mod tests {
     #[test]
     fn d9d3_d_f3_status_ipc_never_reports_completed_for_mixed_world() {
         tauri::async_runtime::block_on(async {
-            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            let _counter_lease = COUNTER_LOCK.lock();
             C_STORE_CREATE_CALLS.store(0, Ordering::SeqCst);
             C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
             let (_root, storage, profiles, secrets, coordinator, registry, _server) =
@@ -5091,7 +5143,7 @@ mod tests {
     #[test]
     fn d9d3_d_f3_missing_job_during_recovery_stays_fail_closed() {
         tauri::async_runtime::block_on(async {
-            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            let _counter_lease = COUNTER_LOCK.lock();
             C_STORE_CREATE_CALLS.store(0, Ordering::SeqCst);
             C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
             let (_root, storage, profiles, secrets, coordinator, registry, _server) =

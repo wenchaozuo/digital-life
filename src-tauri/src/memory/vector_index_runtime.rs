@@ -313,12 +313,12 @@ impl MemoryVectorIndexRuntimeCoordinator {
     fn is_running(&self, life_id: &str) -> bool {
         #[cfg(test)]
         {
-            return self.registry.lock().is_ok_and(|registry| {
+            self.registry.lock().is_ok_and(|registry| {
                 matches!(
                     registry.active_lives.get(life_id),
                     Some(ActiveIndexOperation::Rebuild(_))
                 )
-            });
+            })
         }
         #[cfg(not(test))]
         {

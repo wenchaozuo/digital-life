@@ -1983,7 +1983,8 @@ mod tests {
         // A retired old generation is never current, even if its descriptor
         // remains unchanged. `failed` is not a legal successor of `active` in
         // Schema-17, so it cannot be a stale active-retry world.
-        for state in ["retired"] {
+        {
+            let state = "retired";
             let (_dir, storage, _profile, descriptor) = setup();
             let conn = open_authorized_test_connection(&storage.test_database_main_path().unwrap())
                 .unwrap();

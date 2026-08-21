@@ -182,6 +182,16 @@ pub(crate) struct GenerationRebuildLease {
     pub(crate) fence: i64,
 }
 
+struct GenerationRebuildTerminalization<'a> {
+    job_id: &'a str,
+    lease: &'a GenerationRebuildLease,
+    status: &'a str,
+    error_code: &'a str,
+    candidate_epoch: i64,
+    uncertain_item: Option<&'a GenerationRebuildItemRecord>,
+    uncertain_catchup_item: Option<&'a GenerationRebuildCatchupItemRecord>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GenerationRebuildSnapshotResult {
     pub(crate) snapshot_sequence: i64,
@@ -946,15 +956,15 @@ impl StorageService {
         error_code: &str,
         candidate_epoch: i64,
     ) -> Result<(), StorageError> {
-        self.terminalize_generation_rebuild(
-            item.job_id.as_str(),
+        self.terminalize_generation_rebuild(GenerationRebuildTerminalization {
+            job_id: item.job_id.as_str(),
             lease,
-            "failed",
+            status: "failed",
             error_code,
             candidate_epoch,
-            Some(item),
-            None,
-        )
+            uncertain_item: Some(item),
+            uncertain_catchup_item: None,
+        })
     }
 
     pub(crate) fn fail_generation_rebuild_after_catchup_unknown(
@@ -964,15 +974,15 @@ impl StorageService {
         error_code: &str,
         candidate_epoch: i64,
     ) -> Result<(), StorageError> {
-        self.terminalize_generation_rebuild(
-            item.job_id.as_str(),
+        self.terminalize_generation_rebuild(GenerationRebuildTerminalization {
+            job_id: item.job_id.as_str(),
             lease,
-            "failed",
+            status: "failed",
             error_code,
             candidate_epoch,
-            None,
-            Some(item),
-        )
+            uncertain_item: None,
+            uncertain_catchup_item: Some(item),
+        })
     }
 
     pub(crate) fn fail_generation_rebuild(
@@ -982,15 +992,15 @@ impl StorageService {
         error_code: &str,
         candidate_epoch: i64,
     ) -> Result<(), StorageError> {
-        self.terminalize_generation_rebuild(
+        self.terminalize_generation_rebuild(GenerationRebuildTerminalization {
             job_id,
             lease,
-            "failed",
+            status: "failed",
             error_code,
             candidate_epoch,
-            None,
-            None,
-        )
+            uncertain_item: None,
+            uncertain_catchup_item: None,
+        })
     }
 
     pub(crate) fn cancel_generation_rebuild(
@@ -999,27 +1009,30 @@ impl StorageService {
         lease: &GenerationRebuildLease,
         candidate_epoch: i64,
     ) -> Result<(), StorageError> {
-        self.terminalize_generation_rebuild(
+        self.terminalize_generation_rebuild(GenerationRebuildTerminalization {
             job_id,
             lease,
-            "cancelled",
-            "GENERATION_REBUILD_CANCELLED",
+            status: "cancelled",
+            error_code: "GENERATION_REBUILD_CANCELLED",
             candidate_epoch,
-            None,
-            None,
-        )
+            uncertain_item: None,
+            uncertain_catchup_item: None,
+        })
     }
 
     fn terminalize_generation_rebuild(
         &self,
-        job_id: &str,
-        lease: &GenerationRebuildLease,
-        status: &str,
-        error_code: &str,
-        candidate_epoch: i64,
-        uncertain_item: Option<&GenerationRebuildItemRecord>,
-        uncertain_catchup_item: Option<&GenerationRebuildCatchupItemRecord>,
+        terminalization: GenerationRebuildTerminalization<'_>,
     ) -> Result<(), StorageError> {
+        let GenerationRebuildTerminalization {
+            job_id,
+            lease,
+            status,
+            error_code,
+            candidate_epoch,
+            uncertain_item,
+            uncertain_catchup_item,
+        } = terminalization;
         if !matches!(status, "failed" | "cancelled")
             || !request_valid(job_id)
             || !owner_valid(&lease.owner)

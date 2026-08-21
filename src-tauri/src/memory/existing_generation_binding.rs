@@ -663,6 +663,30 @@ mod tests {
         .unwrap();
     }
 
+    fn assert_second_building_fixture_rejected(
+        storage: &StorageService,
+        generation_id: &str,
+        descriptor_hash: &str,
+        dimension: usize,
+    ) {
+        let conn =
+            open_authorized_test_connection(&storage.test_database_main_path().unwrap()).unwrap();
+        let error = conn
+            .execute(
+                "INSERT INTO memory_vector_generation
+                 (generation_id, descriptor_hash, dimension, state, authority_epoch)
+                 VALUES (?1, ?2, ?3, 'building', 1)",
+                params![generation_id, descriptor_hash, dimension as i64],
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("UNIQUE constraint failed: memory_vector_generation.state"),
+            "Schema 17 must reject a second building generation: {error}"
+        );
+    }
+
     async fn setup_pre_existing_lance_store(
         storage: &StorageService,
         registry: &LanceDbVectorStoreRegistry,
@@ -2100,16 +2124,8 @@ mod tests {
     }
 
     #[test]
-    fn d9d2_existing_generation_binding_two_building_returns_ambiguous() {
+    fn d9d2_existing_generation_binding_second_building_is_rejected_by_lifecycle_guard() {
         let (_dir, storage) = test_storage();
-        let secrets = InMemorySecretStore::new();
-        create_test_profile(
-            &storage,
-            &secrets,
-            "https://api.openai.com/v1",
-            "text-embedding-3-small",
-            1536,
-        );
 
         insert_generation_fixture(
             &storage,
@@ -2119,30 +2135,7 @@ mod tests {
             "building",
             1,
         );
-        insert_generation_fixture(
-            &storage,
-            "generation-2",
-            &"b".repeat(64),
-            1536,
-            "building",
-            1,
-        );
-
-        let coordinator = ModelRuntimeCoordinator::new(Duration::from_secs(5));
-        let runtime = ModelRuntimeService::new(&storage, &secrets, &coordinator);
-        let registry = LanceDbVectorStoreRegistry::default();
-
-        let res = tauri::async_runtime::block_on(resolve_existing_generation_fenced_execution(
-            &storage, &runtime, &registry,
-        ));
-        let err = match res {
-            Err(e) => e,
-            Ok(_) => panic!("expected AmbiguousExistingGeneration error"),
-        };
-        assert_eq!(
-            err.code(),
-            ExistingGenerationBindingErrorCode::AmbiguousExistingGeneration
-        );
+        assert_second_building_fixture_rejected(&storage, "generation-2", &"b".repeat(64), 1536);
     }
 
     #[test]
@@ -2694,7 +2687,17 @@ mod tests {
                     .unwrap();
             conn_b
                 .execute(
-                    "UPDATE memory_vector_generation SET state='retired', authority_epoch=2 WHERE generation_id='generation-1' AND authority_epoch=1",
+                    "UPDATE memory_vector_generation
+                     SET state='active', authority_epoch=2
+                     WHERE generation_id='generation-1' AND state='building' AND authority_epoch=1",
+                    [],
+                )
+                .unwrap();
+            conn_b
+                .execute(
+                    "UPDATE memory_vector_generation
+                     SET state='retired', authority_epoch=3
+                     WHERE generation_id='generation-1' AND state='active' AND authority_epoch=2",
                     [],
                 )
                 .unwrap();
@@ -2802,7 +2805,8 @@ mod tests {
             assert_eq!(obs, ExistingGenerationBindingObservationResult::Unchanged);
         }
 
-        // Subcase 3: Ambiguous building candidate -> same-connection zero SQLite mutations
+        // Subcase 3: Schema 17 rejects a second building candidate; the
+        // surviving read bridge still performs zero SQLite mutations.
         {
             let (_dir, storage) = test_storage();
             let secrets = InMemorySecretStore::new();
@@ -2822,13 +2826,11 @@ mod tests {
                 "building",
                 1,
             );
-            insert_generation_fixture(
+            assert_second_building_fixture_rejected(
                 &storage,
                 "generation-2",
                 &"b".repeat(64),
                 1536,
-                "building",
-                1,
             );
 
             let coordinator = ModelRuntimeCoordinator::new(Duration::from_secs(5));

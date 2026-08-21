@@ -282,8 +282,8 @@ mod tests {
         create_schema_migration_table(&connection);
         connection
             .execute(
-            "INSERT INTO schema_migration (version, name, applied_at) VALUES (17, 'future', '2026-01-01T00:00:00Z')",
-                [],
+                "INSERT INTO schema_migration (version, name, applied_at) VALUES (?1, 'future', '2026-01-01T00:00:00Z')",
+                [MAX_SUPPORTED_SCHEMA_VERSION + 1],
             )
             .unwrap();
         drop(connection);
@@ -296,7 +296,10 @@ mod tests {
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
             .unwrap();
         assert_eq!(journal_mode, "delete");
-        assert_eq!(read_schema_version(&legacy).unwrap(), 17);
+        assert_eq!(
+            read_schema_version(&legacy).unwrap(),
+            MAX_SUPPORTED_SCHEMA_VERSION + 1
+        );
         assert!(!path.with_extension("sqlite3-wal").exists());
     }
 
@@ -381,8 +384,8 @@ mod tests {
         create_schema_migration_table(&connection);
         connection
             .execute(
-            "INSERT INTO schema_migration (version, name, applied_at) VALUES (17, 'future', '2026-01-01T00:00:00Z')",
-                [],
+                "INSERT INTO schema_migration (version, name, applied_at) VALUES (?1, 'future', '2026-01-01T00:00:00Z')",
+                [MAX_SUPPORTED_SCHEMA_VERSION + 1],
             )
             .unwrap();
         drop(connection);

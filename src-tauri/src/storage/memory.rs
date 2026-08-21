@@ -548,7 +548,10 @@ mod tests {
             .connection
             .query_row("SELECT COUNT(*) FROM memory_record", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 16);
+        assert_eq!(
+            version,
+            super::super::connection::MAX_SUPPORTED_SCHEMA_VERSION
+        );
         assert_eq!(memory_count, 0);
     }
 

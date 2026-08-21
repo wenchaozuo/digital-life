@@ -2056,7 +2056,7 @@ mod tests {
         // target as an INDEPENDENT database.
         let restored = StorageService::initialize_with_roots(target.clone(), None).unwrap();
 
-        // Schema 14 and writer fences preserved. Schema version 14 is the
+        // Schema 18 and writer fences preserved. Schema version 18 is the
         // current runtime schema; LAST_STATIC_MIGRATION_VERSION = 12 is only the
         // ceiling of the statically-replayed migration list.
         {
@@ -2064,7 +2064,7 @@ mod tests {
             assert_eq!(
                 connection::read_schema_version(&restored_conn.connection).unwrap(),
                 connection::MAX_SUPPORTED_SCHEMA_VERSION,
-                "restored schema version must be 14"
+                "restored schema version must be 18"
             );
             assert_eq!(
                 super::migration::LAST_STATIC_MIGRATION_VERSION,
@@ -2096,7 +2096,7 @@ mod tests {
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert_eq!(fence_count, 24);
+            assert_eq!(fence_count, 45);
         }
 
         // All 8 outbox states preserved with full epoch evidence.

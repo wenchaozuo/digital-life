@@ -736,7 +736,10 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 16);
+        assert_eq!(
+            version,
+            super::super::connection::MAX_SUPPORTED_SCHEMA_VERSION
+        );
         let mut columns = Vec::new();
         for table in ["conversation", "conversation_message"] {
             columns.extend(

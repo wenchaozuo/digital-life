@@ -60,19 +60,49 @@ static D_BEFORE_PROMOTION_HOOK: std::sync::Mutex<
 > = std::sync::Mutex::new(None);
 
 #[cfg(test)]
+enum TestVectorGenerationRebuildHookKind {
+    AfterSnapshot,
+    BeforePromotion,
+}
+
+#[cfg(test)]
+#[must_use = "hold this guard until the test-owned rebuild hook is no longer needed"]
+pub(super) struct TestVectorGenerationRebuildHookGuard(TestVectorGenerationRebuildHookKind);
+
+#[cfg(test)]
+impl Drop for TestVectorGenerationRebuildHookGuard {
+    fn drop(&mut self) {
+        match self.0 {
+            TestVectorGenerationRebuildHookKind::AfterSnapshot => {
+                if let Ok(mut hook) = C_AFTER_SNAPSHOT_HOOK.lock() {
+                    hook.take();
+                }
+            }
+            TestVectorGenerationRebuildHookKind::BeforePromotion => {
+                if let Ok(mut hook) = D_BEFORE_PROMOTION_HOOK.lock() {
+                    hook.take();
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 pub(super) fn set_c_after_snapshot_hook_for_test(
     entered: std::sync::mpsc::Sender<()>,
     release: std::sync::mpsc::Receiver<()>,
-) {
+) -> TestVectorGenerationRebuildHookGuard {
     *C_AFTER_SNAPSHOT_HOOK.lock().unwrap() = Some((entered, release));
+    TestVectorGenerationRebuildHookGuard(TestVectorGenerationRebuildHookKind::AfterSnapshot)
 }
 
 #[cfg(test)]
 pub(super) fn set_d_before_promotion_hook_for_test(
     entered: std::sync::mpsc::Sender<()>,
     release: std::sync::mpsc::Receiver<()>,
-) {
+) -> TestVectorGenerationRebuildHookGuard {
     *D_BEFORE_PROMOTION_HOOK.lock().unwrap() = Some((entered, release));
+    TestVectorGenerationRebuildHookGuard(TestVectorGenerationRebuildHookKind::BeforePromotion)
 }
 
 #[cfg(test)]
@@ -2760,7 +2790,7 @@ mod tests {
             let gate = FencedVectorSyncCompositionGate::default();
             let (entered_tx, entered_rx) = std::sync::mpsc::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel();
-            set_c_after_snapshot_hook_for_test(entered_tx, release_rx);
+            let _hook_guard = set_c_after_snapshot_hook_for_test(entered_tx, release_rx);
 
             let job = std::thread::scope(|scope| {
                 let pipeline = scope.spawn(|| {
@@ -2814,7 +2844,7 @@ mod tests {
             let gate = FencedVectorSyncCompositionGate::default();
             let (entered_tx, entered_rx) = std::sync::mpsc::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel();
-            set_d_before_promotion_hook_for_test(entered_tx, release_rx);
+            let _hook_guard = set_d_before_promotion_hook_for_test(entered_tx, release_rx);
 
             let job = std::thread::scope(|scope| {
                 let pipeline = scope.spawn(|| {
@@ -2984,7 +3014,7 @@ mod tests {
             let gate = FencedVectorSyncCompositionGate::default();
             let (entered_tx, entered_rx) = std::sync::mpsc::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel();
-            set_c_after_snapshot_hook_for_test(entered_tx, release_rx);
+            let _hook_guard = set_c_after_snapshot_hook_for_test(entered_tx, release_rx);
 
             let result = std::thread::scope(|scope| {
                 let pipeline = scope.spawn(|| {

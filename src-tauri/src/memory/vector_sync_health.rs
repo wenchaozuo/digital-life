@@ -979,16 +979,25 @@ mod tests {
             3,
         )
         .unwrap();
-        for ctx in [&ctx_a, &ctx_b] {
-            storage
-                .register_building_vector_generation(
-                    ctx.generation_id().as_str(),
-                    ctx.descriptor_hash(),
-                    ctx.dimension(),
-                )
-                .unwrap();
-        }
         let conn = authorized_fixture_connection(&storage);
+        storage
+            .register_building_vector_generation(
+                ctx_a.generation_id().as_str(),
+                ctx_a.descriptor_hash(),
+                ctx_a.dimension(),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO memory_vector_generation
+             (generation_id, descriptor_hash, dimension, state, authority_epoch)
+             VALUES (?1, ?2, ?3, 'failed', 1)",
+            rusqlite::params![
+                ctx_b.generation_id().as_str(),
+                ctx_b.descriptor_hash(),
+                ctx_b.dimension() as i64
+            ],
+        )
+        .unwrap();
 
         // Insert generation items for both gen-health and gen-other
         conn.execute(

@@ -5888,12 +5888,23 @@ mod tests {
         let gen_b = crate::vector_store::VectorGenerationId::parse("gen-b").unwrap();
         let context_a = VectorGenerationContext::new(gen_a.clone(), desc_a.clone(), 3).unwrap();
         let context_b = VectorGenerationContext::new(gen_b.clone(), desc_b.clone(), 3).unwrap();
-        // Register both generations.
+        // Schema 17 permits only one building generation. Keep the explicit
+        // worker target building and retain a second historical generation so
+        // the test still proves that no row or Lance write crosses IDs.
         storage
             .register_building_vector_generation("gen-a", &desc_a, 3)
             .unwrap();
-        storage
-            .register_building_vector_generation("gen-b", &desc_b, 3)
+        let connection = crate::storage::open_authorized_test_connection(
+            &storage.test_database_main_path().unwrap(),
+        )
+        .unwrap();
+        connection
+            .execute(
+                "INSERT INTO memory_vector_generation
+                 (generation_id, descriptor_hash, dimension, state, authority_epoch)
+                 VALUES (?1, ?2, ?3, 'failed', 1)",
+                rusqlite::params![gen_b.as_str(), desc_b, 3_i64],
+            )
             .unwrap();
         let vectors_a = tauri::async_runtime::block_on(
             crate::vector_store::LanceDbVectorStore::open(temp.path().join("lance-a")),

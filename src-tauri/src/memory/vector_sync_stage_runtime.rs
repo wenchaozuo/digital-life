@@ -930,10 +930,12 @@ mod tests {
         assert!(legacy_source.contains("pub fn start_memory_vector_sync"));
 
         let rebuild_source = include_str!("vector_index_runtime.rs");
-        assert!(rebuild_source.contains("FencedVectorSyncCompositionGate"));
-        assert!(
-            rebuild_source.contains("let _composition_guard = composition_gate.acquire().await")
-        );
+        assert!(!rebuild_source.contains("FencedVectorSyncCompositionGate"));
+        assert!(!rebuild_source.contains("composition_gate.acquire().await"));
+
+        let stage_source = include_str!("vector_sync_stage_runtime.rs");
+        assert!(stage_source.contains("let _guard = gate.acquire().await"));
+        assert!(stage_source.contains("resolve_active_generation_fenced_execution"));
     }
 
     #[test]
@@ -1058,8 +1060,44 @@ mod tests {
             1536,
         )
         .unwrap();
-        storage
-            .register_building_vector_generation("group1-dry-run", &descriptor, 1536)
+        let connection = crate::storage::open_authorized_test_connection(
+            &storage.test_database_main_path().unwrap(),
+        )
+        .unwrap();
+        connection
+            .execute(
+                "INSERT INTO memory_vector_generation
+                 (generation_id, descriptor_hash, dimension, state, authority_epoch)
+                 VALUES ('group1-dry-run', ?1, 1536, 'active', 1)",
+                [descriptor.as_str()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO memory_vector_generation_binding
+                 (generation_id, descriptor_version, embedding_profile_id, created_at)
+                 VALUES ('group1-dry-run', 'D9D2_GENERATION_DESCRIPTOR_V1', ?1,
+                         '2026-01-01T00:00:00.000Z')",
+                [profile.id.as_str()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO memory_vector_generation_store_witness
+                 (generation_id, create_operation_id, state, last_error_code, updated_at)
+                 VALUES ('group1-dry-run', NULL, 'ready', NULL,
+                         '2026-01-01T00:00:00.000Z')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE memory_vector_generation_authority
+                 SET active_generation_id='group1-dry-run',
+                     updated_at='2026-01-01T00:00:00.000Z'
+                 WHERE singleton=1",
+                [],
+            )
             .unwrap();
 
         let registry = LanceDbVectorStoreRegistry::default();

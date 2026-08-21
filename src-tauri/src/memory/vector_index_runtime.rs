@@ -2,12 +2,18 @@
 //! Status queries never initialize LanceDB or call an embedding provider.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc, Mutex, MutexGuard,
     },
+};
+
+#[cfg(test)]
+use std::{
+    collections::VecDeque,
+    sync::atomic::AtomicU64,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -29,14 +35,14 @@ use crate::{
 
 use super::{
     vector_index::{
-        MemoryIndexErrorCode, MemoryRebuildObserver, MemoryRebuildPhase, MemoryRebuildProgress,
-        MemoryRebuildReport, MemoryRebuildRequest, MemoryVectorIndexRepository,
-        MemoryVectorIndexService,
+        MemoryIndexErrorCode, MemoryRebuildObserver, MemoryRebuildReport, MemoryRebuildRequest,
+        MemoryVectorIndexRepository, MemoryVectorIndexService,
     },
     MemoryStatus,
 };
 
 const STATUS_PAGE_SIZE: usize = 256;
+#[cfg(test)]
 const MAX_COMPLETED_JOBS: usize = 20;
 
 pub trait ActiveDataRootResolver: Send + Sync {
@@ -169,16 +175,19 @@ struct JobEntry {
 struct JobRegistry {
     jobs: HashMap<VectorIndexJobId, JobEntry>,
     active_lives: HashMap<String, ActiveIndexOperation>,
+    #[cfg(test)]
     completed_order: VecDeque<VectorIndexJobId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ActiveIndexOperation {
+    #[cfg(test)]
     Rebuild(VectorIndexJobId),
     SyncWorker,
 }
 
 pub struct MemoryVectorIndexRuntimeCoordinator {
+    #[cfg(test)]
     sequence: AtomicU64,
     registry: Mutex<JobRegistry>,
 }
@@ -186,6 +195,7 @@ pub struct MemoryVectorIndexRuntimeCoordinator {
 impl Default for MemoryVectorIndexRuntimeCoordinator {
     fn default() -> Self {
         Self {
+            #[cfg(test)]
             sequence: AtomicU64::new(0),
             registry: Mutex::new(JobRegistry::default()),
         }
@@ -193,6 +203,7 @@ impl Default for MemoryVectorIndexRuntimeCoordinator {
 }
 
 impl MemoryVectorIndexRuntimeCoordinator {
+    #[cfg(test)]
     fn start_job(&self, life_id: String) -> Result<VectorIndexJobId, VectorIndexRuntimeError> {
         validate_life_id(&life_id)?;
         let mut registry = self.registry()?;
@@ -250,57 +261,7 @@ impl MemoryVectorIndexRuntimeCoordinator {
         Ok(entry.result.clone())
     }
 
-    fn cancellation(
-        &self,
-        job_id: &VectorIndexJobId,
-    ) -> Result<Arc<AtomicBool>, VectorIndexRuntimeError> {
-        self.registry()?
-            .jobs
-            .get(job_id)
-            .map(|entry| Arc::clone(&entry.cancel))
-            .ok_or_else(|| runtime_error(VectorIndexRuntimeErrorCode::JobNotFound))
-    }
-
-    fn update_status(&self, job_id: &VectorIndexJobId, status: VectorIndexJobStatus) {
-        if let Ok(mut registry) = self.registry.lock() {
-            if let Some(entry) = registry.jobs.get_mut(job_id) {
-                if !entry.result.status.terminal() {
-                    entry.result.status = status;
-                }
-            }
-        }
-    }
-
-    fn update_profile(&self, job_id: &VectorIndexJobId, model: String, dimension: usize) {
-        if let Ok(mut registry) = self.registry.lock() {
-            if let Some(entry) = registry.jobs.get_mut(job_id) {
-                entry.result.progress.embedding_model = Some(model);
-                entry.result.progress.dimension = Some(dimension);
-            }
-        }
-    }
-
-    fn update_progress(&self, job_id: &VectorIndexJobId, progress: MemoryRebuildProgress) {
-        if let Ok(mut registry) = self.registry.lock() {
-            if let Some(entry) = registry.jobs.get_mut(job_id) {
-                entry.result.status = match progress.phase {
-                    MemoryRebuildPhase::Scanning => VectorIndexJobStatus::Scanning,
-                    MemoryRebuildPhase::Embedding => VectorIndexJobStatus::Embedding,
-                    MemoryRebuildPhase::Writing => VectorIndexJobStatus::Writing,
-                };
-                let public = &mut entry.result.progress;
-                public.scanned_count = progress.scanned_count;
-                public.eligible_count = progress.eligible_count;
-                public.embedded_count = progress.embedded_count;
-                public.indexed_count = progress.indexed_count;
-                public.skipped_candidate_count = progress.skipped_candidate_count;
-                public.skipped_sensitive_count = progress.skipped_sensitive_count;
-                public.current_batch = progress.current_batch;
-                public.total_batches = progress.total_batches;
-            }
-        }
-    }
-
+    #[cfg(test)]
     fn finish(
         &self,
         job_id: &VectorIndexJobId,
@@ -350,12 +311,20 @@ impl MemoryVectorIndexRuntimeCoordinator {
     }
 
     fn is_running(&self, life_id: &str) -> bool {
-        self.registry.lock().is_ok_and(|registry| {
-            matches!(
-                registry.active_lives.get(life_id),
-                Some(ActiveIndexOperation::Rebuild(_))
-            )
-        })
+        #[cfg(test)]
+        {
+            return self.registry.lock().is_ok_and(|registry| {
+                matches!(
+                    registry.active_lives.get(life_id),
+                    Some(ActiveIndexOperation::Rebuild(_))
+                )
+            });
+        }
+        #[cfg(not(test))]
+        {
+            let _ = life_id;
+            false
+        }
     }
 
     pub(crate) fn begin_sync_worker(&self, life_id: &str) -> Result<(), VectorIndexRuntimeError> {
@@ -735,6 +704,7 @@ fn runtime_error(code: VectorIndexRuntimeErrorCode) -> VectorIndexRuntimeError {
     }
 }
 
+#[cfg(test)]
 fn generate_job_id(sequence: &AtomicU64) -> VectorIndexJobId {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -759,6 +729,7 @@ mod tests {
     };
 
     use crate::{
+        memory::vector_index::MemoryRebuildProgress,
         memory::{CreateMemoryCandidateRequest, MemoryKind, MemoryService, MemorySourceType},
         model::profile::{
             CreateModelProfileRequest, ModelProfileService, ModelProviderKind,

@@ -49,6 +49,48 @@ static C_VECTOR_UPSERT_CALLS: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 static C_VECTOR_METADATA_READ_CALLS: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
+static C_AFTER_SNAPSHOT_HOOK: std::sync::Mutex<
+    Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+static D_BEFORE_PROMOTION_HOOK: std::sync::Mutex<
+    Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(super) fn set_c_after_snapshot_hook_for_test(
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+) {
+    *C_AFTER_SNAPSHOT_HOOK.lock().unwrap() = Some((entered, release));
+}
+
+#[cfg(test)]
+pub(super) fn set_d_before_promotion_hook_for_test(
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+) {
+    *D_BEFORE_PROMOTION_HOOK.lock().unwrap() = Some((entered, release));
+}
+
+#[cfg(test)]
+fn wait_for_c_after_snapshot_hook() {
+    if let Some((entered, release)) = C_AFTER_SNAPSHOT_HOOK.lock().unwrap().take() {
+        let _ = entered.send(());
+        let _ = release.recv_timeout(std::time::Duration::from_secs(30));
+    }
+}
+
+#[cfg(test)]
+fn wait_for_d_before_promotion_hook() {
+    if let Some((entered, release)) = D_BEFORE_PROMOTION_HOOK.lock().unwrap().take() {
+        let _ = entered.send(());
+        let _ = release.recv_timeout(std::time::Duration::from_secs(30));
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GenerationRebuildCHandoff {
     pub(crate) job_id: String,
@@ -245,6 +287,8 @@ where
         storage
             .snapshot_generation_rebuild(&job.job_id, &lease)
             .map_err(GenerationRebuildCError::storage)?;
+        #[cfg(test)]
+        wait_for_c_after_snapshot_hook();
     }
 
     loop {
@@ -541,6 +585,8 @@ where
         let current_late_delete_lease = late_delete_lease
             .as_ref()
             .expect("late-delete lease was acquired above");
+        #[cfg(test)]
+        wait_for_d_before_promotion_hook();
         match storage.promote_generation_rebuild(
             &job.job_id,
             &lease,
@@ -1839,6 +1885,7 @@ mod tests {
     use super::*;
 
     use std::{
+        collections::BTreeSet,
         io::{Read, Write},
         net::{TcpListener, TcpStream},
         sync::{
@@ -1856,7 +1903,8 @@ mod tests {
     use crate::{
         memory::vector_sync_stage_runtime::{
             arm_promotion_recovery_hide_job_for_test, fail_next_outer_compensation_for_test,
-            resolve_generation_rebuild_status, run_vector_generation_rebuild_guarded,
+            resolve_generation_rebuild_status, run_fenced_vector_sync_drain,
+            run_vector_generation_rebuild, run_vector_generation_rebuild_guarded,
             set_outer_compensation_failure_signal_for_test,
             set_promotion_recovery_entered_signal_for_test,
             set_promotion_recovery_missing_signal_for_test, FencedVectorSyncCompositionGate,
@@ -1880,6 +1928,8 @@ mod tests {
             VectorGenerationId, VectorStore,
         },
     };
+
+    use super::{set_c_after_snapshot_hook_for_test, set_d_before_promotion_hook_for_test};
 
     static COUNTER_LOCK: Mutex<()> = Mutex::new(());
 
@@ -2300,6 +2350,743 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap()
+    }
+
+    fn seed_active_source_generation(storage: &StorageService) {
+        let database = storage.test_database_main_path().unwrap();
+        let connection = open_authorized_test_connection(&database).unwrap();
+        let descriptor = "a".repeat(64);
+        connection
+            .execute(
+                "INSERT INTO memory_vector_generation
+                    (generation_id,descriptor_hash,dimension,state,authority_epoch)
+                 VALUES (?1,?2,3,'active',7)",
+                rusqlite::params!["source-g1", descriptor],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE memory_vector_generation_authority
+                 SET active_generation_id='source-g1' WHERE singleton=1",
+                [],
+            )
+            .unwrap();
+    }
+
+    async fn create_retained_source_store(
+        storage: &StorageService,
+        registry: &LanceDbVectorStoreRegistry,
+    ) {
+        let data_root = storage.active_data_root().unwrap();
+        let generation_id = VectorGenerationId::parse("source-g1").unwrap();
+        let context = VectorGenerationContext::new(
+            generation_id.clone(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            3,
+        )
+        .unwrap();
+        let store = registry
+            .generation_store_for_write(&data_root, &generation_id)
+            .await
+            .unwrap();
+        store.create_generation(&context).await.unwrap();
+        store.health_check_generation(&context).await.unwrap();
+    }
+
+    fn current_eligible_set(storage: &StorageService) -> BTreeSet<(String, String, i64, String)> {
+        let database = storage.test_database_main_path().unwrap();
+        let connection = open_authorized_test_connection(&database).unwrap();
+        let mut statement = connection
+            .prepare(
+                "SELECT life_id,id,kind,revision,content,summary,status,is_sensitive
+                 FROM memory_record ORDER BY life_id,id",
+            )
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, i64>(7)?,
+                ))
+            })
+            .unwrap();
+        let mut eligible = BTreeSet::new();
+        for row in rows {
+            let (life_id, memory_id, kind, revision, content, summary, status, sensitive) =
+                row.unwrap();
+            if status != "confirmed" || sensitive != 0 {
+                continue;
+            }
+            let Some(selected) =
+                crate::memory::vector_index::canonical_index_text(summary.as_deref(), &content)
+            else {
+                continue;
+            };
+            let canonical = selected.trim();
+            if revision < 1
+                || canonical.is_empty()
+                || crate::memory::candidate_service::contains_prohibited_content(&content)
+                || summary
+                    .as_deref()
+                    .is_some_and(crate::memory::candidate_service::contains_prohibited_content)
+            {
+                continue;
+            }
+            let content_hash = crate::memory::vector_index::canonical_memory_index_hash(
+                &kind,
+                selected,
+                &content,
+                summary.as_deref(),
+            );
+            eligible.insert((life_id, memory_id, revision, content_hash));
+        }
+        eligible
+    }
+
+    async fn assert_exact_sqlite_generation_and_lance_sets(
+        storage: &StorageService,
+        registry: &LanceDbVectorStoreRegistry,
+        job: &GenerationRebuildJobRecord,
+    ) {
+        let expected = current_eligible_set(storage);
+        let generation = storage
+            .list_generation_rebuild_generation_items(&job.generation_id)
+            .unwrap()
+            .into_iter()
+            .map(|item| {
+                (
+                    item.life_id,
+                    item.memory_id,
+                    item.memory_revision,
+                    item.content_hash,
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(generation, expected, "SQLite generation set must be exact");
+
+        let generation_id = VectorGenerationId::parse(&job.generation_id).unwrap();
+        let context =
+            VectorGenerationContext::new(generation_id, job.descriptor_hash.clone(), job.dimension)
+                .unwrap();
+        let data_root = storage.active_data_root().unwrap();
+        let store = registry
+            .existing_generation_store(&data_root, context.generation_id())
+            .await
+            .unwrap()
+            .expect("the promoted Lance generation must remain present");
+        let metadata = store.list_generation_metadata(&context).await.unwrap();
+        assert!(metadata.iter().all(|sample| {
+            sample.generation_id == job.generation_id
+                && sample.descriptor_hash == job.descriptor_hash
+                && sample.dimension == job.dimension
+        }));
+        let lance = metadata
+            .into_iter()
+            .map(|sample| {
+                (
+                    sample.life_id,
+                    sample.memory_id,
+                    sample.memory_revision,
+                    sample.content_hash,
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(lance, expected, "Lance generation set must be exact");
+    }
+
+    fn assert_no_plaintext_test_credential(
+        storage: &StorageService,
+        status: &crate::memory::vector_sync_stage_runtime::VectorGenerationRebuildStatus,
+    ) {
+        let sentinel = "d9d3-f3-profile-key";
+        let database = storage.test_database_main_path().unwrap();
+        let connection = open_authorized_test_connection(&database).unwrap();
+        let memory_hits: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM memory_record
+                 WHERE content LIKE ?1 OR COALESCE(summary,'') LIKE ?1",
+                [format!("%{sentinel}%")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let profile_hits: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM model_profile
+                 WHERE display_name LIKE ?1 OR base_url LIKE ?1 OR model_name LIKE ?1",
+                [format!("%{sentinel}%")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(memory_hits, 0);
+        assert_eq!(profile_hits, 0);
+        let serialized = serde_json::to_string(status).unwrap();
+        assert!(!serialized.contains(sentinel));
+    }
+
+    #[test]
+    fn d9d3_e_isolated_filesystem_live_dry_run() {
+        tauri::async_runtime::block_on(async {
+            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            C_STORE_CREATE_CALLS.store(0, Ordering::SeqCst);
+            C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
+            let (root, storage, _profiles, secrets, coordinator, registry, server) =
+                full_fixture(ServerBehavior::Success(3));
+            let root_path = root.path().to_path_buf();
+            register_storage_embedding_profile(&storage, &secrets, &server);
+            let gate = FencedVectorSyncCompositionGate::default();
+
+            let first = run_vector_generation_rebuild(
+                &storage,
+                &secrets,
+                &coordinator,
+                &registry,
+                &gate,
+                "d9d3-e-bootstrap",
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+            assert_eq!(first.status, "completed");
+            assert_eq!(first.source_active_generation_id, None);
+            assert_eq!(first.generation_state, "active");
+            assert_eq!(first.generation_authority_epoch, 2);
+            assert_eq!(first.candidate_authority_epoch, 1);
+
+            let status = resolve_generation_rebuild_status(&storage, &first.job_id).unwrap();
+            assert_eq!(status.status, "completed");
+            assert_no_plaintext_test_credential(&storage, &status);
+            assert_exact_sqlite_generation_and_lance_sets(&storage, &registry, &first).await;
+
+            let database = storage.test_database_main_path().unwrap();
+            let connection = open_authorized_test_connection(&database).unwrap();
+            let pointer: Option<String> = connection
+                .query_row(
+                    "SELECT active_generation_id
+                     FROM memory_vector_generation_authority WHERE singleton=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(pointer, Some(first.generation_id.clone()));
+            let generation_count: i64 = connection
+                .query_row("SELECT COUNT(*) FROM memory_vector_generation", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(generation_count, 1);
+            let attempt_count: i64 = connection
+                .query_row(
+                    "SELECT COALESCE((SELECT SUM(attempt_count)
+                                      FROM memory_vector_generation_rebuild_item),0)
+                            + COALESCE((SELECT SUM(attempt_count)
+                                        FROM memory_vector_generation_rebuild_catchup_item),0)",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            drop(connection);
+            let request_count = server.request_count();
+
+            let second = run_vector_generation_rebuild(
+                &storage,
+                &secrets,
+                &coordinator,
+                &registry,
+                &gate,
+                "d9d3-e-bootstrap",
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+            assert_eq!(second.job_id, first.job_id);
+            assert_eq!(second.generation_id, first.generation_id);
+            assert_eq!(second.promotion_operation_id, first.promotion_operation_id);
+            assert_eq!(server.request_count(), request_count);
+
+            let connection = open_authorized_test_connection(&database).unwrap();
+            let generation_count_after: i64 = connection
+                .query_row("SELECT COUNT(*) FROM memory_vector_generation", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            let attempt_count_after: i64 = connection
+                .query_row(
+                    "SELECT COALESCE((SELECT SUM(attempt_count)
+                                      FROM memory_vector_generation_rebuild_item),0)
+                            + COALESCE((SELECT SUM(attempt_count)
+                                        FROM memory_vector_generation_rebuild_catchup_item),0)",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(generation_count_after, generation_count);
+            assert_eq!(attempt_count_after, attempt_count);
+            drop(connection);
+
+            let data_root = storage.active_data_root().unwrap();
+            assert!(data_root
+                .join("vectors/generations")
+                .join(&first.generation_id)
+                .join("lancedb")
+                .is_dir());
+            drop(registry);
+            drop(storage);
+            drop(secrets);
+            drop(server);
+            drop(root);
+            assert!(
+                !root_path.exists(),
+                "isolated dry-run root must be removable"
+            );
+        });
+    }
+
+    #[test]
+    fn d9d3_e_g1_to_g2_full_cutover_and_post_promotion_sync() {
+        tauri::async_runtime::block_on(async {
+            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            C_STORE_CREATE_CALLS.store(0, Ordering::SeqCst);
+            C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
+            let (_root, storage, _profiles, secrets, coordinator, registry, server) =
+                full_fixture(ServerBehavior::Success(3));
+            register_storage_embedding_profile(&storage, &secrets, &server);
+            seed_active_source_generation(&storage);
+            create_retained_source_store(&storage, &registry).await;
+            let data_root = storage.active_data_root().unwrap();
+            let gate = FencedVectorSyncCompositionGate::default();
+
+            let job = run_vector_generation_rebuild(
+                &storage,
+                &secrets,
+                &coordinator,
+                &registry,
+                &gate,
+                "d9d3-e-g1-g2",
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+            assert_eq!(job.status, "completed");
+            assert_eq!(
+                job.source_active_generation_id.as_deref(),
+                Some("source-g1")
+            );
+            assert_eq!(job.source_active_authority_epoch, Some(7));
+            assert_exact_sqlite_generation_and_lance_sets(&storage, &registry, &job).await;
+
+            let database = storage.test_database_main_path().unwrap();
+            let connection = open_authorized_test_connection(&database).unwrap();
+            let source_state: (String, i64) = connection
+                .query_row(
+                    "SELECT state,authority_epoch FROM memory_vector_generation
+                     WHERE generation_id='source-g1'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            let pointer: Option<String> = connection
+                .query_row(
+                    "SELECT active_generation_id
+                     FROM memory_vector_generation_authority WHERE singleton=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(source_state, ("retired".into(), 8));
+            assert_eq!(pointer, Some(job.generation_id.clone()));
+            drop(connection);
+            assert!(data_root
+                .join("vectors/generations/source-g1/lancedb")
+                .is_dir());
+
+            let _updated = storage
+                .revise_confirmed_memory_for_vector_sync_test(
+                    "life-a",
+                    "memory-a",
+                    crate::memory::MemoryKind::Fact,
+                    "post-promotion authoritative content",
+                    Some("post-promotion authoritative summary"),
+                )
+                .unwrap();
+            let ordinary = run_fenced_vector_sync_drain(
+                &storage,
+                &secrets,
+                &coordinator,
+                &registry,
+                &gate,
+                "d9d3-e-post-promotion-sync",
+                16,
+            )
+            .await
+            .unwrap();
+            assert_eq!(ordinary.applied_upserts, 1);
+            assert_eq!(ordinary.applied_deletes, 0);
+            assert_exact_sqlite_generation_and_lance_sets(&storage, &registry, &job).await;
+
+            let source_context = VectorGenerationContext::new(
+                VectorGenerationId::parse("source-g1").unwrap(),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                3,
+            )
+            .unwrap();
+            let source_store = registry
+                .existing_generation_store(&data_root, source_context.generation_id())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(source_store
+                .list_generation_metadata(&source_context)
+                .await
+                .unwrap()
+                .is_empty());
+        });
+    }
+
+    #[test]
+    fn d9d3_e_post_snapshot_concurrent_mutation_catches_up() {
+        tauri::async_runtime::block_on(async {
+            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            C_STORE_CREATE_CALLS.store(0, Ordering::SeqCst);
+            C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
+            let (_root, storage, _profiles, secrets, coordinator, registry, server) =
+                full_fixture(ServerBehavior::Success(3));
+            register_storage_embedding_profile(&storage, &secrets, &server);
+            let gate = FencedVectorSyncCompositionGate::default();
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            set_c_after_snapshot_hook_for_test(entered_tx, release_rx);
+
+            let job = std::thread::scope(|scope| {
+                let pipeline = scope.spawn(|| {
+                    tauri::async_runtime::block_on(run_vector_generation_rebuild(
+                        &storage,
+                        &secrets,
+                        &coordinator,
+                        &registry,
+                        &gate,
+                        "d9d3-e-post-s",
+                        Duration::from_secs(30),
+                    ))
+                });
+                entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                let _updated = storage
+                    .revise_confirmed_memory_for_vector_sync_test(
+                        "life-a",
+                        "memory-a",
+                        crate::memory::MemoryKind::Fact,
+                        "post-snapshot authoritative content",
+                        Some("post-snapshot authoritative summary"),
+                    )
+                    .unwrap();
+                release_tx.send(()).unwrap();
+                pipeline.join().unwrap()
+            })
+            .unwrap();
+            assert_eq!(job.status, "completed");
+            assert_eq!(job.snapshot_sequence, Some(0));
+            assert!(job.caught_up_sequence.unwrap() > job.snapshot_sequence.unwrap());
+            assert_exact_sqlite_generation_and_lance_sets(&storage, &registry, &job).await;
+            let generation_items = storage
+                .list_generation_rebuild_generation_items(&job.generation_id)
+                .unwrap();
+            assert_eq!(generation_items.len(), 1);
+            assert_eq!(generation_items[0].memory_revision, 2);
+        });
+    }
+
+    #[test]
+    fn d9d3_e_promotion_mutation_race_never_promotes_stale_t() {
+        tauri::async_runtime::block_on(async {
+            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            C_STORE_CREATE_CALLS.store(0, Ordering::SeqCst);
+            C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
+            let (_root, storage, _profiles, secrets, coordinator, registry, server) =
+                full_fixture(ServerBehavior::Success(3));
+            register_storage_embedding_profile(&storage, &secrets, &server);
+            seed_active_source_generation(&storage);
+            create_retained_source_store(&storage, &registry).await;
+            let gate = FencedVectorSyncCompositionGate::default();
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            set_d_before_promotion_hook_for_test(entered_tx, release_rx);
+
+            let job = std::thread::scope(|scope| {
+                let pipeline = scope.spawn(|| {
+                    tauri::async_runtime::block_on(run_vector_generation_rebuild(
+                        &storage,
+                        &secrets,
+                        &coordinator,
+                        &registry,
+                        &gate,
+                        "d9d3-e-promotion-race",
+                        Duration::from_secs(30),
+                    ))
+                });
+                entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                let before = storage
+                    .load_generation_rebuild_job_by_request("d9d3-e-promotion-race")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(before.status, "ready");
+                let database = storage.test_database_main_path().unwrap();
+                let connection = open_authorized_test_connection(&database).unwrap();
+                let pointer: Option<String> = connection
+                    .query_row(
+                        "SELECT active_generation_id
+                         FROM memory_vector_generation_authority WHERE singleton=1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let candidate_state: String = connection
+                    .query_row(
+                        "SELECT state FROM memory_vector_generation WHERE generation_id=?1",
+                        [before.generation_id.as_str()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(pointer.as_deref(), Some("source-g1"));
+                assert_eq!(candidate_state, "building");
+                drop(connection);
+                let _updated = storage
+                    .revise_confirmed_memory_for_vector_sync_test(
+                        "life-a",
+                        "memory-a",
+                        crate::memory::MemoryKind::Fact,
+                        "promotion-race authoritative content",
+                        Some("promotion-race authoritative summary"),
+                    )
+                    .unwrap();
+                release_tx.send(()).unwrap();
+                pipeline.join().unwrap()
+            })
+            .unwrap();
+            assert_eq!(job.status, "completed");
+            assert!(job.promotion_sequence.unwrap() > job.snapshot_sequence.unwrap());
+            assert_exact_sqlite_generation_and_lance_sets(&storage, &registry, &job).await;
+            let database = storage.test_database_main_path().unwrap();
+            let connection = open_authorized_test_connection(&database).unwrap();
+            let pointer: Option<String> = connection
+                .query_row(
+                    "SELECT active_generation_id
+                     FROM memory_vector_generation_authority WHERE singleton=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(pointer, Some(job.generation_id.clone()));
+        });
+    }
+
+    #[test]
+    fn d9d3_e_late_delete_resolved_by_rebuild_without_generalizing_ld() {
+        tauri::async_runtime::block_on(async {
+            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            C_STORE_CREATE_CALLS.store(0, Ordering::SeqCst);
+            C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
+            let (_root, storage, _profiles, secrets, coordinator, registry, server) =
+                full_fixture(ServerBehavior::Success(3));
+            register_storage_embedding_profile(&storage, &secrets, &server);
+            let database = storage.test_database_main_path().unwrap();
+            seed_recovery_postimage(&storage, &database);
+            let gate = FencedVectorSyncCompositionGate::default();
+
+            let job = run_vector_generation_rebuild(
+                &storage,
+                &secrets,
+                &coordinator,
+                &registry,
+                &gate,
+                "d9d3-e-late-delete",
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+            assert_eq!(job.status, "completed");
+            assert_exact_sqlite_generation_and_lance_sets(&storage, &registry, &job).await;
+
+            let connection = open_authorized_test_connection(&database).unwrap();
+            let late_delete: (String, String, Option<i64>) = connection
+                .query_row(
+                    "SELECT state,last_resolution_disposition,
+                            captured_generation_authority_epoch
+                     FROM memory_vector_late_delete_resolution
+                     WHERE life_id='life-a' AND memory_id='memory-c'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                late_delete,
+                (
+                    "resolved_rebuilt".into(),
+                    "resolved_rebuilt".into(),
+                    Some(7)
+                )
+            );
+            let rebuild_resolution: (String, Option<String>, Option<i64>, String, Option<i64>) =
+                connection
+                    .query_row(
+                        "SELECT source_kind,source_generation_id,
+                                source_generation_authority_epoch,disposition,
+                                replacement_mutation_sequence
+                         FROM memory_vector_generation_rebuild_resolution
+                         WHERE job_id=?1 AND source_kind='late_delete'",
+                        [job.job_id.as_str()],
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                            ))
+                        },
+                    )
+                    .unwrap();
+            assert_eq!(
+                rebuild_resolution,
+                (
+                    "late_delete".into(),
+                    Some("source-g1".into()),
+                    Some(7),
+                    "resolved_by_rebuild".into(),
+                    None,
+                )
+            );
+            drop(connection);
+            assert_eq!(
+                server.request_count(),
+                1,
+                "the rebuild Delete must not replay embedding I/O"
+            );
+        });
+    }
+
+    #[test]
+    fn d9d3_e_failed_g2_preserves_g1_and_requeues_without_rebind() {
+        tauri::async_runtime::block_on(async {
+            let _counter_lock = COUNTER_LOCK.lock().unwrap();
+            C_STORE_CREATE_CALLS.store(0, Ordering::SeqCst);
+            C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
+            let (_root, storage, _profiles, secrets, coordinator, registry, server) =
+                full_fixture(ServerBehavior::SuccessThenClose(3, 1));
+            register_storage_embedding_profile(&storage, &secrets, &server);
+            seed_active_source_generation(&storage);
+            create_retained_source_store(&storage, &registry).await;
+            let database = storage.test_database_main_path().unwrap();
+            let gate = FencedVectorSyncCompositionGate::default();
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            set_c_after_snapshot_hook_for_test(entered_tx, release_rx);
+
+            let result = std::thread::scope(|scope| {
+                let pipeline = scope.spawn(|| {
+                    tauri::async_runtime::block_on(run_vector_generation_rebuild(
+                        &storage,
+                        &secrets,
+                        &coordinator,
+                        &registry,
+                        &gate,
+                        "d9d3-e-failed-g2",
+                        Duration::from_secs(30),
+                    ))
+                });
+                entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                let _updated = storage
+                    .revise_confirmed_memory_for_vector_sync_test(
+                        "life-a",
+                        "memory-a",
+                        crate::memory::MemoryKind::Fact,
+                        "failed-g2 authoritative content",
+                        Some("failed-g2 authoritative summary"),
+                    )
+                    .unwrap();
+                release_tx.send(()).unwrap();
+                pipeline.join().unwrap()
+            });
+            assert!(result.is_err());
+            let job = storage
+                .load_generation_rebuild_job_by_request("d9d3-e-failed-g2")
+                .unwrap()
+                .unwrap();
+            assert_eq!(job.status, "failed");
+
+            let connection = open_authorized_test_connection(&database).unwrap();
+            let generations: (String, i64, String, Option<String>) = connection
+                .query_row(
+                    "SELECT source.state,source.authority_epoch,candidate.state,
+                            authority.active_generation_id
+                     FROM memory_vector_generation source
+                     JOIN memory_vector_generation candidate
+                       ON candidate.generation_id=?1
+                     JOIN memory_vector_generation_authority authority
+                       ON authority.singleton=1
+                     WHERE source.generation_id='source-g1'",
+                    [job.generation_id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(generations.0, "active");
+            assert_eq!(generations.1, 7);
+            assert_eq!(generations.2, "failed");
+            assert_eq!(generations.3.as_deref(), Some("source-g1"));
+
+            let outbox: (i64, String, Option<String>, Option<i64>, Option<String>) = connection
+                .query_row(
+                    "SELECT mutation_sequence,state,claimed_generation_id,
+                            claimed_generation_authority_epoch,last_send_disposition
+                     FROM memory_vector_sync_outbox
+                     WHERE life_id='life-a' AND memory_id='memory-a'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            assert_eq!(outbox.0, 1);
+            assert_eq!(outbox.1, "pending");
+            assert_eq!(outbox.2, None);
+            assert_eq!(outbox.3, None);
+            assert_eq!(outbox.4, None);
+
+            let resolution_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*)
+                     FROM memory_vector_generation_rebuild_resolution
+                     WHERE job_id=?1 AND source_kind='outbox'",
+                    [job.job_id.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(resolution_count, 0);
+
+            let catchup: (String, Option<String>, Option<String>) = connection
+                .query_row(
+                    "SELECT state,last_send_disposition,canonical_document
+                     FROM memory_vector_generation_rebuild_catchup_item
+                     WHERE job_id=?1",
+                    [job.job_id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(catchup.0, "uncertain");
+            assert_eq!(catchup.1.as_deref(), Some("possibly_sent"));
+            assert_eq!(catchup.2, None);
+            drop(connection);
+        });
     }
 
     #[test]
@@ -3806,7 +4593,7 @@ mod tests {
     /// Seeds a covered outbox Delete and one Late Delete row so a promotion
     /// writes real outbox + Late Delete resolution evidence (used by the F2/F3
     /// mixed-world scenarios that need a corruptable resolution row).
-    fn seed_recovery_postimage(storage: &StorageService, database: &std::path::Path) {
+    fn seed_recovery_postimage(_storage: &StorageService, database: &std::path::Path) {
         let connection = open_authorized_test_connection(database).unwrap();
         connection
             .execute_batch(
@@ -3870,7 +4657,7 @@ mod tests {
             let _counter_lock = COUNTER_LOCK.lock().unwrap();
             C_STORE_CREATE_CALLS.store(0, Ordering::SeqCst);
             C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
-            let (_root, storage, profiles, secrets, coordinator, registry, server) =
+            let (_root, storage, profiles, secrets, coordinator, registry, _server) =
                 full_fixture(ServerBehavior::Success(3));
             let database = storage.test_database_main_path().unwrap();
 
@@ -3996,7 +4783,7 @@ mod tests {
             let _counter_lock = COUNTER_LOCK.lock().unwrap();
             C_STORE_CREATE_CALLS.store(0, Ordering::SeqCst);
             C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
-            let (_root, storage, profiles, secrets, coordinator, registry, server) =
+            let (_root, storage, profiles, secrets, coordinator, registry, _server) =
                 full_fixture(ServerBehavior::Success(3));
             let database = storage.test_database_main_path().unwrap();
 
@@ -4277,7 +5064,7 @@ mod tests {
             let _counter_lock = COUNTER_LOCK.lock().unwrap();
             C_STORE_CREATE_CALLS.store(0, Ordering::SeqCst);
             C_VECTOR_UPSERT_CALLS.store(0, Ordering::SeqCst);
-            let (_root, storage, profiles, secrets, coordinator, registry, server) =
+            let (_root, storage, profiles, secrets, coordinator, registry, _server) =
                 full_fixture(ServerBehavior::Success(3));
             let database = storage.test_database_main_path().unwrap();
 

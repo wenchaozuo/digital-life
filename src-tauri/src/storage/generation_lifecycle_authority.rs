@@ -15,12 +15,14 @@ pub(crate) enum GenerationAuthorityCommitClassification {
     RecoveryRequired,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GenerationAuthorityCasResult {
     Applied,
     StaleOrConflict,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GenerationLifecycleState {
     Building,
@@ -29,6 +31,7 @@ pub(crate) enum GenerationLifecycleState {
     Retired,
 }
 
+#[cfg(test)]
 impl GenerationLifecycleState {
     fn sql(self) -> &'static str {
         match self {
@@ -238,6 +241,7 @@ impl StorageService {
     }
 
     /// Pointer-only CAS; it requires an active target at the exact epoch.
+    #[cfg(test)]
     pub(crate) fn compare_and_set_active_generation_pointer(
         &self,
         expected: Option<&str>,
@@ -264,6 +268,7 @@ impl StorageService {
     }
 
     /// Applies one exact frozen lifecycle transition and increments epoch once.
+    #[cfg(test)]
     pub(crate) fn compare_and_transition_generation_authority(
         &self,
         generation_id: &str,

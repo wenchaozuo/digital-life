@@ -327,6 +327,7 @@ impl StorageService {
             .map_err(|_| unavailable())
     }
 
+    #[cfg(test)]
     pub(crate) fn list_generation_rebuild_items(
         &self,
         job_id: &str,

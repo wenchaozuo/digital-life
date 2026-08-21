@@ -36,20 +36,23 @@ use crate::{
     model::{
         profile::{ModelProfileRepository, ModelProviderKind},
         runtime::{
-            ModelRuntimeErrorCode, ModelRuntimePurpose, ModelRuntimeService,
-            ResolvedEmbeddingProvider, ResolvedModelProfile,
+            ModelRuntimePurpose, ModelRuntimeService, ResolvedEmbeddingProvider,
+            ResolvedModelProfile,
         },
         transport::url_policy::{
             validate_and_normalize_url, TransportTargetKind, ValidatedTransportTarget,
         },
     },
     secrets::SecretStore,
-    storage::{ActiveGenerationAuthority, ExistingBuildingGenerationAuthority, StorageService},
+    storage::{ActiveGenerationAuthority, StorageService},
     vector_store::{
         ExistingGenerationVectorStoreProvider, LanceDbVectorStoreRegistry, VectorGenerationContext,
         VectorStore,
     },
 };
+
+#[cfg(test)]
+use crate::{model::runtime::ModelRuntimeErrorCode, storage::ExistingBuildingGenerationAuthority};
 
 /// Frozen persisted protocol identifier for a canonical D9 generation binding.
 /// This is distinct from the hash domain separator used by descriptor hashing.
@@ -59,6 +62,7 @@ pub(crate) const D9D2_GENERATION_DESCRIPTOR_VERSION: &str = "D9D2_GENERATION_DES
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ExistingGenerationBindingErrorCode {
     NoExistingGeneration,
+    #[cfg(test)]
     AmbiguousExistingGeneration,
     InvalidGenerationMetadata,
     GenerationBindingMismatch,
@@ -72,6 +76,7 @@ impl ExistingGenerationBindingErrorCode {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::NoExistingGeneration => "D9D2_NO_EXISTING_GENERATION",
+            #[cfg(test)]
             Self::AmbiguousExistingGeneration => "D9D2_AMBIGUOUS_EXISTING_GENERATION",
             Self::InvalidGenerationMetadata => "D9D2_INVALID_GENERATION_METADATA",
             Self::GenerationBindingMismatch => "D9D2_GENERATION_BINDING_MISMATCH",
@@ -85,6 +90,7 @@ impl ExistingGenerationBindingErrorCode {
     pub(crate) const fn safe_message(self) -> &'static str {
         match self {
             Self::NoExistingGeneration => "No existing vector generation is available.",
+            #[cfg(test)]
             Self::AmbiguousExistingGeneration => {
                 "Multiple existing vector generations found in building state."
             }
@@ -124,6 +130,7 @@ impl ExistingGenerationBindingError {
         Self::new(ExistingGenerationBindingErrorCode::NoExistingGeneration)
     }
 
+    #[cfg(test)]
     pub(crate) const fn ambiguous_existing_generation() -> Self {
         Self::new(ExistingGenerationBindingErrorCode::AmbiguousExistingGeneration)
     }
@@ -170,15 +177,22 @@ impl std::fmt::Debug for ExistingGenerationBindingError {
 
 impl std::error::Error for ExistingGenerationBindingError {}
 
-/// Sealed binding combining authoritative generation context and active embedding provider.
+/// Historical building-generation binding retained only for cumulative tests.
+///
+/// Production ordinary sync now resolves the Schema-17 active-generation
+/// capability below, and D9D3 owns the building-generation lifecycle. Keeping
+/// this bridge out of non-test builds prevents the retired D9D2 route from
+/// becoming a second production authority.
 ///
 /// Deliberately has NO `Clone`, NO `Copy`, NO `Debug`, NO `Serialize`, NO `Deserialize`,
 /// NO IPC exposure, NO raw scalar getters, NO split getters, and NO generic callbacks.
+#[cfg(test)]
 pub(crate) struct ExistingVectorGenerationBinding<'a> {
     context: VectorGenerationContext,
     provider: ResolvedEmbeddingProvider<'a>,
 }
 
+#[cfg(test)]
 impl<'a> ExistingVectorGenerationBinding<'a> {
     /// Consumes the intermediate binding by value to construct an owned, sealed
     /// [`ExistingGenerationFencedExecution`] using canonical storage root and managed registry.
@@ -209,13 +223,14 @@ impl<'a> ExistingVectorGenerationBinding<'a> {
     }
 }
 
-/// Opaque, sealed execution capability for bounded vector sync drain.
+/// Opaque, sealed execution capability for the retired D9D2 building drain.
 ///
 /// Strictly holds owned generation context, owned resolved embedding provider,
 /// and exact matching existing-generation vector store.
 ///
 /// Deliberately has NO `Clone`, NO `Copy`, NO `Debug`, NO `Serialize`, NO `Deserialize`,
 /// NO IPC exposure, NO raw scalar getters, NO split getters, and NO generic callbacks.
+#[cfg(test)]
 pub(crate) struct ExistingGenerationFencedExecution<'storage, 'provider> {
     storage: &'storage StorageService,
     context: VectorGenerationContext,
@@ -253,6 +268,7 @@ impl<'storage, 'provider> ActiveGenerationFencedExecution<'storage, 'provider> {
     }
 }
 
+#[cfg(test)]
 impl<'storage, 'provider> ExistingGenerationFencedExecution<'storage, 'provider> {
     /// Executes a bounded, fenced drain over the owned generation context.
     ///
@@ -423,6 +439,7 @@ pub(crate) fn verify_provider_facts(
 }
 
 /// Resolves the intermediate existing vector generation binding from SQLite generation authority and active model runtime.
+#[cfg(test)]
 pub(crate) fn resolve_existing_generation_binding<'a, R, S>(
     storage: &StorageService,
     runtime: &'a ModelRuntimeService<'a, R, S>,
@@ -483,6 +500,7 @@ where
 /// - `&LanceDbVectorStoreRegistry`
 ///
 /// The caller cannot supply arbitrary generation IDs, contexts, providers, stores, or filesystem paths.
+#[cfg(test)]
 pub(crate) async fn resolve_existing_generation_fenced_execution<'storage, 'runtime, R, S>(
     storage: &'storage StorageService,
     runtime: &'runtime ModelRuntimeService<'runtime, R, S>,

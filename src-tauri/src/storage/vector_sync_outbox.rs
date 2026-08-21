@@ -742,6 +742,7 @@ impl std::ops::Not for FencedAttemptStartResult {
 /// It deliberately has no `Clone`, no `Copy`, no `Debug`, no `Serialize`, no `Deserialize`,
 /// and no raw scalar getters to ensure the caller cannot extract generation scalars or
 /// bypass authority rechecks.
+#[cfg(test)]
 pub(crate) struct ExistingBuildingGenerationAuthority {
     generation_id: String,
     descriptor_hash: String,
@@ -824,6 +825,7 @@ impl ActiveGenerationAuthority {
     }
 }
 
+#[cfg(test)]
 impl ExistingBuildingGenerationAuthority {
     /// Verifies that the expected descriptor hash and expected dimension match the candidate authority.
     pub(crate) fn verify_descriptor_and_dimension(
@@ -881,7 +883,6 @@ impl ExistingBuildingGenerationAuthority {
     }
 }
 
-#[allow(dead_code)]
 impl StorageService {
     /// Loads exactly the active generation selected by the singleton pointer.
     /// Every join is exact and mandatory, so malformed, historical, or
@@ -941,6 +942,7 @@ impl StorageService {
     /// - 0 rows -> `D9D2_NO_EXISTING_GENERATION`
     /// - 1 row -> validates metadata -> `ExistingBuildingGenerationAuthority`
     /// - 2 rows -> `D9D2_AMBIGUOUS_EXISTING_GENERATION`
+    #[cfg(test)]
     pub(crate) fn load_existing_building_generation_candidate(
         &self,
     ) -> Result<ExistingBuildingGenerationAuthority, ExistingGenerationBindingError> {
@@ -1026,6 +1028,7 @@ impl StorageService {
 
     /// D-9D1 creates only explicit, non-active generations.  Activation and
     /// rebuild orchestration remain D-9D3 responsibilities.
+    #[cfg(test)]
     pub(crate) fn register_building_vector_generation(
         &self,
         generation_id: &str,
@@ -1078,6 +1081,7 @@ impl StorageService {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn claim_one_fenced_vector_sync(
         &self,
         generation_id: &str,

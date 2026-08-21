@@ -51,9 +51,11 @@ pub(crate) use late_delete_resolution::{
     LateDeleteResolutionFinalizeResult, LateDeleteRuntimeLease,
     LateDeleteStartedCommitUnknownNoPermit, PreDeleteCorruptCapability, PresentPostQueryCapability,
 };
+#[cfg(test)]
+pub(crate) use vector_sync_outbox::ExistingBuildingGenerationAuthority;
 pub(crate) use vector_sync_outbox::{
-    is_delete_unknown_evidence, ActiveGenerationAuthority, ExistingBuildingGenerationAuthority,
-    FencedAttemptReservation, FencedAttemptToken, FencedDeleteWitnessResult, FencedFailureDecision,
+    is_delete_unknown_evidence, ActiveGenerationAuthority, FencedAttemptReservation,
+    FencedAttemptToken, FencedDeleteWitnessResult, FencedFailureDecision,
     FencedFailureFinalizeResult, FencedFinalizeResult, FencedVectorSyncClaim,
     MAX_VECTOR_SYNC_ATTEMPTS,
 };

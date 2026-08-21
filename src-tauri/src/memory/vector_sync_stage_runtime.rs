@@ -663,10 +663,13 @@ fn map_binding_error(
             fenced_error(FencedVectorSyncDrainErrorCode::Unavailable)
         }
         ExistingGenerationBindingErrorCode::NoExistingGeneration
-        | ExistingGenerationBindingErrorCode::AmbiguousExistingGeneration
         | ExistingGenerationBindingErrorCode::GenerationProviderUnavailable
         | ExistingGenerationBindingErrorCode::GenerationProviderMismatch
         | ExistingGenerationBindingErrorCode::ExistingVectorStoreUnavailable => {
+            fenced_error(FencedVectorSyncDrainErrorCode::Unavailable)
+        }
+        #[cfg(test)]
+        ExistingGenerationBindingErrorCode::AmbiguousExistingGeneration => {
             fenced_error(FencedVectorSyncDrainErrorCode::Unavailable)
         }
     }

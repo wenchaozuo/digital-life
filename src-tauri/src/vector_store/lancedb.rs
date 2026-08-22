@@ -17,9 +17,10 @@ use lancedb::{
 };
 
 use super::{
-    validate_hash, validate_identifier, ConditionalGenerationDeleteOutcome, GenerationVectorRecord,
-    VectorGenerationContext, VectorGenerationId, VectorMetadataSample, VectorRecord,
-    VectorSearchHit, VectorSearchQuery, VectorSpace, VectorStore, VectorStoreError,
+    validate_generation_search_metadata, validate_hash, validate_identifier,
+    ConditionalGenerationDeleteOutcome, GenerationVectorRecord, GenerationVectorSearchHit,
+    GenerationVectorSearchQuery, VectorGenerationContext, VectorGenerationId, VectorMetadataSample,
+    VectorRecord, VectorSearchHit, VectorSearchQuery, VectorSpace, VectorStore, VectorStoreError,
     VectorStoreErrorCode, VectorStoreFuture,
 };
 
@@ -736,6 +737,105 @@ impl LanceDbVectorStore {
         Ok(())
     }
 
+    async fn search_generation_inner(
+        &self,
+        context: &VectorGenerationContext,
+        query: GenerationVectorSearchQuery,
+    ) -> Result<Vec<GenerationVectorSearchHit>, VectorStoreError> {
+        query.validate_against(context)?;
+        let table = self.open_generation_table(context).await?;
+        let filter = format!(
+            "generation_id = {} AND life_id = {}",
+            sql_literal(context.generation_id().as_str()),
+            sql_literal(query.life_id())
+        );
+        let candidate_count = table
+            .count_rows(Some(filter.clone()))
+            .await
+            .map_err(|_| read_failed())?;
+        if candidate_count == 0 {
+            return Ok(Vec::new());
+        }
+        let batches = table
+            .vector_search(query.vector().to_vec())
+            .map_err(|_| read_failed())?
+            .distance_type(DistanceType::Cosine)
+            .only_if(filter)
+            .limit(candidate_count)
+            .select(Select::columns(&[
+                "generation_id",
+                "life_id",
+                "memory_id",
+                "memory_revision",
+                "content_hash",
+                "descriptor_hash",
+                "dimension",
+                "_distance",
+            ]))
+            .execute()
+            .await
+            .map_err(|_| read_failed())?
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|_| read_failed())?;
+        let mut hits = Vec::with_capacity(candidate_count);
+        for batch in batches {
+            let generation_ids = column_string(&batch, "generation_id")?;
+            let life_ids = column_string(&batch, "life_id")?;
+            let memory_ids = column_string(&batch, "memory_id")?;
+            let revisions = batch
+                .column_by_name("memory_revision")
+                .and_then(|array| array.as_any().downcast_ref::<Int64Array>())
+                .ok_or_else(read_failed)?;
+            let content_hashes = column_string(&batch, "content_hash")?;
+            let descriptor_hashes = column_string(&batch, "descriptor_hash")?;
+            let dimensions = batch
+                .column_by_name("dimension")
+                .and_then(|array| array.as_any().downcast_ref::<Int32Array>())
+                .ok_or_else(read_failed)?;
+            let distances = batch
+                .column_by_name("_distance")
+                .and_then(|array| array.as_any().downcast_ref::<Float32Array>())
+                .ok_or_else(read_failed)?;
+            for row in 0..batch.num_rows() {
+                let dimension = dimensions.value(row);
+                if dimension < 0 || life_ids.value(row) != query.life_id() {
+                    return Err(corrupt());
+                }
+                validate_generation_search_metadata(
+                    context,
+                    generation_ids.value(row),
+                    life_ids.value(row),
+                    memory_ids.value(row),
+                    revisions.value(row),
+                    content_hashes.value(row),
+                    descriptor_hashes.value(row),
+                    dimension as usize,
+                )?;
+                let score = (1.0 - distances.value(row)).clamp(-1.0, 1.0);
+                if !score.is_finite() {
+                    return Err(read_failed());
+                }
+                if query.min_score().is_none_or(|minimum| score >= minimum) {
+                    hits.push(GenerationVectorSearchHit {
+                        memory_id: memory_ids.value(row).to_owned(),
+                        memory_revision: revisions.value(row),
+                        content_hash: content_hashes.value(row).to_owned(),
+                        score,
+                    });
+                }
+            }
+        }
+        hits.sort_by(|left, right| {
+            right
+                .score()
+                .total_cmp(&left.score())
+                .then_with(|| left.memory_id().cmp(right.memory_id()))
+        });
+        hits.truncate(query.limit());
+        Ok(hits)
+    }
+
     async fn count_generation_inner(
         &self,
         context: &VectorGenerationContext,
@@ -1211,6 +1311,14 @@ impl VectorStore for LanceDbVectorStore {
             hits.truncate(query.limit);
             Ok(hits)
         })
+    }
+
+    fn search_generation<'a>(
+        &'a self,
+        context: &'a VectorGenerationContext,
+        query: GenerationVectorSearchQuery,
+    ) -> VectorStoreFuture<'a, Result<Vec<GenerationVectorSearchHit>, VectorStoreError>> {
+        Box::pin(async move { self.search_generation_inner(context, query).await })
     }
 
     fn delete<'a>(
@@ -1935,6 +2043,152 @@ mod tests {
             .execute()
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn generation_search_returns_bound_identity_hits_and_preserves_store_state() {
+        block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let store = LanceDbVectorStore::open(temp.path()).await.unwrap();
+            let context = gen_context("search-lance", 3);
+            store.create_generation(&context).await.unwrap();
+            for record in [
+                gen_record(&context, "life-a", "memory-b", 2, vec![1.0, 0.0, 0.0]),
+                gen_record(&context, "life-a", "memory-a", 1, vec![1.0, 0.0, 0.0]),
+                gen_record(
+                    &context,
+                    "life-b",
+                    "memory-other-life",
+                    1,
+                    vec![1.0, 0.0, 0.0],
+                ),
+            ] {
+                store.upsert_generation(&context, record).await.unwrap();
+            }
+
+            let before_count = store
+                .count_generation(&context, Some("life-a"))
+                .await
+                .unwrap();
+            let before_metadata = store.list_generation_metadata(&context).await.unwrap();
+            let top_hit = store
+                .search_generation(
+                    &context,
+                    GenerationVectorSearchQuery::new("life-a", vec![1.0, 0.0, 0.0], 1, Some(0.5)),
+                )
+                .await
+                .unwrap();
+            assert_eq!(top_hit.len(), 1);
+            assert_eq!(top_hit[0].memory_id(), "memory-a");
+            assert_eq!(top_hit[0].memory_revision(), 1);
+            assert_eq!(top_hit[0].content_hash(), "content-memory-a");
+            assert_eq!(top_hit[0].score(), 1.0);
+
+            let all_hits = store
+                .search_generation(
+                    &context,
+                    GenerationVectorSearchQuery::new("life-a", vec![1.0, 0.0, 0.0], 10, None),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                all_hits
+                    .iter()
+                    .map(|hit| hit.memory_id())
+                    .collect::<Vec<_>>(),
+                vec!["memory-a", "memory-b"]
+            );
+            assert_eq!(
+                store
+                    .count_generation(&context, Some("life-a"))
+                    .await
+                    .unwrap(),
+                before_count
+            );
+            assert_eq!(
+                store.list_generation_metadata(&context).await.unwrap(),
+                before_metadata
+            );
+
+            let wrong_context = VectorGenerationContext::new(
+                context.generation_id().clone(),
+                context.descriptor_hash(),
+                2,
+            )
+            .unwrap();
+            let mismatch = store
+                .search_generation(
+                    &wrong_context,
+                    GenerationVectorSearchQuery::new("life-a", vec![1.0, 0.0], 1, None),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                mismatch.code,
+                VectorStoreErrorCode::GenerationSchemaMismatch
+            );
+        });
+    }
+
+    #[test]
+    fn generation_search_missing_generation_does_not_create_or_use_legacy_rows() {
+        block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let store = LanceDbVectorStore::open(temp.path()).await.unwrap();
+            let context = gen_context("search-missing", 3);
+            let missing = store
+                .search_generation(
+                    &context,
+                    GenerationVectorSearchQuery::new("life", vec![1.0, 0.0, 0.0], 1, None),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(missing.code, VectorStoreErrorCode::GenerationNotFound);
+            assert!(!store.generation_marker_path().exists());
+            assert!(store.table_names().await.unwrap().is_empty());
+
+            store
+                .upsert(record("life", "legacy", "model", vec![1.0, 0.0, 0.0]))
+                .await
+                .unwrap();
+            let no_fallback = store
+                .search_generation(
+                    &context,
+                    GenerationVectorSearchQuery::new("life", vec![1.0, 0.0, 0.0], 1, None),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(no_fallback.code, VectorStoreErrorCode::GenerationNotFound);
+            assert!(!store
+                .table_names()
+                .await
+                .unwrap()
+                .iter()
+                .any(|name| name == GENERATION_TABLE));
+        });
+    }
+
+    #[test]
+    fn generation_search_fails_closed_on_malformed_metadata() {
+        block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let store = LanceDbVectorStore::open(temp.path()).await.unwrap();
+            let context = gen_context("search-corrupt", 2);
+            store.create_generation(&context).await.unwrap();
+            append_generation_dimension_corruption(&store, &context).await;
+
+            let error = store
+                .search_generation(
+                    &context,
+                    GenerationVectorSearchQuery::new("life", vec![1.0, 0.0], 1, None),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, VectorStoreErrorCode::GenerationCorrupt);
+            assert!(!error
+                .message
+                .contains(temp.path().to_string_lossy().as_ref()));
+        });
     }
 
     /// Test-only low-level Lance inspection: counts the exact

@@ -404,6 +404,101 @@ impl VectorSearchQuery {
     }
 }
 
+/// Generation-bound semantic search request. The target generation and
+/// dimension are supplied by `VectorGenerationContext`, never by this query.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GenerationVectorSearchQuery {
+    life_id: String,
+    vector: Vec<f32>,
+    limit: usize,
+    min_score: Option<f32>,
+}
+
+impl GenerationVectorSearchQuery {
+    pub fn new(
+        life_id: impl Into<String>,
+        vector: Vec<f32>,
+        limit: usize,
+        min_score: Option<f32>,
+    ) -> Self {
+        Self {
+            life_id: life_id.into(),
+            vector,
+            limit,
+            min_score,
+        }
+    }
+
+    pub fn life_id(&self) -> &str {
+        &self.life_id
+    }
+
+    pub fn vector(&self) -> &[f32] {
+        &self.vector
+    }
+
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    pub fn min_score(&self) -> Option<f32> {
+        self.min_score
+    }
+
+    pub(crate) fn validate_against(
+        &self,
+        context: &VectorGenerationContext,
+    ) -> Result<(), VectorStoreError> {
+        validate_identifier(&self.life_id, "Life ID")?;
+        if self.limit == 0 || self.limit > MAX_SEARCH_LIMIT {
+            return Err(VectorStoreError::new(
+                VectorStoreErrorCode::InvalidLimit,
+                "Vector search limit must be within the supported range.",
+                false,
+            ));
+        }
+        if self
+            .min_score
+            .is_some_and(|score| !score.is_finite() || !(-1.0..=1.0).contains(&score))
+        {
+            return Err(VectorStoreError::new(
+                VectorStoreErrorCode::InvalidScoreThreshold,
+                "Vector search score threshold must be finite and between -1 and 1.",
+                false,
+            ));
+        }
+        validate_vector(&self.vector, context.dimension())
+    }
+}
+
+/// Generation search returns only authoritative identity and similarity
+/// metadata. Memory content remains a SQLite concern.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GenerationVectorSearchHit {
+    memory_id: String,
+    memory_revision: i64,
+    content_hash: String,
+    score: f32,
+}
+
+impl GenerationVectorSearchHit {
+    pub fn memory_id(&self) -> &str {
+        &self.memory_id
+    }
+
+    pub fn memory_revision(&self) -> i64 {
+        self.memory_revision
+    }
+
+    pub fn content_hash(&self) -> &str {
+        &self.content_hash
+    }
+
+    pub fn score(&self) -> f32 {
+        self.score
+    }
+}
+
 /// A hit is only an index reference. Memory content must be loaded from SQLite.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -482,6 +577,21 @@ pub trait VectorStore: Send + Sync {
         &'a self,
         query: VectorSearchQuery,
     ) -> VectorStoreFuture<'a, Result<Vec<VectorSearchHit>, VectorStoreError>>;
+
+    fn search_generation<'a>(
+        &'a self,
+        context: &'a VectorGenerationContext,
+        query: GenerationVectorSearchQuery,
+    ) -> VectorStoreFuture<'a, Result<Vec<GenerationVectorSearchHit>, VectorStoreError>> {
+        let _ = (context, query);
+        Box::pin(async {
+            Err(VectorStoreError::new(
+                VectorStoreErrorCode::StoreUnavailable,
+                "Generation-aware storage is unavailable for this vector store.",
+                false,
+            ))
+        })
+    }
 
     /// Removes every derived vector space for this life/memory pair.
     fn delete<'a>(
@@ -747,6 +857,33 @@ pub(crate) fn validate_vector(
             VectorStoreErrorCode::InvalidVector,
             "A zero-magnitude vector cannot be indexed or searched.",
             false,
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_generation_search_metadata(
+    context: &VectorGenerationContext,
+    generation_id: &str,
+    life_id: &str,
+    memory_id: &str,
+    memory_revision: i64,
+    content_hash: &str,
+    descriptor_hash: &str,
+    dimension: usize,
+) -> Result<(), VectorStoreError> {
+    let metadata_valid = generation_id == context.generation_id().as_str()
+        && memory_revision >= 0
+        && descriptor_hash == context.descriptor_hash()
+        && dimension == context.dimension()
+        && validate_identifier(life_id, "Life ID").is_ok()
+        && validate_identifier(memory_id, "Memory ID").is_ok()
+        && validate_hash(content_hash, "Content hash").is_ok();
+    if !metadata_valid {
+        return Err(VectorStoreError::new(
+            VectorStoreErrorCode::GenerationCorrupt,
+            "The vector generation is corrupt.",
+            true,
         ));
     }
     Ok(())

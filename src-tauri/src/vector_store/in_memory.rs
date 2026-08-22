@@ -4,9 +4,10 @@ use std::{
 };
 
 use super::{
-    validate_hash, validate_identifier, ConditionalGenerationDeleteOutcome, GenerationVectorRecord,
-    VectorGenerationContext, VectorGenerationId, VectorMetadataSample, VectorRecord,
-    VectorSearchHit, VectorSearchQuery, VectorSpace, VectorStore, VectorStoreError,
+    validate_generation_search_metadata, validate_hash, validate_identifier,
+    ConditionalGenerationDeleteOutcome, GenerationVectorRecord, GenerationVectorSearchHit,
+    GenerationVectorSearchQuery, VectorGenerationContext, VectorGenerationId, VectorMetadataSample,
+    VectorRecord, VectorSearchHit, VectorSearchQuery, VectorSpace, VectorStore, VectorStoreError,
     VectorStoreErrorCode, VectorStoreFuture,
 };
 
@@ -159,6 +160,66 @@ impl VectorStore for InMemoryVectorStore {
                     .then_with(|| left.memory_id.cmp(&right.memory_id))
             });
             hits.truncate(query.limit);
+            Ok(hits)
+        })
+    }
+
+    fn search_generation<'a>(
+        &'a self,
+        context: &'a VectorGenerationContext,
+        query: GenerationVectorSearchQuery,
+    ) -> VectorStoreFuture<'a, Result<Vec<GenerationVectorSearchHit>, VectorStoreError>> {
+        Box::pin(async move {
+            query.validate_against(context)?;
+            self.validate_existing_generation(context)?;
+            let generation_id = context.generation_id().as_str();
+            let records = self.generation_records.read().map_err(|_| {
+                VectorStoreError::new(
+                    VectorStoreErrorCode::StoreUnavailable,
+                    "The in-memory vector store is unavailable.",
+                    true,
+                )
+            })?;
+            let mut hits = Vec::new();
+            for record in records.values().filter(|record| {
+                record.generation_id().as_str() == generation_id
+                    && record.life_id() == query.life_id()
+            }) {
+                record.validate_against(context)?;
+                validate_generation_search_metadata(
+                    context,
+                    record.generation_id().as_str(),
+                    record.life_id(),
+                    record.memory_id(),
+                    record.memory_revision(),
+                    record.content_hash(),
+                    record.descriptor_hash(),
+                    record.dimension(),
+                )?;
+                let score = Self::cosine_similarity(query.vector(), record.vector());
+                if !score.is_finite() {
+                    return Err(VectorStoreError::new(
+                        VectorStoreErrorCode::GenerationCorrupt,
+                        "The vector generation is corrupt.",
+                        true,
+                    ));
+                }
+                if query.min_score().is_none_or(|minimum| score >= minimum) {
+                    hits.push(GenerationVectorSearchHit {
+                        memory_id: record.memory_id().to_owned(),
+                        memory_revision: record.memory_revision(),
+                        content_hash: record.content_hash().to_owned(),
+                        score,
+                    });
+                }
+            }
+            hits.sort_by(|left, right| {
+                right
+                    .score
+                    .total_cmp(&left.score)
+                    .then_with(|| left.memory_id.cmp(&right.memory_id))
+            });
+            hits.truncate(query.limit());
             Ok(hits)
         })
     }
@@ -953,6 +1014,172 @@ mod tests {
             vec![0.1, 0.2, 0.3],
         )
         .unwrap()
+    }
+
+    fn gen_record_with_vector(
+        ctx: &VectorGenerationContext,
+        life: &str,
+        memory: &str,
+        revision: i64,
+        content: &str,
+        vector: Vec<f32>,
+    ) -> GenerationVectorRecord {
+        GenerationVectorRecord::try_new(
+            ctx.generation_id().clone(),
+            life,
+            memory,
+            revision,
+            content,
+            ctx.descriptor_hash(),
+            vector,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn generation_search_is_context_bound_and_read_only() {
+        let store = InMemoryVectorStore::new();
+        let context_a = VectorGenerationContext::new(
+            VectorGenerationId::parse("search-generation-a").unwrap(),
+            "descriptor-search-a",
+            3,
+        )
+        .unwrap();
+        let context_b = VectorGenerationContext::new(
+            VectorGenerationId::parse("search-generation-b").unwrap(),
+            "descriptor-search-b",
+            3,
+        )
+        .unwrap();
+        block_on(store.create_generation(&context_a)).unwrap();
+        block_on(store.create_generation(&context_b)).unwrap();
+        for record in [
+            gen_record_with_vector(
+                &context_a,
+                "life-a",
+                "memory-b",
+                2,
+                "content-b",
+                vec![1.0, 0.0, 0.0],
+            ),
+            gen_record_with_vector(
+                &context_a,
+                "life-a",
+                "memory-a",
+                1,
+                "content-a",
+                vec![1.0, 0.0, 0.0],
+            ),
+            gen_record_with_vector(
+                &context_a,
+                "life-b",
+                "memory-other-life",
+                1,
+                "content-other-life",
+                vec![1.0, 0.0, 0.0],
+            ),
+        ] {
+            block_on(store.upsert_generation(&context_a, record)).unwrap();
+        }
+        block_on(store.upsert_generation(
+            &context_b,
+            gen_record_with_vector(
+                &context_b,
+                "life-a",
+                "memory-a",
+                9,
+                "content-generation-b",
+                vec![1.0, 0.0, 0.0],
+            ),
+        ))
+        .unwrap();
+
+        let before_count = block_on(store.count_generation(&context_a, Some("life-a"))).unwrap();
+        let before_metadata = block_on(store.list_generation_metadata(&context_a)).unwrap();
+        let top_hit = block_on(store.search_generation(
+            &context_a,
+            GenerationVectorSearchQuery::new("life-a", vec![1.0, 0.0, 0.0], 1, Some(0.5)),
+        ))
+        .unwrap();
+        assert_eq!(top_hit.len(), 1);
+        assert_eq!(top_hit[0].memory_id(), "memory-a");
+        assert_eq!(top_hit[0].memory_revision(), 1);
+        assert_eq!(top_hit[0].content_hash(), "content-a");
+        assert_eq!(top_hit[0].score(), 1.0);
+
+        let all_hits = block_on(store.search_generation(
+            &context_a,
+            GenerationVectorSearchQuery::new("life-a", vec![1.0, 0.0, 0.0], 10, None),
+        ))
+        .unwrap();
+        assert_eq!(
+            all_hits
+                .iter()
+                .map(|hit| hit.memory_id())
+                .collect::<Vec<_>>(),
+            vec!["memory-a", "memory-b"]
+        );
+        let generation_b_hits = block_on(store.search_generation(
+            &context_b,
+            GenerationVectorSearchQuery::new("life-a", vec![1.0, 0.0, 0.0], 10, None),
+        ))
+        .unwrap();
+        assert_eq!(generation_b_hits[0].content_hash(), "content-generation-b");
+        assert_eq!(
+            block_on(store.count_generation(&context_a, Some("life-a"))).unwrap(),
+            before_count
+        );
+        assert_eq!(
+            block_on(store.list_generation_metadata(&context_a)).unwrap(),
+            before_metadata
+        );
+    }
+
+    #[test]
+    fn generation_search_rejects_invalid_queries_and_never_falls_back() {
+        let store = InMemoryVectorStore::new();
+        let context = gen_context("search-validation");
+        let missing = block_on(store.search_generation(
+            &context,
+            GenerationVectorSearchQuery::new("life", vec![1.0, 0.0, 0.0], 1, None),
+        ))
+        .unwrap_err();
+        assert_eq!(missing.code, VectorStoreErrorCode::GenerationNotFound);
+
+        block_on(store.upsert(record("life", "legacy", "model", vec![1.0, 0.0, 0.0]))).unwrap();
+        let no_fallback = block_on(store.search_generation(
+            &context,
+            GenerationVectorSearchQuery::new("life", vec![1.0, 0.0, 0.0], 1, None),
+        ))
+        .unwrap_err();
+        assert_eq!(no_fallback.code, VectorStoreErrorCode::GenerationNotFound);
+
+        block_on(store.create_generation(&context)).unwrap();
+        for (query, code) in [
+            (
+                GenerationVectorSearchQuery::new("life", vec![1.0, 0.0], 1, None),
+                VectorStoreErrorCode::DimensionMismatch,
+            ),
+            (
+                GenerationVectorSearchQuery::new("life", vec![0.0, 0.0, 0.0], 1, None),
+                VectorStoreErrorCode::InvalidVector,
+            ),
+            (
+                GenerationVectorSearchQuery::new("life", vec![1.0, 0.0, 0.0], 0, None),
+                VectorStoreErrorCode::InvalidLimit,
+            ),
+            (
+                GenerationVectorSearchQuery::new("life", vec![1.0, 0.0, 0.0], 1, Some(2.0)),
+                VectorStoreErrorCode::InvalidScoreThreshold,
+            ),
+        ] {
+            assert_eq!(
+                block_on(store.search_generation(&context, query))
+                    .unwrap_err()
+                    .code,
+                code
+            );
+        }
     }
 
     #[test]

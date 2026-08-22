@@ -20,9 +20,12 @@ use super::{
     validate_generation_search_metadata, validate_hash, validate_identifier,
     ConditionalGenerationDeleteOutcome, GenerationSearchMetadata, GenerationVectorRecord,
     GenerationVectorSearchHit, GenerationVectorSearchQuery, VectorGenerationContext,
-    VectorGenerationId, VectorMetadataSample, VectorRecord, VectorSearchHit, VectorSearchQuery,
-    VectorSpace, VectorStore, VectorStoreError, VectorStoreErrorCode, VectorStoreFuture,
+    VectorGenerationId, VectorMetadataSample, VectorRecord, VectorSpace, VectorStore,
+    VectorStoreError, VectorStoreErrorCode, VectorStoreFuture,
 };
+
+#[cfg(test)]
+use super::{VectorSearchHit, VectorSearchQuery};
 
 const TABLE_PREFIX: &str = "vs_";
 const SPACE_MODEL_METADATA: &str = "digital_life.embedding_model";
@@ -1243,6 +1246,7 @@ impl VectorStore for LanceDbVectorStore {
         Box::pin(async move { self.upsert_records(records).await })
     }
 
+    #[cfg(test)]
     fn search<'a>(
         &'a self,
         query: VectorSearchQuery,

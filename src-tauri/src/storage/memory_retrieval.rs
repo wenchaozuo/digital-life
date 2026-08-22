@@ -2,104 +2,173 @@ use rusqlite::{params, params_from_iter, types::Value};
 
 use crate::memory::{
     candidate_service::contains_prohibited_content,
-    retrieval::{MemoryRetrievalRepository, MemoryRetrievalResult, RetrievalQuery},
-    retrieval_router::{AuthoritativeMemoryRetrievalRepository, AuthoritativeRetrievalRecord},
+    retrieval_router::{
+        AuthoritativeMemoryRetrievalRepository, AuthoritativeRetrievalRecord,
+        KeywordRetrievalQuery, KeywordRetrievalRepository,
+    },
     MemoryError, MemoryKind, MemoryRecord,
 };
 
 #[cfg(test)]
-use crate::memory::retrieval_router::MemoryRetrievalRouterRepository;
+use crate::memory::{
+    retrieval::{MemoryRetrievalRepository, MemoryRetrievalResult, RetrievalQuery},
+    retrieval_router::MemoryRetrievalRouterRepository,
+};
 
 use super::{memory::read_stored_memory, memory::MEMORY_COLUMNS, StorageService};
 
+struct KeywordMemoryRow {
+    memory_id: String,
+    #[cfg(test)]
+    kind: MemoryKind,
+    #[cfg(test)]
+    content: String,
+    #[cfg(test)]
+    summary: Option<String>,
+    #[cfg(test)]
+    importance: f64,
+    #[cfg(test)]
+    confidence: f64,
+    #[cfg(test)]
+    created_at: String,
+}
+
+impl KeywordRetrievalRepository for StorageService {
+    fn retrieve_keyword_ids(
+        &self,
+        query: &KeywordRetrievalQuery,
+    ) -> Result<Vec<String>, MemoryError> {
+        Ok(retrieve_confirmed_keyword_rows(
+            self,
+            &query.life_id,
+            &query.query_text,
+            query.kinds.as_deref(),
+            query.limit,
+        )?
+        .into_iter()
+        .map(|row| row.memory_id)
+        .collect())
+    }
+}
+
+#[cfg(test)]
 impl MemoryRetrievalRepository for StorageService {
     fn retrieve_confirmed(
         &self,
         query: &RetrievalQuery,
     ) -> Result<Vec<MemoryRetrievalResult>, MemoryError> {
-        let state = self.state().map_err(|_| MemoryError::database())?;
-        let life_exists: bool = state
-            .connection
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM life_identity WHERE id = ?1)",
-                params![query.life_id],
-                |row| row.get(0),
-            )
-            .map_err(|_| MemoryError::database())?;
-        if !life_exists {
-            return Err(MemoryError::new(
-                "LIFE_NOT_FOUND",
-                "The specified life was not found.",
-                true,
-            ));
-        }
-
-        let terms: Vec<&str> = query.query_text.split_whitespace().collect();
-        let kinds = query.kinds.as_deref().unwrap_or_default();
-        let mut sql = String::from(
-            "SELECT id, kind, content, summary, importance, confidence, created_at
-             FROM memory_record
-             WHERE life_id = ? AND status = 'confirmed' AND is_sensitive = 0",
-        );
-        let mut values = vec![Value::Text(query.life_id.clone())];
-
-        for term in terms {
-            sql.push_str(
-                " AND (content LIKE ? ESCAPE '\\' COLLATE NOCASE
-                        OR COALESCE(summary, '') LIKE ? ESCAPE '\\' COLLATE NOCASE)",
-            );
-            let pattern = format!("%{}%", escape_like(term));
-            values.push(Value::Text(pattern.clone()));
-            values.push(Value::Text(pattern));
-        }
-
-        if !kinds.is_empty() {
-            sql.push_str(" AND kind IN (");
-            sql.push_str(&vec!["?"; kinds.len()].join(", "));
-            sql.push(')');
-            values.extend(
-                kinds
-                    .iter()
-                    .map(|kind| Value::Text(kind.as_str().to_string())),
-            );
-        }
-
-        sql.push_str(" ORDER BY importance DESC, created_at DESC, id ASC LIMIT ?");
-        values.push(Value::Integer(i64::from(query.limit)));
-
-        let mut statement = state
-            .connection
-            .prepare(&sql)
-            .map_err(|_| MemoryError::database())?;
-        let rows = statement
-            .query_map(params_from_iter(values), |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, f64>(4)?,
-                    row.get::<_, f64>(5)?,
-                    row.get::<_, String>(6)?,
-                ))
-            })
-            .map_err(|_| MemoryError::database())?;
-
-        rows.map(|row| {
-            let (memory_id, kind, content, summary, importance, confidence, created_at) =
-                row.map_err(|_| MemoryError::database())?;
-            Ok(MemoryRetrievalResult {
-                memory_id,
-                kind: MemoryKind::parse(&kind)?,
-                content,
-                summary,
-                importance,
-                confidence,
-                created_at,
-            })
+        retrieve_confirmed_keyword_rows(
+            self,
+            &query.life_id,
+            &query.query_text,
+            query.kinds.as_deref(),
+            query.limit as usize,
+        )
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| MemoryRetrievalResult {
+                    memory_id: row.memory_id,
+                    kind: row.kind,
+                    content: row.content,
+                    summary: row.summary,
+                    importance: row.importance,
+                    confidence: row.confidence,
+                    created_at: row.created_at,
+                })
+                .collect()
         })
-        .collect()
     }
+}
+
+fn retrieve_confirmed_keyword_rows(
+    storage: &StorageService,
+    life_id: &str,
+    query_text: &str,
+    kinds: Option<&[MemoryKind]>,
+    limit: usize,
+) -> Result<Vec<KeywordMemoryRow>, MemoryError> {
+    let state = storage.state().map_err(|_| MemoryError::database())?;
+    let life_exists: bool = state
+        .connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM life_identity WHERE id = ?1)",
+            params![life_id],
+            |row| row.get(0),
+        )
+        .map_err(|_| MemoryError::database())?;
+    if !life_exists {
+        return Err(MemoryError::new(
+            "LIFE_NOT_FOUND",
+            "The specified life was not found.",
+            true,
+        ));
+    }
+
+    let terms: Vec<&str> = query_text.split_whitespace().collect();
+    let kinds = kinds.unwrap_or_default();
+    let mut sql = String::from(
+        "SELECT id, kind, content, summary, importance, confidence, created_at
+         FROM memory_record
+         WHERE life_id = ? AND status = 'confirmed' AND is_sensitive = 0",
+    );
+    let mut values = vec![Value::Text(life_id.to_owned())];
+
+    for term in terms {
+        sql.push_str(
+            " AND (content LIKE ? ESCAPE '\\' COLLATE NOCASE
+                    OR COALESCE(summary, '') LIKE ? ESCAPE '\\' COLLATE NOCASE)",
+        );
+        let pattern = format!("%{}%", escape_like(term));
+        values.push(Value::Text(pattern.clone()));
+        values.push(Value::Text(pattern));
+    }
+
+    if !kinds.is_empty() {
+        sql.push_str(" AND kind IN (");
+        sql.push_str(&vec!["?"; kinds.len()].join(", "));
+        sql.push(')');
+        values.extend(
+            kinds
+                .iter()
+                .map(|kind| Value::Text(kind.as_str().to_string())),
+        );
+    }
+
+    sql.push_str(" ORDER BY importance DESC, created_at DESC, id ASC LIMIT ?");
+    values.push(Value::Integer(
+        i64::try_from(limit).map_err(|_| MemoryError::database())?,
+    ));
+
+    let mut statement = state
+        .connection
+        .prepare(&sql)
+        .map_err(|_| MemoryError::database())?;
+    let rows = statement
+        .query_map(params_from_iter(values), |row| {
+            #[cfg(test)]
+            {
+                let kind = row.get::<_, String>(1)?;
+                Ok(KeywordMemoryRow {
+                    memory_id: row.get(0)?,
+                    kind: MemoryKind::parse(&kind).map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    content: row.get(2)?,
+                    summary: row.get(3)?,
+                    importance: row.get(4)?,
+                    confidence: row.get(5)?,
+                    created_at: row.get(6)?,
+                })
+            }
+            #[cfg(not(test))]
+            {
+                Ok(KeywordMemoryRow {
+                    memory_id: row.get(0)?,
+                })
+            }
+        })
+        .map_err(|_| MemoryError::database())?;
+
+    rows.map(|row| row.map_err(|_| MemoryError::database()))
+        .collect()
 }
 
 #[cfg(test)]

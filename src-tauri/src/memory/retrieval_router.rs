@@ -19,10 +19,10 @@ use crate::{
     vector_store::{VectorSearchHit, VectorSearchQuery, VectorSpace, VectorStore},
 };
 
-use super::{
-    retrieval::{MemoryRetrievalRepository, MemoryRetriever, RetrievalQuery},
-    MemoryError, MemoryKind, MemoryRecord, MemoryStatus,
-};
+use super::{MemoryError, MemoryKind, MemoryRecord, MemoryStatus};
+
+#[cfg(test)]
+use super::retrieval::{MemoryRetrievalRepository, MemoryRetriever, RetrievalQuery};
 
 pub const DEFAULT_HYBRID_LIMIT: usize = 10;
 pub const MAX_HYBRID_LIMIT: usize = 10;
@@ -34,6 +34,23 @@ const CANDIDATE_POOL_MULTIPLIER: usize = 4;
 const KEYWORD_WEIGHT: f64 = 0.5;
 const VECTOR_WEIGHT: f64 = 0.5;
 const MAX_IMPORTANCE_BONUS: f64 = 0.1;
+
+/// Internal keyword retrieval input used only by the governed router. The
+/// caller has already passed `HybridRetrievalRequest` validation, so this
+/// cannot become a second public retrieval API.
+pub(crate) struct KeywordRetrievalQuery {
+    pub(crate) life_id: String,
+    pub(crate) query_text: String,
+    pub(crate) kinds: Option<Vec<MemoryKind>>,
+    pub(crate) limit: usize,
+}
+
+pub(crate) trait KeywordRetrievalRepository {
+    fn retrieve_keyword_ids(
+        &self,
+        query: &KeywordRetrievalQuery,
+    ) -> Result<Vec<String>, MemoryError>;
+}
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -213,7 +230,7 @@ impl AuthoritativeRetrievalRecord {
 /// boundary, this path returns the current revision and canonical hash along
 /// with the current governed memory record.
 pub(crate) trait AuthoritativeMemoryRetrievalRepository:
-    MemoryRetrievalRepository + Send + Sync
+    KeywordRetrievalRepository + Send + Sync
 {
     fn life_exists(&self, life_id: &str) -> Result<bool, MemoryError>;
 
@@ -346,18 +363,18 @@ where
     let mut keyword_scores = HashMap::new();
     let mut keyword_status = KeywordRetrievalStatus::NotRequested;
     if request.strategy != RetrievalStrategy::VectorOnly {
-        match MemoryRetriever::new(repository).retrieve(RetrievalQuery {
+        match repository.retrieve_keyword_ids(&KeywordRetrievalQuery {
             life_id: request.life_id.clone(),
             query_text: request.query.clone(),
             kinds: request.memory_kind_filter.clone(),
-            limit: pool_limit as u32,
+            limit: pool_limit,
         }) {
             Ok(results) => {
                 keyword_status = KeywordRetrievalStatus::Available;
                 for (rank, result) in results.into_iter().enumerate() {
                     let score = 1.0 / (rank + 1) as f64;
                     keyword_scores
-                        .entry(result.memory_id)
+                        .entry(result)
                         .and_modify(|current: &mut f64| *current = current.max(score))
                         .or_insert(score);
                 }

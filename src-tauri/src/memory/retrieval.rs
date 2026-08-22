@@ -25,8 +25,6 @@ pub struct MemoryRetrievalResult {
     pub created_at: String,
 }
 
-pub type RetrievalResult = MemoryRetrievalResult;
-
 pub trait MemoryRetrievalRepository {
     fn retrieve_confirmed(
         &self,

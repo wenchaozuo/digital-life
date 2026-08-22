@@ -17,7 +17,8 @@ pub mod existing_generation_binding;
 pub mod extraction_commands;
 mod late_delete_resolution_runner;
 pub mod management;
-pub mod retrieval;
+#[cfg(test)]
+pub(crate) mod retrieval;
 pub mod retrieval_router;
 pub mod retrieval_runtime;
 pub mod revisions;

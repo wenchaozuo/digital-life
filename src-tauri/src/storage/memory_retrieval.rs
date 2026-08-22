@@ -1,10 +1,14 @@
 use rusqlite::{params, params_from_iter, types::Value};
 
 use crate::memory::{
+    candidate_service::contains_prohibited_content,
     retrieval::{MemoryRetrievalRepository, MemoryRetrievalResult, RetrievalQuery},
-    retrieval_router::MemoryRetrievalRouterRepository,
+    retrieval_router::{AuthoritativeMemoryRetrievalRepository, AuthoritativeRetrievalRecord},
     MemoryError, MemoryKind, MemoryRecord,
 };
+
+#[cfg(test)]
+use crate::memory::retrieval_router::MemoryRetrievalRouterRepository;
 
 use super::{memory::read_stored_memory, memory::MEMORY_COLUMNS, StorageService};
 
@@ -98,6 +102,7 @@ impl MemoryRetrievalRepository for StorageService {
     }
 }
 
+#[cfg(test)]
 impl MemoryRetrievalRouterRepository for StorageService {
     fn life_exists(&self, life_id: &str) -> Result<bool, MemoryError> {
         let state = self.state().map_err(|_| MemoryError::database())?;
@@ -116,6 +121,36 @@ impl MemoryRetrievalRouterRepository for StorageService {
         life_id: &str,
         memory_ids: &[String],
     ) -> Result<Vec<MemoryRecord>, MemoryError> {
+        <Self as AuthoritativeMemoryRetrievalRepository>::load_authoritative_retrieval_records(
+            self, life_id, memory_ids,
+        )
+        .map(|records| {
+            records
+                .into_iter()
+                .map(AuthoritativeRetrievalRecord::into_memory)
+                .collect()
+        })
+    }
+}
+
+impl AuthoritativeMemoryRetrievalRepository for StorageService {
+    fn life_exists(&self, life_id: &str) -> Result<bool, MemoryError> {
+        let state = self.state().map_err(|_| MemoryError::database())?;
+        state
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM life_identity WHERE id = ?1)",
+                params![life_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| MemoryError::database())
+    }
+
+    fn load_authoritative_retrieval_records(
+        &self,
+        life_id: &str,
+        memory_ids: &[String],
+    ) -> Result<Vec<AuthoritativeRetrievalRecord>, MemoryError> {
         if memory_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -123,7 +158,7 @@ impl MemoryRetrievalRouterRepository for StorageService {
         let state = self.state().map_err(|_| MemoryError::database())?;
         let placeholders = vec!["?"; memory_ids.len()].join(", ");
         let sql = format!(
-            "SELECT {MEMORY_COLUMNS} FROM memory_record
+            "SELECT {MEMORY_COLUMNS}, revision FROM memory_record
              WHERE life_id = ? AND status = 'confirmed' AND is_sensitive = 0
                AND id IN ({placeholders})
              ORDER BY id ASC"
@@ -136,10 +171,30 @@ impl MemoryRetrievalRouterRepository for StorageService {
             .prepare(&sql)
             .map_err(|_| MemoryError::database())?;
         let rows = statement
-            .query_map(params_from_iter(values), read_stored_memory)
+            .query_map(params_from_iter(values), |row| {
+                let stored = read_stored_memory(row)?;
+                let revision = row.get::<_, i64>(15)?;
+                Ok((stored, revision))
+            })
             .map_err(|_| MemoryError::database())?;
-        rows.map(|row| row.map_err(|_| MemoryError::database())?.try_into())
-            .collect()
+
+        let mut records = Vec::new();
+        for row in rows {
+            let (stored, revision) = row.map_err(|_| MemoryError::database())?;
+            let memory: MemoryRecord = stored.try_into()?;
+            if contains_prohibited_content(&memory.content)
+                || memory
+                    .summary
+                    .as_deref()
+                    .is_some_and(contains_prohibited_content)
+            {
+                continue;
+            }
+            records.push(AuthoritativeRetrievalRecord::from_current(
+                memory, revision,
+            )?);
+        }
+        Ok(records)
     }
 }
 

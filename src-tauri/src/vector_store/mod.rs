@@ -482,6 +482,21 @@ pub struct GenerationVectorSearchHit {
 }
 
 impl GenerationVectorSearchHit {
+    #[cfg(test)]
+    pub(crate) fn from_test_parts(
+        memory_id: impl Into<String>,
+        memory_revision: i64,
+        content_hash: impl Into<String>,
+        score: f32,
+    ) -> Self {
+        Self {
+            memory_id: memory_id.into(),
+            memory_revision,
+            content_hash: content_hash.into(),
+            score,
+        }
+    }
+
     pub fn memory_id(&self) -> &str {
         &self.memory_id
     }
@@ -862,23 +877,27 @@ pub(crate) fn validate_vector(
     Ok(())
 }
 
+pub(crate) struct GenerationSearchMetadata<'a> {
+    pub(crate) context: &'a VectorGenerationContext,
+    pub(crate) generation_id: &'a str,
+    pub(crate) life_id: &'a str,
+    pub(crate) memory_id: &'a str,
+    pub(crate) memory_revision: i64,
+    pub(crate) content_hash: &'a str,
+    pub(crate) descriptor_hash: &'a str,
+    pub(crate) dimension: usize,
+}
+
 pub(crate) fn validate_generation_search_metadata(
-    context: &VectorGenerationContext,
-    generation_id: &str,
-    life_id: &str,
-    memory_id: &str,
-    memory_revision: i64,
-    content_hash: &str,
-    descriptor_hash: &str,
-    dimension: usize,
+    metadata: &GenerationSearchMetadata<'_>,
 ) -> Result<(), VectorStoreError> {
-    let metadata_valid = generation_id == context.generation_id().as_str()
-        && memory_revision >= 0
-        && descriptor_hash == context.descriptor_hash()
-        && dimension == context.dimension()
-        && validate_identifier(life_id, "Life ID").is_ok()
-        && validate_identifier(memory_id, "Memory ID").is_ok()
-        && validate_hash(content_hash, "Content hash").is_ok();
+    let metadata_valid = metadata.generation_id == metadata.context.generation_id().as_str()
+        && metadata.memory_revision >= 0
+        && metadata.descriptor_hash == metadata.context.descriptor_hash()
+        && metadata.dimension == metadata.context.dimension()
+        && validate_identifier(metadata.life_id, "Life ID").is_ok()
+        && validate_identifier(metadata.memory_id, "Memory ID").is_ok()
+        && validate_hash(metadata.content_hash, "Content hash").is_ok();
     if !metadata_valid {
         return Err(VectorStoreError::new(
             VectorStoreErrorCode::GenerationCorrupt,

@@ -101,12 +101,6 @@ impl<'a> ResolvedEmbeddingProvider<'a> {
     pub(crate) fn provider(&self) -> &dyn EmbeddingProvider {
         self.provider.as_ref()
     }
-
-    /// Transfers the short-lived provider into another Rust-internal
-    /// orchestrator without exposing credentials to IPC or serialization.
-    pub(crate) fn into_provider(self) -> Box<dyn EmbeddingProvider + 'a> {
-        self.provider
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]

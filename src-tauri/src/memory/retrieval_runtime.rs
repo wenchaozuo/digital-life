@@ -1,115 +1,109 @@
-//! Production assembly for governed, read-only hybrid memory retrieval.
+//! Production assembly for governed, generation-aware hybrid memory retrieval.
 //!
-//! It resolves a fresh embedding provider per request, but never creates an
-//! index, writes a vector, opens SQLite independently, or exposes a command.
+//! Semantic retrieval is supplied only by the sealed D10-B2 capability. This
+//! runtime owns query governance, keyword/semantic degradation, and the final
+//! governed result boundary; it does not own a provider, vector space, or
+//! vector store.
 
-use std::path::PathBuf;
+use std::{future::Future, pin::Pin};
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    embedding::{
-        EmbeddingBatch, EmbeddingError, EmbeddingErrorCode, EmbeddingFuture, EmbeddingModelInfo,
-        EmbeddingProvider, EmbeddingRequest,
+    memory::{
+        active_generation_retrieval::ActiveGenerationRetrievalErrorCode,
+        retrieval_router::{
+            retrieve_generation_aware, AuthoritativeMemoryRetrievalRepository,
+            HybridRetrievalRequest, KeywordRetrievalStatus, MemoryRetrievalRouterErrorCode,
+            RetrievalCandidate, RetrievalStrategy, SemanticRetrievalOutcome, VectorRetrievalStatus,
+            DEFAULT_HYBRID_LIMIT,
+        },
+        MemoryKind,
     },
-    model::{
-        profile::ModelProfileRepository,
-        runtime::{ModelRuntimeCoordinator, ModelRuntimeErrorCode, ModelRuntimeService},
-    },
+    model::{profile::ModelProfileRepository, runtime::ModelRuntimeService},
     secrets::SecretStore,
     storage::StorageService,
-    vector_store::{
-        LanceDbVectorStoreRegistry, VectorRecord, VectorSearchHit, VectorSearchQuery, VectorSpace,
-        VectorStore, VectorStoreError, VectorStoreFuture,
-    },
-};
-
-use super::{
-    retrieval_router::{
-        HybridRetrievalRequest, KeywordRetrievalStatus, MemoryRetrievalRouter,
-        MemoryRetrievalRouterErrorCode, MemoryRetrievalRouterRepository, RetrievalCandidate,
-        RetrievalStrategy, VectorRetrievalStatus, DEFAULT_HYBRID_LIMIT,
-    },
-    MemoryKind,
+    vector_store::{GenerationVectorSearchHit, LanceDbVectorStoreRegistry},
 };
 
 pub const MAX_RETRIEVAL_QUERY_CHARACTERS: usize = 4_000;
 pub const VECTOR_MIN_SCORE: f32 = 0.20;
 
-pub trait MemoryRetrievalDataRootResolver: Send + Sync {
-    fn active_data_root(&self) -> Result<PathBuf, RetrievalRuntimeError>;
+pub(crate) type SemanticRetrievalFuture<'a> = Pin<
+    Box<
+        dyn Future<
+                Output = Result<Vec<GenerationVectorSearchHit>, ActiveGenerationRetrievalErrorCode>,
+            > + Send
+            + 'a,
+    >,
+>;
+
+pub(crate) trait SemanticRetrievalProvider {
+    fn semantic_search<'a>(
+        &'a self,
+        life_id: &'a str,
+        query: &'a str,
+        limit: usize,
+        min_score: Option<f32>,
+    ) -> SemanticRetrievalFuture<'a>;
 }
 
-impl MemoryRetrievalDataRootResolver for StorageService {
-    fn active_data_root(&self) -> Result<PathBuf, RetrievalRuntimeError> {
-        StorageService::active_data_root(self)
-            .map_err(|_| runtime_error(RetrievalRuntimeErrorCode::RuntimeUnavailable))
-    }
-}
-
-pub struct ResolvedRuntimeEmbeddingProvider<'a> {
-    pub model_name: String,
-    pub dimension: usize,
-    provider: Box<dyn EmbeddingProvider + 'a>,
-}
-
-impl ResolvedRuntimeEmbeddingProvider<'_> {
-    fn provider(&self) -> &dyn EmbeddingProvider {
-        self.provider.as_ref()
-    }
-}
-
-pub trait ActiveEmbeddingProviderFactory: Send + Sync {
-    fn resolve_active_embedding_provider(
-        &self,
-    ) -> Result<ResolvedRuntimeEmbeddingProvider<'_>, RetrievalDegradationCode>;
-}
-
-pub struct ModelRuntimeEmbeddingProviderFactory<'a, P, S>
+/// Canonical production adapter from the runtime services to D10-B2.
+pub(crate) struct GenerationAwareSemanticRetrieval<'a, P, S>
 where
-    P: ModelProfileRepository,
+    P: ModelProfileRepository + Sync,
     S: SecretStore + ?Sized,
 {
-    profiles: &'a P,
-    secrets: &'a S,
-    coordinator: &'a ModelRuntimeCoordinator,
+    storage: &'a StorageService,
+    runtime: &'a ModelRuntimeService<'a, P, S>,
+    registry: &'a LanceDbVectorStoreRegistry,
 }
 
-impl<'a, P, S> ModelRuntimeEmbeddingProviderFactory<'a, P, S>
+impl<'a, P, S> GenerationAwareSemanticRetrieval<'a, P, S>
 where
-    P: ModelProfileRepository,
+    P: ModelProfileRepository + Sync,
     S: SecretStore + ?Sized,
 {
-    pub fn new(profiles: &'a P, secrets: &'a S, coordinator: &'a ModelRuntimeCoordinator) -> Self {
+    pub(crate) fn new(
+        storage: &'a StorageService,
+        runtime: &'a ModelRuntimeService<'a, P, S>,
+        registry: &'a LanceDbVectorStoreRegistry,
+    ) -> Self {
         Self {
-            profiles,
-            secrets,
-            coordinator,
+            storage,
+            runtime,
+            registry,
         }
     }
 }
 
-impl<P, S> ActiveEmbeddingProviderFactory for ModelRuntimeEmbeddingProviderFactory<'_, P, S>
+impl<P, S> SemanticRetrievalProvider for GenerationAwareSemanticRetrieval<'_, P, S>
 where
-    P: ModelProfileRepository + Send + Sync,
+    P: ModelProfileRepository + Sync,
     S: SecretStore + ?Sized,
 {
-    fn resolve_active_embedding_provider(
-        &self,
-    ) -> Result<ResolvedRuntimeEmbeddingProvider<'_>, RetrievalDegradationCode> {
-        let resolved = ModelRuntimeService::new(self.profiles, self.secrets, self.coordinator)
-            .resolve_active_embedding_provider()
-            .map_err(map_model_runtime_error)?;
-        let dimension = resolved
-            .profile
-            .embedding_dimension
-            .map(|value| value as usize)
-            .ok_or(RetrievalDegradationCode::EmbeddingDimensionMismatch)?;
-        let model_name = resolved.profile.model_name.clone();
-        Ok(ResolvedRuntimeEmbeddingProvider {
-            model_name,
-            dimension,
-            provider: resolved.into_provider(),
+    fn semantic_search<'a>(
+        &'a self,
+        life_id: &'a str,
+        query: &'a str,
+        limit: usize,
+        min_score: Option<f32>,
+    ) -> SemanticRetrievalFuture<'a> {
+        let life_id = life_id.to_owned();
+        let query = query.to_owned();
+        Box::pin(async move {
+            let execution =
+                super::active_generation_retrieval::resolve_active_generation_retrieval_execution(
+                    self.storage,
+                    self.runtime,
+                    self.registry,
+                )
+                .await
+                .map_err(|error| error.code())?;
+            execution
+                .semantic_search(&life_id, &query, limit, min_score)
+                .await
+                .map_err(|error| error.code())
         })
     }
 }
@@ -178,36 +172,22 @@ pub struct RetrievalRuntimeError {
     pub recoverable: bool,
 }
 
-pub struct MemoryRetrievalRuntimeService<'a, R, F, D>
+pub(crate) struct MemoryRetrievalRuntimeService<'a, R, S>
 where
-    R: MemoryRetrievalRouterRepository,
-    F: ActiveEmbeddingProviderFactory + ?Sized,
-    D: MemoryRetrievalDataRootResolver + ?Sized,
+    R: AuthoritativeMemoryRetrievalRepository,
+    S: SemanticRetrievalProvider + ?Sized,
 {
     memories: &'a R,
-    provider_factory: &'a F,
-    data_root: &'a D,
-    registry: &'a LanceDbVectorStoreRegistry,
+    semantic: &'a S,
 }
 
-impl<'a, R, F, D> MemoryRetrievalRuntimeService<'a, R, F, D>
+impl<'a, R, S> MemoryRetrievalRuntimeService<'a, R, S>
 where
-    R: MemoryRetrievalRouterRepository,
-    F: ActiveEmbeddingProviderFactory + ?Sized,
-    D: MemoryRetrievalDataRootResolver + ?Sized,
+    R: AuthoritativeMemoryRetrievalRepository,
+    S: SemanticRetrievalProvider + ?Sized,
 {
-    pub fn new(
-        memories: &'a R,
-        provider_factory: &'a F,
-        data_root: &'a D,
-        registry: &'a LanceDbVectorStoreRegistry,
-    ) -> Self {
-        Self {
-            memories,
-            provider_factory,
-            data_root,
-            registry,
-        }
+    pub(crate) fn new(memories: &'a R, semantic: &'a S) -> Self {
+        Self { memories, semantic }
     }
 
     pub async fn retrieve(
@@ -217,106 +197,59 @@ where
         validate_request(&request)?;
         if contains_high_risk_credential(&request.query) {
             return self
-                .retrieve_keyword_only(
+                .retrieve_with_semantic(
                     request,
+                    SemanticRetrievalOutcome::NotRequested,
                     vec![RetrievalDegradationCode::VectorSkippedSensitiveQuery],
                 )
                 .await;
         }
 
-        let resolved = match self.provider_factory.resolve_active_embedding_provider() {
-            Ok(resolved) => resolved,
-            Err(code) => return self.retrieve_keyword_only(request, vec![code]).await,
-        };
-        let space = VectorSpace {
-            embedding_model: resolved.model_name.clone(),
-            dimension: resolved.dimension,
-        };
-        let root = match self.data_root.active_data_root() {
-            Ok(root) => root,
-            Err(_) => {
-                return self
-                    .retrieve_keyword_only(
-                        request,
-                        vec![RetrievalDegradationCode::VectorStoreUnavailable],
-                    )
-                    .await
-            }
-        };
-        let Some(store) = self
-            .registry
-            .existing_store(&root)
+        let semantic_limit = DEFAULT_HYBRID_LIMIT.saturating_mul(4).min(100);
+        let (semantic, degradations) = match self
+            .semantic
+            .semantic_search(
+                &request.life_id,
+                &request.query,
+                semantic_limit,
+                Some(VECTOR_MIN_SCORE),
+            )
             .await
-            .map_err(|_| runtime_error(RetrievalRuntimeErrorCode::RuntimeUnavailable))?
-        else {
-            return self
-                .retrieve_keyword_only(
-                    request,
-                    vec![RetrievalDegradationCode::IndexDirectoryMissing],
-                )
-                .await;
+        {
+            Ok(hits) => (SemanticRetrievalOutcome::Available(hits), Vec::new()),
+            Err(code) => (
+                SemanticRetrievalOutcome::Unavailable,
+                vec![map_generation_error(code)],
+            ),
         };
-        match store.count(&request.life_id, Some(&space)).await {
-            Ok(0) => {
-                return self
-                    .retrieve_keyword_only(
-                        request,
-                        vec![RetrievalDegradationCode::VectorIndexUnavailable],
-                    )
-                    .await
-            }
-            Err(_) => {
-                return self
-                    .retrieve_keyword_only(
-                        request,
-                        vec![RetrievalDegradationCode::VectorStoreUnavailable],
-                    )
-                    .await
-            }
-            Ok(_) => {}
-        }
-
-        let router =
-            MemoryRetrievalRouter::new(self.memories, resolved.provider(), store.as_ref(), space)
-                .map_err(|_| runtime_error(RetrievalRuntimeErrorCode::RuntimeUnavailable))?;
-        let result = router
-            .retrieve(HybridRetrievalRequest {
-                life_id: request.life_id,
-                query: request.query,
-                limit: DEFAULT_HYBRID_LIMIT,
-                strategy: RetrievalStrategy::Hybrid,
-                min_score: Some(VECTOR_MIN_SCORE),
-                memory_kind_filter: request.memory_kind_filter,
-            })
-            .await;
-        self.finish_router_result(result, Vec::new())
+        self.retrieve_with_semantic(request, semantic, degradations)
+            .await
     }
 
-    async fn retrieve_keyword_only(
+    async fn retrieve_with_semantic(
         &self,
         request: GovernedRetrievalRequest,
+        semantic: SemanticRetrievalOutcome,
         degradations: Vec<RetrievalDegradationCode>,
     ) -> Result<GovernedRetrievalResult, RetrievalRuntimeError> {
-        let router = MemoryRetrievalRouter::new(
+        let strategy = if matches!(semantic, SemanticRetrievalOutcome::NotRequested) {
+            RetrievalStrategy::KeywordOnly
+        } else {
+            RetrievalStrategy::Hybrid
+        };
+        let result = retrieve_generation_aware(
             self.memories,
-            &KeywordOnlyEmbeddingProvider,
-            &KeywordOnlyVectorStore,
-            VectorSpace {
-                embedding_model: "keyword-only".to_string(),
-                dimension: 1,
-            },
-        )
-        .map_err(|_| runtime_error(RetrievalRuntimeErrorCode::RuntimeUnavailable))?;
-        let result = router
-            .retrieve(HybridRetrievalRequest {
+            HybridRetrievalRequest {
                 life_id: request.life_id,
                 query: request.query,
                 limit: DEFAULT_HYBRID_LIMIT,
-                strategy: RetrievalStrategy::KeywordOnly,
-                min_score: None,
+                strategy,
+                min_score: Some(VECTOR_MIN_SCORE),
                 memory_kind_filter: request.memory_kind_filter,
-            })
-            .await;
+            },
+            semantic,
+        )
+        .await;
         self.finish_router_result(result, degradations)
     }
 
@@ -406,106 +339,28 @@ where
     }
 }
 
-struct KeywordOnlyEmbeddingProvider;
-
-impl EmbeddingProvider for KeywordOnlyEmbeddingProvider {
-    fn model_info(&self) -> EmbeddingModelInfo {
-        EmbeddingModelInfo {
-            model_name: "keyword-only".to_string(),
-            dimension: Some(1),
+fn map_generation_error(code: ActiveGenerationRetrievalErrorCode) -> RetrievalDegradationCode {
+    match code {
+        ActiveGenerationRetrievalErrorCode::NoActiveGeneration => {
+            RetrievalDegradationCode::VectorIndexUnavailable
+        }
+        ActiveGenerationRetrievalErrorCode::GenerationProviderUnavailable
+        | ActiveGenerationRetrievalErrorCode::EmbeddingFailed => {
+            RetrievalDegradationCode::EmbeddingProviderUnavailable
+        }
+        ActiveGenerationRetrievalErrorCode::EmbeddingDimensionMismatch => {
+            RetrievalDegradationCode::EmbeddingDimensionMismatch
+        }
+        ActiveGenerationRetrievalErrorCode::GenerationStoreUnavailable
+        | ActiveGenerationRetrievalErrorCode::VectorSearchFailed => {
+            RetrievalDegradationCode::VectorStoreUnavailable
+        }
+        ActiveGenerationRetrievalErrorCode::GenerationStale
+        | ActiveGenerationRetrievalErrorCode::GenerationProviderMismatch
+        | ActiveGenerationRetrievalErrorCode::InvalidQuery => {
+            RetrievalDegradationCode::VectorUnavailable
         }
     }
-
-    fn model_name(&self) -> &str {
-        "keyword-only"
-    }
-
-    fn vector_dimension(&self) -> Option<usize> {
-        Some(1)
-    }
-
-    fn embed<'a>(
-        &'a self,
-        _request: EmbeddingRequest,
-    ) -> EmbeddingFuture<'a, Result<EmbeddingBatch, EmbeddingError>> {
-        Box::pin(async {
-            Err(EmbeddingError::definitely_not_sent(
-                EmbeddingErrorCode::InvalidRequest,
-            ))
-        })
-    }
-}
-
-struct KeywordOnlyVectorStore;
-
-impl VectorStore for KeywordOnlyVectorStore {
-    fn upsert<'a>(
-        &'a self,
-        _record: VectorRecord,
-    ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
-        Box::pin(async { Err(vector_store_error()) })
-    }
-    fn upsert_batch<'a>(
-        &'a self,
-        _records: Vec<VectorRecord>,
-    ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
-        Box::pin(async { Err(vector_store_error()) })
-    }
-    fn search<'a>(
-        &'a self,
-        _query: VectorSearchQuery,
-    ) -> VectorStoreFuture<'a, Result<Vec<VectorSearchHit>, VectorStoreError>> {
-        Box::pin(async { Err(vector_store_error()) })
-    }
-    fn delete<'a>(
-        &'a self,
-        _life_id: &'a str,
-        _memory_id: &'a str,
-    ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
-        Box::pin(async { Err(vector_store_error()) })
-    }
-    fn delete_from_space<'a>(
-        &'a self,
-        _life_id: &'a str,
-        _memory_id: &'a str,
-        _space: &'a VectorSpace,
-    ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
-        Box::pin(async { Err(vector_store_error()) })
-    }
-    fn delete_by_life<'a>(
-        &'a self,
-        _life_id: &'a str,
-    ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
-        Box::pin(async { Err(vector_store_error()) })
-    }
-    fn clear_space<'a>(
-        &'a self,
-        _life_id: &'a str,
-        _space: &'a VectorSpace,
-    ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
-        Box::pin(async { Err(vector_store_error()) })
-    }
-    fn count<'a>(
-        &'a self,
-        _life_id: &'a str,
-        _space: Option<&'a VectorSpace>,
-    ) -> VectorStoreFuture<'a, Result<usize, VectorStoreError>> {
-        Box::pin(async { Err(vector_store_error()) })
-    }
-    fn health_check<'a>(
-        &'a self,
-        _life_id: &'a str,
-    ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>> {
-        Box::pin(async { Err(vector_store_error()) })
-    }
-}
-
-fn vector_store_error() -> VectorStoreError {
-    VectorStoreError::new(
-        crate::vector_store::VectorStoreErrorCode::StoreUnavailable,
-        "The keyword-only store is unavailable.",
-        true,
-    )
 }
 
 fn validate_request(request: &GovernedRetrievalRequest) -> Result<(), RetrievalRuntimeError> {
@@ -516,32 +371,6 @@ fn validate_request(request: &GovernedRetrievalRequest) -> Result<(), RetrievalR
         return Err(runtime_error(RetrievalRuntimeErrorCode::InvalidRequest));
     }
     Ok(())
-}
-
-fn map_model_runtime_error(
-    error: crate::model::runtime::ModelRuntimeError,
-) -> RetrievalDegradationCode {
-    match error.code {
-        ModelRuntimeErrorCode::NoActiveProfile => {
-            RetrievalDegradationCode::NoActiveEmbeddingProfile
-        }
-        ModelRuntimeErrorCode::ProfileNotFound => {
-            RetrievalDegradationCode::EmbeddingProfileNotFound
-        }
-        ModelRuntimeErrorCode::CredentialNotFound => {
-            RetrievalDegradationCode::EmbeddingCredentialNotFound
-        }
-        ModelRuntimeErrorCode::ProfilePurposeMismatch => {
-            RetrievalDegradationCode::EmbeddingPurposeMismatch
-        }
-        ModelRuntimeErrorCode::UnsupportedProvider => {
-            RetrievalDegradationCode::UnsupportedEmbeddingProvider
-        }
-        ModelRuntimeErrorCode::DimensionMismatch => {
-            RetrievalDegradationCode::EmbeddingDimensionMismatch
-        }
-        _ => RetrievalDegradationCode::EmbeddingProviderUnavailable,
-    }
 }
 
 fn contains_high_risk_credential(value: &str) -> bool {
@@ -635,57 +464,44 @@ fn runtime_error(code: RetrievalRuntimeErrorCode) -> RetrievalRuntimeError {
 mod tests {
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     };
 
     use crate::{
-        embedding::EmbeddingBatch,
-        memory::retrieval::MemoryRetrievalRepository,
-        memory::{MemoryRecord, MemorySourceType, MemoryStatus},
-        vector_store::LanceDbVectorStore,
+        memory::{
+            retrieval::{MemoryRetrievalRepository, MemoryRetrievalResult, RetrievalQuery},
+            retrieval_router::{
+                AuthoritativeMemoryRetrievalRepository, AuthoritativeRetrievalRecord,
+                RetrievalSource,
+            },
+            vector_index::{canonical_index_text, canonical_memory_index_hash},
+            MemoryError, MemoryRecord, MemorySourceType, MemoryStatus,
+        },
+        vector_store::GenerationVectorSearchHit,
     };
 
     use super::*;
 
-    struct TestRoot(PathBuf);
-    impl TestRoot {
-        fn new() -> Self {
-            let path = tempfile::tempdir().unwrap().keep();
-            Self(path)
-        }
-    }
-    impl Drop for TestRoot {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    struct RootResolver(PathBuf);
-    impl MemoryRetrievalDataRootResolver for RootResolver {
-        fn active_data_root(&self) -> Result<PathBuf, RetrievalRuntimeError> {
-            Ok(self.0.clone())
-        }
-    }
-
     struct Repository {
         records: Vec<MemoryRecord>,
+        authoritative: Vec<AuthoritativeRetrievalRecord>,
         keyword_fails: bool,
         hydrate_fails: bool,
     }
+
     impl MemoryRetrievalRepository for Repository {
         fn retrieve_confirmed(
             &self,
-            _query: &super::super::retrieval::RetrievalQuery,
-        ) -> Result<Vec<super::super::retrieval::MemoryRetrievalResult>, super::super::MemoryError>
-        {
+            _query: &RetrievalQuery,
+        ) -> Result<Vec<MemoryRetrievalResult>, MemoryError> {
             if self.keyword_fails {
-                return Err(super::super::MemoryError::database());
+                return Err(MemoryError::database());
             }
             Ok(self
                 .records
                 .iter()
                 .filter(|record| record.status == MemoryStatus::Confirmed && !record.is_sensitive)
-                .map(|record| super::super::retrieval::MemoryRetrievalResult {
+                .map(|record| MemoryRetrievalResult {
                     memory_id: record.id.clone(),
                     kind: record.kind,
                     content: record.content.clone(),
@@ -697,91 +513,96 @@ mod tests {
                 .collect())
         }
     }
-    impl MemoryRetrievalRouterRepository for Repository {
-        fn life_exists(&self, life_id: &str) -> Result<bool, super::super::MemoryError> {
+
+    impl AuthoritativeMemoryRetrievalRepository for Repository {
+        fn life_exists(&self, life_id: &str) -> Result<bool, MemoryError> {
             Ok(life_id == "life-a")
         }
-        fn load_authoritative_candidates(
+
+        fn load_authoritative_retrieval_records(
             &self,
-            life_id: &str,
-            ids: &[String],
-        ) -> Result<Vec<MemoryRecord>, super::super::MemoryError> {
+            _life_id: &str,
+            _memory_ids: &[String],
+        ) -> Result<Vec<AuthoritativeRetrievalRecord>, MemoryError> {
             if self.hydrate_fails {
-                return Err(super::super::MemoryError::database());
+                return Err(MemoryError::database());
             }
-            Ok(self
-                .records
-                .iter()
-                .filter(|record| record.life_id == life_id && ids.contains(&record.id))
-                .cloned()
-                .collect())
+            Ok(self.authoritative.clone())
         }
     }
 
-    struct TestProvider {
+    struct Semantic {
         calls: Arc<AtomicUsize>,
+        outcome: Mutex<Result<Vec<GenerationVectorSearchHit>, ActiveGenerationRetrievalErrorCode>>,
     }
-    impl EmbeddingProvider for TestProvider {
-        fn model_info(&self) -> EmbeddingModelInfo {
-            EmbeddingModelInfo {
-                model_name: "model-a".into(),
-                dimension: Some(2),
-            }
-        }
-        fn model_name(&self) -> &str {
-            "model-a"
-        }
-        fn vector_dimension(&self) -> Option<usize> {
-            Some(2)
-        }
-        fn embed<'a>(
+
+    impl SemanticRetrievalProvider for Semantic {
+        fn semantic_search<'a>(
             &'a self,
-            _request: EmbeddingRequest,
-        ) -> EmbeddingFuture<'a, Result<EmbeddingBatch, EmbeddingError>> {
+            _life_id: &'a str,
+            _query: &'a str,
+            _limit: usize,
+            _min_score: Option<f32>,
+        ) -> SemanticRetrievalFuture<'a> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async { EmbeddingBatch::from_test_vectors(vec![vec![1.0, 0.0]]) })
-        }
-    }
-    struct Factory {
-        calls: Arc<AtomicUsize>,
-        error: Option<RetrievalDegradationCode>,
-    }
-    impl ActiveEmbeddingProviderFactory for Factory {
-        fn resolve_active_embedding_provider(
-            &self,
-        ) -> Result<ResolvedRuntimeEmbeddingProvider<'_>, RetrievalDegradationCode> {
-            if let Some(error) = self.error {
-                return Err(error);
-            }
-            Ok(ResolvedRuntimeEmbeddingProvider {
-                model_name: "model-a".into(),
-                dimension: 2,
-                provider: Box::new(TestProvider {
-                    calls: Arc::clone(&self.calls),
-                }),
-            })
+            let outcome = self.outcome.lock().unwrap().clone();
+            Box::pin(async move { outcome })
         }
     }
 
-    fn record(id: &str, sensitive: bool, status: MemoryStatus) -> MemoryRecord {
+    fn record(id: &str, life_id: &str, content: &str, summary: Option<&str>) -> MemoryRecord {
         MemoryRecord {
             id: id.into(),
-            life_id: "life-a".into(),
+            life_id: life_id.into(),
             kind: MemoryKind::Fact,
-            status,
-            content: format!("content-{id}"),
-            summary: Some(format!("summary-{id}")),
+            status: MemoryStatus::Confirmed,
+            content: content.into(),
+            summary: summary.map(str::to_owned),
             source_type: MemorySourceType::Manual,
             source_ref: None,
             source_created_at: "2026-07-13T00:00:00.000Z".into(),
             importance: 0.8,
             confidence: 0.9,
-            is_sensitive: sensitive,
+            is_sensitive: false,
             created_at: "2026-07-13T00:00:00.000Z".into(),
             updated_at: "2026-07-13T00:00:00.000Z".into(),
             confirmed_at: Some("2026-07-13T00:00:00.000Z".into()),
         }
     }
+
+    fn authoritative(memory: MemoryRecord, revision: i64) -> AuthoritativeRetrievalRecord {
+        AuthoritativeRetrievalRecord::from_current(memory, revision).unwrap()
+    }
+
+    fn current_hash(memory: &MemoryRecord) -> String {
+        let selected = canonical_index_text(memory.summary.as_deref(), &memory.content).unwrap();
+        canonical_memory_index_hash(
+            memory.kind.as_str(),
+            selected,
+            &memory.content,
+            memory.summary.as_deref(),
+        )
+    }
+
+    fn hit(memory: &MemoryRecord, revision: i64, score: f32) -> GenerationVectorSearchHit {
+        GenerationVectorSearchHit::from_test_parts(
+            memory.id.clone(),
+            revision,
+            current_hash(memory),
+            score,
+        )
+    }
+
+    fn semantic(
+        calls: &Arc<AtomicUsize>,
+        outcome: Result<Vec<GenerationVectorSearchHit>, ActiveGenerationRetrievalErrorCode>,
+    ) -> Semantic {
+        Semantic {
+            calls: Arc::clone(calls),
+            outcome: Mutex::new(outcome),
+        }
+    }
+
     fn request(query: &str) -> GovernedRetrievalRequest {
         GovernedRetrievalRequest {
             life_id: "life-a".into(),
@@ -790,184 +611,269 @@ mod tests {
         }
     }
 
-    #[test]
-    fn sensitive_query_and_missing_profile_degrade_to_keyword_without_embedding() {
-        tauri::async_runtime::block_on(async {
-            let root = TestRoot::new();
-            let resolver = RootResolver(root.0.clone());
-            let registry = LanceDbVectorStoreRegistry::default();
-            let repository = Repository {
-                records: vec![record("m1", false, MemoryStatus::Confirmed)],
-                keyword_fails: false,
-                hydrate_fails: false,
-            };
-            let calls = Arc::new(AtomicUsize::new(0));
-            let factory = Factory {
-                calls: Arc::clone(&calls),
-                error: None,
-            };
-            let service =
-                MemoryRetrievalRuntimeService::new(&repository, &factory, &resolver, &registry);
-            let result = service
-                .retrieve(request("Authorization: Bearer fixture-value-123"))
-                .await
-                .unwrap();
-            assert_eq!(calls.load(Ordering::SeqCst), 0);
-            assert_eq!(result.availability, RetrievalAvailability::KeywordOnly);
-            assert!(result
-                .degradation_codes
-                .contains(&RetrievalDegradationCode::VectorSkippedSensitiveQuery));
-            let missing = Factory {
-                calls: Arc::new(AtomicUsize::new(0)),
-                error: Some(RetrievalDegradationCode::NoActiveEmbeddingProfile),
-            };
-            let service =
-                MemoryRetrievalRuntimeService::new(&repository, &missing, &resolver, &registry);
-            let result = service.retrieve(request("what is a token?")).await.unwrap();
-            assert!(result
-                .degradation_codes
-                .contains(&RetrievalDegradationCode::NoActiveEmbeddingProfile));
-        });
+    fn service<'a>(
+        repository: &'a Repository,
+        semantic: &'a Semantic,
+    ) -> MemoryRetrievalRuntimeService<'a, Repository, Semantic> {
+        MemoryRetrievalRuntimeService::new(repository, semantic)
     }
 
     #[test]
-    fn missing_index_does_not_create_directory_or_write_vectors() {
-        tauri::async_runtime::block_on(async {
-            let root = TestRoot::new();
-            let resolver = RootResolver(root.0.clone());
-            let registry = LanceDbVectorStoreRegistry::default();
-            let repository = Repository {
-                records: vec![record("m1", false, MemoryStatus::Confirmed)],
-                keyword_fails: false,
-                hydrate_fails: false,
-            };
-            let factory = Factory {
-                calls: Arc::new(AtomicUsize::new(0)),
-                error: None,
-            };
-            let service =
-                MemoryRetrievalRuntimeService::new(&repository, &factory, &resolver, &registry);
-            let result = service.retrieve(request("hello")).await.unwrap();
-            assert_eq!(result.availability, RetrievalAvailability::KeywordOnly);
-            assert!(result
-                .degradation_codes
-                .contains(&RetrievalDegradationCode::IndexDirectoryMissing));
-            assert!(!root.0.join("vectors").exists());
-        });
-    }
-
-    #[test]
-    fn hybrid_and_controlled_vector_only_hydrate_authoritative_records() {
-        tauri::async_runtime::block_on(async {
-            let root = TestRoot::new();
-            let resolver = RootResolver(root.0.clone());
-            let index = root.0.join("vectors").join("lancedb");
-            let store = LanceDbVectorStore::open(&index).await.unwrap();
-            store
-                .upsert(VectorRecord {
-                    life_id: "life-a".into(),
-                    memory_id: "m1".into(),
-                    embedding_model: "model-a".into(),
-                    dimension: 2,
-                    vector: vec![1.0, 0.0],
-                    content_hash: "hash".into(),
-                })
-                .await
-                .unwrap();
-            let registry = LanceDbVectorStoreRegistry::default();
-            let calls = Arc::new(AtomicUsize::new(0));
-            let factory = Factory {
-                calls: Arc::clone(&calls),
-                error: None,
-            };
-            let repository = Repository {
-                records: vec![
-                    record("m1", false, MemoryStatus::Confirmed),
-                    record("candidate", false, MemoryStatus::Candidate),
-                    record("sensitive", true, MemoryStatus::Confirmed),
-                ],
-                keyword_fails: false,
-                hydrate_fails: false,
-            };
-            let service =
-                MemoryRetrievalRuntimeService::new(&repository, &factory, &resolver, &registry);
-            let result = service.retrieve(request("coffee")).await.unwrap();
-            assert_eq!(result.availability, RetrievalAvailability::Hybrid);
-            assert_eq!(result.candidates.len(), 1);
-            assert_eq!(result.candidates[0].memory_id, "m1");
-            assert_eq!(calls.load(Ordering::SeqCst), 1);
-            let failing_keyword = Repository {
-                records: vec![record("m1", false, MemoryStatus::Confirmed)],
-                keyword_fails: true,
-                hydrate_fails: false,
-            };
-            let service = MemoryRetrievalRuntimeService::new(
-                &failing_keyword,
-                &factory,
-                &resolver,
-                &registry,
-            );
-            let result = service.retrieve(request("coffee")).await.unwrap();
-            assert_eq!(result.availability, RetrievalAvailability::VectorOnly);
-            assert!(result
-                .degradation_codes
-                .contains(&RetrievalDegradationCode::KeywordUnavailable));
-        });
-    }
-
-    #[test]
-    fn failed_authoritative_hydration_never_returns_lance_hits() {
-        tauri::async_runtime::block_on(async {
-            let root = TestRoot::new();
-            let resolver = RootResolver(root.0.clone());
-            let index = root.0.join("vectors").join("lancedb");
-            let store = LanceDbVectorStore::open(&index).await.unwrap();
-            store
-                .upsert(VectorRecord {
-                    life_id: "life-a".into(),
-                    memory_id: "forged".into(),
-                    embedding_model: "model-a".into(),
-                    dimension: 2,
-                    vector: vec![1.0, 0.0],
-                    content_hash: "hash".into(),
-                })
-                .await
-                .unwrap();
-            let registry = LanceDbVectorStoreRegistry::default();
-            let factory = Factory {
-                calls: Arc::new(AtomicUsize::new(0)),
-                error: None,
-            };
-            let repository = Repository {
-                records: Vec::new(),
-                keyword_fails: true,
-                hydrate_fails: true,
-            };
-            let service =
-                MemoryRetrievalRuntimeService::new(&repository, &factory, &resolver, &registry);
-            let result = service.retrieve(request("coffee")).await.unwrap();
-            assert!(result.candidates.is_empty());
-            assert!(result
-                .degradation_codes
-                .contains(&RetrievalDegradationCode::AuthoritativeReadUnavailable));
-        });
-    }
-
-    #[test]
-    fn ordinary_token_query_is_not_sensitive_and_invalid_requests_are_rejected() {
-        assert!(!contains_high_risk_credential(
-            "What is an access token used for?"
-        ));
-        assert!(contains_high_risk_credential("api_key=fixture-value-123"));
-        assert_eq!(
-            validate_request(&GovernedRetrievalRequest {
-                life_id: "life".into(),
-                query: " ".into(),
-                memory_kind_filter: None
-            })
-            .unwrap_err()
-            .code,
-            RetrievalRuntimeErrorCode::InvalidRequest
+    fn sensitive_query_skips_semantic_and_preserves_keyword_retrieval() {
+        let memory = record("m1", "life-a", "credential discussion", None);
+        let repository = Repository {
+            records: vec![memory.clone()],
+            authoritative: vec![authoritative(memory, 1)],
+            keyword_fails: false,
+            hydrate_fails: false,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let semantic = semantic(
+            &calls,
+            Ok(vec![GenerationVectorSearchHit::from_test_parts(
+                "m1", 1, "unused", 0.9,
+            )]),
         );
+        let result = tauri::async_runtime::block_on(
+            service(&repository, &semantic)
+                .retrieve(request("Authorization: Bearer fixture-value-123")),
+        )
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(result.availability, RetrievalAvailability::KeywordOnly);
+        assert_eq!(result.candidates[0].sources, RetrievalSource::Keyword);
+        assert!(result
+            .degradation_codes
+            .contains(&RetrievalDegradationCode::VectorSkippedSensitiveQuery));
+    }
+
+    #[test]
+    fn hybrid_happy_path_uses_current_identity_and_sqlite_content() {
+        let memory = record("m1", "life-a", "SQLite authoritative body", Some("summary"));
+        let repository = Repository {
+            records: vec![memory.clone()],
+            authoritative: vec![authoritative(memory.clone(), 4)],
+            keyword_fails: false,
+            hydrate_fails: false,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let semantic = semantic(&calls, Ok(vec![hit(&memory, 4, 0.8)]));
+        let result = tauri::async_runtime::block_on(
+            service(&repository, &semantic).retrieve(request("authoritative")),
+        )
+        .unwrap();
+        assert_eq!(result.availability, RetrievalAvailability::Hybrid);
+        assert_eq!(result.candidates.len(), 1);
+        assert_eq!(result.candidates[0].sources, RetrievalSource::Both);
+        assert_eq!(result.candidates[0].keyword_score, Some(1.0));
+        assert_eq!(result.candidates[0].vector_score, Some(f64::from(0.8_f32)));
+        assert_eq!(result.candidates[0].content, "SQLite authoritative body");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn current_vector_hit_can_supply_vector_only_candidate() {
+        let memory = record("m1", "life-a", "semantic-only body", None);
+        let repository = Repository {
+            records: Vec::new(),
+            authoritative: vec![authoritative(memory.clone(), 1)],
+            keyword_fails: false,
+            hydrate_fails: false,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let semantic = semantic(&calls, Ok(vec![hit(&memory, 1, 0.9)]));
+        let result = tauri::async_runtime::block_on(
+            service(&repository, &semantic).retrieve(request("no lexical match")),
+        )
+        .unwrap();
+        assert_eq!(result.candidates.len(), 1);
+        assert_eq!(result.candidates[0].sources, RetrievalSource::Vector);
+        assert_eq!(result.candidates[0].keyword_score, None);
+        assert_eq!(result.candidates[0].vector_score, Some(f64::from(0.9_f32)));
+    }
+
+    #[test]
+    fn stale_revision_drops_only_vector_score_and_keeps_keyword_candidate() {
+        let memory = record("m1", "life-a", "current body", None);
+        let repository = Repository {
+            records: vec![memory.clone()],
+            authoritative: vec![authoritative(memory.clone(), 5)],
+            keyword_fails: false,
+            hydrate_fails: false,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let semantic = semantic(&calls, Ok(vec![hit(&memory, 4, 0.99)]));
+        let result = tauri::async_runtime::block_on(
+            service(&repository, &semantic).retrieve(request("current body")),
+        )
+        .unwrap();
+        assert_eq!(result.candidates[0].sources, RetrievalSource::Keyword);
+        assert_eq!(result.candidates[0].vector_score, None);
+    }
+
+    #[test]
+    fn stale_hash_drops_vector_score_even_when_revision_matches() {
+        let memory = record("m1", "life-a", "current body", None);
+        let repository = Repository {
+            records: vec![memory.clone()],
+            authoritative: vec![authoritative(memory.clone(), 5)],
+            keyword_fails: false,
+            hydrate_fails: false,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let semantic = semantic(
+            &calls,
+            Ok(vec![GenerationVectorSearchHit::from_test_parts(
+                "m1",
+                5,
+                "stale-hash",
+                0.99,
+            )]),
+        );
+        let result = tauri::async_runtime::block_on(
+            service(&repository, &semantic).retrieve(request("current body")),
+        )
+        .unwrap();
+        assert_eq!(result.candidates[0].sources, RetrievalSource::Keyword);
+        assert_eq!(result.candidates[0].vector_score, None);
+    }
+
+    #[test]
+    fn deleted_sensitive_and_cross_life_hits_do_not_become_candidates() {
+        let sensitive = MemoryRecord {
+            is_sensitive: true,
+            ..record("sensitive", "life-a", "sensitive body", None)
+        };
+        let other_life = record("other", "life-b", "other body", None);
+        let repository = Repository {
+            records: Vec::new(),
+            authoritative: vec![
+                authoritative(sensitive.clone(), 1),
+                authoritative(other_life.clone(), 1),
+            ],
+            keyword_fails: false,
+            hydrate_fails: false,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let semantic = semantic(
+            &calls,
+            Ok(vec![
+                hit(&sensitive, 1, 0.9),
+                hit(&other_life, 1, 0.9),
+                GenerationVectorSearchHit::from_test_parts("deleted", 1, "gone", 0.9),
+            ]),
+        );
+        let result = tauri::async_runtime::block_on(
+            service(&repository, &semantic).retrieve(request("no keyword")),
+        )
+        .unwrap();
+        assert!(result.candidates.is_empty());
+    }
+
+    #[test]
+    fn hard_secret_content_and_summary_are_blocked_after_hydration() {
+        for (content, summary) in [
+            ("api_key=fixture-secret-123", None),
+            ("ordinary content", Some("password=fixture-secret-123")),
+        ] {
+            let memory = record("secret", "life-a", content, summary);
+            let repository = Repository {
+                records: vec![memory.clone()],
+                authoritative: vec![authoritative(memory.clone(), 1)],
+                keyword_fails: false,
+                hydrate_fails: false,
+            };
+            let calls = Arc::new(AtomicUsize::new(0));
+            let semantic = semantic(&calls, Ok(vec![hit(&memory, 1, 0.9)]));
+            let result = tauri::async_runtime::block_on(
+                service(&repository, &semantic).retrieve(request("secret")),
+            )
+            .unwrap();
+            assert!(result.candidates.is_empty());
+        }
+    }
+
+    #[test]
+    fn conflicting_duplicate_identity_disables_semantic_channel() {
+        let memory = record("m1", "life-a", "current", None);
+        let repository = Repository {
+            records: vec![memory.clone()],
+            authoritative: vec![authoritative(memory.clone(), 2)],
+            keyword_fails: false,
+            hydrate_fails: false,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let semantic = semantic(
+            &calls,
+            Ok(vec![
+                hit(&memory, 2, 0.8),
+                GenerationVectorSearchHit::from_test_parts("m1", 3, "conflict", 0.99),
+            ]),
+        );
+        let result = tauri::async_runtime::block_on(
+            service(&repository, &semantic).retrieve(request("current")),
+        )
+        .unwrap();
+        assert_eq!(result.candidates[0].sources, RetrievalSource::Keyword);
+        assert!(result
+            .degradation_codes
+            .contains(&RetrievalDegradationCode::VectorUnavailable));
+    }
+
+    #[test]
+    fn generation_failures_degrade_to_keyword_without_requery() {
+        let memory = record("m1", "life-a", "keyword body", None);
+        for (error, expected) in [
+            (
+                ActiveGenerationRetrievalErrorCode::NoActiveGeneration,
+                RetrievalDegradationCode::VectorIndexUnavailable,
+            ),
+            (
+                ActiveGenerationRetrievalErrorCode::GenerationStoreUnavailable,
+                RetrievalDegradationCode::VectorStoreUnavailable,
+            ),
+            (
+                ActiveGenerationRetrievalErrorCode::GenerationStale,
+                RetrievalDegradationCode::VectorUnavailable,
+            ),
+        ] {
+            let repository = Repository {
+                records: vec![memory.clone()],
+                authoritative: vec![authoritative(memory.clone(), 1)],
+                keyword_fails: false,
+                hydrate_fails: false,
+            };
+            let calls = Arc::new(AtomicUsize::new(0));
+            let semantic = semantic(&calls, Err(error));
+            let result = tauri::async_runtime::block_on(
+                service(&repository, &semantic).retrieve(request("keyword body")),
+            )
+            .unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(result.availability, RetrievalAvailability::KeywordOnly);
+            assert!(result.degradation_codes.contains(&expected));
+            assert_eq!(result.candidates[0].vector_score, None);
+        }
+    }
+
+    #[test]
+    fn authoritative_read_failure_never_returns_unverified_vector_content() {
+        let memory = record("m1", "life-a", "not trusted from lance", None);
+        let repository = Repository {
+            records: vec![memory.clone()],
+            authoritative: Vec::new(),
+            keyword_fails: true,
+            hydrate_fails: true,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let semantic = semantic(&calls, Ok(vec![hit(&memory, 1, 0.99)]));
+        let result = tauri::async_runtime::block_on(
+            service(&repository, &semantic).retrieve(request("not keyword")),
+        )
+        .unwrap();
+        assert!(result.candidates.is_empty());
+        assert!(result
+            .degradation_codes
+            .contains(&RetrievalDegradationCode::AuthoritativeReadUnavailable));
     }
 }

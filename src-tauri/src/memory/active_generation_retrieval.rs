@@ -822,14 +822,11 @@ mod tests {
         }
     }
 
-    fn sqlite_snapshot(
-        storage: &StorageService,
-    ) -> (
-        String,
-        Vec<(String, String, i64)>,
-        Vec<(String, String)>,
-        i64,
-    ) {
+    type GenerationSnapshot = (String, String, i64);
+    type WitnessSnapshot = (String, String);
+    type SqliteSnapshot = (String, Vec<GenerationSnapshot>, Vec<WitnessSnapshot>, i64);
+
+    fn sqlite_snapshot(storage: &StorageService) -> SqliteSnapshot {
         let connection =
             open_authorized_test_connection(&storage.test_database_main_path().unwrap()).unwrap();
         let active = connection

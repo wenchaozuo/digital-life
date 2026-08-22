@@ -6,6 +6,15 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    memory::{
+        candidate_service::contains_prohibited_content,
+        vector_index::{canonical_index_text, canonical_memory_index_hash},
+    },
+    vector_store::GenerationVectorSearchHit,
+};
+
+#[cfg(test)]
+use crate::{
     embedding::{EmbeddingProvider, EmbeddingPurpose, EmbeddingRequest},
     vector_store::{VectorSearchHit, VectorSearchQuery, VectorSpace, VectorStore},
 };
@@ -153,6 +162,7 @@ impl MemoryRetrievalRouterError {
     }
 }
 
+#[cfg(test)]
 pub trait MemoryRetrievalRouterRepository: MemoryRetrievalRepository + Send + Sync {
     fn life_exists(&self, life_id: &str) -> Result<bool, MemoryError>;
 
@@ -163,6 +173,55 @@ pub trait MemoryRetrievalRouterRepository: MemoryRetrievalRepository + Send + Sy
         life_id: &str,
         memory_ids: &[String],
     ) -> Result<Vec<MemoryRecord>, MemoryError>;
+}
+
+/// Current SQLite identity evidence used by the generation-aware retrieval
+/// path. It is deliberately internal and does not cross the IPC boundary.
+#[derive(Clone)]
+pub(crate) struct AuthoritativeRetrievalRecord {
+    memory: MemoryRecord,
+    revision: i64,
+    content_hash: String,
+}
+
+impl AuthoritativeRetrievalRecord {
+    pub(crate) fn from_current(memory: MemoryRecord, revision: i64) -> Result<Self, MemoryError> {
+        if revision <= 0 {
+            return Err(MemoryError::database());
+        }
+        let selected_text = canonical_index_text(memory.summary.as_deref(), &memory.content)
+            .ok_or_else(MemoryError::database)?;
+        let content_hash = canonical_memory_index_hash(
+            memory.kind.as_str(),
+            selected_text,
+            &memory.content,
+            memory.summary.as_deref(),
+        );
+        Ok(Self {
+            memory,
+            revision,
+            content_hash,
+        })
+    }
+
+    pub(crate) fn into_memory(self) -> MemoryRecord {
+        self.memory
+    }
+}
+
+/// Production retrieval repository boundary. Unlike the legacy router
+/// boundary, this path returns the current revision and canonical hash along
+/// with the current governed memory record.
+pub(crate) trait AuthoritativeMemoryRetrievalRepository:
+    MemoryRetrievalRepository + Send + Sync
+{
+    fn life_exists(&self, life_id: &str) -> Result<bool, MemoryError>;
+
+    fn load_authoritative_retrieval_records(
+        &self,
+        life_id: &str,
+        memory_ids: &[String],
+    ) -> Result<Vec<AuthoritativeRetrievalRecord>, MemoryError>;
 }
 
 pub struct MemoryCandidateMerger;
@@ -182,6 +241,12 @@ impl MemoryCandidateMerger {
                 record.life_id == life_id
                     && record.status == MemoryStatus::Confirmed
                     && !record.is_sensitive
+                    && !contains_prohibited_content(&record.content)
+                    && !record
+                        .summary
+                        .as_deref()
+                        .is_some_and(contains_prohibited_content)
+                    && canonical_index_text(record.summary.as_deref(), &record.content).is_some()
                     && kinds.is_none_or(|allowed| allowed.contains(&record.kind))
             })
             .filter_map(|record| {
@@ -224,8 +289,199 @@ impl MemoryCandidateMerger {
         candidates.truncate(limit);
         candidates
     }
+
+    pub(crate) fn merge_authoritative(
+        records: Vec<AuthoritativeRetrievalRecord>,
+        life_id: &str,
+        kinds: Option<&[MemoryKind]>,
+        keyword_scores: &HashMap<String, f64>,
+        vector_scores: &HashMap<String, f64>,
+        limit: usize,
+    ) -> Vec<RetrievalCandidate> {
+        Self::merge(
+            records
+                .into_iter()
+                .map(AuthoritativeRetrievalRecord::into_memory)
+                .collect(),
+            life_id,
+            kinds,
+            keyword_scores,
+            vector_scores,
+            limit,
+        )
+    }
 }
 
+pub(crate) enum SemanticRetrievalOutcome {
+    NotRequested,
+    Available(Vec<GenerationVectorSearchHit>),
+    Unavailable,
+}
+
+pub(crate) async fn retrieve_generation_aware<R>(
+    repository: &R,
+    request: HybridRetrievalRequest,
+    semantic: SemanticRetrievalOutcome,
+) -> Result<HybridRetrievalResult, MemoryRetrievalRouterError>
+where
+    R: AuthoritativeMemoryRetrievalRepository,
+{
+    validate_request(&request)?;
+    match repository.life_exists(&request.life_id) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(MemoryRetrievalRouterError::new(
+                MemoryRetrievalRouterErrorCode::LifeNotFound,
+                "The specified life was not found.",
+                true,
+            ))
+        }
+        Err(_) => return Err(repository_unavailable()),
+    }
+
+    let pool_limit = request
+        .limit
+        .saturating_mul(CANDIDATE_POOL_MULTIPLIER)
+        .min(100);
+    let mut keyword_scores = HashMap::new();
+    let mut keyword_status = KeywordRetrievalStatus::NotRequested;
+    if request.strategy != RetrievalStrategy::VectorOnly {
+        match MemoryRetriever::new(repository).retrieve(RetrievalQuery {
+            life_id: request.life_id.clone(),
+            query_text: request.query.clone(),
+            kinds: request.memory_kind_filter.clone(),
+            limit: pool_limit as u32,
+        }) {
+            Ok(results) => {
+                keyword_status = KeywordRetrievalStatus::Available;
+                for (rank, result) in results.into_iter().enumerate() {
+                    let score = 1.0 / (rank + 1) as f64;
+                    keyword_scores
+                        .entry(result.memory_id)
+                        .and_modify(|current: &mut f64| *current = current.max(score))
+                        .or_insert(score);
+                }
+            }
+            Err(_) if request.strategy == RetrievalStrategy::Hybrid => {
+                keyword_status = KeywordRetrievalStatus::KeywordUnavailable;
+            }
+            Err(_) => {
+                return Err(MemoryRetrievalRouterError::new(
+                    MemoryRetrievalRouterErrorCode::KeywordUnavailable,
+                    "Keyword memory retrieval is unavailable.",
+                    true,
+                ));
+            }
+        }
+    }
+
+    let (mut vector_status, semantic_hits) = match (request.strategy, semantic) {
+        (RetrievalStrategy::KeywordOnly, _) | (_, SemanticRetrievalOutcome::NotRequested) => {
+            (VectorRetrievalStatus::NotRequested, Vec::new())
+        }
+        (_, SemanticRetrievalOutcome::Available(hits)) => (VectorRetrievalStatus::Available, hits),
+        (_, SemanticRetrievalOutcome::Unavailable) => {
+            (VectorRetrievalStatus::VectorUnavailable, Vec::new())
+        }
+    };
+
+    let memory_ids: Vec<_> = keyword_scores
+        .keys()
+        .cloned()
+        .chain(semantic_hits.iter().map(|hit| hit.memory_id().to_owned()))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let records = repository
+        .load_authoritative_retrieval_records(&request.life_id, &memory_ids)
+        .map_err(|_| repository_unavailable())?;
+    let authoritative_count = records.len();
+
+    let vector_scores = if vector_status == VectorRetrievalStatus::Available {
+        match validate_generation_hits(&records, &request.life_id, &semantic_hits) {
+            Ok(scores) => scores,
+            Err(()) => {
+                vector_status = VectorRetrievalStatus::VectorUnavailable;
+                HashMap::new()
+            }
+        }
+    } else {
+        HashMap::new()
+    };
+    let candidates = MemoryCandidateMerger::merge_authoritative(
+        records,
+        &request.life_id,
+        request.memory_kind_filter.as_deref(),
+        &keyword_scores,
+        &vector_scores,
+        request.limit,
+    );
+    Ok(HybridRetrievalResult {
+        candidates,
+        keyword_status,
+        vector_status,
+        trace: Some(RetrievalTrace {
+            keyword_candidate_count: keyword_scores.len(),
+            vector_candidate_count: vector_scores.len(),
+            authoritative_candidate_count: authoritative_count,
+            keyword_status,
+            vector_status,
+        }),
+    })
+}
+
+fn validate_generation_hits(
+    records: &[AuthoritativeRetrievalRecord],
+    life_id: &str,
+    hits: &[GenerationVectorSearchHit],
+) -> Result<HashMap<String, f64>, ()> {
+    let mut identities = HashMap::<String, (i64, String)>::new();
+    for hit in hits {
+        if !hit.score().is_finite() {
+            return Err(());
+        }
+        let identity = (hit.memory_revision(), hit.content_hash().to_owned());
+        if let Some(previous) = identities.get(hit.memory_id()) {
+            if previous != &identity {
+                return Err(());
+            }
+        } else {
+            identities.insert(hit.memory_id().to_owned(), identity);
+        }
+    }
+
+    let records_by_id: HashMap<_, _> = records
+        .iter()
+        .map(|record| (record.memory.id.as_str(), record))
+        .collect();
+    let mut scores = HashMap::new();
+    for hit in hits {
+        let Some(record) = records_by_id.get(hit.memory_id()) else {
+            continue;
+        };
+        if record.memory.life_id != life_id
+            || record.memory.status != MemoryStatus::Confirmed
+            || record.memory.is_sensitive
+            || contains_prohibited_content(&record.memory.content)
+            || record
+                .memory
+                .summary
+                .as_deref()
+                .is_some_and(contains_prohibited_content)
+            || record.revision != hit.memory_revision()
+            || record.content_hash != hit.content_hash()
+        {
+            continue;
+        }
+        scores
+            .entry(hit.memory_id().to_owned())
+            .and_modify(|current: &mut f64| *current = current.max(f64::from(hit.score())))
+            .or_insert_with(|| f64::from(hit.score()));
+    }
+    Ok(scores)
+}
+
+#[cfg(test)]
 pub(crate) struct MemoryRetrievalRouter<'a, R, E, V>
 where
     R: MemoryRetrievalRouterRepository,
@@ -238,6 +494,7 @@ where
     vector_space: VectorSpace,
 }
 
+#[cfg(test)]
 impl<'a, R, E, V> MemoryRetrievalRouter<'a, R, E, V>
 where
     R: MemoryRetrievalRouterRepository,
@@ -463,6 +720,7 @@ fn invalid_request(message: &str) -> MemoryRetrievalRouterError {
     )
 }
 
+#[cfg(test)]
 fn vector_unavailable() -> MemoryRetrievalRouterError {
     MemoryRetrievalRouterError::new(
         MemoryRetrievalRouterErrorCode::VectorUnavailable,

@@ -16,8 +16,8 @@ use crate::{
         },
         retrieval_router::RetrievalSource,
         retrieval_runtime::{
-            GovernedRetrievalRequest, MemoryRetrievalRuntimeService,
-            ModelRuntimeEmbeddingProviderFactory, RetrievalAvailability, RetrievalDegradationCode,
+            GenerationAwareSemanticRetrieval, GovernedRetrievalRequest,
+            MemoryRetrievalRuntimeService, RetrievalAvailability, RetrievalDegradationCode,
         },
     },
     model::{
@@ -251,17 +251,14 @@ where
             .ok_or_else(|| error(ConversationCognitionErrorCode::PersonaNotFound))?;
         let persona = parse_persona(&life, &persona_record)?;
 
-        let factory = ModelRuntimeEmbeddingProviderFactory::new(
+        let model_runtime =
+            ModelRuntimeService::new(self.storage, self.secrets, self.model_coordinator);
+        let semantic = GenerationAwareSemanticRetrieval::new(
             self.storage,
-            self.secrets,
-            self.model_coordinator,
-        );
-        let retrieval = MemoryRetrievalRuntimeService::new(
-            self.storage,
-            &factory,
-            self.storage,
+            &model_runtime,
             self.retrieval_registry,
         );
+        let retrieval = MemoryRetrievalRuntimeService::new(self.storage, &semantic);
         let retrieval_result = retrieval
             .retrieve(GovernedRetrievalRequest {
                 life_id: life.id.clone(),

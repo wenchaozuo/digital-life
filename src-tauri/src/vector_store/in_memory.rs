@@ -5,10 +5,10 @@ use std::{
 
 use super::{
     validate_generation_search_metadata, validate_hash, validate_identifier,
-    ConditionalGenerationDeleteOutcome, GenerationVectorRecord, GenerationVectorSearchHit,
-    GenerationVectorSearchQuery, VectorGenerationContext, VectorGenerationId, VectorMetadataSample,
-    VectorRecord, VectorSearchHit, VectorSearchQuery, VectorSpace, VectorStore, VectorStoreError,
-    VectorStoreErrorCode, VectorStoreFuture,
+    ConditionalGenerationDeleteOutcome, GenerationSearchMetadata, GenerationVectorRecord,
+    GenerationVectorSearchHit, GenerationVectorSearchQuery, VectorGenerationContext,
+    VectorGenerationId, VectorMetadataSample, VectorRecord, VectorSearchHit, VectorSearchQuery,
+    VectorSpace, VectorStore, VectorStoreError, VectorStoreErrorCode, VectorStoreFuture,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -186,16 +186,16 @@ impl VectorStore for InMemoryVectorStore {
                     && record.life_id() == query.life_id()
             }) {
                 record.validate_against(context)?;
-                validate_generation_search_metadata(
+                validate_generation_search_metadata(&GenerationSearchMetadata {
                     context,
-                    record.generation_id().as_str(),
-                    record.life_id(),
-                    record.memory_id(),
-                    record.memory_revision(),
-                    record.content_hash(),
-                    record.descriptor_hash(),
-                    record.dimension(),
-                )?;
+                    generation_id: record.generation_id().as_str(),
+                    life_id: record.life_id(),
+                    memory_id: record.memory_id(),
+                    memory_revision: record.memory_revision(),
+                    content_hash: record.content_hash(),
+                    descriptor_hash: record.descriptor_hash(),
+                    dimension: record.dimension(),
+                })?;
                 let score = Self::cosine_similarity(query.vector(), record.vector());
                 if !score.is_finite() {
                     return Err(VectorStoreError::new(

@@ -18,10 +18,10 @@ use lancedb::{
 
 use super::{
     validate_generation_search_metadata, validate_hash, validate_identifier,
-    ConditionalGenerationDeleteOutcome, GenerationVectorRecord, GenerationVectorSearchHit,
-    GenerationVectorSearchQuery, VectorGenerationContext, VectorGenerationId, VectorMetadataSample,
-    VectorRecord, VectorSearchHit, VectorSearchQuery, VectorSpace, VectorStore, VectorStoreError,
-    VectorStoreErrorCode, VectorStoreFuture,
+    ConditionalGenerationDeleteOutcome, GenerationSearchMetadata, GenerationVectorRecord,
+    GenerationVectorSearchHit, GenerationVectorSearchQuery, VectorGenerationContext,
+    VectorGenerationId, VectorMetadataSample, VectorRecord, VectorSearchHit, VectorSearchQuery,
+    VectorSpace, VectorStore, VectorStoreError, VectorStoreErrorCode, VectorStoreFuture,
 };
 
 const TABLE_PREFIX: &str = "vs_";
@@ -802,16 +802,16 @@ impl LanceDbVectorStore {
                 if dimension < 0 || life_ids.value(row) != query.life_id() {
                     return Err(corrupt());
                 }
-                validate_generation_search_metadata(
+                validate_generation_search_metadata(&GenerationSearchMetadata {
                     context,
-                    generation_ids.value(row),
-                    life_ids.value(row),
-                    memory_ids.value(row),
-                    revisions.value(row),
-                    content_hashes.value(row),
-                    descriptor_hashes.value(row),
-                    dimension as usize,
-                )?;
+                    generation_id: generation_ids.value(row),
+                    life_id: life_ids.value(row),
+                    memory_id: memory_ids.value(row),
+                    memory_revision: revisions.value(row),
+                    content_hash: content_hashes.value(row),
+                    descriptor_hash: descriptor_hashes.value(row),
+                    dimension: dimension as usize,
+                })?;
                 let score = (1.0 - distances.value(row)).clamp(-1.0, 1.0);
                 if !score.is_finite() {
                     return Err(read_failed());

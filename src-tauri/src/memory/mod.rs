@@ -31,6 +31,8 @@ pub mod vector_sync_stage_runtime;
 pub mod vector_sync_worker;
 
 #[cfg(test)]
+mod generation_retrieval_integration_tests;
+#[cfg(test)]
 mod vector_conversation_integration_tests;
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]

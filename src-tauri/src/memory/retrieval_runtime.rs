@@ -195,6 +195,18 @@ where
         request: GovernedRetrievalRequest,
     ) -> Result<GovernedRetrievalResult, RetrievalRuntimeError> {
         validate_request(&request)?;
+        match self.memories.life_exists(&request.life_id) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(runtime_error(RetrievalRuntimeErrorCode::LifeNotFound));
+            }
+            Err(_) => {
+                return Ok(empty_result(vec![
+                    RetrievalDegradationCode::AuthoritativeReadUnavailable,
+                    RetrievalDegradationCode::BothRetrievalUnavailable,
+                ]));
+            }
+        }
         if contains_high_risk_credential(&request.query) {
             return self
                 .retrieve_with_semantic(
@@ -516,6 +528,9 @@ mod tests {
 
     impl AuthoritativeMemoryRetrievalRepository for Repository {
         fn life_exists(&self, life_id: &str) -> Result<bool, MemoryError> {
+            if life_id == "life-error" {
+                return Err(MemoryError::database());
+            }
             Ok(life_id == "life-a")
         }
 
@@ -604,8 +619,12 @@ mod tests {
     }
 
     fn request(query: &str) -> GovernedRetrievalRequest {
+        request_for_life("life-a", query)
+    }
+
+    fn request_for_life(life_id: &str, query: &str) -> GovernedRetrievalRequest {
         GovernedRetrievalRequest {
-            life_id: "life-a".into(),
+            life_id: life_id.into(),
             query: query.into(),
             memory_kind_filter: None,
         }
@@ -645,6 +664,54 @@ mod tests {
         assert!(result
             .degradation_codes
             .contains(&RetrievalDegradationCode::VectorSkippedSensitiveQuery));
+    }
+
+    #[test]
+    fn nonexistent_life_fails_before_semantic_resolution() {
+        let memory = record("m1", "life-a", "not for the missing life", None);
+        let repository = Repository {
+            records: vec![memory.clone()],
+            authoritative: vec![authoritative(memory, 1)],
+            keyword_fails: false,
+            hydrate_fails: false,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let semantic = semantic(
+            &calls,
+            Ok(vec![GenerationVectorSearchHit::from_test_parts(
+                "m1", 1, "unused", 0.9,
+            )]),
+        );
+        let error = tauri::async_runtime::block_on(
+            service(&repository, &semantic).retrieve(request_for_life("missing", "ordinary")),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, RetrievalRuntimeErrorCode::LifeNotFound);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn life_authority_failure_fails_closed_before_semantic_resolution() {
+        let repository = Repository {
+            records: Vec::new(),
+            authoritative: Vec::new(),
+            keyword_fails: false,
+            hydrate_fails: false,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let semantic = semantic(&calls, Ok(Vec::new()));
+        let result = tauri::async_runtime::block_on(
+            service(&repository, &semantic).retrieve(request_for_life("life-error", "ordinary")),
+        )
+        .unwrap();
+        assert_eq!(result.availability, RetrievalAvailability::NoMemory);
+        assert!(result
+            .degradation_codes
+            .contains(&RetrievalDegradationCode::AuthoritativeReadUnavailable));
+        assert!(result
+            .degradation_codes
+            .contains(&RetrievalDegradationCode::BothRetrievalUnavailable));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

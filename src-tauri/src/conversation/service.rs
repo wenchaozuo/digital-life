@@ -21,6 +21,7 @@ use crate::{
         },
     },
     model::{
+        profile::{ModelProfileService, ModelPurpose},
         runtime::{
             ActiveModelChatRequest, ModelRuntimeCoordinator, ModelRuntimeError,
             ModelRuntimeErrorCode, ModelRuntimeService,
@@ -344,6 +345,16 @@ where
             .iter()
             .filter_map(map_retrieval_degradation)
             .collect::<Vec<_>>();
+        if retrieval_result
+            .degradation_codes
+            .contains(&RetrievalDegradationCode::VectorIndexUnavailable)
+            && matches!(
+                ModelProfileService::new(self.storage).get_active(ModelPurpose::Embedding),
+                Ok(None)
+            )
+        {
+            degradations.push(ConversationDegradationCode::NoActiveEmbeddingProfile);
+        }
         if !memory_context.degradation_codes.is_empty()
             && !degradations.contains(&ConversationDegradationCode::MemoryContextUnavailable)
         {
@@ -581,7 +592,13 @@ fn map_retrieval_degradation(
         RetrievalDegradationCode::AuthoritativeReadUnavailable => {
             ConversationDegradationCode::AuthoritativeReadUnavailable
         }
-        _ => ConversationDegradationCode::EmbeddingProviderUnavailable,
+        RetrievalDegradationCode::EmbeddingProviderUnavailable
+        | RetrievalDegradationCode::EmbeddingProfileNotFound
+        | RetrievalDegradationCode::EmbeddingPurposeMismatch
+        | RetrievalDegradationCode::UnsupportedEmbeddingProvider
+        | RetrievalDegradationCode::EmbeddingDimensionMismatch => {
+            ConversationDegradationCode::EmbeddingProviderUnavailable
+        }
     })
 }
 fn error(code: ConversationCognitionErrorCode) -> ConversationCognitionError {
@@ -691,5 +708,74 @@ mod tests {
         drop(independent);
         drop(permit);
         assert!(coordinator.acquire("two", "life", "conversation-a").is_ok());
+    }
+
+    #[test]
+    fn retrieval_degradation_mapping_is_explicit_and_stable() {
+        let expected = [
+            (
+                RetrievalDegradationCode::VectorSkippedSensitiveQuery,
+                ConversationDegradationCode::VectorSkippedSensitiveQuery,
+            ),
+            (
+                RetrievalDegradationCode::NoActiveEmbeddingProfile,
+                ConversationDegradationCode::NoActiveEmbeddingProfile,
+            ),
+            (
+                RetrievalDegradationCode::EmbeddingCredentialNotFound,
+                ConversationDegradationCode::EmbeddingCredentialNotFound,
+            ),
+            (
+                RetrievalDegradationCode::EmbeddingProfileNotFound,
+                ConversationDegradationCode::EmbeddingProviderUnavailable,
+            ),
+            (
+                RetrievalDegradationCode::EmbeddingPurposeMismatch,
+                ConversationDegradationCode::EmbeddingProviderUnavailable,
+            ),
+            (
+                RetrievalDegradationCode::UnsupportedEmbeddingProvider,
+                ConversationDegradationCode::EmbeddingProviderUnavailable,
+            ),
+            (
+                RetrievalDegradationCode::EmbeddingProviderUnavailable,
+                ConversationDegradationCode::EmbeddingProviderUnavailable,
+            ),
+            (
+                RetrievalDegradationCode::EmbeddingDimensionMismatch,
+                ConversationDegradationCode::EmbeddingProviderUnavailable,
+            ),
+            (
+                RetrievalDegradationCode::IndexDirectoryMissing,
+                ConversationDegradationCode::IndexDirectoryMissing,
+            ),
+            (
+                RetrievalDegradationCode::VectorStoreUnavailable,
+                ConversationDegradationCode::VectorStoreUnavailable,
+            ),
+            (
+                RetrievalDegradationCode::VectorIndexUnavailable,
+                ConversationDegradationCode::VectorIndexUnavailable,
+            ),
+            (
+                RetrievalDegradationCode::VectorUnavailable,
+                ConversationDegradationCode::VectorUnavailable,
+            ),
+            (
+                RetrievalDegradationCode::KeywordUnavailable,
+                ConversationDegradationCode::KeywordUnavailable,
+            ),
+            (
+                RetrievalDegradationCode::AuthoritativeReadUnavailable,
+                ConversationDegradationCode::AuthoritativeReadUnavailable,
+            ),
+            (
+                RetrievalDegradationCode::BothRetrievalUnavailable,
+                ConversationDegradationCode::BothRetrievalUnavailable,
+            ),
+        ];
+        for (retrieval, conversation) in expected {
+            assert_eq!(map_retrieval_degradation(&retrieval), Some(conversation));
+        }
     }
 }

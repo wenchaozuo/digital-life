@@ -641,6 +641,11 @@ impl StorageService {
         Ok(self.state()?.active_root.clone())
     }
 
+    #[cfg(test)]
+    pub(crate) fn total_changes_for_test(&self) -> Result<u64, StorageError> {
+        Ok(self.state()?.connection.total_changes())
+    }
+
     pub fn validate_location(&self, candidate: &str) -> StorageLocationValidation {
         let current_root = match self.state() {
             Ok(state) => state.active_root.clone(),

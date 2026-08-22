@@ -9,8 +9,8 @@ mod protocol;
 pub(crate) use openai_compatible::build_openai_compatible_embedding_provider;
 #[allow(unused_imports)]
 pub(crate) use protocol::{
-    EmbeddingBatch, EmbeddingVector, MAX_EMBEDDING_BATCH_MEMORIES, MAX_VECTOR_DIMENSION,
-    PROTOCOL_VERSION,
+    validate_documents, EmbeddingBatch, EmbeddingVector, MAX_EMBEDDING_BATCH_MEMORIES,
+    MAX_VECTOR_DIMENSION, PROTOCOL_VERSION,
 };
 
 use std::{future::Future, pin::Pin};

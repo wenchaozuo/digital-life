@@ -8,6 +8,7 @@ use tauri::State;
 
 use crate::storage::StorageService;
 
+pub(crate) mod active_generation_retrieval;
 pub mod candidate;
 pub mod candidate_confirmation_commands;
 pub mod candidate_service;

@@ -90,6 +90,14 @@ impl ResolvedChatProvider {
 }
 
 impl<'a> ResolvedEmbeddingProvider<'a> {
+    #[cfg(test)]
+    pub(crate) fn from_test_provider(
+        profile: ResolvedModelProfile,
+        provider: Box<dyn EmbeddingProvider + 'a>,
+    ) -> Self {
+        Self { profile, provider }
+    }
+
     pub(crate) fn provider(&self) -> &dyn EmbeddingProvider {
         self.provider.as_ref()
     }

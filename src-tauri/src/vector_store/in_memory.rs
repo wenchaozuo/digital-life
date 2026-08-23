@@ -7,9 +7,12 @@ use super::{
     validate_generation_search_metadata, validate_hash, validate_identifier,
     ConditionalGenerationDeleteOutcome, GenerationSearchMetadata, GenerationVectorRecord,
     GenerationVectorSearchHit, GenerationVectorSearchQuery, VectorGenerationContext,
-    VectorGenerationId, VectorMetadataSample, VectorRecord, VectorSearchHit, VectorSearchQuery,
-    VectorSpace, VectorStore, VectorStoreError, VectorStoreErrorCode, VectorStoreFuture,
+    VectorGenerationId, VectorMetadataSample, VectorRecord, VectorSpace, VectorStore,
+    VectorStoreError, VectorStoreErrorCode, VectorStoreFuture,
 };
+
+#[cfg(test)]
+use super::{VectorSearchHit, VectorSearchQuery};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct RecordKey {
@@ -137,6 +140,7 @@ impl VectorStore for InMemoryVectorStore {
         })
     }
 
+    #[cfg(test)]
     fn search<'a>(
         &'a self,
         query: VectorSearchQuery,

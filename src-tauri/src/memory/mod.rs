@@ -17,7 +17,11 @@ pub mod existing_generation_binding;
 pub mod extraction_commands;
 mod late_delete_resolution_runner;
 pub mod management;
-pub mod retrieval;
+/// Legacy retrieval abstraction. Kept only for historical regression tests:
+/// production governed retrieval (retrieval_router / retrieval_runtime) no
+/// longer depends on this surface, and release builds must not expose it.
+#[cfg(test)]
+pub(crate) mod retrieval;
 pub mod retrieval_router;
 pub mod retrieval_runtime;
 pub mod revisions;
@@ -30,6 +34,8 @@ pub mod vector_sync_outbox;
 pub mod vector_sync_stage_runtime;
 pub mod vector_sync_worker;
 
+#[cfg(test)]
+mod d10_e_reachability_tests;
 #[cfg(test)]
 mod generation_retrieval_integration_tests;
 #[cfg(test)]

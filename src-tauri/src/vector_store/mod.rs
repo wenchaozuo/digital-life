@@ -369,6 +369,10 @@ impl VectorRecord {
     }
 }
 
+/// Legacy space-keyed vector search request.  Retired from the production
+/// surface: D10 governed retrieval only uses generation-aware search, and the
+/// legacy space-keyed search survives only for historical regression tests.
+#[cfg(test)]
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct VectorSearchQuery {
@@ -379,6 +383,7 @@ pub struct VectorSearchQuery {
     pub min_score: Option<f32>,
 }
 
+#[cfg(test)]
 impl VectorSearchQuery {
     pub(crate) fn validate(&self) -> Result<(), VectorStoreError> {
         validate_identifier(&self.life_id, "Life ID")?;
@@ -515,6 +520,8 @@ impl GenerationVectorSearchHit {
 }
 
 /// A hit is only an index reference. Memory content must be loaded from SQLite.
+/// Retired from the production surface; kept for historical regression tests.
+#[cfg(test)]
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct VectorSearchHit {
@@ -575,8 +582,10 @@ impl VectorStoreError {
 /// Internal derived-index API. No implementation may mutate authoritative
 /// memory records as part of these operations.
 ///
-/// Generation methods are additive. Legacy space-keyed methods remain for
-/// production retrieval/index paths and must not silently switch directories.
+/// Generation methods are additive and are the only retrieval surface.
+/// The legacy space-keyed `search` is retired from production and survives
+/// only under `#[cfg(test)]` for historical regression tests; D9 maintenance
+/// keeps using the space-keyed write/delete/index methods.
 pub trait VectorStore: Send + Sync {
     fn upsert<'a>(
         &'a self,
@@ -588,6 +597,7 @@ pub trait VectorStore: Send + Sync {
         records: Vec<VectorRecord>,
     ) -> VectorStoreFuture<'a, Result<(), VectorStoreError>>;
 
+    #[cfg(test)]
     fn search<'a>(
         &'a self,
         query: VectorSearchQuery,

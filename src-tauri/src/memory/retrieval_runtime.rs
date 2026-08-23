@@ -481,10 +481,9 @@ mod tests {
 
     use crate::{
         memory::{
-            retrieval::{MemoryRetrievalRepository, MemoryRetrievalResult, RetrievalQuery},
             retrieval_router::{
                 AuthoritativeMemoryRetrievalRepository, AuthoritativeRetrievalRecord,
-                RetrievalSource,
+                KeywordRetrievalQuery, KeywordRetrievalRepository, RetrievalSource,
             },
             vector_index::{canonical_index_text, canonical_memory_index_hash},
             MemoryError, MemoryRecord, MemorySourceType, MemoryStatus,
@@ -501,11 +500,11 @@ mod tests {
         hydrate_fails: bool,
     }
 
-    impl MemoryRetrievalRepository for Repository {
-        fn retrieve_confirmed(
+    impl KeywordRetrievalRepository for Repository {
+        fn retrieve_keyword_ids(
             &self,
-            _query: &RetrievalQuery,
-        ) -> Result<Vec<MemoryRetrievalResult>, MemoryError> {
+            _query: &KeywordRetrievalQuery,
+        ) -> Result<Vec<String>, MemoryError> {
             if self.keyword_fails {
                 return Err(MemoryError::database());
             }
@@ -513,15 +512,7 @@ mod tests {
                 .records
                 .iter()
                 .filter(|record| record.status == MemoryStatus::Confirmed && !record.is_sensitive)
-                .map(|record| MemoryRetrievalResult {
-                    memory_id: record.id.clone(),
-                    kind: record.kind,
-                    content: record.content.clone(),
-                    summary: record.summary.clone(),
-                    importance: record.importance,
-                    confidence: record.confidence,
-                    created_at: record.created_at.clone(),
-                })
+                .map(|record| record.id.clone())
                 .collect())
         }
     }

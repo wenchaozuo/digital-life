@@ -2,16 +2,91 @@ use rusqlite::{params, params_from_iter, types::Value};
 
 use crate::memory::{
     candidate_service::contains_prohibited_content,
-    retrieval::{MemoryRetrievalRepository, MemoryRetrievalResult, RetrievalQuery},
-    retrieval_router::{AuthoritativeMemoryRetrievalRepository, AuthoritativeRetrievalRecord},
-    MemoryError, MemoryKind, MemoryRecord,
+    retrieval_router::{
+        AuthoritativeMemoryRetrievalRepository, AuthoritativeRetrievalRecord,
+        KeywordRetrievalQuery, KeywordRetrievalRepository,
+    },
+    MemoryError, MemoryRecord,
 };
 
 #[cfg(test)]
-use crate::memory::retrieval_router::MemoryRetrievalRouterRepository;
+use crate::memory::{
+    retrieval::{MemoryRetrievalRepository, MemoryRetrievalResult, RetrievalQuery},
+    retrieval_router::MemoryRetrievalRouterRepository,
+    MemoryKind,
+};
 
 use super::{memory::read_stored_memory, memory::MEMORY_COLUMNS, StorageService};
 
+impl KeywordRetrievalRepository for StorageService {
+    fn retrieve_keyword_ids(
+        &self,
+        query: &KeywordRetrievalQuery,
+    ) -> Result<Vec<String>, MemoryError> {
+        let state = self.state().map_err(|_| MemoryError::database())?;
+        let life_exists: bool = state
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM life_identity WHERE id = ?1)",
+                params![query.life_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| MemoryError::database())?;
+        if !life_exists {
+            return Err(MemoryError::new(
+                "LIFE_NOT_FOUND",
+                "The specified life was not found.",
+                true,
+            ));
+        }
+
+        let terms: Vec<&str> = query.query_text.split_whitespace().collect();
+        let kinds = query.kinds.as_deref().unwrap_or_default();
+        let mut sql = String::from(
+            "SELECT id
+             FROM memory_record
+             WHERE life_id = ? AND status = 'confirmed' AND is_sensitive = 0",
+        );
+        let mut values = vec![Value::Text(query.life_id.clone())];
+
+        for term in terms {
+            sql.push_str(
+                " AND (content LIKE ? ESCAPE '\\' COLLATE NOCASE
+                        OR COALESCE(summary, '') LIKE ? ESCAPE '\\' COLLATE NOCASE)",
+            );
+            let pattern = format!("%{}%", escape_like(term));
+            values.push(Value::Text(pattern.clone()));
+            values.push(Value::Text(pattern));
+        }
+
+        if !kinds.is_empty() {
+            sql.push_str(" AND kind IN (");
+            sql.push_str(&vec!["?"; kinds.len()].join(", "));
+            sql.push(')');
+            values.extend(
+                kinds
+                    .iter()
+                    .map(|kind| Value::Text(kind.as_str().to_string())),
+            );
+        }
+
+        sql.push_str(" ORDER BY importance DESC, created_at DESC, id ASC LIMIT ?");
+        values.push(Value::Integer(i64::from(query.limit)));
+
+        let mut statement = state
+            .connection
+            .prepare(&sql)
+            .map_err(|_| MemoryError::database())?;
+        let rows = statement
+            .query_map(params_from_iter(values), |row| row.get::<_, String>(0))
+            .map_err(|_| MemoryError::database())?;
+
+        rows.map(|row| row.map_err(|_| MemoryError::database()))
+            .collect()
+    }
+}
+
+#[cfg(test)]
 impl MemoryRetrievalRepository for StorageService {
     fn retrieve_confirmed(
         &self,

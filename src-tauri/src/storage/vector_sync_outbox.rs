@@ -4430,7 +4430,10 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 18);
+        assert_eq!(
+            version,
+            super::super::connection::MAX_SUPPORTED_SCHEMA_VERSION
+        );
     }
 
     #[test]
@@ -4470,7 +4473,10 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 18);
+        assert_eq!(
+            version,
+            super::super::connection::MAX_SUPPORTED_SCHEMA_VERSION
+        );
         drop(storage);
 
         let reopened = StorageService::initialize_with_roots(data_root, None).unwrap();

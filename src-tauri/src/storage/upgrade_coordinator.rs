@@ -88,7 +88,7 @@ fn open_after_mutex<G: StorageUpgradeGate>(
         record_upgrade_event("manifest");
         writer_fence_manifest::validate_writer_fence_manifest(&connection)?;
         migration::validate_attempt_claim_identity_schema(&connection)?;
-        migration::validate_generation_catchup_attempt_schema(&connection)?;
+        migration::validate_emotion_authority_schema(&connection)?;
         record_upgrade_event("post-verify");
         migration::verify_schema_after_upgrade(
             &connection,
@@ -182,6 +182,13 @@ fn open_after_mutex<G: StorageUpgradeGate>(
             return Err(StorageError::migration_version_invariant_failed());
         }
         upgraded_version = migration::GENERATION_CATCHUP_ATTEMPT_SCHEMA_VERSION;
+    }
+    if upgraded_version == migration::GENERATION_CATCHUP_ATTEMPT_SCHEMA_VERSION {
+        let emotion_upgrade = migration::apply_emotion_authority_schema_upgrade(&transaction)?;
+        if emotion_upgrade != migration::EmotionAuthoritySchemaUpgrade::Applied {
+            return Err(StorageError::migration_version_invariant_failed());
+        }
+        upgraded_version = migration::EMOTION_AUTHORITY_SCHEMA_VERSION;
     }
     if upgraded_version != connection::MAX_SUPPORTED_SCHEMA_VERSION {
         return Err(StorageError::migration_version_invariant_failed());
@@ -534,6 +541,7 @@ mod tests {
                 || version == migration::LATE_DELETE_RESOLUTION_SCHEMA_VERSION
                 || version == migration::LATE_DELETE_GENERATION_AUTHORITY_SCHEMA_VERSION
                 || version == migration::GENERATION_LIFECYCLE_SCHEMA_VERSION
+                || version == migration::GENERATION_CATCHUP_ATTEMPT_SCHEMA_VERSION
                 || version == connection::MAX_SUPPORTED_SCHEMA_VERSION
         );
         let mut connection = Connection::open(path).unwrap();
@@ -589,10 +597,16 @@ mod tests {
                 migration::GenerationLifecycleSchemaUpgrade::Applied
             );
         }
-        if version == connection::MAX_SUPPORTED_SCHEMA_VERSION {
+        if version >= migration::GENERATION_CATCHUP_ATTEMPT_SCHEMA_VERSION {
             assert_eq!(
                 migration::apply_generation_catchup_attempt_schema_upgrade(&transaction).unwrap(),
                 migration::GenerationCatchupAttemptSchemaUpgrade::Applied
+            );
+        }
+        if version >= migration::EMOTION_AUTHORITY_SCHEMA_VERSION {
+            assert_eq!(
+                migration::apply_emotion_authority_schema_upgrade(&transaction).unwrap(),
+                migration::EmotionAuthoritySchemaUpgrade::Applied
             );
         }
         transaction.commit().unwrap();
@@ -1174,11 +1188,12 @@ mod tests {
             connection::MAX_SUPPORTED_SCHEMA_VERSION
         );
         migration::validate_attempt_claim_identity_schema(&state.connection).unwrap();
-        // The schema is at 18, so the version-17 lifecycle validator cannot
-        // run; the full 45-trigger writer fence plus the exact Schema-18
-        // catch-up validator prove the complete chain was applied.
-        migration::validate_generation_catchup_attempt_schema(&state.connection).unwrap();
-        assert_eq!(writer_fence_count(&state.connection), 45);
+        // The schema is at 19, so the version-17 lifecycle validator cannot
+        // run alone; the full 51-trigger writer fence plus the exact Schema-19
+        // emotion validator (which re-validates the Schema-18 catch-up
+        // objects) prove the complete chain was applied.
+        migration::validate_emotion_authority_schema(&state.connection).unwrap();
+        assert_eq!(writer_fence_count(&state.connection), 51);
         assert_eq!(
             take_upgrade_events(),
             vec![
@@ -1214,13 +1229,78 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(writer_fence_count, 45);
+        assert_eq!(writer_fence_count, 51);
         migration::validate_attempt_claim_identity_schema(&connection).unwrap();
-        // The schema is at 18, so the version-17 lifecycle validator cannot
-        // run; the full 45-trigger writer fence plus the exact Schema-18
-        // catch-up validator prove the complete chain was applied.
-        migration::validate_generation_catchup_attempt_schema(&connection).unwrap();
+        // The schema is at 19, so the version-17 lifecycle validator cannot
+        // run alone; the full 51-trigger writer fence plus the exact Schema-19
+        // emotion validator (which re-validates the Schema-18 catch-up
+        // objects) prove the complete chain was applied.
+        migration::validate_emotion_authority_schema(&connection).unwrap();
         assert_eq!(gate.inspection_calls.get(), 2);
+    }
+
+    #[test]
+    fn d11_b1_coordinator_upgrades_schema_eighteen_with_lives_to_nineteen_and_backfills() {
+        let _ = take_upgrade_events();
+        let (_root, path) = database_path("schema-eighteen-emotion-upgrade");
+        prepare_schema_version(&path, migration::GENERATION_CATCHUP_ATTEMPT_SCHEMA_VERSION);
+        {
+            // Seed two lives on the real Schema-18 preimage before the
+            // coordinated open, exactly like a historical installation.
+            let authorized = connection::open_authorized_test_connection(&path).unwrap();
+            authorized
+                .execute_batch(
+                    "INSERT INTO persona_template (id, name, version, persona_json)
+                     VALUES ('persona-e', 'Persona', 1, '{}');
+                     INSERT INTO life_identity
+                         (id, name, created_at, version, body_id, persona_id, persona_version)
+                     VALUES
+                         ('life-e1', 'Life E1', '2026-08-23T00:00:00.000Z', 1,
+                          'body-e1', 'persona-e', 1),
+                         ('life-e2', 'Life E2', '2026-08-23T00:00:00.000Z', 1,
+                          'body-e2', 'persona-e', 1);",
+                )
+                .unwrap();
+            drop(authorized);
+        }
+
+        let gate = FakeGate::clear();
+        let connection = open_coordinated_storage_connection_with_gate(&path, &gate).unwrap();
+        assert_eq!(
+            connection::read_schema_version(&connection).unwrap(),
+            connection::MAX_SUPPORTED_SCHEMA_VERSION
+        );
+        migration::validate_emotion_authority_schema(&connection).unwrap();
+        let neutral_rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM emotion_state
+                 WHERE (life_id, valence, activation, revision, policy_version)
+                    IN (('life-e1', 0, 0, 0, 1), ('life-e2', 0, 0, 0, 1))",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(neutral_rows, 2);
+        let covered: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM life_identity l
+                 LEFT JOIN emotion_state s ON s.life_id = l.id
+                 WHERE s.life_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(covered, 0);
+        let writer_fence_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type='trigger' AND name GLOB 'digital_life_writer_epoch_*'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(writer_fence_count, 51);
+        assert_eq!(journal_mode(&path), "wal");
     }
 
     #[test]
@@ -1261,7 +1341,7 @@ mod tests {
             connection::read_schema_version(&connection).unwrap(),
             connection::MAX_SUPPORTED_SCHEMA_VERSION
         );
-        migration::validate_generation_catchup_attempt_schema(&connection).unwrap();
+        migration::validate_emotion_authority_schema(&connection).unwrap();
         let table_exists: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='memory_vector_generation_rebuild_catchup_item'",
@@ -1291,8 +1371,8 @@ mod tests {
         assert!(
             supersede_body.contains("RAISE(ABORT, 'GENERATION_REBUILD_CATCHUP_SUPERSEDE_UNSAFE')")
         );
-        // The three Schema18 writer fences are installed alongside the 45
-        // earlier writer fences.
+        // The three Schema18 writer fences and the six Schema19 emotion writer
+        // fences are installed alongside the older writer fences.
         let writer_fence_total: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_schema WHERE type='trigger' AND name GLOB 'digital_life_writer_epoch_*'",
@@ -1300,7 +1380,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(writer_fence_total, 45);
+        assert_eq!(writer_fence_total, 51);
 
         // C snapshot table semantics are unchanged by the 17→18 upgrade.
         let c_snapshot_sql_after: String = connection
@@ -1359,7 +1439,7 @@ mod tests {
             connection::read_schema_version(&connection).unwrap(),
             connection::MAX_SUPPORTED_SCHEMA_VERSION
         );
-        migration::validate_generation_catchup_attempt_schema(&connection).unwrap();
+        migration::validate_emotion_authority_schema(&connection).unwrap();
         assert_eq!(journal_mode(&path), "wal");
     }
 
@@ -1375,7 +1455,7 @@ mod tests {
             connection::read_schema_version(&connection).unwrap(),
             connection::MAX_SUPPORTED_SCHEMA_VERSION
         );
-        migration::validate_generation_catchup_attempt_schema(&connection).unwrap();
+        migration::validate_emotion_authority_schema(&connection).unwrap();
         assert_eq!(journal_mode(&path), "wal");
         assert_eq!(
             take_upgrade_events(),
@@ -1636,7 +1716,7 @@ mod tests {
                     applied_at TEXT NOT NULL
                 );
                 INSERT INTO schema_migration (version, name, applied_at)
-                VALUES (19, 'future', '2026-01-01T00:00:00Z');",
+                VALUES (20, 'future', '2026-01-01T00:00:00Z');",
             )
             .unwrap();
         drop(connection);
@@ -1666,7 +1746,7 @@ mod tests {
                     applied_at TEXT NOT NULL
                 );
                 INSERT INTO schema_migration (version, name, applied_at)
-                VALUES (19, 'future', '2026-01-01T00:00:00Z')",
+                VALUES (20, 'future', '2026-01-01T00:00:00Z')",
             )
             .unwrap();
         drop(connection);
@@ -1889,8 +1969,8 @@ mod tests {
                 connection::MAX_SUPPORTED_SCHEMA_VERSION
             );
             migration::validate_attempt_claim_identity_schema(&connection).unwrap();
-            migration::validate_generation_catchup_attempt_schema(&connection).unwrap();
-            assert_eq!(writer_fence_count(&connection), 45);
+            migration::validate_emotion_authority_schema(&connection).unwrap();
+            assert_eq!(writer_fence_count(&connection), 51);
             assert_eq!(journal_mode(&path), "delete");
             assert_eq!(
                 take_upgrade_events(),
@@ -2112,8 +2192,8 @@ mod tests {
                 "version-13 competition repetition {repetition}"
             );
             migration::validate_attempt_claim_identity_schema(&state.connection).unwrap();
-            migration::validate_generation_catchup_attempt_schema(&state.connection).unwrap();
-            assert_eq!(writer_fence_count(&state.connection), 45);
+            migration::validate_emotion_authority_schema(&state.connection).unwrap();
+            assert_eq!(writer_fence_count(&state.connection), 51);
         }
     }
 
@@ -2190,9 +2270,9 @@ mod tests {
                     .unwrap(),
                 (0, 0)
             );
-            assert_eq!(writer_fence_count(&state.connection), 45);
+            assert_eq!(writer_fence_count(&state.connection), 51);
             migration::validate_attempt_claim_identity_schema(&state.connection).unwrap();
-            migration::validate_generation_catchup_attempt_schema(&state.connection).unwrap();
+            migration::validate_emotion_authority_schema(&state.connection).unwrap();
         }
     }
 
@@ -2660,7 +2740,7 @@ mod tests {
             connection::read_schema_version(&connection).unwrap(),
             connection::MAX_SUPPORTED_SCHEMA_VERSION
         );
-        migration::validate_generation_catchup_attempt_schema(&connection).unwrap();
+        migration::validate_emotion_authority_schema(&connection).unwrap();
         for (table, column) in [
             ("memory_vector_sync_outbox", "delete_witness_at"),
             (
@@ -2691,7 +2771,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(semantic_trigger_count, 3);
-        assert_eq!(writer_fence_count(&connection), 45);
+        assert_eq!(writer_fence_count(&connection), 51);
         // Historical data semantics in the new world.
         let outbox_witness: Option<String> = connection
             .query_row(

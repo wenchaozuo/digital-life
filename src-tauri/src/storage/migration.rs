@@ -20,6 +20,17 @@ const GENERATION_LIFECYCLE_MIGRATION_NAME: &str = "017_vector_generation_lifecyc
 pub(super) const GENERATION_CATCHUP_ATTEMPT_SCHEMA_VERSION: i64 = 18;
 const GENERATION_CATCHUP_ATTEMPT_MIGRATION_NAME: &str =
     "018_vector_generation_catchup_attempt_identity";
+pub(super) const EMOTION_AUTHORITY_SCHEMA_VERSION: i64 = 19;
+const EMOTION_AUTHORITY_MIGRATION_NAME: &str = "019_emotion_authority";
+const CREATE_EMOTION_STATE_TABLE_SQL: &str =
+    include_str!("migrations/019_emotion_authority.state.sql");
+const CREATE_EMOTION_EVENT_TABLE_SQL: &str =
+    include_str!("migrations/019_emotion_authority.event.sql");
+/// Schema 19 Phase C: the exact neutral-state initializer. Every future
+/// `life_identity` INSERT automatically receives exactly one neutral
+/// `emotion_state` row in the same statement.
+const CREATE_EMOTION_STATE_INITIALIZER_TRIGGER_SQL: &str =
+    include_str!("migrations/019_emotion_authority.initializer_trigger.sql");
 const ADD_CLAIMED_GENERATION_AUTHORITY_EPOCH_SQL: &str = "ALTER TABLE memory_vector_sync_outbox ADD COLUMN claimed_generation_authority_epoch INTEGER NULL CHECK (claimed_generation_authority_epoch IS NULL OR claimed_generation_authority_epoch >= 1)";
 const CREATE_GENERATION_AUTHORITY_TABLE_SQL: &str =
     "CREATE TABLE memory_vector_generation_authority (
@@ -190,6 +201,11 @@ pub(super) enum GenerationLifecycleSchemaUpgrade {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum GenerationCatchupAttemptSchemaUpgrade {
+    Applied,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum EmotionAuthoritySchemaUpgrade {
     Applied,
 }
 
@@ -970,6 +986,245 @@ pub(super) fn apply_generation_catchup_attempt_schema_upgrade(
     Ok(GenerationCatchupAttemptSchemaUpgrade::Applied)
 }
 
+/// Schema 19 adds the D11 emotion authority: one authoritative
+/// `emotion_state` row per life and the immutable `emotion_event` ledger.
+/// The caller owns the transaction and version 19 is recorded only after the
+/// tables, existing-life neutral backfill, neutral-state initializer trigger,
+/// writer fences, and validation all agree.
+pub(super) fn apply_emotion_authority_schema_upgrade(
+    transaction: &Transaction<'_>,
+) -> Result<EmotionAuthoritySchemaUpgrade, StorageError> {
+    if connection::read_schema_version(transaction)? != GENERATION_CATCHUP_ATTEMPT_SCHEMA_VERSION {
+        return Err(StorageError::migration_version_invariant_failed());
+    }
+    // Phase A: the two authoritative tables. Each failpoint fires after its own
+    // durable boundary has been reached (mirroring Schema 18's AfterTable
+    // boundary): the AfterStateTable failpoint means the state table exists
+    // but the event table does not yet.
+    transaction
+        .execute_batch(CREATE_EMOTION_STATE_TABLE_SQL)
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    #[cfg(test)]
+    if should_fail_migration_019_at_for_test(Migration019Failpoint::AfterStateTable) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    transaction
+        .execute_batch(CREATE_EMOTION_EVENT_TABLE_SQL)
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    #[cfg(test)]
+    if should_fail_migration_019_at_for_test(Migration019Failpoint::AfterEventTable) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    // Phase B: existing-life neutral backfill. This runs before any emotion
+    // writer fence exists, so the migration connection needs no writer
+    // capability; the backfill count must cover every life exactly once.
+    let life_count: i64 = transaction
+        .query_row("SELECT COUNT(*) FROM life_identity", [], |row| row.get(0))
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    let migration_now: String = transaction
+        .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |row| {
+            row.get(0)
+        })
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    transaction
+        .execute(
+            "INSERT INTO emotion_state
+                (life_id, valence, activation, revision, policy_version,
+                 last_applied_at, updated_at)
+             SELECT id, 0, 0, 0, 1, ?1, ?1 FROM life_identity",
+            params![migration_now],
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    let backfilled_state_count: i64 = transaction
+        .query_row("SELECT COUNT(*) FROM emotion_state", [], |row| row.get(0))
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    if backfilled_state_count != life_count {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    #[cfg(test)]
+    if should_fail_migration_019_at_for_test(Migration019Failpoint::AfterBackfill) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    // Phase C: neutral-state initialization for every future life insert.
+    // The exact trigger body is authority-bearing and validated below.
+    transaction
+        .execute_batch(CREATE_EMOTION_STATE_INITIALIZER_TRIGGER_SQL)
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    #[cfg(test)]
+    if should_fail_migration_019_at_for_test(Migration019Failpoint::AfterInitializerTrigger) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    // Phase D: install the emotion writer fences so raw legacy connections
+    // can never write emotion authority.
+    writer_fence_manifest::install_emotion_writer_fence_manifest_in_transaction(transaction)?;
+    #[cfg(test)]
+    if should_fail_migration_019_at_for_test(Migration019Failpoint::AfterWriterFences) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    // Phase E: validate the complete object set (tables, FKs, trigger, data
+    // invariants) before the version boundary.
+    validate_emotion_authority_schema_objects(transaction)?;
+    #[cfg(test)]
+    if should_fail_migration_019_at_for_test(Migration019Failpoint::BeforeSchemaVersion) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    // Phase F: write the schema_migration version 19 row.
+    transaction
+        .execute(
+            "INSERT INTO schema_migration (version,name,applied_at) VALUES (?1,?2,?3)",
+            params![
+                EMOTION_AUTHORITY_SCHEMA_VERSION,
+                EMOTION_AUTHORITY_MIGRATION_NAME,
+                migration_now
+            ],
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    #[cfg(test)]
+    if should_fail_migration_019_at_for_test(Migration019Failpoint::PreCommit) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    validate_emotion_authority_schema_objects(transaction)?;
+    Ok(EmotionAuthoritySchemaUpgrade::Applied)
+}
+
+pub(super) fn validate_emotion_authority_schema(
+    connection: &Connection,
+) -> Result<(), StorageError> {
+    if connection::read_schema_version(connection)? != EMOTION_AUTHORITY_SCHEMA_VERSION {
+        return Err(StorageError::migration_version_invariant_failed());
+    }
+    validate_emotion_authority_schema_objects(connection)
+}
+
+fn validate_emotion_authority_schema_objects(connection: &Connection) -> Result<(), StorageError> {
+    // The frozen domains and constraints are proven from SQLite's own
+    // persisted DDL: a normalized full-statement comparison represents CHECK
+    // expressions and table constraints that `PRAGMA table_info` cannot.
+    for (table, expected_sql) in [
+        ("emotion_state", CREATE_EMOTION_STATE_TABLE_SQL),
+        ("emotion_event", CREATE_EMOTION_EVENT_TABLE_SQL),
+    ] {
+        let actual: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type='table' AND name=?1",
+                [table],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| StorageError::migration_transaction_failed())?;
+        let Some(actual) = actual else {
+            return Err(StorageError::migration_transaction_failed());
+        };
+        if normalized_frozen_object_sql(&actual) != normalized_frozen_object_sql(expected_sql) {
+            return Err(StorageError::migration_transaction_failed());
+        }
+    }
+    // Life isolation and deletion cascade come from SQLite's own FK metadata.
+    for table in ["emotion_state", "emotion_event"] {
+        let cascade_fk: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_list(?1)
+                 WHERE \"table\"='life_identity' AND \"from\"='life_id'
+                   AND on_delete='CASCADE'",
+                [table],
+                |row| row.get(0),
+            )
+            .map_err(|_| StorageError::migration_transaction_failed())?;
+        if cascade_fk != 1 {
+            return Err(StorageError::migration_transaction_failed());
+        }
+    }
+    // The neutral-state initializer must be exact, not merely present.
+    let trigger_sql: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema
+             WHERE type='trigger' AND name='emotion_state_life_insert_initializer'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    let Some(trigger_sql) = trigger_sql else {
+        return Err(StorageError::migration_transaction_failed());
+    };
+    if normalized_frozen_object_sql(&trigger_sql)
+        != normalized_frozen_object_sql(CREATE_EMOTION_STATE_INITIALIZER_TRIGGER_SQL)
+    {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    // Exactly one authoritative state row per life.
+    let missing_state_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM life_identity AS l
+              LEFT JOIN emotion_state AS s ON s.life_id = l.id
+             WHERE s.life_id IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    if missing_state_count != 0 {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    // Row-level frozen invariants.
+    let invalid_state_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM emotion_state
+             WHERE valence NOT BETWEEN -1000 AND 1000
+                OR activation NOT BETWEEN -1000 AND 1000
+                OR revision < 0
+                OR policy_version <= 0
+                OR last_applied_at = ''
+                OR updated_at = ''",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    if invalid_state_count != 0 {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    let invalid_event_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM emotion_event
+             WHERE source_kind = ''
+                OR source_ref = ''
+                OR valence_delta NOT BETWEEN -1000 AND 1000
+                OR activation_delta NOT BETWEEN -1000 AND 1000
+                OR applied_revision <= 0
+                OR event_time = ''
+                OR policy_version <= 0
+                OR created_at = ''",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    if invalid_event_count != 0 {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    // Both frozen UNIQUE constraints must actually exist as UNIQUE-origin
+    // autoindexes (origin 'u'); the TEXT PRIMARY KEY also creates a unique
+    // pk-origin autoindex and must not be counted here.
+    let unique_index_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_index_list('emotion_event')
+             WHERE \"unique\" = 1 AND origin = 'u'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    if unique_index_count != 2 {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    // The Schema 18 catch-up objects stay validated on Schema 19 (without the
+    // schema-18 manifest selection, which cannot see the six new emotion
+    // fence triggers), and the complete 51-trigger writer fence must be
+    // present.
+    validate_generation_catchup_attempt_schema_objects_inner(connection)?;
+    writer_fence_manifest::validate_writer_fence_manifest_for_schema(
+        connection,
+        EMOTION_AUTHORITY_SCHEMA_VERSION,
+    )
+}
+
 pub(super) fn validate_generation_catchup_attempt_schema(
     connection: &Connection,
 ) -> Result<(), StorageError> {
@@ -979,7 +1234,24 @@ pub(super) fn validate_generation_catchup_attempt_schema(
     validate_generation_catchup_attempt_schema_objects(connection)
 }
 
+/// Validates the complete Schema-18 object set, including its own writer-fence
+/// manifest selection. Only valid when the database has no later fence
+/// triggers (that is, at schema 18).
 fn validate_generation_catchup_attempt_schema_objects(
+    connection: &Connection,
+) -> Result<(), StorageError> {
+    validate_generation_catchup_attempt_schema_objects_inner(connection)?;
+    writer_fence_manifest::validate_writer_fence_manifest_for_schema(
+        connection,
+        GENERATION_CATCHUP_ATTEMPT_SCHEMA_VERSION,
+    )
+}
+
+/// Validates the Schema-18 catch-up objects (table DDL, columns, FK, semantic
+/// triggers) WITHOUT the writer-fence manifest check, so later schemas can
+/// keep validating these objects while selecting the manifest for their own
+/// version.
+fn validate_generation_catchup_attempt_schema_objects_inner(
     connection: &Connection,
 ) -> Result<(), StorageError> {
     // The frozen domains and cross-field semantics are proven from SQLite's own
@@ -1062,10 +1334,7 @@ fn validate_generation_catchup_attempt_schema_objects(
             return Err(StorageError::migration_transaction_failed());
         }
     }
-    writer_fence_manifest::validate_writer_fence_manifest_for_schema(
-        connection,
-        GENERATION_CATCHUP_ATTEMPT_SCHEMA_VERSION,
-    )
+    Ok(())
 }
 
 fn validate_late_delete_generation_authority_schema_objects(
@@ -1472,6 +1741,13 @@ fn normalize_schema_fragment(value: &str) -> String {
         .collect()
 }
 
+/// SQLite stores object SQL without the terminating semicolon; frozen
+/// migration files may include one. Strip trailing semicolons from both
+/// sides before the exact normalized comparison.
+fn normalized_frozen_object_sql(value: &str) -> String {
+    normalize_schema_fragment(value.trim_end_matches(';'))
+}
+
 fn normalized_top_level_column_definitions(table_sql: &str) -> Option<Vec<String>> {
     let opening = table_sql.find('(')?;
     let body = &table_sql[opening + 1..];
@@ -1599,6 +1875,9 @@ pub(super) fn verify_schema_after_upgrade(
     }
     if expected_schema_version == GENERATION_CATCHUP_ATTEMPT_SCHEMA_VERSION {
         validate_generation_catchup_attempt_schema(connection)?;
+    }
+    if expected_schema_version == EMOTION_AUTHORITY_SCHEMA_VERSION {
+        validate_emotion_authority_schema(connection)?;
     }
     if expected_schema_version >= writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION {
         #[cfg(test)]
@@ -1829,6 +2108,47 @@ pub(super) fn fail_next_migration_018_at_for_test(failpoint: Migration018Failpoi
 #[cfg(test)]
 fn should_fail_migration_018_at_for_test(failpoint: Migration018Failpoint) -> bool {
     MIGRATION_018_FAILPOINT.with(|next| {
+        if next.get() == Some(failpoint) {
+            next.set(None);
+            true
+        } else {
+            false
+        }
+    })
+}
+
+/// Test-only failure points for the single Schema-19 emotion-authority
+/// transaction. Each variant fires after its own durable boundary has been
+/// reached inside the caller-owned transaction, so the whole upgrade (tables,
+/// backfill, initializer trigger, writer fences, validators, version row)
+/// rolls back as one atomic unit.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Migration019Failpoint {
+    AfterStateTable,
+    AfterEventTable,
+    AfterBackfill,
+    AfterInitializerTrigger,
+    AfterWriterFences,
+    BeforeSchemaVersion,
+    PreCommit,
+}
+
+#[cfg(test)]
+thread_local! {
+    static MIGRATION_019_FAILPOINT: std::cell::Cell<Option<Migration019Failpoint>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(super) fn fail_next_migration_019_at_for_test(failpoint: Migration019Failpoint) {
+    MIGRATION_019_FAILPOINT.with(|next| next.set(Some(failpoint)));
+}
+
+#[cfg(test)]
+fn should_fail_migration_019_at_for_test(failpoint: Migration019Failpoint) -> bool {
+    MIGRATION_019_FAILPOINT.with(|next| {
         if next.get() == Some(failpoint) {
             next.set(None);
             true
@@ -2462,6 +2782,55 @@ mod transaction_tests {
         transaction.commit().unwrap();
     }
 
+    fn schema_eighteen_connection() -> Connection {
+        let mut connection = schema_seventeen_connection();
+        apply_generation_catchup_attempt_upgrade(&mut connection);
+        assert_eq!(
+            schema_version(&connection),
+            GENERATION_CATCHUP_ATTEMPT_SCHEMA_VERSION
+        );
+        connection
+    }
+
+    fn apply_emotion_authority_upgrade(connection: &mut Connection) {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert_eq!(
+            apply_emotion_authority_schema_upgrade(&transaction).unwrap(),
+            EmotionAuthoritySchemaUpgrade::Applied
+        );
+        transaction.commit().unwrap();
+    }
+
+    fn seed_lives_at_schema_eighteen(connection: &Connection) -> i64 {
+        // Lives are inserted before Schema 19 exists, so no initializer
+        // trigger or emotion writer fence is involved yet.
+        connection
+            .execute(
+                "INSERT INTO persona_template (id, name, version, persona_json)
+                 VALUES ('persona-a', 'Persona', 1, '{}')",
+                [],
+            )
+            .unwrap();
+        for (id, name) in [
+            ("life-a", "Life A"),
+            ("life-b", "Life B"),
+            ("life-c", "Life C"),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO life_identity
+                 (id, name, created_at, version, body_id, persona_id, persona_version)
+                 VALUES
+                 (?1, ?2, '2026-08-23T00:00:00.000Z', 1, ?3, 'persona-a', 1)",
+                    rusqlite::params![id, name, format!("body-{id}")],
+                )
+                .unwrap();
+        }
+        3
+    }
+
     #[test]
     fn migration_018_schema_seventeen_to_eighteen_is_atomic_and_preserves_c_snapshot_schema() {
         let mut connection = schema_seventeen_connection();
@@ -2503,6 +2872,313 @@ mod transaction_tests {
             )
             .unwrap();
         assert_eq!(writer_fence_count, 45);
+    }
+
+    #[test]
+    fn migration_019_schema_eighteen_to_nineteen_is_atomic_and_preserves_schema_eighteen() {
+        let mut connection = schema_eighteen_connection();
+        let catchup_table_sql: String = connection.query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='table' AND name='memory_vector_generation_rebuild_catchup_item'",
+            [], |row| row.get(0),
+        ).unwrap();
+        apply_emotion_authority_upgrade(&mut connection);
+
+        assert_eq!(
+            schema_version(&connection),
+            EMOTION_AUTHORITY_SCHEMA_VERSION
+        );
+        validate_emotion_authority_schema(&connection).unwrap();
+        for table in ["emotion_state", "emotion_event"] {
+            let exists: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name=?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 1);
+        }
+        let version_name: String = connection
+            .query_row(
+                "SELECT name FROM schema_migration WHERE version=?1",
+                [EMOTION_AUTHORITY_SCHEMA_VERSION],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version_name, EMOTION_AUTHORITY_MIGRATION_NAME);
+        // The Schema 18 catch-up table DDL is byte-for-byte unchanged.
+        let catchup_after: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type='table' AND name='memory_vector_generation_rebuild_catchup_item'",
+                [], |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(catchup_after, catchup_table_sql);
+        assert_eq!(
+            writer_fence_manifest::emotion_writer_fence_trigger_specs().len(),
+            6
+        );
+        // Exactly 18 + 6 + 18 + 3 + 6 = 51 writer fences.
+        let writer_fence_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type='trigger' AND name GLOB 'digital_life_writer_epoch_*'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(writer_fence_count, 51);
+    }
+
+    #[test]
+    fn migration_019_backfills_neutral_state_for_every_existing_life() {
+        let mut connection = schema_eighteen_connection();
+        let life_count = seed_lives_at_schema_eighteen(&connection);
+        assert_eq!(life_count, 3);
+        assert_eq!(
+            schema_version(&connection),
+            GENERATION_CATCHUP_ATTEMPT_SCHEMA_VERSION
+        );
+
+        apply_emotion_authority_upgrade(&mut connection);
+
+        let state_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM emotion_state", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(state_count, life_count);
+        let neutral_invariants: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM emotion_state
+                 WHERE valence <> 0 OR activation <> 0 OR revision <> 0
+                    OR policy_version <> 1 OR last_applied_at = '' OR updated_at = ''",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(neutral_invariants, 0);
+        let life_mapping: Vec<(String, String)> = connection
+            .prepare("SELECT l.id, s.life_id FROM life_identity l LEFT JOIN emotion_state s ON s.life_id=l.id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(life_mapping.len(), 3);
+        for (life_id, state_life_id) in life_mapping {
+            assert_eq!(life_id, state_life_id);
+        }
+    }
+
+    #[test]
+    fn migration_019_initializer_creates_exactly_one_neutral_row_per_new_life() {
+        let mut connection = schema_eighteen_connection();
+        apply_emotion_authority_upgrade(&mut connection);
+        connection
+            .execute(
+                "INSERT INTO persona_template (id, name, version, persona_json)
+                 VALUES ('persona-a', 'Persona', 1, '{}')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO life_identity
+                 (id, name, created_at, version, body_id, persona_id, persona_version)
+                 VALUES ('life-new', 'Life New', '2026-08-23T00:00:00.000Z', 1,
+                         'body', 'persona-a', 1)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO life_identity
+                 (id, name, created_at, version, body_id, persona_id, persona_version)
+                 VALUES ('life-newer', 'Life Newer', '2026-08-23T00:00:00.000Z', 1,
+                         'body', 'persona-a', 1)",
+                [],
+            )
+            .unwrap();
+
+        let state_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM emotion_state", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(state_count, 2);
+        for life_id in ["life-new", "life-newer"] {
+            let (valence, activation, revision, policy_version): (i64, i64, i64, i64) = connection
+                .query_row(
+                    "SELECT valence, activation, revision, policy_version
+                     FROM emotion_state WHERE life_id=?1",
+                    [life_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                (valence, activation, revision, policy_version),
+                (0, 0, 0, 1)
+            );
+        }
+        // An UPSERT that only updates an existing life must not create a
+        // second state row (AFTER INSERT triggers fire only on the insert arm).
+        connection
+            .execute(
+                "INSERT INTO life_identity
+                 (id, name, created_at, version, body_id, persona_id, persona_version)
+                 VALUES ('life-new', 'Life New renamed', '2026-08-23T00:00:00.000Z', 2,
+                         'body', 'persona-a', 1)
+                 ON CONFLICT(id) DO UPDATE SET version = excluded.version",
+                [],
+            )
+            .unwrap();
+        let state_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM emotion_state", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(state_count, 2);
+    }
+
+    #[test]
+    fn migration_019_missing_initializer_trigger_fails_validation_without_repair() {
+        let mut connection = schema_eighteen_connection();
+        apply_emotion_authority_upgrade(&mut connection);
+        connection
+            .execute_batch("DROP TRIGGER emotion_state_life_insert_initializer")
+            .unwrap();
+
+        let error = validate_emotion_authority_schema(&connection).unwrap_err();
+        assert_eq!(error.code, "MIGRATION_TRANSACTION_FAILED");
+        let remaining: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type='trigger' AND name='emotion_state_life_insert_initializer'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn migration_019_failpoints_roll_back_to_exact_schema_eighteen_preimage() {
+        for point in [
+            Migration019Failpoint::AfterStateTable,
+            Migration019Failpoint::AfterEventTable,
+            Migration019Failpoint::AfterBackfill,
+            Migration019Failpoint::AfterInitializerTrigger,
+            Migration019Failpoint::AfterWriterFences,
+            Migration019Failpoint::BeforeSchemaVersion,
+            Migration019Failpoint::PreCommit,
+        ] {
+            let mut connection = schema_eighteen_connection();
+            fail_next_migration_019_at_for_test(point);
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let error = apply_emotion_authority_schema_upgrade(&transaction).unwrap_err();
+            assert_eq!(error.code, "MIGRATION_TRANSACTION_FAILED");
+
+            // Each failpoint fires after its own durable boundary has been
+            // reached inside the caller-owned transaction.
+            let state_exists: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='emotion_state'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let event_exists: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='emotion_event'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let emotion_fence_count: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE type='trigger' AND name LIKE 'digital_life_writer_epoch_emotion_%'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            match point {
+                Migration019Failpoint::AfterStateTable => {
+                    assert_eq!(state_exists, 1);
+                    assert_eq!(event_exists, 0);
+                    assert_eq!(emotion_fence_count, 0);
+                }
+                Migration019Failpoint::AfterEventTable => {
+                    assert_eq!(state_exists, 1);
+                    assert_eq!(event_exists, 1);
+                    assert_eq!(emotion_fence_count, 0);
+                }
+                Migration019Failpoint::AfterBackfill
+                | Migration019Failpoint::AfterInitializerTrigger => {
+                    assert_eq!(emotion_fence_count, 0);
+                }
+                Migration019Failpoint::AfterWriterFences => {
+                    assert_eq!(emotion_fence_count, 6);
+                }
+                Migration019Failpoint::BeforeSchemaVersion | Migration019Failpoint::PreCommit => {
+                    assert_eq!(emotion_fence_count, 6);
+                }
+            }
+            drop(transaction);
+
+            // The committed preimage is exactly Schema 18 again.
+            assert_eq!(
+                schema_version(&connection),
+                GENERATION_CATCHUP_ATTEMPT_SCHEMA_VERSION
+            );
+            validate_generation_catchup_attempt_schema(&connection).unwrap();
+            let emotion_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema
+                     WHERE name IN ('emotion_state', 'emotion_event')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(emotion_count, 0);
+            let writer_fence_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema
+                     WHERE type='trigger' AND name GLOB 'digital_life_writer_epoch_*'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(writer_fence_count, 45);
+        }
+    }
+
+    #[test]
+    fn migration_019_backfill_rolls_back_with_lives_when_validation_fails() {
+        let mut connection = schema_eighteen_connection();
+        seed_lives_at_schema_eighteen(&connection);
+        let preimage = schema_version(&connection);
+
+        // AfterBackfill fails only after the backfill rows exist inside the
+        // transaction; the rollback must remove them with the whole upgrade.
+        fail_next_migration_019_at_for_test(Migration019Failpoint::AfterBackfill);
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let error = apply_emotion_authority_schema_upgrade(&transaction).unwrap_err();
+        assert_eq!(error.code, "MIGRATION_TRANSACTION_FAILED");
+        drop(transaction);
+
+        assert_eq!(schema_version(&connection), preimage);
+        let missing: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE name IN ('emotion_state','emotion_event')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(missing, 0);
+        // The seeded lives themselves are untouched by the failed upgrade.
+        let life_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM life_identity", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(life_count, 3);
     }
 
     #[test]

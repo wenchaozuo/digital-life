@@ -11,10 +11,13 @@ pub(super) const WRITER_FENCE_SCHEMA_VERSION: i64 = 13;
 pub(super) const LATE_DELETE_WRITER_FENCE_SCHEMA_VERSION: i64 = 15;
 pub(super) const GENERATION_LIFECYCLE_WRITER_FENCE_SCHEMA_VERSION: i64 = 17;
 pub(super) const GENERATION_CATCHUP_WRITER_FENCE_SCHEMA_VERSION: i64 = 18;
+pub(super) const EMOTION_WRITER_FENCE_SCHEMA_VERSION: i64 = 19;
 const WRITER_FENCE_TRIGGER_PREFIX: &str = "digital_life_writer_epoch_";
 const HISTORICAL_WRITER_FENCE_TRIGGER_COUNT: usize = 18;
 const LATE_DELETE_WRITER_FENCE_TRIGGER_COUNT: usize = 24;
 const GENERATION_LIFECYCLE_WRITER_FENCE_TRIGGER_COUNT: usize = 42;
+const GENERATION_CATCHUP_WRITER_FENCE_TRIGGER_COUNT: usize = 45;
+const EMOTION_WRITER_FENCE_TRIGGER_COUNT: usize = 51;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(super) enum WriterFenceOperation {
@@ -321,6 +324,42 @@ const WRITER_FENCE_TRIGGER_SPECS: &[WriterFenceTriggerSpec] = &[
         Delete,
         "DELETE"
     ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_emotion_state_insert",
+        "emotion_state",
+        Insert,
+        "INSERT"
+    ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_emotion_state_update",
+        "emotion_state",
+        Update,
+        "UPDATE"
+    ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_emotion_state_delete",
+        "emotion_state",
+        Delete,
+        "DELETE"
+    ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_emotion_event_insert",
+        "emotion_event",
+        Insert,
+        "INSERT"
+    ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_emotion_event_update",
+        "emotion_event",
+        Update,
+        "UPDATE"
+    ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_emotion_event_delete",
+        "emotion_event",
+        Delete,
+        "DELETE"
+    ),
 ];
 
 pub(super) fn writer_fence_trigger_specs() -> &'static [WriterFenceTriggerSpec] {
@@ -339,7 +378,32 @@ pub(super) fn generation_lifecycle_writer_fence_trigger_specs() -> &'static [Wri
 }
 
 pub(super) fn generation_catchup_writer_fence_trigger_specs() -> &'static [WriterFenceTriggerSpec] {
-    &WRITER_FENCE_TRIGGER_SPECS[GENERATION_LIFECYCLE_WRITER_FENCE_TRIGGER_COUNT..]
+    &WRITER_FENCE_TRIGGER_SPECS[GENERATION_LIFECYCLE_WRITER_FENCE_TRIGGER_COUNT
+        ..GENERATION_CATCHUP_WRITER_FENCE_TRIGGER_COUNT]
+}
+
+pub(super) fn emotion_writer_fence_trigger_specs() -> &'static [WriterFenceTriggerSpec] {
+    &WRITER_FENCE_TRIGGER_SPECS
+        [GENERATION_CATCHUP_WRITER_FENCE_TRIGGER_COUNT..EMOTION_WRITER_FENCE_TRIGGER_COUNT]
+}
+
+pub(super) fn install_emotion_writer_fence_manifest_in_transaction(
+    transaction: &Transaction<'_>,
+) -> Result<(), StorageError> {
+    for (index, spec) in emotion_writer_fence_trigger_specs().iter().enumerate() {
+        #[cfg(not(test))]
+        let _ = index;
+        #[cfg(test)]
+        if should_fail_trigger_install_at_for_test(
+            GENERATION_CATCHUP_WRITER_FENCE_TRIGGER_COUNT + index + 1,
+        ) {
+            return Err(StorageError::migration_transaction_failed());
+        }
+        transaction
+            .execute_batch(spec.ddl)
+            .map_err(|_| StorageError::migration_transaction_failed())?;
+    }
+    Ok(())
 }
 
 pub(super) fn install_generation_catchup_writer_fence_manifest_in_transaction(
@@ -454,8 +518,10 @@ pub(super) fn validate_writer_fence_manifest_for_schema(
         })
         .map_err(|_| StorageError::writer_fence_manifest_mismatch())?;
 
-    let expected = if schema_version >= GENERATION_CATCHUP_WRITER_FENCE_SCHEMA_VERSION {
+    let expected = if schema_version >= EMOTION_WRITER_FENCE_SCHEMA_VERSION {
         WRITER_FENCE_TRIGGER_SPECS
+    } else if schema_version >= GENERATION_CATCHUP_WRITER_FENCE_SCHEMA_VERSION {
+        &WRITER_FENCE_TRIGGER_SPECS[..GENERATION_CATCHUP_WRITER_FENCE_TRIGGER_COUNT]
     } else if schema_version >= GENERATION_LIFECYCLE_WRITER_FENCE_SCHEMA_VERSION {
         &WRITER_FENCE_TRIGGER_SPECS[..GENERATION_LIFECYCLE_WRITER_FENCE_TRIGGER_COUNT]
     } else if schema_version >= LATE_DELETE_WRITER_FENCE_SCHEMA_VERSION {
@@ -1152,7 +1218,9 @@ mod tests {
         assert_eq!(writer_fence_trigger_specs().len(), 18);
         assert_eq!(late_delete_writer_fence_trigger_specs().len(), 6);
         assert_eq!(generation_lifecycle_writer_fence_trigger_specs().len(), 18);
-        assert_eq!(WRITER_FENCE_TRIGGER_SPECS.len(), 45);
+        assert_eq!(generation_catchup_writer_fence_trigger_specs().len(), 3);
+        assert_eq!(emotion_writer_fence_trigger_specs().len(), 6);
+        assert_eq!(WRITER_FENCE_TRIGGER_SPECS.len(), 51);
         let resolution_id = late_delete_resolution_insert(&authorized).unwrap();
         assert_eq!(resolution_id, 1);
         assert_eq!(authorized.execute("UPDATE memory_vector_late_delete_resolution SET updated_at='2026-01-02T00:00:00.000Z' WHERE memory_id='late-resolution'", []).unwrap(), 1);
@@ -1211,14 +1279,123 @@ mod tests {
     }
 
     #[test]
-    fn schema_18_generation_identity_immutable_generation_delete_denied_late_delete_resolution_runtime_create_captured_generation_authority_late_delete_24h_semantic_guards_are_orthogonal_to_the_forty_five_writer_fence_triggers(
+    fn schema_19_emotion_tables_are_authorized_writer_only() {
+        let (_root, path) = initialized_fenced_database();
+        let authorized = authorized_connection(&path);
+        seed_protected_rows(&authorized);
+        // The initializer trigger must not interfere with seeded lives: the
+        // neutral emotion_state row is created for every existing life.
+        assert_eq!(
+            authorized
+                .query_row(
+                    "SELECT COUNT(*) FROM emotion_state WHERE life_id='writer-fence-life'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        // Authorized writer can write both emotion tables.
+        assert_eq!(
+            authorized
+                .execute(
+                    "UPDATE emotion_state SET updated_at='2026-08-23T00:00:00.000Z'
+                     WHERE life_id='writer-fence-life'",
+                    [],
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            authorized
+                .execute(
+                    "INSERT INTO emotion_event
+                     (event_id, life_id, source_kind, source_ref, valence_delta,
+                      activation_delta, applied_revision, event_time, policy_version,
+                      created_at)
+                     VALUES ('fence-event-1', 'writer-fence-life', 'fence', 'seed', 1, 1, 1,
+                             '2026-08-23T00:00:00.000Z', 1, '2026-08-23T00:00:00.000Z')",
+                    [],
+                )
+                .unwrap(),
+            1
+        );
+        drop(authorized);
+
+        let raw = Connection::open(&path).unwrap();
+        for (operation, result) in [
+            (
+                "state insert",
+                raw.execute(
+                    "INSERT INTO emotion_state
+                     (life_id, valence, activation, revision, policy_version,
+                      last_applied_at, updated_at)
+                     VALUES ('raw-life', 0, 0, 0, 1, '2026-01-01T00:00:00.000Z',
+                             '2026-01-01T00:00:00.000Z')",
+                    [],
+                ),
+            ),
+            (
+                "state update",
+                raw.execute("UPDATE emotion_state SET revision=1", []),
+            ),
+            (
+                "state delete",
+                raw.execute(
+                    "DELETE FROM emotion_state WHERE life_id='writer-fence-life'",
+                    [],
+                ),
+            ),
+            (
+                "event insert",
+                raw.execute(
+                    "INSERT INTO emotion_event
+                     (event_id, life_id, source_kind, source_ref, valence_delta,
+                      activation_delta, applied_revision, event_time, policy_version,
+                      created_at)
+                     VALUES ('raw-event', 'writer-fence-life', 'fence', 'raw', 1, 1, 1,
+                             '2026-08-23T00:00:00.000Z', 1, '2026-08-23T00:00:00.000Z')",
+                    [],
+                ),
+            ),
+            (
+                "event update",
+                raw.execute("UPDATE emotion_event SET policy_version=2", []),
+            ),
+            (
+                "event delete",
+                raw.execute(
+                    "DELETE FROM emotion_event WHERE event_id='fence-event-1'",
+                    [],
+                ),
+            ),
+        ] {
+            assert!(
+                result.is_err(),
+                "raw emotion {operation} must be stopped by its writer-fence trigger"
+            );
+        }
+        // Nothing was changed by the rejected raw writes.
+        let row_count: (i64, i64) = raw
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM emotion_state),
+                        (SELECT COUNT(*) FROM emotion_event)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row_count, (2, 1));
+    }
+
+    #[test]
+    fn schema_18_generation_identity_immutable_generation_delete_denied_late_delete_resolution_runtime_create_captured_generation_authority_late_delete_24h_semantic_guards_are_orthogonal_to_the_schema19_writer_fence_triggers(
     ) {
         let (_root, path) = initialized_fenced_database();
         let authorized = authorized_connection(&path);
         seed_protected_rows(&authorized);
-        assert_eq!(WRITER_FENCE_TRIGGER_SPECS.len(), 45);
+        assert_eq!(WRITER_FENCE_TRIGGER_SPECS.len(), 51);
         let reserved: i64 = authorized.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type='trigger' AND name LIKE 'digital_life_writer_epoch_%'", [], |r| r.get(0)).unwrap();
-        assert_eq!(reserved, 45);
+        assert_eq!(reserved, 51);
         for name in [
             "memory_vector_generation_semantic_delete_guard",
             "memory_vector_generation_semantic_identity_guard",

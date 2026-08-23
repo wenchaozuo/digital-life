@@ -3,6 +3,8 @@ mod candidate_memory;
 mod connection;
 mod conversation;
 pub(crate) mod deterministic_candidate_extraction;
+#[cfg_attr(not(test), allow(dead_code))]
+mod emotion;
 mod generation_lifecycle_authority;
 mod generation_rebuild;
 mod late_delete_resolution;
@@ -1904,11 +1906,12 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(writer_fence_count, 45);
+        assert_eq!(writer_fence_count, 51);
         migration::validate_attempt_claim_identity_schema(&state.connection).unwrap();
-        // The database is at Schema 18; validate the exact Schema-18 catch-up
-        // authority (which also proves the full 45-trigger writer fence).
-        migration::validate_generation_catchup_attempt_schema(&state.connection).unwrap();
+        // The database is at Schema 19; validate the exact Schema-19 emotion
+        // authority (which re-validates the Schema-18 catch-up objects and
+        // proves the full 51-trigger writer fence).
+        migration::validate_emotion_authority_schema(&state.connection).unwrap();
         assert_eq!(
             state
                 .connection
@@ -2061,7 +2064,7 @@ mod tests {
         // target as an INDEPENDENT database.
         let restored = StorageService::initialize_with_roots(target.clone(), None).unwrap();
 
-        // Schema 18 and writer fences preserved. Schema version 18 is the
+        // Schema 19 and writer fences preserved. Schema version 19 is the
         // current runtime schema; LAST_STATIC_MIGRATION_VERSION = 12 is only the
         // ceiling of the statically-replayed migration list.
         {
@@ -2069,7 +2072,7 @@ mod tests {
             assert_eq!(
                 connection::read_schema_version(&restored_conn.connection).unwrap(),
                 connection::MAX_SUPPORTED_SCHEMA_VERSION,
-                "restored schema version must be 18"
+                "restored schema version must be 19"
             );
             assert_eq!(
                 super::migration::LAST_STATIC_MIGRATION_VERSION,
@@ -2101,7 +2104,7 @@ mod tests {
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert_eq!(fence_count, 45);
+            assert_eq!(fence_count, 51);
         }
 
         // All 8 outbox states preserved with full epoch evidence.

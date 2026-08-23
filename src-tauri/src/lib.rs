@@ -1,6 +1,11 @@
 mod candidate_memory_internal;
+// D11-B1 is the emotion authority foundation; the emotion domain has no
+// production caller until the D11-B2+ policy/conversation stages, so the
+// frozen surface is allowed as dead code outside test builds.
 pub mod conversation;
 pub mod embedding;
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod emotion;
 pub mod memory;
 pub mod model;
 pub mod prompt;

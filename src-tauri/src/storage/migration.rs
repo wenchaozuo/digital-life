@@ -1189,6 +1189,8 @@ fn validate_emotion_authority_schema_objects(connection: &Connection) -> Result<
                 OR source_ref = ''
                 OR valence_delta NOT BETWEEN -1000 AND 1000
                 OR activation_delta NOT BETWEEN -1000 AND 1000
+                OR result_valence NOT BETWEEN -1000 AND 1000
+                OR result_activation NOT BETWEEN -1000 AND 1000
                 OR applied_revision <= 0
                 OR event_time = ''
                 OR policy_version <= 0

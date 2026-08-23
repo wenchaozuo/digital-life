@@ -17,7 +17,8 @@ use super::StorageService;
 const EMOTION_STATE_COLUMNS: &str =
     "life_id, valence, activation, revision, policy_version, last_applied_at, updated_at";
 const EMOTION_EVENT_COLUMNS: &str =
-    "event_id, life_id, source_kind, source_ref, valence_delta, activation_delta, applied_revision, event_time, policy_version, created_at";
+    "event_id, life_id, source_kind, source_ref, valence_delta, activation_delta, \
+     result_valence, result_activation, applied_revision, event_time, policy_version, created_at";
 
 fn read_emotion_state(row: &Row<'_>) -> rusqlite::Result<EmotionState> {
     Ok(EmotionState {
@@ -39,16 +40,20 @@ fn read_emotion_event(row: &Row<'_>) -> rusqlite::Result<EmotionEvent> {
         source_ref: row.get(3)?,
         valence_delta: row.get(4)?,
         activation_delta: row.get(5)?,
-        applied_revision: row.get(6)?,
-        event_time: row.get(7)?,
-        policy_version: row.get(8)?,
-        created_at: row.get(9)?,
+        result_valence: row.get(6)?,
+        result_activation: row.get(7)?,
+        applied_revision: row.get(8)?,
+        event_time: row.get(9)?,
+        policy_version: row.get(10)?,
+        created_at: row.get(11)?,
     })
 }
 
 /// A stored ledger event is a replay of `transition` when every state-relevant
-/// payload field matches: identity, bounded deltas, target revision, policy
-/// version, and event time. A differing payload for the same identity is a
+/// payload field matches: identity, bounded deltas, the resulting state
+/// actually committed (`result_valence` / `result_activation`), target
+/// revision, policy version, and event time. A differing payload for the same
+/// identity - including a different next state with identical deltas - is a
 /// conflict, never a silent skip.
 fn event_evidence_matches(event: &EmotionEvent, transition: &EmotionTransition) -> bool {
     event.life_id == transition.life_id
@@ -56,6 +61,8 @@ fn event_evidence_matches(event: &EmotionEvent, transition: &EmotionTransition) 
         && event.source_ref == transition.source.reference
         && event.valence_delta == transition.valence_delta
         && event.activation_delta == transition.activation_delta
+        && event.result_valence == transition.next_valence
+        && event.result_activation == transition.next_activation
         && event.applied_revision == transition.expected_revision + 1
         && event.event_time == transition.event_time
         && event.policy_version == transition.policy_version
@@ -196,6 +203,8 @@ impl EmotionRepository for StorageService {
             source_ref: transition.source.reference.clone(),
             valence_delta: transition.valence_delta,
             activation_delta: transition.activation_delta,
+            result_valence: transition.next_valence,
+            result_activation: transition.next_activation,
             applied_revision,
             event_time: transition.event_time.clone(),
             policy_version: transition.policy_version,
@@ -205,7 +214,7 @@ impl EmotionRepository for StorageService {
             .execute(
                 &format!(
                     "INSERT INTO emotion_event ({EMOTION_EVENT_COLUMNS})
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
                 ),
                 params![
                     event.event_id,
@@ -214,6 +223,8 @@ impl EmotionRepository for StorageService {
                     event.source_ref,
                     event.valence_delta,
                     event.activation_delta,
+                    event.result_valence,
+                    event.result_activation,
                     event.applied_revision,
                     event.event_time,
                     event.policy_version,
@@ -463,6 +474,8 @@ mod tests {
         assert_eq!(event.source_ref, "turn-7");
         assert_eq!(event.valence_delta, 40);
         assert_eq!(event.activation_delta, -20);
+        assert_eq!(event.result_valence, 40);
+        assert_eq!(event.result_activation, -20);
         assert_eq!(event.applied_revision, 1);
         assert_eq!(event.policy_version, INITIAL_POLICY_VERSION);
         assert_eq!(event.event_time, "2026-08-23T12:00:00.000Z");
@@ -618,6 +631,191 @@ mod tests {
         assert_eq!(event_count, 1);
     }
 
+    fn commit_with_result_state(
+        service: &StorageService,
+        event_id: &str,
+        source_ref: &str,
+        expected_revision: i64,
+        deltas: (i32, i32),
+        result: (i32, i32),
+    ) -> Result<EmotionCommitOutcome, EmotionError> {
+        <StorageService as EmotionRepository>::commit_transition(
+            service,
+            EmotionTransition::new(
+                event_id,
+                "life-a",
+                EmotionEventSource::new("conversation", source_ref),
+                deltas.0,
+                deltas.1,
+                expected_revision,
+                result.0,
+                result.1,
+                INITIAL_POLICY_VERSION,
+                "2026-08-23T12:00:00.000Z",
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn next_state_only_conflict_via_event_id_is_rejected_without_mutation() {
+        let root = TestRoot::new("result-conflict-event-id");
+        let service = seeded_service(&root);
+        commit_with_result_state(&service, "event-1", "turn-7", 0, (40, -20), (40, -20)).unwrap();
+
+        // Same event_id, same source identity, SAME deltas/expected/event
+        // time/policy, but a DIFFERENT resulting valence: this is a
+        // conflicting transition payload, not a replay.
+        let error =
+            commit_with_result_state(&service, "event-1", "turn-7", 0, (40, -20), (50, -20))
+                .unwrap_err();
+        assert_eq!(error.code, EmotionErrorCode::EventConflict);
+
+        let state = life_state(&service, "life-a").unwrap();
+        assert_eq!(state.revision, 1);
+        assert_eq!(state.valence, 40);
+        assert_eq!(state.activation, -20);
+        let (_, event_count) = state_counts(&service);
+        assert_eq!(event_count, 1);
+        let stored = <StorageService as EmotionRepository>::find_event(
+            &service,
+            "life-a",
+            "conversation",
+            "turn-7",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!((stored.result_valence, stored.result_activation), (40, -20));
+    }
+
+    #[test]
+    fn next_state_only_conflict_via_source_identity_is_rejected_without_mutation() {
+        let root = TestRoot::new("result-conflict-source-id");
+        let service = seeded_service(&root);
+        commit_with_result_state(&service, "event-1", "turn-7", 0, (40, -20), (40, -20)).unwrap();
+
+        // A different event_id with the SAME (life_id, source_kind,
+        // source_ref) and a DIFFERENT resulting activation is a conflict.
+        let error =
+            commit_with_result_state(&service, "event-2", "turn-7", 0, (40, -20), (40, -30))
+                .unwrap_err();
+        assert_eq!(error.code, EmotionErrorCode::EventConflict);
+
+        let state = life_state(&service, "life-a").unwrap();
+        assert_eq!(state.revision, 1);
+        assert_eq!(state.valence, 40);
+        assert_eq!(state.activation, -20);
+        let (_, event_count) = state_counts(&service);
+        assert_eq!(event_count, 1);
+    }
+
+    #[test]
+    fn exact_replay_requires_full_evidence_including_result_state() {
+        let root = TestRoot::new("result-replay");
+        let service = seeded_service(&root);
+        let first =
+            commit_with_result_state(&service, "event-1", "turn-7", 0, (40, -20), (40, -20))
+                .unwrap();
+        let EmotionCommitOutcome::Committed { event, state } = first else {
+            panic!("first commit must commit");
+        };
+        assert_eq!((event.result_valence, event.result_activation), (40, -20));
+
+        // Identical transitions (including the resulting state) replay
+        // without mutating state or appending a second ledger row.
+        let replay =
+            commit_with_result_state(&service, "event-1", "turn-7", 0, (40, -20), (40, -20))
+                .unwrap();
+        let EmotionCommitOutcome::Replayed {
+            event: replayed,
+            state: replay_state,
+        } = replay
+        else {
+            panic!("full-evidence replay must be Replayed");
+        };
+        assert_eq!(
+            (replayed.result_valence, replayed.result_activation),
+            (40, -20)
+        );
+        assert_eq!(replay_state.revision, 1);
+        assert_eq!(replay_state.valence, 40);
+        assert_eq!(replay_state.activation, -20);
+        assert_eq!(state.revision, replay_state.revision);
+        let (_, event_count) = state_counts(&service);
+        assert_eq!(event_count, 1);
+    }
+
+    #[test]
+    fn persisted_result_evidence_matches_committed_state_for_each_revision() {
+        let root = TestRoot::new("result-persisted");
+        let service = seeded_service(&root);
+
+        // First transition: deltas +40/-20, deliberately different result
+        // state 25/7 (the policy would decide this; B1 only persists it).
+        let first =
+            commit_with_result_state(&service, "event-1", "turn-1", 0, (40, -20), (25, 7)).unwrap();
+        let EmotionCommitOutcome::Committed {
+            event: first_event,
+            state: first_state,
+        } = first
+        else {
+            panic!("first commit must commit");
+        };
+        assert_eq!(
+            (first_event.result_valence, first_event.result_activation),
+            (25, 7)
+        );
+        assert_eq!(
+            (first_state.valence, first_state.activation),
+            (25, 7),
+            "the committed state must equal the event result evidence"
+        );
+
+        // Second transition applied on revision 1.
+        let second =
+            commit_with_result_state(&service, "event-2", "turn-2", 1, (10, 5), (35, 12)).unwrap();
+        let EmotionCommitOutcome::Committed {
+            event: second_event,
+            state: second_state,
+        } = second
+        else {
+            panic!("second commit must commit");
+        };
+        assert_eq!(
+            (second_event.result_valence, second_event.result_activation),
+            (35, 12)
+        );
+        assert_eq!(
+            (second_state.valence, second_state.activation),
+            (35, 12),
+            "the committed state must equal the event result evidence"
+        );
+
+        // Every persisted ledger row must carry the exact state values that
+        // emotion_state held for its applied revision.
+        let state = service.state().unwrap();
+        let stored: Vec<(i64, i32, i32)> = state
+            .connection
+            .prepare(
+                "SELECT applied_revision, result_valence, result_activation
+                 FROM emotion_event ORDER BY applied_revision",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(stored, vec![(1, 25, 7), (2, 35, 12)]);
+        drop(state);
+
+        // The current authoritative state is exactly the last event result.
+        let current = life_state(&service, "life-a").unwrap();
+        assert_eq!(
+            (current.valence, current.activation, current.revision),
+            (35, 12, 2)
+        );
+    }
+
     #[test]
     fn event_insert_and_state_update_are_atomic_when_unique_revision_collides() {
         let root = TestRoot::new("atomicity");
@@ -633,9 +831,9 @@ mod tests {
                 .execute(
                     "INSERT INTO emotion_event
                      (event_id, life_id, source_kind, source_ref, valence_delta,
-                      activation_delta, applied_revision, event_time, policy_version,
-                      created_at)
-                     VALUES ('sneaky-1', 'life-a', 'external', 'witness', 1, 1, 1,
+                      activation_delta, result_valence, result_activation,
+                      applied_revision, event_time, policy_version, created_at)
+                     VALUES ('sneaky-1', 'life-a', 'external', 'witness', 1, 1, 1, 1, 1,
                              '2026-08-23T11:00:00.000Z', 1, '2026-08-23T11:00:00.000Z')",
                     [],
                 )
@@ -682,9 +880,9 @@ mod tests {
             .execute(
                 "INSERT INTO emotion_event
                  (event_id, life_id, source_kind, source_ref, valence_delta,
-                  activation_delta, applied_revision, event_time, policy_version,
-                  created_at)
-                 VALUES ('tx-1', 'life-a', 'test', 'probe', 1, 1, 1,
+                  activation_delta, result_valence, result_activation,
+                  applied_revision, event_time, policy_version, created_at)
+                 VALUES ('tx-1', 'life-a', 'test', 'probe', 1, 1, 1, 1, 1,
                          '2026-08-23T11:00:00.000Z', 1, '2026-08-23T11:00:00.000Z')",
                 [],
             )
@@ -952,6 +1150,8 @@ mod tests {
                     "event_time",
                     "life_id",
                     "policy_version",
+                    "result_activation",
+                    "result_valence",
                     "source_kind",
                     "source_ref",
                     "valence_delta",
@@ -1002,13 +1202,14 @@ mod tests {
             transition("event-1", "life-a", "conversation", "turn-1", 0),
         )
         .unwrap();
-        let row: (String, String, String, String, i32, i32, i64) = service
+        let row: (String, String, String, String, i32, i32, i32, i32, i64) = service
             .state()
             .unwrap()
             .connection
             .query_row(
                 "SELECT event_id, source_kind, source_ref, event_time,
-                        valence_delta, activation_delta, applied_revision
+                        valence_delta, activation_delta, result_valence,
+                        result_activation, applied_revision
                  FROM emotion_event WHERE event_id='event-1'",
                 [],
                 |row| {
@@ -1020,6 +1221,8 @@ mod tests {
                         row.get(4)?,
                         row.get(5)?,
                         row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
                     ))
                 },
             )
@@ -1031,6 +1234,8 @@ mod tests {
                 "conversation".into(),
                 "turn-1".into(),
                 "2026-08-23T12:00:00.000Z".into(),
+                40,
+                -20,
                 40,
                 -20,
                 1
@@ -1082,13 +1287,33 @@ mod tests {
             let inserted = state.connection.execute(
                 "INSERT INTO emotion_event
                  (event_id, life_id, source_kind, source_ref, valence_delta,
-                  activation_delta, applied_revision, event_time, policy_version,
-                  created_at)
-                 VALUES ('bad-1', 'life-a', 'kind', 'ref', 1001, 1, 1,
+                  activation_delta, result_valence, result_activation,
+                  applied_revision, event_time, policy_version, created_at)
+                 VALUES ('bad-1', 'life-a', 'kind', 'ref', 1001, 1, 1, 1, 1,
                          '2026-08-23T11:00:00.000Z', 1, '2026-08-23T11:00:00.000Z')",
                 [],
             );
             assert!(inserted.is_err());
+            let result_checked = state.connection.execute(
+                "INSERT INTO emotion_event
+                 (event_id, life_id, source_kind, source_ref, valence_delta,
+                  activation_delta, result_valence, result_activation,
+                  applied_revision, event_time, policy_version, created_at)
+                 VALUES ('bad-2', 'life-a', 'kind', 'ref', 1, 1, 1001, 1, 1,
+                         '2026-08-23T11:00:00.000Z', 1, '2026-08-23T11:00:00.000Z')",
+                [],
+            );
+            assert!(result_checked.is_err());
+            let result_checked_activation = state.connection.execute(
+                "INSERT INTO emotion_event
+                 (event_id, life_id, source_kind, source_ref, valence_delta,
+                  activation_delta, result_valence, result_activation,
+                  applied_revision, event_time, policy_version, created_at)
+                 VALUES ('bad-3', 'life-a', 'kind', 'ref', 1, 1, 1, -1001, 1,
+                         '2026-08-23T11:00:00.000Z', 1, '2026-08-23T11:00:00.000Z')",
+                [],
+            );
+            assert!(result_checked_activation.is_err());
         }
         assert_eq!(life_state(&service, "life-a").unwrap().valence, 0);
     }

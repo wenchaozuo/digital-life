@@ -1311,10 +1311,11 @@ mod tests {
                 .execute(
                     "INSERT INTO emotion_event
                      (event_id, life_id, source_kind, source_ref, valence_delta,
-                      activation_delta, applied_revision, event_time, policy_version,
-                      created_at)
-                     VALUES ('fence-event-1', 'writer-fence-life', 'fence', 'seed', 1, 1, 1,
-                             '2026-08-23T00:00:00.000Z', 1, '2026-08-23T00:00:00.000Z')",
+                      activation_delta, result_valence, result_activation,
+                      applied_revision, event_time, policy_version, created_at)
+                     VALUES ('fence-event-1', 'writer-fence-life', 'fence', 'seed',
+                             1, 1, 1, 1, 1, '2026-08-23T00:00:00.000Z', 1,
+                             '2026-08-23T00:00:00.000Z')",
                     [],
                 )
                 .unwrap(),
@@ -1351,10 +1352,11 @@ mod tests {
                 raw.execute(
                     "INSERT INTO emotion_event
                      (event_id, life_id, source_kind, source_ref, valence_delta,
-                      activation_delta, applied_revision, event_time, policy_version,
-                      created_at)
-                     VALUES ('raw-event', 'writer-fence-life', 'fence', 'raw', 1, 1, 1,
-                             '2026-08-23T00:00:00.000Z', 1, '2026-08-23T00:00:00.000Z')",
+                      activation_delta, result_valence, result_activation,
+                      applied_revision, event_time, policy_version, created_at)
+                     VALUES ('raw-event', 'writer-fence-life', 'fence', 'raw',
+                             1, 1, 1, 1, 1, '2026-08-23T00:00:00.000Z', 1,
+                             '2026-08-23T00:00:00.000Z')",
                     [],
                 ),
             ),

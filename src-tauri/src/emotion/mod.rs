@@ -174,6 +174,9 @@ impl EmotionTransition {
 
 /// One immutable ledger row. Bounded state-transition evidence only; it never
 /// carries message, memory, prompt, chain-of-thought, or raw model output.
+/// `result_valence` / `result_activation` record the state values actually
+/// committed by this event, so replay equivalence covers the complete
+/// transition payload (deltas AND resulting state).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct EmotionEvent {
     pub(crate) event_id: String,
@@ -182,6 +185,8 @@ pub(crate) struct EmotionEvent {
     pub(crate) source_ref: String,
     pub(crate) valence_delta: i32,
     pub(crate) activation_delta: i32,
+    pub(crate) result_valence: i32,
+    pub(crate) result_activation: i32,
     pub(crate) applied_revision: i64,
     pub(crate) event_time: String,
     pub(crate) policy_version: i64,

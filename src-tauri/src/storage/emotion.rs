@@ -5,7 +5,7 @@
 //! `emotion_event` + `emotion_state` in one SQLite transaction. No decay, no
 //! policy, no time derivation is implemented here (D11-B2).
 
-use rusqlite::{params, OptionalExtension, Row, TransactionBehavior};
+use rusqlite::{params, OptionalExtension, Row, Transaction, TransactionBehavior};
 
 use crate::emotion::{
     EmotionCommitOutcome, EmotionError, EmotionErrorCode, EmotionEvent, EmotionRepository,
@@ -91,6 +91,176 @@ fn map_event_insert_error(error: rusqlite::Error) -> EmotionError {
     EmotionError::database()
 }
 
+/// The ONE semantic implementation of an emotion mutation. Runs entirely
+/// inside a CALLER-OWNED SQLite transaction: it performs the state read,
+/// event/source replay detection, revision check, event INSERT, emotion_state
+/// CAS UPDATE, and result reload — but NEVER commits or rolls back; the
+/// caller owns that decision so a composite conversation+emotion turn can
+/// share one atomic transaction. [`EmotionRepository::commit_transition`]
+/// wraps this with its own Immediate transaction and commit.
+pub(super) fn commit_transition_in_transaction(
+    transaction: &Transaction<'_>,
+    transition: EmotionTransition,
+) -> Result<EmotionCommitOutcome, EmotionError> {
+    transition
+        .validate()
+        .map_err(|_| EmotionError::invalid_argument("The emotion transition is invalid."))?;
+    // Derive the target revision once with checked arithmetic. An
+    // unrepresentable next revision (expected_revision == i64::MAX) is a
+    // typed argument error before any replay lookup or write, and the same
+    // derived value backs replay equivalence AND the write below.
+    let applied_revision = transition.target_revision()?;
+
+    let now: String = transaction
+        .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", [], |row| {
+            row.get(0)
+        })
+        .map_err(|_| EmotionError::database())?;
+
+    let current = transaction
+        .query_row(
+            &format!("SELECT {EMOTION_STATE_COLUMNS} FROM emotion_state WHERE life_id = ?1"),
+            [&transition.life_id],
+            read_emotion_state,
+        )
+        .optional()
+        .map_err(|_| EmotionError::database())?;
+    let Some(current_state) = current else {
+        let life_exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM life_identity WHERE id = ?1)",
+                [&transition.life_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| EmotionError::database())?;
+        return Err(if life_exists {
+            EmotionError::state_not_found()
+        } else {
+            EmotionError::life_not_found()
+        });
+    };
+
+    // Idempotency: the exact same event must never mutate state twice.
+    // 1) by event identity
+    if let Some(existing) = transaction
+        .query_row(
+            &format!("SELECT {EMOTION_EVENT_COLUMNS} FROM emotion_event WHERE event_id = ?1"),
+            [&transition.event_id],
+            read_emotion_event,
+        )
+        .optional()
+        .map_err(|_| EmotionError::database())?
+    {
+        if event_evidence_matches(&existing, &transition, applied_revision) {
+            return Ok(EmotionCommitOutcome::Replayed {
+                event: existing,
+                state: current_state,
+            });
+        }
+        return Err(EmotionError::event_conflict());
+    }
+    // 2) by source identity
+    if let Some(existing) = transaction
+        .query_row(
+            &format!(
+                "SELECT {EMOTION_EVENT_COLUMNS} FROM emotion_event
+                 WHERE life_id = ?1 AND source_kind = ?2 AND source_ref = ?3"
+            ),
+            params![
+                &transition.life_id,
+                transition.source.kind,
+                transition.source.reference
+            ],
+            read_emotion_event,
+        )
+        .optional()
+        .map_err(|_| EmotionError::database())?
+    {
+        if event_evidence_matches(&existing, &transition, applied_revision) {
+            return Ok(EmotionCommitOutcome::Replayed {
+                event: existing,
+                state: current_state,
+            });
+        }
+        return Err(EmotionError::event_conflict());
+    }
+
+    // Revision conflict: the caller must build on the current revision.
+    if current_state.revision != transition.expected_revision {
+        return Err(EmotionError::revision_conflict());
+    }
+
+    let event = EmotionEvent {
+        event_id: transition.event_id.clone(),
+        life_id: transition.life_id.clone(),
+        source_kind: transition.source.kind.clone(),
+        source_ref: transition.source.reference.clone(),
+        valence_delta: transition.valence_delta,
+        activation_delta: transition.activation_delta,
+        result_valence: transition.next_valence,
+        result_activation: transition.next_activation,
+        applied_revision,
+        event_time: transition.event_time.clone(),
+        policy_version: transition.policy_version,
+        created_at: now.clone(),
+    };
+    transaction
+        .execute(
+            &format!(
+                "INSERT INTO emotion_event ({EMOTION_EVENT_COLUMNS})
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
+            ),
+            params![
+                event.event_id,
+                event.life_id,
+                event.source_kind,
+                event.source_ref,
+                event.valence_delta,
+                event.activation_delta,
+                event.result_valence,
+                event.result_activation,
+                event.applied_revision,
+                event.event_time,
+                event.policy_version,
+                event.created_at,
+            ],
+        )
+        .map_err(map_event_insert_error)?;
+    let changed = transaction
+        .execute(
+            "UPDATE emotion_state
+             SET valence = ?1, activation = ?2, revision = ?3, policy_version = ?4,
+                 last_applied_at = ?5, updated_at = ?6
+             WHERE life_id = ?7 AND revision = ?8",
+            params![
+                transition.next_valence,
+                transition.next_activation,
+                applied_revision,
+                transition.policy_version,
+                transition.event_time,
+                now,
+                transition.life_id,
+                transition.expected_revision,
+            ],
+        )
+        .map_err(|_| EmotionError::database())?;
+    if changed != 1 {
+        return Err(EmotionError::revision_conflict());
+    }
+
+    let committed_state = transaction
+        .query_row(
+            &format!("SELECT {EMOTION_STATE_COLUMNS} FROM emotion_state WHERE life_id = ?1"),
+            [&transition.life_id],
+            read_emotion_state,
+        )
+        .map_err(|_| EmotionError::database())?;
+    Ok(EmotionCommitOutcome::Committed {
+        event,
+        state: committed_state,
+    })
+}
+
 impl EmotionRepository for StorageService {
     fn load_current_state(&self, life_id: &str) -> Result<Option<EmotionState>, EmotionError> {
         let state = self.state().map_err(|_| EmotionError::database())?;
@@ -109,172 +279,14 @@ impl EmotionRepository for StorageService {
         &self,
         transition: EmotionTransition,
     ) -> Result<EmotionCommitOutcome, EmotionError> {
-        transition
-            .validate()
-            .map_err(|_| EmotionError::invalid_argument("The emotion transition is invalid."))?;
-        // Derive the target revision once with checked arithmetic. An
-        // unrepresentable next revision (expected_revision == i64::MAX) is a
-        // typed argument error before any replay lookup or write, and the same
-        // derived value backs replay equivalence AND the commit below.
-        let applied_revision = transition.target_revision()?;
         let mut state = self.state().map_err(|_| EmotionError::database())?;
         let transaction = state
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| EmotionError::database())?;
-
-        let now: String = transaction
-            .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", [], |row| {
-                row.get(0)
-            })
-            .map_err(|_| EmotionError::database())?;
-
-        let current = transaction
-            .query_row(
-                &format!("SELECT {EMOTION_STATE_COLUMNS} FROM emotion_state WHERE life_id = ?1"),
-                [&transition.life_id],
-                read_emotion_state,
-            )
-            .optional()
-            .map_err(|_| EmotionError::database())?;
-        let Some(current_state) = current else {
-            let life_exists: bool = transaction
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM life_identity WHERE id = ?1)",
-                    [&transition.life_id],
-                    |row| row.get(0),
-                )
-                .map_err(|_| EmotionError::database())?;
-            return Err(if life_exists {
-                EmotionError::state_not_found()
-            } else {
-                EmotionError::life_not_found()
-            });
-        };
-
-        // Idempotency: the exact same event must never mutate state twice.
-        // 1) by event identity
-        if let Some(existing) = transaction
-            .query_row(
-                &format!("SELECT {EMOTION_EVENT_COLUMNS} FROM emotion_event WHERE event_id = ?1"),
-                [&transition.event_id],
-                read_emotion_event,
-            )
-            .optional()
-            .map_err(|_| EmotionError::database())?
-        {
-            if event_evidence_matches(&existing, &transition, applied_revision) {
-                return Ok(EmotionCommitOutcome::Replayed {
-                    event: existing,
-                    state: current_state,
-                });
-            }
-            return Err(EmotionError::event_conflict());
-        }
-        // 2) by source identity
-        if let Some(existing) = transaction
-            .query_row(
-                &format!(
-                    "SELECT {EMOTION_EVENT_COLUMNS} FROM emotion_event
-                     WHERE life_id = ?1 AND source_kind = ?2 AND source_ref = ?3"
-                ),
-                params![
-                    &transition.life_id,
-                    transition.source.kind,
-                    transition.source.reference
-                ],
-                read_emotion_event,
-            )
-            .optional()
-            .map_err(|_| EmotionError::database())?
-        {
-            if event_evidence_matches(&existing, &transition, applied_revision) {
-                return Ok(EmotionCommitOutcome::Replayed {
-                    event: existing,
-                    state: current_state,
-                });
-            }
-            return Err(EmotionError::event_conflict());
-        }
-
-        // Revision conflict: the caller must build on the current revision.
-        if current_state.revision != transition.expected_revision {
-            return Err(EmotionError::revision_conflict());
-        }
-
-        // The event insert and the state update are one SQLite transaction:
-        // a failure of either rolls back both.
-        let event = EmotionEvent {
-            event_id: transition.event_id.clone(),
-            life_id: transition.life_id.clone(),
-            source_kind: transition.source.kind.clone(),
-            source_ref: transition.source.reference.clone(),
-            valence_delta: transition.valence_delta,
-            activation_delta: transition.activation_delta,
-            result_valence: transition.next_valence,
-            result_activation: transition.next_activation,
-            applied_revision,
-            event_time: transition.event_time.clone(),
-            policy_version: transition.policy_version,
-            created_at: now.clone(),
-        };
-        transaction
-            .execute(
-                &format!(
-                    "INSERT INTO emotion_event ({EMOTION_EVENT_COLUMNS})
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
-                ),
-                params![
-                    event.event_id,
-                    event.life_id,
-                    event.source_kind,
-                    event.source_ref,
-                    event.valence_delta,
-                    event.activation_delta,
-                    event.result_valence,
-                    event.result_activation,
-                    event.applied_revision,
-                    event.event_time,
-                    event.policy_version,
-                    event.created_at,
-                ],
-            )
-            .map_err(map_event_insert_error)?;
-        let changed = transaction
-            .execute(
-                "UPDATE emotion_state
-                 SET valence = ?1, activation = ?2, revision = ?3, policy_version = ?4,
-                     last_applied_at = ?5, updated_at = ?6
-                 WHERE life_id = ?7 AND revision = ?8",
-                params![
-                    transition.next_valence,
-                    transition.next_activation,
-                    applied_revision,
-                    transition.policy_version,
-                    transition.event_time,
-                    now,
-                    transition.life_id,
-                    transition.expected_revision,
-                ],
-            )
-            .map_err(|_| EmotionError::database())?;
-        if changed != 1 {
-            return Err(EmotionError::revision_conflict());
-        }
+        let outcome = commit_transition_in_transaction(&transaction, transition)?;
         transaction.commit().map_err(|_| EmotionError::database())?;
-
-        let committed_state = state
-            .connection
-            .query_row(
-                &format!("SELECT {EMOTION_STATE_COLUMNS} FROM emotion_state WHERE life_id = ?1"),
-                [&transition.life_id],
-                read_emotion_state,
-            )
-            .map_err(|_| EmotionError::database())?;
-        Ok(EmotionCommitOutcome::Committed {
-            event,
-            state: committed_state,
-        })
+        Ok(outcome)
     }
 
     fn find_event(

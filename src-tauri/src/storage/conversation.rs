@@ -429,7 +429,7 @@ impl StorageService {
     }
 }
 
-fn insert_message(
+pub(super) fn insert_message(
     transaction: &Transaction<'_>,
     id: &str,
     request: &AppendConversationTurnRequest,
@@ -459,7 +459,7 @@ fn insert_message(
     Ok(())
 }
 
-fn load_conversation(
+pub(super) fn load_conversation(
     connection: &Connection,
     life_id: &str,
     conversation_id: &str,
@@ -511,7 +511,7 @@ fn ensure_life_exists(
     }
 }
 
-fn load_turn(
+pub(super) fn load_turn(
     connection: &Connection,
     life_id: &str,
     conversation_id: &str,
@@ -627,7 +627,7 @@ fn count_query<P: rusqlite::Params>(
         .map_err(|_| ConversationHistoryError::new(ConversationHistoryErrorCode::InternalError))
 }
 
-fn storage_unavailable() -> ConversationHistoryError {
+pub(super) fn storage_unavailable() -> ConversationHistoryError {
     ConversationHistoryError::new(ConversationHistoryErrorCode::ConversationStorageUnavailable)
 }
 

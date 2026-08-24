@@ -225,9 +225,11 @@ fn initiative_guidance(level: InitiativeLevel) -> &'static str {
 /// Projection of the authoritative valence dimension onto the frozen
 /// expression bands. Projection only: never persisted, never a category.
 ///
-/// The compiler validates `PromptEmotion` before compiling, so out-of-domain
-/// inputs cannot reach this function; it must never silently clamp.
-pub fn valence_band(valence: i32) -> &'static str {
+/// PRIVATE implementation helper. The ONLY supported production projection
+/// boundary is `PromptCompiler::compile`, which validates `PromptEmotion`
+/// before deriving bands, so out-of-domain values cannot reach this function;
+/// it must never silently clamp. Not exposed outside this module.
+fn valence_band(valence: i32) -> &'static str {
     match valence {
         -1000..=-600 => "strongly negative",
         -599..=-200 => "mildly negative",
@@ -241,9 +243,11 @@ pub fn valence_band(valence: i32) -> &'static str {
 /// Projection of the authoritative activation dimension onto the frozen
 /// expression bands. Projection only: never persisted, never a category.
 ///
-/// The compiler validates `PromptEmotion` before compiling, so out-of-domain
-/// inputs cannot reach this function; it must never silently clamp.
-pub fn activation_band(activation: i32) -> &'static str {
+/// PRIVATE implementation helper. The ONLY supported production projection
+/// boundary is `PromptCompiler::compile`, which validates `PromptEmotion`
+/// before deriving bands, so out-of-domain values cannot reach this function;
+/// it must never silently clamp. Not exposed outside this module.
+fn activation_band(activation: i32) -> &'static str {
     match activation {
         -1000..=-600 => "very subdued",
         -599..=-200 => "subdued",

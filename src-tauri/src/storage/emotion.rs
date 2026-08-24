@@ -5,7 +5,7 @@
 //! `emotion_event` + `emotion_state` in one SQLite transaction. No decay, no
 //! policy, no time derivation is implemented here (D11-B2).
 
-use rusqlite::{params, OptionalExtension, Row, Transaction, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 
 use crate::emotion::{
     EmotionCommitOutcome, EmotionError, EmotionErrorCode, EmotionEvent, EmotionRepository,
@@ -89,6 +89,127 @@ fn map_event_insert_error(error: rusqlite::Error) -> EmotionError {
         }
     }
     EmotionError::database()
+}
+
+/// Read-only runtime view of the authoritative emotion state at one instant.
+/// `observed_at` is the single time observation a governed turn reuses for
+/// both elapsed calculation and transition event_time; `elapsed_seconds` is
+/// clamped at zero so clock rollback behaves as "no decay".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EmotionRuntimeObservation {
+    pub(crate) state: EmotionState,
+    pub(crate) observed_at: String,
+    pub(crate) elapsed_seconds: u64,
+}
+
+/// The ONE elapsed calculation shared by production (`now`) and the
+/// explicit-timestamp test seam. SQLite itself interprets its own stored
+/// timestamp format; a malformed persisted `last_applied_at` or an
+/// unrepresentable difference fails closed through the typed boundary.
+/// Clock rollback (observed < applied) behaves exactly like elapsed zero.
+fn load_emotion_runtime_observation_in_connection(
+    connection: &Connection,
+    observed_at: &str,
+    life_id: &str,
+) -> Result<EmotionRuntimeObservation, EmotionError> {
+    let state = read_emotion_state_by_life(connection, life_id)?;
+    // Both epochs are derived by SQLite from its own timestamp format, so the
+    // persisted value and the observed value share exactly one interpreter.
+    // A timestamp SQLite cannot interpret yields a NULL strftime result,
+    // which fails closed as a typed argument error — never a silent zero.
+    let observed_epoch: Option<i64> = connection
+        .query_row(
+            "SELECT CAST(strftime('%s', ?1) AS INTEGER)",
+            [observed_at],
+            |row| row.get::<_, rusqlite::types::Value>(0),
+        )
+        .optional()
+        .map_err(|_| EmotionError::database())?
+        .and_then(|value| match value {
+            rusqlite::types::Value::Integer(epoch) => Some(epoch),
+            _ => None,
+        });
+    let Some(observed_epoch) = observed_epoch else {
+        return Err(EmotionError::invalid_argument(
+            "the observation timestamp could not be interpreted by SQLite.",
+        ));
+    };
+    let last_applied_epoch: Option<i64> = connection
+        .query_row(
+            "SELECT CAST(strftime('%s', ?1) AS INTEGER)",
+            [&state.last_applied_at],
+            |row| row.get::<_, rusqlite::types::Value>(0),
+        )
+        .optional()
+        .map_err(|_| EmotionError::database())?
+        .and_then(|value| match value {
+            rusqlite::types::Value::Integer(epoch) => Some(epoch),
+            _ => None,
+        });
+    let Some(last_applied_epoch) = last_applied_epoch else {
+        return Err(EmotionError::invalid_argument(
+            "the persisted emotion timestamp could not be interpreted by SQLite.",
+        ));
+    };
+    // Clock rollback (observed earlier than applied) is clamped to zero, so
+    // negative differences behave exactly like "no decay".
+    let elapsed_seconds = u64::try_from(observed_epoch.saturating_sub(last_applied_epoch).max(0))
+        .map_err(|_| {
+        EmotionError::invalid_argument("the computed emotion elapsed time is unrepresentable.")
+    })?;
+    Ok(EmotionRuntimeObservation {
+        state,
+        observed_at: observed_at.to_string(),
+        elapsed_seconds,
+    })
+}
+
+fn read_emotion_state_by_life(
+    connection: &Connection,
+    life_id: &str,
+) -> Result<EmotionState, EmotionError> {
+    connection
+        .query_row(
+            &format!("SELECT {EMOTION_STATE_COLUMNS} FROM emotion_state WHERE life_id = ?1"),
+            [life_id],
+            read_emotion_state,
+        )
+        .optional()
+        .map_err(|_| EmotionError::database())?
+        .ok_or_else(EmotionError::state_not_found)
+}
+
+impl StorageService {
+    /// READ-ONLY production observation of the current emotion state against
+    /// SQLite's own UTC time basis. Never mutates or repairs anything.
+    pub(crate) fn load_emotion_runtime_observation(
+        &self,
+        life_id: &str,
+    ) -> Result<EmotionRuntimeObservation, EmotionError> {
+        let state = self.state().map_err(|_| EmotionError::database())?;
+        let now: String = state
+            .connection
+            .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", [], |row| {
+                row.get(0)
+            })
+            .map_err(|_| EmotionError::database())?;
+        load_emotion_runtime_observation_in_connection(&state.connection, &now, life_id)
+    }
+
+    /// Explicit-timestamp variant of the runtime observation: identical
+    /// calculation semantics to [`Self::load_emotion_runtime_observation`]
+    /// except that `observed_at` (a SQLite-compatible UTC timestamp) replaces
+    /// `now`. Production uses it ONLY for the single C2 emotion-revision
+    /// retry, where the ORIGINAL observation time must stay fixed; tests use
+    /// it as the deterministic clock seam. Not exposed via Tauri.
+    pub(crate) fn load_emotion_runtime_observation_at(
+        &self,
+        life_id: &str,
+        observed_at: &str,
+    ) -> Result<EmotionRuntimeObservation, EmotionError> {
+        let state = self.state().map_err(|_| EmotionError::database())?;
+        load_emotion_runtime_observation_in_connection(&state.connection, observed_at, life_id)
+    }
 }
 
 /// The ONE semantic implementation of an emotion mutation. Runs entirely
@@ -1466,5 +1587,141 @@ mod tests {
             )
             .unwrap();
         assert_eq!(invalid_rows, 0);
+    }
+
+    // ---------- D11-C2: read-only runtime time observation ----------
+
+    fn observation_fixture(root: &TestRoot) -> StorageService {
+        let service = seeded_service(root);
+        // Give life-a a known authoritative last_applied_at via a governed
+        // commit with a fixed event_time.
+        <StorageService as EmotionRepository>::commit_transition(
+            &service,
+            EmotionTransition::new(
+                "obs-event-1",
+                "life-a",
+                EmotionEventSource::new("conversation", "obs-turn-1"),
+                10,
+                5,
+                0,
+                10,
+                5,
+                INITIAL_POLICY_VERSION,
+                "2026-08-24T12:00:00.000Z",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let state = <StorageService as EmotionRepository>::load_current_state(&service, "life-a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.last_applied_at, "2026-08-24T12:00:00.000Z");
+        service
+    }
+
+    #[test]
+    fn observation_at_equal_timestamp_yields_zero_elapsed() {
+        let root = TestRoot::new("observation-equal");
+        let service = observation_fixture(&root);
+        let observation = service
+            .load_emotion_runtime_observation_at("life-a", "2026-08-24T12:00:00.000Z")
+            .unwrap();
+        assert_eq!(observation.elapsed_seconds, 0);
+        assert_eq!(observation.observed_at, "2026-08-24T12:00:00.000Z");
+        assert_eq!(
+            <StorageService as EmotionRepository>::load_current_state(&service, "life-a")
+                .unwrap()
+                .unwrap(),
+            observation.state
+        );
+    }
+
+    #[test]
+    fn observation_one_hour_after_last_applied_yields_3600_seconds() {
+        let root = TestRoot::new("observation-hour");
+        let service = observation_fixture(&root);
+        let observation = service
+            .load_emotion_runtime_observation_at("life-a", "2026-08-24T13:00:00.000Z")
+            .unwrap();
+        assert_eq!(observation.elapsed_seconds, 3600);
+    }
+
+    #[test]
+    fn observation_earlier_than_last_applied_behaves_as_zero_elapsed() {
+        let root = TestRoot::new("observation-rollback");
+        let service = observation_fixture(&root);
+        let observation = service
+            .load_emotion_runtime_observation_at("life-a", "2026-08-24T11:00:00.000Z")
+            .unwrap();
+        assert_eq!(observation.elapsed_seconds, 0);
+    }
+
+    #[test]
+    fn malformed_persisted_timestamp_fails_closed_without_mutation() {
+        let root = TestRoot::new("observation-malformed");
+        let service = seeded_service(&root);
+        {
+            let state = service.state().unwrap();
+            state
+                .connection
+                .execute(
+                    "UPDATE emotion_state SET last_applied_at='not-a-timestamp'
+                     WHERE life_id='life-a'",
+                    [],
+                )
+                .unwrap();
+        }
+        let before = <StorageService as EmotionRepository>::load_current_state(&service, "life-a")
+            .unwrap()
+            .unwrap();
+        let error = service
+            .load_emotion_runtime_observation_at("life-a", "2026-08-24T12:00:00.000Z")
+            .unwrap_err();
+        assert_eq!(error.code, EmotionErrorCode::InvalidArgument);
+        // Read-only: nothing repaired or mutated.
+        assert_eq!(
+            <StorageService as EmotionRepository>::load_current_state(&service, "life-a")
+                .unwrap()
+                .unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn explicit_seam_and_production_reader_share_one_calculation_path() {
+        // The production reader must be the SAME helper as the seam, only with
+        // SQLite 'now' substituted for the explicit timestamp. Prove the
+        // shared path by evaluating SQLite's own 'now' ONCE and feeding that
+        // exact string to both readers: identical inputs through the shared
+        // calculation must produce byte-identical observations.
+        let root = TestRoot::new("observation-shared-path");
+        let service = observation_fixture(&root);
+        let now: String = {
+            let state = service.state().unwrap();
+            state
+                .connection
+                .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        };
+        let via_explicit = service
+            .load_emotion_runtime_observation_at("life-a", &now)
+            .unwrap();
+        let via_production = service.load_emotion_runtime_observation("life-a").unwrap();
+        assert_eq!(
+            via_production.observed_at, now,
+            "production must observe through SQLite's own formatter"
+        );
+        assert_eq!(via_explicit.observed_at, via_production.observed_at);
+        // Both observations are within one wall-clock second of each other and
+        // the fixture's last_applied_at is a fixed past instant in 2026, so
+        // both elapsed values are large but structurally derived from the same
+        // state; equality of the full state proves the same reader path.
+        assert_eq!(via_explicit.state, via_production.state);
+        assert_eq!(
+            via_explicit.elapsed_seconds, via_production.elapsed_seconds,
+            "same fixed basis must yield the same elapsed"
+        );
     }
 }

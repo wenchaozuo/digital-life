@@ -565,3 +565,382 @@ fn reopening_storage_restores_latest_conversation_and_committed_messages() {
         vec!["latest user", "latest assistant"]
     );
 }
+
+// ==================== D11-C2 production emotion cutover ====================
+
+use crate::emotion::{EmotionRepository, EmotionState};
+use crate::storage::conversation_emotion::{
+    conversation_emotion_event_id, conversation_emotion_source_ref,
+};
+
+fn emotion_state_of(storage: &StorageService) -> EmotionState {
+    <StorageService as EmotionRepository>::load_current_state(storage, LIFE_A)
+        .unwrap()
+        .unwrap()
+}
+
+/// Governed event lookup through the frozen B1 repository surface (the raw
+/// connection is private outside the storage module). Returns the canonical
+/// identity triple of the single conversation_turn event for this turn.
+fn governed_event_identity(
+    storage: &StorageService,
+    conversation_id: &str,
+    request_id: &str,
+) -> Option<(String, String, String)> {
+    <StorageService as EmotionRepository>::find_event(
+        storage,
+        LIFE_A,
+        "conversation_turn",
+        &conversation_emotion_source_ref(conversation_id, request_id),
+    )
+    .unwrap()
+    .map(|event| (event.event_id, event.source_kind, event.source_ref))
+}
+
+#[test]
+fn successful_new_chat_commits_exactly_one_governed_emotion_turn() {
+    tauri::async_runtime::block_on(async {
+        let server = MockChatServer::new(vec![("200 OK", chat_response())]);
+        let fixture = Fixture::new();
+        fixture.activate_chat(&server.base_url);
+        let conversation = fixture.create_conversation("C2 success");
+
+        let response = fixture
+            .chat(request(&conversation.id, "c2-request-1", "hello emotion"))
+            .await
+            .unwrap();
+
+        // Model called exactly once; conversation committed exactly once.
+        assert_eq!(server.calls.load(Ordering::SeqCst), 1);
+        assert!(!response.replayed);
+        assert_eq!(response.assistant_message, "persisted assistant");
+        assert_eq!(
+            ConversationHistoryService::new(fixture.storage.as_ref())
+                .count_messages(LIFE_A, &conversation.id)
+                .unwrap(),
+            2
+        );
+        let record = ConversationHistoryService::new(fixture.storage.as_ref())
+            .get(LIFE_A, &conversation.id)
+            .unwrap();
+        assert_eq!(record.revision, 1);
+
+        // Exactly one emotion event with the canonical identity.
+        let event =
+            governed_event_identity(fixture.storage.as_ref(), &conversation.id, "c2-request-1")
+                .expect("the governed turn must carry exactly its canonical emotion event");
+        let state = emotion_state_of(fixture.storage.as_ref());
+        assert_eq!(state.revision, 1);
+        assert_eq!(
+            event.0,
+            conversation_emotion_event_id(LIFE_A, &conversation.id, "c2-request-1")
+        );
+        assert_eq!(event.1, "conversation_turn");
+        assert_eq!(
+            event.2,
+            conversation_emotion_source_ref(&conversation.id, "c2-request-1")
+        );
+
+        // Baseline stimulus at zero elapsed: valence untouched (0), activation
+        // +10 signal through the 7/10 gain = +7.
+        assert_eq!((state.valence, state.activation), (0, 7));
+
+        // The response must NOT leak any emotion values.
+        let response_json = serde_json::to_string(&response)
+            .unwrap()
+            .to_ascii_lowercase();
+        for forbidden in ["valence", "activation", "policyversion", "sourceref"] {
+            assert!(!response_json.contains(forbidden));
+        }
+    });
+}
+
+#[test]
+fn c2_decay_and_impulse_compose_through_the_deterministic_clock_seam() {
+    tauri::async_runtime::block_on(async {
+        let server = MockChatServer::new(vec![("200 OK", chat_response())]);
+        let fixture = Fixture::new();
+        fixture.activate_chat(&server.base_url);
+        let conversation = fixture.create_conversation("C2 decay");
+
+        // Stage 1 — exact one-hour composition through the deterministic
+        // seam: seed last_applied_at to a fixed past instant via a governed
+        // commit, then verify decay + impulse compose exactly per B2
+        // (valence: -200 decays +8/h toward zero → -192; activation:
+        // 100 decays -24/h → 76; impulse +10*7/10 = +7 → 83).
+        <StorageService as EmotionRepository>::commit_transition(
+            fixture.storage.as_ref(),
+            crate::emotion::EmotionTransition::new(
+                "seed-event",
+                LIFE_A,
+                crate::emotion::EmotionEventSource::new("seed", "seed-ref"),
+                -200,
+                100,
+                0,
+                -200,
+                100,
+                1,
+                "2026-08-24T11:00:00.000Z",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let observation = fixture
+            .storage
+            .load_emotion_runtime_observation_at(LIFE_A, "2026-08-24T12:00:00.000Z")
+            .unwrap();
+        assert_eq!(observation.elapsed_seconds, 3600);
+        let policy_request = crate::emotion::policy::EmotionPolicyRequest::new(
+            conversation_emotion_event_id(LIFE_A, &conversation.id, "decay-probe"),
+            crate::emotion::EmotionEventSource::new(
+                "conversation_turn",
+                conversation_emotion_source_ref(&conversation.id, "decay-probe"),
+            ),
+            crate::emotion::policy::EmotionStimulus::new(0, 10).unwrap(),
+            observation.elapsed_seconds,
+            observation.observed_at,
+        )
+        .unwrap();
+        let transition =
+            crate::emotion::policy::evolve(&observation.state, policy_request).unwrap();
+        assert_eq!(
+            (transition.next_valence, transition.next_activation),
+            (-192, 83),
+            "one hour decay then frozen stimulus must compose exactly"
+        );
+
+        // Stage 2 — deterministic production-path behavior: push
+        // last_applied_at to a FIXED FUTURE instant with a second governed
+        // commit, so every real run observes 'now' EARLIER than the seed and
+        // the production reader deterministically clamps elapsed to zero.
+        <StorageService as EmotionRepository>::commit_transition(
+            fixture.storage.as_ref(),
+            crate::emotion::EmotionTransition::new(
+                "future-event",
+                LIFE_A,
+                crate::emotion::EmotionEventSource::new("seed", "seed-ref-future"),
+                0,
+                0,
+                1,
+                -200,
+                100,
+                1,
+                "2099-01-01T00:00:00.000Z",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        // A REAL governed chat turn commits its own event on top through the
+        // production path with rollback-clamped elapsed: the committed state
+        // is exactly the seed plus this turn's frozen +7 activation impulse.
+        fixture
+            .chat(request(&conversation.id, "c2-decay-request", "after seed"))
+            .await
+            .unwrap();
+        assert_eq!(server.calls.load(Ordering::SeqCst), 1);
+        assert!(governed_event_identity(
+            fixture.storage.as_ref(),
+            &conversation.id,
+            "c2-decay-request"
+        )
+        .is_some());
+        let state = emotion_state_of(fixture.storage.as_ref());
+        assert_eq!(state.revision, 3);
+        assert_eq!(
+            (state.valence, state.activation),
+            (-200, 107),
+            "rollback-clamped elapsed keeps the seeded state; only +7 is added"
+        );
+    });
+}
+
+#[test]
+fn c2_exact_replay_short_circuits_before_model_and_emotion() {
+    tauri::async_runtime::block_on(async {
+        let server = MockChatServer::new(vec![("200 OK", chat_response())]);
+        let fixture = Fixture::new();
+        fixture.activate_chat(&server.base_url);
+        let conversation = fixture.create_conversation("C2 replay");
+
+        let first = fixture
+            .chat(request(&conversation.id, "same-request", "ask once"))
+            .await
+            .unwrap();
+        assert!(!first.replayed);
+        assert_eq!(server.calls.load(Ordering::SeqCst), 1);
+        let state_after_first = emotion_state_of(fixture.storage.as_ref());
+
+        let replay = fixture
+            .chat(request(&conversation.id, "same-request", "ask once"))
+            .await
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.assistant_message, "persisted assistant");
+        // No second model call, no extra messages/events/revisions.
+        assert_eq!(server.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            ConversationHistoryService::new(fixture.storage.as_ref())
+                .count_messages(LIFE_A, &conversation.id)
+                .unwrap(),
+            2
+        );
+        assert!(governed_event_identity(
+            fixture.storage.as_ref(),
+            &conversation.id,
+            "same-request"
+        )
+        .is_some());
+        assert_eq!(
+            emotion_state_of(fixture.storage.as_ref()),
+            state_after_first
+        );
+
+        // Same request id + different current message: TurnIdConflict, no new
+        // model call, no emotion mutation.
+        let conflict = fixture
+            .chat(request(&conversation.id, "same-request", "different"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            conflict.code,
+            ConversationCognitionErrorCode::TurnIdConflict
+        );
+        assert_eq!(server.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            emotion_state_of(fixture.storage.as_ref()),
+            state_after_first
+        );
+    });
+}
+
+#[test]
+fn c2_legacy_turn_replay_returns_history_without_backfilling_emotion() {
+    tauri::async_runtime::block_on(async {
+        // No chat provider is activated at all: the high-level replay
+        // short-circuit must return the persisted turn BEFORE any model or
+        // emotion work, which this fixture makes observable.
+        let fixture = Fixture::new();
+        let conversation = fixture.create_conversation("C2 legacy replay");
+
+        // Commit the turn through the LEGACY non-emotion path BEFORE chat.
+        append_fixture_turn(
+            fixture.storage.as_ref(),
+            &conversation.id,
+            "pre-c-turn",
+            "legacy question",
+            "legacy answer",
+        );
+
+        let replay = fixture
+            .chat(request(&conversation.id, "pre-c-turn", "legacy question"))
+            .await
+            .unwrap();
+
+        // High-level replay returns persisted history and never touches
+        // emotion — no model call, no backfilled event, no revision change.
+        assert!(replay.replayed);
+        assert_eq!(replay.assistant_message, "legacy answer");
+        assert!(
+            governed_event_identity(fixture.storage.as_ref(), &conversation.id, "pre-c-turn")
+                .is_none()
+        );
+        let state = emotion_state_of(fixture.storage.as_ref());
+        assert_eq!((state.valence, state.activation, state.revision), (0, 0, 0));
+    });
+}
+
+#[test]
+fn c2_model_failure_persists_nothing_in_either_domain() {
+    tauri::async_runtime::block_on(async {
+        let server = MockChatServer::new(vec![("500 Internal Server Error", "{}")]);
+        let fixture = Fixture::new();
+        fixture.activate_chat(&server.base_url);
+        let conversation = fixture.create_conversation("C2 failure");
+
+        let error = fixture
+            .chat(request(&conversation.id, "failed-c2", "will fail"))
+            .await
+            .unwrap_err();
+        // Existing provider failure mapping is preserved (a 500 with an empty
+        // body is an invalid/failed provider response, NOT any emotion code).
+        assert!(matches!(
+            error.code,
+            ConversationCognitionErrorCode::InvalidProviderResponse
+                | ConversationCognitionErrorCode::ProviderInitializationFailed
+                | ConversationCognitionErrorCode::NetworkUnavailable
+        ));
+        assert_eq!(
+            ConversationHistoryService::new(fixture.storage.as_ref())
+                .count_messages(LIFE_A, &conversation.id)
+                .unwrap(),
+            0
+        );
+        let state = emotion_state_of(fixture.storage.as_ref());
+        assert_eq!((state.valence, state.activation, state.revision), (0, 0, 0));
+    });
+}
+
+#[test]
+fn c2_stale_conversation_revision_maps_to_existing_cognition_error() {
+    // Reuse the blocking server pattern from the existing suite: while the
+    // model call is in flight, another writer advances the conversation, so
+    // the composite commit fails its CAS. Emotion must roll back too.
+    let server = BlockingChatServer::new();
+    let fixture = Fixture::new();
+    fixture.activate_chat(&server.base_url);
+    let conversation = fixture.create_conversation("C2 conv conflict");
+    let storage = Arc::clone(&fixture.storage);
+    let secrets = Arc::clone(&fixture.secrets);
+    let model_runtime = Arc::clone(&fixture.model_runtime);
+    let registry = Arc::clone(&fixture.registry);
+    let coordinator = Arc::clone(&fixture.coordinator);
+    let conversation_id = conversation.id.clone();
+    let request_conversation_id = conversation.id.clone();
+    let handle = thread::spawn(move || {
+        tauri::async_runtime::block_on(
+            ConversationCognitionService::new(
+                storage.as_ref(),
+                secrets.as_ref(),
+                model_runtime.as_ref(),
+                registry.as_ref(),
+                coordinator.as_ref(),
+            )
+            .chat(request(
+                &request_conversation_id,
+                "c2-stale",
+                "generated from stale revision",
+            )),
+        )
+    });
+
+    server
+        .received
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+    append_fixture_turn(
+        fixture.storage.as_ref(),
+        &conversation_id,
+        "independent-c2-turn",
+        "newer user",
+        "newer assistant",
+    );
+    server.release.send(()).unwrap();
+    let error = handle.join().unwrap().unwrap_err();
+    assert_eq!(
+        error.code,
+        ConversationCognitionErrorCode::ConversationChangedDuringRequest
+    );
+    // The independent turn remains; NO partial emotion mutation happened.
+    assert_eq!(
+        ConversationHistoryService::new(fixture.storage.as_ref())
+            .count_messages(LIFE_A, &conversation_id)
+            .unwrap(),
+        2
+    );
+    assert!(
+        governed_event_identity(fixture.storage.as_ref(), &conversation_id, "c2-stale").is_none()
+    );
+    let state = emotion_state_of(fixture.storage.as_ref());
+    assert_eq!((state.valence, state.activation, state.revision), (0, 0, 0));
+}

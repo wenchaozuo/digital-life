@@ -9,6 +9,10 @@ use crate::{
         ConversationHistoryErrorCode, ConversationHistoryService,
         ConversationRole as PersistedConversationRole, PersistedConversationMessage,
     },
+    emotion::{
+        policy::{self, EmotionPolicyRequest, EmotionStimulus},
+        EmotionCommitOutcome, EmotionError, EmotionErrorCode, EmotionEventSource,
+    },
     memory::{
         context_builder::{
             MemoryContextBuildRequest, MemoryContextBuilder, MemoryContextEntry,
@@ -33,6 +37,10 @@ use crate::{
         PromptLifeIdentity, PromptPersona, SafetyRulesVersion,
     },
     secrets::{SecretStore, WindowsCredentialSecretStore},
+    storage::conversation_emotion::{
+        conversation_emotion_event_id, conversation_emotion_source_ref,
+        CONVERSATION_EMOTION_SOURCE_KIND,
+    },
     storage::{LifeIdentityRecord, PersonaTemplateRecord, StorageService},
     vector_store::LanceDbVectorStoreRegistry,
 };
@@ -111,6 +119,10 @@ pub enum ConversationCognitionErrorCode {
     NetworkUnavailable,
     RequestTimeout,
     InvalidProviderResponse,
+    EmotionStateUnavailable,
+    EmotionChangedDuringRequest,
+    EmotionCommitConflict,
+    EmotionIntegrationFailure,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -330,16 +342,90 @@ where
             )
             .await
             .map_err(map_model_error)?;
-        let appended = history
-            .append_turn(AppendConversationTurnRequest {
-                life_id: life.id,
-                conversation_id: request.conversation_id.clone(),
-                turn_id: request.request_id.clone(),
-                user_content: request.current_message,
-                assistant_content: response.text,
-                expected_revision: Some(conversation.revision),
-            })
-            .map_err(map_history_error)?;
+        // MODEL SUCCESS boundary: everything below persists; nothing above
+        // this point has touched emotion or conversation state.
+        //
+        // One time observation drives BOTH the policy elapsed calculation and
+        // the transition event_time, so decay and persisted evidence cannot
+        // drift. The observation happens only after model success.
+        let first_observation = self
+            .storage
+            .load_emotion_runtime_observation(&life.id)
+            .map_err(map_emotion_error)?;
+        let append_request = AppendConversationTurnRequest {
+            life_id: life.id.clone(),
+            conversation_id: request.conversation_id.clone(),
+            turn_id: request.request_id.clone(),
+            user_content: request.current_message.clone(),
+            assistant_content: response.text.clone(),
+            expected_revision: Some(conversation.revision),
+        };
+        let build_transition = |state: &crate::emotion::EmotionState,
+                                elapsed_seconds: u64,
+                                event_time: &str|
+         -> Result<
+            crate::emotion::EmotionTransition,
+            ConversationCognitionError,
+        > {
+            let policy_request = EmotionPolicyRequest::new(
+                conversation_emotion_event_id(
+                    &life.id,
+                    &request.conversation_id,
+                    &request.request_id,
+                ),
+                EmotionEventSource::new(
+                    CONVERSATION_EMOTION_SOURCE_KIND,
+                    conversation_emotion_source_ref(&request.conversation_id, &request.request_id),
+                ),
+                conversation_interaction_stimulus_v1(),
+                elapsed_seconds,
+                event_time,
+            )
+            .map_err(map_emotion_error)?;
+            policy::evolve(state, policy_request).map_err(map_emotion_error)
+        };
+
+        // ONE atomic composite commit for conversation + emotion. On a typed
+        // emotion RevisionConflict (another emotion writer won between our
+        // observation and the commit), refresh against the SAME fixed
+        // event_time via the explicit-timestamp observation seam, rebuild the
+        // transition once from the newer authoritative state, and retry the
+        // composite commit exactly once — WITHOUT calling the model again.
+        let first_observed_at = first_observation.observed_at.clone();
+        let mut transition = build_transition(
+            &first_observation.state,
+            first_observation.elapsed_seconds,
+            &first_observed_at,
+        )?;
+        let composite = match self
+            .storage
+            .append_complete_turn_with_emotion(&append_request, transition)
+        {
+            Ok(outcome) => outcome,
+            Err(commit_error) if commit_error_code_is_emotion_revision_conflict(&commit_error) => {
+                let retry_observation = self
+                    .storage
+                    .load_emotion_runtime_observation_at(&life.id, &first_observed_at)
+                    .map_err(map_emotion_error)?;
+                transition = build_transition(
+                    &retry_observation.state,
+                    // Elapsed recomputed against the NEWER last_applied_at but
+                    // with the SAME fixed observation: a later applied time
+                    // clamps to zero inside the shared calculation.
+                    retry_observation.elapsed_seconds,
+                    &first_observed_at,
+                )?;
+                self.storage
+                    .append_complete_turn_with_emotion(&append_request, transition)
+                    .map_err(map_composite_commit_error)?
+            }
+            Err(commit_error) => return Err(map_composite_commit_error(commit_error)),
+        };
+        let appended = composite.turn;
+        debug_assert!(matches!(
+            composite.emotion,
+            EmotionCommitOutcome::Committed { .. }
+        ));
         let mut degradations = retrieval_result
             .degradation_codes
             .iter()
@@ -538,6 +624,62 @@ fn map_history_error(history_error: ConversationHistoryError) -> ConversationCog
     })
 }
 
+/// Conversation Interaction Stimulus V1: the frozen bounded signal applied to
+/// every successfully generated NEW governed turn. Deliberately makes NO
+/// positive/negative valence claim and infers nothing from message text; a
+/// successful interaction only contributes a small engagement impulse. With
+/// the B2 activation gain (7/10) this yields +7 activation before decay.
+fn conversation_interaction_stimulus_v1() -> EmotionStimulus {
+    EmotionStimulus::new(0, 10).expect("the frozen conversation stimulus is in range")
+}
+
+fn map_emotion_error(emotion_error: EmotionError) -> ConversationCognitionError {
+    error(match emotion_error.code {
+        EmotionErrorCode::LifeNotFound | EmotionErrorCode::StateNotFound => {
+            ConversationCognitionErrorCode::EmotionStateUnavailable
+        }
+        EmotionErrorCode::RevisionConflict => {
+            ConversationCognitionErrorCode::EmotionChangedDuringRequest
+        }
+        EmotionErrorCode::EventConflict => ConversationCognitionErrorCode::EmotionCommitConflict,
+        EmotionErrorCode::InvalidArgument | EmotionErrorCode::DatabaseUnavailable => {
+            ConversationCognitionErrorCode::EmotionIntegrationFailure
+        }
+    })
+}
+
+fn map_composite_commit_error(
+    commit_error: crate::storage::conversation_emotion::ConversationEmotionCommitError,
+) -> ConversationCognitionError {
+    match commit_error {
+        crate::storage::conversation_emotion::ConversationEmotionCommitError::Emotion(
+            emotion_error,
+        ) => map_emotion_error(emotion_error),
+        crate::storage::conversation_emotion::ConversationEmotionCommitError::Conversation(
+            history_error,
+        ) => map_history_error(history_error),
+        // BindingMismatch / EmotionEventMissing are internal governed-path
+        // invariant violations in NEW C2 persistence, never user problems.
+        crate::storage::conversation_emotion::ConversationEmotionCommitError::BindingMismatch(_)
+        | crate::storage::conversation_emotion::ConversationEmotionCommitError::EmotionEventMissing(
+            _,
+        ) => error(ConversationCognitionErrorCode::EmotionIntegrationFailure),
+    }
+}
+
+/// True only for the typed emotion RevisionConflict produced by the C1
+/// composite commit — the single retryable condition. Everything else maps
+/// straight to the cognition boundary without a retry.
+fn commit_error_code_is_emotion_revision_conflict(
+    commit_error: &crate::storage::conversation_emotion::ConversationEmotionCommitError,
+) -> bool {
+    matches!(
+        commit_error,
+        crate::storage::conversation_emotion::ConversationEmotionCommitError::Emotion(emotion)
+            if emotion.code == EmotionErrorCode::RevisionConflict
+    )
+}
+
 fn map_model_error(runtime_error: ModelRuntimeError) -> ConversationCognitionError {
     error(match runtime_error.code {
         ModelRuntimeErrorCode::NoActiveProfile => ConversationCognitionErrorCode::NoActiveProfile,
@@ -661,6 +803,21 @@ fn error(code: ConversationCognitionErrorCode) -> ConversationCognitionError {
         ConversationCognitionErrorCode::RequestTimeout => ("The chat request timed out.", true),
         ConversationCognitionErrorCode::InvalidProviderResponse => {
             ("The chat service returned an invalid response.", true)
+        }
+        ConversationCognitionErrorCode::EmotionStateUnavailable => (
+            "The authoritative emotion state is currently unavailable.",
+            true,
+        ),
+        ConversationCognitionErrorCode::EmotionChangedDuringRequest => (
+            "The emotion state changed while the response was being generated.",
+            true,
+        ),
+        ConversationCognitionErrorCode::EmotionCommitConflict => (
+            "The governed conversation turn conflicts with committed emotion evidence.",
+            false,
+        ),
+        ConversationCognitionErrorCode::EmotionIntegrationFailure => {
+            ("The governed emotion integration failed.", false)
         }
     };
     ConversationCognitionError::new(code, message, recoverable)

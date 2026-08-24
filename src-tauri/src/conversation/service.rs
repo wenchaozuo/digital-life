@@ -47,37 +47,14 @@ use crate::{
 
 const MAX_USER_MESSAGE_CHARACTERS: usize = 32_000;
 
-/// TEST-ONLY deterministic seam, compiled out of production builds entirely:
-/// invoked exactly before EACH composite attempt (first and the single
-/// retry), receiving `(life_id, turn_id, original_observed_at)` so a focused
-/// test can perform one real independent emotion mutation and force the typed
-/// revision race, keyed to its own turn. Not fault injection — production
-/// behavior is byte-identical without it.
+/// TEST-ONLY deterministic seam type owned by a service INSTANCE (never
+/// process-global): invoked exactly before EACH composite attempt (first and
+/// the single retry), receiving `(life_id, turn_id, original_observed_at)` so
+/// a focused test can perform one real independent emotion mutation and force
+/// the typed revision race. Installed via
+/// [`ConversationCognitionService::new_with_pre_composite_hook`].
 #[cfg(test)]
 pub(crate) type PreCompositeHook = Box<dyn Fn(&str, &str, &str) + Send + Sync>;
-
-#[cfg(test)]
-static PRE_COMPOSITE_HOOK: Mutex<Option<PreCompositeHook>> = Mutex::new(None);
-
-/// Invoke the test-only pre-composite seam. Compiles away in production.
-#[cfg(test)]
-fn run_pre_composite_hook(life_id: &str, turn_id: &str, observed_at: &str) {
-    if let Some(hook) = crate::conversation::service::PRE_COMPOSITE_HOOK
-        .lock()
-        .unwrap()
-        .as_ref()
-    {
-        hook(life_id, turn_id, observed_at);
-    }
-}
-
-/// TEST-ONLY install/uninstall access for the pre-composite seam.
-#[cfg(test)]
-pub(crate) fn test_only_pre_composite_hook(hook: Option<PreCompositeHook>) {
-    *crate::conversation::service::PRE_COMPOSITE_HOOK
-        .lock()
-        .unwrap() = hook;
-}
 
 /// TEST-ONLY mapper surface for the observation boundary proof.
 #[cfg(test)]
@@ -251,6 +228,15 @@ where
     model_coordinator: &'a ModelRuntimeCoordinator,
     retrieval_registry: &'a LanceDbVectorStoreRegistry,
     coordinator: &'a ConversationCognitionCoordinator,
+    /// TEST-ONLY deterministic seam owned by THIS service instance, compiled
+    /// out of production builds entirely: invoked exactly before EACH
+    /// composite attempt (first and the single retry), receiving
+    /// `(life_id, turn_id, original_observed_at)` so a focused test can
+    /// perform one real independent emotion mutation and force the typed
+    /// revision race. Not fault injection — a hook-free instance behaves
+    /// identically to the previous layout.
+    #[cfg(test)]
+    pre_composite_hook: Option<PreCompositeHook>,
 }
 
 impl<'a, S> ConversationCognitionService<'a, S>
@@ -270,6 +256,30 @@ where
             model_coordinator,
             retrieval_registry,
             coordinator,
+            #[cfg(test)]
+            pre_composite_hook: None,
+        }
+    }
+
+    /// TEST-ONLY constructor: identical to [`Self::new`] except the returned
+    /// instance owns `hook`, invoked before each composite attempt. No static
+    /// state, no global mutex — parallel tests each drive their own instance.
+    #[cfg(test)]
+    pub(crate) fn new_with_pre_composite_hook(
+        storage: &'a StorageService,
+        secrets: &'a S,
+        model_coordinator: &'a ModelRuntimeCoordinator,
+        retrieval_registry: &'a LanceDbVectorStoreRegistry,
+        coordinator: &'a ConversationCognitionCoordinator,
+        hook: PreCompositeHook,
+    ) -> Self {
+        Self {
+            storage,
+            secrets,
+            model_coordinator,
+            retrieval_registry,
+            coordinator,
+            pre_composite_hook: Some(hook),
         }
     }
 
@@ -444,7 +454,9 @@ where
             &first_observed_at,
         )?;
         #[cfg(test)]
-        run_pre_composite_hook(&life.id, &request.request_id, &first_observed_at);
+        if let Some(hook) = self.pre_composite_hook.as_ref() {
+            hook(&life.id, &request.request_id, &first_observed_at);
+        }
         let composite = match self
             .storage
             .append_complete_turn_with_emotion(&append_request, transition)
@@ -464,7 +476,9 @@ where
                     &first_observed_at,
                 )?;
                 #[cfg(test)]
-                run_pre_composite_hook(&life.id, &request.request_id, &first_observed_at);
+                if let Some(hook) = self.pre_composite_hook.as_ref() {
+                    hook(&life.id, &request.request_id, &first_observed_at);
+                }
                 self.storage
                     .append_complete_turn_with_emotion(&append_request, transition)
                     .map_err(map_composite_commit_error)?

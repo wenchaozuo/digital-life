@@ -54,8 +54,14 @@ fn read_emotion_event(row: &Row<'_>) -> rusqlite::Result<EmotionEvent> {
 /// actually committed (`result_valence` / `result_activation`), target
 /// revision, policy version, and event time. A differing payload for the same
 /// identity - including a different next state with identical deltas - is a
-/// conflict, never a silent skip.
-fn event_evidence_matches(event: &EmotionEvent, transition: &EmotionTransition) -> bool {
+/// conflict, never a silent skip. The `target_revision` is derived once by the
+/// caller with checked arithmetic, so this matcher never performs raw
+/// `expected_revision + 1`.
+fn event_evidence_matches(
+    event: &EmotionEvent,
+    transition: &EmotionTransition,
+    target_revision: i64,
+) -> bool {
     event.life_id == transition.life_id
         && event.source_kind == transition.source.kind
         && event.source_ref == transition.source.reference
@@ -63,7 +69,7 @@ fn event_evidence_matches(event: &EmotionEvent, transition: &EmotionTransition) 
         && event.activation_delta == transition.activation_delta
         && event.result_valence == transition.next_valence
         && event.result_activation == transition.next_activation
-        && event.applied_revision == transition.expected_revision + 1
+        && event.applied_revision == target_revision
         && event.event_time == transition.event_time
         && event.policy_version == transition.policy_version
 }
@@ -106,6 +112,11 @@ impl EmotionRepository for StorageService {
         transition
             .validate()
             .map_err(|_| EmotionError::invalid_argument("The emotion transition is invalid."))?;
+        // Derive the target revision once with checked arithmetic. An
+        // unrepresentable next revision (expected_revision == i64::MAX) is a
+        // typed argument error before any replay lookup or write, and the same
+        // derived value backs replay equivalence AND the commit below.
+        let applied_revision = transition.target_revision()?;
         let mut state = self.state().map_err(|_| EmotionError::database())?;
         let transaction = state
             .connection
@@ -152,7 +163,7 @@ impl EmotionRepository for StorageService {
             .optional()
             .map_err(|_| EmotionError::database())?
         {
-            if event_evidence_matches(&existing, &transition) {
+            if event_evidence_matches(&existing, &transition, applied_revision) {
                 return Ok(EmotionCommitOutcome::Replayed {
                     event: existing,
                     state: current_state,
@@ -177,7 +188,7 @@ impl EmotionRepository for StorageService {
             .optional()
             .map_err(|_| EmotionError::database())?
         {
-            if event_evidence_matches(&existing, &transition) {
+            if event_evidence_matches(&existing, &transition, applied_revision) {
                 return Ok(EmotionCommitOutcome::Replayed {
                     event: existing,
                     state: current_state,
@@ -190,9 +201,6 @@ impl EmotionRepository for StorageService {
         if current_state.revision != transition.expected_revision {
             return Err(EmotionError::revision_conflict());
         }
-        let applied_revision = transition.expected_revision.checked_add(1).ok_or_else(|| {
-            EmotionError::invalid_argument("The expected state revision overflows.")
-        })?;
 
         // The event insert and the state update are one SQLite transaction:
         // a failure of either rolls back both.
@@ -629,6 +637,74 @@ mod tests {
         assert_eq!(life_state(&service, "life-a").unwrap().revision, 1);
         let (_, event_count) = state_counts(&service);
         assert_eq!(event_count, 1);
+    }
+
+    #[test]
+    fn max_expected_revision_is_a_typed_argument_error_without_mutation() {
+        let root = TestRoot::new("max-revision");
+        let service = seeded_service(&root);
+
+        // Populate the ledger so the replay lookups see an existing row: the
+        // old code overflow-called `expected_revision + 1` for i64::MAX here
+        // (panic in debug, wrap in release) before it could reject.
+        <StorageService as EmotionRepository>::commit_transition(
+            &service,
+            transition("event-1", "life-a", "conversation", "turn-7", 0),
+        )
+        .unwrap();
+        assert_eq!(life_state(&service, "life-a").unwrap().revision, 1);
+
+        // Re-propose the SAME event identity at i64::MAX: the by-event-id
+        // replay lookup is the path that previously hit the unchecked math.
+        let error = <StorageService as EmotionRepository>::commit_transition(
+            &service,
+            transition("event-1", "life-a", "conversation", "turn-7", i64::MAX),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, EmotionErrorCode::InvalidArgument);
+
+        // A fresh source identity at i64::MAX is a typed argument error too.
+        let error = <StorageService as EmotionRepository>::commit_transition(
+            &service,
+            transition(
+                "event-max-fresh",
+                "life-a",
+                "conversation",
+                "overflow-probe",
+                i64::MAX,
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, EmotionErrorCode::InvalidArgument);
+
+        // Neither failed proposal mutated state or appended a ledger row.
+        let state = life_state(&service, "life-a").unwrap();
+        assert_eq!(
+            (state.valence, state.activation, state.revision),
+            (40, -20, 1)
+        );
+        let (_, event_count) = state_counts(&service);
+        assert_eq!(event_count, 1);
+
+        // Ordinary replay and revision increment still work on this path.
+        let replayed = <StorageService as EmotionRepository>::commit_transition(
+            &service,
+            transition("event-1", "life-a", "conversation", "turn-7", 0),
+        )
+        .unwrap();
+        assert!(matches!(replayed, EmotionCommitOutcome::Replayed { .. }));
+        <StorageService as EmotionRepository>::commit_transition(
+            &service,
+            transition("event-2", "life-a", "conversation", "turn-8", 1),
+        )
+        .unwrap();
+        let state = life_state(&service, "life-a").unwrap();
+        assert_eq!(
+            (state.valence, state.activation, state.revision),
+            (40, -20, 2)
+        );
+        let (_, event_count) = state_counts(&service);
+        assert_eq!(event_count, 2);
     }
 
     fn commit_with_result_state(

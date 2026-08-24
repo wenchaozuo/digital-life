@@ -170,6 +170,17 @@ impl EmotionTransition {
         }
         Ok(())
     }
+
+    /// The revision this transition applies at. Derived with `checked_add(1)`
+    /// so an unrepresentable next revision (`expected_revision == i64::MAX`) is
+    /// a typed `InvalidArgument` error instead of an overflow panic or a
+    /// debug/release divergence. Replay equivalence and the normal commit must
+    /// reuse the SAME computed value.
+    pub(crate) fn target_revision(&self) -> Result<i64, EmotionError> {
+        self.expected_revision
+            .checked_add(1)
+            .ok_or_else(|| EmotionError::invalid_argument("The expected state revision overflows."))
+    }
 }
 
 /// One immutable ledger row. Bounded state-transition evidence only; it never
@@ -477,6 +488,30 @@ mod tests {
             )
             .unwrap_err()
             .code,
+            EmotionErrorCode::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn target_revision_is_checked_and_rejects_i64_max() {
+        let normal = transition("event-1", "life-a", source("kind", "ref")).unwrap();
+        assert_eq!(normal.target_revision().unwrap(), 1);
+
+        let max_transition = EmotionTransition::new(
+            "event-max",
+            "life-a",
+            source("kind", "ref"),
+            10,
+            -5,
+            i64::MAX,
+            10,
+            -5,
+            1,
+            "2026-08-23T00:00:00.000Z",
+        )
+        .unwrap();
+        assert_eq!(
+            max_transition.target_revision().unwrap_err().code,
             EmotionErrorCode::InvalidArgument
         );
     }

@@ -11,7 +11,7 @@ const syncCommands = [
   "get_memory_vector_sync_settings",
   "set_memory_vector_sync_enabled",
   "get_memory_vector_sync_status",
-  "start_memory_vector_sync",
+  "start_fenced_vector_sync_drain",
   "pause_memory_vector_sync",
   "retry_memory_vector_sync_failures",
 ];
@@ -22,13 +22,24 @@ test("vector sync controls are Settings-only", () => {
     assert.doesNotMatch(chat, new RegExp(command));
     assert.doesNotMatch(main, new RegExp(command));
   }
+  // The stale legacy background-worker start command must not be granted.
+  assert.doesNotMatch(settings, /start_memory_vector_sync/);
+  // The fenced production entrypoint is Settings-only.
+  assert.doesNotMatch(chat, /start_fenced_vector_sync_drain/);
+  assert.doesNotMatch(main, /start_fenced_vector_sync_drain/);
 });
 
 test("worker state is registered without an application-start execution path", () => {
   assert.match(rust, /MemoryVectorSyncWorkerCoordinator::default/);
-  assert.match(rust, /vector_sync_worker::start_memory_vector_sync/);
+  // The registered production manual-sync entrypoint is the bounded fenced
+  // drain; the legacy background-worker start command is NOT registered.
+  assert.match(rust, /vector_sync_stage_runtime::start_fenced_vector_sync_drain/);
+  assert.doesNotMatch(rust, /vector_sync_worker::start_memory_vector_sync/);
   const setup = rust.slice(rust.indexOf(".setup("), rust.indexOf(".invoke_handler("));
-  assert.doesNotMatch(setup, /start_memory_vector_sync|run_worker|\.drain\(/);
+  assert.doesNotMatch(
+    setup,
+    /start_fenced_vector_sync_drain|run_fenced_vector_sync_drain|start_memory_vector_sync|run_worker|\.drain\(/,
+  );
 });
 
 test("public sync IPC has no model, credential, memory text, vector, or path parameters", () => {

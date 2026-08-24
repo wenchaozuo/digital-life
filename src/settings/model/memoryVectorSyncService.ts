@@ -1,5 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 
+/** One user-initiated Settings drain processes at most this many items. */
+export const MANUAL_SYNC_DRAIN_LIMIT = 32;
+
 export interface MemoryVectorSyncSettings {
   lifeId: string;
   enabled: boolean;
@@ -28,6 +31,8 @@ export type MemoryVectorSyncWorkerErrorCode =
   | "REQUEST_TIMEOUT"
   | "INVALID_PROVIDER_RESPONSE"
   | "VECTOR_STORE_UNAVAILABLE"
+  | "UNAVAILABLE"
+  | "DRAIN_FAILED"
   | "INTERNAL_ERROR";
 
 export type MemoryVectorSyncAction = "upsert" | "delete";
@@ -49,16 +54,43 @@ export interface MemoryVectorSyncWorkerStatus {
   nextRetryAt: string | null;
 }
 
-export interface StartMemoryVectorSyncResult {
-  runId: string;
-  accepted: boolean;
+/**
+ * Count-only result of ONE bounded fenced drain (the frozen production
+ * `start_fenced_vector_sync_drain` result). Only redacted counters cross the
+ * boundary: no generation/provider/credential/vector authority metadata.
+ */
+export interface MemoryVectorSyncDrainResult {
+  requestedLimit: number;
+  processed: number;
+  appliedUpserts: number;
+  appliedDeletes: number;
+  retryScheduled: number;
+  blocked: number;
+  failed: number;
+  stoppedNoEligible: boolean;
+  stoppedLostLease: boolean;
+}
+
+/**
+ * Fresh opaque lease owner for ONE manual Settings drain.
+ * `settings-ui:<uuid>`; browser-native UUID where available. The owner is
+ * purely a lease identity — it must never carry life, model, generation,
+ * credential, or path data.
+ */
+function freshSettingsLeaseOwner(): string {
+  const uuid =
+    typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID()
+      : `manual-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return `settings-ui:${uuid}`;
 }
 
 export interface IMemoryVectorSyncService {
   getSettings(lifeId: string): Promise<MemoryVectorSyncSettings>;
   setEnabled(lifeId: string, enabled: boolean): Promise<MemoryVectorSyncSettings>;
   getStatus(lifeId: string): Promise<MemoryVectorSyncWorkerStatus>;
-  startSync(lifeId: string): Promise<StartMemoryVectorSyncResult>;
+  startSync(): Promise<MemoryVectorSyncDrainResult>;
+  /** Legacy background-worker control; retained dormant, NOT used by Settings UI. */
   pauseSync(lifeId: string): Promise<MemoryVectorSyncWorkerStatus>;
   retryFailures(lifeId: string): Promise<number>;
 }
@@ -76,8 +108,13 @@ export class MemoryVectorSyncService implements IMemoryVectorSyncService {
     return invoke<MemoryVectorSyncWorkerStatus>("get_memory_vector_sync_status", { request: { lifeId } });
   }
 
-  async startSync(lifeId: string): Promise<StartMemoryVectorSyncResult> {
-    return invoke<StartMemoryVectorSyncResult>("start_memory_vector_sync", { request: { lifeId } });
+  async startSync(): Promise<MemoryVectorSyncDrainResult> {
+    return invoke<MemoryVectorSyncDrainResult>("start_fenced_vector_sync_drain", {
+      request: {
+        leaseOwner: freshSettingsLeaseOwner(),
+        limit: MANUAL_SYNC_DRAIN_LIMIT,
+      },
+    });
   }
 
   async pauseSync(lifeId: string): Promise<MemoryVectorSyncWorkerStatus> {

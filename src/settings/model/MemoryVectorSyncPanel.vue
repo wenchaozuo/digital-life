@@ -30,6 +30,13 @@
             <li>Blocked: {{ controller.status.blockedCount }}</li>
             <li>Failed: {{ controller.status.failedCount }}</li>
             <li v-if="controller.status.retryWaitCount > 0">Waiting to Retry: {{ controller.status.retryWaitCount }}</li>
+            <li v-if="controller.lastDrainResult">
+              Last manual run: processed {{ controller.lastDrainResult.processed }}
+              (applied {{ controller.lastDrainResult.appliedUpserts }} upserts /
+              {{ controller.lastDrainResult.appliedDeletes }} deletes;
+              failed {{ controller.lastDrainResult.failed }};
+              blocked {{ controller.lastDrainResult.blocked }})
+            </li>
           </ul>
         </div>
 
@@ -38,17 +45,9 @@
           <button 
             @click="handleStart" 
             :disabled="!controller.canStart || props.rebuildRunning"
-            title="Starts the background worker to sync pending memory vectors."
+            title="Runs one bounded fenced drain that processes at most 32 items; it is not a permanent background worker."
           >
             开始同步
-          </button>
-          
-          <button 
-            @click="handlePause" 
-            :disabled="!controller.canPause"
-            title="Signals the worker to pause after completing its current batch."
-          >
-            暂停同步
           </button>
           
           <button 
@@ -64,7 +63,7 @@
         <div v-if="showStartConfirm" class="modal-overlay" role="dialog" aria-modal="true">
           <div class="modal-content">
             <h4>确认启动同步？</h4>
-            <p>本次最多处理 32 项，并非永久后台轮询。<br/>任务结束后若仍有 pending，可由用户再次启动。<br/>可能调用外部 Embedding API。<br/>用户可以随时暂停后续任务领取。</p>
+            <p>本次手动执行最多处理 32 项；它不是常驻后台进程。<br/>本次执行返回后，如果仍有 pending 任务，可以再次点击“开始同步”。<br/>可能调用外部 Embedding API。</p>
             <div class="modal-actions">
               <button @click="confirmStart">确认</button>
               <button @click="showStartConfirm = false">取消</button>
@@ -83,7 +82,7 @@
               同步只更新可重建的 LanceDB 派生索引；<br/>
               SQLite 记忆不会被删除或修改；<br/>
               启用后仍不会在应用启动时自动常驻运行；<br/>
-              用户还需要主动点击“开始同步”。
+              每次同步由用户主动点击“开始同步”执行最多 32 项。
             </p>
             <div class="modal-actions">
               <button @click="confirmEnable">同意启用</button>
@@ -152,10 +151,6 @@ const handleStart = () => {
 const confirmStart = async () => {
   showStartConfirm.value = false;
   await controller.value.startSync();
-};
-
-const handlePause = async () => {
-  await controller.value.pauseSync();
 };
 
 const handleRetry = async () => {

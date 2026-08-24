@@ -2,6 +2,7 @@ import { storageService } from "../../storage/storageService.ts";
 import {
   memoryVectorSyncService,
   type IMemoryVectorSyncService,
+  type MemoryVectorSyncDrainResult,
   type MemoryVectorSyncSettings,
   type MemoryVectorSyncWorkerErrorCode,
   type MemoryVectorSyncWorkerStatus,
@@ -12,31 +13,13 @@ export type MemoryVectorSyncPanelState =
   | "loadingStatus"
   | "ready"
   | "starting"
-  | "polling"
-  | "pausing"
   | "failed";
 
 export interface ICurrentLifeService {
   getCurrentLife(): Promise<{ id: string } | undefined>;
 }
 
-export interface TimerScheduler {
-  set(callback: () => void, delayMs: number): ReturnType<typeof setTimeout>;
-  clear(handle: ReturnType<typeof setTimeout>): void;
-}
-
-const POLL_INTERVAL_MS = 1_000;
-
-const browserTimers: TimerScheduler = {
-  set(callback, delayMs) {
-    return window.setTimeout(callback, delayMs);
-  },
-  clear(handle) {
-    window.clearTimeout(handle);
-  },
-};
-
-export type SyncOperation = "loadStatus" | "startSync" | "pauseSync" | "retryFailures" | "pollStatus" | "setEnabled";
+export type SyncOperation = "loadStatus" | "startSync" | "retryFailures" | "setEnabled";
 
 export interface SyncError {
   operation: SyncOperation;
@@ -45,27 +28,34 @@ export interface SyncError {
   recoverable: boolean;
 }
 
+/**
+ * Settings controller for ONE bounded fenced drain per manual start.
+ *
+ * The frozen production entrypoint `start_fenced_vector_sync_drain` is a
+ * bounded IPC operation: it returns only after processing at most `limit`
+ * items, and it has NO background-worker run id. The controller must never
+ * enter the legacy `start -> polling -> pause background worker` state
+ * machine; after the drain returns, authoritative Settings/status counts are
+ * refreshed once and the panel returns to `ready`.
+ */
 export class MemoryVectorSyncController {
   state: MemoryVectorSyncPanelState = "idle";
   settings?: MemoryVectorSyncSettings;
   status?: MemoryVectorSyncWorkerStatus;
   error?: SyncError;
   lifeId?: string;
+  /** Count-only result of the most recent manual bounded fenced drain. */
+  lastDrainResult?: MemoryVectorSyncDrainResult;
 
-  private pollTimer?: ReturnType<typeof setTimeout>;
-  private active = false;
   private readonly syncService: IMemoryVectorSyncService;
   private readonly lifeService: ICurrentLifeService;
-  private readonly timers: TimerScheduler;
 
   constructor(
     syncService: IMemoryVectorSyncService = memoryVectorSyncService,
     lifeService: ICurrentLifeService = storageService,
-    timers: TimerScheduler = browserTimers,
   ) {
     this.syncService = syncService;
     this.lifeService = lifeService;
-    this.timers = timers;
   }
 
   get isRunning(): boolean {
@@ -78,12 +68,9 @@ export class MemoryVectorSyncController {
         this.status?.enabled &&
         !this.isRunning &&
         this.state !== "starting" &&
-        this.state !== "pausing"
+        this.state !== "loadingStatus" &&
+        this.state !== "failed"
     );
-  }
-
-  get canPause(): boolean {
-    return this.isRunning && this.state !== "pausing";
   }
 
   get canRetry(): boolean {
@@ -94,13 +81,16 @@ export class MemoryVectorSyncController {
   }
 
   async activate(): Promise<void> {
-    this.active = true;
     await this.refreshStatus();
   }
 
+  /**
+   * Panel lifecycle hook (visibility/unmount). The bounded drain flow keeps
+   * no timers or background state, so there is nothing to stop; the panel
+   * simply re-reads authoritative counts the next time it activates.
+   */
   deactivate(): void {
-    this.active = false;
-    this.stopPolling();
+    // Intentionally empty: no polling timer or background worker state exists.
   }
 
   async refreshStatus(): Promise<void> {
@@ -112,30 +102,22 @@ export class MemoryVectorSyncController {
         this.lifeId = undefined;
         this.status = undefined;
         this.settings = undefined;
-        this.stopPolling();
         this.state = "ready";
         return;
       }
       this.lifeId = life.id;
-      
+
       const [settings, status] = await Promise.all([
         this.syncService.getSettings(life.id),
         this.syncService.getStatus(life.id),
       ]);
-      
+
       this.settings = settings;
       this.status = status;
       this.state = "ready";
-      
-      if (this.active && this.isRunning) {
-        this.startPolling();
-      } else {
-        this.stopPolling();
-      }
     } catch (caught: unknown) {
       this.error = errorFromUnknown(caught, "loadStatus");
       this.state = "failed";
-      this.stopPolling();
     }
   }
 
@@ -160,30 +142,15 @@ export class MemoryVectorSyncController {
     this.state = "starting";
     this.error = undefined;
     try {
-      await this.syncService.startSync(this.lifeId);
-      this.state = "polling";
-      this.startPolling(true);
+      // ONE bounded fenced drain. The backend returns only after the bounded
+      // invocation completes (or fails); there is no run id and nothing to
+      // poll, so the panel refreshes authoritative counts once and returns
+      // to `ready`.
+      this.lastDrainResult = await this.syncService.startSync();
+      await this.refreshStatus();
       return true;
     } catch (caught: unknown) {
       this.error = errorFromUnknown(caught, "startSync");
-      this.state = "failed";
-      return false;
-    }
-  }
-
-  async pauseSync(): Promise<boolean> {
-    if (!this.canPause || !this.lifeId) {
-      return false;
-    }
-    this.state = "pausing";
-    this.error = undefined;
-    try {
-      this.status = await this.syncService.pauseSync(this.lifeId);
-      this.state = "polling";
-      this.startPolling(true);
-      return true;
-    } catch (caught: unknown) {
-      this.error = errorFromUnknown(caught, "pauseSync");
       this.state = "failed";
       return false;
     }
@@ -202,45 +169,6 @@ export class MemoryVectorSyncController {
       this.error = errorFromUnknown(caught, "retryFailures");
       this.state = "failed";
       return false;
-    }
-  }
-
-  private startPolling(immediate = false): void {
-    if (!this.active || !this.isRunning) {
-      return;
-    }
-    this.stopPolling();
-    const delay = immediate ? 0 : POLL_INTERVAL_MS;
-    this.pollTimer = this.timers.set(() => {
-      this.pollTimer = undefined;
-      void this.pollStatus();
-    }, delay);
-  }
-
-  private stopPolling(): void {
-    if (this.pollTimer !== undefined) {
-      this.timers.clear(this.pollTimer);
-      this.pollTimer = undefined;
-    }
-  }
-
-  private async pollStatus(): Promise<void> {
-    if (!this.active || !this.lifeId) {
-      return;
-    }
-    this.state = "polling";
-    try {
-      this.status = await this.syncService.getStatus(this.lifeId);
-      if (this.isRunning) {
-        this.startPolling();
-      } else {
-        this.stopPolling();
-        this.state = "ready";
-      }
-    } catch (caught: unknown) {
-      this.error = errorFromUnknown(caught, "pollStatus");
-      this.state = "failed";
-      this.stopPolling();
     }
   }
 }
@@ -280,6 +208,10 @@ function guidanceFor(code: MemoryVectorSyncWorkerErrorCode | "SYNC_UI_ERROR"): s
       return "A full rebuild or another index operation is currently running. Try again later.";
     case "SYNC_DISABLED":
       return "Incremental sync is disabled. Enable it to start syncing.";
+    case "UNAVAILABLE":
+      return "The fenced vector sync execution is currently unavailable. Try again later.";
+    case "DRAIN_FAILED":
+      return "The bounded vector sync drain could not complete. Check model, credential, and storage configuration, then try again.";
     default:
       return "The memory vector sync operation could not be completed.";
   }
@@ -306,6 +238,8 @@ function syncErrorCode(value: unknown): MemoryVectorSyncWorkerErrorCode | "SYNC_
     "REQUEST_TIMEOUT",
     "INVALID_PROVIDER_RESPONSE",
     "VECTOR_STORE_UNAVAILABLE",
+    "UNAVAILABLE",
+    "DRAIN_FAILED",
     "INTERNAL_ERROR"
   ];
   return typeof value === "string" && codes.includes(value as MemoryVectorSyncWorkerErrorCode)

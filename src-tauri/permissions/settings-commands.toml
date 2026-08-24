@@ -31,7 +31,7 @@ commands.allow = [
     "get_memory_vector_sync_settings",
     "set_memory_vector_sync_enabled",
     "get_memory_vector_sync_status",
-    "start_memory_vector_sync",
+    "start_fenced_vector_sync_drain",
     "pause_memory_vector_sync",
     "retry_memory_vector_sync_failures",
 ]

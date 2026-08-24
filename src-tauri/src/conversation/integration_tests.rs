@@ -1319,3 +1319,273 @@ fn f1_observation_and_general_db_errors_map_to_distinct_boundaries() {
         ConversationCognitionErrorCode::EmotionIntegrationFailure
     );
 }
+
+// ==================== D11-D pre-turn emotion projection ====================
+
+/// The full system message content of the FIRST captured model request.
+fn captured_system_context(server: &MockChatServer) -> String {
+    let body: serde_json::Value =
+        serde_json::from_str(&server.requests.lock().unwrap()[0]).unwrap();
+    let messages = body["messages"].as_array().unwrap();
+    let system = messages
+        .iter()
+        .find(|message| message["role"] == "system")
+        .expect("a system message must be present");
+    system["content"].as_str().unwrap().to_string()
+}
+
+/// Everything of the compiled context between `## Current Emotion` and the
+/// next `##`-level section (or the end of the context).
+fn compiled_emotion_section_of(system_context: &str) -> String {
+    let start = system_context.find("## Current Emotion").unwrap();
+    let remaining = &system_context[start..];
+    let end = remaining
+        .find("\n##")
+        .map(|index| start + index)
+        .unwrap_or(system_context.len());
+    system_context[start..end].to_string()
+}
+
+fn seed_emotion_state(storage: &StorageService, valence: i32, activation: i32, event_time: &str) {
+    <StorageService as EmotionRepository>::commit_transition(
+        storage,
+        crate::emotion::EmotionTransition::new(
+            "d11-d-seed",
+            LIFE_A,
+            crate::emotion::EmotionEventSource::new("seed", "d11-d-seed-ref"),
+            valence,
+            activation,
+            0,
+            valence,
+            activation,
+            1,
+            event_time,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn d11_d_model_request_receives_pre_turn_emotion_projection() {
+    tauri::async_runtime::block_on(async {
+        let server = MockChatServer::new(vec![("200 OK", chat_response())]);
+        let fixture = Fixture::new();
+        fixture.activate_chat(&server.base_url);
+        let conversation = fixture.create_conversation("D11-D projection");
+
+        // Deterministic pre-turn state: valence +700 / activation -700 with a
+        // last_applied_at in the FUTURE, so the real production clock observes
+        // elapsed = 0 (rollback clamp) and the effective state IS the seeded
+        // state through the frozen B2 decay.
+        seed_emotion_state(
+            fixture.storage.as_ref(),
+            700,
+            -700,
+            "2099-01-01T00:00:00.000Z",
+        );
+
+        let response = fixture
+            .chat(request(&conversation.id, "d11d-request-1", "feel the mood"))
+            .await
+            .unwrap();
+        assert!(!response.replayed);
+        assert_eq!(server.calls.load(Ordering::SeqCst), 1);
+
+        let system_context = captured_system_context(&server);
+        let section = compiled_emotion_section_of(&system_context);
+        assert!(
+            section.contains("- Transient valence: strongly positive."),
+            "section: {section}"
+        );
+        assert!(
+            section.contains("- Transient activation: very subdued."),
+            "section: {section}"
+        );
+        // Raw authoritative numbers must not reach the prompt as emotion data.
+        assert!(!section.contains("700"), "section: {section}");
+        assert!(!section.contains("-700"), "section: {section}");
+        for forbidden in [
+            "revision",
+            "eventId",
+            "sourceRef",
+            "policyVersion",
+            "lastAppliedAt",
+            "valenceDelta",
+            "activationDelta",
+            "appliedRevision",
+        ] {
+            assert!(
+                !system_context.contains(forbidden),
+                "prompt must not leak {forbidden}: {system_context}"
+            );
+        }
+
+        // The C2 post-model commit still applies the frozen stimulus on top
+        // of the projected state: activation -700 decays 0 then +7 → -693.
+        let state = emotion_state_of(fixture.storage.as_ref());
+        assert_eq!(state.revision, 2);
+        assert_eq!((state.valence, state.activation), (700, -693));
+    });
+}
+
+#[test]
+fn d11_d_same_turn_mutation_is_not_visible_to_that_turns_model_prompt() {
+    tauri::async_runtime::block_on(async {
+        let server = MockChatServer::new(vec![("200 OK", chat_response())]);
+        let fixture = Fixture::new();
+        fixture.activate_chat(&server.base_url);
+        let conversation = fixture.create_conversation("D11-D non-circularity");
+
+        // Fresh neutral state: valence 0 / activation 0, elapsed 0 -> the
+        // model prompt must see the neutral / balanced bands.
+        let before = emotion_state_of(fixture.storage.as_ref());
+        assert_eq!(
+            (before.valence, before.activation, before.revision),
+            (0, 0, 0)
+        );
+
+        let response = fixture
+            .chat(request(&conversation.id, "d11d-request-2", "hello"))
+            .await
+            .unwrap();
+        assert!(!response.replayed);
+        assert_eq!(server.calls.load(Ordering::SeqCst), 1);
+
+        let system_context = captured_system_context(&server);
+        let section = compiled_emotion_section_of(&system_context);
+        assert!(
+            section.contains("- Transient valence: neutral."),
+            "section: {section}"
+        );
+        assert!(
+            section.contains("- Transient activation: balanced."),
+            "section: {section}"
+        );
+        assert!(!section.contains("engaged"), "section: {section}");
+        assert!(!section.contains("highly activated"), "section: {section}");
+        assert!(
+            !section.contains("7"),
+            "same-turn +7 must not leak: {section}"
+        );
+
+        // After the successful C2 commit the authoritative activation is +7:
+        // the current-turn stimulus was applied AFTER model generation.
+        let after = emotion_state_of(fixture.storage.as_ref());
+        assert_eq!(after.revision, 1);
+        assert_eq!((after.valence, after.activation), (0, 7));
+    });
+}
+
+#[test]
+fn d11_d_pre_turn_projection_read_does_not_persist_or_advance_revision() {
+    tauri::async_runtime::block_on(async {
+        let server = BlockingChatServer::new();
+        let fixture = Fixture::new();
+        fixture.activate_chat(&server.base_url);
+        let conversation = fixture.create_conversation("D11-D read-only");
+        let storage = Arc::clone(&fixture.storage);
+        let secrets = Arc::clone(&fixture.secrets);
+        let model_runtime = Arc::clone(&fixture.model_runtime);
+        let registry = Arc::clone(&fixture.registry);
+        let coordinator = Arc::clone(&fixture.coordinator);
+        let conversation_id = conversation.id.clone();
+        let request_conversation_id = conversation.id.clone();
+        let handle = thread::spawn(move || {
+            tauri::async_runtime::block_on(
+                ConversationCognitionService::new(
+                    storage.as_ref(),
+                    secrets.as_ref(),
+                    model_runtime.as_ref(),
+                    registry.as_ref(),
+                    coordinator.as_ref(),
+                )
+                .chat(request(
+                    &request_conversation_id,
+                    "d11d-blocked-request",
+                    "blocked read-only proof",
+                )),
+            )
+        });
+
+        // The model request is IN FLIGHT: the pre-turn observation and the B2
+        // effective-state calculation already ran (they precede the model
+        // call), so the state visible here must be the untouched neutral
+        // state: no revision advance, no event, no timestamp change.
+        server
+            .received
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        let in_flight = emotion_state_of(fixture.storage.as_ref());
+        assert_eq!(
+            (in_flight.valence, in_flight.activation, in_flight.revision),
+            (0, 0, 0),
+            "the projection read must not mutate authoritative emotion"
+        );
+        assert!(
+            governed_event_identity(
+                fixture.storage.as_ref(),
+                &conversation_id,
+                "d11d-blocked-request"
+            )
+            .is_none(),
+            "the projection read must not insert an emotion event"
+        );
+
+        server.release.send(()).unwrap();
+        let response = handle.join().unwrap().unwrap();
+        assert!(!response.replayed);
+
+        // The ONLY mutation happened through the single post-model C2 commit.
+        let after = emotion_state_of(fixture.storage.as_ref());
+        assert_eq!(after.revision, 1);
+        assert_eq!((after.valence, after.activation), (0, 7));
+        assert!(governed_event_identity(
+            fixture.storage.as_ref(),
+            &conversation_id,
+            "d11d-blocked-request"
+        )
+        .is_some());
+    });
+}
+
+#[test]
+fn d11_d_pre_turn_emotion_unavailable_fails_closed_before_the_model() {
+    tauri::async_runtime::block_on(async {
+        // Zero replies: the mock server proves no model request can arrive.
+        let server = MockChatServer::new(Vec::new());
+        let fixture = Fixture::new();
+        fixture.activate_chat(&server.base_url);
+        let conversation = fixture.create_conversation("D11-D fail closed");
+
+        // Breach the one-row-per-life invariant in a way the observation
+        // boundary reports (state missing while the life exists).
+        {
+            let database = fixture.storage.test_database_main_path().unwrap();
+            let connection = crate::storage::open_authorized_test_connection(&database).unwrap();
+            connection
+                .execute("DELETE FROM emotion_state WHERE life_id='life-a'", [])
+                .unwrap();
+            drop(connection);
+        }
+
+        let error = fixture
+            .chat(request(&conversation.id, "d11d-fail-closed", "governed"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code,
+            ConversationCognitionErrorCode::EmotionStateUnavailable
+        );
+        assert!(error.recoverable);
+        // Governed cognition must NOT silently omit the Current Emotion
+        // section or fall back to neutral: no model call happened.
+        assert_eq!(server.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            ConversationHistoryService::new(fixture.storage.as_ref())
+                .count_messages(LIFE_A, &conversation.id)
+                .unwrap(),
+            0
+        );
+    });
+}

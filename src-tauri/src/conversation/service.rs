@@ -34,7 +34,8 @@ use crate::{
     },
     prompt::{
         InitiativeLevel, PromptCommunicationStyle, PromptCompilationRequest, PromptCompiler,
-        PromptLifeIdentity, PromptPersona, SafetyRulesVersion,
+        PromptCompilerErrorCode, PromptEmotion, PromptLifeIdentity, PromptPersona,
+        SafetyRulesVersion,
     },
     secrets::{SecretStore, WindowsCredentialSecretStore},
     storage::conversation_emotion::{
@@ -320,6 +321,27 @@ where
             .ok_or_else(|| error(ConversationCognitionErrorCode::PersonaNotFound))?;
         let persona = parse_persona(&life, &persona_record)?;
 
+        // D11-D PRE-TURN emotion projection. This READ happens before memory
+        // retrieval and before the model call: the prompt must see the
+        // effective emotion that existed BEFORE this turn's model response
+        // and BEFORE the post-model C2 mutation. Pure read: no revision
+        // advance, no event, no timestamp change. Any observation or policy
+        // failure fails closed here — the model is never called without
+        // governed current-emotion evidence.
+        let pre_turn_observation = self
+            .storage
+            .load_emotion_runtime_observation(&life.id)
+            .map_err(map_emotion_observation_error)?;
+        let effective = policy::effective_after_decay(
+            &pre_turn_observation.state,
+            pre_turn_observation.elapsed_seconds,
+        )
+        .map_err(map_emotion_error)?;
+        let prompt_emotion = PromptEmotion {
+            valence: effective.valence,
+            activation: effective.activation,
+        };
+
         let model_runtime =
             ModelRuntimeService::new(self.storage, self.secrets, self.model_coordinator);
         let semantic = GenerationAwareSemanticRetrieval::new(
@@ -365,9 +387,16 @@ where
                     identity_version: life.version,
                 },
                 persona,
+                emotion: prompt_emotion,
                 memory_context: memory_context.context.clone(),
             })
-            .map_err(|_| error(ConversationCognitionErrorCode::PersonaNotFound))?;
+            .map_err(|compile_error| {
+                if compile_error.code == PromptCompilerErrorCode::InvalidEmotion {
+                    error(ConversationCognitionErrorCode::EmotionIntegrationFailure)
+                } else {
+                    error(ConversationCognitionErrorCode::PersonaNotFound)
+                }
+            })?;
         let messages = persisted_history
             .into_iter()
             .map(|message| ModelMessage {

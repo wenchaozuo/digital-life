@@ -46,7 +46,7 @@ use crate::{
     },
     prompt::{
         InitiativeLevel, PromptCommunicationStyle, PromptCompilationRequest, PromptCompiler,
-        PromptLifeIdentity, PromptPersona, SafetyRulesVersion,
+        PromptEmotion, PromptLifeIdentity, PromptPersona, SafetyRulesVersion,
     },
     secrets::{InMemorySecretStore, SecretIdentifier, SecretPurpose, SecretStore, SecretValue},
     storage::{LifeIdentityRecord, PersonaTemplateRecord, StorageService},
@@ -387,6 +387,12 @@ fn compile_context(memory_context: Option<String>) -> String {
                 interests: vec![],
                 initiative_level: InitiativeLevel::Balanced,
                 boundaries: vec![],
+            },
+            // D11-D governed compiler contract: the required current-emotion
+            // projection is neutral in this memory-scope fixture.
+            emotion: PromptEmotion {
+                valence: 0,
+                activation: 0,
             },
             memory_context,
         })

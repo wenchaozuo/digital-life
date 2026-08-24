@@ -26,20 +26,22 @@ use super::{
 use crate::conversation::history::{AppendConversationTurnRequest, AppendConversationTurnResult};
 use crate::emotion::{EmotionCommitOutcome, EmotionError, EmotionTransition};
 
-/// Frozen source kind for conversation-generated emotion events.
-pub(super) const CONVERSATION_EMOTION_SOURCE_KIND: &str = "conversation_turn";
+/// Frozen source kind for conversation-generated emotion events. Crate-level
+/// seam so the D11-C2 orchestrator can construct canonical identity without
+/// duplicating string formatting.
+pub(crate) const CONVERSATION_EMOTION_SOURCE_KIND: &str = "conversation_turn";
 
 /// Deterministic binding of one emotion event to one conversation turn. The
 /// identity is used for equality/idempotency only; it is never parsed back
 /// into components.
-pub(super) fn conversation_emotion_source_ref(conversation_id: &str, turn_id: &str) -> String {
+pub(crate) fn conversation_emotion_source_ref(conversation_id: &str, turn_id: &str) -> String {
     format!("{conversation_id}:{turn_id}")
 }
 
 /// Deterministic canonical emotion event identity for one governed turn. The
-/// future C2 orchestrator must construct event ids through this helper so a
+/// D11-C2 orchestrator must construct event ids through this helper so a
 /// retried turn always resolves to the same emotion event.
-pub(super) fn conversation_emotion_event_id(
+pub(crate) fn conversation_emotion_event_id(
     life_id: &str,
     conversation_id: &str,
     turn_id: &str,
@@ -57,6 +59,11 @@ pub(crate) enum ConversationEmotionCommitError {
     /// The supplied transition does not deterministically bind to the
     /// requested conversation turn (life, kind, ref, or canonical event id).
     BindingMismatch(String),
+    /// The requested conversation turn already exists but carries NO emotion
+    /// event under the canonical identity — a legacy (pre-D11-C) or
+    /// incomplete turn. Never backfilled; the caller supplied a valid
+    /// binding, persisted storage simply has no governed emotion evidence.
+    EmotionEventMissing(String),
 }
 
 impl ConversationEmotionCommitError {
@@ -71,6 +78,7 @@ impl ConversationEmotionCommitError {
             Self::Conversation(error) => format!("{:?}", error.code),
             Self::Emotion(error) => error.code.as_str().to_string(),
             Self::BindingMismatch(_) => "EMOTION_TURN_BINDING_MISMATCH".to_string(),
+            Self::EmotionEventMissing(_) => "EMOTION_TURN_EVENT_MISSING".to_string(),
         }
     }
 }
@@ -132,7 +140,12 @@ impl StorageService {
         request: &AppendConversationTurnRequest,
         transition: EmotionTransition,
     ) -> Result<ConversationEmotionCommitOutcome, ConversationEmotionCommitError> {
-        // Pure binding validation first: zero writes on mismatch.
+        // Shared conversation input validation FIRST — the exact same rules
+        // as legacy ConversationHistoryService::append_turn — so the
+        // composite primitive can never bypass them (zero writes on failure).
+        crate::conversation::history::validate_append_turn_request(request)
+            .map_err(ConversationEmotionCommitError::Conversation)?;
+        // Pure binding validation next: zero writes on mismatch.
         validate_binding(request, &transition)?;
         let mut state = self
             .state()
@@ -165,9 +178,38 @@ impl StorageService {
                     ),
                 ));
             }
+            // Legacy guard: a turn committed by the old non-emotion path has
+            // NO emotion event under the canonical identity. It must NEVER be
+            // retroactively given one, so fail closed BEFORE invoking the B1
+            // helper (whose job would otherwise be to create the missing
+            // event). This is a NON-MUTATING existence check only — replay
+            // equality stays the exclusive property of the B1 semantic
+            // implementation below.
+            let emotion_event_exists: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM emotion_event
+                        WHERE event_id = ?1
+                           OR (life_id = ?2 AND source_kind = ?3 AND source_ref = ?4)
+                    )",
+                    rusqlite::params![
+                        transition.event_id,
+                        transition.life_id,
+                        transition.source.kind,
+                        transition.source.reference,
+                    ],
+                    |row| row.get(0),
+                )
+                .map_err(ConversationEmotionCommitError::from)?;
+            if !emotion_event_exists {
+                return Err(ConversationEmotionCommitError::EmotionEventMissing(
+                    "the conversation turn has no governed emotion event to replay.".to_string(),
+                ));
+            }
             // The persisted turn exists; its emotion evidence must match the
             // supplied transition EXACTLY (canonical replay), otherwise this
-            // is a typed emotion conflict with no mutation anywhere.
+            // is a typed emotion conflict with no mutation anywhere. The B1
+            // helper remains the single replay-equality authority.
             existing.replayed = true;
             existing.conversation_revision = stored_conversation.revision;
             let emotion = commit_transition_in_transaction(&transaction, transition)
@@ -948,5 +990,280 @@ mod tests {
         assert_eq!(conv_rev, 1);
         assert_eq!(events, 1);
         assert_eq!(emotion_rev, 1);
+    }
+
+    // ---------- F1 Blocker A: legacy turn never receives retroactive emotion ----------
+
+    #[test]
+    fn legacy_turn_composite_retry_is_missing_event_without_any_mutation() {
+        let root = TestRoot::new("legacy-guard");
+        let service = seeded_service(&root);
+        let conversation = create_conversation(&service);
+
+        // Commit the turn through the LEGACY non-emotion path.
+        ConversationHistoryService::new(&service)
+            .append_turn(
+                crate::conversation::history::AppendConversationTurnRequest {
+                    life_id: "life-a".into(),
+                    conversation_id: conversation.id.clone(),
+                    turn_id: "legacy-turn".into(),
+                    user_content: "asked before D11-C".into(),
+                    assistant_content: "answered before D11-C".into(),
+                    expected_revision: None,
+                },
+            )
+            .unwrap();
+        let (messages, conv_rev, events, _, emotion_rev) = counts(&service, &conversation.id);
+        assert_eq!((messages, conv_rev, events, emotion_rev), (2, 1, 0, 0));
+
+        // Retry THAT SAME turn through the composite primitive with a
+        // perfectly canonical transition.
+        let error = service
+            .append_complete_turn_with_emotion(
+                &turn_request(
+                    &conversation,
+                    "legacy-turn",
+                    "asked before D11-C",
+                    "ignored",
+                ),
+                bound_transition(&conversation.id, "legacy-turn", 0, (40, -20), (40, -20)),
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            error.code(),
+            "EMOTION_TURN_EVENT_MISSING",
+            "a legacy turn must be typed as missing-event, not backfilled"
+        );
+        // Nothing mutated anywhere: no backfill, no state advance.
+        let (messages, conv_rev, events, _, emotion_rev) = counts(&service, &conversation.id);
+        assert_eq!(messages, 2);
+        assert_eq!(conv_rev, 1);
+        assert_eq!(events, 0);
+        assert_eq!(emotion_rev, 0);
+    }
+
+    #[test]
+    fn conflicting_legacy_retry_after_governed_commit_stays_event_conflict() {
+        // Proves the missing-event guard does not disturb governed replay:
+        // once a turn HAS its canonical event, exact evidence still replays
+        // and conflicting evidence still yields B1 EventConflict.
+        let root = TestRoot::new("governed-replay-intact");
+        let service = seeded_service(&root);
+        let conversation = create_conversation(&service);
+        service
+            .append_complete_turn_with_emotion(
+                &turn_request(&conversation, "turn-1", "hello", "answer"),
+                bound_transition(&conversation.id, "turn-1", 0, (40, -20), (40, -20)),
+            )
+            .unwrap();
+
+        let replay = service
+            .append_complete_turn_with_emotion(
+                &turn_request(&conversation, "turn-1", "hello", "regenerated"),
+                bound_transition(&conversation.id, "turn-1", 0, (40, -20), (40, -20)),
+            )
+            .unwrap();
+        assert!(replay.turn.replayed);
+        assert!(matches!(
+            replay.emotion,
+            EmotionCommitOutcome::Replayed { .. }
+        ));
+
+        let conflict = bound_transition(&conversation.id, "turn-1", 0, (10, -5), (10, -5));
+        let error = service
+            .append_complete_turn_with_emotion(
+                &turn_request(&conversation, "turn-1", "hello", "answer"),
+                conflict,
+            )
+            .unwrap_err();
+        assert_eq!(error.code(), EmotionErrorCode::EventConflict.as_str());
+    }
+
+    // ---------- F1 Blocker B: shared validation parity ----------
+
+    #[test]
+    fn composite_rejects_invalid_requests_before_any_mutation() {
+        let root = TestRoot::new("validation-parity");
+        let service = seeded_service(&root);
+        let conversation = create_conversation(&service);
+
+        let over_limit =
+            "界".repeat(crate::conversation::history::MAX_CONVERSATION_MESSAGE_CHARACTERS + 1);
+        let mut requests: Vec<(String, AppendConversationTurnRequest)> = vec![
+            (
+                "empty user content".into(),
+                crate::conversation::history::AppendConversationTurnRequest {
+                    life_id: "life-a".into(),
+                    conversation_id: conversation.id.clone(),
+                    turn_id: "bad-empty-user".into(),
+                    user_content: "   ".into(),
+                    assistant_content: "assistant".into(),
+                    expected_revision: None,
+                },
+            ),
+            (
+                "empty assistant content".into(),
+                crate::conversation::history::AppendConversationTurnRequest {
+                    life_id: "life-a".into(),
+                    conversation_id: conversation.id.clone(),
+                    turn_id: "bad-empty-assistant".into(),
+                    user_content: "user".into(),
+                    assistant_content: "".into(),
+                    expected_revision: None,
+                },
+            ),
+            (
+                "over-limit user content".into(),
+                crate::conversation::history::AppendConversationTurnRequest {
+                    life_id: "life-a".into(),
+                    conversation_id: conversation.id.clone(),
+                    turn_id: "bad-long-user".into(),
+                    user_content: over_limit.clone(),
+                    assistant_content: "assistant".into(),
+                    expected_revision: None,
+                },
+            ),
+            (
+                "over-limit assistant content".into(),
+                crate::conversation::history::AppendConversationTurnRequest {
+                    life_id: "life-a".into(),
+                    conversation_id: conversation.id.clone(),
+                    turn_id: "bad-long-assistant".into(),
+                    user_content: "user".into(),
+                    assistant_content: over_limit,
+                    expected_revision: None,
+                },
+            ),
+            (
+                "invalid turn id".into(),
+                crate::conversation::history::AppendConversationTurnRequest {
+                    life_id: "life-a".into(),
+                    conversation_id: conversation.id.clone(),
+                    turn_id: "  ".into(),
+                    user_content: "user".into(),
+                    assistant_content: "assistant".into(),
+                    expected_revision: None,
+                },
+            ),
+            (
+                "negative expected revision".into(),
+                crate::conversation::history::AppendConversationTurnRequest {
+                    life_id: "life-a".into(),
+                    conversation_id: conversation.id.clone(),
+                    turn_id: "bad-negative-revision".into(),
+                    user_content: "user".into(),
+                    assistant_content: "assistant".into(),
+                    expected_revision: Some(-1),
+                },
+            ),
+        ];
+
+        for (label, request) in requests.drain(..) {
+            let error = service
+                .append_complete_turn_with_emotion(
+                    &request,
+                    bound_transition(&conversation.id, &request.turn_id, 0, (40, -20), (40, -20)),
+                )
+                .unwrap_err();
+            let code = error.code();
+            assert!(
+                code == format!(
+                    "{:?}",
+                    crate::conversation::history::ConversationHistoryErrorCode::InvalidMessageContent
+                ) || code == format!(
+                    "{:?}",
+                    crate::conversation::history::ConversationHistoryErrorCode::InvalidRequest
+                ),
+                "{label}: unexpected rejection category {code}"
+            );
+            // Zero mutation in either domain after every rejected case.
+            let (messages, conv_rev, events, _, emotion_rev) = counts(&service, &conversation.id);
+            assert_eq!(
+                (messages, conv_rev, events, emotion_rev),
+                (0, 0, 0, 0),
+                "{label}"
+            );
+        }
+
+        // Parity proof: the legacy path rejects each IDENTICAL request with
+        // the same category, i.e. one shared validator serves both paths.
+        let make_empty_user = || crate::conversation::history::AppendConversationTurnRequest {
+            life_id: "life-a".into(),
+            conversation_id: conversation.id.clone(),
+            turn_id: "p-user".into(),
+            user_content: " ".into(),
+            assistant_content: "assistant".into(),
+            expected_revision: None,
+        };
+        let legacy_error = ConversationHistoryService::new(&service)
+            .append_turn(make_empty_user())
+            .unwrap_err();
+        let composite_error = service
+            .append_complete_turn_with_emotion(
+                &make_empty_user(),
+                bound_transition(
+                    &conversation.id,
+                    &make_empty_user().turn_id,
+                    0,
+                    (40, -20),
+                    (40, -20),
+                ),
+            )
+            .unwrap_err();
+        assert_eq!(composite_error.code(), format!("{:?}", legacy_error.code));
+
+        let make_negative_rev = || crate::conversation::history::AppendConversationTurnRequest {
+            life_id: "life-a".into(),
+            conversation_id: conversation.id.clone(),
+            turn_id: "p-rev".into(),
+            user_content: "user".into(),
+            assistant_content: "assistant".into(),
+            expected_revision: Some(-3),
+        };
+        let legacy_error = ConversationHistoryService::new(&service)
+            .append_turn(make_negative_rev())
+            .unwrap_err();
+        let composite_error = service
+            .append_complete_turn_with_emotion(
+                &make_negative_rev(),
+                bound_transition(
+                    &conversation.id,
+                    &make_negative_rev().turn_id,
+                    0,
+                    (40, -20),
+                    (40, -20),
+                ),
+            )
+            .unwrap_err();
+        assert_eq!(composite_error.code(), format!("{:?}", legacy_error.code));
+
+        // Still zero writes after every validation case on both paths.
+        let (_, conv_rev, events, _, emotion_rev) = counts(&service, &conversation.id);
+        assert_eq!((conv_rev, events, emotion_rev), (0, 0, 0));
+    }
+
+    // ---------- F1 Blocker C: C2 identity seam compile-level proof ----------
+
+    #[test]
+    fn canonical_identity_helpers_are_crate_reachable_and_deterministic() {
+        // Compile-level seam proof: these items are pub(crate); a sibling
+        // domain module (as crate::conversation::service will be in C2) can
+        // reference them without duplicating string formatting. Determinism
+        // is re-proven here so the frozen formats cannot drift silently.
+        let kind = super::CONVERSATION_EMOTION_SOURCE_KIND;
+        assert_eq!(kind, "conversation_turn");
+        let source_ref = super::conversation_emotion_source_ref("conv-1", "turn-7");
+        let event_id = super::conversation_emotion_event_id("life-a", "conv-1", "turn-7");
+        assert_eq!(source_ref, "conv-1:turn-7");
+        assert_eq!(event_id, "conversation-emotion:life-a:conv-1:turn-7");
+        assert_eq!(
+            source_ref,
+            super::conversation_emotion_source_ref("conv-1", "turn-7")
+        );
+        assert_eq!(
+            event_id,
+            super::conversation_emotion_event_id("life-a", "conv-1", "turn-7")
+        );
     }
 }

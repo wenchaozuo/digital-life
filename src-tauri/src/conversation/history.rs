@@ -399,15 +399,7 @@ where
         &self,
         request: AppendConversationTurnRequest,
     ) -> Result<AppendConversationTurnResult, ConversationHistoryError> {
-        validate_identifiers(&request.life_id, &request.conversation_id)?;
-        validate_turn_id(&request.turn_id)?;
-        validate_message(&request.user_content)?;
-        validate_message(&request.assistant_content)?;
-        if request.expected_revision.is_some_and(|value| value < 0) {
-            return Err(ConversationHistoryError::new(
-                ConversationHistoryErrorCode::InvalidRequest,
-            ));
-        }
+        validate_append_turn_request(&request)?;
         self.repository.append_complete_turn(&request)
     }
 
@@ -446,6 +438,24 @@ fn normalize_title(title: &str) -> Result<String, ConversationHistoryError> {
         ));
     }
     Ok(value.to_string())
+}
+
+/// The ONE append-turn request validation, shared by the legacy
+/// ConversationHistoryService::append_turn path AND the D11 composite
+/// conversation+emotion primitive, so neither can bypass the other's rules.
+pub(crate) fn validate_append_turn_request(
+    request: &AppendConversationTurnRequest,
+) -> Result<(), ConversationHistoryError> {
+    validate_identifiers(&request.life_id, &request.conversation_id)?;
+    validate_turn_id(&request.turn_id)?;
+    validate_message(&request.user_content)?;
+    validate_message(&request.assistant_content)?;
+    if request.expected_revision.is_some_and(|value| value < 0) {
+        return Err(ConversationHistoryError::new(
+            ConversationHistoryErrorCode::InvalidRequest,
+        ));
+    }
+    Ok(())
 }
 
 fn validate_message(content: &str) -> Result<(), ConversationHistoryError> {

@@ -944,3 +944,351 @@ fn c2_stale_conversation_revision_maps_to_existing_cognition_error() {
     let state = emotion_state_of(fixture.storage.as_ref());
     assert_eq!((state.valence, state.activation, state.revision), (0, 0, 0));
 }
+
+// ==================== D11-C2-F1: retry state machine evidence ====================
+
+use crate::conversation::service::test_only_pre_composite_hook;
+
+/// The pre-composite hook is ONE process-global slot, so the tests that
+/// install different hooks hold this guard for their whole scenario. This
+/// serializes access to the shared SEAM only — it does not mask any race
+/// under test; every race is still forced deterministically by real commits.
+static HOOK_SEAM_GUARD: Mutex<()> = Mutex::new(());
+
+/// RAII ownership of the global test seam: installs the hook on creation and
+/// ALWAYS uninstalls it on drop (including panic paths), and recovers from a
+/// poisoned guard left behind by an earlier panicked test.
+struct HookSeam {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl HookSeam {
+    fn install(hook: Option<crate::conversation::service::PreCompositeHook>) -> Self {
+        let guard = HOOK_SEAM_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Defensive reset: a previous test that panicked between install and
+        // uninstall must never leak its hook into this scenario.
+        test_only_pre_composite_hook(hook);
+        Self { _guard: guard }
+    }
+}
+
+impl Drop for HookSeam {
+    fn drop(&mut self) {
+        test_only_pre_composite_hook(None);
+    }
+}
+
+/// Installs a deterministic pre-composite hook that performs ONE real
+/// independent governed B1 emotion commit per raced invocation, forcing the
+/// typed revision race against the production composite attempt. The hook
+/// only acts on `target_turn_id` (foreign chat calls are no-ops), and stops
+/// racing after `max_races` invocations. Returns the captured observed_at
+/// values for the target turn's attempts.
+fn install_revision_race_hook(
+    storage: Arc<StorageService>,
+    target_turn_id: &'static str,
+    max_races: u32,
+) -> Arc<Mutex<Vec<String>>> {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let captured_for_hook = Arc::clone(&captured);
+    let sequence = std::sync::atomic::AtomicU32::new(0);
+    test_only_pre_composite_hook(Some(Box::new(
+        move |life_id: &str, turn_id: &str, observed_at: &str| {
+            if turn_id != target_turn_id {
+                return;
+            }
+            captured_for_hook
+                .lock()
+                .unwrap()
+                .push(observed_at.to_string());
+            // One REAL independent EmotionRepository::commit_transition per
+            // raced attempt — a legitimate competing emotion writer, not
+            // fault injection. It wins the revision the composite built on.
+            if sequence.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= max_races {
+                return;
+            }
+            <StorageService as EmotionRepository>::commit_transition(
+                storage.as_ref(),
+                crate::emotion::EmotionTransition::new(
+                    format!(
+                        "race-writer-{}",
+                        sequence.load(std::sync::atomic::Ordering::SeqCst)
+                    ),
+                    life_id,
+                    crate::emotion::EmotionEventSource::new(
+                        "race",
+                        format!(
+                            "race-ref-{}",
+                            sequence.load(std::sync::atomic::Ordering::SeqCst)
+                        ),
+                    ),
+                    -5,
+                    -5,
+                    // Build on the CURRENT authoritative revision at hook time.
+                    {
+                        let current = <StorageService as EmotionRepository>::load_current_state(
+                            storage.as_ref(),
+                            life_id,
+                        )
+                        .unwrap()
+                        .expect("race fixture life must exist");
+                        current.revision
+                    },
+                    -5,
+                    -5,
+                    1,
+                    "2099-01-01T00:00:00.000Z",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        },
+    )));
+    captured
+}
+
+#[test]
+fn f1_first_revision_conflict_rebuilds_and_succeeds_with_original_event_time() {
+    let _seam_guard = HookSeam::install(None);
+    tauri::async_runtime::block_on(async {
+        let server = MockChatServer::new(vec![("200 OK", chat_response())]);
+        let fixture = Fixture::new();
+        fixture.activate_chat(&server.base_url);
+        let conversation = fixture.create_conversation("F1 retry success");
+
+        // The hook runs between first observation and first composite: it
+        // commits one real independent emotion event, so the composite's
+        // expected_revision is stale and C2 must rebuild once. Exactly ONE
+        // race: the retry attempt runs unraced. Keyed to THIS turn only.
+        let captured_times =
+            install_revision_race_hook(Arc::clone(&fixture.storage), "f1-retry-request", 1);
+
+        let response = fixture
+            .chat(request(&conversation.id, "f1-retry-request", "race me"))
+            .await
+            .unwrap();
+        // Model called exactly ONCE across both composite attempts.
+        assert_eq!(server.calls.load(Ordering::SeqCst), 1);
+        assert!(!response.replayed);
+        assert_eq!(response.assistant_message, "persisted assistant");
+
+        // Conversation committed exactly once.
+        assert_eq!(
+            ConversationHistoryService::new(fixture.storage.as_ref())
+                .count_messages(LIFE_A, &conversation.id)
+                .unwrap(),
+            2
+        );
+        let record = ConversationHistoryService::new(fixture.storage.as_ref())
+            .get(LIFE_A, &conversation.id)
+            .unwrap();
+        assert_eq!(record.revision, 1);
+
+        // Exactly TWO canonical events exist: one from each race writer plus
+        // exactly one for THIS conversation turn (3 total, 1 canonical).
+        let canonical = governed_event_identity(
+            fixture.storage.as_ref(),
+            &conversation.id,
+            "f1-retry-request",
+        )
+        .expect("the retried turn must carry its canonical emotion event");
+        assert_eq!(
+            canonical.0,
+            conversation_emotion_event_id(LIFE_A, &conversation.id, "f1-retry-request")
+        );
+
+        // The ORIGINAL observed_at was reused for the rebuilt transition.
+        let original_observed_at = &captured_times.lock().unwrap()[0];
+        let persisted_event = <StorageService as EmotionRepository>::find_event(
+            fixture.storage.as_ref(),
+            LIFE_A,
+            "conversation_turn",
+            &conversation_emotion_source_ref(&conversation.id, "f1-retry-request"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            persisted_event.event_time,
+            *original_observed_at,
+            "retry must reuse the ORIGINAL observation time (captured={:?})",
+            captured_times.lock().unwrap()
+        );
+
+        // The race writer's last_applied_at is LATER than the original
+        // observation (2099 vs real now), so the refreshed explicit-time
+        // observation clamped elapsed to zero. Final revision: the one race
+        // commit (0→1) plus this turn's successful retry (1→2) = 2, and the
+        // state is the race writer's (-5,-5) plus this turn's +7 impulse.
+        let state = emotion_state_of(fixture.storage.as_ref());
+        assert_eq!(state.revision, 2);
+        assert_eq!(
+            (state.valence, state.activation),
+            (-5, 2),
+            "rebuild must start from the NEWER state (-5,-5) then add +7"
+        );
+    });
+}
+
+#[test]
+fn f1_second_revision_conflict_stops_with_recoverable_changed_error() {
+    let _seam_guard = HookSeam::install(None);
+    tauri::async_runtime::block_on(async {
+        let server = MockChatServer::new(vec![("200 OK", chat_response())]);
+        let fixture = Fixture::new();
+        fixture.activate_chat(&server.base_url);
+        let conversation = fixture.create_conversation("F1 retry exhausted");
+
+        // The hook races BOTH composite attempts (max 2), so the single
+        // allowed retry also conflicts. Production must stop after two.
+        let _captured = install_revision_race_hook(Arc::clone(&fixture.storage), "f1-exhausted", 2);
+
+        let error = fixture
+            .chat(request(&conversation.id, "f1-exhausted", "always racing"))
+            .await
+            .unwrap_err();
+
+        test_only_pre_composite_hook(None);
+
+        assert_eq!(
+            error.code,
+            ConversationCognitionErrorCode::EmotionChangedDuringRequest
+        );
+        assert!(error.recoverable);
+
+        // Model called exactly ONCE; no third attempt looped.
+        assert_eq!(server.calls.load(Ordering::SeqCst), 1);
+        // Exactly TWO composite attempts: two race writers won revisions.
+        let state = emotion_state_of(fixture.storage.as_ref());
+        assert_eq!(
+            state.revision, 2,
+            "two independent race commits prove exactly two attempts were staged"
+        );
+        // The requested conversation turn was never partially committed.
+        assert_eq!(
+            ConversationHistoryService::new(fixture.storage.as_ref())
+                .count_messages(LIFE_A, &conversation.id)
+                .unwrap(),
+            0
+        );
+        assert!(ConversationHistoryService::new(fixture.storage.as_ref())
+            .find_turn(LIFE_A, &conversation.id, "f1-exhausted")
+            .unwrap()
+            .is_none());
+        assert!(governed_event_identity(
+            fixture.storage.as_ref(),
+            &conversation.id,
+            "f1-exhausted"
+        )
+        .is_none());
+    });
+}
+
+#[test]
+fn f1_real_composite_event_conflict_maps_to_emotion_commit_conflict() {
+    let _seam_guard = HookSeam::install(None);
+    tauri::async_runtime::block_on(async {
+        let server = MockChatServer::new(vec![("200 OK", chat_response())]);
+        let fixture = Fixture::new();
+        fixture.activate_chat(&server.base_url);
+        let conversation = fixture.create_conversation("F1 event conflict");
+        let conversation_id = conversation.id.clone();
+        let storage_for_hook = Arc::clone(&fixture.storage);
+
+        // Narrow deterministic seam: pre-create CONFLICTING canonical emotion
+        // evidence for this exact turn identity before the composite runs.
+        // Keyed to THIS turn only; foreign chat calls are no-ops. (The outer
+        // _seam_guard already owns the global slot for the whole test.)
+        test_only_pre_composite_hook(Some(Box::new(
+            move |life_id: &str, turn_id: &str, _observed_at: &str| {
+                if turn_id != "f1-event-conflict" {
+                    return;
+                }
+                <StorageService as EmotionRepository>::commit_transition(
+                    storage_for_hook.as_ref(),
+                    crate::emotion::EmotionTransition::new(
+                        conversation_emotion_event_id(
+                            life_id,
+                            &conversation_id,
+                            "f1-event-conflict",
+                        ),
+                        life_id,
+                        crate::emotion::EmotionEventSource::new(
+                            "conversation_turn",
+                            conversation_emotion_source_ref(&conversation_id, "f1-event-conflict"),
+                        ),
+                        // Same source identity, DIFFERENT payload → EventConflict.
+                        999,
+                        -999,
+                        0,
+                        999,
+                        -999,
+                        1,
+                        "2098-01-01T00:00:00.000Z",
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            },
+        )));
+
+        let error = fixture
+            .chat(request(
+                &conversation.id,
+                "f1-event-conflict",
+                "conflicting",
+            ))
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.code,
+            ConversationCognitionErrorCode::EmotionCommitConflict
+        );
+        assert!(!error.recoverable);
+        // No additional conversation mutation happened.
+        assert_eq!(
+            ConversationHistoryService::new(fixture.storage.as_ref())
+                .count_messages(LIFE_A, &conversation.id)
+                .unwrap(),
+            0
+        );
+        assert_eq!(server.calls.load(Ordering::SeqCst), 1);
+    });
+}
+
+#[test]
+fn f1_observation_and_general_db_errors_map_to_distinct_boundaries() {
+    // Mapping proof at the private mapper level (no corruption fixture needed).
+    let db = crate::emotion::EmotionError::database();
+    let invalid = crate::emotion::EmotionError::invalid_argument("x");
+
+    let observation_db = crate::conversation::service::test_map_observation_error(db.clone());
+    assert_eq!(
+        observation_db.code,
+        ConversationCognitionErrorCode::EmotionStateUnavailable
+    );
+    assert!(observation_db.recoverable);
+
+    let general_db = crate::conversation::service::test_map_general_error(db);
+    assert_eq!(
+        general_db.code,
+        ConversationCognitionErrorCode::EmotionIntegrationFailure
+    );
+    assert!(!general_db.recoverable);
+
+    // InvalidArgument keeps its distinct classification on BOTH boundaries:
+    // observation-side it is an integration/invariant problem too.
+    let observation_invalid =
+        crate::conversation::service::test_map_observation_error(invalid.clone());
+    assert_eq!(
+        observation_invalid.code,
+        ConversationCognitionErrorCode::EmotionIntegrationFailure
+    );
+    let general_invalid = crate::conversation::service::test_map_general_error(invalid);
+    assert_eq!(
+        general_invalid.code,
+        ConversationCognitionErrorCode::EmotionIntegrationFailure
+    );
+}

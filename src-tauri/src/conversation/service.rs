@@ -47,6 +47,52 @@ use crate::{
 
 const MAX_USER_MESSAGE_CHARACTERS: usize = 32_000;
 
+/// TEST-ONLY deterministic seam, compiled out of production builds entirely:
+/// invoked exactly before EACH composite attempt (first and the single
+/// retry), receiving `(life_id, turn_id, original_observed_at)` so a focused
+/// test can perform one real independent emotion mutation and force the typed
+/// revision race, keyed to its own turn. Not fault injection — production
+/// behavior is byte-identical without it.
+#[cfg(test)]
+pub(crate) type PreCompositeHook = Box<dyn Fn(&str, &str, &str) + Send + Sync>;
+
+#[cfg(test)]
+static PRE_COMPOSITE_HOOK: Mutex<Option<PreCompositeHook>> = Mutex::new(None);
+
+/// Invoke the test-only pre-composite seam. Compiles away in production.
+#[cfg(test)]
+fn run_pre_composite_hook(life_id: &str, turn_id: &str, observed_at: &str) {
+    if let Some(hook) = crate::conversation::service::PRE_COMPOSITE_HOOK
+        .lock()
+        .unwrap()
+        .as_ref()
+    {
+        hook(life_id, turn_id, observed_at);
+    }
+}
+
+/// TEST-ONLY install/uninstall access for the pre-composite seam.
+#[cfg(test)]
+pub(crate) fn test_only_pre_composite_hook(hook: Option<PreCompositeHook>) {
+    *crate::conversation::service::PRE_COMPOSITE_HOOK
+        .lock()
+        .unwrap() = hook;
+}
+
+/// TEST-ONLY mapper surface for the observation boundary proof.
+#[cfg(test)]
+pub(crate) fn test_map_observation_error(
+    emotion_error: EmotionError,
+) -> ConversationCognitionError {
+    map_emotion_observation_error(emotion_error)
+}
+
+/// TEST-ONLY mapper surface for the general policy/commit boundary proof.
+#[cfg(test)]
+pub(crate) fn test_map_general_error(emotion_error: EmotionError) -> ConversationCognitionError {
+    map_emotion_error(emotion_error)
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GovernedConversationRequest {
@@ -351,7 +397,7 @@ where
         let first_observation = self
             .storage
             .load_emotion_runtime_observation(&life.id)
-            .map_err(map_emotion_error)?;
+            .map_err(map_emotion_observation_error)?;
         let append_request = AppendConversationTurnRequest {
             life_id: life.id.clone(),
             conversation_id: request.conversation_id.clone(),
@@ -397,6 +443,8 @@ where
             first_observation.elapsed_seconds,
             &first_observed_at,
         )?;
+        #[cfg(test)]
+        run_pre_composite_hook(&life.id, &request.request_id, &first_observed_at);
         let composite = match self
             .storage
             .append_complete_turn_with_emotion(&append_request, transition)
@@ -406,7 +454,7 @@ where
                 let retry_observation = self
                     .storage
                     .load_emotion_runtime_observation_at(&life.id, &first_observed_at)
-                    .map_err(map_emotion_error)?;
+                    .map_err(map_emotion_observation_error)?;
                 transition = build_transition(
                     &retry_observation.state,
                     // Elapsed recomputed against the NEWER last_applied_at but
@@ -415,6 +463,8 @@ where
                     retry_observation.elapsed_seconds,
                     &first_observed_at,
                 )?;
+                #[cfg(test)]
+                run_pre_composite_hook(&life.id, &request.request_id, &first_observed_at);
                 self.storage
                     .append_complete_turn_with_emotion(&append_request, transition)
                     .map_err(map_composite_commit_error)?
@@ -645,6 +695,29 @@ fn map_emotion_error(emotion_error: EmotionError) -> ConversationCognitionError 
         EmotionErrorCode::InvalidArgument | EmotionErrorCode::DatabaseUnavailable => {
             ConversationCognitionErrorCode::EmotionIntegrationFailure
         }
+    })
+}
+
+/// Mapper for the READ-ONLY emotion runtime observation specifically. A
+/// database hiccup while READING the authoritative state is ordinary
+/// transient absence (retryable), whereas an invalid persisted timestamp or
+/// unsupported observation input is an integration/invariant problem.
+fn map_emotion_observation_error(emotion_error: EmotionError) -> ConversationCognitionError {
+    error(match emotion_error.code {
+        EmotionErrorCode::LifeNotFound
+        | EmotionErrorCode::StateNotFound
+        | EmotionErrorCode::DatabaseUnavailable => {
+            ConversationCognitionErrorCode::EmotionStateUnavailable
+        }
+        EmotionErrorCode::InvalidArgument => {
+            ConversationCognitionErrorCode::EmotionIntegrationFailure
+        }
+        // The observation reader never mutates, so conflict codes cannot
+        // legitimately surface here; map them through the general boundary.
+        EmotionErrorCode::RevisionConflict => {
+            ConversationCognitionErrorCode::EmotionChangedDuringRequest
+        }
+        EmotionErrorCode::EventConflict => ConversationCognitionErrorCode::EmotionCommitConflict,
     })
 }
 

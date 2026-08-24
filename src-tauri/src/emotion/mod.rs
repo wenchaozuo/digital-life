@@ -22,6 +22,9 @@ pub(crate) const NEUTRAL_ACTIVATION: i32 = 0;
 pub(crate) const NEUTRAL_STATE_REVISION: i64 = 0;
 pub(crate) const INITIAL_POLICY_VERSION: i64 = 1;
 
+/// D11-B2 pure deterministic policy layer. No persistence, no clock, no I/O.
+pub(crate) mod policy;
+
 /// One authoritative emotion state row for exactly one life.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct EmotionState {

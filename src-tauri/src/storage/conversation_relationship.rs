@@ -101,7 +101,10 @@ impl ConversationEmotionRelationshipCommitError {
     #[allow(dead_code)] // consumed by tests now and by the C2 orchestrator later
     pub(crate) fn code(&self) -> String {
         match self {
-            Self::Conversation(error) => format!("{error:?}"),
+            // The frozen D11 convention derives the conversation category
+            // ONLY from ConversationHistoryErrorCode — never from message,
+            // recoverable, or full Debug output.
+            Self::Conversation(error) => format!("{:?}", error.code),
             Self::Emotion(error) => error.code.as_str().to_string(),
             Self::Relationship(error) => error.code.as_str().to_string(),
             Self::EmotionBindingMismatch(_) => "EMOTION_TURN_BINDING_MISMATCH".to_string(),
@@ -292,11 +295,13 @@ impl StorageService {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(ConversationEmotionRelationshipCommitError::from)?;
 
-        // On an EXISTING turn, distinguish pre-D11 / D11-only / full-D12 with
-        // bounded non-mutating existence checks BEFORE invoking any writer:
-        // emotion missing → EmotionEventMissing (frozen D11 behavior);
-        // else relationship missing → RelationshipEventMissing (hard C1
-        // invariant, no retroactive backfill).
+        // On an EXISTING turn, the frozen conflict semantics take precedence
+        // FIRST: a same turn_id with different stored user content is ALWAYS
+        // a Conversation TurnIdConflict, regardless of which governance era
+        // produced the turn. Only identical content may proceed to the D12
+        // legacy-event classification below. This duplicate NON-MUTATING
+        // guard exists solely for classification precedence; the frozen D11
+        // shared core re-performs its own check unchanged.
         let existing_turn = conversation::load_turn(
             &transaction,
             &request.life_id,
@@ -304,6 +309,20 @@ impl StorageService {
             &request.turn_id,
         )
         .map_err(ConversationEmotionRelationshipCommitError::Conversation)?;
+        if let Some(existing) = &existing_turn {
+            if existing.user_message.content != request.user_content {
+                return Err(ConversationEmotionRelationshipCommitError::Conversation(
+                    crate::conversation::history::ConversationHistoryError::new(
+                        crate::conversation::history::ConversationHistoryErrorCode::TurnIdConflict,
+                    ),
+                ));
+            }
+        }
+        // With content verified identical, distinguish pre-D11 / D11-only /
+        // full-D12 with bounded non-mutating existence checks BEFORE invoking
+        // any writer: emotion missing → EmotionEventMissing (frozen D11
+        // behavior); else relationship missing → RelationshipEventMissing
+        // (hard C1 invariant, no retroactive backfill).
         if existing_turn.is_some()
             && !emotion_event_exists(&transaction, request)
                 .map_err(ConversationEmotionRelationshipCommitError::from)?
@@ -1159,5 +1178,158 @@ mod tests {
             (2, 1, 1, 1, 1, 1),
             "exactly one turn's worth of rows across all three domains"
         );
+    }
+
+    // ---------- F1 regression: replay precedence over legacy classification --
+
+    /// Builds a composite request with content that differs from the seeded
+    /// turn ("hello") while keeping the same turn_id.
+    fn conflicting_content_request(
+        conversation: &ConversationRecord,
+        turn_id: &str,
+    ) -> AppendConversationTurnRequest {
+        AppendConversationTurnRequest {
+            life_id: "life-a".into(),
+            conversation_id: conversation.id.clone(),
+            turn_id: turn_id.into(),
+            user_content: "DIFFERENT user content".into(),
+            assistant_content: "ignored".into(),
+            expected_revision: None,
+        }
+    }
+
+    fn assert_turn_id_conflict(error: ConversationEmotionRelationshipCommitError, label: &str) {
+        match error {
+            ConversationEmotionRelationshipCommitError::Conversation(inner) => {
+                assert_eq!(
+                    inner.code,
+                    ConversationHistoryErrorCode::TurnIdConflict,
+                    "{label}"
+                );
+            }
+            other => panic!("{label}: expected Conversation(TurnIdConflict), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn f1_pre_d11_turn_with_different_content_is_turn_conflict_not_missing_event() {
+        let root = TestRoot::new("f1-pre-d11-conflict");
+        let service = seeded_service(&root);
+        let conversation = create_conversation(&service);
+
+        // Pre-D11 era: the turn exists with NO emotion and NO relationship.
+        ConversationHistoryService::new(&service)
+            .append_turn(turn_request(&conversation, "legacy-turn"))
+            .unwrap();
+        let before = all_counts(&service, &conversation.id);
+
+        let error = service
+            .append_complete_turn_with_emotion_and_relationship(
+                &conflicting_content_request(&conversation, "legacy-turn"),
+                emotion_transition(&conversation.id, "legacy-turn", 0),
+                relationship_transition_for(&conversation.id, "legacy-turn", 0),
+            )
+            .unwrap_err();
+
+        // Content conflict takes precedence over EmotionEventMissing.
+        assert_turn_id_conflict(error, "pre-D11 different content");
+        let after = all_counts(&service, &conversation.id);
+        assert_eq!(before, after, "zero mutation of any domain");
+    }
+
+    #[test]
+    fn f1_d11_only_turn_with_different_content_is_turn_conflict_not_relationship_missing() {
+        let root = TestRoot::new("f1-d11-only-conflict");
+        let service = seeded_service(&root);
+        let conversation = create_conversation(&service);
+
+        // D11-only era: conversation + canonical emotion, no relationship.
+        service
+            .append_complete_turn_with_emotion(
+                &turn_request(&conversation, "turn-1"),
+                emotion_transition(&conversation.id, "turn-1", 0),
+            )
+            .unwrap();
+        let before = all_counts(&service, &conversation.id);
+        assert_eq!(before.4, 0);
+
+        let error = service
+            .append_complete_turn_with_emotion_and_relationship(
+                &conflicting_content_request(&conversation, "turn-1"),
+                emotion_transition(&conversation.id, "turn-1", 0),
+                relationship_transition_for(&conversation.id, "turn-1", 0),
+            )
+            .unwrap_err();
+
+        // Content conflict takes precedence over RelationshipEventMissing.
+        assert_turn_id_conflict(error, "D11-only different content");
+        let after = all_counts(&service, &conversation.id);
+        assert_eq!(
+            before, after,
+            "no relationship/emotion/conversation mutation"
+        );
+    }
+
+    #[test]
+    fn f1_full_d12_turn_with_different_content_is_turn_conflict() {
+        let root = TestRoot::new("f1-full-d12-conflict");
+        let service = seeded_service(&root);
+        let conversation = create_conversation(&service);
+        commit_composite(&service, &conversation, "turn-1", 0, 0).unwrap();
+        let before = all_counts(&service, &conversation.id);
+
+        let error = service
+            .append_complete_turn_with_emotion_and_relationship(
+                &conflicting_content_request(&conversation, "turn-1"),
+                emotion_transition(&conversation.id, "turn-1", 0),
+                relationship_transition_for(&conversation.id, "turn-1", 0),
+            )
+            .unwrap_err();
+
+        assert_turn_id_conflict(error, "full-D12 different content");
+        let after = all_counts(&service, &conversation.id);
+        assert_eq!(after.0, before.0, "no duplicate messages");
+        assert_eq!(after.1, before.1, "conversation revision unchanged");
+        assert_eq!(after.2, before.2, "no extra emotion event");
+        assert_eq!(after.3, before.3, "emotion revision unchanged");
+        assert_eq!(after.4, before.4, "no extra relationship event");
+        assert_eq!(after.5, before.5, "relationship revision unchanged");
+    }
+
+    // ---------- F1 regression: stable composite conversation code -------------
+
+    #[test]
+    fn f1_conversation_code_is_stable_category_from_error_code() {
+        let cases = [
+            (
+                ConversationHistoryErrorCode::TurnIdConflict,
+                "TurnIdConflict",
+            ),
+            (
+                ConversationHistoryErrorCode::ConversationChangedDuringRequest,
+                "ConversationChangedDuringRequest",
+            ),
+        ];
+        for (code, expected) in cases {
+            let error = ConversationEmotionRelationshipCommitError::Conversation(
+                crate::conversation::history::ConversationHistoryError::new(code),
+            );
+            let category = error.code();
+            assert_eq!(category, expected, "stable code for {category}");
+            // The frozen D11 convention derives the category ONLY from
+            // error.code — never from message/recoverable/full Debug output.
+            assert!(
+                !category.contains("ConversationHistoryError"),
+                "must not leak struct Debug: {category}"
+            );
+            assert!(
+                !category.contains("message"),
+                "must not leak message text: {category}"
+            );
+            assert!(
+                !category.contains("recoverable"),
+                "must not leak recoverable flag: {category}"
+            );
+        }
     }
 }

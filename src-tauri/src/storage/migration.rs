@@ -31,6 +31,17 @@ const CREATE_EMOTION_EVENT_TABLE_SQL: &str =
 /// `emotion_state` row in the same statement.
 const CREATE_EMOTION_STATE_INITIALIZER_TRIGGER_SQL: &str =
     include_str!("migrations/019_emotion_authority.initializer_trigger.sql");
+pub(super) const RELATIONSHIP_AUTHORITY_SCHEMA_VERSION: i64 = 20;
+const RELATIONSHIP_AUTHORITY_MIGRATION_NAME: &str = "020_relationship_authority";
+const CREATE_RELATIONSHIP_STATE_TABLE_SQL: &str =
+    include_str!("migrations/020_relationship_authority.state.sql");
+const CREATE_RELATIONSHIP_EVENT_TABLE_SQL: &str =
+    include_str!("migrations/020_relationship_authority.event.sql");
+/// Schema 20 Phase C: the exact neutral-state initializer for the primary-user
+/// relationship. Every future `life_identity` INSERT automatically receives
+/// exactly one neutral `relationship_state` row in the same statement.
+const CREATE_RELATIONSHIP_STATE_INITIALIZER_TRIGGER_SQL: &str =
+    include_str!("migrations/020_relationship_authority.initializer_trigger.sql");
 const ADD_CLAIMED_GENERATION_AUTHORITY_EPOCH_SQL: &str = "ALTER TABLE memory_vector_sync_outbox ADD COLUMN claimed_generation_authority_epoch INTEGER NULL CHECK (claimed_generation_authority_epoch IS NULL OR claimed_generation_authority_epoch >= 1)";
 const CREATE_GENERATION_AUTHORITY_TABLE_SQL: &str =
     "CREATE TABLE memory_vector_generation_authority (
@@ -206,6 +217,11 @@ pub(super) enum GenerationCatchupAttemptSchemaUpgrade {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum EmotionAuthoritySchemaUpgrade {
+    Applied,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RelationshipAuthoritySchemaUpgrade {
     Applied,
 }
 
@@ -1090,13 +1106,28 @@ pub(super) fn apply_emotion_authority_schema_upgrade(
 pub(super) fn validate_emotion_authority_schema(
     connection: &Connection,
 ) -> Result<(), StorageError> {
-    if connection::read_schema_version(connection)? != EMOTION_AUTHORITY_SCHEMA_VERSION {
+    // Schema 19 introduced the emotion authority; every later schema keeps
+    // those tables authoritative, so the guard admits 19 and above. The fence
+    // manifest follows the live version: later schemas add their own triggers
+    // on top of the 51-triggers emotion epoch.
+    let schema_version = connection::read_schema_version(connection)?;
+    if schema_version < EMOTION_AUTHORITY_SCHEMA_VERSION {
         return Err(StorageError::migration_version_invariant_failed());
     }
-    validate_emotion_authority_schema_objects(connection)
+    validate_emotion_authority_schema_objects_for_fence_epoch(connection, schema_version)
 }
 
 fn validate_emotion_authority_schema_objects(connection: &Connection) -> Result<(), StorageError> {
+    validate_emotion_authority_schema_objects_for_fence_epoch(
+        connection,
+        EMOTION_AUTHORITY_SCHEMA_VERSION,
+    )
+}
+
+fn validate_emotion_authority_schema_objects_for_fence_epoch(
+    connection: &Connection,
+    fence_schema_version: i64,
+) -> Result<(), StorageError> {
     // The frozen domains and constraints are proven from SQLite's own
     // persisted DDL: a normalized full-statement comparison represents CHECK
     // expressions and table constraints that `PRAGMA table_info` cannot.
@@ -1216,14 +1247,298 @@ fn validate_emotion_authority_schema_objects(connection: &Connection) -> Result<
     if unique_index_count != 2 {
         return Err(StorageError::migration_transaction_failed());
     }
-    // The Schema 18 catch-up objects stay validated on Schema 19 (without the
-    // schema-18 manifest selection, which cannot see the six new emotion
-    // fence triggers), and the complete 51-trigger writer fence must be
-    // present.
+    // The Schema 18 catch-up objects stay validated on Schema 19+ (without the
+    // schema-18 manifest selection, which cannot see later fence triggers), and
+    // the writer fence must match the caller's epoch: 51 triggers at Schema 19,
+    // 57 once Schema 20's relationship fences are installed.
     validate_generation_catchup_attempt_schema_objects_inner(connection)?;
     writer_fence_manifest::validate_writer_fence_manifest_for_schema(
         connection,
-        EMOTION_AUTHORITY_SCHEMA_VERSION,
+        fence_schema_version,
+    )
+}
+
+/// Schema 20 adds the D12-B1 relationship authority: one authoritative
+/// `relationship_state` row per (life, primary-user subject) and the immutable
+/// `relationship_event` ledger. The caller owns the transaction and version 20
+/// is recorded only after the tables, existing-life neutral backfill,
+/// neutral-state initializer trigger, writer fences, and validation all agree.
+pub(super) fn apply_relationship_authority_schema_upgrade(
+    transaction: &Transaction<'_>,
+) -> Result<RelationshipAuthoritySchemaUpgrade, StorageError> {
+    if connection::read_schema_version(transaction)? != EMOTION_AUTHORITY_SCHEMA_VERSION {
+        return Err(StorageError::migration_version_invariant_failed());
+    }
+    // Phase A: the two authoritative tables. Each failpoint fires after its own
+    // durable boundary has been reached: the AfterStateTable failpoint means
+    // the state table exists but the event table does not yet.
+    transaction
+        .execute_batch(CREATE_RELATIONSHIP_STATE_TABLE_SQL)
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    #[cfg(test)]
+    if should_fail_migration_020_at_for_test(Migration020Failpoint::AfterStateTable) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    transaction
+        .execute_batch(CREATE_RELATIONSHIP_EVENT_TABLE_SQL)
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    #[cfg(test)]
+    if should_fail_migration_020_at_for_test(Migration020Failpoint::AfterEventTable) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    // Phase B: existing-life neutral primary-user backfill. This runs before
+    // any relationship writer fence exists, so the migration connection needs
+    // no writer capability; the backfill count must cover every life exactly
+    // once.
+    let life_count: i64 = transaction
+        .query_row("SELECT COUNT(*) FROM life_identity", [], |row| row.get(0))
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    let migration_now: String = transaction
+        .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |row| {
+            row.get(0)
+        })
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    transaction
+        .execute(
+            "INSERT INTO relationship_state
+                (life_id, subject_id, familiarity, trust, emotional_closeness,
+                 collaboration, safety, dependency_tendency, boundary_comfort, tension,
+                 revision, policy_version, last_applied_at, updated_at)
+             SELECT id, 'primary_user', 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, ?1, ?1
+             FROM life_identity",
+            params![migration_now],
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    let backfilled_state_count: i64 = transaction
+        .query_row("SELECT COUNT(*) FROM relationship_state", [], |row| {
+            row.get(0)
+        })
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    if backfilled_state_count != life_count {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    #[cfg(test)]
+    if should_fail_migration_020_at_for_test(Migration020Failpoint::AfterBackfill) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    // Phase C: neutral-state initialization for every future life insert.
+    // The exact trigger body is authority-bearing and validated below.
+    transaction
+        .execute_batch(CREATE_RELATIONSHIP_STATE_INITIALIZER_TRIGGER_SQL)
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    #[cfg(test)]
+    if should_fail_migration_020_at_for_test(Migration020Failpoint::AfterInitializerTrigger) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    // Phase D: install the relationship writer fences so raw legacy
+    // connections can never write relationship authority.
+    writer_fence_manifest::install_relationship_writer_fence_manifest_in_transaction(transaction)?;
+    #[cfg(test)]
+    if should_fail_migration_020_at_for_test(Migration020Failpoint::AfterWriterFences) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    // Phase E: validate the complete object set (tables, FKs, trigger, data
+    // invariants) before the version boundary.
+    validate_relationship_authority_schema_objects(transaction)?;
+    #[cfg(test)]
+    if should_fail_migration_020_at_for_test(Migration020Failpoint::BeforeSchemaVersion) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    // Phase F: write the schema_migration version 20 row.
+    transaction
+        .execute(
+            "INSERT INTO schema_migration (version,name,applied_at) VALUES (?1,?2,?3)",
+            params![
+                RELATIONSHIP_AUTHORITY_SCHEMA_VERSION,
+                RELATIONSHIP_AUTHORITY_MIGRATION_NAME,
+                migration_now
+            ],
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    #[cfg(test)]
+    if should_fail_migration_020_at_for_test(Migration020Failpoint::PreCommit) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    validate_relationship_authority_schema_objects(transaction)?;
+    Ok(RelationshipAuthoritySchemaUpgrade::Applied)
+}
+
+pub(super) fn validate_relationship_authority_schema(
+    connection: &Connection,
+) -> Result<(), StorageError> {
+    if connection::read_schema_version(connection)? != RELATIONSHIP_AUTHORITY_SCHEMA_VERSION {
+        return Err(StorageError::migration_version_invariant_failed());
+    }
+    validate_relationship_authority_schema_objects(connection)
+}
+
+fn validate_relationship_authority_schema_objects(
+    connection: &Connection,
+) -> Result<(), StorageError> {
+    // The frozen domains and constraints are proven from SQLite's own
+    // persisted DDL: a normalized full-statement comparison represents CHECK
+    // expressions and table constraints that `PRAGMA table_info` cannot.
+    for (table, expected_sql) in [
+        ("relationship_state", CREATE_RELATIONSHIP_STATE_TABLE_SQL),
+        ("relationship_event", CREATE_RELATIONSHIP_EVENT_TABLE_SQL),
+    ] {
+        let actual: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type='table' AND name=?1",
+                [table],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| StorageError::migration_transaction_failed())?;
+        let Some(actual) = actual else {
+            return Err(StorageError::migration_transaction_failed());
+        };
+        if normalized_frozen_object_sql(&actual) != normalized_frozen_object_sql(expected_sql) {
+            return Err(StorageError::migration_transaction_failed());
+        }
+    }
+    // Life isolation and deletion cascade come from SQLite's own FK metadata:
+    // the state rows hang off life_identity, the events off their state row.
+    for (table, parent, column) in [
+        ("relationship_state", "life_identity", "life_id"),
+        ("relationship_event", "relationship_state", "life_id"),
+    ] {
+        let cascade_fk: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_list(?1)
+                 WHERE \"table\"=?2 AND \"from\"=?3 AND on_delete='CASCADE'",
+                params![table, parent, column],
+                |row| row.get(0),
+            )
+            .map_err(|_| StorageError::migration_transaction_failed())?;
+        if cascade_fk != 1 {
+            return Err(StorageError::migration_transaction_failed());
+        }
+    }
+    let event_subject_fk: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_list('relationship_event')
+             WHERE \"table\"='relationship_state' AND \"from\"='subject_id'
+               AND \"to\"='subject_id'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    if event_subject_fk != 1 {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    // The neutral-state initializer must be exact, not merely present.
+    let trigger_sql: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema
+             WHERE type='trigger' AND name='relationship_state_life_insert_initializer'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    let Some(trigger_sql) = trigger_sql else {
+        return Err(StorageError::migration_transaction_failed());
+    };
+    if normalized_frozen_object_sql(&trigger_sql)
+        != normalized_frozen_object_sql(CREATE_RELATIONSHIP_STATE_INITIALIZER_TRIGGER_SQL)
+    {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    // Exactly one authoritative primary-user state row per life.
+    let missing_state_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM life_identity AS l
+              LEFT JOIN relationship_state AS s
+                ON s.life_id = l.id AND s.subject_id = 'primary_user'
+             WHERE s.life_id IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    if missing_state_count != 0 {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    // Row-level frozen invariants.
+    let invalid_state_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM relationship_state
+             WHERE subject_id = ''
+                OR familiarity NOT BETWEEN 0 AND 1000
+                OR trust NOT BETWEEN -1000 AND 1000
+                OR emotional_closeness NOT BETWEEN 0 AND 1000
+                OR collaboration NOT BETWEEN 0 AND 1000
+                OR safety NOT BETWEEN -1000 AND 1000
+                OR dependency_tendency NOT BETWEEN 0 AND 1000
+                OR boundary_comfort NOT BETWEEN -1000 AND 1000
+                OR tension NOT BETWEEN 0 AND 1000
+                OR revision < 0
+                OR policy_version <= 0
+                OR last_applied_at = ''
+                OR updated_at = ''",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    if invalid_state_count != 0 {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    let invalid_event_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM relationship_event
+             WHERE subject_id = ''
+                OR source_kind = ''
+                OR source_ref = ''
+                OR change_reason = ''
+                OR familiarity_delta NOT BETWEEN -1000 AND 1000
+                OR trust_delta NOT BETWEEN -1000 AND 1000
+                OR emotional_closeness_delta NOT BETWEEN -1000 AND 1000
+                OR collaboration_delta NOT BETWEEN -1000 AND 1000
+                OR safety_delta NOT BETWEEN -1000 AND 1000
+                OR dependency_tendency_delta NOT BETWEEN -1000 AND 1000
+                OR boundary_comfort_delta NOT BETWEEN -1000 AND 1000
+                OR tension_delta NOT BETWEEN -1000 AND 1000
+                OR result_familiarity NOT BETWEEN 0 AND 1000
+                OR result_trust NOT BETWEEN -1000 AND 1000
+                OR result_emotional_closeness NOT BETWEEN 0 AND 1000
+                OR result_collaboration NOT BETWEEN 0 AND 1000
+                OR result_safety NOT BETWEEN -1000 AND 1000
+                OR result_dependency_tendency NOT BETWEEN 0 AND 1000
+                OR result_boundary_comfort NOT BETWEEN -1000 AND 1000
+                OR result_tension NOT BETWEEN 0 AND 1000
+                OR applied_revision <= 0
+                OR event_time = ''
+                OR policy_version <= 0
+                OR created_at = ''",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    if invalid_event_count != 0 {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    // Both frozen UNIQUE constraints must actually exist as UNIQUE-origin
+    // autoindexes (origin 'u'); the composite PRIMARY KEY of
+    // relationship_state creates a pk-origin autoindex and must not be
+    // counted here.
+    let unique_index_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_index_list('relationship_event')
+             WHERE \"unique\" = 1 AND origin = 'u'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    if unique_index_count != 2 {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    // The Schema 18 catch-up objects stay validated on Schema 20 (without the
+    // schema-18 manifest selection, which cannot see the later fence
+    // triggers), and the complete 57-trigger writer fence must be present.
+    validate_generation_catchup_attempt_schema_objects_inner(connection)?;
+    writer_fence_manifest::validate_writer_fence_manifest_for_schema(
+        connection,
+        RELATIONSHIP_AUTHORITY_SCHEMA_VERSION,
     )
 }
 
@@ -1744,10 +2059,11 @@ fn normalize_schema_fragment(value: &str) -> String {
 }
 
 /// SQLite stores object SQL without the terminating semicolon; frozen
-/// migration files may include one. Strip trailing semicolons from both
-/// sides before the exact normalized comparison.
+/// migration files may include one followed by a newline. Strip surrounding
+/// whitespace and any trailing semicolons from both sides before the exact
+/// normalized comparison.
 fn normalized_frozen_object_sql(value: &str) -> String {
-    normalize_schema_fragment(value.trim_end_matches(';'))
+    normalize_schema_fragment(value.trim().trim_end_matches(';'))
 }
 
 fn normalized_top_level_column_definitions(table_sql: &str) -> Option<Vec<String>> {
@@ -1880,6 +2196,9 @@ pub(super) fn verify_schema_after_upgrade(
     }
     if expected_schema_version == EMOTION_AUTHORITY_SCHEMA_VERSION {
         validate_emotion_authority_schema(connection)?;
+    }
+    if expected_schema_version == RELATIONSHIP_AUTHORITY_SCHEMA_VERSION {
+        validate_relationship_authority_schema(connection)?;
     }
     if expected_schema_version >= writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION {
         #[cfg(test)]
@@ -2151,6 +2470,48 @@ pub(super) fn fail_next_migration_019_at_for_test(failpoint: Migration019Failpoi
 #[cfg(test)]
 fn should_fail_migration_019_at_for_test(failpoint: Migration019Failpoint) -> bool {
     MIGRATION_019_FAILPOINT.with(|next| {
+        if next.get() == Some(failpoint) {
+            next.set(None);
+            true
+        } else {
+            false
+        }
+    })
+}
+
+/// Test-only failpoints for Migration020
+/// (`apply_relationship_authority_schema_upgrade`). Each variant corresponds to
+/// a phase of the single-transaction upgrade. The failpoint returns
+/// `MIGRATION_TRANSACTION_FAILED` from inside the transaction, so the whole
+/// upgrade (tables, backfill, initializer trigger, writer fences, validators,
+/// version row) rolls back as one atomic unit.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Migration020Failpoint {
+    AfterStateTable,
+    AfterEventTable,
+    AfterBackfill,
+    AfterInitializerTrigger,
+    AfterWriterFences,
+    BeforeSchemaVersion,
+    PreCommit,
+}
+
+#[cfg(test)]
+thread_local! {
+    static MIGRATION_020_FAILPOINT: std::cell::Cell<Option<Migration020Failpoint>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(super) fn fail_next_migration_020_at_for_test(failpoint: Migration020Failpoint) {
+    MIGRATION_020_FAILPOINT.with(|next| next.set(Some(failpoint)));
+}
+
+#[cfg(test)]
+fn should_fail_migration_020_at_for_test(failpoint: Migration020Failpoint) -> bool {
+    MIGRATION_020_FAILPOINT.with(|next| {
         if next.get() == Some(failpoint) {
             next.set(None);
             true
@@ -2805,6 +3166,27 @@ mod transaction_tests {
         transaction.commit().unwrap();
     }
 
+    fn apply_relationship_authority_upgrade(connection: &mut Connection) {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert_eq!(
+            apply_relationship_authority_schema_upgrade(&transaction).unwrap(),
+            RelationshipAuthoritySchemaUpgrade::Applied
+        );
+        transaction.commit().unwrap();
+    }
+
+    fn schema_nineteen_connection() -> Connection {
+        let mut connection = schema_eighteen_connection();
+        apply_emotion_authority_upgrade(&mut connection);
+        assert_eq!(
+            schema_version(&connection),
+            EMOTION_AUTHORITY_SCHEMA_VERSION
+        );
+        connection
+    }
+
     fn seed_lives_at_schema_eighteen(connection: &Connection) -> i64 {
         // Lives are inserted before Schema 19 exists, so no initializer
         // trigger or emotion writer fence is involved yet.
@@ -3181,6 +3563,521 @@ mod transaction_tests {
             .query_row("SELECT COUNT(*) FROM life_identity", [], |row| row.get(0))
             .unwrap();
         assert_eq!(life_count, 3);
+    }
+
+    #[test]
+    fn migration_020_schema_nineteen_to_twenty_is_atomic_and_preserves_schema_nineteen() {
+        let mut connection = schema_nineteen_connection();
+        let emotion_state_sql: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type='table' AND name='emotion_state'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let emotion_event_sql: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type='table' AND name='emotion_event'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        apply_relationship_authority_upgrade(&mut connection);
+
+        assert_eq!(
+            schema_version(&connection),
+            RELATIONSHIP_AUTHORITY_SCHEMA_VERSION
+        );
+        validate_relationship_authority_schema(&connection).unwrap();
+        for table in ["relationship_state", "relationship_event"] {
+            let exists: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name=?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 1);
+        }
+        let version_name: String = connection
+            .query_row(
+                "SELECT name FROM schema_migration WHERE version=?1",
+                [RELATIONSHIP_AUTHORITY_SCHEMA_VERSION],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version_name, RELATIONSHIP_AUTHORITY_MIGRATION_NAME);
+        // The Schema 19 emotion authority DDL is byte-for-byte unchanged.
+        let emotion_state_after: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type='table' AND name='emotion_state'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(emotion_state_after, emotion_state_sql);
+        let emotion_event_after: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type='table' AND name='emotion_event'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(emotion_event_after, emotion_event_sql);
+        assert_eq!(
+            writer_fence_manifest::relationship_writer_fence_trigger_specs().len(),
+            6
+        );
+        // Exactly 18 + 6 + 18 + 3 + 6 + 6 = 57 writer fences.
+        let writer_fence_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type='trigger' AND name GLOB 'digital_life_writer_epoch_*'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(writer_fence_count, 57);
+    }
+
+    #[test]
+    fn migration_020_backfills_neutral_primary_user_state_for_every_existing_life() {
+        let mut connection = schema_nineteen_connection();
+        seed_lives_at_schema_eighteen(&connection);
+        assert_eq!(
+            schema_version(&connection),
+            EMOTION_AUTHORITY_SCHEMA_VERSION
+        );
+
+        apply_relationship_authority_upgrade(&mut connection);
+
+        let state_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM relationship_state", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(state_count, 3);
+        let neutral_invariants: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM relationship_state
+                 WHERE subject_id <> 'primary_user'
+                    OR familiarity <> 0 OR trust <> 0 OR emotional_closeness <> 0
+                    OR collaboration <> 0 OR safety <> 0 OR dependency_tendency <> 0
+                    OR boundary_comfort <> 0 OR tension <> 0
+                    OR revision <> 0 OR policy_version <> 1
+                    OR last_applied_at = '' OR updated_at = ''",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(neutral_invariants, 0);
+        let life_mapping: Vec<(String, String)> = connection
+            .prepare(
+                "SELECT l.id, s.life_id FROM life_identity l
+                  LEFT JOIN relationship_state s
+                    ON s.life_id=l.id AND s.subject_id='primary_user'",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(life_mapping.len(), 3);
+        for (life_id, state_life_id) in life_mapping {
+            assert_eq!(life_id, state_life_id);
+        }
+    }
+
+    #[test]
+    fn migration_020_initializer_creates_exactly_one_neutral_primary_user_row_per_new_life() {
+        let mut connection = schema_nineteen_connection();
+        apply_relationship_authority_upgrade(&mut connection);
+        connection
+            .execute(
+                "INSERT INTO persona_template (id, name, version, persona_json)
+                 VALUES ('persona-a', 'Persona', 1, '{}')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO life_identity
+                 (id, name, created_at, version, body_id, persona_id, persona_version)
+                 VALUES ('life-new', 'Life New', '2026-08-25T00:00:00.000Z', 1,
+                         'body', 'persona-a', 1)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO life_identity
+                 (id, name, created_at, version, body_id, persona_id, persona_version)
+                 VALUES ('life-newer', 'Life Newer', '2026-08-25T00:00:00.000Z', 1,
+                         'body', 'persona-a', 1)",
+                [],
+            )
+            .unwrap();
+
+        let state_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM relationship_state", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(state_count, 2);
+        for life_id in ["life-new", "life-newer"] {
+            let (subject_id, revision, policy_version): (String, i64, i64) = connection
+                .query_row(
+                    "SELECT subject_id, revision, policy_version
+                     FROM relationship_state WHERE life_id=?1",
+                    [life_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(subject_id, "primary_user");
+            assert_eq!((revision, policy_version), (0, 1));
+        }
+        // An UPSERT that only updates an existing life must not create a
+        // second state row (AFTER INSERT triggers fire only on the insert arm).
+        connection
+            .execute(
+                "INSERT INTO life_identity
+                 (id, name, created_at, version, body_id, persona_id, persona_version)
+                 VALUES ('life-new', 'Life New renamed', '2026-08-25T00:00:00.000Z', 2,
+                         'body', 'persona-a', 1)
+                 ON CONFLICT(id) DO UPDATE SET version = excluded.version",
+                [],
+            )
+            .unwrap();
+        let state_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM relationship_state", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(state_count, 2);
+    }
+
+    #[test]
+    fn migration_020_missing_initializer_trigger_fails_validation_without_repair() {
+        let mut connection = schema_nineteen_connection();
+        apply_relationship_authority_upgrade(&mut connection);
+        connection
+            .execute_batch("DROP TRIGGER relationship_state_life_insert_initializer")
+            .unwrap();
+
+        let error = validate_relationship_authority_schema(&connection).unwrap_err();
+        assert_eq!(error.code, "MIGRATION_TRANSACTION_FAILED");
+        let remaining: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type='trigger' AND name='relationship_state_life_insert_initializer'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn migration_020_tables_enforce_frozen_domains_keys_and_uniqueness() {
+        let mut connection = schema_nineteen_connection();
+        apply_relationship_authority_upgrade(&mut connection);
+        connection
+            .execute(
+                "INSERT INTO persona_template (id, name, version, persona_json)
+                 VALUES ('persona-a', 'Persona', 1, '{}')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO life_identity
+                 (id, name, created_at, version, body_id, persona_id, persona_version)
+                 VALUES ('probe-life', 'Probe', '2026-08-25T00:00:00.000Z', 1,
+                         'body', 'persona-a', 1)",
+                [],
+            )
+            .unwrap();
+
+        let base_state_insert = |familiarity: i32| {
+            connection.execute(
+                "INSERT INTO relationship_state
+                 (life_id, subject_id, familiarity, trust, emotional_closeness,
+                  collaboration, safety, dependency_tendency, boundary_comfort, tension,
+                  revision, policy_version, last_applied_at, updated_at)
+                 VALUES ('probe-life', 'second-subject', ?1, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                         '2026-08-25T11:00:00.000Z', '2026-08-25T11:00:00.000Z')",
+                [familiarity],
+            )
+        };
+        for out_of_range in [-1_i32, 1001] {
+            assert!(
+                base_state_insert(out_of_range).is_err(),
+                "state familiarity {out_of_range} must violate its CHECK"
+            );
+        }
+        // Composite primary key rejects a duplicate (life_id, subject_id).
+        assert!(connection
+            .execute(
+                "INSERT INTO relationship_state
+                     (life_id, subject_id, familiarity, trust, emotional_closeness,
+                      collaboration, safety, dependency_tendency, boundary_comfort, tension,
+                      revision, policy_version, last_applied_at, updated_at)
+                     VALUES ('probe-life', 'primary_user', 5, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                             '2026-08-25T11:00:00.000Z', '2026-08-25T11:00:00.000Z')",
+                [],
+            )
+            .is_err());
+        assert!(base_state_insert(0).is_ok());
+
+        // Events cannot attach to a non-existent relationship_state pair.
+        let orphan_event = connection.execute(
+            "INSERT INTO relationship_event
+             (event_id, life_id, subject_id, source_kind, source_ref, change_reason,
+              familiarity_delta, trust_delta, emotional_closeness_delta,
+              collaboration_delta, safety_delta, dependency_tendency_delta,
+              boundary_comfort_delta, tension_delta,
+              result_familiarity, result_trust, result_emotional_closeness,
+              result_collaboration, result_safety, result_dependency_tendency,
+              result_boundary_comfort, result_tension,
+              applied_revision, event_time, policy_version, created_at)
+             VALUES ('orphan', 'ghost-life', 'primary_user', 'k', 'r', 'policy_reason',
+                     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                     1, 't', 1, 'c')",
+            [],
+        );
+        assert!(orphan_event.is_err());
+
+        // Both frozen UNIQUE constraints hold.
+        let first = connection.execute(
+            "INSERT INTO relationship_event
+             (event_id, life_id, subject_id, source_kind, source_ref, change_reason,
+              familiarity_delta, trust_delta, emotional_closeness_delta,
+              collaboration_delta, safety_delta, dependency_tendency_delta,
+              boundary_comfort_delta, tension_delta,
+              result_familiarity, result_trust, result_emotional_closeness,
+              result_collaboration, result_safety, result_dependency_tendency,
+              result_boundary_comfort, result_tension,
+              applied_revision, event_time, policy_version, created_at)
+             VALUES ('ev-1', 'probe-life', 'primary_user', 'kind', 'ref', 'policy_reason',
+                     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                     1, '2026-08-25T11:00:00.000Z', 1, '2026-08-25T11:00:00.000Z')",
+            [],
+        );
+        assert_eq!(first.unwrap(), 1);
+        let same_source = connection.execute(
+            "INSERT INTO relationship_event
+             (event_id, life_id, subject_id, source_kind, source_ref, change_reason,
+              familiarity_delta, trust_delta, emotional_closeness_delta,
+              collaboration_delta, safety_delta, dependency_tendency_delta,
+              boundary_comfort_delta, tension_delta,
+              result_familiarity, result_trust, result_emotional_closeness,
+              result_collaboration, result_safety, result_dependency_tendency,
+              result_boundary_comfort, result_tension,
+              applied_revision, event_time, policy_version, created_at)
+             VALUES ('ev-2', 'probe-life', 'primary_user', 'kind', 'ref', 'policy_reason',
+                     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                     2, '2026-08-25T11:00:00.000Z', 1, '2026-08-25T11:00:00.000Z')",
+            [],
+        );
+        assert!(same_source.is_err(), "duplicate source identity must fail");
+        let same_revision = connection.execute(
+            "INSERT INTO relationship_event
+             (event_id, life_id, subject_id, source_kind, source_ref, change_reason,
+              familiarity_delta, trust_delta, emotional_closeness_delta,
+              collaboration_delta, safety_delta, dependency_tendency_delta,
+              boundary_comfort_delta, tension_delta,
+              result_familiarity, result_trust, result_emotional_closeness,
+              result_collaboration, result_safety, result_dependency_tendency,
+              result_boundary_comfort, result_tension,
+              applied_revision, event_time, policy_version, created_at)
+             VALUES ('ev-3', 'probe-life', 'primary_user', 'other-kind', 'other-ref',
+                     'policy_reason',
+                     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                     1, '2026-08-25T11:00:00.000Z', 1, '2026-08-25T11:00:00.000Z')",
+            [],
+        );
+        assert!(
+            same_revision.is_err(),
+            "duplicate applied_revision must fail"
+        );
+
+        // The event CHECK constraints reject out-of-domain results and deltas.
+        for (column, bad_value) in [
+            ("result_trust", 1001),
+            ("result_trust", -1001),
+            ("trust_delta", -1001),
+            ("result_familiarity", -1),
+            ("tension_delta", 1001),
+        ] {
+            let sql = format!(
+                "INSERT INTO relationship_event
+                 (event_id, life_id, subject_id, source_kind, source_ref, change_reason,
+                  familiarity_delta, trust_delta, emotional_closeness_delta,
+                  collaboration_delta, safety_delta, dependency_tendency_delta,
+                  boundary_comfort_delta, tension_delta,
+                  result_familiarity, result_trust, result_emotional_closeness,
+                  result_collaboration, result_safety, result_dependency_tendency,
+                  result_boundary_comfort, result_tension,
+                  applied_revision, event_time, policy_version, created_at)
+                 SELECT 'bad-{column}-{bad_value}', 'probe-life', 'primary_user',
+                        'kind', 'ref-bad', 'policy_reason',
+                        0, 0, 0, 0, 0, 0, 0, 0,
+                        CASE WHEN '{column}'='result_familiarity' THEN {bad_value} ELSE 0 END,
+                        CASE WHEN '{column}'='result_trust' THEN {bad_value} ELSE 0 END,
+                        0, 0, 0, 0, 0, 0,
+                        CASE WHEN '{column}'='trust_delta' THEN {bad_value}
+                             WHEN '{column}'='tension_delta' THEN 0 ELSE 1 END,
+                        '2026-08-25T11:00:00.000Z', 1, '2026-08-25T11:00:00.000Z'"
+            );
+            // Deltas are inserted positionally above; fix tension_delta too.
+            let sql = sql.replace(
+                &format!("CASE WHEN '{column}'='tension_delta' THEN 0 ELSE 1 END"),
+                &format!(
+                    "CASE WHEN '{column}'='tension_delta' THEN {bad_value}
+                          WHEN '{column}'='trust_delta' THEN 0 ELSE 1 END"
+                ),
+            );
+            assert!(
+                connection.execute(&sql, []).is_err(),
+                "{column}={bad_value} must violate its CHECK"
+            );
+        }
+    }
+
+    #[test]
+    fn migration_020_no_migration_021_exists_and_twenty_is_the_maximum_supported_version() {
+        assert_eq!(
+            super::super::connection::MAX_SUPPORTED_SCHEMA_VERSION,
+            RELATIONSHIP_AUTHORITY_SCHEMA_VERSION
+        );
+        let migrations_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/storage/migrations");
+        let entries = std::fs::read_dir(&migrations_dir).unwrap();
+        let mut highest = 0;
+        for entry in entries {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            let digits: String = name
+                .chars()
+                .take_while(|character| character.is_ascii_digit())
+                .collect();
+            if let Ok(version) = digits.parse::<i64>() {
+                highest = highest.max(version);
+            }
+        }
+        assert_eq!(highest, 20, "Migration 021 must not exist");
+    }
+
+    #[test]
+    fn migration_020_failpoints_roll_back_to_exact_schema_nineteen_preimage() {
+        for point in [
+            Migration020Failpoint::AfterStateTable,
+            Migration020Failpoint::AfterEventTable,
+            Migration020Failpoint::AfterBackfill,
+            Migration020Failpoint::AfterInitializerTrigger,
+            Migration020Failpoint::AfterWriterFences,
+            Migration020Failpoint::BeforeSchemaVersion,
+            Migration020Failpoint::PreCommit,
+        ] {
+            let mut connection = schema_nineteen_connection();
+            fail_next_migration_020_at_for_test(point);
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let error = apply_relationship_authority_schema_upgrade(&transaction).unwrap_err();
+            assert_eq!(error.code, "MIGRATION_TRANSACTION_FAILED");
+
+            // Each failpoint fires after its own durable boundary has been
+            // reached inside the caller-owned transaction.
+            let state_exists: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema
+                     WHERE type='table' AND name='relationship_state'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let event_exists: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema
+                     WHERE type='table' AND name='relationship_event'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let initializer_exists: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema
+                     WHERE type='trigger'
+                       AND name='relationship_state_life_insert_initializer'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let relationship_fence_count: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema
+                     WHERE type='trigger'
+                       AND name LIKE 'digital_life_writer_epoch_relationship_%'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            match point {
+                Migration020Failpoint::AfterStateTable => {
+                    assert_eq!(state_exists, 1);
+                    assert_eq!(event_exists, 0);
+                    assert_eq!(initializer_exists, 0);
+                    assert_eq!(relationship_fence_count, 0);
+                }
+                Migration020Failpoint::AfterEventTable => {
+                    assert_eq!(state_exists, 1);
+                    assert_eq!(event_exists, 1);
+                    assert_eq!(initializer_exists, 0);
+                    assert_eq!(relationship_fence_count, 0);
+                }
+                Migration020Failpoint::AfterBackfill => {
+                    assert_eq!(initializer_exists, 0);
+                    assert_eq!(relationship_fence_count, 0);
+                }
+                Migration020Failpoint::AfterInitializerTrigger => {
+                    assert_eq!(initializer_exists, 1);
+                    assert_eq!(relationship_fence_count, 0);
+                }
+                Migration020Failpoint::AfterWriterFences => {
+                    assert_eq!(initializer_exists, 1);
+                    assert_eq!(relationship_fence_count, 6);
+                }
+                Migration020Failpoint::BeforeSchemaVersion | Migration020Failpoint::PreCommit => {
+                    assert_eq!(initializer_exists, 1);
+                    assert_eq!(relationship_fence_count, 6);
+                }
+            }
+            drop(transaction);
+
+            // The committed preimage is exactly Schema 19 again.
+            assert_eq!(
+                schema_version(&connection),
+                EMOTION_AUTHORITY_SCHEMA_VERSION
+            );
+            validate_emotion_authority_schema(&connection).unwrap();
+            let relationship_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema
+                     WHERE name LIKE 'relationship_%'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(relationship_count, 0);
+            let writer_fence_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema
+                     WHERE type='trigger' AND name GLOB 'digital_life_writer_epoch_*'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(writer_fence_count, 51);
+        }
     }
 
     #[test]

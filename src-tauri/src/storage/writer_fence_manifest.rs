@@ -12,12 +12,14 @@ pub(super) const LATE_DELETE_WRITER_FENCE_SCHEMA_VERSION: i64 = 15;
 pub(super) const GENERATION_LIFECYCLE_WRITER_FENCE_SCHEMA_VERSION: i64 = 17;
 pub(super) const GENERATION_CATCHUP_WRITER_FENCE_SCHEMA_VERSION: i64 = 18;
 pub(super) const EMOTION_WRITER_FENCE_SCHEMA_VERSION: i64 = 19;
+pub(super) const RELATIONSHIP_WRITER_FENCE_SCHEMA_VERSION: i64 = 20;
 const WRITER_FENCE_TRIGGER_PREFIX: &str = "digital_life_writer_epoch_";
 const HISTORICAL_WRITER_FENCE_TRIGGER_COUNT: usize = 18;
 const LATE_DELETE_WRITER_FENCE_TRIGGER_COUNT: usize = 24;
 const GENERATION_LIFECYCLE_WRITER_FENCE_TRIGGER_COUNT: usize = 42;
 const GENERATION_CATCHUP_WRITER_FENCE_TRIGGER_COUNT: usize = 45;
 const EMOTION_WRITER_FENCE_TRIGGER_COUNT: usize = 51;
+const RELATIONSHIP_WRITER_FENCE_TRIGGER_COUNT: usize = 57;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(super) enum WriterFenceOperation {
@@ -360,6 +362,42 @@ const WRITER_FENCE_TRIGGER_SPECS: &[WriterFenceTriggerSpec] = &[
         Delete,
         "DELETE"
     ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_relationship_state_insert",
+        "relationship_state",
+        Insert,
+        "INSERT"
+    ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_relationship_state_update",
+        "relationship_state",
+        Update,
+        "UPDATE"
+    ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_relationship_state_delete",
+        "relationship_state",
+        Delete,
+        "DELETE"
+    ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_relationship_event_insert",
+        "relationship_event",
+        Insert,
+        "INSERT"
+    ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_relationship_event_update",
+        "relationship_event",
+        Update,
+        "UPDATE"
+    ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_relationship_event_delete",
+        "relationship_event",
+        Delete,
+        "DELETE"
+    ),
 ];
 
 pub(super) fn writer_fence_trigger_specs() -> &'static [WriterFenceTriggerSpec] {
@@ -385,6 +423,28 @@ pub(super) fn generation_catchup_writer_fence_trigger_specs() -> &'static [Write
 pub(super) fn emotion_writer_fence_trigger_specs() -> &'static [WriterFenceTriggerSpec] {
     &WRITER_FENCE_TRIGGER_SPECS
         [GENERATION_CATCHUP_WRITER_FENCE_TRIGGER_COUNT..EMOTION_WRITER_FENCE_TRIGGER_COUNT]
+}
+
+pub(super) fn relationship_writer_fence_trigger_specs() -> &'static [WriterFenceTriggerSpec] {
+    &WRITER_FENCE_TRIGGER_SPECS
+        [EMOTION_WRITER_FENCE_TRIGGER_COUNT..RELATIONSHIP_WRITER_FENCE_TRIGGER_COUNT]
+}
+
+pub(super) fn install_relationship_writer_fence_manifest_in_transaction(
+    transaction: &Transaction<'_>,
+) -> Result<(), StorageError> {
+    for (index, spec) in relationship_writer_fence_trigger_specs().iter().enumerate() {
+        #[cfg(not(test))]
+        let _ = index;
+        #[cfg(test)]
+        if should_fail_trigger_install_at_for_test(EMOTION_WRITER_FENCE_TRIGGER_COUNT + index + 1) {
+            return Err(StorageError::migration_transaction_failed());
+        }
+        transaction
+            .execute_batch(spec.ddl)
+            .map_err(|_| StorageError::migration_transaction_failed())?;
+    }
+    Ok(())
 }
 
 pub(super) fn install_emotion_writer_fence_manifest_in_transaction(
@@ -518,8 +578,10 @@ pub(super) fn validate_writer_fence_manifest_for_schema(
         })
         .map_err(|_| StorageError::writer_fence_manifest_mismatch())?;
 
-    let expected = if schema_version >= EMOTION_WRITER_FENCE_SCHEMA_VERSION {
+    let expected = if schema_version >= RELATIONSHIP_WRITER_FENCE_SCHEMA_VERSION {
         WRITER_FENCE_TRIGGER_SPECS
+    } else if schema_version >= EMOTION_WRITER_FENCE_SCHEMA_VERSION {
+        &WRITER_FENCE_TRIGGER_SPECS[..EMOTION_WRITER_FENCE_TRIGGER_COUNT]
     } else if schema_version >= GENERATION_CATCHUP_WRITER_FENCE_SCHEMA_VERSION {
         &WRITER_FENCE_TRIGGER_SPECS[..GENERATION_CATCHUP_WRITER_FENCE_TRIGGER_COUNT]
     } else if schema_version >= GENERATION_LIFECYCLE_WRITER_FENCE_SCHEMA_VERSION {
@@ -1220,7 +1282,8 @@ mod tests {
         assert_eq!(generation_lifecycle_writer_fence_trigger_specs().len(), 18);
         assert_eq!(generation_catchup_writer_fence_trigger_specs().len(), 3);
         assert_eq!(emotion_writer_fence_trigger_specs().len(), 6);
-        assert_eq!(WRITER_FENCE_TRIGGER_SPECS.len(), 51);
+        assert_eq!(relationship_writer_fence_trigger_specs().len(), 6);
+        assert_eq!(WRITER_FENCE_TRIGGER_SPECS.len(), 57);
         let resolution_id = late_delete_resolution_insert(&authorized).unwrap();
         assert_eq!(resolution_id, 1);
         assert_eq!(authorized.execute("UPDATE memory_vector_late_delete_resolution SET updated_at='2026-01-02T00:00:00.000Z' WHERE memory_id='late-resolution'", []).unwrap(), 1);
@@ -1390,14 +1453,143 @@ mod tests {
     }
 
     #[test]
+    fn schema_20_relationship_tables_are_authorized_writer_only() {
+        let (_root, path) = initialized_fenced_database();
+        let authorized = authorized_connection(&path);
+        seed_protected_rows(&authorized);
+        // The initializer trigger must not interfere with seeded lives: the
+        // neutral primary_user relationship_state row is created for every
+        // existing life.
+        assert_eq!(
+            authorized
+                .query_row(
+                    "SELECT COUNT(*) FROM relationship_state
+                     WHERE life_id='writer-fence-life' AND subject_id='primary_user'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        // Authorized writer can write both relationship tables.
+        assert_eq!(
+            authorized
+                .execute(
+                    "UPDATE relationship_state SET updated_at='2026-08-25T00:00:00.000Z'
+                     WHERE life_id='writer-fence-life' AND subject_id='primary_user'",
+                    [],
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            authorized
+                .execute(
+                    "INSERT INTO relationship_event
+                     (event_id, life_id, subject_id, source_kind, source_ref, change_reason,
+                      familiarity_delta, trust_delta, emotional_closeness_delta,
+                      collaboration_delta, safety_delta, dependency_tendency_delta,
+                      boundary_comfort_delta, tension_delta,
+                      result_familiarity, result_trust, result_emotional_closeness,
+                      result_collaboration, result_safety, result_dependency_tendency,
+                      result_boundary_comfort, result_tension,
+                      applied_revision, event_time, policy_version, created_at)
+                     VALUES ('fence-rel-event-1', 'writer-fence-life', 'primary_user',
+                             'fence', 'seed', 'policy_fence_seed',
+                             1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                             1, '2026-08-25T00:00:00.000Z', 1,
+                             '2026-08-25T00:00:00.000Z')",
+                    [],
+                )
+                .unwrap(),
+            1
+        );
+        drop(authorized);
+
+        let raw = Connection::open(&path).unwrap();
+        for (operation, result) in [
+            (
+                "state insert",
+                raw.execute(
+                    "INSERT INTO relationship_state
+                     (life_id, subject_id, familiarity, trust, emotional_closeness,
+                      collaboration, safety, dependency_tendency, boundary_comfort, tension,
+                      revision, policy_version, last_applied_at, updated_at)
+                     VALUES ('raw-life', 'primary_user', 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                             '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')",
+                    [],
+                ),
+            ),
+            (
+                "state update",
+                raw.execute("UPDATE relationship_state SET revision=1", []),
+            ),
+            (
+                "state delete",
+                raw.execute(
+                    "DELETE FROM relationship_state
+                     WHERE life_id='writer-fence-life' AND subject_id='primary_user'",
+                    [],
+                ),
+            ),
+            (
+                "event insert",
+                raw.execute(
+                    "INSERT INTO relationship_event
+                     (event_id, life_id, subject_id, source_kind, source_ref, change_reason,
+                      familiarity_delta, trust_delta, emotional_closeness_delta,
+                      collaboration_delta, safety_delta, dependency_tendency_delta,
+                      boundary_comfort_delta, tension_delta,
+                      result_familiarity, result_trust, result_emotional_closeness,
+                      result_collaboration, result_safety, result_dependency_tendency,
+                      result_boundary_comfort, result_tension,
+                      applied_revision, event_time, policy_version, created_at)
+                     VALUES ('raw-rel-event', 'writer-fence-life', 'primary_user',
+                             'fence', 'raw', 'policy_fence_raw',
+                             1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                             2, '2026-08-25T00:00:00.000Z', 1,
+                             '2026-08-25T00:00:00.000Z')",
+                    [],
+                ),
+            ),
+            (
+                "event update",
+                raw.execute("UPDATE relationship_event SET policy_version=2", []),
+            ),
+            (
+                "event delete",
+                raw.execute(
+                    "DELETE FROM relationship_event WHERE event_id='fence-rel-event-1'",
+                    [],
+                ),
+            ),
+        ] {
+            assert!(
+                result.is_err(),
+                "raw relationship {operation} must be stopped by its writer-fence trigger"
+            );
+        }
+        // Nothing was changed by the rejected raw writes.
+        let row_count: (i64, i64) = raw
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM relationship_state),
+                        (SELECT COUNT(*) FROM relationship_event)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row_count, (2, 1));
+    }
+
+    #[test]
     fn schema_18_generation_identity_immutable_generation_delete_denied_late_delete_resolution_runtime_create_captured_generation_authority_late_delete_24h_semantic_guards_are_orthogonal_to_the_schema19_writer_fence_triggers(
     ) {
         let (_root, path) = initialized_fenced_database();
         let authorized = authorized_connection(&path);
         seed_protected_rows(&authorized);
-        assert_eq!(WRITER_FENCE_TRIGGER_SPECS.len(), 51);
+        assert_eq!(WRITER_FENCE_TRIGGER_SPECS.len(), 57);
         let reserved: i64 = authorized.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type='trigger' AND name LIKE 'digital_life_writer_epoch_%'", [], |r| r.get(0)).unwrap();
-        assert_eq!(reserved, 51);
+        assert_eq!(reserved, 57);
         for name in [
             "memory_vector_generation_semantic_delete_guard",
             "memory_vector_generation_semantic_identity_guard",

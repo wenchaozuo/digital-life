@@ -17,6 +17,8 @@ mod memory_retrieval;
 mod memory_revision;
 mod migration;
 mod model_profile;
+#[cfg_attr(not(test), allow(dead_code))]
+mod relationship;
 mod upgrade_coordinator;
 pub(crate) mod upgrade_gate;
 mod vector_sync_outbox;
@@ -1907,12 +1909,13 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(writer_fence_count, 51);
+        assert_eq!(writer_fence_count, 57);
         migration::validate_attempt_claim_identity_schema(&state.connection).unwrap();
-        // The database is at Schema 19; validate the exact Schema-19 emotion
-        // authority (which re-validates the Schema-18 catch-up objects and
-        // proves the full 51-trigger writer fence).
+        // The database is at Schema 20; validate the exact Schema-20 relationship
+        // authority (which re-validates the emotion authority, the Schema-18
+        // catch-up objects, and proves the full 57-trigger writer fence).
         migration::validate_emotion_authority_schema(&state.connection).unwrap();
+        migration::validate_relationship_authority_schema(&state.connection).unwrap();
         assert_eq!(
             state
                 .connection
@@ -2105,7 +2108,7 @@ mod tests {
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert_eq!(fence_count, 51);
+            assert_eq!(fence_count, 57);
         }
 
         // All 8 outbox states preserved with full epoch evidence.

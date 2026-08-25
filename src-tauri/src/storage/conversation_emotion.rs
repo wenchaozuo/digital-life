@@ -16,7 +16,7 @@
 //! retroactively given an emotion event; this module is a primitive for NEW
 //! governed commits only.
 
-use rusqlite::TransactionBehavior;
+use rusqlite::{Transaction, TransactionBehavior};
 
 use super::{
     conversation::{self},
@@ -99,7 +99,7 @@ pub(crate) struct ConversationEmotionCommitOutcome {
 /// Validate that `transition` deterministically binds to the requested
 /// conversation turn BEFORE any write happens. Fail closed; never rewrite the
 /// caller-supplied transition.
-fn validate_binding(
+pub(super) fn validate_binding(
     request: &AppendConversationTurnRequest,
     transition: &EmotionTransition,
 ) -> Result<(), ConversationEmotionCommitError> {
@@ -154,165 +154,173 @@ impl StorageService {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(ConversationEmotionCommitError::from)?;
-
-        // 1-2. Load + ownership-validate conversation; detect existing turn.
-        let stored_conversation = conversation::load_conversation(
-            &transaction,
-            &request.life_id,
-            &request.conversation_id,
-        )
-        .map_err(ConversationEmotionCommitError::Conversation)?;
-        if let Some(mut existing) = conversation::load_turn(
-            &transaction,
-            &request.life_id,
-            &request.conversation_id,
-            &request.turn_id,
-        )
-        .map_err(ConversationEmotionCommitError::Conversation)?
-        {
-            // Replay path: same turn_id must carry identical user content.
-            if existing.user_message.content != request.user_content {
-                return Err(ConversationEmotionCommitError::Conversation(
-                    crate::conversation::history::ConversationHistoryError::new(
-                        crate::conversation::history::ConversationHistoryErrorCode::TurnIdConflict,
-                    ),
-                ));
-            }
-            // Legacy guard: a turn committed by the old non-emotion path has
-            // NO emotion event under the canonical identity. It must NEVER be
-            // retroactively given one, so fail closed BEFORE invoking the B1
-            // helper (whose job would otherwise be to create the missing
-            // event). This is a NON-MUTATING existence check only — replay
-            // equality stays the exclusive property of the B1 semantic
-            // implementation below.
-            let emotion_event_exists: bool = transaction
-                .query_row(
-                    "SELECT EXISTS(
-                        SELECT 1 FROM emotion_event
-                        WHERE event_id = ?1
-                           OR (life_id = ?2 AND source_kind = ?3 AND source_ref = ?4)
-                    )",
-                    rusqlite::params![
-                        transition.event_id,
-                        transition.life_id,
-                        transition.source.kind,
-                        transition.source.reference,
-                    ],
-                    |row| row.get(0),
-                )
-                .map_err(ConversationEmotionCommitError::from)?;
-            if !emotion_event_exists {
-                return Err(ConversationEmotionCommitError::EmotionEventMissing(
-                    "the conversation turn has no governed emotion event to replay.".to_string(),
-                ));
-            }
-            // The persisted turn exists; its emotion evidence must match the
-            // supplied transition EXACTLY (canonical replay), otherwise this
-            // is a typed emotion conflict with no mutation anywhere. The B1
-            // helper remains the single replay-equality authority.
-            existing.replayed = true;
-            existing.conversation_revision = stored_conversation.revision;
-            let emotion = commit_transition_in_transaction(&transaction, transition)
-                .map_err(ConversationEmotionCommitError::Emotion)?;
-            transaction
-                .commit()
-                .map_err(ConversationEmotionCommitError::from)?;
-            return Ok(ConversationEmotionCommitOutcome {
-                turn: existing,
-                emotion,
-            });
-        }
-
-        // 3. Validate conversation expected_revision for a new turn.
-        if request
-            .expected_revision
-            .is_some_and(|expected| expected != stored_conversation.revision)
-        {
-            return Err(ConversationEmotionCommitError::Conversation(
-                crate::conversation::history::ConversationHistoryError::new(
-                    crate::conversation::history::ConversationHistoryErrorCode::ConversationChangedDuringRequest,
-                ),
-            ));
-        }
-
-        // 5. Execute the B1 emotion transition inside THIS SAME transaction.
-        //    Running it before message inserts means a stale EMOTION revision
-        //    fails before any conversation row exists (case B), while any
-        //    later conversation failure rolls the emotion work back (case D).
-        let emotion = commit_transition_in_transaction(&transaction, transition)
-            .map_err(ConversationEmotionCommitError::Emotion)?;
-
-        // 6-8. Insert user message, assistant message, CAS conversation
-        //      revision — reusing the exact legacy helpers/semantics.
-        let next_sequence: i64 = transaction
-            .query_row(
-                "SELECT COALESCE(MAX(sequence_no), 0) + 1 FROM conversation_message
-                 WHERE conversation_id = ?1 AND life_id = ?2",
-                rusqlite::params![request.conversation_id, request.life_id],
-                |row| row.get(0),
-            )
-            .map_err(ConversationEmotionCommitError::from)?;
-        conversation::insert_message(
-            &transaction,
-            &crate::conversation::history::generate_id("message"),
-            request,
-            crate::conversation::history::ConversationRole::User,
-            &request.user_content,
-            next_sequence,
-        )
-        .map_err(ConversationEmotionCommitError::Conversation)?;
-        conversation::insert_message(
-            &transaction,
-            &crate::conversation::history::generate_id("message"),
-            request,
-            crate::conversation::history::ConversationRole::Assistant,
-            &request.assistant_content,
-            next_sequence + 1,
-        )
-        .map_err(ConversationEmotionCommitError::Conversation)?;
-        let updated = transaction
-            .execute(
-                "UPDATE conversation SET revision = revision + 1,
-                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-                 last_message_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                 WHERE id = ?1 AND life_id = ?2 AND revision = ?3",
-                rusqlite::params![
-                    request.conversation_id,
-                    request.life_id,
-                    stored_conversation.revision
-                ],
-            )
-            .map_err(ConversationEmotionCommitError::from)?;
-        if updated != 1 {
-            return Err(ConversationEmotionCommitError::Conversation(
-                crate::conversation::history::ConversationHistoryError::new(
-                    crate::conversation::history::ConversationHistoryErrorCode::ConversationChangedDuringRequest,
-                ),
-            ));
-        }
-
-        // 9. Reload the complete turn.
-        let mut turn = conversation::load_turn(
-            &transaction,
-            &request.life_id,
-            &request.conversation_id,
-            &request.turn_id,
-        )
-        .map_err(ConversationEmotionCommitError::Conversation)?
-        .ok_or(ConversationEmotionCommitError::Conversation(
-            crate::conversation::history::ConversationHistoryError::new(
-                crate::conversation::history::ConversationHistoryErrorCode::InternalError,
-            ),
-        ))?;
-        turn.conversation_revision = stored_conversation.revision + 1;
-
-        // 10. Commit once. There is NO intermediate commit between the
-        //     emotion and conversation writes.
+        let outcome =
+            append_complete_turn_with_emotion_in_transaction(&transaction, request, transition)?;
         transaction
             .commit()
             .map_err(ConversationEmotionCommitError::from)?;
-        Ok(ConversationEmotionCommitOutcome { turn, emotion })
+        Ok(outcome)
     }
+}
+
+/// Caller-owned transaction core shared by the D11 wrapper and the D12-C1
+/// triple-composite primitive. The caller owns BEGIN IMMEDIATE and COMMIT:
+/// this helper NEVER begins a nested transaction, NEVER commits, and NEVER
+/// rolls back explicitly (a dropped uncommitted transaction rolls back). It
+/// preserves the frozen D11 semantics exactly: replay detection with identical
+/// user content, the EmotionEventMissing legacy guard, emotion-before-messages
+/// ordering, message inserts, conversation revision CAS, and full-turn reload.
+pub(super) fn append_complete_turn_with_emotion_in_transaction(
+    transaction: &Transaction<'_>,
+    request: &AppendConversationTurnRequest,
+    transition: EmotionTransition,
+) -> Result<ConversationEmotionCommitOutcome, ConversationEmotionCommitError> {
+    // 1-2. Load + ownership-validate conversation; detect existing turn.
+    let stored_conversation =
+        conversation::load_conversation(transaction, &request.life_id, &request.conversation_id)
+            .map_err(ConversationEmotionCommitError::Conversation)?;
+    if let Some(mut existing) = conversation::load_turn(
+        transaction,
+        &request.life_id,
+        &request.conversation_id,
+        &request.turn_id,
+    )
+    .map_err(ConversationEmotionCommitError::Conversation)?
+    {
+        // Replay path: same turn_id must carry identical user content.
+        if existing.user_message.content != request.user_content {
+            return Err(ConversationEmotionCommitError::Conversation(
+                crate::conversation::history::ConversationHistoryError::new(
+                    crate::conversation::history::ConversationHistoryErrorCode::TurnIdConflict,
+                ),
+            ));
+        }
+        // Legacy guard: a turn committed by the old non-emotion path has
+        // NO emotion event under the canonical identity. It must NEVER be
+        // retroactively given one, so fail closed BEFORE invoking the B1
+        // helper (whose job would otherwise be to create the missing
+        // event). This is a NON-MUTATING existence check only — replay
+        // equality stays the exclusive property of the B1 semantic
+        // implementation below.
+        let emotion_event_exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM emotion_event
+                    WHERE event_id = ?1
+                       OR (life_id = ?2 AND source_kind = ?3 AND source_ref = ?4)
+                )",
+                rusqlite::params![
+                    transition.event_id,
+                    transition.life_id,
+                    transition.source.kind,
+                    transition.source.reference,
+                ],
+                |row| row.get(0),
+            )
+            .map_err(ConversationEmotionCommitError::from)?;
+        if !emotion_event_exists {
+            return Err(ConversationEmotionCommitError::EmotionEventMissing(
+                "the conversation turn has no governed emotion event to replay.".to_string(),
+            ));
+        }
+        // The persisted turn exists; its emotion evidence must match the
+        // supplied transition EXACTLY (canonical replay), otherwise this
+        // is a typed emotion conflict with no mutation anywhere. The B1
+        // helper remains the single replay-equality authority.
+        existing.replayed = true;
+        existing.conversation_revision = stored_conversation.revision;
+        let emotion = commit_transition_in_transaction(transaction, transition)
+            .map_err(ConversationEmotionCommitError::Emotion)?;
+        return Ok(ConversationEmotionCommitOutcome {
+            turn: existing,
+            emotion,
+        });
+    }
+
+    // 3. Validate conversation expected_revision for a new turn.
+    if request
+        .expected_revision
+        .is_some_and(|expected| expected != stored_conversation.revision)
+    {
+        return Err(ConversationEmotionCommitError::Conversation(
+            crate::conversation::history::ConversationHistoryError::new(
+                crate::conversation::history::ConversationHistoryErrorCode::ConversationChangedDuringRequest,
+            ),
+        ));
+    }
+
+    // 5. Execute the B1 emotion transition inside THIS SAME transaction.
+    //    Running it before message inserts means a stale EMOTION revision
+    //    fails before any conversation row exists (case B), while any
+    //    later conversation failure rolls the emotion work back (case D).
+    let emotion = commit_transition_in_transaction(transaction, transition)
+        .map_err(ConversationEmotionCommitError::Emotion)?;
+
+    // 6-8. Insert user message, assistant message, CAS conversation
+    //      revision — reusing the exact legacy helpers/semantics.
+    let next_sequence: i64 = transaction
+        .query_row(
+            "SELECT COALESCE(MAX(sequence_no), 0) + 1 FROM conversation_message
+             WHERE conversation_id = ?1 AND life_id = ?2",
+            rusqlite::params![request.conversation_id, request.life_id],
+            |row| row.get(0),
+        )
+        .map_err(ConversationEmotionCommitError::from)?;
+    conversation::insert_message(
+        transaction,
+        &crate::conversation::history::generate_id("message"),
+        request,
+        crate::conversation::history::ConversationRole::User,
+        &request.user_content,
+        next_sequence,
+    )
+    .map_err(ConversationEmotionCommitError::Conversation)?;
+    conversation::insert_message(
+        transaction,
+        &crate::conversation::history::generate_id("message"),
+        request,
+        crate::conversation::history::ConversationRole::Assistant,
+        &request.assistant_content,
+        next_sequence + 1,
+    )
+    .map_err(ConversationEmotionCommitError::Conversation)?;
+    let updated = transaction
+        .execute(
+            "UPDATE conversation SET revision = revision + 1,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+             last_message_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ?1 AND life_id = ?2 AND revision = ?3",
+            rusqlite::params![
+                request.conversation_id,
+                request.life_id,
+                stored_conversation.revision
+            ],
+        )
+        .map_err(ConversationEmotionCommitError::from)?;
+    if updated != 1 {
+        return Err(ConversationEmotionCommitError::Conversation(
+            crate::conversation::history::ConversationHistoryError::new(
+                crate::conversation::history::ConversationHistoryErrorCode::ConversationChangedDuringRequest,
+            ),
+        ));
+    }
+
+    // 9. Reload the complete turn.
+    let mut turn = conversation::load_turn(
+        transaction,
+        &request.life_id,
+        &request.conversation_id,
+        &request.turn_id,
+    )
+    .map_err(ConversationEmotionCommitError::Conversation)?
+    .ok_or(ConversationEmotionCommitError::Conversation(
+        crate::conversation::history::ConversationHistoryError::new(
+            crate::conversation::history::ConversationHistoryErrorCode::InternalError,
+        ),
+    ))?;
+    turn.conversation_revision = stored_conversation.revision + 1;
+
+    Ok(ConversationEmotionCommitOutcome { turn, emotion })
 }
 
 #[cfg(test)]

@@ -3,6 +3,7 @@ mod candidate_memory;
 mod connection;
 mod conversation;
 pub(crate) mod conversation_emotion;
+pub(crate) mod conversation_relationship;
 pub(crate) mod deterministic_candidate_extraction;
 #[cfg_attr(not(test), allow(dead_code))]
 mod emotion;

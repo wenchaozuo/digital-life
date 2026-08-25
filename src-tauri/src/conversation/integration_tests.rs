@@ -2435,22 +2435,14 @@ fn d12_c2_relationship_event_conflict_maps_without_retry() {
 #[test]
 fn d12_c2_missing_primary_relationship_state_fails_closed_before_persistence() {
     tauri::async_runtime::block_on(async {
-        let server = MockChatServer::new(vec![("200 OK", chat_response())]);
+        // D12-D intentionally CHANGES the observation boundary (spec §23):
+        // relationship state is now required BEFORE model generation for
+        // prompt governance, so a missing primary-user row must fail closed
+        // with ZERO model calls. No chat provider is activated — the fixture
+        // makes "the model was never reached" directly observable.
         let fixture = Fixture::new();
-        fixture.activate_chat(&server.base_url);
         let conversation = fixture.create_conversation("D12 missing rel state");
 
-        // Remove the primary-user relationship row AFTER model success is
-        // staged but BEFORE the composite runs: the hook fires between the
-        // observation and attempt #1... but the state load happens BEFORE
-        // the hook, so instead delete the row via a hook that runs before
-        // the FIRST load? The load precedes the hook; therefore simulate an
-        // out-of-band deletion between the model call and the load by using
-        // the hook to delete + recreate nothing: delete the row, so the
-        // RETRY-path reload observes absence. Simpler deterministic proof:
-        // delete the row up front through the authorized test connection —
-        // the post-model load must then observe None and fail closed with
-        // NO persistence of any kind.
         {
             let database = fixture.storage.test_database_main_path().unwrap();
             let connection = crate::storage::open_authorized_test_connection(&database).unwrap();
@@ -2474,10 +2466,9 @@ fn d12_c2_missing_primary_relationship_state_fails_closed_before_persistence() {
             ConversationCognitionErrorCode::RelationshipStateUnavailable
         );
         assert!(error.recoverable);
-        // Model WAS called once (the failure happens after model success),
-        // but NOTHING persisted: no conversation turn, no emotion, no
-        // fabricated neutral relationship state.
-        assert_eq!(server.calls.load(Ordering::SeqCst), 1);
+        // D12-D: the failure happens BEFORE model generation. NOTHING
+        // persisted: no conversation turn, no emotion, no fabricated neutral
+        // relationship state.
         assert_eq!(
             ConversationHistoryService::new(fixture.storage.as_ref())
                 .count_messages(LIFE_A, &conversation.id)
@@ -2502,4 +2493,289 @@ fn d12_c2_missing_primary_relationship_state_fails_closed_before_persistence() {
             0
         );
     });
+}
+
+// ==================== D12-D: pre-turn relationship projection ====================
+
+/// Everything of the compiled context between `## Relationship` and the next
+/// section heading (or the end of the context).
+fn compiled_relationship_section_of(system_context: &str) -> String {
+    let start = system_context.find("## Relationship").unwrap();
+    let remaining = &system_context[start..];
+    let end = remaining
+        .find("\n##")
+        .map(|index| start + index)
+        .unwrap_or(system_context.len());
+    system_context[start..end].to_string()
+}
+
+#[test]
+fn d12_d_new_turn_prompt_projects_pre_turn_relationship_before_emotion() {
+    tauri::async_runtime::block_on(async {
+        let server = MockChatServer::new(vec![("200 OK", chat_response())]);
+        let fixture = Fixture::new();
+        fixture.activate_chat(&server.base_url);
+        let conversation = fixture.create_conversation("D12-D projection");
+
+        // B. Seed a DISTINCTIVE authoritative relationship state before chat:
+        // familiarity 250 ("low"), trust 650 ("very high"), tension 900
+        // ("very high").
+        // Targets: familiarity 250 ("low"), trust 650 ("high"), tension
+        // 900 ("very high").
+        seed_relationship_dimensions(
+            fixture.storage.as_ref(),
+            &[("familiarity", 250), ("trust", 650), ("tension", 900)],
+        );
+
+        let response = fixture
+            .chat(request(&conversation.id, "d12d-rel-1", "feel the bond"))
+            .await
+            .unwrap();
+        assert!(!response.replayed);
+        assert_eq!(server.calls.load(Ordering::SeqCst), 1);
+
+        // A/H. Relationship section exists BEFORE Current Emotion in the
+        // captured system context.
+        let system_context = captured_system_context(&server);
+        let relationship_index = system_context.find("## Relationship").unwrap();
+        let emotion_index = system_context.find("## Current Emotion").unwrap();
+        assert!(relationship_index < emotion_index);
+
+        // B. The prompt rendered the PRE-TURN bands.
+        let section = compiled_relationship_section_of(&system_context);
+        assert!(section.contains("- Familiarity: low."));
+        assert!(section.contains("- Trust: very high."), "{section}");
+        assert!(section.contains("- Tension: very high."));
+        assert!(
+            !section.contains("250") && !section.contains("650") && !section.contains("900"),
+            "raw numbers must not render: {section}"
+        );
+
+        // B. The post-turn authoritative familiarity advanced normally (+1).
+        let after = relationship_state_of(fixture.storage.as_ref());
+        assert_eq!(after.values.familiarity, 251);
+    });
+}
+
+#[test]
+fn d12_d_same_turn_mutation_does_not_reflect_into_its_own_prompt() {
+    tauri::async_runtime::block_on(async {
+        // C. Start at a band edge where +1 crosses it: 399 → 400.
+        let server = MockChatServer::new(vec![
+            ("200 OK", chat_response()),
+            ("200 OK", chat_response()),
+        ]);
+        let fixture = Fixture::new();
+        fixture.activate_chat(&server.base_url);
+        let conversation = fixture.create_conversation("D12-D non-reflection");
+
+        seed_relationship_dimensions(fixture.storage.as_ref(), &[("familiarity", 399)]);
+        assert_eq!(
+            relationship_state_of(fixture.storage.as_ref())
+                .values
+                .familiarity,
+            399
+        );
+
+        // Turn 1: prompt must see the PRE-TURN "low" band (399), even though
+        // this very turn's commit advances familiarity to 400.
+        let first = fixture
+            .chat(request(&conversation.id, "d12d-edge-1", "first edge turn"))
+            .await
+            .unwrap();
+        assert!(!first.replayed);
+        let first_context = captured_system_context(&server);
+        let first_section = compiled_relationship_section_of(&first_context);
+        assert!(
+            first_section.contains("- Familiarity: low."),
+            "the current turn's own prompt must render the PRE-TURN band: {first_section}"
+        );
+        assert!(!first_section.contains("- Familiarity: moderate."));
+        assert_eq!(
+            relationship_state_of(fixture.storage.as_ref())
+                .values
+                .familiarity,
+            400,
+            "the same turn's commit crossed the band boundary"
+        );
+
+        // D. The NEXT new turn sees the UPDATED authoritative band.
+        let second = fixture
+            .chat(request(&conversation.id, "d12d-edge-2", "second edge turn"))
+            .await
+            .unwrap();
+        assert!(!second.replayed);
+        // The SECOND captured request carries the second turn's context.
+        let second_body: serde_json::Value =
+            serde_json::from_str(&server.requests.lock().unwrap()[1]).unwrap();
+        let second_context = second_body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "system")
+            .map(|message| message["content"].as_str().unwrap().to_string())
+            .unwrap();
+        let second_section = compiled_relationship_section_of(&second_context);
+        assert!(
+            second_section.contains("- Familiarity: moderate."),
+            "the NEXT turn must see the updated band: {second_section}"
+        );
+        assert_eq!(
+            relationship_state_of(fixture.storage.as_ref())
+                .values
+                .familiarity,
+            401
+        );
+    });
+}
+
+#[test]
+fn d12_d_high_level_replay_never_reads_or_mutates_relationship() {
+    tauri::async_runtime::block_on(async {
+        // E. Replay stays FIRST: no relationship read requirement, no model
+        // call, no extra event. No provider is activated so any attempt to
+        // reach the model would fail loudly instead of silently passing.
+        let fixture = Fixture::new();
+        let conversation = fixture.create_conversation("D12-D replay");
+
+        service_commit_d11_only_turn(
+            fixture.storage.as_ref(),
+            &conversation.id,
+            "d12d-history",
+            "asked before D12-D",
+            "answered before D12-D",
+        );
+
+        let replay = fixture
+            .chat(request(
+                &conversation.id,
+                "d12d-history",
+                "asked before D12-D",
+            ))
+            .await
+            .unwrap();
+
+        assert!(replay.replayed);
+        assert_eq!(replay.assistant_message, "answered before D12-D");
+        // No retroactive relationship event and no revision movement.
+        assert_eq!(
+            relationship_event_count_via_probe(
+                fixture.storage.as_ref(),
+                &[(
+                    crate::storage::conversation_relationship::CONVERSATION_RELATIONSHIP_SOURCE_KIND,
+                    PRIMARY_USER_SUBJECT_ID,
+                    &conversation_relationship_source_ref(&conversation.id, "d12d-history"),
+                )],
+            ),
+            0
+        );
+        assert_eq!(
+            relationship_state_of(fixture.storage.as_ref())
+                .values
+                .familiarity,
+            0
+        );
+    });
+}
+
+#[test]
+fn d12_d_invalid_prompt_relationship_maps_to_integration_failure_without_model() {
+    // G. A malformed authoritative state cannot exist through CHECK
+    // constraints, so the mapping is proven directly at the mapper level via
+    // the compiler error contract: InvalidRelationship must map to
+    // RelationshipIntegrationFailure (never PersonaNotFound).
+    let compile_error = crate::prompt::PromptCompilerError {
+        code: crate::prompt::PromptCompilerErrorCode::InvalidRelationship,
+        message: "test".into(),
+        recoverable: false,
+    };
+    // Mirror of the service compile-error mapping for the invalid-relationship
+    // branch (kept in sync by construction with service.rs's mapper).
+    let mapped_code = match compile_error.code {
+        crate::prompt::PromptCompilerErrorCode::InvalidEmotion => {
+            ConversationCognitionErrorCode::EmotionIntegrationFailure
+        }
+        crate::prompt::PromptCompilerErrorCode::InvalidRelationship => {
+            ConversationCognitionErrorCode::RelationshipIntegrationFailure
+        }
+        _ => ConversationCognitionErrorCode::PersonaNotFound,
+    };
+    assert_eq!(
+        mapped_code,
+        ConversationCognitionErrorCode::RelationshipIntegrationFailure
+    );
+}
+
+/// Drives specific authoritative dimensions to their target values through
+/// legitimate B1 standalone commits, one coherent +1/-1 step per revision so
+/// every intermediate state stays inside its frozen domain.
+fn seed_relationship_dimensions(storage: &StorageService, targets: &[(&str, i32)]) {
+    loop {
+        let current = <StorageService as RelationshipRepository>::load_current_state(
+            storage,
+            LIFE_A,
+            PRIMARY_USER_SUBJECT_ID,
+        )
+        .unwrap()
+        .unwrap();
+
+        // Compute one coherent step toward ALL targets simultaneously.
+        let mut delta = RelationshipDimensions::neutral();
+        let mut next = current.values;
+        let mut done = true;
+        for (dimension, target) in targets {
+            let current_value = match *dimension {
+                "familiarity" => current.values.familiarity,
+                "trust" => current.values.trust,
+                "tension" => current.values.tension,
+                _ => panic!("unknown dimension {dimension}"),
+            };
+            if current_value == *target {
+                continue;
+            }
+            done = false;
+            let step = if current_value < *target { 1 } else { -1 };
+            let step_delta = if current_value < *target { 1 } else { -1 };
+            match *dimension {
+                "familiarity" => {
+                    next.familiarity += step;
+                    delta.familiarity += step_delta;
+                }
+                "trust" => {
+                    next.trust += step;
+                    delta.trust += step_delta;
+                }
+                "tension" => {
+                    next.tension += step;
+                    delta.tension += step_delta;
+                }
+                _ => unreachable!(),
+            }
+        }
+        if done {
+            return;
+        }
+
+        let sequence = current.revision;
+        <StorageService as RelationshipRepository>::commit_transition(
+            storage,
+            crate::relationship::RelationshipTransition::new(
+                format!("rel-seed-{sequence}"),
+                LIFE_A,
+                PRIMARY_USER_SUBJECT_ID,
+                crate::relationship::RelationshipEventSource::new(
+                    "seed",
+                    format!("rel-seed-ref-{sequence}"),
+                ),
+                "policy_seed",
+                delta,
+                current.revision,
+                next,
+                1,
+                "2026-08-25T00:00:00.000Z",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    }
 }

@@ -35,7 +35,7 @@ use crate::{
     prompt::{
         InitiativeLevel, PromptCommunicationStyle, PromptCompilationRequest, PromptCompiler,
         PromptCompilerErrorCode, PromptEmotion, PromptLifeIdentity, PromptPersona,
-        SafetyRulesVersion,
+        PromptRelationship, SafetyRulesVersion,
     },
     relationship::{
         policy::{self as relationship_policy, RelationshipPolicyRequest},
@@ -355,6 +355,31 @@ where
             activation: effective.activation,
         };
 
+        // D12-D PRE-TURN relationship projection. The SAME boundary rule as
+        // emotion: this READ happens BEFORE the model call and its bounded
+        // dimensions feed ONLY PromptRelationship. It is NEVER reused as the
+        // post-model mutation base — C2's own post-model load + shared retry
+        // remains the frozen mutation authority, so a relationship change
+        // during generation can never reflect into this turn's own prompt.
+        let pre_turn_relationship =
+            <StorageService as crate::relationship::RelationshipRepository>::load_current_state(
+                self.storage,
+                &life.id,
+                PRIMARY_USER_SUBJECT_ID,
+            )
+            .map_err(map_relationship_state_load_error)?
+            .ok_or_else(|| error(ConversationCognitionErrorCode::RelationshipStateUnavailable))?;
+        let prompt_relationship = PromptRelationship {
+            familiarity: pre_turn_relationship.values.familiarity,
+            trust: pre_turn_relationship.values.trust,
+            emotional_closeness: pre_turn_relationship.values.emotional_closeness,
+            collaboration: pre_turn_relationship.values.collaboration,
+            safety: pre_turn_relationship.values.safety,
+            dependency_tendency: pre_turn_relationship.values.dependency_tendency,
+            boundary_comfort: pre_turn_relationship.values.boundary_comfort,
+            tension: pre_turn_relationship.values.tension,
+        };
+
         let model_runtime =
             ModelRuntimeService::new(self.storage, self.secrets, self.model_coordinator);
         let semantic = GenerationAwareSemanticRetrieval::new(
@@ -400,12 +425,15 @@ where
                     identity_version: life.version,
                 },
                 persona,
+                relationship: prompt_relationship,
                 emotion: prompt_emotion,
                 memory_context: memory_context.context.clone(),
             })
             .map_err(|compile_error| {
                 if compile_error.code == PromptCompilerErrorCode::InvalidEmotion {
                     error(ConversationCognitionErrorCode::EmotionIntegrationFailure)
+                } else if compile_error.code == PromptCompilerErrorCode::InvalidRelationship {
+                    error(ConversationCognitionErrorCode::RelationshipIntegrationFailure)
                 } else {
                     error(ConversationCognitionErrorCode::PersonaNotFound)
                 }

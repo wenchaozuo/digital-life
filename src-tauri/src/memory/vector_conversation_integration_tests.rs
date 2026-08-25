@@ -394,6 +394,18 @@ fn compile_context(memory_context: Option<String>) -> String {
                 valence: 0,
                 activation: 0,
             },
+            // D12-D governed compiler contract: the required relationship
+            // projection is neutral in this memory-scope fixture.
+            relationship: crate::prompt::PromptRelationship {
+                familiarity: 0,
+                trust: 0,
+                emotional_closeness: 0,
+                collaboration: 0,
+                safety: 0,
+                dependency_tendency: 0,
+                boundary_comfort: 0,
+                tension: 0,
+            },
             memory_context,
         })
         .unwrap()

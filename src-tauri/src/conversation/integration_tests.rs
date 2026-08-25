@@ -1589,3 +1589,917 @@ fn d11_d_pre_turn_emotion_unavailable_fails_closed_before_the_model() {
         );
     });
 }
+// ==================== D12-C2: production relationship cutover ====================
+
+use crate::relationship::{
+    RelationshipDimensions, RelationshipRepository, RelationshipState, PRIMARY_USER_SUBJECT_ID,
+};
+use crate::storage::conversation_relationship::{
+    conversation_relationship_event_id, conversation_relationship_source_ref,
+};
+
+/// The primary-user relationship state through the frozen B1 repository.
+fn relationship_state_of(storage: &StorageService) -> RelationshipState {
+    <StorageService as RelationshipRepository>::load_current_state(
+        storage,
+        LIFE_A,
+        PRIMARY_USER_SUBJECT_ID,
+    )
+    .unwrap()
+    .expect("primary_user relationship state must exist for a seeded life")
+}
+
+/// Canonical relationship event count for life-a via the frozen B1
+/// repository surface: probes each expected canonical source identity
+/// instead of raw SQL (the connection is private outside storage).
+fn relationship_event_count_via_probe(
+    storage: &StorageService,
+    identities: &[(&str, &str, &str)],
+) -> usize {
+    identities
+        .iter()
+        .filter(|(kind, subject, source_ref)| {
+            <StorageService as RelationshipRepository>::find_event(
+                storage, LIFE_A, subject, kind, source_ref,
+            )
+            .unwrap()
+            .is_some()
+        })
+        .count()
+}
+
+#[test]
+fn d12_c2_new_turn_advances_familiarity_by_exactly_one() {
+    tauri::async_runtime::block_on(async {
+        // TWO replies: one per NEW governed turn in this test.
+        let server = MockChatServer::new(vec![
+            ("200 OK", chat_response()),
+            ("200 OK", chat_response()),
+        ]);
+        let fixture = Fixture::new();
+        fixture.activate_chat(&server.base_url);
+        let conversation = fixture.create_conversation("D12 new turn");
+
+        let before = relationship_state_of(fixture.storage.as_ref());
+        assert_eq!(before.revision, 0);
+        assert_eq!(before.values.familiarity, 0);
+
+        let response = fixture
+            .chat(request(&conversation.id, "d12-new-1", "hello relationship"))
+            .await
+            .unwrap();
+
+        // A. model called exactly once; all three domains committed once.
+        assert_eq!(server.calls.load(Ordering::SeqCst), 1);
+        assert!(!response.replayed);
+        assert_eq!(
+            ConversationHistoryService::new(fixture.storage.as_ref())
+                .count_messages(LIFE_A, &conversation.id)
+                .unwrap(),
+            2
+        );
+        let after = relationship_state_of(fixture.storage.as_ref());
+        assert_eq!(after.revision, 1);
+        assert_eq!(after.values.familiarity, 1, "familiarity 0 -> 1");
+        // Seven other dimensions unchanged (neutral zero).
+        assert_eq!(
+            (
+                after.values.trust,
+                after.values.emotional_closeness,
+                after.values.collaboration,
+                after.values.safety,
+                after.values.dependency_tendency,
+                after.values.boundary_comfort,
+                after.values.tension
+            ),
+            (0, 0, 0, 0, 0, 0, 0)
+        );
+        assert_eq!(
+            relationship_event_count_via_probe(
+                fixture.storage.as_ref(),
+                &[(
+                    crate::storage::conversation_relationship::CONVERSATION_RELATIONSHIP_SOURCE_KIND,
+                    PRIMARY_USER_SUBJECT_ID,
+                    &conversation_relationship_source_ref(&conversation.id, "d12-new-1"),
+                )]
+            ),
+            1
+        );
+
+        // B. A second NEW turn advances familiarity again with its own event.
+        let conversation2 = fixture.create_conversation("D12 second turn");
+        fixture
+            .chat(request(&conversation2.id, "d12-new-2", "second turn"))
+            .await
+            .unwrap();
+        let advanced = relationship_state_of(fixture.storage.as_ref());
+        assert_eq!(advanced.revision, 2);
+        assert_eq!(advanced.values.familiarity, 2, "familiarity 1 -> 2");
+        assert_eq!(
+            relationship_event_count_via_probe(
+                fixture.storage.as_ref(),
+                &[
+                    (
+                        crate::storage::conversation_relationship::CONVERSATION_RELATIONSHIP_SOURCE_KIND,
+                        PRIMARY_USER_SUBJECT_ID,
+                        &conversation_relationship_source_ref(&conversation.id, "d12-new-1"),
+                    ),
+                    (
+                        crate::storage::conversation_relationship::CONVERSATION_RELATIONSHIP_SOURCE_KIND,
+                        PRIMARY_USER_SUBJECT_ID,
+                        &conversation_relationship_source_ref(&conversation2.id, "d12-new-2"),
+                    ),
+                ]
+            ),
+            2
+        );
+        // Canonical identity of the second event is the deterministic helper.
+        let found = <StorageService as RelationshipRepository>::find_event(
+            fixture.storage.as_ref(),
+            LIFE_A,
+            PRIMARY_USER_SUBJECT_ID,
+            crate::storage::conversation_relationship::CONVERSATION_RELATIONSHIP_SOURCE_KIND,
+            &conversation_relationship_source_ref(&conversation2.id, "d12-new-2"),
+        )
+        .unwrap()
+        .expect("second turn must carry its canonical relationship event");
+        assert_eq!(
+            found.event_id,
+            conversation_relationship_event_id(
+                LIFE_A,
+                PRIMARY_USER_SUBJECT_ID,
+                &conversation2.id,
+                "d12-new-2"
+            )
+        );
+    });
+}
+
+#[test]
+fn d12_c2_high_level_replay_never_touches_any_domain() {
+    tauri::async_runtime::block_on(async {
+        // Exactly ONE reply: the replay must never reach the model, so a
+        // second queued reply would hang the mock server on drop.
+        let server = MockChatServer::new(vec![("200 OK", chat_response())]);
+        let fixture = Fixture::new();
+        fixture.activate_chat(&server.base_url);
+        let conversation = fixture.create_conversation("D12 replay");
+
+        fixture
+            .chat(request(
+                &conversation.id,
+                "d12-replay-1",
+                "original message",
+            ))
+            .await
+            .unwrap();
+        let calls_after_first = server.calls.load(Ordering::SeqCst);
+        let emotion_before = emotion_state_of(fixture.storage.as_ref());
+        let relationship_before = relationship_state_of(fixture.storage.as_ref());
+        let events_before = relationship_state_of(fixture.storage.as_ref()).revision;
+
+        // Exact high-level replay: same request_id + same content. The
+        // persisted response returns immediately — the model is never called
+        // again and neither Emotion nor Relationship is read/mutated.
+        let replay = fixture
+            .chat(request(
+                &conversation.id,
+                "d12-replay-1",
+                "original message",
+            ))
+            .await
+            .unwrap();
+
+        assert!(replay.replayed);
+        assert_eq!(replay.assistant_message, "persisted assistant");
+        assert_eq!(
+            server.calls.load(Ordering::SeqCst),
+            calls_after_first,
+            "model must not be called on high-level replay"
+        );
+        assert_eq!(
+            emotion_state_of(fixture.storage.as_ref()).revision,
+            emotion_before.revision
+        );
+        assert_eq!(
+            relationship_state_of(fixture.storage.as_ref()),
+            relationship_before
+        );
+        assert_eq!(
+            relationship_state_of(fixture.storage.as_ref()).revision,
+            events_before
+        );
+        assert_eq!(
+            ConversationHistoryService::new(fixture.storage.as_ref())
+                .count_messages(LIFE_A, &conversation.id)
+                .unwrap(),
+            2,
+            "no message duplication"
+        );
+    });
+}
+
+/// Commits a D11-style governed turn (conversation + emotion only) directly
+/// through the frozen D11 primitive — simulating pre-D12 production history.
+fn service_commit_d11_only_turn(
+    storage: &StorageService,
+    conversation_id: &str,
+    turn_id: &str,
+    user: &str,
+    assistant: &str,
+) {
+    use crate::emotion::{EmotionTransition, INITIAL_POLICY_VERSION};
+    storage
+        .append_complete_turn_with_emotion(
+            &AppendConversationTurnRequest {
+                life_id: LIFE_A.into(),
+                conversation_id: conversation_id.into(),
+                turn_id: turn_id.into(),
+                user_content: user.into(),
+                assistant_content: assistant.into(),
+                expected_revision: None,
+            },
+            EmotionTransition::new(
+                conversation_emotion_event_id(LIFE_A, conversation_id, turn_id),
+                LIFE_A,
+                crate::emotion::EmotionEventSource::new(
+                    "conversation_turn",
+                    conversation_emotion_source_ref(conversation_id, turn_id),
+                ),
+                10,
+                5,
+                0,
+                10,
+                5,
+                INITIAL_POLICY_VERSION,
+                "2026-08-24T00:00:00.000Z",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+}
+
+#[test]
+fn d12_c2_d11_only_historical_turn_replays_without_relationship_backfill() {
+    tauri::async_runtime::block_on(async {
+        // No chat provider is activated at all (mirroring the D11-C2 legacy
+        // replay fixture): the high-level replay short-circuit must return
+        // the persisted turn BEFORE any model or domain work, which this
+        // fixture makes observable.
+        let fixture = Fixture::new();
+        let conversation = fixture.create_conversation("D11-only history");
+
+        // Commit a D11-era turn: governed conversation + emotion, NO
+        // canonical relationship event.
+        service_commit_d11_only_turn(
+            fixture.storage.as_ref(),
+            &conversation.id,
+            "d11-era-turn",
+            "asked in D11",
+            "answered in D11",
+        );
+        assert_eq!(
+            relationship_event_count_via_probe(
+                fixture.storage.as_ref(),
+                &[(
+                    crate::storage::conversation_relationship::CONVERSATION_RELATIONSHIP_SOURCE_KIND,
+                    PRIMARY_USER_SUBJECT_ID,
+                    &conversation_relationship_source_ref(&conversation.id, "d11-era-turn"),
+                )]
+            ),
+            0
+        );
+
+        // High-level replay of that turn through production chat must return
+        // the persisted response immediately and never backfill Relationship.
+        let replay = fixture
+            .chat(request(&conversation.id, "d11-era-turn", "asked in D11"))
+            .await
+            .unwrap();
+
+        assert!(replay.replayed);
+        assert_eq!(replay.assistant_message, "answered in D11");
+        assert_eq!(
+            relationship_event_count_via_probe(
+                fixture.storage.as_ref(),
+                &[(
+                    crate::storage::conversation_relationship::CONVERSATION_RELATIONSHIP_SOURCE_KIND,
+                    PRIMARY_USER_SUBJECT_ID,
+                    &conversation_relationship_source_ref(&conversation.id, "d11-era-turn"),
+                )],
+            ),
+            0,
+            "NO retroactive relationship backfill for a D11-only turn"
+        );
+        assert_eq!(
+            relationship_state_of(fixture.storage.as_ref()).revision,
+            0,
+            "relationship revision unchanged"
+        );
+    });
+}
+
+/// Drives familiarity to `target` via legitimate B1 standalone commits.
+fn seed_familiarity_to(storage: &StorageService, target: i32) {
+    loop {
+        let current = <StorageService as RelationshipRepository>::load_current_state(
+            storage,
+            LIFE_A,
+            PRIMARY_USER_SUBJECT_ID,
+        )
+        .unwrap()
+        .unwrap();
+        if current.values.familiarity >= target {
+            break;
+        }
+        let next_familiarity = (current.values.familiarity as i64 + 1).min(1000) as i32;
+        <StorageService as RelationshipRepository>::commit_transition(
+            storage,
+            crate::relationship::RelationshipTransition::new(
+                format!("cap-seed-{}", current.revision),
+                LIFE_A,
+                PRIMARY_USER_SUBJECT_ID,
+                crate::relationship::RelationshipEventSource::new(
+                    "seed",
+                    format!("cap-seed-ref-{}", current.revision),
+                ),
+                "policy_seed",
+                RelationshipDimensions {
+                    familiarity: next_familiarity - current.values.familiarity,
+                    ..RelationshipDimensions::neutral()
+                },
+                current.revision,
+                RelationshipDimensions {
+                    familiarity: next_familiarity,
+                    ..RelationshipDimensions::neutral()
+                },
+                1,
+                "2026-08-25T00:00:00.000Z",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn d12_c2_familiarity_cap_still_commits_zero_delta_event() {
+    tauri::async_runtime::block_on(async {
+        let server = MockChatServer::new(vec![("200 OK", chat_response())]);
+        let fixture = Fixture::new();
+        fixture.activate_chat(&server.base_url);
+        let conversation = fixture.create_conversation("D12 at cap");
+
+        seed_familiarity_to(fixture.storage.as_ref(), 1000);
+        assert_eq!(
+            relationship_state_of(fixture.storage.as_ref())
+                .values
+                .familiarity,
+            1000
+        );
+
+        let response = fixture
+            .chat(request(&conversation.id, "at-cap-turn", "still counts"))
+            .await
+            .unwrap();
+
+        // E. At the cap the turn still commits its canonical relationship
+        // event + revision exactly once, with delta 0 and familiarity pinned.
+        assert_eq!(server.calls.load(Ordering::SeqCst), 1);
+        assert!(!response.replayed);
+        let capped = relationship_state_of(fixture.storage.as_ref());
+        assert_eq!(capped.values.familiarity, 1000);
+        assert_eq!(capped.revision, 1001);
+        let cap_event = <StorageService as RelationshipRepository>::find_event(
+            fixture.storage.as_ref(),
+            LIFE_A,
+            PRIMARY_USER_SUBJECT_ID,
+            crate::storage::conversation_relationship::CONVERSATION_RELATIONSHIP_SOURCE_KIND,
+            &conversation_relationship_source_ref(&conversation.id, "at-cap-turn"),
+        )
+        .unwrap()
+        .expect("the capped turn still persists its canonical event");
+        assert_eq!(cap_event.deltas.familiarity, 0);
+        assert_eq!(cap_event.result.familiarity, 1000);
+    });
+}
+
+// ---------- retry-budget tests (shared budget across BOTH domains) ----------
+
+/// Builds an INSTANCE-SCOPED hook that performs ONE real independent
+/// RELATIONSHIP commit per raced invocation against the primary-user state —
+/// a legitimate competing relationship writer forcing the typed revision
+/// race. Keyed to `target_turn_id`; stops racing after `max_races`.
+fn make_relationship_race_hook(
+    storage: std::sync::Arc<StorageService>,
+    target_turn_id: &'static str,
+    max_races: u32,
+) -> (
+    crate::conversation::service::PreCompositeHook,
+    std::sync::Arc<StdMutex<Vec<String>>>,
+) {
+    let captured = Arc::new(StdMutex::new(Vec::new()));
+    let captured_for_hook = Arc::clone(&captured);
+    let sequence = std::sync::atomic::AtomicU32::new(0);
+    let hook: crate::conversation::service::PreCompositeHook =
+        Box::new(move |life_id: &str, turn_id: &str, observed_at: &str| {
+            if turn_id != target_turn_id {
+                return;
+            }
+            captured_for_hook
+                .lock()
+                .unwrap()
+                .push(observed_at.to_string());
+            if sequence.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= max_races {
+                return;
+            }
+            let current = <StorageService as RelationshipRepository>::load_current_state(
+                storage.as_ref(),
+                life_id,
+                PRIMARY_USER_SUBJECT_ID,
+            )
+            .unwrap()
+            .expect("race fixture life must exist");
+            let next_familiarity = (current.values.familiarity as i64 + 3).min(1000) as i32;
+            <StorageService as RelationshipRepository>::commit_transition(
+                storage.as_ref(),
+                crate::relationship::RelationshipTransition::new(
+                    format!(
+                        "rel-race-{}",
+                        sequence.load(std::sync::atomic::Ordering::SeqCst)
+                    ),
+                    life_id,
+                    PRIMARY_USER_SUBJECT_ID,
+                    crate::relationship::RelationshipEventSource::new(
+                        "race",
+                        format!(
+                            "rel-race-ref-{}",
+                            sequence.load(std::sync::atomic::Ordering::SeqCst)
+                        ),
+                    ),
+                    "policy_race",
+                    RelationshipDimensions {
+                        familiarity: 3,
+                        ..RelationshipDimensions::neutral()
+                    },
+                    current.revision,
+                    RelationshipDimensions {
+                        familiarity: next_familiarity,
+                        ..RelationshipDimensions::neutral()
+                    },
+                    1,
+                    "2099-01-01T00:00:00.000Z",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        });
+    (hook, captured)
+}
+
+#[test]
+fn d12_c2_relationship_revision_conflict_retries_once_and_succeeds() {
+    tauri::async_runtime::block_on(async {
+        let server = MockChatServer::new(vec![("200 OK", chat_response())]);
+        let fixture = Fixture::new();
+        fixture.activate_chat(&server.base_url);
+        let conversation = fixture.create_conversation("D12 rel retry");
+
+        // The hook races attempt #1 with one real independent relationship
+        // commit (+3 familiarity); the refreshed attempt #2 runs unraced.
+        let (hook, captured_times) =
+            make_relationship_race_hook(Arc::clone(&fixture.storage), "d12-rel-retry", 1);
+
+        let response = fixture
+            .chat_with_pre_composite_hook(
+                request(&conversation.id, "d12-rel-retry", "race relationship"),
+                hook,
+            )
+            .await
+            .unwrap();
+
+        // Model called exactly ONCE; no model recall during retry.
+        assert_eq!(server.calls.load(Ordering::SeqCst), 1);
+        assert!(!response.replayed);
+        // Conversation committed exactly once.
+        assert_eq!(
+            ConversationHistoryService::new(fixture.storage.as_ref())
+                .count_messages(LIFE_A, &conversation.id)
+                .unwrap(),
+            2
+        );
+        // No lost concurrent update: the race's +3 AND this turn's +1 both
+        // landed, in revision order.
+        let final_state = relationship_state_of(fixture.storage.as_ref());
+        assert_eq!(final_state.values.familiarity, 4);
+        assert_eq!(final_state.revision, 2);
+        // Exactly one canonical event for THIS turn plus one race event.
+        assert_eq!(
+            relationship_event_count_via_probe(
+                fixture.storage.as_ref(),
+                &[
+                    (
+                        crate::storage::conversation_relationship::CONVERSATION_RELATIONSHIP_SOURCE_KIND,
+                        PRIMARY_USER_SUBJECT_ID,
+                        &conversation_relationship_source_ref(&conversation.id, "d12-rel-retry"),
+                    ),
+                    ("race", PRIMARY_USER_SUBJECT_ID, "rel-race-ref-1"),
+                ]
+            ),
+            2
+        );
+        let turn_event = <StorageService as RelationshipRepository>::find_event(
+            fixture.storage.as_ref(),
+            LIFE_A,
+            PRIMARY_USER_SUBJECT_ID,
+            crate::storage::conversation_relationship::CONVERSATION_RELATIONSHIP_SOURCE_KIND,
+            &conversation_relationship_source_ref(&conversation.id, "d12-rel-retry"),
+        )
+        .unwrap()
+        .expect("the retried turn carries its canonical relationship event");
+        assert_eq!(turn_event.deltas.familiarity, 1);
+        // The SAME fixed T anchors both attempts' evidence.
+        let original_observed_at = &captured_times.lock().unwrap()[0];
+        assert_eq!(turn_event.event_time, *original_observed_at);
+        // Emotion also committed exactly once (its own canonical event).
+        assert!(governed_event_identity(
+            fixture.storage.as_ref(),
+            &conversation.id,
+            "d12-rel-retry"
+        )
+        .is_some());
+    });
+}
+
+#[test]
+fn d12_c2_emotion_revision_conflict_retry_also_refreshes_relationship() {
+    tauri::async_runtime::block_on(async {
+        let server = MockChatServer::new(vec![("200 OK", chat_response())]);
+        let fixture = Fixture::new();
+        fixture.activate_chat(&server.base_url);
+        let conversation = fixture.create_conversation("D12 emo retry");
+
+        // Reuse the existing EMOTION race hook: attempt #1 hits a typed
+        // Emotion RevisionConflict; the shared single retry must refresh BOTH
+        // authorities and succeed.
+        let (hook, _captured) =
+            make_revision_race_hook(Arc::clone(&fixture.storage), "d12-emo-retry", 1);
+
+        fixture
+            .chat_with_pre_composite_hook(
+                request(&conversation.id, "d12-emo-retry", "race emotion"),
+                hook,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(server.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            ConversationHistoryService::new(fixture.storage.as_ref())
+                .count_messages(LIFE_A, &conversation.id)
+                .unwrap(),
+            2
+        );
+        // Emotion reflects race (-5,-5) plus this turn's +7 impulse.
+        let emotion = emotion_state_of(fixture.storage.as_ref());
+        assert_eq!(emotion.revision, 2);
+        assert_eq!((emotion.valence, emotion.activation), (-5, 2));
+        // Relationship advanced exactly once from the REFRESHED authority:
+        // no lost update, no double apply.
+        let relationship = relationship_state_of(fixture.storage.as_ref());
+        assert_eq!(relationship.values.familiarity, 1);
+        assert_eq!(relationship.revision, 1);
+        assert_eq!(
+            relationship_event_count_via_probe(
+                fixture.storage.as_ref(),
+                &[(
+                    crate::storage::conversation_relationship::CONVERSATION_RELATIONSHIP_SOURCE_KIND,
+                    PRIMARY_USER_SUBJECT_ID,
+                    &conversation_relationship_source_ref(&conversation.id, "d12-emo-retry"),
+                )]
+            ),
+            1
+        );
+    });
+}
+
+// ---------- C2 second-conflict-stops, event conflict, and state-unavailable --
+
+#[test]
+fn d12_c2_second_relationship_conflict_stops_after_exactly_two_attempts() {
+    tauri::async_runtime::block_on(async {
+        let server = MockChatServer::new(vec![("200 OK", chat_response())]);
+        let fixture = Fixture::new();
+        fixture.activate_chat(&server.base_url);
+        let conversation = fixture.create_conversation("D12 rel exhausted");
+
+        // The hook races BOTH composite attempts (max 2) with one real
+        // independent relationship commit each, so the single allowed retry
+        // also conflicts. Production must stop after exactly two attempts.
+        let (hook, _captured) =
+            make_relationship_race_hook(Arc::clone(&fixture.storage), "d12-rel-stop", 2);
+
+        let error = fixture
+            .chat_with_pre_composite_hook(
+                request(&conversation.id, "d12-rel-stop", "always racing rel"),
+                hook,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.code,
+            ConversationCognitionErrorCode::RelationshipChangedDuringRequest
+        );
+        assert!(error.recoverable);
+        // Model called exactly ONCE; no third attempt looped.
+        assert_eq!(server.calls.load(Ordering::SeqCst), 1);
+        // Exactly TWO coherent race commits (+3 each): 0→3→6, proving
+        // exactly two attempts were staged.
+        let state = relationship_state_of(fixture.storage.as_ref());
+        assert_eq!(
+            state.values.familiarity, 6,
+            "two independent race commits prove exactly two attempts"
+        );
+        assert_eq!(state.revision, 2);
+        // The requested conversation turn was never partially committed and
+        // neither was any Emotion work from the failed attempts.
+        assert_eq!(
+            ConversationHistoryService::new(fixture.storage.as_ref())
+                .count_messages(LIFE_A, &conversation.id)
+                .unwrap(),
+            0
+        );
+        assert!(governed_event_identity(
+            fixture.storage.as_ref(),
+            &conversation.id,
+            "d12-rel-stop"
+        )
+        .is_none());
+    });
+}
+
+#[test]
+fn d12_c2_both_authorities_stale_share_one_retry() {
+    tauri::async_runtime::block_on(async {
+        let server = MockChatServer::new(vec![("200 OK", chat_response())]);
+        let fixture = Fixture::new();
+        fixture.activate_chat(&server.base_url);
+        let conversation = fixture.create_conversation("D12 both stale");
+
+        // ONE hook races BOTH authorities on attempt #1 only: one emotion
+        // commit AND one relationship commit. The single shared retry must
+        // refresh BOTH and succeed — no sequential per-domain loops.
+        let storage_for_hook = Arc::clone(&fixture.storage);
+        let raced = std::sync::atomic::AtomicU32::new(0);
+        let hook: crate::conversation::service::PreCompositeHook =
+            Box::new(move |life_id: &str, turn_id: &str, _observed_at: &str| {
+                if turn_id != "d12-both-stale" {
+                    return;
+                }
+                if raced.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 1 {
+                    return;
+                }
+                let current_emotion = <StorageService as EmotionRepository>::load_current_state(
+                    storage_for_hook.as_ref(),
+                    life_id,
+                )
+                .unwrap()
+                .expect("emotion state must exist");
+                <StorageService as EmotionRepository>::commit_transition(
+                    storage_for_hook.as_ref(),
+                    crate::emotion::EmotionTransition::new(
+                        "both-stale-emotion-race",
+                        life_id,
+                        crate::emotion::EmotionEventSource::new("race", "both-stale-emo"),
+                        -5,
+                        -5,
+                        current_emotion.revision,
+                        current_emotion.valence - 5,
+                        current_emotion.activation - 5,
+                        1,
+                        "2099-01-01T00:00:00.000Z",
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                let current_rel = <StorageService as RelationshipRepository>::load_current_state(
+                    storage_for_hook.as_ref(),
+                    life_id,
+                    PRIMARY_USER_SUBJECT_ID,
+                )
+                .unwrap()
+                .expect("relationship state must exist");
+                <StorageService as RelationshipRepository>::commit_transition(
+                    storage_for_hook.as_ref(),
+                    crate::relationship::RelationshipTransition::new(
+                        "both-stale-relationship-race",
+                        life_id,
+                        PRIMARY_USER_SUBJECT_ID,
+                        crate::relationship::RelationshipEventSource::new("race", "both-stale-rel"),
+                        "policy_race",
+                        RelationshipDimensions {
+                            familiarity: 3,
+                            ..RelationshipDimensions::neutral()
+                        },
+                        current_rel.revision,
+                        RelationshipDimensions {
+                            familiarity: current_rel.values.familiarity + 3,
+                            ..RelationshipDimensions::neutral()
+                        },
+                        1,
+                        "2099-01-01T00:00:00.000Z",
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            });
+
+        let response = fixture
+            .chat_with_pre_composite_hook(
+                request(&conversation.id, "d12-both-stale", "stale everything"),
+                hook,
+            )
+            .await
+            .unwrap();
+
+        assert!(!response.replayed);
+        assert_eq!(server.calls.load(Ordering::SeqCst), 1);
+        // Conversation committed exactly once.
+        assert_eq!(
+            ConversationHistoryService::new(fixture.storage.as_ref())
+                .count_messages(LIFE_A, &conversation.id)
+                .unwrap(),
+            2
+        );
+        // Emotion: race (-5,-5) then this turn's +7 impulse → (-5,+2), rev 2.
+        let emotion = emotion_state_of(fixture.storage.as_ref());
+        assert_eq!(emotion.revision, 2);
+        assert_eq!((emotion.valence, emotion.activation), (-5, 2));
+        // Relationship: race +3 then this turn's +1 → familiarity 4, rev 2.
+        let relationship = relationship_state_of(fixture.storage.as_ref());
+        assert_eq!(relationship.values.familiarity, 4);
+        assert_eq!(relationship.revision, 2);
+    });
+}
+
+#[test]
+fn d12_c2_relationship_event_conflict_maps_without_retry() {
+    tauri::async_runtime::block_on(async {
+        let server = MockChatServer::new(vec![("200 OK", chat_response())]);
+        let fixture = Fixture::new();
+        fixture.activate_chat(&server.base_url);
+        let conversation = fixture.create_conversation("D12 rel event conflict");
+        let conversation_id = conversation.id.clone();
+        let storage_for_hook = Arc::clone(&fixture.storage);
+
+        // Narrow deterministic seam: pre-create CONFLICTING canonical
+        // relationship evidence for this exact turn identity before the
+        // composite runs. Same source identity, DIFFERENT payload.
+        let conflict_hook: crate::conversation::service::PreCompositeHook = Box::new(
+            move |life_id: &str, turn_id: &str, _observed_at: &str| {
+                if turn_id != "d12-rel-event-conflict" {
+                    return;
+                }
+                <StorageService as RelationshipRepository>::commit_transition(
+                    storage_for_hook.as_ref(),
+                    crate::relationship::RelationshipTransition::new(
+                        conversation_relationship_event_id(
+                            life_id,
+                            PRIMARY_USER_SUBJECT_ID,
+                            &conversation_id,
+                            "d12-rel-event-conflict",
+                        ),
+                        life_id,
+                        PRIMARY_USER_SUBJECT_ID,
+                        crate::relationship::RelationshipEventSource::new(
+                            crate::storage::conversation_relationship::CONVERSATION_RELATIONSHIP_SOURCE_KIND,
+                            conversation_relationship_source_ref(
+                                &conversation_id,
+                                "d12-rel-event-conflict",
+                            ),
+                        ),
+                        crate::storage::conversation_relationship::CONVERSATION_RELATIONSHIP_CHANGE_REASON,
+                        RelationshipDimensions {
+                            familiarity: 9,
+                            ..RelationshipDimensions::neutral()
+                        },
+                        0,
+                        RelationshipDimensions {
+                            familiarity: 9,
+                            ..RelationshipDimensions::neutral()
+                        },
+                        1,
+                        "2098-01-01T00:00:00.000Z",
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            },
+        );
+
+        let error = fixture
+            .chat_with_pre_composite_hook(
+                request(
+                    &conversation.id,
+                    "d12-rel-event-conflict",
+                    "conflicting rel",
+                ),
+                conflict_hook,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.code,
+            ConversationCognitionErrorCode::RelationshipCommitConflict
+        );
+        assert!(!error.recoverable);
+        // NO retry happened; no conversation/emotion mutation survived.
+        assert_eq!(server.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            ConversationHistoryService::new(fixture.storage.as_ref())
+                .count_messages(LIFE_A, &conversation.id)
+                .unwrap(),
+            0
+        );
+        assert!(governed_event_identity(
+            fixture.storage.as_ref(),
+            &conversation.id,
+            "d12-rel-event-conflict"
+        )
+        .is_none());
+    });
+}
+
+#[test]
+fn d12_c2_missing_primary_relationship_state_fails_closed_before_persistence() {
+    tauri::async_runtime::block_on(async {
+        let server = MockChatServer::new(vec![("200 OK", chat_response())]);
+        let fixture = Fixture::new();
+        fixture.activate_chat(&server.base_url);
+        let conversation = fixture.create_conversation("D12 missing rel state");
+
+        // Remove the primary-user relationship row AFTER model success is
+        // staged but BEFORE the composite runs: the hook fires between the
+        // observation and attempt #1... but the state load happens BEFORE
+        // the hook, so instead delete the row via a hook that runs before
+        // the FIRST load? The load precedes the hook; therefore simulate an
+        // out-of-band deletion between the model call and the load by using
+        // the hook to delete + recreate nothing: delete the row, so the
+        // RETRY-path reload observes absence. Simpler deterministic proof:
+        // delete the row up front through the authorized test connection —
+        // the post-model load must then observe None and fail closed with
+        // NO persistence of any kind.
+        {
+            let database = fixture.storage.test_database_main_path().unwrap();
+            let connection = crate::storage::open_authorized_test_connection(&database).unwrap();
+            connection
+                .execute(
+                    "DELETE FROM relationship_state
+                     WHERE life_id = ?1 AND subject_id = 'primary_user'",
+                    [LIFE_A],
+                )
+                .unwrap();
+            drop(connection);
+        }
+
+        let error = fixture
+            .chat(request(&conversation.id, "d12-no-rel-state", "governed"))
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.code,
+            ConversationCognitionErrorCode::RelationshipStateUnavailable
+        );
+        assert!(error.recoverable);
+        // Model WAS called once (the failure happens after model success),
+        // but NOTHING persisted: no conversation turn, no emotion, no
+        // fabricated neutral relationship state.
+        assert_eq!(server.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            ConversationHistoryService::new(fixture.storage.as_ref())
+                .count_messages(LIFE_A, &conversation.id)
+                .unwrap(),
+            0
+        );
+        assert!(governed_event_identity(
+            fixture.storage.as_ref(),
+            &conversation.id,
+            "d12-no-rel-state"
+        )
+        .is_none());
+        assert_eq!(
+            relationship_event_count_via_probe(
+                fixture.storage.as_ref(),
+                &[(
+                    crate::storage::conversation_relationship::CONVERSATION_RELATIONSHIP_SOURCE_KIND,
+                    PRIMARY_USER_SUBJECT_ID,
+                    &conversation_relationship_source_ref(&conversation.id, "d12-no-rel-state"),
+                )],
+            ),
+            0
+        );
+    });
+}

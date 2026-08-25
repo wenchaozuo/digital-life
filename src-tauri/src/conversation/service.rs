@@ -37,10 +37,19 @@ use crate::{
         PromptCompilerErrorCode, PromptEmotion, PromptLifeIdentity, PromptPersona,
         SafetyRulesVersion,
     },
+    relationship::{
+        policy::{self as relationship_policy, RelationshipPolicyRequest},
+        RelationshipCommitOutcome, RelationshipError, RelationshipErrorCode,
+        RelationshipEventSource, RelationshipState, PRIMARY_USER_SUBJECT_ID,
+    },
     secrets::{SecretStore, WindowsCredentialSecretStore},
     storage::conversation_emotion::{
         conversation_emotion_event_id, conversation_emotion_source_ref,
         CONVERSATION_EMOTION_SOURCE_KIND,
+    },
+    storage::conversation_relationship::{
+        conversation_relationship_event_id, conversation_relationship_source_ref,
+        CONVERSATION_RELATIONSHIP_CHANGE_REASON, CONVERSATION_RELATIONSHIP_SOURCE_KIND,
     },
     storage::{LifeIdentityRecord, PersonaTemplateRecord, StorageService},
     vector_store::LanceDbVectorStoreRegistry,
@@ -147,6 +156,10 @@ pub enum ConversationCognitionErrorCode {
     EmotionChangedDuringRequest,
     EmotionCommitConflict,
     EmotionIntegrationFailure,
+    RelationshipStateUnavailable,
+    RelationshipChangedDuringRequest,
+    RelationshipCommitConflict,
+    RelationshipIntegrationFailure,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -432,7 +445,10 @@ where
         //
         // One time observation drives BOTH the policy elapsed calculation and
         // the transition event_time, so decay and persisted evidence cannot
-        // drift. The observation happens only after model success.
+        // drift. The observation happens only after model success. The SAME
+        // fixed timestamp anchors BOTH transitions' event_time — one
+        // deterministic turn evidence anchor; relationship never reads a
+        // clock of its own.
         let first_observation = self
             .storage
             .load_emotion_runtime_observation(&life.id)
@@ -469,29 +485,82 @@ where
             .map_err(map_emotion_error)?;
             policy::evolve(state, policy_request).map_err(map_emotion_error)
         };
+        let build_relationship_transition = |state: &RelationshipState,
+                                             event_time: &str|
+         -> Result<
+            crate::relationship::RelationshipTransition,
+            ConversationCognitionError,
+        > {
+            // Frozen B2 policy request: canonical identity derived from
+            // this exact turn + the primary-user counterpart from the
+            // authoritative state. No manual familiarity math, no
+            // sentiment inspection, no clock read (T is injected).
+            let policy_request = RelationshipPolicyRequest::new(
+                conversation_relationship_event_id(
+                    &life.id,
+                    PRIMARY_USER_SUBJECT_ID,
+                    &request.conversation_id,
+                    &request.request_id,
+                ),
+                RelationshipEventSource::new(
+                    CONVERSATION_RELATIONSHIP_SOURCE_KIND,
+                    conversation_relationship_source_ref(
+                        &request.conversation_id,
+                        &request.request_id,
+                    ),
+                ),
+                CONVERSATION_RELATIONSHIP_CHANGE_REASON,
+                relationship_policy::RelationshipStimulusV1::SuccessfulConversationTurn,
+                event_time,
+            )
+            .map_err(map_relationship_error)?;
+            relationship_policy::evolve(state, policy_request).map_err(map_relationship_error)
+        };
 
-        // ONE atomic composite commit for conversation + emotion. On a typed
-        // emotion RevisionConflict (another emotion writer won between our
-        // observation and the commit), refresh against the SAME fixed
-        // event_time via the explicit-timestamp observation seam, rebuild the
-        // transition once from the newer authoritative state, and retry the
-        // composite commit exactly once — WITHOUT calling the model again.
+        // ONE atomic triple-composite commit for conversation + emotion +
+        // relationship, with ONE SHARED retry budget: at most TWO total
+        // composite attempts. Either domain's typed RevisionConflict opens
+        // the single retry; the retry refreshes BOTH authorities against the
+        // SAME fixed observation time and rebuilds both transitions without
+        // calling the model again. The second attempt is final.
         let first_observed_at = first_observation.observed_at.clone();
         let mut transition = build_transition(
             &first_observation.state,
             first_observation.elapsed_seconds,
             &first_observed_at,
         )?;
+        // The primary-user relationship authority is loaded only after model
+        // success. Absence is a typed failure — no state may be synthesized.
+        let mut relationship_state =
+            <StorageService as crate::relationship::RelationshipRepository>::load_current_state(
+                self.storage,
+                &life.id,
+                PRIMARY_USER_SUBJECT_ID,
+            )
+            .map_err(map_relationship_state_load_error)?
+            .ok_or_else(|| error(ConversationCognitionErrorCode::RelationshipStateUnavailable))?;
+        let mut relationship_transition =
+            build_relationship_transition(&relationship_state, &first_observed_at)?;
+
         #[cfg(test)]
         if let Some(hook) = self.pre_composite_hook.as_ref() {
             hook(&life.id, &request.request_id, &first_observed_at);
         }
         let composite = match self
             .storage
-            .append_complete_turn_with_emotion(&append_request, transition)
-        {
+            .append_complete_turn_with_emotion_and_relationship(
+                &append_request,
+                transition,
+                relationship_transition,
+            ) {
             Ok(outcome) => outcome,
-            Err(commit_error) if commit_error_code_is_emotion_revision_conflict(&commit_error) => {
+            Err(commit_error) if triple_commit_error_is_revision_conflict(&commit_error) => {
+                // Single shared retry: refresh BOTH authorities. Emotion uses
+                // the frozen explicit-timestamp observation so the SAME fixed
+                // T stays the evidence anchor; relationship reloads its
+                // current authoritative revision. Same model output, same
+                // content, same expected conversation revision, same event
+                // identities, same stimulus values, same T.
                 let retry_observation = self
                     .storage
                     .load_emotion_runtime_observation_at(&life.id, &first_observed_at)
@@ -504,20 +573,38 @@ where
                     retry_observation.elapsed_seconds,
                     &first_observed_at,
                 )?;
+                relationship_state = <StorageService as crate::relationship::RelationshipRepository>::load_current_state(
+                    self.storage,
+                    &life.id,
+                    PRIMARY_USER_SUBJECT_ID,
+                )
+                .map_err(map_relationship_state_load_error)?
+                .ok_or_else(|| error(ConversationCognitionErrorCode::RelationshipStateUnavailable))?;
+                relationship_transition =
+                    build_relationship_transition(&relationship_state, &first_observed_at)?;
                 #[cfg(test)]
                 if let Some(hook) = self.pre_composite_hook.as_ref() {
                     hook(&life.id, &request.request_id, &first_observed_at);
                 }
+                // Attempt #2 is FINAL: any error here maps straight through.
                 self.storage
-                    .append_complete_turn_with_emotion(&append_request, transition)
-                    .map_err(map_composite_commit_error)?
+                    .append_complete_turn_with_emotion_and_relationship(
+                        &append_request,
+                        transition,
+                        relationship_transition,
+                    )
+                    .map_err(map_triple_composite_commit_error)?
             }
-            Err(commit_error) => return Err(map_composite_commit_error(commit_error)),
+            Err(commit_error) => return Err(map_triple_composite_commit_error(commit_error)),
         };
         let appended = composite.turn;
         debug_assert!(matches!(
             composite.emotion,
             EmotionCommitOutcome::Committed { .. }
+        ));
+        debug_assert!(matches!(
+            composite.relationship,
+            RelationshipCommitOutcome::Committed { .. }
         ));
         let mut degradations = retrieval_result
             .degradation_codes
@@ -764,36 +851,85 @@ fn map_emotion_observation_error(emotion_error: EmotionError) -> ConversationCog
     })
 }
 
-fn map_composite_commit_error(
-    commit_error: crate::storage::conversation_emotion::ConversationEmotionCommitError,
+/// Mapper for the READ-ONLY primary-user relationship state load. Absence or
+/// a database hiccup is ordinary transient unavailability; an invariant
+/// violation on the read path is an integration problem.
+fn map_relationship_state_load_error(
+    relationship_error: RelationshipError,
 ) -> ConversationCognitionError {
+    error(match relationship_error.code {
+        RelationshipErrorCode::LifeNotFound
+        | RelationshipErrorCode::StateNotFound
+        | RelationshipErrorCode::DatabaseUnavailable => {
+            ConversationCognitionErrorCode::RelationshipStateUnavailable
+        }
+        RelationshipErrorCode::RevisionConflict => {
+            ConversationCognitionErrorCode::RelationshipChangedDuringRequest
+        }
+        RelationshipErrorCode::EventConflict => {
+            ConversationCognitionErrorCode::RelationshipCommitConflict
+        }
+        // The reader never mutates, so conflict codes cannot legitimately
+        // surface here; an invalid-argument read is an integration failure.
+        RelationshipErrorCode::InvalidArgument => {
+            ConversationCognitionErrorCode::RelationshipIntegrationFailure
+        }
+    })
+}
+
+/// Mapper for the general relationship policy/commit boundary.
+fn map_relationship_error(relationship_error: RelationshipError) -> ConversationCognitionError {
+    error(match relationship_error.code {
+        RelationshipErrorCode::LifeNotFound | RelationshipErrorCode::StateNotFound => {
+            ConversationCognitionErrorCode::RelationshipStateUnavailable
+        }
+        RelationshipErrorCode::RevisionConflict => {
+            ConversationCognitionErrorCode::RelationshipChangedDuringRequest
+        }
+        RelationshipErrorCode::EventConflict => {
+            ConversationCognitionErrorCode::RelationshipCommitConflict
+        }
+        RelationshipErrorCode::InvalidArgument | RelationshipErrorCode::DatabaseUnavailable => {
+            ConversationCognitionErrorCode::RelationshipIntegrationFailure
+        }
+    })
+}
+
+/// Intentional mapper for the D12-C1 triple-composite error boundary. Each
+/// cause domain keeps its own mapping; binding/missing-event failures are
+/// internal governed-path invariant violations, never user problems.
+fn map_triple_composite_commit_error(
+    commit_error: crate::storage::conversation_relationship::ConversationEmotionRelationshipCommitError,
+) -> ConversationCognitionError {
+    use crate::storage::conversation_relationship::ConversationEmotionRelationshipCommitError as Composite;
     match commit_error {
-        crate::storage::conversation_emotion::ConversationEmotionCommitError::Emotion(
-            emotion_error,
-        ) => map_emotion_error(emotion_error),
-        crate::storage::conversation_emotion::ConversationEmotionCommitError::Conversation(
-            history_error,
-        ) => map_history_error(history_error),
-        // BindingMismatch / EmotionEventMissing are internal governed-path
-        // invariant violations in NEW C2 persistence, never user problems.
-        crate::storage::conversation_emotion::ConversationEmotionCommitError::BindingMismatch(_)
-        | crate::storage::conversation_emotion::ConversationEmotionCommitError::EmotionEventMissing(
-            _,
-        ) => error(ConversationCognitionErrorCode::EmotionIntegrationFailure),
+        Composite::Conversation(history_error) => map_history_error(history_error),
+        Composite::Emotion(emotion_error) => map_emotion_error(emotion_error),
+        Composite::Relationship(relationship_error) => map_relationship_error(relationship_error),
+        Composite::EmotionBindingMismatch(_) | Composite::EmotionEventMissing(_) => {
+            error(ConversationCognitionErrorCode::EmotionIntegrationFailure)
+        }
+        Composite::RelationshipBindingMismatch(_) | Composite::RelationshipEventMissing(_) => {
+            error(ConversationCognitionErrorCode::RelationshipIntegrationFailure)
+        }
     }
 }
 
-/// True only for the typed emotion RevisionConflict produced by the C1
-/// composite commit — the single retryable condition. Everything else maps
-/// straight to the cognition boundary without a retry.
-fn commit_error_code_is_emotion_revision_conflict(
-    commit_error: &crate::storage::conversation_emotion::ConversationEmotionCommitError,
+/// True only for the typed emotion/relationship RevisionConflict produced by
+/// the C1 triple-composite commit — the ONLY retryable conditions sharing one
+/// composite retry budget. Retry decisions inspect typed error codes directly;
+/// no string parsing of `code()`.
+fn triple_commit_error_is_revision_conflict(
+    commit_error: &crate::storage::conversation_relationship::ConversationEmotionRelationshipCommitError,
 ) -> bool {
-    matches!(
-        commit_error,
-        crate::storage::conversation_emotion::ConversationEmotionCommitError::Emotion(emotion)
-            if emotion.code == EmotionErrorCode::RevisionConflict
-    )
+    use crate::storage::conversation_relationship::ConversationEmotionRelationshipCommitError as Composite;
+    match commit_error {
+        Composite::Emotion(emotion) => emotion.code == EmotionErrorCode::RevisionConflict,
+        Composite::Relationship(relationship) => {
+            relationship.code == RelationshipErrorCode::RevisionConflict
+        }
+        _ => false,
+    }
 }
 
 fn map_model_error(runtime_error: ModelRuntimeError) -> ConversationCognitionError {
@@ -934,6 +1070,21 @@ fn error(code: ConversationCognitionErrorCode) -> ConversationCognitionError {
         ),
         ConversationCognitionErrorCode::EmotionIntegrationFailure => {
             ("The governed emotion integration failed.", false)
+        }
+        ConversationCognitionErrorCode::RelationshipStateUnavailable => (
+            "The authoritative relationship state is currently unavailable.",
+            true,
+        ),
+        ConversationCognitionErrorCode::RelationshipChangedDuringRequest => (
+            "The relationship state changed while the response was being generated.",
+            true,
+        ),
+        ConversationCognitionErrorCode::RelationshipCommitConflict => (
+            "The governed conversation turn conflicts with committed relationship evidence.",
+            false,
+        ),
+        ConversationCognitionErrorCode::RelationshipIntegrationFailure => {
+            ("The governed relationship integration failed.", false)
         }
     };
     ConversationCognitionError::new(code, message, recoverable)

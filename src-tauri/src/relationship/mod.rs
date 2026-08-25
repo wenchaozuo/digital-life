@@ -27,6 +27,8 @@
 //! belongs to D12-B2 and is not implemented here. There is no passive decay:
 //! time fields are audit evidence only.
 
+pub(crate) mod policy;
+
 pub(crate) const PRIMARY_USER_SUBJECT_ID: &str = "primary_user";
 pub(crate) const NEUTRAL_STATE_REVISION: i64 = 0;
 pub(crate) const INITIAL_POLICY_VERSION: i64 = 1;
@@ -201,8 +203,10 @@ impl RelationshipEventSource {
 
 /// A change reason is a SAFE STRUCTURED CODE, never arbitrary message text:
 /// ASCII lower snake_case ([a-z]([a-z0-9]|_[a-z0-9])*), 1..=64 characters.
-/// Free-text psychological explanations are forbidden in the ledger.
-fn validate_change_reason(change_reason: &str) -> Result<(), RelationshipError> {
+/// Free-text psychological explanations are forbidden in the ledger. Shared by
+/// the B1 transition and the B2 policy request so there is exactly ONE
+/// validation rule set for reason codes.
+pub(crate) fn validate_change_reason(change_reason: &str) -> Result<(), RelationshipError> {
     let bytes = change_reason.as_bytes();
     if bytes.is_empty() || bytes.len() > 64 {
         return Err(RelationshipError::invalid_argument(

@@ -257,6 +257,107 @@ fn emotion_event_exists(
     )
 }
 
+/// Validate the D12 conversation, emotion, and relationship inputs before the
+/// StorageService lock or SQLite transaction is acquired. Both the frozen D12
+/// wrapper and the D13 four-domain primitive use this exact helper so their
+/// invalid-input timing and binding rules cannot diverge.
+pub(super) fn validate_append_complete_turn_with_emotion_and_relationship(
+    request: &AppendConversationTurnRequest,
+    emotion_transition: &EmotionTransition,
+    relationship_transition: &RelationshipTransition,
+) -> Result<(), ConversationEmotionRelationshipCommitError> {
+    crate::conversation::history::validate_append_turn_request(request)
+        .map_err(ConversationEmotionRelationshipCommitError::Conversation)?;
+    validate_binding(request, emotion_transition).map_err(|detail| {
+        ConversationEmotionRelationshipCommitError::EmotionBindingMismatch(match detail {
+            ConversationEmotionCommitError::BindingMismatch(text) => text,
+            other => format!("unexpected binding failure: {other:?}"),
+        })
+    })?;
+    validate_relationship_binding(request, relationship_transition)?;
+    Ok(())
+}
+
+/// Caller-owned D12 triple transaction core. It performs the complete frozen
+/// conversation + emotion + relationship semantic operation inside the
+/// supplied transaction, but never begins, commits, or explicitly rolls back
+/// one. An uncommitted transaction is rolled back by rusqlite when dropped.
+pub(super) fn append_complete_turn_with_emotion_and_relationship_in_transaction(
+    transaction: &Transaction<'_>,
+    request: &AppendConversationTurnRequest,
+    emotion_transition: EmotionTransition,
+    relationship_transition: RelationshipTransition,
+) -> Result<ConversationEmotionRelationshipCommitOutcome, ConversationEmotionRelationshipCommitError>
+{
+    // On an EXISTING turn, the frozen conflict semantics take precedence
+    // FIRST: a same turn_id with different stored user content is ALWAYS
+    // a Conversation TurnIdConflict, regardless of which governance era
+    // produced the turn. Only identical content may proceed to the D12
+    // legacy-event classification below. This duplicate NON-MUTATING
+    // guard exists solely for classification precedence; the frozen D11
+    // shared core re-performs its own check unchanged.
+    let existing_turn = conversation::load_turn(
+        transaction,
+        &request.life_id,
+        &request.conversation_id,
+        &request.turn_id,
+    )
+    .map_err(ConversationEmotionRelationshipCommitError::Conversation)?;
+    if let Some(existing) = &existing_turn {
+        if existing.user_message.content != request.user_content {
+            return Err(ConversationEmotionRelationshipCommitError::Conversation(
+                crate::conversation::history::ConversationHistoryError::new(
+                    crate::conversation::history::ConversationHistoryErrorCode::TurnIdConflict,
+                ),
+            ));
+        }
+    }
+    // With content verified identical, distinguish pre-D11 / D11-only /
+    // full-D12 with bounded non-mutating existence checks BEFORE invoking
+    // any writer: emotion missing → EmotionEventMissing (frozen D11
+    // behavior); else relationship missing → RelationshipEventMissing
+    // (hard C1 invariant, no retroactive backfill).
+    if existing_turn.is_some()
+        && !emotion_event_exists(transaction, request)
+            .map_err(ConversationEmotionRelationshipCommitError::from)?
+    {
+        return Err(
+            ConversationEmotionRelationshipCommitError::EmotionEventMissing(
+                "the conversation turn has no governed emotion event to replay.".to_string(),
+            ),
+        );
+    }
+    if existing_turn.is_some()
+        && !relationship_event_exists(transaction, &relationship_transition)
+            .map_err(ConversationEmotionRelationshipCommitError::from)?
+    {
+        return Err(
+            ConversationEmotionRelationshipCommitError::RelationshipEventMissing(
+                "the governed turn has no canonical relationship event; D11-era turns are never backfilled.".to_string(),
+            ),
+        );
+    }
+
+    // 1. Frozen D11 core: conversation + emotion inside THIS transaction,
+    //    WITHOUT committing. Its replay semantics, legacy guard, message
+    //    inserts, and CAS remain the single shared implementation.
+    let outcome =
+        append_complete_turn_with_emotion_in_transaction(transaction, request, emotion_transition)
+            .map_err(ConversationEmotionRelationshipCommitError::from)?;
+
+    // 2. B1 relationship persistence INSIDE THE SAME transaction. B1
+    //    remains the single replay-equality/CAS authority; a revision or
+    //    event conflict here aborts everything above via rollback-on-drop.
+    let relationship = commit_transition_in_transaction(transaction, relationship_transition)
+        .map_err(ConversationEmotionRelationshipCommitError::Relationship)?;
+
+    Ok(ConversationEmotionRelationshipCommitOutcome {
+        turn: outcome.turn,
+        emotion: outcome.emotion,
+        relationship,
+    })
+}
+
 impl StorageService {
     /// The ONE atomic primitive for a fully governed D12 conversation turn:
     /// conversation messages + revision + emotion_event + emotion_state +
@@ -274,18 +375,11 @@ impl StorageService {
         ConversationEmotionRelationshipCommitOutcome,
         ConversationEmotionRelationshipCommitError,
     > {
-        // Shared conversation input validation FIRST — zero writes on failure.
-        crate::conversation::history::validate_append_turn_request(request)
-            .map_err(ConversationEmotionRelationshipCommitError::Conversation)?;
-        // Pure binding validation next: zero writes on mismatch. Both
-        // transitions must deterministically bind to this exact turn.
-        validate_binding(request, &emotion_transition).map_err(|detail| {
-            ConversationEmotionRelationshipCommitError::EmotionBindingMismatch(match detail {
-                ConversationEmotionCommitError::BindingMismatch(text) => text,
-                other => format!("unexpected binding failure: {other:?}"),
-            })
-        })?;
-        validate_relationship_binding(request, &relationship_transition)?;
+        validate_append_complete_turn_with_emotion_and_relationship(
+            request,
+            &emotion_transition,
+            &relationship_transition,
+        )?;
 
         let mut state = self
             .state()
@@ -294,81 +388,17 @@ impl StorageService {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(ConversationEmotionRelationshipCommitError::from)?;
-
-        // On an EXISTING turn, the frozen conflict semantics take precedence
-        // FIRST: a same turn_id with different stored user content is ALWAYS
-        // a Conversation TurnIdConflict, regardless of which governance era
-        // produced the turn. Only identical content may proceed to the D12
-        // legacy-event classification below. This duplicate NON-MUTATING
-        // guard exists solely for classification precedence; the frozen D11
-        // shared core re-performs its own check unchanged.
-        let existing_turn = conversation::load_turn(
-            &transaction,
-            &request.life_id,
-            &request.conversation_id,
-            &request.turn_id,
-        )
-        .map_err(ConversationEmotionRelationshipCommitError::Conversation)?;
-        if let Some(existing) = &existing_turn {
-            if existing.user_message.content != request.user_content {
-                return Err(ConversationEmotionRelationshipCommitError::Conversation(
-                    crate::conversation::history::ConversationHistoryError::new(
-                        crate::conversation::history::ConversationHistoryErrorCode::TurnIdConflict,
-                    ),
-                ));
-            }
-        }
-        // With content verified identical, distinguish pre-D11 / D11-only /
-        // full-D12 with bounded non-mutating existence checks BEFORE invoking
-        // any writer: emotion missing → EmotionEventMissing (frozen D11
-        // behavior); else relationship missing → RelationshipEventMissing
-        // (hard C1 invariant, no retroactive backfill).
-        if existing_turn.is_some()
-            && !emotion_event_exists(&transaction, request)
-                .map_err(ConversationEmotionRelationshipCommitError::from)?
-        {
-            return Err(
-                ConversationEmotionRelationshipCommitError::EmotionEventMissing(
-                    "the conversation turn has no governed emotion event to replay.".to_string(),
-                ),
-            );
-        }
-        if existing_turn.is_some()
-            && !relationship_event_exists(&transaction, &relationship_transition)
-                .map_err(ConversationEmotionRelationshipCommitError::from)?
-        {
-            return Err(
-                ConversationEmotionRelationshipCommitError::RelationshipEventMissing(
-                    "the governed turn has no canonical relationship event; D11-era turns are never backfilled.".to_string(),
-                ),
-            );
-        }
-
-        // 1. Frozen D11 core: conversation + emotion inside THIS transaction,
-        //    WITHOUT committing. Its replay semantics, legacy guard, message
-        //    inserts, and CAS remain the single shared implementation.
-        let outcome = append_complete_turn_with_emotion_in_transaction(
+        let outcome = append_complete_turn_with_emotion_and_relationship_in_transaction(
             &transaction,
             request,
             emotion_transition,
-        )
-        .map_err(ConversationEmotionRelationshipCommitError::from)?;
-
-        // 2. B1 relationship persistence INSIDE THE SAME transaction. B1
-        //    remains the single replay-equality/CAS authority; a revision or
-        //    event conflict here aborts everything above via rollback-on-drop.
-        let relationship = commit_transition_in_transaction(&transaction, relationship_transition)
-            .map_err(ConversationEmotionRelationshipCommitError::Relationship)?;
-
+            relationship_transition,
+        )?;
         // 3. Single COMMIT. There is no intermediate commit between domains.
         transaction
             .commit()
             .map_err(ConversationEmotionRelationshipCommitError::from)?;
-        Ok(ConversationEmotionRelationshipCommitOutcome {
-            turn: outcome.turn,
-            emotion: outcome.emotion,
-            relationship,
-        })
+        Ok(outcome)
     }
 }
 

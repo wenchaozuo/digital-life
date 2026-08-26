@@ -3,7 +3,8 @@ use std::{fs, path::Path, time::Duration};
 use rusqlite::{backup::Backup, params, Connection, OptionalExtension, Transaction};
 
 use super::{
-    connection, generation_lifecycle_authority, writer_fence_manifest, StorageError, MIGRATIONS,
+    connection, experience_episode, generation_lifecycle_authority, writer_fence_manifest,
+    StorageError, MIGRATIONS,
 };
 
 pub(super) const LAST_STATIC_MIGRATION_VERSION: i64 = 12;
@@ -42,6 +43,8 @@ const CREATE_RELATIONSHIP_EVENT_TABLE_SQL: &str =
 /// exactly one neutral `relationship_state` row in the same statement.
 const CREATE_RELATIONSHIP_STATE_INITIALIZER_TRIGGER_SQL: &str =
     include_str!("migrations/020_relationship_authority.initializer_trigger.sql");
+pub(super) const EXPERIENCE_EPISODE_SCHEMA_VERSION: i64 = 21;
+const EXPERIENCE_EPISODE_MIGRATION_NAME: &str = "021_experience_episode_authority";
 const ADD_CLAIMED_GENERATION_AUTHORITY_EPOCH_SQL: &str = "ALTER TABLE memory_vector_sync_outbox ADD COLUMN claimed_generation_authority_epoch INTEGER NULL CHECK (claimed_generation_authority_epoch IS NULL OR claimed_generation_authority_epoch >= 1)";
 const CREATE_GENERATION_AUTHORITY_TABLE_SQL: &str =
     "CREATE TABLE memory_vector_generation_authority (
@@ -222,6 +225,11 @@ pub(super) enum EmotionAuthoritySchemaUpgrade {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum RelationshipAuthoritySchemaUpgrade {
+    Applied,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ExperienceEpisodeSchemaUpgrade {
     Applied,
 }
 
@@ -1250,7 +1258,8 @@ fn validate_emotion_authority_schema_objects_for_fence_epoch(
     // The Schema 18 catch-up objects stay validated on Schema 19+ (without the
     // schema-18 manifest selection, which cannot see later fence triggers), and
     // the writer fence must match the caller's epoch: 51 triggers at Schema 19,
-    // 57 once Schema 20's relationship fences are installed.
+    // 57 once Schema 20's relationship fences are installed, and 60 after
+    // Schema 21's experience-episode fences are installed.
     validate_generation_catchup_attempt_schema_objects_inner(connection)?;
     writer_fence_manifest::validate_writer_fence_manifest_for_schema(
         connection,
@@ -1366,14 +1375,25 @@ pub(super) fn apply_relationship_authority_schema_upgrade(
 pub(super) fn validate_relationship_authority_schema(
     connection: &Connection,
 ) -> Result<(), StorageError> {
-    if connection::read_schema_version(connection)? != RELATIONSHIP_AUTHORITY_SCHEMA_VERSION {
+    let schema_version = connection::read_schema_version(connection)?;
+    if schema_version < RELATIONSHIP_AUTHORITY_SCHEMA_VERSION {
         return Err(StorageError::migration_version_invariant_failed());
     }
-    validate_relationship_authority_schema_objects(connection)
+    validate_relationship_authority_schema_objects_for_fence_epoch(connection, schema_version)
 }
 
 fn validate_relationship_authority_schema_objects(
     connection: &Connection,
+) -> Result<(), StorageError> {
+    validate_relationship_authority_schema_objects_for_fence_epoch(
+        connection,
+        RELATIONSHIP_AUTHORITY_SCHEMA_VERSION,
+    )
+}
+
+fn validate_relationship_authority_schema_objects_for_fence_epoch(
+    connection: &Connection,
+    fence_schema_version: i64,
 ) -> Result<(), StorageError> {
     // The frozen domains and constraints are proven from SQLite's own
     // persisted DDL: a normalized full-statement comparison represents CHECK
@@ -1532,14 +1552,94 @@ fn validate_relationship_authority_schema_objects(
     if unique_index_count != 2 {
         return Err(StorageError::migration_transaction_failed());
     }
-    // The Schema 18 catch-up objects stay validated on Schema 20 (without the
-    // schema-18 manifest selection, which cannot see the later fence
-    // triggers), and the complete 57-trigger writer fence must be present.
+    // The Schema 18 catch-up objects stay validated on Schema 20+ (without the
+    // schema-18 manifest selection, which cannot see later fence triggers).
     validate_generation_catchup_attempt_schema_objects_inner(connection)?;
     writer_fence_manifest::validate_writer_fence_manifest_for_schema(
         connection,
-        RELATIONSHIP_AUTHORITY_SCHEMA_VERSION,
+        fence_schema_version,
     )
+}
+
+/// Schema 21 adds the SQLite-authoritative bounded occurrence record for a
+/// completed conversation turn. The migration is intentionally DDL-only: no
+/// historical conversation rows are scanned or backfilled.
+pub(super) fn apply_experience_episode_schema_upgrade(
+    transaction: &Transaction<'_>,
+) -> Result<ExperienceEpisodeSchemaUpgrade, StorageError> {
+    if connection::read_schema_version(transaction)? != RELATIONSHIP_AUTHORITY_SCHEMA_VERSION {
+        return Err(StorageError::migration_version_invariant_failed());
+    }
+
+    transaction
+        .execute_batch(experience_episode::CREATE_EXPERIENCE_EPISODE_TABLE_SQL)
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    #[cfg(test)]
+    if should_fail_migration_021_at_for_test(Migration021Failpoint::AfterTable) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+
+    transaction
+        .execute_batch(experience_episode::CREATE_EXPERIENCE_EPISODE_SOURCE_BINDING_TRIGGER_SQL)
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    transaction
+        .execute_batch(experience_episode::CREATE_EXPERIENCE_EPISODE_IMMUTABLE_TRIGGER_SQL)
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    #[cfg(test)]
+    if should_fail_migration_021_at_for_test(Migration021Failpoint::AfterSemanticGuards) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+
+    writer_fence_manifest::install_experience_episode_writer_fence_manifest_in_transaction(
+        transaction,
+    )?;
+    #[cfg(test)]
+    if should_fail_migration_021_at_for_test(Migration021Failpoint::AfterWriterFences) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+
+    validate_experience_episode_schema_objects(transaction)?;
+    #[cfg(test)]
+    if should_fail_migration_021_at_for_test(Migration021Failpoint::BeforeSchemaVersion) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+
+    let migration_now: String = transaction
+        .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", [], |row| {
+            row.get(0)
+        })
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    transaction
+        .execute(
+            "INSERT INTO schema_migration (version,name,applied_at) VALUES (?1,?2,?3)",
+            params![
+                EXPERIENCE_EPISODE_SCHEMA_VERSION,
+                EXPERIENCE_EPISODE_MIGRATION_NAME,
+                migration_now
+            ],
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    #[cfg(test)]
+    if should_fail_migration_021_at_for_test(Migration021Failpoint::PreCommit) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    validate_experience_episode_schema_objects(transaction)?;
+    Ok(ExperienceEpisodeSchemaUpgrade::Applied)
+}
+
+pub(super) fn validate_experience_episode_schema(
+    connection: &Connection,
+) -> Result<(), StorageError> {
+    let schema_version = connection::read_schema_version(connection)?;
+    if schema_version < EXPERIENCE_EPISODE_SCHEMA_VERSION {
+        return Err(StorageError::migration_version_invariant_failed());
+    }
+    validate_experience_episode_schema_objects(connection)?;
+    writer_fence_manifest::validate_writer_fence_manifest_for_schema(connection, schema_version)
+}
+
+fn validate_experience_episode_schema_objects(connection: &Connection) -> Result<(), StorageError> {
+    experience_episode::validate_schema_objects(connection)
 }
 
 pub(super) fn validate_generation_catchup_attempt_schema(
@@ -2200,6 +2300,9 @@ pub(super) fn verify_schema_after_upgrade(
     if expected_schema_version == RELATIONSHIP_AUTHORITY_SCHEMA_VERSION {
         validate_relationship_authority_schema(connection)?;
     }
+    if expected_schema_version == EXPERIENCE_EPISODE_SCHEMA_VERSION {
+        validate_experience_episode_schema(connection)?;
+    }
     if expected_schema_version >= writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION {
         #[cfg(test)]
         if should_fail_post_commit_verification_at_for_test(
@@ -2521,6 +2624,43 @@ fn should_fail_migration_020_at_for_test(failpoint: Migration020Failpoint) -> bo
     })
 }
 
+/// Test-only failpoints for Migration021. Every point is inside the single
+/// caller-owned transaction, so a failure proves the Episode table, semantic
+/// guards, writer fences, and version row do not escape as a partial upgrade.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Migration021Failpoint {
+    AfterTable,
+    AfterSemanticGuards,
+    AfterWriterFences,
+    BeforeSchemaVersion,
+    PreCommit,
+}
+
+#[cfg(test)]
+thread_local! {
+    static MIGRATION_021_FAILPOINT: std::cell::Cell<Option<Migration021Failpoint>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(super) fn fail_next_migration_021_at_for_test(failpoint: Migration021Failpoint) {
+    MIGRATION_021_FAILPOINT.with(|next| next.set(Some(failpoint)));
+}
+
+#[cfg(test)]
+fn should_fail_migration_021_at_for_test(failpoint: Migration021Failpoint) -> bool {
+    MIGRATION_021_FAILPOINT.with(|next| {
+        if next.get() == Some(failpoint) {
+            next.set(None);
+            true
+        } else {
+            false
+        }
+    })
+}
+
 /// Test-only failpoints for Migration016 (`apply_late_delete_generation_authority_schema_upgrade`).
 /// Each variant corresponds to a phase of the single-transaction upgrade. The
 /// failpoint returns `MIGRATION_TRANSACTION_FAILED` from inside the transaction,
@@ -2769,6 +2909,9 @@ pub fn verify_database(
     }
     if expected_schema_version == LATE_DELETE_RESOLUTION_SCHEMA_VERSION {
         validate_late_delete_resolution_schema(connection)?;
+    }
+    if expected_schema_version >= EXPERIENCE_EPISODE_SCHEMA_VERSION {
+        validate_experience_episode_schema(connection)?;
     }
     if expected_schema_version >= writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION {
         writer_fence_manifest::validate_writer_fence_manifest(connection)?;
@@ -3177,12 +3320,33 @@ mod transaction_tests {
         transaction.commit().unwrap();
     }
 
+    fn apply_experience_episode_upgrade(connection: &mut Connection) {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert_eq!(
+            apply_experience_episode_schema_upgrade(&transaction).unwrap(),
+            ExperienceEpisodeSchemaUpgrade::Applied
+        );
+        transaction.commit().unwrap();
+    }
+
     fn schema_nineteen_connection() -> Connection {
         let mut connection = schema_eighteen_connection();
         apply_emotion_authority_upgrade(&mut connection);
         assert_eq!(
             schema_version(&connection),
             EMOTION_AUTHORITY_SCHEMA_VERSION
+        );
+        connection
+    }
+
+    fn schema_twenty_connection() -> Connection {
+        let mut connection = schema_nineteen_connection();
+        apply_relationship_authority_upgrade(&mut connection);
+        assert_eq!(
+            schema_version(&connection),
+            RELATIONSHIP_AUTHORITY_SCHEMA_VERSION
         );
         connection
     }
@@ -3945,10 +4109,10 @@ mod transaction_tests {
     }
 
     #[test]
-    fn migration_020_no_migration_021_exists_and_twenty_is_the_maximum_supported_version() {
+    fn migration_021_no_migration_022_exists_and_twenty_one_is_the_maximum_supported_version() {
         assert_eq!(
             super::super::connection::MAX_SUPPORTED_SCHEMA_VERSION,
-            RELATIONSHIP_AUTHORITY_SCHEMA_VERSION
+            EXPERIENCE_EPISODE_SCHEMA_VERSION
         );
         let migrations_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/storage/migrations");
         let entries = std::fs::read_dir(&migrations_dir).unwrap();
@@ -3963,7 +4127,208 @@ mod transaction_tests {
                 highest = highest.max(version);
             }
         }
-        assert_eq!(highest, 20, "Migration 021 must not exist");
+        assert_eq!(highest, 21, "Migration 021 must be the current migration");
+        let has_022 = std::fs::read_dir(&migrations_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .any(|name| name.starts_with("022"));
+        assert!(!has_022, "Migration 022 must not exist");
+    }
+
+    #[test]
+    fn migration_021_fresh_database_reaches_schema_twenty_one_without_backfill() {
+        let mut connection = schema_twenty_connection();
+        apply_experience_episode_upgrade(&mut connection);
+
+        assert_eq!(
+            schema_version(&connection),
+            EXPERIENCE_EPISODE_SCHEMA_VERSION
+        );
+        validate_experience_episode_schema(&connection).unwrap();
+        let episode_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM experience_episode", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(episode_count, 0);
+        assert_eq!(writer_fence_count(&connection), 60);
+        let migration_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migration WHERE version = ?1",
+                [EXPERIENCE_EPISODE_SCHEMA_VERSION],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migration_count, 1);
+
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let error = apply_experience_episode_schema_upgrade(&transaction).unwrap_err();
+        assert_eq!(error.code, "MIGRATION_VERSION_INVARIANT_FAILED");
+        drop(transaction);
+        assert_eq!(
+            schema_version(&connection),
+            EXPERIENCE_EPISODE_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn migration_021_schema_twenty_upgrade_preserves_populated_conversation_without_episodes() {
+        let mut connection = schema_twenty_connection();
+        seed_lives_at_schema_eighteen(&connection);
+        connection
+            .execute_batch(
+                "INSERT INTO conversation
+                     (id, life_id, title, revision, created_at, updated_at, last_message_at)
+                 VALUES ('migration-conversation', 'life-a', 'Migration Conversation', 1,
+                         '2026-08-26T00:00:00.000Z', '2026-08-26T00:00:00.002Z',
+                         '2026-08-26T00:00:00.002Z');
+                 INSERT INTO conversation_message
+                     (id, conversation_id, life_id, turn_id, role, content, sequence_no, created_at)
+                 VALUES
+                     ('migration-user-message', 'migration-conversation', 'life-a',
+                      'migration-turn', 'user', 'historical user content', 1,
+                      '2026-08-26T00:00:00.001Z'),
+                     ('migration-assistant-message', 'migration-conversation', 'life-a',
+                      'migration-turn', 'assistant', 'historical assistant content', 2,
+                      '2026-08-26T00:00:00.002Z');",
+            )
+            .unwrap();
+
+        apply_experience_episode_upgrade(&mut connection);
+
+        assert_eq!(
+            schema_version(&connection),
+            EXPERIENCE_EPISODE_SCHEMA_VERSION
+        );
+        let episode_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM experience_episode", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(episode_count, 0);
+        let message_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM conversation_message WHERE conversation_id = 'migration-conversation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(message_count, 2);
+        validate_experience_episode_schema(&connection).unwrap();
+    }
+
+    #[test]
+    fn migration_021_failure_points_roll_back_to_exact_schema_twenty_preimage() {
+        for point in [
+            Migration021Failpoint::AfterTable,
+            Migration021Failpoint::AfterSemanticGuards,
+            Migration021Failpoint::AfterWriterFences,
+            Migration021Failpoint::BeforeSchemaVersion,
+            Migration021Failpoint::PreCommit,
+        ] {
+            let mut connection = schema_twenty_connection();
+            fail_next_migration_021_at_for_test(point);
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let error = apply_experience_episode_schema_upgrade(&transaction).unwrap_err();
+            assert_eq!(error.code, "MIGRATION_TRANSACTION_FAILED");
+
+            let table_exists: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema
+                     WHERE type = 'table' AND name = 'experience_episode'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let semantic_guard_count: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema
+                     WHERE type = 'trigger'
+                       AND name IN ('experience_episode_source_binding_guard',
+                                    'experience_episode_immutable_guard')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let episode_fence_count: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema
+                     WHERE type = 'trigger'
+                       AND name GLOB 'digital_life_writer_epoch_experience_episode_*'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            match point {
+                Migration021Failpoint::AfterTable => {
+                    assert_eq!(table_exists, 1);
+                    assert_eq!(semantic_guard_count, 0);
+                    assert_eq!(episode_fence_count, 0);
+                }
+                Migration021Failpoint::AfterSemanticGuards => {
+                    assert_eq!(table_exists, 1);
+                    assert_eq!(semantic_guard_count, 2);
+                    assert_eq!(episode_fence_count, 0);
+                }
+                Migration021Failpoint::AfterWriterFences
+                | Migration021Failpoint::BeforeSchemaVersion
+                | Migration021Failpoint::PreCommit => {
+                    assert_eq!(table_exists, 1);
+                    assert_eq!(semantic_guard_count, 2);
+                    assert_eq!(episode_fence_count, 3);
+                }
+            }
+            drop(transaction);
+
+            assert_eq!(
+                schema_version(&connection),
+                RELATIONSHIP_AUTHORITY_SCHEMA_VERSION
+            );
+            validate_relationship_authority_schema(&connection).unwrap();
+            assert_eq!(writer_fence_count(&connection), 57);
+            let remaining_episode_objects: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE name LIKE 'experience_episode%'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(remaining_episode_objects, 0);
+            let migration_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migration WHERE version = ?1",
+                    [EXPERIENCE_EPISODE_SCHEMA_VERSION],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(migration_count, 0);
+        }
+    }
+
+    #[test]
+    fn schema_twenty_and_schema_twenty_one_writer_fences_both_reopen_exactly() {
+        let schema_twenty = schema_twenty_connection();
+        writer_fence_manifest::validate_writer_fence_manifest_for_schema(
+            &schema_twenty,
+            RELATIONSHIP_AUTHORITY_SCHEMA_VERSION,
+        )
+        .unwrap();
+        assert_eq!(writer_fence_count(&schema_twenty), 57);
+
+        let mut schema_twenty_one = schema_twenty_connection();
+        apply_experience_episode_upgrade(&mut schema_twenty_one);
+        writer_fence_manifest::validate_writer_fence_manifest_for_schema(
+            &schema_twenty_one,
+            EXPERIENCE_EPISODE_SCHEMA_VERSION,
+        )
+        .unwrap();
+        assert_eq!(writer_fence_count(&schema_twenty_one), 60);
+        validate_emotion_authority_schema(&schema_twenty_one).unwrap();
+        validate_relationship_authority_schema(&schema_twenty_one).unwrap();
     }
 
     #[test]

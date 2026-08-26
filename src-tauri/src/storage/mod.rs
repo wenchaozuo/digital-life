@@ -7,6 +7,7 @@ pub(crate) mod conversation_relationship;
 pub(crate) mod deterministic_candidate_extraction;
 #[cfg_attr(not(test), allow(dead_code))]
 mod emotion;
+mod experience_episode;
 mod generation_lifecycle_authority;
 mod generation_rebuild;
 mod late_delete_resolution;
@@ -1910,11 +1911,11 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(writer_fence_count, 57);
+        assert_eq!(writer_fence_count, 60);
         migration::validate_attempt_claim_identity_schema(&state.connection).unwrap();
         // The database is at Schema 20; validate the exact Schema-20 relationship
         // authority (which re-validates the emotion authority, the Schema-18
-        // catch-up objects, and proves the full 57-trigger writer fence).
+        // catch-up objects, and proves the full 60-trigger writer fence).
         migration::validate_emotion_authority_schema(&state.connection).unwrap();
         migration::validate_relationship_authority_schema(&state.connection).unwrap();
         assert_eq!(
@@ -2109,7 +2110,7 @@ mod tests {
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert_eq!(fence_count, 57);
+            assert_eq!(fence_count, 60);
         }
 
         // All 8 outbox states preserved with full epoch evidence.

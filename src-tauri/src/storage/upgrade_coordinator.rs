@@ -90,6 +90,7 @@ fn open_after_mutex<G: StorageUpgradeGate>(
         migration::validate_attempt_claim_identity_schema(&connection)?;
         migration::validate_emotion_authority_schema(&connection)?;
         migration::validate_relationship_authority_schema(&connection)?;
+        migration::validate_experience_episode_schema(&connection)?;
         record_upgrade_event("post-verify");
         migration::verify_schema_after_upgrade(
             &connection,
@@ -198,6 +199,14 @@ fn open_after_mutex<G: StorageUpgradeGate>(
             return Err(StorageError::migration_version_invariant_failed());
         }
         upgraded_version = migration::RELATIONSHIP_AUTHORITY_SCHEMA_VERSION;
+    }
+    if upgraded_version == migration::RELATIONSHIP_AUTHORITY_SCHEMA_VERSION {
+        let experience_episode_upgrade =
+            migration::apply_experience_episode_schema_upgrade(&transaction)?;
+        if experience_episode_upgrade != migration::ExperienceEpisodeSchemaUpgrade::Applied {
+            return Err(StorageError::migration_version_invariant_failed());
+        }
+        upgraded_version = migration::EXPERIENCE_EPISODE_SCHEMA_VERSION;
     }
     if upgraded_version != connection::MAX_SUPPORTED_SCHEMA_VERSION {
         return Err(StorageError::migration_version_invariant_failed());
@@ -552,6 +561,8 @@ mod tests {
                 || version == migration::GENERATION_LIFECYCLE_SCHEMA_VERSION
                 || version == migration::GENERATION_CATCHUP_ATTEMPT_SCHEMA_VERSION
                 || version == migration::EMOTION_AUTHORITY_SCHEMA_VERSION
+                || version == migration::RELATIONSHIP_AUTHORITY_SCHEMA_VERSION
+                || version == migration::EXPERIENCE_EPISODE_SCHEMA_VERSION
                 || version == connection::MAX_SUPPORTED_SCHEMA_VERSION
         );
         let mut connection = Connection::open(path).unwrap();
@@ -623,6 +634,12 @@ mod tests {
             assert_eq!(
                 migration::apply_relationship_authority_schema_upgrade(&transaction).unwrap(),
                 migration::RelationshipAuthoritySchemaUpgrade::Applied
+            );
+        }
+        if version >= migration::EXPERIENCE_EPISODE_SCHEMA_VERSION {
+            assert_eq!(
+                migration::apply_experience_episode_schema_upgrade(&transaction).unwrap(),
+                migration::ExperienceEpisodeSchemaUpgrade::Applied
             );
         }
         transaction.commit().unwrap();
@@ -1205,11 +1222,11 @@ mod tests {
         );
         migration::validate_attempt_claim_identity_schema(&state.connection).unwrap();
         // The schema is at 20, so the version-17 lifecycle validator cannot
-        // run alone; the full 57-trigger writer fence plus the exact Schema-19
+        // run alone; the full 60-trigger writer fence plus the exact Schema-19
         // emotion and Schema-20 relationship validators (which re-validate the
         // Schema-18 catch-up objects) prove the complete chain was applied.
         migration::validate_emotion_authority_schema(&state.connection).unwrap();
-        assert_eq!(writer_fence_count(&state.connection), 57);
+        assert_eq!(writer_fence_count(&state.connection), 60);
         assert_eq!(
             take_upgrade_events(),
             vec![
@@ -1245,10 +1262,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(writer_fence_count, 57);
+        assert_eq!(writer_fence_count, 60);
         migration::validate_attempt_claim_identity_schema(&connection).unwrap();
         // The schema is at 20, so the version-17 lifecycle validator cannot
-        // run alone; the full 57-trigger writer fence plus the exact Schema-19
+        // run alone; the full 60-trigger writer fence plus the exact Schema-19
         // emotion and Schema-20 relationship validators (which re-validate the
         // Schema-18 catch-up objects) prove the complete chain was applied.
         migration::validate_emotion_authority_schema(&connection).unwrap();
@@ -1316,7 +1333,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(writer_fence_count, 57);
+        assert_eq!(writer_fence_count, 60);
         assert_eq!(journal_mode(&path), "wal");
     }
 
@@ -1382,7 +1399,65 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(writer_fence_count, 57);
+        assert_eq!(writer_fence_count, 60);
+        assert_eq!(journal_mode(&path), "wal");
+    }
+
+    #[test]
+    fn d13_b1_coordinator_upgrades_schema_twenty_without_episode_backfill() {
+        let _ = take_upgrade_events();
+        let (_root, path) = database_path("schema-twenty-experience-episode-upgrade");
+        prepare_schema_version(&path, migration::RELATIONSHIP_AUTHORITY_SCHEMA_VERSION);
+        {
+            let authorized = connection::open_authorized_test_connection(&path).unwrap();
+            authorized
+                .execute_batch(
+                    "INSERT INTO persona_template (id, name, version, persona_json)
+                     VALUES ('persona-d13', 'Persona', 1, '{}');
+                     INSERT INTO life_identity
+                         (id, name, created_at, version, body_id, persona_id, persona_version)
+                     VALUES ('life-d13', 'Life D13', '2026-08-26T00:00:00.000Z', 1,
+                             'body-d13', 'persona-d13', 1);
+                     INSERT INTO conversation
+                         (id, life_id, title, revision, created_at, updated_at, last_message_at)
+                     VALUES ('conversation-d13', 'life-d13', 'D13 Conversation', 1,
+                             '2026-08-26T00:00:00.000Z', '2026-08-26T00:00:00.002Z',
+                             '2026-08-26T00:00:00.002Z');
+                     INSERT INTO conversation_message
+                         (id, conversation_id, life_id, turn_id, role, content, sequence_no, created_at)
+                     VALUES
+                         ('user-d13', 'conversation-d13', 'life-d13', 'turn-d13',
+                          'user', 'historical user content', 1, '2026-08-26T00:00:00.001Z'),
+                         ('assistant-d13', 'conversation-d13', 'life-d13', 'turn-d13',
+                          'assistant', 'historical assistant content', 2,
+                          '2026-08-26T00:00:00.002Z');",
+                )
+                .unwrap();
+            drop(authorized);
+        }
+
+        let gate = FakeGate::clear();
+        let connection = open_coordinated_storage_connection_with_gate(&path, &gate).unwrap();
+        assert_eq!(
+            connection::read_schema_version(&connection).unwrap(),
+            migration::EXPERIENCE_EPISODE_SCHEMA_VERSION
+        );
+        migration::validate_experience_episode_schema(&connection).unwrap();
+        let episode_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM experience_episode", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(episode_count, 0);
+        let message_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM conversation_message WHERE conversation_id='conversation-d13'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(message_count, 2);
+        assert_eq!(writer_fence_count(&connection), 60);
         assert_eq!(journal_mode(&path), "wal");
     }
 
@@ -1455,8 +1530,9 @@ mod tests {
             supersede_body.contains("RAISE(ABORT, 'GENERATION_REBUILD_CATCHUP_SUPERSEDE_UNSAFE')")
         );
         // The three Schema18 writer fences, the six Schema19 emotion writer
-        // fences, and the six Schema20 relationship writer fences are
-        // installed alongside the older writer fences.
+        // fences, the six Schema20 relationship writer fences, and the three
+        // Schema21 experience-episode writer fences are installed alongside
+        // the older writer fences.
         let writer_fence_total: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_schema WHERE type='trigger' AND name GLOB 'digital_life_writer_epoch_*'",
@@ -1464,7 +1540,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(writer_fence_total, 57);
+        assert_eq!(writer_fence_total, 60);
 
         // C snapshot table semantics are unchanged by the 17→18 upgrade.
         let c_snapshot_sql_after: String = connection
@@ -1800,7 +1876,7 @@ mod tests {
                     applied_at TEXT NOT NULL
                 );
                 INSERT INTO schema_migration (version, name, applied_at)
-                VALUES (21, 'future', '2026-01-01T00:00:00Z');",
+                VALUES (22, 'future', '2026-01-01T00:00:00Z');",
             )
             .unwrap();
         drop(connection);
@@ -1830,7 +1906,7 @@ mod tests {
                     applied_at TEXT NOT NULL
                 );
                 INSERT INTO schema_migration (version, name, applied_at)
-                VALUES (21, 'future', '2026-01-01T00:00:00Z')",
+                VALUES (22, 'future', '2026-01-01T00:00:00Z')",
             )
             .unwrap();
         drop(connection);
@@ -2054,7 +2130,7 @@ mod tests {
             );
             migration::validate_attempt_claim_identity_schema(&connection).unwrap();
             migration::validate_emotion_authority_schema(&connection).unwrap();
-            assert_eq!(writer_fence_count(&connection), 57);
+            assert_eq!(writer_fence_count(&connection), 60);
             assert_eq!(journal_mode(&path), "delete");
             assert_eq!(
                 take_upgrade_events(),
@@ -2277,7 +2353,7 @@ mod tests {
             );
             migration::validate_attempt_claim_identity_schema(&state.connection).unwrap();
             migration::validate_emotion_authority_schema(&state.connection).unwrap();
-            assert_eq!(writer_fence_count(&state.connection), 57);
+            assert_eq!(writer_fence_count(&state.connection), 60);
         }
     }
 
@@ -2354,7 +2430,7 @@ mod tests {
                     .unwrap(),
                 (0, 0)
             );
-            assert_eq!(writer_fence_count(&state.connection), 57);
+            assert_eq!(writer_fence_count(&state.connection), 60);
             migration::validate_attempt_claim_identity_schema(&state.connection).unwrap();
             migration::validate_emotion_authority_schema(&state.connection).unwrap();
         }
@@ -2855,7 +2931,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(semantic_trigger_count, 3);
-        assert_eq!(writer_fence_count(&connection), 57);
+        assert_eq!(writer_fence_count(&connection), 60);
         // Historical data semantics in the new world.
         let outbox_witness: Option<String> = connection
             .query_row(

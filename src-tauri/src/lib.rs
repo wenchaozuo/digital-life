@@ -7,6 +7,7 @@ pub mod conversation;
 pub mod embedding;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod emotion;
+pub(crate) mod experience;
 pub mod memory;
 pub mod model;
 pub mod prompt;

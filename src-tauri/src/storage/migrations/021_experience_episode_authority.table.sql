@@ -1,0 +1,28 @@
+CREATE TABLE experience_episode (
+    episode_id TEXT PRIMARY KEY NOT NULL CHECK (length(trim(episode_id)) > 0),
+    life_id TEXT NOT NULL CHECK (length(trim(life_id)) > 0),
+    episode_kind TEXT NOT NULL CHECK (episode_kind = 'conversation_turn'),
+    source_kind TEXT NOT NULL CHECK (source_kind = 'conversation_turn'),
+    source_ref TEXT NOT NULL CHECK (length(trim(source_ref)) > 0),
+    conversation_id TEXT NOT NULL CHECK (length(trim(conversation_id)) > 0),
+    turn_id TEXT NOT NULL CHECK (length(trim(turn_id)) > 0),
+    counterpart_subject_id TEXT NOT NULL CHECK (counterpart_subject_id = 'primary_user'),
+    user_message_id TEXT NOT NULL CHECK (length(trim(user_message_id)) > 0),
+    assistant_message_id TEXT NOT NULL CHECK (length(trim(assistant_message_id)) > 0),
+    outcome_kind TEXT NOT NULL CHECK (outcome_kind = 'completed'),
+    started_at TEXT NOT NULL CHECK (length(trim(started_at)) > 0),
+    ended_at TEXT NOT NULL CHECK (length(trim(ended_at)) > 0),
+    episode_version INTEGER NOT NULL CHECK (episode_version = 1),
+    created_at TEXT NOT NULL CHECK (length(trim(created_at)) > 0),
+    CHECK (user_message_id <> assistant_message_id),
+    CHECK (started_at <= ended_at),
+    UNIQUE (life_id, source_kind, source_ref),
+    UNIQUE (life_id, conversation_id, turn_id),
+    UNIQUE (user_message_id),
+    UNIQUE (assistant_message_id),
+    FOREIGN KEY (life_id) REFERENCES life_identity(id) ON DELETE CASCADE,
+    FOREIGN KEY (conversation_id, life_id)
+        REFERENCES conversation(id, life_id) ON DELETE CASCADE,
+    FOREIGN KEY (user_message_id) REFERENCES conversation_message(id) ON DELETE CASCADE,
+    FOREIGN KEY (assistant_message_id) REFERENCES conversation_message(id) ON DELETE CASCADE
+);

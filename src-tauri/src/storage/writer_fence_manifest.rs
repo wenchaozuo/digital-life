@@ -13,6 +13,7 @@ pub(super) const GENERATION_LIFECYCLE_WRITER_FENCE_SCHEMA_VERSION: i64 = 17;
 pub(super) const GENERATION_CATCHUP_WRITER_FENCE_SCHEMA_VERSION: i64 = 18;
 pub(super) const EMOTION_WRITER_FENCE_SCHEMA_VERSION: i64 = 19;
 pub(super) const RELATIONSHIP_WRITER_FENCE_SCHEMA_VERSION: i64 = 20;
+pub(super) const EXPERIENCE_EPISODE_WRITER_FENCE_SCHEMA_VERSION: i64 = 21;
 const WRITER_FENCE_TRIGGER_PREFIX: &str = "digital_life_writer_epoch_";
 const HISTORICAL_WRITER_FENCE_TRIGGER_COUNT: usize = 18;
 const LATE_DELETE_WRITER_FENCE_TRIGGER_COUNT: usize = 24;
@@ -20,6 +21,7 @@ const GENERATION_LIFECYCLE_WRITER_FENCE_TRIGGER_COUNT: usize = 42;
 const GENERATION_CATCHUP_WRITER_FENCE_TRIGGER_COUNT: usize = 45;
 const EMOTION_WRITER_FENCE_TRIGGER_COUNT: usize = 51;
 const RELATIONSHIP_WRITER_FENCE_TRIGGER_COUNT: usize = 57;
+const EXPERIENCE_EPISODE_WRITER_FENCE_TRIGGER_COUNT: usize = 60;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(super) enum WriterFenceOperation {
@@ -398,6 +400,24 @@ const WRITER_FENCE_TRIGGER_SPECS: &[WriterFenceTriggerSpec] = &[
         Delete,
         "DELETE"
     ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_experience_episode_insert",
+        "experience_episode",
+        Insert,
+        "INSERT"
+    ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_experience_episode_update",
+        "experience_episode",
+        Update,
+        "UPDATE"
+    ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_experience_episode_delete",
+        "experience_episode",
+        Delete,
+        "DELETE"
+    ),
 ];
 
 pub(super) fn writer_fence_trigger_specs() -> &'static [WriterFenceTriggerSpec] {
@@ -428,6 +448,33 @@ pub(super) fn emotion_writer_fence_trigger_specs() -> &'static [WriterFenceTrigg
 pub(super) fn relationship_writer_fence_trigger_specs() -> &'static [WriterFenceTriggerSpec] {
     &WRITER_FENCE_TRIGGER_SPECS
         [EMOTION_WRITER_FENCE_TRIGGER_COUNT..RELATIONSHIP_WRITER_FENCE_TRIGGER_COUNT]
+}
+
+pub(super) fn experience_episode_writer_fence_trigger_specs() -> &'static [WriterFenceTriggerSpec] {
+    &WRITER_FENCE_TRIGGER_SPECS
+        [RELATIONSHIP_WRITER_FENCE_TRIGGER_COUNT..EXPERIENCE_EPISODE_WRITER_FENCE_TRIGGER_COUNT]
+}
+
+pub(super) fn install_experience_episode_writer_fence_manifest_in_transaction(
+    transaction: &Transaction<'_>,
+) -> Result<(), StorageError> {
+    for (index, spec) in experience_episode_writer_fence_trigger_specs()
+        .iter()
+        .enumerate()
+    {
+        #[cfg(not(test))]
+        let _ = index;
+        #[cfg(test)]
+        if should_fail_trigger_install_at_for_test(
+            RELATIONSHIP_WRITER_FENCE_TRIGGER_COUNT + index + 1,
+        ) {
+            return Err(StorageError::migration_transaction_failed());
+        }
+        transaction
+            .execute_batch(spec.ddl)
+            .map_err(|_| StorageError::migration_transaction_failed())?;
+    }
+    Ok(())
 }
 
 pub(super) fn install_relationship_writer_fence_manifest_in_transaction(
@@ -578,8 +625,10 @@ pub(super) fn validate_writer_fence_manifest_for_schema(
         })
         .map_err(|_| StorageError::writer_fence_manifest_mismatch())?;
 
-    let expected = if schema_version >= RELATIONSHIP_WRITER_FENCE_SCHEMA_VERSION {
+    let expected = if schema_version >= EXPERIENCE_EPISODE_WRITER_FENCE_SCHEMA_VERSION {
         WRITER_FENCE_TRIGGER_SPECS
+    } else if schema_version >= RELATIONSHIP_WRITER_FENCE_SCHEMA_VERSION {
+        &WRITER_FENCE_TRIGGER_SPECS[..RELATIONSHIP_WRITER_FENCE_TRIGGER_COUNT]
     } else if schema_version >= EMOTION_WRITER_FENCE_SCHEMA_VERSION {
         &WRITER_FENCE_TRIGGER_SPECS[..EMOTION_WRITER_FENCE_TRIGGER_COUNT]
     } else if schema_version >= GENERATION_CATCHUP_WRITER_FENCE_SCHEMA_VERSION {
@@ -1283,7 +1332,7 @@ mod tests {
         assert_eq!(generation_catchup_writer_fence_trigger_specs().len(), 3);
         assert_eq!(emotion_writer_fence_trigger_specs().len(), 6);
         assert_eq!(relationship_writer_fence_trigger_specs().len(), 6);
-        assert_eq!(WRITER_FENCE_TRIGGER_SPECS.len(), 57);
+        assert_eq!(WRITER_FENCE_TRIGGER_SPECS.len(), 60);
         let resolution_id = late_delete_resolution_insert(&authorized).unwrap();
         assert_eq!(resolution_id, 1);
         assert_eq!(authorized.execute("UPDATE memory_vector_late_delete_resolution SET updated_at='2026-01-02T00:00:00.000Z' WHERE memory_id='late-resolution'", []).unwrap(), 1);
@@ -1587,9 +1636,9 @@ mod tests {
         let (_root, path) = initialized_fenced_database();
         let authorized = authorized_connection(&path);
         seed_protected_rows(&authorized);
-        assert_eq!(WRITER_FENCE_TRIGGER_SPECS.len(), 57);
+        assert_eq!(WRITER_FENCE_TRIGGER_SPECS.len(), 60);
         let reserved: i64 = authorized.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type='trigger' AND name LIKE 'digital_life_writer_epoch_%'", [], |r| r.get(0)).unwrap();
-        assert_eq!(reserved, 57);
+        assert_eq!(reserved, 60);
         for name in [
             "memory_vector_generation_semantic_delete_guard",
             "memory_vector_generation_semantic_identity_guard",

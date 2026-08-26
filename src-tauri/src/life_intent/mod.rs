@@ -481,7 +481,9 @@ pub(crate) fn validate_action_request(
 
 fn validate_id(name: &str, value: &str) -> Result<(), LifeIntentError> {
     let trimmed = value.trim();
-    if trimmed.is_empty() || trimmed.len() > MAX_ID_LENGTH {
+    // The frozen D14 ID limit is in Unicode scalar characters (matching
+    // SQLite `length()`), never UTF-8 bytes.
+    if trimmed.is_empty() || trimmed.chars().count() > MAX_ID_LENGTH {
         return Err(LifeIntentError::invalid_argument(format!(
             "{name} must be non-empty and at most {MAX_ID_LENGTH} characters."
         )));
@@ -500,7 +502,9 @@ fn validate_nonempty(name: &str, value: &str) -> Result<(), LifeIntentError> {
 
 fn validate_title(name: &str, value: &str) -> Result<(), LifeIntentError> {
     let trimmed = value.trim();
-    if trimmed.is_empty() || trimmed.len() > MAX_TITLE_LENGTH {
+    // Frozen D14 content limits are Unicode scalar character counts, matching
+    // SQLite `length()`; a multibyte title must not be rejected by byte count.
+    if trimmed.is_empty() || trimmed.chars().count() > MAX_TITLE_LENGTH {
         return Err(LifeIntentError::invalid_argument(format!(
             "{name} must be between 1 and {MAX_TITLE_LENGTH} characters after trimming."
         )));
@@ -510,7 +514,7 @@ fn validate_title(name: &str, value: &str) -> Result<(), LifeIntentError> {
 
 fn validate_objective(name: &str, value: &str) -> Result<(), LifeIntentError> {
     let trimmed = value.trim();
-    if trimmed.is_empty() || trimmed.len() > MAX_OBJECTIVE_LENGTH {
+    if trimmed.is_empty() || trimmed.chars().count() > MAX_OBJECTIVE_LENGTH {
         return Err(LifeIntentError::invalid_argument(format!(
             "{name} must be between 1 and {MAX_OBJECTIVE_LENGTH} characters after trimming."
         )));
@@ -520,7 +524,7 @@ fn validate_objective(name: &str, value: &str) -> Result<(), LifeIntentError> {
 
 fn validate_summary(name: &str, value: &str) -> Result<(), LifeIntentError> {
     let trimmed = value.trim();
-    if trimmed.is_empty() || trimmed.len() > MAX_SUMMARY_LENGTH {
+    if trimmed.is_empty() || trimmed.chars().count() > MAX_SUMMARY_LENGTH {
         return Err(LifeIntentError::invalid_argument(format!(
             "{name} must be between 1 and {MAX_SUMMARY_LENGTH} characters after trimming."
         )));

@@ -214,16 +214,15 @@ fn sqlite_authority_now(connection: &Connection) -> Result<String, LifeIntentErr
         .map_err(|_| LifeIntentError::database())
 }
 
-fn map_create_error(error: rusqlite::Error) -> LifeIntentError {
-    if let rusqlite::Error::SqliteFailure(_, Some(message)) = &error {
-        let lower = message.to_ascii_lowercase();
-        if lower.contains("unique constraint failed") {
-            return LifeIntentError::entity_conflict();
-        }
-        if lower.contains("foreign key constraint failed") {
-            return LifeIntentError::parent_not_found();
-        }
-    }
+/// Maps a residual INSERT failure after the explicit semantic prechecks.
+///
+/// Production classification NEVER inspects SQLite message text (English or
+/// otherwise). Every typed category — replay, EntityConflict, LifeNotFound,
+/// ParentNotFound, ParentLifeMismatch, duplicate step ordinal — is resolved by
+/// explicit statements inside the same IMMEDIATE transaction before the
+/// INSERT, so a failure reaching this point has no provable semantic category
+/// from a structured code and is reported as database unavailability.
+fn map_create_error(_error: rusqlite::Error) -> LifeIntentError {
     LifeIntentError::database()
 }
 
@@ -1717,6 +1716,206 @@ mod tests {
     }
 
     #[test]
+    fn unicode_character_bounds_follow_sqlite_character_counts() {
+        // Frozen D14 bounds are CHARACTER limits. Each CJK scalar below is 3
+        // UTF-8 bytes, so a byte-counting validator would reject the max-bounds
+        // rows this test proves are accepted by both Rust and SQLite.
+        let fixture = Fixture::new();
+        let boundary_character = "目";
+
+        // Entity ID: 128 characters accepted (real SQLite create), 129 rejected.
+        let max_id = boundary_character.repeat(128);
+        assert_eq!(
+            max_id.len(),
+            384,
+            "the 128-character ID must be 384 UTF-8 bytes"
+        );
+        let outcome = fixture
+            .storage
+            .create_goal(LifeGoalCreateRequest {
+                goal_id: max_id.clone(),
+                life_id: "life-a".into(),
+                title: boundary_character.repeat(8),
+                objective: boundary_character.repeat(16),
+            })
+            .unwrap();
+        assert!(matches!(outcome, LifeIntentCreateOutcome::Applied(_)));
+        assert_eq!(
+            fixture
+                .storage
+                .find_goal("life-a", &max_id)
+                .unwrap()
+                .expect("the 128-character goal must be readable")
+                .goal_id,
+            max_id
+        );
+        let over_id = boundary_character.repeat(129);
+        assert_eq!(
+            error_code(
+                fixture
+                    .storage
+                    .create_goal(LifeGoalCreateRequest {
+                        goal_id: over_id,
+                        life_id: "life-a".into(),
+                        title: "t".into(),
+                        objective: "o".into(),
+                    })
+                    .unwrap_err()
+            ),
+            LifeIntentErrorCode::InvalidArgument
+        );
+
+        // Title: 256 characters accepted, 257 rejected (real SQLite create at
+        // the maximum so Rust and SQLite agree on the boundary).
+        let max_title = boundary_character.repeat(256);
+        assert_eq!(
+            max_title.len(),
+            768,
+            "the 256-character title must be 768 UTF-8 bytes"
+        );
+        let title_outcome = fixture
+            .storage
+            .create_goal(LifeGoalCreateRequest {
+                goal_id: "goal-unicode-title".into(),
+                life_id: "life-a".into(),
+                title: max_title.clone(),
+                objective: "unicode title boundary".into(),
+            })
+            .unwrap();
+        assert!(matches!(title_outcome, LifeIntentCreateOutcome::Applied(_)));
+        assert_eq!(
+            fixture
+                .storage
+                .find_goal("life-a", "goal-unicode-title")
+                .unwrap()
+                .unwrap()
+                .title,
+            max_title
+        );
+        let over_title = boundary_character.repeat(257);
+        assert_eq!(
+            error_code(
+                fixture
+                    .storage
+                    .create_goal(LifeGoalCreateRequest {
+                        goal_id: "goal-unicode-title-over".into(),
+                        life_id: "life-a".into(),
+                        title: over_title,
+                        objective: "o".into(),
+                    })
+                    .unwrap_err()
+            ),
+            LifeIntentErrorCode::InvalidArgument
+        );
+
+        // Long content: 4096 characters accepted with a real SQLite create,
+        // 4097 rejected.
+        let max_content = boundary_character.repeat(4096);
+        assert_eq!(
+            max_content.len(),
+            12_288,
+            "the 4096-character content must be 12288 UTF-8 bytes"
+        );
+        let content_outcome = fixture
+            .storage
+            .create_goal(LifeGoalCreateRequest {
+                goal_id: "goal-unicode-content".into(),
+                life_id: "life-a".into(),
+                title: "unicode content boundary".into(),
+                objective: max_content.clone(),
+            })
+            .unwrap();
+        assert!(matches!(
+            content_outcome,
+            LifeIntentCreateOutcome::Applied(_)
+        ));
+        assert_eq!(
+            fixture
+                .storage
+                .find_goal("life-a", "goal-unicode-content")
+                .unwrap()
+                .unwrap()
+                .objective,
+            max_content
+        );
+        let over_content = boundary_character.repeat(4097);
+        assert_eq!(
+            error_code(
+                fixture
+                    .storage
+                    .create_goal(LifeGoalCreateRequest {
+                        goal_id: "goal-unicode-content-over".into(),
+                        life_id: "life-a".into(),
+                        title: "t".into(),
+                        objective: over_content,
+                    })
+                    .unwrap_err()
+            ),
+            LifeIntentErrorCode::InvalidArgument
+        );
+
+        // Summary boundary: 4096 characters accepted with a real SQLite create,
+        // 4097 rejected.
+        fixture
+            .storage
+            .create_goal(fixture.goal_request("goal-unicode-summary"))
+            .unwrap();
+        fixture
+            .storage
+            .create_plan(fixture.plan_request("plan-unicode-summary", "goal-unicode-summary"))
+            .unwrap();
+        fixture
+            .storage
+            .create_step(fixture.step_request("step-unicode-summary", "plan-unicode-summary", 1))
+            .unwrap();
+        let max_summary = boundary_character.repeat(4096);
+        assert_eq!(
+            max_summary.len(),
+            12_288,
+            "the 4096-character summary must be 12288 UTF-8 bytes"
+        );
+        let summary_outcome = fixture
+            .storage
+            .create_action(LifeActionIntentCreateRequest {
+                action_id: "action-unicode-summary".into(),
+                life_id: "life-a".into(),
+                step_id: "step-unicode-summary".into(),
+                execution_class: EXECUTION_CLASS_INTERNAL_INTENT.into(),
+                summary: max_summary.clone(),
+            })
+            .unwrap();
+        assert!(matches!(
+            summary_outcome,
+            LifeIntentCreateOutcome::Applied(_)
+        ));
+        assert_eq!(
+            fixture
+                .storage
+                .find_action("life-a", "action-unicode-summary")
+                .unwrap()
+                .unwrap()
+                .summary,
+            max_summary
+        );
+        let over_summary = boundary_character.repeat(4097);
+        assert_eq!(
+            error_code(
+                fixture
+                    .storage
+                    .create_action(LifeActionIntentCreateRequest {
+                        action_id: "action-unicode-summary-over".into(),
+                        life_id: "life-a".into(),
+                        step_id: "step-unicode-summary".into(),
+                        execution_class: EXECUTION_CLASS_INTERNAL_INTENT.into(),
+                        summary: over_summary,
+                    })
+                    .unwrap_err()
+            ),
+            LifeIntentErrorCode::InvalidArgument
+        );
+    }
+
+    #[test]
     fn direct_updates_of_frozen_goal_content_are_rejected() {
         let fixture = Fixture::new();
         fixture
@@ -1729,8 +1928,9 @@ mod tests {
             "UPDATE life_goal SET objective = 'rewritten' WHERE goal_id = 'goal-frozen'",
             "UPDATE life_goal SET goal_id = 'goal-frozen-2' WHERE goal_id = 'goal-frozen'",
             "UPDATE life_goal SET life_id = 'life-b' WHERE goal_id = 'goal-frozen'",
-            "UPDATE life_goal SET revision = 2 WHERE goal_id = 'goal-frozen'",
-            "UPDATE life_goal SET status = 'cancelled' WHERE goal_id = 'goal-frozen'",
+            "UPDATE life_goal SET created_by_kind = 'agent' WHERE goal_id = 'goal-frozen'",
+            "UPDATE life_goal SET created_at = '2026-01-01T00:00:00.000Z' WHERE goal_id = 'goal-frozen'",
+            "UPDATE life_goal SET goal_version = 2 WHERE goal_id = 'goal-frozen'",
         ] {
             let error = state.connection.execute(sql, []).unwrap_err();
             assert!(
@@ -1756,6 +1956,9 @@ mod tests {
             "UPDATE life_plan SET title = 'rewritten' WHERE plan_id = 'plan-frozen'",
             "UPDATE life_plan SET goal_id = 'other-goal' WHERE plan_id = 'plan-frozen'",
             "UPDATE life_plan SET life_id = 'life-b' WHERE plan_id = 'plan-frozen'",
+            "UPDATE life_plan SET plan_id = 'plan-frozen-2' WHERE plan_id = 'plan-frozen'",
+            "UPDATE life_plan SET created_at = '2026-01-01T00:00:00.000Z' WHERE plan_id = 'plan-frozen'",
+            "UPDATE life_plan SET plan_version = 2 WHERE plan_id = 'plan-frozen'",
         ] {
             let error = state.connection.execute(sql, []).unwrap_err();
             assert!(
@@ -1785,6 +1988,10 @@ mod tests {
             "UPDATE life_plan_step SET ordinal = 9 WHERE step_id = 'step-frozen'",
             "UPDATE life_plan_step SET summary = 'rewritten' WHERE step_id = 'step-frozen'",
             "UPDATE life_plan_step SET plan_id = 'other-plan' WHERE step_id = 'step-frozen'",
+            "UPDATE life_plan_step SET step_id = 'step-frozen-2' WHERE step_id = 'step-frozen'",
+            "UPDATE life_plan_step SET life_id = 'life-b' WHERE step_id = 'step-frozen'",
+            "UPDATE life_plan_step SET created_at = '2026-01-01T00:00:00.000Z' WHERE step_id = 'step-frozen'",
+            "UPDATE life_plan_step SET step_version = 2 WHERE step_id = 'step-frozen'",
         ] {
             let error = state.connection.execute(sql, []).unwrap_err();
             assert!(
@@ -1822,6 +2029,10 @@ mod tests {
             "UPDATE life_action_intent SET execution_class = 'tool_operation_proposal' WHERE action_id = 'action-frozen'",
             "UPDATE life_action_intent SET summary = 'rewritten' WHERE action_id = 'action-frozen'",
             "UPDATE life_action_intent SET step_id = 'other-step' WHERE action_id = 'action-frozen'",
+            "UPDATE life_action_intent SET action_id = 'action-frozen-2' WHERE action_id = 'action-frozen'",
+            "UPDATE life_action_intent SET life_id = 'life-b' WHERE action_id = 'action-frozen'",
+            "UPDATE life_action_intent SET created_at = '2026-01-01T00:00:00.000Z' WHERE action_id = 'action-frozen'",
+            "UPDATE life_action_intent SET action_version = 2 WHERE action_id = 'action-frozen'",
         ] {
             let error = state.connection.execute(sql, []).unwrap_err();
             assert!(
@@ -1829,6 +2040,135 @@ mod tests {
                 "{sql} must fail closed, got {error}"
             );
         }
+    }
+
+    #[test]
+    fn lifecycle_columns_are_structurally_mutable_for_all_four_entities() {
+        // Schema22 compatibility proof only: the frozen B1 guards must not
+        // make D14-B2 lifecycle mutation impossible. No production B2
+        // transition API exists in B1/F1; these direct authorized UPDATEs
+        // exercise valid table CHECK combinations exclusively on the
+        // lifecycle-mutable columns (status, revision, updated_at, closed_at).
+        let fixture = Fixture::new();
+        fixture
+            .storage
+            .create_goal(fixture.goal_request("goal-lc"))
+            .unwrap();
+        fixture
+            .storage
+            .create_plan(fixture.plan_request("plan-lc", "goal-lc"))
+            .unwrap();
+        fixture
+            .storage
+            .create_step(fixture.step_request("step-lc", "plan-lc", 1))
+            .unwrap();
+        fixture
+            .storage
+            .create_action(fixture.action_request(
+                "action-lc",
+                "step-lc",
+                EXECUTION_CLASS_INTERNAL_INTENT,
+            ))
+            .unwrap();
+
+        let state = fixture.storage.state().unwrap();
+        let connection = &state.connection;
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE life_goal SET status = 'completed', revision = 2,
+                         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                         closed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                     WHERE goal_id = 'goal-lc'",
+                    [],
+                )
+                .unwrap(),
+            1,
+            "active/revision1/open must be able to move to completed/revision2/closed"
+        );
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE life_plan SET status = 'active', revision = 2,
+                         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                     WHERE plan_id = 'plan-lc'",
+                    [],
+                )
+                .unwrap(),
+            1,
+            "draft/revision1/open must be able to move to active/revision2/open"
+        );
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE life_plan_step SET status = 'completed', revision = 2,
+                         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                         closed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                     WHERE step_id = 'step-lc'",
+                    [],
+                )
+                .unwrap(),
+            1,
+            "pending/revision1/open must be able to move to completed/revision2/closed"
+        );
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE life_action_intent SET status = 'dismissed', revision = 2,
+                         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                         closed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                     WHERE action_id = 'action-lc'",
+                    [],
+                )
+                .unwrap(),
+            1,
+            "proposed/revision1/open must be able to move to dismissed/revision2/closed"
+        );
+
+        let (goal_status, goal_revision, goal_closed): (String, i64, Option<String>) = connection
+            .query_row(
+                "SELECT status, revision, closed_at FROM life_goal WHERE goal_id = 'goal-lc'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((goal_status.as_str(), goal_revision), ("completed", 2));
+        assert!(goal_closed.is_some());
+        let (plan_status, plan_revision, plan_closed): (String, i64, Option<String>) = connection
+            .query_row(
+                "SELECT status, revision, closed_at FROM life_plan WHERE plan_id = 'plan-lc'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((plan_status.as_str(), plan_revision), ("active", 2));
+        assert!(plan_closed.is_none());
+        let (step_status, step_revision): (String, i64) = connection
+            .query_row(
+                "SELECT status, revision FROM life_plan_step WHERE step_id = 'step-lc'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((step_status.as_str(), step_revision), ("completed", 2));
+        let (action_status, action_revision): (String, i64) = connection
+            .query_row(
+                "SELECT status, revision FROM life_action_intent WHERE action_id = 'action-lc'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((action_status.as_str(), action_revision), ("dismissed", 2));
+
+        // The frozen identity/content evidence is still intact after the
+        // lifecycle-column writes.
+        let error = connection
+            .execute(
+                "UPDATE life_goal SET title = 'rewritten' WHERE goal_id = 'goal-lc'",
+                [],
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("LIFE_GOAL_IMMUTABLE"));
     }
 
     #[test]

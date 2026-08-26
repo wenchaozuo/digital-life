@@ -4817,32 +4817,86 @@ mod transaction_tests {
     }
 
     #[test]
-    fn migration_022_weakened_semantic_guard_fails_closed_without_repair() {
-        let mut connection = schema_twenty_one_connection();
-        apply_life_intent_authority_upgrade(&mut connection);
-        // A correct trigger name with a weakened body must be rejected.
-        connection
-            .execute_batch(
-                "DROP TRIGGER life_goal_immutable_guard;
-                 CREATE TRIGGER life_goal_immutable_guard
+    fn migration_022_wrong_epoch_semantic_guard_fails_closed_without_repair() {
+        // Both a semantically weakened body and the pre-F1 whole-table epoch
+        // body fail exact Schema22 validation: a correct trigger name with any
+        // body that is not the frozen selective-guard body is a wrong-epoch
+        // object and is never repaired during reopen.
+        for (wrong_body, wrong_epoch_marker) in [
+            // Whole-table epoch: rejects every UPDATE, forbidding B2 lifecycle.
+            (
+                "CREATE TRIGGER life_goal_immutable_guard
+                 BEFORE UPDATE ON life_goal
+                 WHEN digital_life_writer_epoch() IS 1
+                 BEGIN
+                     SELECT RAISE(ROLLBACK, 'LIFE_GOAL_IMMUTABLE');
+                 END;",
+                "no selective column comparison may exist",
+            ),
+            // Weakened category: same name, different fixed code.
+            (
+                "CREATE TRIGGER life_goal_immutable_guard
                  BEFORE UPDATE ON life_goal
                  WHEN digital_life_writer_epoch() IS 1
                  BEGIN
                      SELECT RAISE(ROLLBACK, 'LIFE_GOAL_NOT_IMMUTABLE');
                  END;",
-            )
-            .unwrap();
-        let error = validate_life_intent_schema(&connection).unwrap_err();
-        assert_eq!(error.code, "MIGRATION_TRANSACTION_FAILED");
-        // The weakened trigger is never repaired by validation.
-        let sql: String = connection
-            .query_row(
-                "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='life_goal_immutable_guard'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(sql.contains("LIFE_GOAL_NOT_IMMUTABLE"));
+                "LIFE_GOAL_NOT_IMMUTABLE",
+            ),
+            // Weakened epoch: drops the authorized-writer condition.
+            (
+                "CREATE TRIGGER life_goal_immutable_guard
+                 BEFORE UPDATE ON life_goal
+                 WHEN (
+                     NEW.goal_id IS NOT OLD.goal_id
+                     OR NEW.life_id IS NOT OLD.life_id
+                     OR NEW.title IS NOT OLD.title
+                     OR NEW.objective IS NOT OLD.objective
+                     OR NEW.created_by_kind IS NOT OLD.created_by_kind
+                     OR NEW.created_at IS NOT OLD.created_at
+                     OR NEW.goal_version IS NOT OLD.goal_version
+                 )
+                 BEGIN
+                     SELECT RAISE(ROLLBACK, 'LIFE_GOAL_IMMUTABLE');
+                 END;",
+                "writer epoch condition dropped",
+            ),
+        ] {
+            let mut connection = schema_twenty_one_connection();
+            apply_life_intent_authority_upgrade(&mut connection);
+            connection
+                .execute_batch(&format!(
+                    "DROP TRIGGER life_goal_immutable_guard;\n{wrong_body}"
+                ))
+                .unwrap();
+            let error = validate_life_intent_schema(&connection).unwrap_err();
+            assert_eq!(error.code, "MIGRATION_TRANSACTION_FAILED");
+            // The wrong-epoch trigger is never repaired by validation, and its
+            // stored body is exactly the wrong shape that was installed.
+            let sql: String = connection
+                .query_row(
+                    "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='life_goal_immutable_guard'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            match wrong_epoch_marker {
+                "no selective column comparison may exist" => {
+                    assert!(
+                        !sql.contains("NEW."),
+                        "the whole-table epoch body must remain stored"
+                    )
+                }
+                "LIFE_GOAL_NOT_IMMUTABLE" => assert!(sql.contains("LIFE_GOAL_NOT_IMMUTABLE")),
+                "writer epoch condition dropped" => {
+                    assert!(
+                        !sql.contains("digital_life_writer_epoch()"),
+                        "the weakened WHEN must remain stored"
+                    )
+                }
+                other => unreachable!("unexpected marker {other}"),
+            }
+        }
     }
 
     #[test]

@@ -8,6 +8,11 @@ pub mod embedding;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod emotion;
 pub(crate) mod experience;
+// D14-B1 is the goal / plan / action-intent authority foundation; the domain
+// has no production caller until the D14-B2+ lifecycle stages, so the frozen
+// surface is allowed as dead code outside test builds.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod life_intent;
 pub mod memory;
 pub mod model;
 pub mod prompt;

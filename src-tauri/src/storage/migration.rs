@@ -3,8 +3,8 @@ use std::{fs, path::Path, time::Duration};
 use rusqlite::{backup::Backup, params, Connection, OptionalExtension, Transaction};
 
 use super::{
-    connection, experience_episode, generation_lifecycle_authority, writer_fence_manifest,
-    StorageError, MIGRATIONS,
+    connection, experience_episode, generation_lifecycle_authority, life_intent,
+    writer_fence_manifest, StorageError, MIGRATIONS,
 };
 
 pub(super) const LAST_STATIC_MIGRATION_VERSION: i64 = 12;
@@ -45,6 +45,8 @@ const CREATE_RELATIONSHIP_STATE_INITIALIZER_TRIGGER_SQL: &str =
     include_str!("migrations/020_relationship_authority.initializer_trigger.sql");
 pub(super) const EXPERIENCE_EPISODE_SCHEMA_VERSION: i64 = 21;
 const EXPERIENCE_EPISODE_MIGRATION_NAME: &str = "021_experience_episode_authority";
+pub(super) const LIFE_INTENT_AUTHORITY_SCHEMA_VERSION: i64 = 22;
+const LIFE_INTENT_AUTHORITY_MIGRATION_NAME: &str = "022_life_goal_plan_action_authority";
 const ADD_CLAIMED_GENERATION_AUTHORITY_EPOCH_SQL: &str = "ALTER TABLE memory_vector_sync_outbox ADD COLUMN claimed_generation_authority_epoch INTEGER NULL CHECK (claimed_generation_authority_epoch IS NULL OR claimed_generation_authority_epoch >= 1)";
 const CREATE_GENERATION_AUTHORITY_TABLE_SQL: &str =
     "CREATE TABLE memory_vector_generation_authority (
@@ -230,6 +232,11 @@ pub(super) enum RelationshipAuthoritySchemaUpgrade {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ExperienceEpisodeSchemaUpgrade {
+    Applied,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum LifeIntentAuthoritySchemaUpgrade {
     Applied,
 }
 
@@ -1627,6 +1634,88 @@ pub(super) fn apply_experience_episode_schema_upgrade(
     Ok(ExperienceEpisodeSchemaUpgrade::Applied)
 }
 
+/// Schema 22 adds the explicit user-governed Life intention authority: the
+/// five bounded tables `life_goal`, `life_plan`, `life_plan_step`,
+/// `life_action_intent`, and `life_intent_event`, their same-life composite
+/// parent bindings, B1 whole-table immutability guards, and the 15-trigger
+/// writer-fence extension. The migration is intentionally DDL-only: no
+/// historical Goal/Plan/Step/Action rows are synthesized, no default Goal is
+/// initialized, and no `life_identity` initializer trigger is installed.
+pub(super) fn apply_life_intent_schema_upgrade(
+    transaction: &Transaction<'_>,
+) -> Result<LifeIntentAuthoritySchemaUpgrade, StorageError> {
+    if connection::read_schema_version(transaction)? != EXPERIENCE_EPISODE_SCHEMA_VERSION {
+        return Err(StorageError::migration_version_invariant_failed());
+    }
+
+    for table_sql in life_intent::MIGRATION_022_TABLE_SQLS {
+        transaction
+            .execute_batch(table_sql)
+            .map_err(|_| StorageError::migration_transaction_failed())?;
+    }
+    #[cfg(test)]
+    if should_fail_migration_022_at_for_test(Migration022Failpoint::AfterTable) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+
+    for trigger_sql in life_intent::MIGRATION_022_TRIGGER_SQLS {
+        transaction
+            .execute_batch(trigger_sql)
+            .map_err(|_| StorageError::migration_transaction_failed())?;
+    }
+    #[cfg(test)]
+    if should_fail_migration_022_at_for_test(Migration022Failpoint::AfterSemanticGuards) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+
+    writer_fence_manifest::install_life_intent_writer_fence_manifest_in_transaction(transaction)?;
+    #[cfg(test)]
+    if should_fail_migration_022_at_for_test(Migration022Failpoint::AfterWriterFences) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+
+    validate_life_intent_schema_objects(transaction)?;
+    #[cfg(test)]
+    if should_fail_migration_022_at_for_test(Migration022Failpoint::BeforeSchemaVersion) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+
+    let migration_now: String = transaction
+        .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", [], |row| {
+            row.get(0)
+        })
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    transaction
+        .execute(
+            "INSERT INTO schema_migration (version,name,applied_at) VALUES (?1,?2,?3)",
+            params![
+                LIFE_INTENT_AUTHORITY_SCHEMA_VERSION,
+                LIFE_INTENT_AUTHORITY_MIGRATION_NAME,
+                migration_now
+            ],
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    #[cfg(test)]
+    if should_fail_migration_022_at_for_test(Migration022Failpoint::PreCommit) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    validate_life_intent_schema_objects(transaction)?;
+    Ok(LifeIntentAuthoritySchemaUpgrade::Applied)
+}
+
+pub(super) fn validate_life_intent_schema(connection: &Connection) -> Result<(), StorageError> {
+    let schema_version = connection::read_schema_version(connection)?;
+    if schema_version < LIFE_INTENT_AUTHORITY_SCHEMA_VERSION {
+        return Err(StorageError::migration_version_invariant_failed());
+    }
+    validate_life_intent_schema_objects(connection)?;
+    writer_fence_manifest::validate_writer_fence_manifest_for_schema(connection, schema_version)
+}
+
+fn validate_life_intent_schema_objects(connection: &Connection) -> Result<(), StorageError> {
+    life_intent::validate_schema_objects(connection)
+}
+
 pub(super) fn validate_experience_episode_schema(
     connection: &Connection,
 ) -> Result<(), StorageError> {
@@ -2303,6 +2392,9 @@ pub(super) fn verify_schema_after_upgrade(
     if expected_schema_version == EXPERIENCE_EPISODE_SCHEMA_VERSION {
         validate_experience_episode_schema(connection)?;
     }
+    if expected_schema_version == LIFE_INTENT_AUTHORITY_SCHEMA_VERSION {
+        validate_life_intent_schema(connection)?;
+    }
     if expected_schema_version >= writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION {
         #[cfg(test)]
         if should_fail_post_commit_verification_at_for_test(
@@ -2661,6 +2753,44 @@ fn should_fail_migration_021_at_for_test(failpoint: Migration021Failpoint) -> bo
     })
 }
 
+/// Test-only failpoints for Migration022. Every point is inside the single
+/// caller-owned transaction, so a failure proves the five D14 tables, the
+/// semantic immutability guards, the writer fences, and the version row do not
+/// escape as a partial upgrade.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Migration022Failpoint {
+    AfterTable,
+    AfterSemanticGuards,
+    AfterWriterFences,
+    BeforeSchemaVersion,
+    PreCommit,
+}
+
+#[cfg(test)]
+thread_local! {
+    static MIGRATION_022_FAILPOINT: std::cell::Cell<Option<Migration022Failpoint>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(super) fn fail_next_migration_022_at_for_test(failpoint: Migration022Failpoint) {
+    MIGRATION_022_FAILPOINT.with(|next| next.set(Some(failpoint)));
+}
+
+#[cfg(test)]
+fn should_fail_migration_022_at_for_test(failpoint: Migration022Failpoint) -> bool {
+    MIGRATION_022_FAILPOINT.with(|next| {
+        if next.get() == Some(failpoint) {
+            next.set(None);
+            true
+        } else {
+            false
+        }
+    })
+}
+
 /// Test-only failpoints for Migration016 (`apply_late_delete_generation_authority_schema_upgrade`).
 /// Each variant corresponds to a phase of the single-transaction upgrade. The
 /// failpoint returns `MIGRATION_TRANSACTION_FAILED` from inside the transaction,
@@ -2912,6 +3042,9 @@ pub fn verify_database(
     }
     if expected_schema_version >= EXPERIENCE_EPISODE_SCHEMA_VERSION {
         validate_experience_episode_schema(connection)?;
+    }
+    if expected_schema_version >= LIFE_INTENT_AUTHORITY_SCHEMA_VERSION {
+        validate_life_intent_schema(connection)?;
     }
     if expected_schema_version >= writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION {
         writer_fence_manifest::validate_writer_fence_manifest(connection)?;
@@ -3329,6 +3462,27 @@ mod transaction_tests {
             ExperienceEpisodeSchemaUpgrade::Applied
         );
         transaction.commit().unwrap();
+    }
+
+    fn apply_life_intent_authority_upgrade(connection: &mut Connection) {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert_eq!(
+            apply_life_intent_schema_upgrade(&transaction).unwrap(),
+            LifeIntentAuthoritySchemaUpgrade::Applied
+        );
+        transaction.commit().unwrap();
+    }
+
+    fn schema_twenty_one_connection() -> Connection {
+        let mut connection = schema_twenty_connection();
+        apply_experience_episode_upgrade(&mut connection);
+        assert_eq!(
+            schema_version(&connection),
+            EXPERIENCE_EPISODE_SCHEMA_VERSION
+        );
+        connection
     }
 
     fn schema_nineteen_connection() -> Connection {
@@ -4109,10 +4263,10 @@ mod transaction_tests {
     }
 
     #[test]
-    fn migration_021_no_migration_022_exists_and_twenty_one_is_the_maximum_supported_version() {
+    fn migration_022_is_present_twenty_two_is_maximum_and_twenty_three_is_absent() {
         assert_eq!(
             super::super::connection::MAX_SUPPORTED_SCHEMA_VERSION,
-            EXPERIENCE_EPISODE_SCHEMA_VERSION
+            LIFE_INTENT_AUTHORITY_SCHEMA_VERSION
         );
         let migrations_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/storage/migrations");
         let entries = std::fs::read_dir(&migrations_dir).unwrap();
@@ -4127,12 +4281,19 @@ mod transaction_tests {
                 highest = highest.max(version);
             }
         }
-        assert_eq!(highest, 21, "Migration 021 must be the current migration");
-        let has_022 = std::fs::read_dir(&migrations_dir)
+        assert_eq!(highest, 22, "Migration 022 must be the current migration");
+        let names = std::fs::read_dir(&migrations_dir)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .any(|name| name.starts_with("022"));
-        assert!(!has_022, "Migration 022 must not exist");
+            .collect::<Vec<_>>();
+        assert!(
+            names.iter().any(|name| name.starts_with("022")),
+            "Migration 022 must exist"
+        );
+        assert!(
+            !names.iter().any(|name| name.starts_with("023")),
+            "Migration 023 must not exist"
+        );
     }
 
     #[test]
@@ -4443,6 +4604,245 @@ mod transaction_tests {
                 .unwrap();
             assert_eq!(writer_fence_count, 51);
         }
+    }
+
+    #[test]
+    fn migration_022_schema_twenty_one_to_twenty_two_with_zero_historical_backfill() {
+        let mut connection = schema_twenty_one_connection();
+        seed_lives_at_schema_eighteen(&connection);
+        connection
+            .execute_batch(
+                "INSERT INTO conversation
+                     (id, life_id, title, revision, created_at, updated_at, last_message_at)
+                 VALUES ('migration-022-conversation', 'life-a', 'D14 Conversation', 1,
+                         '2026-08-27T00:00:00.000Z', '2026-08-27T00:00:00.002Z',
+                         '2026-08-27T00:00:00.002Z');
+                 INSERT INTO conversation_message
+                     (id, conversation_id, life_id, turn_id, role, content, sequence_no, created_at)
+                 VALUES
+                     ('migration-022-user-message', 'migration-022-conversation', 'life-a',
+                      'migration-022-turn', 'user', 'historical user content', 1,
+                      '2026-08-27T00:00:00.001Z'),
+                     ('migration-022-assistant-message', 'migration-022-conversation', 'life-a',
+                      'migration-022-turn', 'assistant', 'historical assistant content', 2,
+                      '2026-08-27T00:00:00.002Z');",
+            )
+            .unwrap();
+
+        apply_life_intent_authority_upgrade(&mut connection);
+
+        assert_eq!(
+            schema_version(&connection),
+            LIFE_INTENT_AUTHORITY_SCHEMA_VERSION
+        );
+        validate_life_intent_schema(&connection).unwrap();
+        validate_experience_episode_schema(&connection).unwrap();
+        for table in [
+            "life_goal",
+            "life_plan",
+            "life_plan_step",
+            "life_action_intent",
+            "life_intent_event",
+        ] {
+            let row_count: i64 = connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(row_count, 0, "Migration022 must synthesize no {table} rows");
+        }
+        let life_rows: i64 = connection
+            .query_row("SELECT COUNT(*) FROM life_identity", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(life_rows, 3, "existing lives remain unchanged");
+        let message_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM conversation_message WHERE conversation_id = 'migration-022-conversation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            message_count, 2,
+            "existing conversation rows remain unchanged"
+        );
+        assert_eq!(writer_fence_count(&connection), 75);
+        let migration_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migration WHERE version = ?1",
+                [LIFE_INTENT_AUTHORITY_SCHEMA_VERSION],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migration_count, 1);
+
+        // Migration022 can never apply twice.
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let error = apply_life_intent_schema_upgrade(&transaction).unwrap_err();
+        assert_eq!(error.code, "MIGRATION_VERSION_INVARIANT_FAILED");
+        drop(transaction);
+        assert_eq!(
+            schema_version(&connection),
+            LIFE_INTENT_AUTHORITY_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn migration_022_failure_points_roll_back_to_exact_schema_twenty_one_preimage() {
+        for point in [
+            Migration022Failpoint::AfterTable,
+            Migration022Failpoint::AfterSemanticGuards,
+            Migration022Failpoint::AfterWriterFences,
+            Migration022Failpoint::BeforeSchemaVersion,
+            Migration022Failpoint::PreCommit,
+        ] {
+            let mut connection = schema_twenty_one_connection();
+            fail_next_migration_022_at_for_test(point);
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let error = apply_life_intent_schema_upgrade(&transaction).unwrap_err();
+            assert_eq!(error.code, "MIGRATION_TRANSACTION_FAILED");
+
+            let table_count: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema
+                     WHERE type = 'table'
+                       AND name IN ('life_goal','life_plan','life_plan_step',
+                                    'life_action_intent','life_intent_event')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let guard_count: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema
+                     WHERE type = 'trigger'
+                       AND name IN ('life_goal_immutable_guard','life_plan_immutable_guard',
+                                    'life_plan_step_immutable_guard',
+                                    'life_action_intent_immutable_guard',
+                                    'life_intent_event_immutable_guard')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let life_intent_fence_count: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema
+                     WHERE type = 'trigger'
+                       AND name GLOB 'digital_life_writer_epoch_life_*'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            match point {
+                Migration022Failpoint::AfterTable => {
+                    assert_eq!(table_count, 5);
+                    assert_eq!(guard_count, 0);
+                    assert_eq!(life_intent_fence_count, 0);
+                }
+                Migration022Failpoint::AfterSemanticGuards => {
+                    assert_eq!(table_count, 5);
+                    assert_eq!(guard_count, 5);
+                    assert_eq!(life_intent_fence_count, 0);
+                }
+                Migration022Failpoint::AfterWriterFences
+                | Migration022Failpoint::BeforeSchemaVersion
+                | Migration022Failpoint::PreCommit => {
+                    assert_eq!(table_count, 5);
+                    assert_eq!(guard_count, 5);
+                    assert_eq!(life_intent_fence_count, 15);
+                }
+            }
+            drop(transaction);
+
+            // The committed preimage is exactly Schema 21 again.
+            assert_eq!(
+                schema_version(&connection),
+                EXPERIENCE_EPISODE_SCHEMA_VERSION
+            );
+            validate_experience_episode_schema(&connection).unwrap();
+            assert_eq!(writer_fence_count(&connection), 60);
+            let remaining_objects: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema
+                     WHERE name LIKE 'life_goal%'
+                        OR name LIKE 'life_plan%'
+                        OR name LIKE 'life_action_intent%'
+                        OR name LIKE 'life_intent_event%'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(remaining_objects, 0);
+            let migration_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migration WHERE version = ?1",
+                    [LIFE_INTENT_AUTHORITY_SCHEMA_VERSION],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(migration_count, 0);
+        }
+    }
+
+    #[test]
+    fn schema_twenty_one_reopen_stays_at_sixty_and_schema_twenty_two_reopens_at_seventy_five() {
+        // Schema 21 is validated exactly at its own 60-trigger manifest.
+        let mut schema_twenty_one = schema_twenty_connection();
+        apply_experience_episode_upgrade(&mut schema_twenty_one);
+        writer_fence_manifest::validate_writer_fence_manifest_for_schema(
+            &schema_twenty_one,
+            EXPERIENCE_EPISODE_SCHEMA_VERSION,
+        )
+        .unwrap();
+        assert_eq!(writer_fence_count(&schema_twenty_one), 60);
+        let downgrade_probe = validate_life_intent_schema(&schema_twenty_one).unwrap_err();
+        assert_eq!(downgrade_probe.code, "MIGRATION_VERSION_INVARIANT_FAILED");
+
+        // Schema 22 reopens and validates at exactly 75 triggers.
+        apply_life_intent_authority_upgrade(&mut schema_twenty_one);
+        validate_life_intent_schema(&schema_twenty_one).unwrap();
+        writer_fence_manifest::validate_writer_fence_manifest_for_schema(
+            &schema_twenty_one,
+            LIFE_INTENT_AUTHORITY_SCHEMA_VERSION,
+        )
+        .unwrap();
+        assert_eq!(writer_fence_count(&schema_twenty_one), 75);
+        validate_emotion_authority_schema(&schema_twenty_one).unwrap();
+        validate_relationship_authority_schema(&schema_twenty_one).unwrap();
+        validate_experience_episode_schema(&schema_twenty_one).unwrap();
+    }
+
+    #[test]
+    fn migration_022_weakened_semantic_guard_fails_closed_without_repair() {
+        let mut connection = schema_twenty_one_connection();
+        apply_life_intent_authority_upgrade(&mut connection);
+        // A correct trigger name with a weakened body must be rejected.
+        connection
+            .execute_batch(
+                "DROP TRIGGER life_goal_immutable_guard;
+                 CREATE TRIGGER life_goal_immutable_guard
+                 BEFORE UPDATE ON life_goal
+                 WHEN digital_life_writer_epoch() IS 1
+                 BEGIN
+                     SELECT RAISE(ROLLBACK, 'LIFE_GOAL_NOT_IMMUTABLE');
+                 END;",
+            )
+            .unwrap();
+        let error = validate_life_intent_schema(&connection).unwrap_err();
+        assert_eq!(error.code, "MIGRATION_TRANSACTION_FAILED");
+        // The weakened trigger is never repaired by validation.
+        let sql: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='life_goal_immutable_guard'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(sql.contains("LIFE_GOAL_NOT_IMMUTABLE"));
     }
 
     #[test]

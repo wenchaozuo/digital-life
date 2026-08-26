@@ -14,6 +14,7 @@ pub(super) const GENERATION_CATCHUP_WRITER_FENCE_SCHEMA_VERSION: i64 = 18;
 pub(super) const EMOTION_WRITER_FENCE_SCHEMA_VERSION: i64 = 19;
 pub(super) const RELATIONSHIP_WRITER_FENCE_SCHEMA_VERSION: i64 = 20;
 pub(super) const EXPERIENCE_EPISODE_WRITER_FENCE_SCHEMA_VERSION: i64 = 21;
+pub(super) const LIFE_INTENT_WRITER_FENCE_SCHEMA_VERSION: i64 = 22;
 const WRITER_FENCE_TRIGGER_PREFIX: &str = "digital_life_writer_epoch_";
 const HISTORICAL_WRITER_FENCE_TRIGGER_COUNT: usize = 18;
 const LATE_DELETE_WRITER_FENCE_TRIGGER_COUNT: usize = 24;
@@ -22,6 +23,7 @@ const GENERATION_CATCHUP_WRITER_FENCE_TRIGGER_COUNT: usize = 45;
 const EMOTION_WRITER_FENCE_TRIGGER_COUNT: usize = 51;
 const RELATIONSHIP_WRITER_FENCE_TRIGGER_COUNT: usize = 57;
 const EXPERIENCE_EPISODE_WRITER_FENCE_TRIGGER_COUNT: usize = 60;
+const LIFE_INTENT_WRITER_FENCE_TRIGGER_COUNT: usize = 75;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(super) enum WriterFenceOperation {
@@ -418,6 +420,96 @@ const WRITER_FENCE_TRIGGER_SPECS: &[WriterFenceTriggerSpec] = &[
         Delete,
         "DELETE"
     ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_life_goal_insert",
+        "life_goal",
+        Insert,
+        "INSERT"
+    ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_life_goal_update",
+        "life_goal",
+        Update,
+        "UPDATE"
+    ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_life_goal_delete",
+        "life_goal",
+        Delete,
+        "DELETE"
+    ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_life_plan_insert",
+        "life_plan",
+        Insert,
+        "INSERT"
+    ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_life_plan_update",
+        "life_plan",
+        Update,
+        "UPDATE"
+    ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_life_plan_delete",
+        "life_plan",
+        Delete,
+        "DELETE"
+    ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_life_plan_step_insert",
+        "life_plan_step",
+        Insert,
+        "INSERT"
+    ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_life_plan_step_update",
+        "life_plan_step",
+        Update,
+        "UPDATE"
+    ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_life_plan_step_delete",
+        "life_plan_step",
+        Delete,
+        "DELETE"
+    ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_life_action_intent_insert",
+        "life_action_intent",
+        Insert,
+        "INSERT"
+    ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_life_action_intent_update",
+        "life_action_intent",
+        Update,
+        "UPDATE"
+    ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_life_action_intent_delete",
+        "life_action_intent",
+        Delete,
+        "DELETE"
+    ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_life_intent_event_insert",
+        "life_intent_event",
+        Insert,
+        "INSERT"
+    ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_life_intent_event_update",
+        "life_intent_event",
+        Update,
+        "UPDATE"
+    ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_life_intent_event_delete",
+        "life_intent_event",
+        Delete,
+        "DELETE"
+    ),
 ];
 
 pub(super) fn writer_fence_trigger_specs() -> &'static [WriterFenceTriggerSpec] {
@@ -453,6 +545,30 @@ pub(super) fn relationship_writer_fence_trigger_specs() -> &'static [WriterFence
 pub(super) fn experience_episode_writer_fence_trigger_specs() -> &'static [WriterFenceTriggerSpec] {
     &WRITER_FENCE_TRIGGER_SPECS
         [RELATIONSHIP_WRITER_FENCE_TRIGGER_COUNT..EXPERIENCE_EPISODE_WRITER_FENCE_TRIGGER_COUNT]
+}
+
+pub(super) fn life_intent_writer_fence_trigger_specs() -> &'static [WriterFenceTriggerSpec] {
+    &WRITER_FENCE_TRIGGER_SPECS
+        [EXPERIENCE_EPISODE_WRITER_FENCE_TRIGGER_COUNT..LIFE_INTENT_WRITER_FENCE_TRIGGER_COUNT]
+}
+
+pub(super) fn install_life_intent_writer_fence_manifest_in_transaction(
+    transaction: &Transaction<'_>,
+) -> Result<(), StorageError> {
+    for (index, spec) in life_intent_writer_fence_trigger_specs().iter().enumerate() {
+        #[cfg(not(test))]
+        let _ = index;
+        #[cfg(test)]
+        if should_fail_trigger_install_at_for_test(
+            EXPERIENCE_EPISODE_WRITER_FENCE_TRIGGER_COUNT + index + 1,
+        ) {
+            return Err(StorageError::migration_transaction_failed());
+        }
+        transaction
+            .execute_batch(spec.ddl)
+            .map_err(|_| StorageError::migration_transaction_failed())?;
+    }
+    Ok(())
 }
 
 pub(super) fn install_experience_episode_writer_fence_manifest_in_transaction(
@@ -625,8 +741,10 @@ pub(super) fn validate_writer_fence_manifest_for_schema(
         })
         .map_err(|_| StorageError::writer_fence_manifest_mismatch())?;
 
-    let expected = if schema_version >= EXPERIENCE_EPISODE_WRITER_FENCE_SCHEMA_VERSION {
+    let expected = if schema_version >= LIFE_INTENT_WRITER_FENCE_SCHEMA_VERSION {
         WRITER_FENCE_TRIGGER_SPECS
+    } else if schema_version >= EXPERIENCE_EPISODE_WRITER_FENCE_SCHEMA_VERSION {
+        &WRITER_FENCE_TRIGGER_SPECS[..EXPERIENCE_EPISODE_WRITER_FENCE_TRIGGER_COUNT]
     } else if schema_version >= RELATIONSHIP_WRITER_FENCE_SCHEMA_VERSION {
         &WRITER_FENCE_TRIGGER_SPECS[..RELATIONSHIP_WRITER_FENCE_TRIGGER_COUNT]
     } else if schema_version >= EMOTION_WRITER_FENCE_SCHEMA_VERSION {
@@ -710,7 +828,7 @@ mod tests {
         path::{Path, PathBuf},
     };
 
-    use rusqlite::{functions::FunctionFlags, Connection, Error};
+    use rusqlite::{functions::FunctionFlags, params, Connection, Error};
 
     use super::*;
 
@@ -1332,7 +1450,9 @@ mod tests {
         assert_eq!(generation_catchup_writer_fence_trigger_specs().len(), 3);
         assert_eq!(emotion_writer_fence_trigger_specs().len(), 6);
         assert_eq!(relationship_writer_fence_trigger_specs().len(), 6);
-        assert_eq!(WRITER_FENCE_TRIGGER_SPECS.len(), 60);
+        assert_eq!(experience_episode_writer_fence_trigger_specs().len(), 3);
+        assert_eq!(life_intent_writer_fence_trigger_specs().len(), 15);
+        assert_eq!(WRITER_FENCE_TRIGGER_SPECS.len(), 75);
         let resolution_id = late_delete_resolution_insert(&authorized).unwrap();
         assert_eq!(resolution_id, 1);
         assert_eq!(authorized.execute("UPDATE memory_vector_late_delete_resolution SET updated_at='2026-01-02T00:00:00.000Z' WHERE memory_id='late-resolution'", []).unwrap(), 1);
@@ -1636,9 +1756,9 @@ mod tests {
         let (_root, path) = initialized_fenced_database();
         let authorized = authorized_connection(&path);
         seed_protected_rows(&authorized);
-        assert_eq!(WRITER_FENCE_TRIGGER_SPECS.len(), 60);
+        assert_eq!(WRITER_FENCE_TRIGGER_SPECS.len(), 75);
         let reserved: i64 = authorized.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type='trigger' AND name LIKE 'digital_life_writer_epoch_%'", [], |r| r.get(0)).unwrap();
-        assert_eq!(reserved, 60);
+        assert_eq!(reserved, 75);
         for name in [
             "memory_vector_generation_semantic_delete_guard",
             "memory_vector_generation_semantic_identity_guard",
@@ -1747,5 +1867,179 @@ mod tests {
         expect_static_incompatible_writer(update_attempt_count(&epoch_zero));
         expect_static_incompatible_writer(update_fenced_claim_epoch(&epoch_zero));
         expect_static_incompatible_writer(update_last_marked_claim_epoch(&epoch_zero));
+    }
+
+    const D14_FENCED_TABLES: [&str; 5] = [
+        "life_goal",
+        "life_plan",
+        "life_plan_step",
+        "life_action_intent",
+        "life_intent_event",
+    ];
+
+    fn seed_d14_authority_rows(connection: &Connection) {
+        connection
+            .execute_batch(
+                "INSERT INTO life_goal
+                     (goal_id, life_id, title, objective, status, revision, created_by_kind,
+                      created_at, updated_at, closed_at, goal_version)
+                 VALUES ('wf-goal', 'writer-fence-life', 'Fence Goal', 'Fence objective',
+                         'active', 1, 'user_explicit', '2026-08-27T00:00:00.000Z',
+                         '2026-08-27T00:00:00.000Z', NULL, 1);
+                 INSERT INTO life_plan
+                     (plan_id, life_id, goal_id, title, status, revision,
+                      created_at, updated_at, closed_at, plan_version)
+                 VALUES ('wf-plan', 'writer-fence-life', 'wf-goal', 'Fence Plan',
+                         'draft', 1, '2026-08-27T00:00:00.000Z',
+                         '2026-08-27T00:00:00.000Z', NULL, 1);
+                 INSERT INTO life_plan_step
+                     (step_id, life_id, plan_id, ordinal, summary, status, revision,
+                      created_at, updated_at, closed_at, step_version)
+                 VALUES ('wf-step', 'writer-fence-life', 'wf-plan', 1, 'Fence step summary',
+                         'pending', 1, '2026-08-27T00:00:00.000Z',
+                         '2026-08-27T00:00:00.000Z', NULL, 1);
+                 INSERT INTO life_action_intent
+                     (action_id, life_id, step_id, execution_class, summary, status, revision,
+                      created_at, updated_at, closed_at, action_version)
+                 VALUES ('wf-action', 'writer-fence-life', 'wf-step', 'internal_intent',
+                         'Fence action summary', 'proposed', 1, '2026-08-27T00:00:00.000Z',
+                         '2026-08-27T00:00:00.000Z', NULL, 1);
+                 INSERT INTO life_intent_event
+                     (event_id, life_id, entity_kind, goal_id, plan_id, step_id, action_id,
+                      from_status, to_status, expected_revision, applied_revision,
+                      actor_kind, occurred_at, event_version)
+                 VALUES ('wf-event', 'writer-fence-life', 'action', NULL, NULL, NULL, 'wf-action',
+                         'proposed', 'dismissed', 1, 2, 'user_explicit',
+                         '2026-08-27T00:00:00.000Z', 1);",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn schema_22_writer_fence_manifest_is_seventy_five_and_covers_every_d14_table() {
+        let (_root, path) = initialized_fenced_database();
+        let authorized = authorized_connection(&path);
+        validate_writer_fence_manifest(&authorized).unwrap();
+        let reserved: i64 = authorized
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type='trigger' AND name LIKE 'digital_life_writer_epoch_%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reserved, 75);
+        assert_eq!(life_intent_writer_fence_trigger_specs().len(), 15);
+        for table in D14_FENCED_TABLES {
+            for operation in ["insert", "update", "delete"] {
+                let count: i64 = authorized
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_schema
+                         WHERE type='trigger'
+                           AND name = ?1
+                           AND sql LIKE ?2",
+                        params![
+                            format!("digital_life_writer_epoch_{table}_{operation}"),
+                            format!("%ON {table}%")
+                        ],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(count, 1, "{table} {operation} fence must exist");
+            }
+        }
+    }
+
+    #[test]
+    fn d14_tables_allow_authorized_writers_and_stop_every_other_writer() {
+        let (_root, path) = initialized_fenced_database();
+        let authorized = authorized_connection(&path);
+        seed_protected_rows(&authorized);
+        seed_d14_authority_rows(&authorized);
+        drop(authorized);
+
+        let epoch_zero = Connection::open(&path).unwrap();
+        epoch_zero
+            .create_scalar_function(
+                "digital_life_writer_epoch",
+                0,
+                FunctionFlags::SQLITE_UTF8
+                    | FunctionFlags::SQLITE_DETERMINISTIC
+                    | FunctionFlags::SQLITE_INNOCUOUS,
+                |_| Ok(0_i64),
+            )
+            .unwrap();
+        for sql in [
+            "UPDATE life_goal SET title='raw' WHERE goal_id='wf-goal'",
+            "DELETE FROM life_goal WHERE goal_id='wf-goal'",
+            "UPDATE life_plan SET title='raw' WHERE plan_id='wf-plan'",
+            "DELETE FROM life_plan WHERE plan_id='wf-plan'",
+            "UPDATE life_plan_step SET summary='raw' WHERE step_id='wf-step'",
+            "DELETE FROM life_plan_step WHERE step_id='wf-step'",
+            "UPDATE life_action_intent SET summary='raw' WHERE action_id='wf-action'",
+            "DELETE FROM life_action_intent WHERE action_id='wf-action'",
+            "UPDATE life_intent_event SET to_status='cancelled' WHERE event_id='wf-event'",
+            "DELETE FROM life_intent_event WHERE event_id='wf-event'",
+        ] {
+            expect_static_incompatible_writer(epoch_zero.execute(sql, []));
+        }
+        let raw = Connection::open(&path).unwrap();
+        for sql in [
+            "INSERT INTO life_goal
+                 (goal_id, life_id, title, objective, status, revision, created_by_kind,
+                  created_at, updated_at, closed_at, goal_version)
+             VALUES ('raw-goal', 'writer-fence-life', 'Raw', 'Raw objective', 'active', 1,
+                     'user_explicit', '2026-08-27T00:00:00.000Z',
+                     '2026-08-27T00:00:00.000Z', NULL, 1)",
+            "INSERT INTO life_plan
+                 (plan_id, life_id, goal_id, title, status, revision,
+                  created_at, updated_at, closed_at, plan_version)
+             VALUES ('raw-plan', 'writer-fence-life', 'wf-goal', 'Raw', 'draft', 1,
+                     '2026-08-27T00:00:00.000Z', '2026-08-27T00:00:00.000Z', NULL, 1)",
+            "INSERT INTO life_plan_step
+                 (step_id, life_id, plan_id, ordinal, summary, status, revision,
+                  created_at, updated_at, closed_at, step_version)
+             VALUES ('raw-step', 'writer-fence-life', 'wf-plan', 5, 'Raw step', 'pending', 1,
+                     '2026-08-27T00:00:00.000Z', '2026-08-27T00:00:00.000Z', NULL, 1)",
+            "INSERT INTO life_action_intent
+                 (action_id, life_id, step_id, execution_class, summary, status, revision,
+                  created_at, updated_at, closed_at, action_version)
+             VALUES ('raw-action', 'writer-fence-life', 'wf-step', 'internal_intent',
+                     'Raw action', 'proposed', 1, '2026-08-27T00:00:00.000Z',
+                     '2026-08-27T00:00:00.000Z', NULL, 1)",
+            "INSERT INTO life_intent_event
+                 (event_id, life_id, entity_kind, goal_id, plan_id, step_id, action_id,
+                  from_status, to_status, expected_revision, applied_revision,
+                  actor_kind, occurred_at, event_version)
+             VALUES ('raw-event', 'writer-fence-life', 'goal', 'wf-goal', NULL, NULL, NULL,
+                     'active', 'completed', 1, 2, 'user_explicit',
+                     '2026-08-27T00:00:00.000Z', 1)",
+        ] {
+            assert!(
+                raw.execute(sql, []).is_err(),
+                "raw {sql} must be stopped by its D14 writer-fence trigger"
+            );
+        }
+
+        // Authorized epoch-1 writers continue to work on every D14 table.
+        let authorized = authorized_connection(&path);
+        authorized
+            .execute_batch(
+                "INSERT INTO life_action_intent
+                     (action_id, life_id, step_id, execution_class, summary, status, revision,
+                      created_at, updated_at, closed_at, action_version)
+                 VALUES ('wf-action-2', 'writer-fence-life', 'wf-step', 'agent_task_proposal',
+                         'Second authorized action', 'proposed', 1,
+                         '2026-08-27T00:00:00.000Z', '2026-08-27T00:00:00.000Z', NULL, 1);",
+            )
+            .unwrap();
+        let action_count: i64 = authorized
+            .query_row(
+                "SELECT COUNT(*) FROM life_action_intent WHERE action_id = 'wf-action-2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(action_count, 1);
     }
 }

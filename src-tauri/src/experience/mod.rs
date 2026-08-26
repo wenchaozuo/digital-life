@@ -5,11 +5,15 @@
 //! not a conversation archive, memory, summary, appraisal, relationship,
 //! emotion, prompt context, or model interpretation.
 
+mod conversation;
+
 pub(crate) const EPISODE_KIND: &str = "conversation_turn";
 pub(crate) const SOURCE_KIND: &str = "conversation_turn";
 pub(crate) const OUTCOME_KIND: &str = "completed";
 pub(crate) const COUNTERPART_SUBJECT_ID: &str = "primary_user";
 pub(crate) const EPISODE_VERSION: i64 = 1;
+
+pub(crate) use conversation::build_conversation_turn_episode;
 
 const _: fn(&ExperienceEpisode) -> Result<(), ExperienceEpisodeError> = ExperienceEpisode::validate;
 
@@ -124,6 +128,10 @@ impl ExperienceEpisode {
         Ok(())
     }
 }
+
+const _: fn(
+    &crate::conversation::history::AppendConversationTurnResult,
+) -> Result<ExperienceEpisode, ExperienceEpisodeError> = build_conversation_turn_episode;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ExperienceEpisodeCommitOutcome {

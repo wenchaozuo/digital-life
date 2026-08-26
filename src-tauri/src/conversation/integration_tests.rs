@@ -13,8 +13,9 @@ use std::{
 use crate::{
     conversation::{
         history::{
-            AppendConversationTurnRequest, ConversationHistoryService, ConversationRole,
-            CreateConversationCommandRequest, CreateConversationRequest,
+            AppendConversationTurnRequest, ConversationHistoryError, ConversationHistoryErrorCode,
+            ConversationHistoryService, ConversationRole, CreateConversationCommandRequest,
+            CreateConversationRequest,
         },
         service::{
             ConversationCognitionCoordinator, ConversationCognitionErrorCode,
@@ -591,7 +592,10 @@ fn reopening_storage_restores_latest_conversation_and_committed_messages() {
 
 // ==================== D11-C2 production emotion cutover ====================
 
-use crate::emotion::{EmotionRepository, EmotionState};
+use crate::emotion::{EmotionError, EmotionErrorCode, EmotionRepository, EmotionState};
+use crate::experience::{
+    ExperienceEpisodeError, ExperienceEpisodeErrorCode, ExperienceEpisodeRepository,
+};
 use crate::storage::conversation_emotion::{
     conversation_emotion_event_id, conversation_emotion_source_ref,
 };
@@ -618,6 +622,20 @@ fn governed_event_identity(
     )
     .unwrap()
     .map(|event| (event.event_id, event.source_kind, event.source_ref))
+}
+
+fn experience_episode_for_turn(
+    storage: &StorageService,
+    conversation_id: &str,
+    turn_id: &str,
+) -> Option<crate::experience::ExperienceEpisode> {
+    <StorageService as ExperienceEpisodeRepository>::find_episode_by_source(
+        storage,
+        LIFE_A,
+        crate::experience::SOURCE_KIND,
+        &format!("{conversation_id}:{turn_id}"),
+    )
+    .unwrap()
 }
 
 #[test]
@@ -647,6 +665,45 @@ fn successful_new_chat_commits_exactly_one_governed_emotion_turn() {
             .get(LIFE_A, &conversation.id)
             .unwrap();
         assert_eq!(record.revision, 1);
+
+        // D13-C2: the four-domain primitive creates exactly one canonical
+        // episode from the actual persisted message identities/timestamps.
+        let persisted_turn = ConversationHistoryService::new(fixture.storage.as_ref())
+            .find_turn(LIFE_A, &conversation.id, "c2-request-1")
+            .unwrap()
+            .expect("the governed turn must be persisted");
+        let episode =
+            experience_episode_for_turn(fixture.storage.as_ref(), &conversation.id, "c2-request-1")
+                .expect("the new governed turn must have exactly one experience episode");
+        assert_eq!(
+            episode.episode_id,
+            format!(
+                "experience-conversation:{LIFE_A}:{}:c2-request-1",
+                conversation.id
+            )
+        );
+        assert_eq!(episode.source_kind, crate::experience::SOURCE_KIND);
+        assert_eq!(
+            episode.source_ref,
+            format!("{}:c2-request-1", conversation.id)
+        );
+        assert_eq!(
+            episode.user_message_id, persisted_turn.user_message.id,
+            "episode must bind to the persisted user message"
+        );
+        assert_eq!(
+            episode.assistant_message_id, persisted_turn.assistant_message.id,
+            "episode must bind to the persisted assistant message"
+        );
+        assert_eq!(episode.started_at, persisted_turn.user_message.created_at);
+        assert_eq!(
+            episode.ended_at,
+            persisted_turn.assistant_message.created_at
+        );
+        assert_eq!(episode.created_at, episode.ended_at);
+        assert_eq!(episode.counterpart_subject_id, "primary_user");
+        assert_eq!(episode.outcome_kind, "completed");
+        assert_eq!(episode.episode_version, 1);
 
         // Exactly one emotion event with the canonical identity.
         let event =
@@ -793,6 +850,10 @@ fn c2_exact_replay_short_circuits_before_model_and_emotion() {
         assert!(!first.replayed);
         assert_eq!(server.calls.load(Ordering::SeqCst), 1);
         let state_after_first = emotion_state_of(fixture.storage.as_ref());
+        let relationship_after_first = relationship_state_of(fixture.storage.as_ref());
+        let episode_after_first =
+            experience_episode_for_turn(fixture.storage.as_ref(), &conversation.id, "same-request")
+                .expect("a successful new turn must create one experience episode");
 
         let replay = fixture
             .chat(request(&conversation.id, "same-request", "ask once"))
@@ -815,8 +876,17 @@ fn c2_exact_replay_short_circuits_before_model_and_emotion() {
         )
         .is_some());
         assert_eq!(
+            experience_episode_for_turn(fixture.storage.as_ref(), &conversation.id, "same-request",),
+            Some(episode_after_first),
+            "high-level replay must not duplicate or mutate the episode"
+        );
+        assert_eq!(
             emotion_state_of(fixture.storage.as_ref()),
             state_after_first
+        );
+        assert_eq!(
+            relationship_state_of(fixture.storage.as_ref()),
+            relationship_after_first
         );
 
         // Same request id + different current message: TurnIdConflict, no new
@@ -1102,6 +1172,12 @@ fn f1_first_revision_conflict_rebuilds_and_succeeds_with_original_event_time() {
             canonical.0,
             conversation_emotion_event_id(LIFE_A, &conversation.id, "f1-retry-request")
         );
+        assert!(experience_episode_for_turn(
+            fixture.storage.as_ref(),
+            &conversation.id,
+            "f1-retry-request",
+        )
+        .is_some());
 
         // The ORIGINAL observed_at was reused for the rebuilt transition.
         let original_observed_at = &captured_times.lock().unwrap()[0];
@@ -1211,6 +1287,12 @@ fn f1_second_revision_conflict_stops_with_recoverable_changed_error() {
             "f1-exhausted"
         )
         .is_none());
+        assert!(experience_episode_for_turn(
+            fixture.storage.as_ref(),
+            &conversation.id,
+            "f1-exhausted",
+        )
+        .is_none());
     });
 }
 
@@ -1318,6 +1400,122 @@ fn f1_observation_and_general_db_errors_map_to_distinct_boundaries() {
         general_invalid.code,
         ConversationCognitionErrorCode::EmotionIntegrationFailure
     );
+}
+
+#[test]
+fn d13_c2_four_domain_mapper_and_retry_classifier_are_typed() {
+    use crate::storage::conversation_experience::ConversationEmotionRelationshipExperienceCommitError as Composite;
+
+    let conversation = Composite::Conversation(ConversationHistoryError::new(
+        ConversationHistoryErrorCode::ConversationStorageUnavailable,
+    ));
+    let mapped = crate::conversation::service::test_map_four_domain_error(conversation.clone());
+    assert_eq!(
+        mapped.code,
+        ConversationCognitionErrorCode::ConversationStorageUnavailable
+    );
+    assert!(
+        !crate::conversation::service::test_four_domain_error_is_revision_conflict(&conversation)
+    );
+
+    let emotion_revision = Composite::Emotion(EmotionError::new(
+        EmotionErrorCode::RevisionConflict,
+        "synthetic emotion conflict",
+    ));
+    let mapped = crate::conversation::service::test_map_four_domain_error(emotion_revision.clone());
+    assert_eq!(
+        mapped.code,
+        ConversationCognitionErrorCode::EmotionChangedDuringRequest
+    );
+    assert!(
+        crate::conversation::service::test_four_domain_error_is_revision_conflict(
+            &emotion_revision
+        )
+    );
+
+    let relationship_revision =
+        Composite::Relationship(crate::relationship::RelationshipError::new(
+            crate::relationship::RelationshipErrorCode::RevisionConflict,
+            "synthetic relationship conflict",
+        ));
+    let mapped =
+        crate::conversation::service::test_map_four_domain_error(relationship_revision.clone());
+    assert_eq!(
+        mapped.code,
+        ConversationCognitionErrorCode::RelationshipChangedDuringRequest
+    );
+    assert!(
+        crate::conversation::service::test_four_domain_error_is_revision_conflict(
+            &relationship_revision
+        )
+    );
+
+    for (commit_error, expected_code) in [
+        (
+            Composite::EmotionBindingMismatch("binding".into()),
+            ConversationCognitionErrorCode::EmotionIntegrationFailure,
+        ),
+        (
+            Composite::EmotionEventMissing("missing".into()),
+            ConversationCognitionErrorCode::EmotionIntegrationFailure,
+        ),
+        (
+            Composite::RelationshipBindingMismatch("binding".into()),
+            ConversationCognitionErrorCode::RelationshipIntegrationFailure,
+        ),
+        (
+            Composite::RelationshipEventMissing("missing".into()),
+            ConversationCognitionErrorCode::RelationshipIntegrationFailure,
+        ),
+    ] {
+        assert!(
+            !crate::conversation::service::test_four_domain_error_is_revision_conflict(
+                &commit_error
+            )
+        );
+        let mapped = crate::conversation::service::test_map_four_domain_error(commit_error);
+        assert_eq!(mapped.code, expected_code);
+        assert!(!mapped.recoverable);
+    }
+
+    for code in [
+        ExperienceEpisodeErrorCode::InvalidArgument,
+        ExperienceEpisodeErrorCode::LifeNotFound,
+        ExperienceEpisodeErrorCode::SourceNotFound,
+        ExperienceEpisodeErrorCode::SourceBindingMismatch,
+        ExperienceEpisodeErrorCode::DatabaseUnavailable,
+    ] {
+        let commit_error = Composite::Experience(ExperienceEpisodeError::new(code, "synthetic"));
+        assert!(
+            !crate::conversation::service::test_four_domain_error_is_revision_conflict(
+                &commit_error
+            )
+        );
+        let mapped = crate::conversation::service::test_map_four_domain_error(commit_error);
+        assert_eq!(
+            mapped.code,
+            ConversationCognitionErrorCode::ExperienceIntegrationFailure
+        );
+        assert!(!mapped.recoverable);
+    }
+
+    let conflict = Composite::Experience(ExperienceEpisodeError::episode_conflict());
+    assert!(!crate::conversation::service::test_four_domain_error_is_revision_conflict(&conflict));
+    let mapped = crate::conversation::service::test_map_four_domain_error(conflict);
+    assert_eq!(
+        mapped.code,
+        ConversationCognitionErrorCode::ExperienceCommitConflict
+    );
+    assert!(!mapped.recoverable);
+
+    let missing = Composite::ExperienceEpisodeMissing("missing episode".into());
+    assert!(!crate::conversation::service::test_four_domain_error_is_revision_conflict(&missing));
+    let mapped = crate::conversation::service::test_map_four_domain_error(missing);
+    assert_eq!(
+        mapped.code,
+        ConversationCognitionErrorCode::ExperienceIntegrationFailure
+    );
+    assert!(!mapped.recoverable);
 }
 
 // ==================== D11-D pre-turn emotion projection ====================
@@ -1839,6 +2037,81 @@ fn service_commit_d11_only_turn(
         .unwrap();
 }
 
+/// Commits a D12-style governed turn (conversation + emotion + relationship)
+/// directly through the frozen D12 primitive — simulating history written
+/// before D13-C2, with no ExperienceEpisode.
+fn service_commit_d12_only_turn(
+    storage: &StorageService,
+    conversation_id: &str,
+    turn_id: &str,
+    user: &str,
+    assistant: &str,
+) {
+    use crate::emotion::{EmotionTransition, INITIAL_POLICY_VERSION};
+    use crate::relationship::{
+        RelationshipDimensions, RelationshipEventSource, RelationshipTransition,
+        PRIMARY_USER_SUBJECT_ID,
+    };
+
+    let event_time = "2026-08-24T00:00:00.000Z";
+    storage
+        .append_complete_turn_with_emotion_and_relationship(
+            &AppendConversationTurnRequest {
+                life_id: LIFE_A.into(),
+                conversation_id: conversation_id.into(),
+                turn_id: turn_id.into(),
+                user_content: user.into(),
+                assistant_content: assistant.into(),
+                expected_revision: None,
+            },
+            EmotionTransition::new(
+                conversation_emotion_event_id(LIFE_A, conversation_id, turn_id),
+                LIFE_A,
+                crate::emotion::EmotionEventSource::new(
+                    "conversation_turn",
+                    conversation_emotion_source_ref(conversation_id, turn_id),
+                ),
+                10,
+                5,
+                0,
+                10,
+                5,
+                INITIAL_POLICY_VERSION,
+                event_time,
+            )
+            .unwrap(),
+            RelationshipTransition::new(
+                conversation_relationship_event_id(
+                    LIFE_A,
+                    PRIMARY_USER_SUBJECT_ID,
+                    conversation_id,
+                    turn_id,
+                ),
+                LIFE_A,
+                PRIMARY_USER_SUBJECT_ID,
+                RelationshipEventSource::new(
+                    crate::storage::conversation_relationship::
+                        CONVERSATION_RELATIONSHIP_SOURCE_KIND,
+                    conversation_relationship_source_ref(conversation_id, turn_id),
+                ),
+                crate::storage::conversation_relationship::CONVERSATION_RELATIONSHIP_CHANGE_REASON,
+                RelationshipDimensions {
+                    familiarity: 1,
+                    ..RelationshipDimensions::neutral()
+                },
+                0,
+                RelationshipDimensions {
+                    familiarity: 1,
+                    ..RelationshipDimensions::neutral()
+                },
+                1,
+                event_time,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+}
+
 #[test]
 fn d12_c2_d11_only_historical_turn_replays_without_relationship_backfill() {
     tauri::async_runtime::block_on(async {
@@ -1895,6 +2168,64 @@ fn d12_c2_d11_only_historical_turn_replays_without_relationship_backfill() {
             relationship_state_of(fixture.storage.as_ref()).revision,
             0,
             "relationship revision unchanged"
+        );
+    });
+}
+
+#[test]
+fn d13_c2_d12_only_historical_turn_replays_without_experience_backfill() {
+    tauri::async_runtime::block_on(async {
+        // An empty mock server makes an accidental model call observable while
+        // allowing the high-level replay to prove the zero-call boundary.
+        let server = MockChatServer::new(Vec::new());
+        let fixture = Fixture::new();
+        fixture.activate_chat(&server.base_url);
+        let conversation = fixture.create_conversation("D12-only history");
+
+        service_commit_d12_only_turn(
+            fixture.storage.as_ref(),
+            &conversation.id,
+            "d12-history-turn",
+            "asked in D12",
+            "answered in D12",
+        );
+        assert!(experience_episode_for_turn(
+            fixture.storage.as_ref(),
+            &conversation.id,
+            "d12-history-turn",
+        )
+        .is_none());
+        let emotion_before = emotion_state_of(fixture.storage.as_ref());
+        let relationship_before = relationship_state_of(fixture.storage.as_ref());
+
+        let replay = fixture
+            .chat(request(
+                &conversation.id,
+                "d12-history-turn",
+                "asked in D12",
+            ))
+            .await
+            .unwrap();
+
+        assert!(replay.replayed);
+        assert_eq!(replay.assistant_message, "answered in D12");
+        assert_eq!(server.calls.load(Ordering::SeqCst), 0);
+        assert!(experience_episode_for_turn(
+            fixture.storage.as_ref(),
+            &conversation.id,
+            "d12-history-turn",
+        )
+        .is_none());
+        assert_eq!(emotion_state_of(fixture.storage.as_ref()), emotion_before);
+        assert_eq!(
+            relationship_state_of(fixture.storage.as_ref()),
+            relationship_before
+        );
+        assert_eq!(
+            ConversationHistoryService::new(fixture.storage.as_ref())
+                .count_messages(LIFE_A, &conversation.id)
+                .unwrap(),
+            2
         );
     });
 }
@@ -2128,6 +2459,12 @@ fn d12_c2_relationship_revision_conflict_retries_once_and_succeeds() {
             "d12-rel-retry"
         )
         .is_some());
+        assert!(experience_episode_for_turn(
+            fixture.storage.as_ref(),
+            &conversation.id,
+            "d12-rel-retry",
+        )
+        .is_some());
     });
 }
 
@@ -2180,6 +2517,12 @@ fn d12_c2_emotion_revision_conflict_retry_also_refreshes_relationship() {
             ),
             1
         );
+        assert!(experience_episode_for_turn(
+            fixture.storage.as_ref(),
+            &conversation.id,
+            "d12-emo-retry",
+        )
+        .is_some());
     });
 }
 
@@ -2234,6 +2577,12 @@ fn d12_c2_second_relationship_conflict_stops_after_exactly_two_attempts() {
             fixture.storage.as_ref(),
             &conversation.id,
             "d12-rel-stop"
+        )
+        .is_none());
+        assert!(experience_episode_for_turn(
+            fixture.storage.as_ref(),
+            &conversation.id,
+            "d12-rel-stop",
         )
         .is_none());
     });
@@ -2340,6 +2689,12 @@ fn d12_c2_both_authorities_stale_share_one_retry() {
         let relationship = relationship_state_of(fixture.storage.as_ref());
         assert_eq!(relationship.values.familiarity, 4);
         assert_eq!(relationship.revision, 2);
+        assert!(experience_episode_for_turn(
+            fixture.storage.as_ref(),
+            &conversation.id,
+            "d12-both-stale",
+        )
+        .is_some());
     });
 }
 

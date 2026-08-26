@@ -13,6 +13,7 @@ use crate::{
         policy::{self, EmotionPolicyRequest, EmotionStimulus},
         EmotionCommitOutcome, EmotionError, EmotionErrorCode, EmotionEventSource,
     },
+    experience::{ExperienceEpisodeError, ExperienceEpisodeErrorCode},
     memory::{
         context_builder::{
             MemoryContextBuildRequest, MemoryContextBuilder, MemoryContextEntry,
@@ -47,6 +48,7 @@ use crate::{
         conversation_emotion_event_id, conversation_emotion_source_ref,
         CONVERSATION_EMOTION_SOURCE_KIND,
     },
+    storage::conversation_experience::ConversationEmotionRelationshipExperienceCommitError,
     storage::conversation_relationship::{
         conversation_relationship_event_id, conversation_relationship_source_ref,
         CONVERSATION_RELATIONSHIP_CHANGE_REASON, CONVERSATION_RELATIONSHIP_SOURCE_KIND,
@@ -78,6 +80,22 @@ pub(crate) fn test_map_observation_error(
 #[cfg(test)]
 pub(crate) fn test_map_general_error(emotion_error: EmotionError) -> ConversationCognitionError {
     map_emotion_error(emotion_error)
+}
+
+/// TEST-ONLY mapper surface for the four-domain persistence boundary proof.
+#[cfg(test)]
+pub(crate) fn test_map_four_domain_error(
+    commit_error: ConversationEmotionRelationshipExperienceCommitError,
+) -> ConversationCognitionError {
+    map_four_domain_composite_commit_error(commit_error)
+}
+
+/// TEST-ONLY retry-classifier surface for the four-domain persistence proof.
+#[cfg(test)]
+pub(crate) fn test_four_domain_error_is_revision_conflict(
+    commit_error: &ConversationEmotionRelationshipExperienceCommitError,
+) -> bool {
+    four_domain_commit_error_is_revision_conflict(commit_error)
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -160,6 +178,8 @@ pub enum ConversationCognitionErrorCode {
     RelationshipChangedDuringRequest,
     RelationshipCommitConflict,
     RelationshipIntegrationFailure,
+    ExperienceCommitConflict,
+    ExperienceIntegrationFailure,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -545,12 +565,14 @@ where
             relationship_policy::evolve(state, policy_request).map_err(map_relationship_error)
         };
 
-        // ONE atomic triple-composite commit for conversation + emotion +
-        // relationship, with ONE SHARED retry budget: at most TWO total
-        // composite attempts. Either domain's typed RevisionConflict opens
-        // the single retry; the retry refreshes BOTH authorities against the
-        // SAME fixed observation time and rebuilds both transitions without
-        // calling the model again. The second attempt is final.
+        // ONE atomic four-domain composite commit for conversation + emotion
+        // + relationship + experience, with ONE SHARED retry budget: at most
+        // TWO total composite attempts. Either revision authority's typed
+        // RevisionConflict opens the single retry; the retry refreshes BOTH
+        // authorities against the SAME fixed observation time and rebuilds
+        // both transitions without calling the model again. Experience is
+        // immutable occurrence evidence and never opens retry. The second
+        // attempt is final.
         let first_observed_at = first_observation.observed_at.clone();
         let mut transition = build_transition(
             &first_observation.state,
@@ -576,13 +598,13 @@ where
         }
         let composite = match self
             .storage
-            .append_complete_turn_with_emotion_and_relationship(
+            .append_complete_turn_with_emotion_and_relationship_and_experience(
                 &append_request,
                 transition,
                 relationship_transition,
             ) {
             Ok(outcome) => outcome,
-            Err(commit_error) if triple_commit_error_is_revision_conflict(&commit_error) => {
+            Err(commit_error) if four_domain_commit_error_is_revision_conflict(&commit_error) => {
                 // Single shared retry: refresh BOTH authorities. Emotion uses
                 // the frozen explicit-timestamp observation so the SAME fixed
                 // T stays the evidence anchor; relationship reloads its
@@ -616,14 +638,16 @@ where
                 }
                 // Attempt #2 is FINAL: any error here maps straight through.
                 self.storage
-                    .append_complete_turn_with_emotion_and_relationship(
+                    .append_complete_turn_with_emotion_and_relationship_and_experience(
                         &append_request,
                         transition,
                         relationship_transition,
                     )
-                    .map_err(map_triple_composite_commit_error)?
+                    .map_err(map_four_domain_composite_commit_error)?
             }
-            Err(commit_error) => return Err(map_triple_composite_commit_error(commit_error)),
+            Err(commit_error) => {
+                return Err(map_four_domain_composite_commit_error(commit_error));
+            }
         };
         let appended = composite.turn;
         debug_assert!(matches!(
@@ -633,6 +657,10 @@ where
         debug_assert!(matches!(
             composite.relationship,
             RelationshipCommitOutcome::Committed { .. }
+        ));
+        debug_assert!(matches!(
+            composite.experience,
+            crate::experience::ExperienceEpisodeCommitOutcome::Applied { .. }
         ));
         let mut degradations = retrieval_result
             .degradation_codes
@@ -923,13 +951,13 @@ fn map_relationship_error(relationship_error: RelationshipError) -> Conversation
     })
 }
 
-/// Intentional mapper for the D12-C1 triple-composite error boundary. Each
-/// cause domain keeps its own mapping; binding/missing-event failures are
+/// Intentional mapper for the D13-C1 four-domain composite error boundary.
+/// Each cause domain keeps its own mapping; binding/missing-event failures are
 /// internal governed-path invariant violations, never user problems.
-fn map_triple_composite_commit_error(
-    commit_error: crate::storage::conversation_relationship::ConversationEmotionRelationshipCommitError,
+fn map_four_domain_composite_commit_error(
+    commit_error: ConversationEmotionRelationshipExperienceCommitError,
 ) -> ConversationCognitionError {
-    use crate::storage::conversation_relationship::ConversationEmotionRelationshipCommitError as Composite;
+    use ConversationEmotionRelationshipExperienceCommitError as Composite;
     match commit_error {
         Composite::Conversation(history_error) => map_history_error(history_error),
         Composite::Emotion(emotion_error) => map_emotion_error(emotion_error),
@@ -940,17 +968,36 @@ fn map_triple_composite_commit_error(
         Composite::RelationshipBindingMismatch(_) | Composite::RelationshipEventMissing(_) => {
             error(ConversationCognitionErrorCode::RelationshipIntegrationFailure)
         }
+        Composite::Experience(experience_error) => map_experience_error(experience_error),
+        Composite::ExperienceEpisodeMissing(_) => {
+            error(ConversationCognitionErrorCode::ExperienceIntegrationFailure)
+        }
     }
 }
 
+fn map_experience_error(experience_error: ExperienceEpisodeError) -> ConversationCognitionError {
+    error(match experience_error.code {
+        ExperienceEpisodeErrorCode::EpisodeConflict => {
+            ConversationCognitionErrorCode::ExperienceCommitConflict
+        }
+        ExperienceEpisodeErrorCode::InvalidArgument
+        | ExperienceEpisodeErrorCode::LifeNotFound
+        | ExperienceEpisodeErrorCode::SourceNotFound
+        | ExperienceEpisodeErrorCode::SourceBindingMismatch
+        | ExperienceEpisodeErrorCode::DatabaseUnavailable => {
+            ConversationCognitionErrorCode::ExperienceIntegrationFailure
+        }
+    })
+}
+
 /// True only for the typed emotion/relationship RevisionConflict produced by
-/// the C1 triple-composite commit — the ONLY retryable conditions sharing one
+/// the C1 four-domain composite — the ONLY retryable conditions sharing one
 /// composite retry budget. Retry decisions inspect typed error codes directly;
-/// no string parsing of `code()`.
-fn triple_commit_error_is_revision_conflict(
-    commit_error: &crate::storage::conversation_relationship::ConversationEmotionRelationshipCommitError,
+/// no string parsing of `code()` or recoverable flags.
+fn four_domain_commit_error_is_revision_conflict(
+    commit_error: &ConversationEmotionRelationshipExperienceCommitError,
 ) -> bool {
-    use crate::storage::conversation_relationship::ConversationEmotionRelationshipCommitError as Composite;
+    use ConversationEmotionRelationshipExperienceCommitError as Composite;
     match commit_error {
         Composite::Emotion(emotion) => emotion.code == EmotionErrorCode::RevisionConflict,
         Composite::Relationship(relationship) => {
@@ -1113,6 +1160,13 @@ fn error(code: ConversationCognitionErrorCode) -> ConversationCognitionError {
         ),
         ConversationCognitionErrorCode::RelationshipIntegrationFailure => {
             ("The governed relationship integration failed.", false)
+        }
+        ConversationCognitionErrorCode::ExperienceCommitConflict => (
+            "The governed conversation turn conflicts with committed experience evidence.",
+            false,
+        ),
+        ConversationCognitionErrorCode::ExperienceIntegrationFailure => {
+            ("The governed experience integration failed.", false)
         }
     };
     ConversationCognitionError::new(code, message, recoverable)

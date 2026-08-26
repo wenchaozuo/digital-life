@@ -1689,39 +1689,16 @@ mod tests {
 
     #[test]
     fn explicit_seam_and_production_reader_share_one_calculation_path() {
-        // The production reader must be the SAME helper as the seam, only with
-        // SQLite 'now' substituted for the explicit timestamp. Prove the
-        // shared path by evaluating SQLite's own 'now' ONCE and feeding that
-        // exact string to both readers: identical inputs through the shared
-        // calculation must produce byte-identical observations.
+        // Production obtains the real SQLite observation time. Replay the
+        // explicit seam against that exact timestamp: identical timestamp and
+        // state inputs through the shared calculation path must produce an
+        // identical observation.
         let root = TestRoot::new("observation-shared-path");
         let service = observation_fixture(&root);
-        let now: String = {
-            let state = service.state().unwrap();
-            state
-                .connection
-                .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", [], |row| {
-                    row.get(0)
-                })
-                .unwrap()
-        };
-        let via_explicit = service
-            .load_emotion_runtime_observation_at("life-a", &now)
-            .unwrap();
         let via_production = service.load_emotion_runtime_observation("life-a").unwrap();
-        assert_eq!(
-            via_production.observed_at, now,
-            "production must observe through SQLite's own formatter"
-        );
-        assert_eq!(via_explicit.observed_at, via_production.observed_at);
-        // Both observations are within one wall-clock second of each other and
-        // the fixture's last_applied_at is a fixed past instant in 2026, so
-        // both elapsed values are large but structurally derived from the same
-        // state; equality of the full state proves the same reader path.
-        assert_eq!(via_explicit.state, via_production.state);
-        assert_eq!(
-            via_explicit.elapsed_seconds, via_production.elapsed_seconds,
-            "same fixed basis must yield the same elapsed"
-        );
+        let via_explicit = service
+            .load_emotion_runtime_observation_at("life-a", &via_production.observed_at)
+            .unwrap();
+        assert_eq!(via_explicit, via_production);
     }
 }

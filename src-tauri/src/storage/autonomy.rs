@@ -519,6 +519,13 @@ fn create_pending_intent_in_transaction(
         return Err(AutonomyError::proactive_intent_conflict());
     }
 
+    let policy =
+        load_policy(transaction, &request.life_id)?.ok_or_else(AutonomyError::policy_not_found)?;
+    validate_policy_state(&policy)?;
+    if !policy.enabled {
+        return Err(AutonomyError::policy_disabled());
+    }
+
     require_active_goal(transaction, &request.life_id, &request.goal_id)?;
     let now = sqlite_authority_now(transaction)?;
     transaction
@@ -942,6 +949,13 @@ mod tests {
             }
         }
 
+        fn create_policy(&self, life_id: &str, enabled: bool, dnd: bool) {
+            let mut request = self.policy_request(life_id);
+            request.enabled = enabled;
+            request.dnd = dnd;
+            self.storage.create_policy(request).unwrap();
+        }
+
         fn intent_request(
             &self,
             intent_id: &str,
@@ -1078,6 +1092,7 @@ mod tests {
     #[test]
     fn intent_create_replay_identity_precedence_goal_binding_and_lists() {
         let fixture = Fixture::new();
+        fixture.create_policy("autonomy-life-a", true, false);
         fixture.create_goal("autonomy-goal-a", "autonomy-life-a");
         fixture.create_goal("autonomy-goal-b", "autonomy-life-b");
         let request =
@@ -1247,6 +1262,165 @@ mod tests {
     }
 
     #[test]
+    fn new_intent_requires_enabled_policy_and_preserves_identity_precedence() {
+        let fixture = Fixture::new();
+        fixture.create_goal("autonomy-goal-opt-in", "autonomy-life-a");
+        let request = fixture.intent_request(
+            "autonomy-intent-no-policy",
+            "autonomy-life-a",
+            "autonomy-goal-opt-in",
+        );
+
+        assert_eq!(
+            error_code(
+                fixture
+                    .storage
+                    .create_pending_goal_check_in_intent(request)
+                    .unwrap_err()
+            ),
+            AutonomyErrorCode::PolicyNotFound
+        );
+        let state = fixture.storage.state().unwrap();
+        let intent_count: i64 = state
+            .connection
+            .query_row("SELECT COUNT(*) FROM life_proactive_intent", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(intent_count, 0);
+        drop(state);
+
+        fixture.create_policy("autonomy-life-a", false, false);
+        let disabled_request = fixture.intent_request(
+            "autonomy-intent-disabled",
+            "autonomy-life-a",
+            "autonomy-goal-opt-in",
+        );
+        assert_eq!(
+            error_code(
+                fixture
+                    .storage
+                    .create_pending_goal_check_in_intent(disabled_request)
+                    .unwrap_err()
+            ),
+            AutonomyErrorCode::PolicyDisabled
+        );
+
+        let missing_goal_request = fixture.intent_request(
+            "autonomy-intent-disabled-missing-goal",
+            "autonomy-life-a",
+            "missing-goal-while-disabled",
+        );
+        assert_eq!(
+            error_code(
+                fixture
+                    .storage
+                    .create_pending_goal_check_in_intent(missing_goal_request)
+                    .unwrap_err()
+            ),
+            AutonomyErrorCode::PolicyDisabled
+        );
+
+        fixture
+            .storage
+            .update_policy(LifeAutonomyPolicyUpdateRequest {
+                event_id: "autonomy-policy-event-enable".into(),
+                life_id: "autonomy-life-a".into(),
+                enabled: true,
+                dnd: false,
+                max_ready_per_window: 3,
+                window_seconds: 900,
+                min_gap_seconds: 60,
+                expected_revision: 1,
+            })
+            .unwrap();
+        let request = fixture.intent_request(
+            "autonomy-intent-after-enable",
+            "autonomy-life-a",
+            "autonomy-goal-opt-in",
+        );
+        let created = fixture
+            .storage
+            .create_pending_goal_check_in_intent(request.clone())
+            .unwrap();
+        assert!(matches!(created, AutonomyCreateOutcome::Applied(_)));
+
+        fixture
+            .storage
+            .update_policy(LifeAutonomyPolicyUpdateRequest {
+                event_id: "autonomy-policy-event-disable".into(),
+                life_id: "autonomy-life-a".into(),
+                enabled: false,
+                dnd: false,
+                max_ready_per_window: 3,
+                window_seconds: 900,
+                min_gap_seconds: 60,
+                expected_revision: 2,
+            })
+            .unwrap();
+
+        let replay = fixture
+            .storage
+            .create_pending_goal_check_in_intent(request.clone())
+            .unwrap();
+        assert!(matches!(replay, AutonomyCreateOutcome::Replayed(_)));
+
+        let mut conflicting = request;
+        conflicting.goal_id = "missing-goal-after-disable".into();
+        conflicting.importance += 1;
+        assert_eq!(
+            error_code(
+                fixture
+                    .storage
+                    .create_pending_goal_check_in_intent(conflicting)
+                    .unwrap_err()
+            ),
+            AutonomyErrorCode::ProactiveIntentConflict
+        );
+        assert_eq!(
+            fixture
+                .storage
+                .find_intent("autonomy-life-a", "autonomy-intent-after-enable")
+                .unwrap()
+                .unwrap()
+                .importance,
+            700
+        );
+        let state = fixture.storage.state().unwrap();
+        let intent_count: i64 = state
+            .connection
+            .query_row("SELECT COUNT(*) FROM life_proactive_intent", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(intent_count, 1);
+    }
+
+    #[test]
+    fn enabled_dnd_policy_allows_pending_intent_creation() {
+        let fixture = Fixture::new();
+        fixture.create_goal("autonomy-goal-dnd", "autonomy-life-a");
+        fixture.create_policy("autonomy-life-a", true, true);
+
+        let request = fixture.intent_request(
+            "autonomy-intent-dnd",
+            "autonomy-life-a",
+            "autonomy-goal-dnd",
+        );
+        let created = fixture
+            .storage
+            .create_pending_goal_check_in_intent(request)
+            .unwrap();
+        let intent = match created {
+            AutonomyCreateOutcome::Applied(intent) => intent,
+            AutonomyCreateOutcome::Replayed(_) => panic!("first intent create must apply"),
+        };
+        assert_eq!(intent.status, INTENT_STATUS_PENDING);
+        assert_eq!(intent.revision, 1);
+        assert_eq!(intent.focus_state, "available");
+    }
+
+    #[test]
     fn intent_bounds_focus_and_expiry_are_rejected_before_storage() {
         let fixture = Fixture::new();
         fixture.create_goal("autonomy-goal-bounds", "autonomy-life-a");
@@ -1348,6 +1522,18 @@ mod tests {
             .storage
             .create_policy(fixture.policy_request("autonomy-life-a"))
             .unwrap();
+        let intent = fixture
+            .storage
+            .create_pending_goal_check_in_intent(fixture.intent_request(
+                "autonomy-intent-cascade",
+                "autonomy-life-a",
+                "autonomy-goal-cascade",
+            ))
+            .unwrap();
+        let intent = match intent {
+            AutonomyCreateOutcome::Applied(intent) => intent,
+            AutonomyCreateOutcome::Replayed(_) => panic!("first intent create must apply"),
+        };
         fixture
             .storage
             .update_policy(LifeAutonomyPolicyUpdateRequest {
@@ -1361,18 +1547,6 @@ mod tests {
                 expected_revision: 1,
             })
             .unwrap();
-        let intent = fixture
-            .storage
-            .create_pending_goal_check_in_intent(fixture.intent_request(
-                "autonomy-intent-cascade",
-                "autonomy-life-a",
-                "autonomy-goal-cascade",
-            ))
-            .unwrap();
-        let intent = match intent {
-            AutonomyCreateOutcome::Applied(intent) => intent,
-            AutonomyCreateOutcome::Replayed(_) => panic!("first intent create must apply"),
-        };
 
         let state = fixture.storage.state().unwrap();
         let immutable_error = state

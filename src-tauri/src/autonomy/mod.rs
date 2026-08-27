@@ -187,6 +187,7 @@ pub(crate) enum AutonomyErrorCode {
     InvalidArgument,
     LifeNotFound,
     PolicyNotFound,
+    PolicyDisabled,
     PolicyConflict,
     AutonomyPolicyEventConflict,
     GoalNotFound,
@@ -213,6 +214,7 @@ impl AutonomyError {
                 code,
                 AutonomyErrorCode::LifeNotFound
                     | AutonomyErrorCode::PolicyNotFound
+                    | AutonomyErrorCode::PolicyDisabled
                     | AutonomyErrorCode::GoalNotFound
                     | AutonomyErrorCode::DatabaseUnavailable
             ),
@@ -234,6 +236,13 @@ impl AutonomyError {
         Self::new(
             AutonomyErrorCode::PolicyNotFound,
             "No autonomy policy exists for the specified life.",
+        )
+    }
+
+    pub(crate) fn policy_disabled() -> Self {
+        Self::new(
+            AutonomyErrorCode::PolicyDisabled,
+            "Autonomy is disabled for the specified life.",
         )
     }
 

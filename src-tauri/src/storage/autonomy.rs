@@ -445,18 +445,20 @@ fn intent_create_evidence_matches(
     intent: &LifeProactiveIntent,
     request: &LifeProactiveIntentCreateRequest,
 ) -> bool {
-    intent.intent_id == request.intent_id
-        && intent.life_id == request.life_id
-        && intent.goal_id == request.goal_id
-        && intent.intent_kind == request.intent_kind
-        && intent.importance == request.importance
-        && intent.user_relevance == request.user_relevance
-        && intent.self_desire == request.self_desire
-        && intent.interruption_cost == request.interruption_cost
-        && intent.focus_state == request.focus_state
-        && intent.acceptance_score == request.acceptance_score
-        && intent.recent_interaction_seconds == request.recent_interaction_seconds
-        && intent.expires_at == request.expires_at
+    // Storage compares only through the read-only evidence getters; it never
+    // constructs or mutates a request it receives.
+    intent.intent_id == request.intent_id()
+        && intent.life_id == request.life_id()
+        && intent.goal_id == request.goal_id()
+        && intent.intent_kind == request.intent_kind()
+        && intent.importance == request.importance()
+        && intent.user_relevance == request.user_relevance()
+        && intent.self_desire == request.self_desire()
+        && intent.interruption_cost == request.interruption_cost()
+        && intent.focus_state == request.focus_state()
+        && intent.acceptance_score == request.acceptance_score()
+        && intent.recent_interaction_seconds == request.recent_interaction_seconds()
+        && intent.expires_at.as_deref() == request.expires_at()
 }
 
 fn require_life(transaction: &Transaction<'_>, life_id: &str) -> Result<(), AutonomyError> {
@@ -679,7 +681,7 @@ fn create_pending_intent_in_transaction(
 
     // Identity precedence is intentional: an existing intent_id is resolved
     // before any goal existence, same-life, or active-status check.
-    if let Some(existing) = load_intent_by_id(transaction, &request.intent_id)? {
+    if let Some(existing) = load_intent_by_id(transaction, request.intent_id())? {
         if intent_create_evidence_matches(&existing, &request) {
             validate_intent_state(&existing)?;
             return Ok(AutonomyCreateOutcome::Replayed(existing));
@@ -688,13 +690,13 @@ fn create_pending_intent_in_transaction(
     }
 
     let policy =
-        load_policy(transaction, &request.life_id)?.ok_or_else(AutonomyError::policy_not_found)?;
+        load_policy(transaction, request.life_id())?.ok_or_else(AutonomyError::policy_not_found)?;
     validate_policy_state(&policy)?;
     if !policy.enabled {
         return Err(AutonomyError::policy_disabled());
     }
 
-    require_active_goal(transaction, &request.life_id, &request.goal_id)?;
+    require_active_goal(transaction, request.life_id(), request.goal_id())?;
     let now = sqlite_authority_now(transaction)?;
     transaction
         .execute(
@@ -706,28 +708,28 @@ fn create_pending_intent_in_transaction(
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1,
                      ?13, ?14, ?14, NULL, ?15, NULL, ?16)",
             params![
-                &request.intent_id,
-                &request.life_id,
-                &request.goal_id,
-                &request.intent_kind,
-                request.importance,
-                request.user_relevance,
-                request.self_desire,
-                request.interruption_cost,
-                &request.focus_state,
-                request.acceptance_score,
-                request.recent_interaction_seconds,
+                request.intent_id(),
+                request.life_id(),
+                request.goal_id(),
+                request.intent_kind(),
+                request.importance(),
+                request.user_relevance(),
+                request.self_desire(),
+                request.interruption_cost(),
+                request.focus_state(),
+                request.acceptance_score(),
+                request.recent_interaction_seconds(),
                 INTENT_STATUS_PENDING,
                 INTENT_CREATED_BY_KIND_AUTONOMY_POLICY,
                 &now,
-                &request.expires_at,
+                request.expires_at(),
                 INTENT_VERSION,
             ],
         )
         .map_err(map_database_error)?;
 
     let created =
-        load_intent_by_id(transaction, &request.intent_id)?.ok_or_else(AutonomyError::database)?;
+        load_intent_by_id(transaction, request.intent_id())?.ok_or_else(AutonomyError::database)?;
     validate_intent_state(&created)?;
     Ok(AutonomyCreateOutcome::Applied(created))
 }

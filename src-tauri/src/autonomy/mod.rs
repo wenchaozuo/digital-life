@@ -5,6 +5,14 @@
 //! It evaluates only caller-selected pending intent evidence; it does not
 //! create intents automatically, mutate D14 goals, deliver an intent, or
 //! execute an Agent or Tool.
+//!
+//! Construction authority: a new [`LifeProactiveIntentCreateRequest`] can only
+//! be constructed inside this autonomy authority module (its fields are
+//! private in production builds, so crate siblings such as `storage` can
+//! receive and persist an already-sealed request but can never invent
+//! evidence, including `focus_state`, and submit it directly to the
+//! repository). Storage exposes only a read-only getter surface over received
+//! evidence; it is not the perception-consent authority.
 
 #[cfg(test)]
 pub(crate) mod runtime;
@@ -175,6 +183,35 @@ pub(crate) struct LifeProactiveIntent {
     pub(crate) intent_version: i64,
 }
 
+// SEAL: low-level evidence construction authority (production shape).
+// The type itself stays crate-visible because storage persistence and
+// repository signatures must name it, but every evidence field is private to
+// this module, so only the autonomy authority module and its descendants can
+// construct a NEW request. Storage may receive and persist a sealed request;
+// it must never be able to invent evidence and submit it directly to the
+// repository. Keep the sentinel comments stable: the D16-C-F1 seal test
+// inspects exactly the region between them.
+#[cfg(not(test))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LifeProactiveIntentCreateRequest {
+    intent_id: String,
+    life_id: String,
+    goal_id: String,
+    intent_kind: String,
+    importance: i64,
+    user_relevance: i64,
+    self_desire: i64,
+    interruption_cost: i64,
+    focus_state: String,
+    acceptance_score: Option<i64>,
+    recent_interaction_seconds: Option<i64>,
+    expires_at: Option<String>,
+}
+
+// SEAL: test shape. Test builds (storage/repository fixtures, bad-signal
+// mutation probes) construct and mutate requests directly; this shape is
+// compiled ONLY under #[cfg(test)] and never enters a production binary.
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LifeProactiveIntentCreateRequest {
     pub(crate) intent_id: String,
@@ -189,6 +226,59 @@ pub(crate) struct LifeProactiveIntentCreateRequest {
     pub(crate) acceptance_score: Option<i64>,
     pub(crate) recent_interaction_seconds: Option<i64>,
     pub(crate) expires_at: Option<String>,
+}
+
+impl LifeProactiveIntentCreateRequest {
+    /// Read-only evidence surface for storage persistence. Storage binds and
+    /// compares only through these getters; it never constructs or mutates a
+    /// received request.
+    pub(crate) fn intent_id(&self) -> &str {
+        &self.intent_id
+    }
+
+    pub(crate) fn life_id(&self) -> &str {
+        &self.life_id
+    }
+
+    pub(crate) fn goal_id(&self) -> &str {
+        &self.goal_id
+    }
+
+    pub(crate) fn intent_kind(&self) -> &str {
+        &self.intent_kind
+    }
+
+    pub(crate) fn importance(&self) -> i64 {
+        self.importance
+    }
+
+    pub(crate) fn user_relevance(&self) -> i64 {
+        self.user_relevance
+    }
+
+    pub(crate) fn self_desire(&self) -> i64 {
+        self.self_desire
+    }
+
+    pub(crate) fn interruption_cost(&self) -> i64 {
+        self.interruption_cost
+    }
+
+    pub(crate) fn focus_state(&self) -> &str {
+        &self.focus_state
+    }
+
+    pub(crate) fn acceptance_score(&self) -> Option<i64> {
+        self.acceptance_score
+    }
+
+    pub(crate) fn recent_interaction_seconds(&self) -> Option<i64> {
+        self.recent_interaction_seconds
+    }
+
+    pub(crate) fn expires_at(&self) -> Option<&str> {
+        self.expires_at.as_deref()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1157,5 +1247,110 @@ mod initiative_policy_tests {
             &temporal,
         )
         .is_err());
+    }
+
+    const PRODUCTION_SHAPE_SENTINEL: &str =
+        "SEAL: low-level evidence construction authority (production shape).";
+    const TEST_SHAPE_SENTINEL: &str = "SEAL: test shape.";
+
+    #[test]
+    fn low_level_intent_request_production_shape_has_no_crate_visible_evidence_fields() {
+        let source = include_str!("mod.rs");
+        let production_start = source
+            .find(PRODUCTION_SHAPE_SENTINEL)
+            .expect("the production-shape sentinel comment must exist and stay stable");
+        let test_start = source
+            .find(TEST_SHAPE_SENTINEL)
+            .expect("the test-shape sentinel comment must exist and stay stable");
+        assert!(
+            production_start < test_start,
+            "the production shape must precede the test shape"
+        );
+        let production_shape = &source[production_start..test_start];
+
+        // The TYPE remains crate-visible because storage persistence and
+        // repository signatures must name it...
+        assert!(production_shape.contains("pub(crate) struct LifeProactiveIntentCreateRequest"));
+        // ...but no evidence field and no constructor may be crate-visible:
+        // construction is restricted to this autonomy authority module and
+        // its descendants.
+        assert!(
+            !production_shape.contains("fn "),
+            "the production shape must declare no method or constructor"
+        );
+        for field in [
+            "intent_id",
+            "life_id",
+            "goal_id",
+            "intent_kind",
+            "importance",
+            "user_relevance",
+            "self_desire",
+            "interruption_cost",
+            "focus_state",
+            "acceptance_score",
+            "recent_interaction_seconds",
+            "expires_at",
+        ] {
+            assert!(
+                production_shape.contains(field),
+                "production shape must still declare the {field} evidence field"
+            );
+            assert!(
+                !production_shape.contains(&format!("pub(crate) {field}:")),
+                "production shape must keep the {field} evidence field private"
+            );
+        }
+    }
+
+    #[test]
+    fn storage_production_never_constructs_or_mutates_received_intent_requests() {
+        let source = include_str!("../storage/autonomy.rs");
+        let production_half = source
+            .split_once("#[cfg(test)]")
+            .map_or(source, |(production, _)| production);
+        // Storage persists evidence it receives; it never invents a new
+        // request (struct literal) and never writes evidence fields.
+        assert!(!production_half.contains("LifeProactiveIntentCreateRequest {"));
+        for field_write in [
+            "request.importance =",
+            "request.user_relevance =",
+            "request.self_desire =",
+            "request.interruption_cost =",
+            "request.focus_state =",
+            "request.acceptance_score =",
+            "request.recent_interaction_seconds =",
+            "request.expires_at =",
+            "request.intent_id =",
+            "request.life_id =",
+            "request.goal_id =",
+            "request.intent_kind =",
+        ] {
+            assert!(
+                !production_half.contains(field_write),
+                "storage production must not mutate {field_write}"
+            );
+        }
+        // Storage reads received evidence exclusively through the read-only
+        // getter surface exposed by the autonomy authority module.
+        for getter in [
+            "request.intent_id()",
+            "request.life_id()",
+            "request.goal_id()",
+            "request.intent_kind()",
+            "request.importance()",
+            "request.user_relevance()",
+            "request.self_desire()",
+            "request.interruption_cost()",
+            "request.focus_state()",
+            "request.acceptance_score()",
+            "request.recent_interaction_seconds()",
+            "request.expires_at()",
+        ] {
+            assert!(
+                production_half.contains(getter),
+                "storage production must read evidence through {getter}"
+            );
+        }
     }
 }

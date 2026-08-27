@@ -41,6 +41,15 @@ pub(crate) const GOAL_CHECK_IN_INTERRUPTION_COST_V1: i64 = 500;
 const INTENT_ID_PREFIX: &str = "d15c-intent-";
 const EVALUATION_EVENT_ID_PREFIX: &str = "d15c-eval-";
 
+#[cfg(not(test))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct AutonomyTickRequest {
+    pub(super) tick_id: String,
+    pub(super) life_id: String,
+    pub(super) focus_state: String,
+}
+
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AutonomyTickRequest {
     pub(crate) tick_id: String,
@@ -121,7 +130,7 @@ struct BlockedCandidate {
 }
 
 /// Run one explicit, bounded goal check-in tick.
-pub(crate) fn run_autonomy_tick(
+fn run_autonomy_tick_impl(
     storage: &StorageService,
     request: AutonomyTickRequest,
 ) -> Result<AutonomyTickOutcome, AutonomyTickError> {
@@ -205,6 +214,22 @@ pub(crate) fn run_autonomy_tick(
             until,
         }),
     }
+}
+
+#[cfg(not(test))]
+pub(super) fn run_autonomy_tick(
+    storage: &StorageService,
+    request: AutonomyTickRequest,
+) -> Result<AutonomyTickOutcome, AutonomyTickError> {
+    run_autonomy_tick_impl(storage, request)
+}
+
+#[cfg(test)]
+pub(crate) fn run_autonomy_tick(
+    storage: &StorageService,
+    request: AutonomyTickRequest,
+) -> Result<AutonomyTickOutcome, AutonomyTickError> {
+    run_autonomy_tick_impl(storage, request)
 }
 
 fn recover_pending_intent(
@@ -518,18 +543,26 @@ fn evaluation_outcome(
     }
 }
 
-fn validate_tick_request(request: &AutonomyTickRequest) -> Result<(), AutonomyTickError> {
-    let tick_length = request.tick_id.chars().count();
+pub(super) fn validate_tick_identity(
+    tick_id: &str,
+    life_id: &str,
+) -> Result<(), AutonomyTickError> {
+    let tick_length = tick_id.chars().count();
     if !(1..=128).contains(&tick_length) {
         return Err(AutonomyTickError::invalid_argument(
             "tick identity must contain between 1 and 128 Unicode scalar characters.",
         ));
     }
-    if request.life_id.trim().is_empty() {
+    if life_id.trim().is_empty() {
         return Err(AutonomyTickError::invalid_argument(
             "life identity must not be empty.",
         ));
     }
+    Ok(())
+}
+
+fn validate_tick_request(request: &AutonomyTickRequest) -> Result<(), AutonomyTickError> {
+    validate_tick_identity(&request.tick_id, &request.life_id)?;
     if !matches!(
         request.focus_state.as_str(),
         INTENT_FOCUS_STATE_UNKNOWN

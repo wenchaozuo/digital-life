@@ -6,7 +6,18 @@
 //! create intents automatically, mutate D14 goals, deliver an intent, or
 //! execute an Agent or Tool.
 
+#[cfg(test)]
 pub(crate) mod runtime;
+#[cfg(not(test))]
+mod runtime;
+
+pub(crate) mod trusted_runtime;
+
+use runtime::{
+    deterministic_intent_id, run_autonomy_tick, validate_tick_identity, AutonomyTickRequest,
+};
+
+pub(crate) use runtime::{AutonomyTickError, AutonomyTickOutcome};
 
 pub(crate) const POLICY_VERSION: i64 = 1;
 pub(crate) const POLICY_EVENT_VERSION: i64 = 1;

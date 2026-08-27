@@ -1,9 +1,9 @@
-//! SQLite-authoritative persistence for D15-B1 autonomy policy and
-//! proactive-intent evidence.
+//! SQLite-authoritative persistence for D15-B2 autonomy policy and
+//! proactive-intent evaluation evidence.
 //!
-//! This module is deliberately a foundation only. It persists explicit policy
-//! configuration and bounded `goal_check_in` evidence. It does not score
-//! initiative, create or mutate D14 goals, transition intents, schedule work,
+//! It persists explicit policy and bounded `goal_check_in` evidence, evaluates
+//! only pending intents, and records the resulting immutable lifecycle event.
+//! It does not create intents automatically, mutate D14 goals, schedule work,
 //! deliver messages, or invoke an Agent or Tool.
 
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
@@ -11,13 +11,20 @@ use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, Transact
 use super::StorageService;
 use crate::{
     autonomy::{
-        validate_intent_create_request, validate_intent_state, validate_policy_create_request,
-        validate_policy_event_state, validate_policy_state, validate_policy_update_request,
-        AutonomyCreateOutcome, AutonomyError, LifeAutonomyPolicy, LifeAutonomyPolicyCreateRequest,
-        LifeAutonomyPolicyEvent, LifeAutonomyPolicyUpdateOutcome, LifeAutonomyPolicyUpdateRequest,
-        LifeProactiveIntent, LifeProactiveIntentCreateRequest, LifeProactiveIntentEvent,
-        INTENT_CREATED_BY_KIND_AUTONOMY_POLICY, INTENT_STATUS_PENDING, INTENT_VERSION,
-        POLICY_ACTOR_KIND_USER_EXPLICIT, POLICY_EVENT_VERSION,
+        evaluate_initiative_policy, validate_intent_create_request,
+        validate_intent_evaluation_request, validate_intent_event_state, validate_intent_state,
+        validate_policy_create_request, validate_policy_event_state, validate_policy_state,
+        validate_policy_update_request, AutonomyCreateOutcome, AutonomyError,
+        InitiativePolicyDecision, InitiativePolicyTemporalContext, LifeAutonomyPolicy,
+        LifeAutonomyPolicyCreateRequest, LifeAutonomyPolicyEvent, LifeAutonomyPolicyUpdateOutcome,
+        LifeAutonomyPolicyUpdateRequest, LifeProactiveIntent, LifeProactiveIntentCreateRequest,
+        LifeProactiveIntentEvaluationOutcome, LifeProactiveIntentEvaluationRequest,
+        LifeProactiveIntentEvent, INTENT_CREATED_BY_KIND_AUTONOMY_POLICY,
+        INTENT_EVENT_ACTOR_KIND_AUTONOMY_POLICY, INTENT_EVENT_VERSION,
+        INTENT_FOCUS_STATE_AVAILABLE, INTENT_STATUS_CANCELLED, INTENT_STATUS_DEFERRED,
+        INTENT_STATUS_EXPIRED, INTENT_STATUS_PENDING, INTENT_STATUS_READY,
+        INTENT_STATUS_STORED_SILENTLY, INTENT_VERSION, MIN_RECHECK_SECONDS,
+        POLICY_ACTOR_KIND_USER_EXPLICIT, POLICY_EVENT_VERSION, RECENT_INTERACTION_QUIET_SECONDS,
     },
     life_intent::GOAL_STATUS_ACTIVE,
 };
@@ -170,6 +177,25 @@ fn sqlite_authority_now(connection: &Connection) -> Result<String, AutonomyError
         .map_err(|_| AutonomyError::database())
 }
 
+fn sqlite_add_seconds(
+    connection: &Connection,
+    base: &str,
+    seconds: i64,
+) -> Result<String, AutonomyError> {
+    let modifier = if seconds >= 0 {
+        format!("+{seconds} seconds")
+    } else {
+        format!("{seconds} seconds")
+    };
+    connection
+        .query_row(
+            "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', ?1, ?2)",
+            params![base, modifier],
+            |row| row.get(0),
+        )
+        .map_err(|_| AutonomyError::database())
+}
+
 fn map_database_error(_error: rusqlite::Error) -> AutonomyError {
     AutonomyError::database()
 }
@@ -241,6 +267,98 @@ fn load_intent(
         )
         .optional()
         .map_err(|_| AutonomyError::database())
+}
+
+fn load_intent_event_by_id(
+    connection: &Connection,
+    event_id: &str,
+) -> Result<Option<LifeProactiveIntentEvent>, AutonomyError> {
+    connection
+        .query_row(
+            &format!(
+                "SELECT {INTENT_EVENT_COLUMNS} FROM life_proactive_intent_event
+                 WHERE event_id = ?1"
+            ),
+            [event_id],
+            read_intent_event,
+        )
+        .optional()
+        .map_err(|_| AutonomyError::database())
+}
+
+fn intent_event_evidence_matches(
+    event: &LifeProactiveIntentEvent,
+    request: &crate::autonomy::LifeProactiveIntentEvaluationRequest,
+    applied_revision: i64,
+) -> bool {
+    event.event_id == request.event_id
+        && event.life_id == request.life_id
+        && event.intent_id == request.intent_id
+        && event.from_status == INTENT_STATUS_PENDING
+        && event.expected_revision == request.expected_revision
+        && event.applied_revision == applied_revision
+        && event.actor_kind == INTENT_EVENT_ACTOR_KIND_AUTONOMY_POLICY
+        && event.event_version == INTENT_EVENT_VERSION
+}
+
+fn load_goal_is_active(
+    connection: &Connection,
+    life_id: &str,
+    goal_id: &str,
+) -> Result<bool, AutonomyError> {
+    let status: Option<String> = connection
+        .query_row(
+            "SELECT status FROM life_goal WHERE goal_id = ?1 AND life_id = ?2",
+            params![goal_id, life_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| AutonomyError::database())?;
+    Ok(status.as_deref() == Some(GOAL_STATUS_ACTIVE))
+}
+
+#[derive(Debug, Default)]
+struct ReadyEventHistory {
+    count_in_window: i64,
+    oldest_in_window: Option<String>,
+    latest: Option<String>,
+}
+
+fn load_ready_event_history(
+    connection: &Connection,
+    life_id: &str,
+    now: &str,
+    window_seconds: i64,
+) -> Result<ReadyEventHistory, AutonomyError> {
+    let window_start = sqlite_add_seconds(connection, now, -window_seconds)?;
+    let (count_in_window, oldest_in_window): (i64, Option<String>) = connection
+        .query_row(
+            "SELECT COUNT(*), MIN(occurred_at)
+             FROM life_proactive_intent_event
+             WHERE life_id = ?1
+               AND to_status = 'ready'
+               AND occurred_at >= ?2
+               AND occurred_at <= ?3",
+            params![life_id, window_start, now],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|_| AutonomyError::database())?;
+    let latest: Option<String> = connection
+        .query_row(
+            "SELECT MAX(occurred_at)
+             FROM life_proactive_intent_event
+             WHERE life_id = ?1
+               AND to_status = 'ready'
+               AND occurred_at <= ?2",
+            params![life_id, now],
+            |row| row.get(0),
+        )
+        .map_err(|_| AutonomyError::database())?;
+    Ok(ReadyEventHistory {
+        count_in_window,
+        oldest_in_window,
+        latest,
+    })
 }
 
 fn policy_create_evidence_matches(
@@ -564,6 +682,227 @@ fn create_pending_intent_in_transaction(
     Ok(AutonomyCreateOutcome::Applied(created))
 }
 
+fn latest_defer_candidate(context: &InitiativePolicyTemporalContext) -> Option<String> {
+    [
+        context.recent_interaction_not_before.as_deref(),
+        context.temporary_gate_not_before.as_deref(),
+        context.frequency_not_before.as_deref(),
+        context.min_gap_not_before.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+    .map(str::to_owned)
+}
+
+fn evaluate_pending_intent_in_transaction(
+    transaction: &Transaction<'_>,
+    request: LifeProactiveIntentEvaluationRequest,
+) -> Result<LifeProactiveIntentEvaluationOutcome, AutonomyError> {
+    validate_intent_evaluation_request(&request)?;
+
+    // Event identity is checked before loading the target, policy, Goal, or
+    // any current time. An exact replay returns the current authoritative
+    // intent without recomputing the historical decision.
+    if let Some(existing_event) = load_intent_event_by_id(transaction, &request.event_id)? {
+        let applied_revision = next_revision(request.expected_revision)?;
+        if intent_event_evidence_matches(&existing_event, &request, applied_revision) {
+            let current = load_intent(transaction, &request.life_id, &request.intent_id)?
+                .ok_or_else(AutonomyError::intent_not_found)?;
+            validate_intent_event_state(&existing_event)?;
+            validate_intent_state(&current)?;
+            return Ok(LifeProactiveIntentEvaluationOutcome::Replayed {
+                event: existing_event,
+                current,
+            });
+        }
+        return Err(AutonomyError::proactive_intent_event_conflict());
+    }
+
+    let current = load_intent_by_id(transaction, &request.intent_id)?
+        .ok_or_else(AutonomyError::intent_not_found)?;
+    if current.life_id != request.life_id {
+        return Err(AutonomyError::intent_life_mismatch());
+    }
+    validate_intent_state(&current)?;
+    if current.revision != request.expected_revision {
+        return Err(AutonomyError::revision_conflict());
+    }
+    if current.status != INTENT_STATUS_PENDING {
+        return Err(AutonomyError::invalid_intent_state());
+    }
+
+    let applied_revision = next_revision(request.expected_revision)?;
+    let now = sqlite_authority_now(transaction)?;
+    let expired = current
+        .expires_at
+        .as_deref()
+        .is_some_and(|expires_at| expires_at <= now.as_str());
+
+    let policy = if expired {
+        None
+    } else {
+        let policy = load_policy(transaction, &request.life_id)?;
+        if let Some(policy) = &policy {
+            validate_policy_state(policy)?;
+        }
+        policy
+    };
+    let goal_is_active = if let Some(policy) = &policy {
+        if policy.enabled {
+            load_goal_is_active(transaction, &current.life_id, &current.goal_id)?
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    let mut temporal = InitiativePolicyTemporalContext::default();
+    if !expired && policy.as_ref().is_some_and(|policy| policy.enabled) && goal_is_active {
+        temporal.recent_interaction_not_before = match current.recent_interaction_seconds {
+            None => Some(sqlite_add_seconds(transaction, &now, MIN_RECHECK_SECONDS)?),
+            Some(seconds) if seconds < RECENT_INTERACTION_QUIET_SECONDS => {
+                Some(sqlite_add_seconds(
+                    transaction,
+                    &now,
+                    RECENT_INTERACTION_QUIET_SECONDS - seconds,
+                )?)
+            }
+            Some(_) => None,
+        };
+
+        let policy = policy.as_ref().expect("enabled policy was checked above");
+        if policy.dnd || current.focus_state != INTENT_FOCUS_STATE_AVAILABLE {
+            temporal.temporary_gate_not_before = Some(sqlite_add_seconds(
+                transaction,
+                &now,
+                MIN_RECHECK_SECONDS.max(policy.min_gap_seconds),
+            )?);
+        }
+
+        if policy.max_ready_per_window > 0 {
+            let history = load_ready_event_history(
+                transaction,
+                &current.life_id,
+                &now,
+                policy.window_seconds,
+            )?;
+            if history.count_in_window >= policy.max_ready_per_window {
+                let oldest = history
+                    .oldest_in_window
+                    .as_deref()
+                    .ok_or_else(AutonomyError::database)?;
+                temporal.frequency_not_before = Some(sqlite_add_seconds(
+                    transaction,
+                    oldest,
+                    policy.window_seconds,
+                )?);
+            }
+            if let Some(latest) = history.latest.as_deref() {
+                let candidate = sqlite_add_seconds(transaction, latest, policy.min_gap_seconds)?;
+                if candidate > now {
+                    temporal.min_gap_not_before = Some(candidate);
+                }
+            }
+        }
+    }
+
+    let decision =
+        evaluate_initiative_policy(&current, policy.as_ref(), goal_is_active, &now, &temporal)?;
+    let deferred_not_before = latest_defer_candidate(&temporal);
+    let (to_status, not_before, closed_at) = match decision {
+        InitiativePolicyDecision::Ready => (INTENT_STATUS_READY, None, None),
+        InitiativePolicyDecision::Deferred => (
+            INTENT_STATUS_DEFERRED,
+            Some(deferred_not_before.ok_or_else(|| {
+                AutonomyError::invalid_argument("deferred intent is missing not_before.")
+            })?),
+            None,
+        ),
+        InitiativePolicyDecision::StoredSilently => {
+            (INTENT_STATUS_STORED_SILENTLY, None, Some(now.clone()))
+        }
+        InitiativePolicyDecision::Cancelled => (INTENT_STATUS_CANCELLED, None, Some(now.clone())),
+        InitiativePolicyDecision::Expired => (INTENT_STATUS_EXPIRED, None, Some(now.clone())),
+    };
+
+    let changed = transaction
+        .execute(
+            "UPDATE life_proactive_intent
+             SET status = ?1,
+                 revision = ?2,
+                 updated_at = ?3,
+                 not_before = ?4,
+                 closed_at = ?5
+             WHERE intent_id = ?6
+               AND life_id = ?7
+               AND revision = ?8
+               AND status = 'pending'",
+            params![
+                to_status,
+                applied_revision,
+                &now,
+                &not_before,
+                &closed_at,
+                &request.intent_id,
+                &request.life_id,
+                request.expected_revision,
+            ],
+        )
+        .map_err(map_database_error)?;
+    if changed != 1 {
+        return Err(AutonomyError::revision_conflict());
+    }
+
+    let event = LifeProactiveIntentEvent {
+        event_id: request.event_id.clone(),
+        life_id: request.life_id.clone(),
+        intent_id: request.intent_id.clone(),
+        from_status: INTENT_STATUS_PENDING.to_string(),
+        to_status: to_status.to_string(),
+        expected_revision: request.expected_revision,
+        applied_revision,
+        not_before_after: not_before.clone(),
+        actor_kind: INTENT_EVENT_ACTOR_KIND_AUTONOMY_POLICY.to_string(),
+        occurred_at: now.clone(),
+        event_version: INTENT_EVENT_VERSION,
+    };
+    validate_intent_event_state(&event)?;
+    transaction
+        .execute(
+            &format!(
+                "INSERT INTO life_proactive_intent_event ({INTENT_EVENT_COLUMNS})
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
+            ),
+            params![
+                &event.event_id,
+                &event.life_id,
+                &event.intent_id,
+                &event.from_status,
+                &event.to_status,
+                event.expected_revision,
+                event.applied_revision,
+                &event.not_before_after,
+                &event.actor_kind,
+                &event.occurred_at,
+                event.event_version,
+            ],
+        )
+        .map_err(map_database_error)?;
+
+    let persisted_event = load_intent_event_by_id(transaction, &event.event_id)?
+        .ok_or_else(AutonomyError::database)?;
+    let persisted_intent = load_intent(transaction, &event.life_id, &event.intent_id)?
+        .ok_or_else(AutonomyError::intent_not_found)?;
+    validate_intent_event_state(&persisted_event)?;
+    validate_intent_state(&persisted_intent)?;
+    Ok(LifeProactiveIntentEvaluationOutcome::Applied {
+        event: persisted_event,
+        intent: persisted_intent,
+    })
+}
+
 impl crate::autonomy::AutonomyRepository for StorageService {
     fn create_policy(
         &self,
@@ -617,6 +956,22 @@ impl crate::autonomy::AutonomyRepository for StorageService {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| AutonomyError::database())?;
         let outcome = create_pending_intent_in_transaction(&transaction, request)?;
+        transaction
+            .commit()
+            .map_err(|_| AutonomyError::database())?;
+        Ok(outcome)
+    }
+
+    fn evaluate_pending_intent(
+        &self,
+        request: LifeProactiveIntentEvaluationRequest,
+    ) -> Result<LifeProactiveIntentEvaluationOutcome, AutonomyError> {
+        let mut state = self.state().map_err(|_| AutonomyError::database())?;
+        let transaction = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| AutonomyError::database())?;
+        let outcome = evaluate_pending_intent_in_transaction(&transaction, request)?;
         transaction
             .commit()
             .map_err(|_| AutonomyError::database())?;
@@ -729,6 +1084,11 @@ const _: for<'a> fn(
     LifeProactiveIntentCreateRequest,
 ) -> Result<AutonomyCreateOutcome<LifeProactiveIntent>, AutonomyError> =
     <StorageService as crate::autonomy::AutonomyRepository>::create_pending_goal_check_in_intent;
+const _: for<'a> fn(
+    &'a StorageService,
+    LifeProactiveIntentEvaluationRequest,
+) -> Result<LifeProactiveIntentEvaluationOutcome, AutonomyError> =
+    <StorageService as crate::autonomy::AutonomyRepository>::evaluate_pending_intent;
 
 /// Exact normalized validation of every Schema23 D15 object. A matching name
 /// is not sufficient: table and trigger DDL must retain all checks, foreign
@@ -867,6 +1227,11 @@ const _: fn(&Connection) -> Result<(), super::StorageError> = validate_schema_ob
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::{Arc, Barrier},
+        thread,
+    };
+
     use rusqlite::params;
     use tempfile::TempDir;
 
@@ -874,10 +1239,14 @@ mod tests {
     use crate::{
         autonomy::{
             validate_intent_event_state, AutonomyErrorCode, AutonomyRepository,
-            LifeAutonomyPolicyUpdateOutcome, LifeProactiveIntentEvent,
+            LifeAutonomyPolicyUpdateOutcome, LifeProactiveIntentEvaluationOutcome,
+            LifeProactiveIntentEvaluationRequest, LifeProactiveIntentEvent,
             INTENT_EVENT_ACTOR_KIND_AUTONOMY_POLICY, INTENT_EVENT_VERSION,
-            INTENT_FOCUS_STATE_AVAILABLE, INTENT_KIND_GOAL_CHECK_IN, INTENT_STATUS_PENDING,
-            INTENT_STATUS_READY,
+            INTENT_FOCUS_STATE_AVAILABLE, INTENT_FOCUS_STATE_DND, INTENT_FOCUS_STATE_FOCUSED,
+            INTENT_FOCUS_STATE_UNKNOWN, INTENT_KIND_GOAL_CHECK_IN, INTENT_STATUS_CANCELLED,
+            INTENT_STATUS_DEFERRED, INTENT_STATUS_EXPIRED, INTENT_STATUS_PENDING,
+            INTENT_STATUS_READY, INTENT_STATUS_STORED_SILENTLY, MIN_RECHECK_SECONDS,
+            RECENT_INTERACTION_QUIET_SECONDS,
         },
         life_intent::{
             LifeGoalCreateRequest, LifeGoalTransitionKind, LifeGoalTransitionRequest,
@@ -987,6 +1356,92 @@ mod tests {
                     objective: format!("Objective {goal_id}"),
                 })
                 .unwrap();
+        }
+
+        fn create_intent(&self, request: LifeProactiveIntentCreateRequest) -> LifeProactiveIntent {
+            match self
+                .storage
+                .create_pending_goal_check_in_intent(request)
+                .unwrap()
+            {
+                AutonomyCreateOutcome::Applied(intent) => intent,
+                AutonomyCreateOutcome::Replayed(_) => panic!("first intent create must apply"),
+            }
+        }
+
+        fn evaluation_request(
+            &self,
+            event_id: &str,
+            life_id: &str,
+            intent_id: &str,
+            expected_revision: i64,
+        ) -> LifeProactiveIntentEvaluationRequest {
+            LifeProactiveIntentEvaluationRequest {
+                event_id: event_id.into(),
+                life_id: life_id.into(),
+                intent_id: intent_id.into(),
+                expected_revision,
+            }
+        }
+
+        fn intent_event_count(&self) -> i64 {
+            let state = self.storage.state().unwrap();
+            state
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM life_proactive_intent_event",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        }
+
+        fn add_seconds(&self, base: &str, seconds: i64) -> String {
+            let state = self.storage.state().unwrap();
+            sqlite_add_seconds(&state.connection, base, seconds).unwrap()
+        }
+
+        fn insert_ready_event(
+            &self,
+            event_id: &str,
+            life_id: &str,
+            intent_id: &str,
+            occurred_at_modifier: &str,
+        ) {
+            let state = self.storage.state().unwrap();
+            state
+                .connection
+                .execute(
+                    "INSERT INTO life_proactive_intent_event
+                     (event_id, life_id, intent_id, from_status, to_status,
+                      expected_revision, applied_revision, not_before_after,
+                      actor_kind, occurred_at, event_version)
+                     VALUES (?1, ?2, ?3, 'pending', 'ready', 1, 2, NULL,
+                             'autonomy_policy',
+                             strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?4), 1)",
+                    params![event_id, life_id, intent_id, occurred_at_modifier],
+                )
+                .unwrap();
+        }
+
+        fn update_policy(&self, request: LifeAutonomyPolicyUpdateRequest) {
+            self.storage.update_policy(request).unwrap();
+        }
+
+        fn evaluate(
+            &self,
+            event_id: &str,
+            life_id: &str,
+            intent_id: &str,
+            expected_revision: i64,
+        ) -> Result<LifeProactiveIntentEvaluationOutcome, AutonomyError> {
+            self.storage
+                .evaluate_pending_intent(self.evaluation_request(
+                    event_id,
+                    life_id,
+                    intent_id,
+                    expected_revision,
+                ))
         }
     }
 
@@ -1421,6 +1876,121 @@ mod tests {
     }
 
     #[test]
+    fn pending_evaluation_event_identity_replay_and_revision_precedence() {
+        let fixture = Fixture::new();
+        fixture.create_policy("autonomy-life-a", true, false);
+        fixture.create_goal("autonomy-goal-evaluation", "autonomy-life-a");
+        let mut request = fixture.intent_request(
+            "autonomy-intent-evaluation",
+            "autonomy-life-a",
+            "autonomy-goal-evaluation",
+        );
+        request.recent_interaction_seconds = Some(120);
+        fixture.create_intent(request);
+
+        let first = fixture
+            .evaluate(
+                "autonomy-intent-event-1",
+                "autonomy-life-a",
+                "autonomy-intent-evaluation",
+                1,
+            )
+            .unwrap();
+        let event = match first {
+            LifeProactiveIntentEvaluationOutcome::Applied { event, intent } => {
+                assert_eq!(intent.status, INTENT_STATUS_READY);
+                assert_eq!(intent.revision, 2);
+                assert_eq!(intent.updated_at, event.occurred_at);
+                assert!(intent.not_before.is_none());
+                assert!(intent.closed_at.is_none());
+                event
+            }
+            LifeProactiveIntentEvaluationOutcome::Replayed { .. } => {
+                panic!("first evaluation must apply")
+            }
+        };
+        assert_eq!(event.from_status, INTENT_STATUS_PENDING);
+        assert_eq!(event.to_status, INTENT_STATUS_READY);
+        assert_eq!(event.expected_revision, 1);
+        assert_eq!(event.applied_revision, 2);
+        assert!(event.not_before_after.is_none());
+        assert_eq!(fixture.intent_event_count(), 1);
+
+        let replay = fixture
+            .evaluate(
+                "autonomy-intent-event-1",
+                "autonomy-life-a",
+                "autonomy-intent-evaluation",
+                1,
+            )
+            .unwrap();
+        match replay {
+            LifeProactiveIntentEvaluationOutcome::Replayed {
+                event: replayed,
+                current,
+            } => {
+                assert_eq!(replayed, event);
+                assert_eq!(current.revision, 2);
+                assert_eq!(current.status, INTENT_STATUS_READY);
+            }
+            LifeProactiveIntentEvaluationOutcome::Applied { .. } => {
+                panic!("exact evaluation must replay")
+            }
+        }
+        assert_eq!(fixture.intent_event_count(), 1);
+
+        fixture.update_policy(LifeAutonomyPolicyUpdateRequest {
+            event_id: "autonomy-policy-event-after-evaluation".into(),
+            life_id: "autonomy-life-a".into(),
+            enabled: false,
+            dnd: false,
+            max_ready_per_window: 3,
+            window_seconds: 900,
+            min_gap_seconds: 60,
+            expected_revision: 1,
+        });
+        let replay_after_policy_change = fixture
+            .evaluate(
+                "autonomy-intent-event-1",
+                "autonomy-life-a",
+                "autonomy-intent-evaluation",
+                1,
+            )
+            .unwrap();
+        assert!(matches!(
+            replay_after_policy_change,
+            LifeProactiveIntentEvaluationOutcome::Replayed { .. }
+        ));
+
+        let different_intent = fixture
+            .storage
+            .evaluate_pending_intent(fixture.evaluation_request(
+                "autonomy-intent-event-1",
+                "autonomy-life-a",
+                "another-intent",
+                1,
+            ));
+        assert_eq!(
+            error_code(different_intent.unwrap_err()),
+            AutonomyErrorCode::ProactiveIntentEventConflict
+        );
+        let different_revision =
+            fixture
+                .storage
+                .evaluate_pending_intent(fixture.evaluation_request(
+                    "autonomy-intent-event-1",
+                    "autonomy-life-a",
+                    "autonomy-intent-evaluation",
+                    2,
+                ));
+        assert_eq!(
+            error_code(different_revision.unwrap_err()),
+            AutonomyErrorCode::ProactiveIntentEventConflict
+        );
+        assert_eq!(fixture.intent_event_count(), 1);
+    }
+
+    #[test]
     fn intent_bounds_focus_and_expiry_are_rejected_before_storage() {
         let fixture = Fixture::new();
         fixture.create_goal("autonomy-goal-bounds", "autonomy-life-a");
@@ -1512,6 +2082,708 @@ mod tests {
             error_code(fixture.storage.create_policy(bad_policy).unwrap_err()),
             AutonomyErrorCode::InvalidArgument
         );
+    }
+
+    #[test]
+    fn pending_evaluation_expiry_policy_and_goal_governance_are_typed() {
+        let fixture = Fixture::new();
+        fixture.create_policy("autonomy-life-a", true, false);
+
+        fixture.create_goal("autonomy-goal-expired", "autonomy-life-a");
+        let mut expired_request = fixture.intent_request(
+            "autonomy-intent-expired",
+            "autonomy-life-a",
+            "autonomy-goal-expired",
+        );
+        expired_request.recent_interaction_seconds = Some(120);
+        expired_request.expires_at = Some("2026-01-01T00:00:00.000Z".into());
+        fixture.create_intent(expired_request);
+        let expired = fixture
+            .evaluate(
+                "autonomy-intent-event-expired",
+                "autonomy-life-a",
+                "autonomy-intent-expired",
+                1,
+            )
+            .unwrap();
+        match expired {
+            LifeProactiveIntentEvaluationOutcome::Applied { event, intent } => {
+                assert_eq!(event.to_status, INTENT_STATUS_EXPIRED);
+                assert_eq!(intent.status, INTENT_STATUS_EXPIRED);
+                assert_eq!(intent.revision, 2);
+                assert!(intent.closed_at.is_some());
+                assert!(event.not_before_after.is_none());
+            }
+            LifeProactiveIntentEvaluationOutcome::Replayed { .. } => {
+                panic!("first expiry evaluation must apply")
+            }
+        }
+
+        fixture.create_goal("autonomy-goal-completed", "autonomy-life-a");
+        let completed_intent = fixture.create_intent(fixture.intent_request(
+            "autonomy-intent-completed-goal",
+            "autonomy-life-a",
+            "autonomy-goal-completed",
+        ));
+        fixture
+            .storage
+            .transition_goal(LifeGoalTransitionRequest {
+                goal_id: "autonomy-goal-completed".into(),
+                life_id: "autonomy-life-a".into(),
+                kind: LifeGoalTransitionKind::Complete,
+                event_id: "autonomy-goal-completed-event".into(),
+                expected_revision: 1,
+            })
+            .unwrap();
+        let completed = fixture
+            .evaluate(
+                "autonomy-intent-event-completed-goal",
+                "autonomy-life-a",
+                &completed_intent.intent_id,
+                1,
+            )
+            .unwrap();
+        match completed {
+            LifeProactiveIntentEvaluationOutcome::Applied { event, intent } => {
+                assert_eq!(event.to_status, INTENT_STATUS_CANCELLED);
+                assert_eq!(intent.status, INTENT_STATUS_CANCELLED);
+                assert!(intent.closed_at.is_some());
+            }
+            LifeProactiveIntentEvaluationOutcome::Replayed { .. } => {
+                panic!("first completed-goal evaluation must apply")
+            }
+        }
+
+        fixture.create_goal("autonomy-goal-disabled", "autonomy-life-a");
+        let disabled_intent = fixture.create_intent(fixture.intent_request(
+            "autonomy-intent-disabled-evaluation",
+            "autonomy-life-a",
+            "autonomy-goal-disabled",
+        ));
+
+        fixture.create_policy("autonomy-life-b", true, false);
+        fixture.create_goal("autonomy-goal-missing-policy", "autonomy-life-b");
+        let missing_policy_intent = fixture.create_intent(fixture.intent_request(
+            "autonomy-intent-missing-policy",
+            "autonomy-life-b",
+            "autonomy-goal-missing-policy",
+        ));
+        let state = fixture.storage.state().unwrap();
+        state
+            .connection
+            .execute(
+                "DELETE FROM life_autonomy_policy WHERE life_id='autonomy-life-b'",
+                [],
+            )
+            .unwrap();
+        drop(state);
+        let missing_policy = fixture
+            .evaluate(
+                "autonomy-intent-event-missing-policy",
+                "autonomy-life-b",
+                &missing_policy_intent.intent_id,
+                1,
+            )
+            .unwrap();
+        match missing_policy {
+            LifeProactiveIntentEvaluationOutcome::Applied { event, intent } => {
+                assert_eq!(event.to_status, INTENT_STATUS_CANCELLED);
+                assert_eq!(intent.status, INTENT_STATUS_CANCELLED);
+            }
+            LifeProactiveIntentEvaluationOutcome::Replayed { .. } => {
+                panic!("first missing-policy evaluation must apply")
+            }
+        }
+
+        fixture.update_policy(LifeAutonomyPolicyUpdateRequest {
+            event_id: "autonomy-policy-event-disable-evaluation".into(),
+            life_id: "autonomy-life-a".into(),
+            enabled: false,
+            dnd: false,
+            max_ready_per_window: 3,
+            window_seconds: 900,
+            min_gap_seconds: 60,
+            expected_revision: 1,
+        });
+        let disabled = fixture
+            .evaluate(
+                "autonomy-intent-event-disabled-policy",
+                "autonomy-life-a",
+                &disabled_intent.intent_id,
+                1,
+            )
+            .unwrap();
+        match disabled {
+            LifeProactiveIntentEvaluationOutcome::Applied { event, intent } => {
+                assert_eq!(event.to_status, INTENT_STATUS_CANCELLED);
+                assert_eq!(intent.status, INTENT_STATUS_CANCELLED);
+                assert!(intent.closed_at.is_some());
+            }
+            LifeProactiveIntentEvaluationOutcome::Replayed { .. } => {
+                panic!("first disabled-policy evaluation must apply")
+            }
+        }
+    }
+
+    #[test]
+    fn pending_evaluation_dnd_focus_and_recent_gates_are_deferred() {
+        let fixture = Fixture::new();
+        fixture.create_policy("autonomy-life-a", true, true);
+        fixture.create_goal("autonomy-goal-dnd-evaluation", "autonomy-life-a");
+        let mut dnd_request = fixture.intent_request(
+            "autonomy-intent-dnd-evaluation",
+            "autonomy-life-a",
+            "autonomy-goal-dnd-evaluation",
+        );
+        dnd_request.recent_interaction_seconds = Some(120);
+        let dnd_intent = fixture.create_intent(dnd_request);
+        let dnd_result = fixture
+            .evaluate(
+                "autonomy-intent-event-dnd-evaluation",
+                "autonomy-life-a",
+                &dnd_intent.intent_id,
+                1,
+            )
+            .unwrap();
+        let dnd_intent = match dnd_result {
+            LifeProactiveIntentEvaluationOutcome::Applied { event, intent } => {
+                assert_eq!(event.to_status, INTENT_STATUS_DEFERRED);
+                assert!(event.not_before_after.is_some());
+                assert_eq!(intent.status, INTENT_STATUS_DEFERRED);
+                assert_eq!(intent.revision, 2);
+                assert_eq!(intent.not_before, event.not_before_after);
+                intent
+            }
+            LifeProactiveIntentEvaluationOutcome::Replayed { .. } => {
+                panic!("first DND evaluation must apply")
+            }
+        };
+        assert_eq!(
+            error_code(
+                fixture
+                    .evaluate(
+                        "autonomy-intent-event-dnd-recheck",
+                        "autonomy-life-a",
+                        &dnd_intent.intent_id,
+                        2,
+                    )
+                    .unwrap_err()
+            ),
+            AutonomyErrorCode::InvalidIntentState
+        );
+        assert_eq!(fixture.intent_event_count(), 1);
+
+        let mut focus_policy = fixture.policy_request("autonomy-life-b");
+        focus_policy.max_ready_per_window = 1;
+        focus_policy.window_seconds = 60;
+        focus_policy.min_gap_seconds = 0;
+        fixture.storage.create_policy(focus_policy).unwrap();
+        fixture.create_goal("autonomy-goal-focus-evaluation", "autonomy-life-b");
+        for (intent_id, focus_state) in [
+            ("autonomy-intent-focus-dnd", INTENT_FOCUS_STATE_DND),
+            ("autonomy-intent-focus-focused", INTENT_FOCUS_STATE_FOCUSED),
+            ("autonomy-intent-focus-unknown", INTENT_FOCUS_STATE_UNKNOWN),
+        ] {
+            let mut request = fixture.intent_request(
+                intent_id,
+                "autonomy-life-b",
+                "autonomy-goal-focus-evaluation",
+            );
+            request.focus_state = focus_state.into();
+            request.recent_interaction_seconds = Some(120);
+            let intent = fixture.create_intent(request);
+            let result = fixture
+                .evaluate(
+                    &format!("{intent_id}-event"),
+                    "autonomy-life-b",
+                    &intent.intent_id,
+                    1,
+                )
+                .unwrap();
+            match result {
+                LifeProactiveIntentEvaluationOutcome::Applied { event, intent } => {
+                    assert_eq!(event.to_status, INTENT_STATUS_DEFERRED);
+                    assert_eq!(intent.status, INTENT_STATUS_DEFERRED);
+                    assert_eq!(
+                        intent.not_before,
+                        Some(fixture.add_seconds(&event.occurred_at, MIN_RECHECK_SECONDS))
+                    );
+                    assert_eq!(intent.not_before, event.not_before_after);
+                }
+                LifeProactiveIntentEvaluationOutcome::Replayed { .. } => {
+                    panic!("first focus evaluation must apply")
+                }
+            }
+        }
+
+        for (intent_id, recent_interaction_seconds, expected_status) in [
+            ("autonomy-intent-recent-null", None, INTENT_STATUS_DEFERRED),
+            (
+                "autonomy-intent-recent-zero",
+                Some(0),
+                INTENT_STATUS_DEFERRED,
+            ),
+            (
+                "autonomy-intent-recent-119",
+                Some(119),
+                INTENT_STATUS_DEFERRED,
+            ),
+            ("autonomy-intent-recent-120", Some(120), INTENT_STATUS_READY),
+        ] {
+            let mut request = fixture.intent_request(
+                intent_id,
+                "autonomy-life-b",
+                "autonomy-goal-focus-evaluation",
+            );
+            request.recent_interaction_seconds = recent_interaction_seconds;
+            let intent = fixture.create_intent(request);
+            let result = fixture
+                .evaluate(
+                    &format!("{intent_id}-event"),
+                    "autonomy-life-b",
+                    &intent.intent_id,
+                    1,
+                )
+                .unwrap();
+            let evaluated = match result {
+                LifeProactiveIntentEvaluationOutcome::Applied { intent, event } => {
+                    assert_eq!(intent.status, expected_status);
+                    let expected_not_before = match recent_interaction_seconds {
+                        None => Some(fixture.add_seconds(&event.occurred_at, MIN_RECHECK_SECONDS)),
+                        Some(seconds) if seconds < RECENT_INTERACTION_QUIET_SECONDS => {
+                            Some(fixture.add_seconds(
+                                &event.occurred_at,
+                                RECENT_INTERACTION_QUIET_SECONDS - seconds,
+                            ))
+                        }
+                        Some(_) => None,
+                    };
+                    assert_eq!(intent.not_before, expected_not_before);
+                    if expected_status == INTENT_STATUS_DEFERRED {
+                        assert_eq!(intent.not_before, event.not_before_after);
+                        assert!(intent.not_before.is_some());
+                    } else {
+                        assert!(intent.not_before.is_none());
+                        assert!(event.not_before_after.is_none());
+                    }
+                    intent
+                }
+                LifeProactiveIntentEvaluationOutcome::Replayed { .. } => {
+                    panic!("first recent-interaction evaluation must apply")
+                }
+            };
+            assert_eq!(evaluated.revision, 2);
+        }
+    }
+
+    #[test]
+    fn pending_evaluation_frequency_budget_and_min_gap_use_persisted_events() {
+        let fixture = Fixture::new();
+        let mut zero_budget = fixture.policy_request("autonomy-life-a");
+        zero_budget.max_ready_per_window = 0;
+        zero_budget.min_gap_seconds = 0;
+        fixture.storage.create_policy(zero_budget).unwrap();
+        fixture.create_goal("autonomy-goal-frequency-zero", "autonomy-life-a");
+        let mut zero_request = fixture.intent_request(
+            "autonomy-intent-frequency-zero",
+            "autonomy-life-a",
+            "autonomy-goal-frequency-zero",
+        );
+        zero_request.recent_interaction_seconds = Some(120);
+        let zero_intent = fixture.create_intent(zero_request);
+        let zero_result = fixture
+            .evaluate(
+                "autonomy-intent-event-frequency-zero",
+                "autonomy-life-a",
+                &zero_intent.intent_id,
+                1,
+            )
+            .unwrap();
+        match zero_result {
+            LifeProactiveIntentEvaluationOutcome::Applied { event, intent } => {
+                assert_eq!(event.to_status, INTENT_STATUS_STORED_SILENTLY);
+                assert_eq!(intent.status, INTENT_STATUS_STORED_SILENTLY);
+                assert!(intent.closed_at.is_some());
+                assert!(event.not_before_after.is_none());
+            }
+            LifeProactiveIntentEvaluationOutcome::Replayed { .. } => {
+                panic!("zero-budget evaluation must apply")
+            }
+        }
+
+        fixture.update_policy(LifeAutonomyPolicyUpdateRequest {
+            event_id: "autonomy-policy-event-frequency-ready".into(),
+            life_id: "autonomy-life-a".into(),
+            enabled: true,
+            dnd: false,
+            max_ready_per_window: 1,
+            window_seconds: 60,
+            min_gap_seconds: 0,
+            expected_revision: 1,
+        });
+        fixture.create_goal("autonomy-goal-frequency-ready", "autonomy-life-a");
+        let mut ready_request = fixture.intent_request(
+            "autonomy-intent-frequency-ready",
+            "autonomy-life-a",
+            "autonomy-goal-frequency-ready",
+        );
+        ready_request.recent_interaction_seconds = Some(120);
+        let ready_intent = fixture.create_intent(ready_request);
+        let ready_result = fixture
+            .evaluate(
+                "autonomy-intent-event-frequency-ready",
+                "autonomy-life-a",
+                &ready_intent.intent_id,
+                1,
+            )
+            .unwrap();
+        let ready_occurred_at = match ready_result {
+            LifeProactiveIntentEvaluationOutcome::Applied { event, intent } => {
+                assert_eq!(intent.status, INTENT_STATUS_READY);
+                event.occurred_at
+            }
+            LifeProactiveIntentEvaluationOutcome::Replayed { .. } => {
+                panic!("first frequency-ready evaluation must apply")
+            }
+        };
+        let expected_frequency_not_before = fixture.add_seconds(&ready_occurred_at, 60);
+
+        fixture.create_goal("autonomy-goal-frequency-exhausted", "autonomy-life-a");
+        let mut exhausted_request = fixture.intent_request(
+            "autonomy-intent-frequency-exhausted",
+            "autonomy-life-a",
+            "autonomy-goal-frequency-exhausted",
+        );
+        exhausted_request.recent_interaction_seconds = Some(120);
+        let exhausted_intent = fixture.create_intent(exhausted_request);
+        let exhausted = fixture
+            .evaluate(
+                "autonomy-intent-event-frequency-exhausted",
+                "autonomy-life-a",
+                &exhausted_intent.intent_id,
+                1,
+            )
+            .unwrap();
+        let exhausted_intent = match exhausted {
+            LifeProactiveIntentEvaluationOutcome::Applied { event, intent } => {
+                assert_eq!(event.to_status, INTENT_STATUS_DEFERRED);
+                assert_eq!(intent.status, INTENT_STATUS_DEFERRED);
+                assert_eq!(intent.not_before, event.not_before_after);
+                intent
+            }
+            LifeProactiveIntentEvaluationOutcome::Replayed { .. } => {
+                panic!("frequency exhaustion must apply")
+            }
+        };
+        assert_eq!(
+            exhausted_intent.not_before.as_deref(),
+            Some(expected_frequency_not_before.as_str())
+        );
+
+        fixture.update_policy(LifeAutonomyPolicyUpdateRequest {
+            event_id: "autonomy-policy-event-frequency-gap".into(),
+            life_id: "autonomy-life-a".into(),
+            enabled: true,
+            dnd: false,
+            max_ready_per_window: 2,
+            window_seconds: 60,
+            min_gap_seconds: 60,
+            expected_revision: 2,
+        });
+        fixture.create_goal("autonomy-goal-frequency-gap", "autonomy-life-a");
+        let mut gap_request = fixture.intent_request(
+            "autonomy-intent-frequency-gap",
+            "autonomy-life-a",
+            "autonomy-goal-frequency-gap",
+        );
+        gap_request.recent_interaction_seconds = Some(120);
+        let gap_intent = fixture.create_intent(gap_request);
+        let gap = fixture
+            .evaluate(
+                "autonomy-intent-event-frequency-gap",
+                "autonomy-life-a",
+                &gap_intent.intent_id,
+                1,
+            )
+            .unwrap();
+        match gap {
+            LifeProactiveIntentEvaluationOutcome::Applied { event, intent } => {
+                assert_eq!(event.to_status, INTENT_STATUS_DEFERRED);
+                assert_eq!(intent.status, INTENT_STATUS_DEFERRED);
+                assert_eq!(intent.not_before, event.not_before_after);
+                assert_eq!(
+                    intent.not_before.as_deref(),
+                    Some(expected_frequency_not_before.as_str())
+                );
+            }
+            LifeProactiveIntentEvaluationOutcome::Replayed { .. } => {
+                panic!("minimum-gap evaluation must apply")
+            }
+        }
+
+        let mut window_policy = fixture.policy_request("autonomy-life-b");
+        window_policy.max_ready_per_window = 1;
+        window_policy.window_seconds = 60;
+        window_policy.min_gap_seconds = 0;
+        fixture.storage.create_policy(window_policy).unwrap();
+        fixture.create_goal("autonomy-goal-frequency-window", "autonomy-life-b");
+        let mut old_event_parent_request = fixture.intent_request(
+            "autonomy-intent-frequency-old-event-parent",
+            "autonomy-life-b",
+            "autonomy-goal-frequency-window",
+        );
+        old_event_parent_request.recent_interaction_seconds = Some(120);
+        let old_event_parent = fixture.create_intent(old_event_parent_request);
+        fixture.insert_ready_event(
+            "autonomy-intent-event-frequency-old",
+            "autonomy-life-b",
+            &old_event_parent.intent_id,
+            "-61 seconds",
+        );
+        let mut window_request = fixture.intent_request(
+            "autonomy-intent-frequency-window",
+            "autonomy-life-b",
+            "autonomy-goal-frequency-window",
+        );
+        window_request.recent_interaction_seconds = Some(120);
+        let window_intent = fixture.create_intent(window_request);
+        let window = fixture
+            .evaluate(
+                "autonomy-intent-event-frequency-window",
+                "autonomy-life-b",
+                &window_intent.intent_id,
+                1,
+            )
+            .unwrap();
+        assert!(matches!(
+            window,
+            LifeProactiveIntentEvaluationOutcome::Applied { intent, .. }
+                if intent.status == INTENT_STATUS_READY
+        ));
+    }
+
+    #[test]
+    fn pending_evaluation_target_and_status_errors_are_typed() {
+        let fixture = Fixture::new();
+        fixture.create_policy("autonomy-life-a", true, false);
+        fixture.create_goal("autonomy-goal-targets", "autonomy-life-a");
+        let mut request = fixture.intent_request(
+            "autonomy-intent-targets",
+            "autonomy-life-a",
+            "autonomy-goal-targets",
+        );
+        request.recent_interaction_seconds = Some(120);
+        fixture.create_intent(request);
+
+        let invalid_request =
+            fixture
+                .storage
+                .evaluate_pending_intent(LifeProactiveIntentEvaluationRequest {
+                    event_id: String::new(),
+                    life_id: "autonomy-life-a".into(),
+                    intent_id: "autonomy-intent-targets".into(),
+                    expected_revision: 1,
+                });
+        assert_eq!(
+            error_code(invalid_request.unwrap_err()),
+            AutonomyErrorCode::InvalidArgument
+        );
+        let invalid_revision = fixture
+            .storage
+            .evaluate_pending_intent(fixture.evaluation_request(
+                "autonomy-intent-event-invalid-revision",
+                "autonomy-life-a",
+                "autonomy-intent-targets",
+                0,
+            ));
+        assert_eq!(
+            error_code(invalid_revision.unwrap_err()),
+            AutonomyErrorCode::InvalidArgument
+        );
+
+        let missing = fixture
+            .evaluate(
+                "autonomy-intent-event-missing",
+                "autonomy-life-a",
+                "missing-intent",
+                1,
+            )
+            .unwrap_err();
+        assert_eq!(error_code(missing), AutonomyErrorCode::IntentNotFound);
+
+        let wrong_life = fixture
+            .storage
+            .evaluate_pending_intent(fixture.evaluation_request(
+                "autonomy-intent-event-wrong-life",
+                "autonomy-life-b",
+                "autonomy-intent-targets",
+                1,
+            ));
+        assert_eq!(
+            error_code(wrong_life.unwrap_err()),
+            AutonomyErrorCode::IntentLifeMismatch
+        );
+
+        let applied = fixture
+            .evaluate(
+                "autonomy-intent-event-targets",
+                "autonomy-life-a",
+                "autonomy-intent-targets",
+                1,
+            )
+            .unwrap();
+        assert!(matches!(
+            applied,
+            LifeProactiveIntentEvaluationOutcome::Applied { intent, .. }
+                if intent.status == INTENT_STATUS_READY && intent.revision == 2
+        ));
+        let non_pending = fixture
+            .evaluate(
+                "autonomy-intent-event-non-pending",
+                "autonomy-life-a",
+                "autonomy-intent-targets",
+                2,
+            )
+            .unwrap_err();
+        assert_eq!(
+            error_code(non_pending),
+            AutonomyErrorCode::InvalidIntentState
+        );
+        assert_eq!(fixture.intent_event_count(), 1);
+    }
+
+    #[test]
+    fn competing_sqlite_evaluations_allow_one_cas_winner() {
+        let fixture = Fixture::new();
+        fixture.create_policy("autonomy-life-a", true, false);
+        fixture.create_goal("autonomy-goal-race", "autonomy-life-a");
+        let mut request = fixture.intent_request(
+            "autonomy-intent-race",
+            "autonomy-life-a",
+            "autonomy-goal-race",
+        );
+        request.recent_interaction_seconds = Some(120);
+        fixture.create_intent(request);
+
+        let second_root = fixture._root.path().join("default");
+        let second_service = StorageService::initialize_with_roots(second_root, None).unwrap();
+        let first_service = Arc::new(fixture.storage);
+        let second_service = Arc::new(second_service);
+        let barrier = Arc::new(Barrier::new(3));
+
+        let first_barrier = barrier.clone();
+        let first = first_service.clone();
+        let first_thread = thread::spawn(move || {
+            first_barrier.wait();
+            first.evaluate_pending_intent(LifeProactiveIntentEvaluationRequest {
+                event_id: "autonomy-intent-event-race-a".into(),
+                life_id: "autonomy-life-a".into(),
+                intent_id: "autonomy-intent-race".into(),
+                expected_revision: 1,
+            })
+        });
+
+        let second_barrier = barrier.clone();
+        let second = second_service.clone();
+        let second_thread = thread::spawn(move || {
+            second_barrier.wait();
+            second.evaluate_pending_intent(LifeProactiveIntentEvaluationRequest {
+                event_id: "autonomy-intent-event-race-b".into(),
+                life_id: "autonomy-life-a".into(),
+                intent_id: "autonomy-intent-race".into(),
+                expected_revision: 1,
+            })
+        });
+
+        barrier.wait();
+        let first_result = first_thread.join().unwrap();
+        let second_result = second_thread.join().unwrap();
+        let results = [first_result, second_result];
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| {
+                    matches!(
+                        result,
+                        Ok(LifeProactiveIntentEvaluationOutcome::Applied { .. })
+                    )
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| {
+                    matches!(
+                        result,
+                        Err(error) if error.code == AutonomyErrorCode::RevisionConflict
+                    )
+                })
+                .count(),
+            1
+        );
+        let intent = first_service
+            .find_intent("autonomy-life-a", "autonomy-intent-race")
+            .unwrap()
+            .unwrap();
+        assert_eq!(intent.revision, 2);
+        let state = first_service.state().unwrap();
+        let event_count: i64 = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM life_proactive_intent_event",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(event_count, 1);
+    }
+
+    #[test]
+    fn pending_evaluation_rolls_back_intent_when_event_insert_fails() {
+        let fixture = Fixture::new();
+        fixture.create_policy("autonomy-life-a", true, false);
+        fixture.create_goal("autonomy-goal-atomic-evaluation", "autonomy-life-a");
+        let mut request = fixture.intent_request(
+            "autonomy-intent-atomic-evaluation",
+            "autonomy-life-a",
+            "autonomy-goal-atomic-evaluation",
+        );
+        request.recent_interaction_seconds = Some(120);
+        fixture.create_intent(request);
+
+        let state = fixture.storage.state().unwrap();
+        state
+            .connection
+            .execute_batch(
+                "CREATE TEMP TRIGGER d15_b2_test_event_insert_failure
+                 BEFORE INSERT ON main.life_proactive_intent_event
+                 BEGIN
+                     SELECT RAISE(ABORT, 'D15_B2_TEST_EVENT_INSERT_FAILURE');
+                 END;",
+            )
+            .unwrap();
+        drop(state);
+
+        let error = fixture
+            .evaluate(
+                "autonomy-intent-event-atomic-evaluation",
+                "autonomy-life-a",
+                "autonomy-intent-atomic-evaluation",
+                1,
+            )
+            .unwrap_err();
+        assert_eq!(error_code(error), AutonomyErrorCode::DatabaseUnavailable);
+        let intent = fixture
+            .storage
+            .find_intent("autonomy-life-a", "autonomy-intent-atomic-evaluation")
+            .unwrap()
+            .unwrap();
+        assert_eq!(intent.status, INTENT_STATUS_PENDING);
+        assert_eq!(intent.revision, 1);
+        assert!(intent.closed_at.is_none());
+        assert_eq!(fixture.intent_event_count(), 0);
     }
 
     #[test]

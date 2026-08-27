@@ -1,14 +1,16 @@
-//! D15-B1 autonomous-policy and proactive-intent authority foundation.
+//! D15-B2 autonomous-policy and proactive-intent authority.
 //!
-//! This module defines only bounded, persisted authority records and their
-//! crate-internal repository contract.  D15-B1 stores explicit policy and
-//! `goal_check_in` intent evidence; it does not evaluate initiative, create or
-//! mutate D14 goals, deliver an intent, or execute an Agent or Tool.
+//! This module defines bounded, persisted authority records, the deterministic
+//! InitiativePolicyV1 decision, and their crate-internal repository contract.
+//! It evaluates only caller-selected pending intent evidence; it does not
+//! create intents automatically, mutate D14 goals, deliver an intent, or
+//! execute an Agent or Tool.
 
 pub(crate) const POLICY_VERSION: i64 = 1;
 pub(crate) const POLICY_EVENT_VERSION: i64 = 1;
 pub(crate) const INTENT_VERSION: i64 = 1;
 pub(crate) const INTENT_EVENT_VERSION: i64 = 1;
+pub(crate) const INITIATIVE_POLICY_VERSION: i64 = 1;
 
 pub(crate) const POLICY_ACTOR_KIND_USER_EXPLICIT: &str = "user_explicit";
 pub(crate) const INTENT_CREATED_BY_KIND_AUTONOMY_POLICY: &str = "autonomy_policy";
@@ -38,6 +40,15 @@ pub(crate) const WINDOW_SECONDS_MIN: i64 = 60;
 pub(crate) const WINDOW_SECONDS_MAX: i64 = 86_400;
 pub(crate) const MIN_GAP_SECONDS_MIN: i64 = 0;
 pub(crate) const MIN_GAP_SECONDS_MAX: i64 = 86_400;
+
+pub(crate) const MIN_RECHECK_SECONDS: i64 = 60;
+pub(crate) const RECENT_INTERACTION_QUIET_SECONDS: i64 = 120;
+pub(crate) const NEUTRAL_ACCEPTANCE_SCORE: i64 = 500;
+pub(crate) const MIN_USER_RELEVANCE_FOR_INTERRUPT: i64 = 500;
+pub(crate) const MAX_INTERRUPTION_COST_FOR_INTERRUPT: i64 = 600;
+pub(crate) const MIN_ACCEPTANCE_FOR_INTERRUPT: i64 = 400;
+pub(crate) const READINESS_SCORE_THRESHOLD: i64 = 2500;
+pub(crate) const SELF_DESIRE_CONTRIBUTION_CAP: i64 = 500;
 
 /// One explicit opt-in policy row.  No row is also a meaningful state: it
 /// means autonomy is disabled for that Life.
@@ -168,6 +179,14 @@ pub(crate) struct LifeProactiveIntentCreateRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LifeProactiveIntentEvaluationRequest {
+    pub(crate) event_id: String,
+    pub(crate) life_id: String,
+    pub(crate) intent_id: String,
+    pub(crate) expected_revision: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LifeProactiveIntentEvent {
     pub(crate) event_id: String,
     pub(crate) life_id: String,
@@ -182,6 +201,37 @@ pub(crate) struct LifeProactiveIntentEvent {
     pub(crate) event_version: i64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LifeProactiveIntentEvaluationOutcome {
+    Applied {
+        event: LifeProactiveIntentEvent,
+        intent: LifeProactiveIntent,
+    },
+    Replayed {
+        event: LifeProactiveIntentEvent,
+        current: LifeProactiveIntent,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InitiativePolicyDecision {
+    Ready,
+    Deferred,
+    StoredSilently,
+    Cancelled,
+    Expired,
+}
+
+/// SQLite derives the temporal candidates; this value object keeps the
+/// decision and value policy deterministic and independent of storage.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct InitiativePolicyTemporalContext {
+    pub(crate) recent_interaction_not_before: Option<String>,
+    pub(crate) temporary_gate_not_before: Option<String>,
+    pub(crate) frequency_not_before: Option<String>,
+    pub(crate) min_gap_not_before: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AutonomyErrorCode {
     InvalidArgument,
@@ -194,6 +244,10 @@ pub(crate) enum AutonomyErrorCode {
     GoalLifeMismatch,
     GoalNotActive,
     ProactiveIntentConflict,
+    IntentNotFound,
+    IntentLifeMismatch,
+    InvalidIntentState,
+    ProactiveIntentEventConflict,
     DatabaseUnavailable,
     RevisionConflict,
 }
@@ -288,6 +342,34 @@ impl AutonomyError {
         )
     }
 
+    pub(crate) fn intent_not_found() -> Self {
+        Self::new(
+            AutonomyErrorCode::IntentNotFound,
+            "The specified proactive intent was not found.",
+        )
+    }
+
+    pub(crate) fn intent_life_mismatch() -> Self {
+        Self::new(
+            AutonomyErrorCode::IntentLifeMismatch,
+            "The specified proactive intent belongs to a different Life.",
+        )
+    }
+
+    pub(crate) fn invalid_intent_state() -> Self {
+        Self::new(
+            AutonomyErrorCode::InvalidIntentState,
+            "The proactive intent is not eligible for this lifecycle operation.",
+        )
+    }
+
+    pub(crate) fn proactive_intent_event_conflict() -> Self {
+        Self::new(
+            AutonomyErrorCode::ProactiveIntentEventConflict,
+            "A proactive intent event with conflicting evidence already exists.",
+        )
+    }
+
     pub(crate) fn database() -> Self {
         Self::new(
             AutonomyErrorCode::DatabaseUnavailable,
@@ -323,6 +405,11 @@ pub(crate) trait AutonomyRepository: Send + Sync {
         &self,
         request: LifeProactiveIntentCreateRequest,
     ) -> Result<AutonomyCreateOutcome<LifeProactiveIntent>, AutonomyError>;
+
+    fn evaluate_pending_intent(
+        &self,
+        request: LifeProactiveIntentEvaluationRequest,
+    ) -> Result<LifeProactiveIntentEvaluationOutcome, AutonomyError>;
 
     fn find_intent(
         &self,
@@ -403,6 +490,114 @@ pub(crate) fn validate_intent_create_request(
     }
     validate_focus_state(&request.focus_state)?;
     validate_optional_canonical_timestamp("expires_at", &request.expires_at)
+}
+
+pub(crate) fn validate_intent_evaluation_request(
+    request: &LifeProactiveIntentEvaluationRequest,
+) -> Result<(), AutonomyError> {
+    validate_id("intent event identity", &request.event_id)?;
+    validate_life_id(&request.life_id)?;
+    validate_id("intent identity", &request.intent_id)?;
+    validate_expected_revision(request.expected_revision)
+}
+
+pub(crate) fn evaluate_initiative_policy(
+    intent: &LifeProactiveIntent,
+    policy: Option<&LifeAutonomyPolicy>,
+    goal_is_active: bool,
+    now: &str,
+    temporal: &InitiativePolicyTemporalContext,
+) -> Result<InitiativePolicyDecision, AutonomyError> {
+    if intent
+        .expires_at
+        .as_deref()
+        .is_some_and(|expires_at| expires_at <= now)
+    {
+        return Ok(InitiativePolicyDecision::Expired);
+    }
+
+    let Some(policy) = policy else {
+        return Ok(InitiativePolicyDecision::Cancelled);
+    };
+    if policy.policy_version != INITIATIVE_POLICY_VERSION {
+        return Err(AutonomyError::invalid_argument(
+            "initiative policy version must be 1.",
+        ));
+    }
+    if !policy.enabled || !goal_is_active {
+        return Ok(InitiativePolicyDecision::Cancelled);
+    }
+
+    let recent_gate_required = intent
+        .recent_interaction_seconds
+        .is_none_or(|seconds| seconds < RECENT_INTERACTION_QUIET_SECONDS);
+    let temporary_gate_required = policy.dnd || intent.focus_state != INTENT_FOCUS_STATE_AVAILABLE;
+    let mut defer_candidates = Vec::with_capacity(4);
+    if recent_gate_required {
+        defer_candidates.push(
+            temporal
+                .recent_interaction_not_before
+                .as_deref()
+                .ok_or_else(|| {
+                    AutonomyError::invalid_argument(
+                        "recent interaction gate is missing its authority timestamp.",
+                    )
+                })?,
+        );
+    }
+    if temporary_gate_required {
+        defer_candidates.push(
+            temporal
+                .temporary_gate_not_before
+                .as_deref()
+                .ok_or_else(|| {
+                    AutonomyError::invalid_argument(
+                        "temporary interruption gate is missing its authority timestamp.",
+                    )
+                })?,
+        );
+    }
+    if let Some(candidate) = temporal.frequency_not_before.as_deref() {
+        defer_candidates.push(candidate);
+    }
+    if let Some(candidate) = temporal.min_gap_not_before.as_deref() {
+        defer_candidates.push(candidate);
+    }
+    if let Some(_latest) = defer_candidates.into_iter().max() {
+        return Ok(InitiativePolicyDecision::Deferred);
+    }
+
+    if policy.max_ready_per_window == 0 {
+        return Ok(InitiativePolicyDecision::StoredSilently);
+    }
+    if intent.user_relevance < MIN_USER_RELEVANCE_FOR_INTERRUPT
+        || intent.interruption_cost > MAX_INTERRUPTION_COST_FOR_INTERRUPT
+        || intent.acceptance_score.unwrap_or(NEUTRAL_ACCEPTANCE_SCORE)
+            < MIN_ACCEPTANCE_FOR_INTERRUPT
+    {
+        return Ok(InitiativePolicyDecision::StoredSilently);
+    }
+
+    let acceptance = intent.acceptance_score.unwrap_or(NEUTRAL_ACCEPTANCE_SCORE);
+    let support = intent
+        .importance
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(intent.user_relevance.checked_mul(3)?))
+        .and_then(|value| value.checked_add(intent.self_desire.min(SELF_DESIRE_CONTRIBUTION_CAP)))
+        .and_then(|value| value.checked_add(acceptance))
+        .ok_or_else(|| AutonomyError::invalid_argument("initiative support is unrepresentable."))?;
+    let cost = intent
+        .interruption_cost
+        .checked_mul(3)
+        .ok_or_else(|| AutonomyError::invalid_argument("initiative cost is unrepresentable."))?;
+    let readiness_score = support
+        .checked_sub(cost)
+        .ok_or_else(|| AutonomyError::invalid_argument("initiative score is unrepresentable."))?;
+    if readiness_score >= READINESS_SCORE_THRESHOLD {
+        Ok(InitiativePolicyDecision::Ready)
+    } else {
+        Ok(InitiativePolicyDecision::StoredSilently)
+    }
 }
 
 pub(crate) fn validate_policy_state(policy: &LifeAutonomyPolicy) -> Result<(), AutonomyError> {
@@ -714,3 +909,177 @@ const _: fn(&LifeAutonomyPolicyUpdateRequest) -> Result<(), AutonomyError> =
     validate_policy_update_request;
 const _: fn(&LifeProactiveIntentCreateRequest) -> Result<(), AutonomyError> =
     validate_intent_create_request;
+
+#[cfg(test)]
+mod initiative_policy_tests {
+    use super::*;
+
+    fn policy() -> LifeAutonomyPolicy {
+        LifeAutonomyPolicy {
+            life_id: "life-a".into(),
+            enabled: true,
+            dnd: false,
+            max_ready_per_window: 1,
+            window_seconds: 900,
+            min_gap_seconds: 0,
+            revision: 1,
+            created_at: "2026-08-27T00:00:00.000Z".into(),
+            updated_at: "2026-08-27T00:00:00.000Z".into(),
+            policy_version: POLICY_VERSION,
+        }
+    }
+
+    fn sample_intent() -> LifeProactiveIntent {
+        LifeProactiveIntent {
+            intent_id: "intent-a".into(),
+            life_id: "life-a".into(),
+            goal_id: "goal-a".into(),
+            intent_kind: INTENT_KIND_GOAL_CHECK_IN.into(),
+            importance: 700,
+            user_relevance: 800,
+            self_desire: 200,
+            interruption_cost: 100,
+            focus_state: INTENT_FOCUS_STATE_AVAILABLE.into(),
+            acceptance_score: Some(600),
+            recent_interaction_seconds: Some(120),
+            status: INTENT_STATUS_PENDING.into(),
+            revision: 1,
+            created_by_kind: INTENT_CREATED_BY_KIND_AUTONOMY_POLICY.into(),
+            created_at: "2026-08-27T00:00:00.000Z".into(),
+            updated_at: "2026-08-27T00:00:00.000Z".into(),
+            not_before: None,
+            expires_at: None,
+            closed_at: None,
+            intent_version: INTENT_VERSION,
+        }
+    }
+
+    fn evaluate(intent: &LifeProactiveIntent) -> InitiativePolicyDecision {
+        evaluate_initiative_policy(
+            intent,
+            Some(&policy()),
+            true,
+            "2026-08-27T01:00:00.000Z",
+            &InitiativePolicyTemporalContext::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn value_policy_boundaries_are_deterministic() {
+        let mut intent = sample_intent();
+        intent.user_relevance = 499;
+        assert_eq!(evaluate(&intent), InitiativePolicyDecision::StoredSilently);
+        intent.user_relevance = 500;
+        assert_eq!(evaluate(&intent), InitiativePolicyDecision::Ready);
+
+        intent = sample_intent();
+        intent.interruption_cost = 601;
+        assert_eq!(evaluate(&intent), InitiativePolicyDecision::StoredSilently);
+        intent.interruption_cost = 600;
+        assert_eq!(evaluate(&intent), InitiativePolicyDecision::Ready);
+
+        intent = sample_intent();
+        intent.acceptance_score = Some(399);
+        assert_eq!(evaluate(&intent), InitiativePolicyDecision::StoredSilently);
+        intent.acceptance_score = Some(400);
+        assert_eq!(evaluate(&intent), InitiativePolicyDecision::Ready);
+
+        intent = sample_intent();
+        intent.acceptance_score = None;
+        assert_eq!(evaluate(&intent), InitiativePolicyDecision::Ready);
+
+        intent = sample_intent();
+        intent.importance = 999;
+        intent.user_relevance = 500;
+        intent.self_desire = 99;
+        intent.acceptance_score = Some(400);
+        intent.interruption_cost = 600;
+        assert_eq!(evaluate(&intent), InitiativePolicyDecision::StoredSilently);
+        intent.self_desire = 1000;
+        assert_eq!(evaluate(&intent), InitiativePolicyDecision::Ready);
+
+        intent = sample_intent();
+        intent.importance = 950;
+        intent.user_relevance = 500;
+        intent.self_desire = 499;
+        intent.acceptance_score = Some(400);
+        intent.interruption_cost = 600;
+        assert_eq!(evaluate(&intent), InitiativePolicyDecision::StoredSilently);
+        intent.acceptance_score = Some(401);
+        assert_eq!(evaluate(&intent), InitiativePolicyDecision::Ready);
+    }
+
+    #[test]
+    fn policy_outputs_handle_expiry_policy_goal_and_temporal_precedence() {
+        let mut intent = sample_intent();
+        intent.expires_at = Some("2026-08-27T00:59:59.999Z".into());
+        assert_eq!(evaluate(&intent), InitiativePolicyDecision::Expired);
+
+        let intent = sample_intent();
+        assert_eq!(
+            evaluate_initiative_policy(
+                &intent,
+                None,
+                false,
+                "2026-08-27T01:00:00.000Z",
+                &InitiativePolicyTemporalContext::default(),
+            )
+            .unwrap(),
+            InitiativePolicyDecision::Cancelled
+        );
+        let mut disabled = policy();
+        disabled.enabled = false;
+        assert_eq!(
+            evaluate_initiative_policy(
+                &intent,
+                Some(&disabled),
+                true,
+                "2026-08-27T01:00:00.000Z",
+                &InitiativePolicyTemporalContext::default(),
+            )
+            .unwrap(),
+            InitiativePolicyDecision::Cancelled
+        );
+        assert_eq!(
+            evaluate_initiative_policy(
+                &intent,
+                Some(&policy()),
+                false,
+                "2026-08-27T01:00:00.000Z",
+                &InitiativePolicyTemporalContext::default(),
+            )
+            .unwrap(),
+            InitiativePolicyDecision::Cancelled
+        );
+
+        let mut temporal = InitiativePolicyTemporalContext {
+            recent_interaction_not_before: Some("2026-08-27T01:01:00.000Z".into()),
+            temporary_gate_not_before: Some("2026-08-27T01:02:00.000Z".into()),
+            frequency_not_before: Some("2026-08-27T01:03:00.000Z".into()),
+            min_gap_not_before: Some("2026-08-27T01:04:00.000Z".into()),
+        };
+        assert_eq!(
+            evaluate_initiative_policy(
+                &intent,
+                Some(&policy()),
+                true,
+                "2026-08-27T01:00:00.000Z",
+                &temporal,
+            )
+            .unwrap(),
+            InitiativePolicyDecision::Deferred
+        );
+        temporal = InitiativePolicyTemporalContext::default();
+        let mut focus_blocked = intent;
+        focus_blocked.focus_state = INTENT_FOCUS_STATE_FOCUSED.into();
+        assert!(evaluate_initiative_policy(
+            &focus_blocked,
+            Some(&policy()),
+            true,
+            "2026-08-27T01:00:00.000Z",
+            &temporal,
+        )
+        .is_err());
+    }
+}

@@ -1,9 +1,11 @@
-//! D16-B1 perception-consent authority.
+//! D16 perception-consent authority and privacy-minimized focus observation.
 //!
 //! This module models only explicit user consent for the future, narrowly
-//! defined foreground-focus context capability.  It does not represent or
-//! persist any operating-system observation, application content, or generic
-//! capability grant.
+//! defined foreground-focus context capability.  It does not persist any
+//! operating-system observation, application content, or generic capability
+//! grant.
+
+pub(crate) mod foreground_focus;
 
 pub(crate) const PERCEPTION_POLICY_VERSION: i64 = 1;
 pub(crate) const PERCEPTION_POLICY_EVENT_VERSION: i64 = 1;

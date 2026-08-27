@@ -1,11 +1,9 @@
-//! SQLite-authoritative persistence for D14-B1 goal / plan / action-intent
+//! SQLite-authoritative persistence for D14-B1/B2 goal / plan / action-intent
 //! authority.
 //!
 //! This module is a crate-internal storage boundary, never a Tauri command.
-//! It implements the bounded B1 repository scope: create goal / plan / step /
-//! action intent, find by id, bounded list by life or parent, and governed
-//! hard delete by id. Status transitions and `life_intent_event` writes are
-//! deliberately absent (D14-B2 owns them).
+//! It implements the bounded B1 repository scope plus D14-B2's explicit,
+//! CAS-protected lifecycle transitions and `life_intent_event` writes.
 //!
 //! SQLite is the sole authority for entity identity, same-life parent binding
 //! (composite foreign keys), create replay, cascade deletion, and timestamps.
@@ -16,12 +14,17 @@ use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, Transact
 
 use super::StorageService;
 use crate::life_intent::{
-    validate_action_request, validate_action_shape, validate_goal_request, validate_goal_shape,
-    validate_plan_request, validate_plan_shape, validate_step_request, validate_step_shape,
-    LifeActionIntent, LifeActionIntentCreateRequest, LifeGoal, LifeGoalCreateRequest,
-    LifeIntentCreateOutcome, LifeIntentError, LifeIntentRepository, LifePlan,
-    LifePlanCreateRequest, LifePlanStep, LifePlanStepCreateRequest, ACTION_STATUS_PROPOSED,
-    CREATED_BY_KIND_USER_EXPLICIT, GOAL_STATUS_ACTIVE, PLAN_STATUS_DRAFT, STEP_STATUS_PENDING,
+    validate_action_persisted_state, validate_action_request, validate_action_shape,
+    validate_event_lookup_arguments, validate_goal_persisted_state, validate_goal_request,
+    validate_goal_shape, validate_plan_persisted_state, validate_plan_request, validate_plan_shape,
+    validate_step_persisted_state, validate_step_request, validate_step_shape, LifeActionIntent,
+    LifeActionIntentCreateRequest, LifeActionTransitionRequest, LifeGoal, LifeGoalCreateRequest,
+    LifeGoalTransitionRequest, LifeIntentCreateOutcome, LifeIntentError, LifeIntentEvent,
+    LifeIntentRepository, LifeIntentTransitionOutcome, LifePlan, LifePlanCreateRequest,
+    LifePlanStep, LifePlanStepCreateRequest, LifePlanTransitionKind, LifePlanTransitionRequest,
+    LifeStepTransitionRequest, ACTION_ENTITY_KIND, ACTION_STATUS_PROPOSED,
+    ACTOR_KIND_USER_EXPLICIT, CREATED_BY_KIND_USER_EXPLICIT, EVENT_VERSION, GOAL_ENTITY_KIND,
+    GOAL_STATUS_ACTIVE, PLAN_ENTITY_KIND, PLAN_STATUS_DRAFT, STEP_ENTITY_KIND, STEP_STATUS_PENDING,
 };
 
 pub(super) const CREATE_LIFE_GOAL_TABLE_SQL: &str =
@@ -58,9 +61,8 @@ pub(super) const MIGRATION_022_TABLE_SQLS: &[&str] = &[
     CREATE_LIFE_INTENT_EVENT_TABLE_SQL,
 ];
 
-/// Complete Schema22 D14 semantic-guard phase: the five whole-table
-/// immutability triggers (B1 rejects every UPDATE; D14-B2 owns lifecycle
-/// transitions).
+/// Complete Schema22 D14 semantic-guard phase: the five immutability triggers;
+/// B1 guards immutable evidence while D14-B2 owns lifecycle transitions.
 pub(super) const MIGRATION_022_TRIGGER_SQLS: &[&str] = &[
     CREATE_LIFE_GOAL_IMMUTABLE_TRIGGER_SQL,
     CREATE_LIFE_PLAN_IMMUTABLE_TRIGGER_SQL,
@@ -73,6 +75,7 @@ const LIFE_GOAL_COLUMNS: &str = "goal_id, life_id, title, objective, status, rev
 const LIFE_PLAN_COLUMNS: &str = "plan_id, life_id, goal_id, title, status, revision, created_at, updated_at, closed_at, plan_version";
 const LIFE_PLAN_STEP_COLUMNS: &str = "step_id, life_id, plan_id, ordinal, summary, status, revision, created_at, updated_at, closed_at, step_version";
 const LIFE_ACTION_INTENT_COLUMNS: &str = "action_id, life_id, step_id, execution_class, summary, status, revision, created_at, updated_at, closed_at, action_version";
+const LIFE_INTENT_EVENT_COLUMNS: &str = "event_id, life_id, entity_kind, goal_id, plan_id, step_id, action_id, from_status, to_status, expected_revision, applied_revision, actor_kind, occurred_at, event_version";
 
 fn read_goal(row: &Row<'_>) -> rusqlite::Result<LifeGoal> {
     Ok(LifeGoal {
@@ -134,6 +137,25 @@ fn read_action(row: &Row<'_>) -> rusqlite::Result<LifeActionIntent> {
         updated_at: row.get(8)?,
         closed_at: row.get(9)?,
         action_version: row.get(10)?,
+    })
+}
+
+fn read_event(row: &Row<'_>) -> rusqlite::Result<LifeIntentEvent> {
+    Ok(LifeIntentEvent {
+        event_id: row.get(0)?,
+        life_id: row.get(1)?,
+        entity_kind: row.get(2)?,
+        goal_id: row.get(3)?,
+        plan_id: row.get(4)?,
+        step_id: row.get(5)?,
+        action_id: row.get(6)?,
+        from_status: row.get(7)?,
+        to_status: row.get(8)?,
+        expected_revision: row.get(9)?,
+        applied_revision: row.get(10)?,
+        actor_kind: row.get(11)?,
+        occurred_at: row.get(12)?,
+        event_version: row.get(13)?,
     })
 }
 
@@ -224,6 +246,307 @@ fn sqlite_authority_now(connection: &Connection) -> Result<String, LifeIntentErr
 /// from a structured code and is reported as database unavailability.
 fn map_create_error(_error: rusqlite::Error) -> LifeIntentError {
     LifeIntentError::database()
+}
+
+fn map_transition_error(_error: rusqlite::Error) -> LifeIntentError {
+    LifeIntentError::database()
+}
+
+fn next_revision(expected_revision: i64) -> Result<i64, LifeIntentError> {
+    expected_revision
+        .checked_add(1)
+        .ok_or_else(|| LifeIntentError::invalid_argument("the target revision is unrepresentable."))
+}
+
+fn load_event_by_id(
+    transaction: &Transaction<'_>,
+    event_id: &str,
+) -> Result<Option<LifeIntentEvent>, LifeIntentError> {
+    transaction
+        .query_row(
+            &format!(
+                "SELECT {LIFE_INTENT_EVENT_COLUMNS} FROM life_intent_event WHERE event_id = ?1"
+            ),
+            [event_id],
+            read_event,
+        )
+        .optional()
+        .map_err(|_| LifeIntentError::database())
+}
+
+fn event_target_matches(event: &LifeIntentEvent, entity_kind: &str, entity_id: &str) -> bool {
+    match entity_kind {
+        GOAL_ENTITY_KIND => {
+            event.goal_id.as_deref() == Some(entity_id)
+                && event.plan_id.is_none()
+                && event.step_id.is_none()
+                && event.action_id.is_none()
+        }
+        PLAN_ENTITY_KIND => {
+            event.goal_id.is_none()
+                && event.plan_id.as_deref() == Some(entity_id)
+                && event.step_id.is_none()
+                && event.action_id.is_none()
+        }
+        STEP_ENTITY_KIND => {
+            event.goal_id.is_none()
+                && event.plan_id.is_none()
+                && event.step_id.as_deref() == Some(entity_id)
+                && event.action_id.is_none()
+        }
+        ACTION_ENTITY_KIND => {
+            event.goal_id.is_none()
+                && event.plan_id.is_none()
+                && event.step_id.is_none()
+                && event.action_id.as_deref() == Some(entity_id)
+        }
+        _ => false,
+    }
+}
+
+fn event_evidence_matches(
+    event: &LifeIntentEvent,
+    life_id: &str,
+    entity_kind: &str,
+    entity_id: &str,
+    to_status: &str,
+    expected_revision: i64,
+    applied_revision: i64,
+) -> bool {
+    event.life_id == life_id
+        && event.entity_kind == entity_kind
+        && event_target_matches(event, entity_kind, entity_id)
+        && event.to_status == to_status
+        && event.expected_revision == expected_revision
+        && event.applied_revision == applied_revision
+        && event.actor_kind == ACTOR_KIND_USER_EXPLICIT
+        && event.event_version == EVENT_VERSION
+}
+
+fn insert_event(
+    transaction: &Transaction<'_>,
+    event: &LifeIntentEvent,
+) -> Result<(), LifeIntentError> {
+    transaction
+        .execute(
+            &format!(
+                "INSERT INTO life_intent_event ({LIFE_INTENT_EVENT_COLUMNS})
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
+            ),
+            params![
+                &event.event_id,
+                &event.life_id,
+                &event.entity_kind,
+                event.goal_id.as_deref(),
+                event.plan_id.as_deref(),
+                event.step_id.as_deref(),
+                event.action_id.as_deref(),
+                &event.from_status,
+                &event.to_status,
+                event.expected_revision,
+                event.applied_revision,
+                &event.actor_kind,
+                &event.occurred_at,
+                event.event_version,
+            ],
+        )
+        .map_err(map_transition_error)?;
+    Ok(())
+}
+
+enum LifeIntentEventTarget<'a> {
+    Goal(&'a str),
+    Plan(&'a str),
+    Step(&'a str),
+    Action(&'a str),
+}
+
+struct LifeIntentEventBuild<'a> {
+    event_id: &'a str,
+    life_id: &'a str,
+    target: LifeIntentEventTarget<'a>,
+    from_status: &'a str,
+    to_status: &'a str,
+    expected_revision: i64,
+    applied_revision: i64,
+    occurred_at: &'a str,
+}
+
+fn build_event(input: LifeIntentEventBuild<'_>) -> LifeIntentEvent {
+    let LifeIntentEventBuild {
+        event_id,
+        life_id,
+        target,
+        from_status,
+        to_status,
+        expected_revision,
+        applied_revision,
+        occurred_at,
+    } = input;
+    let (entity_kind, goal_id, plan_id, step_id, action_id) = match target {
+        LifeIntentEventTarget::Goal(goal_id) => (
+            GOAL_ENTITY_KIND,
+            Some(goal_id.to_string()),
+            None,
+            None,
+            None,
+        ),
+        LifeIntentEventTarget::Plan(plan_id) => (
+            PLAN_ENTITY_KIND,
+            None,
+            Some(plan_id.to_string()),
+            None,
+            None,
+        ),
+        LifeIntentEventTarget::Step(step_id) => (
+            STEP_ENTITY_KIND,
+            None,
+            None,
+            Some(step_id.to_string()),
+            None,
+        ),
+        LifeIntentEventTarget::Action(action_id) => (
+            ACTION_ENTITY_KIND,
+            None,
+            None,
+            None,
+            Some(action_id.to_string()),
+        ),
+    };
+    LifeIntentEvent {
+        event_id: event_id.to_string(),
+        life_id: life_id.to_string(),
+        entity_kind: entity_kind.to_string(),
+        goal_id,
+        plan_id,
+        step_id,
+        action_id,
+        from_status: from_status.to_string(),
+        to_status: to_status.to_string(),
+        expected_revision,
+        applied_revision,
+        actor_kind: ACTOR_KIND_USER_EXPLICIT.to_string(),
+        occurred_at: occurred_at.to_string(),
+        event_version: EVENT_VERSION,
+    }
+}
+
+fn load_goal_by_id(
+    transaction: &Transaction<'_>,
+    goal_id: &str,
+) -> Result<Option<LifeGoal>, LifeIntentError> {
+    transaction
+        .query_row(
+            &format!("SELECT {LIFE_GOAL_COLUMNS} FROM life_goal WHERE goal_id = ?1"),
+            [goal_id],
+            read_goal,
+        )
+        .optional()
+        .map_err(|_| LifeIntentError::database())
+}
+
+fn load_plan_by_id(
+    transaction: &Transaction<'_>,
+    plan_id: &str,
+) -> Result<Option<LifePlan>, LifeIntentError> {
+    transaction
+        .query_row(
+            &format!("SELECT {LIFE_PLAN_COLUMNS} FROM life_plan WHERE plan_id = ?1"),
+            [plan_id],
+            read_plan,
+        )
+        .optional()
+        .map_err(|_| LifeIntentError::database())
+}
+
+fn load_step_by_id(
+    transaction: &Transaction<'_>,
+    step_id: &str,
+) -> Result<Option<LifePlanStep>, LifeIntentError> {
+    transaction
+        .query_row(
+            &format!("SELECT {LIFE_PLAN_STEP_COLUMNS} FROM life_plan_step WHERE step_id = ?1"),
+            [step_id],
+            read_step,
+        )
+        .optional()
+        .map_err(|_| LifeIntentError::database())
+}
+
+fn load_action_by_id(
+    transaction: &Transaction<'_>,
+    action_id: &str,
+) -> Result<Option<LifeActionIntent>, LifeIntentError> {
+    transaction
+        .query_row(
+            &format!(
+                "SELECT {LIFE_ACTION_INTENT_COLUMNS} FROM life_action_intent WHERE action_id = ?1"
+            ),
+            [action_id],
+            read_action,
+        )
+        .optional()
+        .map_err(|_| LifeIntentError::database())
+}
+
+fn load_goal_for_transition(
+    transaction: &Transaction<'_>,
+    life_id: &str,
+    goal_id: &str,
+) -> Result<LifeGoal, LifeIntentError> {
+    let Some(goal) = load_goal_by_id(transaction, goal_id)? else {
+        return Err(LifeIntentError::entity_not_found());
+    };
+    if goal.life_id != life_id {
+        return Err(LifeIntentError::entity_life_mismatch());
+    }
+    validate_goal_persisted_state(&goal)?;
+    Ok(goal)
+}
+
+fn load_plan_for_transition(
+    transaction: &Transaction<'_>,
+    life_id: &str,
+    plan_id: &str,
+) -> Result<LifePlan, LifeIntentError> {
+    let Some(plan) = load_plan_by_id(transaction, plan_id)? else {
+        return Err(LifeIntentError::entity_not_found());
+    };
+    if plan.life_id != life_id {
+        return Err(LifeIntentError::entity_life_mismatch());
+    }
+    validate_plan_persisted_state(&plan)?;
+    Ok(plan)
+}
+
+fn load_step_for_transition(
+    transaction: &Transaction<'_>,
+    life_id: &str,
+    step_id: &str,
+) -> Result<LifePlanStep, LifeIntentError> {
+    let Some(step) = load_step_by_id(transaction, step_id)? else {
+        return Err(LifeIntentError::entity_not_found());
+    };
+    if step.life_id != life_id {
+        return Err(LifeIntentError::entity_life_mismatch());
+    }
+    validate_step_persisted_state(&step)?;
+    Ok(step)
+}
+
+fn load_action_for_transition(
+    transaction: &Transaction<'_>,
+    life_id: &str,
+    action_id: &str,
+) -> Result<LifeActionIntent, LifeIntentError> {
+    let Some(action) = load_action_by_id(transaction, action_id)? else {
+        return Err(LifeIntentError::entity_not_found());
+    };
+    if action.life_id != life_id {
+        return Err(LifeIntentError::entity_life_mismatch());
+    }
+    validate_action_persisted_state(&action)?;
+    Ok(action)
 }
 
 /// Same-life validation of the requested step ordinal under one plan. Returns
@@ -512,6 +835,328 @@ pub(super) fn create_action_in_transaction(
         .map_err(|_| LifeIntentError::database())?;
     validate_action_shape(&created)?;
     Ok(LifeIntentCreateOutcome::Applied(created))
+}
+
+/// Performs one goal lifecycle transition inside a caller-owned transaction.
+/// This helper never begins, commits, or rolls back the transaction.
+pub(super) fn transition_goal_in_transaction(
+    transaction: &Transaction<'_>,
+    request: LifeGoalTransitionRequest,
+) -> Result<LifeIntentTransitionOutcome<LifeGoal>, LifeIntentError> {
+    request.validate()?;
+    let applied_revision = next_revision(request.expected_revision)?;
+    let requested_to_status = request.kind.to_status();
+
+    if let Some(event) = load_event_by_id(transaction, &request.event_id)? {
+        if event_evidence_matches(
+            &event,
+            &request.life_id,
+            GOAL_ENTITY_KIND,
+            &request.goal_id,
+            requested_to_status,
+            request.expected_revision,
+            applied_revision,
+        ) {
+            let current =
+                load_goal_for_transition(transaction, &request.life_id, &request.goal_id)?;
+            return Ok(LifeIntentTransitionOutcome::Replayed { event, current });
+        }
+        return Err(LifeIntentError::life_intent_event_conflict());
+    }
+
+    let current = load_goal_for_transition(transaction, &request.life_id, &request.goal_id)?;
+    if current.revision != request.expected_revision {
+        return Err(LifeIntentError::revision_conflict());
+    }
+    let to_status = request
+        .kind
+        .target_status(&current.status)
+        .ok_or_else(LifeIntentError::invalid_transition)?;
+    let now = sqlite_authority_now(transaction)?;
+    let closed_at = Some(now.clone());
+    let event = build_event(LifeIntentEventBuild {
+        event_id: &request.event_id,
+        life_id: &request.life_id,
+        target: LifeIntentEventTarget::Goal(&request.goal_id),
+        from_status: &current.status,
+        to_status,
+        expected_revision: request.expected_revision,
+        applied_revision,
+        occurred_at: &now,
+    });
+
+    let changed = transaction
+        .execute(
+            "UPDATE life_goal
+             SET status = ?1, revision = ?2, updated_at = ?3, closed_at = ?4
+             WHERE goal_id = ?5 AND life_id = ?6 AND revision = ?7 AND status = ?8",
+            params![
+                to_status,
+                applied_revision,
+                &now,
+                &closed_at,
+                &request.goal_id,
+                &request.life_id,
+                request.expected_revision,
+                &current.status,
+            ],
+        )
+        .map_err(map_transition_error)?;
+    if changed != 1 {
+        return Err(LifeIntentError::revision_conflict());
+    }
+    insert_event(transaction, &event)?;
+
+    let committed_event =
+        load_event_by_id(transaction, &request.event_id)?.ok_or_else(LifeIntentError::database)?;
+    let committed_goal = load_goal_for_transition(transaction, &request.life_id, &request.goal_id)?;
+    Ok(LifeIntentTransitionOutcome::Applied {
+        event: committed_event,
+        entity: committed_goal,
+    })
+}
+
+/// Performs one plan lifecycle transition inside a caller-owned transaction.
+/// This helper never begins, commits, or rolls back the transaction.
+pub(super) fn transition_plan_in_transaction(
+    transaction: &Transaction<'_>,
+    request: LifePlanTransitionRequest,
+) -> Result<LifeIntentTransitionOutcome<LifePlan>, LifeIntentError> {
+    request.validate()?;
+    let applied_revision = next_revision(request.expected_revision)?;
+    let requested_to_status = request.kind.to_status();
+
+    if let Some(event) = load_event_by_id(transaction, &request.event_id)? {
+        if event_evidence_matches(
+            &event,
+            &request.life_id,
+            PLAN_ENTITY_KIND,
+            &request.plan_id,
+            requested_to_status,
+            request.expected_revision,
+            applied_revision,
+        ) {
+            let current =
+                load_plan_for_transition(transaction, &request.life_id, &request.plan_id)?;
+            return Ok(LifeIntentTransitionOutcome::Replayed { event, current });
+        }
+        return Err(LifeIntentError::life_intent_event_conflict());
+    }
+
+    let current = load_plan_for_transition(transaction, &request.life_id, &request.plan_id)?;
+    if current.revision != request.expected_revision {
+        return Err(LifeIntentError::revision_conflict());
+    }
+    let to_status = request
+        .kind
+        .target_status(&current.status)
+        .ok_or_else(LifeIntentError::invalid_transition)?;
+    let now = sqlite_authority_now(transaction)?;
+    let closed_at = match request.kind {
+        LifePlanTransitionKind::Activate => None,
+        LifePlanTransitionKind::Complete | LifePlanTransitionKind::Cancel => Some(now.clone()),
+    };
+    let event = build_event(LifeIntentEventBuild {
+        event_id: &request.event_id,
+        life_id: &request.life_id,
+        target: LifeIntentEventTarget::Plan(&request.plan_id),
+        from_status: &current.status,
+        to_status,
+        expected_revision: request.expected_revision,
+        applied_revision,
+        occurred_at: &now,
+    });
+
+    let changed = transaction
+        .execute(
+            "UPDATE life_plan
+             SET status = ?1, revision = ?2, updated_at = ?3, closed_at = ?4
+             WHERE plan_id = ?5 AND life_id = ?6 AND revision = ?7 AND status = ?8",
+            params![
+                to_status,
+                applied_revision,
+                &now,
+                &closed_at,
+                &request.plan_id,
+                &request.life_id,
+                request.expected_revision,
+                &current.status,
+            ],
+        )
+        .map_err(map_transition_error)?;
+    if changed != 1 {
+        return Err(LifeIntentError::revision_conflict());
+    }
+    insert_event(transaction, &event)?;
+
+    let committed_event =
+        load_event_by_id(transaction, &request.event_id)?.ok_or_else(LifeIntentError::database)?;
+    let committed_plan = load_plan_for_transition(transaction, &request.life_id, &request.plan_id)?;
+    Ok(LifeIntentTransitionOutcome::Applied {
+        event: committed_event,
+        entity: committed_plan,
+    })
+}
+
+/// Performs one plan-step lifecycle transition inside a caller-owned
+/// transaction. This helper never begins, commits, or rolls back the
+/// transaction.
+pub(super) fn transition_step_in_transaction(
+    transaction: &Transaction<'_>,
+    request: LifeStepTransitionRequest,
+) -> Result<LifeIntentTransitionOutcome<LifePlanStep>, LifeIntentError> {
+    request.validate()?;
+    let applied_revision = next_revision(request.expected_revision)?;
+    let requested_to_status = request.kind.to_status();
+
+    if let Some(event) = load_event_by_id(transaction, &request.event_id)? {
+        if event_evidence_matches(
+            &event,
+            &request.life_id,
+            STEP_ENTITY_KIND,
+            &request.step_id,
+            requested_to_status,
+            request.expected_revision,
+            applied_revision,
+        ) {
+            let current =
+                load_step_for_transition(transaction, &request.life_id, &request.step_id)?;
+            return Ok(LifeIntentTransitionOutcome::Replayed { event, current });
+        }
+        return Err(LifeIntentError::life_intent_event_conflict());
+    }
+
+    let current = load_step_for_transition(transaction, &request.life_id, &request.step_id)?;
+    if current.revision != request.expected_revision {
+        return Err(LifeIntentError::revision_conflict());
+    }
+    let to_status = request
+        .kind
+        .target_status(&current.status)
+        .ok_or_else(LifeIntentError::invalid_transition)?;
+    let now = sqlite_authority_now(transaction)?;
+    let closed_at = Some(now.clone());
+    let event = build_event(LifeIntentEventBuild {
+        event_id: &request.event_id,
+        life_id: &request.life_id,
+        target: LifeIntentEventTarget::Step(&request.step_id),
+        from_status: &current.status,
+        to_status,
+        expected_revision: request.expected_revision,
+        applied_revision,
+        occurred_at: &now,
+    });
+
+    let changed = transaction
+        .execute(
+            "UPDATE life_plan_step
+             SET status = ?1, revision = ?2, updated_at = ?3, closed_at = ?4
+             WHERE step_id = ?5 AND life_id = ?6 AND revision = ?7 AND status = ?8",
+            params![
+                to_status,
+                applied_revision,
+                &now,
+                &closed_at,
+                &request.step_id,
+                &request.life_id,
+                request.expected_revision,
+                &current.status,
+            ],
+        )
+        .map_err(map_transition_error)?;
+    if changed != 1 {
+        return Err(LifeIntentError::revision_conflict());
+    }
+    insert_event(transaction, &event)?;
+
+    let committed_event =
+        load_event_by_id(transaction, &request.event_id)?.ok_or_else(LifeIntentError::database)?;
+    let committed_step = load_step_for_transition(transaction, &request.life_id, &request.step_id)?;
+    Ok(LifeIntentTransitionOutcome::Applied {
+        event: committed_event,
+        entity: committed_step,
+    })
+}
+
+/// Performs one action-intent lifecycle transition inside a caller-owned
+/// transaction. This helper never begins, commits, or rolls back the
+/// transaction.
+pub(super) fn transition_action_in_transaction(
+    transaction: &Transaction<'_>,
+    request: LifeActionTransitionRequest,
+) -> Result<LifeIntentTransitionOutcome<LifeActionIntent>, LifeIntentError> {
+    request.validate()?;
+    let applied_revision = next_revision(request.expected_revision)?;
+    let requested_to_status = request.kind.to_status();
+
+    if let Some(event) = load_event_by_id(transaction, &request.event_id)? {
+        if event_evidence_matches(
+            &event,
+            &request.life_id,
+            ACTION_ENTITY_KIND,
+            &request.action_id,
+            requested_to_status,
+            request.expected_revision,
+            applied_revision,
+        ) {
+            let current =
+                load_action_for_transition(transaction, &request.life_id, &request.action_id)?;
+            return Ok(LifeIntentTransitionOutcome::Replayed { event, current });
+        }
+        return Err(LifeIntentError::life_intent_event_conflict());
+    }
+
+    let current = load_action_for_transition(transaction, &request.life_id, &request.action_id)?;
+    if current.revision != request.expected_revision {
+        return Err(LifeIntentError::revision_conflict());
+    }
+    let to_status = request
+        .kind
+        .target_status(&current.status)
+        .ok_or_else(LifeIntentError::invalid_transition)?;
+    let now = sqlite_authority_now(transaction)?;
+    let closed_at = Some(now.clone());
+    let event = build_event(LifeIntentEventBuild {
+        event_id: &request.event_id,
+        life_id: &request.life_id,
+        target: LifeIntentEventTarget::Action(&request.action_id),
+        from_status: &current.status,
+        to_status,
+        expected_revision: request.expected_revision,
+        applied_revision,
+        occurred_at: &now,
+    });
+
+    let changed = transaction
+        .execute(
+            "UPDATE life_action_intent
+             SET status = ?1, revision = ?2, updated_at = ?3, closed_at = ?4
+             WHERE action_id = ?5 AND life_id = ?6 AND revision = ?7 AND status = ?8",
+            params![
+                to_status,
+                applied_revision,
+                &now,
+                &closed_at,
+                &request.action_id,
+                &request.life_id,
+                request.expected_revision,
+                &current.status,
+            ],
+        )
+        .map_err(map_transition_error)?;
+    if changed != 1 {
+        return Err(LifeIntentError::revision_conflict());
+    }
+    insert_event(transaction, &event)?;
+
+    let committed_event =
+        load_event_by_id(transaction, &request.event_id)?.ok_or_else(LifeIntentError::database)?;
+    let committed_action =
+        load_action_for_transition(transaction, &request.life_id, &request.action_id)?;
+    Ok(LifeIntentTransitionOutcome::Applied {
+        event: committed_event,
+        entity: committed_action,
+    })
 }
 
 /// SQL literal quoting used only for fixed authority constants (status values
@@ -839,6 +1484,91 @@ impl LifeIntentRepository for StorageService {
             .map_err(|_| LifeIntentError::database())?;
         Ok(deleted > 0)
     }
+
+    fn transition_goal(
+        &self,
+        request: LifeGoalTransitionRequest,
+    ) -> Result<LifeIntentTransitionOutcome<LifeGoal>, LifeIntentError> {
+        let mut state = self.state().map_err(|_| LifeIntentError::database())?;
+        let transaction = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| LifeIntentError::database())?;
+        let outcome = transition_goal_in_transaction(&transaction, request)?;
+        transaction
+            .commit()
+            .map_err(|_| LifeIntentError::database())?;
+        Ok(outcome)
+    }
+
+    fn transition_plan(
+        &self,
+        request: LifePlanTransitionRequest,
+    ) -> Result<LifeIntentTransitionOutcome<LifePlan>, LifeIntentError> {
+        let mut state = self.state().map_err(|_| LifeIntentError::database())?;
+        let transaction = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| LifeIntentError::database())?;
+        let outcome = transition_plan_in_transaction(&transaction, request)?;
+        transaction
+            .commit()
+            .map_err(|_| LifeIntentError::database())?;
+        Ok(outcome)
+    }
+
+    fn transition_step(
+        &self,
+        request: LifeStepTransitionRequest,
+    ) -> Result<LifeIntentTransitionOutcome<LifePlanStep>, LifeIntentError> {
+        let mut state = self.state().map_err(|_| LifeIntentError::database())?;
+        let transaction = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| LifeIntentError::database())?;
+        let outcome = transition_step_in_transaction(&transaction, request)?;
+        transaction
+            .commit()
+            .map_err(|_| LifeIntentError::database())?;
+        Ok(outcome)
+    }
+
+    fn transition_action(
+        &self,
+        request: LifeActionTransitionRequest,
+    ) -> Result<LifeIntentTransitionOutcome<LifeActionIntent>, LifeIntentError> {
+        let mut state = self.state().map_err(|_| LifeIntentError::database())?;
+        let transaction = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| LifeIntentError::database())?;
+        let outcome = transition_action_in_transaction(&transaction, request)?;
+        transaction
+            .commit()
+            .map_err(|_| LifeIntentError::database())?;
+        Ok(outcome)
+    }
+
+    fn find_event(
+        &self,
+        life_id: &str,
+        event_id: &str,
+    ) -> Result<Option<LifeIntentEvent>, LifeIntentError> {
+        validate_event_lookup_arguments(life_id, event_id)?;
+        let state = self.state().map_err(|_| LifeIntentError::database())?;
+        state
+            .connection
+            .query_row(
+                &format!(
+                    "SELECT {LIFE_INTENT_EVENT_COLUMNS} FROM life_intent_event
+                     WHERE life_id = ?1 AND event_id = ?2"
+                ),
+                params![life_id, event_id],
+                read_event,
+            )
+            .optional()
+            .map_err(|_| LifeIntentError::database())
+    }
 }
 
 type GoalCreate = for<'a> fn(
@@ -848,10 +1578,38 @@ type GoalCreate = for<'a> fn(
 type GoalLookup =
     for<'a> fn(&'a StorageService, &'a str, &'a str) -> Result<Option<LifeGoal>, LifeIntentError>;
 type GoalDelete = for<'a> fn(&'a StorageService, &'a str, &'a str) -> Result<bool, LifeIntentError>;
+type GoalTransition = for<'a> fn(
+    &'a StorageService,
+    LifeGoalTransitionRequest,
+) -> Result<LifeIntentTransitionOutcome<LifeGoal>, LifeIntentError>;
+type PlanTransition = for<'a> fn(
+    &'a StorageService,
+    LifePlanTransitionRequest,
+) -> Result<LifeIntentTransitionOutcome<LifePlan>, LifeIntentError>;
+type StepTransition =
+    for<'a> fn(
+        &'a StorageService,
+        LifeStepTransitionRequest,
+    ) -> Result<LifeIntentTransitionOutcome<LifePlanStep>, LifeIntentError>;
+type ActionTransition =
+    for<'a> fn(
+        &'a StorageService,
+        LifeActionTransitionRequest,
+    ) -> Result<LifeIntentTransitionOutcome<LifeActionIntent>, LifeIntentError>;
+type EventLookup = for<'a> fn(
+    &'a StorageService,
+    &'a str,
+    &'a str,
+) -> Result<Option<LifeIntentEvent>, LifeIntentError>;
 
 const _: GoalCreate = <StorageService as LifeIntentRepository>::create_goal;
 const _: GoalLookup = <StorageService as LifeIntentRepository>::find_goal;
 const _: GoalDelete = <StorageService as LifeIntentRepository>::delete_goal;
+const _: GoalTransition = <StorageService as LifeIntentRepository>::transition_goal;
+const _: PlanTransition = <StorageService as LifeIntentRepository>::transition_plan;
+const _: StepTransition = <StorageService as LifeIntentRepository>::transition_step;
+const _: ActionTransition = <StorageService as LifeIntentRepository>::transition_action;
+const _: EventLookup = <StorageService as LifeIntentRepository>::find_event;
 
 /// Exact normalized validation of every Schema22 D14 object. Only existence is
 /// never enough: the stored DDL must match the migration SQL byte-for-byte
@@ -1030,15 +1788,22 @@ const _: fn(&LifeActionIntentCreateRequest) -> Result<(), LifeIntentError> =
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{
+        fs,
+        sync::{Arc, Barrier},
+        thread,
+    };
 
     use rusqlite::params;
     use tempfile::TempDir;
 
     use super::*;
     use crate::life_intent::{
-        LifeIntentErrorCode, EXECUTION_CLASS_AGENT_TASK_PROPOSAL, EXECUTION_CLASS_INTERNAL_INTENT,
-        EXECUTION_CLASS_TOOL_OPERATION_PROPOSAL,
+        LifeActionTransitionKind, LifeActionTransitionRequest, LifeGoalTransitionKind,
+        LifeGoalTransitionRequest, LifeIntentErrorCode, LifeIntentTransitionOutcome,
+        LifePlanTransitionKind, LifePlanTransitionRequest, LifeStepTransitionKind,
+        LifeStepTransitionRequest, EXECUTION_CLASS_AGENT_TASK_PROPOSAL,
+        EXECUTION_CLASS_INTERNAL_INTENT, EXECUTION_CLASS_TOOL_OPERATION_PROPOSAL,
     };
 
     struct Fixture {
@@ -1134,6 +1899,70 @@ mod tests {
                 execution_class: execution_class.into(),
                 summary: "Proposal to review today's vocabulary list.".into(),
             }
+        }
+    }
+
+    fn goal_transition(
+        event_id: &str,
+        life_id: &str,
+        goal_id: &str,
+        expected_revision: i64,
+        kind: LifeGoalTransitionKind,
+    ) -> LifeGoalTransitionRequest {
+        LifeGoalTransitionRequest {
+            event_id: event_id.into(),
+            life_id: life_id.into(),
+            goal_id: goal_id.into(),
+            expected_revision,
+            kind,
+        }
+    }
+
+    fn plan_transition(
+        event_id: &str,
+        life_id: &str,
+        plan_id: &str,
+        expected_revision: i64,
+        kind: LifePlanTransitionKind,
+    ) -> LifePlanTransitionRequest {
+        LifePlanTransitionRequest {
+            event_id: event_id.into(),
+            life_id: life_id.into(),
+            plan_id: plan_id.into(),
+            expected_revision,
+            kind,
+        }
+    }
+
+    fn step_transition(
+        event_id: &str,
+        life_id: &str,
+        step_id: &str,
+        expected_revision: i64,
+        kind: LifeStepTransitionKind,
+    ) -> LifeStepTransitionRequest {
+        LifeStepTransitionRequest {
+            event_id: event_id.into(),
+            life_id: life_id.into(),
+            step_id: step_id.into(),
+            expected_revision,
+            kind,
+        }
+    }
+
+    fn action_transition(
+        event_id: &str,
+        life_id: &str,
+        action_id: &str,
+        expected_revision: i64,
+        kind: LifeActionTransitionKind,
+    ) -> LifeActionTransitionRequest {
+        LifeActionTransitionRequest {
+            event_id: event_id.into(),
+            life_id: life_id.into(),
+            action_id: action_id.into(),
+            expected_revision,
+            kind,
         }
     }
 
@@ -2686,5 +3515,705 @@ mod tests {
             error_code(fixture.storage.create_step(conflicting_step).unwrap_err()),
             LifeIntentErrorCode::EntityConflict
         );
+    }
+
+    #[test]
+    fn goal_lifecycle_records_authoritative_event_and_replays_after_terminal_state() {
+        let fixture = Fixture::new();
+        fixture
+            .storage
+            .create_goal(fixture.goal_request("goal-lifecycle"))
+            .unwrap();
+
+        let request = goal_transition(
+            "event-goal-complete",
+            "life-a",
+            "goal-lifecycle",
+            1,
+            LifeGoalTransitionKind::Complete,
+        );
+        let outcome = fixture.storage.transition_goal(request.clone()).unwrap();
+        let LifeIntentTransitionOutcome::Applied { event, entity } = outcome else {
+            panic!("the first goal transition must apply");
+        };
+        assert_eq!(entity.status, "completed");
+        assert_eq!(entity.revision, 2);
+        assert_eq!(
+            entity.closed_at.as_deref(),
+            Some(event.occurred_at.as_str())
+        );
+        assert_eq!(entity.updated_at, event.occurred_at);
+        assert_eq!(event.event_id, "event-goal-complete");
+        assert_eq!(event.life_id, "life-a");
+        assert_eq!(event.entity_kind, "goal");
+        assert_eq!(event.goal_id.as_deref(), Some("goal-lifecycle"));
+        assert!(event.plan_id.is_none());
+        assert!(event.step_id.is_none());
+        assert!(event.action_id.is_none());
+        assert_eq!(event.from_status, "active");
+        assert_eq!(event.to_status, "completed");
+        assert_eq!(event.expected_revision, 1);
+        assert_eq!(event.applied_revision, 2);
+        assert_eq!(event.actor_kind, "user_explicit");
+        assert_eq!(event.event_version, 1);
+        assert!(!event.occurred_at.is_empty());
+
+        assert_eq!(
+            fixture
+                .storage
+                .find_event("life-a", "event-goal-complete")
+                .unwrap(),
+            Some(event.clone())
+        );
+        assert!(fixture
+            .storage
+            .find_event("life-b", "event-goal-complete")
+            .unwrap()
+            .is_none());
+
+        let replay = fixture.storage.transition_goal(request).unwrap();
+        let LifeIntentTransitionOutcome::Replayed {
+            event: replayed_event,
+            current,
+        } = replay
+        else {
+            panic!("the exact goal transition must replay");
+        };
+        assert_eq!(replayed_event, event);
+        assert_eq!(current.status, "completed");
+        assert_eq!(current.revision, 2);
+        assert_eq!(
+            count_rows(&fixture.storage.state().unwrap().connection).events,
+            1
+        );
+
+        let stale = fixture.storage.transition_goal(goal_transition(
+            "event-goal-stale",
+            "life-a",
+            "goal-lifecycle",
+            1,
+            LifeGoalTransitionKind::Complete,
+        ));
+        assert_eq!(
+            error_code(stale.unwrap_err()),
+            LifeIntentErrorCode::RevisionConflict
+        );
+
+        let terminal = fixture.storage.transition_goal(goal_transition(
+            "event-goal-terminal",
+            "life-a",
+            "goal-lifecycle",
+            2,
+            LifeGoalTransitionKind::Cancel,
+        ));
+        assert_eq!(
+            error_code(terminal.unwrap_err()),
+            LifeIntentErrorCode::InvalidTransition
+        );
+
+        let event_conflict = fixture.storage.transition_goal(goal_transition(
+            "event-goal-complete",
+            "life-a",
+            "goal-lifecycle",
+            1,
+            LifeGoalTransitionKind::Cancel,
+        ));
+        assert_eq!(
+            error_code(event_conflict.unwrap_err()),
+            LifeIntentErrorCode::LifeIntentEventConflict
+        );
+
+        fixture
+            .storage
+            .create_goal(fixture.goal_request("goal-cancel"))
+            .unwrap();
+        let cancelled = fixture
+            .storage
+            .transition_goal(goal_transition(
+                "event-goal-cancel",
+                "life-a",
+                "goal-cancel",
+                1,
+                LifeGoalTransitionKind::Cancel,
+            ))
+            .unwrap();
+        let LifeIntentTransitionOutcome::Applied { entity, .. } = cancelled else {
+            panic!("goal cancellation must apply");
+        };
+        assert_eq!(entity.status, "cancelled");
+        assert_eq!(entity.revision, 2);
+    }
+
+    #[test]
+    fn plan_lifecycle_obeys_graph_and_replays_activation_after_completion() {
+        let fixture = Fixture::new();
+        fixture
+            .storage
+            .create_goal(fixture.goal_request("goal-plan-lifecycle"))
+            .unwrap();
+        fixture
+            .storage
+            .create_plan(fixture.plan_request("plan-lifecycle", "goal-plan-lifecycle"))
+            .unwrap();
+
+        let activate_request = plan_transition(
+            "event-plan-activate",
+            "life-a",
+            "plan-lifecycle",
+            1,
+            LifePlanTransitionKind::Activate,
+        );
+        let activated = fixture
+            .storage
+            .transition_plan(activate_request.clone())
+            .unwrap();
+        let LifeIntentTransitionOutcome::Applied { event, entity } = activated else {
+            panic!("plan activation must apply");
+        };
+        assert_eq!(entity.status, "active");
+        assert_eq!(entity.revision, 2);
+        assert!(entity.closed_at.is_none());
+        assert_eq!(entity.updated_at, event.occurred_at);
+        assert_eq!(event.from_status, "draft");
+        assert_eq!(event.to_status, "active");
+        assert_eq!(event.plan_id.as_deref(), Some("plan-lifecycle"));
+        assert!(event.goal_id.is_none());
+        assert!(event.step_id.is_none());
+        assert!(event.action_id.is_none());
+
+        let completed = fixture
+            .storage
+            .transition_plan(plan_transition(
+                "event-plan-complete",
+                "life-a",
+                "plan-lifecycle",
+                2,
+                LifePlanTransitionKind::Complete,
+            ))
+            .unwrap();
+        let LifeIntentTransitionOutcome::Applied { entity, .. } = completed else {
+            panic!("plan completion must apply");
+        };
+        assert_eq!(entity.status, "completed");
+        assert_eq!(entity.revision, 3);
+        assert!(entity.closed_at.is_some());
+
+        let replayed = fixture.storage.transition_plan(activate_request).unwrap();
+        let LifeIntentTransitionOutcome::Replayed { event, current } = replayed else {
+            panic!("activation must replay after later completion");
+        };
+        assert_eq!(event.event_id, "event-plan-activate");
+        assert_eq!(event.expected_revision, 1);
+        assert_eq!(event.applied_revision, 2);
+        assert_eq!(current.status, "completed");
+        assert_eq!(current.revision, 3);
+
+        for conflicting in [
+            plan_transition(
+                "event-plan-activate",
+                "life-a",
+                "plan-lifecycle",
+                1,
+                LifePlanTransitionKind::Cancel,
+            ),
+            plan_transition(
+                "event-plan-activate",
+                "life-a",
+                "other-plan",
+                1,
+                LifePlanTransitionKind::Activate,
+            ),
+            plan_transition(
+                "event-plan-activate",
+                "life-a",
+                "plan-lifecycle",
+                2,
+                LifePlanTransitionKind::Activate,
+            ),
+        ] {
+            assert_eq!(
+                error_code(fixture.storage.transition_plan(conflicting).unwrap_err()),
+                LifeIntentErrorCode::LifeIntentEventConflict
+            );
+        }
+
+        let terminal_reopen = fixture.storage.transition_plan(plan_transition(
+            "event-plan-reopen",
+            "life-a",
+            "plan-lifecycle",
+            3,
+            LifePlanTransitionKind::Activate,
+        ));
+        assert_eq!(
+            error_code(terminal_reopen.unwrap_err()),
+            LifeIntentErrorCode::InvalidTransition
+        );
+
+        fixture
+            .storage
+            .create_plan(fixture.plan_request("plan-draft-complete", "goal-plan-lifecycle"))
+            .unwrap();
+        assert_eq!(
+            error_code(
+                fixture
+                    .storage
+                    .transition_plan(plan_transition(
+                        "event-plan-illegal",
+                        "life-a",
+                        "plan-draft-complete",
+                        1,
+                        LifePlanTransitionKind::Complete,
+                    ))
+                    .unwrap_err()
+            ),
+            LifeIntentErrorCode::InvalidTransition
+        );
+
+        fixture
+            .storage
+            .create_plan(fixture.plan_request("plan-draft-cancel", "goal-plan-lifecycle"))
+            .unwrap();
+        let draft_cancel = fixture
+            .storage
+            .transition_plan(plan_transition(
+                "event-plan-draft-cancel",
+                "life-a",
+                "plan-draft-cancel",
+                1,
+                LifePlanTransitionKind::Cancel,
+            ))
+            .unwrap();
+        let LifeIntentTransitionOutcome::Applied { entity, .. } = draft_cancel else {
+            panic!("draft cancellation must apply");
+        };
+        assert_eq!(entity.status, "cancelled");
+        assert_eq!(entity.revision, 2);
+        assert!(entity.closed_at.is_some());
+
+        fixture
+            .storage
+            .create_plan(fixture.plan_request("plan-active-cancel", "goal-plan-lifecycle"))
+            .unwrap();
+        fixture
+            .storage
+            .transition_plan(plan_transition(
+                "event-plan-activate-2",
+                "life-a",
+                "plan-active-cancel",
+                1,
+                LifePlanTransitionKind::Activate,
+            ))
+            .unwrap();
+        let active_cancel = fixture
+            .storage
+            .transition_plan(plan_transition(
+                "event-plan-cancel-2",
+                "life-a",
+                "plan-active-cancel",
+                2,
+                LifePlanTransitionKind::Cancel,
+            ))
+            .unwrap();
+        let LifeIntentTransitionOutcome::Applied { entity, .. } = active_cancel else {
+            panic!("active plan cancellation must apply");
+        };
+        assert_eq!(entity.status, "cancelled");
+        assert_eq!(entity.revision, 3);
+    }
+
+    #[test]
+    fn step_lifecycle_supports_all_terminals_without_parent_auto_progression() {
+        let fixture = Fixture::new();
+        fixture
+            .storage
+            .create_goal(fixture.goal_request("goal-step-lifecycle"))
+            .unwrap();
+        fixture
+            .storage
+            .create_plan(fixture.plan_request("plan-step-lifecycle", "goal-step-lifecycle"))
+            .unwrap();
+        for step_id in ["step-complete", "step-skip", "step-cancel"] {
+            let ordinal = match step_id {
+                "step-complete" => 1,
+                "step-skip" => 2,
+                "step-cancel" => 3,
+                _ => unreachable!(),
+            };
+            fixture
+                .storage
+                .create_step(fixture.step_request(step_id, "plan-step-lifecycle", ordinal))
+                .unwrap();
+        }
+
+        for (step_id, event_id, kind, expected_status) in [
+            (
+                "step-complete",
+                "event-step-complete",
+                LifeStepTransitionKind::Complete,
+                "completed",
+            ),
+            (
+                "step-skip",
+                "event-step-skip",
+                LifeStepTransitionKind::Skip,
+                "skipped",
+            ),
+            (
+                "step-cancel",
+                "event-step-cancel",
+                LifeStepTransitionKind::Cancel,
+                "cancelled",
+            ),
+        ] {
+            let outcome = fixture
+                .storage
+                .transition_step(step_transition(event_id, "life-a", step_id, 1, kind))
+                .unwrap();
+            let LifeIntentTransitionOutcome::Applied { event, entity } = outcome else {
+                panic!("step transition must apply");
+            };
+            assert_eq!(entity.status, expected_status);
+            assert_eq!(entity.revision, 2);
+            assert_eq!(
+                entity.closed_at.as_deref(),
+                Some(event.occurred_at.as_str())
+            );
+            assert_eq!(entity.updated_at, event.occurred_at);
+            assert_eq!(event.entity_kind, "step");
+            assert_eq!(event.step_id.as_deref(), Some(step_id));
+            assert_eq!(event.from_status, "pending");
+            assert_eq!(event.to_status, expected_status);
+        }
+
+        let plan = fixture
+            .storage
+            .find_plan("life-a", "plan-step-lifecycle")
+            .unwrap()
+            .unwrap();
+        let goal = fixture
+            .storage
+            .find_goal("life-a", "goal-step-lifecycle")
+            .unwrap()
+            .unwrap();
+        assert_eq!((plan.status.as_str(), plan.revision), ("draft", 1));
+        assert_eq!((goal.status.as_str(), goal.revision), ("active", 1));
+
+        let terminal_again = fixture.storage.transition_step(step_transition(
+            "event-step-terminal-again",
+            "life-a",
+            "step-complete",
+            2,
+            LifeStepTransitionKind::Cancel,
+        ));
+        assert_eq!(
+            error_code(terminal_again.unwrap_err()),
+            LifeIntentErrorCode::InvalidTransition
+        );
+    }
+
+    #[test]
+    fn action_lifecycle_dismisses_all_proposal_classes_without_execution() {
+        let fixture = Fixture::new();
+        fixture
+            .storage
+            .create_goal(fixture.goal_request("goal-action-lifecycle"))
+            .unwrap();
+        fixture
+            .storage
+            .create_plan(fixture.plan_request("plan-action-lifecycle", "goal-action-lifecycle"))
+            .unwrap();
+        fixture
+            .storage
+            .create_step(fixture.step_request("step-action-lifecycle", "plan-action-lifecycle", 1))
+            .unwrap();
+        for (action_id, execution_class) in [
+            ("action-dismiss-internal", EXECUTION_CLASS_INTERNAL_INTENT),
+            ("action-dismiss-agent", EXECUTION_CLASS_AGENT_TASK_PROPOSAL),
+            (
+                "action-dismiss-tool",
+                EXECUTION_CLASS_TOOL_OPERATION_PROPOSAL,
+            ),
+        ] {
+            fixture
+                .storage
+                .create_action(fixture.action_request(
+                    action_id,
+                    "step-action-lifecycle",
+                    execution_class,
+                ))
+                .unwrap();
+            let outcome = fixture
+                .storage
+                .transition_action(action_transition(
+                    &format!("event-{action_id}"),
+                    "life-a",
+                    action_id,
+                    1,
+                    LifeActionTransitionKind::Dismiss,
+                ))
+                .unwrap();
+            let LifeIntentTransitionOutcome::Applied { event, entity } = outcome else {
+                panic!("action dismissal must apply");
+            };
+            assert_eq!(entity.execution_class, execution_class);
+            assert_eq!(entity.status, "dismissed");
+            assert_eq!(entity.revision, 2);
+            assert_eq!(
+                entity.closed_at.as_deref(),
+                Some(event.occurred_at.as_str())
+            );
+            assert_eq!(entity.updated_at, event.occurred_at);
+            assert_eq!(event.entity_kind, "action");
+            assert_eq!(event.action_id.as_deref(), Some(action_id));
+            assert_eq!(event.from_status, "proposed");
+            assert_eq!(event.to_status, "dismissed");
+        }
+
+        let dismissed_again = fixture.storage.transition_action(action_transition(
+            "event-action-dismissed-again",
+            "life-a",
+            "action-dismiss-internal",
+            2,
+            LifeActionTransitionKind::Dismiss,
+        ));
+        assert_eq!(
+            error_code(dismissed_again.unwrap_err()),
+            LifeIntentErrorCode::InvalidTransition
+        );
+    }
+
+    #[test]
+    fn transition_target_binding_and_request_validation_are_fail_closed() {
+        let fixture = Fixture::new();
+        fixture
+            .storage
+            .create_goal(fixture.goal_request("goal-target"))
+            .unwrap();
+
+        let missing = fixture.storage.transition_goal(goal_transition(
+            "event-missing-target",
+            "life-a",
+            "missing-goal",
+            1,
+            LifeGoalTransitionKind::Complete,
+        ));
+        assert_eq!(
+            error_code(missing.unwrap_err()),
+            LifeIntentErrorCode::EntityNotFound
+        );
+
+        let cross_life = fixture.storage.transition_goal(goal_transition(
+            "event-cross-life-target",
+            "life-b",
+            "goal-target",
+            1,
+            LifeGoalTransitionKind::Complete,
+        ));
+        assert_eq!(
+            error_code(cross_life.unwrap_err()),
+            LifeIntentErrorCode::EntityLifeMismatch
+        );
+        assert_eq!(
+            fixture
+                .storage
+                .find_goal("life-a", "goal-target")
+                .unwrap()
+                .unwrap()
+                .status,
+            "active"
+        );
+
+        let invalid_event = fixture.storage.transition_goal(LifeGoalTransitionRequest {
+            event_id: String::new(),
+            life_id: "life-a".into(),
+            goal_id: "goal-target".into(),
+            expected_revision: 1,
+            kind: LifeGoalTransitionKind::Complete,
+        });
+        assert_eq!(
+            error_code(invalid_event.unwrap_err()),
+            LifeIntentErrorCode::InvalidArgument
+        );
+        let invalid_revision = fixture.storage.transition_goal(goal_transition(
+            "event-invalid-revision",
+            "life-a",
+            "goal-target",
+            0,
+            LifeGoalTransitionKind::Complete,
+        ));
+        assert_eq!(
+            error_code(invalid_revision.unwrap_err()),
+            LifeIntentErrorCode::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn caller_owned_transition_helper_commits_only_when_caller_commits() {
+        let fixture = Fixture::new();
+        fixture
+            .storage
+            .create_goal(fixture.goal_request("goal-caller-owned"))
+            .unwrap();
+        let mut state = fixture.storage.state().unwrap();
+        let transaction = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let outcome = transition_goal_in_transaction(
+            &transaction,
+            goal_transition(
+                "event-caller-owned",
+                "life-a",
+                "goal-caller-owned",
+                1,
+                LifeGoalTransitionKind::Complete,
+            ),
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            LifeIntentTransitionOutcome::Applied { .. }
+        ));
+        let event_count: i64 = transaction
+            .query_row("SELECT COUNT(*) FROM life_intent_event", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(event_count, 1);
+        transaction.commit().unwrap();
+        drop(state);
+
+        assert_eq!(
+            fixture
+                .storage
+                .find_goal("life-a", "goal-caller-owned")
+                .unwrap()
+                .unwrap()
+                .status,
+            "completed"
+        );
+    }
+
+    #[test]
+    fn transition_rolls_back_entity_when_event_insert_fails() {
+        let fixture = Fixture::new();
+        fixture
+            .storage
+            .create_goal(fixture.goal_request("goal-atomic"))
+            .unwrap();
+        let state = fixture.storage.state().unwrap();
+        state
+            .connection
+            .execute_batch(
+                "CREATE TEMP TRIGGER d14_b2_test_event_insert_failure
+                 BEFORE INSERT ON main.life_intent_event
+                 BEGIN
+                     SELECT RAISE(ABORT, 'D14_B2_TEST_EVENT_INSERT_FAILURE');
+                 END;",
+            )
+            .unwrap();
+        drop(state);
+
+        let error = fixture
+            .storage
+            .transition_goal(goal_transition(
+                "event-atomic",
+                "life-a",
+                "goal-atomic",
+                1,
+                LifeGoalTransitionKind::Complete,
+            ))
+            .unwrap_err();
+        assert_eq!(error_code(error), LifeIntentErrorCode::DatabaseUnavailable);
+        let goal = fixture
+            .storage
+            .find_goal("life-a", "goal-atomic")
+            .unwrap()
+            .unwrap();
+        assert_eq!(goal.status, "active");
+        assert_eq!(goal.revision, 1);
+        assert!(goal.closed_at.is_none());
+        assert!(fixture
+            .storage
+            .find_event("life-a", "event-atomic")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            count_rows(&fixture.storage.state().unwrap().connection).events,
+            0
+        );
+    }
+
+    #[test]
+    fn competing_sqlite_connections_allow_one_cas_transition() {
+        let fixture = Fixture::new();
+        fixture
+            .storage
+            .create_goal(fixture.goal_request("goal-race"))
+            .unwrap();
+        let second_root = fixture._root.path().join("default");
+        let second_service = StorageService::initialize_with_roots(second_root, None).unwrap();
+        let first_service = Arc::new(fixture.storage);
+        let second_service = Arc::new(second_service);
+        let barrier = Arc::new(Barrier::new(3));
+
+        let first_barrier = barrier.clone();
+        let first = first_service.clone();
+        let first_thread = thread::spawn(move || {
+            first_barrier.wait();
+            first.transition_goal(goal_transition(
+                "event-race-complete",
+                "life-a",
+                "goal-race",
+                1,
+                LifeGoalTransitionKind::Complete,
+            ))
+        });
+
+        let second_barrier = barrier.clone();
+        let second = second_service.clone();
+        let second_thread = thread::spawn(move || {
+            second_barrier.wait();
+            second.transition_goal(goal_transition(
+                "event-race-cancel",
+                "life-a",
+                "goal-race",
+                1,
+                LifeGoalTransitionKind::Cancel,
+            ))
+        });
+
+        barrier.wait();
+        let first_result = first_thread.join().unwrap();
+        let second_result = second_thread.join().unwrap();
+        let results = [first_result, second_result];
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Ok(LifeIntentTransitionOutcome::Applied { .. })))
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| {
+                    matches!(
+                        result,
+                        Err(error) if error.code == LifeIntentErrorCode::RevisionConflict
+                    )
+                })
+                .count(),
+            1
+        );
+
+        let goal = first_service
+            .find_goal("life-a", "goal-race")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(goal.status.as_str(), "completed" | "cancelled"));
+        assert_eq!(goal.revision, 2);
+        let state = first_service.state().unwrap();
+        assert_eq!(count_rows(&state.connection).events, 1);
     }
 }

@@ -2403,6 +2403,13 @@ mod tests {
             LifeProactiveIntentEvaluationOutcome::Applied { event, intent } => {
                 assert_eq!(event.to_status, INTENT_STATUS_STORED_SILENTLY);
                 assert_eq!(intent.status, INTENT_STATUS_STORED_SILENTLY);
+                assert_eq!(intent.revision, 2);
+                assert_eq!(intent.updated_at, event.occurred_at);
+                assert_eq!(
+                    intent.closed_at.as_deref(),
+                    Some(event.occurred_at.as_str())
+                );
+                assert!(intent.not_before.is_none());
                 assert!(intent.closed_at.is_some());
                 assert!(event.not_before_after.is_none());
             }
@@ -2410,6 +2417,7 @@ mod tests {
                 panic!("zero-budget evaluation must apply")
             }
         }
+        assert_eq!(fixture.intent_event_count(), 1);
 
         fixture.update_policy(LifeAutonomyPolicyUpdateRequest {
             event_id: "autonomy-policy-event-frequency-ready".into(),

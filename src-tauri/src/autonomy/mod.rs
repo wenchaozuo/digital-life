@@ -527,6 +527,9 @@ pub(crate) fn evaluate_initiative_policy(
     if !policy.enabled || !goal_is_active {
         return Ok(InitiativePolicyDecision::Cancelled);
     }
+    if policy.max_ready_per_window == 0 {
+        return Ok(InitiativePolicyDecision::StoredSilently);
+    }
 
     let recent_gate_required = intent
         .recent_interaction_seconds
@@ -567,9 +570,6 @@ pub(crate) fn evaluate_initiative_policy(
         return Ok(InitiativePolicyDecision::Deferred);
     }
 
-    if policy.max_ready_per_window == 0 {
-        return Ok(InitiativePolicyDecision::StoredSilently);
-    }
     if intent.user_relevance < MIN_USER_RELEVANCE_FOR_INTERRUPT
         || intent.interruption_cost > MAX_INTERRUPTION_COST_FOR_INTERRUPT
         || intent.acceptance_score.unwrap_or(NEUTRAL_ACCEPTANCE_SCORE)
@@ -1008,6 +1008,57 @@ mod initiative_policy_tests {
         assert_eq!(evaluate(&intent), InitiativePolicyDecision::StoredSilently);
         intent.acceptance_score = Some(401);
         assert_eq!(evaluate(&intent), InitiativePolicyDecision::Ready);
+    }
+
+    #[test]
+    fn zero_ready_budget_precedes_temporal_and_value_gates() {
+        let mut zero_budget = policy();
+        zero_budget.max_ready_per_window = 0;
+        zero_budget.dnd = true;
+
+        for focus_state in [
+            INTENT_FOCUS_STATE_AVAILABLE,
+            INTENT_FOCUS_STATE_UNKNOWN,
+            INTENT_FOCUS_STATE_FOCUSED,
+            INTENT_FOCUS_STATE_DND,
+        ] {
+            let mut intent = sample_intent();
+            intent.focus_state = focus_state.into();
+            intent.recent_interaction_seconds = Some(120);
+            assert_eq!(
+                evaluate_initiative_policy(
+                    &intent,
+                    Some(&zero_budget),
+                    true,
+                    "2026-08-27T01:00:00.000Z",
+                    &InitiativePolicyTemporalContext::default(),
+                )
+                .unwrap(),
+                InitiativePolicyDecision::StoredSilently
+            );
+        }
+
+        zero_budget.dnd = false;
+        for recent_interaction_seconds in [None, Some(0), Some(119)] {
+            let mut intent = sample_intent();
+            intent.recent_interaction_seconds = recent_interaction_seconds;
+            intent.importance = 0;
+            intent.user_relevance = 0;
+            intent.self_desire = 1000;
+            intent.interruption_cost = 1000;
+            intent.acceptance_score = Some(0);
+            assert_eq!(
+                evaluate_initiative_policy(
+                    &intent,
+                    Some(&zero_budget),
+                    true,
+                    "2026-08-27T01:00:00.000Z",
+                    &InitiativePolicyTemporalContext::default(),
+                )
+                .unwrap(),
+                InitiativePolicyDecision::StoredSilently
+            );
+        }
     }
 
     #[test]

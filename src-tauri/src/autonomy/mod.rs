@@ -6,6 +6,8 @@
 //! create intents automatically, mutate D14 goals, deliver an intent, or
 //! execute an Agent or Tool.
 
+pub(crate) mod runtime;
+
 pub(crate) const POLICY_VERSION: i64 = 1;
 pub(crate) const POLICY_EVENT_VERSION: i64 = 1;
 pub(crate) const INTENT_VERSION: i64 = 1;
@@ -385,9 +387,9 @@ impl AutonomyError {
     }
 }
 
-/// Crate-internal autonomy authority boundary.  The surface intentionally has
-/// no intent decision, lifecycle transition, scheduler, delivery, or
-/// execution operation.
+/// Crate-internal autonomy authority boundary. It exposes bounded policy and
+/// intent persistence plus pending evaluation; it has no scheduler, delivery,
+/// or execution operation.
 pub(crate) trait AutonomyRepository: Send + Sync {
     fn create_policy(
         &self,
@@ -427,6 +429,18 @@ pub(crate) trait AutonomyRepository: Send + Sync {
         life_id: &str,
         goal_id: &str,
     ) -> Result<Vec<LifeProactiveIntent>, AutonomyError>;
+
+    fn find_latest_intent_for_goal(
+        &self,
+        life_id: &str,
+        goal_id: &str,
+    ) -> Result<Option<LifeProactiveIntent>, AutonomyError>;
+
+    fn find_intent_event(
+        &self,
+        life_id: &str,
+        event_id: &str,
+    ) -> Result<Option<LifeProactiveIntentEvent>, AutonomyError>;
 
     fn find_policy_event(
         &self,

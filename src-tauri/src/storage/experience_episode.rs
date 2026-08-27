@@ -338,6 +338,29 @@ impl ExperienceEpisodeRepository for StorageService {
         load_episode_by_source(&state.connection, life_id, source_kind, source_ref)
     }
 
+    fn find_latest_episode_for_life(
+        &self,
+        life_id: &str,
+    ) -> Result<Option<ExperienceEpisode>, ExperienceEpisodeError> {
+        validate_lookup_arguments(Some(life_id), None, None)?;
+        let state = self
+            .state()
+            .map_err(|_| ExperienceEpisodeError::database())?;
+        state
+            .connection
+            .query_row(
+                &format!(
+                    "SELECT {EXPERIENCE_EPISODE_COLUMNS} FROM experience_episode
+                     WHERE life_id = ?1
+                     ORDER BY ended_at DESC, episode_id DESC LIMIT 1"
+                ),
+                [life_id],
+                read_episode,
+            )
+            .optional()
+            .map_err(|_| ExperienceEpisodeError::database())
+    }
+
     fn commit_episode(
         &self,
         episode: ExperienceEpisode,
@@ -361,6 +384,7 @@ type EpisodeLookupResult = Result<Option<ExperienceEpisode>, ExperienceEpisodeEr
 type EpisodeLookup = for<'a> fn(&'a StorageService, &'a str) -> EpisodeLookupResult;
 type EpisodeSourceLookup =
     for<'a> fn(&'a StorageService, &'a str, &'a str, &'a str) -> EpisodeLookupResult;
+type LatestEpisodeLookup = for<'a> fn(&'a StorageService, &'a str) -> EpisodeLookupResult;
 type EpisodeCommit = for<'a> fn(
     &'a StorageService,
     ExperienceEpisode,
@@ -369,6 +393,8 @@ type EpisodeCommit = for<'a> fn(
 const _: EpisodeLookup = <StorageService as ExperienceEpisodeRepository>::find_episode;
 const _: EpisodeSourceLookup =
     <StorageService as ExperienceEpisodeRepository>::find_episode_by_source;
+const _: LatestEpisodeLookup =
+    <StorageService as ExperienceEpisodeRepository>::find_latest_episode_for_life;
 const _: EpisodeCommit = <StorageService as ExperienceEpisodeRepository>::commit_episode;
 
 pub(super) fn validate_schema_objects(connection: &Connection) -> Result<(), super::StorageError> {
@@ -847,5 +873,68 @@ mod tests {
         assert!(error
             .to_string()
             .contains("EXPERIENCE_EPISODE_SOURCE_BINDING_MISMATCH"));
+    }
+
+    #[test]
+    fn latest_episode_lookup_is_bounded_and_orders_by_ended_at() {
+        let fixture = EpisodeFixture::new();
+        let first = fixture.episode();
+        fixture.storage.commit_episode(first).unwrap();
+
+        let state = fixture.storage.state().unwrap();
+        state
+            .connection
+            .execute(
+                "INSERT INTO conversation
+                     (id, life_id, title, revision, created_at, updated_at, last_message_at)
+                 VALUES ('episode-conversation-later', 'episode-life', 'Later', 1,
+                         '2026-08-26T00:00:00.003Z', '2026-08-26T00:00:00.004Z',
+                         '2026-08-26T00:00:00.004Z')",
+                [],
+            )
+            .unwrap();
+        state
+            .connection
+            .execute(
+                "INSERT INTO conversation_message
+                     (id, conversation_id, life_id, turn_id, role, content, sequence_no, created_at)
+                 VALUES ('episode-user-message-later', 'episode-conversation-later',
+                         'episode-life', 'episode-turn-later', 'user', 'later user', 1,
+                         '2026-08-26T00:00:00.003Z'),
+                        ('episode-assistant-message-later', 'episode-conversation-later',
+                         'episode-life', 'episode-turn-later', 'assistant', 'later assistant', 2,
+                         '2026-08-26T00:00:00.004Z')",
+                [],
+            )
+            .unwrap();
+        drop(state);
+
+        let later = ExperienceEpisode {
+            episode_id:
+                "experience-conversation:episode-life:episode-conversation-later:episode-turn-later"
+                    .into(),
+            life_id: "episode-life".into(),
+            episode_kind: EPISODE_KIND.into(),
+            source_kind: SOURCE_KIND.into(),
+            source_ref: "episode-conversation-later:episode-turn-later".into(),
+            conversation_id: "episode-conversation-later".into(),
+            turn_id: "episode-turn-later".into(),
+            counterpart_subject_id: "primary_user".into(),
+            user_message_id: "episode-user-message-later".into(),
+            assistant_message_id: "episode-assistant-message-later".into(),
+            outcome_kind: OUTCOME_KIND.into(),
+            started_at: "2026-08-26T00:00:00.003Z".into(),
+            ended_at: "2026-08-26T00:00:00.004Z".into(),
+            episode_version: EPISODE_VERSION,
+            created_at: "2026-08-26T00:00:00.004Z".into(),
+        };
+        fixture.storage.commit_episode(later.clone()).unwrap();
+        assert_eq!(
+            fixture
+                .storage
+                .find_latest_episode_for_life("episode-life")
+                .unwrap(),
+            Some(later)
+        );
     }
 }

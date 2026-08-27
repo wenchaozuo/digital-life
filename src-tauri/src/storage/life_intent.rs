@@ -1250,6 +1250,34 @@ fn list_goals_for_life(
         .map_err(|_| LifeIntentError::database())
 }
 
+/// D15's bounded read view over D14 Goal authority. It intentionally keeps
+/// the D14 repository contract unchanged while making the runtime bound
+/// enforceable in SQLite rather than truncating an unbounded result in memory.
+pub(super) fn list_active_goals_for_autonomy_tick(
+    connection: &Connection,
+    life_id: &str,
+    limit: i64,
+) -> Result<Vec<LifeGoal>, LifeIntentError> {
+    validate_list_arguments(life_id, None)?;
+    if limit < 1 {
+        return Err(LifeIntentError::invalid_argument(
+            "autonomy tick goal limit must be positive.",
+        ));
+    }
+    let mut statement = connection
+        .prepare(&format!(
+            "SELECT {LIFE_GOAL_COLUMNS} FROM life_goal
+             WHERE life_id = ?1 AND status = ?2
+             ORDER BY created_at, goal_id LIMIT ?3"
+        ))
+        .map_err(|_| LifeIntentError::database())?;
+    let rows = statement
+        .query_map(params![life_id, GOAL_STATUS_ACTIVE, limit], read_goal)
+        .map_err(|_| LifeIntentError::database())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|_| LifeIntentError::database())
+}
+
 fn list_plans_for_goal(
     connection: &Connection,
     life_id: &str,

@@ -226,6 +226,11 @@ pub(crate) trait ExperienceEpisodeRepository: Send + Sync {
         source_ref: &str,
     ) -> Result<Option<ExperienceEpisode>, ExperienceEpisodeError>;
 
+    fn find_latest_episode_for_life(
+        &self,
+        life_id: &str,
+    ) -> Result<Option<ExperienceEpisode>, ExperienceEpisodeError>;
+
     fn commit_episode(
         &self,
         episode: ExperienceEpisode,

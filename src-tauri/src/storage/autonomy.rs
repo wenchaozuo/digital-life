@@ -196,6 +196,56 @@ fn sqlite_add_seconds(
         .map_err(|_| AutonomyError::database())
 }
 
+fn sqlite_elapsed_seconds(
+    connection: &Connection,
+    now: &str,
+    earlier: &str,
+) -> Result<i64, AutonomyError> {
+    connection
+        .query_row(
+            "SELECT CAST(MAX(0.0, (julianday(?1) - julianday(?2)) * 86400.0) AS INTEGER)",
+            params![now, earlier],
+            |row| row.get(0),
+        )
+        .map_err(|_| AutonomyError::database())
+}
+
+impl StorageService {
+    pub(crate) fn autonomy_tick_now(&self) -> Result<String, AutonomyError> {
+        let state = self.state().map_err(|_| AutonomyError::database())?;
+        sqlite_authority_now(&state.connection)
+    }
+
+    pub(crate) fn autonomy_tick_add_seconds(
+        &self,
+        base: &str,
+        seconds: i64,
+    ) -> Result<String, AutonomyError> {
+        let state = self.state().map_err(|_| AutonomyError::database())?;
+        sqlite_add_seconds(&state.connection, base, seconds)
+    }
+
+    pub(crate) fn autonomy_tick_elapsed_seconds(
+        &self,
+        now: &str,
+        earlier: &str,
+    ) -> Result<i64, AutonomyError> {
+        let state = self.state().map_err(|_| AutonomyError::database())?;
+        sqlite_elapsed_seconds(&state.connection, now, earlier)
+    }
+
+    pub(crate) fn autonomy_tick_active_goals(
+        &self,
+        life_id: &str,
+        limit: i64,
+    ) -> Result<Vec<crate::life_intent::LifeGoal>, crate::life_intent::LifeIntentError> {
+        let state = self
+            .state()
+            .map_err(|_| crate::life_intent::LifeIntentError::database())?;
+        super::life_intent::list_active_goals_for_autonomy_tick(&state.connection, life_id, limit)
+    }
+}
+
 fn map_database_error(_error: rusqlite::Error) -> AutonomyError {
     AutonomyError::database()
 }
@@ -1043,6 +1093,57 @@ impl crate::autonomy::AutonomyRepository for StorageService {
         Ok(intents)
     }
 
+    fn find_latest_intent_for_goal(
+        &self,
+        life_id: &str,
+        goal_id: &str,
+    ) -> Result<Option<LifeProactiveIntent>, AutonomyError> {
+        validate_lookup_arguments(life_id, "goal identity", goal_id)?;
+        let state = self.state().map_err(|_| AutonomyError::database())?;
+        let intent = state
+            .connection
+            .query_row(
+                &format!(
+                    "SELECT {INTENT_COLUMNS} FROM life_proactive_intent
+                     WHERE life_id = ?1 AND goal_id = ?2
+                     ORDER BY created_at DESC, intent_id DESC LIMIT 1"
+                ),
+                params![life_id, goal_id],
+                read_intent,
+            )
+            .optional()
+            .map_err(|_| AutonomyError::database())?;
+        if let Some(intent) = &intent {
+            validate_intent_state(intent)?;
+        }
+        Ok(intent)
+    }
+
+    fn find_intent_event(
+        &self,
+        life_id: &str,
+        event_id: &str,
+    ) -> Result<Option<LifeProactiveIntentEvent>, AutonomyError> {
+        validate_lookup_arguments(life_id, "intent event identity", event_id)?;
+        let state = self.state().map_err(|_| AutonomyError::database())?;
+        let event = state
+            .connection
+            .query_row(
+                &format!(
+                    "SELECT {INTENT_EVENT_COLUMNS} FROM life_proactive_intent_event
+                     WHERE life_id = ?1 AND event_id = ?2"
+                ),
+                params![life_id, event_id],
+                read_intent_event,
+            )
+            .optional()
+            .map_err(|_| AutonomyError::database())?;
+        if let Some(event) = &event {
+            validate_intent_event_state(event)?;
+        }
+        Ok(event)
+    }
+
     fn find_policy_event(
         &self,
         life_id: &str,
@@ -1089,6 +1190,18 @@ const _: for<'a> fn(
     LifeProactiveIntentEvaluationRequest,
 ) -> Result<LifeProactiveIntentEvaluationOutcome, AutonomyError> =
     <StorageService as crate::autonomy::AutonomyRepository>::evaluate_pending_intent;
+const _: for<'a> fn(
+    &'a StorageService,
+    &'a str,
+    &'a str,
+) -> Result<Option<LifeProactiveIntent>, AutonomyError> =
+    <StorageService as crate::autonomy::AutonomyRepository>::find_latest_intent_for_goal;
+const _: for<'a> fn(
+    &'a StorageService,
+    &'a str,
+    &'a str,
+) -> Result<Option<LifeProactiveIntentEvent>, AutonomyError> =
+    <StorageService as crate::autonomy::AutonomyRepository>::find_intent_event;
 
 /// Exact normalized validation of every Schema23 D15 object. A matching name
 /// is not sufficient: table and trigger DDL must retain all checks, foreign
@@ -1237,6 +1350,11 @@ mod tests {
 
     use super::*;
     use crate::{
+        autonomy::runtime::{
+            deterministic_evaluation_event_id, deterministic_intent_id, run_autonomy_tick,
+            AutonomyTickError, AutonomyTickOutcome, AutonomyTickRequest, AutonomyTickWaitReason,
+            MAX_GOALS_INSPECTED_PER_TICK,
+        },
         autonomy::{
             validate_intent_event_state, AutonomyErrorCode, AutonomyRepository,
             LifeAutonomyPolicyUpdateOutcome, LifeProactiveIntentEvaluationOutcome,
@@ -1247,6 +1365,10 @@ mod tests {
             INTENT_STATUS_DEFERRED, INTENT_STATUS_EXPIRED, INTENT_STATUS_PENDING,
             INTENT_STATUS_READY, INTENT_STATUS_STORED_SILENTLY, MIN_RECHECK_SECONDS,
             RECENT_INTERACTION_QUIET_SECONDS,
+        },
+        experience::{
+            ExperienceEpisode, ExperienceEpisodeRepository, EPISODE_KIND, EPISODE_VERSION,
+            OUTCOME_KIND, SOURCE_KIND,
         },
         life_intent::{
             LifeGoalCreateRequest, LifeGoalTransitionKind, LifeGoalTransitionRequest,
@@ -1394,6 +1516,105 @@ mod tests {
                     |row| row.get(0),
                 )
                 .unwrap()
+        }
+
+        fn intent_count(&self) -> i64 {
+            let state = self.storage.state().unwrap();
+            state
+                .connection
+                .query_row("SELECT COUNT(*) FROM life_proactive_intent", [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        }
+
+        fn tick(
+            &self,
+            tick_id: &str,
+            focus_state: &str,
+        ) -> Result<AutonomyTickOutcome, AutonomyTickError> {
+            run_autonomy_tick(
+                &self.storage,
+                AutonomyTickRequest {
+                    tick_id: tick_id.into(),
+                    life_id: "autonomy-life-a".into(),
+                    focus_state: focus_state.into(),
+                },
+            )
+        }
+
+        fn set_intent_times(&self, intent_id: &str, updated_at: &str, not_before: Option<&str>) {
+            let state = self.storage.state().unwrap();
+            state
+                .connection
+                .execute(
+                    "UPDATE life_proactive_intent
+                     SET updated_at = ?2, not_before = ?3
+                     WHERE intent_id = ?1",
+                    params![intent_id, updated_at, not_before],
+                )
+                .unwrap();
+        }
+
+        fn insert_episode_with_age(&self, life_id: &str, suffix: &str, age_seconds: i64) {
+            let conversation_id = format!("autonomy-episode-conversation-{suffix}");
+            let turn_id = format!("autonomy-episode-turn-{suffix}");
+            let user_message_id = format!("autonomy-episode-user-{suffix}");
+            let assistant_message_id = format!("autonomy-episode-assistant-{suffix}");
+            let episode_id =
+                format!("experience-conversation:{life_id}:{conversation_id}:{turn_id}");
+            let source_ref = format!("{conversation_id}:{turn_id}");
+            let state = self.storage.state().unwrap();
+            let now = sqlite_authority_now(&state.connection).unwrap();
+            let ended_at = sqlite_add_seconds(&state.connection, &now, -age_seconds).unwrap();
+            let started_at = sqlite_add_seconds(&state.connection, &ended_at, -1).unwrap();
+            state
+                .connection
+                .execute(
+                    "INSERT INTO conversation
+                         (id, life_id, title, revision, created_at, updated_at, last_message_at)
+                     VALUES (?1, ?2, ?3, 1, ?4, ?4, ?4)",
+                    params![conversation_id, life_id, "Autonomy Episode", &started_at],
+                )
+                .unwrap();
+            state
+                .connection
+                .execute(
+                    "INSERT INTO conversation_message
+                         (id, conversation_id, life_id, turn_id, role, content, sequence_no, created_at)
+                     VALUES (?1, ?2, ?3, ?4, 'user', 'test user', 1, ?5),
+                            (?6, ?2, ?3, ?4, 'assistant', 'test assistant', 2, ?7)",
+                    params![
+                        user_message_id,
+                        conversation_id,
+                        life_id,
+                        turn_id,
+                        &started_at,
+                        assistant_message_id,
+                        &ended_at,
+                    ],
+                )
+                .unwrap();
+            drop(state);
+            self.storage
+                .commit_episode(ExperienceEpisode {
+                    episode_id,
+                    life_id: life_id.into(),
+                    episode_kind: EPISODE_KIND.into(),
+                    source_kind: SOURCE_KIND.into(),
+                    source_ref,
+                    conversation_id,
+                    turn_id,
+                    counterpart_subject_id: "primary_user".into(),
+                    user_message_id,
+                    assistant_message_id,
+                    outcome_kind: OUTCOME_KIND.into(),
+                    started_at,
+                    ended_at: ended_at.clone(),
+                    episode_version: EPISODE_VERSION,
+                    created_at: ended_at,
+                })
+                .unwrap();
         }
 
         fn add_seconds(&self, base: &str, seconds: i64) -> String {
@@ -2980,5 +3201,441 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn autonomy_tick_disabled_has_no_intent_or_event_writes() {
+        let fixture = Fixture::new();
+        fixture.create_goal("autonomy-tick-disabled-goal", "autonomy-life-a");
+        assert_eq!(
+            fixture.tick("disabled-no-policy", INTENT_FOCUS_STATE_AVAILABLE),
+            Ok(AutonomyTickOutcome::Disabled)
+        );
+        assert_eq!(fixture.intent_count(), 0);
+        assert_eq!(fixture.intent_event_count(), 0);
+
+        fixture.create_policy("autonomy-life-a", false, false);
+        assert_eq!(
+            fixture.tick("disabled-policy", INTENT_FOCUS_STATE_AVAILABLE),
+            Ok(AutonomyTickOutcome::Disabled)
+        );
+        assert_eq!(fixture.intent_count(), 0);
+        assert_eq!(fixture.intent_event_count(), 0);
+    }
+
+    #[test]
+    fn autonomy_tick_ignores_completed_and_cancelled_goals() {
+        let fixture = Fixture::new();
+        fixture.create_policy("autonomy-life-a", true, false);
+        fixture.create_goal("autonomy-tick-completed", "autonomy-life-a");
+        fixture
+            .storage
+            .transition_goal(LifeGoalTransitionRequest {
+                event_id: "autonomy-tick-completed-event".into(),
+                life_id: "autonomy-life-a".into(),
+                goal_id: "autonomy-tick-completed".into(),
+                expected_revision: 1,
+                kind: LifeGoalTransitionKind::Complete,
+            })
+            .unwrap();
+        fixture.create_goal("autonomy-tick-cancelled", "autonomy-life-a");
+        fixture
+            .storage
+            .transition_goal(LifeGoalTransitionRequest {
+                event_id: "autonomy-tick-cancelled-event".into(),
+                life_id: "autonomy-life-a".into(),
+                goal_id: "autonomy-tick-cancelled".into(),
+                expected_revision: 1,
+                kind: LifeGoalTransitionKind::Cancel,
+            })
+            .unwrap();
+
+        assert_eq!(
+            fixture.tick("no-active-goal", INTENT_FOCUS_STATE_AVAILABLE),
+            Ok(AutonomyTickOutcome::NoActiveGoal)
+        );
+        assert_eq!(fixture.intent_count(), 0);
+        assert_eq!(fixture.intent_event_count(), 0);
+    }
+
+    #[test]
+    fn autonomy_tick_inspects_eight_goals_and_produces_at_most_one_intent() {
+        let fixture = Fixture::new();
+        fixture.create_policy("autonomy-life-a", true, false);
+        for index in 0..9 {
+            fixture.create_goal(&format!("autonomy-tick-bound-{index}"), "autonomy-life-a");
+        }
+
+        let outcome = fixture
+            .tick("bounded-one", INTENT_FOCUS_STATE_AVAILABLE)
+            .unwrap();
+        assert!(matches!(outcome, AutonomyTickOutcome::Applied { .. }));
+        assert_eq!(fixture.intent_count(), 1);
+        assert_eq!(fixture.intent_event_count(), 1);
+        assert_eq!(MAX_GOALS_INSPECTED_PER_TICK, 8);
+        assert_eq!(crate::autonomy::runtime::MAX_INTENTS_PRODUCED_PER_TICK, 1);
+    }
+
+    #[test]
+    fn autonomy_tick_replays_same_tick_without_duplicate_rows() {
+        let fixture = Fixture::new();
+        fixture.create_policy("autonomy-life-a", true, false);
+        fixture.create_goal("autonomy-tick-replay-goal", "autonomy-life-a");
+
+        let first = fixture
+            .tick("same-tick", INTENT_FOCUS_STATE_AVAILABLE)
+            .unwrap();
+        let expected_intent_id =
+            deterministic_intent_id("autonomy-life-a", "autonomy-tick-replay-goal", "same-tick");
+        assert!(matches!(
+            first,
+            AutonomyTickOutcome::Applied { ref intent, .. }
+                if intent.intent_id == expected_intent_id
+        ));
+        let second = fixture
+            .tick("same-tick", INTENT_FOCUS_STATE_AVAILABLE)
+            .unwrap();
+        assert!(matches!(
+            second,
+            AutonomyTickOutcome::Waiting {
+                reason: AutonomyTickWaitReason::DeferredNotDue,
+                ..
+            }
+        ));
+        assert_eq!(fixture.intent_count(), 1);
+        assert_eq!(fixture.intent_event_count(), 1);
+        assert_eq!(
+            deterministic_evaluation_event_id(&expected_intent_id),
+            fixture
+                .storage
+                .find_intent_event(
+                    "autonomy-life-a",
+                    &deterministic_evaluation_event_id(&expected_intent_id),
+                )
+                .unwrap()
+                .unwrap()
+                .event_id
+        );
+    }
+
+    #[test]
+    fn autonomy_tick_recovers_pending_intent_through_b2_once() {
+        let fixture = Fixture::new();
+        fixture.create_policy("autonomy-life-a", true, false);
+        fixture.create_goal("autonomy-tick-pending-goal", "autonomy-life-a");
+        let mut request = fixture.intent_request(
+            "autonomy-tick-pending-intent",
+            "autonomy-life-a",
+            "autonomy-tick-pending-goal",
+        );
+        request.recent_interaction_seconds = Some(120);
+        request.expires_at = None;
+        let pending = fixture.create_intent(request);
+
+        let outcome = fixture
+            .tick("recovery-tick", INTENT_FOCUS_STATE_AVAILABLE)
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            AutonomyTickOutcome::Applied {
+                intent: ref evaluated,
+                ..
+            } if evaluated.intent_id == pending.intent_id && evaluated.revision == 2
+        ));
+        assert_eq!(fixture.intent_count(), 1);
+        assert_eq!(fixture.intent_event_count(), 1);
+        let event_id = deterministic_evaluation_event_id(&pending.intent_id);
+        let event = fixture
+            .storage
+            .find_intent_event("autonomy-life-a", &event_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.event_id, event_id);
+        assert_eq!(event.expected_revision, 1);
+        assert_eq!(event.applied_revision, 2);
+    }
+
+    #[test]
+    fn autonomy_tick_deferred_due_creates_fresh_evidence_without_mutating_old_row() {
+        let fixture = Fixture::new();
+        fixture.create_policy("autonomy-life-a", true, false);
+        fixture.create_goal("autonomy-tick-deferred-goal", "autonomy-life-a");
+        let first = fixture
+            .tick("deferred-first", INTENT_FOCUS_STATE_AVAILABLE)
+            .unwrap();
+        let old_intent_id = match first {
+            AutonomyTickOutcome::Applied { intent, .. } => intent.intent_id,
+            other => panic!("expected first tick to apply, got {other:?}"),
+        };
+        let state = fixture.storage.state().unwrap();
+        let now = sqlite_authority_now(&state.connection).unwrap();
+        let old = sqlite_add_seconds(&state.connection, &now, -1).unwrap();
+        drop(state);
+        fixture.set_intent_times(&old_intent_id, &old, Some(&old));
+
+        let second = fixture
+            .tick("deferred-due", INTENT_FOCUS_STATE_AVAILABLE)
+            .unwrap();
+        let new_intent_id = match second {
+            AutonomyTickOutcome::Applied { intent, .. } => intent.intent_id,
+            other => panic!("expected due deferred tick to apply, got {other:?}"),
+        };
+        assert_ne!(new_intent_id, old_intent_id);
+        assert_eq!(fixture.intent_count(), 2);
+        let old_intent = fixture
+            .storage
+            .find_intent("autonomy-life-a", &old_intent_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(old_intent.status, INTENT_STATUS_DEFERRED);
+        assert_eq!(old_intent.not_before.as_deref(), Some(old.as_str()));
+    }
+
+    #[test]
+    fn autonomy_tick_terminal_cooldown_is_sqlite_authoritative_and_bounded() {
+        let fixture = Fixture::new();
+        let mut policy = fixture.policy_request("autonomy-life-a");
+        policy.max_ready_per_window = 0;
+        fixture.storage.create_policy(policy).unwrap();
+        fixture.create_goal("autonomy-tick-terminal-goal", "autonomy-life-a");
+        let mut intent_request = fixture.intent_request(
+            "autonomy-tick-terminal-intent",
+            "autonomy-life-a",
+            "autonomy-tick-terminal-goal",
+        );
+        intent_request.recent_interaction_seconds = Some(120);
+        intent_request.expires_at = None;
+        let intent = fixture.create_intent(intent_request);
+        let evaluated = fixture
+            .evaluate(
+                "autonomy-tick-terminal-event",
+                "autonomy-life-a",
+                &intent.intent_id,
+                1,
+            )
+            .unwrap();
+        assert!(matches!(
+            evaluated,
+            LifeProactiveIntentEvaluationOutcome::Applied { intent, .. }
+                if intent.status == INTENT_STATUS_STORED_SILENTLY
+        ));
+
+        let mut enabled_policy = fixture.policy_request("autonomy-life-a");
+        enabled_policy.max_ready_per_window = 3;
+        fixture.update_policy(LifeAutonomyPolicyUpdateRequest {
+            event_id: "autonomy-tick-terminal-policy-event".into(),
+            life_id: enabled_policy.life_id,
+            enabled: enabled_policy.enabled,
+            dnd: enabled_policy.dnd,
+            max_ready_per_window: enabled_policy.max_ready_per_window,
+            window_seconds: enabled_policy.window_seconds,
+            min_gap_seconds: enabled_policy.min_gap_seconds,
+            expected_revision: 1,
+        });
+        let waiting = fixture
+            .tick("terminal-before-cooldown", INTENT_FOCUS_STATE_AVAILABLE)
+            .unwrap();
+        assert!(matches!(
+            waiting,
+            AutonomyTickOutcome::Waiting {
+                reason: AutonomyTickWaitReason::TerminalCooldown,
+                ..
+            }
+        ));
+        assert_eq!(fixture.intent_count(), 1);
+
+        let state = fixture.storage.state().unwrap();
+        let now = sqlite_authority_now(&state.connection).unwrap();
+        let old = sqlite_add_seconds(&state.connection, &now, -61).unwrap();
+        drop(state);
+        fixture.set_intent_times(&intent.intent_id, &old, None);
+        let after = fixture
+            .tick("terminal-after-cooldown", INTENT_FOCUS_STATE_AVAILABLE)
+            .unwrap();
+        assert!(matches!(after, AutonomyTickOutcome::Applied { .. }));
+        assert_eq!(fixture.intent_count(), 2);
+    }
+
+    #[test]
+    fn autonomy_tick_zero_ready_budget_suppresses_new_work_but_recovers_pending() {
+        let fixture = Fixture::new();
+        let mut policy = fixture.policy_request("autonomy-life-a");
+        policy.max_ready_per_window = 0;
+        fixture.storage.create_policy(policy).unwrap();
+        fixture.create_goal("autonomy-tick-zero-budget-goal", "autonomy-life-a");
+
+        assert_eq!(
+            fixture.tick("zero-budget-new", INTENT_FOCUS_STATE_AVAILABLE),
+            Ok(AutonomyTickOutcome::NoReadyBudget)
+        );
+        assert_eq!(fixture.intent_count(), 0);
+
+        let mut pending_request = fixture.intent_request(
+            "autonomy-tick-zero-budget-pending",
+            "autonomy-life-a",
+            "autonomy-tick-zero-budget-goal",
+        );
+        pending_request.expires_at = None;
+        let pending = fixture.create_intent(pending_request);
+        let recovered = fixture
+            .tick("zero-budget-recovery", INTENT_FOCUS_STATE_AVAILABLE)
+            .unwrap();
+        assert!(matches!(
+            recovered,
+            AutonomyTickOutcome::Applied { intent, .. }
+                if intent.intent_id == pending.intent_id
+                    && intent.status == INTENT_STATUS_STORED_SILENTLY
+        ));
+        assert_eq!(fixture.intent_count(), 1);
+        assert_eq!(fixture.intent_event_count(), 1);
+        assert_eq!(
+            fixture.tick("zero-budget-again", INTENT_FOCUS_STATE_AVAILABLE),
+            Ok(AutonomyTickOutcome::NoReadyBudget)
+        );
+        assert_eq!(fixture.intent_count(), 1);
+        assert_eq!(fixture.intent_event_count(), 1);
+    }
+
+    #[test]
+    fn autonomy_tick_recent_episode_age_and_focus_are_fail_conservative() {
+        for (suffix, age_seconds, expected_status) in [
+            ("zero", 0, INTENT_STATUS_DEFERRED),
+            ("recent", 119, INTENT_STATUS_DEFERRED),
+            ("quiet", 121, INTENT_STATUS_READY),
+        ] {
+            let fixture = Fixture::new();
+            fixture.create_policy("autonomy-life-a", true, false);
+            let goal_id = format!("autonomy-tick-recent-goal-{suffix}");
+            fixture.create_goal(&goal_id, "autonomy-life-a");
+            fixture.insert_episode_with_age("autonomy-life-a", suffix, age_seconds);
+            let outcome = fixture
+                .tick(&format!("recent-{suffix}"), INTENT_FOCUS_STATE_AVAILABLE)
+                .unwrap();
+            let intent = match outcome {
+                AutonomyTickOutcome::Applied { intent, .. } => intent,
+                other => panic!("expected evaluated intent, got {other:?}"),
+            };
+            assert_eq!(intent.status, expected_status);
+            assert!(intent.recent_interaction_seconds.is_some());
+            let recent = intent.recent_interaction_seconds.unwrap();
+            if age_seconds == 0 {
+                assert!(recent <= 1);
+            } else if age_seconds == 119 {
+                assert!((119..120).contains(&recent));
+            } else {
+                assert!(recent >= 120);
+            }
+        }
+
+        for focus_state in [
+            INTENT_FOCUS_STATE_UNKNOWN,
+            INTENT_FOCUS_STATE_FOCUSED,
+            INTENT_FOCUS_STATE_DND,
+        ] {
+            let fixture = Fixture::new();
+            fixture.create_policy("autonomy-life-a", true, false);
+            fixture.create_goal("autonomy-tick-focus-goal", "autonomy-life-a");
+            fixture.insert_episode_with_age("autonomy-life-a", focus_state, 121);
+            let outcome = fixture.tick(focus_state, focus_state).unwrap();
+            assert!(matches!(
+                outcome,
+                AutonomyTickOutcome::Applied { intent, .. }
+                    if intent.status == INTENT_STATUS_DEFERRED
+            ));
+        }
+
+        let fixture = Fixture::new();
+        fixture.create_policy("autonomy-life-a", true, false);
+        fixture.create_goal("autonomy-tick-no-episode-goal", "autonomy-life-a");
+        let outcome = fixture
+            .tick("no-episode", INTENT_FOCUS_STATE_AVAILABLE)
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            AutonomyTickOutcome::Applied { intent, .. }
+                if intent.status == INTENT_STATUS_DEFERRED
+                    && intent.recent_interaction_seconds.is_none()
+        ));
+    }
+
+    #[test]
+    fn autonomy_tick_blocks_a_goal_with_latest_ready_intent() {
+        let fixture = Fixture::new();
+        fixture.create_policy("autonomy-life-a", true, false);
+        fixture.create_goal("autonomy-tick-ready-goal", "autonomy-life-a");
+        let mut request = fixture.intent_request(
+            "autonomy-tick-ready-intent",
+            "autonomy-life-a",
+            "autonomy-tick-ready-goal",
+        );
+        request.recent_interaction_seconds = Some(120);
+        request.expires_at = None;
+        let intent = fixture.create_intent(request);
+        let evaluated = fixture
+            .evaluate(
+                "autonomy-tick-ready-event",
+                "autonomy-life-a",
+                &intent.intent_id,
+                1,
+            )
+            .unwrap();
+        assert!(matches!(
+            evaluated,
+            LifeProactiveIntentEvaluationOutcome::Applied { intent, .. }
+                if intent.status == INTENT_STATUS_READY
+        ));
+
+        let outcome = fixture
+            .tick("ready-block", INTENT_FOCUS_STATE_AVAILABLE)
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            AutonomyTickOutcome::Waiting {
+                goal_id,
+                reason: AutonomyTickWaitReason::ReadyPendingDelivery,
+                until: None,
+            } if goal_id == "autonomy-tick-ready-goal"
+        ));
+        assert_eq!(fixture.intent_count(), 1);
+        assert_eq!(fixture.intent_event_count(), 1);
+    }
+
+    #[test]
+    fn autonomy_tick_reopens_and_applies_one_elapsed_resume_tick() {
+        let fixture = Fixture::new();
+        fixture.create_policy("autonomy-life-a", true, false);
+        fixture.create_goal("autonomy-tick-resume-goal", "autonomy-life-a");
+        let first = fixture
+            .tick("offline-before-close", INTENT_FOCUS_STATE_AVAILABLE)
+            .unwrap();
+        let old_intent_id = match first {
+            AutonomyTickOutcome::Applied { intent, .. } => intent.intent_id,
+            other => panic!("expected persisted deferred evidence, got {other:?}"),
+        };
+        let state = fixture.storage.state().unwrap();
+        let now = sqlite_authority_now(&state.connection).unwrap();
+        let old = sqlite_add_seconds(&state.connection, &now, -61).unwrap();
+        drop(state);
+        fixture.set_intent_times(&old_intent_id, &old, Some(&old));
+        let database_root = fixture._root.path().join("default");
+        drop(fixture.storage);
+
+        let reopened = StorageService::initialize_with_roots(database_root, None).unwrap();
+        let resumed = run_autonomy_tick(
+            &reopened,
+            AutonomyTickRequest {
+                tick_id: "offline-after-open".into(),
+                life_id: "autonomy-life-a".into(),
+                focus_state: INTENT_FOCUS_STATE_AVAILABLE.into(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(resumed, AutonomyTickOutcome::Applied { .. }));
+        let intents = reopened
+            .list_intents_for_goal("autonomy-life-a", "autonomy-tick-resume-goal")
+            .unwrap();
+        assert_eq!(intents.len(), 2);
+        assert_eq!(intents[0].intent_id, old_intent_id);
+        assert_eq!(intents[0].status, INTENT_STATUS_DEFERRED);
     }
 }

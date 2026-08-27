@@ -2570,6 +2570,9 @@ pub(super) fn verify_schema_after_upgrade(
     if expected_schema_version == AUTONOMY_AUTHORITY_SCHEMA_VERSION {
         validate_autonomy_schema(connection)?;
     }
+    if expected_schema_version >= PERCEPTION_AUTHORITY_SCHEMA_VERSION {
+        validate_perception_schema(connection)?;
+    }
     if expected_schema_version >= writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION {
         #[cfg(test)]
         if should_fail_post_commit_verification_at_for_test(
@@ -3299,6 +3302,9 @@ pub fn verify_database(
     if expected_schema_version >= AUTONOMY_AUTHORITY_SCHEMA_VERSION {
         validate_autonomy_schema(connection)?;
     }
+    if expected_schema_version >= PERCEPTION_AUTHORITY_SCHEMA_VERSION {
+        validate_perception_schema(connection)?;
+    }
     if expected_schema_version >= writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION {
         writer_fence_manifest::validate_writer_fence_manifest(connection)?;
     }
@@ -3788,6 +3794,56 @@ mod transaction_tests {
             AUTONOMY_AUTHORITY_SCHEMA_VERSION
         );
         connection
+    }
+
+    const VERIFICATION_LIFE_ID: &str = "migration-024-verification-life";
+
+    fn seed_verification_life(connection: &Connection) {
+        connection
+            .execute(
+                "INSERT INTO persona_template (id, name, version, persona_json)
+                 VALUES ('migration-024-verification-persona', 'Persona', 1, '{}')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO life_identity
+                 (id, name, created_at, version, body_id, persona_id, persona_version)
+                 VALUES (?1, 'Verification Life', '2026-08-27T00:00:00.000Z', 1,
+                         'migration-024-verification-body',
+                         'migration-024-verification-persona', 1)",
+                [VERIFICATION_LIFE_ID],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO app_state (singleton, current_life_id) VALUES (1, ?1)",
+                [VERIFICATION_LIFE_ID],
+            )
+            .unwrap();
+    }
+
+    fn schema_twenty_four_connection_with_current_life() -> (Connection, &'static str) {
+        let mut connection = schema_twenty_three_connection();
+        apply_perception_authority_upgrade(&mut connection);
+        seed_verification_life(&connection);
+        (connection, VERIFICATION_LIFE_ID)
+    }
+
+    fn weaken_perception_policy_guard(connection: &Connection) {
+        connection
+            .execute_batch(
+                "DROP TRIGGER life_perception_policy_immutable_guard;
+                 CREATE TRIGGER life_perception_policy_immutable_guard
+                 BEFORE UPDATE ON life_perception_policy
+                 WHEN digital_life_writer_epoch() IS 1
+                  AND NEW.life_id IS NOT OLD.life_id
+                 BEGIN
+                     SELECT RAISE(ROLLBACK, 'LIFE_PERCEPTION_POLICY_IMMUTABLE');
+                 END;",
+            )
+            .unwrap();
     }
 
     fn schema_nineteen_connection() -> Connection {
@@ -5558,6 +5614,61 @@ mod transaction_tests {
         .unwrap();
         assert_eq!(writer_fence_count(&schema_twenty_four), 93);
         validate_autonomy_schema(&schema_twenty_four).unwrap();
+    }
+
+    #[test]
+    fn migration_024_generic_schema_verifiers_reject_a_weakened_perception_guard() {
+        let (connection, life_id) = schema_twenty_four_connection_with_current_life();
+        weaken_perception_policy_guard(&connection);
+        assert_eq!(writer_fence_count(&connection), 93);
+
+        let error = verify_schema_after_upgrade(&connection, PERCEPTION_AUTHORITY_SCHEMA_VERSION)
+            .unwrap_err();
+        assert_eq!(error.code, "MIGRATION_TRANSACTION_FAILED");
+        assert_eq!(writer_fence_count(&connection), 93);
+
+        let error =
+            verify_database(&connection, PERCEPTION_AUTHORITY_SCHEMA_VERSION, life_id).unwrap_err();
+        assert_eq!(error.code, "MIGRATION_TRANSACTION_FAILED");
+        assert_eq!(writer_fence_count(&connection), 93);
+    }
+
+    #[test]
+    fn migration_024_generic_schema_verifiers_accept_valid_schema_twenty_four() {
+        let (connection, life_id) = schema_twenty_four_connection_with_current_life();
+
+        verify_schema_after_upgrade(&connection, PERCEPTION_AUTHORITY_SCHEMA_VERSION).unwrap();
+        verify_database(&connection, PERCEPTION_AUTHORITY_SCHEMA_VERSION, life_id).unwrap();
+        assert_eq!(writer_fence_count(&connection), 93);
+    }
+
+    #[test]
+    fn migration_024_generic_schema_verifiers_keep_schema_twenty_three_compatible() {
+        let connection = schema_twenty_three_connection();
+        seed_verification_life(&connection);
+
+        let perception_object_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE name IN
+                   ('life_perception_policy', 'life_perception_policy_event',
+                    'life_perception_policy_immutable_guard',
+                    'life_perception_policy_event_immutable_guard')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(perception_object_count, 0);
+        assert_eq!(writer_fence_count(&connection), 87);
+
+        verify_schema_after_upgrade(&connection, AUTONOMY_AUTHORITY_SCHEMA_VERSION).unwrap();
+        verify_database(
+            &connection,
+            AUTONOMY_AUTHORITY_SCHEMA_VERSION,
+            VERIFICATION_LIFE_ID,
+        )
+        .unwrap();
+        assert_eq!(writer_fence_count(&connection), 87);
     }
 
     #[test]

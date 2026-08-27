@@ -252,7 +252,6 @@ pub(super) fn create_goal_in_transaction(
     request: LifeGoalCreateRequest,
 ) -> Result<LifeIntentCreateOutcome<LifeGoal>, LifeIntentError> {
     validate_goal_request(&request)?;
-    require_life(transaction, &request.life_id)?;
 
     if let Some(existing) = transaction
         .query_row(
@@ -271,6 +270,8 @@ pub(super) fn create_goal_in_transaction(
         }
         return Err(LifeIntentError::entity_conflict());
     }
+
+    require_life(transaction, &request.life_id)?;
 
     let now = sqlite_authority_now(transaction)?;
     transaction
@@ -309,14 +310,6 @@ pub(super) fn create_plan_in_transaction(
     request: LifePlanCreateRequest,
 ) -> Result<LifeIntentCreateOutcome<LifePlan>, LifeIntentError> {
     validate_plan_request(&request)?;
-    require_life(transaction, &request.life_id)?;
-    require_parent(
-        transaction,
-        "life_goal",
-        "goal_id",
-        &request.goal_id,
-        &request.life_id,
-    )?;
 
     if let Some(existing) = transaction
         .query_row(
@@ -335,6 +328,15 @@ pub(super) fn create_plan_in_transaction(
         }
         return Err(LifeIntentError::entity_conflict());
     }
+
+    require_life(transaction, &request.life_id)?;
+    require_parent(
+        transaction,
+        "life_goal",
+        "goal_id",
+        &request.goal_id,
+        &request.life_id,
+    )?;
 
     let now = sqlite_authority_now(transaction)?;
     transaction
@@ -372,14 +374,6 @@ pub(super) fn create_step_in_transaction(
     request: LifePlanStepCreateRequest,
 ) -> Result<LifeIntentCreateOutcome<LifePlanStep>, LifeIntentError> {
     validate_step_request(&request)?;
-    require_life(transaction, &request.life_id)?;
-    require_parent(
-        transaction,
-        "life_plan",
-        "plan_id",
-        &request.plan_id,
-        &request.life_id,
-    )?;
 
     if let Some(existing) = transaction
         .query_row(
@@ -399,6 +393,15 @@ pub(super) fn create_step_in_transaction(
         }
         return Err(LifeIntentError::entity_conflict());
     }
+
+    require_life(transaction, &request.life_id)?;
+    require_parent(
+        transaction,
+        "life_plan",
+        "plan_id",
+        &request.plan_id,
+        &request.life_id,
+    )?;
 
     if ordinal_claimed_in_plan(
         transaction,
@@ -446,14 +449,6 @@ pub(super) fn create_action_in_transaction(
     request: LifeActionIntentCreateRequest,
 ) -> Result<LifeIntentCreateOutcome<LifeActionIntent>, LifeIntentError> {
     validate_action_request(&request)?;
-    require_life(transaction, &request.life_id)?;
-    require_parent(
-        transaction,
-        "life_plan_step",
-        "step_id",
-        &request.step_id,
-        &request.life_id,
-    )?;
 
     if let Some(existing) = transaction
         .query_row(
@@ -475,6 +470,15 @@ pub(super) fn create_action_in_transaction(
         }
         return Err(LifeIntentError::entity_conflict());
     }
+
+    require_life(transaction, &request.life_id)?;
+    require_parent(
+        transaction,
+        "life_plan_step",
+        "step_id",
+        &request.step_id,
+        &request.life_id,
+    )?;
 
     let now = sqlite_authority_now(transaction)?;
     transaction
@@ -2529,6 +2533,119 @@ mod tests {
         request.life_id = "life-b".into();
         let error = fixture.storage.create_goal(request).unwrap_err();
         assert_eq!(error_code(error), LifeIntentErrorCode::EntityConflict);
+    }
+
+    #[test]
+    fn existing_id_conflicts_take_precedence_over_life_parent_and_ordinal_checks() {
+        let fixture = Fixture::new();
+
+        fixture
+            .storage
+            .create_goal(fixture.goal_request("goal-precedence"))
+            .unwrap();
+        let mut changed_goal = fixture.goal_request("goal-precedence");
+        changed_goal.title = "Changed evidence".into();
+        assert_eq!(
+            error_code(fixture.storage.create_goal(changed_goal).unwrap_err()),
+            LifeIntentErrorCode::EntityConflict
+        );
+        let mut missing_life_goal = fixture.goal_request("goal-precedence");
+        missing_life_goal.life_id = "missing-life".into();
+        assert_eq!(
+            error_code(fixture.storage.create_goal(missing_life_goal).unwrap_err()),
+            LifeIntentErrorCode::EntityConflict
+        );
+
+        fixture
+            .storage
+            .create_plan(fixture.plan_request("plan-precedence", "goal-precedence"))
+            .unwrap();
+        let mut missing_goal_plan = fixture.plan_request("plan-precedence", "goal-precedence");
+        missing_goal_plan.goal_id = "missing-goal".into();
+        assert_eq!(
+            error_code(fixture.storage.create_plan(missing_goal_plan).unwrap_err()),
+            LifeIntentErrorCode::EntityConflict
+        );
+        let mut cross_life_plan = fixture.plan_request("plan-precedence", "goal-precedence");
+        cross_life_plan.life_id = "life-b".into();
+        assert_eq!(
+            error_code(fixture.storage.create_plan(cross_life_plan).unwrap_err()),
+            LifeIntentErrorCode::EntityConflict
+        );
+
+        fixture
+            .storage
+            .create_step(fixture.step_request("step-precedence", "plan-precedence", 1))
+            .unwrap();
+        let mut missing_plan_step = fixture.step_request("step-precedence", "plan-precedence", 1);
+        missing_plan_step.plan_id = "missing-plan".into();
+        assert_eq!(
+            error_code(fixture.storage.create_step(missing_plan_step).unwrap_err()),
+            LifeIntentErrorCode::EntityConflict
+        );
+        let mut cross_life_step = fixture.step_request("step-precedence", "plan-precedence", 1);
+        cross_life_step.life_id = "life-b".into();
+        assert_eq!(
+            error_code(fixture.storage.create_step(cross_life_step).unwrap_err()),
+            LifeIntentErrorCode::EntityConflict
+        );
+        fixture
+            .storage
+            .create_step(fixture.step_request("step-precedence-other", "plan-precedence", 2))
+            .unwrap();
+        let ordinal_conflict = fixture.step_request("step-precedence", "plan-precedence", 2);
+        assert_eq!(
+            error_code(fixture.storage.create_step(ordinal_conflict).unwrap_err()),
+            LifeIntentErrorCode::EntityConflict
+        );
+        assert_eq!(
+            fixture
+                .storage
+                .find_step("life-a", "step-precedence")
+                .unwrap()
+                .expect("existing step must remain unchanged")
+                .ordinal,
+            1
+        );
+
+        fixture
+            .storage
+            .create_action(fixture.action_request(
+                "action-precedence",
+                "step-precedence",
+                EXECUTION_CLASS_INTERNAL_INTENT,
+            ))
+            .unwrap();
+        let mut missing_step_action = fixture.action_request(
+            "action-precedence",
+            "step-precedence",
+            EXECUTION_CLASS_INTERNAL_INTENT,
+        );
+        missing_step_action.step_id = "missing-step".into();
+        assert_eq!(
+            error_code(
+                fixture
+                    .storage
+                    .create_action(missing_step_action)
+                    .unwrap_err()
+            ),
+            LifeIntentErrorCode::EntityConflict
+        );
+        let mut cross_life_action = fixture.action_request(
+            "action-precedence",
+            "step-precedence",
+            EXECUTION_CLASS_INTERNAL_INTENT,
+        );
+        cross_life_action.life_id = "life-b".into();
+        assert_eq!(
+            error_code(
+                fixture
+                    .storage
+                    .create_action(cross_life_action)
+                    .unwrap_err()
+            ),
+            LifeIntentErrorCode::EntityConflict
+        );
     }
 
     #[test]

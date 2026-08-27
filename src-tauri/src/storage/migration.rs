@@ -4,7 +4,7 @@ use rusqlite::{backup::Backup, params, Connection, OptionalExtension, Transactio
 
 use super::{
     autonomy, connection, experience_episode, generation_lifecycle_authority, life_intent,
-    writer_fence_manifest, StorageError, MIGRATIONS,
+    perception, writer_fence_manifest, StorageError, MIGRATIONS,
 };
 
 pub(super) const LAST_STATIC_MIGRATION_VERSION: i64 = 12;
@@ -49,6 +49,8 @@ pub(super) const LIFE_INTENT_AUTHORITY_SCHEMA_VERSION: i64 = 22;
 const LIFE_INTENT_AUTHORITY_MIGRATION_NAME: &str = "022_life_goal_plan_action_authority";
 pub(super) const AUTONOMY_AUTHORITY_SCHEMA_VERSION: i64 = 23;
 const AUTONOMY_AUTHORITY_MIGRATION_NAME: &str = "023_autonomous_life_proactive_intent_authority";
+pub(super) const PERCEPTION_AUTHORITY_SCHEMA_VERSION: i64 = 24;
+const PERCEPTION_AUTHORITY_MIGRATION_NAME: &str = "024_perception_focus_policy_authority";
 const ADD_CLAIMED_GENERATION_AUTHORITY_EPOCH_SQL: &str = "ALTER TABLE memory_vector_sync_outbox ADD COLUMN claimed_generation_authority_epoch INTEGER NULL CHECK (claimed_generation_authority_epoch IS NULL OR claimed_generation_authority_epoch >= 1)";
 const CREATE_GENERATION_AUTHORITY_TABLE_SQL: &str =
     "CREATE TABLE memory_vector_generation_authority (
@@ -244,6 +246,11 @@ pub(super) enum LifeIntentAuthoritySchemaUpgrade {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum AutonomyAuthoritySchemaUpgrade {
+    Applied,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PerceptionAuthoritySchemaUpgrade {
     Applied,
 }
 
@@ -1802,6 +1809,85 @@ fn validate_autonomy_schema_objects(connection: &Connection) -> Result<(), Stora
     autonomy::validate_schema_objects(connection)
 }
 
+/// Schema 24 adds only the explicit, user-controlled consent authority for
+/// the future privacy-minimized foreground-focus context.  It creates no
+/// observation rows and no default policy rows.  All objects are installed in
+/// the caller-owned IMMEDIATE transaction.
+pub(super) fn apply_perception_schema_upgrade(
+    transaction: &Transaction<'_>,
+) -> Result<PerceptionAuthoritySchemaUpgrade, StorageError> {
+    if connection::read_schema_version(transaction)? != AUTONOMY_AUTHORITY_SCHEMA_VERSION {
+        return Err(StorageError::migration_version_invariant_failed());
+    }
+
+    for table_sql in perception::MIGRATION_024_TABLE_SQLS {
+        transaction
+            .execute_batch(table_sql)
+            .map_err(|_| StorageError::migration_transaction_failed())?;
+    }
+    #[cfg(test)]
+    if should_fail_migration_024_at_for_test(Migration024Failpoint::AfterTable) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+
+    for trigger_sql in perception::MIGRATION_024_TRIGGER_SQLS {
+        transaction
+            .execute_batch(trigger_sql)
+            .map_err(|_| StorageError::migration_transaction_failed())?;
+    }
+    #[cfg(test)]
+    if should_fail_migration_024_at_for_test(Migration024Failpoint::AfterSemanticGuards) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+
+    writer_fence_manifest::install_perception_writer_fence_manifest_in_transaction(transaction)?;
+    #[cfg(test)]
+    if should_fail_migration_024_at_for_test(Migration024Failpoint::AfterWriterFences) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+
+    validate_perception_schema_objects(transaction)?;
+    #[cfg(test)]
+    if should_fail_migration_024_at_for_test(Migration024Failpoint::BeforeSchemaVersion) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+
+    let migration_now: String = transaction
+        .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", [], |row| {
+            row.get(0)
+        })
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    transaction
+        .execute(
+            "INSERT INTO schema_migration (version,name,applied_at) VALUES (?1,?2,?3)",
+            params![
+                PERCEPTION_AUTHORITY_SCHEMA_VERSION,
+                PERCEPTION_AUTHORITY_MIGRATION_NAME,
+                migration_now
+            ],
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    #[cfg(test)]
+    if should_fail_migration_024_at_for_test(Migration024Failpoint::PreCommit) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    validate_perception_schema_objects(transaction)?;
+    Ok(PerceptionAuthoritySchemaUpgrade::Applied)
+}
+
+pub(super) fn validate_perception_schema(connection: &Connection) -> Result<(), StorageError> {
+    let schema_version = connection::read_schema_version(connection)?;
+    if schema_version < PERCEPTION_AUTHORITY_SCHEMA_VERSION {
+        return Err(StorageError::migration_version_invariant_failed());
+    }
+    validate_perception_schema_objects(connection)?;
+    writer_fence_manifest::validate_writer_fence_manifest_for_schema(connection, schema_version)
+}
+
+fn validate_perception_schema_objects(connection: &Connection) -> Result<(), StorageError> {
+    perception::validate_schema_objects(connection)
+}
+
 pub(super) fn validate_experience_episode_schema(
     connection: &Connection,
 ) -> Result<(), StorageError> {
@@ -2918,6 +3004,43 @@ fn should_fail_migration_023_at_for_test(failpoint: Migration023Failpoint) -> bo
     })
 }
 
+/// Test-only failpoints for Migration024.  Each point fires inside the single
+/// caller-owned 23-to-24 transaction, proving the consent tables, semantic
+/// guards, writer fences, and version row roll back together.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Migration024Failpoint {
+    AfterTable,
+    AfterSemanticGuards,
+    AfterWriterFences,
+    BeforeSchemaVersion,
+    PreCommit,
+}
+
+#[cfg(test)]
+thread_local! {
+    static MIGRATION_024_FAILPOINT: std::cell::Cell<Option<Migration024Failpoint>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(super) fn fail_next_migration_024_at_for_test(failpoint: Migration024Failpoint) {
+    MIGRATION_024_FAILPOINT.with(|next| next.set(Some(failpoint)));
+}
+
+#[cfg(test)]
+fn should_fail_migration_024_at_for_test(failpoint: Migration024Failpoint) -> bool {
+    MIGRATION_024_FAILPOINT.with(|next| {
+        if next.get() == Some(failpoint) {
+            next.set(None);
+            true
+        } else {
+            false
+        }
+    })
+}
+
 /// Test-only failpoints for Migration016 (`apply_late_delete_generation_authority_schema_upgrade`).
 /// Each variant corresponds to a phase of the single-transaction upgrade. The
 /// failpoint returns `MIGRATION_TRANSACTION_FAILED` from inside the transaction,
@@ -3616,6 +3739,17 @@ mod transaction_tests {
         transaction.commit().unwrap();
     }
 
+    fn apply_perception_authority_upgrade(connection: &mut Connection) {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert_eq!(
+            apply_perception_schema_upgrade(&transaction).unwrap(),
+            PerceptionAuthoritySchemaUpgrade::Applied
+        );
+        transaction.commit().unwrap();
+    }
+
     fn schema_twenty_one_connection() -> Connection {
         let mut connection = schema_twenty_connection();
         apply_experience_episode_upgrade(&mut connection);
@@ -3632,6 +3766,26 @@ mod transaction_tests {
         assert_eq!(
             schema_version(&connection),
             LIFE_INTENT_AUTHORITY_SCHEMA_VERSION
+        );
+        connection
+    }
+
+    fn schema_twenty_three_connection() -> Connection {
+        let mut connection = schema_twenty_two_connection();
+        connection
+            .create_scalar_function(
+                "digital_life_writer_epoch",
+                0,
+                FunctionFlags::SQLITE_UTF8
+                    | FunctionFlags::SQLITE_DETERMINISTIC
+                    | FunctionFlags::SQLITE_INNOCUOUS,
+                |_| Ok(1_i64),
+            )
+            .unwrap();
+        apply_autonomy_authority_upgrade(&mut connection);
+        assert_eq!(
+            schema_version(&connection),
+            AUTONOMY_AUTHORITY_SCHEMA_VERSION
         );
         connection
     }
@@ -4414,10 +4568,10 @@ mod transaction_tests {
     }
 
     #[test]
-    fn migration_023_is_present_twenty_three_is_maximum_and_twenty_four_is_absent() {
+    fn migration_024_is_present_twenty_four_is_maximum_and_twenty_five_is_absent() {
         assert_eq!(
             super::super::connection::MAX_SUPPORTED_SCHEMA_VERSION,
-            AUTONOMY_AUTHORITY_SCHEMA_VERSION
+            PERCEPTION_AUTHORITY_SCHEMA_VERSION
         );
         let migrations_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/storage/migrations");
         let entries = std::fs::read_dir(&migrations_dir).unwrap();
@@ -4432,7 +4586,7 @@ mod transaction_tests {
                 highest = highest.max(version);
             }
         }
-        assert_eq!(highest, 23, "Migration 023 must be the current migration");
+        assert_eq!(highest, 24, "Migration 024 must be the current migration");
         let names = std::fs::read_dir(&migrations_dir)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
@@ -4446,8 +4600,12 @@ mod transaction_tests {
             "Migration 023 must exist"
         );
         assert!(
-            !names.iter().any(|name| name.starts_with("024")),
-            "Migration 024 must not exist"
+            names.iter().any(|name| name.starts_with("024")),
+            "Migration 024 must exist"
+        );
+        assert!(
+            !names.iter().any(|name| name.starts_with("025")),
+            "Migration 025 must not exist"
         );
     }
 
@@ -5169,6 +5327,237 @@ mod transaction_tests {
                 0
             );
         }
+    }
+
+    #[test]
+    fn migration_024_creates_two_consent_tables_once_without_backfill() {
+        let mut connection = schema_twenty_three_connection();
+        connection
+            .execute_batch(
+                "INSERT INTO persona_template (id, name, version, persona_json)
+                 VALUES ('migration-024-persona', 'Persona', 1, '{}');
+                 INSERT INTO life_identity
+                     (id, name, created_at, version, body_id, persona_id, persona_version)
+                 VALUES ('migration-024-life', 'Life', '2026-08-27T00:00:00.000Z', 1,
+                         'migration-024-body', 'migration-024-persona', 1);",
+            )
+            .unwrap();
+
+        apply_perception_authority_upgrade(&mut connection);
+        assert_eq!(
+            schema_version(&connection),
+            PERCEPTION_AUTHORITY_SCHEMA_VERSION
+        );
+        validate_perception_schema(&connection).unwrap();
+        assert_eq!(writer_fence_count(&connection), 93);
+        for table in ["life_perception_policy", "life_perception_policy_event"] {
+            let count: i64 = connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "Migration024 must synthesize no {table} rows");
+        }
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM life_identity WHERE id='migration-024-life'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migration WHERE version=?1",
+                    [PERCEPTION_AUTHORITY_SCHEMA_VERSION],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migration WHERE version=25",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let error = apply_perception_schema_upgrade(&transaction).unwrap_err();
+        assert_eq!(error.code, "MIGRATION_VERSION_INVARIANT_FAILED");
+        drop(transaction);
+        assert_eq!(writer_fence_count(&connection), 93);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migration WHERE version=?1",
+                    [PERCEPTION_AUTHORITY_SCHEMA_VERSION],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn migration_024_failure_points_roll_back_to_exact_schema_twenty_three_preimage() {
+        let new_fence_names = [
+            "digital_life_writer_epoch_life_perception_policy_insert",
+            "digital_life_writer_epoch_life_perception_policy_update",
+            "digital_life_writer_epoch_life_perception_policy_delete",
+            "digital_life_writer_epoch_life_perception_policy_event_insert",
+            "digital_life_writer_epoch_life_perception_policy_event_update",
+            "digital_life_writer_epoch_life_perception_policy_event_delete",
+        ];
+        for point in [
+            Migration024Failpoint::AfterTable,
+            Migration024Failpoint::AfterSemanticGuards,
+            Migration024Failpoint::AfterWriterFences,
+            Migration024Failpoint::BeforeSchemaVersion,
+            Migration024Failpoint::PreCommit,
+        ] {
+            let mut connection = schema_twenty_three_connection();
+            fail_next_migration_024_at_for_test(point);
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let error = apply_perception_schema_upgrade(&transaction).unwrap_err();
+            assert_eq!(error.code, "MIGRATION_TRANSACTION_FAILED");
+
+            let table_count: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema
+                     WHERE type='table' AND name IN
+                       ('life_perception_policy','life_perception_policy_event')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let guard_count: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema
+                     WHERE type='trigger' AND name IN
+                       ('life_perception_policy_immutable_guard',
+                        'life_perception_policy_event_immutable_guard')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let fence_count: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema
+                     WHERE type='trigger' AND name IN
+                       ('digital_life_writer_epoch_life_perception_policy_insert',
+                        'digital_life_writer_epoch_life_perception_policy_update',
+                        'digital_life_writer_epoch_life_perception_policy_delete',
+                        'digital_life_writer_epoch_life_perception_policy_event_insert',
+                        'digital_life_writer_epoch_life_perception_policy_event_update',
+                        'digital_life_writer_epoch_life_perception_policy_event_delete')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            match point {
+                Migration024Failpoint::AfterTable => {
+                    assert_eq!(table_count, 2);
+                    assert_eq!(guard_count, 0);
+                    assert_eq!(fence_count, 0);
+                }
+                Migration024Failpoint::AfterSemanticGuards => {
+                    assert_eq!(table_count, 2);
+                    assert_eq!(guard_count, 2);
+                    assert_eq!(fence_count, 0);
+                }
+                Migration024Failpoint::AfterWriterFences
+                | Migration024Failpoint::BeforeSchemaVersion
+                | Migration024Failpoint::PreCommit => {
+                    assert_eq!(table_count, 2);
+                    assert_eq!(guard_count, 2);
+                    assert_eq!(fence_count, 6);
+                }
+            }
+            drop(transaction);
+
+            assert_eq!(
+                schema_version(&connection),
+                AUTONOMY_AUTHORITY_SCHEMA_VERSION
+            );
+            validate_autonomy_schema(&connection).unwrap();
+            writer_fence_manifest::validate_writer_fence_manifest_for_schema(
+                &connection,
+                AUTONOMY_AUTHORITY_SCHEMA_VERSION,
+            )
+            .unwrap();
+            assert_eq!(writer_fence_count(&connection), 87);
+            for name in new_fence_names {
+                let count: i64 = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_schema WHERE name=?1",
+                        [name],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap();
+                assert_eq!(count, 0, "failed Migration024 must remove {name}");
+            }
+            for name in [
+                "life_perception_policy",
+                "life_perception_policy_event",
+                "life_perception_policy_immutable_guard",
+                "life_perception_policy_event_immutable_guard",
+            ] {
+                let count: i64 = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_schema WHERE name=?1",
+                        [name],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap();
+                assert_eq!(count, 0, "failed Migration024 must remove {name}");
+            }
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM schema_migration WHERE version=?1",
+                        [PERCEPTION_AUTHORITY_SCHEMA_VERSION],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn schema_twenty_three_and_schema_twenty_four_reopen_against_their_own_manifests() {
+        let schema_twenty_three = schema_twenty_three_connection();
+        validate_autonomy_schema(&schema_twenty_three).unwrap();
+        writer_fence_manifest::validate_writer_fence_manifest_for_schema(
+            &schema_twenty_three,
+            AUTONOMY_AUTHORITY_SCHEMA_VERSION,
+        )
+        .unwrap();
+        assert_eq!(writer_fence_count(&schema_twenty_three), 87);
+        assert!(validate_perception_schema(&schema_twenty_three).is_err());
+
+        let mut schema_twenty_four = schema_twenty_three_connection();
+        apply_perception_authority_upgrade(&mut schema_twenty_four);
+        validate_perception_schema(&schema_twenty_four).unwrap();
+        writer_fence_manifest::validate_writer_fence_manifest_for_schema(
+            &schema_twenty_four,
+            PERCEPTION_AUTHORITY_SCHEMA_VERSION,
+        )
+        .unwrap();
+        assert_eq!(writer_fence_count(&schema_twenty_four), 93);
+        validate_autonomy_schema(&schema_twenty_four).unwrap();
     }
 
     #[test]

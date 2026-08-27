@@ -17,8 +17,12 @@ pub(crate) mod life_intent;
 // foundation; its crate-internal surface has no production caller yet.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod autonomy;
+// D16-B1 is the explicit perception-consent authority foundation.  It has no
+// operating-system observation or production caller until a later D16 stage.
 pub mod memory;
 pub mod model;
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod perception;
 pub mod prompt;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod relationship;

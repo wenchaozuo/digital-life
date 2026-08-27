@@ -22,12 +22,12 @@ pub(crate) enum FocusObservationOutcome {
     Observed(PerceptionFocusState),
 }
 
-pub(crate) trait ForegroundFocusObserver: Send + Sync {
+trait ForegroundFocusObserver: Send + Sync {
     fn observe(&self) -> PerceptionFocusState;
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct WindowsForegroundFocusObserver;
+struct WindowsForegroundFocusObserver;
 
 pub(crate) fn observe_foreground_focus(
     repository: &dyn PerceptionRepository,
@@ -422,6 +422,20 @@ mod tests {
                 "forbidden observer API appeared in the provider source"
             );
         }
+    }
+
+    #[test]
+    fn raw_foreground_observer_is_not_crate_public_or_reexported() {
+        let source = include_str!("foreground_focus.rs");
+        let production_source = source
+            .split_once("#[cfg(test)]")
+            .map_or(source, |(production, _)| production);
+        assert!(!production_source.contains("pub(crate) trait ForegroundFocusObserver"));
+        assert!(!production_source.contains("pub(crate) struct WindowsForegroundFocusObserver"));
+
+        let perception_module = include_str!("mod.rs");
+        assert!(!perception_module.contains("pub use WindowsForegroundFocusObserver"));
+        assert!(!perception_module.contains("pub(crate) use WindowsForegroundFocusObserver"));
     }
 
     #[cfg(windows)]

@@ -16,12 +16,14 @@ use crate::{
 };
 
 use super::{
-    AutonomyCreateOutcome, AutonomyError, AutonomyRepository, LifeAutonomyPolicy,
-    LifeProactiveIntent, LifeProactiveIntentCreateRequest, LifeProactiveIntentEvaluationOutcome,
-    LifeProactiveIntentEvaluationRequest, INTENT_FOCUS_STATE_AVAILABLE, INTENT_FOCUS_STATE_DND,
+    AutonomyCreateOutcome, AutonomyError, AutonomyErrorCode, AutonomyRepository,
+    LifeAutonomyPolicy, LifeProactiveIntent, LifeProactiveIntentCreateRequest,
+    LifeProactiveIntentEvaluationOutcome, LifeProactiveIntentEvaluationRequest,
+    INTENT_CREATED_BY_KIND_AUTONOMY_POLICY, INTENT_FOCUS_STATE_AVAILABLE, INTENT_FOCUS_STATE_DND,
     INTENT_FOCUS_STATE_FOCUSED, INTENT_FOCUS_STATE_UNKNOWN, INTENT_KIND_GOAL_CHECK_IN,
     INTENT_STATUS_CANCELLED, INTENT_STATUS_CONSUMED, INTENT_STATUS_DEFERRED, INTENT_STATUS_EXPIRED,
-    INTENT_STATUS_PENDING, INTENT_STATUS_READY, INTENT_STATUS_STORED_SILENTLY, MIN_RECHECK_SECONDS,
+    INTENT_STATUS_PENDING, INTENT_STATUS_READY, INTENT_STATUS_STORED_SILENTLY, INTENT_VERSION,
+    MIN_RECHECK_SECONDS,
 };
 
 pub(crate) const AUTONOMY_TICK_VERSION: i64 = 1;
@@ -78,6 +80,7 @@ pub(crate) enum AutonomyTickOutcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AutonomyTickError {
     InvalidArgument { message: String },
+    TickConflict { message: String },
     Autonomy(AutonomyError),
     Experience(ExperienceEpisodeError),
     LifeIntent(LifeIntentError),
@@ -86,6 +89,12 @@ pub(crate) enum AutonomyTickError {
 impl AutonomyTickError {
     fn invalid_argument(message: impl Into<String>) -> Self {
         Self::InvalidArgument {
+            message: message.into(),
+        }
+    }
+
+    fn tick_conflict(message: impl Into<String>) -> Self {
+        Self::TickConflict {
             message: message.into(),
         }
     }
@@ -120,6 +129,14 @@ pub(crate) fn run_autonomy_tick(
     debug_assert_eq!(MAX_INTENTS_PRODUCED_PER_TICK, 1);
     validate_tick_request(&request)?;
 
+    let tick_intent_id = deterministic_intent_id(&request.life_id, &request.tick_id);
+    if let Some(intent) = storage
+        .find_intent(&request.life_id, &tick_intent_id)
+        .map_err(AutonomyTickError::Autonomy)?
+    {
+        return replay_existing_tick_intent(storage, &request, intent);
+    }
+
     let policy = storage
         .find_policy(&request.life_id)
         .map_err(AutonomyTickError::Autonomy)?;
@@ -153,7 +170,12 @@ pub(crate) fn run_autonomy_tick(
             .as_ref()
             .is_some_and(|intent| intent.status == INTENT_STATUS_PENDING)
     }) {
-        return recover_pending_intent(storage, &candidates[index]);
+        let intent = candidates[index].latest.as_ref().ok_or_else(|| {
+            AutonomyTickError::Autonomy(AutonomyError::invalid_argument(
+                "pending candidate is missing its latest intent.",
+            ))
+        })?;
+        return recover_pending_intent(storage, intent);
     }
 
     // A zero budget suppresses new production before any elapsed-time or
@@ -166,9 +188,13 @@ pub(crate) fn run_autonomy_tick(
         .autonomy_tick_now()
         .map_err(AutonomyTickError::Autonomy)?;
     match select_candidate(storage, &policy, &candidates, &now)? {
-        Selection::Selected(index) => {
-            create_and_evaluate_fresh_intent(storage, &request, &candidates[index], &now)
-        }
+        Selection::Selected(index) => create_and_evaluate_fresh_intent(
+            storage,
+            &request,
+            &candidates[index],
+            &now,
+            &tick_intent_id,
+        ),
         Selection::Waiting {
             goal_id,
             reason,
@@ -183,13 +209,8 @@ pub(crate) fn run_autonomy_tick(
 
 fn recover_pending_intent(
     storage: &StorageService,
-    candidate: &GoalCandidate,
+    intent: &LifeProactiveIntent,
 ) -> Result<AutonomyTickOutcome, AutonomyTickError> {
-    let Some(intent) = candidate.latest.as_ref() else {
-        return Err(AutonomyTickError::Autonomy(
-            AutonomyError::invalid_argument("pending candidate is missing its latest intent."),
-        ));
-    };
     let evaluation = storage
         .evaluate_pending_intent(LifeProactiveIntentEvaluationRequest {
             event_id: deterministic_evaluation_event_id(&intent.intent_id),
@@ -198,11 +219,83 @@ fn recover_pending_intent(
             expected_revision: intent.revision,
         })
         .map_err(AutonomyTickError::Autonomy)?;
-    Ok(evaluation_outcome(
-        candidate.goal.goal_id.clone(),
-        false,
-        evaluation,
-    ))
+    Ok(evaluation_outcome(intent.goal_id.clone(), evaluation))
+}
+
+fn replay_existing_tick_intent(
+    storage: &StorageService,
+    request: &AutonomyTickRequest,
+    intent: LifeProactiveIntent,
+) -> Result<AutonomyTickOutcome, AutonomyTickError> {
+    let expected_intent_id = deterministic_intent_id(&request.life_id, &request.tick_id);
+    validate_tick_intent_evidence(request, &expected_intent_id, &intent)?;
+
+    if intent.status == INTENT_STATUS_PENDING {
+        return recover_pending_intent(storage, &intent);
+    }
+
+    let event_id = deterministic_evaluation_event_id(&intent.intent_id);
+    let event = storage
+        .find_intent_event(&intent.life_id, &event_id)
+        .map_err(AutonomyTickError::Autonomy)?
+        .ok_or_else(|| {
+            AutonomyTickError::tick_conflict(
+                "the persisted tick intent has no deterministic evaluation event.",
+            )
+        })?;
+    if event.event_id != event_id
+        || event.life_id != intent.life_id
+        || event.intent_id != intent.intent_id
+        || event.from_status != INTENT_STATUS_PENDING
+        || event.to_status != intent.status
+        || event.applied_revision != intent.revision
+        || event.not_before_after != intent.not_before
+    {
+        return Err(AutonomyTickError::tick_conflict(
+            "the persisted tick intent has conflicting evaluation evidence.",
+        ));
+    }
+
+    Ok(AutonomyTickOutcome::Replayed {
+        goal_id: intent.goal_id.clone(),
+        intent: intent.clone(),
+        evaluation: LifeProactiveIntentEvaluationOutcome::Replayed {
+            event,
+            current: intent,
+        },
+    })
+}
+
+fn validate_tick_intent_evidence(
+    request: &AutonomyTickRequest,
+    expected_intent_id: &str,
+    intent: &LifeProactiveIntent,
+) -> Result<(), AutonomyTickError> {
+    if intent.intent_id != expected_intent_id || intent.life_id != request.life_id {
+        return Err(AutonomyTickError::tick_conflict(
+            "the persisted tick intent identity does not match the request.",
+        ));
+    }
+    if intent.focus_state != request.focus_state {
+        return Err(AutonomyTickError::tick_conflict(
+            "the tick was replayed with conflicting focus evidence.",
+        ));
+    }
+    if intent.intent_kind != INTENT_KIND_GOAL_CHECK_IN
+        || intent.importance != GOAL_CHECK_IN_IMPORTANCE_V1
+        || intent.user_relevance != GOAL_CHECK_IN_USER_RELEVANCE_V1
+        || intent.self_desire != GOAL_CHECK_IN_SELF_DESIRE_V1
+        || intent.interruption_cost != GOAL_CHECK_IN_INTERRUPTION_COST_V1
+        || intent.acceptance_score.is_some()
+        || intent.expires_at.is_some()
+        || intent.created_by_kind != INTENT_CREATED_BY_KIND_AUTONOMY_POLICY
+        || intent.intent_version != INTENT_VERSION
+    {
+        return Err(AutonomyTickError::tick_conflict(
+            "the persisted tick intent conflicts with D15-C creation evidence.",
+        ));
+    }
+    Ok(())
 }
 
 fn select_candidate(
@@ -331,6 +424,7 @@ fn create_and_evaluate_fresh_intent(
     request: &AutonomyTickRequest,
     candidate: &GoalCandidate,
     now: &str,
+    intent_id: &str,
 ) -> Result<AutonomyTickOutcome, AutonomyTickError> {
     let latest_episode = storage
         .find_latest_episode_for_life(&request.life_id)
@@ -344,11 +438,9 @@ fn create_and_evaluate_fresh_intent(
         None => None,
     };
 
-    let intent_id =
-        deterministic_intent_id(&request.life_id, &candidate.goal.goal_id, &request.tick_id);
-    let created = storage
-        .create_pending_goal_check_in_intent(LifeProactiveIntentCreateRequest {
-            intent_id,
+    let created =
+        match storage.create_pending_goal_check_in_intent(LifeProactiveIntentCreateRequest {
+            intent_id: intent_id.to_string(),
             life_id: request.life_id.clone(),
             goal_id: candidate.goal.goal_id.clone(),
             intent_kind: INTENT_KIND_GOAL_CHECK_IN.to_string(),
@@ -360,42 +452,29 @@ fn create_and_evaluate_fresh_intent(
             acceptance_score: None,
             recent_interaction_seconds,
             expires_at: None,
-        })
-        .map_err(AutonomyTickError::Autonomy)?;
-    let (creation_replayed, intent) = match created {
-        AutonomyCreateOutcome::Applied(intent) => (false, intent),
-        AutonomyCreateOutcome::Replayed(intent) => (true, intent),
+        }) {
+            Ok(created) => created,
+            Err(error) if error.code == AutonomyErrorCode::ProactiveIntentConflict => {
+                if let Some(existing) = storage
+                    .find_intent(&request.life_id, intent_id)
+                    .map_err(AutonomyTickError::Autonomy)?
+                {
+                    return replay_existing_tick_intent(storage, request, existing);
+                }
+                return Err(AutonomyTickError::Autonomy(error));
+            }
+            Err(error) => return Err(AutonomyTickError::Autonomy(error)),
+        };
+    let intent = match created {
+        AutonomyCreateOutcome::Applied(intent) => intent,
+        AutonomyCreateOutcome::Replayed(intent) => {
+            return replay_existing_tick_intent(storage, request, intent)
+        }
     };
 
     if intent.status != INTENT_STATUS_PENDING {
-        if !creation_replayed {
-            return Err(AutonomyTickError::Autonomy(
-                AutonomyError::invalid_argument("a newly created tick intent was not pending."),
-            ));
-        }
-        let event_id = deterministic_evaluation_event_id(&intent.intent_id);
-        let event = storage
-            .find_intent_event(&request.life_id, &event_id)
-            .map_err(AutonomyTickError::Autonomy)?
-            .ok_or_else(|| {
-                AutonomyTickError::Autonomy(AutonomyError::invalid_argument(
-                    "a replayed tick intent has no deterministic evaluation event.",
-                ))
-            })?;
-        if event.intent_id != intent.intent_id || event.from_status != INTENT_STATUS_PENDING {
-            return Err(AutonomyTickError::Autonomy(
-                AutonomyError::invalid_argument(
-                    "a replayed tick intent has conflicting evaluation evidence.",
-                ),
-            ));
-        }
-        return Ok(evaluation_outcome(
-            candidate.goal.goal_id.clone(),
-            true,
-            LifeProactiveIntentEvaluationOutcome::Replayed {
-                event,
-                current: intent,
-            },
+        return Err(AutonomyTickError::Autonomy(
+            AutonomyError::invalid_argument("a newly created tick intent was not pending."),
         ));
     }
 
@@ -409,26 +488,22 @@ fn create_and_evaluate_fresh_intent(
         .map_err(AutonomyTickError::Autonomy)?;
     Ok(evaluation_outcome(
         candidate.goal.goal_id.clone(),
-        creation_replayed,
         evaluation,
     ))
 }
 
 fn evaluation_outcome(
     goal_id: String,
-    creation_replayed: bool,
     evaluation: LifeProactiveIntentEvaluationOutcome,
 ) -> AutonomyTickOutcome {
     let intent = match &evaluation {
         LifeProactiveIntentEvaluationOutcome::Applied { intent, .. } => intent.clone(),
         LifeProactiveIntentEvaluationOutcome::Replayed { current, .. } => current.clone(),
     };
-    if creation_replayed
-        || matches!(
-            &evaluation,
-            LifeProactiveIntentEvaluationOutcome::Replayed { .. }
-        )
-    {
+    if matches!(
+        &evaluation,
+        LifeProactiveIntentEvaluationOutcome::Replayed { .. }
+    ) {
         AutonomyTickOutcome::Replayed {
             goal_id,
             intent,
@@ -469,8 +544,8 @@ fn validate_tick_request(request: &AutonomyTickRequest) -> Result<(), AutonomyTi
     Ok(())
 }
 
-pub(crate) fn deterministic_intent_id(life_id: &str, goal_id: &str, tick_id: &str) -> String {
-    let canonical_input = format!("d15-c-goal-check-in-intent-v1\0{life_id}\0{goal_id}\0{tick_id}");
+pub(crate) fn deterministic_intent_id(life_id: &str, tick_id: &str) -> String {
+    let canonical_input = format!("d15-c-goal-check-in-intent-v1\0{life_id}\0{tick_id}");
     format!(
         "{INTENT_ID_PREFIX}{:x}",
         Sha256::digest(canonical_input.as_bytes())
@@ -491,9 +566,11 @@ mod tests {
 
     #[test]
     fn deterministic_ids_are_stable_and_bounded() {
-        let intent_id = deterministic_intent_id("life", "goal", "tick");
+        let intent_id = deterministic_intent_id("life", "tick");
         let event_id = deterministic_evaluation_event_id(&intent_id);
-        assert_eq!(intent_id, deterministic_intent_id("life", "goal", "tick"));
+        assert_eq!(intent_id, deterministic_intent_id("life", "tick"));
+        assert_ne!(intent_id, deterministic_intent_id("other-life", "tick"));
+        assert_ne!(intent_id, deterministic_intent_id("life", "other-tick"));
         assert_eq!(event_id, deterministic_evaluation_event_id(&intent_id));
         assert!(intent_id.len() <= 128);
         assert!(event_id.len() <= 128);

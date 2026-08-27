@@ -1469,6 +1469,30 @@ mod tests {
             }
         }
 
+        fn tick_intent_request(
+            &self,
+            intent_id: &str,
+            life_id: &str,
+            goal_id: &str,
+            focus_state: &str,
+            recent_interaction_seconds: Option<i64>,
+        ) -> LifeProactiveIntentCreateRequest {
+            LifeProactiveIntentCreateRequest {
+                intent_id: intent_id.into(),
+                life_id: life_id.into(),
+                goal_id: goal_id.into(),
+                intent_kind: INTENT_KIND_GOAL_CHECK_IN.into(),
+                importance: crate::autonomy::runtime::GOAL_CHECK_IN_IMPORTANCE_V1,
+                user_relevance: crate::autonomy::runtime::GOAL_CHECK_IN_USER_RELEVANCE_V1,
+                self_desire: crate::autonomy::runtime::GOAL_CHECK_IN_SELF_DESIRE_V1,
+                interruption_cost: crate::autonomy::runtime::GOAL_CHECK_IN_INTERRUPTION_COST_V1,
+                focus_state: focus_state.into(),
+                acceptance_score: None,
+                recent_interaction_seconds,
+                expires_at: None,
+            }
+        }
+
         fn create_goal(&self, goal_id: &str, life_id: &str) {
             self.storage
                 .create_goal(LifeGoalCreateRequest {
@@ -3285,8 +3309,7 @@ mod tests {
         let first = fixture
             .tick("same-tick", INTENT_FOCUS_STATE_AVAILABLE)
             .unwrap();
-        let expected_intent_id =
-            deterministic_intent_id("autonomy-life-a", "autonomy-tick-replay-goal", "same-tick");
+        let expected_intent_id = deterministic_intent_id("autonomy-life-a", "same-tick");
         assert!(matches!(
             first,
             AutonomyTickOutcome::Applied { ref intent, .. }
@@ -3297,10 +3320,14 @@ mod tests {
             .unwrap();
         assert!(matches!(
             second,
-            AutonomyTickOutcome::Waiting {
-                reason: AutonomyTickWaitReason::DeferredNotDue,
-                ..
-            }
+            AutonomyTickOutcome::Replayed {
+                goal_id,
+                intent,
+                evaluation: LifeProactiveIntentEvaluationOutcome::Replayed { event, current },
+            } if goal_id == "autonomy-tick-replay-goal"
+                && intent.intent_id == expected_intent_id
+                && current.intent_id == expected_intent_id
+                && event.event_id == deterministic_evaluation_event_id(&expected_intent_id)
         ));
         assert_eq!(fixture.intent_count(), 1);
         assert_eq!(fixture.intent_event_count(), 1);
@@ -3316,6 +3343,372 @@ mod tests {
                 .unwrap()
                 .event_id
         );
+    }
+
+    #[test]
+    fn autonomy_tick_same_tick_is_idempotent_across_multiple_goals() {
+        let fixture = Fixture::new();
+        fixture.create_policy("autonomy-life-a", true, false);
+        fixture.create_goal("autonomy-tick-multi-a", "autonomy-life-a");
+        fixture.create_goal("autonomy-tick-multi-b", "autonomy-life-a");
+
+        let first = fixture
+            .tick("same-multi-goal-tick", INTENT_FOCUS_STATE_AVAILABLE)
+            .unwrap();
+        let first_intent_id = deterministic_intent_id("autonomy-life-a", "same-multi-goal-tick");
+        assert!(matches!(
+            first,
+            AutonomyTickOutcome::Applied {
+                goal_id,
+                intent,
+                evaluation: LifeProactiveIntentEvaluationOutcome::Applied { .. },
+            } if goal_id == "autonomy-tick-multi-a"
+                && intent.intent_id == first_intent_id
+                && intent.status == INTENT_STATUS_DEFERRED
+        ));
+
+        let second = fixture
+            .tick("same-multi-goal-tick", INTENT_FOCUS_STATE_AVAILABLE)
+            .unwrap();
+        assert!(matches!(
+            second,
+            AutonomyTickOutcome::Replayed {
+                goal_id,
+                intent,
+                evaluation: LifeProactiveIntentEvaluationOutcome::Replayed { event, current },
+            } if goal_id == "autonomy-tick-multi-a"
+                && intent.goal_id == "autonomy-tick-multi-a"
+                && current.goal_id == "autonomy-tick-multi-a"
+                && event.intent_id == first_intent_id
+        ));
+        assert_eq!(fixture.intent_count(), 1);
+        assert_eq!(fixture.intent_event_count(), 1);
+        let intents = fixture
+            .storage
+            .list_intents_for_life("autonomy-life-a")
+            .unwrap();
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].goal_id, "autonomy-tick-multi-a");
+    }
+
+    #[test]
+    fn autonomy_tick_ready_same_tick_replays_original_goal() {
+        let fixture = Fixture::new();
+        fixture.create_policy("autonomy-life-a", true, false);
+        fixture.create_goal("autonomy-tick-ready-a", "autonomy-life-a");
+        fixture.create_goal("autonomy-tick-ready-b", "autonomy-life-a");
+        fixture.insert_episode_with_age("autonomy-life-a", "ready-same-tick", 121);
+
+        let first = fixture
+            .tick("ready-same-tick", INTENT_FOCUS_STATE_AVAILABLE)
+            .unwrap();
+        assert!(matches!(
+            first,
+            AutonomyTickOutcome::Applied {
+                goal_id,
+                intent,
+                ..
+            } if goal_id == "autonomy-tick-ready-a" && intent.status == INTENT_STATUS_READY
+        ));
+
+        let second = fixture
+            .tick("ready-same-tick", INTENT_FOCUS_STATE_AVAILABLE)
+            .unwrap();
+        assert!(matches!(
+            second,
+            AutonomyTickOutcome::Replayed {
+                goal_id,
+                intent,
+                evaluation: LifeProactiveIntentEvaluationOutcome::Replayed { current, .. },
+            } if goal_id == "autonomy-tick-ready-a"
+                && intent.status == INTENT_STATUS_READY
+                && current.goal_id == "autonomy-tick-ready-a"
+        ));
+        assert_eq!(fixture.intent_count(), 1);
+        assert_eq!(fixture.intent_event_count(), 1);
+    }
+
+    #[test]
+    fn autonomy_tick_same_tick_focus_conflict_has_no_mutation() {
+        let fixture = Fixture::new();
+        fixture.create_policy("autonomy-life-a", true, false);
+        fixture.create_goal("autonomy-tick-focus-a", "autonomy-life-a");
+        fixture.create_goal("autonomy-tick-focus-b", "autonomy-life-a");
+
+        let first = fixture
+            .tick("focus-conflict-tick", INTENT_FOCUS_STATE_AVAILABLE)
+            .unwrap();
+        assert!(matches!(first, AutonomyTickOutcome::Applied { .. }));
+
+        let conflict = fixture
+            .tick("focus-conflict-tick", INTENT_FOCUS_STATE_FOCUSED)
+            .unwrap_err();
+        assert!(matches!(conflict, AutonomyTickError::TickConflict { .. }));
+        assert_eq!(fixture.intent_count(), 1);
+        assert_eq!(fixture.intent_event_count(), 1);
+        let intent_id = deterministic_intent_id("autonomy-life-a", "focus-conflict-tick");
+        let intent = fixture
+            .storage
+            .find_intent("autonomy-life-a", &intent_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(intent.focus_state, INTENT_FOCUS_STATE_AVAILABLE);
+    }
+
+    #[test]
+    fn autonomy_tick_same_tick_replay_precedes_policy_change_and_zero_budget() {
+        let fixture = Fixture::new();
+        fixture.create_policy("autonomy-life-a", true, false);
+        fixture.create_goal("autonomy-tick-policy-a", "autonomy-life-a");
+        fixture.create_goal("autonomy-tick-policy-b", "autonomy-life-a");
+
+        let first = fixture
+            .tick("policy-replay-tick", INTENT_FOCUS_STATE_AVAILABLE)
+            .unwrap();
+        assert!(matches!(first, AutonomyTickOutcome::Applied { .. }));
+
+        let policy = fixture
+            .storage
+            .find_policy("autonomy-life-a")
+            .unwrap()
+            .unwrap();
+        fixture.update_policy(LifeAutonomyPolicyUpdateRequest {
+            event_id: "autonomy-tick-policy-change".into(),
+            life_id: "autonomy-life-a".into(),
+            enabled: true,
+            dnd: false,
+            max_ready_per_window: 0,
+            window_seconds: policy.window_seconds,
+            min_gap_seconds: policy.min_gap_seconds,
+            expected_revision: policy.revision,
+        });
+
+        let replay = fixture
+            .tick("policy-replay-tick", INTENT_FOCUS_STATE_AVAILABLE)
+            .unwrap();
+        assert!(matches!(replay, AutonomyTickOutcome::Replayed { .. }));
+        assert_eq!(fixture.intent_count(), 1);
+        assert_eq!(fixture.intent_event_count(), 1);
+    }
+
+    #[test]
+    fn autonomy_tick_terminal_same_tick_replays_after_policy_change() {
+        let fixture = Fixture::new();
+        fixture.create_policy("autonomy-life-a", true, false);
+        fixture.create_goal("autonomy-tick-terminal-a", "autonomy-life-a");
+        fixture.create_goal("autonomy-tick-terminal-b", "autonomy-life-a");
+        let tick_id = "terminal-replay-tick";
+        let intent_id = deterministic_intent_id("autonomy-life-a", tick_id);
+        fixture.create_intent(fixture.tick_intent_request(
+            &intent_id,
+            "autonomy-life-a",
+            "autonomy-tick-terminal-a",
+            INTENT_FOCUS_STATE_AVAILABLE,
+            Some(120),
+        ));
+
+        let policy = fixture
+            .storage
+            .find_policy("autonomy-life-a")
+            .unwrap()
+            .unwrap();
+        fixture.update_policy(LifeAutonomyPolicyUpdateRequest {
+            event_id: "autonomy-tick-terminal-disable".into(),
+            life_id: "autonomy-life-a".into(),
+            enabled: false,
+            dnd: policy.dnd,
+            max_ready_per_window: policy.max_ready_per_window,
+            window_seconds: policy.window_seconds,
+            min_gap_seconds: policy.min_gap_seconds,
+            expected_revision: policy.revision,
+        });
+        let first = fixture.tick(tick_id, INTENT_FOCUS_STATE_AVAILABLE).unwrap();
+        assert!(matches!(
+            first,
+            AutonomyTickOutcome::Applied { intent, .. }
+                if intent.status == INTENT_STATUS_CANCELLED
+        ));
+
+        let disabled_policy = fixture
+            .storage
+            .find_policy("autonomy-life-a")
+            .unwrap()
+            .unwrap();
+        fixture.update_policy(LifeAutonomyPolicyUpdateRequest {
+            event_id: "autonomy-tick-terminal-enable".into(),
+            life_id: "autonomy-life-a".into(),
+            enabled: true,
+            dnd: disabled_policy.dnd,
+            max_ready_per_window: disabled_policy.max_ready_per_window,
+            window_seconds: disabled_policy.window_seconds,
+            min_gap_seconds: disabled_policy.min_gap_seconds,
+            expected_revision: disabled_policy.revision,
+        });
+        let second = fixture.tick(tick_id, INTENT_FOCUS_STATE_AVAILABLE).unwrap();
+        assert!(matches!(
+            second,
+            AutonomyTickOutcome::Replayed { goal_id, intent, .. }
+                if goal_id == "autonomy-tick-terminal-a"
+                    && intent.intent_id == intent_id
+                    && intent.status == INTENT_STATUS_CANCELLED
+        ));
+        assert_eq!(fixture.intent_count(), 1);
+        assert_eq!(fixture.intent_event_count(), 1);
+    }
+
+    #[test]
+    fn autonomy_tick_same_tick_recovers_committed_pending_original_goal() {
+        let fixture = Fixture::new();
+        fixture.create_policy("autonomy-life-a", true, false);
+        fixture.create_goal("autonomy-tick-pending-a", "autonomy-life-a");
+        fixture.create_goal("autonomy-tick-pending-b", "autonomy-life-a");
+        let tick_id = "pending-recovery-tick";
+        let intent_id = deterministic_intent_id("autonomy-life-a", tick_id);
+        let pending = fixture.create_intent(fixture.tick_intent_request(
+            &intent_id,
+            "autonomy-life-a",
+            "autonomy-tick-pending-a",
+            INTENT_FOCUS_STATE_AVAILABLE,
+            None,
+        ));
+        assert_eq!(pending.status, INTENT_STATUS_PENDING);
+        assert_eq!(fixture.intent_event_count(), 0);
+
+        let recovered = fixture.tick(tick_id, INTENT_FOCUS_STATE_AVAILABLE).unwrap();
+        assert!(matches!(
+            recovered,
+            AutonomyTickOutcome::Applied { goal_id, intent, .. }
+                if goal_id == "autonomy-tick-pending-a"
+                    && intent.intent_id == intent_id
+                    && intent.status == INTENT_STATUS_DEFERRED
+        ));
+        assert_eq!(fixture.intent_count(), 1);
+        assert_eq!(fixture.intent_event_count(), 1);
+    }
+
+    #[test]
+    fn autonomy_tick_exact_replay_survives_original_goal_completion() {
+        let fixture = Fixture::new();
+        fixture.create_policy("autonomy-life-a", true, false);
+        fixture.create_goal("autonomy-tick-complete-a", "autonomy-life-a");
+        fixture.create_goal("autonomy-tick-complete-b", "autonomy-life-a");
+        fixture.insert_episode_with_age("autonomy-life-a", "complete-same-tick", 121);
+        let tick_id = "complete-same-tick";
+
+        let first = fixture.tick(tick_id, INTENT_FOCUS_STATE_AVAILABLE).unwrap();
+        assert!(matches!(
+            first,
+            AutonomyTickOutcome::Applied { goal_id, intent, .. }
+                if goal_id == "autonomy-tick-complete-a"
+                    && intent.status == INTENT_STATUS_READY
+        ));
+        fixture
+            .storage
+            .transition_goal(LifeGoalTransitionRequest {
+                event_id: "autonomy-tick-complete-event".into(),
+                life_id: "autonomy-life-a".into(),
+                goal_id: "autonomy-tick-complete-a".into(),
+                expected_revision: 1,
+                kind: LifeGoalTransitionKind::Complete,
+            })
+            .unwrap();
+
+        let replay = fixture.tick(tick_id, INTENT_FOCUS_STATE_AVAILABLE).unwrap();
+        assert!(matches!(
+            replay,
+            AutonomyTickOutcome::Replayed { goal_id, intent, .. }
+                if goal_id == "autonomy-tick-complete-a"
+                    && intent.goal_id == "autonomy-tick-complete-a"
+                    && intent.status == INTENT_STATUS_READY
+        ));
+        assert_eq!(fixture.intent_count(), 1);
+        assert_eq!(fixture.intent_event_count(), 1);
+    }
+
+    #[test]
+    fn autonomy_tick_concurrent_same_tick_has_one_intent_and_event() {
+        let fixture = Fixture::new();
+        fixture.create_policy("autonomy-life-a", true, false);
+        fixture.create_goal("autonomy-tick-concurrent-a", "autonomy-life-a");
+        fixture.create_goal("autonomy-tick-concurrent-b", "autonomy-life-a");
+
+        let second_root = fixture._root.path().join("default");
+        let second_service = StorageService::initialize_with_roots(second_root, None).unwrap();
+        let first_service = Arc::new(fixture.storage);
+        let second_service = Arc::new(second_service);
+        let barrier = Arc::new(Barrier::new(3));
+
+        let first_barrier = barrier.clone();
+        let first = first_service.clone();
+        let first_thread = thread::spawn(move || {
+            first_barrier.wait();
+            run_autonomy_tick(
+                &first,
+                AutonomyTickRequest {
+                    tick_id: "concurrent-same-tick".into(),
+                    life_id: "autonomy-life-a".into(),
+                    focus_state: INTENT_FOCUS_STATE_AVAILABLE.into(),
+                },
+            )
+        });
+
+        let second_barrier = barrier.clone();
+        let second = second_service.clone();
+        let second_thread = thread::spawn(move || {
+            second_barrier.wait();
+            run_autonomy_tick(
+                &second,
+                AutonomyTickRequest {
+                    tick_id: "concurrent-same-tick".into(),
+                    life_id: "autonomy-life-a".into(),
+                    focus_state: INTENT_FOCUS_STATE_AVAILABLE.into(),
+                },
+            )
+        });
+
+        barrier.wait();
+        let first_result = first_thread.join().unwrap();
+        let second_result = second_thread.join().unwrap();
+        let results = [first_result, second_result];
+        assert!(results.iter().all(Result::is_ok));
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Ok(AutonomyTickOutcome::Applied { .. })))
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Ok(AutonomyTickOutcome::Replayed { .. })))
+                .count(),
+            1
+        );
+        let intent_id = deterministic_intent_id("autonomy-life-a", "concurrent-same-tick");
+        assert!(first_service
+            .find_intent("autonomy-life-a", &intent_id)
+            .unwrap()
+            .is_some());
+        let state = first_service.state().unwrap();
+        let intent_count: i64 = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM life_proactive_intent WHERE life_id='autonomy-life-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let event_count: i64 = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM life_proactive_intent_event WHERE life_id='autonomy-life-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(intent_count, 1);
+        assert_eq!(event_count, 1);
     }
 
     #[test]

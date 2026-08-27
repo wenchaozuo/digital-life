@@ -13,6 +13,10 @@ pub(crate) mod experience;
 // surface is allowed as dead code outside test builds.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod life_intent;
+// D15-B1 is the explicit autonomy-policy / proactive-intent authority
+// foundation; its crate-internal surface has no production caller yet.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod autonomy;
 pub mod memory;
 pub mod model;
 pub mod prompt;

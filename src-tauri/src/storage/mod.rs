@@ -1,3 +1,5 @@
+#[cfg_attr(not(test), allow(dead_code))]
+mod autonomy;
 mod candidate_extraction;
 mod candidate_memory;
 mod connection;
@@ -1914,11 +1916,11 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(writer_fence_count, 75);
+        assert_eq!(writer_fence_count, 87);
         migration::validate_attempt_claim_identity_schema(&state.connection).unwrap();
-        // The database is at Schema 22; validate the exact Schema-20 relationship
+        // The database is at Schema 23; validate the exact Schema-20 relationship
         // authority (which re-validates the emotion authority, the Schema-18
-        // catch-up objects, and proves the full 75-trigger writer fence).
+        // catch-up objects, and proves the full 87-trigger writer fence).
         migration::validate_emotion_authority_schema(&state.connection).unwrap();
         migration::validate_relationship_authority_schema(&state.connection).unwrap();
         assert_eq!(
@@ -2081,7 +2083,7 @@ mod tests {
             assert_eq!(
                 connection::read_schema_version(&restored_conn.connection).unwrap(),
                 connection::MAX_SUPPORTED_SCHEMA_VERSION,
-                "restored schema version must be 22"
+                "restored schema version must be 23"
             );
             assert_eq!(
                 super::migration::LAST_STATIC_MIGRATION_VERSION,
@@ -2113,7 +2115,7 @@ mod tests {
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert_eq!(fence_count, 75);
+            assert_eq!(fence_count, 87);
         }
 
         // All 8 outbox states preserved with full epoch evidence.

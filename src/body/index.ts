@@ -2,6 +2,9 @@ import { BodyRenderCoordinator } from "./bodyRenderCoordinator.ts";
 import { BodyStateMachine } from "./bodyStateMachine.ts";
 import { FallbackBodyProvider } from "./fallbackBodyProvider.ts";
 import { PngBodyProvider } from "./pngBodyProvider.ts";
+import { PngBodyRenderer } from "./pngBodyRenderer.ts";
+import { FallbackBodyRenderer } from "./fallbackBodyRenderer.ts";
+import type { BodyRenderer } from "./bodyRenderer.ts";
 
 export { BodyStateMachine } from "./bodyStateMachine.ts";
 export { BodyRenderCoordinator } from "./bodyRenderCoordinator.ts";
@@ -9,6 +12,7 @@ export { FallbackBodyProvider } from "./fallbackBodyProvider.ts";
 export type { BodyProvider, BodySnapshot, BodyState, BodyStateChange } from "./types.ts";
 export { BODY_STATES } from "./types.ts";
 export { PngBodyProvider } from "./pngBodyProvider.ts";
+export { FallbackBodyRenderer } from "./fallbackBodyRenderer.ts";
 export {
   BODY_EXPRESSION_EVENT_V1,
   BODY_EXPRESSION_SOURCE,
@@ -23,6 +27,12 @@ export type { BodyRenderResult } from "./bodyRenderCoordinator.ts";
 export { BodyRendererError, BodyRendererHost } from "./bodyRenderer.ts";
 export type { BodyRenderer } from "./bodyRenderer.ts";
 export { PngBodyRenderer } from "./pngBodyRenderer.ts";
+export function createDefaultBodyRenderer(): BodyRenderer {
+  return new FallbackBodyRenderer(
+    new PngBodyRenderer(),
+    new PngBodyRenderer(),
+  );
+}
 export type {
   BodyExpressionBridge,
   BodyExpressionEventV1,

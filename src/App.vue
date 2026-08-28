@@ -4,10 +4,10 @@ import { onMounted, onUnmounted, ref } from "vue";
 import {
   BodyExpressionListenerLifecycle,
   BodyRendererHost,
-  PngBodyRenderer,
   bodyExpressionBridge,
   bodyRenderCoordinator,
   bodyStateMachine,
+  createDefaultBodyRenderer,
   type BodySnapshot,
   type BodyState,
 } from "./body";
@@ -58,7 +58,7 @@ onMounted(async () => {
   // initialization, Conversation, BodyStateMachine authority, or SQLite.
   const hostElement = bodyRendererElement.value;
   if (hostElement !== undefined) {
-    bodyRendererHost = new BodyRendererHost(new PngBodyRenderer());
+    bodyRendererHost = new BodyRendererHost(createDefaultBodyRenderer());
     const rendererMount = bodyRendererHost.mount(hostElement);
     void rendererMount.catch(() => {
       // Contained: the host rolls back to unmounted and the renderer path

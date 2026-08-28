@@ -87,7 +87,9 @@ describe("bundled body package foundation", () => {
       "utf8",
     );
 
-    expect(packageSource).toMatch(/interface BodyPackageDefinition/);
+    expect(packageSource).toMatch(/type BodyPackageDefinition/);
+    expect(packageSource).toMatch(/interface PngBodyPackage/);
+    expect(packageSource).toMatch(/interface Live2DBodyPackage/);
     expect(packageSource).toMatch(/BODY_PACKAGE_CATALOG/);
     expect(packageSource).not.toMatch(/export interface BodyPackageDefinition/);
     expect(indexSource).not.toMatch(/BODY_PACKAGE_CATALOG/);

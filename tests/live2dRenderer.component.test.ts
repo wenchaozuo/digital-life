@@ -72,16 +72,21 @@ class FakeLive2DEngine implements Live2DEngine {
   modelCreated = 0;
   modelDestroyed = 0;
   private readonly options: FakeEngineOptions;
+  private readonly configuredModelUrl: string;
   private canvas: HTMLCanvasElement | undefined;
   private model: HTMLElement | undefined;
 
-  constructor(options: FakeEngineOptions = {}) {
+  constructor(
+    options: FakeEngineOptions = {},
+    configuredModelUrl = MODEL_URL,
+  ) {
     this.options = options;
+    this.configuredModelUrl = configuredModelUrl;
   }
 
-  async mount(host: HTMLElement, modelUrl: string): Promise<void> {
+  async mount(host: HTMLElement): Promise<void> {
     this.mountCalls += 1;
-    this.mountModelUrls.push(modelUrl);
+    this.mountModelUrls.push(this.configuredModelUrl);
     const canvas = document.createElement("canvas");
     this.canvas = canvas;
     host.replaceChildren(canvas);
@@ -176,7 +181,7 @@ describe("Live2DRenderer Core and source boundary", () => {
       coreReady: createLive2DCoreReadyBoundary(),
     });
 
-    await expect(engine.mount(host, MODEL_URL)).rejects.toBeInstanceOf(
+    await expect(engine.mount(host)).rejects.toBeInstanceOf(
       Live2DCoreUnavailableError,
     );
     expect(host.childElementCount).toBe(0);
@@ -472,7 +477,8 @@ describe("D21 production composition and dependency boundaries", () => {
       /new FallbackBodyRenderer\(\s*new PngBodyRenderer\(\),\s*new PngBodyRenderer\(\),/s,
     );
     expect(packageSource).toContain('bodyId: DEFAULT_BODY_ID');
-    expect(bindingSource).not.toMatch(/Live2D|Haru|Mark|Rice/i);
+    expect(bindingSource).toContain('"live2d"');
+    expect(bindingSource).not.toMatch(/Haru|Mark|Rice/i);
     expect(appSource).not.toMatch(/Live2D|live2d/i);
     expect(appSource).toContain("createBodyPresentationForBodyId(life.bodyId)");
   });

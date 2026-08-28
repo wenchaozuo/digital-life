@@ -33,7 +33,7 @@ export interface Live2DRendererConfig {
 }
 
 export interface Live2DEngine {
-  mount(host: HTMLElement, modelUrl: string): Promise<void>;
+  mount(host: HTMLElement): Promise<void>;
   resize(): void;
   render(snapshot: BodySnapshot): Promise<void> | void;
   dispose(): Promise<void> | void;
@@ -176,10 +176,13 @@ class PixiCubism4Live2DEngine implements Live2DEngine {
   private disposed = false;
 
   constructor(config: Live2DRendererConfig) {
-    this.config = config;
+    this.config = Object.freeze({
+      modelUrl: config.modelUrl,
+      coreReady: config.coreReady,
+    });
   }
 
-  async mount(host: HTMLElement, modelUrl: string): Promise<void> {
+  async mount(host: HTMLElement): Promise<void> {
     if (this.disposed || this.app !== undefined) {
       throw new BodyRendererError(MOUNT_FAILURE_MESSAGE);
     }
@@ -227,7 +230,7 @@ class PixiCubism4Live2DEngine implements Live2DEngine {
       canvas.style.height = "100%";
       host.replaceChildren(canvas);
 
-      const model = await Live2DModel.from(modelUrl, {
+      const model = await Live2DModel.from(this.config.modelUrl, {
         ticker: app.ticker,
         autoUpdate: true,
         autoHitTest: false,

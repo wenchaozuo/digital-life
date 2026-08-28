@@ -53,10 +53,13 @@ class LazyPixiCubism4Engine implements Live2DEngine {
   private disposed = false;
 
   constructor(config: Live2DRendererConfig) {
-    this.config = config;
+    this.config = Object.freeze({
+      modelUrl: config.modelUrl,
+      coreReady: config.coreReady,
+    });
   }
 
-  async mount(host: HTMLElement, modelUrl: string): Promise<void> {
+  async mount(host: HTMLElement): Promise<void> {
     if (this.disposed) {
       throw new BodyRendererError(MOUNT_FAILURE_MESSAGE);
     }
@@ -65,7 +68,7 @@ class LazyPixiCubism4Engine implements Live2DEngine {
       await delegate.dispose();
       return;
     }
-    await delegate.mount(host, modelUrl);
+    await delegate.mount(host);
   }
 
   resize(): void {
@@ -296,7 +299,7 @@ export class Live2DRenderer implements BodyRenderer {
     try {
       const engine = this.engineFactory(this.config);
       this.engine = engine;
-      await engine.mount(host, this.config.modelUrl);
+      await engine.mount(host);
 
       if (!this.isCurrentMount(generation)) {
         await this.disposeEngine();

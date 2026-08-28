@@ -8,7 +8,7 @@ import type { BodyProvider } from "./types.ts";
 
 export { DEFAULT_BODY_ID } from "./bodyPackage.ts";
 
-export type BodyPresentationKind = "png";
+export type BodyPresentationKind = "png" | "live2d";
 
 interface BodyBindingDefinition {
   bodyId: string;

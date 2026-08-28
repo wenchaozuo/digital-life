@@ -67,6 +67,31 @@ test("malformed payloads are rejected without throwing", () => {
   }
 });
 
+test("exact plain-object validation accepts only plain payloads", () => {
+  // Accepted: a normal object and a null-prototype plain object.
+  assert.equal(isBodyExpressionEventV1(validEvent("idle")), true);
+  const nullPrototype = Object.assign(Object.create(null), {
+    version: 1,
+    state: "waiting",
+    source: "conversation",
+  });
+  assert.equal(isBodyExpressionEventV1(nullPrototype), true);
+
+  // Rejected without throwing: class instance, Date, Map, Set, array,
+  // function, and any payload beyond the exact three keys.
+  const nonPlain: unknown[] = [
+    new (class FakeEvent {})() as object,
+    new Date("2026-01-01T00:00:00.000Z"),
+    new Map<string, unknown>(),
+    new Set<unknown>(),
+    [1, 2, 3],
+    () => ({ version: 1, state: "idle", source: "conversation" }),
+  ];
+  for (const payload of nonPlain) {
+    assert.equal(isBodyExpressionEventV1(payload), false, String(payload));
+  }
+});
+
 test("publisher targets the main window only with the minimized payload", async () => {
   const transport = new FakeTransport();
   const bridge = createBodyExpressionBridge(transport);

@@ -441,6 +441,11 @@ onUnmounted(() => {
   manualExtractionGeneration += 1;
   clearCancelOutcomeUnknown();
   unsubscribeMessages?.();
+  // Fence the destroyed component's expression generation so a resolved
+  // async completion from that generation can no longer publish idle/error
+  // to the desktop body.  The authoritative conversation operation is not
+  // cancelled.
+  conversationExpression.invalidate();
 });
 </script>
 

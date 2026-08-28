@@ -1,18 +1,25 @@
+import { BodyRenderCoordinator } from "./bodyRenderCoordinator.ts";
 import { BodyStateMachine } from "./bodyStateMachine.ts";
+import { FallbackBodyProvider } from "./fallbackBodyProvider.ts";
 import { PngBodyProvider } from "./pngBodyProvider.ts";
 
 export { BodyStateMachine } from "./bodyStateMachine.ts";
+export { BodyRenderCoordinator } from "./bodyRenderCoordinator.ts";
+export { FallbackBodyProvider } from "./fallbackBodyProvider.ts";
 export type { BodyProvider, BodySnapshot, BodyState, BodyStateChange } from "./types.ts";
 export { BODY_STATES } from "./types.ts";
+export { PngBodyProvider } from "./pngBodyProvider.ts";
 export {
   BODY_EXPRESSION_EVENT_V1,
   BODY_EXPRESSION_SOURCE,
   BODY_EXPRESSION_TARGET,
   BODY_EXPRESSION_VERSION,
+  BodyExpressionListenerLifecycle,
   bodyExpressionBridge,
   createBodyExpressionBridge,
   isBodyExpressionEventV1,
 } from "./expressionBridge.ts";
+export type { BodyRenderResult } from "./bodyRenderCoordinator.ts";
 export type {
   BodyExpressionBridge,
   BodyExpressionEventV1,
@@ -20,6 +27,12 @@ export type {
   BodyExpressionTransport,
 } from "./expressionBridge.ts";
 
-// Future Live2D providers can implement the same BodyProvider contract.
-export const defaultBodyProvider = new PngBodyProvider();
+// D17-C production composition: a real PngBodyProvider is always the stable
+// fallback.  A future Live2D provider can replace the primary without any
+// App.vue ownership change.
+export const defaultBodyProvider = new FallbackBodyProvider(
+  new PngBodyProvider(),
+  new PngBodyProvider(),
+);
+export const bodyRenderCoordinator = new BodyRenderCoordinator(defaultBodyProvider);
 export const bodyStateMachine = new BodyStateMachine();

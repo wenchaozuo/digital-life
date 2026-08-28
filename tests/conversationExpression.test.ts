@@ -116,6 +116,27 @@ test("stale completion from an older operation never overwrites the current one"
   assert.ok(!states.includes("error"), "the stale A error must be ignored");
 });
 
+test("invalidate fences an old completion and leaves the queue usable", async () => {
+  const { publisher, states } = collectingPublisher();
+  const coordinator = new ConversationExpressionCoordinator(publisher);
+
+  // A destroyed component generation: thinking may already be queued, but the
+  // late error completion from that generation must never be published.
+  const token = coordinator.begin("thinking");
+  coordinator.invalidate();
+  coordinator.complete(token, "error");
+  await flushMicrotasks();
+
+  assert.ok(!states.includes("error"), "the invalidated completion must be ignored");
+
+  // A new generation works normally after invalidation.
+  const nextToken = coordinator.begin("waiting");
+  coordinator.complete(nextToken, "idle");
+  await flushMicrotasks();
+
+  assert.deepEqual(states, ["thinking", "waiting", "idle"]);
+});
+
 test("delivery is serialized even when the first publish is held unresolved", async () => {
   let resolveFirst: (() => void) | undefined;
   const firstSettles = new Promise<void>((resolve) => {
@@ -205,6 +226,11 @@ test("ChatView production uses the coordinator seam and no false body ownership"
   assert.match(chatSource, /conversationExpression/);
   assert.match(chatSource, /conversationExpression\.begin\(/);
   assert.match(chatSource, /conversationExpression\.complete\(/);
+  assert.match(
+    chatSource,
+    /conversationExpression\.invalidate\(\)/,
+    "ChatView must fence its expression generation on unmount",
+  );
 
   // No false chat-side body ownership.
   assert.doesNotMatch(chatSource, /bodyStateMachine/, "ChatView must not own a local machine");

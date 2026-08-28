@@ -1,7 +1,13 @@
 <script setup lang="ts">
 import { invoke } from "@tauri-apps/api/core";
 import { onMounted, onUnmounted, ref } from "vue";
-import { bodyExpressionBridge, bodyStateMachine, defaultBodyProvider, type BodyState } from "./body";
+import {
+  BodyExpressionListenerLifecycle,
+  bodyExpressionBridge,
+  bodyRenderCoordinator,
+  bodyStateMachine,
+  type BodyState,
+} from "./body";
 import { initializeDefaultLife, type LifeIdentity } from "./life";
 import { personaManager, type PersonaTemplate } from "./persona";
 import { storageService } from "./storage";
@@ -12,7 +18,13 @@ const lifeIdentity = ref<LifeIdentity>();
 const personaTemplate = ref<PersonaTemplate>();
 const settingsError = ref("");
 let unsubscribe: (() => void) | undefined;
-let unsubscribeBodyExpression: (() => void) | undefined;
+
+// D17-C: the listener registration race with unmount is fenced by this
+// controller, so a registration promise resolving after unmount is
+// immediately unlistened.
+const bodyExpressionListener = new BodyExpressionListenerLifecycle((handler) =>
+  bodyExpressionBridge.listenForBodyExpression(handler),
+);
 
 async function openSettings(): Promise<void> {
   settingsError.value = "";
@@ -34,33 +46,47 @@ async function openChat(): Promise<void> {
 }
 
 onMounted(async () => {
+  // Expression-listener registration starts BEFORE the long main
+  // initialization sequence (storage, Life, persona, provider), so chat
+  // expressions are not needlessly lost during startup.
+  bodyExpressionListener.start(({ state }) => {
+    bodyStateMachine.transition(state);
+  });
+
   await storageService.initialize();
   lifeIdentity.value = await initializeDefaultLife();
   personaTemplate.value = await personaManager.getById(lifeIdentity.value.personaId);
 
-  const body = await defaultBodyProvider.load(bodyStateMachine.getState());
-  bodyState.value = body.state;
-  bodyResource.value = body.resourcePath;
+  // The initial render goes through the same fenced provider/fallback path
+  // as every later transition; there is no unfenced special load path.
+  try {
+    const initial = await bodyRenderCoordinator.render(bodyStateMachine.getState());
+    if (initial.applied) {
+      bodyState.value = initial.snapshot.state;
+      bodyResource.value = initial.snapshot.resourcePath;
+    }
+  } catch {
+    // Presentation-only failure: keep the initial refs untouched.
+  }
 
-  unsubscribe = bodyStateMachine.subscribe(async ({ current }) => {
-    const nextBody = await defaultBodyProvider.switchState(current);
-    bodyState.value = nextBody.state;
-    bodyResource.value = nextBody.resourcePath;
+  unsubscribe = bodyStateMachine.subscribe(({ current }) => {
+    void bodyRenderCoordinator
+      .render(current)
+      .then((result) => {
+        if (result.applied) {
+          bodyState.value = result.snapshot.state;
+          bodyResource.value = result.snapshot.resourcePath;
+        }
+      })
+      .catch(() => {
+        // Presentation-only failure: keep the last applied body.
+      });
   });
-
-  // The main desktop body is the ONLY production owner of the body state
-  // machine: cross-WebView expression events (chat window) are received here
-  // and translate into transitions of this window's machine.
-  unsubscribeBodyExpression = await bodyExpressionBridge.listenForBodyExpression(
-    ({ state }) => {
-      bodyStateMachine.transition(state);
-    },
-  );
 });
 
 onUnmounted(() => {
   unsubscribe?.();
-  unsubscribeBodyExpression?.();
+  bodyExpressionListener.stop();
 });
 </script>
 

@@ -64,6 +64,16 @@ export class ConversationExpressionCoordinator {
     this.enqueue(state);
   }
 
+  /**
+   * Invalidates the current operation generation (D17-C unmount fence).
+   * It publishes nothing, does not clear or poison the delivery queue, and
+   * does not cancel the authoritative conversation operation — any async
+   * completion from the destroyed generation can no longer publish.
+   */
+  invalidate(): void {
+    this.generation += 1;
+  }
+
   private enqueue(state: ConversationExpressionState): void {
     this.deliveryTail = this.deliveryTail
       .then(() => this.publisher(state))

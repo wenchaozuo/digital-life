@@ -362,7 +362,9 @@ describe("D21-C production activation and authority gates", () => {
     const appSource = readWorkspaceFile("src/App.vue");
 
     expect(appSource).toContain("createBodyPresentationForBodyId(life.bodyId)");
-    expect(bindingSource).toContain("BODY_BINDING_CATALOG.get(requestedBodyId)");
+    expect(bindingSource).toContain("resolveBodyPackage(requestedBodyId)");
+    expect(bindingSource).not.toMatch(/BODY_BINDING_CATALOG|new Map/);
+    expect(packageSource).toContain("BODY_PACKAGE_CATALOG");
     expect(bindingSource).not.toMatch(/startsWith|includes|prefix|fuzzy|live2d:/i);
     expect(packageSource).not.toMatch(/import\s*\(|dynamic|bodyId.*(?:path|url)/i);
   });

@@ -1,19 +1,15 @@
-import { BodyRendererError } from "./bodyRenderer.ts";
 import type { BodyRenderer } from "./bodyRenderer.ts";
 import {
-  createPackagePresentation,
-  DEFAULT_BODY_ID,
+  createPackagePresentationForBodyId,
+  createPackagePresentationForTestCatalog,
+  resolveBodyPackage,
+  resolveBodyPackageForTestCatalog,
 } from "./bodyPackage.ts";
 import type { BodyProvider } from "./types.ts";
 
 export { DEFAULT_BODY_ID } from "./bodyPackage.ts";
 
 export type BodyPresentationKind = "png" | "live2d";
-
-interface BodyBindingDefinition {
-  bodyId: string;
-  presentationKind: BodyPresentationKind;
-}
 
 export interface ResolvedBodyBinding {
   requestedBodyId: string;
@@ -27,55 +23,67 @@ export interface BodyPresentationComposition {
   renderer: BodyRenderer;
 }
 
-/** V1 contains exactly one application-owned production body binding. */
-const BODY_BINDING_CATALOG: ReadonlyMap<string, BodyBindingDefinition> =
-  new Map([[DEFAULT_BODY_ID, { bodyId: DEFAULT_BODY_ID, presentationKind: "png" }]]);
+type TestPackageCatalog = Parameters<
+  typeof createPackagePresentationForTestCatalog
+>[1];
+type TestPackageCompositionOptions = Parameters<
+  typeof createPackagePresentationForTestCatalog
+>[2];
 
-/**
- * Resolve an authoritative opaque body selector into a local presentation
- * projection.  The input is compared exactly and is never interpreted as a
- * path, URL, import specifier, or external resource location.
- */
-export function resolveBodyBinding(requestedBodyId: string): ResolvedBodyBinding {
-  const registered = BODY_BINDING_CATALOG.get(requestedBodyId);
-  if (registered !== undefined) {
-    return {
-      requestedBodyId,
-      effectiveBodyId: registered.bodyId,
-      usedFallback: false,
-      presentationKind: registered.presentationKind,
-    };
-  }
-
+function projectBodyBinding(
+  requestedBodyId: string,
+  resolved: ReturnType<typeof resolveBodyPackage>,
+): ResolvedBodyBinding {
   return {
     requestedBodyId,
-    effectiveBodyId: DEFAULT_BODY_ID,
-    usedFallback: true,
-    presentationKind: "png",
+    effectiveBodyId: resolved.effectiveBodyId,
+    usedFallback: resolved.usedFallback,
+    presentationKind: resolved.bodyPackage.presentation.kind,
   };
 }
 
 /**
- * Create a matched provider/renderer pair for one resolved binding.  Both
- * halves are fresh, so mutable provider and renderer state cannot cross Life
- * presentation compositions.
+ * Project the single body-package authority into the binding shape consumed
+ * by callers.  The input is compared exactly and is never interpreted as a
+ * path, URL, import specifier, or external resource location.
  */
-function createBodyPresentationForBinding(
-  binding: ResolvedBodyBinding,
-): BodyPresentationComposition {
-  if (
-    binding.effectiveBodyId !== DEFAULT_BODY_ID ||
-    binding.presentationKind !== "png"
-  ) {
-    throw new BodyRendererError("body binding has no supported presentation.");
-  }
-
-  return createPackagePresentation(binding.effectiveBodyId);
+export function resolveBodyBinding(requestedBodyId: string): ResolvedBodyBinding {
+  return projectBodyBinding(
+    requestedBodyId,
+    resolveBodyPackage(requestedBodyId),
+  );
 }
 
 /** Resolve a selector and create its matched presentation composition. */
 export function createBodyPresentationForBodyId(
   requestedBodyId: string,
 ): BodyPresentationComposition {
-  return createBodyPresentationForBinding(resolveBodyBinding(requestedBodyId));
+  // The package module performs the same exact lookup used by
+  // resolveBodyBinding, then composes from that resolved definition.  There
+  // is no second binding catalog or effective-id-to-presentation assumption.
+  return createPackagePresentationForBodyId(requestedBodyId);
+}
+
+/**
+ * Internal/test-only version of the canonical bodyId factory.  It exists so
+ * a controlled future package can exercise the exact same binding projection
+ * and package composition without becoming a production catalog entry.
+ */
+export function createBodyPresentationForTestCatalog(
+  requestedBodyId: string,
+  catalog: TestPackageCatalog,
+  options?: TestPackageCompositionOptions,
+): BodyPresentationComposition {
+  return createPackagePresentationForTestCatalog(requestedBodyId, catalog, options);
+}
+
+/** Internal/test-only binding projection over the same package authority. */
+export function resolveBodyBindingForTestCatalog(
+  requestedBodyId: string,
+  catalog: Parameters<typeof resolveBodyPackageForTestCatalog>[1],
+): ResolvedBodyBinding {
+  return projectBodyBinding(
+    requestedBodyId,
+    resolveBodyPackageForTestCatalog(requestedBodyId, catalog),
+  );
 }

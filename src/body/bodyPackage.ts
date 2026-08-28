@@ -8,7 +8,10 @@ import {
   DEFAULT_BUNDLED_PNG_RESOURCES,
   type PngBodyResources,
 } from "./pngBodyResources.ts";
-import type { Live2DCoreReadyBoundary } from "./live2dRuntime.ts";
+import type {
+  Live2DCoreReadyBoundary,
+  Live2DEngineFactory,
+} from "./live2dRuntime.ts";
 import {
   requireTrustedLocalLive2DModelPath,
   type TrustedLocalLive2DModelSource,
@@ -37,6 +40,20 @@ interface Live2DBodyPackage {
 
 type BodyPackageDefinition = PngBodyPackage | Live2DBodyPackage;
 
+type BodyPackageCatalog = Readonly<Record<string, BodyPackageDefinition>>;
+
+interface ResolvedBodyPackage {
+  readonly requestedBodyId: string;
+  readonly effectiveBodyId: string;
+  readonly usedFallback: boolean;
+  readonly bodyPackage: BodyPackageDefinition;
+}
+
+interface PackageCompositionOptions {
+  /** Internal test seam; production composition always uses the real adapter. */
+  readonly live2dEngineFactory?: Live2DEngineFactory;
+}
+
 const DEFAULT_BODY_PACKAGE: PngBodyPackage = Object.freeze({
   bodyId: DEFAULT_BODY_ID,
   presentation: Object.freeze({
@@ -48,21 +65,51 @@ const DEFAULT_BODY_PACKAGE: PngBodyPackage = Object.freeze({
 // This catalog is intentionally module-private.  Definitions and the shared
 // resource descriptor are immutable configuration; each factory call still
 // creates fresh provider and renderer runtime state.
-const BODY_PACKAGE_CATALOG: Readonly<Record<string, BodyPackageDefinition>> =
-  Object.freeze({
-    [DEFAULT_BODY_ID]: DEFAULT_BODY_PACKAGE,
-  });
+const BODY_PACKAGE_CATALOG: BodyPackageCatalog = Object.freeze({
+  [DEFAULT_BODY_ID]: DEFAULT_BODY_PACKAGE,
+});
 
-function getBodyPackage(bodyId: string): BodyPackageDefinition {
-  const bodyPackage = BODY_PACKAGE_CATALOG[bodyId];
-  if (bodyPackage === undefined || bodyPackage.bodyId !== bodyId) {
-    throw new BodyRendererError("body package is unavailable.");
+function resolveBodyPackageFromCatalog(
+  requestedBodyId: string,
+  catalog: BodyPackageCatalog,
+): ResolvedBodyPackage {
+  const registered = Object.prototype.hasOwnProperty.call(
+    catalog,
+    requestedBodyId,
+  )
+    ? catalog[requestedBodyId]
+    : undefined;
+
+  if (registered !== undefined && registered.bodyId === requestedBodyId) {
+    return {
+      requestedBodyId,
+      effectiveBodyId: registered.bodyId,
+      usedFallback: false,
+      bodyPackage: registered,
+    };
   }
-  return bodyPackage;
+
+  return {
+    requestedBodyId,
+    effectiveBodyId: DEFAULT_BODY_ID,
+    usedFallback: true,
+    bodyPackage: DEFAULT_BODY_PACKAGE,
+  };
+}
+
+/**
+ * The only production bodyId/package resolution authority.  Binding metadata
+ * is projected from this result; it is not maintained in a second catalog.
+ */
+export function resolveBodyPackage(
+  requestedBodyId: string,
+): ResolvedBodyPackage {
+  return resolveBodyPackageFromCatalog(requestedBodyId, BODY_PACKAGE_CATALOG);
 }
 
 function composeBodyPackage(
   bodyPackage: BodyPackageDefinition,
+  options: PackageCompositionOptions = {},
 ): BodyPresentationComposition {
   if (bodyPackage.presentation.kind === "png") {
     const resources = bodyPackage.presentation.resources;
@@ -85,7 +132,7 @@ function composeBodyPackage(
     const live2dRenderer = new Live2DRenderer({
       modelUrl,
       coreReady,
-    });
+    }, options.live2dEngineFactory);
     return {
       provider: new PngBodyProvider(fallbackResources),
       renderer: new FallbackBodyRenderer(
@@ -106,16 +153,39 @@ function composeBodyPackage(
  */
 export function createPackagePresentationForDefinition(
   bodyPackage: BodyPackageDefinition,
+  options: PackageCompositionOptions = {},
 ): BodyPresentationComposition {
-  return composeBodyPackage(bodyPackage);
+  return composeBodyPackage(bodyPackage, options);
 }
 
 /**
- * Internal package-to-runtime composition boundary.  Callers reach this only
- * through bodyBinding's canonical bodyId resolver, never with raw resources.
+ * Internal/test catalog seam.  It runs the same exact-match resolver and
+ * composition path as production without registering a fabricated package in
+ * the production catalog.  The catalog and options are intentionally absent
+ * from the public body barrel.
  */
-export function createPackagePresentation(
-  effectiveBodyId: string,
+export function createPackagePresentationForTestCatalog(
+  requestedBodyId: string,
+  catalog: BodyPackageCatalog,
+  options: PackageCompositionOptions = {},
 ): BodyPresentationComposition {
-  return composeBodyPackage(getBodyPackage(effectiveBodyId));
+  return composeBodyPackage(
+    resolveBodyPackageFromCatalog(requestedBodyId, catalog).bodyPackage,
+    options,
+  );
+}
+
+/** Internal/test projection of the same catalog authority. */
+export function resolveBodyPackageForTestCatalog(
+  requestedBodyId: string,
+  catalog: BodyPackageCatalog,
+): ResolvedBodyPackage {
+  return resolveBodyPackageFromCatalog(requestedBodyId, catalog);
+}
+
+/** Canonical production composition selected by an opaque bodyId. */
+export function createPackagePresentationForBodyId(
+  requestedBodyId: string,
+): BodyPresentationComposition {
+  return composeBodyPackage(resolveBodyPackage(requestedBodyId).bodyPackage);
 }

@@ -20,6 +20,9 @@ export {
   isBodyExpressionEventV1,
 } from "./expressionBridge.ts";
 export type { BodyRenderResult } from "./bodyRenderCoordinator.ts";
+export { BodyRendererError, BodyRendererHost } from "./bodyRenderer.ts";
+export type { BodyRenderer } from "./bodyRenderer.ts";
+export { PngBodyRenderer } from "./pngBodyRenderer.ts";
 export type {
   BodyExpressionBridge,
   BodyExpressionEventV1,

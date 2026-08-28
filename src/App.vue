@@ -3,6 +3,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { onMounted, onUnmounted, ref } from "vue";
 import {
   BodyExpressionListenerLifecycle,
+  BodyRendererHost,
+  PngBodyRenderer,
   bodyExpressionBridge,
   bodyRenderCoordinator,
   bodyStateMachine,
@@ -14,11 +16,12 @@ import { personaManager, type PersonaTemplate } from "./persona";
 import { storageService } from "./storage";
 
 const bodyState = ref<BodyState>("idle");
-const bodyResource = ref("");
+const bodyRendererElement = ref<HTMLElement>();
 const lifeIdentity = ref<LifeIdentity>();
 const personaTemplate = ref<PersonaTemplate>();
 const settingsError = ref("");
 let unsubscribe: (() => void) | undefined;
+let bodyRendererHost: BodyRendererHost | undefined;
 
 // D17-C: the listener registration race with unmount is fenced by this
 // controller, so a registration promise resolving after unmount is
@@ -47,6 +50,15 @@ async function openChat(): Promise<void> {
 }
 
 onMounted(async () => {
+  // D18-B1: the main renderer host is mounted FIRST (synchronous) so no
+  // BodySnapshot can ever be rendered before the renderer exists.  The main
+  // WebView is the only production owner of the renderer instance.
+  const hostElement = bodyRendererElement.value;
+  if (hostElement !== undefined) {
+    bodyRendererHost = new BodyRendererHost(new PngBodyRenderer());
+    bodyRendererHost.mount(hostElement);
+  }
+
   // D17-C-F1 ordering: the BodyStateMachine -> BodyRenderCoordinator
   // subscription is installed FIRST, before the expression listener and
   // before the initial async render can be pending.  There is therefore no
@@ -95,11 +107,22 @@ onMounted(async () => {
 
 function applyBodySnapshot(snapshot: BodySnapshot): void {
   bodyState.value = snapshot.state;
-  bodyResource.value = snapshot.resourcePath;
+  const host = bodyRendererHost;
+  if (host === undefined) {
+    return;
+  }
+  // Renderer failure is presentation-only: it never affects Conversation,
+  // BodyStateMachine authority, Life, or SQLite; the last successfully
+  // rendered body stays visible.
+  void host.render(snapshot).catch(() => {
+    // Contained: keep the last rendered presentation.
+  });
 }
 
 onUnmounted(() => {
   unsubscribe?.();
+  bodyRendererHost?.dispose();
+  bodyRendererHost = undefined;
   bodyExpressionListener.stop();
 });
 </script>
@@ -127,12 +150,10 @@ onUnmounted(() => {
           ⚙
         </button>
       </div>
-      <img
-        v-if="bodyResource"
-        :src="bodyResource"
-        :alt="`Digital Life ${bodyState} body`"
-        class="body-image"
-        draggable="false"
+      <div
+        ref="bodyRendererElement"
+        class="body-renderer-host"
+        aria-label="Digital Life desktop body"
       />
       <div class="status" data-tauri-drag-region>
         <strong>{{ lifeIdentity?.name }}</strong>

@@ -1467,7 +1467,7 @@ mod tests {
                 focus_state: INTENT_FOCUS_STATE_AVAILABLE.into(),
                 acceptance_score: Some(600),
                 recent_interaction_seconds: Some(30),
-                expires_at: Some("2026-08-28T00:00:00.000Z".into()),
+                expires_at: None,
             }
         }
 
@@ -2343,7 +2343,10 @@ mod tests {
             "autonomy-goal-expired",
         );
         expired_request.recent_interaction_seconds = Some(120);
-        expired_request.expires_at = Some("2026-01-01T00:00:00.000Z".into());
+        let state = fixture.storage.state().unwrap();
+        let now = sqlite_authority_now(&state.connection).unwrap();
+        expired_request.expires_at = Some(sqlite_add_seconds(&state.connection, &now, -1).unwrap());
+        drop(state);
         fixture.create_intent(expired_request);
         let expired = fixture
             .evaluate(

@@ -45,12 +45,15 @@ export interface BodyRenderer {
  *   `BodyRendererError`.
  * - `render`: while `mounting`, it WAITS for the same in-flight mount before
  *   rendering (so the first valid snapshot is never dropped and
- *   `renderer.render` can never run before `renderer.mount` completes).  In
+ *   `renderer.render` can never run before `renderer.mount` completes).  Once
+ *   accepted, renderer deliveries are serialized in call order.  In
  *   `unmounted`/`disposed` it rejects with a bounded `BodyRendererError`.
  * - `dispose`: terminal and safe to repeat.  If dispose happens while a
  *   mount is pending, the completed (or failed) mount's renderer resources
  *   are disposed exactly once afterwards — the host never resurrects.
- *   Async dispose rejections are contained and never become unhandled.
+ *   If a renderer delivery is active, cleanup waits for the complete
+ *   delivery tail.  Async dispose rejections are contained and never become
+ *   unhandled.
  */
 export class BodyRendererHost {
   private readonly renderer: BodyRenderer;
@@ -58,6 +61,8 @@ export class BodyRendererHost {
   private host: HTMLElement | undefined;
   private pendingMount: Promise<void> | undefined;
   private pendingMountHost: HTMLElement | undefined;
+  private renderTail: Promise<void> = Promise.resolve();
+  private pendingRenderCount = 0;
 
   constructor(renderer: BodyRenderer) {
     this.renderer = renderer;
@@ -149,11 +154,37 @@ export class BodyRendererHost {
         throw new BodyRendererError("renderer host is not mounted.");
       }
     }
-    await this.renderer.render(snapshot);
+    return this.enqueueRender(snapshot);
   }
 
   private currentPhase(): "unmounted" | "mounting" | "mounted" | "disposed" {
     return this.phase;
+  }
+
+  private enqueueRender(snapshot: BodySnapshot): Promise<void> {
+    this.pendingRenderCount += 1;
+    const execution = this.renderTail
+      .then(() => {
+        if (this.phase === "disposed") {
+          throw new BodyRendererError("renderer host is disposed.");
+        }
+        return this.invokeRender(snapshot);
+      })
+      .finally(() => {
+        this.pendingRenderCount -= 1;
+      });
+    // Keep the internal queue alive after a caller-visible render failure,
+    // while returning `execution` so this call still receives its own result.
+    this.renderTail = execution.catch(() => {});
+    return execution;
+  }
+
+  private invokeRender(snapshot: BodySnapshot): Promise<void> {
+    try {
+      return Promise.resolve(this.renderer.render(snapshot));
+    } catch (error) {
+      return Promise.reject(error);
+    }
   }
 
   dispose(): void {
@@ -171,19 +202,23 @@ export class BodyRendererHost {
       this.pendingMountHost = undefined;
       if (pendingMount !== undefined) {
         void pendingMount.then(
-          () => {
-            this.disposeRendererContained();
-          },
-          () => {
-            this.disposeRendererContained();
-          },
-        );
+          () => this.renderTail,
+          () => this.renderTail,
+        ).then(() => {
+          this.disposeRendererContained();
+        });
       }
       return;
     }
     this.phase = "disposed";
     this.host = undefined;
-    this.disposeRendererContained();
+    if (this.pendingRenderCount === 0) {
+      this.disposeRendererContained();
+    } else {
+      void this.renderTail.then(() => {
+        this.disposeRendererContained();
+      });
+    }
   }
 
   /**

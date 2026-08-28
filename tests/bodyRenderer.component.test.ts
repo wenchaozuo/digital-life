@@ -16,6 +16,10 @@ const idleSnapshot: BodySnapshot = {
   resourcePath: "/body/idle.png",
   state: "idle",
 };
+const waitingSnapshot: BodySnapshot = {
+  resourcePath: "/body/waiting.png",
+  state: "waiting",
+};
 
 describe("PngBodyRenderer", () => {
   it("mounts exactly one renderer-owned image inside the supplied host", () => {
@@ -243,6 +247,294 @@ class SyncFailureRenderer implements BodyRenderer {
     this.resolveMount?.();
   }
 }
+
+class QueueRenderer implements BodyRenderer {
+  readonly mountedHosts: HTMLElement[] = [];
+  readonly renderCalls: BodySnapshot[] = [];
+  disposeCalls = 0;
+  maxConcurrentRenders = 0;
+  failNextMount = false;
+  private activeRenders = 0;
+  private pendingRenders: Array<{
+    resolve: () => void;
+    reject: (reason: unknown) => void;
+  }> = [];
+
+  mount(host: HTMLElement): void | Promise<void> {
+    this.mountedHosts.push(host);
+    if (this.failNextMount) {
+      this.failNextMount = false;
+      return Promise.reject(new Error("mount failed"));
+    }
+  }
+
+  render(snapshot: BodySnapshot): Promise<void> {
+    this.renderCalls.push(snapshot);
+    this.activeRenders += 1;
+    this.maxConcurrentRenders = Math.max(
+      this.maxConcurrentRenders,
+      this.activeRenders,
+    );
+    return new Promise<void>((resolve, reject) => {
+      this.pendingRenders.push({
+        resolve: () => {
+          this.activeRenders -= 1;
+          resolve();
+        },
+        reject: (reason: unknown) => {
+          this.activeRenders -= 1;
+          reject(reason);
+        },
+      });
+    });
+  }
+
+  dispose(): void {
+    this.disposeCalls += 1;
+  }
+
+  resolveNextRender(): void {
+    const pending = this.pendingRenders.shift();
+    expect(pending).not.toBeUndefined();
+    pending?.resolve();
+  }
+
+  rejectNextRender(reason = new Error("render failed")): void {
+    const pending = this.pendingRenders.shift();
+    expect(pending).not.toBeUndefined();
+    pending?.reject(reason);
+  }
+}
+
+type RenderPlan = "resolve" | "async-reject" | "sync-throw";
+
+class PlannedRenderRenderer implements BodyRenderer {
+  readonly renderCalls: BodySnapshot[] = [];
+  private readonly plans: RenderPlan[];
+
+  constructor(plans: RenderPlan[]) {
+    this.plans = plans;
+  }
+
+  mount(): void {}
+
+  render(snapshot: BodySnapshot): Promise<void> | void {
+    this.renderCalls.push(snapshot);
+    const plan = this.plans.shift() ?? "resolve";
+    if (plan === "async-reject") {
+      return Promise.reject(new Error("async render failed"));
+    }
+    if (plan === "sync-throw") {
+      throw new Error("sync render failed");
+    }
+  }
+
+  dispose(): void {}
+}
+
+describe("BodyRendererHost serialized render delivery", () => {
+  it("does not start a queued render until the active render settles", async () => {
+    const renderer = new QueueRenderer();
+    const host = new BodyRendererHost(renderer);
+    const element = document.createElement("div");
+
+    await host.mount(element);
+    const first = host.render(thinkingSnapshot);
+    await flushMicrotasks();
+    expect(renderer.renderCalls).toEqual([thinkingSnapshot]);
+
+    const second = host.render(idleSnapshot);
+    await flushMicrotasks();
+    expect(renderer.renderCalls).toEqual([thinkingSnapshot]);
+
+    renderer.resolveNextRender();
+    await flushMicrotasks();
+    expect(renderer.renderCalls).toEqual([thinkingSnapshot, idleSnapshot]);
+
+    renderer.resolveNextRender();
+    await first;
+    await second;
+    expect(renderer.maxConcurrentRenders).toBe(1);
+  });
+
+  it("preserves three-item renderer invocation order without overlap", async () => {
+    const renderer = new QueueRenderer();
+    const host = new BodyRendererHost(renderer);
+    const element = document.createElement("div");
+
+    await host.mount(element);
+    const first = host.render(thinkingSnapshot);
+    const second = host.render(idleSnapshot);
+    const third = host.render(waitingSnapshot);
+
+    await flushMicrotasks();
+    expect(renderer.renderCalls).toEqual([thinkingSnapshot]);
+    renderer.resolveNextRender();
+    await flushMicrotasks();
+    expect(renderer.renderCalls).toEqual([thinkingSnapshot, idleSnapshot]);
+    renderer.resolveNextRender();
+    await flushMicrotasks();
+    expect(renderer.renderCalls).toEqual([
+      thinkingSnapshot,
+      idleSnapshot,
+      waitingSnapshot,
+    ]);
+    renderer.resolveNextRender();
+
+    await first;
+    await second;
+    await third;
+    expect(renderer.maxConcurrentRenders).toBe(1);
+  });
+
+  it("keeps the queue usable after an asynchronously rejected render", async () => {
+    const renderer = new PlannedRenderRenderer([
+      "async-reject",
+      "resolve",
+      "resolve",
+    ]);
+    const host = new BodyRendererHost(renderer);
+    const element = document.createElement("div");
+
+    await host.mount(element);
+    const first = host.render(thinkingSnapshot);
+    const second = host.render(idleSnapshot);
+
+    await expect(first).rejects.toThrow("async render failed");
+    await expect(second).resolves.toBeUndefined();
+    await expect(host.render(waitingSnapshot)).resolves.toBeUndefined();
+    expect(renderer.renderCalls).toEqual([
+      thinkingSnapshot,
+      idleSnapshot,
+      waitingSnapshot,
+    ]);
+  });
+
+  it("keeps the queue usable after a synchronously thrown render", async () => {
+    const renderer = new PlannedRenderRenderer([
+      "sync-throw",
+      "resolve",
+      "resolve",
+    ]);
+    const host = new BodyRendererHost(renderer);
+    const element = document.createElement("div");
+
+    await host.mount(element);
+    const first = host.render(thinkingSnapshot);
+    const second = host.render(idleSnapshot);
+
+    await expect(first).rejects.toThrow("sync render failed");
+    await expect(second).resolves.toBeUndefined();
+    await expect(host.render(waitingSnapshot)).resolves.toBeUndefined();
+    expect(renderer.renderCalls).toEqual([
+      thinkingSnapshot,
+      idleSnapshot,
+      waitingSnapshot,
+    ]);
+  });
+
+  it("waits for an active render before disposing the renderer", async () => {
+    const renderer = new QueueRenderer();
+    const host = new BodyRendererHost(renderer);
+    const element = document.createElement("div");
+
+    await host.mount(element);
+    const active = host.render(thinkingSnapshot);
+    await flushMicrotasks();
+    host.dispose();
+
+    expect(host.mounted()).toBe(false);
+    expect(renderer.disposeCalls).toBe(0);
+    renderer.resolveNextRender();
+    await active;
+    await flushMicrotasks();
+
+    expect(renderer.disposeCalls).toBe(1);
+    expect(host.mounted()).toBe(false);
+  });
+
+  it("rejects queued renders on dispose without invoking them", async () => {
+    const renderer = new QueueRenderer();
+    const host = new BodyRendererHost(renderer);
+    const element = document.createElement("div");
+
+    await host.mount(element);
+    const first = host.render(thinkingSnapshot);
+    await flushMicrotasks();
+    const second = host.render(idleSnapshot);
+    const third = host.render(waitingSnapshot);
+    host.dispose();
+
+    renderer.resolveNextRender();
+    await first;
+    await expect(second).rejects.toBeInstanceOf(BodyRendererError);
+    await expect(third).rejects.toBeInstanceOf(BodyRendererError);
+    await flushMicrotasks();
+
+    expect(renderer.renderCalls).toEqual([thinkingSnapshot]);
+    expect(renderer.disposeCalls).toBe(1);
+  });
+
+  it("still disposes after an active render fails", async () => {
+    const renderer = new QueueRenderer();
+    const host = new BodyRendererHost(renderer);
+    const element = document.createElement("div");
+
+    await host.mount(element);
+    const active = host.render(thinkingSnapshot);
+    await flushMicrotasks();
+    host.dispose();
+    renderer.rejectNextRender();
+
+    await expect(active).rejects.toThrow("render failed");
+    await flushMicrotasks();
+    expect(renderer.disposeCalls).toBe(1);
+    expect(host.mounted()).toBe(false);
+  });
+
+  it("rejects mount-waiting renders when dispose closes the host", async () => {
+    const renderer = new ControlledRenderer();
+    const host = new BodyRendererHost(renderer);
+    const element = document.createElement("div");
+
+    const mountPromise = host.mount(element);
+    const first = host.render(thinkingSnapshot);
+    const second = host.render(idleSnapshot);
+    host.dispose();
+
+    expect(host.mounted()).toBe(false);
+    renderer.settleMount();
+    await mountPromise;
+    await expect(first).rejects.toBeInstanceOf(BodyRendererError);
+    await expect(second).rejects.toBeInstanceOf(BodyRendererError);
+    await flushMicrotasks();
+
+    expect(renderer.renderCalls).toEqual([]);
+    expect(renderer.disposeCalls).toBe(1);
+  });
+
+  it("recovers the render queue after mount retry", async () => {
+    const renderer = new QueueRenderer();
+    renderer.failNextMount = true;
+    const host = new BodyRendererHost(renderer);
+    const element = document.createElement("div");
+
+    await expect(host.mount(element)).rejects.toThrow("mount failed");
+    await host.mount(element);
+    const first = host.render(thinkingSnapshot);
+    const second = host.render(idleSnapshot);
+    await flushMicrotasks();
+
+    expect(renderer.renderCalls).toEqual([thinkingSnapshot]);
+    renderer.resolveNextRender();
+    await flushMicrotasks();
+    expect(renderer.renderCalls).toEqual([thinkingSnapshot, idleSnapshot]);
+    renderer.resolveNextRender();
+    await first;
+    await second;
+    expect(renderer.maxConcurrentRenders).toBe(1);
+  });
+});
 
 describe("BodyRendererHost synchronous failure containment", () => {
   it("a synchronous mount throw rolls back and allows a real retry", async () => {

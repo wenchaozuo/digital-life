@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>D21 Browser-Native Live2D Smoke</title>
+    <style>
+      :root {
+        color-scheme: light;
+        font-family: system-ui, sans-serif;
+      }
+
+      body {
+        margin: 1rem;
+      }
+
+      #live2d-host {
+        width: min(480px, 90vw);
+        height: 640px;
+        margin-top: 1rem;
+        overflow: hidden;
+        background: transparent;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>D21 Cubism4 browser smoke</h1>
+      <p id="dependency-status">Loading PixiJS and Cubism4…</p>
+      <label>
+        Model
+        <select id="model-select">
+          <option value="haru">Haru</option>
+          <option value="mark">Mark</option>
+          <option value="rice">Rice</option>
+        </select>
+      </label>
+      <button id="mount-button" type="button">Mount</button>
+      <button id="dispose-button" type="button">Dispose</button>
+      <p id="smoke-status" role="status">unmounted</p>
+      <div id="live2d-host" aria-label="Live2D smoke host"></div>
+    </main>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

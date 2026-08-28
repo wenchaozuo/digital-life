@@ -9,7 +9,10 @@ import {
   type PngBodyResources,
 } from "./pngBodyResources.ts";
 import type { Live2DCoreReadyBoundary } from "./live2dRuntime.ts";
-import type { TrustedLocalLive2DModelSource } from "./live2dModelSource.ts";
+import {
+  requireTrustedLocalLive2DModelPath,
+  type TrustedLocalLive2DModelSource,
+} from "./live2dModelSource.ts";
 import type { BodyPresentationComposition } from "./bodyBinding.ts";
 
 export const DEFAULT_BODY_ID = "default-png";
@@ -78,8 +81,9 @@ function composeBodyPackage(
   if (bodyPackage.presentation.kind === "live2d") {
     const { coreReady, fallbackResources, modelSource } =
       bodyPackage.presentation;
+    const modelUrl = requireTrustedLocalLive2DModelPath(modelSource);
     const live2dRenderer = new Live2DRenderer({
-      modelUrl: modelSource.path,
+      modelUrl,
       coreReady,
     });
     return {

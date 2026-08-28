@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, expectTypeOf, it } from "vitest";
 
 import {
   BODY_STATES,
@@ -19,11 +19,13 @@ import {
 import {
   createTrustedLocalLive2DModelSource,
   isTrustedLocalLive2DModelPath,
+  isTrustedLocalLive2DModelSource,
 } from "../src/body/live2dModelSource";
 import { Live2DCoreUnavailableError } from "../src/body/live2dRenderer";
 import type { Live2DCoreReadyBoundary } from "../src/body/live2dRuntime";
 import type { BodyRenderer } from "../src/body/bodyRenderer";
 import type { BodySnapshot } from "../src/body/types";
+import type { TrustedLocalLive2DModelSource } from "../src/body/live2dModelSource";
 
 const LOCAL_MODEL_PATH = "/bundled-body/test/test.model3.json";
 
@@ -86,16 +88,61 @@ function createLive2DPackage(
   });
 }
 
+function composeRuntimePackage(value: unknown) {
+  // This cast models an untyped runtime boundary in the test. Production
+  // callers still see the branded BodyPackageDefinition parameter.
+  const compose = createPackagePresentationForDefinition as unknown as (
+    definition: unknown,
+  ) => ReturnType<typeof createPackagePresentationForDefinition>;
+  return compose(value);
+}
+
+function createForgedLive2DPackage(
+  modelPath: string,
+  onEnsureReady?: () => void,
+) {
+  return {
+    bodyId: "forged-live2d",
+    presentation: {
+      kind: "live2d" as const,
+      modelSource: {
+        kind: "trusted-local-live2d-model" as const,
+        path: modelPath,
+      },
+      coreReady: createUnavailableCoreBoundary(onEnsureReady),
+      fallbackResources: {
+        idle: "/package-fallback/idle.png",
+        thinking: "/package-fallback/thinking.png",
+        speaking: "/package-fallback/speaking.png",
+        waiting: "/package-fallback/waiting.png",
+        error: "/package-fallback/error.png",
+      },
+    },
+  };
+}
+
 describe("D21-C trusted local model-source boundary", () => {
   it("accepts only an immutable packaged local model descriptor", () => {
     const source = createTrustedLocalLive2DModelSource(LOCAL_MODEL_PATH);
 
-    expect(source).toEqual({
-      kind: "trusted-local-live2d-model",
-      path: LOCAL_MODEL_PATH,
-    });
+    expect(source.kind).toBe("trusted-local-live2d-model");
+    expect(source.path).toBe(LOCAL_MODEL_PATH);
+    expect(Object.keys(source)).toEqual(["kind", "path"]);
+    expect(Object.getOwnPropertySymbols(source)).toHaveLength(1);
     expect(Object.isFrozen(source)).toBe(true);
     expect(isTrustedLocalLive2DModelPath(LOCAL_MODEL_PATH)).toBe(true);
+    expect(isTrustedLocalLive2DModelSource(source)).toBe(true);
+  });
+
+  it("does not let an ordinary object literal satisfy the branded source type", () => {
+    const structurallySimilarSource = {
+      kind: "trusted-local-live2d-model" as const,
+      path: LOCAL_MODEL_PATH,
+    };
+
+    expectTypeOf(structurallySimilarSource).not.toMatchTypeOf<
+      TrustedLocalLive2DModelSource
+    >();
   });
 
   it.each([
@@ -118,10 +165,33 @@ describe("D21-C trusted local model-source boundary", () => {
     const packageSource = readWorkspaceFile("src/body/bodyPackage.ts");
     const modelSource = readWorkspaceFile("src/body/live2dModelSource.ts");
 
-    expect(packageSource).toContain("modelSource.path");
+    expect(packageSource).toContain(
+      "requireTrustedLocalLive2DModelPath(modelSource)",
+    );
+    expect(packageSource).not.toContain("modelSource.path");
     expect(packageSource).not.toMatch(/snapshot|resourcePath|user|bodyId.*path/i);
     expect(modelSource).toContain("^[a-z][a-z0-9+.-]*:");
     expect(modelSource).toContain("model3.json");
+  });
+
+  it.each([
+    "http://example.invalid/evil.model3.json",
+    "https://example.invalid/evil.model3.json",
+    "file:///C:/evil.model3.json",
+    "data:application/json,{}",
+    "javascript:alert(1)",
+    "//example.invalid/evil.model3.json",
+  ])("rejects a forged package source before Core readiness: %s", (modelPath) => {
+    let coreCalls = 0;
+    const forgedPackage = createForgedLive2DPackage(modelPath, () => {
+      coreCalls += 1;
+    });
+
+    expect(() => composeRuntimePackage(forgedPackage)).toThrow(BodyRendererError);
+    expect(coreCalls).toBe(0);
+    expect(isTrustedLocalLive2DModelSource(forgedPackage.presentation.modelSource)).toBe(
+      false,
+    );
   });
 });
 
@@ -159,6 +229,9 @@ describe("D21-C closed presentation and package contract", () => {
     expect(packageSource).toMatch(
       /new FallbackBodyRenderer\(\s*live2dRenderer,\s*new PngBodyRenderer\(\),/s,
     );
+    expect(
+      packageSource.indexOf("requireTrustedLocalLive2DModelPath(modelSource)"),
+    ).toBeLessThan(packageSource.indexOf("new Live2DRenderer("));
   });
 
   it("injects the package Core-ready boundary into the Live2D renderer", async () => {

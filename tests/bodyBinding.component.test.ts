@@ -4,9 +4,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 
 import {
-  BODY_BINDING_CATALOG,
   DEFAULT_BODY_ID,
-  createBodyPresentationForBinding,
   createBodyPresentationForBodyId,
   resolveBodyBinding,
 } from "../src/body/index";
@@ -19,7 +17,6 @@ describe("body binding resolution", () => {
       usedFallback: false,
       presentationKind: "png",
     });
-    expect(BODY_BINDING_CATALOG.size).toBe(1);
   });
 
   it("projects an unknown body to the default without changing the request", () => {
@@ -67,12 +64,8 @@ describe("body binding resolution", () => {
 
 describe("body binding presentation composition", () => {
   it("creates a fresh matched provider and renderer for every binding", async () => {
-    const first = createBodyPresentationForBinding(
-      resolveBodyBinding(DEFAULT_BODY_ID),
-    );
-    const second = createBodyPresentationForBinding(
-      resolveBodyBinding(DEFAULT_BODY_ID),
-    );
+    const first = createBodyPresentationForBodyId(DEFAULT_BODY_ID);
+    const second = createBodyPresentationForBodyId(DEFAULT_BODY_ID);
 
     expect(first.provider).not.toBe(second.provider);
     expect(first.renderer).not.toBe(second.renderer);
@@ -101,7 +94,7 @@ describe("body binding presentation composition", () => {
 
   it("executes the real PNG presentation for an unknown selector fallback", async () => {
     const resolved = resolveBodyBinding("restored-unknown-body");
-    const composition = createBodyPresentationForBinding(resolved);
+    const composition = createBodyPresentationForBodyId("restored-unknown-body");
     const snapshot = await composition.provider.load("thinking");
     const host = document.createElement("div");
 
@@ -112,6 +105,17 @@ describe("body binding presentation composition", () => {
     expect(host.querySelector("img")).not.toBeNull();
     expect(snapshot.state).toBe("thinking");
     await composition.renderer.dispose();
+  });
+
+  it("does not expose the catalog or raw resolved-binding factory through the barrel", () => {
+    const source = fs.readFileSync(
+      path.join(process.cwd(), "src/body/index.ts"),
+      "utf8",
+    );
+
+    expect(source).not.toMatch(/\bBODY_BINDING_CATALOG\b/);
+    expect(source).not.toMatch(/\bcreateBodyPresentationForBinding\b/);
+    expect(source).toMatch(/\bcreateBodyPresentationForBodyId\b/);
   });
 
   it("keeps binding resolution read-only and free of authority writes", () => {

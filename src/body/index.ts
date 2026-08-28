@@ -14,14 +14,11 @@ export { BODY_STATES } from "./types.ts";
 export { PngBodyProvider } from "./pngBodyProvider.ts";
 export { FallbackBodyRenderer } from "./fallbackBodyRenderer.ts";
 export {
-  BODY_BINDING_CATALOG,
   DEFAULT_BODY_ID,
-  createBodyPresentationForBinding,
   createBodyPresentationForBodyId,
   resolveBodyBinding,
 } from "./bodyBinding.ts";
 export type {
-  BodyBindingDefinition,
   BodyPresentationComposition,
   BodyPresentationKind,
   ResolvedBodyBinding,

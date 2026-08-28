@@ -10,7 +10,7 @@ export const DEFAULT_BODY_ID = "default-png";
 
 export type BodyPresentationKind = "png";
 
-export interface BodyBindingDefinition {
+interface BodyBindingDefinition {
   bodyId: string;
   presentationKind: BodyPresentationKind;
 }
@@ -28,7 +28,7 @@ export interface BodyPresentationComposition {
 }
 
 /** V1 contains exactly one application-owned production body binding. */
-export const BODY_BINDING_CATALOG: ReadonlyMap<string, BodyBindingDefinition> =
+const BODY_BINDING_CATALOG: ReadonlyMap<string, BodyBindingDefinition> =
   new Map([[DEFAULT_BODY_ID, { bodyId: DEFAULT_BODY_ID, presentationKind: "png" }]]);
 
 /**
@@ -60,7 +60,7 @@ export function resolveBodyBinding(requestedBodyId: string): ResolvedBodyBinding
  * halves are fresh, so mutable provider and renderer state cannot cross Life
  * presentation compositions.
  */
-export function createBodyPresentationForBinding(
+function createBodyPresentationForBinding(
   binding: ResolvedBodyBinding,
 ): BodyPresentationComposition {
   if (

@@ -6,6 +6,7 @@ import {
   bodyExpressionBridge,
   bodyRenderCoordinator,
   bodyStateMachine,
+  type BodySnapshot,
   type BodyState,
 } from "./body";
 import { initializeDefaultLife, type LifeIdentity } from "./life";
@@ -46,6 +47,27 @@ async function openChat(): Promise<void> {
 }
 
 onMounted(async () => {
+  // D17-C-F1 ordering: the BodyStateMachine -> BodyRenderCoordinator
+  // subscription is installed FIRST, before the expression listener and
+  // before the initial async render can be pending.  There is therefore no
+  // interval in which an expression can transition BodyStateMachine while a
+  // body render is pending but the machine has no renderer subscriber: every
+  // mounted transition creates a render request and advances the render
+  // generation, so a late old initial completion can never overwrite a newer
+  // expression state.
+  unsubscribe = bodyStateMachine.subscribe(({ current }) => {
+    void bodyRenderCoordinator
+      .render(current)
+      .then((result) => {
+        if (result.applied) {
+          applyBodySnapshot(result.snapshot);
+        }
+      })
+      .catch(() => {
+        // Presentation-only failure: keep the last applied body.
+      });
+  });
+
   // Expression-listener registration starts BEFORE the long main
   // initialization sequence (storage, Life, persona, provider), so chat
   // expressions are not needlessly lost during startup.
@@ -53,36 +75,28 @@ onMounted(async () => {
     bodyStateMachine.transition(state);
   });
 
-  await storageService.initialize();
-  lifeIdentity.value = await initializeDefaultLife();
-  personaTemplate.value = await personaManager.getById(lifeIdentity.value.personaId);
-
   // The initial render goes through the same fenced provider/fallback path
-  // as every later transition; there is no unfenced special load path.
+  // as every later transition; there is no unfenced special load path.  The
+  // renderer subscription above guarantees a transition arriving while this
+  // render is pending requests its own generation-fenced render.
   try {
     const initial = await bodyRenderCoordinator.render(bodyStateMachine.getState());
     if (initial.applied) {
-      bodyState.value = initial.snapshot.state;
-      bodyResource.value = initial.snapshot.resourcePath;
+      applyBodySnapshot(initial.snapshot);
     }
   } catch {
     // Presentation-only failure: keep the initial refs untouched.
   }
 
-  unsubscribe = bodyStateMachine.subscribe(({ current }) => {
-    void bodyRenderCoordinator
-      .render(current)
-      .then((result) => {
-        if (result.applied) {
-          bodyState.value = result.snapshot.state;
-          bodyResource.value = result.snapshot.resourcePath;
-        }
-      })
-      .catch(() => {
-        // Presentation-only failure: keep the last applied body.
-      });
-  });
+  await storageService.initialize();
+  lifeIdentity.value = await initializeDefaultLife();
+  personaTemplate.value = await personaManager.getById(lifeIdentity.value.personaId);
 });
+
+function applyBodySnapshot(snapshot: BodySnapshot): void {
+  bodyState.value = snapshot.state;
+  bodyResource.value = snapshot.resourcePath;
+}
 
 onUnmounted(() => {
   unsubscribe?.();

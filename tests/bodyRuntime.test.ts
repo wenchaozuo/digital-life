@@ -5,6 +5,7 @@ import fs from "node:fs";
 import { BodyRenderCoordinator } from "../src/body/bodyRenderCoordinator.ts";
 import { BodyExpressionListenerLifecycle } from "../src/body/expressionBridge.ts";
 import { FallbackBodyProvider } from "../src/body/fallbackBodyProvider.ts";
+import { BodyStateMachine } from "../src/body/bodyStateMachine.ts";
 import type { BodyProvider, BodySnapshot, BodyState } from "../src/body/types.ts";
 
 class FakeBodyProvider implements BodyProvider {
@@ -227,6 +228,99 @@ test("main expression-listener registration starts before the long initializatio
   assert.ok(listenerStart < storageInit, "listener registration precedes storage initialization");
   assert.ok(listenerStart < lifeInit, "listener registration precedes Life initialization");
   assert.ok(listenerStart < personaLoad, "listener registration precedes persona loading");
+});
+
+test("startup race: a transition during the pending initial render fences the old completion", async () => {
+  const machine = new BodyStateMachine(); // starts idle
+  const provider = new ControlledBodyProvider();
+  const coordinator = new BodyRenderCoordinator(provider);
+  let applied: BodySnapshot | undefined;
+
+  // App.vue wiring: the BodyStateMachine -> coordinator renderer subscription
+  // is installed BEFORE the initial render can be pending, so every mounted
+  // transition creates its own generation-fenced render request.
+  const machineUnsubscribe = machine.subscribe(({ current }) => {
+    void coordinator.render(current).then((result) => {
+      if (result.applied) {
+        applied = result.snapshot;
+      }
+    });
+  });
+
+  const initial = coordinator.render(machine.getState()); // idle, held pending
+
+  // An expression transition arrives while the initial render is pending.
+  machine.transition("thinking");
+  assert.ok(
+    provider.pending.has("thinking"),
+    "the transition must immediately create a thinking render request",
+  );
+
+  // Thinking owns the current generation and resolves first.
+  provider.pending.get("thinking")?.resolve({ resourcePath: "thinking.png", state: "thinking" });
+  await flushMicrotasks();
+  assert.deepEqual(applied, { resourcePath: "thinking.png", state: "thinking" });
+
+  // The old idle completion resolves late and must never overwrite thinking.
+  provider.pending.get("idle")?.resolve({ resourcePath: "idle.png", state: "idle" });
+  const initialResult = await initial;
+  assert.equal(initialResult.applied, false, "the late idle completion must not be applied");
+  assert.deepEqual(coordinator.getCurrent(), { resourcePath: "thinking.png", state: "thinking" });
+
+  machineUnsubscribe();
+});
+
+test("startup race: the old completion stays fenced even if it resolves first", async () => {
+  const machine = new BodyStateMachine();
+  const provider = new ControlledBodyProvider();
+  const coordinator = new BodyRenderCoordinator(provider);
+  let applied: BodySnapshot | undefined;
+
+  const machineUnsubscribe = machine.subscribe(({ current }) => {
+    void coordinator.render(current).then((result) => {
+      if (result.applied) {
+        applied = result.snapshot;
+      }
+    });
+  });
+
+  const initial = coordinator.render(machine.getState());
+  machine.transition("thinking");
+
+  // Even if the old idle render settles first, generation ownership belongs
+  // to the thinking render.
+  provider.pending.get("idle")?.resolve({ resourcePath: "idle.png", state: "idle" });
+  const initialResult = await initial;
+  assert.equal(initialResult.applied, false);
+
+  provider.pending.get("thinking")?.resolve({ resourcePath: "thinking.png", state: "thinking" });
+  await flushMicrotasks();
+  assert.deepEqual(applied, { resourcePath: "thinking.png", state: "thinking" });
+  assert.deepEqual(coordinator.getCurrent(), { resourcePath: "thinking.png", state: "thinking" });
+
+  machineUnsubscribe();
+});
+
+test("App.vue installs the renderer subscription once, before listener and initial render", () => {
+  const appSource = fs.readFileSync(new URL("../src/App.vue", import.meta.url), "utf8");
+
+  const subscribeCount = (appSource.match(/bodyStateMachine\.subscribe\(/g) ?? []).length;
+  assert.equal(subscribeCount, 1, "exactly one renderer subscription must exist");
+
+  const subscribeAt = appSource.indexOf("bodyStateMachine.subscribe(");
+  const listenerAt = appSource.indexOf("bodyExpressionListener.start");
+  const initialRenderAt = appSource.indexOf(
+    "bodyRenderCoordinator.render(bodyStateMachine.getState())",
+  );
+
+  assert.ok(subscribeAt >= 0, "App.vue must install the renderer subscription");
+  assert.ok(listenerAt >= 0 && initialRenderAt >= 0);
+  assert.ok(
+    subscribeAt < initialRenderAt,
+    "the renderer subscription must be installed before the initial render is pending",
+  );
+  assert.ok(subscribeAt < listenerAt, "the renderer subscription precedes the listener start");
+  assert.ok(listenerAt < initialRenderAt, "the listener starts before the initial render request");
 });
 
 async function flushMicrotasks(rounds = 16): Promise<void> {

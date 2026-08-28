@@ -12,6 +12,7 @@ export { FallbackBodyProvider } from "./fallbackBodyProvider.ts";
 export type { BodyProvider, BodySnapshot, BodyState, BodyStateChange } from "./types.ts";
 export { BODY_STATES } from "./types.ts";
 export { PngBodyProvider } from "./pngBodyProvider.ts";
+export type { PngBodyResources } from "./pngBodyResources.ts";
 export { FallbackBodyRenderer } from "./fallbackBodyRenderer.ts";
 export {
   DEFAULT_BODY_ID,

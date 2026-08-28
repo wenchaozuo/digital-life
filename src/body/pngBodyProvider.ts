@@ -1,20 +1,21 @@
-import idleBodyResource from "../assets/body/digital-life-idle.png";
+import {
+  copyValidatedPngBodyResources,
+  DEFAULT_BUNDLED_PNG_RESOURCES,
+  type PngBodyResources,
+} from "./pngBodyResources.ts";
 import type { BodyProvider, BodySnapshot, BodyState } from "./types.ts";
 
-const resources: Record<BodyState, string> = {
-  idle: idleBodyResource,
-  thinking: idleBodyResource,
-  speaking: idleBodyResource,
-  waiting: idleBodyResource,
-  error: idleBodyResource,
-};
-
 export class PngBodyProvider implements BodyProvider {
+  private readonly resources: PngBodyResources;
   private state: BodyState = "idle";
+
+  constructor(resources: PngBodyResources = DEFAULT_BUNDLED_PNG_RESOURCES) {
+    this.resources = copyValidatedPngBodyResources(resources);
+  }
 
   getCurrent(): BodySnapshot {
     return {
-      resourcePath: resources[this.state],
+      resourcePath: this.resources[this.state],
       state: this.state,
     };
   }

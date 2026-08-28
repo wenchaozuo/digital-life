@@ -1,12 +1,12 @@
 import { BodyRendererError } from "./bodyRenderer.ts";
 import type { BodyRenderer } from "./bodyRenderer.ts";
-import { FallbackBodyProvider } from "./fallbackBodyProvider.ts";
-import { FallbackBodyRenderer } from "./fallbackBodyRenderer.ts";
-import { PngBodyProvider } from "./pngBodyProvider.ts";
-import { PngBodyRenderer } from "./pngBodyRenderer.ts";
+import {
+  createPackagePresentation,
+  DEFAULT_BODY_ID,
+} from "./bodyPackage.ts";
 import type { BodyProvider } from "./types.ts";
 
-export const DEFAULT_BODY_ID = "default-png";
+export { DEFAULT_BODY_ID } from "./bodyPackage.ts";
 
 export type BodyPresentationKind = "png";
 
@@ -70,16 +70,7 @@ function createBodyPresentationForBinding(
     throw new BodyRendererError("body binding has no supported presentation.");
   }
 
-  return {
-    provider: new FallbackBodyProvider(
-      new PngBodyProvider(),
-      new PngBodyProvider(),
-    ),
-    renderer: new FallbackBodyRenderer(
-      new PngBodyRenderer(),
-      new PngBodyRenderer(),
-    ),
-  };
+  return createPackagePresentation(binding.effectiveBodyId);
 }
 
 /** Resolve a selector and create its matched presentation composition. */

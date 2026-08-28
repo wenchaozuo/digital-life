@@ -1,14 +1,16 @@
-import type { BodyState, BodyStateChange } from "./types";
+import type { BodyState, BodyStateChange } from "./types.ts";
 
 type BodyStateListener = (change: BodyStateChange) => void;
 
 export class BodyStateMachine {
+  private readonly historyLimit: number;
   private currentState: BodyState;
   private readonly listeners = new Set<BodyStateListener>();
   private readonly history: BodyStateChange[] = [];
 
-  constructor(initialState: BodyState = "idle", private readonly historyLimit = 20) {
+  constructor(initialState: BodyState = "idle", historyLimit = 20) {
     this.currentState = initialState;
+    this.historyLimit = historyLimit;
   }
 
   getState(): BodyState {

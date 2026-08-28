@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { invoke } from "@tauri-apps/api/core";
 import { onMounted, onUnmounted, ref } from "vue";
-import { bodyStateMachine, defaultBodyProvider, type BodyState } from "./body";
+import { bodyExpressionBridge, bodyStateMachine, defaultBodyProvider, type BodyState } from "./body";
 import { initializeDefaultLife, type LifeIdentity } from "./life";
 import { personaManager, type PersonaTemplate } from "./persona";
 import { storageService } from "./storage";
@@ -12,6 +12,7 @@ const lifeIdentity = ref<LifeIdentity>();
 const personaTemplate = ref<PersonaTemplate>();
 const settingsError = ref("");
 let unsubscribe: (() => void) | undefined;
+let unsubscribeBodyExpression: (() => void) | undefined;
 
 async function openSettings(): Promise<void> {
   settingsError.value = "";
@@ -46,9 +47,21 @@ onMounted(async () => {
     bodyState.value = nextBody.state;
     bodyResource.value = nextBody.resourcePath;
   });
+
+  // The main desktop body is the ONLY production owner of the body state
+  // machine: cross-WebView expression events (chat window) are received here
+  // and translate into transitions of this window's machine.
+  unsubscribeBodyExpression = await bodyExpressionBridge.listenForBodyExpression(
+    ({ state }) => {
+      bodyStateMachine.transition(state);
+    },
+  );
 });
 
-onUnmounted(() => unsubscribe?.());
+onUnmounted(() => {
+  unsubscribe?.();
+  unsubscribeBodyExpression?.();
+});
 </script>
 
 <template>

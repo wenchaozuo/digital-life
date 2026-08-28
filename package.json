@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
     "test": "npm run test:unit && npm run test:components",
-    "test:unit": "node tests/checkNoExplicitAny.mjs && node --test tests/memoryExtractor.test.ts tests/memoryReview.test.ts tests/manualCandidateExtraction.test.ts tests/modelSettings.test.ts tests/memoryVectorIndexSettings.test.ts tests/memoryVectorSyncSettings.test.ts tests/memoryVectorSyncWorker.test.mjs tests/secureChat.test.mjs tests/conversationPersistence.test.ts tests/conversationManagementUi.test.ts tests/memoryManagementService.test.ts tests/memoryCenterController.test.ts tests/candidateConfirmationService.test.ts tests/candidateConfirmationStore.test.ts",
+    "test:unit": "node tests/checkNoExplicitAny.mjs && node --test tests/bodyExpressionBridge.test.ts tests/memoryExtractor.test.ts tests/memoryReview.test.ts tests/manualCandidateExtraction.test.ts tests/modelSettings.test.ts tests/memoryVectorIndexSettings.test.ts tests/memoryVectorSyncSettings.test.ts tests/memoryVectorSyncWorker.test.mjs tests/secureChat.test.mjs tests/conversationPersistence.test.ts tests/conversationManagementUi.test.ts tests/memoryManagementService.test.ts tests/memoryCenterController.test.ts tests/candidateConfirmationService.test.ts tests/candidateConfirmationStore.test.ts",
     "test:components": "vitest run",
     "preview": "vite preview",
     "tauri": "tauri"

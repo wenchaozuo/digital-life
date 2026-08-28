@@ -1,5 +1,5 @@
 import idleBodyResource from "../assets/body/digital-life-idle.png";
-import type { BodyProvider, BodySnapshot, BodyState } from "./types";
+import type { BodyProvider, BodySnapshot, BodyState } from "./types.ts";
 
 const resources: Record<BodyState, string> = {
   idle: idleBodyResource,

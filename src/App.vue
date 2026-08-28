@@ -50,13 +50,20 @@ async function openChat(): Promise<void> {
 }
 
 onMounted(async () => {
-  // D18-B1: the main renderer host is mounted FIRST (synchronous) so no
-  // BodySnapshot can ever be rendered before the renderer exists.  The main
-  // WebView is the only production owner of the renderer instance.
+  // D18-B1: the main renderer host is mounted FIRST (synchronous invocation
+  // of the async lifecycle) so no BodySnapshot can ever be rendered before
+  // the renderer exists.  The main WebView is the only production owner of
+  // the renderer instance.  Mount failure is presentation-only: it is
+  // contained here and never blocks storage / Life / persona
+  // initialization, Conversation, BodyStateMachine authority, or SQLite.
   const hostElement = bodyRendererElement.value;
   if (hostElement !== undefined) {
     bodyRendererHost = new BodyRendererHost(new PngBodyRenderer());
-    bodyRendererHost.mount(hostElement);
+    const rendererMount = bodyRendererHost.mount(hostElement);
+    void rendererMount.catch(() => {
+      // Contained: the host rolls back to unmounted and the renderer path
+      // reports bounded errors on later render attempts.
+    });
   }
 
   // D17-C-F1 ordering: the BodyStateMachine -> BodyRenderCoordinator

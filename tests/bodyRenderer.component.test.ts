@@ -156,6 +156,176 @@ describe("BodyRendererHost", () => {
   });
 });
 
+class ControlledRenderer implements BodyRenderer {
+  readonly mountedHosts: HTMLElement[] = [];
+  readonly renderCalls: BodySnapshot[] = [];
+  disposeCalls = 0;
+  mountRejects = false;
+  disposeRejects = false;
+  resolveMount: (() => void) | undefined;
+  rejectMount: ((error: Error) => void) | undefined;
+  private mountResult: Promise<void> | undefined;
+
+  mount(host: HTMLElement): Promise<void> {
+    this.mountedHosts.push(host);
+    if (this.mountRejects) {
+      this.mountResult = Promise.reject(new Error("mount failed"));
+    } else {
+      this.mountResult = new Promise<void>((resolve, reject) => {
+        this.resolveMount = resolve;
+        this.rejectMount = reject;
+      });
+    }
+    return this.mountResult;
+  }
+
+  async render(snapshot: BodySnapshot): Promise<void> {
+    this.renderCalls.push(snapshot);
+  }
+
+  dispose(): Promise<void> | void {
+    this.disposeCalls += 1;
+    if (this.disposeRejects) {
+      return Promise.reject(new Error("dispose failed"));
+    }
+  }
+
+  settleMount(): void {
+    if (this.mountRejects) {
+      this.rejectMount?.(new Error("mount failed"));
+    } else {
+      this.resolveMount?.();
+    }
+  }
+}
+
+async function flushMicrotasks(rounds = 16): Promise<void> {
+  for (let round = 0; round < rounds; round += 1) {
+    await Promise.resolve();
+  }
+}
+
+describe("BodyRendererHost async lifecycle", () => {
+  it("never renders before an in-flight async mount completes", async () => {
+    const renderer = new ControlledRenderer();
+    const host = new BodyRendererHost(renderer);
+    const element = document.createElement("div");
+
+    const mountPromise = host.mount(element);
+    const renderPromise = host.render(thinkingSnapshot);
+    await flushMicrotasks();
+    expect(renderer.renderCalls.length).toBe(0);
+
+    renderer.settleMount();
+    await mountPromise;
+    await renderPromise;
+    expect(renderer.renderCalls).toEqual([thinkingSnapshot]);
+    expect(host.mounted()).toBe(true);
+  });
+
+  it("mount failure rolls back to unmounted with bounded render errors and allows retry", async () => {
+    const renderer = new ControlledRenderer();
+    renderer.mountRejects = true;
+    const host = new BodyRendererHost(renderer);
+    const element = document.createElement("div");
+
+    await expect(host.mount(element)).rejects.toThrow("mount failed");
+    expect(host.mounted()).toBe(false);
+    await expect(host.render(thinkingSnapshot)).rejects.toBeInstanceOf(BodyRendererError);
+    expect(renderer.renderCalls.length).toBe(0);
+
+    // A later retry may mount successfully because the host is not disposed.
+    renderer.mountRejects = false;
+    const retry = host.mount(element);
+    renderer.settleMount();
+    await retry;
+    expect(host.mounted()).toBe(true);
+    await host.render(idleSnapshot);
+    expect(renderer.renderCalls).toEqual([idleSnapshot]);
+  });
+
+  it("reuses the same in-flight mount for a concurrent same-host call", async () => {
+    const renderer = new ControlledRenderer();
+    const host = new BodyRendererHost(renderer);
+    const element = document.createElement("div");
+
+    const first = host.mount(element);
+    const second = host.mount(element);
+    expect(renderer.mountedHosts.length).toBe(1);
+
+    renderer.settleMount();
+    await first;
+    await second;
+    expect(renderer.mountedHosts.length).toBe(1);
+    expect(host.mounted()).toBe(true);
+  });
+
+  it("rejects a different host while a mount is pending without a second tree", async () => {
+    const renderer = new ControlledRenderer();
+    const host = new BodyRendererHost(renderer);
+    const first = document.createElement("div");
+    const second = document.createElement("div");
+
+    const pending = host.mount(first);
+    await expect(host.mount(second)).rejects.toBeInstanceOf(BodyRendererError);
+    expect(renderer.mountedHosts.length).toBe(1);
+
+    renderer.settleMount();
+    await pending;
+    expect(renderer.mountedHosts.length).toBe(1);
+    expect(host.mounted()).toBe(true);
+  });
+
+  it("dispose during a pending mount never resurrects and disposes exactly once", async () => {
+    const renderer = new ControlledRenderer();
+    const host = new BodyRendererHost(renderer);
+    const element = document.createElement("div");
+
+    const mountPromise = host.mount(element);
+    host.dispose();
+    expect(host.mounted()).toBe(false);
+
+    renderer.settleMount();
+    await mountPromise;
+    await flushMicrotasks();
+
+    expect(host.mounted()).toBe(false);
+    expect(renderer.disposeCalls).toBe(1);
+    await expect(host.render(idleSnapshot)).rejects.toBeInstanceOf(BodyRendererError);
+    await expect(host.mount(element)).rejects.toBeInstanceOf(BodyRendererError);
+  });
+
+  it("contains an async dispose rejection without an unhandled rejection", async () => {
+    const renderer = new ControlledRenderer();
+    renderer.disposeRejects = true;
+    const host = new BodyRendererHost(renderer);
+    const element = document.createElement("div");
+
+    const mountPromise = host.mount(element);
+    renderer.settleMount();
+    await mountPromise;
+    await host.render(thinkingSnapshot);
+
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      host.dispose();
+      await flushMicrotasks();
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+
+    expect(unhandled).toEqual([]);
+    expect(host.mounted()).toBe(false);
+    host.dispose(); // repeated dispose: no second renderer.dispose
+    expect(renderer.disposeCalls).toBe(1);
+    await expect(host.render(idleSnapshot)).rejects.toBeInstanceOf(BodyRendererError);
+  });
+});
+
 describe("main App renderer ownership shape", () => {
   it("App.vue owns the renderer host and no direct production body image", () => {
     const appSource = fs.readFileSync(path.join(process.cwd(), "src/App.vue"), "utf8");
@@ -166,6 +336,23 @@ describe("main App renderer ownership shape", () => {
     expect(appSource).toMatch(/bodyRenderCoordinator/);
     expect(appSource).not.toMatch(/<img/);
     expect(appSource).not.toMatch(/bodyResource/);
+  });
+
+  it("App.vue contains the renderer mount barrier and keeps long init independent", () => {
+    const appSource = fs.readFileSync(path.join(process.cwd(), "src/App.vue"), "utf8");
+    expect(appSource).toMatch(/bodyRendererHost\.mount\(/);
+    expect(appSource).toMatch(/rendererMount\.catch\(/, "mount rejection must be contained");
+    expect(appSource).not.toMatch(
+      /^[ \t]*bodyRendererHost\.mount\(/m,
+      "mount must not be a fire-and-forget statement",
+    );
+
+    const mountAt = appSource.indexOf("bodyRendererHost.mount(");
+    const storageInitAt = appSource.indexOf("await storageService.initialize()");
+    const lifeInitAt = appSource.indexOf("await initializeDefaultLife()");
+    expect(mountAt).toBeGreaterThanOrEqual(0);
+    expect(storageInitAt).toBeGreaterThan(mountAt);
+    expect(lifeInitAt).toBeGreaterThan(mountAt);
   });
 
   it("ChatView never touches the renderer surface", () => {

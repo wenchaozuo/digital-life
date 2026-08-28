@@ -92,8 +92,17 @@ export class BodyRendererHost {
 
     this.phase = "mounting";
     this.pendingMountHost = host;
-    const mountResult = Promise.resolve(this.renderer.mount(host));
-    const sealedMount = mountResult.then(
+    // Synchronous throws from renderer.mount are captured into the same
+    // rejected-promise path as async rejections, so both failure modes
+    // follow IDENTICAL lifecycle semantics (rollback to unmounted, bounded
+    // error surface, retry possible).
+    let mountOutcome: Promise<void>;
+    try {
+      mountOutcome = Promise.resolve(this.renderer.mount(host));
+    } catch (error) {
+      mountOutcome = Promise.reject(error);
+    }
+    const sealedMount = mountOutcome.then(
       () => {
         if (this.phase === "disposed") {
           // Disposed while mounting: no resurrection; the dispose chain owns
@@ -163,14 +172,10 @@ export class BodyRendererHost {
       if (pendingMount !== undefined) {
         void pendingMount.then(
           () => {
-            void Promise.resolve(this.renderer.dispose()).catch(() => {
-              // Async dispose rejection is contained.
-            });
+            this.disposeRendererContained();
           },
           () => {
-            void Promise.resolve(this.renderer.dispose()).catch(() => {
-              // Async dispose rejection is contained.
-            });
+            this.disposeRendererContained();
           },
         );
       }
@@ -178,8 +183,27 @@ export class BodyRendererHost {
     }
     this.phase = "disposed";
     this.host = undefined;
-    void Promise.resolve(this.renderer.dispose()).catch(() => {
-      // Async dispose rejection is contained.
-    });
+    this.disposeRendererContained();
+  }
+
+  /**
+   * Single contained renderer-dispose path used by every host lifecycle
+   * branch.  Handles BOTH a synchronous throw from `renderer.dispose()` and
+   * a returned rejected Promise; the helper itself never throws and never
+   * leaves an unhandled rejection.
+   */
+  private disposeRendererContained(): void {
+    let outcome: Promise<void> | void;
+    try {
+      outcome = this.renderer.dispose();
+    } catch {
+      // Synchronous dispose throw is contained.
+      return;
+    }
+    if (outcome !== undefined) {
+      void outcome.catch(() => {
+        // Async dispose rejection is contained.
+      });
+    }
   }
 }

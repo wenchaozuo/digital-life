@@ -205,6 +205,114 @@ async function flushMicrotasks(rounds = 16): Promise<void> {
   }
 }
 
+class SyncFailureRenderer implements BodyRenderer {
+  mountSyncThrows = false;
+  mountHeld = false;
+  disposeSyncThrows = false;
+  mountCalls = 0;
+  renderCalls = 0;
+  disposeCalls = 0;
+  private resolveMount: (() => void) | undefined;
+  private mountPromise: Promise<void> | undefined;
+
+  mount(host: HTMLElement): Promise<void> | void {
+    this.mountCalls += 1;
+    if (this.mountSyncThrows) {
+      throw new Error("sync mount failed");
+    }
+    if (this.mountHeld) {
+      this.mountPromise = new Promise<void>((resolve) => {
+        this.resolveMount = resolve;
+      });
+      return this.mountPromise;
+    }
+  }
+
+  async render(snapshot: BodySnapshot): Promise<void> {
+    this.renderCalls += 1;
+  }
+
+  dispose(): Promise<void> | void {
+    this.disposeCalls += 1;
+    if (this.disposeSyncThrows) {
+      throw new Error("sync dispose failed");
+    }
+  }
+
+  settleMount(): void {
+    this.resolveMount?.();
+  }
+}
+
+describe("BodyRendererHost synchronous failure containment", () => {
+  it("a synchronous mount throw rolls back and allows a real retry", async () => {
+    const renderer = new SyncFailureRenderer();
+    renderer.mountSyncThrows = true;
+    const host = new BodyRendererHost(renderer);
+    const element = document.createElement("div");
+
+    await expect(host.mount(element)).rejects.toThrow("sync mount failed");
+    expect(host.mounted()).toBe(false);
+    await expect(host.render(thinkingSnapshot)).rejects.toBeInstanceOf(BodyRendererError);
+    expect(renderer.renderCalls).toBe(0);
+
+    // The rollback is real: a retry mounts successfully.
+    renderer.mountSyncThrows = false;
+    await host.mount(element);
+    expect(host.mounted()).toBe(true);
+    await host.render(idleSnapshot);
+    expect(renderer.renderCalls).toBe(1);
+  });
+
+  it("a synchronous dispose throw is contained exactly once", async () => {
+    const renderer = new SyncFailureRenderer();
+    renderer.disposeSyncThrows = true;
+    const host = new BodyRendererHost(renderer);
+    const element = document.createElement("div");
+
+    await host.mount(element);
+    expect(() => host.dispose()).not.toThrow();
+    expect(host.mounted()).toBe(false);
+    expect(renderer.disposeCalls).toBe(1);
+
+    expect(() => host.dispose()).not.toThrow();
+    expect(renderer.disposeCalls).toBe(1);
+
+    await expect(host.render(idleSnapshot)).rejects.toBeInstanceOf(BodyRendererError);
+    await expect(host.mount(element)).rejects.toBeInstanceOf(BodyRendererError);
+  });
+
+  it("a synchronous dispose throw after a pending mount settles is contained", async () => {
+    const renderer = new SyncFailureRenderer();
+    renderer.mountHeld = true;
+    renderer.disposeSyncThrows = true;
+    const host = new BodyRendererHost(renderer);
+    const element = document.createElement("div");
+
+    const mountPromise = host.mount(element);
+    host.dispose();
+
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      renderer.settleMount();
+      await mountPromise;
+      await flushMicrotasks();
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+
+    expect(unhandled).toEqual([]);
+    expect(host.mounted()).toBe(false);
+    expect(renderer.disposeCalls).toBe(1);
+    await expect(host.render(idleSnapshot)).rejects.toBeInstanceOf(BodyRendererError);
+    await expect(host.mount(element)).rejects.toBeInstanceOf(BodyRendererError);
+  });
+});
+
 describe("BodyRendererHost async lifecycle", () => {
   it("never renders before an in-flight async mount completes", async () => {
     const renderer = new ControlledRenderer();

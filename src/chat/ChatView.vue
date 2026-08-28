@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { invoke } from "@tauri-apps/api/core";
 import { computed, onMounted, onUnmounted, ref, reactive, watch } from "vue";
-import { bodyStateMachine, type BodyState } from "../body";
+import { conversationExpression } from "./conversationExpression";
 import {
   ConversationError,
   conversationService,
@@ -28,7 +28,6 @@ import {
 import { lifeIdentityManager } from "../life";
 import { createClosePanelHandler } from "./memoryReviewAdapter";
 
-const bodyState = ref<BodyState>(bodyStateMachine.getState());
 const messages = ref<readonly ConversationMessage[]>([]);
 const error = ref<{ code: string; message: string }>();
 type ConversationUiState = "idle" | "loadingConversation" | "sending" | "error";
@@ -230,7 +229,6 @@ async function handleReloadAuthoritativeState(): Promise<void> {
 }
 
 let unsubscribeMessages: (() => void) | undefined;
-let unsubscribeBodyState: (() => void) | undefined;
 
 function refreshMessages(): void {
   selectedConversationId.value = conversationService.getConversationId();
@@ -250,12 +248,15 @@ function showConversationError(caught: unknown, fallback: string): void {
 }
 
 async function restoreConversation(): Promise<void> {
+  const expression = conversationExpression.begin("waiting");
   conversationState.value = "loadingConversation";
   try {
     await conversationService.initialize();
     await refreshConversations();
     refreshMessages();
+    conversationExpression.complete(expression, "idle");
   } catch (caught) {
+    conversationExpression.complete(expression, "error");
     showConversationError(caught, "Conversation history could not be restored.");
   } finally {
     if (conversationState.value === "loadingConversation") conversationState.value = "idle";
@@ -276,6 +277,7 @@ async function send(content: string): Promise<void> {
     return;
   }
 
+  const expression = conversationExpression.begin("thinking");
   conversationState.value = "sending";
   error.value = undefined;
 
@@ -286,7 +288,9 @@ async function send(content: string): Promise<void> {
     clearSignal.value += 1;
     memoryNotice.value = memoryNoticeFor(response.memory.degradationCodes, response.memory.rebuildRecommended);
     await refreshConversations();
+    conversationExpression.complete(expression, "idle");
   } catch (caught) {
+    conversationExpression.complete(expression, "error");
     error.value = caught instanceof ConversationError
       ? { code: caught.code, message: caught.message }
       : { code: "CONVERSATION_MODEL_FAILED", message: "The model request could not be completed." };
@@ -300,6 +304,7 @@ async function send(content: string): Promise<void> {
 async function createConversation(): Promise<void> {
   if (interactionDisabled.value) return;
   invalidateManualExtractionForConversationChange();
+  const expression = conversationExpression.begin("waiting");
   conversationState.value = "loadingConversation";
   error.value = undefined;
   try {
@@ -307,7 +312,9 @@ async function createConversation(): Promise<void> {
     clearSignal.value += 1;
     refreshMessages();
     await refreshConversations();
+    conversationExpression.complete(expression, "idle");
   } catch (caught) {
+    conversationExpression.complete(expression, "error");
     showConversationError(caught, "A new conversation could not be created.");
   } finally {
     if (conversationState.value === "loadingConversation") conversationState.value = "idle";
@@ -317,13 +324,16 @@ async function createConversation(): Promise<void> {
 async function switchConversation(conversation: ConversationSummary): Promise<void> {
   if (interactionDisabled.value || conversation.id === selectedConversationId.value) return;
   invalidateManualExtractionForConversationChange();
+  const expression = conversationExpression.begin("waiting");
   conversationState.value = "loadingConversation";
   error.value = undefined;
   try {
     await conversationService.switchConversation(conversation);
     clearSignal.value += 1;
     refreshMessages();
+    conversationExpression.complete(expression, "idle");
   } catch (caught) {
+    conversationExpression.complete(expression, "error");
     showConversationError(caught, "The conversation could not be loaded.");
   } finally {
     if (conversationState.value === "loadingConversation") conversationState.value = "idle";
@@ -333,6 +343,7 @@ async function switchConversation(conversation: ConversationSummary): Promise<vo
 async function deleteConversation(conversation: ConversationSummary): Promise<void> {
   if (interactionDisabled.value || conversation.id !== selectedConversationId.value) return;
   if (!window.confirm(`Delete conversation “${conversation.title}”? This cannot be undone.`)) return;
+  const expression = conversationExpression.begin("waiting");
   conversationState.value = "loadingConversation";
   error.value = undefined;
   try {
@@ -340,7 +351,9 @@ async function deleteConversation(conversation: ConversationSummary): Promise<vo
     clearSignal.value += 1;
     refreshMessages();
     await refreshConversations();
+    conversationExpression.complete(expression, "idle");
   } catch (caught) {
+    conversationExpression.complete(expression, "error");
     showConversationError(caught, "The conversation could not be deleted.");
   } finally {
     if (conversationState.value === "loadingConversation") conversationState.value = "idle";
@@ -421,9 +434,6 @@ const handleClosePanel = createClosePanelHandler(controller, {
 onMounted(() => {
   refreshMessages();
   unsubscribeMessages = conversationService.getSession().subscribe(refreshMessages);
-  unsubscribeBodyState = bodyStateMachine.subscribe(({ current }) => {
-    bodyState.value = current;
-  });
   void restoreConversation();
 });
 
@@ -431,7 +441,6 @@ onUnmounted(() => {
   manualExtractionGeneration += 1;
   clearCancelOutcomeUnknown();
   unsubscribeMessages?.();
-  unsubscribeBodyState?.();
 });
 </script>
 
@@ -453,7 +462,6 @@ onUnmounted(() => {
         <h1>Chat</h1>
         <p v-if="conversationTitle" class="conversation-title">{{ conversationTitle }}</p>
       </div>
-      <span>Body state: {{ bodyState }}</span>
     </header>
 
     <!-- Runtime Persistence Notification Warning Banner -->

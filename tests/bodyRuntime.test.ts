@@ -301,7 +301,7 @@ test("startup race: the old completion stays fenced even if it resolves first", 
   machineUnsubscribe();
 });
 
-test("App.vue installs the renderer subscription once, before listener and initial render", () => {
+test("App.vue installs the local renderer subscription once, before listener and initial render", () => {
   const appSource = fs.readFileSync(new URL("../src/App.vue", import.meta.url), "utf8");
 
   const subscribeCount = (appSource.match(/bodyStateMachine\.subscribe\(/g) ?? []).length;
@@ -310,7 +310,7 @@ test("App.vue installs the renderer subscription once, before listener and initi
   const subscribeAt = appSource.indexOf("bodyStateMachine.subscribe(");
   const listenerAt = appSource.indexOf("bodyExpressionListener.start");
   const initialRenderAt = appSource.indexOf(
-    "bodyRenderCoordinator.render(bodyStateMachine.getState())",
+    "coordinator.render(bodyStateMachine.getState())",
   );
 
   assert.ok(subscribeAt >= 0, "App.vue must install the renderer subscription");

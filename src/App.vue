@@ -5,9 +5,9 @@ import {
   BodyExpressionListenerLifecycle,
   BodyRendererHost,
   bodyExpressionBridge,
-  bodyRenderCoordinator,
   bodyStateMachine,
-  createDefaultBodyRenderer,
+  BodyRenderCoordinator,
+  createBodyPresentationForBodyId,
   type BodySnapshot,
   type BodyState,
 } from "./body";
@@ -21,7 +21,9 @@ const lifeIdentity = ref<LifeIdentity>();
 const personaTemplate = ref<PersonaTemplate>();
 const settingsError = ref("");
 let unsubscribe: (() => void) | undefined;
+let activeBodyRenderCoordinator: BodyRenderCoordinator | undefined;
 let bodyRendererHost: BodyRendererHost | undefined;
+let lifecycleEpoch = 0;
 
 // D17-C: the listener registration race with unmount is fenced by this
 // controller, so a registration promise resolving after unmount is
@@ -50,36 +52,28 @@ async function openChat(): Promise<void> {
 }
 
 onMounted(async () => {
-  // D18-B1: the main renderer host is mounted FIRST (synchronous invocation
-  // of the async lifecycle) so no BodySnapshot can ever be rendered before
-  // the renderer exists.  The main WebView is the only production owner of
-  // the renderer instance.  Mount failure is presentation-only: it is
-  // contained here and never blocks storage / Life / persona
-  // initialization, Conversation, BodyStateMachine authority, or SQLite.
-  const hostElement = bodyRendererElement.value;
-  if (hostElement !== undefined) {
-    bodyRendererHost = new BodyRendererHost(createDefaultBodyRenderer());
-    const rendererMount = bodyRendererHost.mount(hostElement);
-    void rendererMount.catch(() => {
-      // Contained: the host rolls back to unmounted and the renderer path
-      // reports bounded errors on later render attempts.
-    });
-  }
+  const runtimeEpoch = ++lifecycleEpoch;
 
-  // D17-C-F1 ordering: the BodyStateMachine -> BodyRenderCoordinator
-  // subscription is installed FIRST, before the expression listener and
-  // before the initial async render can be pending.  There is therefore no
-  // interval in which an expression can transition BodyStateMachine while a
-  // body render is pending but the machine has no renderer subscriber: every
-  // mounted transition creates a render request and advances the render
-  // generation, so a late old initial completion can never overwrite a newer
-  // expression state.
+  // Capture the mounted host before any asynchronous storage / Life work.
+  // The captured element is used only after the same lifecycle epoch is
+  // still active, so a late Life continuation cannot reuse a stale host.
+  const hostElement = bodyRendererElement.value;
+
+  // D17-C-F1 ordering is retained: the BodyStateMachine subscription is
+  // installed before the expression listener and before any initial render.
+  // Before the current Life is bound, transitions remain authoritative in the
+  // machine and are intentionally presentation-no-ops.
   unsubscribe = bodyStateMachine.subscribe(({ current }) => {
-    void bodyRenderCoordinator
+    const coordinator = activeBodyRenderCoordinator;
+    if (!isRuntimeActive(runtimeEpoch) || coordinator === undefined) {
+      return;
+    }
+
+    void coordinator
       .render(current)
       .then((result) => {
         if (result.applied) {
-          applyBodySnapshot(result.snapshot);
+          applyBodySnapshot(result.snapshot, runtimeEpoch, coordinator);
         }
       })
       .catch(() => {
@@ -94,25 +88,84 @@ onMounted(async () => {
     bodyStateMachine.transition(state);
   });
 
-  // The initial render goes through the same fenced provider/fallback path
-  // as every later transition; there is no unfenced special load path.  The
-  // renderer subscription above guarantees a transition arriving while this
-  // render is pending requests its own generation-fenced render.
-  try {
-    const initial = await bodyRenderCoordinator.render(bodyStateMachine.getState());
-    if (initial.applied) {
-      applyBodySnapshot(initial.snapshot);
-    }
-  } catch {
-    // Presentation-only failure: keep the initial refs untouched.
+  await storageService.initialize();
+  if (!isRuntimeActive(runtimeEpoch)) {
+    return;
   }
 
-  await storageService.initialize();
-  lifeIdentity.value = await initializeDefaultLife();
-  personaTemplate.value = await personaManager.getById(lifeIdentity.value.personaId);
+  const life = await initializeDefaultLife();
+  if (!isRuntimeActive(runtimeEpoch)) {
+    return;
+  }
+  lifeIdentity.value = life;
+
+  // Life.bodyId is the authoritative startup selector.  The canonical
+  // factory returns one matched provider/renderer composition; no default
+  // body is created before this point and no selector is rewritten here.
+  const composition = createBodyPresentationForBodyId(life.bodyId);
+  const coordinator = new BodyRenderCoordinator(composition.provider);
+  const host = new BodyRendererHost(composition.renderer);
+  if (!isRuntimeActive(runtimeEpoch)) {
+    host.dispose();
+    return;
+  }
+
+  activeBodyRenderCoordinator = coordinator;
+  bodyRendererHost = host;
+
+  if (hostElement !== undefined) {
+    // Mount failure is presentation-only and does not block the Life or
+    // persona startup path.  BodyRendererHost owns the async lifecycle
+    // fence and contains a late mount after this runtime is retired.
+    const rendererMount = host.mount(hostElement);
+    void rendererMount.catch(() => {
+      // Contained: the host rolls back to unmounted and later render errors
+      // remain bounded at the presentation boundary.
+    });
+  }
+
+  // The first Life-bound render uses the current machine state, including an
+  // expression captured while binding was still pending.  It shares the same
+  // generation-fenced coordinator as every later transition.
+  try {
+    const initial = await coordinator.render(bodyStateMachine.getState());
+    if (!isRuntimeActive(runtimeEpoch) || activeBodyRenderCoordinator !== coordinator) {
+      return;
+    }
+    if (initial.applied) {
+      applyBodySnapshot(initial.snapshot, runtimeEpoch, coordinator);
+    }
+
+    if (!isRuntimeActive(runtimeEpoch) || activeBodyRenderCoordinator !== coordinator) {
+      return;
+    }
+  } catch {
+    // Presentation-only failure: keep the last applied body and continue
+    // Life/persona startup without inventing a snapshot.
+  }
+
+  if (!isRuntimeActive(runtimeEpoch) || activeBodyRenderCoordinator !== coordinator) {
+    return;
+  }
+
+  const persona = await personaManager.getById(life.personaId);
+  if (isRuntimeActive(runtimeEpoch) && activeBodyRenderCoordinator === coordinator) {
+    personaTemplate.value = persona;
+  }
 });
 
-function applyBodySnapshot(snapshot: BodySnapshot): void {
+function isRuntimeActive(epoch: number): boolean {
+  return lifecycleEpoch === epoch;
+}
+
+function applyBodySnapshot(
+  snapshot: BodySnapshot,
+  runtimeEpoch: number,
+  coordinator: BodyRenderCoordinator,
+): void {
+  if (!isRuntimeActive(runtimeEpoch) || activeBodyRenderCoordinator !== coordinator) {
+    return;
+  }
   bodyState.value = snapshot.state;
   const host = bodyRendererHost;
   if (host === undefined) {
@@ -127,10 +180,16 @@ function applyBodySnapshot(snapshot: BodySnapshot): void {
 }
 
 onUnmounted(() => {
+  // Retire the epoch before touching any async owner so late provider, Life,
+  // mount, and render continuations cannot apply or create new presentation
+  // state after unmount.
+  lifecycleEpoch += 1;
   unsubscribe?.();
+  unsubscribe = undefined;
+  bodyExpressionListener.stop();
   bodyRendererHost?.dispose();
   bodyRendererHost = undefined;
-  bodyExpressionListener.stop();
+  activeBodyRenderCoordinator = undefined;
 });
 </script>
 

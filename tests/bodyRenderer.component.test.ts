@@ -733,26 +733,26 @@ describe("main App renderer ownership shape", () => {
     expect(appSource).toMatch(/bodyRendererElement/);
     expect(appSource).toMatch(/class="body-renderer-host"/);
     expect(appSource).toMatch(/bodyStateMachine/);
-    expect(appSource).toMatch(/bodyRenderCoordinator/);
+    expect(appSource).toMatch(/activeBodyRenderCoordinator/);
     expect(appSource).not.toMatch(/<img/);
     expect(appSource).not.toMatch(/bodyResource/);
   });
 
-  it("App.vue contains the renderer mount barrier and keeps long init independent", () => {
+  it("App.vue binds the renderer after Life and contains mount failure", () => {
     const appSource = fs.readFileSync(path.join(process.cwd(), "src/App.vue"), "utf8");
-    expect(appSource).toMatch(/bodyRendererHost\.mount\(/);
+    expect(appSource).toMatch(/host\.mount\(/);
     expect(appSource).toMatch(/rendererMount\.catch\(/, "mount rejection must be contained");
     expect(appSource).not.toMatch(
-      /^[ \t]*bodyRendererHost\.mount\(/m,
+      /^[ \t]*host\.mount\(/m,
       "mount must not be a fire-and-forget statement",
     );
 
-    const mountAt = appSource.indexOf("bodyRendererHost.mount(");
+    const mountAt = appSource.indexOf("host.mount(");
     const storageInitAt = appSource.indexOf("await storageService.initialize()");
     const lifeInitAt = appSource.indexOf("await initializeDefaultLife()");
     expect(mountAt).toBeGreaterThanOrEqual(0);
-    expect(storageInitAt).toBeGreaterThan(mountAt);
-    expect(lifeInitAt).toBeGreaterThan(mountAt);
+    expect(storageInitAt).toBeLessThan(mountAt);
+    expect(lifeInitAt).toBeLessThan(mountAt);
   });
 
   it("ChatView never touches the renderer surface", () => {

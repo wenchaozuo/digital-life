@@ -303,7 +303,8 @@ describe("default body renderer composition", () => {
       path.join(process.cwd(), "src/App.vue"),
       "utf8",
     );
-    expect(appSource).toContain("createDefaultBodyRenderer()");
+    expect(appSource).toContain("createBodyPresentationForBodyId(life.bodyId)");
+    expect(appSource).not.toContain("createDefaultBodyRenderer()");
     expect(appSource).not.toMatch(/new PngBodyRenderer/);
   });
 });

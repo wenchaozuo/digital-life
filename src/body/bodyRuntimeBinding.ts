@@ -215,8 +215,14 @@ export class BodyRuntimeBindingController {
       const initial = await candidate.coordinator.render(
         this.options.getCurrentState(),
       );
-      if (!this.isCurrentBinding(candidate) || !initial.applied) {
+      if (!this.isCurrentBinding(candidate)) {
         candidate.host.dispose();
+        return;
+      }
+      // A superseded provider result belongs to this still-current binding;
+      // only its snapshot is stale. The newer render request owns the same
+      // coordinator and will continue delivering through this host.
+      if (!initial.applied) {
         return;
       }
 

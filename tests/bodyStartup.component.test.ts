@@ -217,7 +217,24 @@ describe("main current-Life body startup", () => {
       expect(renderer.renderedSnapshots).toEqual([
         { resourcePath: "waiting.png", state: "waiting" },
       ]);
-      expect(wrapper.text()).toContain("State: waiting");
+      expect(renderer.disposeCalls).toBe(0);
+
+      body.bodyStateMachine.transition("speaking");
+      await flushMicrotasks();
+      expect(provider.switchCalls).toEqual(["thinking", "waiting", "speaking"]);
+
+      provider.pending.get("speaking")?.resolve({
+        resourcePath: "speaking.png",
+        state: "speaking",
+      });
+      await flushMicrotasks();
+
+      expect(renderer.renderedSnapshots).toEqual([
+        { resourcePath: "waiting.png", state: "waiting" },
+        { resourcePath: "speaking.png", state: "speaking" },
+      ]);
+      expect(renderer.disposeCalls).toBe(0);
+      expect(wrapper.text()).toContain("State: speaking");
       expect(events.indexOf("persona:persona-1")).toBeGreaterThan(
         events.indexOf("factory:restored-unknown-body"),
       );

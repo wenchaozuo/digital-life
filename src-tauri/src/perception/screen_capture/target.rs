@@ -20,15 +20,15 @@ use std::sync::Mutex;
 
 use serde::Serialize;
 
-/// A de-identified, user-facing target descriptor.  It carries only a stable
-/// per-process index and a bounded display label; no HWND, PID, title,
-/// process path, or monitor device path ever leaves the backend.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+/// Bounded, non-sensitive target selection status.  It deliberately carries
+/// no HWND, PID, title, process path, monitor device path, or enumeration
+/// index — the user picks the target in Windows system UI and the backend
+/// keeps the opaque item.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ScreenCaptureTargetDescriptor {
-    pub(crate) index: u64,
-    pub(crate) kind: String,
-    pub(crate) label: String,
+pub(crate) enum ScreenCaptureTargetStatus {
+    None,
+    Selected,
 }
 
 /// The opaque process-local capture target.  The native handle lives only in
@@ -39,8 +39,6 @@ pub(crate) struct ScreenCaptureTargetDescriptor {
 pub(crate) struct ScreenCaptureTarget {
     /// The session-generation fence that selected this target.
     pub(crate) life_fence: u64,
-    /// De-identified descriptor for status display.
-    pub(crate) descriptor: ScreenCaptureTargetDescriptor,
     /// Opaque native capture item.  Windows: `GraphicsCaptureItem`.
     #[cfg(windows)]
     pub(crate) native: Option<windows::Graphics::Capture::GraphicsCaptureItem>,
@@ -65,20 +63,14 @@ impl ScreenCaptureTargetBroker {
         }
     }
 
-    /// Replaces the current target only after a valid selection.  The old
-    /// target is retired (dropped) in the same lock.  Cancellation never
+    /// Replaces the current target only after a valid picker selection.  The
+    /// old target is retired (dropped) in the same lock.  Cancellation never
     /// fabricates a target and never clears an existing valid one unless the
     /// caller explicitly asks to clear.
-    pub(crate) fn select(
-        &self,
-        life_fence: u64,
-        descriptor: ScreenCaptureTargetDescriptor,
-        native: impl Into<NativeCaptureItem>,
-    ) {
+    pub(crate) fn select(&self, life_fence: u64, native: impl Into<NativeCaptureItem>) {
         let mut state = self.state.lock().unwrap();
         *state = BrokerState::Selected(ScreenCaptureTarget {
             life_fence,
-            descriptor,
             native: Some(native.into()),
         });
     }
@@ -116,11 +108,11 @@ impl ScreenCaptureTargetBroker {
         self.current_target_for_fence(fence)
     }
 
-    /// De-identified status for Settings display.
-    pub(crate) fn current_descriptor(&self) -> Option<ScreenCaptureTargetDescriptor> {
+    /// Bounded, non-sensitive status for Settings display.
+    pub(crate) fn current_status(&self) -> ScreenCaptureTargetStatus {
         match &*self.state.lock().unwrap() {
-            BrokerState::None => None,
-            BrokerState::Selected(target) => Some(target.descriptor.clone()),
+            BrokerState::None => ScreenCaptureTargetStatus::None,
+            BrokerState::Selected(_) => ScreenCaptureTargetStatus::Selected,
         }
     }
 
@@ -128,15 +120,10 @@ impl ScreenCaptureTargetBroker {
     /// the broker is always safe.  Unit tests exercise the fence logic only;
     /// the native provider is never invoked with such a target.
     #[cfg(test)]
-    pub(crate) fn install_target_for_test(
-        &self,
-        life_fence: u64,
-        descriptor: ScreenCaptureTargetDescriptor,
-    ) {
+    pub(crate) fn install_target_for_test(&self, life_fence: u64) {
         let mut state = self.state.lock().unwrap();
         *state = BrokerState::Selected(ScreenCaptureTarget {
             life_fence,
-            descriptor,
             native: None,
         });
     }
@@ -154,30 +141,22 @@ mod tests {
     use super::*;
     use crate::perception::screen_policy::ScreenPerceptionSessionGate;
 
-    fn descriptor(index: u64, label: &str) -> ScreenCaptureTargetDescriptor {
-        ScreenCaptureTargetDescriptor {
-            index,
-            kind: "test".to_string(),
-            label: label.to_string(),
-        }
-    }
-
     #[test]
     fn fresh_broker_has_no_target() {
         let broker = ScreenCaptureTargetBroker::new();
-        assert_eq!(broker.current_descriptor(), None);
+        assert_eq!(broker.current_status(), ScreenCaptureTargetStatus::None);
         assert!(broker.current_target_for_fence(1).is_none());
     }
 
     #[test]
     fn select_replaces_previous_target_and_clear_removes_it() {
         let broker = ScreenCaptureTargetBroker::new();
-        broker.install_target_for_test(1, descriptor(0, "A"));
-        assert_eq!(broker.current_descriptor().unwrap().label, "A");
-        broker.install_target_for_test(2, descriptor(1, "B"));
-        assert_eq!(broker.current_descriptor().unwrap().label, "B");
+        broker.install_target_for_test(1);
+        assert_eq!(broker.current_status(), ScreenCaptureTargetStatus::Selected);
+        broker.install_target_for_test(2);
+        assert_eq!(broker.current_status(), ScreenCaptureTargetStatus::Selected);
         broker.clear();
-        assert_eq!(broker.current_descriptor(), None);
+        assert_eq!(broker.current_status(), ScreenCaptureTargetStatus::None);
     }
 
     #[test]
@@ -188,7 +167,7 @@ mod tests {
         // Life A arms (fence 1) and selects a target under that fence.
         gate.arm_for_life("life-a");
         let fence_a = gate.life_fence_for("life-a").unwrap();
-        broker.install_target_for_test(fence_a, descriptor(0, "A"));
+        broker.install_target_for_test(fence_a);
         assert!(broker.current_target_for_life(&gate, "life-a").is_some());
 
         // Life B rearms (fence 2); A's target must not be inherited.
@@ -203,7 +182,7 @@ mod tests {
         let gate = ScreenPerceptionSessionGate::new();
         gate.arm_for_life("life-a");
         let fence = gate.life_fence_for("life-a").unwrap();
-        broker.install_target_for_test(fence, descriptor(0, "A"));
+        broker.install_target_for_test(fence);
 
         gate.disarm();
         assert!(broker.current_target_for_life(&gate, "life-a").is_none());
@@ -215,7 +194,7 @@ mod tests {
         let gate = ScreenPerceptionSessionGate::new();
         gate.arm_for_life("life-a");
         let fence_first = gate.life_fence_for("life-a").unwrap();
-        broker.install_target_for_test(fence_first, descriptor(0, "A"));
+        broker.install_target_for_test(fence_first);
 
         gate.disarm();
         gate.arm_for_life("life-a");

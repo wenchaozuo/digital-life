@@ -1,18 +1,18 @@
 import { invoke } from "@tauri-apps/api/core";
 
 /**
- * De-identified capture-target descriptor.  The backend never exposes an
- * HWND, PID, window title (as authority), process path, or monitor device
- * path; only a stable per-process index and a bounded display label.
+ * Bounded, non-sensitive capture-target status.  The backend never exposes an
+ * HWND, PID, window title, process path, monitor device path, or selection
+ * index; the user picks the target in Windows system UI and the backend keeps
+ * the opaque item.
  */
-export interface ScreenCaptureTargetDescriptor {
-  index: number;
-  kind: "monitor" | "window" | string;
-  label: string;
-}
+export type ScreenCaptureTargetStatus =
+  | { status: "none" }
+  | { status: "selected" };
 
-export interface ScreenCaptureTargetStatus {
-  selected: ScreenCaptureTargetDescriptor | null;
+export interface ScreenCapturePick {
+  status: ScreenCaptureTargetStatus["status"];
+  cancelled: boolean;
 }
 
 export interface ScreenCaptureSmoke {
@@ -27,9 +27,8 @@ export interface ScreenCaptureSettingsError {
   readonly recoverable: boolean;
 }
 
-interface ScreenCaptureTargetSelectionRequest {
+interface ScreenCapturePickRequest {
   lifeId: string;
-  selectionIndex: number;
 }
 
 const SCREEN_CAPTURE_ERROR_MESSAGES: Record<string, string> = {
@@ -77,22 +76,10 @@ export function screenCaptureErrorFromUnknown(
 }
 
 export class ScreenCaptureSettingsService {
-  async listTargets(): Promise<ScreenCaptureTargetDescriptor[]> {
-    return invoke<ScreenCaptureTargetDescriptor[]>(
-      "list_screen_capture_targets",
-    );
-  }
-
-  async selectTarget(
-    lifeId: string,
-    selectionIndex: number,
-  ): Promise<ScreenCaptureTargetDescriptor> {
-    return invoke<ScreenCaptureTargetDescriptor>(
-      "select_screen_capture_target",
-      {
-        request: { lifeId, selectionIndex } satisfies ScreenCaptureTargetSelectionRequest,
-      },
-    );
+  async pickTarget(lifeId: string): Promise<ScreenCapturePick> {
+    return invoke<ScreenCapturePick>("pick_screen_capture_target", {
+      request: { lifeId } satisfies ScreenCapturePickRequest,
+    });
   }
 
   async getTargetStatus(): Promise<ScreenCaptureTargetStatus> {

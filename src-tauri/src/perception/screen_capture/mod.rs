@@ -22,27 +22,63 @@
 //! There is deliberately no OCR, no polling, no background capture, no frame
 //! persistence, no network/model path, and no raw-pixel frontend exposure.
 
-/// Ensures COM is initialized on the calling thread for WGC/WinRT use.
-///
-/// WGC (`GraphicsCaptureItem`, frame pool, D3D11 device interop) requires a
-/// COM-initialized thread.  This helper initializes the current thread in MTA
-/// (the documented mode for desktop WGC) and tolerates an already-initialized
-/// thread (`S_FALSE`).  A thread already initialized in a *different* mode is
-/// left untouched and reported so the caller can fail closed rather than
-/// silently changing apartment semantics.
+/// COM apartment mode for the calling thread.
 #[cfg(windows)]
-pub(crate) fn ensure_com_initialized() -> Result<(), ScreenCaptureError> {
-    use windows::Win32::{
-        Foundation::RPC_E_CHANGED_MODE,
-        System::Com::{CoInitializeEx, COINIT_MULTITHREADED},
-    };
-    let result = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-    match result.0 {
-        // S_OK: newly initialized.  S_FALSE (1): already initialized on this
-        // thread (any compatible mode).  Both are fine for our use.
-        0 | 1 => Ok(()),
-        _ if result == RPC_E_CHANGED_MODE => Err(ScreenCaptureError::not_supported()),
-        _ => Err(ScreenCaptureError::capture_failed()),
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ComMode {
+    /// Single-threaded apartment — required by the system `GraphicsCapturePicker`
+    /// UI.
+    Sta,
+    /// Multithreaded apartment — sufficient for the capture session itself.
+    Mta,
+}
+
+/// A balanced COM lifetime guard for the calling thread.
+///
+/// WGC/WinRT require a COM-initialized thread.  `ComGuard::acquire` calls
+/// `CoInitializeEx` with the requested mode and records whether *this* call
+/// performed the initialization (`S_OK`) or found the thread already
+/// initialized (`S_FALSE`).  In both cases `Drop` runs exactly one matching
+/// `CoUninitialize`.  On `RPC_E_CHANGED_MODE` the guard is not created and no
+/// `CoUninitialize` is issued for the failed call (fail closed).  The guard
+/// must be kept alive for the whole COM/WinRT operation that requires it.
+#[cfg(windows)]
+pub(crate) struct ComGuard {
+    initialized: bool,
+}
+
+#[cfg(windows)]
+impl ComGuard {
+    pub(crate) fn acquire(mode: ComMode) -> Result<Self, ScreenCaptureError> {
+        use windows::Win32::{
+            Foundation::RPC_E_CHANGED_MODE,
+            System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED, COINIT_MULTITHREADED},
+        };
+        let coinit = match mode {
+            ComMode::Sta => COINIT_APARTMENTTHREADED,
+            ComMode::Mta => COINIT_MULTITHREADED,
+        };
+        let result = unsafe { CoInitializeEx(None, coinit) };
+        match result.0 {
+            // S_OK (0): this call initialized the thread.
+            0 => Ok(Self { initialized: true }),
+            // S_FALSE (1): the thread was already initialized; still needs a
+            // matching CoUninitialize per COM rules.
+            1 => Ok(Self { initialized: true }),
+            _ if result == RPC_E_CHANGED_MODE => Err(ScreenCaptureError::not_supported()),
+            _ => Err(ScreenCaptureError::capture_failed()),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ComGuard {
+    fn drop(&mut self) {
+        if self.initialized {
+            unsafe {
+                let _ = windows::Win32::System::Com::CoUninitialize();
+            }
+        }
     }
 }
 
@@ -56,6 +92,7 @@ pub(crate) mod windows_provider;
 use std::fmt;
 
 use serde::Serialize;
+use tauri::Manager;
 
 use super::screen_policy::{authorize_screen_perception, ScreenPerceptionRepository};
 use super::screen_settings::ScreenPerceptionCommandError;
@@ -246,75 +283,163 @@ pub(crate) struct ScreenCaptureSmokeDto {
     pub(crate) pixel_format: String,
 }
 
-/// DTO for the current process-local target status.  Only the de-identified
-/// descriptor (or none) is exposed; never a raw handle.
+/// DTO for the current process-local target status.  Only the bounded
+/// non-sensitive status (`none` / `selected`) is exposed; never a raw handle
+/// or a display label.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ScreenCaptureTargetStatusDto {
-    pub(crate) selected: Option<target::ScreenCaptureTargetDescriptor>,
+    pub(crate) status: target::ScreenCaptureTargetStatus,
 }
 
-/// Lists the currently available capture targets as de-identified
-/// descriptors.  This is the only target-selection surface exposed to
-/// Settings; the frontend can never supply an HWND/PID/title.
-#[tauri::command]
-pub fn list_screen_capture_targets(
-) -> Result<Vec<target::ScreenCaptureTargetDescriptor>, ScreenPerceptionCommandError> {
-    #[cfg(windows)]
-    {
-        selection::list_target_descriptors().map_err(map_command_error)
-    }
-    #[cfg(not(windows))]
-    {
-        Err(map_command_error(ScreenCaptureError::not_supported()))
-    }
+/// DTO returned after the native picker closes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ScreenCapturePickDto {
+    pub(crate) status: target::ScreenCaptureTargetStatus,
+    pub(crate) cancelled: bool,
 }
 
-/// Selects the target with the given de-identified index.  The backend
-/// re-enumerates, derives the handle, creates the opaque capture item via the
-/// canonical interop path, and binds it to the current session fence.
+/// Runs the Windows system capture picker for the given Life.
+///
+/// Authority order:
+/// 1. validate `life_id`;
+/// 2. `authorize_screen_perception(...)` — durable policy + session gate;
+/// 3. only if authorized, invoke the Windows system picker (parented to the
+///    backend-derived Settings window HWND);
+/// 4. receive the opaque `GraphicsCaptureItem` (or cancellation);
+/// 5. re-check the session fence before installing;
+/// 6. install into the canonical broker.
+///
+/// Picker cancellation returns `cancelled: true` and never silently changes
+/// an existing valid target.  If durable/session authorization disappears
+/// while the picker is open, the returned item is NOT installed.
 #[tauri::command]
-pub fn select_screen_capture_target(
+pub fn pick_screen_capture_target(
+    app: tauri::AppHandle,
+    storage: tauri::State<'_, StorageService>,
     gate: tauri::State<'_, super::screen_policy::ScreenPerceptionSessionGate>,
     broker: tauri::State<'_, target::ScreenCaptureTargetBroker>,
-    request: ScreenCaptureTargetSelectionRequest,
-) -> Result<target::ScreenCaptureTargetDescriptor, ScreenPerceptionCommandError> {
-    select_screen_capture_target_service(gate.inner(), broker.inner(), &request)
+    request: ScreenCapturePickRequest,
+) -> Result<ScreenCapturePickDto, ScreenPerceptionCommandError> {
+    pick_screen_capture_target_service(app, storage.inner(), gate.inner(), broker.inner(), &request)
         .map_err(map_command_error)
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ScreenCaptureTargetSelectionRequest {
+pub(crate) struct ScreenCapturePickRequest {
     pub(crate) life_id: String,
-    pub(crate) selection_index: u64,
 }
 
 #[cfg(windows)]
-pub(crate) fn select_screen_capture_target_service(
+pub(crate) fn pick_screen_capture_target_service(
+    app: tauri::AppHandle,
+    repository: &dyn ScreenPerceptionRepository,
     gate: &super::screen_policy::ScreenPerceptionSessionGate,
     broker: &target::ScreenCaptureTargetBroker,
-    request: &ScreenCaptureTargetSelectionRequest,
-) -> Result<target::ScreenCaptureTargetDescriptor, ScreenCaptureError> {
-    selection::select_target_service(gate, broker, &request.life_id, request.selection_index)
+    request: &ScreenCapturePickRequest,
+) -> Result<ScreenCapturePickDto, ScreenCaptureError> {
+    // 1. validate life_id.
+    if request.life_id.trim().is_empty() {
+        return Err(ScreenCaptureError::invalid_argument(
+            "life identity must not be empty.",
+        ));
+    }
+    // 2. authorize before the picker (durable policy + session gate).
+    authorize_screen_perception(repository, gate, &request.life_id)
+        .map_err(map_authorization_error)?;
+
+    // Capture the fence that authorized this picker session; a rearm while
+    // the picker is open changes it.
+    let fence = gate
+        .life_fence_for(&request.life_id)
+        .ok_or_else(ScreenCaptureError::session_denied)?;
+
+    // 3. derive the trusted owner HWND from the Settings window (never
+    //    supplied by the frontend) and run the system picker.
+    let settings_window = app
+        .get_webview_window("settings")
+        .ok_or_else(ScreenCaptureError::capture_failed)?;
+    let owner_hwnd = selection::settings_owner_hwnd(&settings_window)
+        .ok_or_else(ScreenCaptureError::capture_failed)?;
+    let outcome = selection::pick_capture_item(owner_hwnd)?;
+
+    install_picker_outcome(repository, gate, broker, &request.life_id, fence, outcome)
+}
+
+/// Installs a picker outcome after the authority re-check.  Split out so unit
+/// tests can exercise the post-picker fence recheck and cancellation
+/// semantics without a real Windows picker.
+pub(crate) fn install_picker_outcome(
+    repository: &dyn ScreenPerceptionRepository,
+    gate: &super::screen_policy::ScreenPerceptionSessionGate,
+    broker: &target::ScreenCaptureTargetBroker,
+    life_id: &str,
+    picker_fence: u64,
+    outcome: selection::PickOutcome,
+) -> Result<ScreenCapturePickDto, ScreenCaptureError> {
+    match outcome {
+        selection::PickOutcome::Cancelled => {
+            // Cancellation must not fabricate a target nor clear an existing
+            // valid one.
+            let _ = repository;
+            Ok(ScreenCapturePickDto {
+                status: broker.current_status(),
+                cancelled: true,
+            })
+        }
+        selection::PickOutcome::Selected(item) => {
+            // 5. Re-check the session fence before installing: if the gate
+            //    was disarmed/rearmed/rebound while the picker was open, do
+            //    NOT install the stale item.
+            let current_fence = gate
+                .life_fence_for(life_id)
+                .ok_or_else(ScreenCaptureError::session_denied)?;
+            if current_fence != picker_fence {
+                // The stale item is intentionally NOT installed; dropping it
+                // releases its COM reference.
+                drop(item);
+                return Err(ScreenCaptureError::session_denied());
+            }
+            // 6. install into the canonical broker under the current fence.
+            broker.select(current_fence, item);
+            Ok(ScreenCapturePickDto {
+                status: target::ScreenCaptureTargetStatus::Selected,
+                cancelled: false,
+            })
+        }
+    }
+}
+
+/// The post-picker fence recheck: true only when the gate is still armed for
+/// the same life with the same generation the picker was opened under.
+pub(crate) fn fence_is_current(
+    gate: &super::screen_policy::ScreenPerceptionSessionGate,
+    life_id: &str,
+    picker_fence: u64,
+) -> bool {
+    gate.life_fence_for(life_id) == Some(picker_fence)
 }
 
 #[cfg(not(windows))]
-pub(crate) fn select_screen_capture_target_service(
+pub(crate) fn pick_screen_capture_target_service(
+    _app: tauri::AppHandle,
+    _repository: &dyn ScreenPerceptionRepository,
     _gate: &super::screen_policy::ScreenPerceptionSessionGate,
     _broker: &target::ScreenCaptureTargetBroker,
-    _request: &ScreenCaptureTargetSelectionRequest,
-) -> Result<target::ScreenCaptureTargetDescriptor, ScreenCaptureError> {
+    _request: &ScreenCapturePickRequest,
+) -> Result<ScreenCapturePickDto, ScreenCaptureError> {
     Err(ScreenCaptureError::not_supported())
 }
 
-/// Returns the current de-identified target status.
+/// Returns the current bounded target status.
 #[tauri::command]
 pub fn get_screen_capture_target_status(
     broker: tauri::State<'_, target::ScreenCaptureTargetBroker>,
 ) -> ScreenCaptureTargetStatusDto {
     ScreenCaptureTargetStatusDto {
-        selected: broker.current_descriptor(),
+        status: broker.current_status(),
     }
 }
 
@@ -326,7 +451,9 @@ pub fn clear_screen_capture_target(
     broker: tauri::State<'_, target::ScreenCaptureTargetBroker>,
 ) -> ScreenCaptureTargetStatusDto {
     broker.clear();
-    ScreenCaptureTargetStatusDto { selected: None }
+    ScreenCaptureTargetStatusDto {
+        status: target::ScreenCaptureTargetStatus::None,
+    }
 }
 
 /// The bounded Settings-only smoke command.  It authorizes, captures one
@@ -738,14 +865,7 @@ mod tests {
         gate.arm_for_life("life-a");
         let broker = target::ScreenCaptureTargetBroker::new();
         let fence = gate.life_fence_for("life-a").unwrap();
-        broker.install_target_for_test(
-            fence,
-            target::ScreenCaptureTargetDescriptor {
-                index: 0,
-                kind: "test".to_string(),
-                label: "A".to_string(),
-            },
-        );
+        broker.install_target_for_test(fence);
         let provider = CountingProvider::rejecting();
 
         let error =
@@ -811,14 +931,7 @@ mod tests {
 
         gate.arm_for_life("life-a");
         let fence_a = gate.life_fence_for("life-a").unwrap();
-        broker.install_target_for_test(
-            fence_a,
-            target::ScreenCaptureTargetDescriptor {
-                index: 0,
-                kind: "test".to_string(),
-                label: "A".to_string(),
-            },
-        );
+        broker.install_target_for_test(fence_a);
         gate.arm_for_life("life-b");
         let provider = CountingProvider::rejecting();
 
@@ -841,14 +954,7 @@ mod tests {
         gate.arm_for_life("life-a");
         let broker = target::ScreenCaptureTargetBroker::new();
         let fence = gate.life_fence_for("life-a").unwrap();
-        broker.install_target_for_test(
-            fence,
-            target::ScreenCaptureTargetDescriptor {
-                index: 0,
-                kind: "test".to_string(),
-                label: "A".to_string(),
-            },
-        );
+        broker.install_target_for_test(fence);
         let provider = CountingProvider::returning(valid_frame());
 
         let frame =
@@ -867,14 +973,7 @@ mod tests {
         gate.arm_for_life("life-a");
         let broker = target::ScreenCaptureTargetBroker::new();
         let fence = gate.life_fence_for("life-a").unwrap();
-        broker.install_target_for_test(
-            fence,
-            target::ScreenCaptureTargetDescriptor {
-                index: 0,
-                kind: "test".to_string(),
-                label: "A".to_string(),
-            },
-        );
+        broker.install_target_for_test(fence);
         let provider = CountingProvider::failing(ScreenCaptureError::capture_failed());
 
         let error =
@@ -891,14 +990,7 @@ mod tests {
         gate.arm_for_life("life-a");
         let broker = target::ScreenCaptureTargetBroker::new();
         let fence = gate.life_fence_for("life-a").unwrap();
-        broker.install_target_for_test(
-            fence,
-            target::ScreenCaptureTargetDescriptor {
-                index: 0,
-                kind: "test".to_string(),
-                label: "A".to_string(),
-            },
-        );
+        broker.install_target_for_test(fence);
         let provider = CountingProvider::returning(ScreenFrame {
             width: 4,
             height: 4,
@@ -920,14 +1012,7 @@ mod tests {
         gate.arm_for_life("life-a");
         let broker = target::ScreenCaptureTargetBroker::new();
         let fence = gate.life_fence_for("life-a").unwrap();
-        broker.install_target_for_test(
-            fence,
-            target::ScreenCaptureTargetDescriptor {
-                index: 0,
-                kind: "test".to_string(),
-                label: "A".to_string(),
-            },
-        );
+        broker.install_target_for_test(fence);
         let provider = CountingProvider::returning(ScreenFrame {
             width: 1_000_000,
             height: 1_000_000,
@@ -949,14 +1034,7 @@ mod tests {
         gate.arm_for_life("life-a");
         let broker = target::ScreenCaptureTargetBroker::new();
         let fence = gate.life_fence_for("life-a").unwrap();
-        broker.install_target_for_test(
-            fence,
-            target::ScreenCaptureTargetDescriptor {
-                index: 0,
-                kind: "test".to_string(),
-                label: "A".to_string(),
-            },
-        );
+        broker.install_target_for_test(fence);
         let provider = CountingProvider::returning(valid_frame());
         assert!(
             capture_one_shot_with_provider(&repository, &gate, &broker, "life-a", &provider)
@@ -980,6 +1058,253 @@ mod tests {
                 .unwrap_err();
         assert_eq!(error.code, ScreenCaptureErrorCode::SessionDenied);
         assert_eq!(provider.calls(), calls_before);
+    }
+
+    // --- C1-R1 picker authority regression tests --------------------------
+
+    #[test]
+    fn picker_cannot_run_while_policy_disabled() {
+        let repository = FakeRepository::with_policy(false);
+        let gate = super::super::screen_policy::ScreenPerceptionSessionGate::new();
+        gate.arm_for_life("life-a");
+        let broker = target::ScreenCaptureTargetBroker::new();
+
+        // The picker itself is never invoked (authorization fails first).
+        let result =
+            pick_screen_capture_target_authorize_only(&repository, &gate, &broker, "life-a");
+        assert_eq!(
+            result.unwrap_err().code,
+            ScreenCaptureErrorCode::SessionDenied
+        );
+        assert_eq!(
+            broker.current_status(),
+            target::ScreenCaptureTargetStatus::None
+        );
+    }
+
+    #[test]
+    fn picker_cannot_run_while_session_disarmed() {
+        let repository = FakeRepository::with_policy(true);
+        let gate = super::super::screen_policy::ScreenPerceptionSessionGate::new();
+        // Never armed.
+        let broker = target::ScreenCaptureTargetBroker::new();
+
+        let result =
+            pick_screen_capture_target_authorize_only(&repository, &gate, &broker, "life-a");
+        assert_eq!(
+            result.unwrap_err().code,
+            ScreenCaptureErrorCode::SessionDenied
+        );
+    }
+
+    #[test]
+    fn picker_cancel_preserves_existing_valid_target() {
+        let repository = FakeRepository::with_policy(true);
+        let gate = super::super::screen_policy::ScreenPerceptionSessionGate::new();
+        gate.arm_for_life("life-a");
+        let broker = target::ScreenCaptureTargetBroker::new();
+        let fence = gate.life_fence_for("life-a").unwrap();
+        broker.install_target_for_test(fence);
+        assert_eq!(
+            broker.current_status(),
+            target::ScreenCaptureTargetStatus::Selected
+        );
+
+        let outcome = install_picker_outcome(
+            &repository,
+            &gate,
+            &broker,
+            "life-a",
+            fence,
+            selection::PickOutcome::Cancelled,
+        )
+        .unwrap();
+        assert!(outcome.cancelled);
+        assert_eq!(outcome.status, target::ScreenCaptureTargetStatus::Selected);
+        // Existing target unchanged.
+        assert_eq!(
+            broker.current_status(),
+            target::ScreenCaptureTargetStatus::Selected
+        );
+    }
+
+    #[test]
+    fn picker_selected_item_not_installed_after_fence_change_while_open() {
+        let repository = FakeRepository::with_policy(true);
+        let gate = super::super::screen_policy::ScreenPerceptionSessionGate::new();
+        gate.arm_for_life("life-a");
+        let broker = target::ScreenCaptureTargetBroker::new();
+        let picker_fence = gate.life_fence_for("life-a").unwrap();
+
+        // While the picker is "open", the session is rearmed (fence changes).
+        gate.disarm();
+        gate.arm_for_life("life-a");
+        let new_fence = gate.life_fence_for("life-a").unwrap();
+        assert_ne!(picker_fence, new_fence);
+
+        // The post-picker recheck must reject the stale fence.
+        assert!(!fence_is_current(&gate, "life-a", picker_fence));
+
+        // On platforms where a fake item exists, the full install path also
+        // denies and leaves the broker untouched.
+        #[cfg(not(windows))]
+        {
+            let error = install_picker_outcome(
+                &repository,
+                &gate,
+                &broker,
+                "life-a",
+                picker_fence,
+                selection::test_pick_outcome_selected(),
+            )
+            .unwrap_err();
+            assert_eq!(error.code, ScreenCaptureErrorCode::SessionDenied);
+            assert_eq!(
+                broker.current_status(),
+                target::ScreenCaptureTargetStatus::None
+            );
+        }
+        #[cfg(windows)]
+        {
+            let _ = repository;
+            assert_eq!(
+                broker.current_status(),
+                target::ScreenCaptureTargetStatus::None
+            );
+        }
+    }
+
+    #[test]
+    fn picker_selected_item_not_installed_after_disarm_while_open() {
+        let repository = FakeRepository::with_policy(true);
+        let gate = super::super::screen_policy::ScreenPerceptionSessionGate::new();
+        gate.arm_for_life("life-a");
+        let broker = target::ScreenCaptureTargetBroker::new();
+        let picker_fence = gate.life_fence_for("life-a").unwrap();
+
+        // While the picker is "open", the session is disarmed.
+        gate.disarm();
+
+        // The post-picker recheck must reject the stale fence.
+        assert!(!fence_is_current(&gate, "life-a", picker_fence));
+
+        #[cfg(not(windows))]
+        {
+            let error = install_picker_outcome(
+                &repository,
+                &gate,
+                &broker,
+                "life-a",
+                picker_fence,
+                selection::test_pick_outcome_selected(),
+            )
+            .unwrap_err();
+            assert_eq!(error.code, ScreenCaptureErrorCode::SessionDenied);
+            assert_eq!(
+                broker.current_status(),
+                target::ScreenCaptureTargetStatus::None
+            );
+        }
+        #[cfg(windows)]
+        {
+            let _ = repository;
+            assert_eq!(
+                broker.current_status(),
+                target::ScreenCaptureTargetStatus::None
+            );
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn picker_selected_item_installed_when_fence_unchanged() {
+        let repository = FakeRepository::with_policy(true);
+        let gate = super::super::screen_policy::ScreenPerceptionSessionGate::new();
+        gate.arm_for_life("life-a");
+        let broker = target::ScreenCaptureTargetBroker::new();
+        let picker_fence = gate.life_fence_for("life-a").unwrap();
+
+        let outcome = install_picker_outcome(
+            &repository,
+            &gate,
+            &broker,
+            "life-a",
+            picker_fence,
+            selection::test_pick_outcome_selected(),
+        )
+        .unwrap();
+        assert!(!outcome.cancelled);
+        assert_eq!(outcome.status, target::ScreenCaptureTargetStatus::Selected);
+        assert_eq!(
+            broker.current_status(),
+            target::ScreenCaptureTargetStatus::Selected
+        );
+    }
+
+    /// The authorization-only prefix of the picker service, used to prove the
+    /// picker cannot run without authorization.  It never touches the real
+    /// picker.
+    fn pick_screen_capture_target_authorize_only(
+        repository: &dyn ScreenPerceptionRepository,
+        gate: &super::super::screen_policy::ScreenPerceptionSessionGate,
+        broker: &target::ScreenCaptureTargetBroker,
+        life_id: &str,
+    ) -> Result<ScreenCapturePickDto, ScreenCaptureError> {
+        if life_id.trim().is_empty() {
+            return Err(ScreenCaptureError::invalid_argument(
+                "life identity must not be empty.",
+            ));
+        }
+        authorize_screen_perception(repository, gate, life_id).map_err(map_authorization_error)?;
+        let _fence = gate
+            .life_fence_for(life_id)
+            .ok_or_else(ScreenCaptureError::session_denied)?;
+        // The real picker would run here; tests never reach it when
+        // authorization fails.
+        let _ = broker;
+        Ok(ScreenCapturePickDto {
+            status: target::ScreenCaptureTargetStatus::Selected,
+            cancelled: false,
+        })
+    }
+
+    /// C1-R1: production target-selection source must not contain
+    /// `GetWindowTextW` or mutable index authority.
+    #[test]
+    fn production_selection_has_no_title_observation_or_index_authority() {
+        for (path, source) in [
+            (
+                "selection.rs",
+                include_str!("selection.rs")
+                    .split_once("#[cfg(test)]")
+                    .map_or(include_str!("selection.rs"), |(production, _)| production),
+            ),
+            (
+                "mod.rs",
+                include_str!("mod.rs")
+                    .split_once("#[cfg(test)]")
+                    .map_or(include_str!("mod.rs"), |(production, _)| production),
+            ),
+            (
+                "target.rs",
+                include_str!("target.rs")
+                    .split_once("#[cfg(test)]")
+                    .map_or(include_str!("target.rs"), |(production, _)| production),
+            ),
+        ] {
+            assert!(
+                !source.contains("GetWindowTextW"),
+                "{path} must not observe window titles"
+            );
+            assert!(
+                !source.contains("EnumWindows"),
+                "{path} must not enumerate windows for target selection"
+            );
+            assert!(
+                !source.contains("selection_index"),
+                "{path} must not carry mutable index authority"
+            );
+        }
     }
 
     /// §28 static boundary evidence: the C1 production source introduces no

@@ -2161,6 +2161,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "lancedb",
+ "raw-window-handle",
  "reqwest 0.12.28",
  "rusqlite",
  "rustls",
@@ -2177,6 +2178,7 @@ dependencies = [
  "url",
  "webpki-roots",
  "windows",
+ "windows-future",
  "windows-sys 0.61.2",
  "zeroize",
 ]

@@ -37,6 +37,13 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .register_uri_scheme_protocol(
+            storage::body_package::BODY_ASSET_PROTOCOL_SCHEME,
+            |context, request| {
+                let storage = context.app_handle().state::<storage::StorageService>();
+                storage::body_package::serve_body_asset_request(&storage, request)
+            },
+        )
         .setup(|app| {
             let storage = storage::StorageService::initialize(app.handle())
                 .map_err(|error| std::io::Error::other(error.message))?;
@@ -117,6 +124,11 @@ pub fn run() {
             storage::update_life_identity_base_info,
             storage::save_persona_template,
             storage::get_persona_template,
+            storage::body_package::install_live2d_body_package,
+            storage::body_package::list_body_packages,
+            storage::body_package::get_body_package,
+            storage::body_package::delete_body_package,
+            storage::body_package::get_body_package_registry_snapshot,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

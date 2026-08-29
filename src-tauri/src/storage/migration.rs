@@ -3,8 +3,8 @@ use std::{fs, path::Path, time::Duration};
 use rusqlite::{backup::Backup, params, Connection, OptionalExtension, Transaction};
 
 use super::{
-    autonomy, connection, experience_episode, generation_lifecycle_authority, life_intent,
-    perception, writer_fence_manifest, StorageError, MIGRATIONS,
+    autonomy, body_package, connection, experience_episode, generation_lifecycle_authority,
+    life_intent, perception, writer_fence_manifest, StorageError, MIGRATIONS,
 };
 
 pub(super) const LAST_STATIC_MIGRATION_VERSION: i64 = 12;
@@ -51,6 +51,8 @@ pub(super) const AUTONOMY_AUTHORITY_SCHEMA_VERSION: i64 = 23;
 const AUTONOMY_AUTHORITY_MIGRATION_NAME: &str = "023_autonomous_life_proactive_intent_authority";
 pub(super) const PERCEPTION_AUTHORITY_SCHEMA_VERSION: i64 = 24;
 const PERCEPTION_AUTHORITY_MIGRATION_NAME: &str = "024_perception_focus_policy_authority";
+pub(super) const BODY_PACKAGE_AUTHORITY_SCHEMA_VERSION: i64 = 25;
+const BODY_PACKAGE_AUTHORITY_MIGRATION_NAME: &str = "025_managed_body_package_authority";
 const ADD_CLAIMED_GENERATION_AUTHORITY_EPOCH_SQL: &str = "ALTER TABLE memory_vector_sync_outbox ADD COLUMN claimed_generation_authority_epoch INTEGER NULL CHECK (claimed_generation_authority_epoch IS NULL OR claimed_generation_authority_epoch >= 1)";
 const CREATE_GENERATION_AUTHORITY_TABLE_SQL: &str =
     "CREATE TABLE memory_vector_generation_authority (
@@ -251,6 +253,11 @@ pub(super) enum AutonomyAuthoritySchemaUpgrade {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum PerceptionAuthoritySchemaUpgrade {
+    Applied,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum BodyPackageAuthoritySchemaUpgrade {
     Applied,
 }
 
@@ -1888,6 +1895,61 @@ fn validate_perception_schema_objects(connection: &Connection) -> Result<(), Sto
     perception::validate_schema_objects(connection)
 }
 
+/// Schema 25 adds the SQLite-authoritative managed Live2D package registry.
+/// Package bytes remain outside SQLite, but no managed asset is trusted unless
+/// its package and manifest rows are registered atomically here.
+pub(super) fn apply_body_package_schema_upgrade(
+    transaction: &Transaction<'_>,
+) -> Result<BodyPackageAuthoritySchemaUpgrade, StorageError> {
+    if connection::read_schema_version(transaction)? != PERCEPTION_AUTHORITY_SCHEMA_VERSION {
+        return Err(StorageError::migration_version_invariant_failed());
+    }
+
+    for table_sql in body_package::MIGRATION_025_TABLE_SQLS {
+        transaction
+            .execute_batch(table_sql)
+            .map_err(|_| StorageError::migration_transaction_failed())?;
+    }
+    for trigger_sql in body_package::MIGRATION_025_TRIGGER_SQLS {
+        transaction
+            .execute_batch(trigger_sql)
+            .map_err(|_| StorageError::migration_transaction_failed())?;
+    }
+    writer_fence_manifest::install_body_package_writer_fence_manifest_in_transaction(transaction)?;
+
+    validate_body_package_schema_objects(transaction)?;
+    let migration_now: String = transaction
+        .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", [], |row| {
+            row.get(0)
+        })
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    transaction
+        .execute(
+            "INSERT INTO schema_migration (version,name,applied_at) VALUES (?1,?2,?3)",
+            params![
+                BODY_PACKAGE_AUTHORITY_SCHEMA_VERSION,
+                BODY_PACKAGE_AUTHORITY_MIGRATION_NAME,
+                migration_now
+            ],
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    validate_body_package_schema_objects(transaction)?;
+    Ok(BodyPackageAuthoritySchemaUpgrade::Applied)
+}
+
+pub(super) fn validate_body_package_schema(connection: &Connection) -> Result<(), StorageError> {
+    let schema_version = connection::read_schema_version(connection)?;
+    if schema_version < BODY_PACKAGE_AUTHORITY_SCHEMA_VERSION {
+        return Err(StorageError::migration_version_invariant_failed());
+    }
+    validate_body_package_schema_objects(connection)?;
+    writer_fence_manifest::validate_writer_fence_manifest_for_schema(connection, schema_version)
+}
+
+fn validate_body_package_schema_objects(connection: &Connection) -> Result<(), StorageError> {
+    body_package::validate_schema_objects(connection)
+}
+
 pub(super) fn validate_experience_episode_schema(
     connection: &Connection,
 ) -> Result<(), StorageError> {
@@ -2572,6 +2634,9 @@ pub(super) fn verify_schema_after_upgrade(
     }
     if expected_schema_version >= PERCEPTION_AUTHORITY_SCHEMA_VERSION {
         validate_perception_schema(connection)?;
+    }
+    if expected_schema_version >= BODY_PACKAGE_AUTHORITY_SCHEMA_VERSION {
+        validate_body_package_schema(connection)?;
     }
     if expected_schema_version >= writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION {
         #[cfg(test)]
@@ -3305,6 +3370,9 @@ pub fn verify_database(
     if expected_schema_version >= PERCEPTION_AUTHORITY_SCHEMA_VERSION {
         validate_perception_schema(connection)?;
     }
+    if expected_schema_version >= BODY_PACKAGE_AUTHORITY_SCHEMA_VERSION {
+        validate_body_package_schema(connection)?;
+    }
     if expected_schema_version >= writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION {
         writer_fence_manifest::validate_writer_fence_manifest(connection)?;
     }
@@ -3756,6 +3824,17 @@ mod transaction_tests {
         transaction.commit().unwrap();
     }
 
+    fn apply_body_package_authority_upgrade(connection: &mut Connection) {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert_eq!(
+            apply_body_package_schema_upgrade(&transaction).unwrap(),
+            BodyPackageAuthoritySchemaUpgrade::Applied
+        );
+        transaction.commit().unwrap();
+    }
+
     fn schema_twenty_one_connection() -> Connection {
         let mut connection = schema_twenty_connection();
         apply_experience_episode_upgrade(&mut connection);
@@ -3829,6 +3908,12 @@ mod transaction_tests {
         apply_perception_authority_upgrade(&mut connection);
         seed_verification_life(&connection);
         (connection, VERIFICATION_LIFE_ID)
+    }
+
+    fn schema_twenty_five_connection_with_current_life() -> (Connection, &'static str) {
+        let (mut connection, life_id) = schema_twenty_four_connection_with_current_life();
+        apply_body_package_authority_upgrade(&mut connection);
+        (connection, life_id)
     }
 
     fn weaken_perception_policy_guard(connection: &Connection) {
@@ -4624,10 +4709,10 @@ mod transaction_tests {
     }
 
     #[test]
-    fn migration_024_is_present_twenty_four_is_maximum_and_twenty_five_is_absent() {
+    fn migration_025_is_present_twenty_five_is_current_and_twenty_six_is_absent() {
         assert_eq!(
             super::super::connection::MAX_SUPPORTED_SCHEMA_VERSION,
-            PERCEPTION_AUTHORITY_SCHEMA_VERSION
+            BODY_PACKAGE_AUTHORITY_SCHEMA_VERSION
         );
         let migrations_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/storage/migrations");
         let entries = std::fs::read_dir(&migrations_dir).unwrap();
@@ -4642,7 +4727,7 @@ mod transaction_tests {
                 highest = highest.max(version);
             }
         }
-        assert_eq!(highest, 24, "Migration 024 must be the current migration");
+        assert_eq!(highest, 25, "Migration 025 must be the current migration");
         let names = std::fs::read_dir(&migrations_dir)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
@@ -4660,8 +4745,12 @@ mod transaction_tests {
             "Migration 024 must exist"
         );
         assert!(
-            !names.iter().any(|name| name.starts_with("025")),
-            "Migration 025 must not exist"
+            names.iter().any(|name| name.starts_with("025")),
+            "Migration 025 must exist"
+        );
+        assert!(
+            !names.iter().any(|name| name.starts_with("026")),
+            "Migration 026 must not exist"
         );
     }
 
@@ -5669,6 +5758,145 @@ mod transaction_tests {
         )
         .unwrap();
         assert_eq!(writer_fence_count(&connection), 87);
+    }
+
+    #[test]
+    fn migration_025_upgrades_schema_twenty_four_without_backfill_and_installs_full_manifest() {
+        let (mut connection, life_id) = schema_twenty_four_connection_with_current_life();
+        apply_body_package_authority_upgrade(&mut connection);
+
+        assert_eq!(
+            schema_version(&connection),
+            BODY_PACKAGE_AUTHORITY_SCHEMA_VERSION
+        );
+        validate_body_package_schema(&connection).unwrap();
+        assert_eq!(writer_fence_count(&connection), 99);
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM body_package", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM body_package_asset", [], |row| row
+                    .get::<_, i64>(0),)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM life_identity WHERE id=?1",
+                    [life_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_foreign_key_list('body_package')
+                     WHERE \"table\"='life_identity'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+            "body_package must not become a Life foreign-key child"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_foreign_key_list('body_package_asset')
+                     WHERE \"table\"='body_package' AND \"from\"='body_id'
+                       AND \"to\"='body_id' AND on_delete='CASCADE'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn migration_025_constraints_and_immutability_guards_are_authoritative() {
+        let (mut connection, _) = schema_twenty_four_connection_with_current_life();
+        apply_body_package_authority_upgrade(&mut connection);
+
+        assert!(connection
+            .execute(
+                "INSERT INTO body_package
+                 (body_id, display_name, presentation_kind, model_entry_path,
+                  package_content_hash, package_version, installed_at)
+                 VALUES ('live2d-not-hex', 'Invalid', 'live2d', 'avatar.model3.json',
+                         'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                         1, '2026-08-29T00:00:00.000Z')",
+                [],
+            )
+            .is_err());
+        connection
+            .execute(
+                "INSERT INTO body_package
+                 (body_id, display_name, presentation_kind, model_entry_path,
+                  package_content_hash, package_version, installed_at)
+                 VALUES ('live2d-abc', 'Test Body', 'live2d', 'avatar.model3.json',
+                         'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                         1, '2026-08-29T00:00:00.000Z')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO body_package_asset
+                 (body_id, relative_path, asset_kind, content_hash, size_bytes)
+                 VALUES ('live2d-abc', 'avatar.model3.json', 'model3',
+                         'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 2)",
+                [],
+            )
+            .unwrap();
+        assert!(connection
+            .execute(
+                "UPDATE body_package SET display_name='Changed' WHERE body_id='live2d-abc'",
+                [],
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("BODY_PACKAGE_IMMUTABLE"));
+        assert!(connection
+            .execute(
+                "UPDATE body_package_asset SET size_bytes=3
+                 WHERE body_id='live2d-abc' AND relative_path='avatar.model3.json'",
+                [],
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("BODY_PACKAGE_ASSET_IMMUTABLE"));
+
+        connection
+            .execute("DELETE FROM body_package WHERE body_id='live2d-abc'", [])
+            .unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM body_package_asset WHERE body_id='live2d-abc'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+            "asset rows must cascade only with their package"
+        );
+    }
+
+    #[test]
+    fn migration_025_generic_schema_verifiers_accept_valid_schema_twenty_five() {
+        let (connection, life_id) = schema_twenty_five_connection_with_current_life();
+        verify_schema_after_upgrade(&connection, BODY_PACKAGE_AUTHORITY_SCHEMA_VERSION).unwrap();
+        verify_database(&connection, BODY_PACKAGE_AUTHORITY_SCHEMA_VERSION, life_id).unwrap();
+        assert_eq!(writer_fence_count(&connection), 99);
     }
 
     #[test]

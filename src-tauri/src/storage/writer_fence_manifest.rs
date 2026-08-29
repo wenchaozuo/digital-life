@@ -17,6 +17,7 @@ pub(super) const EXPERIENCE_EPISODE_WRITER_FENCE_SCHEMA_VERSION: i64 = 21;
 pub(super) const LIFE_INTENT_WRITER_FENCE_SCHEMA_VERSION: i64 = 22;
 pub(super) const AUTONOMY_WRITER_FENCE_SCHEMA_VERSION: i64 = 23;
 pub(super) const PERCEPTION_WRITER_FENCE_SCHEMA_VERSION: i64 = 24;
+pub(super) const BODY_PACKAGE_WRITER_FENCE_SCHEMA_VERSION: i64 = 25;
 const WRITER_FENCE_TRIGGER_PREFIX: &str = "digital_life_writer_epoch_";
 const HISTORICAL_WRITER_FENCE_TRIGGER_COUNT: usize = 18;
 const LATE_DELETE_WRITER_FENCE_TRIGGER_COUNT: usize = 24;
@@ -28,6 +29,7 @@ const EXPERIENCE_EPISODE_WRITER_FENCE_TRIGGER_COUNT: usize = 60;
 const LIFE_INTENT_WRITER_FENCE_TRIGGER_COUNT: usize = 75;
 const AUTONOMY_WRITER_FENCE_TRIGGER_COUNT: usize = 87;
 const PERCEPTION_WRITER_FENCE_TRIGGER_COUNT: usize = 93;
+const BODY_PACKAGE_WRITER_FENCE_TRIGGER_COUNT: usize = 99;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(super) enum WriterFenceOperation {
@@ -622,6 +624,42 @@ const WRITER_FENCE_TRIGGER_SPECS: &[WriterFenceTriggerSpec] = &[
         Delete,
         "DELETE"
     ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_body_package_insert",
+        "body_package",
+        Insert,
+        "INSERT"
+    ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_body_package_update",
+        "body_package",
+        Update,
+        "UPDATE"
+    ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_body_package_delete",
+        "body_package",
+        Delete,
+        "DELETE"
+    ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_body_package_asset_insert",
+        "body_package_asset",
+        Insert,
+        "INSERT"
+    ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_body_package_asset_update",
+        "body_package_asset",
+        Update,
+        "UPDATE"
+    ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_body_package_asset_delete",
+        "body_package_asset",
+        Delete,
+        "DELETE"
+    ),
 ];
 
 pub(super) fn writer_fence_trigger_specs() -> &'static [WriterFenceTriggerSpec] {
@@ -674,6 +712,11 @@ pub(super) fn perception_writer_fence_trigger_specs() -> &'static [WriterFenceTr
         [AUTONOMY_WRITER_FENCE_TRIGGER_COUNT..PERCEPTION_WRITER_FENCE_TRIGGER_COUNT]
 }
 
+pub(super) fn body_package_writer_fence_trigger_specs() -> &'static [WriterFenceTriggerSpec] {
+    &WRITER_FENCE_TRIGGER_SPECS
+        [PERCEPTION_WRITER_FENCE_TRIGGER_COUNT..BODY_PACKAGE_WRITER_FENCE_TRIGGER_COUNT]
+}
+
 pub(super) fn install_life_intent_writer_fence_manifest_in_transaction(
     transaction: &Transaction<'_>,
 ) -> Result<(), StorageError> {
@@ -721,6 +764,25 @@ pub(super) fn install_perception_writer_fence_manifest_in_transaction(
         #[cfg(test)]
         if should_fail_trigger_install_at_for_test(AUTONOMY_WRITER_FENCE_TRIGGER_COUNT + index + 1)
         {
+            return Err(StorageError::migration_transaction_failed());
+        }
+        transaction
+            .execute_batch(spec.ddl)
+            .map_err(|_| StorageError::migration_transaction_failed())?;
+    }
+    Ok(())
+}
+
+pub(super) fn install_body_package_writer_fence_manifest_in_transaction(
+    transaction: &Transaction<'_>,
+) -> Result<(), StorageError> {
+    for (index, spec) in body_package_writer_fence_trigger_specs().iter().enumerate() {
+        #[cfg(not(test))]
+        let _ = index;
+        #[cfg(test)]
+        if should_fail_trigger_install_at_for_test(
+            PERCEPTION_WRITER_FENCE_TRIGGER_COUNT + index + 1,
+        ) {
             return Err(StorageError::migration_transaction_failed());
         }
         transaction
@@ -900,8 +962,10 @@ pub(super) fn validate_writer_fence_manifest_for_schema(
         })
         .map_err(|_| StorageError::writer_fence_manifest_mismatch())?;
 
-    let expected = if schema_version >= PERCEPTION_WRITER_FENCE_SCHEMA_VERSION {
+    let expected = if schema_version >= BODY_PACKAGE_WRITER_FENCE_SCHEMA_VERSION {
         WRITER_FENCE_TRIGGER_SPECS
+    } else if schema_version >= PERCEPTION_WRITER_FENCE_SCHEMA_VERSION {
+        &WRITER_FENCE_TRIGGER_SPECS[..PERCEPTION_WRITER_FENCE_TRIGGER_COUNT]
     } else if schema_version >= AUTONOMY_WRITER_FENCE_SCHEMA_VERSION {
         &WRITER_FENCE_TRIGGER_SPECS[..AUTONOMY_WRITER_FENCE_TRIGGER_COUNT]
     } else if schema_version >= LIFE_INTENT_WRITER_FENCE_SCHEMA_VERSION {
@@ -1047,7 +1111,18 @@ mod tests {
         let connection = authorized_connection(&path);
         connection
             .execute_batch(
-                "DROP TRIGGER IF EXISTS digital_life_writer_epoch_life_perception_policy_event_insert;
+                "DROP TRIGGER IF EXISTS digital_life_writer_epoch_body_package_asset_insert;
+                 DROP TRIGGER IF EXISTS digital_life_writer_epoch_body_package_asset_update;
+                 DROP TRIGGER IF EXISTS digital_life_writer_epoch_body_package_asset_delete;
+                 DROP TRIGGER IF EXISTS digital_life_writer_epoch_body_package_insert;
+                 DROP TRIGGER IF EXISTS digital_life_writer_epoch_body_package_update;
+                 DROP TRIGGER IF EXISTS digital_life_writer_epoch_body_package_delete;
+                 DROP TRIGGER IF EXISTS body_package_asset_immutable_guard;
+                 DROP TRIGGER IF EXISTS body_package_immutable_guard;
+                 DROP TABLE IF EXISTS body_package_asset;
+                 DROP TABLE IF EXISTS body_package;
+                 DELETE FROM schema_migration WHERE version = 25;
+                 DROP TRIGGER IF EXISTS digital_life_writer_epoch_life_perception_policy_event_insert;
                  DROP TRIGGER IF EXISTS digital_life_writer_epoch_life_perception_policy_event_update;
                  DROP TRIGGER IF EXISTS digital_life_writer_epoch_life_perception_policy_event_delete;
                  DROP TRIGGER IF EXISTS digital_life_writer_epoch_life_perception_policy_insert;
@@ -1090,7 +1165,18 @@ mod tests {
         let connection = authorized_connection(&path);
         connection
             .execute_batch(
-                "DROP TRIGGER IF EXISTS digital_life_writer_epoch_life_perception_policy_event_insert;
+                "DROP TRIGGER IF EXISTS digital_life_writer_epoch_body_package_asset_insert;
+                 DROP TRIGGER IF EXISTS digital_life_writer_epoch_body_package_asset_update;
+                 DROP TRIGGER IF EXISTS digital_life_writer_epoch_body_package_asset_delete;
+                 DROP TRIGGER IF EXISTS digital_life_writer_epoch_body_package_insert;
+                 DROP TRIGGER IF EXISTS digital_life_writer_epoch_body_package_update;
+                 DROP TRIGGER IF EXISTS digital_life_writer_epoch_body_package_delete;
+                 DROP TRIGGER IF EXISTS body_package_asset_immutable_guard;
+                 DROP TRIGGER IF EXISTS body_package_immutable_guard;
+                 DROP TABLE IF EXISTS body_package_asset;
+                 DROP TABLE IF EXISTS body_package;
+                 DELETE FROM schema_migration WHERE version = 25;
+                 DROP TRIGGER IF EXISTS digital_life_writer_epoch_life_perception_policy_event_insert;
                  DROP TRIGGER IF EXISTS digital_life_writer_epoch_life_perception_policy_event_update;
                  DROP TRIGGER IF EXISTS digital_life_writer_epoch_life_perception_policy_event_delete;
                  DROP TRIGGER IF EXISTS digital_life_writer_epoch_life_perception_policy_insert;
@@ -1681,7 +1767,7 @@ mod tests {
         assert_eq!(experience_episode_writer_fence_trigger_specs().len(), 3);
         assert_eq!(life_intent_writer_fence_trigger_specs().len(), 15);
         assert_eq!(autonomy_writer_fence_trigger_specs().len(), 12);
-        assert_eq!(WRITER_FENCE_TRIGGER_SPECS.len(), 93);
+        assert_eq!(WRITER_FENCE_TRIGGER_SPECS.len(), 99);
         let resolution_id = late_delete_resolution_insert(&authorized).unwrap();
         assert_eq!(resolution_id, 1);
         assert_eq!(authorized.execute("UPDATE memory_vector_late_delete_resolution SET updated_at='2026-01-02T00:00:00.000Z' WHERE memory_id='late-resolution'", []).unwrap(), 1);
@@ -1985,9 +2071,9 @@ mod tests {
         let (_root, path) = initialized_fenced_database();
         let authorized = authorized_connection(&path);
         seed_protected_rows(&authorized);
-        assert_eq!(WRITER_FENCE_TRIGGER_SPECS.len(), 93);
+        assert_eq!(WRITER_FENCE_TRIGGER_SPECS.len(), 99);
         let reserved: i64 = authorized.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type='trigger' AND name LIKE 'digital_life_writer_epoch_%'", [], |r| r.get(0)).unwrap();
-        assert_eq!(reserved, 93);
+        assert_eq!(reserved, 99);
         for name in [
             "memory_vector_generation_semantic_delete_guard",
             "memory_vector_generation_semantic_identity_guard",
@@ -2215,14 +2301,34 @@ mod tests {
     }
 
     #[test]
-    fn schema_24_writer_fence_manifest_adds_exactly_six_perception_operations() {
+    fn schema_25_writer_fence_manifest_adds_exactly_six_body_package_operations_after_perception() {
         let (_root, path) = initialized_fenced_database();
         let authorized = authorized_connection(&path);
         validate_writer_fence_manifest(&authorized).unwrap();
         assert_eq!(autonomy_writer_fence_trigger_specs().len(), 12);
         assert_eq!(perception_writer_fence_trigger_specs().len(), 6);
-        assert_eq!(WRITER_FENCE_TRIGGER_SPECS.len(), 93);
+        assert_eq!(WRITER_FENCE_TRIGGER_SPECS.len(), 99);
         for table in ["life_perception_policy", "life_perception_policy_event"] {
+            for operation in ["insert", "update", "delete"] {
+                let count: i64 = authorized
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_schema
+                         WHERE type='trigger'
+                           AND name = ?1
+                           AND tbl_name = ?2
+                           AND sql LIKE ?3",
+                        params![
+                            format!("digital_life_writer_epoch_{table}_{operation}"),
+                            table,
+                            format!("%BEFORE {} ON {table}%", operation.to_ascii_uppercase())
+                        ],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(count, 1, "{table} {operation} fence must exist");
+            }
+        }
+        for table in ["body_package", "body_package_asset"] {
             for operation in ["insert", "update", "delete"] {
                 let count: i64 = authorized
                     .query_row(

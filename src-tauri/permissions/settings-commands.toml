@@ -34,4 +34,9 @@ commands.allow = [
     "start_fenced_vector_sync_drain",
     "pause_memory_vector_sync",
     "retry_memory_vector_sync_failures",
+    "install_live2d_body_package",
+    "list_body_packages",
+    "get_body_package",
+    "delete_body_package",
+    "get_body_package_registry_snapshot",
 ]

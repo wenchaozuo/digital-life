@@ -38,6 +38,16 @@ export type { BodyRenderResult } from "./bodyRenderCoordinator.ts";
 export { BodyRendererError, BodyRendererHost } from "./bodyRenderer.ts";
 export type { BodyRenderer } from "./bodyRenderer.ts";
 export { PngBodyRenderer } from "./pngBodyRenderer.ts";
+export {
+  BodyPackageService,
+  bodyPackageService,
+} from "./bodyPackageService.ts";
+export type {
+  BodyPackageAssetSnapshot,
+  BodyPackageStatus,
+  InstallLive2DBodyPackageRequest,
+  InstalledBodyPackageSnapshot,
+} from "./bodyPackageService.ts";
 export function createDefaultBodyRenderer(): BodyRenderer {
   return new FallbackBodyRenderer(
     new PngBodyRenderer(),

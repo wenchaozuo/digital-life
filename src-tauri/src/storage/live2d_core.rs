@@ -234,6 +234,14 @@ fn core_corrupt() -> StorageError {
     )
 }
 
+fn core_activation_deferred() -> StorageError {
+    core_error(
+        "LIVE2D_CORE_RESTART_REQUIRED",
+        "A full application restart is required before the managed Cubism Core may be activated.",
+        true,
+    )
+}
+
 fn unsafe_path() -> StorageError {
     core_error(
         "LIVE2D_CORE_UNSAFE_PATH",
@@ -585,6 +593,16 @@ fn snapshot_for_status(
             restart_required,
         };
     }
+    if restart_required {
+        return ManagedCubismCoreSnapshot {
+            status: ManagedCubismCoreStatus::RestartRequired,
+            runtime_family: component.runtime_family.clone(),
+            version_label: Some(component.version_label.clone()),
+            sha256: Some(component.sha256.clone()),
+            script_url: None,
+            restart_required: true,
+        };
+    }
     ManagedCubismCoreSnapshot {
         status: ManagedCubismCoreStatus::ReadyForStartup,
         runtime_family: component.runtime_family.clone(),
@@ -679,7 +697,7 @@ impl StorageService {
         &self,
     ) -> Result<ManagedCubismCoreSnapshot, StorageError> {
         let allowlist = Box::leak(test_approved_cores().into_boxed_slice());
-        self.get_cubism_core_snapshot_with_allowlist(allowlist, false)
+        self.get_cubism_core_snapshot_with_allowlist(allowlist)
     }
 
     fn import_cubism_core_with_allowlist(
@@ -797,17 +815,21 @@ impl StorageService {
         if had_previous {
             let _ = fs::remove_file(&backup_path);
         }
-        self.get_cubism_core_snapshot_with_allowlist(allowlist, true)
+        // The durable registration is successful, but this process must not
+        // activate the newly installed bytes.  The flag is intentionally
+        // process-local and resets only when a new StorageService/process is
+        // initialized.
+        self.mark_core_activation_restart_required();
+        self.get_cubism_core_snapshot_with_allowlist(allowlist)
     }
 
     pub fn get_cubism_core_snapshot(&self) -> Result<ManagedCubismCoreSnapshot, StorageError> {
-        self.get_cubism_core_snapshot_with_allowlist(PRODUCTION_APPROVED_CORES, false)
+        self.get_cubism_core_snapshot_with_allowlist(PRODUCTION_APPROVED_CORES)
     }
 
     fn get_cubism_core_snapshot_with_allowlist(
         &self,
         allowlist: &[ApprovedCubismCore],
-        restart_required: bool,
     ) -> Result<ManagedCubismCoreSnapshot, StorageError> {
         let state = self.state().map_err(|_| database_unavailable())?;
         let active_root = state.active_root.clone();
@@ -816,7 +838,7 @@ impl StorageService {
         Ok(snapshot_for_status(
             &active_root,
             component.as_ref(),
-            restart_required,
+            self.core_activation_requires_restart(),
             allowlist,
         ))
     }
@@ -914,6 +936,9 @@ fn parse_fixed_core_uri(uri: &tauri::http::Uri) -> bool {
 fn load_servable_core_bytes(
     storage: &StorageService,
 ) -> Result<(Vec<u8>, RegisteredCoreComponent), StorageError> {
+    if storage.core_activation_requires_restart() {
+        return Err(core_activation_deferred());
+    }
     let state = storage.state().map_err(|_| database_unavailable())?;
     let active_root = state.active_root.clone();
     let component =
@@ -935,6 +960,9 @@ fn serve_core_request_for_test(
     }
     if !parse_fixed_core_uri(request.uri()) {
         return empty_core_response(StatusCode::FORBIDDEN);
+    }
+    if storage.core_activation_requires_restart() {
+        return empty_core_response(StatusCode::NOT_FOUND);
     }
     let state = storage.state().map_err(|_| database_unavailable());
     let Ok(state) = state else {
@@ -1101,6 +1129,10 @@ mod tests {
                 .join(CORE_FIXED_RESOURCE_NAME)
         }
 
+        fn reopen(&self) -> StorageService {
+            StorageService::initialize_with_roots(self.root.path().join("data"), None).unwrap()
+        }
+
         fn request(&self, method: Method, uri: &str) -> Request<Vec<u8>> {
             Request::builder()
                 .method(method)
@@ -1152,16 +1184,30 @@ mod tests {
             .storage
             .import_cubism_core_with_test_allowlist(request)
             .unwrap();
-        assert_eq!(snapshot.status, ManagedCubismCoreStatus::ReadyForStartup);
+        assert_eq!(snapshot.status, ManagedCubismCoreStatus::RestartRequired);
         assert_eq!(
             snapshot.sha256.as_deref(),
             Some(test_fixture_sha256().as_str())
         );
-        assert!(snapshot.script_url.is_some());
+        assert!(snapshot.script_url.is_none());
         assert!(
             snapshot.restart_required,
-            "activation requires a fresh WebView"
+            "activation requires a fresh application process"
         );
+
+        let refreshed = fixture
+            .storage
+            .get_cubism_core_snapshot_with_test_allowlist()
+            .unwrap();
+        assert_eq!(refreshed.status, ManagedCubismCoreStatus::RestartRequired);
+        assert!(refreshed.script_url.is_none());
+        assert!(refreshed.restart_required);
+
+        let response = serve_core_request_for_test(
+            &fixture.storage,
+            fixture.request(Method::GET, &windows_core_uri()),
+        );
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
         // The same file is not approved by the production authority.
         let production_request = ImportCubismCoreRequest {
@@ -1172,6 +1218,64 @@ mod tests {
             .import_cubism_core(production_request)
             .unwrap_err();
         assert_eq!(error.code, "LIVE2D_CORE_UNAPPROVED");
+    }
+
+    #[test]
+    fn fresh_storage_service_reactivates_only_after_process_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let data_root = root.path().join("data");
+        let source_dir = root.path().join("source");
+        fs::create_dir(&source_dir).unwrap();
+        let source = source_dir.join(CORE_FIXED_RESOURCE_NAME);
+        fs::write(&source, TEST_FIXTURE_CORE_BYTES).unwrap();
+        let request = || {
+            Request::builder()
+                .method(Method::GET)
+                .uri(windows_core_uri())
+                .body(Vec::new())
+                .unwrap()
+        };
+
+        let storage_a = StorageService::initialize_with_roots(data_root.clone(), None).unwrap();
+        let imported = storage_a
+            .import_cubism_core_with_test_allowlist(ImportCubismCoreRequest {
+                source_path: source.to_string_lossy().into_owned(),
+            })
+            .unwrap();
+        assert_eq!(imported.status, ManagedCubismCoreStatus::RestartRequired);
+        assert!(imported.script_url.is_none());
+        assert_eq!(
+            serve_core_request_for_test(&storage_a, request()).status(),
+            StatusCode::NOT_FOUND
+        );
+        drop(storage_a);
+
+        let storage_b = StorageService::initialize_with_roots(data_root, None).unwrap();
+        let ready = storage_b
+            .get_cubism_core_snapshot_with_test_allowlist()
+            .unwrap();
+        assert_eq!(ready.status, ManagedCubismCoreStatus::ReadyForStartup);
+        assert!(!ready.restart_required);
+        assert!(ready.script_url.is_some());
+        assert_eq!(
+            serve_core_request_for_test(&storage_b, request()).status(),
+            StatusCode::OK
+        );
+
+        // Even an identical replacement is a new install operation owned by
+        // this process and therefore cannot hot-activate.
+        let replacement = storage_b
+            .import_cubism_core_with_test_allowlist(ImportCubismCoreRequest {
+                source_path: source.to_string_lossy().into_owned(),
+            })
+            .unwrap();
+        assert_eq!(replacement.status, ManagedCubismCoreStatus::RestartRequired);
+        assert!(replacement.restart_required);
+        assert!(replacement.script_url.is_none());
+        assert_eq!(
+            serve_core_request_for_test(&storage_b, request()).status(),
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[test]
@@ -1264,7 +1368,7 @@ mod tests {
                 .get_cubism_core_snapshot_with_test_allowlist()
                 .unwrap()
                 .status,
-            ManagedCubismCoreStatus::ReadyForStartup
+            ManagedCubismCoreStatus::RestartRequired
         );
 
         fs::remove_file(fixture.active_core_path()).unwrap();
@@ -1320,9 +1424,19 @@ mod tests {
             );
         }
 
-        // Fixed resource is served to main with the correct MIME.
+        // The installing process cannot serve executable Core bytes before a
+        // restart, even for Main.
         let response = serve_core_request_for_test(
             &fixture.storage,
+            fixture.request(Method::GET, &windows_core_uri()),
+        );
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // A fresh StorageService represents the next application process and
+        // can serve the same persisted, verified Core.
+        let restarted = fixture.reopen();
+        let response = serve_core_request_for_test(
+            &restarted,
             fixture.request(Method::GET, &windows_core_uri()),
         );
         assert_eq!(response.status(), StatusCode::OK);
@@ -1338,7 +1452,7 @@ mod tests {
 
         // The mac/linux origin shape is also accepted.
         let response = serve_core_request_for_test(
-            &fixture.storage,
+            &restarted,
             fixture.request(Method::GET, &mac_linux_core_uri()),
         );
         assert_eq!(response.status(), StatusCode::OK);
@@ -1350,10 +1464,8 @@ mod tests {
             "digital-life-core://localhost/other.js".to_string(),
             "http://digital-life-core.localhost/live2dcubismcore.min.js?x=1".to_string(),
         ] {
-            let response = serve_core_request_for_test(
-                &fixture.storage,
-                fixture.request(Method::GET, &bad_uri),
-            );
+            let response =
+                serve_core_request_for_test(&restarted, fixture.request(Method::GET, &bad_uri));
             assert_ne!(
                 response.status(),
                 StatusCode::OK,
@@ -1364,7 +1476,7 @@ mod tests {
         // A corrupted managed file cannot be served.
         fs::write(fixture.active_core_path(), b"corrupted").unwrap();
         let response = serve_core_request_for_test(
-            &fixture.storage,
+            &restarted,
             fixture.request(Method::GET, &windows_core_uri()),
         );
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -1453,7 +1565,7 @@ mod tests {
                 .get_cubism_core_snapshot_with_test_allowlist()
                 .unwrap()
                 .status,
-            ManagedCubismCoreStatus::ReadyForStartup
+            ManagedCubismCoreStatus::RestartRequired
         );
         let previous_sha = test_fixture_sha256();
 
@@ -1484,11 +1596,11 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, "LIVE2D_CORE_REGISTRATION_FAILED");
 
-        // Original SQLite row and managed bytes are restored; status stays
-        // ReadyForStartup under the test allowlist and the original Core is
-        // still serveable.
-        let snapshot = fixture
-            .storage
+        // Original SQLite row and managed bytes are restored.  The current
+        // process remains fenced because its earlier successful import still
+        // requires restart; a fresh service sees the preserved Core as ready.
+        let restarted = fixture.reopen();
+        let snapshot = restarted
             .get_cubism_core_snapshot_with_test_allowlist()
             .unwrap();
         assert_eq!(snapshot.status, ManagedCubismCoreStatus::ReadyForStartup);
@@ -1499,7 +1611,7 @@ mod tests {
             "the original managed bytes must be restored"
         );
         let response = serve_core_request_for_test(
-            &fixture.storage,
+            &restarted,
             fixture.request(Method::GET, &windows_core_uri()),
         );
         assert_eq!(response.status(), StatusCode::OK);
@@ -1508,7 +1620,7 @@ mod tests {
     #[test]
     fn promotion_failure_with_successful_restore_preserves_previous_authority() {
         let fixture = Fixture::new();
-        // 1. Install a valid Core A and verify ReadyForStartup.
+        // 1. Install a valid Core A; the installing process is restart-fenced.
         let core_a = fixture.write_core(TEST_FIXTURE_CORE_BYTES);
         fixture
             .storage
@@ -1522,7 +1634,7 @@ mod tests {
                 .get_cubism_core_snapshot_with_test_allowlist()
                 .unwrap()
                 .status,
-            ManagedCubismCoreStatus::ReadyForStartup
+            ManagedCubismCoreStatus::RestartRequired
         );
         let previous_sha = test_fixture_sha256();
 
@@ -1553,10 +1665,10 @@ mod tests {
         assert_eq!(error.code, "LIVE2D_CORE_IMPORT_COPY_FAILED");
 
         // 7. SQLite still references Core A; 8. the active managed bytes
-        // equal Core A; 9. status remains ReadyForStartup; 10. Core A remains
-        // serveable.
-        let snapshot = fixture
-            .storage
+        // equal Core A; a fresh service sees the preserved Core as ready and
+        // can serve it.
+        let restarted = fixture.reopen();
+        let snapshot = restarted
             .get_cubism_core_snapshot_with_test_allowlist()
             .unwrap();
         assert_eq!(snapshot.status, ManagedCubismCoreStatus::ReadyForStartup);
@@ -1567,7 +1679,7 @@ mod tests {
             "the previous managed bytes must be restored and proven"
         );
         let response = serve_core_request_for_test(
-            &fixture.storage,
+            &restarted,
             fixture.request(Method::GET, &windows_core_uri()),
         );
         assert_eq!(response.status(), StatusCode::OK);

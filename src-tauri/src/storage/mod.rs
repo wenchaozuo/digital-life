@@ -86,7 +86,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Mutex, MutexGuard,
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -440,6 +440,9 @@ pub(crate) struct OutboxSyncHealthAggregate {
 pub struct StorageService {
     state: Mutex<StorageState>,
     location: StorageLocationResolver,
+    /// Process-local fence preventing a newly installed Core from becoming
+    /// executable until the next application process owns the service.
+    core_activation_restart_required: AtomicBool,
     #[cfg(test)]
     candidate_confirmation_panic_failpoint: Mutex<Option<candidate_memory::D4PanicFailpoint>>,
     #[cfg(test)]
@@ -477,6 +480,7 @@ impl StorageService {
                 database_path,
             }),
             location,
+            core_activation_restart_required: AtomicBool::new(false),
             #[cfg(test)]
             candidate_confirmation_panic_failpoint: Mutex::new(None),
             #[cfg(test)]
@@ -495,6 +499,16 @@ impl StorageService {
 
     fn state(&self) -> Result<MutexGuard<'_, StorageState>, StorageError> {
         self.state.lock().map_err(StorageError::database)
+    }
+
+    pub(crate) fn core_activation_requires_restart(&self) -> bool {
+        self.core_activation_restart_required
+            .load(Ordering::Acquire)
+    }
+
+    pub(crate) fn mark_core_activation_restart_required(&self) {
+        self.core_activation_restart_required
+            .store(true, Ordering::Release);
     }
 
     pub(crate) fn inspect_outbox_sync_health(

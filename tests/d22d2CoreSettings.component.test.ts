@@ -23,7 +23,11 @@ function makeLife(): LifeIdentity {
 }
 
 function snapshot(
-  status: "not-configured" | "ready-for-startup" | "corrupt-unavailable" = "not-configured",
+  status:
+    | "not-configured"
+    | "ready-for-startup"
+    | "corrupt-unavailable"
+    | "restart-required" = "not-configured",
   restartRequired = false,
 ) {
   return {
@@ -120,12 +124,14 @@ describe("D22-D2 Live2D Core Settings", () => {
   });
 
   it("installs an approved Core, shows restart required, and discards the source path", async () => {
-    const { wrapper, dialog, core } = await mountCoreSettings();
+    const { wrapper, dialog, core, getSnapshot } = await mountCoreSettings();
     const selectedPath = "C:\\sdk\\live2dcubismcore.min.js";
     vi.mocked(dialog.open).mockResolvedValue(selectedPath);
     const install = vi
       .spyOn(core.live2dCoreSettingsService, "install")
-      .mockResolvedValue(snapshot("ready-for-startup", true));
+      .mockResolvedValue(snapshot("restart-required", true));
+    getSnapshot.mockResolvedValue(snapshot("restart-required", true));
+    getSnapshot.mockClear();
     try {
       await wrapper.get("[data-testid='install-cubism-core']").trigger("click");
       await flushMicrotasks();
@@ -135,6 +141,16 @@ describe("D22-D2 Live2D Core Settings", () => {
       expect(wrapper.text()).toContain("Verified Cubism Core installed.");
       expect(wrapper.text()).toContain("full application exit and restart");
       expect(wrapper.text()).not.toContain(selectedPath);
+
+      await wrapper.get("[data-testid='refresh-cubism-core']").trigger("click");
+      await flushMicrotasks();
+      expect(getSnapshot).toHaveBeenCalledTimes(1);
+      expect(wrapper.get("[data-testid='live2d-core-status']").text()).toBe(
+        "Restart required",
+      );
+      expect(wrapper.get("[data-testid='live2d-core-restart-required']").text()).toBe(
+        "Yes",
+      );
     } finally {
       wrapper.unmount();
     }

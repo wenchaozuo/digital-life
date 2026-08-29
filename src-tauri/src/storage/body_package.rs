@@ -23,9 +23,16 @@ use url::Url;
 use super::{unique_suffix, StorageError, StorageService};
 
 pub(crate) const BODY_ASSET_PROTOCOL_SCHEME: &str = "digital-life-body";
+pub(crate) const BODY_RENDERER_WEBVIEW_LABEL: &str = "main";
 pub(crate) const MANAGED_BODIES_DIRECTORY: &str = "bodies";
 pub(crate) const MANAGED_STAGING_DIRECTORY: &str = "staging";
 pub(crate) const MANAGED_PACKAGES_DIRECTORY: &str = "packages";
+
+#[cfg(any(test, target_os = "windows", target_os = "android"))]
+const WINDOWS_ANDROID_BODY_ASSET_ORIGIN: &str = "http://digital-life-body.localhost/";
+#[cfg(any(test, not(any(target_os = "windows", target_os = "android"))))]
+const MAC_LINUX_BODY_ASSET_ORIGIN: &str = "digital-life-body://localhost/";
+const BODY_ASSET_CORS_ALLOW_ORIGIN: &str = "*";
 
 /// V1 package limits are intentionally centralized and applied to actual
 /// bytes read, not only to filesystem metadata or JSON-declared sizes.
@@ -1110,13 +1117,23 @@ fn package_is_available(active_root: &Path, package: &RegisteredPackage) -> bool
     package_content_hash(&manifest) == package.package_content_hash
 }
 
-fn body_asset_url(body_id: &str, relative_path: &str) -> Option<String> {
+#[cfg(any(target_os = "windows", target_os = "android"))]
+fn body_asset_origin() -> &'static str {
+    WINDOWS_ANDROID_BODY_ASSET_ORIGIN
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "android")))]
+fn body_asset_origin() -> &'static str {
+    MAC_LINUX_BODY_ASSET_ORIGIN
+}
+
+fn body_asset_url_for_origin(origin: &str, body_id: &str, relative_path: &str) -> Option<String> {
     if !is_valid_body_id(body_id)
         || normalize_reference(relative_path, false).ok()? != relative_path
     {
         return None;
     }
-    let mut url = Url::parse(&format!("{BODY_ASSET_PROTOCOL_SCHEME}://localhost/")).ok()?;
+    let mut url = Url::parse(origin).ok()?;
     {
         let mut segments = url.path_segments_mut().ok()?;
         segments.push(body_id);
@@ -1125,6 +1142,10 @@ fn body_asset_url(body_id: &str, relative_path: &str) -> Option<String> {
         }
     }
     Some(url.to_string())
+}
+
+fn body_asset_url(body_id: &str, relative_path: &str) -> Option<String> {
+    body_asset_url_for_origin(body_asset_origin(), body_id, relative_path)
 }
 
 fn snapshot_for_package(
@@ -1428,6 +1449,17 @@ fn serve_registered_asset(
     Ok((bytes, mime_type(asset_kind)))
 }
 
+pub(crate) fn serve_body_asset_request_for_webview(
+    storage: &StorageService,
+    webview_label: &str,
+    request: Request<Vec<u8>>,
+) -> Response<Vec<u8>> {
+    if webview_label != BODY_RENDERER_WEBVIEW_LABEL {
+        return empty_asset_response(StatusCode::FORBIDDEN);
+    }
+    serve_body_asset_request(storage, request)
+}
+
 pub(crate) fn serve_body_asset_request(
     storage: &StorageService,
     request: Request<Vec<u8>>,
@@ -1453,6 +1485,7 @@ pub(crate) fn serve_body_asset_request(
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, mime)
         .header(header::CONTENT_LENGTH, content_length)
+        .header("Access-Control-Allow-Origin", BODY_ASSET_CORS_ALLOW_ORIGIN)
         .header(header::CACHE_CONTROL, "no-store")
         .body(body)
         .expect("fixed body asset response must be valid")
@@ -1747,6 +1780,31 @@ mod tests {
         format!("{BODY_ASSET_PROTOCOL_SCHEME}://localhost/{body_id}/{path}")
     }
 
+    #[test]
+    fn body_asset_url_uses_platform_origin_and_encodes_path_components() {
+        let body_id = "live2d-deadbeef";
+        let relative_path = "Textures/face one.png";
+        assert_eq!(
+            body_asset_url_for_origin(WINDOWS_ANDROID_BODY_ASSET_ORIGIN, body_id, relative_path,)
+                .unwrap(),
+            "http://digital-life-body.localhost/live2d-deadbeef/Textures/face%20one.png"
+        );
+        assert_eq!(
+            body_asset_url_for_origin(MAC_LINUX_BODY_ASSET_ORIGIN, body_id, relative_path).unwrap(),
+            "digital-life-body://localhost/live2d-deadbeef/Textures/face%20one.png"
+        );
+        #[cfg(any(target_os = "windows", target_os = "android"))]
+        assert_eq!(
+            body_asset_url(body_id, relative_path).unwrap(),
+            "http://digital-life-body.localhost/live2d-deadbeef/Textures/face%20one.png"
+        );
+        #[cfg(not(any(target_os = "windows", target_os = "android")))]
+        assert_eq!(
+            body_asset_url(body_id, relative_path).unwrap(),
+            "digital-life-body://localhost/live2d-deadbeef/Textures/face%20one.png"
+        );
+    }
+
     fn assert_no_managed_children(path: &Path) {
         let children = fs::read_dir(path)
             .unwrap()
@@ -1766,9 +1824,10 @@ mod tests {
         assert!(is_valid_body_id(&package.body_id));
         assert_eq!(package.presentation_kind, "live2d");
         assert_eq!(package.status, BodyPackageStatus::Available);
-        assert!(package
-            .model_entry
-            .starts_with("digital-life-body://localhost/"));
+        assert_eq!(
+            package.model_entry,
+            body_asset_url(&package.body_id, "avatar.model3.json").unwrap()
+        );
         assert_eq!(package.assets.len(), 9);
         let asset_paths = package
             .assets
@@ -2324,6 +2383,15 @@ mod tests {
             model_response.body(),
             &fs::read(&fixture.descriptor).unwrap()
         );
+        assert_eq!(
+            model_response
+                .headers()
+                .get("Access-Control-Allow-Origin")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "*"
+        );
 
         let texture_uri = body_asset_uri(&package.body_id, "texture.png");
         let texture_response =
@@ -2352,6 +2420,15 @@ mod tests {
                 .to_str()
                 .unwrap(),
             "9"
+        );
+        assert_eq!(
+            head_response
+                .headers()
+                .get("Access-Control-Allow-Origin")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "*"
         );
 
         let post_response =
@@ -2432,5 +2509,37 @@ mod tests {
             serve_body_asset_request(&fixture.storage, request(Method::GET, &texture_uri)).status(),
             StatusCode::NOT_FOUND
         );
+    }
+
+    #[test]
+    fn body_asset_protocol_allows_only_the_main_webview_label() {
+        let fixture = Fixture::new();
+        let package = install(&fixture);
+
+        let main_response = serve_body_asset_request_for_webview(
+            &fixture.storage,
+            BODY_RENDERER_WEBVIEW_LABEL,
+            request(Method::GET, &package.model_entry),
+        );
+        assert_eq!(main_response.status(), StatusCode::OK);
+        assert_eq!(
+            main_response
+                .headers()
+                .get("Access-Control-Allow-Origin")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "*"
+        );
+
+        for label in ["settings", "chat", "background"] {
+            let response = serve_body_asset_request_for_webview(
+                &fixture.storage,
+                label,
+                request(Method::GET, &package.model_entry),
+            );
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "label: {label}");
+            assert!(response.body().is_empty(), "label: {label}");
+        }
     }
 }

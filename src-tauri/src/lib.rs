@@ -41,7 +41,11 @@ pub fn run() {
             storage::body_package::BODY_ASSET_PROTOCOL_SCHEME,
             |context, request| {
                 let storage = context.app_handle().state::<storage::StorageService>();
-                storage::body_package::serve_body_asset_request(&storage, request)
+                storage::body_package::serve_body_asset_request_for_webview(
+                    &storage,
+                    context.webview_label(),
+                    request,
+                )
             },
         )
         .setup(|app| {

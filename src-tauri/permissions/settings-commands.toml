@@ -40,4 +40,6 @@ commands.allow = [
     "delete_body_package",
     "get_body_package_registry_snapshot",
     "set_current_life_body",
+    "get_cubism_core_snapshot",
+    "import_cubism_core",
 ]

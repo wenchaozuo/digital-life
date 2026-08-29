@@ -262,6 +262,13 @@ body,
   -webkit-user-drag: none;
 }
 
+.body-renderer-host {
+  width: min(72vw, 300px);
+  height: min(64vh, 420px);
+  min-width: 1px;
+  min-height: 1px;
+}
+
 .status {
   display: grid;
   gap: 0.15rem;

@@ -67,6 +67,30 @@ class RecordingRenderer implements BodyRenderer {
   }
 }
 
+class AsyncDisposingRenderer implements BodyRenderer {
+  readonly rendered: BodySnapshot[] = [];
+  readonly disposeGate = new Deferred<void>();
+  disposeCalls = 0;
+  private host: HTMLElement | undefined;
+
+  async mount(host: HTMLElement): Promise<void> {
+    this.host = host;
+    const marker = document.createElement("span");
+    marker.dataset.bodyId = "async-dispose";
+    host.append(marker);
+  }
+
+  render(snapshot: BodySnapshot): void {
+    this.rendered.push(snapshot);
+  }
+
+  async dispose(): Promise<void> {
+    this.disposeCalls += 1;
+    await this.disposeGate.promise;
+    this.host?.replaceChildren();
+  }
+}
+
 function life(bodyId: string): LifeIdentity {
   return {
     id: "life-1",
@@ -204,6 +228,47 @@ describe("D22-C Main body runtime binding controller", () => {
       "default-png",
     );
 
+    controller.dispose();
+  });
+
+  it("waits for async old renderer cleanup before reusing the host", async () => {
+    const host = document.createElement("div");
+    let currentLife = life("body-a");
+    const oldRenderer = new AsyncDisposingRenderer();
+    const newRenderer = new RecordingRenderer("body-b");
+    const controller = new BodyRuntimeBindingController({
+      loadRegistrySnapshot: async () => emptyRegistry(),
+      installRegistrySnapshot: () => undefined,
+      loadCurrentLife: async () => currentLife,
+      createPresentation: (bodyId) => ({
+        provider: new ImmediateProvider(),
+        renderer: bodyId === "body-a" ? oldRenderer : newRenderer,
+      }),
+      getCurrentState: () => "idle",
+    });
+
+    await controller.initialize(host, async () => currentLife);
+    currentLife = life("body-b");
+    let refreshSettled = false;
+    const refresh = controller.refresh().then(() => {
+      refreshSettled = true;
+    });
+
+    await flushMicrotasks();
+    expect(oldRenderer.disposeCalls).toBe(1);
+    expect(refreshSettled).toBe(false);
+    expect(host.querySelector("[data-body-id]")?.getAttribute("data-body-id")).toBe(
+      "async-dispose",
+    );
+
+    oldRenderer.disposeGate.resolve();
+    await refresh;
+    expect(newRenderer.rendered).toEqual([
+      { resourcePath: "idle.png", state: "idle" },
+    ]);
+    expect(host.querySelector("[data-body-id]")?.getAttribute("data-body-id")).toBe(
+      "body-b",
+    );
     controller.dispose();
   });
 

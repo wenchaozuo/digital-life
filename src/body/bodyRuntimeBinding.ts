@@ -164,11 +164,11 @@ export class BodyRuntimeBindingController {
     this.activeBinding = undefined;
     this.pendingBinding = undefined;
 
-    const retirement = this.retirementTail.then(() => {
+    const retirement = this.retirementTail.then(async () => {
       if (previous === undefined) {
         return;
       }
-      previous.host.dispose();
+      await previous.host.disposeAndWait();
     });
     this.retirementTail = retirement.catch(() => undefined);
     await retirement.catch(() => undefined);

@@ -6,6 +6,7 @@ import type { ModelPurpose } from "../model";
 import ModelProfilesView from "./model/ModelProfilesView.vue";
 import MemoryCenterView from "./memory/MemoryCenterView.vue";
 import BodySettingsView from "./body/BodySettingsView.vue";
+import Live2DCoreSettingsView from "./core/Live2DCoreSettingsView.vue";
 import {
   storageService,
   type StorageLocationInfo,
@@ -30,7 +31,7 @@ const migration = ref<StorageMigrationResult>();
 const phase = ref<StorageSettingsPhase>("unselected");
 const error = ref<StorageSettingsError>();
 const confirmationVisible = ref(false);
-type SettingsSection = "storage" | "chat" | "embedding" | "candidate_extraction" | "memory" | "body";
+type SettingsSection = "storage" | "chat" | "embedding" | "candidate_extraction" | "memory" | "body" | "core";
 interface SettingsViewHandle {
   clearSensitiveInputs(): void;
   requestLeave(): boolean;
@@ -168,6 +169,9 @@ function requestActiveViewLeave(): boolean {
   if (activeSection.value === "body") {
     return true;
   }
+  if (activeSection.value === "core") {
+    return true;
+  }
   return modelProfilesView.value?.requestLeave() ?? true;
 }
 
@@ -224,6 +228,7 @@ onMounted(async () => {
         <button type="button" :class="{ selected: activeSection === 'candidate_extraction' }" :disabled="phase === 'migrating'" @click="switchSection('candidate_extraction')">Candidate profiles</button>
         <button type="button" :class="{ selected: activeSection === 'memory' }" :disabled="phase === 'migrating'" @click="switchSection('memory')">Memory Center</button>
         <button type="button" :class="{ selected: activeSection === 'body' }" :disabled="phase === 'migrating'" @click="switchSection('body')">Body</button>
+        <button type="button" :class="{ selected: activeSection === 'core' }" :disabled="phase === 'migrating'" @click="switchSection('core')">Live2D Core</button>
       </nav>
 
       <section v-if="activeSection === 'storage'" class="settings-section" aria-label="Storage location settings">
@@ -309,6 +314,8 @@ onMounted(async () => {
       />
 
       <BodySettingsView v-else-if="activeSection === 'body'" />
+
+      <Live2DCoreSettingsView v-else-if="activeSection === 'core'" />
 
       <ModelProfilesView
         v-else

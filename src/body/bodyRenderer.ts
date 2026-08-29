@@ -63,6 +63,7 @@ export class BodyRendererHost {
   private pendingMountHost: HTMLElement | undefined;
   private renderTail: Promise<void> = Promise.resolve();
   private pendingRenderCount = 0;
+  private disposalPromise: Promise<void> | undefined;
 
   constructor(renderer: BodyRenderer) {
     this.renderer = renderer;
@@ -188,9 +189,20 @@ export class BodyRendererHost {
   }
 
   dispose(): void {
+    void this.disposeAndWait();
+  }
+
+  /**
+   * Starts terminal disposal and resolves only after renderer cleanup has
+   * completed. Callers that replace the renderer in the same host must await
+   * this boundary so an asynchronous old renderer cannot clear the new tree.
+   */
+  async disposeAndWait(): Promise<void> {
     if (this.phase === "disposed") {
+      await this.disposalPromise;
       return;
     }
+
     if (this.phase === "mounting") {
       // Dispose during a pending mount: the mounted-phase check must never
       // resurrect the renderer, and whatever the completed or failed mount
@@ -200,25 +212,33 @@ export class BodyRendererHost {
       this.host = undefined;
       this.pendingMount = undefined;
       this.pendingMountHost = undefined;
-      if (pendingMount !== undefined) {
-        void pendingMount.then(
-          () => this.renderTail,
-          () => this.renderTail,
-        ).then(() => {
-          this.disposeRendererContained();
-        });
-      }
+      const disposal = this.finishDisposal(pendingMount);
+      this.disposalPromise = disposal;
+      await disposal;
       return;
     }
+
     this.phase = "disposed";
     this.host = undefined;
-    if (this.pendingRenderCount === 0) {
-      this.disposeRendererContained();
-    } else {
-      void this.renderTail.then(() => {
-        this.disposeRendererContained();
-      });
+    const disposal = this.finishDisposal();
+    this.disposalPromise = disposal;
+    await disposal;
+  }
+
+  private async finishDisposal(
+    pendingMount?: Promise<void>,
+  ): Promise<void> {
+    if (pendingMount !== undefined) {
+      try {
+        await pendingMount;
+      } catch {
+        // Mount failure is already exposed through the mount promise.
+      }
     }
+    if (this.pendingRenderCount > 0) {
+      await this.renderTail;
+    }
+    await this.disposeRendererContained();
   }
 
   /**
@@ -227,7 +247,7 @@ export class BodyRendererHost {
    * a returned rejected Promise; the helper itself never throws and never
    * leaves an unhandled rejection.
    */
-  private disposeRendererContained(): void {
+  private async disposeRendererContained(): Promise<void> {
     let outcome: Promise<void> | void;
     try {
       outcome = this.renderer.dispose();
@@ -236,9 +256,11 @@ export class BodyRendererHost {
       return;
     }
     if (outcome !== undefined) {
-      void outcome.catch(() => {
+      try {
+        await outcome;
+      } catch {
         // Async dispose rejection is contained.
-      });
+      }
     }
   }
 }

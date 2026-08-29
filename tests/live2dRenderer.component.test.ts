@@ -195,12 +195,15 @@ describe("Live2DRenderer Core and source boundary", () => {
   });
 
   it("contains no remote Core fetch or script injection in production source", () => {
-    // D22-D1: managedCubismCore.ts is the one sanctioned script-injection
-    // seam; every other production source stays free of remote Core fetch
-    // and script injection.
+    // D22-D2: managedCubismCore.ts is the one sanctioned script-injection
+    // seam. The Settings service is also excluded because it owns only the
+    // fixed filename used by its exact picker check; it has no script or
+    // renderer authority.
     for (const source of sourceFilesUnder(
       "src",
-      (name) => name === "managedCubismCore.ts",
+      (name) =>
+        name === "managedCubismCore.ts" ||
+        name === "live2dCoreSettingsService.ts",
     )) {
       expect(source).not.toMatch(
         /https:\/\/cubism\.live2d\.com|live2dcubismcore\.min\.js/i,

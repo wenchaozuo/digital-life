@@ -13,12 +13,11 @@
 //!      integrity (DB row + managed path + file hash + allowlist presence)
 //! ```
 //!
-//! The production allowlist intentionally contains ZERO approved hashes in
-//! D22-D1: no proprietary Cubism Core file is committed, downloaded, or
-//! copied into fixtures, and no SHA-256 is fabricated.  The import command
-//! therefore fails closed (`LIVE2D_CORE_UNAPPROVED`) until D22-D2 adds an
-//! independently verified official entry.  A test-only allowlist exists
-//! exclusively under `#[cfg(test)]` and can never compile into production.
+//! The production allowlist contains only independently verified official Core
+//! identities.  No proprietary Cubism Core file is committed, downloaded, or
+//! copied into fixtures; the compiled SHA-256 is the only production trust
+//! authority.  A test-only allowlist exists exclusively under `#[cfg(test)]`
+//! and can never compile into production.
 //!
 //! The table stores no original user path, no remote URL, no script URL, and
 //! no JavaScript source text.  The original source absolute path is transient
@@ -77,11 +76,15 @@ pub(crate) struct ApprovedCubismCore {
     pub(crate) sha256: &'static str,
 }
 
-/// D22-D1 production allowlist: intentionally EMPTY.  No production-approved
-/// proprietary Core hash exists yet; D22-D2 adds entries only from
-/// independently verified official provenance.  This array is private and
+/// D22-D2 production allowlist.  This is the exact SHA-256 of the official
+/// Cubism SDK for Web `5-r.5` Core file, independently verified from the local
+/// SDK archive with `certutil` and Python `hashlib`.  The array is private and
 /// immutable; no frontend or IPC can supply or extend it.
-const PRODUCTION_APPROVED_CORES: &[ApprovedCubismCore] = &[];
+const PRODUCTION_APPROVED_CORES: &[ApprovedCubismCore] = &[ApprovedCubismCore {
+    runtime_family: CORE_RUNTIME_FAMILY,
+    version_label: "5-r.5",
+    sha256: "8741f739779b5d5210872bd3d7d99f0f1e56e6c87409e7d26d6bb4b80aa1ef47",
+}];
 
 /// Test-only allowlist seam.  The fixture is an inert, harmless byte string
 /// (never a Cubism Core implementation) whose hash proves the matching,
@@ -1116,11 +1119,20 @@ mod tests {
     }
 
     #[test]
-    fn production_allowlist_is_empty_and_never_contains_test_hashes() {
+    fn production_allowlist_contains_only_the_verified_official_core() {
         assert!(
-            PRODUCTION_APPROVED_CORES.is_empty(),
-            "D22-D1 production allowlist must intentionally contain zero hashes"
+            PRODUCTION_APPROVED_CORES.len() == 1,
+            "D22-D2 must contain exactly one verified production Core"
         );
+        let approved = &PRODUCTION_APPROVED_CORES[0];
+        assert_eq!(approved.runtime_family, CORE_RUNTIME_FAMILY);
+        assert_eq!(approved.version_label, "5-r.5");
+        assert_eq!(
+            approved.sha256,
+            "8741f739779b5d5210872bd3d7d99f0f1e56e6c87409e7d26d6bb4b80aa1ef47"
+        );
+        assert_eq!(approved.sha256.len(), 64);
+        assert!(approved.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()));
         for approved in test_approved_cores() {
             assert!(
                 find_approved_by_hash(PRODUCTION_APPROVED_CORES, approved.sha256).is_none(),
@@ -1373,10 +1385,12 @@ mod tests {
     }
 
     #[test]
-    fn main_commands_acl_grants_snapshot_but_never_import_and_chat_gets_neither() {
+    fn core_command_acl_keeps_import_in_settings_and_snapshot_out_of_chat() {
         let permissions_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("permissions");
         let main_acl = std::fs::read_to_string(permissions_dir.join("main-commands.toml"))
             .expect("main-commands.toml must exist");
+        let settings_acl = std::fs::read_to_string(permissions_dir.join("settings-commands.toml"))
+            .expect("settings-commands.toml must exist");
 
         // Main may read the Core snapshot (its ready boundary needs it)...
         assert!(
@@ -1389,11 +1403,21 @@ mod tests {
             "Main must never invoke import_cubism_core"
         );
 
+        assert!(
+            settings_acl.contains("get_cubism_core_snapshot"),
+            "Settings must be able to display the authoritative Core status"
+        );
+        assert!(
+            settings_acl.contains("import_cubism_core"),
+            "Settings must be the only Core installer surface"
+        );
+
         // Chat receives neither Core command.
         let chat_acl = std::fs::read_to_string(permissions_dir.join("chat-commands.toml"))
             .expect("chat-commands.toml must exist");
         assert!(
-            !chat_acl.contains("cubism_core"),
+            !chat_acl.contains("get_cubism_core_snapshot")
+                && !chat_acl.contains("import_cubism_core"),
             "Chat must receive no Cubism Core command"
         );
     }

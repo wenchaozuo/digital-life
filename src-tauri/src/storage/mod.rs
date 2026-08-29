@@ -30,6 +30,8 @@ mod model_profile;
 mod perception;
 #[cfg_attr(not(test), allow(dead_code))]
 mod relationship;
+#[cfg_attr(not(test), allow(dead_code))]
+mod screen_perception;
 mod upgrade_coordinator;
 pub(crate) mod upgrade_gate;
 mod vector_sync_outbox;
@@ -1943,11 +1945,11 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(writer_fence_count, 102);
+        assert_eq!(writer_fence_count, 108);
         migration::validate_attempt_claim_identity_schema(&state.connection).unwrap();
-        // The database is at Schema 26; validate the exact Schema-20 relationship
+        // The database is at Schema 27; validate the exact Schema-20 relationship
         // authority (which re-validates the emotion authority, the Schema-18
-        // catch-up objects, and proves the full 102-trigger writer fence).
+        // catch-up objects, and proves the full 108-trigger writer fence).
         migration::validate_emotion_authority_schema(&state.connection).unwrap();
         migration::validate_relationship_authority_schema(&state.connection).unwrap();
         assert_eq!(
@@ -2102,7 +2104,7 @@ mod tests {
         // target as an INDEPENDENT database.
         let restored = StorageService::initialize_with_roots(target.clone(), None).unwrap();
 
-        // Schema 25 and writer fences preserved. Schema version 25 is the
+        // Schema 27 and writer fences preserved. Schema version 27 is the
         // current runtime schema; LAST_STATIC_MIGRATION_VERSION = 12 is only the
         // ceiling of the statically-replayed migration list.
         {
@@ -2142,7 +2144,7 @@ mod tests {
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert_eq!(fence_count, 99);
+            assert_eq!(fence_count, 108);
         }
 
         // All 8 outbox states preserved with full epoch evidence.

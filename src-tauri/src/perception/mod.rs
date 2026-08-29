@@ -4,8 +4,13 @@
 //! defined foreground-focus context capability.  It does not persist any
 //! operating-system observation, application content, or generic capability
 //! grant.
+//!
+//! D23-B1 adds an independent screen-perception authority.  It is a separate
+//! consent domain and must never be conflated with the D16 focus-context
+//! consent below.
 
 pub(crate) mod foreground_focus;
+pub(crate) mod screen_policy;
 
 pub(crate) const PERCEPTION_POLICY_VERSION: i64 = 1;
 pub(crate) const PERCEPTION_POLICY_EVENT_VERSION: i64 = 1;

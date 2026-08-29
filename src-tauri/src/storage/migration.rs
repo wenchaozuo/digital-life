@@ -4,7 +4,8 @@ use rusqlite::{backup::Backup, params, Connection, OptionalExtension, Transactio
 
 use super::{
     autonomy, body_package, connection, experience_episode, generation_lifecycle_authority,
-    life_intent, live2d_core, perception, writer_fence_manifest, StorageError, MIGRATIONS,
+    life_intent, live2d_core, perception, screen_perception, writer_fence_manifest, StorageError,
+    MIGRATIONS,
 };
 
 pub(super) const LAST_STATIC_MIGRATION_VERSION: i64 = 12;
@@ -55,6 +56,8 @@ pub(super) const BODY_PACKAGE_AUTHORITY_SCHEMA_VERSION: i64 = 25;
 const BODY_PACKAGE_AUTHORITY_MIGRATION_NAME: &str = "025_managed_body_package_authority";
 pub(super) const LIVE2D_CORE_AUTHORITY_SCHEMA_VERSION: i64 = 26;
 const LIVE2D_CORE_AUTHORITY_MIGRATION_NAME: &str = "026_live2d_core_component_authority";
+pub(super) const SCREEN_PERCEPTION_AUTHORITY_SCHEMA_VERSION: i64 = 27;
+const SCREEN_PERCEPTION_AUTHORITY_MIGRATION_NAME: &str = "027_screen_perception_authority";
 const ADD_CLAIMED_GENERATION_AUTHORITY_EPOCH_SQL: &str = "ALTER TABLE memory_vector_sync_outbox ADD COLUMN claimed_generation_authority_epoch INTEGER NULL CHECK (claimed_generation_authority_epoch IS NULL OR claimed_generation_authority_epoch >= 1)";
 const CREATE_GENERATION_AUTHORITY_TABLE_SQL: &str =
     "CREATE TABLE memory_vector_generation_authority (
@@ -265,6 +268,11 @@ pub(super) enum BodyPackageAuthoritySchemaUpgrade {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Live2DCoreAuthoritySchemaUpgrade {
+    Applied,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ScreenPerceptionAuthoritySchemaUpgrade {
     Applied,
 }
 
@@ -2013,6 +2021,89 @@ fn validate_live2d_core_schema_objects(connection: &Connection) -> Result<(), St
     live2d_core::validate_schema_objects(connection)
 }
 
+/// Schema 27 adds the independent D23-B1 screen-perception consent authority.
+/// It creates no observation rows, no capture-target rows, and no default
+/// policy rows.  All objects are installed in the caller-owned IMMEDIATE
+/// transaction.
+pub(super) fn apply_screen_perception_schema_upgrade(
+    transaction: &Transaction<'_>,
+) -> Result<ScreenPerceptionAuthoritySchemaUpgrade, StorageError> {
+    if connection::read_schema_version(transaction)? != LIVE2D_CORE_AUTHORITY_SCHEMA_VERSION {
+        return Err(StorageError::migration_version_invariant_failed());
+    }
+
+    for table_sql in screen_perception::MIGRATION_027_TABLE_SQLS {
+        transaction
+            .execute_batch(table_sql)
+            .map_err(|_| StorageError::migration_transaction_failed())?;
+    }
+    #[cfg(test)]
+    if should_fail_migration_027_at_for_test(Migration027Failpoint::AfterTable) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+
+    for trigger_sql in screen_perception::MIGRATION_027_TRIGGER_SQLS {
+        transaction
+            .execute_batch(trigger_sql)
+            .map_err(|_| StorageError::migration_transaction_failed())?;
+    }
+    #[cfg(test)]
+    if should_fail_migration_027_at_for_test(Migration027Failpoint::AfterSemanticGuards) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+
+    writer_fence_manifest::install_screen_perception_writer_fence_manifest_in_transaction(
+        transaction,
+    )?;
+    #[cfg(test)]
+    if should_fail_migration_027_at_for_test(Migration027Failpoint::AfterWriterFences) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+
+    validate_screen_perception_schema_objects(transaction)?;
+    #[cfg(test)]
+    if should_fail_migration_027_at_for_test(Migration027Failpoint::BeforeSchemaVersion) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+
+    let migration_now: String = transaction
+        .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", [], |row| {
+            row.get(0)
+        })
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    transaction
+        .execute(
+            "INSERT INTO schema_migration (version,name,applied_at) VALUES (?1,?2,?3)",
+            params![
+                SCREEN_PERCEPTION_AUTHORITY_SCHEMA_VERSION,
+                SCREEN_PERCEPTION_AUTHORITY_MIGRATION_NAME,
+                migration_now
+            ],
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    #[cfg(test)]
+    if should_fail_migration_027_at_for_test(Migration027Failpoint::PreCommit) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    validate_screen_perception_schema_objects(transaction)?;
+    Ok(ScreenPerceptionAuthoritySchemaUpgrade::Applied)
+}
+
+pub(super) fn validate_screen_perception_schema(
+    connection: &Connection,
+) -> Result<(), StorageError> {
+    let schema_version = connection::read_schema_version(connection)?;
+    if schema_version < SCREEN_PERCEPTION_AUTHORITY_SCHEMA_VERSION {
+        return Err(StorageError::migration_version_invariant_failed());
+    }
+    validate_screen_perception_schema_objects(connection)?;
+    writer_fence_manifest::validate_writer_fence_manifest_for_schema(connection, schema_version)
+}
+
+fn validate_screen_perception_schema_objects(connection: &Connection) -> Result<(), StorageError> {
+    screen_perception::validate_schema_objects(connection)
+}
+
 pub(super) fn validate_experience_episode_schema(
     connection: &Connection,
 ) -> Result<(), StorageError> {
@@ -2704,6 +2795,9 @@ pub(super) fn verify_schema_after_upgrade(
     if expected_schema_version >= LIVE2D_CORE_AUTHORITY_SCHEMA_VERSION {
         validate_live2d_core_schema(connection)?;
     }
+    if expected_schema_version >= SCREEN_PERCEPTION_AUTHORITY_SCHEMA_VERSION {
+        validate_screen_perception_schema(connection)?;
+    }
     if expected_schema_version >= writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION {
         #[cfg(test)]
         if should_fail_post_commit_verification_at_for_test(
@@ -3175,6 +3269,43 @@ fn should_fail_migration_024_at_for_test(failpoint: Migration024Failpoint) -> bo
     })
 }
 
+/// Test-only failpoints for Migration027.  Each point fires inside the single
+/// caller-owned 26-to-27 transaction, proving the consent tables, semantic
+/// guards, writer fences, and version row roll back together.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Migration027Failpoint {
+    AfterTable,
+    AfterSemanticGuards,
+    AfterWriterFences,
+    BeforeSchemaVersion,
+    PreCommit,
+}
+
+#[cfg(test)]
+thread_local! {
+    static MIGRATION_027_FAILPOINT: std::cell::Cell<Option<Migration027Failpoint>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(super) fn fail_next_migration_027_at_for_test(failpoint: Migration027Failpoint) {
+    MIGRATION_027_FAILPOINT.with(|next| next.set(Some(failpoint)));
+}
+
+#[cfg(test)]
+fn should_fail_migration_027_at_for_test(failpoint: Migration027Failpoint) -> bool {
+    MIGRATION_027_FAILPOINT.with(|next| {
+        if next.get() == Some(failpoint) {
+            next.set(None);
+            true
+        } else {
+            false
+        }
+    })
+}
+
 /// Test-only failpoints for Migration016 (`apply_late_delete_generation_authority_schema_upgrade`).
 /// Each variant corresponds to a phase of the single-transaction upgrade. The
 /// failpoint returns `MIGRATION_TRANSACTION_FAILED` from inside the transaction,
@@ -3441,6 +3572,9 @@ pub fn verify_database(
     }
     if expected_schema_version >= LIVE2D_CORE_AUTHORITY_SCHEMA_VERSION {
         validate_live2d_core_schema(connection)?;
+    }
+    if expected_schema_version >= SCREEN_PERCEPTION_AUTHORITY_SCHEMA_VERSION {
+        validate_screen_perception_schema(connection)?;
     }
     if expected_schema_version >= writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION {
         writer_fence_manifest::validate_writer_fence_manifest(connection)?;
@@ -4795,10 +4929,10 @@ mod transaction_tests {
     }
 
     #[test]
-    fn migration_026_is_present_twenty_six_is_current_and_twenty_seven_is_absent() {
+    fn migration_027_is_present_twenty_seven_is_current_and_twenty_eight_is_absent() {
         assert_eq!(
             super::super::connection::MAX_SUPPORTED_SCHEMA_VERSION,
-            LIVE2D_CORE_AUTHORITY_SCHEMA_VERSION
+            SCREEN_PERCEPTION_AUTHORITY_SCHEMA_VERSION
         );
         let migrations_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/storage/migrations");
         let entries = std::fs::read_dir(&migrations_dir).unwrap();
@@ -4813,20 +4947,20 @@ mod transaction_tests {
                 highest = highest.max(version);
             }
         }
-        assert_eq!(highest, 26, "Migration 026 must be the current migration");
+        assert_eq!(highest, 27, "Migration 027 must be the current migration");
         let names = std::fs::read_dir(&migrations_dir)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .collect::<Vec<_>>();
-        for version in ["022", "023", "024", "025", "026"] {
+        for version in ["022", "023", "024", "025", "026", "027"] {
             assert!(
                 names.iter().any(|name| name.starts_with(version)),
                 "Migration {version} must exist"
             );
         }
         assert!(
-            !names.iter().any(|name| name.starts_with("027")),
-            "Migration 027 must not exist"
+            !names.iter().any(|name| name.starts_with("028")),
+            "Migration 028 must not exist"
         );
     }
 
@@ -6136,6 +6270,396 @@ mod transaction_tests {
         let (connection, life_id) = schema_twenty_six_connection_with_current_life();
         verify_schema_after_upgrade(&connection, LIVE2D_CORE_AUTHORITY_SCHEMA_VERSION).unwrap();
         verify_database(&connection, LIVE2D_CORE_AUTHORITY_SCHEMA_VERSION, life_id).unwrap();
+        assert_eq!(writer_fence_count(&connection), 102);
+    }
+
+    fn apply_screen_perception_authority_upgrade(connection: &mut Connection) {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert_eq!(
+            apply_screen_perception_schema_upgrade(&transaction).unwrap(),
+            ScreenPerceptionAuthoritySchemaUpgrade::Applied
+        );
+        transaction.commit().unwrap();
+    }
+
+    fn schema_twenty_seven_connection_with_current_life() -> (Connection, &'static str) {
+        let (mut connection, life_id) = schema_twenty_six_connection_with_current_life();
+        apply_screen_perception_authority_upgrade(&mut connection);
+        (connection, life_id)
+    }
+
+    #[test]
+    fn migration_027_creates_two_consent_tables_once_without_backfill() {
+        let mut connection = schema_twenty_six_connection_with_current_life().0;
+        connection
+            .execute_batch(
+                "INSERT INTO persona_template (id, name, version, persona_json)
+                 VALUES ('migration-027-persona', 'Persona', 1, '{}');
+                 INSERT INTO life_identity
+                     (id, name, created_at, version, body_id, persona_id, persona_version)
+                 VALUES ('migration-027-life', 'Life', '2026-08-27T00:00:00.000Z', 1,
+                         'migration-027-body', 'migration-027-persona', 1);",
+            )
+            .unwrap();
+
+        apply_screen_perception_authority_upgrade(&mut connection);
+        assert_eq!(
+            schema_version(&connection),
+            SCREEN_PERCEPTION_AUTHORITY_SCHEMA_VERSION
+        );
+        validate_screen_perception_schema(&connection).unwrap();
+        assert_eq!(writer_fence_count(&connection), 108);
+        for table in [
+            "life_screen_perception_policy",
+            "life_screen_perception_policy_event",
+        ] {
+            let count: i64 = connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "Migration027 must synthesize no {table} rows");
+        }
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM life_identity WHERE id='migration-027-life'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migration WHERE version=?1",
+                    [SCREEN_PERCEPTION_AUTHORITY_SCHEMA_VERSION],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let error = apply_screen_perception_schema_upgrade(&transaction).unwrap_err();
+        assert_eq!(error.code, "MIGRATION_VERSION_INVARIANT_FAILED");
+        drop(transaction);
+        assert_eq!(writer_fence_count(&connection), 108);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migration WHERE version=?1",
+                    [SCREEN_PERCEPTION_AUTHORITY_SCHEMA_VERSION],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn migration_027_failure_points_roll_back_to_exact_schema_twenty_six_preimage() {
+        let new_fence_names = [
+            "digital_life_writer_epoch_life_screen_perception_policy_insert",
+            "digital_life_writer_epoch_life_screen_perception_policy_update",
+            "digital_life_writer_epoch_life_screen_perception_policy_delete",
+            "digital_life_writer_epoch_life_screen_perception_policy_event_insert",
+            "digital_life_writer_epoch_life_screen_perception_policy_event_update",
+            "digital_life_writer_epoch_life_screen_perception_policy_event_delete",
+        ];
+        for point in [
+            Migration027Failpoint::AfterTable,
+            Migration027Failpoint::AfterSemanticGuards,
+            Migration027Failpoint::AfterWriterFences,
+            Migration027Failpoint::BeforeSchemaVersion,
+            Migration027Failpoint::PreCommit,
+        ] {
+            let mut connection = schema_twenty_six_connection_with_current_life().0;
+            fail_next_migration_027_at_for_test(point);
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let error = apply_screen_perception_schema_upgrade(&transaction).unwrap_err();
+            assert_eq!(error.code, "MIGRATION_TRANSACTION_FAILED");
+
+            let table_count: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema
+                     WHERE type='table' AND name IN
+                       ('life_screen_perception_policy','life_screen_perception_policy_event')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let guard_count: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema
+                     WHERE type='trigger' AND name IN
+                       ('life_screen_perception_policy_immutable_guard',
+                        'life_screen_perception_policy_event_immutable_guard')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let fence_count: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema
+                     WHERE type='trigger' AND name IN
+                       ('digital_life_writer_epoch_life_screen_perception_policy_insert',
+                        'digital_life_writer_epoch_life_screen_perception_policy_update',
+                        'digital_life_writer_epoch_life_screen_perception_policy_delete',
+                        'digital_life_writer_epoch_life_screen_perception_policy_event_insert',
+                        'digital_life_writer_epoch_life_screen_perception_policy_event_update',
+                        'digital_life_writer_epoch_life_screen_perception_policy_event_delete')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            match point {
+                Migration027Failpoint::AfterTable => {
+                    assert_eq!(table_count, 2);
+                    assert_eq!(guard_count, 0);
+                    assert_eq!(fence_count, 0);
+                }
+                Migration027Failpoint::AfterSemanticGuards => {
+                    assert_eq!(table_count, 2);
+                    assert_eq!(guard_count, 2);
+                    assert_eq!(fence_count, 0);
+                }
+                Migration027Failpoint::AfterWriterFences
+                | Migration027Failpoint::BeforeSchemaVersion
+                | Migration027Failpoint::PreCommit => {
+                    assert_eq!(table_count, 2);
+                    assert_eq!(guard_count, 2);
+                    assert_eq!(fence_count, 6);
+                }
+            }
+            drop(transaction);
+
+            assert_eq!(
+                schema_version(&connection),
+                LIVE2D_CORE_AUTHORITY_SCHEMA_VERSION
+            );
+            validate_live2d_core_schema(&connection).unwrap();
+            writer_fence_manifest::validate_writer_fence_manifest_for_schema(
+                &connection,
+                LIVE2D_CORE_AUTHORITY_SCHEMA_VERSION,
+            )
+            .unwrap();
+            assert_eq!(writer_fence_count(&connection), 102);
+            for name in new_fence_names {
+                let count: i64 = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_schema WHERE name=?1",
+                        [name],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap();
+                assert_eq!(count, 0, "failed Migration027 must remove {name}");
+            }
+            for name in [
+                "life_screen_perception_policy",
+                "life_screen_perception_policy_event",
+                "life_screen_perception_policy_immutable_guard",
+                "life_screen_perception_policy_event_immutable_guard",
+            ] {
+                let count: i64 = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_schema WHERE name=?1",
+                        [name],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap();
+                assert_eq!(count, 0, "failed Migration027 must remove {name}");
+            }
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM schema_migration WHERE version=?1",
+                        [SCREEN_PERCEPTION_AUTHORITY_SCHEMA_VERSION],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn migration_027_constraints_and_immutability_guards_are_authoritative() {
+        let (connection, _life_id) = schema_twenty_seven_connection_with_current_life();
+
+        for (sql, label) in [
+            (
+                "INSERT INTO life_screen_perception_policy
+                 (life_id, screen_perception_enabled, revision, created_at, updated_at, policy_version)
+                 VALUES ('missing-life', 1, 1, '2026-08-29T00:00:00.000Z', '2026-08-29T00:00:00.000Z', 1)",
+                "missing life must be rejected by the FK",
+            ),
+            (
+                "INSERT INTO life_screen_perception_policy
+                 (life_id, screen_perception_enabled, revision, created_at, updated_at, policy_version)
+                 VALUES ('  ', 1, 1, '2026-08-29T00:00:00.000Z', '2026-08-29T00:00:00.000Z', 1)",
+                "blank life_id must be rejected",
+            ),
+            (
+                "INSERT INTO life_screen_perception_policy
+                 (life_id, screen_perception_enabled, revision, created_at, updated_at, policy_version)
+                 VALUES ('migration-027-life', 2, 1, '2026-08-29T00:00:00.000Z', '2026-08-29T00:00:00.000Z', 1)",
+                "screen_perception_enabled must be 0 or 1",
+            ),
+            (
+                "INSERT INTO life_screen_perception_policy
+                 (life_id, screen_perception_enabled, revision, created_at, updated_at, policy_version)
+                 VALUES ('migration-027-life', 1, 0, '2026-08-29T00:00:00.000Z', '2026-08-29T00:00:00.000Z', 1)",
+                "revision must be >= 1",
+            ),
+            (
+                "INSERT INTO life_screen_perception_policy
+                 (life_id, screen_perception_enabled, revision, created_at, updated_at, policy_version)
+                 VALUES ('migration-027-life', 1, 1, '2026-08-29T00:00:00.000Z', '2026-08-29T00:00:00.000Z', 2)",
+                "policy_version must be 1",
+            ),
+        ] {
+            assert!(connection.execute(sql, []).is_err(), "{label}");
+        }
+
+        // The verification life exists; a valid row is accepted.
+        connection
+            .execute(
+                "INSERT INTO life_screen_perception_policy
+                 (life_id, screen_perception_enabled, revision, created_at, updated_at, policy_version)
+                 VALUES (?1, 1, 1, '2026-08-29T00:00:00.000Z', '2026-08-29T00:00:00.000Z', 1)",
+                [VERIFICATION_LIFE_ID],
+            )
+            .unwrap();
+        assert!(connection
+            .execute(
+                "UPDATE life_screen_perception_policy
+                 SET life_id='other-life' WHERE life_id=?1",
+                [VERIFICATION_LIFE_ID],
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("LIFE_SCREEN_PERCEPTION_POLICY_IMMUTABLE"));
+        assert!(connection
+            .execute(
+                "UPDATE life_screen_perception_policy
+                 SET created_at='changed' WHERE life_id=?1",
+                [VERIFICATION_LIFE_ID],
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("LIFE_SCREEN_PERCEPTION_POLICY_IMMUTABLE"));
+
+        connection
+            .execute(
+                "INSERT INTO life_screen_perception_policy_event
+                 (event_id, life_id, old_screen_perception_enabled, new_screen_perception_enabled,
+                  expected_revision, applied_revision, actor_kind, occurred_at, event_version)
+                 VALUES ('evt-1', ?1, 0, 1, 1, 2, 'user_explicit',
+                         '2026-08-29T00:00:00.000Z', 1)",
+                [VERIFICATION_LIFE_ID],
+            )
+            .unwrap();
+        assert!(connection
+            .execute(
+                "UPDATE life_screen_perception_policy_event
+                 SET new_screen_perception_enabled=0 WHERE event_id='evt-1'",
+                [],
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("LIFE_SCREEN_PERCEPTION_POLICY_EVENT_IMMUTABLE"));
+
+        let forbidden_columns: Vec<String> = connection
+            .prepare("SELECT name FROM pragma_table_info('life_screen_perception_policy')")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        for column in &forbidden_columns {
+            assert!(
+                ![
+                    "screenshot",
+                    "pixel",
+                    "ocr",
+                    "window_title",
+                    "process_path",
+                    "pid",
+                    "hwnd",
+                    "monitor",
+                    "capture_target",
+                    "capture_token",
+                ]
+                .contains(&column.as_str()),
+                "life_screen_perception_policy must not carry {column}"
+            );
+        }
+    }
+
+    #[test]
+    fn migration_027_generic_schema_verifiers_accept_valid_schema_twenty_seven() {
+        let (connection, life_id) = schema_twenty_seven_connection_with_current_life();
+        verify_schema_after_upgrade(&connection, SCREEN_PERCEPTION_AUTHORITY_SCHEMA_VERSION)
+            .unwrap();
+        verify_database(
+            &connection,
+            SCREEN_PERCEPTION_AUTHORITY_SCHEMA_VERSION,
+            life_id,
+        )
+        .unwrap();
+        assert_eq!(writer_fence_count(&connection), 108);
+    }
+
+    #[test]
+    fn schema_twenty_six_and_schema_twenty_seven_reopen_against_their_own_manifests() {
+        let schema_twenty_six = schema_twenty_six_connection_with_current_life().0;
+        validate_live2d_core_schema(&schema_twenty_six).unwrap();
+        writer_fence_manifest::validate_writer_fence_manifest_for_schema(
+            &schema_twenty_six,
+            LIVE2D_CORE_AUTHORITY_SCHEMA_VERSION,
+        )
+        .unwrap();
+        assert_eq!(writer_fence_count(&schema_twenty_six), 102);
+        assert!(validate_screen_perception_schema(&schema_twenty_six).is_err());
+
+        let mut schema_twenty_seven = schema_twenty_six_connection_with_current_life().0;
+        apply_screen_perception_authority_upgrade(&mut schema_twenty_seven);
+        validate_screen_perception_schema(&schema_twenty_seven).unwrap();
+        writer_fence_manifest::validate_writer_fence_manifest_for_schema(
+            &schema_twenty_seven,
+            SCREEN_PERCEPTION_AUTHORITY_SCHEMA_VERSION,
+        )
+        .unwrap();
+        assert_eq!(writer_fence_count(&schema_twenty_seven), 108);
+        validate_live2d_core_schema(&schema_twenty_seven).unwrap();
+    }
+
+    #[test]
+    fn migration_027_generic_schema_verifiers_keep_schema_twenty_six_compatible() {
+        let connection = schema_twenty_six_connection_with_current_life().0;
+        let screen_object_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE name IN
+                   ('life_screen_perception_policy', 'life_screen_perception_policy_event',
+                    'life_screen_perception_policy_immutable_guard',
+                    'life_screen_perception_policy_event_immutable_guard')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(screen_object_count, 0);
+        assert_eq!(writer_fence_count(&connection), 102);
+
+        verify_schema_after_upgrade(&connection, LIVE2D_CORE_AUTHORITY_SCHEMA_VERSION).unwrap();
         assert_eq!(writer_fence_count(&connection), 102);
     }
 

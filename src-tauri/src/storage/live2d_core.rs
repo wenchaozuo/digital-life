@@ -247,18 +247,68 @@ fn rollback_failed() -> StorageError {
     )
 }
 
+/// Test-only failpoint registry.  Each failpoint is keyed by a per-test
+/// token (the staged Core's sha256), so a flag armed by one test can only be
+/// consumed by that same test's import call even though the test harness
+/// runs tests in parallel threads.  Because the token is the sha, every test
+/// that arms a failpoint must use fixture bytes whose sha is unique across
+/// the whole test binary.  Flags are one-shot and self-clearing.
 #[cfg(test)]
-static FAIL_NEXT_CORE_REGISTRATION: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+mod test_failpoints {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
 
-#[cfg(test)]
-fn fail_next_core_registration_for_test() {
-    FAIL_NEXT_CORE_REGISTRATION.store(true, std::sync::atomic::Ordering::SeqCst);
-}
+    static REGISTRY: LazyLock<Mutex<HashMap<&'static str, u8>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
 
-#[cfg(test)]
-fn take_fail_next_core_registration_for_test() -> bool {
-    FAIL_NEXT_CORE_REGISTRATION.swap(false, std::sync::atomic::Ordering::SeqCst)
+    const REGISTRATION: u8 = 1;
+    const PROMOTION: u8 = 2;
+    const RESTORE: u8 = 4;
+
+    pub fn arm_registration(token: &'static str) {
+        arm(token, REGISTRATION);
+    }
+
+    pub fn arm_promotion(token: &'static str) {
+        arm(token, PROMOTION);
+    }
+
+    pub fn arm_restore(token: &'static str) {
+        arm(token, RESTORE);
+    }
+
+    fn arm(token: &'static str, flag: u8) {
+        let mut registry = REGISTRY.lock().unwrap();
+        let bits = registry.entry(token).or_insert(0);
+        *bits |= flag;
+    }
+
+    pub fn consume_registration(token: &str) -> bool {
+        consume(token, REGISTRATION)
+    }
+
+    pub fn consume_promotion(token: &str) -> bool {
+        consume(token, PROMOTION)
+    }
+
+    pub fn consume_restore(token: &str) -> bool {
+        consume(token, RESTORE)
+    }
+
+    fn consume(token: &str, flag: u8) -> bool {
+        let mut registry = REGISTRY.lock().unwrap();
+        let Some(bits) = registry.get_mut(token) else {
+            return false;
+        };
+        if *bits & flag == 0 {
+            return false;
+        }
+        *bits &= !flag;
+        if *bits == 0 {
+            registry.remove(token);
+        }
+        true
+    }
 }
 
 #[cfg(windows)]
@@ -314,6 +364,43 @@ fn require_safe_regular_file(path: &Path) -> Result<(), StorageError> {
         return Err(unsafe_path());
     }
     Ok(())
+}
+
+/// Shared rollback of a failed Core replacement.  Preserves the previous
+/// active authority exactly as it was before the replacement attempt:
+///
+/// 1. remove the untrusted newly promoted final file when required (its
+///    bytes were never registered, so it is authority-less);
+/// 2. restore the managed backup into the final managed location;
+/// 3. prove the expected final managed file exists as a safe regular
+///    non-link file;
+/// 4. return `LIVE2D_CORE_ROLLBACK_FAILED` when restoration cannot be
+///    proven, so the caller never claims preservation it cannot support.
+///
+/// A missing previous Core (no backup) is trivially preserved: with no prior
+/// authority there is nothing to restore.  The same preservation semantics
+/// serve both promotion failure and registration failure.
+fn restore_previous_core(
+    backup_path: &Path,
+    final_path: &Path,
+    remove_untrusted_final: bool,
+    #[cfg(test)] fail_token: &str,
+) -> Result<(), StorageError> {
+    if remove_untrusted_final {
+        fs::remove_file(final_path).map_err(|_| rollback_failed())?;
+    }
+    // Test-only seam: force the backup restoration to fail so a test can
+    // prove the distinct rollback failure is surfaced.  Keyed by the staged
+    // Core's sha so only the arming test's import consumes it.
+    #[cfg(test)]
+    if test_failpoints::consume_restore(fail_token) {
+        return Err(rollback_failed());
+    }
+    if !backup_path.exists() {
+        return Ok(());
+    }
+    fs::rename(backup_path, final_path).map_err(|_| rollback_failed())?;
+    require_safe_regular_file(final_path).map_err(|_| rollback_failed())
 }
 
 /// The user-selected source file must be an absolute regular non-link file.
@@ -531,7 +618,7 @@ fn register_core_component(
     approved: &ApprovedCubismCore,
 ) -> Result<(), StorageError> {
     #[cfg(test)]
-    if take_fail_next_core_registration_for_test() {
+    if test_failpoints::consume_registration(approved.sha256) {
         return Err(registration_failed());
     }
     let transaction = connection
@@ -651,28 +738,54 @@ impl StorageService {
                 import_copy_failed()
             })?;
         }
-        fs::rename(&staged_path, &final_path).map_err(|error| {
-            // Promotion failed: restore the preserved old file.
-            if had_previous {
-                let _ = fs::rename(&backup_path, &final_path);
-            }
+        // Test-only seam: force the staged->final promotion to fail exactly
+        // after the previous Core has been moved to backup.  Keyed by the
+        // staged Core's sha so only the arming test's import consumes it.
+        #[cfg(test)]
+        if test_failpoints::consume_promotion(&sha256) {
             let _ = fs::remove_dir_all(&staging_dir);
-            let _ = error;
+            if let Err(rollback) = restore_previous_core(
+                &backup_path,
+                &final_path,
+                false,
+                #[cfg(test)]
+                &sha256,
+            ) {
+                return Err(rollback);
+            }
+            return Err(import_copy_failed());
+        }
+        fs::rename(&staged_path, &final_path).map_err(|_error| {
+            // Promotion failed: the preserved old Core must be restored and
+            // its restoration proven, never silently ignored.
+            let _ = fs::remove_dir_all(&staging_dir);
+            if let Err(rollback) = restore_previous_core(
+                &backup_path,
+                &final_path,
+                false,
+                #[cfg(test)]
+                &sha256,
+            ) {
+                return rollback;
+            }
             import_copy_failed()
         })?;
         let _ = fs::remove_dir_all(&staging_dir);
 
         // 5. Register the component row.  If registration fails, the managed
-        // file is rolled back to the preserved old Core.
+        // file is rolled back to the preserved old Core with the same proven
+        // preservation semantics as a promotion failure.
         let registration = register_core_component(&mut state.connection, approved);
         drop(state);
         if let Err(error) = registration {
-            let _ = fs::remove_file(&final_path);
-            if had_previous {
-                let restore = fs::rename(&backup_path, &final_path);
-                if restore.is_err() {
-                    return Err(rollback_failed());
-                }
+            if let Err(rollback) = restore_previous_core(
+                &backup_path,
+                &final_path,
+                true,
+                #[cfg(test)]
+                &sha256,
+            ) {
+                return Err(rollback);
             }
             return Err(error);
         }
@@ -1322,16 +1435,19 @@ mod tests {
 
         // Stage a distinct valid test Core B and arm the registration
         // failpoint so the SQLite authority replacement fails AFTER the
-        // filesystem promotion begins.
-        let core_b = fixture.write_core(b"/* d22-d1 replacement fixture B, not Cubism Core */");
-        let sha_b = hash_bytes(b"/* d22-d1 replacement fixture B, not Cubism Core */");
+        // filesystem promotion begins.  The B fixture bytes are unique to
+        // this test: the failpoint token is the sha, so no other test may
+        // share these bytes.
+        let core_b =
+            fixture.write_core(b"/* d22-d1 replacement fixture B-regfail, not Cubism Core */");
+        let sha_b = hash_bytes(b"/* d22-d1 replacement fixture B-regfail, not Cubism Core */");
         let approved_b = ApprovedCubismCore {
             runtime_family: CORE_RUNTIME_FAMILY,
             version_label: "d22-d1-test-fixture-b",
             sha256: Box::leak(sha_b.clone().into_boxed_str()),
         };
         let allowlist_b = Box::leak(vec![approved_b].into_boxed_slice());
-        fail_next_core_registration_for_test();
+        test_failpoints::arm_registration(Box::leak(sha_b.clone().into_boxed_str()));
 
         let error = fixture
             .storage
@@ -1363,6 +1479,125 @@ mod tests {
             fixture.request(Method::GET, &windows_core_uri()),
         );
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn promotion_failure_with_successful_restore_preserves_previous_authority() {
+        let fixture = Fixture::new();
+        // 1. Install a valid Core A and verify ReadyForStartup.
+        let core_a = fixture.write_core(TEST_FIXTURE_CORE_BYTES);
+        fixture
+            .storage
+            .import_cubism_core_with_test_allowlist(ImportCubismCoreRequest {
+                source_path: core_a.to_string_lossy().into_owned(),
+            })
+            .unwrap();
+        assert_eq!(
+            fixture
+                .storage
+                .get_cubism_core_snapshot_with_test_allowlist()
+                .unwrap()
+                .status,
+            ManagedCubismCoreStatus::ReadyForStartup
+        );
+        let previous_sha = test_fixture_sha256();
+
+        // 2. Begin replacement with valid Core B; 3. force the staged->final
+        // promotion failure AFTER Core A has been moved to backup.  The B
+        // fixture bytes are unique to this test (failpoint token = sha).
+        let core_b = fixture.write_core(b"/* d22-d1 promotion-fixture B1, not Cubism Core */");
+        let sha_b = hash_bytes(b"/* d22-d1 promotion-fixture B1, not Cubism Core */");
+        let approved_b = ApprovedCubismCore {
+            runtime_family: CORE_RUNTIME_FAMILY,
+            version_label: "d22-d1-test-fixture-b",
+            sha256: Box::leak(sha_b.clone().into_boxed_str()),
+        };
+        let allowlist_b = Box::leak(vec![approved_b].into_boxed_slice());
+        test_failpoints::arm_promotion(Box::leak(sha_b.clone().into_boxed_str()));
+
+        // 4. Restoration succeeds; 6. the command reports the ordinary copy
+        // failure, not a rollback failure.
+        let error = fixture
+            .storage
+            .import_cubism_core_with_allowlist(
+                ImportCubismCoreRequest {
+                    source_path: core_b.to_string_lossy().into_owned(),
+                },
+                allowlist_b,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "LIVE2D_CORE_IMPORT_COPY_FAILED");
+
+        // 7. SQLite still references Core A; 8. the active managed bytes
+        // equal Core A; 9. status remains ReadyForStartup; 10. Core A remains
+        // serveable.
+        let snapshot = fixture
+            .storage
+            .get_cubism_core_snapshot_with_test_allowlist()
+            .unwrap();
+        assert_eq!(snapshot.status, ManagedCubismCoreStatus::ReadyForStartup);
+        assert_eq!(snapshot.sha256.as_deref(), Some(previous_sha.as_str()));
+        assert_eq!(
+            fs::read(fixture.active_core_path()).unwrap(),
+            TEST_FIXTURE_CORE_BYTES,
+            "the previous managed bytes must be restored and proven"
+        );
+        let response = serve_core_request_for_test(
+            &fixture.storage,
+            fixture.request(Method::GET, &windows_core_uri()),
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn promotion_failure_with_failed_restore_returns_rollback_failed() {
+        let fixture = Fixture::new();
+        // 1. Install a valid Core A.
+        let core_a = fixture.write_core(TEST_FIXTURE_CORE_BYTES);
+        fixture
+            .storage
+            .import_cubism_core_with_test_allowlist(ImportCubismCoreRequest {
+                source_path: core_a.to_string_lossy().into_owned(),
+            })
+            .unwrap();
+
+        // 2. Begin a valid B replacement; 3. force the promotion failure;
+        // 4. force the old-backup restoration failure.  The B fixture bytes
+        // are unique to this test (failpoint token = sha).
+        let core_b = fixture.write_core(b"/* d22-d1 promotion-fixture B2, not Cubism Core */");
+        let sha_b = hash_bytes(b"/* d22-d1 promotion-fixture B2, not Cubism Core */");
+        let approved_b = ApprovedCubismCore {
+            runtime_family: CORE_RUNTIME_FAMILY,
+            version_label: "d22-d1-test-fixture-b",
+            sha256: Box::leak(sha_b.clone().into_boxed_str()),
+        };
+        let allowlist_b = Box::leak(vec![approved_b].into_boxed_slice());
+        test_failpoints::arm_promotion(Box::leak(sha_b.clone().into_boxed_str()));
+        test_failpoints::arm_restore(Box::leak(sha_b.clone().into_boxed_str()));
+
+        // 5. The result code is exactly the distinct rollback failure; the
+        // ordinary copy failure must never be reported when preservation of
+        // the previous authority cannot be proven.
+        let error = fixture
+            .storage
+            .import_cubism_core_with_allowlist(
+                ImportCubismCoreRequest {
+                    source_path: core_b.to_string_lossy().into_owned(),
+                },
+                allowlist_b,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "LIVE2D_CORE_ROLLBACK_FAILED");
+
+        // No new SQLite B authority may be committed.
+        let state = fixture.storage.state().unwrap();
+        let component = read_registered_core(&state.connection).unwrap();
+        drop(state);
+        assert_eq!(
+            component.map(|component| component.sha256).as_deref(),
+            Some(test_fixture_sha256().as_str()),
+            "no new Core B authority may be committed"
+        );
     }
 
     #[test]

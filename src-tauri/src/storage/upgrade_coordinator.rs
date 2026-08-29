@@ -95,6 +95,7 @@ fn open_after_mutex<G: StorageUpgradeGate>(
         migration::validate_autonomy_schema(&connection)?;
         migration::validate_perception_schema(&connection)?;
         migration::validate_body_package_schema(&connection)?;
+        migration::validate_live2d_core_schema(&connection)?;
         record_upgrade_event("post-verify");
         migration::verify_schema_after_upgrade(
             &connection,
@@ -239,6 +240,13 @@ fn open_after_mutex<G: StorageUpgradeGate>(
             return Err(StorageError::migration_version_invariant_failed());
         }
         upgraded_version = migration::BODY_PACKAGE_AUTHORITY_SCHEMA_VERSION;
+    }
+    if upgraded_version == migration::BODY_PACKAGE_AUTHORITY_SCHEMA_VERSION {
+        let live2d_core_upgrade = migration::apply_live2d_core_schema_upgrade(&transaction)?;
+        if live2d_core_upgrade != migration::Live2DCoreAuthoritySchemaUpgrade::Applied {
+            return Err(StorageError::migration_version_invariant_failed());
+        }
+        upgraded_version = migration::LIVE2D_CORE_AUTHORITY_SCHEMA_VERSION;
     }
     if upgraded_version != connection::MAX_SUPPORTED_SCHEMA_VERSION {
         return Err(StorageError::migration_version_invariant_failed());
@@ -599,6 +607,7 @@ mod tests {
                 || version == migration::AUTONOMY_AUTHORITY_SCHEMA_VERSION
                 || version == migration::PERCEPTION_AUTHORITY_SCHEMA_VERSION
                 || version == migration::BODY_PACKAGE_AUTHORITY_SCHEMA_VERSION
+                || version == migration::LIVE2D_CORE_AUTHORITY_SCHEMA_VERSION
                 || version == connection::MAX_SUPPORTED_SCHEMA_VERSION
         );
         let mut connection = Connection::open(path).unwrap();
@@ -700,6 +709,12 @@ mod tests {
             assert_eq!(
                 migration::apply_body_package_schema_upgrade(&transaction).unwrap(),
                 migration::BodyPackageAuthoritySchemaUpgrade::Applied
+            );
+        }
+        if version >= migration::LIVE2D_CORE_AUTHORITY_SCHEMA_VERSION {
+            assert_eq!(
+                migration::apply_live2d_core_schema_upgrade(&transaction).unwrap(),
+                migration::Live2DCoreAuthoritySchemaUpgrade::Applied
             );
         }
         transaction.commit().unwrap();
@@ -1287,7 +1302,7 @@ mod tests {
         // (which re-validate the Schema-18 catch-up objects) prove the
         // complete chain was applied.
         migration::validate_emotion_authority_schema(&state.connection).unwrap();
-        assert_eq!(writer_fence_count(&state.connection), 99);
+        assert_eq!(writer_fence_count(&state.connection), 102);
         assert_eq!(
             take_upgrade_events(),
             vec![
@@ -1323,10 +1338,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(writer_fence_count, 99);
+        assert_eq!(writer_fence_count, 102);
         migration::validate_attempt_claim_identity_schema(&connection).unwrap();
-        // The schema is at 25, so the version-17 lifecycle validator cannot
-        // run alone; the full 99-trigger writer fence plus the exact Schema-19
+        // The schema is at 26, so the version-17 lifecycle validator cannot
+        // run alone; the full 102-trigger writer fence plus the exact Schema-19
         // emotion and Schema-20 relationship validators (which re-validate the
         // Schema-18 catch-up objects) prove the complete chain was applied.
         migration::validate_emotion_authority_schema(&connection).unwrap();
@@ -1394,7 +1409,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(writer_fence_count, 99);
+        assert_eq!(writer_fence_count, 102);
         assert_eq!(journal_mode(&path), "wal");
     }
 
@@ -1460,7 +1475,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(writer_fence_count, 99);
+        assert_eq!(writer_fence_count, 102);
         assert_eq!(journal_mode(&path), "wal");
     }
 
@@ -1518,7 +1533,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(message_count, 2);
-        assert_eq!(writer_fence_count(&connection), 99);
+        assert_eq!(writer_fence_count(&connection), 102);
         assert_eq!(journal_mode(&path), "wal");
     }
 
@@ -1577,7 +1592,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 row_count, 0,
-                "the 21→23 upgrade must synthesize no {table} rows"
+                "the 21鈫?3 upgrade must synthesize no {table} rows"
             );
         }
         let message_count: i64 = connection
@@ -1596,7 +1611,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(migration_count, 1);
-        assert_eq!(writer_fence_count(&connection), 99);
+        assert_eq!(writer_fence_count(&connection), 102);
         assert_eq!(journal_mode(&path), "wal");
     }
 
@@ -1631,7 +1646,7 @@ mod tests {
         let gate = FakeGate::clear();
         let connection = open_coordinated_storage_connection_with_gate(&path, &gate).unwrap();
 
-        // The authoritative coordinated open must advance 17 → 18 through the
+        // The authoritative coordinated open must advance 17 鈫?18 through the
         // real migration chain (not a direct helper call) and configure WAL
         // only after post-upgrade validation succeeded.
         assert_eq!(
@@ -1680,9 +1695,9 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(writer_fence_total, 99);
+        assert_eq!(writer_fence_total, 102);
 
-        // C snapshot table semantics are unchanged by the 17→18 upgrade.
+        // C snapshot table semantics are unchanged by the 17鈫?8 upgrade.
         let c_snapshot_sql_after: String = connection
             .query_row(
                 "SELECT sql FROM sqlite_schema WHERE type='table' AND name='memory_vector_generation_rebuild_item'",
@@ -2272,7 +2287,7 @@ mod tests {
             );
             migration::validate_attempt_claim_identity_schema(&connection).unwrap();
             migration::validate_emotion_authority_schema(&connection).unwrap();
-            assert_eq!(writer_fence_count(&connection), 99);
+            assert_eq!(writer_fence_count(&connection), 102);
             assert_eq!(journal_mode(&path), "delete");
             assert_eq!(
                 take_upgrade_events(),
@@ -2495,7 +2510,7 @@ mod tests {
             );
             migration::validate_attempt_claim_identity_schema(&state.connection).unwrap();
             migration::validate_emotion_authority_schema(&state.connection).unwrap();
-            assert_eq!(writer_fence_count(&state.connection), 99);
+            assert_eq!(writer_fence_count(&state.connection), 102);
         }
     }
 
@@ -2572,7 +2587,7 @@ mod tests {
                     .unwrap(),
                 (0, 0)
             );
-            assert_eq!(writer_fence_count(&state.connection), 99);
+            assert_eq!(writer_fence_count(&state.connection), 102);
             migration::validate_attempt_claim_identity_schema(&state.connection).unwrap();
             migration::validate_emotion_authority_schema(&state.connection).unwrap();
         }
@@ -2663,8 +2678,8 @@ mod tests {
     /// The commit failure is genuine SQLite lock arbitration, not injection. On
     /// this rollback-journal (`DELETE`) database a second connection's plain read
     /// transaction holds a SHARED lock, which is compatible with the
-    /// coordinator's `BEGIN IMMEDIATE` (RESERVED) — so `final-rm`, `att-i1`, and
-    /// every in-transaction validation run normally — but denies the EXCLUSIVE
+    /// coordinator's `BEGIN IMMEDIATE` (RESERVED) 鈥?so `final-rm`, `att-i1`, and
+    /// every in-transaction validation run normally 鈥?but denies the EXCLUSIVE
     /// promotion that `COMMIT` needs. Holding the reader's transaction object
     /// alive across the call is the synchronization; no sleep is involved.
     #[test]
@@ -3073,7 +3088,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(semantic_trigger_count, 3);
-        assert_eq!(writer_fence_count(&connection), 99);
+        assert_eq!(writer_fence_count(&connection), 102);
         // Historical data semantics in the new world.
         let outbox_witness: Option<String> = connection
             .query_row(

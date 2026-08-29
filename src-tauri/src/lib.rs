@@ -48,6 +48,17 @@ pub fn run() {
                 )
             },
         )
+        .register_uri_scheme_protocol(
+            storage::live2d_core::CORE_ASSET_PROTOCOL_SCHEME,
+            |context, request| {
+                let storage = context.app_handle().state::<storage::StorageService>();
+                storage::live2d_core::serve_core_request_for_webview(
+                    &storage,
+                    context.webview_label(),
+                    request,
+                )
+            },
+        )
         .setup(|app| {
             let storage = storage::StorageService::initialize(app.handle())
                 .map_err(|error| std::io::Error::other(error.message))?;
@@ -134,6 +145,8 @@ pub fn run() {
             storage::body_package::delete_body_package,
             storage::body_package::get_body_package_registry_snapshot,
             storage::body_package::set_current_life_body,
+            storage::live2d_core::import_cubism_core,
+            storage::live2d_core::get_cubism_core_snapshot,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

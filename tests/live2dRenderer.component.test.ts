@@ -150,11 +150,17 @@ function readWorkspaceFile(relativePath: string): string {
   return fs.readFileSync(path.resolve(process.cwd(), relativePath), "utf8");
 }
 
-function sourceFilesUnder(relativePath: string): string[] {
+function sourceFilesUnder(
+  relativePath: string,
+  exclude?: (name: string) => boolean,
+): string[] {
   const root = path.resolve(process.cwd(), relativePath);
   const files: string[] = [];
   const visit = (directory: string): void => {
     for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      if (exclude?.(entry.name) === true) {
+        continue;
+      }
       const entryPath = path.join(directory, entry.name);
       if (entry.isDirectory()) {
         visit(entryPath);
@@ -189,7 +195,13 @@ describe("Live2DRenderer Core and source boundary", () => {
   });
 
   it("contains no remote Core fetch or script injection in production source", () => {
-    for (const source of sourceFilesUnder("src")) {
+    // D22-D1: managedCubismCore.ts is the one sanctioned script-injection
+    // seam; every other production source stays free of remote Core fetch
+    // and script injection.
+    for (const source of sourceFilesUnder(
+      "src",
+      (name) => name === "managedCubismCore.ts",
+    )) {
       expect(source).not.toMatch(
         /https:\/\/cubism\.live2d\.com|live2dcubismcore\.min\.js/i,
       );

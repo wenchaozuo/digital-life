@@ -17,6 +17,7 @@ mod generation_rebuild;
 mod late_delete_resolution;
 #[cfg_attr(not(test), allow(dead_code))]
 mod life_intent;
+pub(crate) mod live2d_core;
 mod llm_candidate_extraction;
 mod location;
 mod memory;
@@ -1928,11 +1929,11 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(writer_fence_count, 99);
+        assert_eq!(writer_fence_count, 102);
         migration::validate_attempt_claim_identity_schema(&state.connection).unwrap();
-        // The database is at Schema 25; validate the exact Schema-20 relationship
+        // The database is at Schema 26; validate the exact Schema-20 relationship
         // authority (which re-validates the emotion authority, the Schema-18
-        // catch-up objects, and proves the full 99-trigger writer fence).
+        // catch-up objects, and proves the full 102-trigger writer fence).
         migration::validate_emotion_authority_schema(&state.connection).unwrap();
         migration::validate_relationship_authority_schema(&state.connection).unwrap();
         assert_eq!(

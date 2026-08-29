@@ -210,11 +210,17 @@ function readWorkspaceFile(relativePath: string): string {
   return fs.readFileSync(path.resolve(process.cwd(), relativePath), "utf8");
 }
 
-function sourceFilesUnder(relativePath: string): string[] {
+function sourceFilesUnder(
+  relativePath: string,
+  exclude?: (name: string) => boolean,
+): string[] {
   const root = path.resolve(process.cwd(), relativePath);
   const files: string[] = [];
   const visit = (directory: string): void => {
     for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      if (exclude?.(entry.name) === true) {
+        continue;
+      }
       const entryPath = path.join(directory, entry.name);
       if (entry.isDirectory()) {
         visit(entryPath);
@@ -543,7 +549,13 @@ describe("D21-D production ownership and honest asset boundary", () => {
   });
 
   it("keeps production Core/model source free of remote bootstrap and samples", () => {
-    const productionSource = sourceFilesUnder("src/body").join("\n");
+    // D22-D1: managedCubismCore.ts is the one sanctioned script-injection
+    // seam; every other production body module stays free of remote
+    // bootstrap and Core script references.
+    const productionSource = sourceFilesUnder(
+      "src/body",
+      (name) => name === "managedCubismCore.ts",
+    ).join("\n");
     expect(productionSource).not.toMatch(
       /https:\/\/cubism\.live2d\.com|live2dcubismcore\.min\.js|script\.src\s*=|append\(\s*script\s*\)/i,
     );

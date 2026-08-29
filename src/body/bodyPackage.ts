@@ -18,7 +18,7 @@ import {
   type TrustedManagedLive2DModelSource,
   type TrustedLocalLive2DModelSource,
 } from "./live2dModelSource.ts";
-import { createLive2DCoreReadyBoundary } from "./live2dRuntime.ts";
+import { createManagedCubismCoreReadyBoundary } from "./managedCubismCore.ts";
 import type { InstalledBodyPackageSnapshot } from "./bodyPackageService.ts";
 import type { BodyPresentationComposition } from "./bodyBinding.ts";
 
@@ -176,7 +176,10 @@ function buildManagedBodyPackage(
     presentation: Object.freeze({
       kind: "live2d" as const,
       modelSource,
-      coreReady: createLive2DCoreReadyBoundary(),
+      // D22-D1: production managed packages go through the managed Core
+      // provisioning boundary (backend-certified script injection) rather
+      // than assuming an already-global Core.
+      coreReady: createManagedCubismCoreReadyBoundary(),
       fallbackResources: DEFAULT_BUNDLED_PNG_RESOURCES,
     }),
   });

@@ -4,7 +4,7 @@ use rusqlite::{backup::Backup, params, Connection, OptionalExtension, Transactio
 
 use super::{
     autonomy, body_package, connection, experience_episode, generation_lifecycle_authority,
-    life_intent, perception, writer_fence_manifest, StorageError, MIGRATIONS,
+    life_intent, live2d_core, perception, writer_fence_manifest, StorageError, MIGRATIONS,
 };
 
 pub(super) const LAST_STATIC_MIGRATION_VERSION: i64 = 12;
@@ -53,6 +53,8 @@ pub(super) const PERCEPTION_AUTHORITY_SCHEMA_VERSION: i64 = 24;
 const PERCEPTION_AUTHORITY_MIGRATION_NAME: &str = "024_perception_focus_policy_authority";
 pub(super) const BODY_PACKAGE_AUTHORITY_SCHEMA_VERSION: i64 = 25;
 const BODY_PACKAGE_AUTHORITY_MIGRATION_NAME: &str = "025_managed_body_package_authority";
+pub(super) const LIVE2D_CORE_AUTHORITY_SCHEMA_VERSION: i64 = 26;
+const LIVE2D_CORE_AUTHORITY_MIGRATION_NAME: &str = "026_live2d_core_component_authority";
 const ADD_CLAIMED_GENERATION_AUTHORITY_EPOCH_SQL: &str = "ALTER TABLE memory_vector_sync_outbox ADD COLUMN claimed_generation_authority_epoch INTEGER NULL CHECK (claimed_generation_authority_epoch IS NULL OR claimed_generation_authority_epoch >= 1)";
 const CREATE_GENERATION_AUTHORITY_TABLE_SQL: &str =
     "CREATE TABLE memory_vector_generation_authority (
@@ -258,6 +260,11 @@ pub(super) enum PerceptionAuthoritySchemaUpgrade {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum BodyPackageAuthoritySchemaUpgrade {
+    Applied,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Live2DCoreAuthoritySchemaUpgrade {
     Applied,
 }
 
@@ -1950,6 +1957,62 @@ fn validate_body_package_schema_objects(connection: &Connection) -> Result<(), S
     body_package::validate_schema_objects(connection)
 }
 
+/// Schema 26 adds the SQLite-authoritative managed Cubism Core component
+/// authority.  Core bytes remain outside SQLite, but no managed Core file is
+/// trusted unless its component row is registered here and the registered
+/// SHA-256 stays present in the production allowlist.
+pub(super) fn apply_live2d_core_schema_upgrade(
+    transaction: &Transaction<'_>,
+) -> Result<Live2DCoreAuthoritySchemaUpgrade, StorageError> {
+    if connection::read_schema_version(transaction)? != BODY_PACKAGE_AUTHORITY_SCHEMA_VERSION {
+        return Err(StorageError::migration_version_invariant_failed());
+    }
+
+    for table_sql in live2d_core::MIGRATION_026_TABLE_SQLS {
+        transaction
+            .execute_batch(table_sql)
+            .map_err(|_| StorageError::migration_transaction_failed())?;
+    }
+    for trigger_sql in live2d_core::MIGRATION_026_TRIGGER_SQLS {
+        transaction
+            .execute_batch(trigger_sql)
+            .map_err(|_| StorageError::migration_transaction_failed())?;
+    }
+    writer_fence_manifest::install_live2d_core_writer_fence_manifest_in_transaction(transaction)?;
+
+    validate_live2d_core_schema_objects(transaction)?;
+    let migration_now: String = transaction
+        .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", [], |row| {
+            row.get(0)
+        })
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    transaction
+        .execute(
+            "INSERT INTO schema_migration (version,name,applied_at) VALUES (?1,?2,?3)",
+            params![
+                LIVE2D_CORE_AUTHORITY_SCHEMA_VERSION,
+                LIVE2D_CORE_AUTHORITY_MIGRATION_NAME,
+                migration_now
+            ],
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    validate_live2d_core_schema_objects(transaction)?;
+    Ok(Live2DCoreAuthoritySchemaUpgrade::Applied)
+}
+
+pub(super) fn validate_live2d_core_schema(connection: &Connection) -> Result<(), StorageError> {
+    let schema_version = connection::read_schema_version(connection)?;
+    if schema_version < LIVE2D_CORE_AUTHORITY_SCHEMA_VERSION {
+        return Err(StorageError::migration_version_invariant_failed());
+    }
+    validate_live2d_core_schema_objects(connection)?;
+    writer_fence_manifest::validate_writer_fence_manifest_for_schema(connection, schema_version)
+}
+
+fn validate_live2d_core_schema_objects(connection: &Connection) -> Result<(), StorageError> {
+    live2d_core::validate_schema_objects(connection)
+}
+
 pub(super) fn validate_experience_episode_schema(
     connection: &Connection,
 ) -> Result<(), StorageError> {
@@ -2637,6 +2700,9 @@ pub(super) fn verify_schema_after_upgrade(
     }
     if expected_schema_version >= BODY_PACKAGE_AUTHORITY_SCHEMA_VERSION {
         validate_body_package_schema(connection)?;
+    }
+    if expected_schema_version >= LIVE2D_CORE_AUTHORITY_SCHEMA_VERSION {
+        validate_live2d_core_schema(connection)?;
     }
     if expected_schema_version >= writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION {
         #[cfg(test)]
@@ -3373,6 +3439,9 @@ pub fn verify_database(
     if expected_schema_version >= BODY_PACKAGE_AUTHORITY_SCHEMA_VERSION {
         validate_body_package_schema(connection)?;
     }
+    if expected_schema_version >= LIVE2D_CORE_AUTHORITY_SCHEMA_VERSION {
+        validate_live2d_core_schema(connection)?;
+    }
     if expected_schema_version >= writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION {
         writer_fence_manifest::validate_writer_fence_manifest(connection)?;
     }
@@ -3913,6 +3982,23 @@ mod transaction_tests {
     fn schema_twenty_five_connection_with_current_life() -> (Connection, &'static str) {
         let (mut connection, life_id) = schema_twenty_four_connection_with_current_life();
         apply_body_package_authority_upgrade(&mut connection);
+        (connection, life_id)
+    }
+
+    fn apply_live2d_core_authority_upgrade(connection: &mut Connection) {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert_eq!(
+            apply_live2d_core_schema_upgrade(&transaction).unwrap(),
+            Live2DCoreAuthoritySchemaUpgrade::Applied
+        );
+        transaction.commit().unwrap();
+    }
+
+    fn schema_twenty_six_connection_with_current_life() -> (Connection, &'static str) {
+        let (mut connection, life_id) = schema_twenty_five_connection_with_current_life();
+        apply_live2d_core_authority_upgrade(&mut connection);
         (connection, life_id)
     }
 
@@ -4709,10 +4795,10 @@ mod transaction_tests {
     }
 
     #[test]
-    fn migration_025_is_present_twenty_five_is_current_and_twenty_six_is_absent() {
+    fn migration_026_is_present_twenty_six_is_current_and_twenty_seven_is_absent() {
         assert_eq!(
             super::super::connection::MAX_SUPPORTED_SCHEMA_VERSION,
-            BODY_PACKAGE_AUTHORITY_SCHEMA_VERSION
+            LIVE2D_CORE_AUTHORITY_SCHEMA_VERSION
         );
         let migrations_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/storage/migrations");
         let entries = std::fs::read_dir(&migrations_dir).unwrap();
@@ -4727,30 +4813,20 @@ mod transaction_tests {
                 highest = highest.max(version);
             }
         }
-        assert_eq!(highest, 25, "Migration 025 must be the current migration");
+        assert_eq!(highest, 26, "Migration 026 must be the current migration");
         let names = std::fs::read_dir(&migrations_dir)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .collect::<Vec<_>>();
+        for version in ["022", "023", "024", "025", "026"] {
+            assert!(
+                names.iter().any(|name| name.starts_with(version)),
+                "Migration {version} must exist"
+            );
+        }
         assert!(
-            names.iter().any(|name| name.starts_with("022")),
-            "Migration 022 must exist"
-        );
-        assert!(
-            names.iter().any(|name| name.starts_with("023")),
-            "Migration 023 must exist"
-        );
-        assert!(
-            names.iter().any(|name| name.starts_with("024")),
-            "Migration 024 must exist"
-        );
-        assert!(
-            names.iter().any(|name| name.starts_with("025")),
-            "Migration 025 must exist"
-        );
-        assert!(
-            !names.iter().any(|name| name.starts_with("026")),
-            "Migration 026 must not exist"
+            !names.iter().any(|name| name.starts_with("027")),
+            "Migration 027 must not exist"
         );
     }
 
@@ -5897,6 +5973,145 @@ mod transaction_tests {
         verify_schema_after_upgrade(&connection, BODY_PACKAGE_AUTHORITY_SCHEMA_VERSION).unwrap();
         verify_database(&connection, BODY_PACKAGE_AUTHORITY_SCHEMA_VERSION, life_id).unwrap();
         assert_eq!(writer_fence_count(&connection), 99);
+    }
+
+    #[test]
+    fn migration_026_upgrades_schema_twenty_five_without_backfill_and_installs_full_manifest() {
+        let (mut connection, life_id) = schema_twenty_five_connection_with_current_life();
+        apply_live2d_core_authority_upgrade(&mut connection);
+
+        assert_eq!(
+            schema_version(&connection),
+            LIVE2D_CORE_AUTHORITY_SCHEMA_VERSION
+        );
+        validate_live2d_core_schema(&connection).unwrap();
+        assert_eq!(writer_fence_count(&connection), 102);
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM live2d_core_component", [], |row| row
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap(),
+            0,
+            "Migration026 must synthesize no component rows"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM life_identity WHERE id=?1",
+                    [life_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+            "existing lives remain unchanged"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migration WHERE version=?1",
+                    [LIVE2D_CORE_AUTHORITY_SCHEMA_VERSION],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let error = apply_live2d_core_schema_upgrade(&transaction).unwrap_err();
+        assert_eq!(error.code, "MIGRATION_VERSION_INVARIANT_FAILED");
+        drop(transaction);
+        assert_eq!(
+            schema_version(&connection),
+            LIVE2D_CORE_AUTHORITY_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn migration_026_constraints_and_immutability_guard_are_authoritative() {
+        let (connection, _life_id) = schema_twenty_six_connection_with_current_life();
+
+        // slot, runtime_family, managed_relative_path, and sha256 form must
+        // be exact; the table carries no user path / URL / source text.
+        for (sql, label) in [
+            (
+                "INSERT INTO live2d_core_component
+                 (slot, runtime_family, version_label, sha256, managed_relative_path, installed_at)
+                 VALUES ('other', 'cubism4', 'v1', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'live2dcubismcore.min.js', '2026-08-29T00:00:00.000Z')",
+                "slot must be 'active'",
+            ),
+            (
+                "INSERT INTO live2d_core_component
+                 (slot, runtime_family, version_label, sha256, managed_relative_path, installed_at)
+                 VALUES ('active', 'cubism5', 'v1', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'live2dcubismcore.min.js', '2026-08-29T00:00:00.000Z')",
+                "runtime_family must be cubism4",
+            ),
+            (
+                "INSERT INTO live2d_core_component
+                 (slot, runtime_family, version_label, sha256, managed_relative_path, installed_at)
+                 VALUES ('active', 'cubism4', 'v1', 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', 'live2dcubismcore.min.js', '2026-08-29T00:00:00.000Z')",
+                "sha256 must be lowercase",
+            ),
+            (
+                "INSERT INTO live2d_core_component
+                 (slot, runtime_family, version_label, sha256, managed_relative_path, installed_at)
+                 VALUES ('active', 'cubism4', 'v1', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'other.js', '2026-08-29T00:00:00.000Z')",
+                "managed_relative_path must be the fixed resource",
+            ),
+            (
+                "INSERT INTO live2d_core_component
+                 (slot, runtime_family, version_label, sha256, managed_relative_path, installed_at)
+                 VALUES ('active', 'cubism4', 'v1', 'short', 'live2dcubismcore.min.js', '2026-08-29T00:00:00.000Z')",
+                "sha256 length must be 64",
+            ),
+        ] {
+            assert!(
+                connection.execute(sql, []).is_err(),
+                "{label} must be rejected by the schema"
+            );
+        }
+
+        connection
+            .execute(
+                "INSERT INTO live2d_core_component
+                 (slot, runtime_family, version_label, sha256, managed_relative_path, installed_at)
+                 VALUES ('active', 'cubism4', 'v1', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'live2dcubismcore.min.js', '2026-08-29T00:00:00.000Z')",
+                [],
+            )
+            .unwrap();
+        assert!(connection
+            .execute(
+                "UPDATE live2d_core_component SET version_label='changed' WHERE slot='active'",
+                [],
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("LIVE2D_CORE_COMPONENT_IMMUTABLE"));
+
+        let forbidden_columns: Vec<String> = connection
+            .prepare("SELECT name FROM pragma_table_info('live2d_core_component')")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        for column in &forbidden_columns {
+            assert!(
+                !["source_path", "url", "script_url", "source_text", "payload"]
+                    .contains(&column.as_str()),
+                "live2d_core_component must not carry {column}"
+            );
+        }
+    }
+
+    #[test]
+    fn migration_026_generic_schema_verifiers_accept_valid_schema_twenty_six() {
+        let (connection, life_id) = schema_twenty_six_connection_with_current_life();
+        verify_schema_after_upgrade(&connection, LIVE2D_CORE_AUTHORITY_SCHEMA_VERSION).unwrap();
+        verify_database(&connection, LIVE2D_CORE_AUTHORITY_SCHEMA_VERSION, life_id).unwrap();
+        assert_eq!(writer_fence_count(&connection), 102);
     }
 
     #[test]

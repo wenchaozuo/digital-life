@@ -350,7 +350,16 @@ describe("D21-C production activation and authority gates", () => {
   });
 
   it("keeps remote Core bootstrap and sample model names out of production source", () => {
-    const productionSource = sourceFilesUnder("src/body").join("\n");
+    // D22-D1: the managed Cubism Core provisioning authority
+    // (managedCubismCore.ts) is the ONE sanctioned script-injection seam,
+    // backed by the backend allowlist and main-only protocol.  Every other
+    // production body module retains the D21-C no-injection guarantee.
+    const bodyDirectory = path.resolve(process.cwd(), "src/body");
+    const productionSource = fs
+      .readdirSync(bodyDirectory)
+      .filter((name) => name.endsWith(".ts") && name !== "managedCubismCore.ts")
+      .map((name) => fs.readFileSync(path.join(bodyDirectory, name), "utf8"))
+      .join("\n");
 
     expect(productionSource).not.toMatch(
       /https:\/\/cubism\.live2d\.com|live2dcubismcore\.min\.js|script\.src\s*=|append\(\s*script\s*\)/i,

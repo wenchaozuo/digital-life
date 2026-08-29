@@ -17,8 +17,9 @@ pub(crate) mod life_intent;
 // foundation; its crate-internal surface has no production caller yet.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod autonomy;
-// D16-B1 is the explicit perception-consent authority foundation.  It has no
-// operating-system observation or production caller until a later D16 stage.
+// D16-B1 remains the independent foreground-focus consent authority. D23-B2
+// exposes only the separate screen-perception consent/session authority to
+// Settings; neither domain performs operating-system capture here.
 pub mod memory;
 pub mod model;
 #[cfg_attr(not(test), allow(dead_code))]
@@ -64,6 +65,7 @@ pub fn run() {
                 .map_err(|error| std::io::Error::other(error.message))?;
             app.manage(storage);
             app.manage(secrets::WindowsCredentialSecretStore::new());
+            app.manage(perception::screen_policy::ScreenPerceptionSessionGate::new());
             app.manage(storage::LlmCandidateExtractionCoordinator::default());
             app.manage(model::runtime::ModelRuntimeCoordinator::default());
             app.manage(conversation::ConversationCognitionCoordinator::default());
@@ -147,6 +149,12 @@ pub fn run() {
             storage::body_package::set_current_life_body,
             storage::live2d_core::import_cubism_core,
             storage::live2d_core::get_cubism_core_snapshot,
+            perception::screen_settings::get_screen_perception_policy,
+            perception::screen_settings::create_screen_perception_policy,
+            perception::screen_settings::update_screen_perception_policy,
+            perception::screen_settings::get_screen_perception_session_status,
+            perception::screen_settings::arm_screen_perception_session,
+            perception::screen_settings::disarm_screen_perception_session,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

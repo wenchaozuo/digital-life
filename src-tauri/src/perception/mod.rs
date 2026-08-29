@@ -11,6 +11,7 @@
 
 pub(crate) mod foreground_focus;
 pub(crate) mod screen_policy;
+pub(crate) mod screen_settings;
 
 pub(crate) const PERCEPTION_POLICY_VERSION: i64 = 1;
 pub(crate) const PERCEPTION_POLICY_EVENT_VERSION: i64 = 1;

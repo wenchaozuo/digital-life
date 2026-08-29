@@ -42,4 +42,10 @@ commands.allow = [
     "set_current_life_body",
     "get_cubism_core_snapshot",
     "import_cubism_core",
+    "get_screen_perception_policy",
+    "create_screen_perception_policy",
+    "update_screen_perception_policy",
+    "get_screen_perception_session_status",
+    "arm_screen_perception_session",
+    "disarm_screen_perception_session",
 ]

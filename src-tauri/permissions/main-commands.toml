@@ -12,4 +12,5 @@ commands.allow = [
     "save_persona_template",
     "get_persona_template",
     "get_body_package_registry_snapshot",
+    "get_cubism_core_snapshot",
 ]

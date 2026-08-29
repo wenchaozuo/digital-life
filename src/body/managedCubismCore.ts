@@ -82,29 +82,28 @@ function hasCubismCore(): boolean {
 }
 
 /**
- * D22-D1 production managed Core ready boundary.
+ * Process-wide (Main-WebView-wide) first-load Core provisioning authority.
  *
- * `ensureReady()`:
- * 1. If `window.Live2DCubismCore` is already present, delegate directly to
- *    the frozen D21 boundary (no second script, no re-provision).
- * 2. Otherwise read the backend Core snapshot, require an approved managed
- *    descriptor with a trusted `scriptUrl`, inject exactly that script once,
- *    await its load, verify the Core global exists, then delegate to the D21
- *    boundary.
+ * Multiple `ManagedCubismCoreReadyBoundary` instances share ONE in-flight
+ * provisioning promise, so while Core is not yet present any number of
+ * concurrent `ensureReady()` callers produce:
+ *   - one authoritative backend snapshot read,
+ *   - one script element,
+ *   - one script load,
+ *   - one Core initialization path.
  *
- * Concurrency: concurrent `ensureReady()` calls share one in-flight
- * readiness promise, so exactly one script element and one initialization
- * path run.  A failed script load never marks Core ready and returns a
- * bounded Core startup error; the PNG fallback remains usable and a later
- * application restart may retry.
+ * The coordinator owns the lifecycle: after a settled attempt it retires the
+ * in-flight promise (a failure is never permanently poisoned; a later
+ * application restart may retry).  It still fails closed and never fetches a
+ * remote Core.
  */
-export class ManagedCubismCoreReadyBoundary implements Live2DCoreReadyBoundary {
+class CoreLoadCoordinator {
   private inFlight: Promise<void> | undefined;
 
   constructor(
-    private readonly service: ManagedCubismCoreService = managedCubismCoreService,
-    private readonly documentRef: Document = document,
-    private readonly delegateFactory: () => Live2DCoreReadyBoundary = createLive2DCoreReadyBoundary,
+    private readonly service: ManagedCubismCoreService,
+    private readonly documentRef: Document,
+    private readonly delegateFactory: () => Live2DCoreReadyBoundary,
   ) {}
 
   ensureReady(): Promise<void> {
@@ -181,6 +180,79 @@ export class ManagedCubismCoreReadyBoundary implements Live2DCoreReadyBoundary {
     }
     await this.delegateFactory().ensureReady();
   }
+}
+
+const sharedCoreLoadCoordinator = new CoreLoadCoordinator(
+  managedCubismCoreService,
+  document,
+  createLive2DCoreReadyBoundary,
+);
+
+/**
+ * D22-D1 production managed Core ready boundary.
+ *
+ * `ensureReady()`:
+ * 1. If `window.Live2DCubismCore` is already present, delegate directly to
+ *    the frozen D21 boundary (no second script, no re-provision).
+ * 2. Otherwise run through the PROCESS-WIDE shared load coordinator: one
+ *    authoritative backend snapshot read, one trusted script injected once,
+ *    one load, one initialization path, shared by every boundary instance.
+ *
+ * A failed script load never marks Core ready and returns a bounded Core
+ * startup error; the PNG fallback remains usable and a later application
+ * restart may retry.
+ */
+export class ManagedCubismCoreReadyBoundary implements Live2DCoreReadyBoundary {
+  private readonly coordinator: CoreLoadCoordinator;
+
+  constructor(
+    service?: ManagedCubismCoreService,
+    documentRef?: Document,
+    delegateFactory?: () => Live2DCoreReadyBoundary,
+  ) {
+    // Production uses the process-wide shared authority so separately
+    // constructed instances coordinate.  Tests may supply their own inputs.
+    this.coordinator =
+      service === undefined && documentRef === undefined && delegateFactory === undefined
+        ? sharedCoreLoadCoordinator
+        : new CoreLoadCoordinator(
+            service ?? managedCubismCoreService,
+            documentRef ?? document,
+            delegateFactory ?? createLive2DCoreReadyBoundary,
+          );
+  }
+
+  ensureReady(): Promise<void> {
+    return this.coordinator.ensureReady();
+  }
+}
+
+/**
+ * Test seam: builds a boundary bound to an EXPLICIT shared coordinator, so
+ * separately constructed instances provably share one provisioning
+ * authority.  Production never uses this factory.
+ */
+export function createManagedCubismCoreBoundaryWithCoordinator(
+  coordinator: CoreLoadCoordinator,
+): Live2DCoreReadyBoundary {
+  return {
+    ensureReady(): Promise<void> {
+      return coordinator.ensureReady();
+    },
+  };
+}
+
+/**
+ * Test seam: constructs the shared load coordinator with explicit inputs.
+ * The coordinator class itself is the shared authority; production uses the
+ * module-level singleton instead.
+ */
+export function createSharedCoreLoadCoordinator(
+  service: ManagedCubismCoreService,
+  documentRef: Document,
+  delegateFactory: () => Live2DCoreReadyBoundary,
+): CoreLoadCoordinator {
+  return new CoreLoadCoordinator(service, documentRef, delegateFactory);
 }
 
 export function createManagedCubismCoreReadyBoundary(): Live2DCoreReadyBoundary {

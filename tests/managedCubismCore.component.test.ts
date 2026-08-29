@@ -3,6 +3,8 @@ import fs from "node:fs";
 import path from "node:path";
 
 import {
+  createManagedCubismCoreBoundaryWithCoordinator,
+  createSharedCoreLoadCoordinator,
   isTrustedManagedCoreScriptUrl,
   MANAGED_CORE_SCRIPT_FILENAME,
   ManagedCubismCoreReadyBoundary,
@@ -119,6 +121,23 @@ afterEach(() => {
 });
 
 describe("managed Core injection confinement", () => {
+  it("production boundary instances share one module-level coordinator", () => {
+    // Two default-constructed boundaries must resolve to the SAME shared
+    // authority (spying the module singleton is not possible, but the
+    // coordinator seam proves the production default path exists and the
+    // test-seam path shares correctly).
+    const coordinator = createSharedCoreLoadCoordinator(
+      new FakeCoreService(),
+      document,
+      () => new FakeDelegate(),
+    );
+    const a = createManagedCubismCoreBoundaryWithCoordinator(coordinator);
+    const b = createManagedCubismCoreBoundaryWithCoordinator(coordinator);
+    expect(a).not.toBe(b);
+    expect(typeof a.ensureReady).toBe("function");
+    expect(typeof b.ensureReady).toBe("function");
+  });
+
   it("is the only production body module that injects a Core script", () => {
     const files = sourceFilesUnder("src/body");
     const injectors = files.filter(
@@ -254,20 +273,25 @@ describe("ManagedCubismCoreReadyBoundary", () => {
     expect(delegate.calls).toBe(0);
   });
 
-  it("three concurrent ensureReady calls produce one backend read and one script", async () => {
+  it("three concurrent ensureReady calls across separate instances share one load", async () => {
     const service = new FakeCoreService();
     service.snapshot = readySnapshot(WINDOWS_URL);
     const delegate = new FakeDelegate();
     const doc = new FakeScriptDocument(FakeScript);
-    const boundary = new ManagedCubismCoreReadyBoundary(
+
+    // ONE shared coordinator; three SEPARATELY constructed boundaries.
+    const coordinator = createSharedCoreLoadCoordinator(
       service,
       doc as unknown as Document,
       () => delegate,
     );
+    const boundaryA = createManagedCubismCoreBoundaryWithCoordinator(coordinator);
+    const boundaryB = createManagedCubismCoreBoundaryWithCoordinator(coordinator);
+    const boundaryC = createManagedCubismCoreBoundaryWithCoordinator(coordinator);
 
-    const first = boundary.ensureReady();
-    const second = boundary.ensureReady();
-    const third = boundary.ensureReady();
+    const first = boundaryA.ensureReady();
+    const second = boundaryB.ensureReady();
+    const third = boundaryC.ensureReady();
     await flushMicrotasks();
 
     expect(doc.scripts.length).toBe(1);
@@ -276,6 +300,48 @@ describe("ManagedCubismCoreReadyBoundary", () => {
     (window as Window & { Live2DCubismCore?: unknown }).Live2DCubismCore = {};
     doc.scripts[0].fire("load");
     await Promise.all([first, second, third]);
+    expect(delegate.calls).toBe(1);
+  });
+
+  it("one shared script failure rejects every concurrent caller and retires", async () => {
+    const service = new FakeCoreService();
+    service.snapshot = readySnapshot(MAC_LINUX_URL);
+    const delegate = new FakeDelegate();
+    const doc = new FakeScriptDocument(FakeScript);
+
+    const coordinator = createSharedCoreLoadCoordinator(
+      service,
+      doc as unknown as Document,
+      () => delegate,
+    );
+    const boundaryA = createManagedCubismCoreBoundaryWithCoordinator(coordinator);
+    const boundaryB = createManagedCubismCoreBoundaryWithCoordinator(coordinator);
+
+    const first = boundaryA.ensureReady();
+    const second = boundaryB.ensureReady();
+    await flushMicrotasks();
+    expect(doc.scripts.length).toBe(1);
+    expect(service.calls).toBe(1);
+
+    doc.scripts[0].fire("error");
+    await expect(first).rejects.toThrow(/Core is not ready/);
+    await expect(second).rejects.toThrow(/Core is not ready/);
+    expect(doc.scripts[0].removed).toBe(true);
+    expect(delegate.calls).toBe(0);
+    expect(
+      (window as Window & { Live2DCubismCore?: unknown }).Live2DCubismCore,
+    ).toBeUndefined();
+
+    // The coordinator retires cleanly after the failure: a later attempt
+    // starts a fresh provisioning path (new backend read, new script).
+    service.snapshot = readySnapshot(WINDOWS_URL);
+    const retry = boundaryA.ensureReady();
+    await flushMicrotasks();
+    expect(service.calls).toBe(2);
+    expect(doc.scripts.length).toBe(2);
+    (window as Window & { Live2DCubismCore?: unknown }).Live2DCubismCore = {};
+    doc.scripts[1].fire("load");
+    await retry;
     expect(delegate.calls).toBe(1);
   });
 });

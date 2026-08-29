@@ -6066,6 +6066,30 @@ mod transaction_tests {
                  VALUES ('active', 'cubism4', 'v1', 'short', 'live2dcubismcore.min.js', '2026-08-29T00:00:00.000Z')",
                 "sha256 length must be 64",
             ),
+            (
+                "INSERT INTO live2d_core_component
+                 (slot, runtime_family, version_label, sha256, managed_relative_path, installed_at)
+                 VALUES ('active', 'cubism4', 'v1', 'zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz', 'live2dcubismcore.min.js', '2026-08-29T00:00:00.000Z')",
+                "sha256 must be exactly 64 lowercase hex characters (z rejected)",
+            ),
+            (
+                "INSERT INTO live2d_core_component
+                 (slot, runtime_family, version_label, sha256, managed_relative_path, installed_at)
+                 VALUES ('active', 'cubism4', 'v1', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaag', 'live2dcubismcore.min.js', '2026-08-29T00:00:00.000Z')",
+                "sha256 must be exactly 64 lowercase hex characters (g rejected)",
+            ),
+            (
+                "INSERT INTO live2d_core_component
+                 (slot, runtime_family, version_label, sha256, managed_relative_path, installed_at)
+                 VALUES ('active', 'cubism4', 'v1', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'live2dcubismcore.min.js', '2026-08-29T00:00:00.000Z')",
+                "sha256 length must be 64 (65 hex chars rejected)",
+            ),
+            (
+                "INSERT INTO live2d_core_component
+                 (slot, runtime_family, version_label, sha256, managed_relative_path, installed_at)
+                 VALUES ('active', 'cubism4', 'v1', 'aaaa-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'live2dcubismcore.min.js', '2026-08-29T00:00:00.000Z')",
+                "sha256 must be exactly 64 lowercase hex characters (punctuation rejected)",
+            ),
         ] {
             assert!(
                 connection.execute(sql, []).is_err(),
@@ -6073,11 +6097,12 @@ mod transaction_tests {
             );
         }
 
+        // A valid 64-char lowercase hex value is accepted.
         connection
             .execute(
                 "INSERT INTO live2d_core_component
                  (slot, runtime_family, version_label, sha256, managed_relative_path, installed_at)
-                 VALUES ('active', 'cubism4', 'v1', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'live2dcubismcore.min.js', '2026-08-29T00:00:00.000Z')",
+                 VALUES ('active', 'cubism4', 'v1', '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', 'live2dcubismcore.min.js', '2026-08-29T00:00:00.000Z')",
                 [],
             )
             .unwrap();

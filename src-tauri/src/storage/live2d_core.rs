@@ -239,6 +239,159 @@ fn unsafe_path() -> StorageError {
     )
 }
 
+fn rollback_failed() -> StorageError {
+    core_error(
+        "LIVE2D_CORE_ROLLBACK_FAILED",
+        "The Cubism Core replacement could not be rolled back; authority is not preserved.",
+        true,
+    )
+}
+
+#[cfg(test)]
+static FAIL_NEXT_CORE_REGISTRATION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+fn fail_next_core_registration_for_test() {
+    FAIL_NEXT_CORE_REGISTRATION.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn take_fail_next_core_registration_for_test() -> bool {
+    FAIL_NEXT_CORE_REGISTRATION.swap(false, std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(windows)]
+fn has_reparse_attribute(attributes: u32) -> bool {
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(windows)]
+fn is_reparse_or_symlink(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    metadata.file_type().is_symlink() || has_reparse_attribute(metadata.file_attributes())
+}
+
+#[cfg(not(windows))]
+fn is_reparse_or_symlink(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+/// Verifies every component of the managed Core root chain with real
+/// filesystem metadata.  No component may resolve through a symlink /
+/// junction / reparse point: a lexical `Path::starts_with` is never enough.
+fn require_safe_component(path: &Path, label: &str) -> Result<(), StorageError> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            core_missing()
+        } else {
+            unsafe_path()
+        }
+    })?;
+    if !metadata.is_dir() || is_reparse_or_symlink(&metadata) {
+        return Err(unsafe_path());
+    }
+    if !path.is_absolute() {
+        return Err(unsafe_path());
+    }
+    let _ = label;
+    Ok(())
+}
+
+/// The final managed Core file must be a regular non-link file whenever it is
+/// read or served.
+fn require_safe_regular_file(path: &Path) -> Result<(), StorageError> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            core_missing()
+        } else {
+            unsafe_path()
+        }
+    })?;
+    if !metadata.is_file() || is_reparse_or_symlink(&metadata) {
+        return Err(unsafe_path());
+    }
+    Ok(())
+}
+
+/// The user-selected source file must be an absolute regular non-link file.
+fn require_safe_source_file(path: &Path) -> Result<(), StorageError> {
+    if !path.is_absolute() {
+        return Err(invalid_input());
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|_| core_missing())?;
+    if !metadata.is_file() || is_reparse_or_symlink(&metadata) {
+        return Err(invalid_input());
+    }
+    Ok(())
+}
+
+/// Ensures `<active-root>/live2d/core/{staging,active}` exist and every
+/// component of the chain is a real directory (no symlink/junction/reparse
+/// escape), matching the D22-B managed-asset policy.
+fn managed_core_roots(active_root: &Path) -> Result<(PathBuf, PathBuf), StorageError> {
+    require_safe_component(active_root, "active root")?;
+    let live2d = active_root.join(MANAGED_CORE_DIRECTORY);
+    match fs::symlink_metadata(&live2d) {
+        Ok(metadata) => {
+            if !metadata.is_dir() || is_reparse_or_symlink(&metadata) {
+                return Err(unsafe_path());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(&live2d).map_err(|_| import_copy_failed())?;
+        }
+        Err(_) => return Err(import_copy_failed()),
+    }
+    require_safe_component(&live2d, "live2d")?;
+    let core_root = live2d.join(MANAGED_CORE_SUBDIRECTORY);
+    match fs::symlink_metadata(&core_root) {
+        Ok(metadata) => {
+            if !metadata.is_dir() || is_reparse_or_symlink(&metadata) {
+                return Err(unsafe_path());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(&core_root).map_err(|_| import_copy_failed())?;
+        }
+        Err(_) => return Err(import_copy_failed()),
+    }
+    require_safe_component(&core_root, "core")?;
+    let staging = core_root.join(MANAGED_CORE_STAGING_DIRECTORY);
+    let active = core_root.join(MANAGED_CORE_ACTIVE_DIRECTORY);
+    for (path, label) in [(&staging, "staging"), (&active, "active")] {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                if !metadata.is_dir() || is_reparse_or_symlink(&metadata) {
+                    return Err(unsafe_path());
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(path).map_err(|_| import_copy_failed())?;
+            }
+            Err(_) => return Err(import_copy_failed()),
+        }
+        require_safe_component(path, label)?;
+    }
+    Ok((staging, active))
+}
+
+fn managed_active_core_path(active_root: &Path) -> Result<PathBuf, StorageError> {
+    let (_staging, active) = managed_core_roots(active_root)?;
+    let candidate = active.join(CORE_FIXED_RESOURCE_NAME);
+    if !candidate.starts_with(&active) {
+        return Err(unsafe_path());
+    }
+    // The final managed file must be a regular non-link managed file
+    // whenever it is read or served.
+    if fs::symlink_metadata(&candidate).is_ok() {
+        require_safe_regular_file(&candidate)?;
+    }
+    Ok(candidate)
+}
+
 /// Bounded read of a source file into memory, refusing anything larger than
 /// `limit` real bytes.
 fn read_file_with_limit(path: &Path, limit: u64) -> Result<Vec<u8>, StorageError> {
@@ -273,27 +426,6 @@ fn hex_digest(bytes: &[u8]) -> String {
         output.push_str(&format!("{byte:02x}"));
     }
     output
-}
-
-/// Ensures `<active-root>/live2d/core/{staging,active}` exist.
-fn managed_core_roots(active_root: &Path) -> Result<(PathBuf, PathBuf), StorageError> {
-    let core_root = active_root
-        .join(MANAGED_CORE_DIRECTORY)
-        .join(MANAGED_CORE_SUBDIRECTORY);
-    let staging = core_root.join(MANAGED_CORE_STAGING_DIRECTORY);
-    let active = core_root.join(MANAGED_CORE_ACTIVE_DIRECTORY);
-    fs::create_dir_all(&staging).map_err(|_| import_copy_failed())?;
-    fs::create_dir_all(&active).map_err(|_| import_copy_failed())?;
-    Ok((staging, active))
-}
-
-fn managed_active_core_path(active_root: &Path) -> Result<PathBuf, StorageError> {
-    let (_staging, active) = managed_core_roots(active_root)?;
-    let candidate = active.join(CORE_FIXED_RESOURCE_NAME);
-    if !candidate.starts_with(&active) {
-        return Err(unsafe_path());
-    }
-    Ok(candidate)
 }
 
 fn read_registered_core(
@@ -398,6 +530,10 @@ fn register_core_component(
     connection: &mut Connection,
     approved: &ApprovedCubismCore,
 ) -> Result<(), StorageError> {
+    #[cfg(test)]
+    if take_fail_next_core_registration_for_test() {
+        return Err(registration_failed());
+    }
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|_| database_unavailable())?;
@@ -465,6 +601,7 @@ impl StorageService {
             return Err(invalid_input());
         }
         let source = Path::new(&request.source_path);
+        require_safe_source_file(source)?;
 
         // 1. Bounded read + SHA-256 of the real bytes.
         let bytes = read_file_with_limit(source, MAX_CORE_BYTES)?;
@@ -493,27 +630,56 @@ impl StorageService {
             return Err(error);
         }
 
-        // 4. Promote to the managed active location.  Replacement is allowed
-        // at the authority level (a re-import always signals restartRequired
-        // because the Main WebView never hot-replaces a loaded Core), but
-        // never partially: the staged copy is atomic-renamed into place.
+        // 4. Promote to the managed active location with replacement
+        // atomicity.  A previously valid registered Core must survive a
+        // failed replacement:
+        //   - preserve the old active file in a bounded backup inside the
+        //     managed Core root (never protocol-served);
+        //   - promote the verified staged file;
+        //   - attempt the SQLite authority replacement;
+        //   - on failure: remove the new file, restore the old backup;
+        //   - on success: retire the backup.
+        // If restoration itself fails, a distinct rollback failure is
+        // surfaced (authority preservation cannot be claimed).
         let final_path = active_root_dir.join(CORE_FIXED_RESOURCE_NAME);
-        if fs::symlink_metadata(&final_path).is_ok() {
-            let _ = fs::remove_file(&final_path);
+        let backup_path = staging_root.join(format!("backup-{}", unique_suffix()));
+        let had_previous = fs::symlink_metadata(&final_path).is_ok();
+        if had_previous {
+            require_safe_regular_file(&final_path)?;
+            fs::rename(&final_path, &backup_path).map_err(|_| {
+                let _ = fs::remove_dir_all(&staging_dir);
+                import_copy_failed()
+            })?;
         }
-        fs::rename(&staged_path, &final_path).map_err(|_| {
+        fs::rename(&staged_path, &final_path).map_err(|error| {
+            // Promotion failed: restore the preserved old file.
+            if had_previous {
+                let _ = fs::rename(&backup_path, &final_path);
+            }
             let _ = fs::remove_dir_all(&staging_dir);
+            let _ = error;
             import_copy_failed()
         })?;
         let _ = fs::remove_dir_all(&staging_dir);
 
         // 5. Register the component row.  If registration fails, the managed
-        // file is removed so no untrusted orphan remains authoritative.
+        // file is rolled back to the preserved old Core.
         let registration = register_core_component(&mut state.connection, approved);
         drop(state);
         if let Err(error) = registration {
             let _ = fs::remove_file(&final_path);
+            if had_previous {
+                let restore = fs::rename(&backup_path, &final_path);
+                if restore.is_err() {
+                    return Err(rollback_failed());
+                }
+            }
             return Err(error);
+        }
+
+        // Replacement committed: retire the backup.
+        if had_previous {
+            let _ = fs::remove_file(&backup_path);
         }
         self.get_cubism_core_snapshot_with_allowlist(allowlist, true)
     }
@@ -776,7 +942,7 @@ const _: fn(&Connection) -> Result<(), StorageError> = validate_schema_objects;
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use tauri::http::{Method, Request, StatusCode};
 
@@ -1094,6 +1260,32 @@ mod tests {
     }
 
     #[test]
+    fn main_commands_acl_grants_snapshot_but_never_import_and_chat_gets_neither() {
+        let permissions_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("permissions");
+        let main_acl = std::fs::read_to_string(permissions_dir.join("main-commands.toml"))
+            .expect("main-commands.toml must exist");
+
+        // Main may read the Core snapshot (its ready boundary needs it)...
+        assert!(
+            main_acl.contains("get_cubism_core_snapshot"),
+            "Main must be able to invoke get_cubism_core_snapshot"
+        );
+        // ...but Core import is NOT a Main renderer capability.
+        assert!(
+            !main_acl.contains("import_cubism_core"),
+            "Main must never invoke import_cubism_core"
+        );
+
+        // Chat receives neither Core command.
+        let chat_acl = std::fs::read_to_string(permissions_dir.join("chat-commands.toml"))
+            .expect("chat-commands.toml must exist");
+        assert!(
+            !chat_acl.contains("cubism_core"),
+            "Chat must receive no Cubism Core command"
+        );
+    }
+
+    #[test]
     fn oversized_core_file_is_rejected_before_hashing_completes() {
         let fixture = Fixture::new();
         let oversized = vec![0x61_u8; (MAX_CORE_BYTES + 1) as usize];
@@ -1106,5 +1298,218 @@ mod tests {
             .import_cubism_core_with_test_allowlist(request)
             .unwrap_err();
         assert_eq!(error.code, "LIVE2D_CORE_TOO_LARGE");
+    }
+
+    #[test]
+    fn replacement_failure_preserves_the_previous_valid_core() {
+        let fixture = Fixture::new();
+        let core_a = fixture.write_core(TEST_FIXTURE_CORE_BYTES);
+        fixture
+            .storage
+            .import_cubism_core_with_test_allowlist(ImportCubismCoreRequest {
+                source_path: core_a.to_string_lossy().into_owned(),
+            })
+            .unwrap();
+        assert_eq!(
+            fixture
+                .storage
+                .get_cubism_core_snapshot_with_test_allowlist()
+                .unwrap()
+                .status,
+            ManagedCubismCoreStatus::ReadyForStartup
+        );
+        let previous_sha = test_fixture_sha256();
+
+        // Stage a distinct valid test Core B and arm the registration
+        // failpoint so the SQLite authority replacement fails AFTER the
+        // filesystem promotion begins.
+        let core_b = fixture.write_core(b"/* d22-d1 replacement fixture B, not Cubism Core */");
+        let sha_b = hash_bytes(b"/* d22-d1 replacement fixture B, not Cubism Core */");
+        let approved_b = ApprovedCubismCore {
+            runtime_family: CORE_RUNTIME_FAMILY,
+            version_label: "d22-d1-test-fixture-b",
+            sha256: Box::leak(sha_b.clone().into_boxed_str()),
+        };
+        let allowlist_b = Box::leak(vec![approved_b].into_boxed_slice());
+        fail_next_core_registration_for_test();
+
+        let error = fixture
+            .storage
+            .import_cubism_core_with_allowlist(
+                ImportCubismCoreRequest {
+                    source_path: core_b.to_string_lossy().into_owned(),
+                },
+                allowlist_b,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "LIVE2D_CORE_REGISTRATION_FAILED");
+
+        // Original SQLite row and managed bytes are restored; status stays
+        // ReadyForStartup under the test allowlist and the original Core is
+        // still serveable.
+        let snapshot = fixture
+            .storage
+            .get_cubism_core_snapshot_with_test_allowlist()
+            .unwrap();
+        assert_eq!(snapshot.status, ManagedCubismCoreStatus::ReadyForStartup);
+        assert_eq!(snapshot.sha256.as_deref(), Some(previous_sha.as_str()));
+        assert_eq!(
+            fs::read(fixture.active_core_path()).unwrap(),
+            TEST_FIXTURE_CORE_BYTES,
+            "the original managed bytes must be restored"
+        );
+        let response = serve_core_request_for_test(
+            &fixture.storage,
+            fixture.request(Method::GET, &windows_core_uri()),
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn successful_replacement_commits_new_authority_and_retires_backup() {
+        let fixture = Fixture::new();
+        let core_a = fixture.write_core(TEST_FIXTURE_CORE_BYTES);
+        fixture
+            .storage
+            .import_cubism_core_with_test_allowlist(ImportCubismCoreRequest {
+                source_path: core_a.to_string_lossy().into_owned(),
+            })
+            .unwrap();
+
+        let core_b = fixture.write_core(b"/* d22-d1 replacement fixture B, not Cubism Core */");
+        let sha_b = hash_bytes(b"/* d22-d1 replacement fixture B, not Cubism Core */");
+        let approved_b = ApprovedCubismCore {
+            runtime_family: CORE_RUNTIME_FAMILY,
+            version_label: "d22-d1-test-fixture-b",
+            sha256: Box::leak(sha_b.clone().into_boxed_str()),
+        };
+        let allowlist_b = Box::leak(vec![approved_b].into_boxed_slice());
+        let snapshot = fixture
+            .storage
+            .import_cubism_core_with_allowlist(
+                ImportCubismCoreRequest {
+                    source_path: core_b.to_string_lossy().into_owned(),
+                },
+                allowlist_b,
+            )
+            .unwrap();
+        assert_eq!(snapshot.sha256.as_deref(), Some(sha_b.as_str()));
+        assert!(
+            snapshot.restart_required,
+            "replacement always requires a fresh WebView"
+        );
+        // The new managed bytes are in place and no backup remains.
+        assert_eq!(
+            fs::read(fixture.active_core_path()).unwrap(),
+            b"/* d22-d1 replacement fixture B, not Cubism Core */"
+        );
+        let staging_root = fixture
+            .root
+            .path()
+            .join("data")
+            .join(MANAGED_CORE_DIRECTORY)
+            .join(MANAGED_CORE_SUBDIRECTORY)
+            .join(MANAGED_CORE_STAGING_DIRECTORY);
+        let backup_count = fs::read_dir(&staging_root)
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .map(|entry| entry.file_name().to_string_lossy().starts_with("backup-"))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(backup_count, 0, "the backup must be retired after commit");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_core_root_rejects_symlink_escapes() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new();
+        // A symlink replacing the `core` directory must be rejected.
+        let live2d = fixture
+            .root
+            .path()
+            .join("data")
+            .join(MANAGED_CORE_DIRECTORY);
+        fs::create_dir_all(&live2d).unwrap();
+        let core_dir = live2d.join(MANAGED_CORE_SUBDIRECTORY);
+        fs::remove_dir_all(&core_dir).unwrap_or(());
+        let outside = fixture.root.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        symlink(&outside, &core_dir).unwrap();
+        assert_eq!(
+            managed_core_roots(&fixture.root.path().join("data"))
+                .unwrap_err()
+                .code,
+            "LIVE2D_CORE_UNSAFE_PATH"
+        );
+        fs::remove_dir_all(&core_dir).unwrap();
+
+        // A symlink replacing `staging` or `active` is rejected.
+        for sub in [
+            MANAGED_CORE_STAGING_DIRECTORY,
+            MANAGED_CORE_ACTIVE_DIRECTORY,
+        ] {
+            fs::create_dir_all(&core_dir).unwrap();
+            let link = core_dir.join(sub);
+            fs::remove_dir_all(&link).unwrap_or(());
+            symlink(&outside, &link).unwrap();
+            assert_eq!(
+                managed_core_roots(&fixture.root.path().join("data"))
+                    .unwrap_err()
+                    .code,
+                "LIVE2D_CORE_UNSAFE_PATH",
+                "{sub} symlink must be rejected"
+            );
+            fs::remove_dir_all(&link).unwrap();
+        }
+
+        // A final Core file symlink is rejected on read/serve.
+        fs::create_dir_all(&core_dir.join(MANAGED_CORE_ACTIVE_DIRECTORY)).unwrap();
+        let final_path = fixture.active_core_path();
+        symlink(&outside, &final_path).unwrap();
+        assert_eq!(
+            managed_active_core_path(&fixture.root.path().join("data"))
+                .unwrap_err()
+                .code,
+            "LIVE2D_CORE_UNSAFE_PATH"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn managed_core_root_rejects_windows_reparse_points() {
+        // The reparse-point policy is enforced with real metadata: a
+        // directory or file carrying FILE_ATTRIBUTE_REPARSE_POINT must be
+        // rejected as unsafe.  Fresh managed paths must not be reparse
+        // points, and the shared gate must treat the attribute as unsafe.
+        let fixture = Fixture::new();
+        let (staging, active) = managed_core_roots(&fixture.root.path().join("data")).unwrap();
+        for directory in [&staging, &active] {
+            let metadata = fs::symlink_metadata(directory).unwrap();
+            assert!(
+                !is_reparse_or_symlink(&metadata),
+                "fresh managed dirs are not reparse points"
+            );
+        }
+        let path = fixture.active_core_path();
+        fs::write(&path, TEST_FIXTURE_CORE_BYTES).unwrap();
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        assert!(
+            !is_reparse_or_symlink(&metadata),
+            "fresh managed file is not a reparse point"
+        );
+
+        // Prove the fail-closed attribute decision directly: any metadata
+        // carrying FILE_ATTRIBUTE_REPARSE_POINT is treated as unsafe, even
+        // when CI cannot create a real junction.
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        assert!(!has_reparse_attribute(0));
+        assert!(has_reparse_attribute(FILE_ATTRIBUTE_REPARSE_POINT));
+        assert!(has_reparse_attribute(0x80 | FILE_ATTRIBUTE_REPARSE_POINT));
+        assert!(!has_reparse_attribute(0x80));
     }
 }

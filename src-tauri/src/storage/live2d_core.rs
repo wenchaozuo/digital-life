@@ -917,6 +917,9 @@ fn parse_fixed_core_uri(uri: &tauri::http::Uri) -> bool {
     if uri.query().is_some() {
         return false;
     }
+    if uri.port_u16().is_some() {
+        return false;
+    }
     let Some(host) = uri.host() else {
         return false;
     };
@@ -1463,6 +1466,10 @@ mod tests {
             format!("{}/../live2dcubismcore.min.js", windows_core_uri()),
             "digital-life-core://localhost/other.js".to_string(),
             "http://digital-life-core.localhost/live2dcubismcore.min.js?x=1".to_string(),
+            "http://digital-life-core.localhost:80/live2dcubismcore.min.js".to_string(),
+            "http://digital-life-core.localhost:1234/live2dcubismcore.min.js".to_string(),
+            "digital-life-core://localhost:80/live2dcubismcore.min.js".to_string(),
+            "digital-life-core://localhost:1234/live2dcubismcore.min.js".to_string(),
         ] {
             let response =
                 serve_core_request_for_test(&restarted, fixture.request(Method::GET, &bad_uri));

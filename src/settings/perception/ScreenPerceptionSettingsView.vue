@@ -4,6 +4,13 @@ import { computed, onMounted, ref } from "vue";
 import type { LifeIdentity } from "../../life";
 import { storageService } from "../../storage";
 import {
+  screenCaptureErrorFromUnknown,
+  screenCaptureSettingsService,
+  type ScreenCaptureSettingsError,
+  type ScreenCaptureSmoke,
+  type ScreenCaptureTargetDescriptor,
+} from "./screenCaptureService";
+import {
   screenPerceptionErrorFromUnknown,
   screenPerceptionSettingsService,
   type ScreenPerceptionPolicy,
@@ -20,6 +27,14 @@ const phase = ref<ScreenPerceptionSettingsPhase>("loading");
 const loading = ref(false);
 const error = ref<ScreenPerceptionSettingsError>();
 const operation = ref("");
+
+// Capture-target selection state (process-local, de-identified).
+const targets = ref<ScreenCaptureTargetDescriptor[]>([]);
+const selectedTarget = ref<ScreenCaptureTargetDescriptor | null>(null);
+const targetError = ref<ScreenCaptureSettingsError>();
+const targetOperation = ref("");
+const targetLoading = ref(false);
+const smoke = ref<ScreenCaptureSmoke>();
 
 const sessionLifeId = computed(() =>
   session.value?.status === "armed" ? session.value.lifeId : undefined,
@@ -47,6 +62,12 @@ const canArm = computed(
     !loading.value &&
     Boolean(currentLife.value && policy.value?.enabled) &&
     !sessionActiveForCurrentLife.value,
+);
+const canSelectTarget = computed(
+  () =>
+    Boolean(currentLife.value) &&
+    sessionActiveForCurrentLife.value &&
+    !targetLoading.value,
 );
 const consentLabel = computed(() => {
   if (!currentLife.value) return "No current Life";
@@ -79,11 +100,21 @@ async function refresh(): Promise<void> {
     policy.value = loadedPolicy;
     session.value = loadedSession;
     phase.value = "ready";
+    await refreshTargetStatus();
   } catch (caught) {
     error.value = screenPerceptionErrorFromUnknown(caught);
     phase.value = "failed";
   } finally {
     loading.value = false;
+  }
+}
+
+async function refreshTargetStatus(): Promise<void> {
+  try {
+    const status = await screenCaptureSettingsService.getTargetStatus();
+    selectedTarget.value = status.selected;
+  } catch (caught) {
+    targetError.value = screenCaptureErrorFromUnknown(caught);
   }
 }
 
@@ -149,6 +180,7 @@ async function armSession(): Promise<void> {
     session.value = await screenPerceptionSettingsService.armSession(life.id);
     phase.value = "ready";
     operation.value = "Screen perception is armed for this application session.";
+    await refreshTargetStatus();
   } catch (caught) {
     error.value = screenPerceptionErrorFromUnknown(caught);
     phase.value = "failed";
@@ -167,11 +199,87 @@ async function disarmSession(): Promise<void> {
     session.value = await screenPerceptionSettingsService.disarmSession();
     phase.value = "ready";
     operation.value = "Screen perception is disarmed for this application session.";
+    await refreshTargetStatus();
   } catch (caught) {
     error.value = screenPerceptionErrorFromUnknown(caught);
     phase.value = "failed";
   } finally {
     loading.value = false;
+  }
+}
+
+async function loadTargets(): Promise<void> {
+  const life = currentLife.value;
+  if (!life || !canSelectTarget.value) return;
+
+  targetLoading.value = true;
+  targetError.value = undefined;
+  targetOperation.value = "";
+  try {
+    targets.value = await screenCaptureSettingsService.listTargets();
+    targetOperation.value =
+      targets.value.length > 0
+        ? "Choose a window or monitor from the list to select a capture target."
+        : "No capture targets are available on this device.";
+  } catch (caught) {
+    targetError.value = screenCaptureErrorFromUnknown(caught);
+  } finally {
+    targetLoading.value = false;
+  }
+}
+
+async function selectTarget(index: number): Promise<void> {
+  const life = currentLife.value;
+  if (!life || targetLoading.value) return;
+
+  targetLoading.value = true;
+  targetError.value = undefined;
+  targetOperation.value = "";
+  try {
+    selectedTarget.value = await screenCaptureSettingsService.selectTarget(
+      life.id,
+      index,
+    );
+    targetOperation.value = "Capture target selected for this session.";
+  } catch (caught) {
+    targetError.value = screenCaptureErrorFromUnknown(caught);
+  } finally {
+    targetLoading.value = false;
+  }
+}
+
+async function clearTarget(): Promise<void> {
+  if (targetLoading.value) return;
+  targetLoading.value = true;
+  targetError.value = undefined;
+  targetOperation.value = "";
+  try {
+    const status = await screenCaptureSettingsService.clearTarget();
+    selectedTarget.value = status.selected;
+    targetOperation.value = "Capture target cleared for this session.";
+  } catch (caught) {
+    targetError.value = screenCaptureErrorFromUnknown(caught);
+  } finally {
+    targetLoading.value = false;
+  }
+}
+
+async function runSmokeCapture(): Promise<void> {
+  const life = currentLife.value;
+  if (!life || targetLoading.value) return;
+
+  targetLoading.value = true;
+  targetError.value = undefined;
+  targetOperation.value = "";
+  smoke.value = undefined;
+  try {
+    smoke.value = await screenCaptureSettingsService.captureSmoke(life.id);
+    targetOperation.value =
+      "One-shot capture succeeded (metadata only; pixels are never shown or stored).";
+  } catch (caught) {
+    targetError.value = screenCaptureErrorFromUnknown(caught);
+  } finally {
+    targetLoading.value = false;
   }
 }
 
@@ -286,6 +394,80 @@ onMounted(() => {
     <p v-if="sessionLifeId && sessionMismatch" class="phase" data-testid="screen-perception-armed-life">
       Session owner: {{ sessionLifeId }}
     </p>
+
+    <section class="result" aria-label="Screen capture target" data-testid="screen-capture-target-section">
+      <h2>Capture target (this session only)</h2>
+      <p>
+        Selecting a target does not create or change consent. The target exists only in this
+        process and is cleared when the application restarts.
+      </p>
+      <dl>
+        <div>
+          <dt>Current target</dt>
+          <dd data-testid="screen-capture-target-status">
+            {{ selectedTarget ? `${selectedTarget.label}` : "None" }}
+          </dd>
+        </div>
+        <div v-if="smoke">
+          <dt>Last one-shot smoke capture</dt>
+          <dd data-testid="screen-capture-smoke">
+            {{ smoke.width }}×{{ smoke.height }} {{ smoke.pixelFormat }} (metadata only)
+          </dd>
+        </div>
+      </dl>
+
+      <div class="actions" aria-label="Screen capture target actions">
+        <button
+          type="button"
+          data-testid="screen-capture-list-targets"
+          :disabled="!canSelectTarget || targetLoading"
+          @click="loadTargets"
+        >
+          List capture targets
+        </button>
+        <button
+          type="button"
+          data-testid="screen-capture-clear-target"
+          :disabled="!selectedTarget || targetLoading"
+          @click="clearTarget"
+        >
+          Clear target
+        </button>
+        <button
+          type="button"
+          class="primary"
+          data-testid="screen-capture-smoke"
+          :disabled="!selectedTarget || !sessionActiveForCurrentLife || targetLoading"
+          @click="runSmokeCapture"
+        >
+          One-shot capture smoke test
+        </button>
+      </div>
+
+      <p v-if="targets.length > 0" class="phase">
+        Select a de-identified target:
+      </p>
+      <ul class="target-list" aria-label="Available capture targets">
+        <li v-for="target in targets" :key="target.index">
+          <button
+            type="button"
+            data-testid="screen-capture-target-option"
+            :disabled="!canSelectTarget || targetLoading"
+            @click="selectTarget(target.index)"
+          >
+            {{ target.label }}
+          </button>
+        </li>
+      </ul>
+
+      <p v-if="targetOperation" class="phase" data-testid="screen-capture-operation" role="status">
+        {{ targetOperation }}
+      </p>
+      <section v-if="targetError" class="result error" data-testid="screen-capture-error" aria-live="polite">
+        <strong>{{ targetError.code }}</strong>
+        <p>{{ targetError.message }}</p>
+      </section>
+    </section>
   </section>
 </template>
 
@@ -297,4 +479,6 @@ onMounted(() => {
 .screen-perception-settings dd { margin: 0; }
 .screen-perception-settings .actions { display: flex; flex-wrap: wrap; gap: 0.65rem; }
 .screen-perception-settings .mismatch { color: #fbbf24; }
+.screen-perception-settings .target-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.4rem; }
+.screen-perception-settings .target-list button { text-align: left; }
 </style>

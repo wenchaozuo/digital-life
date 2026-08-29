@@ -268,6 +268,20 @@ impl ScreenPerceptionSessionGate {
             GateState::ArmedForLife(_, life_id) => Some(life_id.clone()),
         }
     }
+
+    /// The opaque session-generation fence for the exact armed life, if any.
+    /// A rearm or disarm changes the fence, so a capture target bound to an
+    /// older fence is automatically rejected for the new session.  This is a
+    /// process-local token, never persisted.
+    pub(crate) fn life_fence_for(&self, life_id: &str) -> Option<u64> {
+        match &*self.state.lock().unwrap() {
+            GateState::Disarmed => None,
+            GateState::ArmedForLife(generation, armed_life) if armed_life == life_id => {
+                Some(*generation)
+            }
+            GateState::ArmedForLife(_, _) => None,
+        }
+    }
 }
 
 /// Crate-internal persistence boundary for the D23-B1 screen-perception

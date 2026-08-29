@@ -48,4 +48,9 @@ commands.allow = [
     "get_screen_perception_session_status",
     "arm_screen_perception_session",
     "disarm_screen_perception_session",
+    "list_screen_capture_targets",
+    "select_screen_capture_target",
+    "get_screen_capture_target_status",
+    "clear_screen_capture_target",
+    "capture_screen_smoke",
 ]

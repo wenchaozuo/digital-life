@@ -66,6 +66,7 @@ pub fn run() {
             app.manage(storage);
             app.manage(secrets::WindowsCredentialSecretStore::new());
             app.manage(perception::screen_policy::ScreenPerceptionSessionGate::new());
+            app.manage(perception::screen_capture::target::ScreenCaptureTargetBroker::new());
             app.manage(storage::LlmCandidateExtractionCoordinator::default());
             app.manage(model::runtime::ModelRuntimeCoordinator::default());
             app.manage(conversation::ConversationCognitionCoordinator::default());
@@ -155,6 +156,11 @@ pub fn run() {
             perception::screen_settings::get_screen_perception_session_status,
             perception::screen_settings::arm_screen_perception_session,
             perception::screen_settings::disarm_screen_perception_session,
+            perception::screen_capture::list_screen_capture_targets,
+            perception::screen_capture::select_screen_capture_target,
+            perception::screen_capture::get_screen_capture_target_status,
+            perception::screen_capture::clear_screen_capture_target,
+            perception::screen_capture::capture_screen_smoke,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

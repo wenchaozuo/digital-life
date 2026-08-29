@@ -5,6 +5,7 @@ import { computed, onMounted, ref } from "vue";
 import type { ModelPurpose } from "../model";
 import ModelProfilesView from "./model/ModelProfilesView.vue";
 import MemoryCenterView from "./memory/MemoryCenterView.vue";
+import BodySettingsView from "./body/BodySettingsView.vue";
 import {
   storageService,
   type StorageLocationInfo,
@@ -29,7 +30,7 @@ const migration = ref<StorageMigrationResult>();
 const phase = ref<StorageSettingsPhase>("unselected");
 const error = ref<StorageSettingsError>();
 const confirmationVisible = ref(false);
-type SettingsSection = "storage" | "chat" | "embedding" | "candidate_extraction" | "memory";
+type SettingsSection = "storage" | "chat" | "embedding" | "candidate_extraction" | "memory" | "body";
 interface SettingsViewHandle {
   clearSensitiveInputs(): void;
   requestLeave(): boolean;
@@ -164,6 +165,9 @@ function requestActiveViewLeave(): boolean {
   if (activeSection.value === "memory") {
     return memoryCenterView.value?.requestLeave() ?? true;
   }
+  if (activeSection.value === "body") {
+    return true;
+  }
   return modelProfilesView.value?.requestLeave() ?? true;
 }
 
@@ -219,6 +223,7 @@ onMounted(async () => {
         <button type="button" :class="{ selected: activeSection === 'embedding' }" :disabled="phase === 'migrating'" @click="switchSection('embedding')">Embedding models</button>
         <button type="button" :class="{ selected: activeSection === 'candidate_extraction' }" :disabled="phase === 'migrating'" @click="switchSection('candidate_extraction')">Candidate profiles</button>
         <button type="button" :class="{ selected: activeSection === 'memory' }" :disabled="phase === 'migrating'" @click="switchSection('memory')">Memory Center</button>
+        <button type="button" :class="{ selected: activeSection === 'body' }" :disabled="phase === 'migrating'" @click="switchSection('body')">Body</button>
       </nav>
 
       <section v-if="activeSection === 'storage'" class="settings-section" aria-label="Storage location settings">
@@ -302,6 +307,8 @@ onMounted(async () => {
         v-else-if="activeSection === 'memory'"
         ref="memoryCenterView"
       />
+
+      <BodySettingsView v-else-if="activeSection === 'body'" />
 
       <ModelProfilesView
         v-else

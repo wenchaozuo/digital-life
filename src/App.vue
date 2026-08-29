@@ -2,13 +2,15 @@
 import { invoke } from "@tauri-apps/api/core";
 import { onMounted, onUnmounted, ref } from "vue";
 import {
+  BodyBindingChangedListenerLifecycle,
   BodyExpressionListenerLifecycle,
-  BodyRendererHost,
+  BodyRuntimeBindingController,
+  bodyBindingChangedBridge,
   bodyExpressionBridge,
   bodyStateMachine,
-  BodyRenderCoordinator,
+  bodyPackageService,
   createBodyPresentationForBodyId,
-  type BodySnapshot,
+  installManagedBodyPackageRegistrySnapshot,
   type BodyState,
 } from "./body";
 import { initializeDefaultLife, type LifeIdentity } from "./life";
@@ -21,8 +23,7 @@ const lifeIdentity = ref<LifeIdentity>();
 const personaTemplate = ref<PersonaTemplate>();
 const settingsError = ref("");
 let unsubscribe: (() => void) | undefined;
-let activeBodyRenderCoordinator: BodyRenderCoordinator | undefined;
-let bodyRendererHost: BodyRendererHost | undefined;
+let bodyRuntimeBinding: BodyRuntimeBindingController | undefined;
 let lifecycleEpoch = 0;
 
 // D17-C: the listener registration race with unmount is fenced by this
@@ -30,6 +31,9 @@ let lifecycleEpoch = 0;
 // immediately unlistened.
 const bodyExpressionListener = new BodyExpressionListenerLifecycle((handler) =>
   bodyExpressionBridge.listenForBodyExpression(handler),
+);
+const bodyBindingChangedListener = new BodyBindingChangedListenerLifecycle((handler) =>
+  bodyBindingChangedBridge.listen(handler),
 );
 
 async function openSettings(): Promise<void> {
@@ -59,26 +63,31 @@ onMounted(async () => {
   // still active, so a late Life continuation cannot reuse a stale host.
   const hostElement = bodyRendererElement.value;
 
+  const runtimeBinding = new BodyRuntimeBindingController({
+    loadRegistrySnapshot: () => bodyPackageService.getRegistrySnapshot(),
+    installRegistrySnapshot: installManagedBodyPackageRegistrySnapshot,
+    loadCurrentLife: () => storageService.getCurrentLife(),
+    // App owns only the opaque bodyId composition entrypoint. Package
+    // definitions and managed source values stay inside the body authority.
+    createPresentation: (bodyId) => createBodyPresentationForBodyId(bodyId),
+    getCurrentState: () => bodyStateMachine.getState(),
+    onSnapshot: (snapshot) => {
+      if (isRuntimeActive(runtimeEpoch)) {
+        bodyState.value = snapshot.state;
+      }
+    },
+  });
+  bodyRuntimeBinding = runtimeBinding;
+
   // D17-C-F1 ordering is retained: the BodyStateMachine subscription is
   // installed before the expression listener and before any initial render.
   // Before the current Life is bound, transitions remain authoritative in the
-  // machine and are intentionally presentation-no-ops.
+  // machine and are intentionally presentation no-ops.
   unsubscribe = bodyStateMachine.subscribe(({ current }) => {
-    const coordinator = activeBodyRenderCoordinator;
-    if (!isRuntimeActive(runtimeEpoch) || coordinator === undefined) {
+    if (!isRuntimeActive(runtimeEpoch)) {
       return;
     }
-
-    void coordinator
-      .render(current)
-      .then((result) => {
-        if (result.applied) {
-          applyBodySnapshot(result.snapshot, runtimeEpoch, coordinator);
-        }
-      })
-      .catch(() => {
-        // Presentation-only failure: keep the last applied body.
-      });
+    void runtimeBinding.render(current);
   });
 
   // Expression-listener registration starts BEFORE the long main
@@ -88,95 +97,49 @@ onMounted(async () => {
     bodyStateMachine.transition(state);
   });
 
+  // This event is only a post-commit refresh hint. Main rereads the
+  // authoritative registry and Life and never accepts a bodyId or URL from
+  // the event payload.
+  bodyBindingChangedListener.start((event) => {
+    if (!isRuntimeActive(runtimeEpoch) || event.version !== 1) {
+      return;
+    }
+    void runtimeBinding
+      .refresh()
+      .then((life) => {
+        if (isRuntimeActive(runtimeEpoch) && life !== undefined) {
+          lifeIdentity.value = life;
+        }
+      })
+      .catch(() => {
+        // Refresh failure is presentation-only; a later hint retries.
+      });
+  });
+
   await storageService.initialize();
   if (!isRuntimeActive(runtimeEpoch)) {
     return;
   }
 
-  const life = await initializeDefaultLife();
+  const life = await runtimeBinding.initialize(hostElement, () =>
+    initializeDefaultLife(),
+  );
   if (!isRuntimeActive(runtimeEpoch)) {
+    return;
+  }
+  if (life === undefined) {
     return;
   }
   lifeIdentity.value = life;
 
-  // Life.bodyId is the authoritative startup selector.  The canonical
-  // factory returns one matched provider/renderer composition; no default
-  // body is created before this point and no selector is rewritten here.
-  const composition = createBodyPresentationForBodyId(life.bodyId);
-  const coordinator = new BodyRenderCoordinator(composition.provider);
-  const host = new BodyRendererHost(composition.renderer);
-  if (!isRuntimeActive(runtimeEpoch)) {
-    host.dispose();
-    return;
-  }
-
-  activeBodyRenderCoordinator = coordinator;
-  bodyRendererHost = host;
-
-  if (hostElement !== undefined) {
-    // Mount failure is presentation-only and does not block the Life or
-    // persona startup path.  BodyRendererHost owns the async lifecycle
-    // fence and contains a late mount after this runtime is retired.
-    const rendererMount = host.mount(hostElement);
-    void rendererMount.catch(() => {
-      // Contained: the host rolls back to unmounted and later render errors
-      // remain bounded at the presentation boundary.
-    });
-  }
-
-  // The first Life-bound render uses the current machine state, including an
-  // expression captured while binding was still pending.  It shares the same
-  // generation-fenced coordinator as every later transition.
-  try {
-    const initial = await coordinator.render(bodyStateMachine.getState());
-    if (!isRuntimeActive(runtimeEpoch) || activeBodyRenderCoordinator !== coordinator) {
-      return;
-    }
-    if (initial.applied) {
-      applyBodySnapshot(initial.snapshot, runtimeEpoch, coordinator);
-    }
-
-    if (!isRuntimeActive(runtimeEpoch) || activeBodyRenderCoordinator !== coordinator) {
-      return;
-    }
-  } catch {
-    // Presentation-only failure: keep the last applied body and continue
-    // Life/persona startup without inventing a snapshot.
-  }
-
-  if (!isRuntimeActive(runtimeEpoch) || activeBodyRenderCoordinator !== coordinator) {
-    return;
-  }
-
   const persona = await personaManager.getById(life.personaId);
-  if (isRuntimeActive(runtimeEpoch) && activeBodyRenderCoordinator === coordinator) {
+  if (isRuntimeActive(runtimeEpoch) && bodyRuntimeBinding === runtimeBinding) {
     personaTemplate.value = persona;
   }
 });
 
 function isRuntimeActive(epoch: number): boolean {
   return lifecycleEpoch === epoch;
-}
-
-function applyBodySnapshot(
-  snapshot: BodySnapshot,
-  runtimeEpoch: number,
-  coordinator: BodyRenderCoordinator,
-): void {
-  if (!isRuntimeActive(runtimeEpoch) || activeBodyRenderCoordinator !== coordinator) {
-    return;
-  }
-  bodyState.value = snapshot.state;
-  const host = bodyRendererHost;
-  if (host === undefined) {
-    return;
-  }
-  // Renderer failure is presentation-only: it never affects Conversation,
-  // BodyStateMachine authority, Life, or SQLite; the last successfully
-  // rendered body stays visible.
-  void host.render(snapshot).catch(() => {
-    // Contained: keep the last rendered presentation.
-  });
 }
 
 onUnmounted(() => {
@@ -187,9 +150,9 @@ onUnmounted(() => {
   unsubscribe?.();
   unsubscribe = undefined;
   bodyExpressionListener.stop();
-  bodyRendererHost?.dispose();
-  bodyRendererHost = undefined;
-  activeBodyRenderCoordinator = undefined;
+  bodyBindingChangedListener.stop();
+  bodyRuntimeBinding?.dispose();
+  bodyRuntimeBinding = undefined;
 });
 </script>
 

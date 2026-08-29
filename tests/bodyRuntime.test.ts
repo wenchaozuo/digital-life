@@ -220,7 +220,7 @@ test("main expression-listener registration starts before the long initializatio
   const appSource = fs.readFileSync(new URL("../src/App.vue", import.meta.url), "utf8");
   const listenerStart = appSource.indexOf("bodyExpressionListener.start");
   const storageInit = appSource.indexOf("await storageService.initialize()");
-  const lifeInit = appSource.indexOf("await initializeDefaultLife()");
+  const lifeInit = appSource.indexOf("runtimeBinding.initialize(");
   const personaLoad = appSource.indexOf("personaManager.getById");
 
   assert.ok(listenerStart >= 0, "App.vue must start the listener controller");
@@ -301,7 +301,7 @@ test("startup race: the old completion stays fenced even if it resolves first", 
   machineUnsubscribe();
 });
 
-test("App.vue installs the local renderer subscription once, before listener and initial render", () => {
+test("App.vue installs the local renderer subscription once before runtime binding", () => {
   const appSource = fs.readFileSync(new URL("../src/App.vue", import.meta.url), "utf8");
 
   const subscribeCount = (appSource.match(/bodyStateMachine\.subscribe\(/g) ?? []).length;
@@ -309,9 +309,7 @@ test("App.vue installs the local renderer subscription once, before listener and
 
   const subscribeAt = appSource.indexOf("bodyStateMachine.subscribe(");
   const listenerAt = appSource.indexOf("bodyExpressionListener.start");
-  const initialRenderAt = appSource.indexOf(
-    "coordinator.render(bodyStateMachine.getState())",
-  );
+  const initialRenderAt = appSource.indexOf("runtimeBinding.initialize(");
 
   assert.ok(subscribeAt >= 0, "App.vue must install the renderer subscription");
   assert.ok(listenerAt >= 0 && initialRenderAt >= 0);

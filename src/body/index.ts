@@ -48,6 +48,30 @@ export type {
   InstallLive2DBodyPackageRequest,
   InstalledBodyPackageSnapshot,
 } from "./bodyPackageService.ts";
+export {
+  installManagedBodyPackageRegistrySnapshot,
+} from "./bodyPackage.ts";
+export {
+  BodyRuntimeBindingController,
+} from "./bodyRuntimeBinding.ts";
+export type {
+  BodyRuntimeBindingAuthority,
+  BodyRuntimeBindingControllerOptions,
+} from "./bodyRuntimeBinding.ts";
+export {
+  BODY_BINDING_CHANGED_EVENT,
+  BODY_BINDING_CHANGED_VERSION,
+  BodyBindingChangedListenerLifecycle,
+  bodyBindingChangedBridge,
+  createBodyBindingChangedBridge,
+  isBodyBindingChangedEvent,
+} from "./bodyBindingEvent.ts";
+export type {
+  BodyBindingChangedBridge,
+  BodyBindingChangedEvent,
+  BodyBindingChangedHandler,
+  BodyBindingChangedTransport,
+} from "./bodyBindingEvent.ts";
 export function createDefaultBodyRenderer(): BodyRenderer {
   return new FallbackBodyRenderer(
     new PngBodyRenderer(),

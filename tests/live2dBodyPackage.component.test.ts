@@ -161,15 +161,16 @@ describe("D21-C trusted local model-source boundary", () => {
     );
   });
 
-  it("keeps model source package-configured and independent from bodyId/state", () => {
+  it("keeps managed and local model sources inside the package authority", () => {
     const packageSource = readWorkspaceFile("src/body/bodyPackage.ts");
     const modelSource = readWorkspaceFile("src/body/live2dModelSource.ts");
 
     expect(packageSource).toContain(
-      "requireTrustedLocalLive2DModelPath(modelSource)",
+      "requireTrustedLive2DModelUrl(modelSource)",
     );
     expect(packageSource).not.toContain("modelSource.path");
-    expect(packageSource).not.toMatch(/snapshot|resourcePath|user|bodyId.*path/i);
+    expect(packageSource).toContain("createTrustedManagedLive2DModelSource");
+    expect(packageSource).not.toMatch(/resourcePath|user|modelSource\.path/i);
     expect(modelSource).toContain("^[a-z][a-z0-9+.-]*:");
     expect(modelSource).toContain("model3.json");
   });
@@ -230,7 +231,7 @@ describe("D21-C closed presentation and package contract", () => {
       /new FallbackBodyRenderer\(\s*live2dRenderer,\s*new PngBodyRenderer\(\),/s,
     );
     expect(
-      packageSource.indexOf("requireTrustedLocalLive2DModelPath(modelSource)"),
+      packageSource.indexOf("requireTrustedLive2DModelUrl(modelSource)"),
     ).toBeLessThan(packageSource.indexOf("new Live2DRenderer("));
   });
 
@@ -337,13 +338,14 @@ describe("D21-C production activation and authority gates", () => {
     await composition.renderer.dispose();
   });
 
-  it("keeps App, chat, and settings renderer-neutral", () => {
-    expect(readWorkspaceFile("src/App.vue")).not.toMatch(/Live2D|live2d/i);
+  it("keeps App as the renderer owner and chat/settings free of renderer construction", () => {
+    expect(readWorkspaceFile("src/App.vue")).toMatch(/BodyRuntimeBindingController/);
+    expect(readWorkspaceFile("src/App.vue")).not.toMatch(/new Live2DRenderer|createLive2DCoreReadyBoundary/);
     for (const source of [
       ...sourceFilesUnder("src/chat"),
       ...sourceFilesUnder("src/settings"),
     ]) {
-      expect(source).not.toMatch(/Live2D|live2d|BodyRenderer|BodyRendererHost/i);
+      expect(source).not.toMatch(/new Live2DRenderer|createLive2DCoreReadyBoundary|BodyRendererHost|<canvas/i);
     }
   });
 
@@ -361,7 +363,9 @@ describe("D21-C production activation and authority gates", () => {
     const packageSource = readWorkspaceFile("src/body/bodyPackage.ts");
     const appSource = readWorkspaceFile("src/App.vue");
 
-    expect(appSource).toContain("createBodyPresentationForBodyId(life.bodyId)");
+    expect(appSource).toContain(
+      "createPresentation: (bodyId) => createBodyPresentationForBodyId(bodyId)",
+    );
     expect(bindingSource).toContain("resolveBodyPackage(requestedBodyId)");
     expect(bindingSource).not.toMatch(/BODY_BINDING_CATALOG|new Map/);
     expect(packageSource).toContain("BODY_PACKAGE_CATALOG");

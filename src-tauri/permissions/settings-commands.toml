@@ -39,4 +39,5 @@ commands.allow = [
     "get_body_package",
     "delete_body_package",
     "get_body_package_registry_snapshot",
+    "set_current_life_body",
 ]

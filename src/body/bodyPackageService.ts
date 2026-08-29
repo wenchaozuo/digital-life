@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { LifeIdentity } from "../life";
 
 export type BodyPackageStatus = "available" | "corrupt-unavailable";
 
@@ -59,6 +60,10 @@ export class BodyPackageService {
     return invoke<InstalledBodyPackageSnapshot[]>(
       "get_body_package_registry_snapshot",
     );
+  }
+
+  async setCurrentBody(bodyId: string): Promise<LifeIdentity> {
+    return invoke<LifeIdentity>("set_current_life_body", { bodyId });
   }
 }
 

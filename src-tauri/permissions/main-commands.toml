@@ -11,4 +11,5 @@ commands.allow = [
     "update_life_identity_base_info",
     "save_persona_template",
     "get_persona_template",
+    "get_body_package_registry_snapshot",
 ]

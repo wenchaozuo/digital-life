@@ -729,30 +729,31 @@ describe("BodyRendererHost async lifecycle", () => {
 describe("main App renderer ownership shape", () => {
   it("App.vue owns the renderer host and no direct production body image", () => {
     const appSource = fs.readFileSync(path.join(process.cwd(), "src/App.vue"), "utf8");
-    expect(appSource).toMatch(/bodyRendererHost/);
+    expect(appSource).toMatch(/BodyRuntimeBindingController/);
     expect(appSource).toMatch(/bodyRendererElement/);
     expect(appSource).toMatch(/class="body-renderer-host"/);
     expect(appSource).toMatch(/bodyStateMachine/);
-    expect(appSource).toMatch(/activeBodyRenderCoordinator/);
     expect(appSource).not.toMatch(/<img/);
     expect(appSource).not.toMatch(/bodyResource/);
   });
 
   it("App.vue binds the renderer after Life and contains mount failure", () => {
     const appSource = fs.readFileSync(path.join(process.cwd(), "src/App.vue"), "utf8");
-    expect(appSource).toMatch(/host\.mount\(/);
-    expect(appSource).toMatch(/rendererMount\.catch\(/, "mount rejection must be contained");
-    expect(appSource).not.toMatch(
-      /^[ \t]*host\.mount\(/m,
-      "mount must not be a fire-and-forget statement",
+    const controllerSource = fs.readFileSync(
+      path.join(process.cwd(), "src/body/bodyRuntimeBinding.ts"),
+      "utf8",
     );
+    expect(appSource).toMatch(/runtimeBinding\.initialize\(/);
+    expect(controllerSource).toMatch(/candidate\.host\.mount\(/);
+    expect(controllerSource).toMatch(/catch/);
 
-    const mountAt = appSource.indexOf("host.mount(");
+    const mountAt = appSource.indexOf("runtimeBinding.initialize(");
     const storageInitAt = appSource.indexOf("await storageService.initialize()");
-    const lifeInitAt = appSource.indexOf("await initializeDefaultLife()");
     expect(mountAt).toBeGreaterThanOrEqual(0);
     expect(storageInitAt).toBeLessThan(mountAt);
-    expect(lifeInitAt).toBeLessThan(mountAt);
+    expect(controllerSource.indexOf("loadAndInstallRegistry")).toBeLessThan(
+      controllerSource.indexOf("initializeLife()"),
+    );
   });
 
   it("ChatView never touches the renderer surface", () => {

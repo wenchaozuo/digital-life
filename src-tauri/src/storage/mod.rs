@@ -1011,29 +1011,7 @@ impl StorageService {
         body_id: &str,
     ) -> Result<LifeIdentityRecord, StorageError> {
         let state = self.state()?;
-        let updated = state
-            .connection
-            .execute(
-                "UPDATE life_identity
-                 SET name = ?2, body_id = ?3, version = version + 1
-                 WHERE id = ?1",
-                params![id, name, body_id],
-            )
-            .map_err(StorageError::database)?;
-
-        if updated == 0 {
-            return Err(StorageError::not_found("Life identity"));
-        }
-
-        state
-            .connection
-            .query_row(
-                "SELECT id, name, created_at, version, body_id, persona_id, persona_version
-                 FROM life_identity WHERE id = ?1",
-                params![id],
-                Self::read_life,
-            )
-            .map_err(StorageError::database)
+        update_life_base_info_on_connection(&state.connection, id, name, body_id)
     }
 
     fn read_life(row: &rusqlite::Row<'_>) -> rusqlite::Result<LifeIdentityRecord> {
@@ -1047,6 +1025,37 @@ impl StorageService {
             persona_version: row.get(6)?,
         })
     }
+}
+
+/// Existing Life base-info update authority shared by the regular command and
+/// narrow domain operations that need to commit inside their own transaction.
+pub(crate) fn update_life_base_info_on_connection(
+    connection: &Connection,
+    id: &str,
+    name: &str,
+    body_id: &str,
+) -> Result<LifeIdentityRecord, StorageError> {
+    let updated = connection
+        .execute(
+            "UPDATE life_identity
+             SET name = ?2, body_id = ?3, version = version + 1
+             WHERE id = ?1",
+            params![id, name, body_id],
+        )
+        .map_err(StorageError::database)?;
+
+    if updated == 0 {
+        return Err(StorageError::not_found("Life identity"));
+    }
+
+    connection
+        .query_row(
+            "SELECT id, name, created_at, version, body_id, persona_id, persona_version
+             FROM life_identity WHERE id = ?1",
+            params![id],
+            StorageService::read_life,
+        )
+        .map_err(StorageError::database)
 }
 
 fn rollback_after_activation(

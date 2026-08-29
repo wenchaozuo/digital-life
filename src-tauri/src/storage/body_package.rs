@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::{
     http::{header, Method, Request, Response, StatusCode, Uri},
-    State,
+    AppHandle, Emitter, State,
 };
 use url::Url;
 
@@ -24,6 +24,8 @@ use super::{unique_suffix, StorageError, StorageService};
 
 pub(crate) const BODY_ASSET_PROTOCOL_SCHEME: &str = "digital-life-body";
 pub(crate) const BODY_RENDERER_WEBVIEW_LABEL: &str = "main";
+pub(crate) const BODY_BINDING_CHANGED_EVENT: &str = "digital-life://body-binding-changed/v1";
+pub(crate) const DEFAULT_BODY_ID: &str = "default-png";
 pub(crate) const MANAGED_BODIES_DIRECTORY: &str = "bodies";
 pub(crate) const MANAGED_STAGING_DIRECTORY: &str = "staging";
 pub(crate) const MANAGED_PACKAGES_DIRECTORY: &str = "packages";
@@ -92,6 +94,22 @@ pub struct InstalledBodyPackageSnapshot {
     pub installed_at: String,
     pub status: BodyPackageStatus,
     pub assets: Vec<BodyPackageAssetSnapshot>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BodyBindingChangedEvent {
+    pub version: u8,
+    pub life_id: String,
+    pub life_version: i64,
+}
+
+fn body_binding_changed_event(life: &super::LifeIdentityRecord) -> BodyBindingChangedEvent {
+    BodyBindingChangedEvent {
+        version: 1,
+        life_id: life.id.clone(),
+        life_version: life.version,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1266,6 +1284,58 @@ impl StorageService {
         self.list_body_packages()
     }
 
+    /// Select one body through the existing Life identity authority.
+    ///
+    /// `default-png` is the bundled presentation and has no managed registry
+    /// row. Every other target must be a registered, available package whose
+    /// manifest and managed bytes still verify. The Life update and committed
+    /// record read share one SQLite transaction; callers emit only the
+    /// resulting refresh hint after this method returns successfully.
+    pub fn set_current_life_body(
+        &self,
+        body_id: &str,
+    ) -> Result<super::LifeIdentityRecord, StorageError> {
+        if body_id != DEFAULT_BODY_ID && !is_valid_body_id(body_id) {
+            return Err(package_not_found());
+        }
+
+        let mut state = self.state().map_err(|_| database_unavailable())?;
+        let active_root = state.active_root.clone();
+        let transaction = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| database_unavailable())?;
+        if body_id != DEFAULT_BODY_ID {
+            let mut packages = read_registered_packages(&transaction, Some(body_id))?;
+            let package = packages.pop().ok_or_else(package_not_found)?;
+            if !package_is_available(&active_root, &package) {
+                return Err(package_corrupt());
+            }
+        }
+        let current_life = transaction
+            .query_row(
+                "SELECT life.id, life.name, life.created_at, life.version, life.body_id,
+                        life.persona_id, life.persona_version
+                 FROM app_state state
+                 INNER JOIN life_identity life ON life.id = state.current_life_id
+                 WHERE state.singleton = 1",
+                [],
+                StorageService::read_life,
+            )
+            .optional()
+            .map_err(|_| database_unavailable())?
+            .ok_or_else(|| StorageError::not_found("Current Life identity"))?;
+
+        let committed = super::update_life_base_info_on_connection(
+            &transaction,
+            &current_life.id,
+            &current_life.name,
+            body_id,
+        )?;
+        transaction.commit().map_err(|_| database_unavailable())?;
+        Ok(committed)
+    }
+
     pub fn delete_body_package(&self, body_id: &str) -> Result<(), StorageError> {
         if !is_valid_body_id(body_id) {
             return Err(package_not_found());
@@ -1349,6 +1419,25 @@ pub fn get_body_package_registry_snapshot(
     storage: State<'_, StorageService>,
 ) -> Result<Vec<InstalledBodyPackageSnapshot>, StorageError> {
     storage.get_body_package_registry_snapshot()
+}
+
+#[tauri::command]
+pub fn set_current_life_body(
+    app: AppHandle,
+    storage: State<'_, StorageService>,
+    body_id: String,
+) -> Result<super::LifeIdentityRecord, StorageError> {
+    let life = storage.set_current_life_body(&body_id)?;
+    let event = body_binding_changed_event(&life);
+    // Selection is already durable. A delivery failure must not turn a
+    // committed selection into a false command failure; the next Main-WebView
+    // startup or refresh rereads SQLite authority.
+    let _ = app.emit_to(
+        BODY_RENDERER_WEBVIEW_LABEL,
+        BODY_BINDING_CHANGED_EVENT,
+        event,
+    );
+    Ok(life)
 }
 
 fn percent_decode_path(value: &str) -> Result<String, ()> {
@@ -1768,6 +1857,31 @@ mod tests {
             .unwrap()
     }
 
+    fn save_test_life(fixture: &Fixture, body_id: &str) -> LifeIdentityRecord {
+        fixture
+            .storage
+            .save_persona(PersonaTemplateRecord {
+                id: "persona-body-selection".to_string(),
+                name: "Persona".to_string(),
+                version: 1,
+                persona_json: "{}".to_string(),
+            })
+            .unwrap();
+        fixture
+            .storage
+            .save_life(LifeIdentityRecord {
+                id: "life-body-selection".to_string(),
+                name: "Life".to_string(),
+                created_at: "2026-08-29T00:00:00.000Z".to_string(),
+                version: 1,
+                body_id: body_id.to_string(),
+                persona_id: "persona-body-selection".to_string(),
+                persona_version: 1,
+            })
+            .unwrap();
+        fixture.storage.get_current_life().unwrap().unwrap()
+    }
+
     fn request(method: Method, uri: &str) -> Request<Vec<u8>> {
         Request::builder()
             .method(method)
@@ -1888,6 +2002,86 @@ mod tests {
             .get_body_package("live2d-deadbeef")
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn current_life_body_selection_accepts_default_and_available_packages() {
+        let fixture = Fixture::new();
+        let package = install(&fixture);
+        let initial = save_test_life(&fixture, DEFAULT_BODY_ID);
+
+        let selected = fixture
+            .storage
+            .set_current_life_body(&package.body_id)
+            .unwrap();
+        assert_eq!(selected.id, initial.id);
+        assert_eq!(selected.name, initial.name);
+        assert_eq!(selected.body_id, package.body_id);
+        assert_eq!(selected.created_at, initial.created_at);
+        assert_eq!(selected.version, initial.version + 1);
+        assert_eq!(selected.persona_id, initial.persona_id);
+        assert_eq!(selected.persona_version, initial.persona_version);
+
+        let restored = fixture
+            .storage
+            .set_current_life_body(DEFAULT_BODY_ID)
+            .unwrap();
+        assert_eq!(restored.body_id, DEFAULT_BODY_ID);
+        assert_eq!(restored.version, selected.version + 1);
+        assert_eq!(
+            fixture.storage.get_current_life().unwrap().unwrap().body_id,
+            DEFAULT_BODY_ID
+        );
+    }
+
+    #[test]
+    fn body_selection_rejects_unknown_and_corrupt_targets_without_life_mutation() {
+        let fixture = Fixture::new();
+        let package = install(&fixture);
+        let initial = save_test_life(&fixture, DEFAULT_BODY_ID);
+
+        let unknown = fixture
+            .storage
+            .set_current_life_body("live2d-unknown")
+            .unwrap_err();
+        assert_eq!(unknown.code, "BODY_PACKAGE_NOT_FOUND");
+        assert_eq!(
+            fixture.storage.get_current_life().unwrap().unwrap().version,
+            initial.version
+        );
+
+        fs::write(
+            fixture.package_dir(&package.body_id).join("avatar.moc3"),
+            b"tampered",
+        )
+        .unwrap();
+        let corrupt = fixture
+            .storage
+            .set_current_life_body(&package.body_id)
+            .unwrap_err();
+        assert_eq!(corrupt.code, "BODY_PACKAGE_CORRUPT");
+        let unchanged = fixture.storage.get_current_life().unwrap().unwrap();
+        assert_eq!(unchanged.body_id, DEFAULT_BODY_ID);
+        assert_eq!(unchanged.version, initial.version);
+    }
+
+    #[test]
+    fn body_binding_changed_event_contains_only_post_commit_refresh_metadata() {
+        let fixture = Fixture::new();
+        let initial = save_test_life(&fixture, DEFAULT_BODY_ID);
+        let selected = fixture
+            .storage
+            .set_current_life_body(DEFAULT_BODY_ID)
+            .unwrap();
+        let event = body_binding_changed_event(&selected);
+        let payload = serde_json::to_value(event).unwrap();
+
+        assert_eq!(payload["version"], 1);
+        assert_eq!(payload["lifeId"], selected.id);
+        assert_eq!(payload["lifeVersion"], selected.version);
+        assert!(payload.get("bodyId").is_none());
+        assert!(payload.get("modelEntry").is_none());
+        assert_eq!(selected.version, initial.version + 1);
     }
 
     #[test]

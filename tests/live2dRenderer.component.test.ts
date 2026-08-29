@@ -479,8 +479,8 @@ describe("D21 production composition and dependency boundaries", () => {
     expect(packageSource).toContain('bodyId: DEFAULT_BODY_ID');
     expect(bindingSource).toContain('"live2d"');
     expect(bindingSource).not.toMatch(/Haru|Mark|Rice/i);
-    expect(appSource).not.toMatch(/Live2D|live2d/i);
-    expect(appSource).toContain("createBodyPresentationForBodyId(life.bodyId)");
+    expect(appSource).toMatch(/BodyRuntimeBindingController/);
+    expect(appSource).toContain("createBodyPresentationForBodyId(bodyId)");
   });
 
   it("keeps the exact B1 dependency choice without application polyfills", () => {

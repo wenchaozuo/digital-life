@@ -128,6 +128,18 @@ describe("main current-Life body startup", () => {
     const composition = { provider, renderer };
     const life = makeLife("restored-unknown-body");
 
+    const installRegistry = body.installManagedBodyPackageRegistrySnapshot;
+    vi.spyOn(body.bodyPackageService, "getRegistrySnapshot").mockImplementation(async () => {
+      events.push("registry");
+      return [];
+    });
+    vi.spyOn(body, "installManagedBodyPackageRegistrySnapshot").mockImplementation(
+      (snapshot) => {
+        events.push("registry-install");
+        installRegistry(snapshot);
+      },
+    );
+
     vi.spyOn(body.bodyExpressionBridge, "listenForBodyExpression").mockImplementation(
       async (handler) => {
         events.push("listener");
@@ -176,6 +188,9 @@ describe("main current-Life body startup", () => {
       expect(factorySpy).toHaveBeenCalledWith(life.bodyId);
       expect(events.indexOf("listener")).toBeLessThan(events.indexOf("storage"));
       expect(events.indexOf("storage")).toBeLessThan(events.indexOf("life"));
+      expect(events.indexOf("registry")).toBeGreaterThan(events.indexOf("storage"));
+      expect(events.indexOf("registry")).toBeLessThan(events.indexOf("registry-install"));
+      expect(events.indexOf("registry-install")).toBeLessThan(events.indexOf("life"));
       expect(events.indexOf("life")).toBeLessThan(events.indexOf(`factory:${life.bodyId}`));
       expect(renderer.mountedHosts).toEqual([
         wrapper.find(".body-renderer-host").element,

@@ -116,7 +116,7 @@ describe("bundled body package foundation", () => {
       "utf8",
     );
 
-    expect(appSource).toContain("life.bodyId");
+    expect(appSource).toContain("BodyRuntimeBindingController");
     expect(appSource).toContain("createBodyPresentationForBodyId");
     expect(appSource).not.toMatch(/BodyPackageDefinition|PngBodyResources/);
     expect(appSource).not.toContain("digital-life-idle.png");

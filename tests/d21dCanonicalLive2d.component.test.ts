@@ -518,7 +518,7 @@ describe("D21-D canonical lifecycle and failover", () => {
 });
 
 describe("D21-D production ownership and honest asset boundary", () => {
-  it("keeps production catalog/default PNG-only and App renderer-neutral", () => {
+  it("keeps the default fallback and App runtime binding authority", () => {
     const defaultPackage = resolveBodyPackage(DEFAULT_BODY_ID);
     expect(defaultPackage.bodyPackage.presentation.kind).toBe("png");
     expect(resolveBodyBinding("unknown-body")).toMatchObject({
@@ -529,11 +529,14 @@ describe("D21-D production ownership and honest asset boundary", () => {
     expect(createBodyPresentationForBodyId("unknown-body").provider).toBeDefined();
 
     const appSource = readWorkspaceFile("src/App.vue");
-    expect(appSource).toContain("createBodyPresentationForBodyId(life.bodyId)");
-    expect(appSource).not.toMatch(/Live2D|live2d|Pixi|Cubism|model3/i);
+    expect(appSource).toContain("BodyRuntimeBindingController");
+    expect(appSource).toContain("createBodyPresentationForBodyId(bodyId)");
+    expect(appSource).not.toMatch(/new Live2DRenderer|createLive2DCoreReadyBoundary|Pixi|Cubism|model3/i);
     for (const source of [
       ...sourceFilesUnder("src/chat"),
-      ...sourceFilesUnder("src/settings"),
+      ...sourceFilesUnder("src/settings").filter(
+        (value) => !value.includes("Import Live2D body"),
+      ),
     ]) {
       expect(source).not.toMatch(/Live2D|live2d|Pixi|Cubism|BodyRendererHost/i);
     }
@@ -553,9 +556,9 @@ describe("D21-D production ownership and honest asset boundary", () => {
     expect(indexSource).not.toMatch(
       /createPackagePresentation|BodyPackageDefinition|from\s+["']\.\/live2d/i,
     );
-    expect(packageSource).toContain("requireTrustedLocalLive2DModelPath(modelSource)");
+    expect(packageSource).toContain("requireTrustedLive2DModelUrl(modelSource)");
     expect(packageSource).toContain("new Live2DRenderer(");
-    expect(packageSource.indexOf("requireTrustedLocalLive2DModelPath(modelSource)")).toBeLessThan(
+    expect(packageSource.indexOf("requireTrustedLive2DModelUrl(modelSource)")).toBeLessThan(
       packageSource.indexOf("new Live2DRenderer("),
     );
   });

@@ -133,6 +133,7 @@ pub fn run() {
             storage::body_package::get_body_package,
             storage::body_package::delete_body_package,
             storage::body_package::get_body_package_registry_snapshot,
+            storage::body_package::set_current_life_body,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

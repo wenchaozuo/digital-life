@@ -68,9 +68,9 @@ pub fn run() {
             app.manage(perception::screen_policy::ScreenPerceptionSessionGate::new());
             app.manage(perception::screen_capture::target::ScreenCaptureTargetBroker::new());
             app.manage(perception::screen_capture::operation::ScreenCaptureOperationGate::new());
-            // D24-A: the single App-managed process-local screen-context
-            // handoff broker.  It is authority foundation only — no WebView
-            // command or production flow consumes it yet.
+            // D24-A/B1: the single App-managed process-local screen-context
+            // handoff broker.  Main observation and explicit handoff commands
+            // consume it; Chat integration remains a later stage.
             app.manage(perception::screen_context::ScreenContextHandoffBroker::new());
             app.manage(storage::LlmCandidateExtractionCoordinator::default());
             app.manage(model::runtime::ModelRuntimeCoordinator::default());
@@ -166,6 +166,7 @@ pub fn run() {
             perception::screen_capture::clear_screen_capture_target,
             perception::screen_capture::capture_screen_smoke,
             perception::screen_observation::observe_screen_now,
+            perception::screen_observation::prepare_main_screen_context_for_chat,
             perception::screen_observation::get_main_screen_perception_status,
         ])
         .run(tauri::generate_context!())

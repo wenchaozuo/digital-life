@@ -296,6 +296,47 @@ pub(crate) fn capture_screen_observation_with_permit(
     broker: &ScreenCaptureTargetBroker,
     life_id: &str,
 ) -> Result<ScreenObservation, ScreenObservationError> {
+    let observation = capture_screen_observation_while_permit_held(
+        &operation_permit,
+        repository,
+        session_gate,
+        broker,
+        life_id,
+    );
+
+    // The owned D23 API preserves its existing contract: the operation slot
+    // is released before this function returns to its caller.
+    drop(operation_permit);
+    observation
+}
+
+/// Additive D24 composition seam.  The caller retains ownership of the
+/// canonical operation permit, so the operation gate remains BUSY after D23
+/// capture/OCR returns and through any following authority handoff work.
+///
+/// This function deliberately shares the exact native D23 capture/OCR path
+/// with [`capture_screen_observation_with_permit`].  It does not create a
+/// second operation gate, queue, provider, or authorization authority.
+pub(crate) fn capture_screen_observation_while_permit_held(
+    operation_permit: &ScreenCaptureOperationPermit,
+    repository: &dyn ScreenPerceptionRepository,
+    session_gate: &ScreenPerceptionSessionGate,
+    broker: &ScreenCaptureTargetBroker,
+    life_id: &str,
+) -> Result<ScreenObservation, ScreenObservationError> {
+    capture_screen_observation_common(operation_permit, repository, session_gate, broker, life_id)
+}
+
+/// Private native D23 capture/OCR implementation shared by the owned and
+/// borrowed permit entry points.  Keeping the common path private prevents a
+/// second provider or authority composition from being exposed.
+fn capture_screen_observation_common(
+    operation_permit: &ScreenCaptureOperationPermit,
+    repository: &dyn ScreenPerceptionRepository,
+    session_gate: &ScreenPerceptionSessionGate,
+    broker: &ScreenCaptureTargetBroker,
+    life_id: &str,
+) -> Result<ScreenObservation, ScreenObservationError> {
     let capture_provider = screen_capture::provider::native_provider();
 
     // Capture before creating the OCR engine so denied/no-target requests do
@@ -312,9 +353,10 @@ pub(crate) fn capture_screen_observation_with_permit(
     let ocr_provider = native_ocr_provider()?;
     let observation = observe_frame(frame, captured_at, ocr_provider.as_ref())?;
 
-    // `operation_permit` remains in this scope until `observe_frame` has
-    // explicitly retired the raw frame and its resized OCR input.
-    drop(operation_permit);
+    // Keep the borrow live until `observe_frame` has explicitly retired the
+    // raw frame and its resized OCR input.  The caller still owns the permit
+    // when this function returns.
+    let _ = operation_permit;
     Ok(observation)
 }
 
@@ -324,6 +366,32 @@ pub(crate) fn capture_screen_observation_with_permit(
 #[cfg(test)]
 fn observe_screen_once_with_permit(
     operation_permit: ScreenCaptureOperationPermit,
+    repository: &dyn ScreenPerceptionRepository,
+    session_gate: &ScreenPerceptionSessionGate,
+    broker: &ScreenCaptureTargetBroker,
+    life_id: &str,
+    capture_provider: &dyn ScreenCaptureProvider,
+    ocr_provider: &dyn ScreenOcrProvider,
+) -> Result<ScreenObservation, ScreenObservationError> {
+    let observation = observe_screen_once_while_permit_held(
+        &operation_permit,
+        repository,
+        session_gate,
+        broker,
+        life_id,
+        capture_provider,
+        ocr_provider,
+    );
+
+    // The injected D23 test helper retains the owned helper's release
+    // semantics so existing single-operation tests remain representative.
+    drop(operation_permit);
+    observation
+}
+
+#[cfg(test)]
+fn observe_screen_once_while_permit_held(
+    operation_permit: &ScreenCaptureOperationPermit,
     repository: &dyn ScreenPerceptionRepository,
     session_gate: &ScreenPerceptionSessionGate,
     broker: &ScreenCaptureTargetBroker,
@@ -342,9 +410,9 @@ fn observe_screen_once_with_permit(
     let captured_at = utc_now_timestamp();
     let observation = observe_frame(frame, captured_at, ocr_provider)?;
 
-    // The permit is deliberately dropped after observe_frame returns.  The
-    // frame and any resized bytes have already been retired at that point.
-    drop(operation_permit);
+    // The permit borrow remains valid through frame/OCR retirement.  The
+    // caller, not this borrowed seam, decides when the operation slot opens.
+    let _ = operation_permit;
     Ok(observation)
 }
 
@@ -1370,6 +1438,39 @@ mod tests {
         assert!(!observation.captured_at.is_empty());
         assert!(!observation.truncated);
         assert!(operation_gate.try_enter().is_ok());
+    }
+
+    #[test]
+    fn borrowed_permit_stays_busy_until_the_caller_releases_it() {
+        let (repository, session_gate, broker) = authorized_fixture();
+        let capture = FakeCaptureProvider::returning(valid_frame(16, 16));
+        let ocr = FakeOcrProvider::returning(["borrowed permit"]);
+        let operation_gate = screen_capture::operation::ScreenCaptureOperationGate::new();
+        let operation_permit = operation_gate
+            .try_enter()
+            .expect("the caller must acquire the canonical operation permit");
+
+        let observation = observe_screen_once_while_permit_held(
+            &operation_permit,
+            &repository,
+            &session_gate,
+            &broker,
+            "life-a",
+            &capture,
+            &ocr,
+        )
+        .expect("borrowed-permit observation must complete");
+        assert_eq!(observation.text, "borrowed permit");
+        assert!(
+            operation_gate.try_enter().is_err(),
+            "the caller-owned permit must keep the canonical gate busy after OCR"
+        );
+
+        drop(operation_permit);
+        assert!(
+            operation_gate.try_enter().is_ok(),
+            "the canonical gate must become available only after the caller drops its permit"
+        );
     }
 
     #[test]

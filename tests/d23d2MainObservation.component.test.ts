@@ -309,6 +309,159 @@ describe("D23-D2 Main explicit screen observation", () => {
     }
   });
 
+  it("retires observation presentation ownership when Life changes during observation", async () => {
+    const lifeB = makeLife("life-b", "Life B");
+    const observation = new Deferred<MainScreenObservation>();
+    const mounted = await mountMain();
+    mounted.observeNow.mockReturnValue(observation.promise);
+    try {
+      const button = mounted.wrapper.get("[data-testid='screen-observe-now']");
+      await button.trigger("click");
+      expect(
+        mounted.wrapper.get("[data-testid='screen-perception-indicator']").text(),
+      ).toContain("Observing");
+
+      vi.spyOn(mounted.storageService, "getCurrentLife").mockResolvedValue(lifeB);
+      mounted.emitBindingChange({ version: 1, lifeId: "life-b", lifeVersion: 2 });
+      await flushMicrotasks();
+      await vi.waitFor(() => {
+        expect(mounted.getStatus).toHaveBeenLastCalledWith("life-b");
+      });
+      await mounted.wrapper.vm.$nextTick();
+
+      expect(mounted.getStatus).toHaveBeenLastCalledWith("life-b");
+      expect(
+        mounted.wrapper.get("[data-testid='screen-perception-indicator']").text(),
+      ).toContain("Ready");
+      expect(
+        mounted.wrapper.find("[data-testid='screen-observation-preview']").exists(),
+      ).toBe(false);
+      expect((button.element as HTMLButtonElement).disabled).toBe(false);
+
+      observation.resolve(makeObservation("Life A late observation"));
+      await flushMicrotasks();
+
+      expect(mounted.wrapper.text()).not.toContain("Life A late observation");
+      expect(
+        mounted.wrapper.find("[data-testid='screen-observation-preview']").exists(),
+      ).toBe(false);
+      expect(
+        mounted.wrapper.get("[data-testid='screen-perception-indicator']").text(),
+      ).toContain("Ready");
+    } finally {
+      mounted.wrapper.unmount();
+    }
+  });
+
+  it("retires a pending observation when accepted readiness becomes not ready", async () => {
+    const observation = new Deferred<MainScreenObservation>();
+    const mounted = await mountMain();
+    mounted.observeNow.mockReturnValue(observation.promise);
+    try {
+      await mounted.wrapper.get("[data-testid='screen-observe-now']").trigger("click");
+      expect(
+        mounted.wrapper.get("[data-testid='screen-perception-indicator']").text(),
+      ).toContain("Observing");
+
+      mounted.getStatus.mockResolvedValue(notReadyStatus);
+      window.dispatchEvent(new Event("focus"));
+      await flushMicrotasks();
+
+      expect(
+        mounted.wrapper.get("[data-testid='screen-perception-indicator']").text(),
+      ).toContain("Disarmed");
+      expect(
+        mounted.wrapper.find("[data-testid='screen-observation-preview']").exists(),
+      ).toBe(false);
+      expect(
+        (mounted.wrapper.get("[data-testid='screen-observe-now']").element as HTMLButtonElement)
+          .disabled,
+      ).toBe(true);
+
+      observation.resolve(makeObservation("late after disarm"));
+      await flushMicrotasks();
+
+      expect(mounted.wrapper.text()).not.toContain("late after disarm");
+      expect(mounted.wrapper.text()).not.toContain("Observing");
+    } finally {
+      mounted.wrapper.unmount();
+    }
+  });
+
+  it("keeps the bounded status error after readiness lookup fails during observation", async () => {
+    const observation = new Deferred<MainScreenObservation>();
+    const mounted = await mountMain();
+    mounted.observeNow.mockReturnValue(observation.promise);
+    try {
+      await mounted.wrapper.get("[data-testid='screen-observe-now']").trigger("click");
+
+      mounted.getStatus.mockRejectedValue({
+        code: "SESSION_DENIED",
+        message: "native detail must not escape",
+        recoverable: false,
+      });
+      window.dispatchEvent(new Event("focus"));
+      await flushMicrotasks();
+
+      expect(mounted.wrapper.get("[data-testid='screen-observation-error']").text()).toContain(
+        "not authorized",
+      );
+      expect(mounted.wrapper.text()).not.toContain("native detail must not escape");
+      expect(
+        mounted.wrapper.get("[data-testid='screen-perception-indicator']").text(),
+      ).toContain("Needs setup");
+
+      observation.resolve(makeObservation("late after status failure"));
+      await flushMicrotasks();
+
+      expect(mounted.wrapper.text()).not.toContain("late after status failure");
+      expect(mounted.wrapper.get("[data-testid='screen-observation-error']").text()).toContain(
+        "not authorized",
+      );
+      expect(mounted.wrapper.text()).not.toContain("Observing");
+    } finally {
+      mounted.wrapper.unmount();
+    }
+  });
+
+  it("prevents an invalidated old request from overwriting a newer request", async () => {
+    const oldObservation = new Deferred<MainScreenObservation>();
+    const newObservation = new Deferred<MainScreenObservation>();
+    const mounted = await mountMain();
+    mounted.observeNow
+      .mockImplementationOnce(() => oldObservation.promise)
+      .mockImplementationOnce(() => newObservation.promise);
+    try {
+      await mounted.wrapper.get("[data-testid='screen-observe-now']").trigger("click");
+
+      mounted.getStatus.mockResolvedValue(notReadyStatus);
+      window.dispatchEvent(new Event("focus"));
+      await flushMicrotasks();
+
+      mounted.getStatus.mockResolvedValue(readyStatus);
+      window.dispatchEvent(new Event("focus"));
+      await flushMicrotasks();
+      await mounted.wrapper.get("[data-testid='screen-observe-now']").trigger("click");
+      expect(mounted.observeNow).toHaveBeenCalledTimes(2);
+
+      newObservation.resolve(makeObservation("new request wins"));
+      await flushMicrotasks();
+      expect(
+        mounted.wrapper.get("[data-testid='screen-observation-preview']").text(),
+      ).toContain("new request wins");
+
+      oldObservation.resolve(makeObservation("old request must stay hidden"));
+      await flushMicrotasks();
+
+      expect(
+        mounted.wrapper.get("[data-testid='screen-observation-preview']").text(),
+      ).toContain("new request wins");
+      expect(mounted.wrapper.text()).not.toContain("old request must stay hidden");
+    } finally {
+      mounted.wrapper.unmount();
+    }
+  });
+
   it("clears the old preview and refreshes readiness when Life changes", async () => {
     const lifeB = makeLife("life-b", "Life B");
     const mounted = await mountMain();

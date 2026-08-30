@@ -37,6 +37,7 @@ let unsubscribe: (() => void) | undefined;
 let bodyRuntimeBinding: BodyRuntimeBindingController | undefined;
 let lifecycleEpoch = 0;
 let screenStatusRequestGeneration = 0;
+let screenObservationRequestGeneration = 0;
 
 const screenReadinessLabel = computed(() => {
   if (screenObservationLoading.value) {
@@ -96,6 +97,11 @@ function clearScreenObservation(): void {
   screenObservationError.value = undefined;
 }
 
+function invalidateScreenObservationRequest(): void {
+  screenObservationRequestGeneration += 1;
+  screenObservationLoading.value = false;
+}
+
 async function refreshScreenPerceptionStatus(
   lifeId: string,
   runtimeEpoch: number,
@@ -112,6 +118,7 @@ async function refreshScreenPerceptionStatus(
     }
     screenPerceptionStatus.value = status;
     if (!status.ready) {
+      invalidateScreenObservationRequest();
       clearScreenObservation();
     }
   } catch (error: unknown) {
@@ -122,6 +129,7 @@ async function refreshScreenPerceptionStatus(
     ) {
       return;
     }
+    invalidateScreenObservationRequest();
     screenPerceptionStatus.value = undefined;
     clearScreenObservation();
     screenObservationError.value = screenObservationErrorFromUnknown(error);
@@ -136,6 +144,7 @@ function applyCurrentLife(life: LifeIdentity, runtimeEpoch: number): void {
   lifeIdentity.value = life;
   if (previousLifeId !== life.id) {
     screenStatusRequestGeneration += 1;
+    invalidateScreenObservationRequest();
     screenPerceptionStatus.value = undefined;
     clearScreenObservation();
   }
@@ -149,20 +158,23 @@ async function observeScreenNow(): Promise<void> {
   }
 
   const runtimeEpoch = lifecycleEpoch;
+  const requestGeneration = ++screenObservationRequestGeneration;
   screenObservationLoading.value = true;
   screenObservationError.value = undefined;
   try {
     const observation = await mainScreenObservationService.observeNow(lifeId);
     if (
       isRuntimeActive(runtimeEpoch) &&
-      lifeIdentity.value?.id === lifeId
+      lifeIdentity.value?.id === lifeId &&
+      screenObservationRequestGeneration === requestGeneration
     ) {
       screenObservation.value = observation;
     }
   } catch (error: unknown) {
     if (
       isRuntimeActive(runtimeEpoch) &&
-      lifeIdentity.value?.id === lifeId
+      lifeIdentity.value?.id === lifeId &&
+      screenObservationRequestGeneration === requestGeneration
     ) {
       screenObservation.value = undefined;
       screenObservationError.value = screenObservationErrorFromUnknown(error);
@@ -170,7 +182,8 @@ async function observeScreenNow(): Promise<void> {
   } finally {
     if (
       isRuntimeActive(runtimeEpoch) &&
-      lifeIdentity.value?.id === lifeId
+      lifeIdentity.value?.id === lifeId &&
+      screenObservationRequestGeneration === requestGeneration
     ) {
       screenObservationLoading.value = false;
       void refreshScreenPerceptionStatus(lifeId, runtimeEpoch);
@@ -279,6 +292,7 @@ onUnmounted(() => {
   // state after unmount.
   lifecycleEpoch += 1;
   screenStatusRequestGeneration += 1;
+  invalidateScreenObservationRequest();
   window.removeEventListener("focus", handleMainWindowFocus);
   unsubscribe?.();
   unsubscribe = undefined;

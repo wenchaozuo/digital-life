@@ -45,7 +45,7 @@ use windows::{
                 D3D11_USAGE_STAGING,
             },
             Dxgi::{
-                Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC},
+                Common::{DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC},
                 IDXGIDevice, IDXGISurface,
             },
         },
@@ -57,7 +57,9 @@ use windows::{
 
 use super::provider::ScreenCaptureProvider;
 use super::target::ScreenCaptureTarget;
-use super::{ComGuard, ComMode, ScreenCaptureError, ScreenFrame, ScreenPixelFormat};
+use super::{
+    ComGuard, ComMode, ScreenCaptureError, ScreenFrame, ScreenPixelFormat, ValidatedFrameGeometry,
+};
 
 /// RAII retirement of all WGC session resources.  Once the session/frame
 /// pool have been created, `Drop` closes them on every exit path — success,
@@ -72,17 +74,32 @@ struct CaptureSessionGuard {
 
 #[cfg(windows)]
 impl CaptureSessionGuard {
-    fn new(frame_pool: Direct3D11CaptureFramePool, session: GraphicsCaptureSession) -> Self {
+    fn with_frame_pool(frame_pool: Direct3D11CaptureFramePool) -> Self {
         Self {
             frame_pool: Some(frame_pool),
-            session: Some(session),
+            session: None,
             frame: None,
         }
     }
 
-    fn take_frame(&mut self, frame: Direct3D11CaptureFrame) -> Direct3D11CaptureFrame {
+    fn install_session(&mut self, session: GraphicsCaptureSession) {
+        self.session = Some(session);
+    }
+
+    fn frame_pool(&self) -> Option<&Direct3D11CaptureFramePool> {
+        self.frame_pool.as_ref()
+    }
+
+    fn session(&self) -> Option<&GraphicsCaptureSession> {
+        self.session.as_ref()
+    }
+
+    fn install_frame(&mut self, frame: Direct3D11CaptureFrame) {
         self.frame = Some(frame);
-        self.frame.as_ref().unwrap().clone()
+    }
+
+    fn frame(&self) -> Option<&Direct3D11CaptureFrame> {
+        self.frame.as_ref()
     }
 }
 
@@ -151,6 +168,7 @@ impl ScreenCaptureProvider for WindowsGraphicsCaptureProvider {
         let item_size = item
             .Size()
             .map_err(|_| ScreenCaptureError::capture_failed())?;
+        super::validate_capture_geometry(item_size.Width, item_size.Height)?;
 
         // Frame pool with exactly one buffer: the one-shot semantics.
         let frame_pool = Direct3D11CaptureFramePool::Create(
@@ -160,29 +178,38 @@ impl ScreenCaptureProvider for WindowsGraphicsCaptureProvider {
             item_size,
         )
         .map_err(|_| ScreenCaptureError::capture_failed())?;
+        // The guard owns the pool before any subsequent fallible operation.
+        let mut guard = CaptureSessionGuard::with_frame_pool(frame_pool);
 
-        let session = frame_pool
+        let session = guard
+            .frame_pool()
+            .ok_or_else(ScreenCaptureError::capture_failed)?
             .CreateCaptureSession(&item)
             .map_err(|_| ScreenCaptureError::capture_failed())?;
-        session
+        // Install the session before starting it so a StartCapture failure
+        // still closes both the session and frame pool through the guard.
+        guard.install_session(session);
+        guard
+            .session()
+            .ok_or_else(ScreenCaptureError::capture_failed)?
             .StartCapture()
             .map_err(|_| ScreenCaptureError::capture_failed())?;
-
-        // From this point the session and pool exist and must be retired on
-        // every path; the RAII guard guarantees it even when `?` returns.
-        let mut guard = CaptureSessionGuard::new(frame_pool, session);
 
         // WGC frames arrive asynchronously; one-shot waits for the first
         // frame with a bounded timeout.
         let frame = wait_for_frame(
             guard
-                .frame_pool
-                .as_ref()
+                .frame_pool()
                 .ok_or_else(ScreenCaptureError::capture_failed)?,
         )?;
-        let frame = guard.take_frame(frame);
+        // Own the frame immediately after acquisition; all later errors then
+        // run through the same explicit Close() path.
+        guard.install_frame(frame);
+        let frame = guard
+            .frame()
+            .ok_or_else(ScreenCaptureError::capture_failed)?;
 
-        let (width, height, bytes) = copy_frame_to_cpu(&device, &frame)?;
+        let (width, height, bytes) = copy_frame_to_cpu(&device, frame)?;
         let screen_frame = ScreenFrame {
             width,
             height,
@@ -227,6 +254,51 @@ fn wrap_device_as_winrt(device: &ID3D11Device) -> Result<IDirect3DDevice, Screen
         .map_err(|_| ScreenCaptureError::not_supported())
 }
 
+/// Validates the source surface before `CopyResource`.  The staging texture
+/// is created with the same geometry and format only after this check passes.
+fn validate_surface_for_copy(
+    format: DXGI_FORMAT,
+    width: u32,
+    height: u32,
+    geometry: ValidatedFrameGeometry,
+) -> Result<(), ScreenCaptureError> {
+    if format != DXGI_FORMAT_B8G8R8A8_UNORM || width != geometry.width || height != geometry.height
+    {
+        return Err(ScreenCaptureError::frame_invalid());
+    }
+    Ok(())
+}
+
+/// Validates the mapped staging-texture layout before any raw row slice or
+/// pointer arithmetic is performed.  The returned height is converted once
+/// and reused by the copy loop.
+fn validate_mapped_layout(
+    row_pitch: usize,
+    data: *const u8,
+    geometry: ValidatedFrameGeometry,
+) -> Result<usize, ScreenCaptureError> {
+    if row_pitch < geometry.row_bytes || data.is_null() {
+        return Err(ScreenCaptureError::frame_invalid());
+    }
+    let height =
+        usize::try_from(geometry.height).map_err(|_| ScreenCaptureError::frame_invalid())?;
+    let mapped_span = row_pitch
+        .checked_mul(height)
+        .ok_or_else(ScreenCaptureError::frame_invalid)?;
+    let last_row_end = row_pitch
+        .checked_mul(
+            height
+                .checked_sub(1)
+                .ok_or_else(ScreenCaptureError::frame_invalid)?,
+        )
+        .and_then(|offset| offset.checked_add(geometry.row_bytes))
+        .ok_or_else(ScreenCaptureError::frame_invalid)?;
+    if last_row_end > mapped_span {
+        return Err(ScreenCaptureError::frame_invalid());
+    }
+    Ok(height)
+}
+
 /// Copies the capture frame's DXGI surface into a CPU-readable staging
 /// texture and returns `(width, height, bgra8_bytes)`.
 fn copy_frame_to_cpu(
@@ -236,11 +308,7 @@ fn copy_frame_to_cpu(
     let content_size = frame
         .ContentSize()
         .map_err(|_| ScreenCaptureError::capture_failed())?;
-    let width = content_size.Width as u32;
-    let height = content_size.Height as u32;
-    if width == 0 || height == 0 {
-        return Err(ScreenCaptureError::frame_invalid());
-    }
+    let geometry = super::validate_capture_geometry(content_size.Width, content_size.Height)?;
 
     // The frame's Surface is a WinRT IDirect3DSurface.  Cast it to the
     // interop access interface, then to the underlying DXGI surface.
@@ -262,11 +330,14 @@ fn copy_frame_to_cpu(
             .map_err(|_| ScreenCaptureError::capture_failed())?
     };
     let src_format = surface_desc.Format;
-    if src_format != DXGI_FORMAT_B8G8R8A8_UNORM {
-        // WGC produces B8G8R8A8 by default.  Any other format is rejected
-        // rather than silently misinterpreted.
-        return Err(ScreenCaptureError::frame_invalid());
-    }
+    // WGC produces B8G8R8A8 by default.  Any other format or geometry is
+    // rejected rather than silently misinterpreted or copied incompatibly.
+    validate_surface_for_copy(
+        src_format,
+        surface_desc.Width,
+        surface_desc.Height,
+        geometry,
+    )?;
 
     let context = unsafe {
         device
@@ -275,8 +346,8 @@ fn copy_frame_to_cpu(
     };
 
     let staging_desc = D3D11_TEXTURE2D_DESC {
-        Width: width,
-        Height: height,
+        Width: geometry.width,
+        Height: geometry.height,
         MipLevels: 1,
         ArraySize: 1,
         Format: src_format,
@@ -315,22 +386,34 @@ fn copy_frame_to_cpu(
     }
     let mapped = unsafe { mapped.assume_init() };
 
-    let row_pitch = mapped.RowPitch as usize;
-    let row_bytes = width as usize * 4;
-    let byte_count = row_bytes * height as usize;
-    let mut bytes = Vec::with_capacity(byte_count);
-    let src_ptr = mapped.pData as *const u8;
-    unsafe {
-        for row in 0..height as usize {
-            let src_row = src_ptr.add(row * row_pitch);
-            bytes.extend_from_slice(std::slice::from_raw_parts(src_row, row_bytes));
+    let result: Result<Vec<u8>, ScreenCaptureError> = (|| {
+        let row_pitch =
+            usize::try_from(mapped.RowPitch).map_err(|_| ScreenCaptureError::frame_invalid())?;
+        let height = validate_mapped_layout(row_pitch, mapped.pData.cast(), geometry)?;
+
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(geometry.byte_count)
+            .map_err(|_| ScreenCaptureError::capture_failed())?;
+        let src_ptr = mapped.pData.cast::<u8>();
+        for row in 0..height {
+            let row_offset = row_pitch
+                .checked_mul(row)
+                .ok_or_else(ScreenCaptureError::frame_invalid)?;
+            let src_row = unsafe { src_ptr.add(row_offset) };
+            let row_slice = unsafe { std::slice::from_raw_parts(src_row, geometry.row_bytes) };
+            bytes.extend_from_slice(row_slice);
         }
-    }
+        if bytes.len() != geometry.byte_count {
+            return Err(ScreenCaptureError::frame_invalid());
+        }
+        Ok(bytes)
+    })();
     unsafe {
         context.Unmap(&staging, 0);
     }
 
-    Ok((width, height, bytes))
+    Ok((geometry.width, geometry.height, result?))
 }
 
 /// Creates the D3D11 device used for capture.  Prefers the hardware adapter;
@@ -387,6 +470,87 @@ mod tests {
             frame: None,
         };
         drop(guard);
+    }
+
+    #[test]
+    fn production_arms_cleanup_guard_before_start_and_frame_copy() {
+        let production = include_str!("windows_provider.rs")
+            .split_once("#[cfg(test)]")
+            .map_or(include_str!("windows_provider.rs"), |(source, _)| source);
+        let pool_guard = production
+            .find("CaptureSessionGuard::with_frame_pool")
+            .expect("the frame pool must be guarded immediately");
+        let session_create = production
+            .find("CreateCaptureSession")
+            .expect("the session must be created after the pool guard");
+        let session_guard = production
+            .find("guard.install_session(session)")
+            .expect("the session must be installed in the guard");
+        let start_capture = production
+            .find(".StartCapture()")
+            .expect("capture must start through the guarded session");
+        let frame_wait = production
+            .find("wait_for_frame")
+            .expect("the provider must wait for one frame");
+        let frame_guard = production
+            .find("guard.install_frame(frame)")
+            .expect("the frame must be guarded immediately after acquisition");
+        let frame_copy = production
+            .find("copy_frame_to_cpu(&device, frame)")
+            .expect("copy must borrow the guarded frame");
+
+        assert!(pool_guard < session_create);
+        assert!(session_create < session_guard);
+        assert!(session_guard < start_capture);
+        assert!(start_capture < frame_wait);
+        assert!(frame_wait < frame_guard);
+        assert!(frame_guard < frame_copy);
+    }
+
+    #[test]
+    fn surface_geometry_mismatch_is_rejected_before_copy_resource() {
+        let geometry = super::super::validate_capture_geometry(64, 32).unwrap();
+        let error = validate_surface_for_copy(
+            DXGI_FORMAT_B8G8R8A8_UNORM,
+            geometry.width + 1,
+            geometry.height,
+            geometry,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.code,
+            super::super::ScreenCaptureErrorCode::FrameInvalid
+        );
+    }
+
+    #[test]
+    fn mapped_layout_rejects_short_rows_and_null_pointer() {
+        let geometry = super::super::validate_capture_geometry(64, 2).unwrap();
+        let data = std::ptr::NonNull::<u8>::dangling().as_ptr();
+
+        let short_row = validate_mapped_layout(geometry.row_bytes - 1, data, geometry).unwrap_err();
+        assert_eq!(
+            short_row.code,
+            super::super::ScreenCaptureErrorCode::FrameInvalid
+        );
+
+        let null_pointer =
+            validate_mapped_layout(geometry.row_bytes, std::ptr::null(), geometry).unwrap_err();
+        assert_eq!(
+            null_pointer.code,
+            super::super::ScreenCaptureErrorCode::FrameInvalid
+        );
+    }
+
+    #[test]
+    fn mapped_layout_rejects_checked_span_overflow() {
+        let geometry = super::super::validate_capture_geometry(1, 2).unwrap();
+        let data = std::ptr::NonNull::<u8>::dangling().as_ptr();
+        let error = validate_mapped_layout(usize::MAX, data, geometry).unwrap_err();
+        assert_eq!(
+            error.code,
+            super::super::ScreenCaptureErrorCode::FrameInvalid
+        );
     }
 
     #[test]

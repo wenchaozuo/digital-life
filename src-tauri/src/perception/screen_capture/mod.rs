@@ -112,6 +112,64 @@ pub(crate) const MAX_FRAME_BYTES: usize = 1024 * 1024 * 1024;
 /// Bytes per pixel for the only pixel format C1 reads back: BGRA8.
 pub(crate) const FRAME_BYTES_PER_PIXEL: u32 = 4;
 
+/// The checked geometry and byte sizes used by the native capture path.
+/// Keeping these values together prevents allocation and unsafe-copy callers
+/// from recomputing a size with unchecked arithmetic.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ValidatedFrameGeometry {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) row_bytes: usize,
+    pub(crate) byte_count: usize,
+}
+
+/// Validates signed native dimensions before any frame-pool, texture, or CPU
+/// buffer allocation.  Native Windows APIs expose dimensions as `i32`, so a
+/// negative value must be rejected rather than cast to an unsigned size.
+pub(crate) fn validate_capture_geometry(
+    width: i32,
+    height: i32,
+) -> Result<ValidatedFrameGeometry, ScreenCaptureError> {
+    validate_capture_geometry_with_limit(width, height, MAX_FRAME_BYTES)
+}
+
+fn validate_capture_geometry_with_limit(
+    width: i32,
+    height: i32,
+    max_frame_bytes: usize,
+) -> Result<ValidatedFrameGeometry, ScreenCaptureError> {
+    if width <= 0 || height <= 0 {
+        return Err(ScreenCaptureError::frame_invalid());
+    }
+
+    let width = u32::try_from(width).map_err(|_| ScreenCaptureError::frame_invalid())?;
+    let height = u32::try_from(height).map_err(|_| ScreenCaptureError::frame_invalid())?;
+    if width > MAX_FRAME_WIDTH || height > MAX_FRAME_HEIGHT {
+        return Err(ScreenCaptureError::frame_invalid());
+    }
+
+    let width_usize = usize::try_from(width).map_err(|_| ScreenCaptureError::frame_invalid())?;
+    let height_usize = usize::try_from(height).map_err(|_| ScreenCaptureError::frame_invalid())?;
+    let bytes_per_pixel =
+        usize::try_from(FRAME_BYTES_PER_PIXEL).map_err(|_| ScreenCaptureError::frame_invalid())?;
+    let row_bytes = width_usize
+        .checked_mul(bytes_per_pixel)
+        .ok_or_else(ScreenCaptureError::frame_invalid)?;
+    let byte_count = row_bytes
+        .checked_mul(height_usize)
+        .ok_or_else(ScreenCaptureError::frame_invalid)?;
+    if byte_count > max_frame_bytes {
+        return Err(ScreenCaptureError::frame_invalid());
+    }
+
+    Ok(ValidatedFrameGeometry {
+        width,
+        height,
+        row_bytes,
+        byte_count,
+    })
+}
+
 /// The bounded pixel formats C1 can produce.  Only BGRA8 is produced by the
 /// Windows provider; the enum is kept narrow so D23-D1 OCR has a fixed
 /// contract.
@@ -389,27 +447,48 @@ pub(crate) fn install_picker_outcome(
                 cancelled: true,
             })
         }
-        selection::PickOutcome::Selected(item) => {
-            // 5. Re-check the session fence before installing: if the gate
-            //    was disarmed/rearmed/rebound while the picker was open, do
-            //    NOT install the stale item.
-            let current_fence = gate
-                .life_fence_for(life_id)
-                .ok_or_else(ScreenCaptureError::session_denied)?;
-            if current_fence != picker_fence {
-                // The stale item is intentionally NOT installed; dropping it
-                // releases its COM reference.
-                drop(item);
-                return Err(ScreenCaptureError::session_denied());
-            }
-            // 6. install into the canonical broker under the current fence.
-            broker.select(current_fence, item);
-            Ok(ScreenCapturePickDto {
-                status: target::ScreenCaptureTargetStatus::Selected,
-                cancelled: false,
-            })
-        }
+        selection::PickOutcome::Selected(item) => install_selected_picker_item(
+            repository,
+            gate,
+            life_id,
+            picker_fence,
+            item,
+            |current_fence, item| broker.select(current_fence, item),
+        ),
     }
+}
+
+/// Re-checks both durable consent and the process-local generation immediately
+/// after a picker returns, then invokes the installation closure only when the
+/// opaque selected item is still authorized.  The generic closure is a narrow
+/// test seam: tests can prove that a selected item is not installed without
+/// constructing a platform-native `GraphicsCaptureItem`.
+fn install_selected_picker_item<T>(
+    repository: &dyn ScreenPerceptionRepository,
+    gate: &super::screen_policy::ScreenPerceptionSessionGate,
+    life_id: &str,
+    picker_fence: u64,
+    item: T,
+    install: impl FnOnce(u64, T),
+) -> Result<ScreenCapturePickDto, ScreenCaptureError> {
+    // Durable consent is authoritative even when the process-local gate was
+    // not proactively disarmed by the Settings command layer.
+    authorize_screen_perception(repository, gate, life_id).map_err(map_authorization_error)?;
+
+    // A rearm/disarm/rebind while the picker was open invalidates the opaque
+    // item.  Dropping `item` on this error releases the native reference.
+    let current_fence = gate
+        .life_fence_for(life_id)
+        .ok_or_else(ScreenCaptureError::session_denied)?;
+    if current_fence != picker_fence {
+        return Err(ScreenCaptureError::session_denied());
+    }
+
+    install(current_fence, item);
+    Ok(ScreenCapturePickDto {
+        status: target::ScreenCaptureTargetStatus::Selected,
+        cancelled: false,
+    })
 }
 
 /// The post-picker fence recheck: true only when the gate is still armed for
@@ -654,6 +733,59 @@ mod tests {
             frame.validate().unwrap_err().code,
             ScreenCaptureErrorCode::FrameInvalid
         );
+    }
+
+    #[test]
+    fn native_geometry_rejects_non_positive_dimensions_before_allocation() {
+        for (width, height) in [(0, 1080), (-1, 1080), (1920, 0), (1920, -1)] {
+            assert_eq!(
+                validate_capture_geometry(width, height).unwrap_err().code,
+                ScreenCaptureErrorCode::FrameInvalid
+            );
+        }
+    }
+
+    #[test]
+    fn native_geometry_rejects_dimensions_over_hard_bounds() {
+        for (width, height) in [
+            (i32::try_from(MAX_FRAME_WIDTH).unwrap() + 1, 1),
+            (1, i32::try_from(MAX_FRAME_HEIGHT).unwrap() + 1),
+            (i32::MAX, i32::MAX),
+        ] {
+            assert_eq!(
+                validate_capture_geometry(width, height).unwrap_err().code,
+                ScreenCaptureErrorCode::FrameInvalid
+            );
+        }
+    }
+
+    #[test]
+    fn native_geometry_uses_checked_byte_arithmetic_and_keeps_sizes_together() {
+        let geometry = validate_capture_geometry(
+            i32::try_from(MAX_FRAME_WIDTH).unwrap(),
+            i32::try_from(MAX_FRAME_HEIGHT).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(geometry.row_bytes, 16_384usize * 4);
+        assert_eq!(geometry.byte_count, MAX_FRAME_BYTES);
+
+        assert_eq!(
+            validate_capture_geometry(i32::MAX, 1).unwrap_err().code,
+            ScreenCaptureErrorCode::FrameInvalid
+        );
+    }
+
+    #[test]
+    fn native_geometry_rejects_byte_count_over_limit_without_allocating() {
+        let width = i32::try_from(MAX_FRAME_WIDTH).unwrap();
+        let height = i32::try_from(MAX_FRAME_HEIGHT).unwrap();
+        let error = validate_capture_geometry_with_limit(
+            width,
+            height,
+            MAX_FRAME_BYTES.checked_sub(1).unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ScreenCaptureErrorCode::FrameInvalid);
     }
 
     // --- §27 authorization-before-pixels test seams -----------------------
@@ -1213,6 +1345,46 @@ mod tests {
                 target::ScreenCaptureTargetStatus::None
             );
         }
+    }
+
+    #[test]
+    fn picker_selected_item_not_installed_after_durable_revoke_with_unchanged_fence() {
+        let repository = FakeRepository::with_policy(true);
+        let gate = super::super::screen_policy::ScreenPerceptionSessionGate::new();
+        gate.arm_for_life("life-a");
+        let broker = target::ScreenCaptureTargetBroker::new();
+        let picker_fence = gate.life_fence_for("life-a").unwrap();
+
+        // Revoke the durable policy directly while the picker is open.  The
+        // process-local gate intentionally remains armed with the same fence.
+        repository
+            .update_screen_perception_policy(
+                super::super::screen_policy::LifeScreenPerceptionPolicyUpdateRequest {
+                    event_id: "revoke-picker-1".into(),
+                    life_id: "life-a".into(),
+                    screen_perception_enabled: false,
+                    expected_revision: 1,
+                },
+            )
+            .unwrap();
+        assert_eq!(gate.life_fence_for("life-a"), Some(picker_fence));
+
+        let mut installed = false;
+        let result = install_selected_picker_item(
+            &repository,
+            &gate,
+            "life-a",
+            picker_fence,
+            (),
+            |_, ()| installed = true,
+        );
+        let error = result.unwrap_err();
+        assert_eq!(error.code, ScreenCaptureErrorCode::SessionDenied);
+        assert!(!installed);
+        assert_eq!(
+            broker.current_status(),
+            target::ScreenCaptureTargetStatus::None
+        );
     }
 
     #[cfg(not(windows))]

@@ -125,16 +125,43 @@ enum PollState {
 
 #[cfg(windows)]
 fn poll_operation(operation: &windows_future::IAsyncOperation<GraphicsCaptureItem>) -> PollState {
+    match picker_operation_state(operation.Status()) {
+        PickerOperationState::Pending => PollState::Pending,
+        PickerOperationState::Cancelled => PollState::Done(Ok(PickOutcome::Cancelled)),
+        PickerOperationState::Failed => PollState::Done(Err(ScreenCaptureError::capture_failed())),
+        PickerOperationState::Completed => map_completed_picker_result(operation.GetResults()),
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PickerOperationState {
+    Pending,
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+#[cfg(windows)]
+fn picker_operation_state(
+    status: windows::core::Result<windows_future::AsyncStatus>,
+) -> PickerOperationState {
     use windows_future::AsyncStatus;
-    match operation.Status() {
-        Ok(AsyncStatus::Completed) => match operation.GetResults() {
-            Ok(item) => PollState::Done(Ok(PickOutcome::Selected(item))),
-            Err(_) => PollState::Done(Ok(PickOutcome::Cancelled)),
-        },
-        Ok(AsyncStatus::Canceled) | Ok(AsyncStatus::Error) => {
-            PollState::Done(Ok(PickOutcome::Cancelled))
-        }
-        _ => PollState::Pending,
+    match status {
+        Ok(AsyncStatus::Completed) => PickerOperationState::Completed,
+        Ok(AsyncStatus::Canceled) => PickerOperationState::Cancelled,
+        Ok(AsyncStatus::Error) | Err(_) => PickerOperationState::Failed,
+        Ok(_) => PickerOperationState::Pending,
+    }
+}
+
+#[cfg(windows)]
+fn map_completed_picker_result(result: windows::core::Result<GraphicsCaptureItem>) -> PollState {
+    match result {
+        Ok(item) => PollState::Done(Ok(PickOutcome::Selected(item))),
+        // Completed + GetResults failure is a runtime picker failure, not a
+        // user cancellation.  Keep the bounded failure visible to the caller.
+        Err(_) => PollState::Done(Err(ScreenCaptureError::capture_failed())),
     }
 }
 
@@ -186,4 +213,40 @@ fn test_native_item() -> NativeCaptureItem {
 #[cfg(not(windows))]
 fn test_native_item() -> NativeCaptureItem {
     ()
+}
+
+#[cfg(test)]
+#[cfg(windows)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn async_error_is_failure_and_cancelled_is_not() {
+        assert_eq!(
+            picker_operation_state(Ok(windows_future::AsyncStatus::Error)),
+            PickerOperationState::Failed
+        );
+        assert_eq!(
+            picker_operation_state(Ok(windows_future::AsyncStatus::Canceled)),
+            PickerOperationState::Cancelled
+        );
+        assert_eq!(
+            picker_operation_state(Err(windows::core::Error::from_win32())),
+            PickerOperationState::Failed
+        );
+    }
+
+    #[test]
+    fn completed_get_results_error_is_a_bounded_failure() {
+        let state = map_completed_picker_result(Err(windows::core::Error::from_win32()));
+        match state {
+            PollState::Done(Err(error)) => {
+                assert_eq!(
+                    error.code,
+                    crate::perception::screen_capture::ScreenCaptureErrorCode::CaptureFailed
+                );
+            }
+            _ => panic!("completed picker result failure must not be cancellation"),
+        }
+    }
 }

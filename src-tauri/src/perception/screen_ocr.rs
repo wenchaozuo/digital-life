@@ -817,7 +817,9 @@ impl OcrAsyncOperation for WindowsOcrAsyncOperation<'_> {
 /// operation/bitmap at that point would let the sensitive operation escape
 /// the C1 permit.  Therefore this state machine has exactly one cancellation
 /// request and returns only after a terminal status has been observed and the
-/// async object has been closed.
+/// async object has been closed.  Once `timed_out` becomes true, a later
+/// `Completed` state is terminal for retirement only; its result is no longer
+/// valid for publication.
 fn wait_for_ocr_operation<O: OcrAsyncOperation + ?Sized>(
     operation: &O,
     policy: OcrWaitPolicy,
@@ -825,26 +827,26 @@ fn wait_for_ocr_operation<O: OcrAsyncOperation + ?Sized>(
     let deadline = std::time::Instant::now()
         .checked_add(policy.timeout)
         .unwrap_or_else(std::time::Instant::now);
-    let mut cancellation_requested = false;
+    let mut timed_out = false;
     let mut cancellation_failed = false;
 
     loop {
         let status = operation.status()?;
         match status {
             OcrAsyncStatus::Completed => {
-                return finish_ocr_operation(operation, status, cancellation_failed);
+                return finish_ocr_operation(operation, status, timed_out, cancellation_failed);
             }
             OcrAsyncStatus::Canceled => {
-                return finish_ocr_operation(operation, status, cancellation_failed);
+                return finish_ocr_operation(operation, status, timed_out, cancellation_failed);
             }
             OcrAsyncStatus::Error => {
-                return finish_ocr_operation(operation, status, cancellation_failed);
+                return finish_ocr_operation(operation, status, timed_out, cancellation_failed);
             }
             OcrAsyncStatus::Started => {}
         }
 
-        if !cancellation_requested && std::time::Instant::now() >= deadline {
-            cancellation_requested = true;
+        if !timed_out && std::time::Instant::now() >= deadline {
+            timed_out = true;
             if operation.cancel().is_err() {
                 // Do not convert a failed cancellation request into a false
                 // OCR_TIMEOUT.  Continue observing until the operation itself
@@ -863,6 +865,7 @@ fn wait_for_ocr_operation<O: OcrAsyncOperation + ?Sized>(
 fn finish_ocr_operation<O: OcrAsyncOperation + ?Sized>(
     operation: &O,
     status: OcrAsyncStatus,
+    timed_out: bool,
     cancellation_failed: bool,
 ) -> Result<ScreenOcrResult, ScreenObservationError> {
     let result = if cancellation_failed {
@@ -872,6 +875,7 @@ fn finish_ocr_operation<O: OcrAsyncOperation + ?Sized>(
         Err(ScreenObservationError::ocr_failed())
     } else {
         match status {
+            OcrAsyncStatus::Completed if timed_out => Err(ScreenObservationError::ocr_timeout()),
             OcrAsyncStatus::Completed => operation.get_results(),
             OcrAsyncStatus::Canceled => Err(ScreenObservationError::ocr_timeout()),
             OcrAsyncStatus::Error => Err(ScreenObservationError::ocr_failed()),
@@ -1638,6 +1642,22 @@ mod tests {
         assert_eq!(error.code, ScreenObservationErrorCode::OcrTimeout);
         assert_eq!(operation.cancel_calls.load(Ordering::SeqCst), 1);
         assert_eq!(operation.status_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(operation.get_results_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(operation.close_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn ocr_timeout_rejects_late_completed_result() {
+        let operation = ScriptedOcrOperation::new(
+            [OcrAsyncStatus::Started, OcrAsyncStatus::Completed],
+            Ok(()),
+            Ok(ScreenOcrResult::from_lines(["must not be published"])),
+        );
+        let error = wait_for_ocr_operation(&operation, OcrWaitPolicy::immediate()).unwrap_err();
+
+        assert_eq!(error.code, ScreenObservationErrorCode::OcrTimeout);
+        assert_eq!(operation.cancel_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(operation.status_calls.load(Ordering::SeqCst), 2);
         assert_eq!(operation.get_results_calls.load(Ordering::SeqCst), 0);
         assert_eq!(operation.close_calls.load(Ordering::SeqCst), 1);
     }

@@ -82,6 +82,7 @@ impl Drop for ComGuard {
     }
 }
 
+pub(crate) mod operation;
 pub(crate) mod provider;
 #[cfg(windows)]
 pub(crate) mod selection;
@@ -238,6 +239,7 @@ pub(crate) enum ScreenCaptureErrorCode {
     TargetRequired,
     TargetUnavailable,
     SessionDenied,
+    Busy,
     FrameInvalid,
     CaptureFailed,
     InvalidArgument,
@@ -260,6 +262,7 @@ impl ScreenCaptureError {
                 ScreenCaptureErrorCode::NotSupported
                     | ScreenCaptureErrorCode::TargetRequired
                     | ScreenCaptureErrorCode::TargetUnavailable
+                    | ScreenCaptureErrorCode::Busy
                     | ScreenCaptureErrorCode::CaptureFailed
             ),
         }
@@ -290,6 +293,13 @@ impl ScreenCaptureError {
         Self::new(
             ScreenCaptureErrorCode::SessionDenied,
             "Screen capture was not authorized for this session.",
+        )
+    }
+
+    pub(crate) fn busy() -> Self {
+        Self::new(
+            ScreenCaptureErrorCode::Busy,
+            "Another screen-perception operation is already in progress.",
         )
     }
 
@@ -378,16 +388,19 @@ pub async fn pick_screen_capture_target(
     request: ScreenCapturePickRequest,
 ) -> Result<ScreenCapturePickDto, ScreenPerceptionCommandError> {
     dispatch_screen_capture_blocking(move || {
-        let storage = app.state::<StorageService>();
-        let gate = app.state::<super::screen_policy::ScreenPerceptionSessionGate>();
-        let broker = app.state::<target::ScreenCaptureTargetBroker>();
-        pick_screen_capture_target_service(
-            app.clone(),
-            storage.inner(),
-            gate.inner(),
-            broker.inner(),
-            &request,
-        )
+        let operation_gate = app.state::<operation::ScreenCaptureOperationGate>();
+        with_screen_capture_operation(operation_gate.inner(), || {
+            let storage = app.state::<StorageService>();
+            let gate = app.state::<super::screen_policy::ScreenPerceptionSessionGate>();
+            let broker = app.state::<target::ScreenCaptureTargetBroker>();
+            pick_screen_capture_target_service(
+                app.clone(),
+                storage.inner(),
+                gate.inner(),
+                broker.inner(),
+                &request,
+            )
+        })
     })
     .await
 }
@@ -552,12 +565,28 @@ pub async fn capture_screen_smoke(
     life_id: String,
 ) -> Result<ScreenCaptureSmokeDto, ScreenPerceptionCommandError> {
     dispatch_screen_capture_blocking(move || {
-        let storage = app.state::<StorageService>();
-        let gate = app.state::<super::screen_policy::ScreenPerceptionSessionGate>();
-        let broker = app.state::<target::ScreenCaptureTargetBroker>();
-        capture_screen_smoke_service(storage.inner(), gate.inner(), broker.inner(), &life_id)
+        let operation_gate = app.state::<operation::ScreenCaptureOperationGate>();
+        with_screen_capture_operation(operation_gate.inner(), || {
+            let storage = app.state::<StorageService>();
+            let gate = app.state::<super::screen_policy::ScreenPerceptionSessionGate>();
+            let broker = app.state::<target::ScreenCaptureTargetBroker>();
+            capture_screen_smoke_service(storage.inner(), gate.inner(), broker.inner(), &life_id)
+        })
     })
     .await
+}
+
+/// Enters the one canonical process-local screen-operation slot and releases
+/// it when the operation returns or unwinds.  Picker and capture commands both
+/// use this helper, so they cannot race through separate permits.
+fn with_screen_capture_operation<R>(
+    operation_gate: &operation::ScreenCaptureOperationGate,
+    operation: impl FnOnce() -> Result<R, ScreenCaptureError>,
+) -> Result<R, ScreenCaptureError> {
+    let _permit = operation_gate
+        .try_enter()
+        .map_err(|_| ScreenCaptureError::busy())?;
+    operation()
 }
 
 /// Runs one blocking screen-capture operation on Tauri's blocking executor.
@@ -659,6 +688,10 @@ fn map_command_error(error: ScreenCaptureError) -> ScreenPerceptionCommandError 
             "SCREEN_CAPTURE_SESSION_DENIED",
             "Screen capture is not authorized for this session.",
         ),
+        ScreenCaptureErrorCode::Busy => (
+            "SCREEN_CAPTURE_BUSY",
+            "Another screen-perception operation is already in progress.",
+        ),
         ScreenCaptureErrorCode::FrameInvalid => (
             "SCREEN_CAPTURE_FRAME_INVALID",
             "The captured frame was invalid or out of bounds.",
@@ -710,6 +743,136 @@ mod tests {
         });
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn picker_holding_shared_gate_rejects_capture_without_entering() {
+        use std::sync::{mpsc, Arc};
+
+        let operation_gate = Arc::new(operation::ScreenCaptureOperationGate::new());
+        let (entered_sender, entered_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let picker_gate = Arc::clone(&operation_gate);
+        let picker = std::thread::spawn(move || {
+            with_screen_capture_operation(&picker_gate, || {
+                entered_sender
+                    .send(())
+                    .expect("picker operation must report entry");
+                release_receiver
+                    .recv()
+                    .expect("picker operation must receive release");
+                Ok::<(), ScreenCaptureError>(())
+            })
+        });
+
+        entered_receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("picker operation did not enter shared gate");
+
+        let capture_entered = std::sync::atomic::AtomicUsize::new(0);
+        let result = with_screen_capture_operation(&operation_gate, || {
+            capture_entered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok::<(), ScreenCaptureError>(())
+        });
+        assert_eq!(result.unwrap_err().code, ScreenCaptureErrorCode::Busy);
+        assert_eq!(capture_entered.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        release_sender.send(()).expect("picker must be released");
+        picker
+            .join()
+            .expect("picker operation must not panic")
+            .unwrap();
+    }
+
+    #[test]
+    fn capture_holding_shared_gate_rejects_picker_without_entering() {
+        use std::sync::{mpsc, Arc};
+
+        let operation_gate = Arc::new(operation::ScreenCaptureOperationGate::new());
+        let (entered_sender, entered_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let capture_gate = Arc::clone(&operation_gate);
+        let capture = std::thread::spawn(move || {
+            with_screen_capture_operation(&capture_gate, || {
+                entered_sender
+                    .send(())
+                    .expect("capture operation must report entry");
+                release_receiver
+                    .recv()
+                    .expect("capture operation must receive release");
+                Ok::<(), ScreenCaptureError>(())
+            })
+        });
+
+        entered_receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("capture operation did not enter shared gate");
+
+        let picker_entered = std::sync::atomic::AtomicUsize::new(0);
+        let result = with_screen_capture_operation(&operation_gate, || {
+            picker_entered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok::<(), ScreenCaptureError>(())
+        });
+        assert_eq!(result.unwrap_err().code, ScreenCaptureErrorCode::Busy);
+        assert_eq!(picker_entered.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        release_sender.send(()).expect("capture must be released");
+        capture
+            .join()
+            .expect("capture operation must not panic")
+            .unwrap();
+    }
+
+    #[test]
+    fn busy_capture_rejects_before_provider_call() {
+        let repository = FakeRepository::with_policy(true);
+        let gate = super::super::screen_policy::ScreenPerceptionSessionGate::new();
+        gate.arm_for_life("life-a");
+        let broker = target::ScreenCaptureTargetBroker::new();
+        let fence = gate.life_fence_for("life-a").unwrap();
+        broker.install_target_for_test(fence);
+        let provider = CountingProvider::rejecting();
+        let operation_gate = operation::ScreenCaptureOperationGate::new();
+        let _permit = operation_gate
+            .try_enter()
+            .expect("the first capture operation must enter");
+
+        let result = with_screen_capture_operation(&operation_gate, || {
+            capture_one_shot_with_provider(&repository, &gate, &broker, "life-a", &provider)
+        });
+        assert_eq!(result.unwrap_err().code, ScreenCaptureErrorCode::Busy);
+        assert_eq!(provider.calls(), 0);
+    }
+
+    #[test]
+    fn failed_operation_releases_shared_gate_for_the_next_operation() {
+        let operation_gate = operation::ScreenCaptureOperationGate::new();
+        let failed = with_screen_capture_operation(&operation_gate, || {
+            Err::<(), ScreenCaptureError>(ScreenCaptureError::capture_failed())
+        });
+        assert_eq!(
+            failed.unwrap_err().code,
+            ScreenCaptureErrorCode::CaptureFailed
+        );
+
+        let mut entered = false;
+        with_screen_capture_operation(&operation_gate, || {
+            entered = true;
+            Ok::<(), ScreenCaptureError>(())
+        })
+        .unwrap();
+        assert!(entered);
+    }
+
+    #[test]
+    fn busy_error_maps_to_bounded_frontend_code() {
+        let mapped = map_command_error(ScreenCaptureError::busy());
+        assert_eq!(mapped.code, "SCREEN_CAPTURE_BUSY");
+        assert_eq!(
+            mapped.message,
+            "Another screen-perception operation is already in progress."
+        );
+        assert!(mapped.recoverable);
     }
 
     #[test]

@@ -67,6 +67,7 @@ pub fn run() {
             app.manage(secrets::WindowsCredentialSecretStore::new());
             app.manage(perception::screen_policy::ScreenPerceptionSessionGate::new());
             app.manage(perception::screen_capture::target::ScreenCaptureTargetBroker::new());
+            app.manage(perception::screen_capture::operation::ScreenCaptureOperationGate::new());
             app.manage(storage::LlmCandidateExtractionCoordinator::default());
             app.manage(model::runtime::ModelRuntimeCoordinator::default());
             app.manage(conversation::ConversationCognitionCoordinator::default());

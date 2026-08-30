@@ -40,6 +40,8 @@ const SCREEN_CAPTURE_ERROR_MESSAGES: Record<string, string> = {
     "The selected capture target is no longer available.",
   SCREEN_CAPTURE_SESSION_DENIED:
     "Screen capture is not authorized for this session.",
+  SCREEN_CAPTURE_BUSY:
+    "Another screen-perception operation is already in progress.",
   SCREEN_CAPTURE_FRAME_INVALID:
     "The captured frame was invalid or out of bounds.",
   SCREEN_CAPTURE_FAILED:

@@ -5,7 +5,10 @@
 //! and a second operation receives a bounded busy result while the first
 //! operation owns the permit.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 /// Canonical application-managed screen-operation coordinator.
 ///
@@ -13,13 +16,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// exchange makes acquisition fail immediately rather than waiting behind a
 /// native picker or frame operation.
 pub(crate) struct ScreenCaptureOperationGate {
-    busy: AtomicBool,
+    busy: Arc<AtomicBool>,
 }
 
 impl ScreenCaptureOperationGate {
     pub(crate) fn new() -> Self {
         Self {
-            busy: AtomicBool::new(false),
+            busy: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -28,22 +31,29 @@ impl ScreenCaptureOperationGate {
     /// The returned permit releases the gate on every normal exit path.  Its
     /// `Drop` implementation also releases it during ordinary Rust panic
     /// unwinding.
-    pub(crate) fn try_enter(&self) -> Result<ScreenCaptureOperationPermit<'_>, ()> {
+    pub(crate) fn try_enter(&self) -> Result<ScreenCaptureOperationPermit, ()> {
         self.busy
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .map(|_| ScreenCaptureOperationPermit { gate: self })
+            .map(|_| ScreenCaptureOperationPermit {
+                busy: Arc::clone(&self.busy),
+            })
             .map_err(|_| ())
     }
 }
 
 /// RAII ownership of the single screen-operation slot.
-pub(crate) struct ScreenCaptureOperationPermit<'a> {
-    gate: &'a ScreenCaptureOperationGate,
+///
+/// The permit owns an `Arc` clone of the gate's atomic state, not an
+/// independent gate.  That makes the permit movable into a blocking task
+/// while all permits still coordinate through the one canonical authority.
+#[derive(Debug)]
+pub(crate) struct ScreenCaptureOperationPermit {
+    busy: Arc<AtomicBool>,
 }
 
-impl Drop for ScreenCaptureOperationPermit<'_> {
+impl Drop for ScreenCaptureOperationPermit {
     fn drop(&mut self) {
-        self.gate.busy.store(false, Ordering::Release);
+        self.busy.store(false, Ordering::Release);
     }
 }
 

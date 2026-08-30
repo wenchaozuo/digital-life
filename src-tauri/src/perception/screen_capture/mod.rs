@@ -387,20 +387,21 @@ pub async fn pick_screen_capture_target(
     app: tauri::AppHandle,
     request: ScreenCapturePickRequest,
 ) -> Result<ScreenCapturePickDto, ScreenPerceptionCommandError> {
-    dispatch_screen_capture_blocking(move || {
+    let operation_permit = {
         let operation_gate = app.state::<operation::ScreenCaptureOperationGate>();
-        with_screen_capture_operation(operation_gate.inner(), || {
-            let storage = app.state::<StorageService>();
-            let gate = app.state::<super::screen_policy::ScreenPerceptionSessionGate>();
-            let broker = app.state::<target::ScreenCaptureTargetBroker>();
-            pick_screen_capture_target_service(
-                app.clone(),
-                storage.inner(),
-                gate.inner(),
-                broker.inner(),
-                &request,
-            )
-        })
+        try_enter_screen_capture_operation(operation_gate.inner())?
+    };
+    dispatch_screen_capture_blocking(operation_permit, move || {
+        let storage = app.state::<StorageService>();
+        let gate = app.state::<super::screen_policy::ScreenPerceptionSessionGate>();
+        let broker = app.state::<target::ScreenCaptureTargetBroker>();
+        pick_screen_capture_target_service(
+            app.clone(),
+            storage.inner(),
+            gate.inner(),
+            broker.inner(),
+            &request,
+        )
     })
     .await
 }
@@ -564,29 +565,28 @@ pub async fn capture_screen_smoke(
     app: tauri::AppHandle,
     life_id: String,
 ) -> Result<ScreenCaptureSmokeDto, ScreenPerceptionCommandError> {
-    dispatch_screen_capture_blocking(move || {
+    let operation_permit = {
         let operation_gate = app.state::<operation::ScreenCaptureOperationGate>();
-        with_screen_capture_operation(operation_gate.inner(), || {
-            let storage = app.state::<StorageService>();
-            let gate = app.state::<super::screen_policy::ScreenPerceptionSessionGate>();
-            let broker = app.state::<target::ScreenCaptureTargetBroker>();
-            capture_screen_smoke_service(storage.inner(), gate.inner(), broker.inner(), &life_id)
-        })
+        try_enter_screen_capture_operation(operation_gate.inner())?
+    };
+    dispatch_screen_capture_blocking(operation_permit, move || {
+        let storage = app.state::<StorageService>();
+        let gate = app.state::<super::screen_policy::ScreenPerceptionSessionGate>();
+        let broker = app.state::<target::ScreenCaptureTargetBroker>();
+        capture_screen_smoke_service(storage.inner(), gate.inner(), broker.inner(), &life_id)
     })
     .await
 }
 
-/// Enters the one canonical process-local screen-operation slot and releases
-/// it when the operation returns or unwinds.  Picker and capture commands both
-/// use this helper, so they cannot race through separate permits.
-fn with_screen_capture_operation<R>(
+/// Acquires the one canonical process-local screen-operation slot before any
+/// blocking dispatch.  The permit owns its authority, so the borrow of the
+/// application-managed gate ends before the command awaits.
+fn try_enter_screen_capture_operation(
     operation_gate: &operation::ScreenCaptureOperationGate,
-    operation: impl FnOnce() -> Result<R, ScreenCaptureError>,
-) -> Result<R, ScreenCaptureError> {
-    let _permit = operation_gate
+) -> Result<operation::ScreenCaptureOperationPermit, ScreenPerceptionCommandError> {
+    operation_gate
         .try_enter()
-        .map_err(|_| ScreenCaptureError::busy())?;
-    operation()
+        .map_err(|_| map_command_error(ScreenCaptureError::busy()))
 }
 
 /// Runs one blocking screen-capture operation on Tauri's blocking executor.
@@ -597,16 +597,20 @@ fn with_screen_capture_operation<R>(
 /// intentionally owned and synchronous: callers reacquire canonical managed
 /// state inside it, and no borrowed `State<'_>` can cross the await boundary.
 async fn dispatch_screen_capture_blocking<R, F>(
+    operation_permit: operation::ScreenCaptureOperationPermit,
     operation: F,
 ) -> Result<R, ScreenPerceptionCommandError>
 where
     R: Send + 'static,
     F: FnOnce() -> Result<R, ScreenCaptureError> + Send + 'static,
 {
-    tauri::async_runtime::spawn_blocking(operation)
-        .await
-        .map_err(|_| map_command_error(ScreenCaptureError::capture_failed()))?
-        .map_err(map_command_error)
+    tauri::async_runtime::spawn_blocking(move || {
+        let _operation_permit = operation_permit;
+        operation()
+    })
+    .await
+    .map_err(|_| map_command_error(ScreenCaptureError::capture_failed()))?
+    .map_err(map_command_error)
 }
 
 pub(crate) fn capture_screen_smoke_service(
@@ -722,15 +726,22 @@ mod tests {
         let result = tauri::async_runtime::block_on(async move {
             let (started_sender, started_receiver) = std::sync::mpsc::channel();
             let (release_sender, release_receiver) = std::sync::mpsc::channel();
-            let task = tauri::async_runtime::spawn(dispatch_screen_capture_blocking(move || {
-                started_sender
-                    .send(std::thread::current().id())
-                    .map_err(|_| ScreenCaptureError::capture_failed())?;
-                release_receiver
-                    .recv()
-                    .map_err(|_| ScreenCaptureError::capture_failed())?;
-                Ok::<(), ScreenCaptureError>(())
-            }));
+            let operation_gate = operation::ScreenCaptureOperationGate::new();
+            let operation_permit = operation_gate
+                .try_enter()
+                .expect("blocking operation must enter");
+            let task = tauri::async_runtime::spawn(dispatch_screen_capture_blocking(
+                operation_permit,
+                move || {
+                    started_sender
+                        .send(std::thread::current().id())
+                        .map_err(|_| ScreenCaptureError::capture_failed())?;
+                    release_receiver
+                        .recv()
+                        .map_err(|_| ScreenCaptureError::capture_failed())?;
+                    Ok::<(), ScreenCaptureError>(())
+                },
+            ));
 
             let worker_thread = started_receiver
                 .recv_timeout(std::time::Duration::from_secs(5))
@@ -746,6 +757,36 @@ mod tests {
     }
 
     #[test]
+    fn busy_command_path_does_not_submit_blocking_operation() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let operation_gate = operation::ScreenCaptureOperationGate::new();
+        let _first_permit = try_enter_screen_capture_operation(&operation_gate)
+            .expect("first command must acquire the shared permit");
+        let submitted = Arc::new(AtomicUsize::new(0));
+        let second_result = try_enter_screen_capture_operation(&operation_gate);
+
+        let second_result = match second_result {
+            Ok(operation_permit) => tauri::async_runtime::block_on(
+                dispatch_screen_capture_blocking(operation_permit, {
+                    let submitted = Arc::clone(&submitted);
+                    move || {
+                        submitted.fetch_add(1, Ordering::SeqCst);
+                        Ok::<(), ScreenCaptureError>(())
+                    }
+                }),
+            ),
+            Err(error) => Err(error),
+        };
+
+        assert_eq!(second_result.unwrap_err().code, "SCREEN_CAPTURE_BUSY");
+        assert_eq!(submitted.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn picker_holding_shared_gate_rejects_capture_without_entering() {
         use std::sync::{mpsc, Arc};
 
@@ -754,34 +795,26 @@ mod tests {
         let (release_sender, release_receiver) = mpsc::channel();
         let picker_gate = Arc::clone(&operation_gate);
         let picker = std::thread::spawn(move || {
-            with_screen_capture_operation(&picker_gate, || {
-                entered_sender
-                    .send(())
-                    .expect("picker operation must report entry");
-                release_receiver
-                    .recv()
-                    .expect("picker operation must receive release");
-                Ok::<(), ScreenCaptureError>(())
-            })
+            let _permit = picker_gate
+                .try_enter()
+                .expect("picker operation must enter shared gate");
+            entered_sender
+                .send(())
+                .expect("picker operation must report entry");
+            release_receiver
+                .recv()
+                .expect("picker operation must receive release");
         });
 
         entered_receiver
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("picker operation did not enter shared gate");
 
-        let capture_entered = std::sync::atomic::AtomicUsize::new(0);
-        let result = with_screen_capture_operation(&operation_gate, || {
-            capture_entered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok::<(), ScreenCaptureError>(())
-        });
-        assert_eq!(result.unwrap_err().code, ScreenCaptureErrorCode::Busy);
-        assert_eq!(capture_entered.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let result = try_enter_screen_capture_operation(&operation_gate);
+        assert_eq!(result.unwrap_err().code, "SCREEN_CAPTURE_BUSY");
 
         release_sender.send(()).expect("picker must be released");
-        picker
-            .join()
-            .expect("picker operation must not panic")
-            .unwrap();
+        picker.join().expect("picker operation must not panic");
     }
 
     #[test]
@@ -793,34 +826,26 @@ mod tests {
         let (release_sender, release_receiver) = mpsc::channel();
         let capture_gate = Arc::clone(&operation_gate);
         let capture = std::thread::spawn(move || {
-            with_screen_capture_operation(&capture_gate, || {
-                entered_sender
-                    .send(())
-                    .expect("capture operation must report entry");
-                release_receiver
-                    .recv()
-                    .expect("capture operation must receive release");
-                Ok::<(), ScreenCaptureError>(())
-            })
+            let _permit = capture_gate
+                .try_enter()
+                .expect("capture operation must enter shared gate");
+            entered_sender
+                .send(())
+                .expect("capture operation must report entry");
+            release_receiver
+                .recv()
+                .expect("capture operation must receive release");
         });
 
         entered_receiver
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("capture operation did not enter shared gate");
 
-        let picker_entered = std::sync::atomic::AtomicUsize::new(0);
-        let result = with_screen_capture_operation(&operation_gate, || {
-            picker_entered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok::<(), ScreenCaptureError>(())
-        });
-        assert_eq!(result.unwrap_err().code, ScreenCaptureErrorCode::Busy);
-        assert_eq!(picker_entered.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let result = try_enter_screen_capture_operation(&operation_gate);
+        assert_eq!(result.unwrap_err().code, "SCREEN_CAPTURE_BUSY");
 
         release_sender.send(()).expect("capture must be released");
-        capture
-            .join()
-            .expect("capture operation must not panic")
-            .unwrap();
+        capture.join().expect("capture operation must not panic");
     }
 
     #[test]
@@ -832,36 +857,38 @@ mod tests {
         let fence = gate.life_fence_for("life-a").unwrap();
         broker.install_target_for_test(fence);
         let provider = CountingProvider::rejecting();
+        let provider_calls = std::sync::Arc::clone(&provider.calls);
         let operation_gate = operation::ScreenCaptureOperationGate::new();
-        let _permit = operation_gate
+        let _first_permit = operation_gate
             .try_enter()
             .expect("the first capture operation must enter");
 
-        let result = with_screen_capture_operation(&operation_gate, || {
-            capture_one_shot_with_provider(&repository, &gate, &broker, "life-a", &provider)
-        });
-        assert_eq!(result.unwrap_err().code, ScreenCaptureErrorCode::Busy);
-        assert_eq!(provider.calls(), 0);
+        let result = match try_enter_screen_capture_operation(&operation_gate) {
+            Ok(operation_permit) => tauri::async_runtime::block_on(
+                dispatch_screen_capture_blocking(operation_permit, move || {
+                    capture_one_shot_with_provider(&repository, &gate, &broker, "life-a", &provider)
+                        .map(|_| ())
+                }),
+            ),
+            Err(error) => Err(error),
+        };
+        assert_eq!(result.unwrap_err().code, "SCREEN_CAPTURE_BUSY");
+        assert_eq!(provider_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]
     fn failed_operation_releases_shared_gate_for_the_next_operation() {
         let operation_gate = operation::ScreenCaptureOperationGate::new();
-        let failed = with_screen_capture_operation(&operation_gate, || {
-            Err::<(), ScreenCaptureError>(ScreenCaptureError::capture_failed())
-        });
-        assert_eq!(
-            failed.unwrap_err().code,
-            ScreenCaptureErrorCode::CaptureFailed
-        );
+        let operation_permit = operation_gate
+            .try_enter()
+            .expect("failed operation must enter shared gate");
+        let failed = tauri::async_runtime::block_on(dispatch_screen_capture_blocking(
+            operation_permit,
+            || Err::<(), ScreenCaptureError>(ScreenCaptureError::capture_failed()),
+        ));
+        assert_eq!(failed.unwrap_err().code, "SCREEN_CAPTURE_FAILED");
 
-        let mut entered = false;
-        with_screen_capture_operation(&operation_gate, || {
-            entered = true;
-            Ok::<(), ScreenCaptureError>(())
-        })
-        .unwrap();
-        assert!(entered);
+        assert!(operation_gate.try_enter().is_ok());
     }
 
     #[test]

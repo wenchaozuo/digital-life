@@ -42,6 +42,10 @@ hyper = { version = "=1.10.1", default-features = false, features = ["client", "
 hyper-util = { version = "=0.1.20", default-features = false, features = ["tokio"] }
 raw-window-handle = "=0.6.2"
 windows-future = "=0.2.1"
+# D24-A: OS-backed cryptographically secure random source for opaque
+# process-local candidate/grant identities.  Pinned to the version already
+# resolved in the frozen lockfile tree (0.3.4); no new transitive dependency.
+getrandom = { version = "=0.3.4", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"

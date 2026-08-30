@@ -68,6 +68,10 @@ pub fn run() {
             app.manage(perception::screen_policy::ScreenPerceptionSessionGate::new());
             app.manage(perception::screen_capture::target::ScreenCaptureTargetBroker::new());
             app.manage(perception::screen_capture::operation::ScreenCaptureOperationGate::new());
+            // D24-A: the single App-managed process-local screen-context
+            // handoff broker.  It is authority foundation only — no WebView
+            // command or production flow consumes it yet.
+            app.manage(perception::screen_context::ScreenContextHandoffBroker::new());
             app.manage(storage::LlmCandidateExtractionCoordinator::default());
             app.manage(model::runtime::ModelRuntimeCoordinator::default());
             app.manage(conversation::ConversationCognitionCoordinator::default());

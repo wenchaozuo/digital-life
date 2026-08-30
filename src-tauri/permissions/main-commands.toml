@@ -13,4 +13,6 @@ commands.allow = [
     "get_persona_template",
     "get_body_package_registry_snapshot",
     "get_cubism_core_snapshot",
+    "observe_screen_now",
+    "get_main_screen_perception_status",
 ]

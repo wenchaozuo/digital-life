@@ -161,6 +161,8 @@ pub fn run() {
             perception::screen_capture::get_screen_capture_target_status,
             perception::screen_capture::clear_screen_capture_target,
             perception::screen_capture::capture_screen_smoke,
+            perception::screen_observation::observe_screen_now,
+            perception::screen_observation::get_main_screen_perception_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

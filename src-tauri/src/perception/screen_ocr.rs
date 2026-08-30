@@ -171,6 +171,50 @@ impl fmt::Display for ScreenObservationError {
 
 impl std::error::Error for ScreenObservationError {}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OcrAsyncStatus {
+    Started,
+    Completed,
+    Canceled,
+    Error,
+}
+
+/// Minimal lifecycle seam for the WinRT OCR operation.
+///
+/// `close` is deliberately part of the seam: an operation may only be
+/// retired after [`OcrAsyncStatus`] is terminal.  The test implementation
+/// uses the same state machine as the Windows adapter, so cancellation
+/// settlement cannot be accidentally replaced by a timer-only return.
+trait OcrAsyncOperation {
+    fn status(&self) -> Result<OcrAsyncStatus, ScreenObservationError>;
+    fn cancel(&self) -> Result<(), ScreenObservationError>;
+    fn get_results(&self) -> Result<ScreenOcrResult, ScreenObservationError>;
+    fn close(&self) -> Result<(), ScreenObservationError>;
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OcrWaitPolicy {
+    timeout: Duration,
+    poll_interval: Duration,
+}
+
+impl OcrWaitPolicy {
+    fn production() -> Self {
+        Self {
+            timeout: OCR_TIMEOUT,
+            poll_interval: OCR_POLL_INTERVAL,
+        }
+    }
+
+    #[cfg(test)]
+    fn immediate() -> Self {
+        Self {
+            timeout: Duration::ZERO,
+            poll_interval: Duration::ZERO,
+        }
+    }
+}
+
 /// A provider result is line-oriented so the composition boundary can impose
 /// the observation byte and line limits without retaining OCR rectangles or
 /// any other native metadata.
@@ -633,7 +677,6 @@ impl ScreenOcrProvider for WindowsLocalOcrProvider {
     ) -> Result<ScreenOcrResult, ScreenObservationError> {
         use windows::{
             Graphics::Imaging::{BitmapAlphaMode, BitmapPixelFormat, SoftwareBitmap},
-            Media::Ocr::OcrResult,
             Storage::Streams::DataWriter,
         };
 
@@ -706,41 +749,143 @@ impl ScreenOcrProvider for WindowsLocalOcrProvider {
             .RecognizeAsync(&bitmap)
             .map_err(|_| ScreenObservationError::ocr_failed())
             .and_then(|operation| wait_for_ocr_result(&operation));
-        let _ = bitmap.Close();
-        let result: OcrResult = result?;
-        extract_ocr_result(result)
+        let bitmap_close = bitmap
+            .Close()
+            .map_err(|_| ScreenObservationError::ocr_failed());
+        let result = result?;
+        bitmap_close?;
+        Ok(result)
     }
 }
 
 #[cfg(windows)]
 fn wait_for_ocr_result(
     operation: &windows_future::IAsyncOperation<windows::Media::Ocr::OcrResult>,
-) -> Result<windows::Media::Ocr::OcrResult, ScreenObservationError> {
-    use windows_future::AsyncStatus;
+) -> Result<ScreenOcrResult, ScreenObservationError> {
+    let operation = WindowsOcrAsyncOperation { operation };
+    wait_for_ocr_operation(&operation, OcrWaitPolicy::production())
+}
 
-    let deadline = std::time::Instant::now()
-        .checked_add(OCR_TIMEOUT)
-        .unwrap_or_else(std::time::Instant::now);
-    loop {
-        let status = operation
+#[cfg(windows)]
+struct WindowsOcrAsyncOperation<'operation> {
+    operation: &'operation windows_future::IAsyncOperation<windows::Media::Ocr::OcrResult>,
+}
+
+#[cfg(windows)]
+impl OcrAsyncOperation for WindowsOcrAsyncOperation<'_> {
+    fn status(&self) -> Result<OcrAsyncStatus, ScreenObservationError> {
+        use windows_future::AsyncStatus;
+
+        match self
+            .operation
             .Status()
-            .map_err(|_| ScreenObservationError::ocr_failed())?;
+            .map_err(|_| ScreenObservationError::ocr_failed())?
+        {
+            AsyncStatus::Started => Ok(OcrAsyncStatus::Started),
+            AsyncStatus::Completed => Ok(OcrAsyncStatus::Completed),
+            AsyncStatus::Canceled => Ok(OcrAsyncStatus::Canceled),
+            AsyncStatus::Error => Ok(OcrAsyncStatus::Error),
+            _ => Err(ScreenObservationError::ocr_failed()),
+        }
+    }
+
+    fn cancel(&self) -> Result<(), ScreenObservationError> {
+        self.operation
+            .Cancel()
+            .map_err(|_| ScreenObservationError::ocr_failed())
+    }
+
+    fn get_results(&self) -> Result<ScreenOcrResult, ScreenObservationError> {
+        self.operation
+            .GetResults()
+            .map_err(|_| ScreenObservationError::ocr_failed())
+            .and_then(extract_ocr_result)
+    }
+
+    fn close(&self) -> Result<(), ScreenObservationError> {
+        self.operation
+            .Close()
+            .map_err(|_| ScreenObservationError::ocr_failed())
+    }
+}
+
+/// Waits for a terminal OCR state and retires the operation only then.
+///
+/// The initial deadline is the point at which cancellation is requested.  A
+/// second deadline must not release the operation while it remains Started:
+/// `IAsyncInfo::Close` is not valid before completion, and dropping the
+/// operation/bitmap at that point would let the sensitive operation escape
+/// the C1 permit.  Therefore this state machine has exactly one cancellation
+/// request and returns only after a terminal status has been observed and the
+/// async object has been closed.
+fn wait_for_ocr_operation<O: OcrAsyncOperation + ?Sized>(
+    operation: &O,
+    policy: OcrWaitPolicy,
+) -> Result<ScreenOcrResult, ScreenObservationError> {
+    let deadline = std::time::Instant::now()
+        .checked_add(policy.timeout)
+        .unwrap_or_else(std::time::Instant::now);
+    let mut cancellation_requested = false;
+    let mut cancellation_failed = false;
+
+    loop {
+        let status = operation.status()?;
         match status {
-            AsyncStatus::Completed => {
-                return operation
-                    .GetResults()
-                    .map_err(|_| ScreenObservationError::ocr_failed());
+            OcrAsyncStatus::Completed => {
+                return finish_ocr_operation(operation, status, cancellation_failed);
             }
-            AsyncStatus::Canceled => return Err(ScreenObservationError::ocr_timeout()),
-            AsyncStatus::Error => return Err(ScreenObservationError::ocr_failed()),
-            AsyncStatus::Started => {}
-            _ => return Err(ScreenObservationError::ocr_failed()),
+            OcrAsyncStatus::Canceled => {
+                return finish_ocr_operation(operation, status, cancellation_failed);
+            }
+            OcrAsyncStatus::Error => {
+                return finish_ocr_operation(operation, status, cancellation_failed);
+            }
+            OcrAsyncStatus::Started => {}
         }
-        if std::time::Instant::now() >= deadline {
-            let _ = operation.Cancel();
-            return Err(ScreenObservationError::ocr_timeout());
+
+        if !cancellation_requested && std::time::Instant::now() >= deadline {
+            cancellation_requested = true;
+            if operation.cancel().is_err() {
+                // Do not convert a failed cancellation request into a false
+                // OCR_TIMEOUT.  Continue observing until the operation itself
+                // reaches a terminal state.
+                cancellation_failed = true;
+            }
+            continue;
         }
-        std::thread::sleep(OCR_POLL_INTERVAL);
+
+        if !policy.poll_interval.is_zero() {
+            std::thread::sleep(policy.poll_interval);
+        }
+    }
+}
+
+fn finish_ocr_operation<O: OcrAsyncOperation + ?Sized>(
+    operation: &O,
+    status: OcrAsyncStatus,
+    cancellation_failed: bool,
+) -> Result<ScreenOcrResult, ScreenObservationError> {
+    let result = if cancellation_failed {
+        // A failed cancellation request cannot be reported as a successful
+        // OCR result, even if the operation later completes normally.  The
+        // terminal observation below is still required before retirement.
+        Err(ScreenObservationError::ocr_failed())
+    } else {
+        match status {
+            OcrAsyncStatus::Completed => operation.get_results(),
+            OcrAsyncStatus::Canceled => Err(ScreenObservationError::ocr_timeout()),
+            OcrAsyncStatus::Error => Err(ScreenObservationError::ocr_failed()),
+            OcrAsyncStatus::Started => Err(ScreenObservationError::ocr_failed()),
+        }
+    };
+
+    // The status was terminal before this call.  Close is intentionally
+    // checked rather than discarded; a failed retirement is not reported as
+    // a successful timeout or OCR result.
+    let close_result = operation.close();
+    match close_result {
+        Ok(()) => result,
+        Err(error) => Err(error),
     }
 }
 
@@ -802,6 +947,7 @@ fn bounded_hstring_line(value: &windows::core::HSTRING) -> (String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         mpsc, Arc,
@@ -961,6 +1107,126 @@ mod tests {
         ) -> Result<ScreenOcrResult, ScreenObservationError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.result.clone()
+        }
+    }
+
+    struct ScriptedOcrOperation {
+        statuses: std::sync::Mutex<VecDeque<OcrAsyncStatus>>,
+        cancel_result: std::sync::Mutex<Result<(), ScreenObservationError>>,
+        result: Result<ScreenOcrResult, ScreenObservationError>,
+        cancel_calls: AtomicUsize,
+        get_results_calls: AtomicUsize,
+        close_calls: AtomicUsize,
+        status_calls: AtomicUsize,
+    }
+
+    impl ScriptedOcrOperation {
+        fn new(
+            statuses: impl IntoIterator<Item = OcrAsyncStatus>,
+            cancel_result: Result<(), ScreenObservationError>,
+            result: Result<ScreenOcrResult, ScreenObservationError>,
+        ) -> Self {
+            Self {
+                statuses: std::sync::Mutex::new(statuses.into_iter().collect()),
+                cancel_result: std::sync::Mutex::new(cancel_result),
+                result,
+                cancel_calls: AtomicUsize::new(0),
+                get_results_calls: AtomicUsize::new(0),
+                close_calls: AtomicUsize::new(0),
+                status_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl OcrAsyncOperation for ScriptedOcrOperation {
+        fn status(&self) -> Result<OcrAsyncStatus, ScreenObservationError> {
+            self.status_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self
+                .statuses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(OcrAsyncStatus::Error))
+        }
+
+        fn cancel(&self) -> Result<(), ScreenObservationError> {
+            self.cancel_calls.fetch_add(1, Ordering::SeqCst);
+            self.cancel_result.lock().unwrap().clone()
+        }
+
+        fn get_results(&self) -> Result<ScreenOcrResult, ScreenObservationError> {
+            self.get_results_calls.fetch_add(1, Ordering::SeqCst);
+            self.result.clone()
+        }
+
+        fn close(&self) -> Result<(), ScreenObservationError> {
+            self.close_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct BlockingSettlementOperation {
+        settlement_started: mpsc::Sender<()>,
+        release: Arc<MutexReceiver>,
+        cancel_calls: AtomicUsize,
+        close_calls: AtomicUsize,
+        status_calls: AtomicUsize,
+    }
+
+    impl BlockingSettlementOperation {
+        fn new(settlement_started: mpsc::Sender<()>, release: mpsc::Receiver<()>) -> Self {
+            Self {
+                settlement_started,
+                release: Arc::new(MutexReceiver(std::sync::Mutex::new(release))),
+                cancel_calls: AtomicUsize::new(0),
+                close_calls: AtomicUsize::new(0),
+                status_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl OcrAsyncOperation for BlockingSettlementOperation {
+        fn status(&self) -> Result<OcrAsyncStatus, ScreenObservationError> {
+            let call = self.status_calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                return Ok(OcrAsyncStatus::Started);
+            }
+            if call == 1 {
+                self.settlement_started.send(()).unwrap();
+                self.release.0.lock().unwrap().recv().unwrap();
+            }
+            Ok(OcrAsyncStatus::Canceled)
+        }
+
+        fn cancel(&self) -> Result<(), ScreenObservationError> {
+            self.cancel_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn get_results(&self) -> Result<ScreenOcrResult, ScreenObservationError> {
+            panic!("a canceled OCR operation must not request results")
+        }
+
+        fn close(&self) -> Result<(), ScreenObservationError> {
+            self.close_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct BlockingSettlementOcrProvider {
+        operation: Arc<BlockingSettlementOperation>,
+    }
+
+    impl ScreenOcrProvider for BlockingSettlementOcrProvider {
+        fn max_image_dimension(&self) -> Result<u32, ScreenObservationError> {
+            Ok(2048)
+        }
+
+        fn recognize(
+            &self,
+            _image: &PreparedOcrImage<'_>,
+        ) -> Result<ScreenOcrResult, ScreenObservationError> {
+            wait_for_ocr_operation(self.operation.as_ref(), OcrWaitPolicy::immediate())
         }
     }
 
@@ -1331,6 +1597,164 @@ mod tests {
         release_sender.send(()).unwrap();
         let observation = worker.join().unwrap().unwrap();
         assert_eq!(observation.status, ScreenObservationStatus::Recognized);
+        assert!(operation_gate.try_enter().is_ok());
+    }
+
+    #[test]
+    fn ocr_started_then_completed_gets_results_and_closes_after_terminal() {
+        let operation = ScriptedOcrOperation::new(
+            [OcrAsyncStatus::Started, OcrAsyncStatus::Completed],
+            Ok(()),
+            Ok(ScreenOcrResult::from_lines(["completed"])),
+        );
+        let result = wait_for_ocr_operation(
+            &operation,
+            OcrWaitPolicy {
+                timeout: Duration::from_secs(1),
+                poll_interval: Duration::ZERO,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result, ScreenOcrResult::from_lines(["completed"]));
+        assert_eq!(operation.cancel_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(operation.get_results_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(operation.close_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn ocr_timeout_cancels_once_and_waits_for_terminal_canceled() {
+        let operation = ScriptedOcrOperation::new(
+            [
+                OcrAsyncStatus::Started,
+                OcrAsyncStatus::Started,
+                OcrAsyncStatus::Canceled,
+            ],
+            Ok(()),
+            Ok(ScreenOcrResult::from_lines(["must not run"])),
+        );
+        let error = wait_for_ocr_operation(&operation, OcrWaitPolicy::immediate()).unwrap_err();
+
+        assert_eq!(error.code, ScreenObservationErrorCode::OcrTimeout);
+        assert_eq!(operation.cancel_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(operation.status_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(operation.get_results_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(operation.close_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn ocr_cancel_failure_waits_for_terminal_and_maps_to_failure() {
+        let operation = ScriptedOcrOperation::new(
+            [OcrAsyncStatus::Started, OcrAsyncStatus::Completed],
+            Err(ScreenObservationError::ocr_failed()),
+            Ok(ScreenOcrResult::from_lines(["must not be published"])),
+        );
+        let error = wait_for_ocr_operation(&operation, OcrWaitPolicy::immediate()).unwrap_err();
+
+        assert_eq!(error.code, ScreenObservationErrorCode::OcrFailed);
+        assert_eq!(operation.cancel_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(operation.status_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(operation.get_results_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(operation.close_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn ocr_cancel_failure_waits_for_terminal_error_and_maps_to_failure() {
+        let operation = ScriptedOcrOperation::new(
+            [OcrAsyncStatus::Started, OcrAsyncStatus::Error],
+            Err(ScreenObservationError::ocr_failed()),
+            Ok(ScreenOcrResult::from_lines(["must not run"])),
+        );
+        let error = wait_for_ocr_operation(&operation, OcrWaitPolicy::immediate()).unwrap_err();
+
+        assert_eq!(error.code, ScreenObservationErrorCode::OcrFailed);
+        assert_eq!(operation.cancel_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(operation.status_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(operation.get_results_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(operation.close_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn ocr_error_is_terminal_failure_and_is_closed() {
+        let operation = ScriptedOcrOperation::new(
+            [OcrAsyncStatus::Error],
+            Ok(()),
+            Ok(ScreenOcrResult::from_lines(["must not run"])),
+        );
+        let error = wait_for_ocr_operation(&operation, OcrWaitPolicy::immediate()).unwrap_err();
+
+        assert_eq!(error.code, ScreenObservationErrorCode::OcrFailed);
+        assert_eq!(operation.cancel_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(operation.close_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn ocr_canceled_is_terminal_timeout_and_is_closed() {
+        let operation = ScriptedOcrOperation::new(
+            [OcrAsyncStatus::Canceled],
+            Ok(()),
+            Ok(ScreenOcrResult::from_lines(["must not run"])),
+        );
+        let error = wait_for_ocr_operation(&operation, OcrWaitPolicy::immediate()).unwrap_err();
+
+        assert_eq!(error.code, ScreenObservationErrorCode::OcrTimeout);
+        assert_eq!(operation.cancel_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(operation.close_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn operation_permit_remains_busy_during_ocr_cancellation_settlement() {
+        let (repository, session_gate, broker) = authorized_fixture();
+        let capture = FakeCaptureProvider::returning(valid_frame(16, 16));
+        let (settlement_started_sender, settlement_started_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let operation = Arc::new(BlockingSettlementOperation::new(
+            settlement_started_sender,
+            release_receiver,
+        ));
+        let ocr = Arc::new(BlockingSettlementOcrProvider {
+            operation: Arc::clone(&operation),
+        });
+        let operation_gate = Arc::new(screen_capture::operation::ScreenCaptureOperationGate::new());
+        let worker_gate = Arc::clone(&operation_gate);
+        let worker = std::thread::spawn(move || {
+            observe_screen_once_with_providers(
+                &worker_gate,
+                &repository,
+                &session_gate,
+                &broker,
+                "life-a",
+                &capture,
+                ocr.as_ref(),
+            )
+        });
+
+        settlement_started_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("OCR cancellation settlement should be entered before release");
+
+        let (repository_2, session_gate_2, broker_2) = authorized_fixture();
+        let capture_2 = FakeCaptureProvider::returning(valid_frame(4, 4));
+        let ocr_2 = FakeOcrProvider::returning(["must not run"]);
+        let busy = observe_screen_once_with_providers(
+            &operation_gate,
+            &repository_2,
+            &session_gate_2,
+            &broker_2,
+            "life-a",
+            &capture_2,
+            &ocr_2,
+        )
+        .unwrap_err();
+        assert_eq!(busy.code, ScreenObservationErrorCode::ObservationBusy);
+        assert_eq!(capture_2.calls(), 0);
+        assert_eq!(ocr_2.calls(), 0);
+
+        release_sender.send(()).unwrap();
+        let error = worker.join().unwrap().unwrap_err();
+        assert_eq!(error.code, ScreenObservationErrorCode::OcrTimeout);
+        assert_eq!(operation.cancel_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(operation.close_calls.load(Ordering::SeqCst), 1);
         assert!(operation_gate.try_enter().is_ok());
     }
 

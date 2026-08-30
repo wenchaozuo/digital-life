@@ -14,6 +14,11 @@ export interface MainScreenObservation {
   readonly status: MainScreenObservationStatus;
   readonly text: string;
   readonly truncated: boolean;
+  readonly candidateId: string;
+}
+
+export interface MainScreenContextGrant {
+  readonly grantId: string;
 }
 
 export interface MainScreenObservationError {
@@ -36,6 +41,25 @@ const SCREEN_OBSERVATION_ERROR_MESSAGES: Record<string, string> = {
   CAPTURE_FAILED: "The screen capture could not be completed.",
   SCREEN_PERCEPTION_STATUS_UNAVAILABLE:
     "Screen perception readiness is temporarily unavailable. Try again.",
+  SCREEN_CONTEXT_LIFE_UNAVAILABLE:
+    "The current Life could not be verified. Try again.",
+  SCREEN_CONTEXT_LIFE_CHANGED:
+    "The current Life changed during the screen operation. Try again.",
+  SCREEN_CONTEXT_SESSION_UNAVAILABLE:
+    "The screen-perception session is not available for this Life.",
+  SCREEN_CONTEXT_SESSION_CHANGED:
+    "The screen-perception session changed during the operation. Try again.",
+  SCREEN_CONTEXT_CONSENT_UNAVAILABLE:
+    "Screen-perception consent could not be verified. Try again.",
+  SCREEN_CONTEXT_CONSENT_DISABLED:
+    "Screen-perception consent is disabled for this Life.",
+  SCREEN_CONTEXT_UNAVAILABLE:
+    "The requested screen context is unavailable or stale.",
+  SCREEN_CONTEXT_EXPIRED: "The screen context candidate has expired.",
+  SCREEN_CONTEXT_NO_USABLE:
+    "The current screen observation contains no usable screen text.",
+  SCREEN_CONTEXT_BROKER_UNAVAILABLE:
+    "The screen context handoff authority is temporarily unavailable.",
 };
 
 /**
@@ -79,6 +103,16 @@ export class MainScreenObservationService {
 
   async observeNow(lifeId: string): Promise<MainScreenObservation> {
     return invoke<MainScreenObservation>("observe_screen_now", { lifeId });
+  }
+
+  async prepareMainScreenContextForChat(
+    lifeId: string,
+    candidateId: string,
+  ): Promise<MainScreenContextGrant> {
+    return invoke<MainScreenContextGrant>(
+      "prepare_main_screen_context_for_chat",
+      { lifeId, candidateId },
+    );
   }
 }
 

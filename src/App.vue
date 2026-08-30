@@ -18,6 +18,7 @@ import { personaManager, type PersonaTemplate } from "./persona";
 import {
   mainScreenObservationService,
   screenObservationErrorFromUnknown,
+  type MainScreenContextGrant,
   type MainScreenObservation,
   type MainScreenObservationError,
   type MainScreenPerceptionStatus,
@@ -33,11 +34,15 @@ const screenPerceptionStatus = ref<MainScreenPerceptionStatus>();
 const screenObservation = ref<MainScreenObservation>();
 const screenObservationError = ref<MainScreenObservationError>();
 const screenObservationLoading = ref(false);
+const screenContextGrant = ref<MainScreenContextGrant>();
+const screenPreparedCandidateId = ref<string>();
+const screenContextPreparing = ref(false);
 let unsubscribe: (() => void) | undefined;
 let bodyRuntimeBinding: BodyRuntimeBindingController | undefined;
 let lifecycleEpoch = 0;
 let screenStatusRequestGeneration = 0;
 let screenObservationRequestGeneration = 0;
+let screenHandoffRequestGeneration = 0;
 
 const screenReadinessLabel = computed(() => {
   if (screenObservationLoading.value) {
@@ -59,8 +64,25 @@ const screenReadinessLabel = computed(() => {
 const canObserveScreen = computed(
   () =>
     lifeIdentity.value !== undefined &&
+    screenPerceptionStatus.value?.targetSelected === true &&
     screenPerceptionStatus.value?.ready === true &&
     !screenObservationLoading.value,
+);
+
+const screenObservationPrepared = computed(() => {
+  const observation = screenObservation.value;
+  return (
+    observation?.status === "recognized" &&
+    screenContextGrant.value !== undefined &&
+    screenPreparedCandidateId.value === observation.candidateId
+  );
+});
+
+const canPrepareScreenContext = computed(
+  () =>
+    screenObservation.value?.status === "recognized" &&
+    !screenObservationPrepared.value &&
+    !screenContextPreparing.value,
 );
 
 // D17-C: the listener registration race with unmount is fenced by this
@@ -92,14 +114,23 @@ async function openChat(): Promise<void> {
   }
 }
 
+function invalidateScreenHandoff(): void {
+  screenHandoffRequestGeneration += 1;
+  screenContextPreparing.value = false;
+  screenContextGrant.value = undefined;
+  screenPreparedCandidateId.value = undefined;
+}
+
 function clearScreenObservation(): void {
   screenObservation.value = undefined;
   screenObservationError.value = undefined;
+  invalidateScreenHandoff();
 }
 
 function invalidateScreenObservationRequest(): void {
   screenObservationRequestGeneration += 1;
   screenObservationLoading.value = false;
+  clearScreenObservation();
 }
 
 async function refreshScreenPerceptionStatus(
@@ -117,9 +148,8 @@ async function refreshScreenPerceptionStatus(
       return;
     }
     screenPerceptionStatus.value = status;
-    if (!status.ready) {
+    if (!status.consentEnabled || !status.sessionArmed) {
       invalidateScreenObservationRequest();
-      clearScreenObservation();
     }
   } catch (error: unknown) {
     if (
@@ -131,7 +161,6 @@ async function refreshScreenPerceptionStatus(
     }
     invalidateScreenObservationRequest();
     screenPerceptionStatus.value = undefined;
-    clearScreenObservation();
     screenObservationError.value = screenObservationErrorFromUnknown(error);
   }
 }
@@ -146,7 +175,6 @@ function applyCurrentLife(life: LifeIdentity, runtimeEpoch: number): void {
     screenStatusRequestGeneration += 1;
     invalidateScreenObservationRequest();
     screenPerceptionStatus.value = undefined;
-    clearScreenObservation();
   }
   void refreshScreenPerceptionStatus(life.id, runtimeEpoch);
 }
@@ -159,6 +187,7 @@ async function observeScreenNow(): Promise<void> {
 
   const runtimeEpoch = lifecycleEpoch;
   const requestGeneration = ++screenObservationRequestGeneration;
+  clearScreenObservation();
   screenObservationLoading.value = true;
   screenObservationError.value = undefined;
   try {
@@ -187,6 +216,106 @@ async function observeScreenNow(): Promise<void> {
     ) {
       screenObservationLoading.value = false;
       void refreshScreenPerceptionStatus(lifeId, runtimeEpoch);
+    }
+  }
+}
+
+function isCurrentScreenPrepare(
+  runtimeEpoch: number,
+  lifeId: string,
+  observationRequestGeneration: number,
+  candidateId: string,
+  handoffRequestGeneration: number,
+): boolean {
+  const observation = screenObservation.value;
+  return (
+    isRuntimeActive(runtimeEpoch) &&
+    lifeIdentity.value?.id === lifeId &&
+    screenObservationRequestGeneration === observationRequestGeneration &&
+    screenHandoffRequestGeneration === handoffRequestGeneration &&
+    observation?.status === "recognized" &&
+    observation.candidateId === candidateId
+  );
+}
+
+function prepareFailureInvalidatesScreenObservation(code: string): boolean {
+  return new Set([
+    "SCREEN_CONTEXT_LIFE_UNAVAILABLE",
+    "SCREEN_CONTEXT_LIFE_CHANGED",
+    "SCREEN_CONTEXT_SESSION_UNAVAILABLE",
+    "SCREEN_CONTEXT_SESSION_CHANGED",
+    "SCREEN_CONTEXT_CONSENT_UNAVAILABLE",
+    "SCREEN_CONTEXT_CONSENT_DISABLED",
+    "SCREEN_CONTEXT_UNAVAILABLE",
+    "SCREEN_CONTEXT_EXPIRED",
+    "SCREEN_CONTEXT_NO_USABLE",
+  ]).has(code);
+}
+
+async function prepareScreenContextForChat(): Promise<void> {
+  const lifeId = lifeIdentity.value?.id;
+  const observation = screenObservation.value;
+  if (
+    lifeId === undefined ||
+    observation?.status !== "recognized" ||
+    !canPrepareScreenContext.value
+  ) {
+    return;
+  }
+
+  const runtimeEpoch = lifecycleEpoch;
+  const observationRequestGeneration = screenObservationRequestGeneration;
+  const candidateId = observation.candidateId;
+  const handoffRequestGeneration = ++screenHandoffRequestGeneration;
+  screenContextPreparing.value = true;
+  screenObservationError.value = undefined;
+
+  try {
+    const grant = await mainScreenObservationService.prepareMainScreenContextForChat(
+      lifeId,
+      candidateId,
+    );
+    if (
+      isCurrentScreenPrepare(
+        runtimeEpoch,
+        lifeId,
+        observationRequestGeneration,
+        candidateId,
+        handoffRequestGeneration,
+      )
+    ) {
+      screenContextGrant.value = grant;
+      screenPreparedCandidateId.value = candidateId;
+    }
+  } catch (error: unknown) {
+    if (
+      isCurrentScreenPrepare(
+        runtimeEpoch,
+        lifeId,
+        observationRequestGeneration,
+        candidateId,
+        handoffRequestGeneration,
+      )
+    ) {
+      const boundedError = screenObservationErrorFromUnknown(error);
+      if (prepareFailureInvalidatesScreenObservation(boundedError.code)) {
+        invalidateScreenObservationRequest();
+        screenObservationError.value = boundedError;
+      } else {
+        screenObservationError.value = boundedError;
+      }
+    }
+  } finally {
+    if (
+      isCurrentScreenPrepare(
+        runtimeEpoch,
+        lifeId,
+        observationRequestGeneration,
+        candidateId,
+        handoffRequestGeneration,
+      )
+    ) {
+      screenContextPreparing.value = false;
     }
   }
 }
@@ -359,11 +488,34 @@ onUnmounted(() => {
           </button>
         </div>
         <pre
-          v-if="screenObservation"
+          v-if="screenObservation?.status === 'recognized'"
           class="screen-observation-preview"
           data-testid="screen-observation-preview"
           aria-live="polite"
         >{{ screenObservation.text }}</pre>
+        <p
+          v-else-if="screenObservation?.status === 'noText'"
+          class="screen-observation-no-text"
+          data-testid="screen-observation-no-text"
+          aria-live="polite"
+        >No screen text was recognized.</p>
+        <button
+          v-if="screenObservation?.status === 'recognized'"
+          type="button"
+          class="screen-use-in-chat"
+          data-testid="screen-use-in-chat"
+          :disabled="!canPrepareScreenContext"
+          :aria-busy="screenContextPreparing"
+          @click="prepareScreenContextForChat"
+        >
+          {{
+            screenContextPreparing
+              ? "Preparing…"
+              : screenObservationPrepared
+                ? "Ready for chat"
+                : "Use in chat"
+          }}
+        </button>
         <p
           v-if="screenObservationError"
           class="screen-perception-error"
@@ -525,6 +677,34 @@ body,
   font: 0.75rem/1.35 ui-monospace, SFMono-Regular, Consolas, monospace;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+.screen-observation-no-text {
+  margin: 0;
+  color: #cbd5e1;
+  font-size: 0.78rem;
+}
+
+.screen-use-in-chat {
+  justify-self: start;
+  border: 1px solid rgb(167 243 208 / 46%);
+  border-radius: 0.45rem;
+  padding: 0.3rem 0.55rem;
+  background: rgb(6 95 70 / 82%);
+  color: #ecfdf5;
+  cursor: pointer;
+  font-size: 0.78rem;
+}
+
+.screen-use-in-chat:disabled {
+  background: rgb(71 85 105 / 65%);
+  color: #cbd5e1;
+  cursor: not-allowed;
+}
+
+.screen-use-in-chat:not(:disabled):hover,
+.screen-use-in-chat:not(:disabled):focus-visible {
+  background: rgb(5 150 105 / 90%);
 }
 
 .screen-perception-error {

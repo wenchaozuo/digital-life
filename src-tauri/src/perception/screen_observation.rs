@@ -14,6 +14,10 @@ use super::{
         operation::{ScreenCaptureOperationGate, ScreenCaptureOperationPermit},
         target::ScreenCaptureTargetBroker,
     },
+    screen_chat_attachment::{
+        MainScreenContextAttachmentOfferDto, ScreenContextChatAttachmentBroker,
+        ScreenContextChatAttachmentError, ScreenContextChatAttachmentErrorCode,
+    },
     screen_context::{
         ScreenContextCandidateInput, ScreenContextError, ScreenContextErrorCode,
         ScreenContextHandoffBroker, ScreenContextSessionFence,
@@ -26,6 +30,7 @@ use super::{
         authorize_screen_perception, LifeScreenPerceptionPolicy, ScreenPerceptionErrorCode,
         ScreenPerceptionRepository, ScreenPerceptionSessionGate,
     },
+    CurrentLifeAuthority,
 };
 use crate::storage::StorageService;
 
@@ -71,27 +76,13 @@ const SCREEN_CONTEXT_BROKER_UNAVAILABLE_CODE: &str = "SCREEN_CONTEXT_BROKER_UNAV
 const SCREEN_CONTEXT_BROKER_UNAVAILABLE_MESSAGE: &str =
     "The screen context handoff authority is temporarily unavailable.";
 
-/// Narrow authority seam for the authoritative current Life lookup.  The
-/// production implementation reads StorageService's current-life join; tests
-/// use per-instance scripted readers without changing the production path.
-trait CurrentLifeAuthority: Send + Sync {
-    fn current_life_id(&self) -> Result<Option<String>, ()>;
-}
-
-impl CurrentLifeAuthority for StorageService {
-    fn current_life_id(&self) -> Result<Option<String>, ()> {
-        self.get_current_life()
-            .map(|life| life.map(|record| record.id))
-            .map_err(|_| ())
-    }
-}
-
 struct ObservationAuthorities<'a> {
     current_life: &'a dyn CurrentLifeAuthority,
     repository: &'a dyn ScreenPerceptionRepository,
     session_gate: &'a ScreenPerceptionSessionGate,
     target_broker: &'a ScreenCaptureTargetBroker,
     handoff_broker: &'a ScreenContextHandoffBroker,
+    attachment_broker: &'a ScreenContextChatAttachmentBroker,
 }
 
 struct PrepareAuthorities<'a> {
@@ -99,6 +90,14 @@ struct PrepareAuthorities<'a> {
     repository: &'a dyn ScreenPerceptionRepository,
     session_gate: &'a ScreenPerceptionSessionGate,
     handoff_broker: &'a ScreenContextHandoffBroker,
+}
+
+struct OfferAuthorities<'a> {
+    current_life: &'a dyn CurrentLifeAuthority,
+    repository: &'a dyn ScreenPerceptionRepository,
+    session_gate: &'a ScreenPerceptionSessionGate,
+    handoff_broker: &'a ScreenContextHandoffBroker,
+    attachment_broker: &'a ScreenContextChatAttachmentBroker,
 }
 
 /// Presentation-only readiness metadata.  No target identity, native handle,
@@ -399,15 +398,26 @@ async fn dispatch_observation_blocking(
         let session_gate = app.state::<ScreenPerceptionSessionGate>();
         let target_broker = app.state::<ScreenCaptureTargetBroker>();
         let handoff_broker = app.state::<ScreenContextHandoffBroker>();
+        let attachment_broker = app.state::<ScreenContextChatAttachmentBroker>();
         let authorities = ObservationAuthorities {
             current_life: storage.inner(),
             repository: storage.inner(),
             session_gate: session_gate.inner(),
             target_broker: target_broker.inner(),
             handoff_broker: handoff_broker.inner(),
+            attachment_broker: attachment_broker.inner(),
         };
 
-        observe_screen_now_service(&authorities, &operation_permit, &life_id)
+        // A successful observe replaces any previous grant; if a Chat
+        // attachment marker existed before it, the marker is now stale and
+        // was cleared by the service.  Emit the presentation-only Chat
+        // refresh hint so Chat can reread backend status.
+        let had_marker = attachment_broker.current().is_some();
+        let result = observe_screen_now_service(&authorities, &operation_permit, &life_id);
+        if result.is_ok() && had_marker {
+            super::screen_chat_attachment::emit_chat_attachment_changed(&app);
+        }
+        result
     })
     .await
     .map_err(|_| dispatch_failed_error())?
@@ -494,9 +504,36 @@ where
         })
         .map_err(screen_context_error_dto)?;
 
+    // D24-C1: a successful later Candidate installation already replaced the
+    // underlying D24-A Grant, so any Chat attachment marker pointing at the
+    // previous grant is stale.  Clear it (fail-closed presentation state)
+    // after the new Candidate is canonical.  A cleanup failure must never
+    // invalidate the successfully authorized new Candidate; the command
+    // layer emits the presentation refresh hint when possible.  Capture/OCR
+    // semantics are unchanged.
+    clear_stale_attachment_after_candidate(
+        authorities.handoff_broker,
+        authorities.attachment_broker,
+    );
+
     // The candidate install happens before this function returns, while the
     // borrowed permit is still owned by the caller.
     Ok(observation_dto(preview_observation, candidate_id))
+}
+
+/// Clears any existing Chat attachment marker after the newer Candidate
+/// became canonical, exact-cancelling its stored stale Pending Grant.  The
+/// underlying grant is already replaced, so this only shrinks presentation
+/// state; it never touches the new Candidate and never uses the global
+/// broker `cancel()`.  Returns whether a marker was cleared.
+fn clear_stale_attachment_after_candidate(
+    handoff_broker: &ScreenContextHandoffBroker,
+    attachment_broker: &ScreenContextChatAttachmentBroker,
+) -> bool {
+    super::screen_chat_attachment::clear_current_attachment_and_cancel_grant(
+        handoff_broker,
+        attachment_broker,
+    )
 }
 
 async fn dispatch_prepare_blocking(
@@ -612,6 +649,221 @@ where
             }
         }
     }
+}
+
+/// Shared Main-offer choreography with a private, per-call post-offer seam
+/// for deterministic race tests.  Production supplies a no-op; it never
+/// exposes an alternate broker or authority path.  The test callback receives
+/// only the newly offered opaque attachment identity so rollback can be
+/// proven behaviorally.
+fn offer_main_screen_context_to_chat_service_with_post_offer<AfterOffer>(
+    authorities: &OfferAuthorities<'_>,
+    _operation_permit: &ScreenCaptureOperationPermit,
+    life_id: &str,
+    grant_id: &str,
+    after_offer: AfterOffer,
+) -> Result<MainScreenContextAttachmentOfferDto, MainScreenPerceptionErrorDto>
+where
+    AfterOffer: FnOnce(&str),
+{
+    validate_life_id(life_id)?;
+    validate_candidate_id(grant_id)?;
+    require_current_life(authorities.current_life, life_id)?;
+    require_current_screen_authorization(
+        authorities.repository,
+        authorities.session_gate,
+        life_id,
+    )?;
+    let fence_before = authorities
+        .session_gate
+        .life_fence_for(life_id)
+        .ok_or_else(session_unavailable_error)?;
+
+    // The underlying handoff broker remains the actual grant authority: this
+    // validates the exact Pending Grant tuple (grant / Life / session fence)
+    // and applies the monotonic TTL, without binding, refreshing, or reading
+    // any payload.
+    authorities
+        .handoff_broker
+        .validate_pending_grant(grant_id, life_id, ScreenContextSessionFence(fence_before))
+        .map_err(screen_context_error_dto)?;
+
+    let attachment_id = authorities
+        .attachment_broker
+        .offer(grant_id, life_id, ScreenContextSessionFence(fence_before))
+        .map_err(attachment_offer_error_dto)?;
+
+    after_offer(&attachment_id);
+
+    let post_offer_check = (|| {
+        require_current_life(authorities.current_life, life_id)?;
+        require_current_screen_authorization(
+            authorities.repository,
+            authorities.session_gate,
+            life_id,
+        )?;
+        let fence_after = authorities
+            .session_gate
+            .life_fence_for(life_id)
+            .ok_or_else(session_changed_error)?;
+        if fence_after != fence_before {
+            return Err(session_changed_error());
+        }
+        Ok(())
+    })();
+
+    match post_offer_check {
+        Ok(()) => Ok(MainScreenContextAttachmentOfferDto { attachment_id }),
+        Err(error) => {
+            // The offer has already been installed.  Roll back only the
+            // just-offered attachment and its exact Pending Grant; never a
+            // newer handoff and never the global broker cancel().
+            match authorities.attachment_broker.remove_exact(&attachment_id) {
+                Ok(removed) => {
+                    let _ = authorities
+                        .handoff_broker
+                        .cancel_pending_grant(&removed.grant_id, &removed.life_id);
+                    Err(error)
+                }
+                Err(_) => Err(error),
+            }
+        }
+    }
+}
+
+/// Maps an attachment-broker error onto the Main error surface.
+fn attachment_offer_error_dto(
+    error: ScreenContextChatAttachmentError,
+) -> MainScreenPerceptionErrorDto {
+    match error.code {
+        ScreenContextChatAttachmentErrorCode::InvalidArgument => invalid_life_id_error(),
+        ScreenContextChatAttachmentErrorCode::SynchronizationUnavailable => {
+            broker_unavailable_error()
+        }
+        ScreenContextChatAttachmentErrorCode::AttachmentNotFound => context_unavailable_error(),
+    }
+}
+
+/// Explicit Main-only command: offers one validated Pending Grant to Chat.
+///
+/// Authority sequence (canonical D23 operation gate → authoritative current
+/// Life → durable screen authorization → F0 fence → exact Pending Grant
+/// validation → idempotent attachment offer → authoritative current Life →
+/// durable authorization → F1 fence → require F1 == F0).  Target selection is
+/// NOT required.  On success a presentation-only Chat refresh hint is emitted
+/// and a bounded result containing only `attachmentId` is returned.
+#[tauri::command]
+pub async fn offer_main_screen_context_to_chat(
+    app: tauri::AppHandle,
+    life_id: String,
+    grant_id: String,
+) -> Result<MainScreenContextAttachmentOfferDto, MainScreenPerceptionErrorDto> {
+    validate_life_id(&life_id)?;
+    validate_candidate_id(&grant_id)?;
+    let operation_permit = {
+        let operation_gate = app.state::<ScreenCaptureOperationGate>();
+        try_enter_observation_operation(operation_gate.inner())?
+    };
+    dispatch_offer_blocking(app, operation_permit, life_id, grant_id).await
+}
+
+async fn dispatch_offer_blocking(
+    app: tauri::AppHandle,
+    operation_permit: ScreenCaptureOperationPermit,
+    life_id: String,
+    grant_id: String,
+) -> Result<MainScreenContextAttachmentOfferDto, MainScreenPerceptionErrorDto> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let storage = app.state::<StorageService>();
+        let session_gate = app.state::<ScreenPerceptionSessionGate>();
+        let handoff_broker = app.state::<ScreenContextHandoffBroker>();
+        let attachment_broker = app.state::<ScreenContextChatAttachmentBroker>();
+        let authorities = OfferAuthorities {
+            current_life: storage.inner(),
+            repository: storage.inner(),
+            session_gate: session_gate.inner(),
+            handoff_broker: handoff_broker.inner(),
+            attachment_broker: attachment_broker.inner(),
+        };
+        let result = offer_main_screen_context_to_chat_service_with_post_offer(
+            &authorities,
+            &operation_permit,
+            &life_id,
+            &grant_id,
+            |_| {},
+        );
+        if result.is_ok() {
+            super::screen_chat_attachment::emit_chat_attachment_changed(&app);
+        }
+        result
+    })
+    .await
+    .map_err(|_| dispatch_failed_error())?
+}
+
+/// Explicit Main-only command: exact-cancels the Pending Grant identified by
+/// grant ID + Life.  It exists so a late B2 prepare result can be destroyed
+/// rather than merely ignored.  Safe when the grant was already replaced,
+/// already expired, or no longer exists; never clears a newer Candidate or
+/// Grant.
+#[tauri::command]
+pub fn revoke_main_pending_screen_context_grant(
+    app: tauri::AppHandle,
+    life_id: String,
+    grant_id: String,
+) -> Result<(), MainScreenPerceptionErrorDto> {
+    let handoff_broker = app.state::<ScreenContextHandoffBroker>();
+    revoke_main_pending_screen_context_grant_service(handoff_broker.inner(), &life_id, &grant_id)
+}
+
+fn revoke_main_pending_screen_context_grant_service(
+    handoff_broker: &ScreenContextHandoffBroker,
+    life_id: &str,
+    grant_id: &str,
+) -> Result<(), MainScreenPerceptionErrorDto> {
+    validate_life_id(life_id)?;
+    validate_candidate_id(grant_id)?;
+    match handoff_broker.cancel_pending_grant(grant_id, life_id) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            // The grant was already replaced, expired, or never existed; the
+            // desired end state already holds.  This command never clears a
+            // newer Candidate/Grant.
+            Ok(())
+        }
+    }
+}
+
+/// Explicit Main-only command: exact-removes the attachment identified by
+/// `attachmentId` and exact-cancels its stored Pending Grant if still
+/// current.  Bounded/idempotent when the attachment is already gone or stale;
+/// never globally cancels the current handoff.
+#[tauri::command]
+pub fn revoke_main_screen_context_attachment(
+    app: tauri::AppHandle,
+    attachment_id: String,
+) -> Result<(), MainScreenPerceptionErrorDto> {
+    let handoff_broker = app.state::<ScreenContextHandoffBroker>();
+    let attachment_broker = app.state::<ScreenContextChatAttachmentBroker>();
+    revoke_main_screen_context_attachment_service(
+        handoff_broker.inner(),
+        attachment_broker.inner(),
+        &attachment_id,
+    )
+}
+
+fn revoke_main_screen_context_attachment_service(
+    handoff_broker: &ScreenContextHandoffBroker,
+    attachment_broker: &ScreenContextChatAttachmentBroker,
+    attachment_id: &str,
+) -> Result<(), MainScreenPerceptionErrorDto> {
+    super::screen_chat_attachment::validate_attachment_id(attachment_id)
+        .map_err(attachment_offer_error_dto)?;
+    let removed = attachment_broker
+        .remove_exact(attachment_id)
+        .map_err(attachment_offer_error_dto)?;
+    let _ = handoff_broker.cancel_pending_grant(&removed.grant_id, &removed.life_id);
+    Ok(())
 }
 
 /// Explicit Main-WebView Candidate → GrantPending command.
@@ -800,6 +1052,7 @@ mod tests {
         ScreenPerceptionSessionGate,
         ScreenCaptureTargetBroker,
         ScreenContextHandoffBroker,
+        ScreenContextChatAttachmentBroker,
         ScreenCaptureOperationGate,
     ) {
         let current_life = FakeCurrentLife::for_life(LIFE_A);
@@ -812,16 +1065,19 @@ mod tests {
             session_gate,
             ScreenCaptureTargetBroker::new(),
             ScreenContextHandoffBroker::new(),
+            ScreenContextChatAttachmentBroker::new(),
             ScreenCaptureOperationGate::new(),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn observe_with_capture<Capture>(
         current_life: &dyn CurrentLifeAuthority,
         repository: &dyn ScreenPerceptionRepository,
         session_gate: &ScreenPerceptionSessionGate,
         target_broker: &ScreenCaptureTargetBroker,
         handoff_broker: &ScreenContextHandoffBroker,
+        attachment_broker: &ScreenContextChatAttachmentBroker,
         operation_gate: &ScreenCaptureOperationGate,
         capture: Capture,
     ) -> Result<MainScreenObservationDto, MainScreenPerceptionErrorDto>
@@ -843,6 +1099,7 @@ mod tests {
             session_gate,
             target_broker,
             handoff_broker,
+            attachment_broker,
         };
         let result = observe_screen_now_service_with_capture(
             &authorities,
@@ -881,6 +1138,41 @@ mod tests {
             LIFE_A,
             candidate_id,
             after_issue,
+        );
+        drop(operation_permit);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn offer_with_hook<AfterOffer>(
+        current_life: &dyn CurrentLifeAuthority,
+        repository: &dyn ScreenPerceptionRepository,
+        session_gate: &ScreenPerceptionSessionGate,
+        handoff_broker: &ScreenContextHandoffBroker,
+        attachment_broker: &ScreenContextChatAttachmentBroker,
+        operation_gate: &ScreenCaptureOperationGate,
+        grant_id: &str,
+        after_offer: AfterOffer,
+    ) -> Result<MainScreenContextAttachmentOfferDto, MainScreenPerceptionErrorDto>
+    where
+        AfterOffer: FnOnce(&str),
+    {
+        let operation_permit = operation_gate
+            .try_enter()
+            .expect("the test offer must own the canonical permit");
+        let authorities = OfferAuthorities {
+            current_life,
+            repository,
+            session_gate,
+            handoff_broker,
+            attachment_broker,
+        };
+        let result = offer_main_screen_context_to_chat_service_with_post_offer(
+            &authorities,
+            &operation_permit,
+            LIFE_A,
+            grant_id,
+            after_offer,
         );
         drop(operation_permit);
         result
@@ -992,8 +1284,15 @@ mod tests {
 
     #[test]
     fn observe_keeps_permit_until_after_candidate_installation() {
-        let (current_life, repository, session_gate, target_broker, handoff_broker, operation_gate) =
-            test_fixture();
+        let (
+            current_life,
+            repository,
+            session_gate,
+            target_broker,
+            handoff_broker,
+            attachment_broker,
+            operation_gate,
+        ) = test_fixture();
         let operation_permit = operation_gate
             .try_enter()
             .expect("observation must acquire the canonical permit");
@@ -1003,6 +1302,7 @@ mod tests {
             session_gate: &session_gate,
             target_broker: &target_broker,
             handoff_broker: &handoff_broker,
+            attachment_broker: &attachment_broker,
         };
         let result = observe_screen_now_service_with_capture(
             &authorities,
@@ -1040,8 +1340,15 @@ mod tests {
 
     #[test]
     fn unchanged_fence_installs_candidate_with_exact_fence_and_life() {
-        let (current_life, repository, session_gate, target_broker, handoff_broker, operation_gate) =
-            test_fixture();
+        let (
+            current_life,
+            repository,
+            session_gate,
+            target_broker,
+            handoff_broker,
+            attachment_broker,
+            operation_gate,
+        ) = test_fixture();
         let fence_before = session_gate.life_fence_for(LIFE_A).unwrap();
         let result = observe_with_capture(
             &current_life,
@@ -1049,6 +1356,7 @@ mod tests {
             &session_gate,
             &target_broker,
             &handoff_broker,
+            &attachment_broker,
             &operation_gate,
             |_, _, _, _, _| Ok(recognized("same fence")),
         )
@@ -1067,8 +1375,15 @@ mod tests {
 
     #[test]
     fn disarm_and_rearm_during_observation_rejects_candidate_installation() {
-        let (current_life, repository, session_gate, target_broker, handoff_broker, operation_gate) =
-            test_fixture();
+        let (
+            current_life,
+            repository,
+            session_gate,
+            target_broker,
+            handoff_broker,
+            attachment_broker,
+            operation_gate,
+        ) = test_fixture();
         let fence_before = session_gate.life_fence_for(LIFE_A).unwrap();
         let sentinel_id = install_sentinel_candidate(&handoff_broker, fence_before);
         let error = observe_with_capture(
@@ -1077,6 +1392,7 @@ mod tests {
             &session_gate,
             &target_broker,
             &handoff_broker,
+            &attachment_broker,
             &operation_gate,
             |_, _, session_gate, _, _| {
                 session_gate.disarm();
@@ -1092,8 +1408,15 @@ mod tests {
 
     #[test]
     fn durable_consent_revoke_during_observation_rejects_candidate_installation() {
-        let (current_life, repository, session_gate, target_broker, handoff_broker, operation_gate) =
-            test_fixture();
+        let (
+            current_life,
+            repository,
+            session_gate,
+            target_broker,
+            handoff_broker,
+            attachment_broker,
+            operation_gate,
+        ) = test_fixture();
         let fence = session_gate.life_fence_for(LIFE_A).unwrap();
         let sentinel_id = install_sentinel_candidate(&handoff_broker, fence);
         let error = observe_with_capture(
@@ -1102,6 +1425,7 @@ mod tests {
             &session_gate,
             &target_broker,
             &handoff_broker,
+            &attachment_broker,
             &operation_gate,
             |_, _, _, _, _| {
                 repository.set_enabled(LIFE_A, false);
@@ -1115,8 +1439,15 @@ mod tests {
 
     #[test]
     fn authoritative_life_change_during_observation_rejects_candidate_installation() {
-        let (current_life, repository, session_gate, target_broker, handoff_broker, operation_gate) =
-            test_fixture();
+        let (
+            current_life,
+            repository,
+            session_gate,
+            target_broker,
+            handoff_broker,
+            attachment_broker,
+            operation_gate,
+        ) = test_fixture();
         let fence = session_gate.life_fence_for(LIFE_A).unwrap();
         let sentinel_id = install_sentinel_candidate(&handoff_broker, fence);
         let error = observe_with_capture(
@@ -1125,6 +1456,7 @@ mod tests {
             &session_gate,
             &target_broker,
             &handoff_broker,
+            &attachment_broker,
             &operation_gate,
             |_, _, _, _, _| {
                 current_life.set(Some(LIFE_B));
@@ -1138,8 +1470,15 @@ mod tests {
 
     #[test]
     fn post_capture_failed_life_authority_returns_no_preview_or_candidate() {
-        let (current_life, repository, session_gate, target_broker, handoff_broker, operation_gate) =
-            test_fixture();
+        let (
+            current_life,
+            repository,
+            session_gate,
+            target_broker,
+            handoff_broker,
+            attachment_broker,
+            operation_gate,
+        ) = test_fixture();
         let fence = session_gate.life_fence_for(LIFE_A).unwrap();
         let sentinel_id = install_sentinel_candidate(&handoff_broker, fence);
         let error = observe_with_capture(
@@ -1148,6 +1487,7 @@ mod tests {
             &session_gate,
             &target_broker,
             &handoff_broker,
+            &attachment_broker,
             &operation_gate,
             |_, _, _, _, _| {
                 current_life.unavailable();
@@ -1161,14 +1501,22 @@ mod tests {
 
     #[test]
     fn recognized_observation_installs_candidate_and_returns_opaque_id() {
-        let (current_life, repository, session_gate, target_broker, handoff_broker, operation_gate) =
-            test_fixture();
+        let (
+            current_life,
+            repository,
+            session_gate,
+            target_broker,
+            handoff_broker,
+            attachment_broker,
+            operation_gate,
+        ) = test_fixture();
         let result = observe_with_capture(
             &current_life,
             &repository,
             &session_gate,
             &target_broker,
             &handoff_broker,
+            &attachment_broker,
             &operation_gate,
             |_, _, _, _, _| Ok(recognized("recognized candidate")),
         )
@@ -1180,14 +1528,22 @@ mod tests {
 
     #[test]
     fn no_text_observation_installs_and_replaces_previous_handoff() {
-        let (current_life, repository, session_gate, target_broker, handoff_broker, operation_gate) =
-            test_fixture();
+        let (
+            current_life,
+            repository,
+            session_gate,
+            target_broker,
+            handoff_broker,
+            attachment_broker,
+            operation_gate,
+        ) = test_fixture();
         let first = observe_with_capture(
             &current_life,
             &repository,
             &session_gate,
             &target_broker,
             &handoff_broker,
+            &attachment_broker,
             &operation_gate,
             |_, _, _, _, _| Ok(recognized("old text")),
         )
@@ -1208,6 +1564,7 @@ mod tests {
             &session_gate,
             &target_broker,
             &handoff_broker,
+            &attachment_broker,
             &operation_gate,
             |_, _, _, _, _| Ok(no_text()),
         )
@@ -1235,8 +1592,15 @@ mod tests {
 
     #[test]
     fn second_success_replaces_pending_and_bound_handoff_authority() {
-        let (current_life, repository, session_gate, target_broker, handoff_broker, operation_gate) =
-            test_fixture();
+        let (
+            current_life,
+            repository,
+            session_gate,
+            target_broker,
+            handoff_broker,
+            attachment_broker,
+            operation_gate,
+        ) = test_fixture();
         let fence = session_gate.life_fence_for(LIFE_A).unwrap();
         let first = observe_with_capture(
             &current_life,
@@ -1244,6 +1608,7 @@ mod tests {
             &session_gate,
             &target_broker,
             &handoff_broker,
+            &attachment_broker,
             &operation_gate,
             |_, _, _, _, _| Ok(recognized("first")),
         )
@@ -1262,6 +1627,7 @@ mod tests {
             &session_gate,
             &target_broker,
             &handoff_broker,
+            &attachment_broker,
             &operation_gate,
             |_, _, _, _, _| Ok(recognized("second")),
         )
@@ -1287,6 +1653,7 @@ mod tests {
             &session_gate,
             &target_broker,
             &handoff_broker,
+            &attachment_broker,
             &operation_gate,
             |_, _, _, _, _| Ok(recognized("third")),
         )
@@ -1302,14 +1669,22 @@ mod tests {
 
     #[test]
     fn prepare_requires_the_current_candidate_id() {
-        let (current_life, repository, session_gate, target_broker, handoff_broker, operation_gate) =
-            test_fixture();
+        let (
+            current_life,
+            repository,
+            session_gate,
+            target_broker,
+            handoff_broker,
+            attachment_broker,
+            operation_gate,
+        ) = test_fixture();
         let candidate = observe_with_capture(
             &current_life,
             &repository,
             &session_gate,
             &target_broker,
             &handoff_broker,
+            &attachment_broker,
             &operation_gate,
             |_, _, _, _, _| Ok(recognized("prepare me")),
         )
@@ -1341,14 +1716,22 @@ mod tests {
 
     #[test]
     fn prepare_requires_authoritative_current_life() {
-        let (current_life, repository, session_gate, target_broker, handoff_broker, operation_gate) =
-            test_fixture();
+        let (
+            current_life,
+            repository,
+            session_gate,
+            target_broker,
+            handoff_broker,
+            attachment_broker,
+            operation_gate,
+        ) = test_fixture();
         let candidate = observe_with_capture(
             &current_life,
             &repository,
             &session_gate,
             &target_broker,
             &handoff_broker,
+            &attachment_broker,
             &operation_gate,
             |_, _, _, _, _| Ok(recognized("life authority")),
         )
@@ -1369,14 +1752,22 @@ mod tests {
 
     #[test]
     fn prepare_requires_current_durable_consent() {
-        let (current_life, repository, session_gate, target_broker, handoff_broker, operation_gate) =
-            test_fixture();
+        let (
+            current_life,
+            repository,
+            session_gate,
+            target_broker,
+            handoff_broker,
+            attachment_broker,
+            operation_gate,
+        ) = test_fixture();
         let candidate = observe_with_capture(
             &current_life,
             &repository,
             &session_gate,
             &target_broker,
             &handoff_broker,
+            &attachment_broker,
             &operation_gate,
             |_, _, _, _, _| Ok(recognized("consent authority")),
         )
@@ -1397,14 +1788,22 @@ mod tests {
 
     #[test]
     fn prepare_requires_the_current_session_fence() {
-        let (current_life, repository, session_gate, target_broker, handoff_broker, operation_gate) =
-            test_fixture();
+        let (
+            current_life,
+            repository,
+            session_gate,
+            target_broker,
+            handoff_broker,
+            attachment_broker,
+            operation_gate,
+        ) = test_fixture();
         let candidate = observe_with_capture(
             &current_life,
             &repository,
             &session_gate,
             &target_broker,
             &handoff_broker,
+            &attachment_broker,
             &operation_gate,
             |_, _, _, _, _| Ok(recognized("session authority")),
         )
@@ -1426,8 +1825,15 @@ mod tests {
 
     #[test]
     fn prepare_does_not_require_a_selected_capture_target() {
-        let (current_life, repository, session_gate, target_broker, handoff_broker, operation_gate) =
-            test_fixture();
+        let (
+            current_life,
+            repository,
+            session_gate,
+            target_broker,
+            handoff_broker,
+            attachment_broker,
+            operation_gate,
+        ) = test_fixture();
         assert_eq!(
             target_broker.current_status(),
             super::super::screen_capture::target::ScreenCaptureTargetStatus::None
@@ -1438,6 +1844,7 @@ mod tests {
             &session_gate,
             &target_broker,
             &handoff_broker,
+            &attachment_broker,
             &operation_gate,
             |_, _, _, _, _| Ok(recognized("target no longer needed")),
         )
@@ -1467,14 +1874,22 @@ mod tests {
 
     #[test]
     fn post_issue_life_change_cancels_grant_pending_before_error() {
-        let (current_life, repository, session_gate, target_broker, handoff_broker, operation_gate) =
-            test_fixture();
+        let (
+            current_life,
+            repository,
+            session_gate,
+            target_broker,
+            handoff_broker,
+            attachment_broker,
+            operation_gate,
+        ) = test_fixture();
         let candidate = observe_with_capture(
             &current_life,
             &repository,
             &session_gate,
             &target_broker,
             &handoff_broker,
+            &attachment_broker,
             &operation_gate,
             |_, _, _, _, _| Ok(recognized("post issue life")),
         )
@@ -1501,14 +1916,22 @@ mod tests {
 
     #[test]
     fn post_issue_session_change_cancels_grant_pending_before_error() {
-        let (current_life, repository, session_gate, target_broker, handoff_broker, operation_gate) =
-            test_fixture();
+        let (
+            current_life,
+            repository,
+            session_gate,
+            target_broker,
+            handoff_broker,
+            attachment_broker,
+            operation_gate,
+        ) = test_fixture();
         let candidate = observe_with_capture(
             &current_life,
             &repository,
             &session_gate,
             &target_broker,
             &handoff_broker,
+            &attachment_broker,
             &operation_gate,
             |_, _, _, _, _| Ok(recognized("post issue session")),
         )
@@ -1536,14 +1959,22 @@ mod tests {
 
     #[test]
     fn post_issue_consent_revoke_cancels_grant_pending_before_error() {
-        let (current_life, repository, session_gate, target_broker, handoff_broker, operation_gate) =
-            test_fixture();
+        let (
+            current_life,
+            repository,
+            session_gate,
+            target_broker,
+            handoff_broker,
+            attachment_broker,
+            operation_gate,
+        ) = test_fixture();
         let candidate = observe_with_capture(
             &current_life,
             &repository,
             &session_gate,
             &target_broker,
             &handoff_broker,
+            &attachment_broker,
             &operation_gate,
             |_, _, _, _, _| Ok(recognized("post issue consent")),
         )
@@ -1679,10 +2110,562 @@ mod tests {
             "observe_screen_now",
             "prepare_main_screen_context_for_chat",
             "get_main_screen_perception_status",
+            "offer_main_screen_context_to_chat",
+            "revoke_main_pending_screen_context_grant",
+            "revoke_main_screen_context_attachment",
         ] {
             assert!(main.contains(&format!("\"{command}\"")));
             assert!(!settings.contains(&format!("\"{command}\"")));
             assert!(!chat.contains(&format!("\"{command}\"")));
         }
+    }
+
+    // ── D24-C1 Main offer / revoke ───────────────────────────────────────
+
+    fn offer_fixture_with_pending_grant(
+        _current_life: &FakeCurrentLife,
+        _repository: &FakeRepository,
+        session_gate: &ScreenPerceptionSessionGate,
+        handoff_broker: &ScreenContextHandoffBroker,
+    ) -> String {
+        let fence = session_gate.life_fence_for(LIFE_A).unwrap();
+        let candidate_id = handoff_broker
+            .install_candidate(ScreenContextCandidateInput {
+                life_id: LIFE_A.to_string(),
+                session_fence: ScreenContextSessionFence(fence),
+                observation: recognized("offer me"),
+            })
+            .expect("the offer candidate must install");
+        handoff_broker
+            .issue_grant(&candidate_id, LIFE_A, ScreenContextSessionFence(fence))
+            .expect("the offer grant must issue")
+    }
+
+    fn offer_success_fixture() -> (
+        FakeCurrentLife,
+        FakeRepository,
+        ScreenPerceptionSessionGate,
+        ScreenContextHandoffBroker,
+        ScreenContextChatAttachmentBroker,
+        ScreenCaptureOperationGate,
+        String,
+    ) {
+        let (
+            current_life,
+            repository,
+            session_gate,
+            _target,
+            handoff_broker,
+            attachment_broker,
+            operation_gate,
+        ) = test_fixture();
+        let grant_id = offer_fixture_with_pending_grant(
+            &current_life,
+            &repository,
+            &session_gate,
+            &handoff_broker,
+        );
+        (
+            current_life,
+            repository,
+            session_gate,
+            handoff_broker,
+            attachment_broker,
+            operation_gate,
+            grant_id,
+        )
+    }
+
+    #[test]
+    fn offer_requires_the_canonical_operation_permit() {
+        let operation_gate = ScreenCaptureOperationGate::new();
+        let _held = operation_gate
+            .try_enter()
+            .expect("the first operation must own the gate");
+        let error = try_enter_observation_operation(&operation_gate).unwrap_err();
+        assert_eq!(error.code, OBSERVATION_BUSY_CODE);
+    }
+
+    #[test]
+    fn offer_succeeds_without_a_selected_capture_target() {
+        let (
+            current_life,
+            repository,
+            session_gate,
+            handoff_broker,
+            attachment_broker,
+            operation_gate,
+            grant_id,
+        ) = offer_success_fixture();
+        // The offer fixture never installs a capture target.
+        let result = offer_with_hook(
+            &current_life,
+            &repository,
+            &session_gate,
+            &handoff_broker,
+            &attachment_broker,
+            &operation_gate,
+            &grant_id,
+            |_| {},
+        )
+        .expect("the offer must not require a target");
+        assert!(!result.attachment_id.is_empty());
+    }
+
+    #[test]
+    fn offer_requires_authoritative_current_life() {
+        let (
+            current_life,
+            repository,
+            session_gate,
+            handoff_broker,
+            attachment_broker,
+            operation_gate,
+            grant_id,
+        ) = offer_success_fixture();
+        current_life.set(Some(LIFE_B));
+        let error = offer_with_hook(
+            &current_life,
+            &repository,
+            &session_gate,
+            &handoff_broker,
+            &attachment_broker,
+            &operation_gate,
+            &grant_id,
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(error.code, SCREEN_CONTEXT_LIFE_CHANGED_CODE);
+        assert!(attachment_broker.current().is_none());
+    }
+
+    #[test]
+    fn offer_requires_durable_consent() {
+        let (
+            current_life,
+            repository,
+            session_gate,
+            handoff_broker,
+            attachment_broker,
+            operation_gate,
+            grant_id,
+        ) = offer_success_fixture();
+        repository.set_enabled(LIFE_A, false);
+        let error = offer_with_hook(
+            &current_life,
+            &repository,
+            &session_gate,
+            &handoff_broker,
+            &attachment_broker,
+            &operation_gate,
+            &grant_id,
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(error.code, SCREEN_CONTEXT_CONSENT_DISABLED_CODE);
+        assert!(attachment_broker.current().is_none());
+    }
+
+    #[test]
+    fn offer_requires_the_current_session() {
+        let (
+            current_life,
+            repository,
+            session_gate,
+            handoff_broker,
+            attachment_broker,
+            operation_gate,
+            grant_id,
+        ) = offer_success_fixture();
+        session_gate.disarm();
+        let error = offer_with_hook(
+            &current_life,
+            &repository,
+            &session_gate,
+            &handoff_broker,
+            &attachment_broker,
+            &operation_gate,
+            &grant_id,
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(error.code, SCREEN_CONTEXT_SESSION_UNAVAILABLE_CODE);
+        assert!(attachment_broker.current().is_none());
+    }
+
+    #[test]
+    fn offer_rejects_an_invalid_or_unknown_grant() {
+        let (
+            current_life,
+            repository,
+            session_gate,
+            handoff_broker,
+            attachment_broker,
+            operation_gate,
+            _grant_id,
+        ) = offer_success_fixture();
+        let error = offer_with_hook(
+            &current_life,
+            &repository,
+            &session_gate,
+            &handoff_broker,
+            &attachment_broker,
+            &operation_gate,
+            "not-a-grant",
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(error.code, SCREEN_CONTEXT_UNAVAILABLE_CODE);
+        assert!(attachment_broker.current().is_none());
+    }
+
+    #[test]
+    fn same_grant_retry_returns_the_same_attachment_id() {
+        let (
+            current_life,
+            repository,
+            session_gate,
+            handoff_broker,
+            attachment_broker,
+            operation_gate,
+            grant_id,
+        ) = offer_success_fixture();
+        let first = offer_with_hook(
+            &current_life,
+            &repository,
+            &session_gate,
+            &handoff_broker,
+            &attachment_broker,
+            &operation_gate,
+            &grant_id,
+            |_| {},
+        )
+        .expect("the first offer must succeed");
+        let second = offer_with_hook(
+            &current_life,
+            &repository,
+            &session_gate,
+            &handoff_broker,
+            &attachment_broker,
+            &operation_gate,
+            &grant_id,
+            |_| {},
+        )
+        .expect("the identical retry must succeed");
+        assert_eq!(
+            first.attachment_id, second.attachment_id,
+            "the identical offer must return the same attachment ID"
+        );
+    }
+
+    #[test]
+    fn post_offer_life_change_rolls_back_exact_attachment_and_grant() {
+        let (
+            current_life,
+            repository,
+            session_gate,
+            handoff_broker,
+            attachment_broker,
+            operation_gate,
+            grant_id,
+        ) = offer_success_fixture();
+        let fence = session_gate.life_fence_for(LIFE_A).unwrap();
+        let offered_attachment_id = std::sync::Mutex::new(None);
+        let error = offer_with_hook(
+            &current_life,
+            &repository,
+            &session_gate,
+            &handoff_broker,
+            &attachment_broker,
+            &operation_gate,
+            &grant_id,
+            |attachment_id| {
+                *offered_attachment_id.lock().unwrap() = Some(attachment_id.to_string());
+                current_life.set(Some(LIFE_B));
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, SCREEN_CONTEXT_LIFE_CHANGED_CODE);
+        // The just-offered attachment is removed.
+        assert!(attachment_broker.current().is_none());
+        let offered_attachment_id = offered_attachment_id.lock().unwrap().clone().unwrap();
+        assert!(
+            attachment_broker
+                .remove_exact(&offered_attachment_id)
+                .is_err(),
+            "the rollback must have removed the exact attachment"
+        );
+        // Its exact Pending Grant was cancelled: it can no longer validate.
+        let error = handoff_broker
+            .validate_pending_grant(&grant_id, LIFE_A, ScreenContextSessionFence(fence))
+            .expect_err("the rollback must cancel the exact pending grant");
+        assert_eq!(error.code, ScreenContextErrorCode::NoCurrentContext);
+    }
+
+    #[test]
+    fn post_offer_session_change_rolls_back_exact_attachment_and_grant() {
+        let (
+            current_life,
+            repository,
+            session_gate,
+            handoff_broker,
+            attachment_broker,
+            operation_gate,
+            grant_id,
+        ) = offer_success_fixture();
+        let offered_attachment_id = std::sync::Mutex::new(None);
+        let error = offer_with_hook(
+            &current_life,
+            &repository,
+            &session_gate,
+            &handoff_broker,
+            &attachment_broker,
+            &operation_gate,
+            &grant_id,
+            |attachment_id| {
+                *offered_attachment_id.lock().unwrap() = Some(attachment_id.to_string());
+                session_gate.disarm();
+                session_gate.arm_for_life(LIFE_A);
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, SCREEN_CONTEXT_SESSION_CHANGED_CODE);
+        assert!(attachment_broker.current().is_none());
+        let offered_attachment_id = offered_attachment_id.lock().unwrap().clone().unwrap();
+        assert!(
+            attachment_broker
+                .remove_exact(&offered_attachment_id)
+                .is_err(),
+            "the rollback must have removed the exact attachment"
+        );
+    }
+
+    #[test]
+    fn post_offer_consent_revoke_rolls_back_exact_attachment_and_grant() {
+        let (
+            current_life,
+            repository,
+            session_gate,
+            handoff_broker,
+            attachment_broker,
+            operation_gate,
+            grant_id,
+        ) = offer_success_fixture();
+        let offered_attachment_id = std::sync::Mutex::new(None);
+        let error = offer_with_hook(
+            &current_life,
+            &repository,
+            &session_gate,
+            &handoff_broker,
+            &attachment_broker,
+            &operation_gate,
+            &grant_id,
+            |attachment_id| {
+                *offered_attachment_id.lock().unwrap() = Some(attachment_id.to_string());
+                repository.set_enabled(LIFE_A, false);
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, SCREEN_CONTEXT_CONSENT_DISABLED_CODE);
+        assert!(attachment_broker.current().is_none());
+        let offered_attachment_id = offered_attachment_id.lock().unwrap().clone().unwrap();
+        assert!(
+            attachment_broker
+                .remove_exact(&offered_attachment_id)
+                .is_err(),
+            "the rollback must have removed the exact attachment"
+        );
+    }
+
+    #[test]
+    fn offer_result_serializes_only_the_opaque_attachment_id() {
+        assert_eq!(
+            serde_json::to_value(MainScreenContextAttachmentOfferDto {
+                attachment_id: "opaque-attachment".to_string(),
+            })
+            .unwrap(),
+            serde_json::json!({"attachmentId": "opaque-attachment"})
+        );
+    }
+
+    #[test]
+    fn late_old_grant_revoke_does_not_damage_a_newer_candidate_or_grant() {
+        let (
+            current_life,
+            repository,
+            session_gate,
+            _target,
+            handoff_broker,
+            attachment_broker,
+            operation_gate,
+        ) = test_fixture();
+        let fence = session_gate.life_fence_for(LIFE_A).unwrap();
+        let old_candidate = install_sentinel_candidate(&handoff_broker, fence);
+        let old_grant = handoff_broker
+            .issue_grant(&old_candidate, LIFE_A, ScreenContextSessionFence(fence))
+            .expect("the old grant must issue");
+
+        // A newer Candidate + Grant replaces the old one.
+        let new_candidate = install_sentinel_candidate(&handoff_broker, fence);
+        let new_grant = handoff_broker
+            .issue_grant(&new_candidate, LIFE_A, ScreenContextSessionFence(fence))
+            .expect("the newer grant must issue");
+
+        // Late revoke of the OLD grant must be a safe no-op.
+        let result =
+            revoke_main_pending_screen_context_grant_service(&handoff_broker, LIFE_A, &old_grant);
+        assert!(result.is_ok(), "a late revoke must be safe");
+        // The newer grant is untouched.
+        handoff_broker
+            .validate_pending_grant(&new_grant, LIFE_A, ScreenContextSessionFence(fence))
+            .expect("the newer grant must survive the late revoke");
+        // The old grant stays cancelled (replaced).
+        assert!(
+            handoff_broker
+                .validate_pending_grant(&old_grant, LIFE_A, ScreenContextSessionFence(fence))
+                .is_err(),
+            "the replaced old grant must remain unusable"
+        );
+        let _ = (current_life, repository, attachment_broker, operation_gate);
+    }
+
+    #[test]
+    fn late_old_grant_revoke_does_not_damage_a_newer_candidate_only() {
+        let (
+            current_life,
+            repository,
+            session_gate,
+            _target,
+            handoff_broker,
+            attachment_broker,
+            operation_gate,
+        ) = test_fixture();
+        let fence = session_gate.life_fence_for(LIFE_A).unwrap();
+        let old_candidate = install_sentinel_candidate(&handoff_broker, fence);
+        let old_grant = handoff_broker
+            .issue_grant(&old_candidate, LIFE_A, ScreenContextSessionFence(fence))
+            .expect("the old grant must issue");
+        // A newer Candidate replaces the old grant without issuing.
+        let new_candidate = install_sentinel_candidate(&handoff_broker, fence);
+
+        let result =
+            revoke_main_pending_screen_context_grant_service(&handoff_broker, LIFE_A, &old_grant);
+        assert!(result.is_ok(), "a late revoke must be safe");
+        // The newer Candidate survives and can issue.
+        let new_grant = handoff_broker
+            .issue_grant(&new_candidate, LIFE_A, ScreenContextSessionFence(fence))
+            .expect("the newer candidate must remain usable");
+        assert!(!new_grant.is_empty());
+        let _ = (current_life, repository, attachment_broker, operation_gate);
+    }
+
+    #[test]
+    fn stale_attachment_revoke_does_not_damage_a_newer_attachment() {
+        let (
+            current_life,
+            repository,
+            session_gate,
+            _target,
+            handoff_broker,
+            attachment_broker,
+            operation_gate,
+        ) = test_fixture();
+        let fence = session_gate.life_fence_for(LIFE_A).unwrap();
+        let old_candidate = install_sentinel_candidate(&handoff_broker, fence);
+        let old_grant = handoff_broker
+            .issue_grant(&old_candidate, LIFE_A, ScreenContextSessionFence(fence))
+            .expect("the old grant must issue");
+        let old_attachment = attachment_broker
+            .offer(&old_grant, LIFE_A, ScreenContextSessionFence(fence))
+            .expect("the old offer must succeed");
+        let new_candidate = install_sentinel_candidate(&handoff_broker, fence);
+        let new_grant = handoff_broker
+            .issue_grant(&new_candidate, LIFE_A, ScreenContextSessionFence(fence))
+            .expect("the newer grant must issue");
+        let new_attachment = attachment_broker
+            .offer(&new_grant, LIFE_A, ScreenContextSessionFence(fence))
+            .expect("the newer offer must succeed");
+        assert_ne!(old_attachment, new_attachment);
+
+        // Revoking the STALE attachment must fail bounded and must not damage
+        // the newer attachment or its grant.
+        let result = revoke_main_screen_context_attachment_service(
+            &handoff_broker,
+            &attachment_broker,
+            &old_attachment,
+        );
+        assert!(
+            result.is_err(),
+            "a stale attachment revoke must fail bounded"
+        );
+        let current = attachment_broker
+            .current()
+            .expect("the newer offer survives");
+        assert_eq!(current.attachment_id, new_attachment);
+        handoff_broker
+            .validate_pending_grant(&new_grant, LIFE_A, ScreenContextSessionFence(fence))
+            .expect("the newer grant must survive");
+        let _ = (current_life, repository, operation_gate);
+    }
+
+    #[test]
+    fn revoke_main_attachment_removes_exact_attachment_and_cancels_its_grant() {
+        let (
+            current_life,
+            repository,
+            session_gate,
+            handoff_broker,
+            attachment_broker,
+            operation_gate,
+            grant_id,
+        ) = offer_success_fixture();
+        let fence = session_gate.life_fence_for(LIFE_A).unwrap();
+        let attachment_id = attachment_broker
+            .offer(&grant_id, LIFE_A, ScreenContextSessionFence(fence))
+            .expect("the offer must succeed");
+
+        revoke_main_screen_context_attachment_service(
+            &handoff_broker,
+            &attachment_broker,
+            &attachment_id,
+        )
+        .expect("the exact attachment revoke must succeed");
+        assert!(attachment_broker.current().is_none());
+        assert!(
+            handoff_broker
+                .validate_pending_grant(&grant_id, LIFE_A, ScreenContextSessionFence(fence))
+                .is_err(),
+            "the revoked attachment's grant must be cancelled"
+        );
+        let _ = (current_life, repository, operation_gate);
+    }
+
+    #[test]
+    fn revoke_main_attachment_is_idempotent_when_already_gone() {
+        let (
+            current_life,
+            repository,
+            session_gate,
+            handoff_broker,
+            attachment_broker,
+            operation_gate,
+            grant_id,
+        ) = offer_success_fixture();
+        let fence = session_gate.life_fence_for(LIFE_A).unwrap();
+        let attachment_id = attachment_broker
+            .offer(&grant_id, LIFE_A, ScreenContextSessionFence(fence))
+            .expect("the offer must succeed");
+        attachment_broker
+            .remove_exact(&attachment_id)
+            .expect("the attachment must remove");
+
+        let result = revoke_main_screen_context_attachment_service(
+            &handoff_broker,
+            &attachment_broker,
+            &attachment_id,
+        );
+        assert!(result.is_err(), "an absent attachment must fail bounded");
+        assert!(attachment_broker.current().is_none());
+        let _ = (current_life, repository, operation_gate, fence);
     }
 }

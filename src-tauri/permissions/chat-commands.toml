@@ -17,4 +17,6 @@ commands.allow = [
     "prepare_candidate_confirmation",
     "confirm_candidate_memory",
     "cancel_candidate_confirmation_approval",
+    "get_pending_screen_context_attachment",
+    "dismiss_pending_screen_context_attachment",
 ]

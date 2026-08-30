@@ -72,6 +72,13 @@ pub fn run() {
             // handoff broker.  Main observation and explicit handoff commands
             // consume it; Chat integration remains a later stage.
             app.manage(perception::screen_context::ScreenContextHandoffBroker::new());
+            // D24-C1: the single App-managed Chat screen-attachment marker
+            // bridging a validated Pending Grant to an opaque Chat-facing
+            // attachment ID.  Presentation-only; the handoff broker above
+            // remains the actual grant authority.
+            app.manage(
+                perception::screen_chat_attachment::ScreenContextChatAttachmentBroker::new(),
+            );
             app.manage(storage::LlmCandidateExtractionCoordinator::default());
             app.manage(model::runtime::ModelRuntimeCoordinator::default());
             app.manage(conversation::ConversationCognitionCoordinator::default());
@@ -168,6 +175,11 @@ pub fn run() {
             perception::screen_observation::observe_screen_now,
             perception::screen_observation::prepare_main_screen_context_for_chat,
             perception::screen_observation::get_main_screen_perception_status,
+            perception::screen_observation::offer_main_screen_context_to_chat,
+            perception::screen_observation::revoke_main_pending_screen_context_grant,
+            perception::screen_observation::revoke_main_screen_context_attachment,
+            perception::screen_chat_attachment::get_pending_screen_context_attachment,
+            perception::screen_chat_attachment::dismiss_pending_screen_context_attachment,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

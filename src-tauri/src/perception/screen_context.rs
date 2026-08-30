@@ -33,6 +33,12 @@
 //!   expiry, or retirement removes the authority;
 //! - cancellation clears any current state; retirement clears only a bound
 //!   grant whose binding matches the expected scope;
+//! - D24-C1 adds two narrow crate-internal seams for the Chat attachment
+//!   bridge: `validate_pending_grant` verifies an exact, non-expired Pending
+//!   Grant tuple without binding, refreshing, or returning any payload, and
+//!   `cancel_pending_grant` exact-cancels only the Pending Grant whose grant
+//!   ID and Life match exactly (never a Candidate, a different/newer Pending
+//!   Grant, or a Bound Grant);
 //! - no Candidate or Grant survives broker reconstruction; a freshly
 //!   constructed broker is always `EMPTY` and nothing is persisted;
 //! - every state transition is guarded by one canonical mutex; authority-
@@ -195,12 +201,14 @@ pub(crate) struct ScreenContextCandidateInput {
 
 /// Monotonic clock seam owned by the broker instance.  Production uses
 /// [`std::time::Instant`]; tests install a per-instance deterministic clock.
-/// There is deliberately no process-global test clock.
-trait BrokerClock: Send + Sync {
+/// There is deliberately no process-global test clock.  The trait is
+/// crate-visible so the D24-C1 attachment tests can construct a
+/// deterministic-clock handoff broker.
+pub(crate) trait BrokerClock: Send + Sync {
     fn now(&self) -> Instant;
 }
 
-struct InstantBrokerClock;
+pub(crate) struct InstantBrokerClock;
 
 impl BrokerClock for InstantBrokerClock {
     fn now(&self) -> Instant {
@@ -256,7 +264,7 @@ impl ScreenContextHandoffBroker {
     }
 
     #[cfg(test)]
-    fn with_clock(clock: Box<dyn BrokerClock>) -> Self {
+    pub(crate) fn with_clock(clock: Box<dyn BrokerClock>) -> Self {
         Self {
             state: Mutex::new(ScreenContextState::Empty),
             clock,
@@ -463,6 +471,95 @@ impl ScreenContextHandoffBroker {
         }
     }
 
+    /// Validates that the current state is exactly the Pending Grant for the
+    /// supplied grant / Life / session-fence tuple and that it is not expired.
+    ///
+    /// D24-C1 narrow authority seam for the Chat attachment bridge: it
+    /// verifies the stored D23 session fence exactly, applies the existing
+    /// monotonic TTL (an expired Pending Grant clears the underlying state to
+    /// `EMPTY`), returns no OCR/payload, never binds the grant, and never
+    /// refreshes the TTL.  Candidate and Bound states are NOT valid pending
+    /// grants.  This operation never mutates a non-expired matching grant;
+    /// the underlying broker remains the actual grant authority.
+    pub(crate) fn validate_pending_grant(
+        &self,
+        grant_id: &str,
+        life_id: &str,
+        session_fence: ScreenContextSessionFence,
+    ) -> Result<(), ScreenContextError> {
+        validate_scope_id("grant identity", grant_id)?;
+        validate_life_id(life_id)?;
+        let now = self.clock.now();
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ScreenContextError::synchronization_unavailable())?;
+        match &mut *state {
+            ScreenContextState::GrantPending {
+                grant_id: stored_grant_id,
+                life_id: grant_life_id,
+                session_fence: grant_fence,
+                deadline,
+                ..
+            } => {
+                if now >= *deadline {
+                    *state = ScreenContextState::Empty;
+                    return Err(ScreenContextError::expired());
+                }
+                if grant_id != stored_grant_id.as_str() {
+                    return Err(ScreenContextError::no_current_context());
+                }
+                if life_id != *grant_life_id {
+                    return Err(ScreenContextError::life_mismatch());
+                }
+                if session_fence != *grant_fence {
+                    return Err(ScreenContextError::session_fence_mismatch());
+                }
+                Ok(())
+            }
+            _ => Err(ScreenContextError::no_current_context()),
+        }
+    }
+
+    /// Exact-cancels only the Pending Grant whose grant ID and Life match
+    /// exactly.  It MUST NOT clear a Candidate, a different/newer Pending
+    /// Grant, or a Bound Grant.
+    ///
+    /// D24-C1 exact authority-shrinking operation used for stale frontend
+    /// cleanup and post-offer rollback.  It is deliberately not a replacement
+    /// for the global [`Self::cancel`]; it returns an error when no exact
+    /// Pending Grant exists so callers can distinguish "cancelled" from
+    /// "nothing to cancel" without ever widening authority.
+    pub(crate) fn cancel_pending_grant(
+        &self,
+        grant_id: &str,
+        life_id: &str,
+    ) -> Result<(), ScreenContextError> {
+        validate_scope_id("grant identity", grant_id)?;
+        validate_life_id(life_id)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ScreenContextError::synchronization_unavailable())?;
+        match &mut *state {
+            ScreenContextState::GrantPending {
+                grant_id: stored_grant_id,
+                life_id: grant_life_id,
+                ..
+            } => {
+                if grant_id != stored_grant_id.as_str() {
+                    return Err(ScreenContextError::no_current_context());
+                }
+                if life_id != *grant_life_id {
+                    return Err(ScreenContextError::life_mismatch());
+                }
+                *state = ScreenContextState::Empty;
+                Ok(())
+            }
+            _ => Err(ScreenContextError::no_current_context()),
+        }
+    }
+
     /// Clears whatever current state exists — Candidate, Pending Grant, or
     /// Bound Grant — back to `EMPTY`.  Cancellation only shrinks authority:
     /// no previous ID may become valid again.  As an authority-shrinking
@@ -600,8 +697,8 @@ fn bounded_payload(
 /// target identity; the output is not predictable by ordinary increment or
 /// replay.  Identifier secrecy alone is not authorization.  A failure of the
 /// OS random source fails closed with a typed synchronization error instead
-/// of panicking.
-fn generate_opaque_identity() -> Result<String, ScreenContextError> {
+/// of panicking.  D24-C1 reuses this source for Chat attachment IDs.
+pub(crate) fn generate_opaque_identity() -> Result<String, ScreenContextError> {
     let mut bytes = [0u8; IDENTITY_HEX_BYTES];
     getrandom::fill(&mut bytes).map_err(|_| ScreenContextError::synchronization_unavailable())?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
@@ -1439,6 +1536,274 @@ mod tests {
             .issue_grant(&candidate_id, LIFE_A, FENCE_1)
             .expect_err("a cancelled candidate identity must not be reusable");
         assert_eq!(error.code, ScreenContextErrorCode::NoCurrentContext);
+    }
+
+    #[test]
+    fn exact_pending_grant_validates() {
+        let (broker, _clock) = broker_with_manual_clock();
+        let candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("hello"));
+        let grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
+        broker
+            .validate_pending_grant(&grant_id, LIFE_A, FENCE_1)
+            .expect("the exact current pending grant tuple must validate");
+        // Validation neither binds the grant nor consumes the payload: the
+        // grant remains a pending grant that can still bind and claim.
+        let payload = claim_ok(
+            &broker,
+            &grant_id,
+            LIFE_A,
+            FENCE_1,
+            CONVERSATION_1,
+            REQUEST_1,
+        );
+        assert_eq!(payload.text, "hello");
+    }
+
+    #[test]
+    fn pending_grant_validation_rejects_wrong_grant() {
+        let (broker, _clock) = broker_with_manual_clock();
+        let candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("hello"));
+        let grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
+        let error = broker
+            .validate_pending_grant("wrong-grant", LIFE_A, FENCE_1)
+            .expect_err("a wrong grant identity must not validate");
+        assert_eq!(error.code, ScreenContextErrorCode::NoCurrentContext);
+        // The real grant is untouched by the failed validation.
+        broker
+            .validate_pending_grant(&grant_id, LIFE_A, FENCE_1)
+            .expect("the real grant must remain valid");
+    }
+
+    #[test]
+    fn pending_grant_validation_rejects_wrong_life() {
+        let (broker, _clock) = broker_with_manual_clock();
+        let candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("hello"));
+        let grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
+        let error = broker
+            .validate_pending_grant(&grant_id, LIFE_B, FENCE_1)
+            .expect_err("a wrong Life must not validate the pending grant");
+        assert_eq!(error.code, ScreenContextErrorCode::LifeMismatch);
+    }
+
+    #[test]
+    fn pending_grant_validation_rejects_wrong_session_fence() {
+        let (broker, _clock) = broker_with_manual_clock();
+        let candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("hello"));
+        let grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
+        let error = broker
+            .validate_pending_grant(&grant_id, LIFE_A, FENCE_2)
+            .expect_err("a wrong session fence must not validate the pending grant");
+        assert_eq!(error.code, ScreenContextErrorCode::SessionFenceMismatch);
+    }
+
+    #[test]
+    fn pending_grant_validation_rejects_candidate_state() {
+        let (broker, _clock) = broker_with_manual_clock();
+        let candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("hello"));
+        let error = broker
+            .validate_pending_grant(&candidate_id, LIFE_A, FENCE_1)
+            .expect_err("a Candidate is not a valid pending grant");
+        assert_eq!(error.code, ScreenContextErrorCode::NoCurrentContext);
+        // The candidate remains installed and usable.
+        let grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
+        assert!(!grant_id.is_empty());
+    }
+
+    #[test]
+    fn pending_grant_validation_rejects_bound_state() {
+        let (broker, _clock) = broker_with_manual_clock();
+        let candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("hello"));
+        let grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
+        let _payload = claim_ok(
+            &broker,
+            &grant_id,
+            LIFE_A,
+            FENCE_1,
+            CONVERSATION_1,
+            REQUEST_1,
+        );
+        let error = broker
+            .validate_pending_grant(&grant_id, LIFE_A, FENCE_1)
+            .expect_err("a Bound grant is not a valid pending grant");
+        assert_eq!(error.code, ScreenContextErrorCode::NoCurrentContext);
+    }
+
+    #[test]
+    fn expired_pending_grant_validation_clears_underlying_state() {
+        let (broker, clock) = broker_with_manual_clock();
+        let candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("hello"));
+        let grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
+        clock.advance(SCREEN_CONTEXT_HANDOFF_TTL);
+        let error = broker
+            .validate_pending_grant(&grant_id, LIFE_A, FENCE_1)
+            .expect_err("an expired pending grant must fail validation");
+        assert_eq!(error.code, ScreenContextErrorCode::Expired);
+        assert_empty(&broker);
+        // The expired identity must not become usable again after clearing.
+        let error = broker
+            .validate_pending_grant(&grant_id, LIFE_A, FENCE_1)
+            .expect_err("the expired identity must not be reusable");
+        assert_eq!(error.code, ScreenContextErrorCode::NoCurrentContext);
+    }
+
+    #[test]
+    fn pending_grant_validation_never_refreshes_ttl() {
+        let (broker, clock) = broker_with_manual_clock();
+        let candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("hello"));
+        let grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
+        // Validate at T0 + 9 min, then advance past the original deadline.
+        clock.advance(Duration::from_secs(9 * 60));
+        broker
+            .validate_pending_grant(&grant_id, LIFE_A, FENCE_1)
+            .expect("the pending grant is still valid at T0 + 9 min");
+        clock.advance(Duration::from_secs(2 * 60));
+        let error = broker
+            .validate_pending_grant(&grant_id, LIFE_A, FENCE_1)
+            .expect_err("validation must never refresh the monotonic TTL");
+        assert_eq!(error.code, ScreenContextErrorCode::Expired);
+    }
+
+    #[test]
+    fn exact_pending_grant_cancels() {
+        let (broker, _clock) = broker_with_manual_clock();
+        let candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("hello"));
+        let grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
+        broker
+            .cancel_pending_grant(&grant_id, LIFE_A)
+            .expect("the exact pending grant must cancel");
+        assert_empty(&broker);
+        assert_error(
+            claim(
+                &broker,
+                &grant_id,
+                LIFE_A,
+                FENCE_1,
+                CONVERSATION_1,
+                REQUEST_1,
+            ),
+            ScreenContextErrorCode::NoCurrentContext,
+        );
+    }
+
+    #[test]
+    fn pending_grant_cancellation_rejects_wrong_grant_id() {
+        let (broker, _clock) = broker_with_manual_clock();
+        let candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("hello"));
+        let grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
+        let error = broker
+            .cancel_pending_grant("wrong-grant", LIFE_A)
+            .expect_err("a wrong grant identity must not cancel");
+        assert_eq!(error.code, ScreenContextErrorCode::NoCurrentContext);
+        // The real pending grant is untouched and still binds.
+        let payload = claim_ok(
+            &broker,
+            &grant_id,
+            LIFE_A,
+            FENCE_1,
+            CONVERSATION_1,
+            REQUEST_1,
+        );
+        assert_eq!(payload.text, "hello");
+    }
+
+    #[test]
+    fn pending_grant_cancellation_rejects_wrong_life() {
+        let (broker, _clock) = broker_with_manual_clock();
+        let candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("hello"));
+        let grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
+        let error = broker
+            .cancel_pending_grant(&grant_id, LIFE_B)
+            .expect_err("a wrong Life must not cancel the pending grant");
+        assert_eq!(error.code, ScreenContextErrorCode::LifeMismatch);
+        let payload = claim_ok(
+            &broker,
+            &grant_id,
+            LIFE_A,
+            FENCE_1,
+            CONVERSATION_1,
+            REQUEST_1,
+        );
+        assert_eq!(payload.text, "hello");
+    }
+
+    #[test]
+    fn pending_grant_cancellation_never_clears_candidate() {
+        let (broker, _clock) = broker_with_manual_clock();
+        let candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("hello"));
+        let error = broker
+            .cancel_pending_grant(&candidate_id, LIFE_A)
+            .expect_err("a Candidate must never be cleared by exact pending cancellation");
+        assert_eq!(error.code, ScreenContextErrorCode::NoCurrentContext);
+        // The candidate is still the current authority and can issue a grant.
+        let grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
+        assert!(!grant_id.is_empty());
+    }
+
+    #[test]
+    fn pending_grant_cancellation_never_clears_newer_grant() {
+        let (broker, _clock) = broker_with_manual_clock();
+        let old_candidate = install(&broker, LIFE_A, FENCE_1, recognized("old"));
+        let old_grant = issue(&broker, &old_candidate, LIFE_A, FENCE_1);
+        let new_candidate = install(&broker, LIFE_A, FENCE_1, recognized("new"));
+        let new_grant = issue(&broker, &new_candidate, LIFE_A, FENCE_1);
+        let error = broker
+            .cancel_pending_grant(&old_grant, LIFE_A)
+            .expect_err("a replaced grant must never cancel the newer pending grant");
+        assert_eq!(error.code, ScreenContextErrorCode::NoCurrentContext);
+        let payload = claim_ok(
+            &broker,
+            &new_grant,
+            LIFE_A,
+            FENCE_1,
+            CONVERSATION_1,
+            REQUEST_1,
+        );
+        assert_eq!(payload.text, "new");
+    }
+
+    #[test]
+    fn pending_grant_cancellation_never_clears_bound_grant() {
+        let (broker, _clock) = broker_with_manual_clock();
+        let candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("hello"));
+        let grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
+        let _payload = claim_ok(
+            &broker,
+            &grant_id,
+            LIFE_A,
+            FENCE_1,
+            CONVERSATION_1,
+            REQUEST_1,
+        );
+        let error = broker
+            .cancel_pending_grant(&grant_id, LIFE_A)
+            .expect_err("a Bound grant must never be cleared by exact pending cancellation");
+        assert_eq!(error.code, ScreenContextErrorCode::NoCurrentContext);
+        // The bound grant remains claimable by its exact same-request tuple.
+        let retry = claim_ok(
+            &broker,
+            &grant_id,
+            LIFE_A,
+            FENCE_1,
+            CONVERSATION_1,
+            REQUEST_1,
+        );
+        assert_eq!(retry.text, "hello");
+    }
+
+    #[test]
+    fn pending_grant_cancellation_does_not_cancel_a_replaced_state() {
+        // Cancelling a grant after a newer Candidate installation must fail
+        // rather than destroy the newer Candidate.
+        let (broker, _clock) = broker_with_manual_clock();
+        let candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("first"));
+        let grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
+        let new_candidate = install(&broker, LIFE_A, FENCE_1, recognized("second"));
+        let error = broker
+            .cancel_pending_grant(&grant_id, LIFE_A)
+            .expect_err("a replaced grant must not cancel through a newer Candidate");
+        assert_eq!(error.code, ScreenContextErrorCode::NoCurrentContext);
+        let new_grant = issue(&broker, &new_candidate, LIFE_A, FENCE_1);
+        assert!(!new_grant.is_empty());
     }
 
     #[test]

@@ -11,6 +11,7 @@
 
 pub(crate) mod foreground_focus;
 pub(crate) mod screen_capture;
+pub(crate) mod screen_chat_attachment;
 pub(crate) mod screen_context;
 pub(crate) mod screen_observation;
 pub(crate) mod screen_ocr;
@@ -21,6 +22,21 @@ pub(crate) const PERCEPTION_POLICY_VERSION: i64 = 1;
 pub(crate) const PERCEPTION_POLICY_EVENT_VERSION: i64 = 1;
 pub(crate) const PERCEPTION_POLICY_ACTOR_KIND_USER_EXPLICIT: &str = "user_explicit";
 const MAX_ID_LENGTH: usize = 128;
+
+/// Narrow authority seam for the authoritative current Life lookup.  The
+/// production implementation reads StorageService's current-life join; tests
+/// use per-instance scripted readers without changing the production path.
+pub(crate) trait CurrentLifeAuthority: Send + Sync {
+    fn current_life_id(&self) -> Result<Option<String>, ()>;
+}
+
+impl CurrentLifeAuthority for crate::storage::StorageService {
+    fn current_life_id(&self) -> Result<Option<String>, ()> {
+        self.get_current_life()
+            .map(|life| life.map(|record| record.id))
+            .map_err(|_| ())
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct LifePerceptionPolicy {

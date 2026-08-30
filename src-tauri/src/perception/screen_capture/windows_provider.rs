@@ -597,19 +597,10 @@ mod tests {
         };
         use crate::storage::{LifeIdentityRecord, PersonaTemplateRecord, StorageService};
 
-        // A real test window that is visible, non-sensitive, and pickable.
-        let owner = create_smoke_test_window("D23-C1 Smoke Target");
-        assert!(!owner.0.is_null(), "failed to create the smoke test window");
-        // Show the owner and bring it to the foreground; the system picker
-        // requires a visible foreground owner window.
-        unsafe {
-            let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
-                owner,
-                windows::Win32::UI::WindowsAndMessaging::SW_SHOW,
-            );
-            let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(owner);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        // Keep the picker owner and the selectable target separate.  The
+        // owner thread runs a real Win32 message loop for the whole picker
+        // lifetime, while the target remains visible and responsive.
+        let smoke_windows = SmokeWindowFixture::new();
 
         let root = tempfile::tempdir().unwrap();
         let storage =
@@ -658,14 +649,12 @@ mod tests {
         eprintln!(
             ">>> D23-C1 smoke: select any NON-SENSITIVE window (e.g. this harness) in the Windows capture picker."
         );
-        let outcome = selection::pick_capture_item(owner).expect("the real picker must run");
+        let outcome =
+            selection::pick_capture_item(smoke_windows.owner).expect("the real picker must run");
         let selection::PickOutcome::Selected(item) = outcome else {
             eprintln!(
                 ">>> D23-C1 smoke: picker closed without a selection; run manually to complete the interactive chain."
             );
-            unsafe {
-                let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(owner);
-            }
             return;
         };
 
@@ -699,10 +688,6 @@ mod tests {
             error.code,
             ScreenCaptureErrorCode::SessionDenied | ScreenCaptureErrorCode::TargetRequired
         ));
-
-        unsafe {
-            let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(owner);
-        }
     }
 
     /// Automated real-Windows capture smoke through the production service
@@ -814,17 +799,134 @@ mod tests {
         unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTONEAREST) }
     }
 
-    /// Creates a small visible test window used only as the picker owner and
-    /// as a pickable non-sensitive target.  The HWND is backend-derived; the
-    /// frontend never supplies it.
-    fn create_smoke_test_window(title: &str) -> windows::Win32::Foundation::HWND {
+    /// Owns a responsive native picker owner and a separate selectable
+    /// non-sensitive target for the interactive smoke.  Both windows are
+    /// created and destroyed on their UI thread; the test thread only uses
+    /// the owner HWND while the picker is running.
+    struct SmokeWindowFixture {
+        owner: windows::Win32::Foundation::HWND,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl SmokeWindowFixture {
+        fn new() -> Self {
+            use std::sync::mpsc;
+            use windows::Win32::UI::WindowsAndMessaging::{
+                DispatchMessageW, GetMessageW, ShowWindow, TranslateMessage, MSG, SW_SHOW,
+            };
+
+            let (ready_sender, ready_receiver) = mpsc::channel();
+            let thread = std::thread::Builder::new()
+                .name("d23-c1-smoke-window".to_string())
+                .spawn(move || {
+                    use windows::Win32::UI::WindowsAndMessaging::{
+                        PeekMessageW, PM_NOREMOVE, WM_USER,
+                    };
+
+                    // Force creation of this thread's message queue before
+                    // publishing the HWNDs to the test thread.
+                    let mut queue_probe = MSG::default();
+                    unsafe {
+                        let _ = PeekMessageW(&mut queue_probe, None, WM_USER, WM_USER, PM_NOREMOVE);
+                    }
+
+                    let (owner, target) = create_smoke_test_windows();
+                    let _ = ready_sender.send((owner.0 as usize, target.0 as usize));
+                    if owner.0.is_null() || target.0.is_null() {
+                        return;
+                    }
+
+                    unsafe {
+                        let _ = ShowWindow(owner, SW_SHOW);
+                        let _ = ShowWindow(target, SW_SHOW);
+                        let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(owner);
+                    }
+
+                    let mut message = MSG::default();
+                    loop {
+                        let result = unsafe { GetMessageW(&mut message, None, 0, 0) };
+                        if result.0 <= 0 {
+                            break;
+                        }
+                        unsafe {
+                            let _ = TranslateMessage(&message);
+                            let _ = DispatchMessageW(&message);
+                        }
+                    }
+
+                    // WM_CLOSE on either window ends the loop; retire both
+                    // windows on the same UI thread before the fixture joins.
+                    unsafe {
+                        if !owner.0.is_null() {
+                            let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(owner);
+                        }
+                        if !target.0.is_null() {
+                            let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(target);
+                        }
+                    }
+                })
+                .expect("failed to start smoke window thread");
+
+            let (owner_raw, target_raw) = ready_receiver
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("smoke window thread did not publish its HWNDs");
+            assert!(owner_raw != 0, "failed to create the smoke picker owner");
+            assert!(target_raw != 0, "failed to create the smoke capture target");
+            Self {
+                owner: windows::Win32::Foundation::HWND(owner_raw as *mut core::ffi::c_void),
+                thread: Some(thread),
+            }
+        }
+    }
+
+    impl Drop for SmokeWindowFixture {
+        fn drop(&mut self) {
+            use windows::Win32::Foundation::{LPARAM, WPARAM};
+            use windows::Win32::UI::WindowsAndMessaging::WM_CLOSE;
+
+            unsafe {
+                if !self.owner.0.is_null() {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                        Some(self.owner),
+                        WM_CLOSE,
+                        WPARAM(0),
+                        LPARAM(0),
+                    );
+                }
+            }
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// Creates the responsive picker owner and the separate visible target.
+    fn create_smoke_test_windows() -> (
+        windows::Win32::Foundation::HWND,
+        windows::Win32::Foundation::HWND,
+    ) {
+        let owner = create_smoke_test_window("D23-C1 Picker Owner", 100, 100, 320, 200);
+        let target = create_smoke_test_window("D23-C1 Smoke Target", 460, 100, 480, 300);
+        (owner, target)
+    }
+
+    /// Creates a visible test window used only as the picker owner or the
+    /// pickable non-sensitive target.  The HWND is backend-derived; the
+    /// frontend never supplies an owner handle.
+    fn create_smoke_test_window(
+        title: &str,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    ) -> windows::Win32::Foundation::HWND {
         use windows::core::w;
         use windows::Win32::{
             Foundation::HWND,
             UI::WindowsAndMessaging::{
-                CreateWindowExW, DefWindowProcW, RegisterClassW, CS_HREDRAW, CS_VREDRAW,
-                WINDOW_EX_STYLE, WINDOW_STYLE, WM_DESTROY, WNDCLASSW, WS_OVERLAPPEDWINDOW,
-                WS_VISIBLE,
+                CreateWindowExW, DefWindowProcW, PostQuitMessage, RegisterClassW, CS_HREDRAW,
+                CS_VREDRAW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_DESTROY, WNDCLASSW,
+                WS_OVERLAPPEDWINDOW, WS_VISIBLE,
             },
         };
 
@@ -834,7 +936,16 @@ mod tests {
             wparam: windows::Win32::Foundation::WPARAM,
             lparam: windows::Win32::Foundation::LPARAM,
         ) -> windows::Win32::Foundation::LRESULT {
+            if msg == WM_CLOSE {
+                unsafe {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd);
+                }
+                return windows::Win32::Foundation::LRESULT(0);
+            }
             if msg == WM_DESTROY {
+                unsafe {
+                    PostQuitMessage(0);
+                }
                 return windows::Win32::Foundation::LRESULT(0);
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -862,10 +973,10 @@ mod tests {
                 w!("D23C1SmokeWindowClass"),
                 title,
                 WINDOW_STYLE(WS_OVERLAPPEDWINDOW.0 | WS_VISIBLE.0),
-                100,
-                100,
-                320,
-                200,
+                x,
+                y,
+                width,
+                height,
                 None,
                 None,
                 None,

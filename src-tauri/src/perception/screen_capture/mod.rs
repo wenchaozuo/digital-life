@@ -373,15 +373,23 @@ pub(crate) struct ScreenCapturePickDto {
 /// an existing valid target.  If durable/session authorization disappears
 /// while the picker is open, the returned item is NOT installed.
 #[tauri::command]
-pub fn pick_screen_capture_target(
+pub async fn pick_screen_capture_target(
     app: tauri::AppHandle,
-    storage: tauri::State<'_, StorageService>,
-    gate: tauri::State<'_, super::screen_policy::ScreenPerceptionSessionGate>,
-    broker: tauri::State<'_, target::ScreenCaptureTargetBroker>,
     request: ScreenCapturePickRequest,
 ) -> Result<ScreenCapturePickDto, ScreenPerceptionCommandError> {
-    pick_screen_capture_target_service(app, storage.inner(), gate.inner(), broker.inner(), &request)
-        .map_err(map_command_error)
+    dispatch_screen_capture_blocking(move || {
+        let storage = app.state::<StorageService>();
+        let gate = app.state::<super::screen_policy::ScreenPerceptionSessionGate>();
+        let broker = app.state::<target::ScreenCaptureTargetBroker>();
+        pick_screen_capture_target_service(
+            app.clone(),
+            storage.inner(),
+            gate.inner(),
+            broker.inner(),
+            &request,
+        )
+    })
+    .await
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -539,13 +547,36 @@ pub fn clear_screen_capture_target(
 /// frame through the canonical provider, validates the frame, drops it, and
 /// returns only geometry metadata.
 #[tauri::command]
-pub fn capture_screen_smoke(
-    storage: tauri::State<'_, StorageService>,
-    gate: tauri::State<'_, super::screen_policy::ScreenPerceptionSessionGate>,
-    broker: tauri::State<'_, target::ScreenCaptureTargetBroker>,
+pub async fn capture_screen_smoke(
+    app: tauri::AppHandle,
     life_id: String,
 ) -> Result<ScreenCaptureSmokeDto, ScreenPerceptionCommandError> {
-    capture_screen_smoke_service(storage.inner(), gate.inner(), broker.inner(), &life_id)
+    dispatch_screen_capture_blocking(move || {
+        let storage = app.state::<StorageService>();
+        let gate = app.state::<super::screen_policy::ScreenPerceptionSessionGate>();
+        let broker = app.state::<target::ScreenCaptureTargetBroker>();
+        capture_screen_smoke_service(storage.inner(), gate.inner(), broker.inner(), &life_id)
+    })
+    .await
+}
+
+/// Runs one blocking screen-capture operation on Tauri's blocking executor.
+///
+/// Both the native picker and one-shot WGC capture may wait on OS work.  The
+/// Tauri command boundary must therefore await this helper rather than run the
+/// operation inline on the application/event-loop thread.  The closure is
+/// intentionally owned and synchronous: callers reacquire canonical managed
+/// state inside it, and no borrowed `State<'_>` can cross the await boundary.
+async fn dispatch_screen_capture_blocking<R, F>(
+    operation: F,
+) -> Result<R, ScreenPerceptionCommandError>
+where
+    R: Send + 'static,
+    F: FnOnce() -> Result<R, ScreenCaptureError> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(operation)
+        .await
+        .map_err(|_| map_command_error(ScreenCaptureError::capture_failed()))?
         .map_err(map_command_error)
 }
 
@@ -651,6 +682,35 @@ fn map_command_error(error: ScreenCaptureError) -> ScreenPerceptionCommandError 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blocking_capture_dispatch_runs_long_operation_off_caller_thread() {
+        let caller_thread = std::thread::current().id();
+        let result = tauri::async_runtime::block_on(async move {
+            let (started_sender, started_receiver) = std::sync::mpsc::channel();
+            let (release_sender, release_receiver) = std::sync::mpsc::channel();
+            let task = tauri::async_runtime::spawn(dispatch_screen_capture_blocking(move || {
+                started_sender
+                    .send(std::thread::current().id())
+                    .map_err(|_| ScreenCaptureError::capture_failed())?;
+                release_receiver
+                    .recv()
+                    .map_err(|_| ScreenCaptureError::capture_failed())?;
+                Ok::<(), ScreenCaptureError>(())
+            }));
+
+            let worker_thread = started_receiver
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("blocking operation did not start");
+            assert_ne!(worker_thread, caller_thread);
+            release_sender
+                .send(())
+                .expect("blocking operation did not accept release");
+            task.await.expect("dispatch task panicked")
+        });
+
+        assert!(result.is_ok());
+    }
 
     #[test]
     fn frame_validation_accepts_valid_bounded_geometry() {

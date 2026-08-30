@@ -11,6 +11,7 @@
 
 pub(crate) mod foreground_focus;
 pub(crate) mod screen_capture;
+pub(crate) mod screen_ocr;
 pub(crate) mod screen_policy;
 pub(crate) mod screen_settings;
 

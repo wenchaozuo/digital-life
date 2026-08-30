@@ -690,6 +690,125 @@ mod tests {
         ));
     }
 
+    /// Real Windows production-path local OCR smoke.
+    ///
+    /// This is the D23-D1 acceptance path.  It requires a human to select the
+    /// dedicated high-contrast target titled `D23 OCR SMOKE 12345`; the
+    /// selected item then travels through the canonical C1 broker, capture
+    /// permit, local Windows OCR provider, and ephemeral observation boundary.
+    /// No frame or OCR intermediate is returned or persisted by this test.
+    #[test]
+    #[ignore = "interactive: opens the Windows system capture picker and local OCR"]
+    fn real_windows_local_ocr_production_observation_smoke() {
+        use super::super::selection;
+        use super::super::target::ScreenCaptureTargetBroker;
+        use crate::perception::screen_ocr::{
+            capture_screen_observation, ScreenObservationErrorCode, ScreenObservationStatus,
+        };
+        use crate::perception::screen_policy::{
+            authorize_screen_perception, ScreenPerceptionRepository, ScreenPerceptionSessionGate,
+        };
+        use crate::storage::{LifeIdentityRecord, PersonaTemplateRecord, StorageService};
+
+        let smoke_windows = SmokeWindowFixture::with_target_title("D23 OCR SMOKE 12345");
+
+        let root = tempfile::tempdir().unwrap();
+        let storage =
+            StorageService::initialize_with_roots(root.path().to_path_buf(), None).unwrap();
+        storage
+            .save_persona(PersonaTemplateRecord {
+                id: "d1-smoke-persona".into(),
+                name: "D1 Smoke Persona".into(),
+                version: 1,
+                persona_json: "{}".into(),
+            })
+            .unwrap();
+        storage
+            .save_life(LifeIdentityRecord {
+                id: "d1-smoke-life".into(),
+                name: "D1 Smoke Life".into(),
+                created_at: "2026-08-29T00:00:00.000Z".into(),
+                version: 1,
+                body_id: "d1-smoke-body".into(),
+                persona_id: "d1-smoke-persona".into(),
+                persona_version: 1,
+            })
+            .unwrap();
+        storage
+            .create_screen_perception_policy(
+                crate::perception::screen_policy::LifeScreenPerceptionPolicyCreateRequest {
+                    life_id: "d1-smoke-life".into(),
+                    screen_perception_enabled: true,
+                },
+            )
+            .unwrap();
+
+        let session_gate = ScreenPerceptionSessionGate::new();
+        session_gate.arm_for_life("d1-smoke-life");
+        let broker = ScreenCaptureTargetBroker::new();
+        authorize_screen_perception(&storage, &session_gate, "d1-smoke-life")
+            .expect("durable policy + armed gate must authorize");
+
+        eprintln!(
+            ">>> D23-D1 smoke: select only the non-sensitive `D23 OCR SMOKE 12345` window in the Windows capture picker."
+        );
+        let outcome =
+            selection::pick_capture_item(smoke_windows.owner).expect("the real picker must run");
+        let selection::PickOutcome::Selected(item) = outcome else {
+            panic!("D23-D1 smoke requires a selected target; picker returned Cancelled");
+        };
+
+        let fence = session_gate
+            .life_fence_for("d1-smoke-life")
+            .expect("armed smoke life must have a fence");
+        broker.select(fence, item);
+
+        let operation_gate = super::super::operation::ScreenCaptureOperationGate::new();
+        let observation = match capture_screen_observation(
+            &operation_gate,
+            &storage,
+            &session_gate,
+            &broker,
+            "d1-smoke-life",
+        ) {
+            Ok(observation) => observation,
+            Err(error) if error.code == ScreenObservationErrorCode::OcrUnavailable => {
+                eprintln!("ENVIRONMENTAL LOCAL_OCR_LANGUAGE_UNAVAILABLE");
+                return;
+            }
+            Err(error) => panic!("D23-D1 local OCR smoke failed: {error}"),
+        };
+
+        assert_eq!(observation.status, ScreenObservationStatus::Recognized);
+        let compact_text: String = observation
+            .text
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .flat_map(|character| character.to_lowercase())
+            .collect();
+        assert!(
+            compact_text.contains("d23")
+                && compact_text.contains("ocr")
+                && compact_text.contains("smoke")
+                && compact_text.contains("12345"),
+            "OCR result did not contain the D23-D1 sentinel"
+        );
+        assert!(
+            observation.text.len() <= crate::perception::screen_ocr::MAX_OBSERVATION_TEXT_BYTES
+        );
+
+        session_gate.disarm();
+        let denied = capture_screen_observation(
+            &operation_gate,
+            &storage,
+            &session_gate,
+            &broker,
+            "d1-smoke-life",
+        )
+        .unwrap_err();
+        assert_eq!(denied.code, ScreenObservationErrorCode::SessionDenied);
+    }
+
     /// Automated real-Windows capture smoke through the production service
     /// path.
     ///
@@ -810,6 +929,10 @@ mod tests {
 
     impl SmokeWindowFixture {
         fn new() -> Self {
+            Self::with_target_title("D23-C1 Smoke Target")
+        }
+
+        fn with_target_title(target_title: &'static str) -> Self {
             use std::sync::mpsc;
             use windows::Win32::UI::WindowsAndMessaging::{
                 DispatchMessageW, GetMessageW, ShowWindow, TranslateMessage, MSG, SW_SHOW,
@@ -830,7 +953,7 @@ mod tests {
                         let _ = PeekMessageW(&mut queue_probe, None, WM_USER, WM_USER, PM_NOREMOVE);
                     }
 
-                    let (owner, target) = create_smoke_test_windows();
+                    let (owner, target) = create_smoke_test_windows(target_title);
                     let _ = ready_sender.send((owner.0 as usize, target.0 as usize));
                     if owner.0.is_null() || target.0.is_null() {
                         return;
@@ -901,12 +1024,14 @@ mod tests {
     }
 
     /// Creates the responsive picker owner and the separate visible target.
-    fn create_smoke_test_windows() -> (
+    fn create_smoke_test_windows(
+        target_title: &str,
+    ) -> (
         windows::Win32::Foundation::HWND,
         windows::Win32::Foundation::HWND,
     ) {
         let owner = create_smoke_test_window("D23-C1 Picker Owner", 100, 100, 320, 200);
-        let target = create_smoke_test_window("D23-C1 Smoke Target", 460, 100, 480, 300);
+        let target = create_smoke_test_window(target_title, 460, 100, 480, 300);
         (owner, target)
     }
 
@@ -922,11 +1047,15 @@ mod tests {
     ) -> windows::Win32::Foundation::HWND {
         use windows::core::w;
         use windows::Win32::{
-            Foundation::HWND,
+            Foundation::{HWND, LPARAM, WPARAM},
+            Graphics::Gdi::{
+                CreateFontW, GetStockObject, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH,
+                DEFAULT_QUALITY, FF_SWISS, OUT_DEFAULT_PRECIS, WHITE_BRUSH,
+            },
             UI::WindowsAndMessaging::{
-                CreateWindowExW, DefWindowProcW, PostQuitMessage, RegisterClassW, CS_HREDRAW,
-                CS_VREDRAW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_DESTROY, WNDCLASSW,
-                WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+                CreateWindowExW, DefWindowProcW, PostQuitMessage, RegisterClassW, SendMessageW,
+                CS_HREDRAW, CS_VREDRAW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_DESTROY,
+                WM_SETFONT, WNDCLASSW, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
             },
         };
 
@@ -956,6 +1085,7 @@ mod tests {
                 style: CS_HREDRAW | CS_VREDRAW,
                 lpfnWndProc: Some(smoke_wnd_proc),
                 hInstance: windows::Win32::Foundation::HINSTANCE(std::ptr::null_mut()),
+                hbrBackground: windows::Win32::Graphics::Gdi::HBRUSH(GetStockObject(WHITE_BRUSH).0),
                 lpszClassName: w!("D23C1SmokeWindowClass"),
                 ..Default::default()
             };
@@ -968,7 +1098,7 @@ mod tests {
                 .collect::<Vec<u16>>();
             let title_ptr = Box::leak(title_utf16.into_boxed_slice()).as_ptr();
             let title = windows::core::PCWSTR(title_ptr);
-            CreateWindowExW(
+            let window = CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 w!("D23C1SmokeWindowClass"),
                 title,
@@ -982,7 +1112,54 @@ mod tests {
                 None,
                 None,
             )
-            .unwrap_or(HWND(std::ptr::null_mut()))
+            .unwrap_or(HWND(std::ptr::null_mut()));
+
+            if !window.0.is_null() {
+                // Put the sentinel in the captured client area as large,
+                // high-contrast native text.  The OCR smoke therefore does
+                // not depend on whether a particular Windows build includes
+                // non-client title-bar pixels in a window capture.
+                if let Ok(label) = CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    w!("STATIC"),
+                    title,
+                    WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | 1),
+                    18,
+                    48,
+                    width.saturating_sub(36),
+                    90,
+                    Some(window),
+                    None,
+                    None,
+                    None,
+                ) {
+                    let font = CreateFontW(
+                        -36,
+                        0,
+                        0,
+                        0,
+                        700,
+                        0,
+                        0,
+                        0,
+                        DEFAULT_CHARSET,
+                        OUT_DEFAULT_PRECIS,
+                        CLIP_DEFAULT_PRECIS,
+                        DEFAULT_QUALITY,
+                        DEFAULT_PITCH.0 as u32 | FF_SWISS.0 as u32,
+                        w!("Segoe UI"),
+                    );
+                    if !font.0.is_null() {
+                        let _ = SendMessageW(
+                            label,
+                            WM_SETFONT,
+                            Some(WPARAM(font.0 as usize)),
+                            Some(LPARAM(1)),
+                        );
+                    }
+                }
+            }
+            window
         }
     }
 }

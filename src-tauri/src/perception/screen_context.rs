@@ -4,7 +4,8 @@
 //! handoff state.  A later D24 batch installs a successfully produced D23
 //! [`ScreenObservation`] as a bounded `Candidate`; the broker can then issue a
 //! single `Grant` that a governed conversation request may bind once
-//! (`conversation_id` + `request_id`) and claim while it stays valid.
+//! (`grant_id` + `life_id` + `session_fence` + `conversation_id` +
+//! `request_id`) and claim while it stays valid.
 //!
 //! Frozen contract:
 //!
@@ -173,9 +174,10 @@ pub(crate) struct ScreenContextPayload {
     pub(crate) truncated: bool,
 }
 
-/// Validated, non-empty identifier arguments for broker operations.
+/// Validated, non-empty identity and scope arguments for broker operations.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ScreenContextIds {
+    pub(crate) grant_id: String,
     pub(crate) life_id: String,
     pub(crate) session_fence: ScreenContextSessionFence,
     pub(crate) conversation_id: String,
@@ -319,20 +321,23 @@ impl ScreenContextHandoffBroker {
             .state
             .lock()
             .map_err(|_| ScreenContextError::synchronization_unavailable())?;
-        match &mut *state {
+        if let ScreenContextState::Candidate { deadline, .. } = &*state {
+            if now >= *deadline {
+                *state = ScreenContextState::Empty;
+                return Err(ScreenContextError::expired());
+            }
+        }
+
+        match &*state {
             ScreenContextState::Candidate {
                 candidate_id: stored_candidate_id,
                 life_id: candidate_life_id,
                 session_fence: candidate_fence,
                 payload,
-                deadline,
                 ..
             } => {
                 if candidate_id != *stored_candidate_id {
                     return Err(ScreenContextError::no_current_context());
-                }
-                if now >= *deadline {
-                    return Err(ScreenContextError::expired());
                 }
                 if life_id != *candidate_life_id {
                     return Err(ScreenContextError::life_mismatch());
@@ -343,36 +348,49 @@ impl ScreenContextHandoffBroker {
                 if payload.status != ScreenContextTextStatus::Recognized {
                     return Err(ScreenContextError::no_usable_screen_context());
                 }
-                *state = ScreenContextState::GrantPending {
-                    grant_id: grant_id.clone(),
-                    life_id: life_id.to_string(),
-                    session_fence: *candidate_fence,
-                    payload: payload.clone(),
-                    deadline: *deadline,
-                };
-                Ok(grant_id)
             }
-            _ => Err(ScreenContextError::no_current_context()),
+            _ => return Err(ScreenContextError::no_current_context()),
         }
+
+        let ScreenContextState::Candidate {
+            life_id: candidate_life_id,
+            session_fence: candidate_fence,
+            payload,
+            deadline,
+            ..
+        } = std::mem::replace(&mut *state, ScreenContextState::Empty)
+        else {
+            unreachable!("candidate state was validated while holding the mutex");
+        };
+        *state = ScreenContextState::GrantPending {
+            grant_id: grant_id.clone(),
+            life_id: candidate_life_id,
+            session_fence: candidate_fence,
+            payload,
+            deadline,
+        };
+        Ok(grant_id)
     }
 
     /// Atomically binds a Pending Grant to exactly one request scope and
     /// returns the immutable, bounded perception context.  The first valid
-    /// claim transitions `GRANT_PENDING → GRANT_BOUND`; the exact same tuple
-    /// may claim the identical payload again while the grant remains valid
-    /// (same-request retry), and any different Life / session fence /
-    /// conversation / request fails closed.  Claiming never consumes or
-    /// mutates the payload.
+    /// claim transitions `GRANT_PENDING → GRANT_BOUND`; the exact same grant /
+    /// Life / session fence / conversation / request tuple may claim the
+    /// identical payload again while the grant remains valid (same-request
+    /// retry), and any different identity or scope fails closed.  Claiming
+    /// never consumes or mutates the payload.
     pub(crate) fn claim_grant(
         &self,
         ids: ScreenContextIds,
     ) -> Result<ScreenContextPayload, ScreenContextError> {
         let ScreenContextIds {
+            grant_id,
             life_id,
             session_fence,
             conversation_id,
             request_id,
         } = ids;
+        validate_scope_id("grant identity", &grant_id)?;
         validate_life_id(&life_id)?;
         validate_scope_id("conversation identity", &conversation_id)?;
         validate_scope_id("request identity", &request_id)?;
@@ -383,14 +401,18 @@ impl ScreenContextHandoffBroker {
             .map_err(|_| ScreenContextError::synchronization_unavailable())?;
         match &mut *state {
             ScreenContextState::GrantPending {
-                grant_id,
+                grant_id: stored_grant_id,
                 life_id: grant_life_id,
                 session_fence: grant_fence,
                 payload,
                 deadline,
             } => {
                 if now >= *deadline {
+                    *state = ScreenContextState::Empty;
                     return Err(ScreenContextError::expired());
+                }
+                if grant_id != stored_grant_id.as_str() {
+                    return Err(ScreenContextError::no_current_context());
                 }
                 if life_id != *grant_life_id {
                     return Err(ScreenContextError::life_mismatch());
@@ -400,7 +422,7 @@ impl ScreenContextHandoffBroker {
                 }
                 let bound_payload = payload.clone();
                 *state = ScreenContextState::GrantBound {
-                    grant_id: grant_id.clone(),
+                    grant_id: stored_grant_id.clone(),
                     life_id: life_id.clone(),
                     session_fence: *grant_fence,
                     payload: bound_payload.clone(),
@@ -411,7 +433,7 @@ impl ScreenContextHandoffBroker {
                 Ok(bound_payload)
             }
             ScreenContextState::GrantBound {
-                grant_id: _,
+                grant_id: stored_grant_id,
                 life_id: grant_life_id,
                 session_fence: grant_fence,
                 payload,
@@ -420,7 +442,11 @@ impl ScreenContextHandoffBroker {
                 request_id: bound_request_id,
             } => {
                 if now >= *deadline {
+                    *state = ScreenContextState::Empty;
                     return Err(ScreenContextError::expired());
+                }
+                if grant_id != stored_grant_id.as_str() {
+                    return Err(ScreenContextError::no_current_context());
                 }
                 if life_id != *grant_life_id {
                     return Err(ScreenContextError::life_mismatch());
@@ -440,21 +466,23 @@ impl ScreenContextHandoffBroker {
     /// Clears whatever current state exists — Candidate, Pending Grant, or
     /// Bound Grant — back to `EMPTY`.  Cancellation only shrinks authority:
     /// no previous ID may become valid again.  As an authority-shrinking
-    /// operation, a poisoned lock may recover only toward `EMPTY`.
+    /// operation, a poisoned lock may recover only toward `EMPTY` and the
+    /// mutex remains poisoned so later authority-broadening calls fail closed.
     pub(crate) fn cancel(&self) -> Result<(), ScreenContextError> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| ScreenContextError::synchronization_unavailable())?;
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         *state = ScreenContextState::Empty;
         Ok(())
     }
 
     /// Retires a Bound Grant after a successful governed conversation commit.
     /// The expected bound identity/scope must match exactly; a mismatched
-    /// retirement scope must not destroy another authority.  Expiry is also
-    /// checked: an expired grant is already dead and cannot be retired.  On
-    /// valid retirement the state becomes `EMPTY`.
+    /// retirement scope must not destroy another authority.  Retirement is
+    /// authority-shrinking and therefore may clear a correctly scoped bound
+    /// grant even after its handoff deadline elapsed.  On valid retirement
+    /// the state becomes `EMPTY`.
     pub(crate) fn retire_bound_grant(
         &self,
         grant_id: &str,
@@ -465,7 +493,6 @@ impl ScreenContextHandoffBroker {
         validate_life_id(life_id)?;
         validate_scope_id("conversation identity", conversation_id)?;
         validate_scope_id("request identity", request_id)?;
-        let now = self.clock.now();
         let mut state = self
             .state
             .lock()
@@ -474,15 +501,10 @@ impl ScreenContextHandoffBroker {
             ScreenContextState::GrantBound {
                 grant_id: bound_grant_id,
                 life_id: bound_life_id,
-                session_fence: _,
-                payload: _,
-                deadline,
                 conversation_id: bound_conversation_id,
                 request_id: bound_request_id,
+                ..
             } => {
-                if now >= *deadline {
-                    return Err(ScreenContextError::expired());
-                }
                 if grant_id != *bound_grant_id
                     || life_id != *bound_life_id
                     || conversation_id != *bound_conversation_id
@@ -680,12 +702,14 @@ mod tests {
 
     fn claim(
         broker: &ScreenContextHandoffBroker,
+        grant_id: &str,
         life_id: &str,
         fence: ScreenContextSessionFence,
         conversation_id: &str,
         request_id: &str,
     ) -> Result<ScreenContextPayload, ScreenContextError> {
         broker.claim_grant(ScreenContextIds {
+            grant_id: grant_id.to_string(),
             life_id: life_id.to_string(),
             session_fence: fence,
             conversation_id: conversation_id.to_string(),
@@ -695,12 +719,21 @@ mod tests {
 
     fn claim_ok(
         broker: &ScreenContextHandoffBroker,
+        grant_id: &str,
         life_id: &str,
         fence: ScreenContextSessionFence,
         conversation_id: &str,
         request_id: &str,
     ) -> ScreenContextPayload {
-        claim(broker, life_id, fence, conversation_id, request_id).expect("claim should succeed")
+        claim(
+            broker,
+            grant_id,
+            life_id,
+            fence,
+            conversation_id,
+            request_id,
+        )
+        .expect("claim should succeed")
     }
 
     fn assert_empty(broker: &ScreenContextHandoffBroker) {
@@ -774,13 +807,20 @@ mod tests {
     fn new_candidate_replaces_pending_grant() {
         let (broker, _clock) = broker_with_manual_clock();
         let candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("first"));
-        let _grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
+        let grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
         let new_candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("second"));
         assert_ne!(new_candidate_id, candidate_id);
 
         // The replaced pending grant must be gone.
         assert_error(
-            claim(&broker, LIFE_A, FENCE_1, CONVERSATION_1, REQUEST_1),
+            claim(
+                &broker,
+                &grant_id,
+                LIFE_A,
+                FENCE_1,
+                CONVERSATION_1,
+                REQUEST_1,
+            ),
             ScreenContextErrorCode::NoCurrentContext,
         );
         // The replacement candidate is independently usable.
@@ -791,13 +831,27 @@ mod tests {
     fn new_candidate_replaces_bound_grant() {
         let (broker, _clock) = broker_with_manual_clock();
         let candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("first"));
-        let _grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
-        let _first_payload = claim_ok(&broker, LIFE_A, FENCE_1, CONVERSATION_1, REQUEST_1);
+        let grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
+        let _first_payload = claim_ok(
+            &broker,
+            &grant_id,
+            LIFE_A,
+            FENCE_1,
+            CONVERSATION_1,
+            REQUEST_1,
+        );
         let new_candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("second"));
 
         // The replaced bound grant must be gone, including same-tuple retry.
         assert_error(
-            claim(&broker, LIFE_A, FENCE_1, CONVERSATION_1, REQUEST_1),
+            claim(
+                &broker,
+                &grant_id,
+                LIFE_A,
+                FENCE_1,
+                CONVERSATION_1,
+                REQUEST_1,
+            ),
             ScreenContextErrorCode::NoCurrentContext,
         );
         let _ = issue(&broker, &new_candidate_id, LIFE_A, FENCE_1);
@@ -865,14 +919,28 @@ mod tests {
         let (broker, _clock) = broker_with_manual_clock();
         let candidate_id = install(&broker, LIFE_A, FENCE_1, no_text());
         assert_error(
-            claim(&broker, LIFE_A, FENCE_1, CONVERSATION_1, REQUEST_1),
+            claim(
+                &broker,
+                "not-a-grant",
+                LIFE_A,
+                FENCE_1,
+                CONVERSATION_1,
+                REQUEST_1,
+            ),
             ScreenContextErrorCode::NoCurrentContext,
         );
         assert!(broker.issue_grant(&candidate_id, LIFE_A, FENCE_1).is_err());
         // No empty grant was fabricated: the state remains a candidate that
         // still cannot bind anything.
         assert_error(
-            claim(&broker, LIFE_A, FENCE_1, CONVERSATION_1, REQUEST_1),
+            claim(
+                &broker,
+                "not-a-grant",
+                LIFE_A,
+                FENCE_1,
+                CONVERSATION_1,
+                REQUEST_1,
+            ),
             ScreenContextErrorCode::NoCurrentContext,
         );
     }
@@ -890,7 +958,14 @@ mod tests {
         // reset the lifetime clock.
         clock.advance(Duration::from_secs(60));
         assert_error(
-            claim(&broker, LIFE_A, FENCE_1, CONVERSATION_1, REQUEST_1),
+            claim(
+                &broker,
+                &grant_id,
+                LIFE_A,
+                FENCE_1,
+                CONVERSATION_1,
+                REQUEST_1,
+            ),
             ScreenContextErrorCode::Expired,
         );
     }
@@ -901,11 +976,18 @@ mod tests {
         let candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("hello"));
         // Use the grant at T0 + 8 min.
         clock.advance(Duration::from_secs(8 * 60));
-        let _grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
+        let grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
         // The grant expires at approximately T0 + 10 min, not T0 + 18 min.
         clock.advance(Duration::from_secs(2 * 60));
         assert_error(
-            claim(&broker, LIFE_A, FENCE_1, CONVERSATION_1, REQUEST_1),
+            claim(
+                &broker,
+                &grant_id,
+                LIFE_A,
+                FENCE_1,
+                CONVERSATION_1,
+                REQUEST_1,
+            ),
             ScreenContextErrorCode::Expired,
         );
     }
@@ -919,37 +1001,101 @@ mod tests {
             .issue_grant(&candidate_id, LIFE_A, FENCE_1)
             .expect_err("an expired candidate must not issue");
         assert_eq!(error.code, ScreenContextErrorCode::Expired);
+        assert_empty(&broker);
+        let error = broker
+            .issue_grant(&candidate_id, LIFE_A, FENCE_1)
+            .expect_err("an expired candidate identity must not be reusable");
+        assert_eq!(error.code, ScreenContextErrorCode::NoCurrentContext);
     }
 
     #[test]
     fn expired_pending_grant_fails() {
         let (broker, clock) = broker_with_manual_clock();
         let candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("hello"));
-        let _grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
+        let grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
         clock.advance(SCREEN_CONTEXT_HANDOFF_TTL);
         assert_error(
-            claim(&broker, LIFE_A, FENCE_1, CONVERSATION_1, REQUEST_1),
+            claim(
+                &broker,
+                &grant_id,
+                LIFE_A,
+                FENCE_1,
+                CONVERSATION_1,
+                REQUEST_1,
+            ),
             ScreenContextErrorCode::Expired,
+        );
+        assert_empty(&broker);
+        assert_error(
+            claim(
+                &broker,
+                &grant_id,
+                LIFE_A,
+                FENCE_1,
+                CONVERSATION_1,
+                REQUEST_1,
+            ),
+            ScreenContextErrorCode::NoCurrentContext,
         );
     }
 
     #[test]
-    fn expired_bound_grant_cannot_be_reclaimed() {
+    fn expired_bound_grant_claim_clears_state_and_identity() {
         let (broker, clock) = broker_with_manual_clock();
         let candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("hello"));
         let grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
-        let _first = claim_ok(&broker, LIFE_A, FENCE_1, CONVERSATION_1, REQUEST_1);
+        let _first = claim_ok(
+            &broker,
+            &grant_id,
+            LIFE_A,
+            FENCE_1,
+            CONVERSATION_1,
+            REQUEST_1,
+        );
         clock.advance(SCREEN_CONTEXT_HANDOFF_TTL);
         assert_error(
-            claim(&broker, LIFE_A, FENCE_1, CONVERSATION_1, REQUEST_1),
+            claim(
+                &broker,
+                &grant_id,
+                LIFE_A,
+                FENCE_1,
+                CONVERSATION_1,
+                REQUEST_1,
+            ),
             ScreenContextErrorCode::Expired,
         );
-        assert!(
-            broker
-                .retire_bound_grant(&grant_id, LIFE_A, CONVERSATION_1, REQUEST_1)
-                .is_err(),
-            "an expired bound grant must not be retired"
+        assert_empty(&broker);
+        assert_error(
+            claim(
+                &broker,
+                &grant_id,
+                LIFE_A,
+                FENCE_1,
+                CONVERSATION_1,
+                REQUEST_1,
+            ),
+            ScreenContextErrorCode::NoCurrentContext,
         );
+    }
+
+    #[test]
+    fn bound_grant_retirement_cleans_up_after_deadline() {
+        let (broker, clock) = broker_with_manual_clock();
+        let candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("hello"));
+        let grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
+        let _first = claim_ok(
+            &broker,
+            &grant_id,
+            LIFE_A,
+            FENCE_1,
+            CONVERSATION_1,
+            REQUEST_1,
+        );
+        clock.advance(SCREEN_CONTEXT_HANDOFF_TTL);
+        broker
+            .retire_bound_grant(&grant_id, LIFE_A, CONVERSATION_1, REQUEST_1)
+            .expect("exact-scope retirement must clear an elapsed bound grant");
+        assert_empty(&broker);
     }
 
     #[test]
@@ -980,11 +1126,115 @@ mod tests {
     }
 
     #[test]
+    fn wrong_grant_id_cannot_claim_pending_or_substitute_candidate_id() {
+        let (broker, _clock) = broker_with_manual_clock();
+        let candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("hello"));
+        let grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
+
+        for wrong_grant_id in ["wrong-grant", candidate_id.as_str()] {
+            assert_error(
+                claim(
+                    &broker,
+                    wrong_grant_id,
+                    LIFE_A,
+                    FENCE_1,
+                    CONVERSATION_1,
+                    REQUEST_1,
+                ),
+                ScreenContextErrorCode::NoCurrentContext,
+            );
+        }
+
+        let payload = claim_ok(
+            &broker,
+            &grant_id,
+            LIFE_A,
+            FENCE_1,
+            CONVERSATION_1,
+            REQUEST_1,
+        );
+        assert_eq!(payload.text, "hello");
+    }
+
+    #[test]
+    fn wrong_grant_id_cannot_retrieve_bound_grant() {
+        let (broker, _clock) = broker_with_manual_clock();
+        let candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("hello"));
+        let grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
+        let first = claim_ok(
+            &broker,
+            &grant_id,
+            LIFE_A,
+            FENCE_1,
+            CONVERSATION_1,
+            REQUEST_1,
+        );
+
+        assert_error(
+            claim(
+                &broker,
+                "wrong-grant",
+                LIFE_A,
+                FENCE_1,
+                CONVERSATION_1,
+                REQUEST_1,
+            ),
+            ScreenContextErrorCode::NoCurrentContext,
+        );
+        let retry = claim_ok(
+            &broker,
+            &grant_id,
+            LIFE_A,
+            FENCE_1,
+            CONVERSATION_1,
+            REQUEST_1,
+        );
+        assert_eq!(retry, first);
+    }
+
+    #[test]
+    fn replaced_grant_id_cannot_claim_new_pending_grant() {
+        let (broker, _clock) = broker_with_manual_clock();
+        let old_candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("old"));
+        let old_grant_id = issue(&broker, &old_candidate_id, LIFE_A, FENCE_1);
+        let new_candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("new"));
+        let new_grant_id = issue(&broker, &new_candidate_id, LIFE_A, FENCE_1);
+
+        assert_error(
+            claim(
+                &broker,
+                &old_grant_id,
+                LIFE_A,
+                FENCE_1,
+                CONVERSATION_1,
+                REQUEST_1,
+            ),
+            ScreenContextErrorCode::NoCurrentContext,
+        );
+        let payload = claim_ok(
+            &broker,
+            &new_grant_id,
+            LIFE_A,
+            FENCE_1,
+            CONVERSATION_1,
+            REQUEST_1,
+        );
+        assert_eq!(payload.text, "new");
+    }
+
+    #[test]
     fn first_claim_binds_once() {
         let (broker, _clock) = broker_with_manual_clock();
         let candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("hello"));
         let grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
-        let payload = claim_ok(&broker, LIFE_A, FENCE_1, CONVERSATION_1, REQUEST_1);
+        let payload = claim_ok(
+            &broker,
+            &grant_id,
+            LIFE_A,
+            FENCE_1,
+            CONVERSATION_1,
+            REQUEST_1,
+        );
         assert_eq!(payload.text, "hello");
         let state = broker.state.lock().unwrap();
         match &*state {
@@ -1010,9 +1260,23 @@ mod tests {
     fn same_exact_tuple_is_idempotent_with_identical_payload() {
         let (broker, _clock) = broker_with_manual_clock();
         let candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("same text"));
-        let _grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
-        let first = claim_ok(&broker, LIFE_A, FENCE_1, CONVERSATION_1, REQUEST_1);
-        let second = claim_ok(&broker, LIFE_A, FENCE_1, CONVERSATION_1, REQUEST_1);
+        let grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
+        let first = claim_ok(
+            &broker,
+            &grant_id,
+            LIFE_A,
+            FENCE_1,
+            CONVERSATION_1,
+            REQUEST_1,
+        );
+        let second = claim_ok(
+            &broker,
+            &grant_id,
+            LIFE_A,
+            FENCE_1,
+            CONVERSATION_1,
+            REQUEST_1,
+        );
         assert_eq!(
             first, second,
             "same-request retry must return an identical payload"
@@ -1023,10 +1287,24 @@ mod tests {
     fn different_request_is_rejected() {
         let (broker, _clock) = broker_with_manual_clock();
         let candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("hello"));
-        let _grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
-        let _first = claim_ok(&broker, LIFE_A, FENCE_1, CONVERSATION_1, REQUEST_1);
+        let grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
+        let _first = claim_ok(
+            &broker,
+            &grant_id,
+            LIFE_A,
+            FENCE_1,
+            CONVERSATION_1,
+            REQUEST_1,
+        );
         assert_error(
-            claim(&broker, LIFE_A, FENCE_1, CONVERSATION_1, REQUEST_2),
+            claim(
+                &broker,
+                &grant_id,
+                LIFE_A,
+                FENCE_1,
+                CONVERSATION_1,
+                REQUEST_2,
+            ),
             ScreenContextErrorCode::GrantAlreadyBound,
         );
     }
@@ -1035,10 +1313,24 @@ mod tests {
     fn different_conversation_is_rejected() {
         let (broker, _clock) = broker_with_manual_clock();
         let candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("hello"));
-        let _grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
-        let _first = claim_ok(&broker, LIFE_A, FENCE_1, CONVERSATION_1, REQUEST_1);
+        let grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
+        let _first = claim_ok(
+            &broker,
+            &grant_id,
+            LIFE_A,
+            FENCE_1,
+            CONVERSATION_1,
+            REQUEST_1,
+        );
         assert_error(
-            claim(&broker, LIFE_A, FENCE_1, CONVERSATION_2, REQUEST_1),
+            claim(
+                &broker,
+                &grant_id,
+                LIFE_A,
+                FENCE_1,
+                CONVERSATION_2,
+                REQUEST_1,
+            ),
             ScreenContextErrorCode::GrantAlreadyBound,
         );
     }
@@ -1047,10 +1339,24 @@ mod tests {
     fn different_life_is_rejected() {
         let (broker, _clock) = broker_with_manual_clock();
         let candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("hello"));
-        let _grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
-        let _first = claim_ok(&broker, LIFE_A, FENCE_1, CONVERSATION_1, REQUEST_1);
+        let grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
+        let _first = claim_ok(
+            &broker,
+            &grant_id,
+            LIFE_A,
+            FENCE_1,
+            CONVERSATION_1,
+            REQUEST_1,
+        );
         assert_error(
-            claim(&broker, LIFE_B, FENCE_1, CONVERSATION_1, REQUEST_1),
+            claim(
+                &broker,
+                &grant_id,
+                LIFE_B,
+                FENCE_1,
+                CONVERSATION_1,
+                REQUEST_1,
+            ),
             ScreenContextErrorCode::LifeMismatch,
         );
     }
@@ -1059,10 +1365,24 @@ mod tests {
     fn different_session_fence_is_rejected() {
         let (broker, _clock) = broker_with_manual_clock();
         let candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("hello"));
-        let _grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
-        let _first = claim_ok(&broker, LIFE_A, FENCE_1, CONVERSATION_1, REQUEST_1);
+        let grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
+        let _first = claim_ok(
+            &broker,
+            &grant_id,
+            LIFE_A,
+            FENCE_1,
+            CONVERSATION_1,
+            REQUEST_1,
+        );
         assert_error(
-            claim(&broker, LIFE_A, FENCE_2, CONVERSATION_1, REQUEST_1),
+            claim(
+                &broker,
+                &grant_id,
+                LIFE_A,
+                FENCE_2,
+                CONVERSATION_1,
+                REQUEST_1,
+            ),
             ScreenContextErrorCode::SessionFenceMismatch,
         );
     }
@@ -1072,16 +1392,37 @@ mod tests {
         let (broker, _clock) = broker_with_manual_clock();
         let candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("hello"));
         let grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
-        let _first = claim_ok(&broker, LIFE_A, FENCE_1, CONVERSATION_1, REQUEST_1);
+        let _first = claim_ok(
+            &broker,
+            &grant_id,
+            LIFE_A,
+            FENCE_1,
+            CONVERSATION_1,
+            REQUEST_1,
+        );
         // The same Life after disarm/re-arm carries a new session fence; the
         // bound grant must never be rebound to the new fence.
         assert_error(
-            claim(&broker, LIFE_A, FENCE_2, CONVERSATION_1, REQUEST_1),
+            claim(
+                &broker,
+                &grant_id,
+                LIFE_A,
+                FENCE_2,
+                CONVERSATION_1,
+                REQUEST_1,
+            ),
             ScreenContextErrorCode::SessionFenceMismatch,
         );
         // The original binding is untouched by the failed rebinding attempt:
         // the true bound scope still retries and still retires.
-        let _retry = claim_ok(&broker, LIFE_A, FENCE_1, CONVERSATION_1, REQUEST_1);
+        let _retry = claim_ok(
+            &broker,
+            &grant_id,
+            LIFE_A,
+            FENCE_1,
+            CONVERSATION_1,
+            REQUEST_1,
+        );
         broker
             .retire_bound_grant(&grant_id, LIFE_A, CONVERSATION_1, REQUEST_1)
             .expect("the original bound scope must still retire");
@@ -1108,7 +1449,14 @@ mod tests {
         broker.cancel().expect("cancellation must succeed");
         assert_empty(&broker);
         assert_error(
-            claim(&broker, LIFE_A, FENCE_1, CONVERSATION_1, REQUEST_1),
+            claim(
+                &broker,
+                &grant_id,
+                LIFE_A,
+                FENCE_1,
+                CONVERSATION_1,
+                REQUEST_1,
+            ),
             ScreenContextErrorCode::NoCurrentContext,
         );
         assert!(
@@ -1124,11 +1472,25 @@ mod tests {
         let (broker, _clock) = broker_with_manual_clock();
         let candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("hello"));
         let grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
-        let _first = claim_ok(&broker, LIFE_A, FENCE_1, CONVERSATION_1, REQUEST_1);
+        let _first = claim_ok(
+            &broker,
+            &grant_id,
+            LIFE_A,
+            FENCE_1,
+            CONVERSATION_1,
+            REQUEST_1,
+        );
         broker.cancel().expect("cancellation must succeed");
         assert_empty(&broker);
         assert_error(
-            claim(&broker, LIFE_A, FENCE_1, CONVERSATION_1, REQUEST_1),
+            claim(
+                &broker,
+                &grant_id,
+                LIFE_A,
+                FENCE_1,
+                CONVERSATION_1,
+                REQUEST_1,
+            ),
             ScreenContextErrorCode::NoCurrentContext,
         );
         assert!(
@@ -1144,7 +1506,14 @@ mod tests {
         let (broker, _clock) = broker_with_manual_clock();
         let candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("hello"));
         let grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
-        let _first = claim_ok(&broker, LIFE_A, FENCE_1, CONVERSATION_1, REQUEST_1);
+        let _first = claim_ok(
+            &broker,
+            &grant_id,
+            LIFE_A,
+            FENCE_1,
+            CONVERSATION_1,
+            REQUEST_1,
+        );
         broker
             .retire_bound_grant(&grant_id, LIFE_A, CONVERSATION_1, REQUEST_1)
             .expect("a correctly scoped retirement must succeed");
@@ -1156,7 +1525,14 @@ mod tests {
         let (broker, _clock) = broker_with_manual_clock();
         let candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("hello"));
         let grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
-        let _first = claim_ok(&broker, LIFE_A, FENCE_1, CONVERSATION_1, REQUEST_1);
+        let _first = claim_ok(
+            &broker,
+            &grant_id,
+            LIFE_A,
+            FENCE_1,
+            CONVERSATION_1,
+            REQUEST_1,
+        );
 
         let cases: Vec<(&str, &str, &str)> = vec![
             ("wrong-grant", CONVERSATION_1, REQUEST_1),
@@ -1174,7 +1550,14 @@ mod tests {
         }
 
         // The original authority is untouched and the true scope still retires.
-        let _retry = claim_ok(&broker, LIFE_A, FENCE_1, CONVERSATION_1, REQUEST_1);
+        let _retry = claim_ok(
+            &broker,
+            &grant_id,
+            LIFE_A,
+            FENCE_1,
+            CONVERSATION_1,
+            REQUEST_1,
+        );
         broker
             .retire_bound_grant(&grant_id, LIFE_A, CONVERSATION_1, REQUEST_1)
             .expect("the true scope must still retire");
@@ -1186,7 +1569,14 @@ mod tests {
         let (broker, _clock) = broker_with_manual_clock();
         let first_candidate = install(&broker, LIFE_A, FENCE_1, recognized("first"));
         let first_grant = issue(&broker, &first_candidate, LIFE_A, FENCE_1);
-        let _first_bound = claim_ok(&broker, LIFE_A, FENCE_1, CONVERSATION_1, REQUEST_1);
+        let _first_bound = claim_ok(
+            &broker,
+            &first_grant,
+            LIFE_A,
+            FENCE_1,
+            CONVERSATION_1,
+            REQUEST_1,
+        );
         // Replacing the bound grant revokes the old authority: the replaced
         // grant can never be retired, and the state now holds a fresh
         // independent grant (the old bound tuple is no longer special).
@@ -1203,10 +1593,24 @@ mod tests {
         // a new scope and is revoked by one more replacement.  Installing the
         // third candidate alone (without issuing) already revokes the second
         // bound grant.
-        let _second_bound = claim_ok(&broker, LIFE_A, FENCE_1, CONVERSATION_2, REQUEST_2);
+        let _second_bound = claim_ok(
+            &broker,
+            &second_grant,
+            LIFE_A,
+            FENCE_1,
+            CONVERSATION_2,
+            REQUEST_2,
+        );
         let third_candidate = install(&broker, LIFE_A, FENCE_1, recognized("third"));
         assert_error(
-            claim(&broker, LIFE_A, FENCE_1, CONVERSATION_2, REQUEST_2),
+            claim(
+                &broker,
+                &second_grant,
+                LIFE_A,
+                FENCE_1,
+                CONVERSATION_2,
+                REQUEST_2,
+            ),
             ScreenContextErrorCode::NoCurrentContext,
         );
         assert!(
@@ -1223,7 +1627,7 @@ mod tests {
     fn competing_claims_serialize_to_exactly_one_winner() {
         let broker = Arc::new(ScreenContextHandoffBroker::new());
         let candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("hello"));
-        let _grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
+        let grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
 
         let results = Arc::new(Mutex::new(Vec::new()));
         let mut handles = Vec::new();
@@ -1232,8 +1636,10 @@ mod tests {
         {
             let broker = Arc::clone(&broker);
             let results = Arc::clone(&results);
+            let grant_id = grant_id.clone();
             handles.push(std::thread::spawn(move || {
                 let result = broker.claim_grant(ScreenContextIds {
+                    grant_id,
                     life_id: LIFE_A.to_string(),
                     session_fence: FENCE_1,
                     conversation_id: conversation_id.to_string(),
@@ -1266,7 +1672,16 @@ mod tests {
         }
         drop(state);
 
-        let winner_tuple = if claim(&broker, LIFE_A, FENCE_1, CONVERSATION_1, REQUEST_1).is_ok() {
+        let winner_tuple = if claim(
+            &broker,
+            &grant_id,
+            LIFE_A,
+            FENCE_1,
+            CONVERSATION_1,
+            REQUEST_1,
+        )
+        .is_ok()
+        {
             (CONVERSATION_1, REQUEST_1)
         } else {
             (CONVERSATION_2, REQUEST_2)
@@ -1281,6 +1696,7 @@ mod tests {
         assert_error(
             claim(
                 &broker,
+                &grant_id,
                 LIFE_A,
                 FENCE_1,
                 losing_conversation,
@@ -1291,6 +1707,7 @@ mod tests {
         // The winner scope remains claimable (same-request retry).
         let retry = claim_ok(
             &broker,
+            &grant_id,
             LIFE_A,
             FENCE_1,
             winning_conversation,
@@ -1338,12 +1755,65 @@ mod tests {
 
         assert_error(
             poisoned_broker.claim_grant(ScreenContextIds {
+                grant_id: "poisoned-grant".to_string(),
                 life_id: LIFE_A.to_string(),
                 session_fence: FENCE_1,
                 conversation_id: CONVERSATION_1.to_string(),
                 request_id: REQUEST_1.to_string(),
             }),
             ScreenContextErrorCode::SynchronizationUnavailable,
+        );
+    }
+
+    #[test]
+    fn poisoned_cancel_clears_state_only_toward_empty() {
+        let broker = ScreenContextHandoffBroker::new();
+        let candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("hello"));
+        let grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
+
+        let poison_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = broker.state.lock().unwrap();
+            panic!("intentional lock poison for cancellation recovery");
+        }));
+        assert!(poison_result.is_err(), "the poison panic must be caught");
+
+        broker
+            .cancel()
+            .expect("authority-shrinking cancel may recover a poisoned lock");
+        let state = broker
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(*state, ScreenContextState::Empty);
+        drop(state);
+
+        let error = broker
+            .issue_grant(&candidate_id, LIFE_A, FENCE_1)
+            .expect_err("old candidate must not be usable after poisoned cancel");
+        assert_eq!(
+            error.code,
+            ScreenContextErrorCode::SynchronizationUnavailable
+        );
+        assert_error(
+            broker.claim_grant(ScreenContextIds {
+                grant_id,
+                life_id: LIFE_A.to_string(),
+                session_fence: FENCE_1,
+                conversation_id: CONVERSATION_1.to_string(),
+                request_id: REQUEST_1.to_string(),
+            }),
+            ScreenContextErrorCode::SynchronizationUnavailable,
+        );
+        let error = broker
+            .install_candidate(ScreenContextCandidateInput {
+                life_id: LIFE_A.to_string(),
+                session_fence: FENCE_1,
+                observation: recognized("new"),
+            })
+            .expect_err("install must remain fail-closed after poisoned cancel");
+        assert_eq!(
+            error.code,
+            ScreenContextErrorCode::SynchronizationUnavailable
         );
     }
 
@@ -1361,23 +1831,30 @@ mod tests {
         assert_empty(&broker);
 
         let candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("hello"));
-        let _grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
-        let error = claim(&broker, LIFE_A, FENCE_1, " ", REQUEST_1)
+        let grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
+        let error = claim(&broker, &grant_id, LIFE_A, FENCE_1, " ", REQUEST_1)
             .expect_err("an empty conversation identity must be rejected");
         assert_eq!(error.code, ScreenContextErrorCode::InvalidArgument);
-        let error = claim(&broker, LIFE_A, FENCE_1, CONVERSATION_1, "  ")
+        let error = claim(&broker, &grant_id, LIFE_A, FENCE_1, CONVERSATION_1, "  ")
             .expect_err("an empty request identity must be rejected");
         assert_eq!(error.code, ScreenContextErrorCode::InvalidArgument);
         // The grant is untouched by rejected invalid claims.
-        let _retry = claim_ok(&broker, LIFE_A, FENCE_1, CONVERSATION_1, REQUEST_1);
+        let _retry = claim_ok(
+            &broker,
+            &grant_id,
+            LIFE_A,
+            FENCE_1,
+            CONVERSATION_1,
+            REQUEST_1,
+        );
     }
 
     #[test]
     fn production_source_has_no_frame_native_target_window_or_process_fields() {
         let source = include_str!("screen_context.rs");
-        let production_source = source
-            .split_once("#[cfg(test)]")
-            .map_or(source, |(production, _)| production);
+        let (production_source, _) = source
+            .split_once("#[cfg(test)]\nmod tests")
+            .expect("the production/test module boundary must remain explicit");
         let forbidden = [
             "ScreenFrame",
             "BGRA",
@@ -1414,8 +1891,15 @@ mod tests {
         let (broker, _clock) = broker_with_manual_clock();
         let oversized = "x".repeat(40 * 1024);
         let candidate_id = install(&broker, LIFE_A, FENCE_1, recognized(&oversized));
-        let _grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
-        let payload = claim_ok(&broker, LIFE_A, FENCE_1, CONVERSATION_1, REQUEST_1);
+        let grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
+        let payload = claim_ok(
+            &broker,
+            &grant_id,
+            LIFE_A,
+            FENCE_1,
+            CONVERSATION_1,
+            REQUEST_1,
+        );
         assert!(payload.truncated);
         assert!(
             payload.text.len() <= SCREEN_CONTEXT_MAX_TEXT_BYTES,

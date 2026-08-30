@@ -15,11 +15,14 @@ use std::{
 
 use super::{
     screen_capture::{
-        self, operation::ScreenCaptureOperationPermit, provider::ScreenCaptureProvider,
-        target::ScreenCaptureTargetBroker, ScreenCaptureErrorCode, ScreenFrame,
+        self, operation::ScreenCaptureOperationPermit, target::ScreenCaptureTargetBroker,
+        ScreenCaptureErrorCode, ScreenFrame,
     },
     screen_policy::{ScreenPerceptionRepository, ScreenPerceptionSessionGate},
 };
+
+#[cfg(test)]
+use super::screen_capture::provider::ScreenCaptureProvider;
 
 /// Hard upper bound for the text returned by one ephemeral observation.
 pub(crate) const MAX_OBSERVATION_TEXT_BYTES: usize = 32 * 1024;
@@ -260,9 +263,9 @@ pub(crate) trait ScreenOcrProvider: Send + Sync {
     ) -> Result<ScreenOcrResult, ScreenObservationError>;
 }
 
-/// Production D23-D1 entry point.  The canonical C1 operation permit is
-/// acquired before capture, retained through preprocessing/OCR/observation,
-/// and released only after the frame and OCR intermediate have retired.
+/// Convenience D23-D1 entry point for backend smoke/internal callers.  The
+/// canonical C1 operation permit is acquired before capture and then handed
+/// to the native permit-bearing composition path.
 pub(crate) fn capture_screen_observation(
     operation_gate: &screen_capture::operation::ScreenCaptureOperationGate,
     repository: &dyn ScreenPerceptionRepository,
@@ -273,6 +276,26 @@ pub(crate) fn capture_screen_observation(
     let operation_permit = operation_gate
         .try_enter()
         .map_err(|_| ScreenObservationError::observation_busy())?;
+    capture_screen_observation_with_permit(
+        operation_permit,
+        repository,
+        session_gate,
+        broker,
+        life_id,
+    )
+}
+
+/// Production D23-D1 composition boundary.  The caller must already own the
+/// canonical C1 permit; this function selects both native providers and keeps
+/// that permit alive through capture, preprocessing, local OCR, and
+/// observation construction.
+pub(crate) fn capture_screen_observation_with_permit(
+    operation_permit: ScreenCaptureOperationPermit,
+    repository: &dyn ScreenPerceptionRepository,
+    session_gate: &ScreenPerceptionSessionGate,
+    broker: &ScreenCaptureTargetBroker,
+    life_id: &str,
+) -> Result<ScreenObservation, ScreenObservationError> {
     let capture_provider = screen_capture::provider::native_provider();
 
     // Capture before creating the OCR engine so denied/no-target requests do
@@ -295,10 +318,11 @@ pub(crate) fn capture_screen_observation(
     Ok(observation)
 }
 
-/// Testable composition boundary.  The owned permit is intentionally part of
-/// the signature: callers cannot invoke this complete pipeline without
-/// demonstrating ownership of the canonical C1 single-flight slot.
-pub(crate) fn observe_screen_once_with_permit(
+/// Test-only composition boundary with injected providers.  Keeping this
+/// helper private prevents an arbitrary-provider path from becoming a
+/// production observation entry point.
+#[cfg(test)]
+fn observe_screen_once_with_permit(
     operation_permit: ScreenCaptureOperationPermit,
     repository: &dyn ScreenPerceptionRepository,
     session_gate: &ScreenPerceptionSessionGate,
@@ -324,9 +348,9 @@ pub(crate) fn observe_screen_once_with_permit(
     Ok(observation)
 }
 
-/// Acquires the canonical permit and runs the complete pipeline with injected
-/// providers.  Production uses `capture_screen_observation`; this seam keeps
-/// authorization and single-flight tests independent of Windows OCR.
+/// Test-only helper that acquires the canonical permit and runs the complete
+/// pipeline with injected providers.  Production uses
+/// `capture_screen_observation_with_permit` and native providers.
 #[cfg(test)]
 fn observe_screen_once_with_providers(
     operation_gate: &screen_capture::operation::ScreenCaptureOperationGate,
@@ -819,7 +843,9 @@ impl OcrAsyncOperation for WindowsOcrAsyncOperation<'_> {
 /// request and returns only after a terminal status has been observed and the
 /// async object has been closed.  Once `timed_out` becomes true, a later
 /// `Completed` state is terminal for retirement only; its result is no longer
-/// valid for publication.
+/// valid for publication.  A status-query failure is likewise terminal only
+/// for result adjudication: the operation remains owned and is polled until a
+/// terminal status can be observed.
 fn wait_for_ocr_operation<O: OcrAsyncOperation + ?Sized>(
     operation: &O,
     policy: OcrWaitPolicy,
@@ -828,32 +854,47 @@ fn wait_for_ocr_operation<O: OcrAsyncOperation + ?Sized>(
         .checked_add(policy.timeout)
         .unwrap_or_else(std::time::Instant::now);
     let mut timed_out = false;
+    let mut cancel_requested = false;
     let mut cancellation_failed = false;
+    let mut lifecycle_failed = false;
 
     loop {
-        let status = operation.status()?;
-        match status {
-            OcrAsyncStatus::Completed => {
-                return finish_ocr_operation(operation, status, timed_out, cancellation_failed);
+        let status = match operation.status() {
+            Ok(status) => Some(status),
+            Err(_) => {
+                lifecycle_failed = true;
+                None
             }
-            OcrAsyncStatus::Canceled => {
-                return finish_ocr_operation(operation, status, timed_out, cancellation_failed);
+        };
+
+        if let Some(status) = status {
+            match status {
+                OcrAsyncStatus::Completed | OcrAsyncStatus::Canceled | OcrAsyncStatus::Error => {
+                    return finish_ocr_operation(
+                        operation,
+                        status,
+                        timed_out,
+                        cancel_requested,
+                        cancellation_failed,
+                        lifecycle_failed,
+                    );
+                }
+                OcrAsyncStatus::Started => {}
             }
-            OcrAsyncStatus::Error => {
-                return finish_ocr_operation(operation, status, timed_out, cancellation_failed);
-            }
-            OcrAsyncStatus::Started => {}
         }
 
-        if !timed_out && std::time::Instant::now() >= deadline {
-            timed_out = true;
-            if operation.cancel().is_err() {
-                // Do not convert a failed cancellation request into a false
-                // OCR_TIMEOUT.  Continue observing until the operation itself
-                // reaches a terminal state.
-                cancellation_failed = true;
+        if !cancel_requested {
+            let deadline_reached = std::time::Instant::now() >= deadline;
+            if status.is_none() || deadline_reached {
+                timed_out |= deadline_reached;
+                cancel_requested = true;
+                if operation.cancel().is_err() {
+                    // Do not convert a failed cancellation request into a
+                    // false OCR_TIMEOUT.  Continue observing until the
+                    // operation itself reaches a terminal state.
+                    cancellation_failed = true;
+                }
             }
-            continue;
         }
 
         if !policy.poll_interval.is_zero() {
@@ -866,16 +907,21 @@ fn finish_ocr_operation<O: OcrAsyncOperation + ?Sized>(
     operation: &O,
     status: OcrAsyncStatus,
     timed_out: bool,
+    cancel_requested: bool,
     cancellation_failed: bool,
+    lifecycle_failed: bool,
 ) -> Result<ScreenOcrResult, ScreenObservationError> {
-    let result = if cancellation_failed {
+    let result = if lifecycle_failed || cancellation_failed {
         // A failed cancellation request cannot be reported as a successful
-        // OCR result, even if the operation later completes normally.  The
-        // terminal observation below is still required before retirement.
+        // OCR result, even if the operation later completes normally.  A
+        // failed status query has the same result-finality rule.  The terminal
+        // observation below is still required before retirement.
         Err(ScreenObservationError::ocr_failed())
     } else {
         match status {
-            OcrAsyncStatus::Completed if timed_out => Err(ScreenObservationError::ocr_timeout()),
+            OcrAsyncStatus::Completed if timed_out || cancel_requested => {
+                Err(ScreenObservationError::ocr_timeout())
+            }
             OcrAsyncStatus::Completed => operation.get_results(),
             OcrAsyncStatus::Canceled => Err(ScreenObservationError::ocr_timeout()),
             OcrAsyncStatus::Error => Err(ScreenObservationError::ocr_failed()),
@@ -1115,7 +1161,7 @@ mod tests {
     }
 
     struct ScriptedOcrOperation {
-        statuses: std::sync::Mutex<VecDeque<OcrAsyncStatus>>,
+        statuses: std::sync::Mutex<VecDeque<Result<OcrAsyncStatus, ScreenObservationError>>>,
         cancel_result: std::sync::Mutex<Result<(), ScreenObservationError>>,
         result: Result<ScreenOcrResult, ScreenObservationError>,
         cancel_calls: AtomicUsize,
@@ -1127,6 +1173,14 @@ mod tests {
     impl ScriptedOcrOperation {
         fn new(
             statuses: impl IntoIterator<Item = OcrAsyncStatus>,
+            cancel_result: Result<(), ScreenObservationError>,
+            result: Result<ScreenOcrResult, ScreenObservationError>,
+        ) -> Self {
+            Self::new_with_status_results(statuses.into_iter().map(Ok), cancel_result, result)
+        }
+
+        fn new_with_status_results(
+            statuses: impl IntoIterator<Item = Result<OcrAsyncStatus, ScreenObservationError>>,
             cancel_result: Result<(), ScreenObservationError>,
             result: Result<ScreenOcrResult, ScreenObservationError>,
         ) -> Self {
@@ -1145,12 +1199,11 @@ mod tests {
     impl OcrAsyncOperation for ScriptedOcrOperation {
         fn status(&self) -> Result<OcrAsyncStatus, ScreenObservationError> {
             self.status_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(self
-                .statuses
+            self.statuses
                 .lock()
                 .unwrap()
                 .pop_front()
-                .unwrap_or(OcrAsyncStatus::Error))
+                .unwrap_or(Ok(OcrAsyncStatus::Error))
         }
 
         fn cancel(&self) -> Result<(), ScreenObservationError> {
@@ -1193,7 +1246,7 @@ mod tests {
         fn status(&self) -> Result<OcrAsyncStatus, ScreenObservationError> {
             let call = self.status_calls.fetch_add(1, Ordering::SeqCst);
             if call == 0 {
-                return Ok(OcrAsyncStatus::Started);
+                return Err(ScreenObservationError::ocr_failed());
             }
             if call == 1 {
                 self.settlement_started.send(()).unwrap();
@@ -1556,6 +1609,18 @@ mod tests {
     }
 
     #[test]
+    fn production_composition_requires_an_owned_permit_and_native_providers() {
+        let _: fn(
+            ScreenCaptureOperationPermit,
+            &dyn ScreenPerceptionRepository,
+            &ScreenPerceptionSessionGate,
+            &screen_capture::target::ScreenCaptureTargetBroker,
+            &str,
+        ) -> Result<ScreenObservation, ScreenObservationError> =
+            capture_screen_observation_with_permit;
+    }
+
+    #[test]
     fn screen_observation_permit_spans_capture_and_ocr() {
         let (repository, session_gate, broker) = authorized_fixture();
         let capture = FakeCaptureProvider::returning(valid_frame(16, 16));
@@ -1663,6 +1728,104 @@ mod tests {
     }
 
     #[test]
+    fn ocr_status_error_requests_cancel_and_waits_for_canceled() {
+        let operation = ScriptedOcrOperation::new_with_status_results(
+            [
+                Err(ScreenObservationError::ocr_failed()),
+                Ok(OcrAsyncStatus::Canceled),
+            ],
+            Ok(()),
+            Ok(ScreenOcrResult::from_lines(["must not be published"])),
+        );
+        let error = wait_for_ocr_operation(
+            &operation,
+            OcrWaitPolicy {
+                timeout: Duration::from_secs(1),
+                poll_interval: Duration::ZERO,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, ScreenObservationErrorCode::OcrFailed);
+        assert_eq!(operation.cancel_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(operation.status_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(operation.get_results_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(operation.close_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn ocr_status_error_requests_cancel_and_rejects_completed_result() {
+        let operation = ScriptedOcrOperation::new_with_status_results(
+            [
+                Err(ScreenObservationError::ocr_failed()),
+                Ok(OcrAsyncStatus::Completed),
+            ],
+            Ok(()),
+            Ok(ScreenOcrResult::from_lines(["must not be published"])),
+        );
+        let error = wait_for_ocr_operation(
+            &operation,
+            OcrWaitPolicy {
+                timeout: Duration::from_secs(1),
+                poll_interval: Duration::ZERO,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, ScreenObservationErrorCode::OcrFailed);
+        assert_eq!(operation.cancel_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(operation.status_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(operation.get_results_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(operation.close_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn ocr_timeout_status_error_during_settlement_does_not_repeat_cancel() {
+        let operation = ScriptedOcrOperation::new_with_status_results(
+            [
+                Ok(OcrAsyncStatus::Started),
+                Err(ScreenObservationError::ocr_failed()),
+                Ok(OcrAsyncStatus::Canceled),
+            ],
+            Ok(()),
+            Ok(ScreenOcrResult::from_lines(["must not be published"])),
+        );
+        let error = wait_for_ocr_operation(&operation, OcrWaitPolicy::immediate()).unwrap_err();
+
+        assert_eq!(error.code, ScreenObservationErrorCode::OcrFailed);
+        assert_eq!(operation.cancel_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(operation.status_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(operation.get_results_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(operation.close_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn ocr_status_error_and_cancel_failure_wait_for_terminal_failure() {
+        let operation = ScriptedOcrOperation::new_with_status_results(
+            [
+                Err(ScreenObservationError::ocr_failed()),
+                Ok(OcrAsyncStatus::Completed),
+            ],
+            Err(ScreenObservationError::ocr_failed()),
+            Ok(ScreenOcrResult::from_lines(["must not be published"])),
+        );
+        let error = wait_for_ocr_operation(
+            &operation,
+            OcrWaitPolicy {
+                timeout: Duration::from_secs(1),
+                poll_interval: Duration::ZERO,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, ScreenObservationErrorCode::OcrFailed);
+        assert_eq!(operation.cancel_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(operation.status_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(operation.get_results_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(operation.close_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn ocr_cancel_failure_waits_for_terminal_and_maps_to_failure() {
         let operation = ScriptedOcrOperation::new(
             [OcrAsyncStatus::Started, OcrAsyncStatus::Completed],
@@ -1723,7 +1886,7 @@ mod tests {
     }
 
     #[test]
-    fn operation_permit_remains_busy_during_ocr_cancellation_settlement() {
+    fn operation_permit_remains_busy_during_status_error_settlement() {
         let (repository, session_gate, broker) = authorized_fixture();
         let capture = FakeCaptureProvider::returning(valid_frame(16, 16));
         let (settlement_started_sender, settlement_started_receiver) = mpsc::channel();
@@ -1772,7 +1935,7 @@ mod tests {
 
         release_sender.send(()).unwrap();
         let error = worker.join().unwrap().unwrap_err();
-        assert_eq!(error.code, ScreenObservationErrorCode::OcrTimeout);
+        assert_eq!(error.code, ScreenObservationErrorCode::OcrFailed);
         assert_eq!(operation.cancel_calls.load(Ordering::SeqCst), 1);
         assert_eq!(operation.close_calls.load(Ordering::SeqCst), 1);
         assert!(operation_gate.try_enter().is_ok());

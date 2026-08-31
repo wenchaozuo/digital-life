@@ -70,6 +70,12 @@ const manualExtractionDisabled = computed(() =>
 const screenContextAttachmentId = ref<string>();
 const screenContextAttachmentDismissing = ref(false);
 const screenContextAttachmentError = ref<ChatScreenContextAttachmentError>();
+interface ScreenContextRetryReservation {
+  conversationId: string | undefined;
+  currentMessage: string;
+  perceptionAttachmentId: string;
+}
+const screenContextRetryReservation = ref<ScreenContextRetryReservation>();
 let consumedScreenContextAttachmentId: string | undefined;
 let chatLifecycleEpoch = 0;
 let screenContextAttachmentStatusGeneration = 0;
@@ -297,7 +303,19 @@ async function send(content: string): Promise<void> {
   // Capture the current authoritative C2 marker at the exact user-send
   // boundary.  The ConversationService receives only this opaque locator;
   // no screen content or native authority is reread here.
-  const capturedAttachmentId = screenContextAttachmentId.value;
+  const liveAttachmentId = screenContextAttachmentId.value;
+  if (
+    liveAttachmentId !== undefined
+    && screenContextRetryReservation.value !== undefined
+    && screenContextRetryReservation.value.perceptionAttachmentId !== liveAttachmentId
+  ) {
+    // A newly observed backend marker supersedes older local replay evidence
+    // at the same user-send boundary, even if its refresh arrived just before
+    // the older request's failure was handled.
+    screenContextRetryReservation.value = undefined;
+  }
+  const capturedAttachmentId =
+    liveAttachmentId ?? screenContextRetryReservation.value?.perceptionAttachmentId;
   const runtimeEpoch = chatLifecycleEpoch;
   if (capturedAttachmentId !== undefined) {
     // Fence status work that started before this attached send.  Its late
@@ -323,6 +341,9 @@ async function send(content: string): Promise<void> {
       // cannot reattach the old ID; a genuinely newer backend attachment is
       // still accepted by the normal status path.
       consumedScreenContextAttachmentId = capturedAttachmentId;
+      if (screenContextRetryReservation.value?.perceptionAttachmentId === capturedAttachmentId) {
+        screenContextRetryReservation.value = undefined;
+      }
       if (isChatRuntimeActive(runtimeEpoch)) {
         screenContextAttachmentStatusGeneration += 1;
         screenContextAttachmentMutationGeneration += 1;
@@ -348,14 +369,19 @@ async function send(content: string): Promise<void> {
       : { code: "CONVERSATION_MODEL_FAILED", message: "The model request could not be completed." };
     error.value = boundedError;
     conversationState.value = "error";
-    if (
-      capturedAttachmentId !== undefined
-      && boundedError.code === "PERCEPTION_CONTEXT_UNAVAILABLE"
-      && isChatRuntimeActive(runtimeEpoch)
-    ) {
-      // This is a real attached-request failure.  Re-read authority for
-      // presentation only; never silently retry as ordinary text-only chat.
-      await refreshPendingScreenContextAttachment(runtimeEpoch);
+    if (capturedAttachmentId !== undefined && isChatRuntimeActive(runtimeEpoch)) {
+      if (boundedError.code === "PERCEPTION_CONTEXT_UNAVAILABLE") {
+        // Replay lookup already found no committed turn.  Drop only the
+        // local retry presentation and reread authority; never downgrade to
+        // an ordinary text-only request.
+        clearMatchingScreenContextRetryReservation(capturedAttachmentId);
+        await refreshPendingScreenContextAttachment(runtimeEpoch);
+      } else if (shouldReserveScreenContextRetry(boundedError.code, content)) {
+        // A non-definitive failure may have happened after Rust committed
+        // the turn.  Preserve the exact opaque locator locally so the next
+        // unchanged send can reach ConversationService's stable requestId.
+        reserveScreenContextRetry(capturedAttachmentId, content, runtimeEpoch);
+      }
     }
   } finally {
     refreshMessages();
@@ -492,6 +518,51 @@ function isChatRuntimeActive(runtimeEpoch: number): boolean {
   return chatLifecycleEpoch === runtimeEpoch;
 }
 
+function shouldReserveScreenContextRetry(code: string, content: string): boolean {
+  if (content.trim().length === 0) return false;
+  return ![
+    "CONVERSATION_INPUT_REQUIRED",
+    "CONVERSATION_IN_PROGRESS",
+    "PERCEPTION_CONTEXT_RETRY_MISMATCH",
+    "PERCEPTION_CONTEXT_UNAVAILABLE",
+  ].includes(code);
+}
+
+function reserveScreenContextRetry(
+  perceptionAttachmentId: string,
+  content: string,
+  runtimeEpoch: number,
+): void {
+  if (!isChatRuntimeActive(runtimeEpoch)) return;
+
+  // A different live backend marker is a newer Observe result and supersedes
+  // any older local replay presentation.  It must never be overwritten by a
+  // late failure from the older send.
+  if (
+    screenContextAttachmentId.value !== undefined
+    && screenContextAttachmentId.value !== perceptionAttachmentId
+  ) {
+    screenContextRetryReservation.value = undefined;
+    return;
+  }
+
+  if (screenContextRetryReservation.value?.perceptionAttachmentId === perceptionAttachmentId) {
+    return;
+  }
+
+  screenContextRetryReservation.value = {
+    conversationId: conversationService.getConversationId(),
+    currentMessage: content.trim(),
+    perceptionAttachmentId,
+  };
+}
+
+function clearMatchingScreenContextRetryReservation(perceptionAttachmentId: string): void {
+  if (screenContextRetryReservation.value?.perceptionAttachmentId === perceptionAttachmentId) {
+    screenContextRetryReservation.value = undefined;
+  }
+}
+
 function isAttachmentRefreshHint(payload: unknown): boolean {
   if (typeof payload !== "object" || payload === null) {
     return false;
@@ -542,16 +613,27 @@ async function refreshPendingScreenContextAttachment(runtimeEpoch: number): Prom
     if (!normalized.available) {
       consumedScreenContextAttachmentId = undefined;
       screenContextAttachmentId.value = undefined;
-    } else if (normalized.attachmentId === consumedScreenContextAttachmentId) {
-      // A stale/late reread may still report the just-consumed ID.  Keep the
-      // presentation clear until backend authority reports unavailable or a
-      // genuinely new attachment.
-      if (screenContextAttachmentId.value === normalized.attachmentId) {
-        screenContextAttachmentId.value = undefined;
-      }
     } else {
-      consumedScreenContextAttachmentId = undefined;
-      screenContextAttachmentId.value = normalized.attachmentId;
+      if (
+        screenContextRetryReservation.value !== undefined
+        && normalized.attachmentId !== screenContextRetryReservation.value.perceptionAttachmentId
+      ) {
+        // A genuinely new backend attachment supersedes the old local replay
+        // evidence.  The new marker remains the only normal attachment UI.
+        screenContextRetryReservation.value = undefined;
+      }
+
+      if (normalized.attachmentId === consumedScreenContextAttachmentId) {
+        // A stale/late reread may still report the just-consumed ID.  Keep the
+        // presentation clear until backend authority reports unavailable or
+        // a genuinely new attachment.
+        if (screenContextAttachmentId.value === normalized.attachmentId) {
+          screenContextAttachmentId.value = undefined;
+        }
+      } else {
+        consumedScreenContextAttachmentId = undefined;
+        screenContextAttachmentId.value = normalized.attachmentId;
+      }
     }
     screenContextAttachmentError.value = undefined;
     return true;
@@ -744,16 +826,21 @@ onUnmounted(() => {
     </div>
 
     <section
-      v-if="screenContextAttachmentId !== undefined"
+      v-if="screenContextAttachmentId !== undefined || screenContextRetryReservation !== undefined"
       class="screen-context-attachment"
       data-testid="screen-context-attachment"
       aria-live="polite"
     >
-      <div class="screen-context-attachment-copy">
+      <div v-if="screenContextAttachmentId !== undefined" class="screen-context-attachment-copy">
         <strong>Screen context attached</strong>
         <span>Will be used with your next message</span>
       </div>
+      <div v-else class="screen-context-attachment-copy" data-testid="screen-context-retry-reservation">
+        <strong>Screen-context retry reserved</strong>
+        <span>Retry the previous message unchanged</span>
+      </div>
       <button
+        v-if="screenContextAttachmentId !== undefined"
         type="button"
         data-testid="screen-context-attachment-remove"
         :disabled="screenContextAttachmentDismissing"

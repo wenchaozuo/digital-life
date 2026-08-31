@@ -214,6 +214,73 @@ describe("D24-D2 Chat perception attachment send", () => {
     expect(mocks.dismiss).not.toHaveBeenCalled();
   });
 
+  it("retains a retry reservation after backend attachment cleanup and reuses the old attachment", async () => {
+    mocks.getPending.mockResolvedValue({ available: true, attachmentId: "attachment-a" });
+    mocks.send
+      .mockRejectedValueOnce(conversationError("TRANSPORT_OUTCOME_UNKNOWN"))
+      .mockResolvedValueOnce(successResponse(true));
+    const wrapper = mountChatView();
+    await flushPromises();
+
+    await wrapper.get("[data-testid='chat-send']").trigger("click");
+    await flushPromises();
+
+    // Rust may have committed and retired A even though the first response
+    // was lost.  The normal attachment indicator must disappear, but the
+    // exact local retry path must remain available.
+    mocks.getPending.mockResolvedValue({ available: false });
+    window.dispatchEvent(new Event("focus"));
+    await flushPromises();
+
+    expect(wrapper.find("[data-testid='screen-context-retry-reservation']").exists()).toBe(true);
+    expect(wrapper.text()).toContain("Screen-context retry reserved");
+    expect(wrapper.text()).toContain("Retry the previous message unchanged");
+    expect(wrapper.text()).not.toContain("Screen context attached");
+    expect(wrapper.text()).not.toContain("attachment-a");
+    expect(wrapper.text()).not.toContain("requestId");
+
+    await wrapper.get("[data-testid='chat-send']").trigger("click");
+    await flushPromises();
+
+    expect(mocks.send).toHaveBeenNthCalledWith(1, {
+      userInput: "hello",
+      perceptionAttachmentId: "attachment-a",
+    });
+    expect(mocks.send).toHaveBeenNthCalledWith(2, {
+      userInput: "hello",
+      perceptionAttachmentId: "attachment-a",
+    });
+    expect(wrapper.find("[data-testid='screen-context-retry-reservation']").exists()).toBe(false);
+  });
+
+  it("preserves the retry reservation when a focus status reread is unavailable", async () => {
+    mocks.getPending.mockResolvedValue({ available: true, attachmentId: "attachment-a" });
+    mocks.send.mockRejectedValueOnce(conversationError("PROVIDER_FAILED"));
+    const wrapper = mountChatView();
+    await flushPromises();
+
+    await wrapper.get("[data-testid='chat-send']").trigger("click");
+    await flushPromises();
+
+    mocks.getPending.mockRejectedValueOnce(new Error("status unavailable"));
+    window.dispatchEvent(new Event("focus"));
+    await flushPromises();
+    expect(wrapper.find("[data-testid='screen-context-attachment']").exists()).toBe(true);
+
+    mocks.getPending.mockResolvedValue({ available: false });
+    window.dispatchEvent(new Event("focus"));
+    await flushPromises();
+    expect(wrapper.find("[data-testid='screen-context-retry-reservation']").exists()).toBe(true);
+
+    mocks.send.mockResolvedValueOnce(successResponse(true));
+    await wrapper.get("[data-testid='chat-send']").trigger("click");
+    await flushPromises();
+    expect(mocks.send).toHaveBeenLastCalledWith({
+      userInput: "hello",
+      perceptionAttachmentId: "attachment-a",
+    });
+  });
+
   it("clears only the captured attachment after success and rereads backend status", async () => {
     mocks.getPending
       .mockReset()
@@ -288,7 +355,120 @@ describe("D24-D2 Chat perception attachment send", () => {
     });
     expect(mocks.getPending).toHaveBeenCalledTimes(3);
     expect(wrapper.find("[data-testid='screen-context-attachment']").exists()).toBe(false);
+    expect(wrapper.find("[data-testid='screen-context-retry-reservation']").exists()).toBe(false);
     expect(wrapper.find(".chat-error").text()).toContain("PERCEPTION_CONTEXT_UNAVAILABLE");
+  });
+
+  it("keeps the same reserved attachment after a changed-message retry mismatch", async () => {
+    mocks.getPending.mockResolvedValue({ available: true, attachmentId: "attachment-a" });
+    mocks.send.mockRejectedValueOnce(conversationError("PROVIDER_FAILED"));
+    const wrapper = mountChatView();
+    await flushPromises();
+
+    await wrapper.get("[data-testid='chat-send']").trigger("click");
+    await flushPromises();
+    mocks.getPending.mockResolvedValue({ available: false });
+    window.dispatchEvent(new Event("focus"));
+    await flushPromises();
+
+    mocks.input = "changed message";
+    mocks.send.mockRejectedValueOnce(
+      conversationError("PERCEPTION_CONTEXT_RETRY_MISMATCH", "retry unchanged"),
+    );
+    await wrapper.get("[data-testid='chat-send']").trigger("click");
+    await flushPromises();
+
+    expect(mocks.send).toHaveBeenLastCalledWith({
+      userInput: "changed message",
+      perceptionAttachmentId: "attachment-a",
+    });
+    expect(wrapper.find("[data-testid='screen-context-retry-reservation']").exists()).toBe(true);
+  });
+
+  it("keeps the reserved attachment across a conversation switch", async () => {
+    mocks.getPending.mockResolvedValue({ available: true, attachmentId: "attachment-a" });
+    mocks.send.mockRejectedValueOnce(conversationError("PROVIDER_FAILED"));
+    const wrapper = mountChatView();
+    await flushPromises();
+
+    await wrapper.get("[data-testid='chat-send']").trigger("click");
+    await flushPromises();
+    mocks.getPending.mockResolvedValue({ available: false });
+    window.dispatchEvent(new Event("focus"));
+    await flushPromises();
+    await wrapper.find(".switch-conversation").trigger("click");
+    await flushPromises();
+
+    mocks.send.mockRejectedValueOnce(
+      conversationError("PERCEPTION_CONTEXT_RETRY_MISMATCH", "retry unchanged"),
+    );
+    await wrapper.get("[data-testid='chat-send']").trigger("click");
+    await flushPromises();
+
+    expect(mocks.switchConversation).toHaveBeenCalledWith({ id: "conversation-b", title: "B" });
+    expect(mocks.send).toHaveBeenLastCalledWith({
+      userInput: "hello",
+      perceptionAttachmentId: "attachment-a",
+    });
+    expect(wrapper.find("[data-testid='screen-context-retry-reservation']").exists()).toBe(true);
+  });
+
+  it("lets a genuinely new backend attachment supersede the old retry reservation", async () => {
+    mocks.getPending.mockResolvedValue({ available: true, attachmentId: "attachment-old" });
+    mocks.send.mockRejectedValueOnce(conversationError("PROVIDER_FAILED"));
+    const wrapper = mountChatView();
+    await flushPromises();
+
+    await wrapper.get("[data-testid='chat-send']").trigger("click");
+    await flushPromises();
+    mocks.getPending.mockResolvedValue({ available: false });
+    window.dispatchEvent(new Event("focus"));
+    await flushPromises();
+    expect(wrapper.find("[data-testid='screen-context-retry-reservation']").exists()).toBe(true);
+
+    mocks.getPending.mockResolvedValue({ available: true, attachmentId: "attachment-new" });
+    window.dispatchEvent(new Event("focus"));
+    await flushPromises();
+
+    expect(wrapper.find("[data-testid='screen-context-retry-reservation']").exists()).toBe(false);
+    expect(wrapper.get("[data-testid='screen-context-attachment']").text()).toContain(
+      "Screen context attached",
+    );
+    mocks.send.mockResolvedValueOnce(successResponse());
+    await wrapper.get("[data-testid='chat-send']").trigger("click");
+    await flushPromises();
+    expect(mocks.send).toHaveBeenLastCalledWith({
+      userInput: "hello",
+      perceptionAttachmentId: "attachment-new",
+    });
+  });
+
+  it("retains the same attachment across repeated ambiguous failures", async () => {
+    mocks.getPending.mockResolvedValue({ available: true, attachmentId: "attachment-a" });
+    mocks.send
+      .mockRejectedValueOnce(conversationError("PROVIDER_FAILED"))
+      .mockRejectedValueOnce(conversationError("CONVERSATION_MODEL_FAILED"));
+    const wrapper = mountChatView();
+    await flushPromises();
+
+    await wrapper.get("[data-testid='chat-send']").trigger("click");
+    await flushPromises();
+    mocks.getPending.mockResolvedValue({ available: false });
+    window.dispatchEvent(new Event("focus"));
+    await flushPromises();
+
+    await wrapper.get("[data-testid='chat-send']").trigger("click");
+    await flushPromises();
+
+    expect(mocks.send).toHaveBeenNthCalledWith(1, {
+      userInput: "hello",
+      perceptionAttachmentId: "attachment-a",
+    });
+    expect(mocks.send).toHaveBeenNthCalledWith(2, {
+      userInput: "hello",
+      perceptionAttachmentId: "attachment-a",
+    });
+    expect(wrapper.find("[data-testid='screen-context-retry-reservation']").exists()).toBe(true);
   });
 
   it("keeps an IN_USE attachment visible with bounded retry guidance", async () => {

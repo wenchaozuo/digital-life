@@ -73,4 +73,36 @@ describe("D26-B Main Vision delivery service boundary", () => {
       recoverable: false,
     });
   });
+
+  it("binds status review to the exact safe review identity", async () => {
+    const mockedInvoke = vi.mocked(invoke);
+    mockedInvoke.mockResolvedValue({
+      status: "reviewReady",
+      review: {
+        reviewId: "review-a",
+        scope: "FULL_SELECTED_TARGET",
+        width: 1920,
+        height: 1080,
+        providerKind: "openai_compatible",
+        providerHost: "vision.example.invalid",
+        profileDisplayName: "Work Vision",
+        modelName: "vision-model",
+      },
+    });
+    const service = new MainScreenVisionDeliveryService();
+    const status = await service.getStatus();
+    expect(status.status).toBe("reviewReady");
+    expect(status.review?.reviewId).toBe("review-a");
+    expect(status.review?.providerHost).toBe("vision.example.invalid");
+    expect(status.review?.modelName).toBe("vision-model");
+  });
+
+  it("reports idle with a null review", async () => {
+    const mockedInvoke = vi.mocked(invoke);
+    mockedInvoke.mockResolvedValue({ status: "idle", review: null });
+    const service = new MainScreenVisionDeliveryService();
+    const status = await service.getStatus();
+    expect(status.status).toBe("idle");
+    expect(status.review).toBeNull();
+  });
 });

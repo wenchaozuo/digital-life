@@ -28,9 +28,9 @@ import {
   mainScreenVisionDeliveryService,
   screenVisionDeliveryErrorFromUnknown,
   type MainScreenVisionAnalysis,
+  type MainScreenVisionAttempt,
   type MainScreenVisionDeliveryError,
   type MainScreenVisionReview,
-  type MainScreenVisionReviewDisplay,
   type MainScreenVisionStatus,
 } from "./perception/screenVisionDeliveryService";
 import { storageService } from "./storage";
@@ -56,10 +56,7 @@ const screenVisionError = ref<MainScreenVisionDeliveryError>();
 const screenVisionPreparing = ref(false);
 const screenVisionSending = ref(false);
 const screenVisionAbandoning = ref(false);
-const screenVisionAttempt = ref<{
-  confirmationEventId: string;
-  deliveryId: string;
-}>();
+const screenVisionAttempt = ref<MainScreenVisionAttempt>();
 let unsubscribe: (() => void) | undefined;
 let bodyRuntimeBinding: BodyRuntimeBindingController | undefined;
 let lifecycleEpoch = 0;
@@ -124,9 +121,20 @@ const canUseScreenContextAction = computed(
     !screenContextPreparing.value,
 );
 
-const screenVisionReviewForDisplay = computed<
-  MainScreenVisionReviewDisplay | undefined
->(() => screenVisionReview.value ?? screenVisionStatus.value?.review ?? undefined);
+const screenVisionReviewForDisplay = computed<MainScreenVisionReview | undefined>(
+  () => {
+    const status = screenVisionStatus.value;
+    if (status !== undefined) {
+      // Backend status is the authoritative delivery lifecycle; its review is
+      // the only review that may render.  An idle + null review must never let
+      // a stale local review survive on screen.
+      return status.review ?? undefined;
+    }
+    // No backend status yet: the local review may render only during the
+    // prepare transition, never as a retained stale review.
+    return screenVisionPreparing.value ? screenVisionReview.value : undefined;
+  },
+);
 
 const screenVisionDefiniteDeliveryObserved = computed(
   () =>
@@ -136,41 +144,73 @@ const screenVisionDefiniteDeliveryObserved = computed(
 
 const screenVisionRetryAvailable = computed(
   () =>
-    screenVisionReview.value !== undefined &&
-    screenVisionAttempt.value !== undefined &&
-    (screenVisionStatus.value?.status === "awaitingRetryDecision" ||
-      screenVisionError.value?.code === "VISION_NOT_SENT" ||
-      screenVisionError.value?.code === "VISION_SEND_OUTCOME_UNKNOWN"),
-);
-
-const screenVisionCanPrepare = computed(
-  () =>
-    lifeIdentity.value !== undefined &&
-    !screenVisionPreparing.value &&
-    !screenVisionSending.value &&
-    !screenVisionAbandoning.value &&
-    screenVisionStatus.value?.status !== "deliveryInProgress" &&
-    screenVisionStatus.value?.status !== "awaitingRetryDecision" &&
-    !screenVisionDefiniteDeliveryObserved.value,
-);
-
-const screenVisionCanSend = computed(
-  () =>
-    screenVisionReview.value !== undefined &&
-    !screenVisionPreparing.value &&
-    !screenVisionSending.value &&
-    !screenVisionAbandoning.value &&
-    screenVisionStatus.value?.status !== "deliveryInProgress" &&
-    !screenVisionDefiniteDeliveryObserved.value,
-);
-
-const screenVisionCanAbandon = computed(
-  () =>
-    screenVisionReview.value !== undefined &&
     screenVisionStatus.value?.status === "awaitingRetryDecision" &&
-    !screenVisionSending.value &&
-    !screenVisionAbandoning.value,
+    screenVisionStatus.value.review !== null &&
+    screenVisionAttempt.value !== undefined &&
+    screenVisionAttempt.value.reviewId === screenVisionStatus.value.review.reviewId,
 );
+
+const screenVisionCanPrepare = computed(() => {
+  if (
+    lifeIdentity.value === undefined ||
+    screenVisionPreparing.value ||
+    screenVisionSending.value ||
+    screenVisionAbandoning.value
+  ) {
+    return false;
+  }
+  const status = screenVisionStatus.value;
+  if (status === undefined) {
+    return true;
+  }
+  // Backend lifecycle authority: Prepare is allowed only when the backend is
+  // idle or has a review-ready slot.  Committed (awaiting retry), in-flight,
+  // and terminal deliveries are never replaced by a new preparation.
+  return status.status === "idle" || status.status === "reviewReady";
+});
+
+const screenVisionCanSend = computed(() => {
+  if (
+    screenVisionPreparing.value ||
+    screenVisionSending.value ||
+    screenVisionAbandoning.value
+  ) {
+    return false;
+  }
+  const status = screenVisionStatus.value;
+  if (status === undefined) {
+    return false;
+  }
+  if (status.status === "reviewReady") {
+    // New explicit confirmation: the exact frontend/backend review exists.
+    return (
+      status.review !== null &&
+      screenVisionReview.value?.reviewId === status.review.reviewId
+    );
+  }
+  if (status.status === "awaitingRetryDecision") {
+    // Exact retry: the committed backend tuple must be bound locally.
+    const attempt = screenVisionAttempt.value;
+    return (
+      status.review !== null &&
+      attempt !== undefined &&
+      attempt.reviewId === status.review.reviewId
+    );
+  }
+  // idle, deliveryInProgress, definiteDeliveryObserved, and unknown status
+  // never allow send, regardless of any local review.
+  return false;
+});
+
+const screenVisionCanAbandon = computed(() => {
+  const status = screenVisionStatus.value;
+  return (
+    status?.status === "awaitingRetryDecision" &&
+    status.review !== null &&
+    !screenVisionSending.value &&
+    !screenVisionAbandoning.value
+  );
+});
 
 // D17-C: the listener registration race with unmount is fenced by this
 // controller, so a registration promise resolving after unmount is
@@ -268,6 +308,60 @@ function invalidateScreenVision(): void {
   screenVisionAbandoning.value = false;
 }
 
+// Backend ScreenVision status is the authoritative delivery lifecycle.
+// A frontend error code is presentation/diagnosis only and never decides
+// tuple destruction (D26-F1/F2).  This single rule reconciles every status
+// refresh; catch/finally blocks must not re-implement lifecycle decisions.
+function reconcileScreenVisionStatus(status: MainScreenVisionStatus): void {
+  screenVisionStatus.value = status;
+  const authoritativeReview = status.review;
+
+  if (status.status === "idle" || authoritativeReview === null) {
+    // Idle with null review: no review and no committed retry tuple can
+    // survive.  This closes the stale-local-review bug (D26-F2).
+    screenVisionReview.value = undefined;
+    screenVisionAttempt.value = undefined;
+    return;
+  }
+
+  // Backend review replaces any local review (display authority).
+  screenVisionReview.value = authoritativeReview;
+
+  if (status.status === "awaitingRetryDecision") {
+    // A matching local attempt is the exact committed retry tuple bound to
+    // this backend review.  Any other attempt belongs to a different review
+    // and must not be reused (no invented recovery).
+    if (
+      screenVisionAttempt.value?.reviewId !== authoritativeReview.reviewId
+    ) {
+      screenVisionAttempt.value = undefined;
+    }
+    return;
+  }
+
+  if (status.status === "reviewReady") {
+    // reviewReady has no committed retry-tuple authority: a previous failed
+    // execute does not justify retaining an attempt for this review.  The
+    // next explicit Analyze creates a fresh attempt.
+    screenVisionAttempt.value = undefined;
+    return;
+  }
+
+  if (status.status === "deliveryInProgress") {
+    // Keep the exact matching attempt so the committed retry tuple survives
+    // the in-flight window; no other local state may override the backend.
+    if (screenVisionAttempt.value?.reviewId !== authoritativeReview.reviewId) {
+      screenVisionAttempt.value = undefined;
+    }
+    return;
+  }
+
+  // definiteDeliveryObserved: the review stays for terminal display only.
+  // The attempt tuple must not survive, and the terminal state is never
+  // converted to idle.
+  screenVisionAttempt.value = undefined;
+}
+
 async function refreshScreenVisionStatus(runtimeEpoch: number): Promise<void> {
   const lifeId = lifeIdentity.value?.id;
   if (lifeId === undefined) {
@@ -283,7 +377,7 @@ async function refreshScreenVisionStatus(runtimeEpoch: number): Promise<void> {
     ) {
       return;
     }
-    screenVisionStatus.value = status;
+    reconcileScreenVisionStatus(status);
   } catch (error: unknown) {
     if (
       !isRuntimeActive(runtimeEpoch) ||
@@ -315,8 +409,9 @@ async function prepareScreenVisionReview(): Promise<void> {
   try {
     const review = await mainScreenVisionDeliveryService.prepareReview();
     if (isCurrentScreenVisionRequest(runtimeEpoch, lifeId, requestGeneration)) {
+      // Keep the prepared review locally for the display transition; the
+      // authoritative backend status reread in finally reconciles it.
       screenVisionReview.value = review;
-      screenVisionStatus.value = { status: "reviewReady", review };
       screenVisionResult.value = undefined;
       screenVisionAttempt.value = undefined;
     }
@@ -332,15 +427,6 @@ async function prepareScreenVisionReview(): Promise<void> {
   }
 }
 
-function shouldRetainScreenVisionAttempt(
-  error: MainScreenVisionDeliveryError,
-): boolean {
-  return (
-    error.code === "VISION_NOT_SENT" ||
-    error.code === "VISION_SEND_OUTCOME_UNKNOWN"
-  );
-}
-
 async function executeScreenVisionReview(): Promise<void> {
   const lifeId = lifeIdentity.value?.id;
   const review = screenVisionReview.value;
@@ -351,7 +437,10 @@ async function executeScreenVisionReview(): Promise<void> {
   let attempt = screenVisionAttempt.value;
   if (attempt === undefined) {
     try {
+      // New explicit confirmation: bind the attempt exactly to the backend
+      // review so a retry can never be reused for another review.
       attempt = {
+        reviewId: review.reviewId,
         confirmationEventId: createSecureVisionAttemptId(),
         deliveryId: createSecureVisionAttemptId(),
       };
@@ -372,40 +461,22 @@ async function executeScreenVisionReview(): Promise<void> {
   screenVisionError.value = undefined;
   try {
     const result = await mainScreenVisionDeliveryService.executeReview(
-      review.reviewId,
+      attempt.reviewId,
       attempt.confirmationEventId,
       attempt.deliveryId,
     );
     if (isCurrentScreenVisionRequest(runtimeEpoch, lifeId, requestGeneration)) {
       screenVisionResult.value = result;
       screenVisionError.value = undefined;
-      screenVisionAttempt.value = undefined;
-      screenVisionReview.value = undefined;
-      screenVisionStatus.value = { status: "idle", review: null };
+      // Lifecycle state is not fabricated here: the authoritative backend
+      // status reread in finally reconciles review/attempt/status.
     }
   } catch (error: unknown) {
     if (isCurrentScreenVisionRequest(runtimeEpoch, lifeId, requestGeneration)) {
-      const boundedError = screenVisionDeliveryErrorFromUnknown(error);
-      screenVisionError.value = boundedError;
-      if (
-        boundedError.code === SCREEN_VISION_TERMINAL_SETTLEMENT_ERROR_CODE
-      ) {
-        screenVisionAttempt.value = undefined;
-        screenVisionReview.value = undefined;
-        screenVisionStatus.value = {
-          status: "definiteDeliveryObserved",
-          review,
-        };
-      } else if (!shouldRetainScreenVisionAttempt(boundedError)) {
-        screenVisionAttempt.value = undefined;
-        screenVisionReview.value = undefined;
-        screenVisionStatus.value = { status: "idle", review: null };
-      } else {
-        screenVisionStatus.value = {
-          status: "awaitingRetryDecision",
-          review,
-        };
-      }
+      // Preserve the bounded diagnostic for display.  The review and attempt
+      // are deliberately NOT cleared: only the authoritative backend status
+      // reread (reconcileScreenVisionStatus) may decide tuple retention.
+      screenVisionError.value = screenVisionDeliveryErrorFromUnknown(error);
     }
   } finally {
     if (isCurrentScreenVisionRequest(runtimeEpoch, lifeId, requestGeneration)) {
@@ -429,6 +500,8 @@ async function abandonScreenVisionDelivery(): Promise<void> {
   try {
     await mainScreenVisionDeliveryService.abandonDelivery(review.reviewId);
     if (isCurrentScreenVisionRequest(runtimeEpoch, lifeId, requestGeneration)) {
+      // The abandon succeeded; the backend is idle.  Clear local state and let
+      // the authoritative reread in finally confirm it.
       screenVisionReview.value = undefined;
       screenVisionAttempt.value = undefined;
       screenVisionStatus.value = { status: "idle", review: null };

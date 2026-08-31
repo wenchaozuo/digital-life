@@ -245,18 +245,6 @@ pub(crate) struct MainScreenVisionReviewDto {
     pub(crate) model_name: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct MainScreenVisionReviewDisplayDto {
-    pub(crate) scope: String,
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-    pub(crate) provider_kind: String,
-    pub(crate) provider_host: String,
-    pub(crate) profile_display_name: String,
-    pub(crate) model_name: String,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum MainScreenVisionStatusKind {
@@ -271,7 +259,7 @@ pub(crate) enum MainScreenVisionStatusKind {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MainScreenVisionStatusDto {
     pub(crate) status: MainScreenVisionStatusKind,
-    pub(crate) review: Option<MainScreenVisionReviewDisplayDto>,
+    pub(crate) review: Option<MainScreenVisionReviewDto>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -816,18 +804,6 @@ fn validate_id(value: &str) -> Result<(), ScreenVisionReviewError> {
     Ok(())
 }
 
-fn review_display(evidence: &ReviewEvidence) -> MainScreenVisionReviewDisplayDto {
-    MainScreenVisionReviewDisplayDto {
-        scope: FULL_SELECTED_TARGET_SCOPE.to_string(),
-        width: evidence.width,
-        height: evidence.height,
-        provider_kind: evidence.binding.provider_kind().as_str().to_string(),
-        provider_host: evidence.provider_host.clone(),
-        profile_display_name: evidence.profile.display_name.clone(),
-        model_name: evidence.profile.model_name.clone(),
-    }
-}
-
 fn review_dto(evidence: &ReviewEvidence) -> MainScreenVisionReviewDto {
     MainScreenVisionReviewDto {
         review_id: evidence.review_id.clone(),
@@ -1044,7 +1020,7 @@ pub fn get_main_screen_vision_status(
             } else {
                 MainScreenVisionStatusKind::ReviewReady
             },
-            Some(review_display(&evidence)),
+            Some(review_dto(&evidence)),
         ),
         ScreenVisionReviewStatusSnapshot::Committed(committed) => (
             if delivery_gate.is_busy() {
@@ -1052,11 +1028,11 @@ pub fn get_main_screen_vision_status(
             } else {
                 MainScreenVisionStatusKind::AwaitingRetryDecision
             },
-            Some(review_display(&committed.evidence)),
+            Some(review_dto(&committed.evidence)),
         ),
         ScreenVisionReviewStatusSnapshot::DefiniteDeliveryObserved(observed) => (
             MainScreenVisionStatusKind::DefiniteDeliveryObserved,
-            Some(review_display(&observed.evidence)),
+            Some(review_dto(&observed.evidence)),
         ),
     };
     Ok(MainScreenVisionStatusDto { status, review })
@@ -2467,5 +2443,112 @@ mod tests {
             broker.status_snapshot().unwrap(),
             ScreenVisionReviewStatusSnapshot::Committed(_)
         ));
+    }
+
+    fn get_status_dto_for_test(
+        review_broker: &ScreenVisionReviewBroker,
+        delivery_gate: &ScreenVisionDeliveryOperationGate,
+    ) -> MainScreenVisionStatusDto {
+        let snapshot = review_broker
+            .status_snapshot()
+            .expect("status snapshot should not fail");
+        let (status, review) = match snapshot {
+            ScreenVisionReviewStatusSnapshot::Empty => (MainScreenVisionStatusKind::Idle, None),
+            ScreenVisionReviewStatusSnapshot::Ready(evidence) => (
+                if delivery_gate.is_busy() {
+                    MainScreenVisionStatusKind::DeliveryInProgress
+                } else {
+                    MainScreenVisionStatusKind::ReviewReady
+                },
+                Some(review_dto(&evidence)),
+            ),
+            ScreenVisionReviewStatusSnapshot::Committed(committed) => (
+                if delivery_gate.is_busy() {
+                    MainScreenVisionStatusKind::DeliveryInProgress
+                } else {
+                    MainScreenVisionStatusKind::AwaitingRetryDecision
+                },
+                Some(review_dto(&committed.evidence)),
+            ),
+            ScreenVisionReviewStatusSnapshot::DefiniteDeliveryObserved(observed) => (
+                MainScreenVisionStatusKind::DefiniteDeliveryObserved,
+                Some(review_dto(&observed.evidence)),
+            ),
+        };
+        MainScreenVisionStatusDto { status, review }
+    }
+
+    #[test]
+    fn status_dto_exposes_exact_safe_review_id_across_lifecycle() {
+        let review_id = "review-status-dto";
+        let broker = review_broker(ManualReviewClock::new(), vec![review_id]);
+        let review = install_review(&broker, "profile-a", review_id);
+
+        let delivery_gate = ScreenVisionDeliveryOperationGate::new();
+        let ready = get_status_dto_for_test(&broker, &delivery_gate);
+        assert_eq!(ready.status, MainScreenVisionStatusKind::ReviewReady);
+        let ready_review = ready
+            .review
+            .as_ref()
+            .expect("Ready status must carry a review");
+        assert_eq!(ready_review.review_id, review.review_id);
+
+        broker
+            .commit_exact(
+                &review.review_id,
+                "confirmation-status",
+                "delivery-status",
+                "grant-terminal",
+            )
+            .expect("review should commit");
+        let committed = get_status_dto_for_test(&broker, &delivery_gate);
+        assert_eq!(
+            committed.status,
+            MainScreenVisionStatusKind::AwaitingRetryDecision
+        );
+        let committed_review = committed
+            .review
+            .expect("Committed status must carry a review");
+        assert_eq!(committed_review.review_id, review.review_id);
+
+        mark_terminal_observed(
+            &broker,
+            &ExecuteMainScreenVisionReviewRequest {
+                review_id: review.review_id.clone(),
+                confirmation_event_id: "confirmation-status".to_string(),
+                delivery_id: "delivery-status".to_string(),
+            },
+            DefiniteDeliveryTerminalKind::ProviderErrorResponse,
+        );
+        let observed = get_status_dto_for_test(&broker, &delivery_gate);
+        assert_eq!(
+            observed.status,
+            MainScreenVisionStatusKind::DefiniteDeliveryObserved
+        );
+        let observed_review = observed
+            .review
+            .expect("terminal status must carry a review");
+        assert_eq!(observed_review.review_id, review.review_id);
+
+        let idle_broker = review_broker(ManualReviewClock::new(), Vec::new());
+        let idle = get_status_dto_for_test(&idle_broker, &delivery_gate);
+        assert_eq!(idle.status, MainScreenVisionStatusKind::Idle);
+        assert!(idle.review.is_none(), "Idle status must expose null review");
+
+        let json = serde_json::to_string(&ready).expect("status should serialize");
+        for forbidden in [
+            "candidateId",
+            "grantId",
+            "confirmationEventId",
+            "deliveryId",
+            "sessionFence",
+            "policyRevision",
+            "credential",
+            "authorization",
+            "pixels",
+            "base64",
+        ] {
+            assert!(!json.contains(forbidden), "status DTO leaked {forbidden}");
+        }
     }
 }

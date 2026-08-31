@@ -7,7 +7,8 @@ export type MainScreenVisionStatusKind =
   | "awaitingRetryDecision"
   | "definiteDeliveryObserved";
 
-export interface MainScreenVisionReviewDisplay {
+export interface MainScreenVisionReview {
+  readonly reviewId: string;
   readonly scope: string;
   readonly width: number;
   readonly height: number;
@@ -17,13 +18,15 @@ export interface MainScreenVisionReviewDisplay {
   readonly modelName: string;
 }
 
-export interface MainScreenVisionReview extends MainScreenVisionReviewDisplay {
+export interface MainScreenVisionAttempt {
   readonly reviewId: string;
+  readonly confirmationEventId: string;
+  readonly deliveryId: string;
 }
 
 export interface MainScreenVisionStatus {
   readonly status: MainScreenVisionStatusKind;
-  readonly review: MainScreenVisionReviewDisplay | null;
+  readonly review: MainScreenVisionReview | null;
 }
 
 export interface MainScreenVisionAnalysis {

@@ -18,6 +18,7 @@ pub(crate) mod screen_ocr;
 pub(crate) mod screen_policy;
 pub(crate) mod screen_settings;
 pub(crate) mod screen_vision_outbound_policy;
+pub(crate) mod screen_vision_outbound_projection;
 pub(crate) mod screen_vision_outbound_settings;
 
 pub(crate) const PERCEPTION_POLICY_VERSION: i64 = 1;

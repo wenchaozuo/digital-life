@@ -278,6 +278,21 @@ impl ScreenVisionOutboundCandidateBroker {
     pub(crate) fn clear_poison_for_test(&self) {
         self.state.clear_poison();
     }
+
+    /// Test-only age control used by the D25-D2 issue tests.  The production
+    /// C2 clock and TTL semantics remain unchanged.
+    #[cfg(test)]
+    pub(crate) fn expire_current_for_test(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("candidate state should initially lock");
+        if let ScreenVisionOutboundCandidateState::Candidate(candidate) = &mut *state {
+            candidate.created_at = Instant::now()
+                .checked_sub(SCREEN_VISION_OUTBOUND_CANDIDATE_TTL)
+                .expect("test instant should support candidate expiry");
+        }
+    }
 }
 
 fn candidate_error(

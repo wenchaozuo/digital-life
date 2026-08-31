@@ -85,6 +85,11 @@ pub fn run() {
             app.manage(
                 perception::screen_vision_outbound_candidate::ScreenVisionOutboundCandidateBroker::new(),
             );
+            // D25-D2: the single process-local one-shot outbound grant broker.
+            // It is internal state only; no command or ACL is added here.
+            app.manage(
+                perception::screen_vision_outbound_grant::ScreenVisionOutboundGrantBroker::new(),
+            );
             app.manage(storage::LlmCandidateExtractionCoordinator::default());
             app.manage(model::runtime::ModelRuntimeCoordinator::default());
             app.manage(conversation::ConversationCognitionCoordinator::default());

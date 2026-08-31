@@ -259,6 +259,25 @@ impl ScreenVisionOutboundCandidateBroker {
             candidate_error(ScreenVisionOutboundCandidateErrorCode::SynchronizationUnavailable)
         })
     }
+
+    /// Test-only mutex controls used by the C3 composition tests to exercise
+    /// the existing C2 synchronization-failure contract.  Production never
+    /// clears a poisoned lock or exposes this seam.
+    #[cfg(test)]
+    pub(crate) fn poison_for_test(&self) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _state = self
+                .state
+                .lock()
+                .expect("candidate state should initially lock");
+            panic!("intentional test mutex poison");
+        }));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_poison_for_test(&self) {
+        self.state.clear_poison();
+    }
 }
 
 fn candidate_error(

@@ -19,6 +19,7 @@ pub(crate) mod screen_policy;
 pub(crate) mod screen_settings;
 pub(crate) mod screen_vision_outbound_candidate;
 pub(crate) mod screen_vision_outbound_policy;
+pub(crate) mod screen_vision_outbound_preparation;
 pub(crate) mod screen_vision_outbound_projection;
 pub(crate) mod screen_vision_outbound_settings;
 

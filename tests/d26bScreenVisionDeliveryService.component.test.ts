@@ -5,6 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   MainScreenVisionDeliveryService,
   createSecureVisionAttemptId,
+  screenVisionDeliveryErrorFromUnknown,
 } from "../src/perception/screenVisionDeliveryService";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
@@ -57,5 +58,19 @@ describe("D26-B Main Vision delivery service boundary", () => {
     expect(id).toMatch(
       /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-8[0-9a-f]{3}-[0-9a-f]{12}$/,
     );
+  });
+
+  it("preserves the bounded definite-delivery terminal error", () => {
+    expect(
+      screenVisionDeliveryErrorFromUnknown({
+        code: "VISION_TERMINAL_SETTLEMENT_UNAVAILABLE_AFTER_SEND",
+        recoverable: false,
+      }),
+    ).toEqual({
+      code: "VISION_TERMINAL_SETTLEMENT_UNAVAILABLE_AFTER_SEND",
+      message:
+        "The Vision provider received this image, but local one-shot finalization could not be completed. This attempt will not be resent automatically.",
+      recoverable: false,
+    });
   });
 });

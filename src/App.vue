@@ -68,6 +68,8 @@ let screenObservationRequestGeneration = 0;
 let screenHandoffRequestGeneration = 0;
 let screenVisionStatusRequestGeneration = 0;
 let screenVisionRequestGeneration = 0;
+const SCREEN_VISION_TERMINAL_SETTLEMENT_ERROR_CODE =
+  "VISION_TERMINAL_SETTLEMENT_UNAVAILABLE_AFTER_SEND";
 
 const screenReadinessLabel = computed(() => {
   if (screenObservationLoading.value) {
@@ -126,6 +128,12 @@ const screenVisionReviewForDisplay = computed<
   MainScreenVisionReviewDisplay | undefined
 >(() => screenVisionReview.value ?? screenVisionStatus.value?.review ?? undefined);
 
+const screenVisionDefiniteDeliveryObserved = computed(
+  () =>
+    screenVisionStatus.value?.status === "definiteDeliveryObserved" ||
+    screenVisionError.value?.code === SCREEN_VISION_TERMINAL_SETTLEMENT_ERROR_CODE,
+);
+
 const screenVisionRetryAvailable = computed(
   () =>
     screenVisionReview.value !== undefined &&
@@ -142,7 +150,8 @@ const screenVisionCanPrepare = computed(
     !screenVisionSending.value &&
     !screenVisionAbandoning.value &&
     screenVisionStatus.value?.status !== "deliveryInProgress" &&
-    screenVisionStatus.value?.status !== "awaitingRetryDecision",
+    screenVisionStatus.value?.status !== "awaitingRetryDecision" &&
+    !screenVisionDefiniteDeliveryObserved.value,
 );
 
 const screenVisionCanSend = computed(
@@ -151,7 +160,8 @@ const screenVisionCanSend = computed(
     !screenVisionPreparing.value &&
     !screenVisionSending.value &&
     !screenVisionAbandoning.value &&
-    screenVisionStatus.value?.status !== "deliveryInProgress",
+    screenVisionStatus.value?.status !== "deliveryInProgress" &&
+    !screenVisionDefiniteDeliveryObserved.value,
 );
 
 const screenVisionCanAbandon = computed(
@@ -282,7 +292,13 @@ async function refreshScreenVisionStatus(runtimeEpoch: number): Promise<void> {
     ) {
       return;
     }
-    screenVisionError.value = screenVisionDeliveryErrorFromUnknown(error);
+    const boundedError = screenVisionDeliveryErrorFromUnknown(error);
+    if (
+      screenVisionError.value?.code !==
+      SCREEN_VISION_TERMINAL_SETTLEMENT_ERROR_CODE
+    ) {
+      screenVisionError.value = boundedError;
+    }
   }
 }
 
@@ -371,7 +387,16 @@ async function executeScreenVisionReview(): Promise<void> {
     if (isCurrentScreenVisionRequest(runtimeEpoch, lifeId, requestGeneration)) {
       const boundedError = screenVisionDeliveryErrorFromUnknown(error);
       screenVisionError.value = boundedError;
-      if (!shouldRetainScreenVisionAttempt(boundedError)) {
+      if (
+        boundedError.code === SCREEN_VISION_TERMINAL_SETTLEMENT_ERROR_CODE
+      ) {
+        screenVisionAttempt.value = undefined;
+        screenVisionReview.value = undefined;
+        screenVisionStatus.value = {
+          status: "definiteDeliveryObserved",
+          review,
+        };
+      } else if (!shouldRetainScreenVisionAttempt(boundedError)) {
         screenVisionAttempt.value = undefined;
         screenVisionReview.value = undefined;
         screenVisionStatus.value = { status: "idle", review: null };
@@ -1002,7 +1027,10 @@ onUnmounted(() => {
             {{ screenVisionReviewForDisplay.providerHost }} using
             {{ screenVisionReviewForDisplay.modelName }}.
           </p>
-          <p>The image has not been sent yet.</p>
+          <p v-if="screenVisionDefiniteDeliveryObserved">
+            The Vision provider received this image, but local one-shot finalization could not be completed. This attempt will not be resent automatically.
+          </p>
+          <p v-else>The image has not been sent yet.</p>
           <p>Screen contents are treated as untrusted data by the Vision prompt.</p>
           <p>No additional manual privacy masks are applied in this V1 full-target analysis.</p>
           <p class="screen-vision-review-meta">
@@ -1011,7 +1039,7 @@ onUnmounted(() => {
             {{ screenVisionReviewForDisplay.height }}
           </p>
           <button
-            v-if="screenVisionReview"
+            v-if="screenVisionReview && !screenVisionDefiniteDeliveryObserved"
             type="button"
             class="screen-vision-send"
             data-testid="screen-vision-analyze"

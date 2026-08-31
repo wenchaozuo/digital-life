@@ -4,7 +4,8 @@ export type MainScreenVisionStatusKind =
   | "idle"
   | "reviewReady"
   | "deliveryInProgress"
-  | "awaitingRetryDecision";
+  | "awaitingRetryDecision"
+  | "definiteDeliveryObserved";
 
 export interface MainScreenVisionReviewDisplay {
   readonly scope: string;
@@ -91,6 +92,8 @@ const SCREEN_VISION_DELIVERY_ERROR_MESSAGES: Readonly<Record<string, string>> = 
     "The Vision provider responded. Prepare a new image before trying again.",
   VISION_RESPONSE_INVALID_AFTER_SEND:
     "The image was sent, but the Vision response was invalid. Prepare a new analysis.",
+  VISION_TERMINAL_SETTLEMENT_UNAVAILABLE_AFTER_SEND:
+    "The Vision provider received this image, but local one-shot finalization could not be completed. This attempt will not be resent automatically.",
   VISION_ABANDON_UNAVAILABLE: "This Vision attempt can no longer be abandoned.",
   VISION_SYNCHRONIZATION_UNAVAILABLE:
     "Vision delivery is temporarily unavailable.",

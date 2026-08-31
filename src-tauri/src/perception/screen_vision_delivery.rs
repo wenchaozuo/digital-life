@@ -14,6 +14,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
@@ -108,6 +111,7 @@ pub(crate) enum MainScreenVisionErrorCode {
     OutcomeUnknown,
     ProviderResponded,
     ResponseInvalidAfterSend,
+    TerminalSettlementUnavailableAfterSend,
     AbandonUnavailable,
     SynchronizationUnavailable,
 }
@@ -159,6 +163,9 @@ impl MainScreenVisionErrorCode {
             Self::OutcomeUnknown => "VISION_SEND_OUTCOME_UNKNOWN",
             Self::ProviderResponded => "VISION_PROVIDER_RESPONDED",
             Self::ResponseInvalidAfterSend => "VISION_RESPONSE_INVALID_AFTER_SEND",
+            Self::TerminalSettlementUnavailableAfterSend => {
+                "VISION_TERMINAL_SETTLEMENT_UNAVAILABLE_AFTER_SEND"
+            }
             Self::AbandonUnavailable => "VISION_ABANDON_UNAVAILABLE",
             Self::SynchronizationUnavailable => "VISION_SYNCHRONIZATION_UNAVAILABLE",
         }
@@ -208,6 +215,9 @@ impl MainScreenVisionErrorCode {
             Self::ResponseInvalidAfterSend => {
                 "The image was sent, but the Vision response was invalid. Prepare a new analysis."
             }
+            Self::TerminalSettlementUnavailableAfterSend => {
+                "The Vision provider received this image, but local one-shot finalization could not be completed. This attempt will not be resent automatically."
+            }
             Self::AbandonUnavailable => "This Vision attempt can no longer be abandoned.",
             Self::SynchronizationUnavailable => "Vision delivery is temporarily unavailable.",
         }
@@ -254,6 +264,7 @@ pub(crate) enum MainScreenVisionStatusKind {
     ReviewReady,
     DeliveryInProgress,
     AwaitingRetryDecision,
+    DefiniteDeliveryObserved,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -307,10 +318,26 @@ struct CommittedReview {
     grant_id: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DefiniteDeliveryTerminalKind {
+    SuccessfulHttpResponse,
+    ProviderErrorResponse,
+}
+
+#[derive(Clone)]
+struct DefiniteDeliveryObservedReview {
+    evidence: ReviewEvidence,
+    confirmation_event_id: String,
+    delivery_id: String,
+    grant_id: String,
+    terminal_kind: DefiniteDeliveryTerminalKind,
+}
+
 enum ReviewState {
     Empty,
     Ready(ReviewEvidence),
     Committed(CommittedReview),
+    DefiniteDeliveryObserved(DefiniteDeliveryObservedReview),
 }
 
 #[derive(Clone)]
@@ -326,6 +353,7 @@ pub(crate) enum ScreenVisionReviewErrorCode {
     ReviewExpired,
     ReviewInUse,
     ReviewConflict,
+    DefiniteDeliveryObserved,
     SynchronizationUnavailable,
     RandomUnavailable,
 }
@@ -383,6 +411,8 @@ pub(crate) struct ScreenVisionReviewBroker {
     state: Mutex<ReviewState>,
     clock: Arc<dyn ReviewClock>,
     id_source: Arc<dyn ReviewIdSource>,
+    #[cfg(test)]
+    terminal_cleanup_failures: AtomicUsize,
 }
 
 impl ScreenVisionReviewBroker {
@@ -391,17 +421,22 @@ impl ScreenVisionReviewBroker {
             state: Mutex::new(ReviewState::Empty),
             clock: Arc::new(SystemReviewClock),
             id_source: Arc::new(CsPrngReviewIdSource),
+            #[cfg(test)]
+            terminal_cleanup_failures: AtomicUsize::new(0),
         }
     }
 
     pub(crate) fn ensure_can_prepare(&self) -> Result<(), ScreenVisionReviewError> {
         let state = self.lock_state()?;
-        if matches!(&*state, ReviewState::Committed(_)) {
-            return Err(ScreenVisionReviewError::new(
+        match &*state {
+            ReviewState::Committed(_) => Err(ScreenVisionReviewError::new(
                 ScreenVisionReviewErrorCode::ReviewInUse,
-            ));
+            )),
+            ReviewState::DefiniteDeliveryObserved(_) => Err(ScreenVisionReviewError::new(
+                ScreenVisionReviewErrorCode::DefiniteDeliveryObserved,
+            )),
+            ReviewState::Empty | ReviewState::Ready(_) => Ok(()),
         }
-        Ok(())
     }
 
     pub(crate) fn install_ready(
@@ -426,10 +461,18 @@ impl ScreenVisionReviewBroker {
         }
         let review_id = self.id_source.generate()?;
         let mut state = self.lock_state()?;
-        if matches!(&*state, ReviewState::Committed(_)) {
-            return Err(ScreenVisionReviewError::new(
-                ScreenVisionReviewErrorCode::ReviewInUse,
-            ));
+        match &*state {
+            ReviewState::Committed(_) => {
+                return Err(ScreenVisionReviewError::new(
+                    ScreenVisionReviewErrorCode::ReviewInUse,
+                ));
+            }
+            ReviewState::DefiniteDeliveryObserved(_) => {
+                return Err(ScreenVisionReviewError::new(
+                    ScreenVisionReviewErrorCode::DefiniteDeliveryObserved,
+                ));
+            }
+            ReviewState::Empty | ReviewState::Ready(_) => {}
         }
         let evidence = ReviewEvidence {
             review_id: review_id.clone(),
@@ -480,6 +523,9 @@ impl ScreenVisionReviewBroker {
                 }
                 Ok(ScreenVisionReviewExecution::Committed(committed.clone()))
             }
+            ReviewState::DefiniteDeliveryObserved(_) => Err(ScreenVisionReviewError::new(
+                ScreenVisionReviewErrorCode::DefiniteDeliveryObserved,
+            )),
             ReviewState::Empty => Err(ScreenVisionReviewError::new(
                 ScreenVisionReviewErrorCode::NoReview,
             )),
@@ -501,6 +547,9 @@ impl ScreenVisionReviewBroker {
             }
             ReviewState::Committed(_) | ReviewState::Ready(_) => Err(ScreenVisionReviewError::new(
                 ScreenVisionReviewErrorCode::ReviewConflict,
+            )),
+            ReviewState::DefiniteDeliveryObserved(_) => Err(ScreenVisionReviewError::new(
+                ScreenVisionReviewErrorCode::DefiniteDeliveryObserved,
             )),
             ReviewState::Empty => Err(ScreenVisionReviewError::new(
                 ScreenVisionReviewErrorCode::NoReview,
@@ -537,6 +586,9 @@ impl ScreenVisionReviewBroker {
                     ScreenVisionReviewErrorCode::NoReview,
                 )),
                 ReviewState::Ready(_) => unreachable!(),
+                ReviewState::DefiniteDeliveryObserved(_) => Err(ScreenVisionReviewError::new(
+                    ScreenVisionReviewErrorCode::DefiniteDeliveryObserved,
+                )),
             };
         };
         if evidence.review_id != review_id {
@@ -555,6 +607,109 @@ impl ScreenVisionReviewBroker {
             grant_id: grant_id.to_string(),
         });
         Ok(())
+    }
+
+    fn mark_definite_delivery_observed_exact(
+        &self,
+        review_id: &str,
+        confirmation_event_id: &str,
+        delivery_id: &str,
+        grant_id: &str,
+        terminal_kind: DefiniteDeliveryTerminalKind,
+    ) -> Result<(), ScreenVisionReviewError> {
+        validate_id(review_id)?;
+        validate_id(confirmation_event_id)?;
+        validate_id(delivery_id)?;
+        validate_id(grant_id)?;
+
+        let mut state = self.lock_state()?;
+        match &*state {
+            ReviewState::Committed(committed)
+                if committed.evidence.review_id == review_id
+                    && committed.confirmation_event_id == confirmation_event_id
+                    && committed.delivery_id == delivery_id
+                    && committed.grant_id == grant_id =>
+            {
+                let committed = match std::mem::replace(&mut *state, ReviewState::Empty) {
+                    ReviewState::Committed(committed) => committed,
+                    _ => unreachable!("review state cannot change while its mutex is held"),
+                };
+                *state = ReviewState::DefiniteDeliveryObserved(DefiniteDeliveryObservedReview {
+                    evidence: committed.evidence,
+                    confirmation_event_id: committed.confirmation_event_id,
+                    delivery_id: committed.delivery_id,
+                    grant_id: committed.grant_id,
+                    terminal_kind,
+                });
+                Ok(())
+            }
+            ReviewState::DefiniteDeliveryObserved(observed)
+                if observed.evidence.review_id == review_id
+                    && observed.confirmation_event_id == confirmation_event_id
+                    && observed.delivery_id == delivery_id
+                    && observed.grant_id == grant_id
+                    && observed.terminal_kind == terminal_kind =>
+            {
+                Ok(())
+            }
+            ReviewState::DefiniteDeliveryObserved(_) => Err(ScreenVisionReviewError::new(
+                ScreenVisionReviewErrorCode::DefiniteDeliveryObserved,
+            )),
+            ReviewState::Committed(_) | ReviewState::Ready(_) => Err(ScreenVisionReviewError::new(
+                ScreenVisionReviewErrorCode::ReviewConflict,
+            )),
+            ReviewState::Empty => Err(ScreenVisionReviewError::new(
+                ScreenVisionReviewErrorCode::NoReview,
+            )),
+        }
+    }
+
+    fn clear_definite_delivery_observed_exact(
+        &self,
+        review_id: &str,
+        confirmation_event_id: &str,
+        delivery_id: &str,
+        grant_id: &str,
+    ) -> Result<(), ScreenVisionReviewError> {
+        validate_id(review_id)?;
+        validate_id(confirmation_event_id)?;
+        validate_id(delivery_id)?;
+        validate_id(grant_id)?;
+
+        #[cfg(test)]
+        if self.terminal_cleanup_failures.swap(0, Ordering::AcqRel) > 0 {
+            return Err(ScreenVisionReviewError::new(
+                ScreenVisionReviewErrorCode::SynchronizationUnavailable,
+            ));
+        }
+
+        let mut state = self.lock_state()?;
+        match &*state {
+            ReviewState::DefiniteDeliveryObserved(observed)
+                if observed.evidence.review_id == review_id
+                    && observed.confirmation_event_id == confirmation_event_id
+                    && observed.delivery_id == delivery_id
+                    && observed.grant_id == grant_id =>
+            {
+                *state = ReviewState::Empty;
+                Ok(())
+            }
+            ReviewState::DefiniteDeliveryObserved(_) => Err(ScreenVisionReviewError::new(
+                ScreenVisionReviewErrorCode::DefiniteDeliveryObserved,
+            )),
+            ReviewState::Committed(_) | ReviewState::Ready(_) => Err(ScreenVisionReviewError::new(
+                ScreenVisionReviewErrorCode::ReviewConflict,
+            )),
+            ReviewState::Empty => Err(ScreenVisionReviewError::new(
+                ScreenVisionReviewErrorCode::NoReview,
+            )),
+        }
+    }
+
+    #[cfg(test)]
+    fn fail_next_terminal_cleanup_for_test(&self) {
+        self.terminal_cleanup_failures
+            .fetch_add(1, Ordering::AcqRel);
     }
 
     pub(crate) fn validate_committed_exact(
@@ -580,6 +735,9 @@ impl ScreenVisionReviewBroker {
             }
             ReviewState::Committed(_) => Err(ScreenVisionReviewError::new(
                 ScreenVisionReviewErrorCode::ReviewConflict,
+            )),
+            ReviewState::DefiniteDeliveryObserved(_) => Err(ScreenVisionReviewError::new(
+                ScreenVisionReviewErrorCode::DefiniteDeliveryObserved,
             )),
             _ => Err(ScreenVisionReviewError::new(
                 ScreenVisionReviewErrorCode::NoReview,
@@ -629,6 +787,9 @@ impl ScreenVisionReviewBroker {
             ReviewState::Committed(committed) => {
                 ScreenVisionReviewStatusSnapshot::Committed(committed.clone())
             }
+            ReviewState::DefiniteDeliveryObserved(observed) => {
+                ScreenVisionReviewStatusSnapshot::DefiniteDeliveryObserved(observed.clone())
+            }
         })
     }
 
@@ -643,6 +804,7 @@ enum ScreenVisionReviewStatusSnapshot {
     Empty,
     Ready(ReviewEvidence),
     Committed(CommittedReview),
+    DefiniteDeliveryObserved(DefiniteDeliveryObservedReview),
 }
 
 fn validate_id(value: &str) -> Result<(), ScreenVisionReviewError> {
@@ -892,6 +1054,10 @@ pub fn get_main_screen_vision_status(
             },
             Some(review_display(&committed.evidence)),
         ),
+        ScreenVisionReviewStatusSnapshot::DefiniteDeliveryObserved(observed) => (
+            MainScreenVisionStatusKind::DefiniteDeliveryObserved,
+            Some(review_display(&observed.evidence)),
+        ),
     };
     Ok(MainScreenVisionStatusDto { status, review })
 }
@@ -1105,6 +1271,15 @@ async fn execute_main_screen_vision_review_service(
 
     match response {
         Ok(response) => {
+            review_broker
+                .mark_definite_delivery_observed_exact(
+                    &request.review_id,
+                    &request.confirmation_event_id,
+                    &request.delivery_id,
+                    &grant_id,
+                    DefiniteDeliveryTerminalKind::SuccessfulHttpResponse,
+                )
+                .map_err(|_| terminal_settlement_error())?;
             settle_terminal_success(
                 grant_broker,
                 candidate_broker,
@@ -1113,7 +1288,7 @@ async fn execute_main_screen_vision_review_service(
                 &request,
                 &grant_id,
                 &evidence.candidate_id,
-            );
+            )?;
             let analysis = parse_screen_vision_analysis(response.body()).map_err(|_| {
                 MainScreenVisionError::new(
                     MainScreenVisionErrorCode::ResponseInvalidAfterSend,
@@ -1136,6 +1311,15 @@ async fn execute_main_screen_vision_review_service(
         }
         Err(SensitiveProviderExecutionError::Provider(error)) => {
             if error.status().is_some() {
+                review_broker
+                    .mark_definite_delivery_observed_exact(
+                        &request.review_id,
+                        &request.confirmation_event_id,
+                        &request.delivery_id,
+                        &grant_id,
+                        DefiniteDeliveryTerminalKind::ProviderErrorResponse,
+                    )
+                    .map_err(|_| terminal_settlement_error())?;
                 settle_terminal_provider_response(
                     grant_broker,
                     candidate_broker,
@@ -1144,7 +1328,7 @@ async fn execute_main_screen_vision_review_service(
                     &request,
                     &grant_id,
                     &evidence.candidate_id,
-                );
+                )?;
                 return Err(MainScreenVisionError::new(
                     MainScreenVisionErrorCode::ProviderResponded,
                     true,
@@ -1164,6 +1348,13 @@ async fn execute_main_screen_vision_review_service(
             }
         }
     }
+}
+
+const fn terminal_settlement_error() -> MainScreenVisionError {
+    MainScreenVisionError::new(
+        MainScreenVisionErrorCode::TerminalSettlementUnavailableAfterSend,
+        false,
+    )
 }
 
 fn final_pre_send_guard(
@@ -1291,16 +1482,21 @@ fn settle_terminal_success(
     request: &ExecuteMainScreenVisionReviewRequest,
     grant_id: &str,
     candidate_id: &str,
-) {
-    let _ = grant_broker.retire_bound_after_success(grant_id, &request.delivery_id);
+) -> Result<(), MainScreenVisionError> {
+    grant_broker
+        .retire_bound_after_success(grant_id, &request.delivery_id)
+        .map_err(|_| terminal_settlement_error())?;
     drop(lease);
     revoke_candidate_best_effort(candidate_broker, candidate_id);
-    let _ = review_broker.clear_committed_exact(
-        &request.review_id,
-        &request.confirmation_event_id,
-        &request.delivery_id,
-        grant_id,
-    );
+    review_broker
+        .clear_definite_delivery_observed_exact(
+            &request.review_id,
+            &request.confirmation_event_id,
+            &request.delivery_id,
+            grant_id,
+        )
+        .map_err(|_| terminal_settlement_error())?;
+    Ok(())
 }
 
 fn settle_terminal_provider_response(
@@ -1311,16 +1507,21 @@ fn settle_terminal_provider_response(
     request: &ExecuteMainScreenVisionReviewRequest,
     grant_id: &str,
     candidate_id: &str,
-) {
-    let _ = grant_broker.retire_bound_after_provider_response(grant_id, &request.delivery_id);
+) -> Result<(), MainScreenVisionError> {
+    grant_broker
+        .retire_bound_after_provider_response(grant_id, &request.delivery_id)
+        .map_err(|_| terminal_settlement_error())?;
     drop(lease);
     revoke_candidate_best_effort(candidate_broker, candidate_id);
-    let _ = review_broker.clear_committed_exact(
-        &request.review_id,
-        &request.confirmation_event_id,
-        &request.delivery_id,
-        grant_id,
-    );
+    review_broker
+        .clear_definite_delivery_observed_exact(
+            &request.review_id,
+            &request.confirmation_event_id,
+            &request.delivery_id,
+            grant_id,
+        )
+        .map_err(|_| terminal_settlement_error())?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -1468,6 +1669,7 @@ fn map_review_error(error: ScreenVisionReviewError) -> MainScreenVisionError {
         ScreenVisionReviewErrorCode::ReviewConflict => {
             MainScreenVisionError::new(MainScreenVisionErrorCode::ReviewConflict, true)
         }
+        ScreenVisionReviewErrorCode::DefiniteDeliveryObserved => terminal_settlement_error(),
         ScreenVisionReviewErrorCode::SynchronizationUnavailable
         | ScreenVisionReviewErrorCode::RandomUnavailable => {
             MainScreenVisionError::new(MainScreenVisionErrorCode::SynchronizationUnavailable, true)
@@ -1617,7 +1819,9 @@ mod tests {
     use super::*;
     use crate::perception::screen_capture::{ScreenFrame, ScreenPixelFormat};
     use crate::perception::screen_vision_outbound_destination::ScreenVisionOutboundDestinationProviderKind;
+    use crate::perception::screen_vision_outbound_grant::ScreenVisionOutboundGrantState;
     use crate::perception::screen_vision_outbound_projection::project_screen_frame;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Clone)]
     struct ManualReviewClock {
@@ -1706,6 +1910,7 @@ mod tests {
             state: Mutex::new(ReviewState::Empty),
             clock: Arc::new(clock),
             id_source: Arc::new(SequenceReviewIdSource::new(ids)),
+            terminal_cleanup_failures: AtomicUsize::new(0),
         }
     }
 
@@ -1739,6 +1944,111 @@ mod tests {
             Vec::new(),
         );
         project_screen_frame(&frame, &request).expect("test projection should succeed")
+    }
+
+    fn terminal_fixture() -> (
+        ScreenVisionReviewBroker,
+        ScreenVisionOutboundCandidateBroker,
+        ScreenVisionOutboundGrantBroker,
+        ExecuteMainScreenVisionReviewRequest,
+        String,
+    ) {
+        let review_broker = review_broker(ManualReviewClock::new(), vec!["review-terminal"]);
+        let candidate_broker = ScreenVisionOutboundCandidateBroker::new();
+        let grant_broker = ScreenVisionOutboundGrantBroker::new();
+        let candidate_id = candidate_broker
+            .replace_candidate("life-a", "fence-a", 1, projection())
+            .expect("candidate should install");
+        let destination = resolved(profile("profile-a", "2026-08-31T00:00:00Z"));
+        let binding = destination.binding.clone();
+        let review = review_broker
+            .install_ready(
+                candidate_id.clone(),
+                "life-a".to_string(),
+                destination,
+                "vision.example.invalid".to_string(),
+                2,
+                1,
+            )
+            .expect("review should install");
+        let request = ExecuteMainScreenVisionReviewRequest {
+            review_id: review.review_id,
+            confirmation_event_id: "confirmation-terminal".to_string(),
+            delivery_id: "delivery-terminal".to_string(),
+        };
+        review_broker
+            .commit_exact(
+                &request.review_id,
+                &request.confirmation_event_id,
+                &request.delivery_id,
+                "grant-terminal",
+            )
+            .expect("review should commit");
+        grant_broker.install_bound_for_test(
+            "grant-terminal",
+            &request.confirmation_event_id,
+            &candidate_id,
+            "life-a",
+            "fence-a",
+            1,
+            binding,
+            &request.delivery_id,
+        );
+        (
+            review_broker,
+            candidate_broker,
+            grant_broker,
+            request,
+            candidate_id,
+        )
+    }
+
+    fn mark_terminal_observed(
+        review_broker: &ScreenVisionReviewBroker,
+        request: &ExecuteMainScreenVisionReviewRequest,
+        terminal_kind: DefiniteDeliveryTerminalKind,
+    ) {
+        review_broker
+            .mark_definite_delivery_observed_exact(
+                &request.review_id,
+                &request.confirmation_event_id,
+                &request.delivery_id,
+                "grant-terminal",
+                terminal_kind,
+            )
+            .expect("definite provider response should install terminal fence");
+    }
+
+    fn assert_definite_delivery_observed(
+        review_broker: &ScreenVisionReviewBroker,
+        request: &ExecuteMainScreenVisionReviewRequest,
+        terminal_kind: DefiniteDeliveryTerminalKind,
+    ) {
+        assert!(matches!(
+            review_broker.status_snapshot().unwrap(),
+            ScreenVisionReviewStatusSnapshot::DefiniteDeliveryObserved(observed)
+                if observed.terminal_kind == terminal_kind
+        ));
+        assert!(matches!(
+            review_broker.get_for_execution(
+                &request.review_id,
+                &request.confirmation_event_id,
+                &request.delivery_id,
+            ),
+            Err(error) if error.code() == ScreenVisionReviewErrorCode::DefiniteDeliveryObserved
+        ));
+        assert!(matches!(
+            review_broker.get_for_execution(
+                "different-review",
+                "different-confirmation",
+                "different-delivery",
+            ),
+            Err(error) if error.code() == ScreenVisionReviewErrorCode::DefiniteDeliveryObserved
+        ));
+        assert_eq!(
+            review_broker.ensure_can_prepare().unwrap_err().code(),
+            ScreenVisionReviewErrorCode::DefiniteDeliveryObserved
+        );
     }
 
     #[test]
@@ -1840,5 +2150,322 @@ mod tests {
 
         fn require_zeroizing(_: Zeroizing<Vec<u8>>) {}
         require_zeroizing(first);
+    }
+
+    #[test]
+    fn definite_2xx_response_settlement_failure_keeps_no_resend_fence() {
+        let (review_broker, candidate_broker, grant_broker, request, candidate_id) =
+            terminal_fixture();
+        let lease = candidate_broker
+            .acquire_exact_delivery_lease(
+                &candidate_id,
+                "life-a",
+                "fence-a",
+                1,
+                &request.delivery_id,
+            )
+            .expect("delivery lease should acquire");
+        let provider_calls = AtomicUsize::new(0);
+        provider_calls.fetch_add(1, Ordering::SeqCst);
+        mark_terminal_observed(
+            &review_broker,
+            &request,
+            DefiniteDeliveryTerminalKind::SuccessfulHttpResponse,
+        );
+        grant_broker.fail_next_terminal_retirement_for_test();
+
+        let error = settle_terminal_success(
+            &grant_broker,
+            &candidate_broker,
+            &review_broker,
+            lease,
+            &request,
+            "grant-terminal",
+            &candidate_id,
+        )
+        .expect_err("D2 retirement failure must surface after a definite response");
+
+        assert_eq!(
+            error.code,
+            MainScreenVisionErrorCode::TerminalSettlementUnavailableAfterSend
+        );
+        assert!(!error.recoverable);
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        assert_definite_delivery_observed(
+            &review_broker,
+            &request,
+            DefiniteDeliveryTerminalKind::SuccessfulHttpResponse,
+        );
+        assert_eq!(
+            grant_broker.get_exact("grant-terminal").unwrap().state,
+            ScreenVisionOutboundGrantState::Bound
+        );
+        assert_eq!(
+            provider_calls.load(Ordering::SeqCst),
+            1,
+            "same or different tuples are blocked before another provider call"
+        );
+    }
+
+    #[test]
+    fn definite_non_2xx_response_settlement_failure_keeps_no_resend_fence() {
+        let (review_broker, candidate_broker, grant_broker, request, candidate_id) =
+            terminal_fixture();
+        let lease = candidate_broker
+            .acquire_exact_delivery_lease(
+                &candidate_id,
+                "life-a",
+                "fence-a",
+                1,
+                &request.delivery_id,
+            )
+            .expect("delivery lease should acquire");
+        let provider_calls = AtomicUsize::new(0);
+        provider_calls.fetch_add(1, Ordering::SeqCst);
+        mark_terminal_observed(
+            &review_broker,
+            &request,
+            DefiniteDeliveryTerminalKind::ProviderErrorResponse,
+        );
+        grant_broker.fail_next_terminal_retirement_for_test();
+
+        let error = settle_terminal_provider_response(
+            &grant_broker,
+            &candidate_broker,
+            &review_broker,
+            lease,
+            &request,
+            "grant-terminal",
+            &candidate_id,
+        )
+        .expect_err("D2 retirement failure must surface after a definite response");
+
+        assert_eq!(
+            error.code,
+            MainScreenVisionErrorCode::TerminalSettlementUnavailableAfterSend
+        );
+        assert!(!error.recoverable);
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        assert_definite_delivery_observed(
+            &review_broker,
+            &request,
+            DefiniteDeliveryTerminalKind::ProviderErrorResponse,
+        );
+        assert_eq!(
+            grant_broker.get_exact("grant-terminal").unwrap().state,
+            ScreenVisionOutboundGrantState::Bound
+        );
+    }
+
+    #[test]
+    fn successful_definite_response_consumes_d2_cleans_up_and_returns_idle() {
+        for terminal_kind in [
+            DefiniteDeliveryTerminalKind::SuccessfulHttpResponse,
+            DefiniteDeliveryTerminalKind::ProviderErrorResponse,
+        ] {
+            let (review_broker, candidate_broker, grant_broker, request, candidate_id) =
+                terminal_fixture();
+            let lease = candidate_broker
+                .acquire_exact_delivery_lease(
+                    &candidate_id,
+                    "life-a",
+                    "fence-a",
+                    1,
+                    &request.delivery_id,
+                )
+                .expect("delivery lease should acquire");
+            mark_terminal_observed(&review_broker, &request, terminal_kind);
+
+            match terminal_kind {
+                DefiniteDeliveryTerminalKind::SuccessfulHttpResponse => {
+                    settle_terminal_success(
+                        &grant_broker,
+                        &candidate_broker,
+                        &review_broker,
+                        lease,
+                        &request,
+                        "grant-terminal",
+                        &candidate_id,
+                    )
+                    .expect("2xx terminal settlement should complete");
+                }
+                DefiniteDeliveryTerminalKind::ProviderErrorResponse => {
+                    settle_terminal_provider_response(
+                        &grant_broker,
+                        &candidate_broker,
+                        &review_broker,
+                        lease,
+                        &request,
+                        "grant-terminal",
+                        &candidate_id,
+                    )
+                    .expect("non-2xx terminal settlement should complete");
+                }
+            }
+
+            assert!(matches!(
+                review_broker.status_snapshot().unwrap(),
+                ScreenVisionReviewStatusSnapshot::Empty
+            ));
+            assert!(matches!(
+                grant_broker.get_exact("grant-terminal"),
+                Err(error) if error.code() == ScreenVisionOutboundGrantErrorCode::GrantConsumed
+            ));
+            assert!(matches!(
+                review_broker.get_for_execution(
+                    &request.review_id,
+                    &request.confirmation_event_id,
+                    &request.delivery_id,
+                ),
+                Err(error) if error.code() == ScreenVisionReviewErrorCode::NoReview
+            ));
+            assert!(matches!(
+                candidate_broker.get_exact(&candidate_id),
+                Err(error) if error.code() == ScreenVisionOutboundCandidateErrorCode::NoCurrentCandidate
+            ));
+            assert!(review_broker.ensure_can_prepare().is_ok());
+        }
+    }
+
+    #[test]
+    fn d2_consumed_but_review_cleanup_failure_preserves_terminal_state() {
+        let (review_broker, candidate_broker, grant_broker, request, candidate_id) =
+            terminal_fixture();
+        let lease = candidate_broker
+            .acquire_exact_delivery_lease(
+                &candidate_id,
+                "life-a",
+                "fence-a",
+                1,
+                &request.delivery_id,
+            )
+            .expect("delivery lease should acquire");
+        mark_terminal_observed(
+            &review_broker,
+            &request,
+            DefiniteDeliveryTerminalKind::SuccessfulHttpResponse,
+        );
+        review_broker.fail_next_terminal_cleanup_for_test();
+
+        let error = settle_terminal_success(
+            &grant_broker,
+            &candidate_broker,
+            &review_broker,
+            lease,
+            &request,
+            "grant-terminal",
+            &candidate_id,
+        )
+        .expect_err("review cleanup failure must surface after D2 consumption");
+
+        assert_eq!(
+            error.code,
+            MainScreenVisionErrorCode::TerminalSettlementUnavailableAfterSend
+        );
+        assert!(!error.recoverable);
+        assert!(matches!(
+            grant_broker.get_exact("grant-terminal"),
+            Err(error) if error.code() == ScreenVisionOutboundGrantErrorCode::GrantConsumed
+        ));
+        assert_definite_delivery_observed(
+            &review_broker,
+            &request,
+            DefiniteDeliveryTerminalKind::SuccessfulHttpResponse,
+        );
+    }
+
+    #[test]
+    fn definite_delivery_observed_cannot_be_abandoned_as_not_sent() {
+        let (review_broker, _candidate_broker, grant_broker, request, _candidate_id) =
+            terminal_fixture();
+        mark_terminal_observed(
+            &review_broker,
+            &request,
+            DefiniteDeliveryTerminalKind::ProviderErrorResponse,
+        );
+        let delivery_gate = ScreenVisionDeliveryOperationGate::new();
+        let delivery_permit = delivery_gate
+            .try_enter()
+            .expect("test delivery permit should acquire");
+
+        let error = abandon_main_screen_vision_delivery_service(
+            &review_broker,
+            &grant_broker,
+            &_candidate_broker,
+            delivery_permit,
+            AbandonMainScreenVisionDeliveryRequest {
+                review_id: request.review_id.clone(),
+            },
+        )
+        .expect_err("observed delivery must not be treated as never sent");
+
+        assert_eq!(
+            error.code,
+            MainScreenVisionErrorCode::TerminalSettlementUnavailableAfterSend
+        );
+        assert!(!error.recoverable);
+        assert_eq!(
+            grant_broker.get_exact("grant-terminal").unwrap().state,
+            ScreenVisionOutboundGrantState::Bound
+        );
+    }
+
+    #[test]
+    fn possibly_sent_without_definite_response_keeps_exact_committed_retry_tuple() {
+        let broker = review_broker(ManualReviewClock::new(), vec!["review-ambiguous"]);
+        let review = install_review(&broker, "profile-a", "review-ambiguous");
+        broker
+            .commit_exact(
+                &review.review_id,
+                "confirmation-ambiguous",
+                "delivery-ambiguous",
+                "grant-ambiguous",
+            )
+            .unwrap();
+
+        assert!(matches!(
+            broker.get_for_execution(
+                &review.review_id,
+                "confirmation-ambiguous",
+                "delivery-ambiguous"
+            ),
+            Ok(ScreenVisionReviewExecution::Committed(committed))
+                if committed.grant_id == "grant-ambiguous"
+        ));
+        assert!(matches!(
+            broker.get_for_execution(
+                &review.review_id,
+                "other-confirmation",
+                "other-delivery"
+            ),
+            Err(error) if error.code() == ScreenVisionReviewErrorCode::ReviewConflict
+        ));
+    }
+
+    #[test]
+    fn definitely_not_sent_keeps_exact_committed_retry_tuple() {
+        let broker = review_broker(ManualReviewClock::new(), vec!["review-not-sent"]);
+        let review = install_review(&broker, "profile-a", "review-not-sent");
+        broker
+            .commit_exact(
+                &review.review_id,
+                "confirmation-not-sent",
+                "delivery-not-sent",
+                "grant-not-sent",
+            )
+            .unwrap();
+
+        assert!(matches!(
+            broker.get_for_execution(
+                &review.review_id,
+                "confirmation-not-sent",
+                "delivery-not-sent"
+            ),
+            Ok(ScreenVisionReviewExecution::Committed(_))
+        ));
+        assert!(matches!(
+            broker.status_snapshot().unwrap(),
+            ScreenVisionReviewStatusSnapshot::Committed(_)
+        ));
     }
 }

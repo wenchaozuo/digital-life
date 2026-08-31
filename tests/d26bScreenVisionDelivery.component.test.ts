@@ -312,6 +312,40 @@ describe("D26-B Main explicit governed Vision delivery", () => {
     }
   });
 
+  it("shows a definite-delivery terminal error without retry or another send", async () => {
+    const { wrapper, executeVisionReview, setVisionStatus } = await mountMain();
+    executeVisionReview.mockRejectedValue({
+      code: "VISION_TERMINAL_SETTLEMENT_UNAVAILABLE_AFTER_SEND",
+      recoverable: false,
+    });
+    try {
+      await wrapper.get("[data-testid='screen-vision-prepare']").trigger("click");
+      await flushMicrotasks();
+      setVisionStatus({ status: "definiteDeliveryObserved", review });
+      await wrapper.get("[data-testid='screen-vision-analyze']").trigger("click");
+      await flushMicrotasks();
+
+      const section = wrapper.get("[data-testid='main-screen-vision-delivery']");
+      expect(executeVisionReview).toHaveBeenCalledTimes(1);
+      expect(section.text()).toContain(
+        "The Vision provider received this image, but local one-shot finalization could not be completed.",
+      );
+      expect(section.text()).not.toContain("The image has not been sent yet.");
+      expect(section.text()).not.toContain("Retry");
+      expect(section.find("[data-testid='screen-vision-analyze']").exists()).toBe(false);
+      expect(section.find("[data-testid='screen-vision-abandon']").exists()).toBe(false);
+      expect(wrapper.get("[data-testid='screen-vision-prepare']").attributes("disabled")).toBe(
+        "",
+      );
+
+      await wrapper.get("[data-testid='screen-vision-prepare']").trigger("click");
+      await flushMicrotasks();
+      expect(executeVisionReview).toHaveBeenCalledTimes(1);
+    } finally {
+      wrapper.unmount();
+    }
+  });
+
   it("drops a stale preparation result after the current Life changes", async () => {
     const { wrapper, prepareVisionReview, switchLife } = await mountMain();
     const deferred = new Deferred<MainScreenVisionReview>();

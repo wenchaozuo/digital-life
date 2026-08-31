@@ -10,6 +10,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use super::screen_policy::{
     authorize_screen_perception, ScreenPerceptionRepository, ScreenPerceptionSessionGate,
 };
@@ -165,6 +168,8 @@ pub(crate) struct ScreenVisionOutboundGrantBroker {
     state: Mutex<ScreenVisionOutboundGrantStateSlot>,
     clock: Arc<dyn GrantClock>,
     id_source: Arc<dyn GrantIdSource>,
+    #[cfg(test)]
+    terminal_retirement_failures: AtomicUsize,
 }
 
 impl ScreenVisionOutboundGrantBroker {
@@ -173,6 +178,8 @@ impl ScreenVisionOutboundGrantBroker {
             state: Mutex::new(ScreenVisionOutboundGrantStateSlot::Empty),
             clock: Arc::new(SystemGrantClock),
             id_source: Arc::new(CsprngGrantIdSource),
+            #[cfg(test)]
+            terminal_retirement_failures: AtomicUsize::new(0),
         }
     }
 
@@ -185,7 +192,45 @@ impl ScreenVisionOutboundGrantBroker {
             state: Mutex::new(ScreenVisionOutboundGrantStateSlot::Empty),
             clock,
             id_source,
+            terminal_retirement_failures: AtomicUsize::new(0),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_terminal_retirement_for_test(&self) {
+        self.terminal_retirement_failures
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_bound_for_test(
+        &self,
+        grant_id: &str,
+        confirmation_event_id: &str,
+        candidate_id: &str,
+        life_id: &str,
+        screen_session_fence: &str,
+        outbound_policy_revision: i64,
+        destination_binding: ScreenVisionOutboundDestinationBinding,
+        delivery_id: &str,
+    ) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("grant state should initially lock");
+        *state = ScreenVisionOutboundGrantStateSlot::Bound {
+            grant: ScreenVisionOutboundGrantRecord {
+                grant_id: grant_id.to_string(),
+                confirmation_event_id: confirmation_event_id.to_string(),
+                candidate_id: candidate_id.to_string(),
+                life_id: life_id.to_string(),
+                screen_session_fence: screen_session_fence.to_string(),
+                outbound_policy_revision,
+                destination_binding,
+                created_at: Instant::now(),
+            },
+            delivery_id: delivery_id.to_string(),
+        };
     }
 
     /// Issues a grant only after deriving every scope dimension from the
@@ -630,6 +675,13 @@ impl ScreenVisionOutboundGrantBroker {
     ) -> Result<(), ScreenVisionOutboundGrantError> {
         validate_id(grant_id)?;
         validate_id(delivery_id)?;
+
+        #[cfg(test)]
+        if self.terminal_retirement_failures.swap(0, Ordering::AcqRel) > 0 {
+            return Err(grant_error(
+                ScreenVisionOutboundGrantErrorCode::SynchronizationUnavailable,
+            ));
+        }
 
         let mut state = self.lock_state()?;
         match &*state {

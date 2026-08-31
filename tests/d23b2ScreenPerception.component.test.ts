@@ -52,6 +52,9 @@ async function mountPerception(options: {
   const perception = await import(
     "../src/settings/perception/screenPerceptionSettingsService"
   );
+  const outbound = await import(
+    "../src/settings/perception/screenVisionOutboundSettingsService"
+  );
   const settingsModule = await import("../src/settings/SettingsApp.vue");
 
   vi.spyOn(storage.storageService, "getStorageLocation").mockResolvedValue({
@@ -67,6 +70,9 @@ async function mountPerception(options: {
   const getSessionStatus = vi
     .spyOn(perception.screenPerceptionSettingsService, "getSessionStatus")
     .mockResolvedValue(options.session ?? { status: "disarmed" });
+  vi.spyOn(outbound.screenVisionOutboundSettingsService, "getPolicy").mockResolvedValue(
+    null,
+  );
 
   const wrapper = mount(settingsModule.default);
   const sectionButton = wrapper

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 
 import type { LifeIdentity } from "../../life";
 import { storageService } from "../../storage";
@@ -17,8 +17,15 @@ import {
   type ScreenPerceptionSessionStatus,
   type ScreenPerceptionSettingsError,
 } from "./screenPerceptionSettingsService";
+import {
+  screenVisionOutboundErrorFromUnknown,
+  screenVisionOutboundSettingsService,
+  type ScreenVisionOutboundPolicy,
+  type ScreenVisionOutboundSettingsError,
+} from "./screenVisionOutboundSettingsService";
 
 type ScreenPerceptionSettingsPhase = "loading" | "ready" | "failed";
+type ScreenVisionOutboundSettingsPhase = "loading" | "ready" | "failed";
 
 const currentLife = ref<LifeIdentity>();
 const policy = ref<ScreenPerceptionPolicy | null>();
@@ -34,6 +41,16 @@ const targetError = ref<ScreenCaptureSettingsError>();
 const targetOperation = ref("");
 const targetLoading = ref(false);
 const smoke = ref<ScreenCaptureSmoke>();
+
+const outboundPolicy = ref<ScreenVisionOutboundPolicy | null>();
+const outboundPhase = ref<ScreenVisionOutboundSettingsPhase>("loading");
+const outboundLoading = ref(false);
+const outboundError = ref<ScreenVisionOutboundSettingsError>();
+const outboundOperation = ref("");
+
+let componentEpoch = 0;
+let refreshGeneration = 0;
+let outboundMutationGeneration = 0;
 
 const targetSelected = computed(
   () => targetStatus.value?.status === "selected",
@@ -71,11 +88,21 @@ const canSelectTarget = computed(
     Boolean(currentLife.value) &&
     sessionActiveForCurrentLife.value &&
     !targetLoading.value,
-);const consentLabel = computed(() => {
+);
+
+const consentLabel = computed(() => {
   if (!currentLife.value) return "No current Life";
   if (!policy.value) return "Not configured";
   return policy.value.enabled ? "Enabled" : "Disabled";
 });
+
+const outboundConsentLabel = computed(() => {
+  if (!currentLife.value) return "No current Life";
+  if (outboundPhase.value === "loading") return "Loading…";
+  if (outboundPolicy.value === undefined) return "Unavailable";
+  return outboundPolicy.value?.enabled ? "Enabled" : "Disabled";
+});
+
 const sessionLabel = computed(() => {
   if (phase.value === "loading") return "Loading…";
   if (!session.value) return "Unavailable";
@@ -85,38 +112,221 @@ const sessionLabel = computed(() => {
   return "Disarmed";
 });
 
+function isCurrentRefresh(
+  epoch: number,
+  generation: number,
+  lifeId?: string,
+): boolean {
+  return (
+    componentEpoch === epoch &&
+    refreshGeneration === generation &&
+    (lifeId === undefined || currentLife.value?.id === lifeId)
+  );
+}
+
+function isCurrentOutboundMutation(
+  epoch: number,
+  generation: number,
+  lifeId: string,
+): boolean {
+  return (
+    componentEpoch === epoch &&
+    outboundMutationGeneration === generation &&
+    currentLife.value?.id === lifeId
+  );
+}
+
 async function refresh(): Promise<void> {
+  const epoch = componentEpoch;
+  const generation = ++refreshGeneration;
   phase.value = "loading";
   loading.value = true;
   error.value = undefined;
   operation.value = "";
+  outboundPhase.value = "loading";
+  outboundError.value = undefined;
+  outboundOperation.value = "";
   try {
     const life = await storageService.getCurrentLife();
+    if (!isCurrentRefresh(epoch, generation)) return;
+
     currentLife.value = life;
-    const [loadedPolicy, loadedSession] = await Promise.all([
+
+    const perceptionLoad = Promise.all([
       life
         ? screenPerceptionSettingsService.getPolicy(life.id)
         : Promise.resolve(null),
       screenPerceptionSettingsService.getSessionStatus(),
     ]);
-    policy.value = loadedPolicy;
-    session.value = loadedSession;
-    phase.value = "ready";
-    await refreshTargetStatus();
+    const outboundLoad = life
+      ? screenVisionOutboundSettingsService.getPolicy(life.id)
+      : Promise.resolve(null);
+    const [perceptionResult] = await Promise.allSettled([perceptionLoad]);
+    if (isCurrentRefresh(epoch, generation, life?.id)) {
+      if (perceptionResult.status === "fulfilled") {
+        const [loadedPolicy, loadedSession] = perceptionResult.value;
+        policy.value = loadedPolicy;
+        session.value = loadedSession;
+        phase.value = "ready";
+      } else {
+        error.value = screenPerceptionErrorFromUnknown(perceptionResult.reason);
+        phase.value = "failed";
+      }
+      // D23 controls remain responsive while the independent D25 read is in flight.
+      loading.value = false;
+      await refreshTargetStatus(epoch, generation);
+    }
+
+    const [outboundResult] = await Promise.allSettled([outboundLoad]);
+    if (isCurrentRefresh(epoch, generation, life?.id)) {
+      if (outboundResult.status === "fulfilled") {
+        outboundPolicy.value = outboundResult.value;
+        outboundPhase.value = "ready";
+      } else {
+        outboundError.value = screenVisionOutboundErrorFromUnknown(
+          outboundResult.reason,
+        );
+        outboundPhase.value = "failed";
+      }
+    }
   } catch (caught) {
+    if (!isCurrentRefresh(epoch, generation)) return;
     error.value = screenPerceptionErrorFromUnknown(caught);
     phase.value = "failed";
+    outboundError.value = screenVisionOutboundErrorFromUnknown(caught);
+    outboundPhase.value = "failed";
   } finally {
-    loading.value = false;
+    if (isCurrentRefresh(epoch, generation)) {
+      loading.value = false;
+    }
   }
 }
 
-async function refreshTargetStatus(): Promise<void> {
+async function refreshTargetStatus(
+  epoch = componentEpoch,
+  generation = refreshGeneration,
+): Promise<void> {
+  targetError.value = undefined;
   try {
-    targetStatus.value = await screenCaptureSettingsService.getTargetStatus();
+    const loadedTargetStatus = await screenCaptureSettingsService.getTargetStatus();
+    if (isCurrentRefresh(epoch, generation)) {
+      targetStatus.value = loadedTargetStatus;
+    }
   } catch (caught) {
-    targetError.value = screenCaptureErrorFromUnknown(caught);
+    if (isCurrentRefresh(epoch, generation)) {
+      targetError.value = screenCaptureErrorFromUnknown(caught);
+    }
   }
+}
+
+async function rereadOutboundPolicyAfterUpdateFailure(
+  lifeId: string,
+  epoch: number,
+  mutationGeneration: number,
+  requestedEnabled: boolean,
+  caught: unknown,
+): Promise<void> {
+  const updateError = screenVisionOutboundErrorFromUnknown(caught);
+  try {
+    const refreshedPolicy =
+      await screenVisionOutboundSettingsService.getPolicy(lifeId);
+    if (!isCurrentOutboundMutation(epoch, mutationGeneration, lifeId)) return;
+
+    outboundPolicy.value = refreshedPolicy;
+    outboundPhase.value = "ready";
+    outboundError.value = updateError;
+    outboundOperation.value =
+      refreshedPolicy?.enabled === requestedEnabled
+        ? "Current permission state was refreshed."
+        : "The current permission state was refreshed. Review it before trying again.";
+  } catch (refreshCaught) {
+    if (!isCurrentOutboundMutation(epoch, mutationGeneration, lifeId)) return;
+
+    outboundPhase.value = "failed";
+    outboundError.value = screenVisionOutboundErrorFromUnknown(refreshCaught);
+    outboundOperation.value =
+      "The current permission state could not be refreshed. Retry before trying again.";
+  }
+}
+
+async function updateOutboundConsent(enabled: boolean): Promise<void> {
+  const life = currentLife.value;
+  const existingPolicy = outboundPolicy.value;
+  if (
+    !life ||
+    outboundLoading.value ||
+    outboundPhase.value !== "ready" ||
+    (!enabled && !existingPolicy?.enabled)
+  ) {
+    return;
+  }
+
+  const epoch = componentEpoch;
+  const mutationGeneration = ++outboundMutationGeneration;
+  outboundLoading.value = true;
+  outboundError.value = undefined;
+  outboundOperation.value = "";
+  let updateAttempted = false;
+
+  try {
+    let policyForUpdate = existingPolicy;
+    if (!policyForUpdate) {
+      policyForUpdate = await screenVisionOutboundSettingsService.createPolicy(
+        life.id,
+      );
+      if (!isCurrentOutboundMutation(epoch, mutationGeneration, life.id)) return;
+
+      // Creation is deliberately disabled-only. The explicit user action then
+      // performs the separate enabled transition using the returned revision.
+      outboundPolicy.value = policyForUpdate;
+    }
+
+    if (!isCurrentOutboundMutation(epoch, mutationGeneration, life.id)) return;
+
+    updateAttempted = true;
+    const updatedPolicy = await screenVisionOutboundSettingsService.updatePolicy(
+      life.id,
+      enabled,
+      policyForUpdate.revision,
+    );
+    if (!isCurrentOutboundMutation(epoch, mutationGeneration, life.id)) return;
+
+    outboundPolicy.value = updatedPolicy;
+    outboundPhase.value = "ready";
+    outboundOperation.value = enabled
+      ? "Screen image sharing permission enabled for this Life. Enabling this permission does not send any images by itself."
+      : "Screen image sharing permission disabled for this Life.";
+  } catch (caught) {
+    if (!isCurrentOutboundMutation(epoch, mutationGeneration, life.id)) return;
+
+    if (updateAttempted) {
+      await rereadOutboundPolicyAfterUpdateFailure(
+        life.id,
+        epoch,
+        mutationGeneration,
+        enabled,
+        caught,
+      );
+    } else {
+      outboundPhase.value = "failed";
+      outboundError.value = screenVisionOutboundErrorFromUnknown(caught);
+    }
+  } finally {
+    if (
+      componentEpoch === epoch &&
+      outboundMutationGeneration === mutationGeneration
+    ) {
+      outboundLoading.value = false;
+    }
+  }
+}
+
+async function enableOutboundConsent(): Promise<void> {
+  await updateOutboundConsent(true);
+}
+
+async function disableOutboundConsent(): Promise<void> {
+  await updateOutboundConsent(false);
 }
 
 async function enableConsent(): Promise<void> {
@@ -268,7 +478,14 @@ async function runSmokeCapture(): Promise<void> {
 }
 
 onMounted(() => {
+  componentEpoch += 1;
   void refresh();
+});
+
+onUnmounted(() => {
+  componentEpoch += 1;
+  refreshGeneration += 1;
+  outboundMutationGeneration += 1;
 });
 </script>
 
@@ -356,7 +573,7 @@ onMounted(() => {
       <button
         type="button"
         data-testid="screen-perception-refresh"
-        :disabled="loading"
+        :disabled="loading || outboundLoading"
         @click="refresh"
       >
         Refresh status
@@ -378,6 +595,83 @@ onMounted(() => {
     <p v-if="sessionLifeId && sessionMismatch" class="phase" data-testid="screen-perception-armed-life">
       Session owner: {{ sessionLifeId }}
     </p>
+
+    <section
+      class="result screen-vision-outbound-settings"
+      aria-label="Screen image sharing for Vision"
+      data-testid="screen-vision-outbound-section"
+    >
+      <h2>Screen image sharing for Vision</h2>
+      <p>
+        This is separate from local screen perception. It allows this Life to authorize a future
+        explicit network transmission of a privacy-reviewed screen image to a configured Vision provider.
+      </p>
+      <dl>
+        <div>
+          <dt>Screen image sharing permission</dt>
+          <dd data-testid="screen-vision-outbound-status">{{ outboundConsentLabel }}</dd>
+        </div>
+        <div v-if="outboundPolicy">
+          <dt>Permission revision</dt>
+          <dd data-testid="screen-vision-outbound-revision">{{ outboundPolicy.revision }}</dd>
+        </div>
+      </dl>
+      <p class="important">
+        Enabling this permission does not send any images by itself.
+      </p>
+      <p>Cloud Vision image transmission is not active yet.</p>
+      <p v-if="outboundPolicy?.enabled" data-testid="screen-vision-outbound-enabled-copy">
+        This permission only allows a future explicit Vision action to become eligible. No screen
+        image is being uploaded by this setting alone.
+      </p>
+      <p v-if="outboundPhase === 'loading'" class="phase" data-testid="screen-vision-outbound-loading" role="status">
+        Loading screen image sharing settings…
+      </p>
+      <p v-else-if="!currentLife" class="phase" data-testid="screen-vision-outbound-no-life">
+        Create or restore a Life before configuring screen image sharing.
+      </p>
+      <p v-else-if="outboundPolicy === null" class="phase" data-testid="screen-vision-outbound-no-policy">
+        No screen-image sharing permission has been granted for this Life.
+      </p>
+      <p v-else-if="outboundPolicy === undefined" class="phase" data-testid="screen-vision-outbound-unavailable">
+        The current screen image sharing permission could not be loaded. Refresh to try again.
+      </p>
+
+      <div class="actions" aria-label="Screen image sharing permission actions">
+        <button
+          v-if="!outboundPolicy?.enabled"
+          type="button"
+          class="primary"
+          data-testid="screen-vision-outbound-enable"
+          :disabled="outboundLoading || outboundPhase !== 'ready' || !currentLife"
+          @click="enableOutboundConsent"
+        >
+          Enable screen image sharing
+        </button>
+        <button
+          v-else
+          type="button"
+          class="danger"
+          data-testid="screen-vision-outbound-disable"
+          :disabled="outboundLoading || outboundPhase !== 'ready'"
+          @click="disableOutboundConsent"
+        >
+          Disable screen image sharing
+        </button>
+      </div>
+      <p v-if="outboundOperation" class="phase" data-testid="screen-vision-outbound-operation" role="status">
+        {{ outboundOperation }}
+      </p>
+      <section v-if="outboundError" class="result error" data-testid="screen-vision-outbound-error" aria-live="polite">
+        <strong>{{ outboundError.code }}</strong>
+        <p>{{ outboundError.message }}</p>
+        <p
+          v-if="outboundError.code === 'SCREEN_VISION_OUTBOUND_REVISION_CONFLICT' || outboundError.code === 'SCREEN_VISION_OUTBOUND_POLICY_EVENT_CONFLICT'"
+        >
+          The latest permission state has been refreshed. Do not retry automatically; review the current state first.
+        </p>
+      </section>
+    </section>
 
     <section class="result" aria-label="Screen capture target" data-testid="screen-capture-target-section">
       <h2>Capture target (this session only)</h2>
@@ -448,4 +742,6 @@ onMounted(() => {
 .screen-perception-settings dd { margin: 0; }
 .screen-perception-settings .actions { display: flex; flex-wrap: wrap; gap: 0.65rem; }
 .screen-perception-settings .mismatch { color: #fbbf24; }
+.screen-vision-outbound-settings { border-color: #475569; }
+.screen-vision-outbound-settings .important { color: #fde68a; font-weight: 700; }
 </style>

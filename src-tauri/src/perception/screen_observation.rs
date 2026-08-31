@@ -15,9 +15,9 @@ use super::{
         target::ScreenCaptureTargetBroker,
     },
     screen_chat_attachment::{
-        cancel_and_remove_exact_attachment, MainScreenContextAttachmentOfferDto,
-        ScreenContextChatAttachmentBroker, ScreenContextChatAttachmentError,
-        ScreenContextChatAttachmentErrorCode,
+        cancel_and_remove_exact_attachment, revoke_exact_attachment_preserving_bound,
+        MainScreenContextAttachmentOfferDto, ScreenContextChatAttachmentBroker,
+        ScreenContextChatAttachmentError, ScreenContextChatAttachmentErrorCode,
     },
     screen_context::{
         ScreenContextCandidateInput, ScreenContextError, ScreenContextErrorCode,
@@ -34,6 +34,9 @@ use super::{
     CurrentLifeAuthority,
 };
 use crate::storage::StorageService;
+
+#[cfg(test)]
+use super::screen_chat_attachment::OfferedChatAttachment;
 
 const MAX_LIFE_ID_CHARS: usize = 128;
 
@@ -750,6 +753,11 @@ fn attachment_offer_error_dto(
             broker_unavailable_error()
         }
         ScreenContextChatAttachmentErrorCode::AttachmentNotFound => context_unavailable_error(),
+        ScreenContextChatAttachmentErrorCode::AttachmentInUse => bounded_error(
+            "SCREEN_CONTEXT_ATTACHMENT_IN_USE",
+            "The screen context attachment is currently in use and cannot be dismissed yet.",
+            true,
+        ),
     }
 }
 
@@ -848,10 +856,11 @@ fn revoke_main_pending_screen_context_grant_service(
     }
 }
 
-/// Explicit Main-only command: exact-removes the attachment identified by
-/// `attachmentId` and exact-cancels its stored Pending Grant if still
-/// current.  Bounded/idempotent when the attachment is already gone or stale;
-/// never globally cancels the current handoff.
+/// Explicit Main-only command: exact-revokes the attachment identified by
+/// `attachmentId`.  A live Bound Grant remains intact and returns a bounded
+/// recoverable in-use error; Pending Grants are exact-cancelled before their
+/// marker is removed.  Absent/replaced/expired grants are stale-cleaned
+/// exactly, and the global handoff cancel is never used.
 #[tauri::command]
 pub fn revoke_main_screen_context_attachment(
     app: tauri::AppHandle,
@@ -871,25 +880,25 @@ fn revoke_main_screen_context_attachment_service(
     attachment_broker: &ScreenContextChatAttachmentBroker,
     attachment_id: &str,
 ) -> Result<(), MainScreenPerceptionErrorDto> {
-    cancel_and_remove_exact_attachment(handoff_broker, attachment_broker, attachment_id)
+    revoke_exact_attachment_preserving_bound(handoff_broker, attachment_broker, attachment_id)
         .map_err(attachment_offer_error_dto)
 }
 
 #[cfg(test)]
-fn revoke_main_screen_context_attachment_service_with_test_hook<AfterCancel>(
+fn revoke_main_screen_context_attachment_service_with_test_hook<BeforeCancel>(
     handoff_broker: &ScreenContextHandoffBroker,
     attachment_broker: &ScreenContextChatAttachmentBroker,
     attachment_id: &str,
-    after_cancel: AfterCancel,
+    before_cancel: BeforeCancel,
 ) -> Result<(), MainScreenPerceptionErrorDto>
 where
-    AfterCancel: FnOnce(),
+    BeforeCancel: FnOnce(&OfferedChatAttachment),
 {
-    super::screen_chat_attachment::cancel_and_remove_exact_attachment_with_test_hook(
+    super::screen_chat_attachment::revoke_exact_attachment_preserving_bound_with_test_hook(
         handoff_broker,
         attachment_broker,
         attachment_id,
-        after_cancel,
+        before_cancel,
     )
     .map_err(attachment_offer_error_dto)
 }
@@ -2726,6 +2735,104 @@ mod tests {
     }
 
     #[test]
+    fn main_bound_attachment_revoke_returns_in_use_and_preserves_exact_bound() {
+        let (
+            current_life,
+            repository,
+            session_gate,
+            handoff_broker,
+            attachment_broker,
+            operation_gate,
+            grant_id,
+        ) = offer_success_fixture();
+        let fence = session_gate.life_fence_for(LIFE_A).unwrap();
+        let attachment_id = attachment_broker
+            .offer(&grant_id, LIFE_A, ScreenContextSessionFence(fence))
+            .expect("the offer must succeed");
+        handoff_broker
+            .claim_grant(ScreenContextIds {
+                grant_id: grant_id.clone(),
+                life_id: LIFE_A.to_string(),
+                session_fence: ScreenContextSessionFence(fence),
+                conversation_id: CONVERSATION_ID.to_string(),
+                request_id: REQUEST_ID.to_string(),
+            })
+            .expect("the attachment grant must bind");
+
+        let error = revoke_main_screen_context_attachment_service(
+            &handoff_broker,
+            &attachment_broker,
+            &attachment_id,
+        )
+        .expect_err("a live Bound Grant must not be revoked");
+        assert_eq!(error.code, "SCREEN_CONTEXT_ATTACHMENT_IN_USE");
+        assert!(error.recoverable);
+        assert_eq!(
+            attachment_broker
+                .current()
+                .expect("the live Bound Grant marker must survive")
+                .attachment_id,
+            attachment_id
+        );
+        claim_payload(&handoff_broker, &grant_id, fence)
+            .expect("the exact same request must still claim the Bound Grant");
+        let _ = (current_life, repository, operation_gate);
+    }
+
+    #[test]
+    fn main_bound_attachment_revoke_race_returns_in_use_and_preserves_state() {
+        let (
+            current_life,
+            repository,
+            session_gate,
+            handoff_broker,
+            attachment_broker,
+            operation_gate,
+            grant_id,
+        ) = offer_success_fixture();
+        let fence = session_gate.life_fence_for(LIFE_A).unwrap();
+        let attachment_id = attachment_broker
+            .offer(&grant_id, LIFE_A, ScreenContextSessionFence(fence))
+            .expect("the offer must succeed");
+
+        // The helper has read the exact marker, then the governed send wins
+        // the handoff race and binds that same grant before cancellation.
+        let error = revoke_main_screen_context_attachment_service_with_test_hook(
+            &handoff_broker,
+            &attachment_broker,
+            &attachment_id,
+            |attachment| {
+                handoff_broker
+                    .claim_grant(ScreenContextIds {
+                        grant_id: attachment.grant_id.clone(),
+                        life_id: attachment.life_id.clone(),
+                        session_fence: attachment.session_fence,
+                        conversation_id: CONVERSATION_ID.to_string(),
+                        request_id: REQUEST_ID.to_string(),
+                    })
+                    .expect("the send-side claim must win before revoke cancel");
+            },
+        )
+        .expect_err("a live Bound Grant must not be revoked");
+        assert_eq!(error.code, "SCREEN_CONTEXT_ATTACHMENT_IN_USE");
+        assert!(error.recoverable);
+        assert_eq!(
+            error.message,
+            "The screen context attachment is currently in use and cannot be dismissed yet."
+        );
+        assert_eq!(
+            attachment_broker
+                .current()
+                .expect("the live Bound Grant marker must survive")
+                .attachment_id,
+            attachment_id
+        );
+        claim_payload(&handoff_broker, &grant_id, fence)
+            .expect("the Bound Grant must remain claimable for the same request");
+        let _ = (current_life, repository, operation_gate);
+    }
+
+    #[test]
     fn revoke_main_attachment_is_idempotent_when_already_gone() {
         let (
             current_life,
@@ -2788,7 +2895,7 @@ mod tests {
     }
 
     #[test]
-    fn main_attachment_revoke_does_not_remove_newer_marker_after_cancellation() {
+    fn main_attachment_revoke_does_not_remove_newer_marker_during_exact_revoke() {
         let (
             _current_life,
             _repository,
@@ -2808,7 +2915,7 @@ mod tests {
             &handoff_broker,
             &attachment_broker,
             &old_attachment,
-            || {
+            |_| {
                 let new_candidate = install_sentinel_candidate(&handoff_broker, fence);
                 let new_grant = handoff_broker
                     .issue_grant(&new_candidate, LIFE_A, ScreenContextSessionFence(fence))

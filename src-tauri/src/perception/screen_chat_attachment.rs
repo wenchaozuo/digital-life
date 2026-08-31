@@ -22,8 +22,9 @@
 //!   command re-reads the authoritative current Life, durable consent, and
 //!   current session fence, then re-validates the underlying Pending-or-Bound
 //!   Grant;
-//! - every exact removal cancels the matching Pending Grant only — never a
-//!   newer handoff, never the global broker `cancel()`.
+//! - explicit exact revoke/dismiss cancels the matching Pending Grant, while a
+//!   live Bound Grant remains intact and reports bounded `AttachmentInUse`;
+//!   stale cleanup remains exact and never uses the global broker `cancel()`.
 //!
 //! The module adds exactly two Chat-only commands and emits a
 //! presentation-only refresh hint (`screen-context-attachment-changed`,
@@ -62,6 +63,7 @@ const MAX_ID_CHARS: usize = 128;
 pub(crate) enum ScreenContextChatAttachmentErrorCode {
     InvalidArgument,
     AttachmentNotFound,
+    AttachmentInUse,
     SynchronizationUnavailable,
 }
 
@@ -90,6 +92,13 @@ impl ScreenContextChatAttachmentError {
         Self::new(
             ScreenContextChatAttachmentErrorCode::AttachmentNotFound,
             "The screen context attachment no longer exists.",
+        )
+    }
+
+    fn attachment_in_use() -> Self {
+        Self::new(
+            ScreenContextChatAttachmentErrorCode::AttachmentInUse,
+            "The screen context attachment is currently in use and cannot be dismissed yet.",
         )
     }
 
@@ -360,13 +369,104 @@ where
     )
 }
 
+/// Explicitly revokes one exact attachment without destroying a live Bound
+/// Grant.  Pending Grants are cancelled before their marker is removed.  If
+/// cancellation reports that the exact Pending Grant is no longer current,
+/// the handoff broker is queried with the stored Life and session fence so a
+/// live Bound Grant can be distinguished from a definitively stale grant.
+///
+/// This is intentionally separate from the Pending-oriented stale-cleanup
+/// helper above: successful New Observe replacement and post-offer rollback
+/// still have their existing Pending cleanup semantics.
+fn revoke_exact_attachment_preserving_bound_with_before_cancel<BeforeCancel>(
+    handoff_broker: &ScreenContextHandoffBroker,
+    attachment_broker: &ScreenContextChatAttachmentBroker,
+    attachment_id: &str,
+    before_cancel: BeforeCancel,
+) -> Result<(), ScreenContextChatAttachmentError>
+where
+    BeforeCancel: FnOnce(&OfferedChatAttachment),
+{
+    let attachment = attachment_broker.get_exact(attachment_id)?;
+    before_cancel(&attachment);
+
+    match handoff_broker.cancel_pending_grant(&attachment.grant_id, &attachment.life_id) {
+        Ok(()) => attachment_broker
+            .remove_exact(&attachment.attachment_id)
+            .map(|_| ()),
+        Err(error)
+            if matches!(
+                error.code,
+                ScreenContextErrorCode::NoCurrentContext | ScreenContextErrorCode::LifeMismatch
+            ) =>
+        {
+            match handoff_broker.validate_attachment_grant_alive(
+                &attachment.grant_id,
+                &attachment.life_id,
+                attachment.session_fence,
+            ) {
+                Ok(()) => Err(ScreenContextChatAttachmentError::attachment_in_use()),
+                Err(error)
+                    if matches!(
+                        error.code,
+                        ScreenContextErrorCode::SynchronizationUnavailable
+                            | ScreenContextErrorCode::InvalidArgument
+                    ) =>
+                {
+                    Err(chat_handoff_attachment_error(error))
+                }
+                Err(_) => attachment_broker
+                    .remove_exact(&attachment.attachment_id)
+                    .map(|_| ()),
+            }
+        }
+        Err(error) => Err(chat_handoff_attachment_error(error)),
+    }
+}
+
+/// Explicit exact revoke shared by Chat dismiss and Main attachment revoke.
+/// The returned error is an internal attachment outcome; callers map it to
+/// their own bounded WebView DTO without exposing grant or request metadata.
+pub(crate) fn revoke_exact_attachment_preserving_bound(
+    handoff_broker: &ScreenContextHandoffBroker,
+    attachment_broker: &ScreenContextChatAttachmentBroker,
+    attachment_id: &str,
+) -> Result<(), ScreenContextChatAttachmentError> {
+    revoke_exact_attachment_preserving_bound_with_before_cancel(
+        handoff_broker,
+        attachment_broker,
+        attachment_id,
+        |_| {},
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn revoke_exact_attachment_preserving_bound_with_test_hook<BeforeCancel>(
+    handoff_broker: &ScreenContextHandoffBroker,
+    attachment_broker: &ScreenContextChatAttachmentBroker,
+    attachment_id: &str,
+    before_cancel: BeforeCancel,
+) -> Result<(), ScreenContextChatAttachmentError>
+where
+    BeforeCancel: FnOnce(&OfferedChatAttachment),
+{
+    revoke_exact_attachment_preserving_bound_with_before_cancel(
+        handoff_broker,
+        attachment_broker,
+        attachment_id,
+        before_cancel,
+    )
+}
+
 /// Removes the current attachment marker (if any) only after exact-cancelling
 /// its stored Pending Grant.  Returns whether a marker was actually removed.
 ///
-/// This is the only shared invalidation path: it is used after a successful
-/// Observe/Candidate installation (the old grant was replaced, so any marker
-/// pointing at it is stale) and by the Chat status read when the marker no
-/// longer belongs to the current Life/fence or its grant is stale/expired.
+/// This remains the shared stale-invalidation path: it is used after a
+/// successful Observe/Candidate installation (the old grant was replaced, so
+/// any marker pointing at it is stale) and by the Chat status read when the
+/// marker no longer belongs to the current Life/fence or its grant is
+/// stale/expired.  Explicit user revoke/dismiss uses the Bound-aware helper
+/// above instead.
 /// If exact cancellation cannot be confirmed because synchronization is
 /// unavailable, the marker remains retryable and the global broker `cancel()`
 /// is never used.
@@ -380,56 +480,15 @@ pub(crate) fn clear_current_attachment_and_cancel_grant(
     cancel_and_remove_exact_attachment(handoff_broker, attachment_broker, &attachment_id).is_ok()
 }
 
-/// Chat dismiss path for one exact attachment.  A Pending Grant is cancelled
-/// before its marker is removed.  When cancellation reports no current
-/// Pending Grant, the attachment-specific liveness seam distinguishes an
-/// exact live Bound Grant (keep the marker and return a bounded recoverable
-/// error) from an absent/replaced/expired grant (remove only the old marker).
-/// Synchronization uncertainty never removes the marker.
+/// Chat dismiss path for one exact attachment.  It maps the shared internal
+/// Bound-aware revoke outcome to the Chat-facing bounded DTO.
 fn dismiss_exact_attachment(
     handoff_broker: &ScreenContextHandoffBroker,
     attachment_broker: &ScreenContextChatAttachmentBroker,
     attachment_id: &str,
 ) -> Result<(), ChatScreenContextAttachmentErrorDto> {
-    let attachment = attachment_broker
-        .get_exact(attachment_id)
-        .map_err(chat_attachment_error_dto)?;
-    match handoff_broker.cancel_pending_grant(&attachment.grant_id, &attachment.life_id) {
-        Ok(()) => attachment_broker
-            .remove_exact(&attachment.attachment_id)
-            .map(|_| ())
-            .map_err(chat_attachment_error_dto),
-        Err(error)
-            if matches!(
-                error.code,
-                ScreenContextErrorCode::NoCurrentContext | ScreenContextErrorCode::LifeMismatch
-            ) =>
-        {
-            match handoff_broker.validate_attachment_grant_alive(
-                &attachment.grant_id,
-                &attachment.life_id,
-                attachment.session_fence,
-            ) {
-                Ok(()) => Err(ChatScreenContextAttachmentErrorDto::attachment_in_use()),
-                Err(error)
-                    if matches!(
-                        error.code,
-                        ScreenContextErrorCode::SynchronizationUnavailable
-                    ) =>
-                {
-                    Err(chat_handoff_attachment_error_dto(error))
-                }
-                Err(error) if error.code == ScreenContextErrorCode::InvalidArgument => {
-                    Err(chat_handoff_attachment_error_dto(error))
-                }
-                Err(_) => attachment_broker
-                    .remove_exact(&attachment.attachment_id)
-                    .map(|_| ())
-                    .map_err(chat_attachment_error_dto),
-            }
-        }
-        Err(error) => Err(chat_handoff_attachment_error_dto(error)),
-    }
+    revoke_exact_attachment_preserving_bound(handoff_broker, attachment_broker, attachment_id)
+        .map_err(chat_attachment_error_dto)
 }
 
 /// Bounded Chat-facing status: only `available` plus the opaque
@@ -552,6 +611,9 @@ fn chat_attachment_error_dto(
         ScreenContextChatAttachmentErrorCode::AttachmentNotFound => {
             ChatScreenContextAttachmentErrorDto::not_found()
         }
+        ScreenContextChatAttachmentErrorCode::AttachmentInUse => {
+            ChatScreenContextAttachmentErrorDto::attachment_in_use()
+        }
         ScreenContextChatAttachmentErrorCode::SynchronizationUnavailable => {
             ChatScreenContextAttachmentErrorDto::broker_unavailable()
         }
@@ -567,12 +629,6 @@ fn chat_handoff_attachment_error(error: ScreenContextError) -> ScreenContextChat
         }
         _ => ScreenContextChatAttachmentError::synchronization_unavailable(),
     }
-}
-
-fn chat_handoff_attachment_error_dto(
-    error: ScreenContextError,
-) -> ChatScreenContextAttachmentErrorDto {
-    chat_attachment_error_dto(chat_handoff_attachment_error(error))
 }
 
 /// Rejects any caller that is not the Chat window.  The label is assigned by
@@ -1587,6 +1643,53 @@ mod tests {
                 request_id: "bound-request".to_string(),
             })
             .expect("dismiss must not cancel the Bound Grant");
+    }
+
+    #[test]
+    fn dismiss_removes_marker_when_exact_bound_grant_has_expired() {
+        let clock = ManualClock::new();
+        let handoff_broker = ScreenContextHandoffBroker::with_clock(Box::new(clock.clone()));
+        let session_gate = ScreenPerceptionSessionGate::new();
+        session_gate.arm_for_life(LIFE_A);
+        let fence = session_gate.life_fence_for(LIFE_A).unwrap();
+        let grant_id = install_and_issue(&handoff_broker, LIFE_A, ScreenContextSessionFence(fence));
+        let attachment_broker = ScreenContextChatAttachmentBroker::new();
+        let attachment_id = offer(
+            &attachment_broker,
+            &grant_id,
+            LIFE_A,
+            ScreenContextSessionFence(fence),
+        );
+        handoff_broker
+            .claim_grant(ScreenContextIds {
+                grant_id: grant_id.clone(),
+                life_id: LIFE_A.to_string(),
+                session_fence: ScreenContextSessionFence(fence),
+                conversation_id: "bound-conversation".to_string(),
+                request_id: "bound-request".to_string(),
+            })
+            .expect("the attachment grant must bind");
+        clock.advance(super::super::screen_context::SCREEN_CONTEXT_HANDOFF_TTL);
+
+        dismiss_pending_screen_context_attachment_service(
+            &handoff_broker,
+            &attachment_broker,
+            &attachment_id,
+        )
+        .expect("an expired exact grant is stale-cleaned successfully");
+        assert_broker_empty(&attachment_broker);
+        assert!(
+            handoff_broker
+                .claim_grant(ScreenContextIds {
+                    grant_id,
+                    life_id: LIFE_A.to_string(),
+                    session_fence: ScreenContextSessionFence(fence),
+                    conversation_id: "bound-conversation".to_string(),
+                    request_id: "bound-request".to_string(),
+                })
+                .is_err(),
+            "the expired Bound Grant must remain absent"
+        );
     }
 
     #[test]

@@ -33,10 +33,21 @@ use crate::{
         },
         ModelMessage, ModelMessageRole,
     },
+    perception::{
+        screen_chat_attachment::ScreenContextChatAttachmentBroker,
+        screen_context::{
+            ScreenContextErrorCode, ScreenContextHandoffBroker, ScreenContextIds,
+            ScreenContextPayload, ScreenContextSessionFence, ScreenContextTextStatus,
+        },
+        screen_policy::{
+            authorize_screen_perception, ScreenPerceptionRepository, ScreenPerceptionSessionGate,
+        },
+        CurrentLifeAuthority,
+    },
     prompt::{
         InitiativeLevel, PromptCommunicationStyle, PromptCompilationRequest, PromptCompiler,
-        PromptCompilerErrorCode, PromptEmotion, PromptLifeIdentity, PromptPersona,
-        PromptRelationship, SafetyRulesVersion,
+        PromptCompilerErrorCode, PromptCurrentPerception, PromptEmotion, PromptLifeIdentity,
+        PromptPersona, PromptRelationship, SafetyRulesVersion,
     },
     relationship::{
         policy::{self as relationship_policy, RelationshipPolicyRequest},
@@ -58,6 +69,7 @@ use crate::{
 };
 
 const MAX_USER_MESSAGE_CHARACTERS: usize = 32_000;
+const MAX_PERCEPTION_ATTACHMENT_ID_CHARACTERS: usize = 128;
 
 /// TEST-ONLY deterministic seam type owned by a service INSTANCE (never
 /// process-global): invoked exactly before EACH composite attempt (first and
@@ -104,6 +116,8 @@ pub struct GovernedConversationRequest {
     pub request_id: String,
     pub conversation_id: String,
     pub current_message: String,
+    #[serde(default)]
+    pub perception_attachment_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
@@ -180,6 +194,7 @@ pub enum ConversationCognitionErrorCode {
     RelationshipIntegrationFailure,
     ExperienceCommitConflict,
     ExperienceIntegrationFailure,
+    PerceptionContextUnavailable,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -262,6 +277,7 @@ where
     model_coordinator: &'a ModelRuntimeCoordinator,
     retrieval_registry: &'a LanceDbVectorStoreRegistry,
     coordinator: &'a ConversationCognitionCoordinator,
+    screen_perception: Option<ScreenPerceptionAuthorities<'a>>,
     /// TEST-ONLY deterministic seam owned by THIS service instance, compiled
     /// out of production builds entirely: invoked exactly before EACH
     /// composite attempt (first and the single retry), receiving
@@ -271,6 +287,21 @@ where
     /// identically to the previous layout.
     #[cfg(test)]
     pre_composite_hook: Option<PreCompositeHook>,
+}
+
+struct ScreenPerceptionAuthorities<'a> {
+    current_life: &'a dyn CurrentLifeAuthority,
+    repository: &'a dyn ScreenPerceptionRepository,
+    session_gate: &'a ScreenPerceptionSessionGate,
+    handoff_broker: &'a ScreenContextHandoffBroker,
+    attachment_broker: &'a ScreenContextChatAttachmentBroker,
+}
+
+struct ClaimedScreenPerception {
+    attachment_id: String,
+    grant_id: String,
+    life_id: String,
+    prompt: PromptCurrentPerception,
 }
 
 impl<'a, S> ConversationCognitionService<'a, S>
@@ -290,6 +321,37 @@ where
             model_coordinator,
             retrieval_registry,
             coordinator,
+            screen_perception: None,
+            #[cfg(test)]
+            pre_composite_hook: None,
+        }
+    }
+
+    pub(crate) fn new_with_screen_perception(
+        storage: &'a StorageService,
+        secrets: &'a S,
+        model_coordinator: &'a ModelRuntimeCoordinator,
+        retrieval_registry: &'a LanceDbVectorStoreRegistry,
+        coordinator: &'a ConversationCognitionCoordinator,
+        current_life: &'a dyn CurrentLifeAuthority,
+        repository: &'a dyn ScreenPerceptionRepository,
+        session_gate: &'a ScreenPerceptionSessionGate,
+        handoff_broker: &'a ScreenContextHandoffBroker,
+        attachment_broker: &'a ScreenContextChatAttachmentBroker,
+    ) -> Self {
+        Self {
+            storage,
+            secrets,
+            model_coordinator,
+            retrieval_registry,
+            coordinator,
+            screen_perception: Some(ScreenPerceptionAuthorities {
+                current_life,
+                repository,
+                session_gate,
+                handoff_broker,
+                attachment_broker,
+            }),
             #[cfg(test)]
             pre_composite_hook: None,
         }
@@ -313,6 +375,7 @@ where
             model_coordinator,
             retrieval_registry,
             coordinator,
+            screen_perception: None,
             pre_composite_hook: Some(hook),
         }
     }
@@ -340,6 +403,11 @@ where
                 return Err(error(ConversationCognitionErrorCode::TurnIdConflict));
             }
             return Ok(replayed_response(request, existing, started));
+        }
+        if request.perception_attachment_id.is_some() && self.screen_perception.is_none() {
+            return Err(error(
+                ConversationCognitionErrorCode::PerceptionContextUnavailable,
+            ));
         }
         let conversation = history
             .get(&life.id, &request.conversation_id)
@@ -437,27 +505,18 @@ where
         let memory_context = MemoryContextBuilder
             .build(MemoryContextBuildRequest { entries })
             .map_err(|_| error(ConversationCognitionErrorCode::InvalidConversationRequest))?;
-        let compilation = PromptCompiler
-            .compile(PromptCompilationRequest {
-                safety_rules_version: SafetyRulesVersion::V1,
-                life_identity: PromptLifeIdentity {
-                    display_name: life.name.clone(),
-                    identity_version: life.version,
-                },
-                persona,
-                relationship: prompt_relationship,
-                emotion: prompt_emotion,
-                memory_context: memory_context.context.clone(),
-            })
-            .map_err(|compile_error| {
-                if compile_error.code == PromptCompilerErrorCode::InvalidEmotion {
-                    error(ConversationCognitionErrorCode::EmotionIntegrationFailure)
-                } else if compile_error.code == PromptCompilerErrorCode::InvalidRelationship {
-                    error(ConversationCognitionErrorCode::RelationshipIntegrationFailure)
-                } else {
-                    error(ConversationCognitionErrorCode::PersonaNotFound)
-                }
-            })?;
+        let prompt_request = PromptCompilationRequest {
+            safety_rules_version: SafetyRulesVersion::V1,
+            life_identity: PromptLifeIdentity {
+                display_name: life.name.clone(),
+                identity_version: life.version,
+            },
+            persona,
+            relationship: prompt_relationship,
+            emotion: prompt_emotion,
+            memory_context: memory_context.context.clone(),
+            current_perception: None,
+        };
         let messages = persisted_history
             .into_iter()
             .map(|message| ModelMessage {
@@ -472,10 +531,59 @@ where
                 content: request.current_message.clone(),
             }))
             .collect();
+        let no_active_embedding_profile = retrieval_result
+            .degradation_codes
+            .contains(&RetrievalDegradationCode::VectorIndexUnavailable)
+            && matches!(
+                ModelProfileService::new(self.storage).get_active(ModelPurpose::Embedding),
+                Ok(None)
+            );
         let runtime = ModelRuntimeService::new(self.storage, self.secrets, self.model_coordinator);
-        let resolved = runtime
-            .resolve_active_chat_provider()
-            .map_err(map_model_error)?;
+        let compile_prompt = |request: PromptCompilationRequest| {
+            PromptCompiler.compile(request).map_err(|compile_error| {
+                if compile_error.code == PromptCompilerErrorCode::InvalidEmotion {
+                    error(ConversationCognitionErrorCode::EmotionIntegrationFailure)
+                } else if compile_error.code == PromptCompilerErrorCode::InvalidRelationship {
+                    error(ConversationCognitionErrorCode::RelationshipIntegrationFailure)
+                } else {
+                    error(ConversationCognitionErrorCode::PersonaNotFound)
+                }
+            })
+        };
+        let (resolved, compilation, claimed_perception) =
+            if let Some(attachment_id) = request.perception_attachment_id.as_deref() {
+                // All potentially failing or slow preparation, including
+                // credential lookup and Provider construction, finishes
+                // before this final perception claim. After claim the only
+                // pre-Provider work is bounded in-memory prompt compilation.
+                let resolved = runtime
+                    .resolve_active_chat_provider()
+                    .map_err(map_model_error)?;
+                let authorities = self.screen_perception.as_ref().ok_or_else(|| {
+                    error(ConversationCognitionErrorCode::PerceptionContextUnavailable)
+                })?;
+                let claimed = claim_screen_perception(
+                    authorities,
+                    attachment_id,
+                    &life.id,
+                    &request.conversation_id,
+                    &request.request_id,
+                )?;
+                let compilation = compile_prompt(PromptCompilationRequest {
+                    current_perception: Some(claimed.prompt.clone()),
+                    ..prompt_request
+                })?;
+                (resolved, compilation, Some(claimed))
+            } else {
+                // Preserve the existing no-perception path: compilation is
+                // still performed before Provider resolution and no screen
+                // authority is touched.
+                let compilation = compile_prompt(prompt_request)?;
+                let resolved = runtime
+                    .resolve_active_chat_provider()
+                    .map_err(map_model_error)?;
+                (resolved, compilation, None)
+            };
         let profile_display_name = resolved.profile.display_name.clone();
         let model_name = resolved.profile.model_name.clone();
         let response = runtime
@@ -662,19 +770,22 @@ where
             composite.experience,
             crate::experience::ExperienceEpisodeCommitOutcome::Applied { .. }
         ));
+        if let Some(claimed) = claimed_perception.as_ref() {
+            if let Some(authorities) = self.screen_perception.as_ref() {
+                retire_claimed_screen_perception(
+                    claimed,
+                    &request.conversation_id,
+                    &request.request_id,
+                    authorities,
+                );
+            }
+        }
         let mut degradations = retrieval_result
             .degradation_codes
             .iter()
             .filter_map(map_retrieval_degradation)
             .collect::<Vec<_>>();
-        if retrieval_result
-            .degradation_codes
-            .contains(&RetrievalDegradationCode::VectorIndexUnavailable)
-            && matches!(
-                ModelProfileService::new(self.storage).get_active(ModelPurpose::Embedding),
-                Ok(None)
-            )
-        {
+        if no_active_embedding_profile {
             degradations.push(ConversationDegradationCode::NoActiveEmbeddingProfile);
         }
         if !memory_context.degradation_codes.is_empty()
@@ -705,20 +816,29 @@ where
 
 #[cfg(windows)]
 #[tauri::command]
+#[allow(private_interfaces)]
 pub async fn chat_with_governed_context(
     storage: State<'_, StorageService>,
     secrets: State<'_, WindowsCredentialSecretStore>,
     model_coordinator: State<'_, ModelRuntimeCoordinator>,
     retrieval_registry: State<'_, LanceDbVectorStoreRegistry>,
     coordinator: State<'_, ConversationCognitionCoordinator>,
+    session_gate: State<'_, ScreenPerceptionSessionGate>,
+    handoff_broker: State<'_, ScreenContextHandoffBroker>,
+    attachment_broker: State<'_, ScreenContextChatAttachmentBroker>,
     request: GovernedConversationRequest,
 ) -> Result<GovernedConversationResponse, ConversationCognitionError> {
-    ConversationCognitionService::new(
+    ConversationCognitionService::new_with_screen_perception(
         storage.inner(),
         secrets.inner(),
         model_coordinator.inner(),
         retrieval_registry.inner(),
         coordinator.inner(),
+        storage.inner(),
+        storage.inner(),
+        session_gate.inner(),
+        handoff_broker.inner(),
+        attachment_broker.inner(),
     )
     .chat(request)
     .await
@@ -795,6 +915,104 @@ fn parse_persona(
         boundaries: stored.boundaries,
     })
 }
+
+fn claim_screen_perception(
+    authorities: &ScreenPerceptionAuthorities<'_>,
+    attachment_id: &str,
+    original_life_id: &str,
+    conversation_id: &str,
+    request_id: &str,
+) -> Result<ClaimedScreenPerception, ConversationCognitionError> {
+    let current_life_id = authorities
+        .current_life
+        .current_life_id()
+        .map_err(|_| error(ConversationCognitionErrorCode::PerceptionContextUnavailable))?;
+    if current_life_id.as_deref() != Some(original_life_id) {
+        return Err(error(
+            ConversationCognitionErrorCode::PerceptionContextUnavailable,
+        ));
+    }
+
+    authorize_screen_perception(
+        authorities.repository,
+        authorities.session_gate,
+        original_life_id,
+    )
+    .map_err(|_| error(ConversationCognitionErrorCode::PerceptionContextUnavailable))?;
+    let session_fence = authorities
+        .session_gate
+        .life_fence_for(original_life_id)
+        .ok_or_else(|| error(ConversationCognitionErrorCode::PerceptionContextUnavailable))?;
+    let expected_fence = ScreenContextSessionFence(session_fence);
+    let attachment = authorities
+        .attachment_broker
+        .get_exact(attachment_id)
+        .map_err(|_| error(ConversationCognitionErrorCode::PerceptionContextUnavailable))?;
+    if attachment.life_id != original_life_id || attachment.session_fence != expected_fence {
+        return Err(error(
+            ConversationCognitionErrorCode::PerceptionContextUnavailable,
+        ));
+    }
+
+    let payload = authorities
+        .handoff_broker
+        .claim_grant(ScreenContextIds {
+            grant_id: attachment.grant_id.clone(),
+            life_id: original_life_id.to_string(),
+            session_fence: expected_fence,
+            conversation_id: conversation_id.to_string(),
+            request_id: request_id.to_string(),
+        })
+        .map_err(|_| error(ConversationCognitionErrorCode::PerceptionContextUnavailable))?;
+    let prompt = prompt_perception_from_payload(payload)?;
+
+    Ok(ClaimedScreenPerception {
+        attachment_id: attachment.attachment_id,
+        grant_id: attachment.grant_id,
+        life_id: original_life_id.to_string(),
+        prompt,
+    })
+}
+
+fn prompt_perception_from_payload(
+    payload: ScreenContextPayload,
+) -> Result<PromptCurrentPerception, ConversationCognitionError> {
+    if payload.status != ScreenContextTextStatus::Recognized {
+        return Err(error(
+            ConversationCognitionErrorCode::PerceptionContextUnavailable,
+        ));
+    }
+    Ok(PromptCurrentPerception {
+        text: payload.text,
+        truncated: payload.truncated,
+    })
+}
+
+fn retire_claimed_screen_perception(
+    claimed: &ClaimedScreenPerception,
+    conversation_id: &str,
+    request_id: &str,
+    authorities: &ScreenPerceptionAuthorities<'_>,
+) {
+    let may_remove_attachment = match authorities.handoff_broker.retire_bound_grant(
+        &claimed.grant_id,
+        &claimed.life_id,
+        conversation_id,
+        request_id,
+    ) {
+        Ok(()) => true,
+        // A newer Observe may have replaced the old bound grant. The old
+        // grant is then definitively absent; exact attachment removal still
+        // cannot touch a newer attachment ID.
+        Err(error) => error.code == ScreenContextErrorCode::NoCurrentContext,
+    };
+    if may_remove_attachment {
+        let _ = authorities
+            .attachment_broker
+            .remove_exact(&claimed.attachment_id);
+    }
+}
+
 fn validate_request(
     request: &GovernedConversationRequest,
 ) -> Result<(), ConversationCognitionError> {
@@ -802,6 +1020,13 @@ fn validate_request(
         || request.conversation_id.trim().is_empty()
         || request.current_message.trim().is_empty()
         || request.current_message.chars().count() > MAX_USER_MESSAGE_CHARACTERS
+        || request
+            .perception_attachment_id
+            .as_deref()
+            .is_some_and(|value| {
+                value.trim().is_empty()
+                    || value.chars().count() > MAX_PERCEPTION_ATTACHMENT_ID_CHARACTERS
+            })
     {
         return Err(error(
             ConversationCognitionErrorCode::InvalidConversationRequest,
@@ -1168,6 +1393,10 @@ fn error(code: ConversationCognitionErrorCode) -> ConversationCognitionError {
         ConversationCognitionErrorCode::ExperienceIntegrationFailure => {
             ("The governed experience integration failed.", false)
         }
+        ConversationCognitionErrorCode::PerceptionContextUnavailable => (
+            "The attached screen context is no longer available. Observe the screen again and reattach it.",
+            true,
+        ),
     };
     ConversationCognitionError::new(code, message, recoverable)
 }
@@ -1181,10 +1410,64 @@ mod tests {
             request_id: "r".into(),
             conversation_id: "conversation".into(),
             current_message: "hello".into(),
+            perception_attachment_id: None,
         };
         assert!(validate_request(&request).is_ok());
+        let decoded = serde_json::from_value::<GovernedConversationRequest>(serde_json::json!({
+            "requestId": "r",
+            "conversationId": "conversation",
+            "currentMessage": "hello"
+        }))
+        .unwrap();
+        assert_eq!(decoded.perception_attachment_id, None);
+        let decoded = serde_json::from_value::<GovernedConversationRequest>(serde_json::json!({
+            "requestId": "r",
+            "conversationId": "conversation",
+            "currentMessage": "hello",
+            "perceptionAttachmentId": "opaque-attachment"
+        }))
+        .unwrap();
+        assert_eq!(
+            decoded.perception_attachment_id.as_deref(),
+            Some("opaque-attachment")
+        );
+        let mut invalid_attachment = request.clone();
+        invalid_attachment.perception_attachment_id = Some("  ".into());
+        assert_eq!(
+            validate_request(&invalid_attachment).unwrap_err().code,
+            ConversationCognitionErrorCode::InvalidConversationRequest
+        );
+        invalid_attachment.perception_attachment_id = Some("x".repeat(129));
+        assert_eq!(
+            validate_request(&invalid_attachment).unwrap_err().code,
+            ConversationCognitionErrorCode::InvalidConversationRequest
+        );
         let invalid = serde_json::json!({"requestId":"r","conversationId":"conversation","currentMessage":"x","history":[]});
         assert!(serde_json::from_value::<GovernedConversationRequest>(invalid).is_err());
+    }
+
+    #[test]
+    fn perception_unavailable_error_is_static_bounded_and_recoverable() {
+        let error = error(ConversationCognitionErrorCode::PerceptionContextUnavailable);
+        assert_eq!(
+            error.message,
+            "The attached screen context is no longer available. Observe the screen again and reattach it."
+        );
+        assert!(error.recoverable);
+        assert_eq!(
+            serde_json::to_value(error.code).unwrap(),
+            serde_json::json!("PERCEPTION_CONTEXT_UNAVAILABLE")
+        );
+    }
+
+    #[test]
+    fn retrieval_query_source_is_exactly_the_current_message() {
+        let source = include_str!("service.rs");
+        let start = source.find("let retrieval_result =").unwrap();
+        let end = source[start..].find("let entries =").unwrap() + start;
+        let retrieval_source = &source[start..end];
+        assert!(retrieval_source.contains("query: request.current_message.clone(),"));
+        assert!(!retrieval_source.contains("perception_attachment_id"));
     }
     #[test]
     fn coordinator_scopes_concurrency_to_conversation_and_request_id() {

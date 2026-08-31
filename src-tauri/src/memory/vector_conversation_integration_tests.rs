@@ -407,6 +407,7 @@ fn compile_context(memory_context: Option<String>) -> String {
                 tension: 0,
             },
             memory_context,
+            current_perception: None,
         })
         .unwrap()
         .system_context

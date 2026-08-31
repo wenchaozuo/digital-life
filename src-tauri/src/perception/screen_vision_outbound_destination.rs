@@ -70,6 +70,7 @@ fn destination_error(
 /// All fields are private and validated/normalized by `new`.  Equality is
 /// derived over every identity field; there is no display label or opaque
 /// fingerprint that can replace the structured evidence.
+#[derive(Clone)]
 #[must_use]
 pub(crate) struct ScreenVisionOutboundDestinationBinding {
     profile_id: String,

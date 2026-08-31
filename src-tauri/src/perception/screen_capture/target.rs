@@ -31,6 +31,15 @@ pub(crate) enum ScreenCaptureTargetStatus {
     Selected,
 }
 
+/// Exact geometry reported by the currently selected native target.  This is
+/// intentionally the only target metadata that a Vision preparation path may
+/// request; no native identity or display metadata crosses the module seam.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ScreenCaptureTargetDimensions {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+}
+
 /// The opaque process-local capture target.  The native handle lives only in
 /// the backend process and is never serialized.  `native` is `Option` only so
 /// fence-logic unit tests can run without a live Windows capture item;
@@ -106,6 +115,35 @@ impl ScreenCaptureTargetBroker {
     ) -> Option<ScreenCaptureTarget> {
         let fence = gate.life_fence_for(life_id)?;
         self.current_target_for_fence(fence)
+    }
+
+    /// Reads the exact current target size without capturing pixels.  The
+    /// caller must already be on a COM-initialized blocking thread on
+    /// Windows.  A stale, missing, unsupported, or unreadable target fails
+    /// closed as `None`.
+    pub(crate) fn current_dimensions_for_life(
+        &self,
+        gate: &crate::perception::screen_policy::ScreenPerceptionSessionGate,
+        life_id: &str,
+    ) -> Option<ScreenCaptureTargetDimensions> {
+        let target = self.current_target_for_life(gate, life_id)?;
+
+        #[cfg(windows)]
+        {
+            let native = target.native.as_ref()?;
+            let size = native.Size().ok()?;
+            let geometry = super::validate_capture_geometry(size.Width, size.Height).ok()?;
+            Some(ScreenCaptureTargetDimensions {
+                width: geometry.width,
+                height: geometry.height,
+            })
+        }
+
+        #[cfg(not(windows))]
+        {
+            let _ = target;
+            None
+        }
     }
 
     /// Bounded, non-sensitive status for Settings display.

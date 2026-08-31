@@ -90,6 +90,13 @@ pub fn run() {
             app.manage(
                 perception::screen_vision_outbound_grant::ScreenVisionOutboundGrantBroker::new(),
             );
+            // D26-B: Main-owned explicit Vision delivery state.  Both brokers
+            // are process-local single-slot authorities and are not exposed
+            // to Settings or Chat.
+            app.manage(perception::screen_vision_delivery::ScreenVisionReviewBroker::new());
+            app.manage(
+                perception::screen_vision_delivery::ScreenVisionDeliveryOperationGate::new(),
+            );
             app.manage(storage::LlmCandidateExtractionCoordinator::default());
             app.manage(model::runtime::ModelRuntimeCoordinator::default());
             app.manage(conversation::ConversationCognitionCoordinator::default());
@@ -194,6 +201,10 @@ pub fn run() {
             perception::screen_observation::revoke_main_screen_context_attachment,
             perception::screen_chat_attachment::get_pending_screen_context_attachment,
             perception::screen_chat_attachment::dismiss_pending_screen_context_attachment,
+            perception::screen_vision_delivery::prepare_main_screen_vision_review,
+            perception::screen_vision_delivery::get_main_screen_vision_status,
+            perception::screen_vision_delivery::execute_main_screen_vision_review,
+            perception::screen_vision_delivery::abandon_main_screen_vision_delivery,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

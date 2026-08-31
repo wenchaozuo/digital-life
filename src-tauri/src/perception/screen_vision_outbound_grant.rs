@@ -73,6 +73,8 @@ enum ScreenVisionOutboundGrantTerminalReason {
     Expired,
     Revoked,
     Succeeded,
+    ProviderResponded,
+    Abandoned,
 }
 
 /// Bounded grant metadata.  Destination URL/model details are intentionally
@@ -515,6 +517,117 @@ impl ScreenVisionOutboundGrantBroker {
         grant_id: &str,
         delivery_id: &str,
     ) -> Result<(), ScreenVisionOutboundGrantError> {
+        self.retire_bound_exact(
+            grant_id,
+            delivery_id,
+            ScreenVisionOutboundGrantTerminalReason::Succeeded,
+        )
+    }
+
+    /// Retires the exact BOUND grant after any definite provider HTTP
+    /// response, including a non-2xx status.  A response proves the one-shot
+    /// request reached the provider, so routine resend is not permitted.
+    pub(crate) fn retire_bound_after_provider_response(
+        &self,
+        grant_id: &str,
+        delivery_id: &str,
+    ) -> Result<(), ScreenVisionOutboundGrantError> {
+        self.retire_bound_exact(
+            grant_id,
+            delivery_id,
+            ScreenVisionOutboundGrantTerminalReason::ProviderResponded,
+        )
+    }
+
+    /// Terminally abandons the exact idle BOUND grant.  It never changes a
+    /// BOUND grant back to READY and cannot race a send while the caller owns
+    /// the separate Vision delivery operation permit.
+    pub(crate) fn abandon_bound_exact(
+        &self,
+        grant_id: &str,
+        delivery_id: &str,
+    ) -> Result<(), ScreenVisionOutboundGrantError> {
+        self.retire_bound_exact(
+            grant_id,
+            delivery_id,
+            ScreenVisionOutboundGrantTerminalReason::Abandoned,
+        )
+    }
+
+    /// Revalidates exact BOUND ownership without changing its state.  D26's
+    /// final byte-send guard uses this after the transport handshake and
+    /// immediately before the only request send.
+    pub(crate) fn validate_bound_exact(
+        &self,
+        grant_id: &str,
+        delivery_id: &str,
+        candidate_id: &str,
+        life_id: &str,
+        screen_session_fence: &str,
+        outbound_policy_revision: i64,
+        destination_binding: &ScreenVisionOutboundDestinationBinding,
+    ) -> Result<ScreenVisionOutboundGrantMetadata, ScreenVisionOutboundGrantError> {
+        validate_id(grant_id)?;
+        validate_id(delivery_id)?;
+        validate_id(candidate_id)?;
+        validate_id(life_id)?;
+        validate_id(screen_session_fence)?;
+        if outbound_policy_revision < 1 {
+            return Err(grant_error(
+                ScreenVisionOutboundGrantErrorCode::InvalidArgument,
+            ));
+        }
+
+        let state = self.lock_state()?;
+        match &*state {
+            ScreenVisionOutboundGrantStateSlot::Bound {
+                grant,
+                delivery_id: bound_delivery_id,
+            } if grant.grant_id == grant_id => {
+                if bound_delivery_id != delivery_id
+                    || grant.candidate_id != candidate_id
+                    || grant.life_id != life_id
+                    || grant.screen_session_fence != screen_session_fence
+                    || grant.outbound_policy_revision != outbound_policy_revision
+                {
+                    return Err(grant_error(
+                        ScreenVisionOutboundGrantErrorCode::DeliveryConflict,
+                    ));
+                }
+                if &grant.destination_binding != destination_binding {
+                    return Err(grant_error(
+                        ScreenVisionOutboundGrantErrorCode::DestinationMismatch,
+                    ));
+                }
+                Ok(grant_metadata(
+                    grant,
+                    ScreenVisionOutboundGrantState::Bound,
+                    Instant::now(),
+                ))
+            }
+            ScreenVisionOutboundGrantStateSlot::Consumed {
+                grant,
+                terminal_reason,
+            } if grant.grant_id == grant_id => Err(terminal_error(*terminal_reason)),
+            ScreenVisionOutboundGrantStateSlot::Bound { grant, .. }
+                if grant.grant_id != grant_id =>
+            {
+                Err(grant_error(
+                    ScreenVisionOutboundGrantErrorCode::GrantMismatch,
+                ))
+            }
+            _ => Err(grant_error(
+                ScreenVisionOutboundGrantErrorCode::GrantMismatch,
+            )),
+        }
+    }
+
+    fn retire_bound_exact(
+        &self,
+        grant_id: &str,
+        delivery_id: &str,
+        terminal_reason: ScreenVisionOutboundGrantTerminalReason,
+    ) -> Result<(), ScreenVisionOutboundGrantError> {
         validate_id(grant_id)?;
         validate_id(delivery_id)?;
 
@@ -532,7 +645,7 @@ impl ScreenVisionOutboundGrantBroker {
                     };
                 *state = ScreenVisionOutboundGrantStateSlot::Consumed {
                     grant,
-                    terminal_reason: ScreenVisionOutboundGrantTerminalReason::Succeeded,
+                    terminal_reason,
                 };
                 Ok(())
             }
@@ -601,7 +714,9 @@ fn terminal_error(
             ScreenVisionOutboundGrantErrorCode::GrantExpired
         }
         ScreenVisionOutboundGrantTerminalReason::Revoked
-        | ScreenVisionOutboundGrantTerminalReason::Succeeded => {
+        | ScreenVisionOutboundGrantTerminalReason::Succeeded
+        | ScreenVisionOutboundGrantTerminalReason::ProviderResponded
+        | ScreenVisionOutboundGrantTerminalReason::Abandoned => {
             ScreenVisionOutboundGrantErrorCode::GrantConsumed
         }
     };
@@ -1929,6 +2044,66 @@ mod tests {
                 destination(),
             ),
             ScreenVisionOutboundGrantErrorCode::GrantConsumed,
+        );
+    }
+
+    #[test]
+    fn provider_response_and_user_abandon_are_terminal_exact_bound_settlements() {
+        let provider_fixture = Fixture::new();
+        let provider = issue_metadata(
+            provider_fixture
+                .issue("event-provider-response", destination())
+                .expect("provider-response grant should issue"),
+        );
+        provider_fixture
+            .grant_broker
+            .claim_exact_for_delivery(
+                &provider.grant_id,
+                "delivery-provider-response",
+                &provider_fixture.candidate_id,
+                destination(),
+            )
+            .expect("provider-response grant should bind");
+        provider_fixture
+            .grant_broker
+            .retire_bound_after_provider_response(&provider.grant_id, "delivery-provider-response")
+            .expect("provider response should consume exact BOUND");
+        assert_error_code(
+            provider_fixture.grant_broker.claim_exact_for_delivery(
+                &provider.grant_id,
+                "delivery-provider-response",
+                &provider_fixture.candidate_id,
+                destination(),
+            ),
+            ScreenVisionOutboundGrantErrorCode::GrantConsumed,
+        );
+
+        let abandon_fixture = Fixture::new();
+        let abandoned = issue_metadata(
+            abandon_fixture
+                .issue("event-abandon", destination())
+                .expect("abandon grant should issue"),
+        );
+        abandon_fixture
+            .grant_broker
+            .claim_exact_for_delivery(
+                &abandoned.grant_id,
+                "delivery-abandon",
+                &abandon_fixture.candidate_id,
+                destination(),
+            )
+            .expect("abandon grant should bind");
+        abandon_fixture
+            .grant_broker
+            .abandon_bound_exact(&abandoned.grant_id, "delivery-abandon")
+            .expect("idle exact BOUND should be abandonable");
+        assert_error_code(
+            abandon_fixture.issue("event-abandon", destination()),
+            ScreenVisionOutboundGrantErrorCode::GrantConsumed,
+        );
+        assert_error_code(
+            abandon_fixture.issue("event-new-same-candidate", destination()),
+            ScreenVisionOutboundGrantErrorCode::CandidateConsumed,
         );
     }
 

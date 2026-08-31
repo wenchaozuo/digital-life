@@ -13,7 +13,7 @@
 
 use super::screen_capture::{
     capture_one_shot_with_provider,
-    operation::ScreenCaptureOperationGate,
+    operation::{ScreenCaptureOperationGate, ScreenCaptureOperationPermit},
     provider::{self, ScreenCaptureProvider},
     target::ScreenCaptureTargetBroker,
     ScreenCaptureError, ScreenCaptureErrorCode,
@@ -114,6 +114,31 @@ pub(crate) fn prepare_screen_vision_candidate(
     )
 }
 
+/// Production C3 entrypoint for a caller that already owns the canonical
+/// screen-operation permit.  D26 uses this to keep target-dimension
+/// preflight and the subsequent one-shot capture inside one operation slot.
+pub(crate) fn prepare_screen_vision_candidate_with_operation_permit(
+    storage: &StorageService,
+    session_gate: &ScreenPerceptionSessionGate,
+    target_broker: &ScreenCaptureTargetBroker,
+    operation_permit: ScreenCaptureOperationPermit,
+    candidate_broker: &ScreenVisionOutboundCandidateBroker,
+    request: &ScreenVisionOutboundPreparationRequest,
+) -> Result<ScreenVisionOutboundPreparationResult, ScreenVisionOutboundPreparationError> {
+    let provider = provider::native_provider();
+    prepare_screen_vision_candidate_with_provider_and_permit(
+        storage,
+        storage,
+        session_gate,
+        target_broker,
+        operation_permit,
+        candidate_broker,
+        request,
+        provider.as_ref(),
+        &PreparationHooks::none(),
+    )
+}
+
 /// Private provider/test-hook seam for deterministic authority and lifecycle
 /// tests.  Production can only reach the public-in-module function above,
 /// which always constructs the canonical native provider.
@@ -128,14 +153,39 @@ fn prepare_screen_vision_candidate_with_provider(
     provider: &dyn ScreenCaptureProvider,
     hooks: &PreparationHooks<'_>,
 ) -> Result<ScreenVisionOutboundPreparationResult, ScreenVisionOutboundPreparationError> {
+    let operation_permit = operation_gate
+        .try_enter()
+        .map_err(|_| preparation_error(ScreenVisionOutboundPreparationErrorCode::OperationBusy))?;
+    prepare_screen_vision_candidate_with_provider_and_permit(
+        screen_repository,
+        outbound_repository,
+        session_gate,
+        target_broker,
+        operation_permit,
+        candidate_broker,
+        request,
+        provider,
+        hooks,
+    )
+}
+
+fn prepare_screen_vision_candidate_with_provider_and_permit(
+    screen_repository: &dyn ScreenPerceptionRepository,
+    outbound_repository: &dyn ScreenVisionOutboundPolicyRepository,
+    session_gate: &ScreenPerceptionSessionGate,
+    target_broker: &ScreenCaptureTargetBroker,
+    operation_permit: ScreenCaptureOperationPermit,
+    candidate_broker: &ScreenVisionOutboundCandidateBroker,
+    request: &ScreenVisionOutboundPreparationRequest,
+    provider: &dyn ScreenCaptureProvider,
+    hooks: &PreparationHooks<'_>,
+) -> Result<ScreenVisionOutboundPreparationResult, ScreenVisionOutboundPreparationError> {
     validate_request(request)?;
 
     // This is the one canonical screen-operation permit.  It is held in this
     // stack frame until after final authority revalidation and C2 installation;
-    // try_enter is fail-fast and never creates a queue.
-    let _operation_permit = operation_gate
-        .try_enter()
-        .map_err(|_| preparation_error(ScreenVisionOutboundPreparationErrorCode::OperationBusy))?;
+    // the caller already acquired it fail-fast and no queue exists.
+    let _operation_permit = operation_permit;
 
     // Backend authority is read before any provider call.  The fence and
     // policy revision captured here are never accepted from the request.

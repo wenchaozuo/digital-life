@@ -17,11 +17,12 @@ pub(crate) use error::{
 #[allow(unused_imports)]
 pub(crate) use openai_compatible::{
     OpenAiCompatibleProvider, OpenAiCompatibleProviderConfig, ProviderJsonRequest,
-    SensitiveProviderJsonRequest,
+    SensitiveProviderExecutionError, SensitiveProviderJsonRequest,
 };
 pub(crate) use response::ProviderHttpResponse;
 #[allow(unused_imports)]
 pub(crate) use vision::{
-    build_screen_vision_request, parse_screen_vision_analysis, ScreenVisionAnalysis,
-    ScreenVisionResponseError, ScreenVisionResponseErrorCode, SCREEN_VISION_SAFETY_INSTRUCTION,
+    build_screen_vision_request, parse_screen_vision_analysis, validate_screen_vision_profile,
+    ScreenVisionAnalysis, ScreenVisionResponseError, ScreenVisionResponseErrorCode,
+    SCREEN_VISION_SAFETY_INSTRUCTION,
 };

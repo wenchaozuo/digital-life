@@ -10,7 +10,7 @@ use serde::Serialize;
 use serde_json::Value;
 use zeroize::Zeroizing;
 
-use crate::model::profile::{ModelProfile, ModelPurpose, MAX_VISION_TOKENS};
+use crate::model::profile::{ModelProfile, ModelProviderKind, ModelPurpose, MAX_VISION_TOKENS};
 
 use super::{ProviderError, ProviderErrorKind, SensitiveProviderJsonRequest};
 
@@ -21,6 +21,26 @@ const MAX_SUMMARY_CHARACTERS: usize = 4096;
 const MAX_OBSERVATIONS: usize = 32;
 const MAX_OBSERVATION_CHARACTERS: usize = 512;
 const MAX_TOTAL_SEMANTIC_CHARACTERS: usize = 16_384;
+
+/// Validates the profile-only portion of the fixed D26-A Vision contract.
+/// This is safe to run before any capture because it does not inspect image
+/// bytes or build a request body.
+pub(crate) fn validate_screen_vision_profile(profile: &ModelProfile) -> Result<(), ProviderError> {
+    if profile.purpose != ModelPurpose::Vision
+        || profile.provider_kind != ModelProviderKind::OpenaiCompatible
+        || profile.temperature != Some(0.0)
+        || !profile
+            .max_tokens
+            .is_some_and(|value| (1..=MAX_VISION_TOKENS).contains(&value))
+        || profile.embedding_dimension.is_some()
+        || profile.model_name.trim().is_empty()
+    {
+        return Err(ProviderError::definitely_not_sent(
+            ProviderErrorKind::InvalidConfiguration,
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Serialize)]
 struct VisionChatRequest<'a> {
@@ -75,12 +95,7 @@ pub(crate) fn build_screen_vision_request(
     user_text: &str,
     image_base64: &str,
 ) -> Result<SensitiveProviderJsonRequest, ProviderError> {
-    if profile.purpose != ModelPurpose::Vision
-        || profile.temperature != Some(0.0)
-        || !profile
-            .max_tokens
-            .is_some_and(|value| (1..=MAX_VISION_TOKENS).contains(&value))
-        || profile.embedding_dimension.is_some()
+    if validate_screen_vision_profile(profile).is_err()
         || user_text.trim().is_empty()
         || image_base64.trim().is_empty()
     {

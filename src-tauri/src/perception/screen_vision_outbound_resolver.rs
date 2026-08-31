@@ -11,6 +11,16 @@ use super::screen_vision_outbound_destination::{
 };
 use crate::model::profile::{ModelProviderKind, ModelPurpose};
 
+/// One backend-loaded Vision profile together with the exact D25-D1 identity
+/// derived from that same profile read.  Delivery code must carry this pair
+/// forward instead of resolving display metadata, provider configuration, and
+/// request fields from separate snapshots.
+#[derive(Clone)]
+pub(crate) struct ResolvedScreenVisionDestination {
+    pub(crate) profile: crate::model::profile::ModelProfile,
+    pub(crate) binding: ScreenVisionOutboundDestinationBinding,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ScreenVisionDestinationResolverErrorCode {
     ProviderUnavailable,
@@ -39,7 +49,7 @@ impl ScreenVisionDestinationResolverError {
 /// Resolves the destination only from the backend's active Vision profile.
 pub(crate) fn resolve_active_screen_vision_destination<R: ModelProfileRepository>(
     repository: &R,
-) -> Result<ScreenVisionOutboundDestinationBinding, ScreenVisionDestinationResolverError> {
+) -> Result<ResolvedScreenVisionDestination, ScreenVisionDestinationResolverError> {
     let active = repository
         .get_active_profile(ModelPurpose::Vision)
         .map_err(map_profile_error)?
@@ -68,18 +78,20 @@ pub(crate) fn resolve_active_screen_vision_destination<R: ModelProfileRepository
             ScreenVisionOutboundDestinationProviderKind::OpenaiCompatible
         }
     };
-    ScreenVisionOutboundDestinationBinding::new(
-        profile.id,
+    let binding = ScreenVisionOutboundDestinationBinding::new(
+        profile.id.clone(),
         provider_kind,
-        profile.base_url,
-        profile.model_name,
-        profile.updated_at,
+        profile.base_url.clone(),
+        profile.model_name.clone(),
+        profile.updated_at.clone(),
     )
     .map_err(|_| {
         ScreenVisionDestinationResolverError::new(
             ScreenVisionDestinationResolverErrorCode::InvalidDestination,
         )
-    })
+    })?;
+
+    Ok(ResolvedScreenVisionDestination { profile, binding })
 }
 
 #[allow(dead_code)]
@@ -95,7 +107,7 @@ impl<'a, R: ModelProfileRepository> ScreenVisionOutboundDestinationResolver<'a, 
 
     pub(crate) fn resolve_active_screen_vision_destination(
         &self,
-    ) -> Result<ScreenVisionOutboundDestinationBinding, ScreenVisionDestinationResolverError> {
+    ) -> Result<ResolvedScreenVisionDestination, ScreenVisionDestinationResolverError> {
         resolve_active_screen_vision_destination(self.repository)
     }
 }
@@ -260,14 +272,18 @@ mod tests {
             }),
         );
         let binding = resolve_active_screen_vision_destination(&repository).unwrap();
-        assert_eq!(binding.profile_id(), "vision-profile");
-        assert_eq!(binding.base_url(), "https://vision.example.invalid/v1");
-        assert_eq!(binding.model_name(), "vision-model");
-        assert_eq!(binding.profile_updated_at(), "2026-08-31T01:00:00Z");
+        assert_eq!(binding.binding.profile_id(), "vision-profile");
         assert_eq!(
-            binding.provider_kind(),
+            binding.binding.base_url(),
+            "https://vision.example.invalid/v1"
+        );
+        assert_eq!(binding.binding.model_name(), "vision-model");
+        assert_eq!(binding.binding.profile_updated_at(), "2026-08-31T01:00:00Z");
+        assert_eq!(
+            binding.binding.provider_kind(),
             ScreenVisionOutboundDestinationProviderKind::OpenaiCompatible
         );
+        assert_eq!(binding.profile.purpose, ModelPurpose::Vision);
     }
 
     #[test]
@@ -324,6 +340,9 @@ mod tests {
         repository.profile.borrow_mut().as_mut().unwrap().updated_at =
             "2026-08-31T02:00:00Z".into();
         let second = resolve_active_screen_vision_destination(&repository).unwrap();
-        assert!(!(first == second));
+        assert_ne!(
+            first.binding.profile_updated_at(),
+            second.binding.profile_updated_at()
+        );
     }
 }

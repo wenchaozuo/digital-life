@@ -7,7 +7,10 @@
 //! network transmission.  Future use must re-read every required authority.
 
 use std::{
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, MutexGuard,
+    },
     time::{Duration, Instant},
 };
 
@@ -28,6 +31,7 @@ pub(crate) enum ScreenVisionOutboundCandidateErrorCode {
     CandidateMismatch,
     ScopeMismatch,
     CandidateExpired,
+    CandidateInUse,
     SynchronizationUnavailable,
     RandomUnavailable,
 }
@@ -68,6 +72,12 @@ struct ScreenVisionOutboundCandidate {
     outbound_policy_revision: i64,
     projection: ScreenVisionOutboundProjection,
     created_at: Instant,
+    delivery_lease: Option<DeliveryLeaseRecord>,
+}
+
+struct DeliveryLeaseRecord {
+    token: u64,
+    delivery_id: String,
 }
 
 enum ScreenVisionOutboundCandidateState {
@@ -94,6 +104,7 @@ impl CandidateClock for SystemCandidateClock {
 pub(crate) struct ScreenVisionOutboundCandidateBroker {
     state: Mutex<ScreenVisionOutboundCandidateState>,
     clock: Arc<dyn CandidateClock>,
+    next_lease_token: AtomicU64,
 }
 
 impl ScreenVisionOutboundCandidateBroker {
@@ -101,6 +112,7 @@ impl ScreenVisionOutboundCandidateBroker {
         Self {
             state: Mutex::new(ScreenVisionOutboundCandidateState::Empty),
             clock: Arc::new(SystemCandidateClock),
+            next_lease_token: AtomicU64::new(0),
         }
     }
 
@@ -109,6 +121,7 @@ impl ScreenVisionOutboundCandidateBroker {
         Self {
             state: Mutex::new(ScreenVisionOutboundCandidateState::Empty),
             clock,
+            next_lease_token: AtomicU64::new(0),
         }
     }
 
@@ -124,10 +137,20 @@ impl ScreenVisionOutboundCandidateBroker {
     ) -> Result<String, ScreenVisionOutboundCandidateError> {
         validate_scope(life_id, screen_session_fence, outbound_policy_revision)?;
 
-        // Generate the locator before mutating state.  A random-source or
-        // synchronization failure leaves the existing state untouched.
-        let candidate_id = generate_candidate_id()?;
         let mut state = self.lock_state()?;
+        if matches!(
+            &*state,
+            ScreenVisionOutboundCandidateState::Candidate(candidate)
+                if candidate.delivery_lease.is_some()
+        ) {
+            return Err(candidate_error(
+                ScreenVisionOutboundCandidateErrorCode::CandidateInUse,
+            ));
+        }
+
+        // Generate the locator before mutating state.  A random-source failure
+        // leaves the existing state untouched.
+        let candidate_id = generate_candidate_id()?;
         let created_at = self.clock.now();
         let candidate = ScreenVisionOutboundCandidate {
             candidate_id: candidate_id.clone(),
@@ -136,6 +159,7 @@ impl ScreenVisionOutboundCandidateBroker {
             outbound_policy_revision,
             projection,
             created_at,
+            delivery_lease: None,
         };
 
         // Assignment drops the old candidate while the mutex is held.  There
@@ -226,6 +250,15 @@ impl ScreenVisionOutboundCandidateBroker {
     ) -> Result<(), ScreenVisionOutboundCandidateError> {
         validate_candidate_id(candidate_id)?;
         let mut state = self.lock_state()?;
+        if matches!(
+            &*state,
+            ScreenVisionOutboundCandidateState::Candidate(candidate)
+                if candidate.candidate_id == candidate_id && candidate.delivery_lease.is_some()
+        ) {
+            return Err(candidate_error(
+                ScreenVisionOutboundCandidateErrorCode::CandidateInUse,
+            ));
+        }
         let now = self.clock.now();
         if expire_if_needed(&mut state, now) {
             return Err(candidate_error(
@@ -249,6 +282,175 @@ impl ScreenVisionOutboundCandidateBroker {
         }
     }
 
+    /// Reserves the exact candidate for one provider-bound delivery.  The
+    /// lease owns no pixel bytes and is intentionally process-local RAII.
+    /// Candidate replacement and exact revoke fail closed while it is held.
+    pub(crate) fn acquire_exact_delivery_lease<'a>(
+        &'a self,
+        candidate_id: &str,
+        life_id: &str,
+        screen_session_fence: &str,
+        outbound_policy_revision: i64,
+        delivery_id: &str,
+    ) -> Result<ScreenVisionOutboundCandidateDeliveryLease<'a>, ScreenVisionOutboundCandidateError>
+    {
+        validate_candidate_id(candidate_id)?;
+        validate_scope(life_id, screen_session_fence, outbound_policy_revision)?;
+        validate_bounded_nonblank(delivery_id)?;
+
+        let mut state = self.lock_state()?;
+        let now = self.clock.now();
+        if expire_if_needed(&mut state, now) {
+            return Err(candidate_error(
+                ScreenVisionOutboundCandidateErrorCode::CandidateExpired,
+            ));
+        }
+
+        let ScreenVisionOutboundCandidateState::Candidate(candidate) = &mut *state else {
+            return Err(candidate_error(
+                ScreenVisionOutboundCandidateErrorCode::NoCurrentCandidate,
+            ));
+        };
+        if candidate.candidate_id != candidate_id {
+            return Err(candidate_error(
+                ScreenVisionOutboundCandidateErrorCode::CandidateMismatch,
+            ));
+        }
+        if candidate.life_id != life_id
+            || candidate.screen_session_fence != screen_session_fence
+            || candidate.outbound_policy_revision != outbound_policy_revision
+        {
+            return Err(candidate_error(
+                ScreenVisionOutboundCandidateErrorCode::ScopeMismatch,
+            ));
+        }
+        if candidate.delivery_lease.is_some() {
+            return Err(candidate_error(
+                ScreenVisionOutboundCandidateErrorCode::CandidateInUse,
+            ));
+        }
+
+        let token = self
+            .next_lease_token
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map(|previous| previous + 1)
+            .map_err(|_| {
+                candidate_error(ScreenVisionOutboundCandidateErrorCode::SynchronizationUnavailable)
+            })?;
+        candidate.delivery_lease = Some(DeliveryLeaseRecord {
+            token,
+            delivery_id: delivery_id.to_string(),
+        });
+
+        Ok(ScreenVisionOutboundCandidateDeliveryLease {
+            broker: self,
+            candidate_id: candidate_id.to_string(),
+            delivery_id: delivery_id.to_string(),
+            token,
+        })
+    }
+
+    /// Checks that an exact lease still owns the exact current candidate. It
+    /// also enforces the original five-minute TTL; holding a lease never
+    /// silently renews authorization.
+    pub(crate) fn validate_exact_delivery_lease(
+        &self,
+        lease: &ScreenVisionOutboundCandidateDeliveryLease<'_>,
+        candidate_id: &str,
+        life_id: &str,
+        screen_session_fence: &str,
+        outbound_policy_revision: i64,
+        delivery_id: &str,
+    ) -> Result<(), ScreenVisionOutboundCandidateError> {
+        if !std::ptr::eq(lease.broker, self) {
+            return Err(candidate_error(
+                ScreenVisionOutboundCandidateErrorCode::SynchronizationUnavailable,
+            ));
+        }
+        validate_candidate_id(candidate_id)?;
+        validate_scope(life_id, screen_session_fence, outbound_policy_revision)?;
+        validate_bounded_nonblank(delivery_id)?;
+
+        let state = self.lock_state()?;
+        let ScreenVisionOutboundCandidateState::Candidate(candidate) = &*state else {
+            return Err(candidate_error(
+                ScreenVisionOutboundCandidateErrorCode::NoCurrentCandidate,
+            ));
+        };
+        if candidate.candidate_id != candidate_id {
+            return Err(candidate_error(
+                ScreenVisionOutboundCandidateErrorCode::CandidateMismatch,
+            ));
+        }
+        if candidate.life_id != life_id
+            || candidate.screen_session_fence != screen_session_fence
+            || candidate.outbound_policy_revision != outbound_policy_revision
+        {
+            return Err(candidate_error(
+                ScreenVisionOutboundCandidateErrorCode::ScopeMismatch,
+            ));
+        }
+        if self
+            .clock
+            .now()
+            .saturating_duration_since(candidate.created_at)
+            >= SCREEN_VISION_OUTBOUND_CANDIDATE_TTL
+        {
+            return Err(candidate_error(
+                ScreenVisionOutboundCandidateErrorCode::CandidateExpired,
+            ));
+        }
+        let Some(record) = &candidate.delivery_lease else {
+            return Err(candidate_error(
+                ScreenVisionOutboundCandidateErrorCode::CandidateInUse,
+            ));
+        };
+        if record.token != lease.token
+            || record.delivery_id != delivery_id
+            || lease.candidate_id != candidate_id
+            || lease.delivery_id != delivery_id
+        {
+            return Err(candidate_error(
+                ScreenVisionOutboundCandidateErrorCode::CandidateInUse,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Borrows the projection only for the synchronous local closure. The
+    /// closure cannot move or clone the projection and must return an owned
+    /// bounded result before this method returns.
+    pub(crate) fn with_exact_leased_projection<T>(
+        &self,
+        lease: &ScreenVisionOutboundCandidateDeliveryLease<'_>,
+        operation: impl FnOnce(&ScreenVisionOutboundProjection) -> T,
+    ) -> Result<T, ScreenVisionOutboundCandidateError> {
+        if !std::ptr::eq(lease.broker, self) {
+            return Err(candidate_error(
+                ScreenVisionOutboundCandidateErrorCode::SynchronizationUnavailable,
+            ));
+        }
+        let state = self.lock_state()?;
+        let ScreenVisionOutboundCandidateState::Candidate(candidate) = &*state else {
+            return Err(candidate_error(
+                ScreenVisionOutboundCandidateErrorCode::NoCurrentCandidate,
+            ));
+        };
+        let Some(record) = &candidate.delivery_lease else {
+            return Err(candidate_error(
+                ScreenVisionOutboundCandidateErrorCode::CandidateInUse,
+            ));
+        };
+        if record.token != lease.token || candidate.candidate_id != lease.candidate_id {
+            return Err(candidate_error(
+                ScreenVisionOutboundCandidateErrorCode::CandidateInUse,
+            ));
+        }
+        Ok(operation(&candidate.projection))
+    }
+
     fn lock_state(
         &self,
     ) -> Result<
@@ -258,6 +460,22 @@ impl ScreenVisionOutboundCandidateBroker {
         self.state.lock().map_err(|_| {
             candidate_error(ScreenVisionOutboundCandidateErrorCode::SynchronizationUnavailable)
         })
+    }
+
+    fn release_delivery_lease(&self, candidate_id: &str, token: u64) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if let ScreenVisionOutboundCandidateState::Candidate(candidate) = &mut *state {
+            if candidate.candidate_id == candidate_id
+                && candidate
+                    .delivery_lease
+                    .as_ref()
+                    .is_some_and(|lease| lease.token == token)
+            {
+                candidate.delivery_lease = None;
+            }
+        }
     }
 
     /// Test-only mutex controls used by the C3 composition tests to exercise
@@ -292,6 +510,21 @@ impl ScreenVisionOutboundCandidateBroker {
                 .checked_sub(SCREEN_VISION_OUTBOUND_CANDIDATE_TTL)
                 .expect("test instant should support candidate expiry");
         }
+    }
+}
+
+/// Process-local RAII ownership of one exact candidate delivery lease.
+pub(crate) struct ScreenVisionOutboundCandidateDeliveryLease<'a> {
+    broker: &'a ScreenVisionOutboundCandidateBroker,
+    candidate_id: String,
+    delivery_id: String,
+    token: u64,
+}
+
+impl Drop for ScreenVisionOutboundCandidateDeliveryLease<'_> {
+    fn drop(&mut self) {
+        self.broker
+            .release_delivery_lease(&self.candidate_id, self.token);
     }
 }
 
@@ -352,7 +585,14 @@ fn expire_if_needed(state: &mut ScreenVisionOutboundCandidateState, now: Instant
         }
     };
     if expired {
-        *state = ScreenVisionOutboundCandidateState::Empty;
+        let leased = matches!(
+            &*state,
+            ScreenVisionOutboundCandidateState::Candidate(candidate)
+                if candidate.delivery_lease.is_some()
+        );
+        if !leased {
+            *state = ScreenVisionOutboundCandidateState::Empty;
+        }
     }
     expired
 }
@@ -782,5 +1022,112 @@ mod tests {
         assert_eq!(metadata.width, 1);
         assert_eq!(metadata.height, 1);
         assert_eq!(metadata.pixel_format, ScreenVisionOutboundPixelFormat::Rgb8);
+    }
+
+    #[test]
+    fn exact_delivery_lease_blocks_replacement_revoke_and_second_lease() {
+        let (broker, _clock) = broker_with_manual_clock();
+        let candidate_id = install(&broker, LIFE_A, FENCE_A, REVISION_A);
+        let lease = broker
+            .acquire_exact_delivery_lease(&candidate_id, LIFE_A, FENCE_A, REVISION_A, "delivery-a")
+            .expect("exact candidate lease should be acquired");
+
+        assert_error_code(
+            broker.replace_candidate(LIFE_B, FENCE_B, REVISION_B, projection()),
+            ScreenVisionOutboundCandidateErrorCode::CandidateInUse,
+        );
+        assert_error_code(
+            broker.revoke_exact(&candidate_id),
+            ScreenVisionOutboundCandidateErrorCode::CandidateInUse,
+        );
+        assert_error_code(
+            broker.acquire_exact_delivery_lease(
+                &candidate_id,
+                LIFE_A,
+                FENCE_A,
+                REVISION_A,
+                "delivery-b",
+            ),
+            ScreenVisionOutboundCandidateErrorCode::CandidateInUse,
+        );
+        broker
+            .validate_exact_delivery_lease(
+                &lease,
+                &candidate_id,
+                LIFE_A,
+                FENCE_A,
+                REVISION_A,
+                "delivery-a",
+            )
+            .expect("the original exact lease should remain valid");
+    }
+
+    #[test]
+    fn delivery_lease_does_not_refresh_candidate_ttl() {
+        let (broker, clock) = broker_with_manual_clock();
+        let candidate_id = install(&broker, LIFE_A, FENCE_A, REVISION_A);
+        let lease = broker
+            .acquire_exact_delivery_lease(&candidate_id, LIFE_A, FENCE_A, REVISION_A, "delivery-a")
+            .expect("exact candidate lease should be acquired");
+        clock.advance(SCREEN_VISION_OUTBOUND_CANDIDATE_TTL);
+
+        assert_error_code(
+            broker.validate_exact_delivery_lease(
+                &lease,
+                &candidate_id,
+                LIFE_A,
+                FENCE_A,
+                REVISION_A,
+                "delivery-a",
+            ),
+            ScreenVisionOutboundCandidateErrorCode::CandidateExpired,
+        );
+        drop(lease);
+        assert_error_code(
+            broker.get_exact(&candidate_id),
+            ScreenVisionOutboundCandidateErrorCode::CandidateExpired,
+        );
+    }
+
+    #[test]
+    fn stale_lease_drop_cannot_clear_a_newer_candidate_lease() {
+        let (broker, _clock) = broker_with_manual_clock();
+        let candidate_id = install(&broker, LIFE_A, FENCE_A, REVISION_A);
+        let lease = broker
+            .acquire_exact_delivery_lease(&candidate_id, LIFE_A, FENCE_A, REVISION_A, "delivery-a")
+            .expect("exact candidate lease should be acquired");
+
+        // Simulate a replacement performed by an owning recovery path after
+        // the old lease token became stale.  The production replacement path
+        // itself rejects a live lease; this test exercises the token fence on
+        // the RAII drop directly.
+        let newer_candidate = ScreenVisionOutboundCandidate {
+            candidate_id: candidate_id.clone(),
+            life_id: LIFE_B.to_string(),
+            screen_session_fence: FENCE_B.to_string(),
+            outbound_policy_revision: REVISION_B,
+            projection: projection(),
+            created_at: Instant::now(),
+            delivery_lease: Some(DeliveryLeaseRecord {
+                token: lease.token.wrapping_add(1),
+                delivery_id: "delivery-b".to_string(),
+            }),
+        };
+        *broker
+            .state
+            .lock()
+            .expect("candidate state should not be poisoned") =
+            ScreenVisionOutboundCandidateState::Candidate(newer_candidate);
+        drop(lease);
+
+        let state = broker
+            .state
+            .lock()
+            .expect("candidate state should remain readable");
+        let ScreenVisionOutboundCandidateState::Candidate(candidate) = &*state else {
+            panic!("newer candidate must remain installed");
+        };
+        assert!(candidate.delivery_lease.is_some());
+        assert_eq!(candidate.life_id, LIFE_B);
     }
 }

@@ -107,6 +107,19 @@ impl fmt::Display for Http1TransportError {
 
 impl Error for Http1TransportError {}
 
+/// Generic sensitive-exchange outcome. The callback remains transport
+/// agnostic so perception authority does not leak into this HTTP module.
+pub(crate) enum SensitiveExchangeError<E> {
+    PreSendGuard(E),
+    Transport(Http1TransportError),
+}
+
+impl<E> From<Http1TransportError> for SensitiveExchangeError<E> {
+    fn from(error: Http1TransportError) -> Self {
+        Self::Transport(error)
+    }
+}
+
 /// A bounded, one-shot request. It deliberately has no Clone implementation.
 pub(crate) struct PreparedHttpRequest {
     method: Method,
@@ -299,6 +312,26 @@ pub(crate) async fn exchange_sensitive(
     target: &ValidatedTransportTarget,
     request: PreparedSensitiveHttpRequest,
 ) -> Result<Http1Response, Http1TransportError> {
+    exchange_sensitive_with_guard(target, request, || Ok::<(), Infallible>(()))
+        .await
+        .map_err(|error| match error {
+            SensitiveExchangeError::PreSendGuard(never) => match never {},
+            SensitiveExchangeError::Transport(error) => error,
+        })
+}
+
+/// Executes one sensitive HTTP/1.1 exchange and runs the generic authority
+/// guard after handshake but immediately before the sole `send_request`.
+/// Guard failure drops the zeroizing body without entering `PossiblySent`.
+pub(crate) async fn exchange_sensitive_with_guard<E, F>(
+    target: &ValidatedTransportTarget,
+    request: PreparedSensitiveHttpRequest,
+    pre_send_guard: F,
+) -> Result<Http1Response, SensitiveExchangeError<E>>
+where
+    E: Send,
+    F: FnOnce() -> Result<(), E> + Send,
+{
     let PreparedSensitiveHttpRequest {
         method,
         origin_form,
@@ -314,10 +347,11 @@ pub(crate) async fn exchange_sensitive(
         body_len,
         ZeroizingBody::new(body),
     )?;
-    exchange_request(
+    exchange_request_with_guard(
         target,
         hyper_request,
         Instant::now() + TRANSPORT_TOTAL_TIMEOUT,
+        pre_send_guard,
     )
     .await
 }
@@ -342,18 +376,26 @@ async fn exchange_with_deadline(
         body_len,
         Full::new(body),
     )?;
-    exchange_request(target, hyper_request, deadline).await
+    exchange_request_with_guard(target, hyper_request, deadline, || Ok::<(), Infallible>(()))
+        .await
+        .map_err(|error| match error {
+            SensitiveExchangeError::PreSendGuard(never) => match never {},
+            SensitiveExchangeError::Transport(error) => error,
+        })
 }
 
-async fn exchange_request<B>(
+async fn exchange_request_with_guard<B, E, F>(
     target: &ValidatedTransportTarget,
     hyper_request: Request<B>,
     deadline: Instant,
-) -> Result<Http1Response, Http1TransportError>
+    pre_send_guard: F,
+) -> Result<Http1Response, SensitiveExchangeError<E>>
 where
     B: Body + Send + 'static,
     B::Data: Send,
     B::Error: Into<Box<dyn Error + Send + Sync>>,
+    E: Send,
+    F: FnOnce() -> Result<(), E> + Send,
 {
     let transport = establish_connection(target, deadline)
         .await
@@ -373,6 +415,11 @@ where
         })?;
     tokio::pin!(connection);
 
+    // The guard is the final authority check. It runs before the send
+    // disposition changes to PossiblySent and before Hyper receives the
+    // request body.
+    pre_send_guard().map_err(SensitiveExchangeError::PreSendGuard)?;
+
     // This is the sole send boundary: no code below retries or reconnects.
     let disposition = SendDisposition::PossiblySent;
     let response = {
@@ -391,23 +438,30 @@ where
                         .await
                         .map_err(|_| timeout_error(disposition))?
                         .map_err(|error| map_post_send_hyper_error(&error, Http1ErrorKind::HttpSendFailed))?,
-                    Err(error) => return Err(map_post_send_hyper_error(&error, Http1ErrorKind::ConnectionDriverFailed)),
+                    Err(error) => {
+                        return Err(SensitiveExchangeError::Transport(
+                            map_post_send_hyper_error(
+                                &error,
+                                Http1ErrorKind::ConnectionDriverFailed,
+                            ),
+                        ))
+                    }
                 }
             }
         }
     };
 
     if !content_encoding_is_identity(response.headers()) {
-        return Err(Http1TransportError::new(
+        return Err(SensitiveExchangeError::Transport(Http1TransportError::new(
             Http1ErrorKind::ContentEncodingRejected,
             disposition,
-        ));
+        )));
     }
     if content_length_exceeds_limit(response.headers()) {
-        return Err(Http1TransportError::new(
+        return Err(SensitiveExchangeError::Transport(Http1TransportError::new(
             Http1ErrorKind::ResponseBodyTooLarge,
             disposition,
-        ));
+        )));
     }
 
     let (parts, mut body) = response.into_parts();
@@ -421,17 +475,45 @@ where
                 match result.map_err(|_| timeout_error(disposition))? {
                     Some(Ok(frame)) => match frame.into_data() {
                         Ok(data) => append_body_frame(&mut collected, data, disposition)?,
-                        Err(_) => return Err(Http1TransportError::new(Http1ErrorKind::ResponseBodyFailed, disposition)),
+                        Err(_) => {
+                            return Err(SensitiveExchangeError::Transport(
+                                Http1TransportError::new(
+                                    Http1ErrorKind::ResponseBodyFailed,
+                                    disposition,
+                                ),
+                            ))
+                        }
                     },
-                    Some(Err(_)) => return Err(Http1TransportError::new(Http1ErrorKind::ResponseBodyFailed, disposition)),
+                    Some(Err(_)) => {
+                        return Err(SensitiveExchangeError::Transport(
+                            Http1TransportError::new(
+                                Http1ErrorKind::ResponseBodyFailed,
+                                disposition,
+                            ),
+                        ))
+                    }
                     None => break,
                 }
             }
             driver = &mut connection => {
                 match driver {
                     Ok(()) if body.is_end_stream() => break,
-                    Ok(()) => return Err(Http1TransportError::new(Http1ErrorKind::ConnectionDriverFailed, disposition)),
-                    Err(error) => return Err(map_post_send_hyper_error(&error, Http1ErrorKind::ConnectionDriverFailed)),
+                    Ok(()) => {
+                        return Err(SensitiveExchangeError::Transport(
+                            Http1TransportError::new(
+                                Http1ErrorKind::ConnectionDriverFailed,
+                                disposition,
+                            ),
+                        ))
+                    }
+                    Err(error) => {
+                        return Err(SensitiveExchangeError::Transport(
+                            map_post_send_hyper_error(
+                                &error,
+                                Http1ErrorKind::ConnectionDriverFailed,
+                            ),
+                        ))
+                    }
                 }
             }
         }
@@ -824,6 +906,37 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.disposition(), SendDisposition::PossiblySent);
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sensitive_final_guard_blocks_request_bytes_before_send() {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let target = loopback_target(&listener).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).await.unwrap();
+            request
+        });
+
+        let result = exchange_sensitive_with_guard(
+            &target,
+            prepared_sensitive(b"guarded-sensitive-body".to_vec()),
+            || Err::<(), _>("authority changed"),
+        )
+        .await;
+        match result {
+            Err(SensitiveExchangeError::PreSendGuard(error)) => {
+                assert_eq!(error, "authority changed")
+            }
+            Err(SensitiveExchangeError::Transport(error)) => {
+                panic!("guard must fail before transport send: {error:?}")
+            }
+            Ok(_) => panic!("guard failure must prevent the request"),
+        }
+        assert!(server.await.unwrap().is_empty());
     }
 
     #[test]

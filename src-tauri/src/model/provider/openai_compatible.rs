@@ -9,7 +9,8 @@ use crate::{
         profile::{credential_purpose, ModelProfile, ModelProviderKind, ModelPurpose},
         transport::{
             http1::{
-                exchange, exchange_sensitive, PreparedHttpRequest, PreparedSensitiveHttpRequest,
+                exchange, exchange_sensitive, exchange_sensitive_with_guard, PreparedHttpRequest,
+                PreparedSensitiveHttpRequest, SensitiveExchangeError,
             },
             url_policy::{validate_and_normalize_url, ValidatedTransportTarget},
             MAX_REQUEST_BODY_BYTES, MAX_SENSITIVE_REQUEST_BODY_BYTES,
@@ -160,6 +161,14 @@ pub(crate) struct SensitiveProviderJsonRequest {
     body: Zeroizing<Vec<u8>>,
 }
 
+/// Provider-side wrapper for a generic authority guard.  The transport keeps
+/// this error generic; provider configuration/credential failures remain the
+/// fixed redacted `ProviderError` variant.
+pub(crate) enum SensitiveProviderExecutionError<E> {
+    PreSendGuard(E),
+    Provider(ProviderError),
+}
+
 impl SensitiveProviderJsonRequest {
     pub(crate) fn new(body: Zeroizing<Vec<u8>>) -> Result<Self, ProviderError> {
         if body.len() as u64 > MAX_SENSITIVE_REQUEST_BODY_BYTES {
@@ -235,6 +244,36 @@ impl<'a, S: SecretStore + ?Sized> OpenAiCompatibleProvider<'a, S> {
             .await
     }
 
+    /// Executes one sensitive Vision request with a generic final authority
+    /// guard. The guard runs inside transport after handshake and immediately
+    /// before the sole HTTP send.
+    pub(crate) async fn execute_sensitive_with_guard<E, F>(
+        &self,
+        config: &OpenAiCompatibleProviderConfig,
+        request: SensitiveProviderJsonRequest,
+        pre_send_guard: F,
+    ) -> Result<ProviderHttpResponse, SensitiveProviderExecutionError<E>>
+    where
+        E: Send,
+        F: FnOnce() -> Result<(), E> + Send,
+    {
+        if config.purpose != ModelPurpose::Vision {
+            return Err(SensitiveProviderExecutionError::Provider(
+                ProviderError::definitely_not_sent(ProviderErrorKind::InvalidConfiguration),
+            ));
+        }
+        let secret = self
+            .secrets
+            .get_secret(&config.credential)
+            .map_err(|error| {
+                SensitiveProviderExecutionError::Provider(ProviderError::from_secret_error(
+                    error.code,
+                ))
+            })?;
+        self.execute_sensitive_with_secret_guard(config, request, secret, pre_send_guard)
+            .await
+    }
+
     async fn execute_with_secret(
         &self,
         config: &OpenAiCompatibleProviderConfig,
@@ -297,6 +336,55 @@ impl<'a, S: SecretStore + ?Sized> OpenAiCompatibleProvider<'a, S> {
             .await
             .map_err(ProviderError::from_transport)?;
         response_from_transport(response)
+    }
+
+    async fn execute_sensitive_with_secret_guard<E, F>(
+        &self,
+        config: &OpenAiCompatibleProviderConfig,
+        request: SensitiveProviderJsonRequest,
+        secret: SecretValue,
+        pre_send_guard: F,
+    ) -> Result<ProviderHttpResponse, SensitiveProviderExecutionError<E>>
+    where
+        E: Send,
+        F: FnOnce() -> Result<(), E> + Send,
+    {
+        let mut authorization = Zeroizing::new(String::with_capacity(
+            "Bearer ".len() + secret.expose_secret().len(),
+        ));
+        authorization.push_str("Bearer ");
+        authorization.push_str(secret.expose_secret());
+        let authorization_value = HeaderValue::from_str(&authorization).map_err(|_| {
+            SensitiveProviderExecutionError::Provider(ProviderError::definitely_not_sent(
+                ProviderErrorKind::RequestRejected,
+            ))
+        })?;
+
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+        headers.insert(AUTHORIZATION, authorization_value);
+        let request = PreparedSensitiveHttpRequest::new(
+            Method::POST,
+            config.origin_form.clone(),
+            headers,
+            request.into_body(),
+        )
+        .map_err(|error| {
+            SensitiveProviderExecutionError::Provider(ProviderError::from_transport(error))
+        })?;
+
+        let response = exchange_sensitive_with_guard(&config.target, request, pre_send_guard)
+            .await
+            .map_err(|error| match error {
+                SensitiveExchangeError::PreSendGuard(error) => {
+                    SensitiveProviderExecutionError::PreSendGuard(error)
+                }
+                SensitiveExchangeError::Transport(error) => {
+                    SensitiveProviderExecutionError::Provider(ProviderError::from_transport(error))
+                }
+            })?;
+        response_from_transport(response).map_err(SensitiveProviderExecutionError::Provider)
     }
 }
 

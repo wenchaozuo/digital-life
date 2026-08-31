@@ -23,6 +23,16 @@ import {
   type MainScreenObservationError,
   type MainScreenPerceptionStatus,
 } from "./perception/screenObservationService";
+import {
+  createSecureVisionAttemptId,
+  mainScreenVisionDeliveryService,
+  screenVisionDeliveryErrorFromUnknown,
+  type MainScreenVisionAnalysis,
+  type MainScreenVisionDeliveryError,
+  type MainScreenVisionReview,
+  type MainScreenVisionReviewDisplay,
+  type MainScreenVisionStatus,
+} from "./perception/screenVisionDeliveryService";
 import { storageService } from "./storage";
 
 const bodyState = ref<BodyState>("idle");
@@ -39,12 +49,25 @@ const screenContextGrantLifeId = ref<string>();
 const screenContextAttachmentId = ref<string>();
 const screenPreparedCandidateId = ref<string>();
 const screenContextPreparing = ref(false);
+const screenVisionStatus = ref<MainScreenVisionStatus>();
+const screenVisionReview = ref<MainScreenVisionReview>();
+const screenVisionResult = ref<MainScreenVisionAnalysis>();
+const screenVisionError = ref<MainScreenVisionDeliveryError>();
+const screenVisionPreparing = ref(false);
+const screenVisionSending = ref(false);
+const screenVisionAbandoning = ref(false);
+const screenVisionAttempt = ref<{
+  confirmationEventId: string;
+  deliveryId: string;
+}>();
 let unsubscribe: (() => void) | undefined;
 let bodyRuntimeBinding: BodyRuntimeBindingController | undefined;
 let lifecycleEpoch = 0;
 let screenStatusRequestGeneration = 0;
 let screenObservationRequestGeneration = 0;
 let screenHandoffRequestGeneration = 0;
+let screenVisionStatusRequestGeneration = 0;
+let screenVisionRequestGeneration = 0;
 
 const screenReadinessLabel = computed(() => {
   if (screenObservationLoading.value) {
@@ -97,6 +120,46 @@ const canUseScreenContextAction = computed(
     screenObservation.value?.status === "recognized" &&
     (!screenObservationPrepared.value || screenContextCleanupRequired.value) &&
     !screenContextPreparing.value,
+);
+
+const screenVisionReviewForDisplay = computed<
+  MainScreenVisionReviewDisplay | undefined
+>(() => screenVisionReview.value ?? screenVisionStatus.value?.review ?? undefined);
+
+const screenVisionRetryAvailable = computed(
+  () =>
+    screenVisionReview.value !== undefined &&
+    screenVisionAttempt.value !== undefined &&
+    (screenVisionStatus.value?.status === "awaitingRetryDecision" ||
+      screenVisionError.value?.code === "VISION_NOT_SENT" ||
+      screenVisionError.value?.code === "VISION_SEND_OUTCOME_UNKNOWN"),
+);
+
+const screenVisionCanPrepare = computed(
+  () =>
+    lifeIdentity.value !== undefined &&
+    !screenVisionPreparing.value &&
+    !screenVisionSending.value &&
+    !screenVisionAbandoning.value &&
+    screenVisionStatus.value?.status !== "deliveryInProgress" &&
+    screenVisionStatus.value?.status !== "awaitingRetryDecision",
+);
+
+const screenVisionCanSend = computed(
+  () =>
+    screenVisionReview.value !== undefined &&
+    !screenVisionPreparing.value &&
+    !screenVisionSending.value &&
+    !screenVisionAbandoning.value &&
+    screenVisionStatus.value?.status !== "deliveryInProgress",
+);
+
+const screenVisionCanAbandon = computed(
+  () =>
+    screenVisionReview.value !== undefined &&
+    screenVisionStatus.value?.status === "awaitingRetryDecision" &&
+    !screenVisionSending.value &&
+    !screenVisionAbandoning.value,
 );
 
 // D17-C: the listener registration race with unmount is fenced by this
@@ -170,6 +233,193 @@ function clearScreenObservation(): void {
   invalidateScreenHandoff();
 }
 
+function isCurrentScreenVisionRequest(
+  runtimeEpoch: number,
+  lifeId: string,
+  requestGeneration: number,
+): boolean {
+  return (
+    isRuntimeActive(runtimeEpoch) &&
+    lifeIdentity.value?.id === lifeId &&
+    screenVisionRequestGeneration === requestGeneration
+  );
+}
+
+function invalidateScreenVision(): void {
+  screenVisionRequestGeneration += 1;
+  screenVisionStatusRequestGeneration += 1;
+  screenVisionStatus.value = undefined;
+  screenVisionReview.value = undefined;
+  screenVisionResult.value = undefined;
+  screenVisionError.value = undefined;
+  screenVisionAttempt.value = undefined;
+  screenVisionPreparing.value = false;
+  screenVisionSending.value = false;
+  screenVisionAbandoning.value = false;
+}
+
+async function refreshScreenVisionStatus(runtimeEpoch: number): Promise<void> {
+  const lifeId = lifeIdentity.value?.id;
+  if (lifeId === undefined) {
+    return;
+  }
+  const requestGeneration = ++screenVisionStatusRequestGeneration;
+  try {
+    const status = await mainScreenVisionDeliveryService.getStatus();
+    if (
+      !isRuntimeActive(runtimeEpoch) ||
+      requestGeneration !== screenVisionStatusRequestGeneration ||
+      lifeIdentity.value?.id !== lifeId
+    ) {
+      return;
+    }
+    screenVisionStatus.value = status;
+  } catch (error: unknown) {
+    if (
+      !isRuntimeActive(runtimeEpoch) ||
+      requestGeneration !== screenVisionStatusRequestGeneration ||
+      lifeIdentity.value?.id !== lifeId
+    ) {
+      return;
+    }
+    screenVisionError.value = screenVisionDeliveryErrorFromUnknown(error);
+  }
+}
+
+async function prepareScreenVisionReview(): Promise<void> {
+  const lifeId = lifeIdentity.value?.id;
+  if (lifeId === undefined || !screenVisionCanPrepare.value) {
+    return;
+  }
+
+  const runtimeEpoch = lifecycleEpoch;
+  const requestGeneration = ++screenVisionRequestGeneration;
+  screenVisionPreparing.value = true;
+  screenVisionError.value = undefined;
+  try {
+    const review = await mainScreenVisionDeliveryService.prepareReview();
+    if (isCurrentScreenVisionRequest(runtimeEpoch, lifeId, requestGeneration)) {
+      screenVisionReview.value = review;
+      screenVisionStatus.value = { status: "reviewReady", review };
+      screenVisionResult.value = undefined;
+      screenVisionAttempt.value = undefined;
+    }
+  } catch (error: unknown) {
+    if (isCurrentScreenVisionRequest(runtimeEpoch, lifeId, requestGeneration)) {
+      screenVisionError.value = screenVisionDeliveryErrorFromUnknown(error);
+    }
+  } finally {
+    if (isCurrentScreenVisionRequest(runtimeEpoch, lifeId, requestGeneration)) {
+      screenVisionPreparing.value = false;
+      void refreshScreenVisionStatus(runtimeEpoch);
+    }
+  }
+}
+
+function shouldRetainScreenVisionAttempt(
+  error: MainScreenVisionDeliveryError,
+): boolean {
+  return (
+    error.code === "VISION_NOT_SENT" ||
+    error.code === "VISION_SEND_OUTCOME_UNKNOWN"
+  );
+}
+
+async function executeScreenVisionReview(): Promise<void> {
+  const lifeId = lifeIdentity.value?.id;
+  const review = screenVisionReview.value;
+  if (lifeId === undefined || review === undefined || !screenVisionCanSend.value) {
+    return;
+  }
+
+  let attempt = screenVisionAttempt.value;
+  if (attempt === undefined) {
+    try {
+      attempt = {
+        confirmationEventId: createSecureVisionAttemptId(),
+        deliveryId: createSecureVisionAttemptId(),
+      };
+    } catch {
+      screenVisionError.value = {
+        code: "VISION_IDENTITY_UNAVAILABLE",
+        message: "A secure Vision attempt could not be created.",
+        recoverable: true,
+      };
+      return;
+    }
+    screenVisionAttempt.value = attempt;
+  }
+
+  const runtimeEpoch = lifecycleEpoch;
+  const requestGeneration = ++screenVisionRequestGeneration;
+  screenVisionSending.value = true;
+  screenVisionError.value = undefined;
+  try {
+    const result = await mainScreenVisionDeliveryService.executeReview(
+      review.reviewId,
+      attempt.confirmationEventId,
+      attempt.deliveryId,
+    );
+    if (isCurrentScreenVisionRequest(runtimeEpoch, lifeId, requestGeneration)) {
+      screenVisionResult.value = result;
+      screenVisionError.value = undefined;
+      screenVisionAttempt.value = undefined;
+      screenVisionReview.value = undefined;
+      screenVisionStatus.value = { status: "idle", review: null };
+    }
+  } catch (error: unknown) {
+    if (isCurrentScreenVisionRequest(runtimeEpoch, lifeId, requestGeneration)) {
+      const boundedError = screenVisionDeliveryErrorFromUnknown(error);
+      screenVisionError.value = boundedError;
+      if (!shouldRetainScreenVisionAttempt(boundedError)) {
+        screenVisionAttempt.value = undefined;
+        screenVisionReview.value = undefined;
+        screenVisionStatus.value = { status: "idle", review: null };
+      } else {
+        screenVisionStatus.value = {
+          status: "awaitingRetryDecision",
+          review,
+        };
+      }
+    }
+  } finally {
+    if (isCurrentScreenVisionRequest(runtimeEpoch, lifeId, requestGeneration)) {
+      screenVisionSending.value = false;
+      void refreshScreenVisionStatus(runtimeEpoch);
+    }
+  }
+}
+
+async function abandonScreenVisionDelivery(): Promise<void> {
+  const lifeId = lifeIdentity.value?.id;
+  const review = screenVisionReview.value;
+  if (lifeId === undefined || review === undefined || !screenVisionCanAbandon.value) {
+    return;
+  }
+
+  const runtimeEpoch = lifecycleEpoch;
+  const requestGeneration = ++screenVisionRequestGeneration;
+  screenVisionAbandoning.value = true;
+  screenVisionError.value = undefined;
+  try {
+    await mainScreenVisionDeliveryService.abandonDelivery(review.reviewId);
+    if (isCurrentScreenVisionRequest(runtimeEpoch, lifeId, requestGeneration)) {
+      screenVisionReview.value = undefined;
+      screenVisionAttempt.value = undefined;
+      screenVisionStatus.value = { status: "idle", review: null };
+    }
+  } catch (error: unknown) {
+    if (isCurrentScreenVisionRequest(runtimeEpoch, lifeId, requestGeneration)) {
+      screenVisionError.value = screenVisionDeliveryErrorFromUnknown(error);
+    }
+  } finally {
+    if (isCurrentScreenVisionRequest(runtimeEpoch, lifeId, requestGeneration)) {
+      screenVisionAbandoning.value = false;
+      void refreshScreenVisionStatus(runtimeEpoch);
+    }
+  }
+}
+
 function invalidateScreenObservationRequest(): void {
   screenObservationRequestGeneration += 1;
   screenObservationLoading.value = false;
@@ -218,8 +468,10 @@ function applyCurrentLife(life: LifeIdentity, runtimeEpoch: number): void {
     screenStatusRequestGeneration += 1;
     invalidateScreenObservationRequest();
     screenPerceptionStatus.value = undefined;
+    invalidateScreenVision();
   }
   void refreshScreenPerceptionStatus(life.id, runtimeEpoch);
+  void refreshScreenVisionStatus(runtimeEpoch);
 }
 
 async function observeScreenNow(): Promise<void> {
@@ -514,6 +766,7 @@ function handleMainWindowFocus(): void {
   const lifeId = lifeIdentity.value?.id;
   if (lifeId !== undefined) {
     void refreshScreenPerceptionStatus(lifeId, lifecycleEpoch);
+    void refreshScreenVisionStatus(lifecycleEpoch);
   }
 }
 
@@ -611,6 +864,8 @@ onUnmounted(() => {
   // state after unmount.
   lifecycleEpoch += 1;
   screenStatusRequestGeneration += 1;
+  screenVisionRequestGeneration += 1;
+  screenVisionStatusRequestGeneration += 1;
   invalidateScreenObservationRequest();
   window.removeEventListener("focus", handleMainWindowFocus);
   unsubscribe?.();
@@ -715,6 +970,98 @@ onUnmounted(() => {
         >
           {{ screenObservationError.message }}
         </p>
+      </section>
+      <section
+        class="screen-vision-delivery"
+        aria-label="Screen Vision delivery"
+        data-testid="main-screen-vision-delivery"
+      >
+        <div class="screen-vision-header">
+          <strong>Screen Vision</strong>
+          <button
+            type="button"
+            data-testid="screen-vision-prepare"
+            :disabled="!screenVisionCanPrepare"
+            :aria-busy="screenVisionPreparing"
+            @click="prepareScreenVisionReview"
+          >
+            {{
+              screenVisionPreparing
+                ? "Preparing…"
+                : "Prepare the full selected screen target for Vision"
+            }}
+          </button>
+        </div>
+        <div
+          v-if="screenVisionReviewForDisplay"
+          class="screen-vision-review"
+          data-testid="screen-vision-review"
+        >
+          <p>
+            One screen image from the full selected target will be sent to
+            {{ screenVisionReviewForDisplay.providerHost }} using
+            {{ screenVisionReviewForDisplay.modelName }}.
+          </p>
+          <p>The image has not been sent yet.</p>
+          <p>Screen contents are treated as untrusted data by the Vision prompt.</p>
+          <p>No additional manual privacy masks are applied in this V1 full-target analysis.</p>
+          <p class="screen-vision-review-meta">
+            {{ screenVisionReviewForDisplay.profileDisplayName }} ·
+            {{ screenVisionReviewForDisplay.width }} ×
+            {{ screenVisionReviewForDisplay.height }}
+          </p>
+          <button
+            v-if="screenVisionReview"
+            type="button"
+            class="screen-vision-send"
+            data-testid="screen-vision-analyze"
+            :disabled="!screenVisionCanSend"
+            :aria-busy="screenVisionSending"
+            @click="executeScreenVisionReview"
+          >
+            {{
+              screenVisionSending
+                ? "Analyzing…"
+                : screenVisionRetryAvailable
+                  ? "Retry this same Vision attempt"
+                  : "Analyze with Vision now"
+            }}
+          </button>
+          <button
+            v-if="screenVisionCanAbandon"
+            type="button"
+            class="screen-vision-abandon"
+            data-testid="screen-vision-abandon"
+            :disabled="screenVisionAbandoning"
+            :aria-busy="screenVisionAbandoning"
+            @click="abandonScreenVisionDelivery"
+          >
+            {{ screenVisionAbandoning ? "Abandoning…" : "Abandon this Vision attempt" }}
+          </button>
+        </div>
+        <p
+          v-if="screenVisionError"
+          class="screen-vision-error"
+          data-testid="screen-vision-error"
+          aria-live="polite"
+        >
+          {{ screenVisionError.message }}
+        </p>
+        <section
+          v-if="screenVisionResult"
+          class="screen-vision-result"
+          data-testid="screen-vision-result"
+          aria-live="polite"
+        >
+          <strong>Vision analysis</strong>
+          <p>AI-generated interpretation. Screen contents may be incomplete or misread.</p>
+          <p>{{ screenVisionResult.summary }}</p>
+          <ul>
+            <li v-for="observation in screenVisionResult.observations" :key="observation">
+              {{ observation }}
+            </li>
+          </ul>
+        </section>
       </section>
     </section>
   </main>
@@ -903,6 +1250,120 @@ body,
   margin: 0;
   color: #fecaca;
   font-size: 0.78rem;
+}
+
+.screen-vision-delivery {
+  display: grid;
+  width: min(100%, 320px);
+  gap: 0.4rem;
+  padding: 0.6rem;
+  border: 1px solid rgb(251 191 36 / 30%);
+  border-radius: 0.7rem;
+  background: rgb(69 26 3 / 58%);
+  user-select: text;
+}
+
+.screen-vision-header {
+  display: grid;
+  gap: 0.4rem;
+}
+
+.screen-vision-header strong {
+  color: #fef3c7;
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+
+.screen-vision-header button,
+.screen-vision-send,
+.screen-vision-abandon {
+  border: 1px solid rgb(253 230 138 / 45%);
+  border-radius: 0.45rem;
+  padding: 0.35rem 0.55rem;
+  background: rgb(180 83 9 / 82%);
+  color: #fffbeb;
+  cursor: pointer;
+  font-size: 0.78rem;
+  text-align: left;
+}
+
+.screen-vision-header button:disabled,
+.screen-vision-send:disabled,
+.screen-vision-abandon:disabled {
+  background: rgb(71 85 105 / 65%);
+  color: #cbd5e1;
+  cursor: not-allowed;
+}
+
+.screen-vision-header button:not(:disabled):hover,
+.screen-vision-header button:not(:disabled):focus-visible,
+.screen-vision-send:not(:disabled):hover,
+.screen-vision-send:not(:disabled):focus-visible {
+  background: rgb(217 119 6 / 92%);
+}
+
+.screen-vision-review {
+  display: grid;
+  gap: 0.25rem;
+  border-top: 1px solid rgb(253 230 138 / 20%);
+  padding-top: 0.35rem;
+}
+
+.screen-vision-review p,
+.screen-vision-result p {
+  margin: 0;
+  color: #fef3c7;
+  font-size: 0.76rem;
+  line-height: 1.35;
+}
+
+.screen-vision-review-meta {
+  color: #fde68a !important;
+}
+
+.screen-vision-send {
+  margin-top: 0.15rem;
+  background: rgb(146 64 14 / 90%);
+  font-weight: 600;
+}
+
+.screen-vision-abandon {
+  justify-self: start;
+  border-color: rgb(254 202 202 / 35%);
+  background: rgb(127 29 29 / 78%);
+}
+
+.screen-vision-abandon:not(:disabled):hover,
+.screen-vision-abandon:not(:disabled):focus-visible {
+  background: rgb(185 28 28 / 88%);
+}
+
+.screen-vision-error {
+  margin: 0;
+  color: #fecaca;
+  font-size: 0.78rem;
+  line-height: 1.35;
+}
+
+.screen-vision-result {
+  display: grid;
+  gap: 0.25rem;
+  border-top: 1px solid rgb(253 230 138 / 20%);
+  padding-top: 0.35rem;
+}
+
+.screen-vision-result strong {
+  color: #fef3c7;
+  font-size: 0.82rem;
+}
+
+.screen-vision-result ul {
+  display: grid;
+  gap: 0.2rem;
+  margin: 0;
+  padding-left: 1rem;
+  color: #fef3c7;
+  font-size: 0.76rem;
 }
 
 </style>

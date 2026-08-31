@@ -110,6 +110,7 @@ async function mountMain(options: {
   const personaModule = await import("../src/persona");
   const storageModule = await import("../src/storage");
   const screenModule = await import("../src/perception/screenObservationService");
+  const visionModule = await import("../src/perception/screenVisionDeliveryService");
 
   const life = options.life ?? makeLife();
   const expressionUnlisten = vi.fn();
@@ -174,6 +175,18 @@ async function mountMain(options: {
   const revokeMainScreenContextAttachment = vi
     .spyOn(screenModule.mainScreenObservationService, "revokeMainScreenContextAttachment")
     .mockResolvedValue();
+  const getVisionStatus = vi
+    .spyOn(visionModule.mainScreenVisionDeliveryService, "getStatus")
+    .mockResolvedValue({ status: "idle", review: null });
+  const prepareVisionReview = vi
+    .spyOn(visionModule.mainScreenVisionDeliveryService, "prepareReview")
+    .mockRejectedValue({ code: "VISION_PROVIDER_UNAVAILABLE" });
+  const executeVisionReview = vi
+    .spyOn(visionModule.mainScreenVisionDeliveryService, "executeReview")
+    .mockRejectedValue({ code: "VISION_REVIEW_UNAVAILABLE" });
+  const abandonVisionDelivery = vi
+    .spyOn(visionModule.mainScreenVisionDeliveryService, "abandonDelivery")
+    .mockResolvedValue();
 
   const { default: App } = await import("../src/App.vue");
   const wrapper = mount(App, { attachTo: options.attachTo });
@@ -187,6 +200,10 @@ async function mountMain(options: {
     offerMainScreenContextToChat,
     revokeMainPendingScreenContextGrant,
     revokeMainScreenContextAttachment,
+    getVisionStatus,
+    prepareVisionReview,
+    executeVisionReview,
+    abandonVisionDelivery,
     emitBindingChange: (event: {
       version: 1;
       lifeId: string;

@@ -19,4 +19,8 @@ commands.allow = [
     "offer_main_screen_context_to_chat",
     "revoke_main_pending_screen_context_grant",
     "revoke_main_screen_context_attachment",
+    "prepare_main_screen_vision_review",
+    "get_main_screen_vision_status",
+    "execute_main_screen_vision_review",
+    "abandon_main_screen_vision_delivery",
 ]

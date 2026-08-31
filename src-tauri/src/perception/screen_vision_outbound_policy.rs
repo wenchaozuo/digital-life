@@ -237,6 +237,11 @@ pub(crate) fn validate_screen_vision_outbound_policy_event_state(
 ) -> Result<(), ScreenVisionOutboundPolicyError> {
     validate_id("policy event identity", &event.event_id)?;
     validate_life_id(&event.life_id)?;
+    if event.old_screen_vision_outbound_enabled == event.new_screen_vision_outbound_enabled {
+        return Err(ScreenVisionOutboundPolicyError::invalid_argument(
+            "screen vision outbound policy event must represent a boolean state transition.",
+        ));
+    }
     validate_expected_revision(event.expected_revision)?;
     if Some(event.applied_revision) != event.expected_revision.checked_add(1) {
         return Err(ScreenVisionOutboundPolicyError::invalid_argument(
@@ -443,6 +448,49 @@ mod tests {
             error.code,
             ScreenVisionOutboundPolicyErrorCode::InvalidArgument
         );
+    }
+
+    #[test]
+    fn event_validation_accepts_real_transitions_and_rejects_no_ops() {
+        for (event_id, old, new) in [
+            ("event-enable", false, true),
+            ("event-disable", true, false),
+        ] {
+            let event = LifeScreenVisionOutboundPolicyEvent {
+                event_id: event_id.into(),
+                life_id: "life-a".into(),
+                old_screen_vision_outbound_enabled: old,
+                new_screen_vision_outbound_enabled: new,
+                expected_revision: 1,
+                applied_revision: 2,
+                actor_kind: SCREEN_VISION_OUTBOUND_POLICY_ACTOR_KIND_USER_EXPLICIT.into(),
+                occurred_at: "2026-08-31T00:00:00.000Z".into(),
+                event_version: SCREEN_VISION_OUTBOUND_POLICY_EVENT_VERSION,
+            };
+            validate_screen_vision_outbound_policy_event_state(&event).unwrap();
+        }
+
+        for (event_id, old, new) in [
+            ("event-no-op-disabled", false, false),
+            ("event-no-op-enabled", true, true),
+        ] {
+            let event = LifeScreenVisionOutboundPolicyEvent {
+                event_id: event_id.into(),
+                life_id: "life-a".into(),
+                old_screen_vision_outbound_enabled: old,
+                new_screen_vision_outbound_enabled: new,
+                expected_revision: 1,
+                applied_revision: 2,
+                actor_kind: SCREEN_VISION_OUTBOUND_POLICY_ACTOR_KIND_USER_EXPLICIT.into(),
+                occurred_at: "2026-08-31T00:00:00.000Z".into(),
+                event_version: SCREEN_VISION_OUTBOUND_POLICY_EVENT_VERSION,
+            };
+            let error = validate_screen_vision_outbound_policy_event_state(&event).unwrap_err();
+            assert_eq!(
+                error.code,
+                ScreenVisionOutboundPolicyErrorCode::InvalidArgument
+            );
+        }
     }
 
     #[test]

@@ -158,8 +158,10 @@ fn policy_event_evidence_matches(
     request: &LifeScreenVisionOutboundPolicyUpdateRequest,
     applied_revision: i64,
 ) -> bool {
+    let expected_old_screen_vision_outbound_enabled = !request.screen_vision_outbound_enabled;
     event.event_id == request.event_id
         && event.life_id == request.life_id
+        && event.old_screen_vision_outbound_enabled == expected_old_screen_vision_outbound_enabled
         && event.new_screen_vision_outbound_enabled == request.screen_vision_outbound_enabled
         && event.expected_revision == request.expected_revision
         && event.applied_revision == applied_revision
@@ -255,10 +257,10 @@ fn update_policy_in_transaction(
     // Event identity is checked before the current revision.  This makes a
     // retried committed event replayable even after the policy has advanced.
     if let Some(existing_event) = load_policy_event_by_id(transaction, &request.event_id)? {
+        validate_screen_vision_outbound_policy_event_state(&existing_event)?;
         if policy_event_evidence_matches(&existing_event, &request, applied_revision) {
             let current = load_policy(transaction, &request.life_id)?
                 .ok_or_else(ScreenVisionOutboundPolicyError::policy_not_found)?;
-            validate_screen_vision_outbound_policy_event_state(&existing_event)?;
             validate_screen_vision_outbound_policy_state(&current)?;
             return Ok(LifeScreenVisionOutboundPolicyUpdateOutcome::Replayed {
                 event: existing_event,
@@ -713,6 +715,103 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(found, event);
+    }
+
+    #[test]
+    fn replay_evidence_requires_the_implied_previous_boolean_state() {
+        let request = LifeScreenVisionOutboundPolicyUpdateRequest {
+            event_id: "vision-event-enable".into(),
+            life_id: "vision-life-a".into(),
+            screen_vision_outbound_enabled: true,
+            expected_revision: 1,
+        };
+        let no_op_event = LifeScreenVisionOutboundPolicyEvent {
+            event_id: "vision-event-enable".into(),
+            life_id: "vision-life-a".into(),
+            old_screen_vision_outbound_enabled: true,
+            new_screen_vision_outbound_enabled: true,
+            expected_revision: 1,
+            applied_revision: 2,
+            actor_kind: SCREEN_VISION_OUTBOUND_POLICY_ACTOR_KIND_USER_EXPLICIT.into(),
+            occurred_at: "2026-08-31T00:00:00.000Z".into(),
+            event_version: SCREEN_VISION_OUTBOUND_POLICY_EVENT_VERSION,
+        };
+
+        assert!(!policy_event_evidence_matches(&no_op_event, &request, 2));
+        let error = validate_screen_vision_outbound_policy_event_state(&no_op_event).unwrap_err();
+        assert_eq!(
+            error.code,
+            ScreenVisionOutboundPolicyErrorCode::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn migration_028_event_table_enforces_real_boolean_transitions() {
+        let fixture = Fixture::new();
+        fixture.create();
+        let state = fixture.storage.state().unwrap();
+
+        for (event_id, old, new) in [
+            ("vision-event-no-op-disabled", false, false),
+            ("vision-event-no-op-enabled", true, true),
+        ] {
+            let error = state
+                .connection
+                .execute(
+                    "INSERT INTO life_screen_vision_outbound_policy_event
+                     (event_id, life_id, old_screen_vision_outbound_enabled,
+                      new_screen_vision_outbound_enabled, expected_revision,
+                      applied_revision, actor_kind, occurred_at, event_version)
+                     VALUES (?1, 'vision-life-a', ?2, ?3, 1, 2, 'user_explicit',
+                             '2026-08-31T00:00:00.000Z', 1)",
+                    params![event_id, old, new],
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains("CHECK constraint failed"));
+        }
+
+        for (event_id, old, new) in [
+            ("vision-event-direct-enable", false, true),
+            ("vision-event-direct-disable", true, false),
+        ] {
+            state
+                .connection
+                .execute(
+                    "INSERT INTO life_screen_vision_outbound_policy_event
+                     (event_id, life_id, old_screen_vision_outbound_enabled,
+                      new_screen_vision_outbound_enabled, expected_revision,
+                      applied_revision, actor_kind, occurred_at, event_version)
+                     VALUES (?1, 'vision-life-a', ?2, ?3, 1, 2, 'user_explicit',
+                             '2026-08-31T00:00:00.000Z', 1)",
+                    params![event_id, old, new],
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn schema_validator_rejects_event_table_without_transition_constraint() {
+        let fixture = Fixture::new();
+        let state = fixture.storage.state().unwrap();
+        state
+            .connection
+            .execute_batch(
+                "DROP TRIGGER life_screen_vision_outbound_policy_event_immutable_guard;
+                 DROP TABLE life_screen_vision_outbound_policy_event;",
+            )
+            .unwrap();
+
+        let weakened_event_sql = CREATE_LIFE_SCREEN_VISION_OUTBOUND_POLICY_EVENT_TABLE_SQL.replace(
+            "    CHECK (old_screen_vision_outbound_enabled <> new_screen_vision_outbound_enabled),",
+            "",
+        );
+        state.connection.execute_batch(&weakened_event_sql).unwrap();
+        state
+            .connection
+            .execute_batch(CREATE_LIFE_SCREEN_VISION_OUTBOUND_POLICY_EVENT_IMMUTABLE_TRIGGER_SQL)
+            .unwrap();
+
+        assert!(validate_schema_objects(&state.connection).is_err());
     }
 
     #[test]

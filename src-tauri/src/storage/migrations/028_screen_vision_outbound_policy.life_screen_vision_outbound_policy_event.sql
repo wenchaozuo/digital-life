@@ -8,5 +8,6 @@ CREATE TABLE life_screen_vision_outbound_policy_event (
     actor_kind TEXT NOT NULL CHECK (actor_kind = 'user_explicit'),
     occurred_at TEXT NOT NULL CHECK (length(trim(occurred_at)) > 0),
     event_version INTEGER NOT NULL CHECK (event_version = 1),
+    CHECK (old_screen_vision_outbound_enabled <> new_screen_vision_outbound_enabled),
     FOREIGN KEY (life_id) REFERENCES life_screen_vision_outbound_policy(life_id) ON DELETE CASCADE
 );

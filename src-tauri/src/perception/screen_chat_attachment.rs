@@ -204,6 +204,34 @@ impl ScreenContextChatAttachmentBroker {
         }
     }
 
+    /// Read-only lookup of the exact current attachment ID.  A different or
+    /// newer offer is treated as not found, and a poisoned lock fails closed
+    /// without changing the marker.
+    pub(crate) fn get_exact(
+        &self,
+        attachment_id: &str,
+    ) -> Result<OfferedChatAttachment, ScreenContextChatAttachmentError> {
+        validate_id("attachment identity", attachment_id)?;
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ScreenContextChatAttachmentError::synchronization_unavailable())?;
+        match &*state {
+            ChatAttachmentState::Offered {
+                attachment_id: current_attachment_id,
+                grant_id,
+                life_id,
+                session_fence,
+            } if current_attachment_id == attachment_id => Ok(OfferedChatAttachment {
+                attachment_id: current_attachment_id.clone(),
+                grant_id: grant_id.clone(),
+                life_id: life_id.clone(),
+                session_fence: *session_fence,
+            }),
+            _ => Err(ScreenContextChatAttachmentError::attachment_not_found()),
+        }
+    }
+
     /// Exact-removes the current attachment whose ID matches exactly and
     /// returns its stored metadata.  A different/newer offer is never
     /// removed; an absent or replaced attachment fails with
@@ -253,38 +281,101 @@ fn validate_id(name: &str, value: &str) -> Result<(), ScreenContextChatAttachmen
     Ok(())
 }
 
-/// Validates an attachment identity argument on the Chat/Main command surface.
-pub(crate) fn validate_attachment_id(value: &str) -> Result<(), ScreenContextChatAttachmentError> {
-    validate_id("attachment identity", value)
+/// Exact-cancels a stored Pending Grant, treating only an exact absence of that
+/// Pending Grant as an idempotent success.  A Life mismatch is safe here
+/// because the opaque grant identity proves that the supplied old
+/// grant/Life tuple cannot be the current exact Pending Grant.  Synchronization
+/// failure remains an error so callers can preserve their attachment marker.
+pub(crate) fn cancel_exact_pending_grant_or_confirm_absent(
+    handoff_broker: &ScreenContextHandoffBroker,
+    attachment: &OfferedChatAttachment,
+) -> Result<(), ScreenContextError> {
+    match handoff_broker.cancel_pending_grant(&attachment.grant_id, &attachment.life_id) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.code,
+                ScreenContextErrorCode::NoCurrentContext | ScreenContextErrorCode::LifeMismatch
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
-/// Removes the current attachment marker (if any) and exact-cancels its
-/// stored Pending Grant.  Returns whether a marker was actually removed.
+/// Exact-cancels the matching Pending Grant before removing its attachment
+/// marker.  The optional test-only hook runs after cancellation and before
+/// final exact removal so replacement races are tested at the real boundary.
+fn cancel_and_remove_exact_attachment_with_after_cancel<AfterCancel>(
+    handoff_broker: &ScreenContextHandoffBroker,
+    attachment_broker: &ScreenContextChatAttachmentBroker,
+    attachment_id: &str,
+    after_cancel: AfterCancel,
+) -> Result<(), ScreenContextChatAttachmentError>
+where
+    AfterCancel: FnOnce(),
+{
+    let attachment = attachment_broker.get_exact(attachment_id)?;
+    cancel_exact_pending_grant_or_confirm_absent(handoff_broker, &attachment)
+        .map_err(chat_handoff_attachment_error)?;
+    after_cancel();
+    attachment_broker
+        .remove_exact(&attachment.attachment_id)
+        .map(|_| ())
+}
+
+/// Exact-cancels the matching Pending Grant before removing its attachment
+/// marker.  A synchronization failure leaves the marker in place for retry.
+pub(crate) fn cancel_and_remove_exact_attachment(
+    handoff_broker: &ScreenContextHandoffBroker,
+    attachment_broker: &ScreenContextChatAttachmentBroker,
+    attachment_id: &str,
+) -> Result<(), ScreenContextChatAttachmentError> {
+    cancel_and_remove_exact_attachment_with_after_cancel(
+        handoff_broker,
+        attachment_broker,
+        attachment_id,
+        || {},
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn cancel_and_remove_exact_attachment_with_test_hook<AfterCancel>(
+    handoff_broker: &ScreenContextHandoffBroker,
+    attachment_broker: &ScreenContextChatAttachmentBroker,
+    attachment_id: &str,
+    after_cancel: AfterCancel,
+) -> Result<(), ScreenContextChatAttachmentError>
+where
+    AfterCancel: FnOnce(),
+{
+    cancel_and_remove_exact_attachment_with_after_cancel(
+        handoff_broker,
+        attachment_broker,
+        attachment_id,
+        after_cancel,
+    )
+}
+
+/// Removes the current attachment marker (if any) only after exact-cancelling
+/// its stored Pending Grant.  Returns whether a marker was actually removed.
 ///
 /// This is the only shared invalidation path: it is used after a successful
 /// Observe/Candidate installation (the old grant was replaced, so any marker
 /// pointing at it is stale) and by the Chat status read when the marker no
 /// longer belongs to the current Life/fence or its grant is stale/expired.
-/// The grant cancellation is best-effort and exact: a grant that was already
-/// replaced or bound is intentionally left alone, and the global broker
-/// `cancel()` is never used.
+/// If exact cancellation cannot be confirmed because synchronization is
+/// unavailable, the marker remains retryable and the global broker `cancel()`
+/// is never used.
 pub(crate) fn clear_current_attachment_and_cancel_grant(
     handoff_broker: &ScreenContextHandoffBroker,
     attachment_broker: &ScreenContextChatAttachmentBroker,
 ) -> bool {
-    let Some(attachment) = attachment_broker.current() else {
+    let Some(attachment_id) = attachment_broker.current().map(|a| a.attachment_id) else {
         return false;
     };
-    if attachment_broker
-        .remove_exact(&attachment.attachment_id)
-        .is_err()
-    {
-        // The marker was replaced by a newer offer in the meantime; the
-        // newer attachment is untouched and nothing of ours remains.
-        return false;
-    }
-    let _ = handoff_broker.cancel_pending_grant(&attachment.grant_id, &attachment.life_id);
-    true
+    cancel_and_remove_exact_attachment(handoff_broker, attachment_broker, &attachment_id).is_ok()
 }
 
 /// Bounded Chat-facing status: only `available` plus the opaque
@@ -405,15 +496,14 @@ fn chat_attachment_error_dto(
     }
 }
 
-/// Maps an exact-cancellation failure that survived the idempotent cases.
-/// Only the synchronized/unavailable class can reach here; the caller treats
-/// `NoCurrentContext` / `LifeMismatch` as the desired end state.
-fn chat_handoff_error_dto(error: ScreenContextError) -> ChatScreenContextAttachmentErrorDto {
+fn chat_handoff_attachment_error(error: ScreenContextError) -> ScreenContextChatAttachmentError {
     match error.code {
         ScreenContextErrorCode::InvalidArgument => {
-            ChatScreenContextAttachmentErrorDto::invalid_argument()
+            ScreenContextChatAttachmentError::invalid_argument(
+                "The screen context handoff request is invalid.",
+            )
         }
-        _ => ChatScreenContextAttachmentErrorDto::broker_unavailable(),
+        _ => ScreenContextChatAttachmentError::synchronization_unavailable(),
     }
 }
 
@@ -521,31 +611,16 @@ pub(crate) fn get_pending_screen_context_attachment_service(
     }
 }
 
-/// Chat-only dismiss.  Atomically/consistently exact-removes the attachment
-/// and exact-cancels its matching underlying Pending Grant.  There is no
-/// UI-only dismissal and no global cancel; a newer unrelated offer is never
-/// removed.
+/// Chat-only dismiss.  Exact-cancels the matching underlying Pending Grant
+/// before removing the attachment marker.  There is no UI-only dismissal and
+/// no global cancel; a newer unrelated offer is never removed.
 pub(crate) fn dismiss_pending_screen_context_attachment_service(
     handoff_broker: &ScreenContextHandoffBroker,
     attachment_broker: &ScreenContextChatAttachmentBroker,
     attachment_id: &str,
 ) -> Result<(), ChatScreenContextAttachmentErrorDto> {
-    validate_attachment_id(attachment_id).map_err(chat_attachment_error_dto)?;
-    let attachment = attachment_broker
-        .remove_exact(attachment_id)
-        .map_err(chat_attachment_error_dto)?;
-    match handoff_broker.cancel_pending_grant(&attachment.grant_id, &attachment.life_id) {
-        Ok(()) => Ok(()),
-        Err(ScreenContextError {
-            code: ScreenContextErrorCode::NoCurrentContext | ScreenContextErrorCode::LifeMismatch,
-            ..
-        }) => {
-            // The stored grant was already replaced or bound: the desired end
-            // state (no pending grant behind this attachment) already holds.
-            Ok(())
-        }
-        Err(error) => Err(chat_handoff_error_dto(error)),
-    }
+    cancel_and_remove_exact_attachment(handoff_broker, attachment_broker, attachment_id)
+        .map_err(chat_attachment_error_dto)
 }
 
 /// Chat-only: reads the current attachment status through full backend
@@ -723,6 +798,38 @@ mod tests {
         assert_eq!(
             error.code,
             ScreenContextChatAttachmentErrorCode::AttachmentNotFound
+        );
+    }
+
+    #[test]
+    fn get_exact_is_read_only_and_rejects_a_replaced_attachment() {
+        let attachment_broker = ScreenContextChatAttachmentBroker::new();
+        let handoff_broker = ScreenContextHandoffBroker::new();
+        let old_grant = install_and_issue(&handoff_broker, LIFE_A, FENCE_1);
+        let old_attachment = offer(&attachment_broker, &old_grant, LIFE_A, FENCE_1);
+
+        let metadata = attachment_broker
+            .get_exact(&old_attachment)
+            .expect("the exact marker must be readable");
+        assert_eq!(metadata.attachment_id, old_attachment);
+        assert_eq!(metadata.grant_id, old_grant);
+        assert!(attachment_broker.current().is_some());
+
+        let new_grant = install_and_issue(&handoff_broker, LIFE_A, FENCE_1);
+        let new_attachment = offer(&attachment_broker, &new_grant, LIFE_A, FENCE_1);
+        let error = attachment_broker
+            .get_exact(&old_attachment)
+            .expect_err("a replaced marker must not be returned by exact read");
+        assert_eq!(
+            error.code,
+            ScreenContextChatAttachmentErrorCode::AttachmentNotFound
+        );
+        assert_eq!(
+            attachment_broker
+                .current()
+                .expect("the newer marker must remain")
+                .attachment_id,
+            new_attachment
         );
     }
 
@@ -1189,6 +1296,26 @@ mod tests {
     }
 
     #[test]
+    fn stale_cleanup_keeps_attachment_when_handoff_synchronization_fails() {
+        let fixture = StatusFixture::armed();
+        let attachment_id = fixture.offer_current_grant();
+        fixture.handoff_broker.poison_for_test();
+
+        assert!(!clear_current_attachment_and_cancel_grant(
+            &fixture.handoff_broker,
+            &fixture.attachment_broker,
+        ));
+        assert_eq!(
+            fixture
+                .attachment_broker
+                .current()
+                .expect("the marker must remain retryable")
+                .attachment_id,
+            attachment_id
+        );
+    }
+
+    #[test]
     fn status_serializes_only_available_and_attachment_id() {
         let unavailable = ChatScreenContextAttachmentStatusDto::unavailable();
         assert_eq!(
@@ -1254,6 +1381,136 @@ mod tests {
             .validate_pending_grant(&grant_id, LIFE_A, ScreenContextSessionFence(fence))
             .expect_err("the dismissed grant must no longer be pending");
         assert_eq!(error.code, ScreenContextErrorCode::NoCurrentContext);
+    }
+
+    #[test]
+    fn dismiss_returns_broker_error_and_keeps_attachment_on_cancel_failure() {
+        let fixture = StatusFixture::armed();
+        let attachment_id = fixture.offer_current_grant();
+        fixture.handoff_broker.poison_for_test();
+
+        let error = dismiss_pending_screen_context_attachment_service(
+            &fixture.handoff_broker,
+            &fixture.attachment_broker,
+            &attachment_id,
+        )
+        .expect_err("dismiss must not report success when cancellation is unknown");
+        assert_eq!(error.code, "SCREEN_CONTEXT_ATTACHMENT_BROKER_UNAVAILABLE");
+        assert_eq!(
+            fixture
+                .attachment_broker
+                .current()
+                .expect("the failed dismiss must preserve the marker")
+                .attachment_id,
+            attachment_id
+        );
+    }
+
+    #[test]
+    fn dismiss_removes_marker_when_the_exact_grant_is_already_absent() {
+        let fixture = StatusFixture::armed();
+        let fence = fixture
+            .session_gate
+            .life_fence_for(LIFE_A)
+            .expect("fixture gate is armed");
+        let old_grant = install_and_issue(
+            &fixture.handoff_broker,
+            LIFE_A,
+            ScreenContextSessionFence(fence),
+        );
+        let old_attachment = offer(
+            &fixture.attachment_broker,
+            &old_grant,
+            LIFE_A,
+            ScreenContextSessionFence(fence),
+        );
+        let newer_candidate = fixture
+            .handoff_broker
+            .install_candidate(ScreenContextCandidateInput {
+                life_id: LIFE_A.to_string(),
+                session_fence: ScreenContextSessionFence(fence),
+                observation: recognized(),
+            })
+            .expect("the newer Candidate must replace the old grant");
+
+        dismiss_pending_screen_context_attachment_service(
+            &fixture.handoff_broker,
+            &fixture.attachment_broker,
+            &old_attachment,
+        )
+        .expect("an already-absent exact grant is idempotent for dismiss");
+        assert_broker_empty(&fixture.attachment_broker);
+        assert!(!fixture
+            .handoff_broker
+            .issue_grant(&newer_candidate, LIFE_A, ScreenContextSessionFence(fence),)
+            .expect("the newer Candidate must survive cleanup")
+            .is_empty());
+    }
+
+    #[test]
+    fn exact_cleanup_does_not_remove_a_newer_marker_after_cancellation() {
+        let fixture = StatusFixture::armed();
+        let fence = fixture
+            .session_gate
+            .life_fence_for(LIFE_A)
+            .expect("fixture gate is armed");
+        let old_grant = install_and_issue(
+            &fixture.handoff_broker,
+            LIFE_A,
+            ScreenContextSessionFence(fence),
+        );
+        let old_attachment = offer(
+            &fixture.attachment_broker,
+            &old_grant,
+            LIFE_A,
+            ScreenContextSessionFence(fence),
+        );
+        let mut newer_attachment = None;
+
+        let error = cancel_and_remove_exact_attachment_with_test_hook(
+            &fixture.handoff_broker,
+            &fixture.attachment_broker,
+            &old_attachment,
+            || {
+                let new_grant = install_and_issue(
+                    &fixture.handoff_broker,
+                    LIFE_A,
+                    ScreenContextSessionFence(fence),
+                );
+                newer_attachment = Some(offer(
+                    &fixture.attachment_broker,
+                    &new_grant,
+                    LIFE_A,
+                    ScreenContextSessionFence(fence),
+                ));
+            },
+        )
+        .expect_err("old exact removal must lose to a newer marker");
+        assert_eq!(
+            error.code,
+            ScreenContextChatAttachmentErrorCode::AttachmentNotFound
+        );
+        let newer_attachment = newer_attachment.expect("the hook must install a newer marker");
+        assert_eq!(
+            fixture
+                .attachment_broker
+                .current()
+                .expect("the newer marker must survive")
+                .attachment_id,
+            newer_attachment
+        );
+        let newer_metadata = fixture
+            .attachment_broker
+            .get_exact(&newer_attachment)
+            .expect("the newer marker must remain readable");
+        fixture
+            .handoff_broker
+            .validate_pending_grant(
+                &newer_metadata.grant_id,
+                LIFE_A,
+                ScreenContextSessionFence(fence),
+            )
+            .expect("the newer Pending Grant must remain untouched");
     }
 
     #[test]

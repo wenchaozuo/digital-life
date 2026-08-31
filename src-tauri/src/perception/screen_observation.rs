@@ -15,8 +15,9 @@ use super::{
         target::ScreenCaptureTargetBroker,
     },
     screen_chat_attachment::{
-        MainScreenContextAttachmentOfferDto, ScreenContextChatAttachmentBroker,
-        ScreenContextChatAttachmentError, ScreenContextChatAttachmentErrorCode,
+        cancel_and_remove_exact_attachment, MainScreenContextAttachmentOfferDto,
+        ScreenContextChatAttachmentBroker, ScreenContextChatAttachmentError,
+        ScreenContextChatAttachmentErrorCode,
     },
     screen_context::{
         ScreenContextCandidateInput, ScreenContextError, ScreenContextErrorCode,
@@ -716,16 +717,24 @@ where
         Ok(()) => Ok(MainScreenContextAttachmentOfferDto { attachment_id }),
         Err(error) => {
             // The offer has already been installed.  Roll back only the
-            // just-offered attachment and its exact Pending Grant; never a
-            // newer handoff and never the global broker cancel().
-            match authorities.attachment_broker.remove_exact(&attachment_id) {
-                Ok(removed) => {
-                    let _ = authorities
-                        .handoff_broker
-                        .cancel_pending_grant(&removed.grant_id, &removed.life_id);
+            // just-offered attachment and its exact Pending Grant.  Exact
+            // cancellation must be confirmed before the marker is removed;
+            // synchronization failure preserves the marker for retry.
+            match cancel_and_remove_exact_attachment(
+                authorities.handoff_broker,
+                authorities.attachment_broker,
+                &attachment_id,
+            ) {
+                Ok(()) => Err(error),
+                Err(cleanup_error)
+                    if cleanup_error.code
+                        == ScreenContextChatAttachmentErrorCode::AttachmentNotFound =>
+                {
+                    // A newer offer won the exact-removal race, so the old
+                    // marker is already absent and the newer marker remains.
                     Err(error)
                 }
-                Err(_) => Err(error),
+                Err(cleanup_error) => Err(attachment_offer_error_dto(cleanup_error)),
             }
         }
     }
@@ -825,12 +834,17 @@ fn revoke_main_pending_screen_context_grant_service(
     validate_candidate_id(grant_id)?;
     match handoff_broker.cancel_pending_grant(grant_id, life_id) {
         Ok(()) => Ok(()),
-        Err(_) => {
-            // The grant was already replaced, expired, or never existed; the
-            // desired end state already holds.  This command never clears a
-            // newer Candidate/Grant.
+        Err(error)
+            if matches!(
+                error.code,
+                ScreenContextErrorCode::NoCurrentContext | ScreenContextErrorCode::LifeMismatch
+            ) =>
+        {
+            // The supplied old grant/Life tuple is not the current exact
+            // Pending Grant, so the requested authority is already absent.
             Ok(())
         }
+        Err(error) => Err(screen_context_error_dto(error)),
     }
 }
 
@@ -857,13 +871,27 @@ fn revoke_main_screen_context_attachment_service(
     attachment_broker: &ScreenContextChatAttachmentBroker,
     attachment_id: &str,
 ) -> Result<(), MainScreenPerceptionErrorDto> {
-    super::screen_chat_attachment::validate_attachment_id(attachment_id)
-        .map_err(attachment_offer_error_dto)?;
-    let removed = attachment_broker
-        .remove_exact(attachment_id)
-        .map_err(attachment_offer_error_dto)?;
-    let _ = handoff_broker.cancel_pending_grant(&removed.grant_id, &removed.life_id);
-    Ok(())
+    cancel_and_remove_exact_attachment(handoff_broker, attachment_broker, attachment_id)
+        .map_err(attachment_offer_error_dto)
+}
+
+#[cfg(test)]
+fn revoke_main_screen_context_attachment_service_with_test_hook<AfterCancel>(
+    handoff_broker: &ScreenContextHandoffBroker,
+    attachment_broker: &ScreenContextChatAttachmentBroker,
+    attachment_id: &str,
+    after_cancel: AfterCancel,
+) -> Result<(), MainScreenPerceptionErrorDto>
+where
+    AfterCancel: FnOnce(),
+{
+    super::screen_chat_attachment::cancel_and_remove_exact_attachment_with_test_hook(
+        handoff_broker,
+        attachment_broker,
+        attachment_id,
+        after_cancel,
+    )
+    .map_err(attachment_offer_error_dto)
 }
 
 /// Explicit Main-WebView Candidate → GrantPending command.
@@ -2122,6 +2150,52 @@ mod tests {
 
     // ── D24-C1 Main offer / revoke ───────────────────────────────────────
 
+    #[test]
+    fn newer_observation_clears_old_attachment_after_grant_replacement() {
+        let (
+            current_life,
+            repository,
+            session_gate,
+            target_broker,
+            handoff_broker,
+            attachment_broker,
+            operation_gate,
+        ) = test_fixture();
+        let fence = session_gate.life_fence_for(LIFE_A).unwrap();
+        let old_candidate = install_sentinel_candidate(&handoff_broker, fence);
+        let old_grant = handoff_broker
+            .issue_grant(&old_candidate, LIFE_A, ScreenContextSessionFence(fence))
+            .expect("the old grant must issue");
+        let old_attachment = attachment_broker
+            .offer(&old_grant, LIFE_A, ScreenContextSessionFence(fence))
+            .expect("the old attachment must be offered");
+
+        let observation = observe_with_capture(
+            &current_life,
+            &repository,
+            &session_gate,
+            &target_broker,
+            &handoff_broker,
+            &attachment_broker,
+            &operation_gate,
+            |_, _, _, _, _| Ok(recognized("new observation")),
+        )
+        .expect("the newer observation must install");
+
+        assert!(
+            attachment_broker.get_exact(&old_attachment).is_err(),
+            "the old marker must clear after its grant is replaced"
+        );
+        let newer_grant = handoff_broker
+            .issue_grant(
+                &observation.candidate_id,
+                LIFE_A,
+                ScreenContextSessionFence(fence),
+            )
+            .expect("the newer Candidate must survive stale marker cleanup");
+        assert!(!newer_grant.is_empty());
+    }
+
     fn offer_fixture_with_pending_grant(
         _current_life: &FakeCurrentLife,
         _repository: &FakeRepository,
@@ -2560,6 +2634,17 @@ mod tests {
     }
 
     #[test]
+    fn pending_grant_revoke_reports_handoff_synchronization_failure() {
+        let (_, _, _, handoff_broker, _, _, grant_id) = offer_success_fixture();
+        handoff_broker.poison_for_test();
+
+        let error =
+            revoke_main_pending_screen_context_grant_service(&handoff_broker, LIFE_A, &grant_id)
+                .expect_err("a synchronization failure must not be reported as success");
+        assert_eq!(error.code, SCREEN_CONTEXT_BROKER_UNAVAILABLE_CODE);
+    }
+
+    #[test]
     fn stale_attachment_revoke_does_not_damage_a_newer_attachment() {
         let (
             current_life,
@@ -2667,5 +2752,135 @@ mod tests {
         assert!(result.is_err(), "an absent attachment must fail bounded");
         assert!(attachment_broker.current().is_none());
         let _ = (current_life, repository, operation_gate, fence);
+    }
+
+    #[test]
+    fn revoke_main_attachment_keeps_marker_when_handoff_cancellation_fails() {
+        let (
+            _current_life,
+            _repository,
+            session_gate,
+            handoff_broker,
+            attachment_broker,
+            _operation_gate,
+            grant_id,
+        ) = offer_success_fixture();
+        let fence = session_gate.life_fence_for(LIFE_A).unwrap();
+        let attachment_id = attachment_broker
+            .offer(&grant_id, LIFE_A, ScreenContextSessionFence(fence))
+            .expect("the attachment must be offered");
+        handoff_broker.poison_for_test();
+
+        let error = revoke_main_screen_context_attachment_service(
+            &handoff_broker,
+            &attachment_broker,
+            &attachment_id,
+        )
+        .expect_err("attachment revoke must report cancellation uncertainty");
+        assert_eq!(error.code, SCREEN_CONTEXT_BROKER_UNAVAILABLE_CODE);
+        assert_eq!(
+            attachment_broker
+                .get_exact(&attachment_id)
+                .expect("the failed revoke must preserve the marker")
+                .attachment_id,
+            attachment_id
+        );
+    }
+
+    #[test]
+    fn main_attachment_revoke_does_not_remove_newer_marker_after_cancellation() {
+        let (
+            _current_life,
+            _repository,
+            session_gate,
+            handoff_broker,
+            attachment_broker,
+            _operation_gate,
+            grant_id,
+        ) = offer_success_fixture();
+        let fence = session_gate.life_fence_for(LIFE_A).unwrap();
+        let old_attachment = attachment_broker
+            .offer(&grant_id, LIFE_A, ScreenContextSessionFence(fence))
+            .expect("the old attachment must be offered");
+        let mut newer_attachment = None;
+
+        let error = revoke_main_screen_context_attachment_service_with_test_hook(
+            &handoff_broker,
+            &attachment_broker,
+            &old_attachment,
+            || {
+                let new_candidate = install_sentinel_candidate(&handoff_broker, fence);
+                let new_grant = handoff_broker
+                    .issue_grant(&new_candidate, LIFE_A, ScreenContextSessionFence(fence))
+                    .expect("the newer grant must issue");
+                newer_attachment = Some(
+                    attachment_broker
+                        .offer(&new_grant, LIFE_A, ScreenContextSessionFence(fence))
+                        .expect("the newer attachment must be offered"),
+                );
+            },
+        )
+        .expect_err("the old exact removal must lose to a newer marker");
+        assert_eq!(error.code, SCREEN_CONTEXT_UNAVAILABLE_CODE);
+        let newer_attachment = newer_attachment.expect("the hook must install a newer marker");
+        assert_eq!(
+            attachment_broker
+                .current()
+                .expect("the newer marker must survive")
+                .attachment_id,
+            newer_attachment
+        );
+        let newer_metadata = attachment_broker
+            .get_exact(&newer_attachment)
+            .expect("the newer marker must remain readable");
+        handoff_broker
+            .validate_pending_grant(
+                &newer_metadata.grant_id,
+                LIFE_A,
+                ScreenContextSessionFence(fence),
+            )
+            .expect("the newer Pending Grant must remain untouched");
+    }
+
+    #[test]
+    fn post_offer_rollback_keeps_marker_when_handoff_cancellation_fails() {
+        let (
+            current_life,
+            repository,
+            session_gate,
+            handoff_broker,
+            attachment_broker,
+            operation_gate,
+            grant_id,
+        ) = offer_success_fixture();
+        let offered_attachment_id = std::sync::Mutex::new(None);
+        let error = offer_with_hook(
+            &current_life,
+            &repository,
+            &session_gate,
+            &handoff_broker,
+            &attachment_broker,
+            &operation_gate,
+            &grant_id,
+            |attachment_id| {
+                *offered_attachment_id.lock().unwrap() = Some(attachment_id.to_string());
+                current_life.set(Some(LIFE_B));
+                handoff_broker.poison_for_test();
+            },
+        )
+        .expect_err("rollback must report handoff synchronization failure");
+        assert_eq!(error.code, SCREEN_CONTEXT_BROKER_UNAVAILABLE_CODE);
+        let offered_attachment_id = offered_attachment_id
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the offer hook must capture the marker");
+        assert_eq!(
+            attachment_broker
+                .get_exact(&offered_attachment_id)
+                .expect("failed rollback must preserve the marker")
+                .attachment_id,
+            offered_attachment_id
+        );
     }
 }

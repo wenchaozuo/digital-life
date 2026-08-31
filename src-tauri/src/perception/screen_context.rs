@@ -271,6 +271,17 @@ impl ScreenContextHandoffBroker {
         }
     }
 
+    /// Poisons this instance's state lock for cross-module cleanup tests.
+    /// Production code has no access to this seam; the poisoned lock must be
+    /// reported as synchronization-unavailable by exact operations.
+    #[cfg(test)]
+    pub(crate) fn poison_for_test(&self) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = self.state.lock().unwrap();
+            panic!("intentional handoff lock poison for cleanup test");
+        }));
+    }
+
     /// Installs a new candidate from a successfully produced D23
     /// [`ScreenObservation`].  The installation atomically replaces ANY
     /// previous broker state — previous Candidate, previous Pending Grant, or

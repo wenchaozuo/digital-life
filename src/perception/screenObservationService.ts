@@ -21,6 +21,10 @@ export interface MainScreenContextGrant {
   readonly grantId: string;
 }
 
+export interface MainScreenContextAttachmentOffer {
+  readonly attachmentId: string;
+}
+
 export interface MainScreenObservationError {
   readonly code: string;
   readonly message: string;
@@ -113,6 +117,32 @@ export class MainScreenObservationService {
       "prepare_main_screen_context_for_chat",
       { lifeId, candidateId },
     );
+  }
+
+  async offerMainScreenContextToChat(
+    lifeId: string,
+    grantId: string,
+  ): Promise<MainScreenContextAttachmentOffer> {
+    return invoke<MainScreenContextAttachmentOffer>(
+      "offer_main_screen_context_to_chat",
+      { lifeId, grantId },
+    );
+  }
+
+  async revokeMainPendingScreenContextGrant(
+    lifeId: string,
+    grantId: string,
+  ): Promise<void> {
+    return invoke<void>("revoke_main_pending_screen_context_grant", {
+      lifeId,
+      grantId,
+    });
+  }
+
+  async revokeMainScreenContextAttachment(attachmentId: string): Promise<void> {
+    return invoke<void>("revoke_main_screen_context_attachment", {
+      attachmentId,
+    });
   }
 }
 

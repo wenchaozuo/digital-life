@@ -35,6 +35,8 @@ const screenObservation = ref<MainScreenObservation>();
 const screenObservationError = ref<MainScreenObservationError>();
 const screenObservationLoading = ref(false);
 const screenContextGrant = ref<MainScreenContextGrant>();
+const screenContextGrantLifeId = ref<string>();
+const screenContextAttachmentId = ref<string>();
 const screenPreparedCandidateId = ref<string>();
 const screenContextPreparing = ref(false);
 let unsubscribe: (() => void) | undefined;
@@ -73,15 +75,27 @@ const screenObservationPrepared = computed(() => {
   const observation = screenObservation.value;
   return (
     observation?.status === "recognized" &&
-    screenContextGrant.value !== undefined &&
+    screenContextAttachmentId.value !== undefined &&
     screenPreparedCandidateId.value === observation.candidateId
   );
 });
 
-const canPrepareScreenContext = computed(
+const screenContextCleanupRequired = computed(() => {
+  const observation = screenObservation.value;
+  return (
+    observation?.status === "recognized" &&
+    screenContextGrant.value !== undefined &&
+    screenContextGrantLifeId.value === lifeIdentity.value?.id &&
+    screenPreparedCandidateId.value === observation.candidateId &&
+    screenContextAttachmentId.value === undefined &&
+    !screenContextPreparing.value
+  );
+});
+
+const canUseScreenContextAction = computed(
   () =>
     screenObservation.value?.status === "recognized" &&
-    !screenObservationPrepared.value &&
+    (!screenObservationPrepared.value || screenContextCleanupRequired.value) &&
     !screenContextPreparing.value,
 );
 
@@ -114,11 +128,40 @@ async function openChat(): Promise<void> {
   }
 }
 
+function revokePendingGrantWithoutPublishingError(lifeId: string, grantId: string): void {
+  void mainScreenObservationService
+    .revokeMainPendingScreenContextGrant(lifeId, grantId)
+    .catch(() => {
+      // The stale result is never applied.  A bounded status reread or a
+      // later exact cleanup path remains authoritative for the backend grant.
+    });
+}
+
+function clearLocalPendingGrant(lifeId: string, grantId: string): void {
+  if (
+    screenContextGrant.value?.grantId !== grantId ||
+    screenContextGrantLifeId.value !== lifeId
+  ) {
+    return;
+  }
+  screenContextGrant.value = undefined;
+  screenContextGrantLifeId.value = undefined;
+  screenPreparedCandidateId.value = undefined;
+}
+
 function invalidateScreenHandoff(): void {
+  const pendingGrant = screenContextGrant.value;
+  const pendingGrantLifeId = screenContextGrantLifeId.value;
   screenHandoffRequestGeneration += 1;
   screenContextPreparing.value = false;
   screenContextGrant.value = undefined;
+  screenContextGrantLifeId.value = undefined;
+  screenContextAttachmentId.value = undefined;
   screenPreparedCandidateId.value = undefined;
+
+  if (pendingGrant !== undefined && pendingGrantLifeId !== undefined) {
+    revokePendingGrantWithoutPublishingError(pendingGrantLifeId, pendingGrant.grantId);
+  }
 }
 
 function clearScreenObservation(): void {
@@ -252,14 +295,83 @@ function prepareFailureInvalidatesScreenObservation(code: string): boolean {
   ]).has(code);
 }
 
+async function retryScreenContextGrantCleanup(): Promise<void> {
+  const lifeId = screenContextGrantLifeId.value;
+  const grant = screenContextGrant.value;
+  const observation = screenObservation.value;
+  if (
+    lifeId === undefined ||
+    grant === undefined ||
+    observation?.status !== "recognized" ||
+    screenPreparedCandidateId.value !== observation.candidateId ||
+    screenContextAttachmentId.value !== undefined ||
+    screenContextPreparing.value
+  ) {
+    return;
+  }
+
+  const runtimeEpoch = lifecycleEpoch;
+  const observationRequestGeneration = screenObservationRequestGeneration;
+  const handoffRequestGeneration = screenHandoffRequestGeneration;
+  screenContextPreparing.value = true;
+
+  try {
+    await mainScreenObservationService.revokeMainPendingScreenContextGrant(
+      lifeId,
+      grant.grantId,
+    );
+    if (
+      isCurrentScreenPrepare(
+        runtimeEpoch,
+        lifeId,
+        observationRequestGeneration,
+        observation.candidateId,
+        handoffRequestGeneration,
+      )
+    ) {
+      clearLocalPendingGrant(lifeId, grant.grantId);
+      screenObservationError.value = undefined;
+    }
+  } catch (error: unknown) {
+    if (
+      isCurrentScreenPrepare(
+        runtimeEpoch,
+        lifeId,
+        observationRequestGeneration,
+        observation.candidateId,
+        handoffRequestGeneration,
+      )
+    ) {
+      screenObservationError.value = screenObservationErrorFromUnknown(error);
+    }
+  } finally {
+    if (
+      isCurrentScreenPrepare(
+        runtimeEpoch,
+        lifeId,
+        observationRequestGeneration,
+        observation.candidateId,
+        handoffRequestGeneration,
+      )
+    ) {
+      screenContextPreparing.value = false;
+    }
+  }
+}
+
 async function prepareScreenContextForChat(): Promise<void> {
   const lifeId = lifeIdentity.value?.id;
   const observation = screenObservation.value;
   if (
     lifeId === undefined ||
     observation?.status !== "recognized" ||
-    !canPrepareScreenContext.value
+    !canUseScreenContextAction.value
   ) {
+    return;
+  }
+
+  if (screenContextCleanupRequired.value) {
+    await retryScreenContextGrantCleanup();
     return;
   }
 
@@ -285,7 +397,85 @@ async function prepareScreenContextForChat(): Promise<void> {
       )
     ) {
       screenContextGrant.value = grant;
+      screenContextGrantLifeId.value = lifeId;
       screenPreparedCandidateId.value = candidateId;
+
+      try {
+        const attachment = await mainScreenObservationService.offerMainScreenContextToChat(
+          lifeId,
+          grant.grantId,
+        );
+        if (
+          !isCurrentScreenPrepare(
+            runtimeEpoch,
+            lifeId,
+            observationRequestGeneration,
+            candidateId,
+            handoffRequestGeneration,
+          )
+        ) {
+          void mainScreenObservationService
+            .revokeMainScreenContextAttachment(attachment.attachmentId)
+            .catch(() => {
+              // A stale offer is never displayed; backend exact cleanup owns
+              // the late attachment even when the cleanup call is unavailable.
+            });
+          return;
+        }
+
+        screenContextGrant.value = undefined;
+        screenContextGrantLifeId.value = undefined;
+        screenContextAttachmentId.value = attachment.attachmentId;
+      } catch (error: unknown) {
+        if (
+          !isCurrentScreenPrepare(
+            runtimeEpoch,
+            lifeId,
+            observationRequestGeneration,
+            candidateId,
+            handoffRequestGeneration,
+          )
+        ) {
+          revokePendingGrantWithoutPublishingError(lifeId, grant.grantId);
+          return;
+        }
+
+        const boundedOfferError = screenObservationErrorFromUnknown(error);
+        try {
+          await mainScreenObservationService.revokeMainPendingScreenContextGrant(
+            lifeId,
+            grant.grantId,
+          );
+          if (
+            isCurrentScreenPrepare(
+              runtimeEpoch,
+              lifeId,
+              observationRequestGeneration,
+              candidateId,
+              handoffRequestGeneration,
+            )
+          ) {
+            clearLocalPendingGrant(lifeId, grant.grantId);
+            screenObservationError.value = boundedOfferError;
+          }
+        } catch (cleanupError: unknown) {
+          if (
+            isCurrentScreenPrepare(
+              runtimeEpoch,
+              lifeId,
+              observationRequestGeneration,
+              candidateId,
+              handoffRequestGeneration,
+            )
+          ) {
+            // Keep the opaque local Grant only as a bounded retry/cleanup
+            // handle; it is never rendered or persisted.
+            screenObservationError.value = screenObservationErrorFromUnknown(cleanupError);
+          }
+        }
+      }
+    } else {
+      revokePendingGrantWithoutPublishingError(lifeId, grant.grantId);
     }
   } catch (error: unknown) {
     if (
@@ -504,16 +694,18 @@ onUnmounted(() => {
           type="button"
           class="screen-use-in-chat"
           data-testid="screen-use-in-chat"
-          :disabled="!canPrepareScreenContext"
+          :disabled="!canUseScreenContextAction"
           :aria-busy="screenContextPreparing"
           @click="prepareScreenContextForChat"
         >
           {{
             screenContextPreparing
-              ? "Preparing…"
+              ? "Transferring…"
               : screenObservationPrepared
-                ? "Ready for chat"
-                : "Use in chat"
+                ? "Ready in chat"
+                : screenContextCleanupRequired
+                  ? "Retry cleanup"
+                  : "Use in chat"
           }}
         </button>
         <p

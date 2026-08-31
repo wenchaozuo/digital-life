@@ -165,6 +165,15 @@ async function mountMain(options: {
   const prepareMainScreenContextForChat = vi
     .spyOn(screenModule.mainScreenObservationService, "prepareMainScreenContextForChat")
     .mockResolvedValue({ grantId: "grant-opaque" });
+  const offerMainScreenContextToChat = vi
+    .spyOn(screenModule.mainScreenObservationService, "offerMainScreenContextToChat")
+    .mockResolvedValue({ attachmentId: "attachment-opaque" });
+  const revokeMainPendingScreenContextGrant = vi
+    .spyOn(screenModule.mainScreenObservationService, "revokeMainPendingScreenContextGrant")
+    .mockResolvedValue();
+  const revokeMainScreenContextAttachment = vi
+    .spyOn(screenModule.mainScreenObservationService, "revokeMainScreenContextAttachment")
+    .mockResolvedValue();
 
   const { default: App } = await import("../src/App.vue");
   const wrapper = mount(App, { attachTo: options.attachTo });
@@ -175,6 +184,9 @@ async function mountMain(options: {
     getStatus,
     observeNow,
     prepareMainScreenContextForChat,
+    offerMainScreenContextToChat,
+    revokeMainPendingScreenContextGrant,
+    revokeMainScreenContextAttachment,
     emitBindingChange: (event: {
       version: 1;
       lifeId: string;
@@ -256,7 +268,7 @@ describe("D23-D2 Main explicit screen observation", () => {
   });
 
   it("shows NoText without enabling Use in chat", async () => {
-    const { wrapper, prepareMainScreenContextForChat } = await mountMain({
+    const { wrapper, prepareMainScreenContextForChat, offerMainScreenContextToChat } = await mountMain({
       observation: makeNoTextObservation(),
     });
     try {
@@ -268,13 +280,19 @@ describe("D23-D2 Main explicit screen observation", () => {
       );
       expect(wrapper.find("[data-testid='screen-use-in-chat']").exists()).toBe(false);
       expect(prepareMainScreenContextForChat).not.toHaveBeenCalled();
+      expect(offerMainScreenContextToChat).not.toHaveBeenCalled();
     } finally {
       wrapper.unmount();
     }
   });
 
-  it("stores a successful prepare only in runtime state and disables repeat use", async () => {
-    const { wrapper, observeNow, prepareMainScreenContextForChat } = await mountMain();
+  it("completes the handoff in runtime state and disables repeat use", async () => {
+    const {
+      wrapper,
+      observeNow,
+      prepareMainScreenContextForChat,
+      offerMainScreenContextToChat,
+    } = await mountMain();
     try {
       await wrapper.get("[data-testid='screen-observe-now']").trigger("click");
       await flushMicrotasks();
@@ -283,9 +301,11 @@ describe("D23-D2 Main explicit screen observation", () => {
 
       expect(prepareMainScreenContextForChat).toHaveBeenCalledTimes(1);
       expect(prepareMainScreenContextForChat).toHaveBeenCalledWith("life-a", "candidate-a");
+      expect(offerMainScreenContextToChat).toHaveBeenCalledTimes(1);
+      expect(offerMainScreenContextToChat).toHaveBeenCalledWith("life-a", "grant-opaque");
       const useInChat = wrapper.get("[data-testid='screen-use-in-chat']");
       expect((useInChat.element as HTMLButtonElement).disabled).toBe(true);
-      expect(useInChat.text()).toBe("Ready for chat");
+      expect(useInChat.text()).toBe("Ready in chat");
       expect(wrapper.text()).not.toContain("grant-opaque");
       expect(observeNow).toHaveBeenCalledTimes(1);
     } finally {
@@ -306,7 +326,7 @@ describe("D23-D2 Main explicit screen observation", () => {
       await mounted.wrapper.get("[data-testid='screen-use-in-chat']").trigger("click");
       await flushMicrotasks();
       expect(mounted.wrapper.get("[data-testid='screen-use-in-chat']").text()).toBe(
-        "Ready for chat",
+        "Ready in chat",
       );
 
       await mounted.wrapper.get("[data-testid='screen-observe-now']").trigger("click");
@@ -348,8 +368,12 @@ describe("D23-D2 Main explicit screen observation", () => {
       await flushMicrotasks();
 
       expect(mounted.wrapper.text()).toContain("second observation");
-      expect(mounted.wrapper.text()).not.toContain("Ready for chat");
+      expect(mounted.wrapper.text()).not.toContain("Ready in chat");
       expect(mounted.wrapper.text()).not.toContain("late-grant");
+      expect(mounted.revokeMainPendingScreenContextGrant).toHaveBeenCalledWith(
+        "life-a",
+        "late-grant",
+      );
     } finally {
       mounted.wrapper.unmount();
     }
@@ -380,6 +404,10 @@ describe("D23-D2 Main explicit screen observation", () => {
         false,
       );
       expect(mounted.wrapper.find("[data-testid='screen-use-in-chat']").exists()).toBe(false);
+      expect(mounted.revokeMainPendingScreenContextGrant).toHaveBeenCalledWith(
+        "life-a",
+        "late-life-grant",
+      );
     } finally {
       mounted.wrapper.unmount();
     }
@@ -399,6 +427,135 @@ describe("D23-D2 Main explicit screen observation", () => {
     await flushMicrotasks();
 
     expect(document.body.textContent ?? "").not.toContain("late-unmount-grant");
+    expect(mounted.revokeMainPendingScreenContextGrant).toHaveBeenCalledWith(
+      "life-a",
+      "late-unmount-grant",
+    );
+  });
+
+  it("does not show Ready in chat until the Offer succeeds", async () => {
+    const offerResult = new Deferred<{ attachmentId: string }>();
+    const mounted = await mountMain();
+    mounted.offerMainScreenContextToChat.mockReturnValue(offerResult.promise);
+    try {
+      await mounted.wrapper.get("[data-testid='screen-observe-now']").trigger("click");
+      await flushMicrotasks();
+      await mounted.wrapper.get("[data-testid='screen-use-in-chat']").trigger("click");
+      await flushMicrotasks();
+
+      expect(mounted.prepareMainScreenContextForChat).toHaveBeenCalledWith(
+        "life-a",
+        "candidate-a",
+      );
+      expect(mounted.offerMainScreenContextToChat).toHaveBeenCalledTimes(1);
+      expect(mounted.wrapper.get("[data-testid='screen-use-in-chat']").text()).toContain(
+        "Transferring",
+      );
+      expect(mounted.wrapper.text()).not.toContain("Ready in chat");
+
+      offerResult.resolve({ attachmentId: "attachment-opaque" });
+      await flushMicrotasks();
+
+      expect(mounted.offerMainScreenContextToChat).toHaveBeenCalledWith(
+        "life-a",
+        "grant-opaque",
+      );
+      expect(mounted.wrapper.get("[data-testid='screen-use-in-chat']").text()).toBe(
+        "Ready in chat",
+      );
+    } finally {
+      mounted.wrapper.unmount();
+    }
+  });
+
+  it("revokes a late Offer attachment after a newer observation", async () => {
+    const first = makeObservation("first observation", "candidate-first");
+    const second = makeObservation("second observation", "candidate-second");
+    const offerResult = new Deferred<{ attachmentId: string }>();
+    const mounted = await mountMain({ observation: first });
+    mounted.observeNow
+      .mockResolvedValueOnce(first)
+      .mockResolvedValueOnce(second);
+    mounted.offerMainScreenContextToChat.mockReturnValue(offerResult.promise);
+    try {
+      await mounted.wrapper.get("[data-testid='screen-observe-now']").trigger("click");
+      await flushMicrotasks();
+      await mounted.wrapper.get("[data-testid='screen-use-in-chat']").trigger("click");
+      await flushMicrotasks();
+
+      await mounted.wrapper.get("[data-testid='screen-observe-now']").trigger("click");
+      await flushMicrotasks();
+      offerResult.resolve({ attachmentId: "late-attachment" });
+      await flushMicrotasks();
+
+      expect(mounted.revokeMainScreenContextAttachment).toHaveBeenCalledWith(
+        "late-attachment",
+      );
+      expect(mounted.wrapper.text()).toContain("second observation");
+      expect(mounted.wrapper.text()).not.toContain("Ready in chat");
+    } finally {
+      mounted.wrapper.unmount();
+    }
+  });
+
+  it("cleans an Offer failure before showing a bounded transfer error", async () => {
+    const rawDetail = "C:/private/native-offer-details";
+    const mounted = await mountMain();
+    mounted.offerMainScreenContextToChat.mockRejectedValue({
+      code: "SCREEN_CONTEXT_BROKER_UNAVAILABLE",
+      message: rawDetail,
+      recoverable: true,
+    });
+    try {
+      await mounted.wrapper.get("[data-testid='screen-observe-now']").trigger("click");
+      await flushMicrotasks();
+      await mounted.wrapper.get("[data-testid='screen-use-in-chat']").trigger("click");
+      await flushMicrotasks();
+
+      expect(mounted.revokeMainPendingScreenContextGrant).toHaveBeenCalledWith(
+        "life-a",
+        "grant-opaque",
+      );
+      expect(mounted.wrapper.text()).not.toContain("Ready in chat");
+      expect(mounted.wrapper.get("[data-testid='screen-observation-error']").text()).toContain(
+        "temporarily unavailable",
+      );
+      expect(mounted.wrapper.text()).not.toContain(rawDetail);
+    } finally {
+      mounted.wrapper.unmount();
+    }
+  });
+
+  it("retains a pending grant for bounded cleanup retry when Offer rollback is unavailable", async () => {
+    const mounted = await mountMain();
+    mounted.offerMainScreenContextToChat.mockRejectedValue({
+      code: "SCREEN_CONTEXT_BROKER_UNAVAILABLE",
+      message: "offer details must not escape",
+      recoverable: true,
+    });
+    mounted.revokeMainPendingScreenContextGrant.mockRejectedValue({
+      code: "SCREEN_CONTEXT_BROKER_UNAVAILABLE",
+      message: "cleanup details must not escape",
+      recoverable: true,
+    });
+    try {
+      await mounted.wrapper.get("[data-testid='screen-observe-now']").trigger("click");
+      await flushMicrotasks();
+      await mounted.wrapper.get("[data-testid='screen-use-in-chat']").trigger("click");
+      await flushMicrotasks();
+
+      const action = mounted.wrapper.get("[data-testid='screen-use-in-chat']");
+      expect(action.text()).toBe("Retry cleanup");
+      expect((action.element as HTMLButtonElement).disabled).toBe(false);
+      expect(mounted.wrapper.text()).not.toContain("Ready in chat");
+      expect(mounted.wrapper.get("[data-testid='screen-observation-error']").text()).toContain(
+        "temporarily unavailable",
+      );
+      expect(mounted.wrapper.text()).not.toContain("offer details must not escape");
+      expect(mounted.wrapper.text()).not.toContain("cleanup details must not escape");
+    } finally {
+      mounted.wrapper.unmount();
+    }
   });
 
   it("disables Observe Now while readiness is not valid", async () => {
@@ -555,7 +712,7 @@ describe("D23-D2 Main explicit screen observation", () => {
       );
       const useInChat = wrapper.get("[data-testid='screen-use-in-chat']");
       expect((useInChat.element as HTMLButtonElement).disabled).toBe(true);
-      expect(useInChat.text()).toBe("Ready for chat");
+      expect(useInChat.text()).toBe("Ready in chat");
       expect(
         (wrapper.get("[data-testid='screen-observe-now']").element as HTMLButtonElement).disabled,
       ).toBe(true);

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { computed, onMounted, onUnmounted, ref, reactive, watch } from "vue";
 import { conversationExpression } from "./conversationExpression";
 import {
@@ -27,6 +28,11 @@ import {
 } from "../memory/candidateConfirmationTypes";
 import { lifeIdentityManager } from "../life";
 import { createClosePanelHandler } from "./memoryReviewAdapter";
+import {
+  screenContextAttachmentErrorFromUnknown,
+  screenContextAttachmentService,
+  type ChatScreenContextAttachmentError,
+} from "../perception/screenContextAttachmentService";
 
 const messages = ref<readonly ConversationMessage[]>([]);
 const error = ref<{ code: string; message: string }>();
@@ -60,6 +66,16 @@ let manualExtractionGeneration = 0;
 const manualExtractionDisabled = computed(() =>
   interactionDisabled.value || !hasCurrentConversation.value || manualExtractionStatus.value === "loading",
 );
+
+const screenContextAttachmentId = ref<string>();
+const screenContextAttachmentDismissing = ref(false);
+const screenContextAttachmentError = ref<ChatScreenContextAttachmentError>();
+let chatLifecycleEpoch = 0;
+let screenContextAttachmentStatusGeneration = 0;
+let screenContextAttachmentMutationGeneration = 0;
+let screenContextAttachmentListenerGeneration = 0;
+let unlistenScreenContextAttachmentChanged: UnlistenFn | undefined;
+const SCREEN_CONTEXT_ATTACHMENT_CHANGED_EVENT = "screen-context-attachment-changed";
 
 function invalidateManualExtractionForConversationChange(): void {
   manualExtractionGeneration += 1;
@@ -426,18 +442,189 @@ async function triggerManualCandidateExtraction(): Promise<void> {
   }
 }
 
+function isChatRuntimeActive(runtimeEpoch: number): boolean {
+  return chatLifecycleEpoch === runtimeEpoch;
+}
+
+function isAttachmentRefreshHint(payload: unknown): boolean {
+  if (typeof payload !== "object" || payload === null) {
+    return false;
+  }
+  const record = payload as { version?: unknown };
+  return Object.keys(record).length === 1 && record.version === 1;
+}
+
+function normalizeAttachmentStatus(
+  status: unknown,
+): { available: false } | { available: true; attachmentId: string } | undefined {
+  if (typeof status !== "object" || status === null) {
+    return undefined;
+  }
+  const record = status as { available?: unknown; attachmentId?: unknown };
+  if (record.available === false) {
+    return { available: false };
+  }
+  if (
+    record.available === true &&
+    typeof record.attachmentId === "string" &&
+    record.attachmentId.trim().length > 0
+  ) {
+    return { available: true, attachmentId: record.attachmentId };
+  }
+  return undefined;
+}
+
+async function refreshPendingScreenContextAttachment(runtimeEpoch: number): Promise<boolean> {
+  const statusGeneration = ++screenContextAttachmentStatusGeneration;
+  const mutationGeneration = screenContextAttachmentMutationGeneration;
+  try {
+    const status = await screenContextAttachmentService.getPendingAttachment();
+    if (
+      !isChatRuntimeActive(runtimeEpoch) ||
+      statusGeneration !== screenContextAttachmentStatusGeneration ||
+      mutationGeneration !== screenContextAttachmentMutationGeneration
+    ) {
+      return false;
+    }
+
+    const normalized = normalizeAttachmentStatus(status);
+    if (normalized === undefined) {
+      screenContextAttachmentError.value = screenContextAttachmentErrorFromUnknown(undefined);
+      return false;
+    }
+
+    screenContextAttachmentId.value = normalized.available
+      ? normalized.attachmentId
+      : undefined;
+    screenContextAttachmentError.value = undefined;
+    return true;
+  } catch (caught: unknown) {
+    if (
+      !isChatRuntimeActive(runtimeEpoch) ||
+      statusGeneration !== screenContextAttachmentStatusGeneration ||
+      mutationGeneration !== screenContextAttachmentMutationGeneration
+    ) {
+      return false;
+    }
+    screenContextAttachmentError.value = screenContextAttachmentErrorFromUnknown(caught);
+    return false;
+  }
+}
+
+async function registerScreenContextAttachmentListener(runtimeEpoch: number): Promise<void> {
+  const listenerGeneration = ++screenContextAttachmentListenerGeneration;
+  try {
+    const unlisten = await listen<unknown>(
+      SCREEN_CONTEXT_ATTACHMENT_CHANGED_EVENT,
+      (event) => {
+        if (!isChatRuntimeActive(runtimeEpoch) || !isAttachmentRefreshHint(event.payload)) {
+          return;
+        }
+        void refreshPendingScreenContextAttachment(runtimeEpoch);
+      },
+    );
+
+    if (
+      !isChatRuntimeActive(runtimeEpoch) ||
+      listenerGeneration !== screenContextAttachmentListenerGeneration
+    ) {
+      void unlisten();
+      return;
+    }
+    unlistenScreenContextAttachmentChanged = unlisten;
+  } catch {
+    // Mount/focus rereads remain the recovery path when event registration is
+    // unavailable or the event is delivered before registration completes.
+  }
+}
+
+function handleChatWindowFocus(): void {
+  void refreshPendingScreenContextAttachment(chatLifecycleEpoch);
+}
+
+async function dismissPendingScreenContextAttachment(): Promise<void> {
+  const attachmentId = screenContextAttachmentId.value;
+  if (attachmentId === undefined || screenContextAttachmentDismissing.value) {
+    return;
+  }
+
+  const runtimeEpoch = chatLifecycleEpoch;
+  const mutationGeneration = ++screenContextAttachmentMutationGeneration;
+  screenContextAttachmentStatusGeneration += 1;
+  screenContextAttachmentDismissing.value = true;
+  screenContextAttachmentError.value = undefined;
+
+  try {
+    await screenContextAttachmentService.dismissPendingAttachment(attachmentId);
+    if (
+      !isChatRuntimeActive(runtimeEpoch) ||
+      mutationGeneration !== screenContextAttachmentMutationGeneration
+    ) {
+      return;
+    }
+
+    if (screenContextAttachmentId.value === attachmentId) {
+      screenContextAttachmentMutationGeneration += 1;
+      screenContextAttachmentStatusGeneration += 1;
+      screenContextAttachmentId.value = undefined;
+      screenContextAttachmentError.value = undefined;
+      screenContextAttachmentDismissing.value = false;
+    }
+  } catch (caught: unknown) {
+    if (
+      !isChatRuntimeActive(runtimeEpoch) ||
+      mutationGeneration !== screenContextAttachmentMutationGeneration
+    ) {
+      return;
+    }
+
+    const boundedError = screenContextAttachmentErrorFromUnknown(caught);
+    if (boundedError.code === "SCREEN_CONTEXT_ATTACHMENT_NOT_FOUND") {
+      await refreshPendingScreenContextAttachment(runtimeEpoch);
+      if (
+        isChatRuntimeActive(runtimeEpoch) &&
+        mutationGeneration === screenContextAttachmentMutationGeneration &&
+        screenContextAttachmentId.value === attachmentId
+      ) {
+        screenContextAttachmentError.value = boundedError;
+      }
+    } else {
+      screenContextAttachmentError.value = boundedError;
+    }
+  } finally {
+    if (
+      isChatRuntimeActive(runtimeEpoch) &&
+      mutationGeneration === screenContextAttachmentMutationGeneration
+    ) {
+      screenContextAttachmentDismissing.value = false;
+    }
+  }
+}
+
 const handleClosePanel = createClosePanelHandler(controller, {
   showMemoryPanel,
   showUnconfirmedHint,
 });
 
 onMounted(() => {
+  const runtimeEpoch = ++chatLifecycleEpoch;
+  window.addEventListener("focus", handleChatWindowFocus);
+  void registerScreenContextAttachmentListener(runtimeEpoch);
+  void refreshPendingScreenContextAttachment(runtimeEpoch);
   refreshMessages();
   unsubscribeMessages = conversationService.getSession().subscribe(refreshMessages);
   void restoreConversation();
 });
 
 onUnmounted(() => {
+  chatLifecycleEpoch += 1;
+  screenContextAttachmentStatusGeneration += 1;
+  screenContextAttachmentMutationGeneration += 1;
+  screenContextAttachmentListenerGeneration += 1;
+  window.removeEventListener("focus", handleChatWindowFocus);
+  const unlisten = unlistenScreenContextAttachmentChanged;
+  unlistenScreenContextAttachmentChanged = undefined;
+  void unlisten?.();
   manualExtractionGeneration += 1;
   clearCancelOutcomeUnknown();
   unsubscribeMessages?.();
@@ -488,6 +675,35 @@ onUnmounted(() => {
         检查可记忆内容
       </button>
     </div>
+
+    <section
+      v-if="screenContextAttachmentId !== undefined"
+      class="screen-context-attachment"
+      data-testid="screen-context-attachment"
+      aria-live="polite"
+    >
+      <div class="screen-context-attachment-copy">
+        <strong>Screen context attached</strong>
+        <span>Will be used with your next message</span>
+      </div>
+      <button
+        type="button"
+        data-testid="screen-context-attachment-remove"
+        :disabled="screenContextAttachmentDismissing"
+        :aria-busy="screenContextAttachmentDismissing"
+        @click="dismissPendingScreenContextAttachment"
+      >
+        Remove
+      </button>
+    </section>
+    <p
+      v-if="screenContextAttachmentError"
+      class="screen-context-attachment-error"
+      data-testid="screen-context-attachment-error"
+      role="alert"
+    >
+      {{ screenContextAttachmentError.message }}
+    </p>
 
     <section class="message-list" aria-label="Conversation messages">
       <p v-if="visibleMessages.length === 0" class="empty-state">No messages in this runtime session.</p>
@@ -776,6 +992,51 @@ input {
   display: flex;
   gap: 0.75rem;
   justify-self: start;
+}
+
+.screen-context-attachment {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  border: 1px solid #0ea5e9;
+  border-radius: 0.65rem;
+  background: rgba(14, 165, 233, 0.1);
+  padding: 0.7rem 0.85rem;
+}
+
+.screen-context-attachment-copy {
+  display: grid;
+  gap: 0.2rem;
+}
+
+.screen-context-attachment-copy strong {
+  color: #e0f2fe;
+}
+
+.screen-context-attachment-copy span {
+  color: #bae6fd;
+  font-size: 0.85rem;
+}
+
+.screen-context-attachment button {
+  border: 1px solid #7dd3fc;
+  border-radius: 0.45rem;
+  background: #0c4a6e;
+  color: #e0f2fe;
+  cursor: pointer;
+  padding: 0.4rem 0.65rem;
+}
+
+.screen-context-attachment button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.screen-context-attachment-error {
+  margin: 0;
+  color: #fecaca;
+  overflow-wrap: anywhere;
 }
 
 .system-toggle,

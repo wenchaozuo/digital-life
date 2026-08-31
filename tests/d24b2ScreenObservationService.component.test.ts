@@ -47,6 +47,42 @@ describe("D24-B2 Main screen handoff service", () => {
     expect(grant).toEqual({ grantId: "grant-opaque" });
   });
 
+  it("offers with only the exact Life and opaque grant ID", async () => {
+    mockedInvoke.mockResolvedValue({ attachmentId: "attachment-opaque" });
+    const service = new MainScreenObservationService();
+
+    const attachment = await service.offerMainScreenContextToChat(
+      "life-a",
+      "grant-opaque",
+    );
+
+    expect(mockedInvoke).toHaveBeenCalledTimes(1);
+    expect(mockedInvoke).toHaveBeenCalledWith(
+      "offer_main_screen_context_to_chat",
+      { lifeId: "life-a", grantId: "grant-opaque" },
+    );
+    expect(attachment).toEqual({ attachmentId: "attachment-opaque" });
+  });
+
+  it("revoke APIs send only their exact opaque authority arguments", async () => {
+    mockedInvoke.mockResolvedValue(undefined);
+    const service = new MainScreenObservationService();
+
+    await service.revokeMainPendingScreenContextGrant("life-a", "grant-opaque");
+    await service.revokeMainScreenContextAttachment("attachment-opaque");
+
+    expect(mockedInvoke.mock.calls).toEqual([
+      [
+        "revoke_main_pending_screen_context_grant",
+        { lifeId: "life-a", grantId: "grant-opaque" },
+      ],
+      [
+        "revoke_main_screen_context_attachment",
+        { attachmentId: "attachment-opaque" },
+      ],
+    ]);
+  });
+
   it("converts unknown backend errors to bounded UI text", () => {
     const rawDetail = "C:/private/native-frame-and-grant";
     const error = screenObservationErrorFromUnknown({

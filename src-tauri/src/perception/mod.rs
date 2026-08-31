@@ -18,6 +18,7 @@ pub(crate) mod screen_ocr;
 pub(crate) mod screen_policy;
 pub(crate) mod screen_settings;
 pub(crate) mod screen_vision_outbound_candidate;
+pub(crate) mod screen_vision_outbound_delivery_claim;
 pub(crate) mod screen_vision_outbound_destination;
 pub(crate) mod screen_vision_outbound_grant;
 pub(crate) mod screen_vision_outbound_policy;

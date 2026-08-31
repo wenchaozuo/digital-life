@@ -4,11 +4,12 @@ use super::connector::{establish_connection, TransportConnectError};
 use super::header_limit_io::{HeaderLimitError, HeaderLimitIo};
 use super::url_policy::ValidatedTransportTarget;
 use super::{
-    MAX_HEADERS_PER_BLOCK, MAX_REQUEST_BODY_BYTES, MAX_RESPONSE_BODY_BYTES, TRANSPORT_TOTAL_TIMEOUT,
+    MAX_HEADERS_PER_BLOCK, MAX_REQUEST_BODY_BYTES, MAX_RESPONSE_BODY_BYTES,
+    MAX_SENSITIVE_REQUEST_BODY_BYTES, TRANSPORT_TOTAL_TIMEOUT,
 };
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use http_body_util::{BodyExt, Full};
-use hyper::body::Body;
+use hyper::body::{Body, Frame, SizeHint};
 use hyper::http::header::{
     ACCEPT_ENCODING, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, HOST, PROXY_AUTHORIZATION, TE,
     TRAILER, TRANSFER_ENCODING, UPGRADE,
@@ -18,7 +19,13 @@ use hyper_util::rt::TokioIo;
 use std::error::Error;
 use std::fmt;
 use std::str::FromStr;
+use std::{
+    convert::Infallible,
+    pin::Pin,
+    task::{Context, Poll},
+};
 use tokio::time::{timeout_at, Instant};
+use zeroize::Zeroizing;
 
 const PROXY_CONNECTION: HeaderName = HeaderName::from_static("proxy-connection");
 const EXPECT: HeaderName = HeaderName::from_static("expect");
@@ -143,6 +150,109 @@ impl fmt::Debug for PreparedHttpRequest {
     }
 }
 
+/// A bounded, one-shot sensitive request. Its body remains a zeroizing byte
+/// vector until ownership crosses the Hyper body boundary; it is never
+/// converted to `Bytes`.
+pub(crate) struct PreparedSensitiveHttpRequest {
+    method: Method,
+    origin_form: String,
+    headers: HeaderMap,
+    body: Zeroizing<Vec<u8>>,
+}
+
+impl PreparedSensitiveHttpRequest {
+    pub(crate) fn new(
+        method: Method,
+        origin_form: String,
+        headers: HeaderMap,
+        body: Zeroizing<Vec<u8>>,
+    ) -> Result<Self, Http1TransportError> {
+        if body.len() as u64 > MAX_SENSITIVE_REQUEST_BODY_BYTES {
+            return Err(Http1TransportError::new(
+                Http1ErrorKind::RequestTooLarge,
+                SendDisposition::DefinitelyNotSent,
+            ));
+        }
+        validate_origin_form(&origin_form)?;
+        validate_request_headers(&headers)?;
+        Ok(Self {
+            method,
+            origin_form,
+            headers,
+            body,
+        })
+    }
+
+    pub(crate) fn into_body(self) -> Zeroizing<Vec<u8>> {
+        self.body
+    }
+}
+
+impl fmt::Debug for PreparedSensitiveHttpRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PreparedSensitiveHttpRequest")
+            .field("method", &self.method)
+            .field("origin_form", &"redacted")
+            .field("header_count", &self.headers.len())
+            .field("body_len", &self.body.len())
+            .finish()
+    }
+}
+
+struct ZeroizingBody {
+    data: Option<ZeroizingBodyData>,
+}
+
+impl ZeroizingBody {
+    fn new(body: Zeroizing<Vec<u8>>) -> Self {
+        let data = (!body.is_empty()).then_some(ZeroizingBodyData { body, offset: 0 });
+        Self { data }
+    }
+}
+
+impl Body for ZeroizingBody {
+    type Data = ZeroizingBodyData;
+    type Error = Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        Poll::Ready(self.data.take().map(|data| Ok(Frame::data(data))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.data.is_none()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.data
+            .as_ref()
+            .map(|data| SizeHint::with_exact(data.remaining() as u64))
+            .unwrap_or_else(|| SizeHint::with_exact(0))
+    }
+}
+
+struct ZeroizingBodyData {
+    body: Zeroizing<Vec<u8>>,
+    offset: usize,
+}
+
+impl Buf for ZeroizingBodyData {
+    fn remaining(&self) -> usize {
+        self.body.len().saturating_sub(self.offset)
+    }
+
+    fn chunk(&self) -> &[u8] {
+        &self.body[self.offset..]
+    }
+
+    fn advance(&mut self, count: usize) {
+        assert!(count <= self.remaining());
+        self.offset += count;
+    }
+}
+
 /// A sealed exchange result. Response headers are intentionally filtered to empty in D-8C3.
 pub(crate) struct Http1Response {
     status: StatusCode,
@@ -182,11 +292,69 @@ pub(crate) async fn exchange(
     exchange_with_deadline(target, request, Instant::now() + TRANSPORT_TOTAL_TIMEOUT).await
 }
 
+/// Executes one bounded sensitive HTTP/1.1 exchange. The transport policy and
+/// response handling are shared with `exchange`; only the request body owner
+/// differs so the sensitive bytes are zeroized on drop.
+pub(crate) async fn exchange_sensitive(
+    target: &ValidatedTransportTarget,
+    request: PreparedSensitiveHttpRequest,
+) -> Result<Http1Response, Http1TransportError> {
+    let PreparedSensitiveHttpRequest {
+        method,
+        origin_form,
+        headers,
+        body,
+    } = request;
+    let body_len = body.len();
+    let hyper_request = build_hyper_request(
+        target,
+        method,
+        origin_form,
+        headers,
+        body_len,
+        ZeroizingBody::new(body),
+    )?;
+    exchange_request(
+        target,
+        hyper_request,
+        Instant::now() + TRANSPORT_TOTAL_TIMEOUT,
+    )
+    .await
+}
+
 async fn exchange_with_deadline(
     target: &ValidatedTransportTarget,
     request: PreparedHttpRequest,
     deadline: Instant,
 ) -> Result<Http1Response, Http1TransportError> {
+    let PreparedHttpRequest {
+        method,
+        origin_form,
+        headers,
+        body,
+    } = request;
+    let body_len = body.len();
+    let hyper_request = build_hyper_request(
+        target,
+        method,
+        origin_form,
+        headers,
+        body_len,
+        Full::new(body),
+    )?;
+    exchange_request(target, hyper_request, deadline).await
+}
+
+async fn exchange_request<B>(
+    target: &ValidatedTransportTarget,
+    hyper_request: Request<B>,
+    deadline: Instant,
+) -> Result<Http1Response, Http1TransportError>
+where
+    B: Body + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn Error + Send + Sync>>,
+{
     let transport = establish_connection(target, deadline)
         .await
         .map_err(map_connect_error)?;
@@ -205,7 +373,6 @@ async fn exchange_with_deadline(
         })?;
     tokio::pin!(connection);
 
-    let hyper_request = build_hyper_request(target, request)?;
     // This is the sole send boundary: no code below retries or reconnects.
     let disposition = SendDisposition::PossiblySent;
     let response = {
@@ -322,16 +489,14 @@ fn validate_request_headers(headers: &HeaderMap) -> Result<(), Http1TransportErr
     Ok(())
 }
 
-fn build_hyper_request(
+fn build_hyper_request<B>(
     target: &ValidatedTransportTarget,
-    request: PreparedHttpRequest,
-) -> Result<Request<Full<Bytes>>, Http1TransportError> {
-    let PreparedHttpRequest {
-        method,
-        origin_form,
-        mut headers,
-        body,
-    } = request;
+    method: Method,
+    origin_form: String,
+    mut headers: HeaderMap,
+    body_len: usize,
+    body: B,
+) -> Result<Request<B>, Http1TransportError> {
     let host = format!("{}:{}", target.host_ascii(), target.port());
     let host_value = HeaderValue::from_str(&host).map_err(|_| {
         Http1TransportError::new(
@@ -339,7 +504,7 @@ fn build_hyper_request(
             SendDisposition::DefinitelyNotSent,
         )
     })?;
-    let length_value = HeaderValue::from_str(&body.len().to_string()).map_err(|_| {
+    let length_value = HeaderValue::from_str(&body_len.to_string()).map_err(|_| {
         Http1TransportError::new(
             Http1ErrorKind::RequestHeaderRejected,
             SendDisposition::DefinitelyNotSent,
@@ -352,7 +517,7 @@ fn build_hyper_request(
     Request::builder()
         .method(method)
         .uri(origin_form)
-        .body(Full::new(body))
+        .body(body)
         .map_err(|_| {
             Http1TransportError::new(
                 Http1ErrorKind::InvalidRequestTarget,
@@ -469,6 +634,16 @@ mod tests {
         .unwrap()
     }
 
+    fn prepared_sensitive(body: Vec<u8>) -> PreparedSensitiveHttpRequest {
+        PreparedSensitiveHttpRequest::new(
+            Method::POST,
+            "/v1/test?fixed=1".to_string(),
+            HeaderMap::new(),
+            Zeroizing::new(body),
+        )
+        .unwrap()
+    }
+
     async fn loopback_target(listener: &TcpListener) -> ValidatedTransportTarget {
         validate_and_normalize_url(&format!(
             "http://127.0.0.1:{}/",
@@ -532,6 +707,123 @@ mod tests {
         let rendered = format!("{rejected:?} {rejected}");
         assert!(!rendered.contains("secret.example"));
         assert!(!rendered.contains("/private"));
+    }
+
+    #[test]
+    fn sensitive_request_has_separate_limit_and_redacted_debug() {
+        let exact_regular = PreparedSensitiveHttpRequest::new(
+            Method::POST,
+            "/".to_string(),
+            HeaderMap::new(),
+            Zeroizing::new(vec![0; MAX_REQUEST_BODY_BYTES as usize]),
+        );
+        assert!(exact_regular.is_ok());
+
+        let above_regular = PreparedSensitiveHttpRequest::new(
+            Method::POST,
+            "/".to_string(),
+            HeaderMap::new(),
+            Zeroizing::new(vec![b'x'; MAX_REQUEST_BODY_BYTES as usize + 1]),
+        );
+        assert!(above_regular.is_ok());
+
+        let error = PreparedSensitiveHttpRequest::new(
+            Method::POST,
+            "/private-sensitive-path".to_string(),
+            HeaderMap::new(),
+            Zeroizing::new(vec![b'x'; MAX_SENSITIVE_REQUEST_BODY_BYTES as usize + 1]),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), Http1ErrorKind::RequestTooLarge);
+        assert_eq!(error.disposition(), SendDisposition::DefinitelyNotSent);
+        let mut headers = HeaderMap::new();
+        headers.insert(HOST, HeaderValue::from_static("sensitive.example"));
+        let rejected = PreparedSensitiveHttpRequest::new(
+            Method::POST,
+            "/private-sensitive-path".to_string(),
+            headers,
+            Zeroizing::new(b"sensitive-body-canary".to_vec()),
+        )
+        .unwrap_err();
+        let rendered = format!("{rejected:?} {rejected}");
+        assert!(!rendered.contains("sensitive.example"));
+        assert!(!rendered.contains("private-sensitive-path"));
+        assert!(!rendered.contains("sensitive-body-canary"));
+    }
+
+    #[tokio::test]
+    async fn sensitive_exchange_accepts_body_above_regular_limit_without_retry() {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let target = loopback_target(&listener).await;
+        let body_len = MAX_REQUEST_BODY_BYTES as usize + 1;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::with_capacity(body_len + 4096);
+            let mut chunk = [0_u8; 8192];
+            loop {
+                let read = stream.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                let header_end = request
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|index| index + 4);
+                if header_end.is_some_and(|index| request.len() >= index + body_len) {
+                    break;
+                }
+            }
+            let header_end = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|index| index + 4)
+                .unwrap();
+            assert_eq!(request.len() - header_end, body_len);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(30), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+
+        let response = exchange_sensitive(&target, prepared_sensitive(vec![b'x'; body_len]))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.body(), b"ok");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sensitive_send_disconnect_preserves_possibly_sent_without_retry() {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let target = loopback_target(&listener).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            drop(stream);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(30), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let error = exchange_sensitive(&target, prepared_sensitive(Vec::new()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.disposition(), SendDisposition::PossiblySent);
+        server.await.unwrap();
     }
 
     #[test]

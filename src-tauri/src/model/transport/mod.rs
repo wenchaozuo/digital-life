@@ -22,6 +22,10 @@ pub(crate) const TRANSPORT_TOTAL_TIMEOUT: std::time::Duration = std::time::Durat
 /// Frozen for D-8C3 outbound request framing.
 #[allow(dead_code)]
 pub(crate) const MAX_REQUEST_BODY_BYTES: u64 = 262144;
+/// Dedicated D26-A bound for a single sensitive multimodal request body.
+/// Regular Chat, Embedding, and Candidate Extraction requests keep the
+/// smaller `MAX_REQUEST_BODY_BYTES` admission unchanged.
+pub(crate) const MAX_SENSITIVE_REQUEST_BODY_BYTES: u64 = 12 * 1024 * 1024;
 /// Frozen for D-8C3 inbound body collection.
 #[allow(dead_code)]
 pub(crate) const MAX_RESPONSE_BODY_BYTES: u64 = 1048576;

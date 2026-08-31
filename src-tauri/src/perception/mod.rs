@@ -24,6 +24,7 @@ pub(crate) mod screen_vision_outbound_grant;
 pub(crate) mod screen_vision_outbound_policy;
 pub(crate) mod screen_vision_outbound_preparation;
 pub(crate) mod screen_vision_outbound_projection;
+pub(crate) mod screen_vision_outbound_resolver;
 pub(crate) mod screen_vision_outbound_settings;
 
 pub(crate) const PERCEPTION_POLICY_VERSION: i64 = 1;

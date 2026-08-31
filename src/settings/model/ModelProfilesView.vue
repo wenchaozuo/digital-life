@@ -173,11 +173,15 @@ defineExpose({ clearSensitiveInputs, requestLeave });
 </script>
 
 <template>
-  <section class="model-profiles-view" :aria-label="purpose === 'chat' ? 'Chat model profiles' : 'Embedding model profiles'">
+  <section class="model-profiles-view" :aria-label="purpose === 'chat' ? 'Chat model profiles' : purpose === 'embedding' ? 'Embedding model profiles' : purpose === 'candidate_extraction' ? 'Candidate extraction model profiles' : 'Vision model profiles'">
     <header class="model-header">
       <div>
-        <h2>{{ purpose === "chat" ? "Conversation models" : "Embedding models" }}</h2>
+        <h2>{{ purpose === "chat" ? "Conversation models" : purpose === "embedding" ? "Embedding models" : purpose === "candidate_extraction" ? "Candidate extraction models" : "Vision models" }}</h2>
         <p>Each profile has an independent API Key stored only in Windows Credential Manager.</p>
+        <template v-if="purpose === 'vision'">
+          <p>Used for explicitly confirmed screen-image Vision analysis.</p>
+          <p>Selecting a Vision model does not send screenshots by itself.</p>
+        </template>
       </div>
       <button type="button" class="primary" @click="openCreate">Create profile</button>
     </header>

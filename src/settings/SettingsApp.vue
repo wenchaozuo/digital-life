@@ -37,6 +37,7 @@ type SettingsSection =
   | "chat"
   | "embedding"
   | "candidate_extraction"
+  | "vision"
   | "memory"
   | "body"
   | "core"
@@ -51,6 +52,7 @@ const memoryCenterView = ref<SettingsViewHandle>();
 const activeModelPurpose = computed<ModelPurpose>(() => {
   if (activeSection.value === "embedding") return "embedding";
   if (activeSection.value === "candidate_extraction") return "candidate_extraction";
+  if (activeSection.value === "vision") return "vision";
   return "chat";
 });
 
@@ -238,6 +240,7 @@ onMounted(async () => {
         <button type="button" :class="{ selected: activeSection === 'chat' }" :disabled="phase === 'migrating'" @click="switchSection('chat')">Conversation models</button>
         <button type="button" :class="{ selected: activeSection === 'embedding' }" :disabled="phase === 'migrating'" @click="switchSection('embedding')">Embedding models</button>
         <button type="button" :class="{ selected: activeSection === 'candidate_extraction' }" :disabled="phase === 'migrating'" @click="switchSection('candidate_extraction')">Candidate profiles</button>
+        <button type="button" :class="{ selected: activeSection === 'vision' }" :disabled="phase === 'migrating'" @click="switchSection('vision')">Vision models</button>
         <button type="button" :class="{ selected: activeSection === 'memory' }" :disabled="phase === 'migrating'" @click="switchSection('memory')">Memory Center</button>
         <button type="button" :class="{ selected: activeSection === 'body' }" :disabled="phase === 'migrating'" @click="switchSection('body')">Body</button>
         <button type="button" :class="{ selected: activeSection === 'core' }" :disabled="phase === 'migrating'" @click="switchSection('core')">Live2D Core</button>

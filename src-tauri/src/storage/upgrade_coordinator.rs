@@ -98,6 +98,7 @@ fn open_after_mutex<G: StorageUpgradeGate>(
         migration::validate_live2d_core_schema(&connection)?;
         migration::validate_screen_perception_schema(&connection)?;
         migration::validate_screen_vision_outbound_policy_schema(&connection)?;
+        migration::validate_model_profile_schema(&connection)?;
         record_upgrade_event("post-verify");
         migration::verify_schema_after_upgrade(
             &connection,
@@ -267,6 +268,14 @@ fn open_after_mutex<G: StorageUpgradeGate>(
             return Err(StorageError::migration_version_invariant_failed());
         }
         upgraded_version = migration::SCREEN_VISION_OUTBOUND_POLICY_AUTHORITY_SCHEMA_VERSION;
+    }
+    if upgraded_version == migration::SCREEN_VISION_OUTBOUND_POLICY_AUTHORITY_SCHEMA_VERSION {
+        let vision_model_profile_upgrade =
+            migration::apply_vision_model_profile_schema_upgrade(&transaction)?;
+        if vision_model_profile_upgrade != migration::VisionModelProfileSchemaUpgrade::Applied {
+            return Err(StorageError::migration_version_invariant_failed());
+        }
+        upgraded_version = migration::VISION_MODEL_PROFILE_SCHEMA_VERSION;
     }
     if upgraded_version != connection::MAX_SUPPORTED_SCHEMA_VERSION {
         return Err(StorageError::migration_version_invariant_failed());
@@ -752,6 +761,12 @@ mod tests {
                 migration::ScreenVisionOutboundPolicyAuthoritySchemaUpgrade::Applied
             );
         }
+        if version >= migration::VISION_MODEL_PROFILE_SCHEMA_VERSION {
+            assert_eq!(
+                migration::apply_vision_model_profile_schema_upgrade(&transaction).unwrap(),
+                migration::VisionModelProfileSchemaUpgrade::Applied
+            );
+        }
         transaction.commit().unwrap();
         connection
             .pragma_update(None, "journal_mode", "DELETE")
@@ -952,17 +967,19 @@ mod tests {
     }
 
     #[test]
-    fn d25_a_coordinator_upgrades_schema_twenty_seven_to_schema_twenty_eight_without_backfill() {
-        let (_root, path) = database_path("schema-twenty-seven-d25-a");
+    fn d26_a_coordinator_upgrades_schema_twenty_seven_to_schema_twenty_nine_without_vision_backfill(
+    ) {
+        let (_root, path) = database_path("schema-twenty-seven-d26-a");
         prepare_schema_version(&path, migration::SCREEN_PERCEPTION_AUTHORITY_SCHEMA_VERSION);
         let gate = FakeGate::clear();
 
         let connection = open_coordinated_storage_connection_with_gate(&path, &gate).unwrap();
         assert_eq!(
             connection::read_schema_version(&connection).unwrap(),
-            migration::SCREEN_VISION_OUTBOUND_POLICY_AUTHORITY_SCHEMA_VERSION
+            connection::MAX_SUPPORTED_SCHEMA_VERSION
         );
         migration::validate_screen_vision_outbound_policy_schema(&connection).unwrap();
+        migration::validate_model_profile_schema(&connection).unwrap();
         let policy_rows: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM life_screen_vision_outbound_policy",
@@ -978,6 +995,21 @@ mod tests {
             )
             .unwrap();
         assert_eq!((policy_rows, event_rows), (0, 0));
+        let vision_profile_rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM model_profile WHERE purpose='vision'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let active_vision_rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM active_model_profile WHERE purpose='vision'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((vision_profile_rows, active_vision_rows), (0, 0));
         assert_eq!(writer_fence_count(&connection), 114);
         assert_eq!(journal_mode(&path), "wal");
         assert_eq!(gate.inspection_calls.get(), 2);
@@ -1363,7 +1395,7 @@ mod tests {
             connection::MAX_SUPPORTED_SCHEMA_VERSION
         );
         migration::validate_attempt_claim_identity_schema(&state.connection).unwrap();
-        // The schema is at 28, so the version-17 lifecycle validator cannot
+        // The schema is at 29, so the version-17 lifecycle validator cannot
         // run alone; the full 114-trigger writer fence plus the exact Schema-19
         // emotion, Schema-20 relationship, and Schema-21 episode validators
         // (which re-validate the Schema-18 catch-up objects) prove the
@@ -1407,7 +1439,7 @@ mod tests {
             .unwrap();
         assert_eq!(writer_fence_count, 114);
         migration::validate_attempt_claim_identity_schema(&connection).unwrap();
-        // The schema is at 28, so the version-17 lifecycle validator cannot
+        // The schema is at 29, so the version-17 lifecycle validator cannot
         // run alone; the full 114-trigger writer fence plus the exact Schema-19
         // emotion and Schema-20 relationship validators (which re-validate the
         // Schema-18 catch-up objects) prove the complete chain was applied.

@@ -24,8 +24,8 @@ const emit = defineEmits<{
 const displayName = ref(props.profile?.displayName ?? "");
 const baseUrl = ref(props.profile?.baseUrl ?? "");
 const modelName = ref(props.profile?.modelName ?? "");
-const temperature = ref(props.profile?.temperature ?? (props.purpose === "candidate_extraction" ? 0.0 : 0.7));
-const maxTokens = ref(props.profile?.maxTokens ?? (props.purpose === "candidate_extraction" ? 2048 : 4096));
+const temperature = ref(props.profile?.temperature ?? (props.purpose === "candidate_extraction" || props.purpose === "vision" ? 0.0 : 0.7));
+const maxTokens = ref(props.profile?.maxTokens ?? (props.purpose === "candidate_extraction" || props.purpose === "vision" ? 2048 : 4096));
 const embeddingDimension = ref(props.profile?.embeddingDimension ?? 1536);
 
 const initialSnapshot = snapshot();
@@ -47,9 +47,17 @@ const draft = computed<ModelProfileDraft>(() => {
       modelName: modelName.value,
       embeddingDimension: Number(embeddingDimension.value),
     };
-  } else {
+  } else if (props.purpose === "candidate_extraction") {
     return {
       purpose: "candidate_extraction",
+      displayName: displayName.value,
+      baseUrl: baseUrl.value,
+      modelName: modelName.value,
+      maxTokens: Number(maxTokens.value),
+    };
+  } else {
+    return {
+      purpose: "vision",
       displayName: displayName.value,
       baseUrl: baseUrl.value,
       modelName: modelName.value,
@@ -86,8 +94,12 @@ function submit(): void {
   <section class="model-profile-form" :aria-label="profile ? 'Edit model profile' : 'Create model profile'">
     <header>
 
-      <h3>{{ profile ? "Edit" : "Create" }} {{ purpose === "chat" ? "chat" : purpose === "embedding" ? "embedding" : "candidate extraction" }} profile</h3>
+      <h3>{{ profile ? "Edit" : "Create" }} {{ purpose === "chat" ? "chat" : purpose === "embedding" ? "embedding" : purpose === "candidate_extraction" ? "candidate extraction" : "Vision" }} profile</h3>
       <p>Profile settings do not contain an API Key.</p>
+      <template v-if="purpose === 'vision'">
+        <p>Used for explicitly confirmed screen-image Vision analysis.</p>
+        <p>Selecting a Vision model does not send screenshots by itself.</p>
+      </template>
     </header>
 
     <label>
@@ -116,6 +128,16 @@ function submit(): void {
       </label>
     </template>
     <template v-else-if="purpose === 'candidate_extraction'">
+      <label>
+        Temperature (Fixed)
+        <input type="number" value="0.0" disabled />
+      </label>
+      <label>
+        Max tokens
+        <input v-model.number="maxTokens" type="number" min="1" max="4096" step="1" />
+      </label>
+    </template>
+    <template v-else-if="purpose === 'vision'">
       <label>
         Temperature (Fixed)
         <input type="number" value="0.0" disabled />

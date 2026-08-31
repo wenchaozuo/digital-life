@@ -4,8 +4,8 @@ use rusqlite::{backup::Backup, params, Connection, OptionalExtension, Transactio
 
 use super::{
     autonomy, body_package, connection, experience_episode, generation_lifecycle_authority,
-    life_intent, live2d_core, perception, screen_perception, screen_vision_outbound_policy,
-    writer_fence_manifest, StorageError, MIGRATIONS,
+    life_intent, live2d_core, model_profile, perception, screen_perception,
+    screen_vision_outbound_policy, writer_fence_manifest, StorageError, MIGRATIONS,
 };
 
 pub(super) const LAST_STATIC_MIGRATION_VERSION: i64 = 12;
@@ -61,6 +61,10 @@ const SCREEN_PERCEPTION_AUTHORITY_MIGRATION_NAME: &str = "027_screen_perception_
 pub(super) const SCREEN_VISION_OUTBOUND_POLICY_AUTHORITY_SCHEMA_VERSION: i64 = 28;
 const SCREEN_VISION_OUTBOUND_POLICY_AUTHORITY_MIGRATION_NAME: &str =
     "028_screen_vision_outbound_policy";
+pub(super) const VISION_MODEL_PROFILE_SCHEMA_VERSION: i64 = 29;
+const VISION_MODEL_PROFILE_MIGRATION_NAME: &str = "029_vision_model_profiles";
+const VISION_MODEL_PROFILE_MIGRATION_SQL: &str =
+    include_str!("migrations/029_vision_model_profiles.sql");
 const ADD_CLAIMED_GENERATION_AUTHORITY_EPOCH_SQL: &str = "ALTER TABLE memory_vector_sync_outbox ADD COLUMN claimed_generation_authority_epoch INTEGER NULL CHECK (claimed_generation_authority_epoch IS NULL OR claimed_generation_authority_epoch >= 1)";
 const CREATE_GENERATION_AUTHORITY_TABLE_SQL: &str =
     "CREATE TABLE memory_vector_generation_authority (
@@ -281,6 +285,11 @@ pub(super) enum ScreenPerceptionAuthoritySchemaUpgrade {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ScreenVisionOutboundPolicyAuthoritySchemaUpgrade {
+    Applied,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum VisionModelProfileSchemaUpgrade {
     Applied,
 }
 
@@ -2174,6 +2183,51 @@ fn validate_screen_vision_outbound_policy_schema_objects(
     screen_vision_outbound_policy::validate_schema_objects(connection)
 }
 
+/// Schema 29 expands only the existing model-profile purpose vocabulary with
+/// the independent Vision purpose. The table rebuild preserves rowids, profile
+/// data, active mappings, timestamps, indexes, and foreign-key semantics; it
+/// creates no Vision rows or active mapping.
+pub(super) fn apply_vision_model_profile_schema_upgrade(
+    transaction: &Transaction<'_>,
+) -> Result<VisionModelProfileSchemaUpgrade, StorageError> {
+    if connection::read_schema_version(transaction)?
+        != SCREEN_VISION_OUTBOUND_POLICY_AUTHORITY_SCHEMA_VERSION
+    {
+        return Err(StorageError::migration_version_invariant_failed());
+    }
+
+    transaction
+        .execute_batch(VISION_MODEL_PROFILE_MIGRATION_SQL)
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    model_profile::validate_schema_029(transaction)?;
+
+    let migration_now: String = transaction
+        .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", [], |row| {
+            row.get(0)
+        })
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    transaction
+        .execute(
+            "INSERT INTO schema_migration (version,name,applied_at) VALUES (?1,?2,?3)",
+            params![
+                VISION_MODEL_PROFILE_SCHEMA_VERSION,
+                VISION_MODEL_PROFILE_MIGRATION_NAME,
+                migration_now
+            ],
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    model_profile::validate_schema_029(transaction)?;
+    Ok(VisionModelProfileSchemaUpgrade::Applied)
+}
+
+pub(super) fn validate_model_profile_schema(connection: &Connection) -> Result<(), StorageError> {
+    let schema_version = connection::read_schema_version(connection)?;
+    if schema_version < VISION_MODEL_PROFILE_SCHEMA_VERSION {
+        return Err(StorageError::migration_version_invariant_failed());
+    }
+    model_profile::validate_schema_029(connection)
+}
+
 pub(super) fn validate_experience_episode_schema(
     connection: &Connection,
 ) -> Result<(), StorageError> {
@@ -2870,6 +2924,9 @@ pub(super) fn verify_schema_after_upgrade(
     }
     if expected_schema_version >= SCREEN_VISION_OUTBOUND_POLICY_AUTHORITY_SCHEMA_VERSION {
         validate_screen_vision_outbound_policy_schema(connection)?;
+    }
+    if expected_schema_version >= VISION_MODEL_PROFILE_SCHEMA_VERSION {
+        validate_model_profile_schema(connection)?;
     }
     if expected_schema_version >= writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION {
         #[cfg(test)]
@@ -3651,6 +3708,9 @@ pub fn verify_database(
     }
     if expected_schema_version >= SCREEN_VISION_OUTBOUND_POLICY_AUTHORITY_SCHEMA_VERSION {
         validate_screen_vision_outbound_policy_schema(connection)?;
+    }
+    if expected_schema_version >= VISION_MODEL_PROFILE_SCHEMA_VERSION {
+        validate_model_profile_schema(connection)?;
     }
     if expected_schema_version >= writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION {
         writer_fence_manifest::validate_writer_fence_manifest(connection)?;
@@ -5005,10 +5065,10 @@ mod transaction_tests {
     }
 
     #[test]
-    fn migration_028_is_present_twenty_eight_is_current_and_twenty_nine_is_absent() {
+    fn migration_029_is_present_twenty_nine_is_current_and_thirty_is_absent() {
         assert_eq!(
             super::super::connection::MAX_SUPPORTED_SCHEMA_VERSION,
-            SCREEN_VISION_OUTBOUND_POLICY_AUTHORITY_SCHEMA_VERSION
+            VISION_MODEL_PROFILE_SCHEMA_VERSION
         );
         let migrations_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/storage/migrations");
         let entries = std::fs::read_dir(&migrations_dir).unwrap();
@@ -5023,20 +5083,20 @@ mod transaction_tests {
                 highest = highest.max(version);
             }
         }
-        assert_eq!(highest, 28, "Migration 028 must be the current migration");
+        assert_eq!(highest, 29, "Migration 029 must be the current migration");
         let names = std::fs::read_dir(&migrations_dir)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .collect::<Vec<_>>();
-        for version in ["022", "023", "024", "025", "026", "027", "028"] {
+        for version in ["022", "023", "024", "025", "026", "027", "028", "029"] {
             assert!(
                 names.iter().any(|name| name.starts_with(version)),
                 "Migration {version} must exist"
             );
         }
         assert!(
-            !names.iter().any(|name| name.starts_with("029")),
-            "Migration 029 must not exist"
+            !names.iter().any(|name| name.starts_with("030")),
+            "Migration 030 must not exist"
         );
     }
 
@@ -6381,6 +6441,209 @@ mod transaction_tests {
         let (mut connection, life_id) = schema_twenty_seven_connection_with_current_life();
         apply_screen_vision_outbound_policy_authority_upgrade(&mut connection);
         (connection, life_id)
+    }
+
+    fn apply_vision_model_profile_authority_upgrade(connection: &mut Connection) {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert_eq!(
+            apply_vision_model_profile_schema_upgrade(&transaction).unwrap(),
+            VisionModelProfileSchemaUpgrade::Applied
+        );
+        transaction.commit().unwrap();
+    }
+
+    fn model_profile_identity_rows(connection: &Connection) -> Vec<(i64, String)> {
+        let mut statement = connection
+            .prepare("SELECT rowid, id FROM model_profile ORDER BY rowid")
+            .unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    type ModelProfileRow = (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<f64>,
+        Option<i64>,
+        Option<i64>,
+        String,
+        String,
+    );
+
+    fn model_profile_rows(connection: &Connection) -> Vec<ModelProfileRow> {
+        let mut statement = connection
+            .prepare(
+                "SELECT id, purpose, provider_kind, display_name, base_url, model_name,
+                        temperature, max_tokens, embedding_dimension, created_at, updated_at
+                 FROM model_profile ORDER BY id",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                ))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    fn active_model_profile_identity_rows(connection: &Connection) -> Vec<(i64, String, String)> {
+        let mut statement = connection
+            .prepare("SELECT rowid, purpose, profile_id FROM active_model_profile ORDER BY rowid")
+            .unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    #[test]
+    fn migration_029_preserves_existing_profiles_and_active_mappings_without_vision_backfill() {
+        let (mut connection, life_id) = schema_twenty_eight_connection_with_current_life();
+        connection
+            .execute_batch(
+                "INSERT INTO model_profile (
+                    id, purpose, provider_kind, display_name, base_url, model_name,
+                    temperature, max_tokens, embedding_dimension, created_at, updated_at
+                 ) VALUES
+                    ('d26-chat', 'chat', 'openai_compatible', 'D26 Chat',
+                     'https://chat.example.invalid/v1', 'chat-model', 0.7, 4096, NULL,
+                     '2026-08-31T00:00:00.001Z', '2026-08-31T00:00:00.002Z'),
+                    ('d26-embedding', 'embedding', 'openai_compatible', 'D26 Embedding',
+                     'https://embedding.example.invalid/v1', 'embedding-model', NULL, NULL, 1536,
+                     '2026-08-31T00:00:00.003Z', '2026-08-31T00:00:00.004Z'),
+                    ('d26-candidate', 'candidate_extraction', 'openai_compatible', 'D26 Candidate',
+                     'https://candidate.example.invalid/v1', 'candidate-model', 0.0, 4096, NULL,
+                     '2026-08-31T00:00:00.005Z', '2026-08-31T00:00:00.006Z');
+                 INSERT INTO active_model_profile (purpose, profile_id) VALUES
+                    ('chat', 'd26-chat'),
+                    ('embedding', 'd26-embedding'),
+                    ('candidate_extraction', 'd26-candidate');",
+            )
+            .unwrap();
+        let profiles_before = model_profile_identity_rows(&connection);
+        let active_before = active_model_profile_identity_rows(&connection);
+        let profile_data_before = model_profile_rows(&connection);
+
+        apply_vision_model_profile_authority_upgrade(&mut connection);
+
+        assert_eq!(
+            schema_version(&connection),
+            VISION_MODEL_PROFILE_SCHEMA_VERSION
+        );
+        validate_model_profile_schema(&connection).unwrap();
+        validate_screen_vision_outbound_policy_schema(&connection).unwrap();
+        verify_schema_after_upgrade(&connection, VISION_MODEL_PROFILE_SCHEMA_VERSION).unwrap();
+        verify_database(&connection, VISION_MODEL_PROFILE_SCHEMA_VERSION, life_id).unwrap();
+        assert_eq!(model_profile_identity_rows(&connection), profiles_before);
+        assert_eq!(
+            active_model_profile_identity_rows(&connection),
+            active_before
+        );
+        assert_eq!(model_profile_rows(&connection), profile_data_before);
+        assert_eq!(writer_fence_count(&connection), 114);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM model_profile WHERE purpose='vision'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM active_model_profile WHERE purpose='vision'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migration
+                     WHERE version=?1 AND name='029_vision_model_profiles'",
+                    [VISION_MODEL_PROFILE_SCHEMA_VERSION],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        let foreign_key_violations: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(foreign_key_violations, 0);
+    }
+
+    #[test]
+    fn migration_029_rejects_reapply_and_malformed_reconstructed_schema() {
+        let (mut connection, _life_id) = schema_twenty_eight_connection_with_current_life();
+        apply_vision_model_profile_authority_upgrade(&mut connection);
+
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let error = apply_vision_model_profile_schema_upgrade(&transaction).unwrap_err();
+        assert_eq!(error.code, "MIGRATION_VERSION_INVARIANT_FAILED");
+        drop(transaction);
+
+        let original_sql: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type='table' AND name='model_profile'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let weakened_sql = original_sql.replacen("max_tokens <= 4096", "max_tokens <= 4095", 1);
+        assert_ne!(weakened_sql, original_sql);
+        let schema_cookie: i64 = connection
+            .query_row("PRAGMA schema_version", [], |row| row.get(0))
+            .unwrap();
+        connection
+            .pragma_update(None, "writable_schema", "ON")
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE sqlite_schema SET sql=?1 WHERE type='table' AND name='model_profile'",
+                [&weakened_sql],
+            )
+            .unwrap();
+        connection
+            .pragma_update(None, "schema_version", schema_cookie + 1)
+            .unwrap();
+        connection
+            .pragma_update(None, "writable_schema", "OFF")
+            .unwrap();
+
+        assert!(validate_model_profile_schema(&connection).is_err());
     }
 
     #[test]

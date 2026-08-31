@@ -5,7 +5,225 @@ use crate::model::profile::{
     ModelProfileRepository, ModelProviderKind, ModelPurpose,
 };
 
-use super::StorageService;
+use super::{StorageError, StorageService};
+
+pub(super) const MODEL_PROFILE_SCHEMA_029_SQL: &str = r#"CREATE TABLE "model_profile" (
+    id TEXT PRIMARY KEY CHECK (length(trim(id)) > 0),
+    purpose TEXT NOT NULL CHECK (purpose IN ('chat', 'embedding', 'candidate_extraction', 'vision')),
+    provider_kind TEXT NOT NULL CHECK (provider_kind = 'openai_compatible'),
+    display_name TEXT NOT NULL CHECK (length(trim(display_name)) > 0),
+    base_url TEXT NOT NULL CHECK (length(trim(base_url)) > 0),
+    model_name TEXT NOT NULL CHECK (length(trim(model_name)) > 0),
+    temperature REAL,
+    max_tokens INTEGER,
+    embedding_dimension INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (id, purpose),
+    CHECK (
+        (purpose = 'chat'
+            AND temperature IS NOT NULL
+            AND temperature >= 0.0
+            AND temperature <= 2.0
+            AND max_tokens IS NOT NULL
+            AND max_tokens > 0
+            AND max_tokens <= 1000000
+            AND embedding_dimension IS NULL)
+        OR
+        (purpose = 'embedding'
+            AND temperature IS NULL
+            AND max_tokens IS NULL
+            AND embedding_dimension IS NOT NULL
+            AND embedding_dimension > 0
+            AND embedding_dimension <= 65536)
+        OR
+        (purpose = 'candidate_extraction'
+            AND temperature IS NOT NULL
+            AND temperature = 0.0
+            AND max_tokens IS NOT NULL
+            AND typeof(max_tokens) = 'integer'
+            AND max_tokens >= 1
+            AND max_tokens <= 4096
+            AND embedding_dimension IS NULL)
+        OR
+        (purpose = 'vision'
+            AND temperature IS NOT NULL
+            AND temperature = 0.0
+            AND max_tokens IS NOT NULL
+            AND typeof(max_tokens) = 'integer'
+            AND max_tokens >= 1
+            AND max_tokens <= 4096
+            AND embedding_dimension IS NULL)
+    )
+)"#;
+
+pub(super) const ACTIVE_MODEL_PROFILE_SCHEMA_029_SQL: &str = r#"CREATE TABLE active_model_profile (
+    purpose TEXT PRIMARY KEY CHECK (purpose IN ('chat', 'embedding', 'candidate_extraction', 'vision')),
+    profile_id TEXT NOT NULL,
+    FOREIGN KEY (profile_id, purpose)
+        REFERENCES model_profile(id, purpose)
+        ON DELETE CASCADE
+)"#;
+
+/// Validates the exact reconstructed Schema-29 model-profile tables from
+/// SQLite's own schema. This is deliberately read-only; a malformed table is
+/// rejected rather than repaired on startup.
+pub(super) fn validate_schema_029(connection: &Connection) -> Result<(), StorageError> {
+    for (table, expected_sql) in [
+        ("model_profile", MODEL_PROFILE_SCHEMA_029_SQL),
+        ("active_model_profile", ACTIVE_MODEL_PROFILE_SCHEMA_029_SQL),
+    ] {
+        let actual: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type='table' AND name=?1",
+                [table],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| StorageError::migration_transaction_failed())?;
+        let Some(actual) = actual else {
+            return Err(StorageError::migration_transaction_failed());
+        };
+        if normalize_schema_fragment(&actual) != normalize_schema_fragment(expected_sql) {
+            return Err(StorageError::migration_transaction_failed());
+        }
+    }
+
+    let profile_columns = read_schema_columns(connection, "model_profile")?;
+    if profile_columns
+        .iter()
+        .map(|column| column.0.as_str())
+        .collect::<Vec<_>>()
+        != [
+            "id",
+            "purpose",
+            "provider_kind",
+            "display_name",
+            "base_url",
+            "model_name",
+            "temperature",
+            "max_tokens",
+            "embedding_dimension",
+            "created_at",
+            "updated_at",
+        ]
+    {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    let profile_types = [
+        "TEXT", "TEXT", "TEXT", "TEXT", "TEXT", "TEXT", "REAL", "INTEGER", "INTEGER", "TEXT",
+        "TEXT",
+    ];
+    let profile_not_null = [0, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1];
+    for (index, column) in profile_columns.iter().enumerate() {
+        if column.1 != profile_types[index]
+            || column.2 != profile_not_null[index]
+            || column.4 != if index == 0 { 1 } else { 0 }
+        {
+            return Err(StorageError::migration_transaction_failed());
+        }
+    }
+
+    let active_columns = read_schema_columns(connection, "active_model_profile")?;
+    if active_columns
+        .iter()
+        .map(|column| column.0.as_str())
+        .collect::<Vec<_>>()
+        != ["purpose", "profile_id"]
+    {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    if active_columns[0].1 != "TEXT"
+        || active_columns[0].2 != 0
+        || active_columns[0].4 != 1
+        || active_columns[1].1 != "TEXT"
+        || active_columns[1].2 != 1
+        || active_columns[1].4 != 0
+    {
+        return Err(StorageError::migration_transaction_failed());
+    }
+
+    let purpose_index: Option<(bool, String)> = connection
+        .query_row(
+            "SELECT \"unique\", origin FROM pragma_index_list('model_profile') WHERE name='idx_model_profile_purpose'",
+            [],
+            |row| Ok((row.get::<_, i64>(0)? == 1, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    if purpose_index != Some((false, "c".to_string())) {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    let purpose_index_columns: Vec<String> = connection
+        .prepare("PRAGMA index_info(idx_model_profile_purpose)")
+        .map_err(|_| StorageError::migration_transaction_failed())?
+        .query_map([], |row| row.get(2))
+        .map_err(|_| StorageError::migration_transaction_failed())?
+        .collect::<Result<_, _>>()
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    if purpose_index_columns != ["purpose"] {
+        return Err(StorageError::migration_transaction_failed());
+    }
+
+    let foreign_keys: Vec<(String, String, String, String)> = connection
+        .prepare("PRAGMA foreign_key_list(active_model_profile)")
+        .map_err(|_| StorageError::migration_transaction_failed())?
+        .query_map([], |row| {
+            Ok((row.get(2)?, row.get(3)?, row.get(4)?, row.get(6)?))
+        })
+        .map_err(|_| StorageError::migration_transaction_failed())?
+        .collect::<Result<_, _>>()
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    if foreign_keys.len() != 2
+        || !foreign_keys
+            .iter()
+            .all(|(table, _, _, on_delete)| table == "model_profile" && on_delete == "CASCADE")
+        || !foreign_keys
+            .iter()
+            .any(|(_, from, to, _)| from == "profile_id" && to == "id")
+        || !foreign_keys
+            .iter()
+            .any(|(_, from, to, _)| from == "purpose" && to == "purpose")
+    {
+        return Err(StorageError::migration_transaction_failed());
+    }
+    Ok(())
+}
+
+type SchemaColumn = (String, String, i64, Option<String>, i64);
+
+fn read_schema_columns(
+    connection: &Connection,
+    table: &str,
+) -> Result<Vec<SchemaColumn>, StorageError> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })
+        .map_err(|_| StorageError::migration_transaction_failed())?
+        .collect::<Result<_, _>>();
+    rows.map_err(|_| StorageError::migration_transaction_failed())
+}
+
+fn normalize_schema_fragment(value: &str) -> String {
+    value
+        .trim()
+        .trim_end_matches(';')
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .map(|byte| byte.to_ascii_lowercase())
+        .map(char::from)
+        .collect()
+}
 
 const PROFILE_COLUMNS: &str = "id, purpose, provider_kind, display_name, base_url, model_name, \
     temperature, max_tokens, embedding_dimension, created_at, updated_at";
@@ -348,6 +566,19 @@ mod tests {
             model_name: "candidate-model".into(),
             temperature: Some(0.0),
             max_tokens: Some(4096),
+            embedding_dimension: None,
+        }
+    }
+
+    fn vision_request(name: &str) -> CreateModelProfileRequest {
+        CreateModelProfileRequest {
+            purpose: ModelPurpose::Vision,
+            provider_kind: ModelProviderKind::OpenaiCompatible,
+            display_name: name.into(),
+            base_url: "https://vision.example.invalid/v1".into(),
+            model_name: "vision-model".into(),
+            temperature: Some(0.0),
+            max_tokens: Some(2048),
             embedding_dimension: None,
         }
     }
@@ -990,6 +1221,79 @@ mod tests {
     }
 
     #[test]
+    fn vision_profile_crud_and_active_mapping_are_independent() {
+        let root = TestRoot::new("vision-crud-active");
+        let storage = service(&root);
+        let profiles = ModelProfileService::new(&storage);
+        let chat = profiles.create(chat_request("Chat")).unwrap();
+        let vision = profiles.create(vision_request("Vision")).unwrap();
+
+        assert_eq!(
+            profiles
+                .list(ListModelProfilesRequest {
+                    purpose: Some(ModelPurpose::Vision),
+                })
+                .unwrap(),
+            vec![vision.clone()]
+        );
+        profiles
+            .set_active(SetActiveModelProfileRequest {
+                purpose: ModelPurpose::Chat,
+                profile_id: chat.id.clone(),
+            })
+            .unwrap();
+        profiles
+            .set_active(SetActiveModelProfileRequest {
+                purpose: ModelPurpose::Vision,
+                profile_id: vision.id.clone(),
+            })
+            .unwrap();
+        assert_eq!(
+            profiles
+                .get_active(ModelPurpose::Vision)
+                .unwrap()
+                .unwrap()
+                .profile_id,
+            vision.id
+        );
+        assert_eq!(
+            profiles
+                .get_active(ModelPurpose::Chat)
+                .unwrap()
+                .unwrap()
+                .profile_id,
+            chat.id
+        );
+
+        let updated = profiles
+            .update(UpdateModelProfileRequest {
+                profile_id: vision.id.clone(),
+                purpose: ModelPurpose::Vision,
+                provider_kind: ModelProviderKind::OpenaiCompatible,
+                display_name: "Updated Vision".into(),
+                base_url: "https://updated-vision.example.invalid/v1".into(),
+                model_name: "updated-vision-model".into(),
+                temperature: Some(0.0),
+                max_tokens: Some(4096),
+                embedding_dimension: None,
+            })
+            .unwrap();
+        assert_eq!(updated.purpose, ModelPurpose::Vision);
+        assert_eq!(updated.temperature, Some(0.0));
+        assert_eq!(updated.max_tokens, Some(4096));
+        assert_eq!(
+            profiles
+                .set_active(SetActiveModelProfileRequest {
+                    purpose: ModelPurpose::Chat,
+                    profile_id: vision.id,
+                })
+                .unwrap_err()
+                .code,
+            ModelProfileErrorCode::PurposeMismatch
+        );
+    }
+
+    #[test]
     fn active_profiles_are_isolated_replaceable_and_purpose_checked() {
         let root = TestRoot::new("active");
         let storage = service(&root);
@@ -1083,6 +1387,10 @@ mod tests {
             (
                 candidate_request("Guarded Candidate"),
                 SecretPurpose::CandidateExtractionModelApiKey,
+            ),
+            (
+                vision_request("Guarded Vision"),
+                SecretPurpose::VisionModelApiKey,
             ),
         ] {
             let profile = profiles.create(request).unwrap();

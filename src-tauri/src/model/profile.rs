@@ -17,6 +17,7 @@ const MAX_MODEL_NAME_CHARACTERS: usize = 256;
 const MAX_BASE_URL_CHARACTERS: usize = 2048;
 const MAX_TOKENS: u32 = 1_000_000;
 const MAX_CANDIDATE_EXTRACTION_TOKENS: u32 = 4_096;
+pub(crate) const MAX_VISION_TOKENS: u32 = 4_096;
 const MAX_EMBEDDING_DIMENSION: u32 = 65_536;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -25,6 +26,7 @@ pub enum ModelPurpose {
     Chat,
     Embedding,
     CandidateExtraction,
+    Vision,
 }
 
 impl ModelPurpose {
@@ -33,6 +35,7 @@ impl ModelPurpose {
             Self::Chat => "chat",
             Self::Embedding => "embedding",
             Self::CandidateExtraction => "candidate_extraction",
+            Self::Vision => "vision",
         }
     }
 
@@ -41,6 +44,7 @@ impl ModelPurpose {
             "chat" => Ok(Self::Chat),
             "embedding" => Ok(Self::Embedding),
             "candidate_extraction" => Ok(Self::CandidateExtraction),
+            "vision" => Ok(Self::Vision),
             _ => Err(ModelProfileError::database()),
         }
     }
@@ -346,6 +350,7 @@ pub(crate) const fn credential_purpose(purpose: ModelPurpose) -> SecretPurpose {
         ModelPurpose::Chat => SecretPurpose::ChatModelApiKey,
         ModelPurpose::Embedding => SecretPurpose::EmbeddingModelApiKey,
         ModelPurpose::CandidateExtraction => SecretPurpose::CandidateExtractionModelApiKey,
+        ModelPurpose::Vision => SecretPurpose::VisionModelApiKey,
     }
 }
 
@@ -512,6 +517,11 @@ fn validate_parameters(
                     .is_some_and(|value| (1..=MAX_CANDIDATE_EXTRACTION_TOKENS).contains(&value))
                 && embedding_dimension.is_none()
         }
+        ModelPurpose::Vision => {
+            temperature == Some(0.0)
+                && max_tokens.is_some_and(|value| (1..=MAX_VISION_TOKENS).contains(&value))
+                && embedding_dimension.is_none()
+        }
     };
     if !valid {
         return Err(ModelProfileError::new(
@@ -627,6 +637,19 @@ mod validation_tests {
         }
     }
 
+    fn vision_request() -> CreateModelProfileRequest {
+        CreateModelProfileRequest {
+            purpose: ModelPurpose::Vision,
+            provider_kind: ModelProviderKind::OpenaiCompatible,
+            display_name: "Vision".into(),
+            base_url: "https://vision.example.invalid/v1".into(),
+            model_name: "vision-model".into(),
+            temperature: Some(0.0),
+            max_tokens: Some(MAX_VISION_TOKENS),
+            embedding_dimension: None,
+        }
+    }
+
     #[test]
     fn model_purpose_wire_values_are_strict_and_stable() {
         assert_eq!(
@@ -642,8 +665,16 @@ mod validation_tests {
             "\"candidate_extraction\""
         );
         assert_eq!(
+            serde_json::to_string(&ModelPurpose::Vision).unwrap(),
+            "\"vision\""
+        );
+        assert_eq!(
             serde_json::from_str::<ModelPurpose>("\"candidate_extraction\"").unwrap(),
             ModelPurpose::CandidateExtraction
+        );
+        assert_eq!(
+            serde_json::from_str::<ModelPurpose>("\"vision\"").unwrap(),
+            ModelPurpose::Vision
         );
         for invalid in [
             "\"candidateExtraction\"",
@@ -775,6 +806,33 @@ mod validation_tests {
             "embeddingDimension": null
         });
         assert!(serde_json::from_value::<CreateModelProfileRequest>(unsupported_provider).is_err());
+    }
+
+    #[test]
+    fn vision_parameters_are_fixed_bounded_and_credential_is_distinct() {
+        assert!(NormalizedProfile::from_create(vision_request()).is_ok());
+        assert_eq!(
+            credential_purpose(ModelPurpose::Vision),
+            SecretPurpose::VisionModelApiKey
+        );
+
+        for mutate in [
+            |request: &mut CreateModelProfileRequest| request.temperature = None,
+            |request: &mut CreateModelProfileRequest| request.temperature = Some(0.1),
+            |request: &mut CreateModelProfileRequest| request.max_tokens = None,
+            |request: &mut CreateModelProfileRequest| request.max_tokens = Some(0),
+            |request: &mut CreateModelProfileRequest| {
+                request.max_tokens = Some(MAX_VISION_TOKENS + 1)
+            },
+            |request: &mut CreateModelProfileRequest| request.embedding_dimension = Some(1),
+        ] {
+            let mut request = vision_request();
+            mutate(&mut request);
+            assert_eq!(
+                NormalizedProfile::from_create(request).unwrap_err().code,
+                ModelProfileErrorCode::InvalidParameters
+            );
+        }
     }
 
     #[test]

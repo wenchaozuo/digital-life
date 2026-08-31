@@ -8,6 +8,7 @@
 mod error;
 mod openai_compatible;
 mod response;
+mod vision;
 
 #[allow(unused_imports)]
 pub(crate) use error::{
@@ -16,5 +17,11 @@ pub(crate) use error::{
 #[allow(unused_imports)]
 pub(crate) use openai_compatible::{
     OpenAiCompatibleProvider, OpenAiCompatibleProviderConfig, ProviderJsonRequest,
+    SensitiveProviderJsonRequest,
 };
 pub(crate) use response::ProviderHttpResponse;
+#[allow(unused_imports)]
+pub(crate) use vision::{
+    build_screen_vision_request, parse_screen_vision_analysis, ScreenVisionAnalysis,
+    ScreenVisionResponseError, ScreenVisionResponseErrorCode, SCREEN_VISION_SAFETY_INSTRUCTION,
+};

@@ -46,8 +46,8 @@ function profile(id: string, purpose: ModelPurpose): ModelProfile {
     displayName: `${purpose}-${id}`,
     baseUrl: "https://example.invalid/v1",
     modelName: `${purpose}-model`,
-    temperature: purpose === "chat" ? 0.7 : null,
-    maxTokens: purpose === "chat" ? 4096 : null,
+    temperature: purpose === "chat" || purpose === "candidate_extraction" || purpose === "vision" ? (purpose === "chat" ? 0.7 : 0.0) : null,
+    maxTokens: purpose === "chat" || purpose === "candidate_extraction" || purpose === "vision" ? (purpose === "chat" ? 4096 : 2048) : null,
     embeddingDimension: purpose === "embedding" ? 1536 : null,
     createdAt: "2026-07-13T00:00:00Z",
     updatedAt: "2026-07-13T00:00:00Z",
@@ -59,7 +59,8 @@ function profile(id: string, purpose: ModelPurpose): ModelProfile {
 function credentialPurpose(purpose: ModelPurpose): CredentialPurpose {
   if (purpose === "chat") return "CHAT_MODEL_API_KEY";
   if (purpose === "embedding") return "EMBEDDING_MODEL_API_KEY";
-  return "CANDIDATE_EXTRACTION_MODEL_API_KEY";
+  if (purpose === "candidate_extraction") return "CANDIDATE_EXTRACTION_MODEL_API_KEY";
+  return "VISION_MODEL_API_KEY";
 }
 
 function createMocks(initial: readonly ModelProfile[]) {
@@ -400,4 +401,54 @@ test("12. Error mappings for secure API operations", () => {
   assert.equal(errStoreUnavailable.code, "CREDENTIAL_STORE_UNAVAILABLE");
   assert.equal(errStoreUnavailable.safeMessage, "Secure credential storage is currently unavailable.");
   assert.doesNotMatch(errStoreUnavailable.safeMessage, /underlying/);
+});
+
+test("13. Vision profile uses independent bounded settings and credential purpose", async () => {
+  const vision = profile("vision-1", "vision");
+  const mocks = createMocks([vision]);
+  const controller = new ModelProfileController("vision", mocks.modelService, mocks.credentialService);
+
+  await controller.refresh();
+  assert.deepEqual(controller.profiles.map((item) => item.id), ["vision-1"]);
+  assert.equal(await controller.saveCredential(vision.id, "component-only-placeholder"), true);
+  assert.equal(mocks.calls.credentialSaves[0]?.purpose, "VISION_MODEL_API_KEY");
+  assert.equal(await controller.setActive(vision.id), true);
+  assert.equal(mocks.calls.setActive[0]?.purpose, "vision");
+
+  const invalid = await controller.saveProfile({
+    purpose: "vision",
+    displayName: "Vision",
+    baseUrl: "https://vision.example/v1",
+    modelName: "vision-model",
+    maxTokens: 4097,
+  });
+  assert.equal(invalid, undefined);
+
+  const saved = await controller.saveProfile({
+    purpose: "vision",
+    displayName: "Vision",
+    baseUrl: "https://vision.example/v1",
+    modelName: "vision-model",
+    maxTokens: 2048,
+  });
+  assert.ok(saved);
+  assert.equal(mocks.calls.creates.at(-1)?.purpose, "vision");
+  assert.equal(mocks.calls.creates.at(-1)?.temperature, 0.0);
+  assert.equal(mocks.calls.creates.at(-1)?.maxTokens, 2048);
+  assert.equal("embeddingDimension" in (mocks.calls.creates.at(-1) ?? {}), false);
+  assert.equal(await controller.deleteCredential(vision.id), true);
+  assert.equal(mocks.calls.credentialDeletes.at(-1)?.purpose, "VISION_MODEL_API_KEY");
+});
+
+test("14. Vision settings copy and surface contain no D25 execution path", () => {
+  const settingsSource = fs.readFileSync(path.join(__dirname, "../src/settings/SettingsApp.vue"), "utf8");
+  const formSource = fs.readFileSync(path.join(__dirname, "../src/settings/model/ModelProfileForm.vue"), "utf8");
+  const viewSource = fs.readFileSync(path.join(__dirname, "../src/settings/model/ModelProfilesView.vue"), "utf8");
+  assert.match(settingsSource, /Vision models/);
+  assert.match(formSource, /Used for explicitly confirmed screen-image Vision analysis\./);
+  assert.match(formSource, /Selecting a Vision model does not send screenshots by itself\./);
+  assert.match(viewSource, /Selecting a Vision model does not send screenshots by itself\./);
+  assert.doesNotMatch(settingsSource, /analyze_screen_with_vision|ScreenVisionOutbound/);
+  assert.doesNotMatch(formSource, /analyze_screen_with_vision|ScreenVisionOutbound/);
+  assert.doesNotMatch(viewSource, /analyze_screen_with_vision|ScreenVisionOutbound/);
 });

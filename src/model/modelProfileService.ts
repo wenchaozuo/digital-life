@@ -1,6 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
 
-export type ModelPurpose = "chat" | "embedding" | "candidate_extraction";
+export type ModelPurpose =
+  | "chat"
+  | "embedding"
+  | "candidate_extraction"
+  | "vision";
 export type ModelProviderKind = "openai_compatible";
 
 export interface ModelProfile {

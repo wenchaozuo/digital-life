@@ -73,10 +73,19 @@ export interface CandidateExtractionProfileDraft {
   maxTokens: number;
 }
 
+export interface VisionProfileDraft {
+  purpose: "vision";
+  displayName: string;
+  baseUrl: string;
+  modelName: string;
+  maxTokens: number;
+}
+
 export type ModelProfileDraft =
   | ChatProfileDraft
   | EmbeddingProfileDraft
-  | CandidateExtractionProfileDraft;
+  | CandidateExtractionProfileDraft
+  | VisionProfileDraft;
 
 export interface IModelProfileService {
   create(request: CreateModelProfileRequest): Promise<ModelProfile>;
@@ -343,6 +352,8 @@ function createRequest(draft: ModelProfileDraft): CreateModelProfileRequest {
     return { ...base, temperature: draft.temperature, maxTokens: draft.maxTokens };
   } else if (draft.purpose === "embedding") {
     return { ...base, embeddingDimension: draft.embeddingDimension };
+  } else if (draft.purpose === "candidate_extraction") {
+    return { ...base, temperature: 0.0, maxTokens: draft.maxTokens };
   } else {
     return { ...base, temperature: 0.0, maxTokens: draft.maxTokens };
   }
@@ -373,6 +384,10 @@ export function isDraftValid(draft: ModelProfileDraft): boolean {
   } else if (draft.purpose === "embedding") {
     return Number.isInteger(draft.embeddingDimension) &&
         draft.embeddingDimension > 0;
+  } else if (draft.purpose === "candidate_extraction") {
+    return Number.isInteger(draft.maxTokens) &&
+        draft.maxTokens >= 1 &&
+        draft.maxTokens <= 4096;
   } else {
     return Number.isInteger(draft.maxTokens) &&
         draft.maxTokens >= 1 &&

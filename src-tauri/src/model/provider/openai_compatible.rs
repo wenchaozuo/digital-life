@@ -6,11 +6,13 @@ use zeroize::Zeroizing;
 
 use crate::{
     model::{
-        profile::{credential_purpose, ModelProfile, ModelProviderKind},
+        profile::{credential_purpose, ModelProfile, ModelProviderKind, ModelPurpose},
         transport::{
-            http1::{exchange, PreparedHttpRequest},
+            http1::{
+                exchange, exchange_sensitive, PreparedHttpRequest, PreparedSensitiveHttpRequest,
+            },
             url_policy::{validate_and_normalize_url, ValidatedTransportTarget},
-            MAX_REQUEST_BODY_BYTES,
+            MAX_REQUEST_BODY_BYTES, MAX_SENSITIVE_REQUEST_BODY_BYTES,
         },
     },
     secrets::{SecretIdentifier, SecretStore, SecretValue},
@@ -19,7 +21,7 @@ use crate::{
 use super::{ProviderError, ProviderErrorKind, ProviderHttpResponse};
 
 #[cfg(test)]
-use crate::model::{profile::ModelPurpose, transport::url_policy::TransportTargetKind};
+use crate::model::transport::url_policy::TransportTargetKind;
 
 const CHAT_COMPLETIONS_PATH: &str = "chat/completions";
 const EMBEDDINGS_PATH: &str = "embeddings";
@@ -31,9 +33,28 @@ pub(crate) struct OpenAiCompatibleProviderConfig {
     origin_form: String,
     credential: SecretIdentifier,
     model_name: String,
+    purpose: ModelPurpose,
 }
 
 impl OpenAiCompatibleProviderConfig {
+    /// Resolves the provider binding from a profile while requiring the
+    /// caller's intended model purpose to match the SQLite profile purpose.
+    pub(crate) fn from_profile_for_purpose(
+        profile: &ModelProfile,
+        expected_purpose: ModelPurpose,
+    ) -> Result<Self, ProviderError> {
+        if profile.purpose != expected_purpose {
+            return Err(ProviderError::definitely_not_sent(
+                ProviderErrorKind::InvalidConfiguration,
+            ));
+        }
+        Self::from_profile(profile)
+    }
+
+    pub(crate) fn from_vision_profile(profile: &ModelProfile) -> Result<Self, ProviderError> {
+        Self::from_profile_for_purpose(profile, ModelPurpose::Vision)
+    }
+
     pub(crate) fn from_profile(profile: &ModelProfile) -> Result<Self, ProviderError> {
         if profile.provider_kind != ModelProviderKind::OpenaiCompatible
             || profile.model_name.trim().is_empty()
@@ -96,6 +117,7 @@ impl OpenAiCompatibleProviderConfig {
             origin_form,
             credential,
             model_name: profile.model_name.clone(),
+            purpose: profile.purpose,
         })
     }
 }
@@ -131,6 +153,43 @@ impl std::fmt::Debug for ProviderJsonRequest {
     }
 }
 
+/// Prepared multimodal JSON bytes. The body is intentionally owned by a
+/// zeroizing allocation and has no `Clone`, `Serialize`, or body-rendering
+/// surface.
+pub(crate) struct SensitiveProviderJsonRequest {
+    body: Zeroizing<Vec<u8>>,
+}
+
+impl SensitiveProviderJsonRequest {
+    pub(crate) fn new(body: Zeroizing<Vec<u8>>) -> Result<Self, ProviderError> {
+        if body.len() as u64 > MAX_SENSITIVE_REQUEST_BODY_BYTES {
+            return Err(ProviderError::definitely_not_sent(
+                ProviderErrorKind::RequestTooLarge,
+            ));
+        }
+        if std::str::from_utf8(&body).is_err()
+            || serde_json::from_slice::<serde::de::IgnoredAny>(&body).is_err()
+        {
+            return Err(ProviderError::definitely_not_sent(
+                ProviderErrorKind::InvalidJsonRequest,
+            ));
+        }
+        Ok(Self { body })
+    }
+
+    pub(crate) fn into_body(self) -> Zeroizing<Vec<u8>> {
+        self.body
+    }
+}
+
+impl std::fmt::Debug for SensitiveProviderJsonRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SensitiveProviderJsonRequest")
+            .field("body_len", &self.body.len())
+            .finish()
+    }
+}
+
 /// Stateless provider adapter. API keys are never retained by this struct.
 pub(crate) struct OpenAiCompatibleProvider<'a, S: SecretStore + ?Sized> {
     secrets: &'a S,
@@ -146,11 +205,34 @@ impl<'a, S: SecretStore + ?Sized> OpenAiCompatibleProvider<'a, S> {
         config: &OpenAiCompatibleProviderConfig,
         request: ProviderJsonRequest,
     ) -> Result<ProviderHttpResponse, ProviderError> {
+        if config.purpose == ModelPurpose::Vision {
+            return Err(ProviderError::definitely_not_sent(
+                ProviderErrorKind::InvalidConfiguration,
+            ));
+        }
         let secret = self
             .secrets
             .get_secret(&config.credential)
             .map_err(|error| ProviderError::from_secret_error(error.code))?;
         self.execute_with_secret(config, request, secret).await
+    }
+
+    pub(crate) async fn execute_sensitive(
+        &self,
+        config: &OpenAiCompatibleProviderConfig,
+        request: SensitiveProviderJsonRequest,
+    ) -> Result<ProviderHttpResponse, ProviderError> {
+        if config.purpose != ModelPurpose::Vision {
+            return Err(ProviderError::definitely_not_sent(
+                ProviderErrorKind::InvalidConfiguration,
+            ));
+        }
+        let secret = self
+            .secrets
+            .get_secret(&config.credential)
+            .map_err(|error| ProviderError::from_secret_error(error.code))?;
+        self.execute_sensitive_with_secret(config, request, secret)
+            .await
     }
 
     async fn execute_with_secret(
@@ -182,19 +264,58 @@ impl<'a, S: SecretStore + ?Sized> OpenAiCompatibleProvider<'a, S> {
         let response = exchange(&config.target, request)
             .await
             .map_err(ProviderError::from_transport)?;
-        let status = response.status().as_u16();
-        if (200..300).contains(&status) {
-            return Ok(ProviderHttpResponse::new(status, response.body().to_vec()));
-        }
-        Err(ProviderError::from_status(status_kind(status), status))
+        response_from_transport(response)
     }
+
+    async fn execute_sensitive_with_secret(
+        &self,
+        config: &OpenAiCompatibleProviderConfig,
+        request: SensitiveProviderJsonRequest,
+        secret: SecretValue,
+    ) -> Result<ProviderHttpResponse, ProviderError> {
+        let mut authorization = Zeroizing::new(String::with_capacity(
+            "Bearer ".len() + secret.expose_secret().len(),
+        ));
+        authorization.push_str("Bearer ");
+        authorization.push_str(secret.expose_secret());
+        let authorization_value = HeaderValue::from_str(&authorization)
+            .map_err(|_| ProviderError::definitely_not_sent(ProviderErrorKind::RequestRejected))?;
+
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+        headers.insert(AUTHORIZATION, authorization_value);
+        let request = PreparedSensitiveHttpRequest::new(
+            Method::POST,
+            config.origin_form.clone(),
+            headers,
+            request.into_body(),
+        )
+        .map_err(ProviderError::from_transport)?;
+
+        let response = exchange_sensitive(&config.target, request)
+            .await
+            .map_err(ProviderError::from_transport)?;
+        response_from_transport(response)
+    }
+}
+
+fn response_from_transport(
+    response: crate::model::transport::http1::Http1Response,
+) -> Result<ProviderHttpResponse, ProviderError> {
+    let status = response.status().as_u16();
+    if (200..300).contains(&status) {
+        return Ok(ProviderHttpResponse::new(status, response.body().to_vec()));
+    }
+    Err(ProviderError::from_status(status_kind(status), status))
 }
 
 fn origin_form_for(target: &ValidatedTransportTarget, profile: &ModelProfile) -> String {
     let endpoint = match profile.purpose {
         crate::model::profile::ModelPurpose::Embedding => EMBEDDINGS_PATH,
         crate::model::profile::ModelPurpose::Chat
-        | crate::model::profile::ModelPurpose::CandidateExtraction => CHAT_COMPLETIONS_PATH,
+        | crate::model::profile::ModelPurpose::CandidateExtraction
+        | crate::model::profile::ModelPurpose::Vision => CHAT_COMPLETIONS_PATH,
     };
     let mut origin_form = String::new();
     for segment in target.base_path().segments() {
@@ -226,6 +347,7 @@ mod tests {
         net::TcpListener,
         time::{timeout, Duration},
     };
+    use zeroize::Zeroizing;
 
     use crate::{
         model::{
@@ -264,6 +386,22 @@ mod tests {
         ProviderJsonRequest::new(br#"{"prepared":true}"#.to_vec()).unwrap()
     }
 
+    fn vision_profile(base_url: String) -> ModelProfile {
+        ModelProfile {
+            id: "vision-provider-profile".to_string(),
+            purpose: ModelPurpose::Vision,
+            provider_kind: ModelProviderKind::OpenaiCompatible,
+            display_name: "Vision provider profile".to_string(),
+            base_url,
+            model_name: "vision-model".to_string(),
+            temperature: Some(0.0),
+            max_tokens: Some(2048),
+            embedding_dimension: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
     fn test_loopback_config(listener: &TcpListener) -> OpenAiCompatibleProviderConfig {
         let target = validate_and_normalize_url(&format!(
             "http://127.0.0.1:{}/v1",
@@ -279,6 +417,26 @@ mod tests {
             )
             .unwrap(),
             model_name: "test-model".to_string(),
+            purpose: ModelPurpose::CandidateExtraction,
+        }
+    }
+
+    fn test_loopback_vision_config(listener: &TcpListener) -> OpenAiCompatibleProviderConfig {
+        let target = validate_and_normalize_url(&format!(
+            "http://127.0.0.1:{}/v1",
+            listener.local_addr().unwrap().port()
+        ))
+        .unwrap();
+        OpenAiCompatibleProviderConfig {
+            origin_form: origin_form_for(&target, &vision_profile("unused".to_string())),
+            target,
+            credential: SecretIdentifier::new(
+                SecretPurpose::VisionModelApiKey,
+                "vision-provider-profile",
+            )
+            .unwrap(),
+            model_name: "vision-model".to_string(),
+            purpose: ModelPurpose::Vision,
         }
     }
 
@@ -290,6 +448,16 @@ mod tests {
                     "provider-profile",
                 )
                 .unwrap(),
+                SecretValue::new(CANARY.to_string()).unwrap(),
+            )
+            .unwrap();
+    }
+
+    fn seed_vision(store: &InMemorySecretStore) {
+        store
+            .set_secret(
+                &SecretIdentifier::new(SecretPurpose::VisionModelApiKey, "vision-provider-profile")
+                    .unwrap(),
                 SecretValue::new(CANARY.to_string()).unwrap(),
             )
             .unwrap();
@@ -344,6 +512,28 @@ mod tests {
             "http://127.0.0.1:8080/v1".to_string(),
         ))
         .is_err());
+    }
+
+    #[test]
+    fn vision_profile_binding_uses_chat_completions_and_vision_credential_only() {
+        let vision = vision_profile("https://vision.example.invalid/v1".to_string());
+        let config = OpenAiCompatibleProviderConfig::from_vision_profile(&vision).unwrap();
+        assert_eq!(config.origin_form, "/v1/chat/completions");
+        assert_eq!(config.credential.profile_id, "vision-provider-profile");
+        assert_eq!(config.credential.purpose, SecretPurpose::VisionModelApiKey);
+        assert_eq!(config.model_name, "vision-model");
+        assert_eq!(config.purpose, ModelPurpose::Vision);
+        assert!(OpenAiCompatibleProviderConfig::from_profile_for_purpose(
+            &vision,
+            ModelPurpose::Chat,
+        )
+        .is_err());
+        assert!(
+            OpenAiCompatibleProviderConfig::from_vision_profile(&profile(
+                "https://vision.example.invalid/v1".to_string(),
+            ))
+            .is_err()
+        );
     }
 
     fn embedding_profile(base_url: String) -> ModelProfile {
@@ -541,6 +731,46 @@ mod tests {
         assert_eq!(response.body(), br#"{"ok":true}"#);
         assert!(!format!("{response:?}").contains("ok"));
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sensitive_vision_exchange_uses_the_dedicated_credential_path() {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let config = test_loopback_vision_config(&listener);
+        let server = tokio::spawn(serve_once(listener, 200, br#"{"ok":true}"#));
+        let store = InMemorySecretStore::new();
+        seed_vision(&store);
+        let request = SensitiveProviderJsonRequest::new(Zeroizing::new(
+            br#"{"synthetic_image":"not-a-screen-pixel"}"#.to_vec(),
+        ))
+        .unwrap();
+        let response = OpenAiCompatibleProvider::new(&store)
+            .execute_sensitive(&config, request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn regular_provider_path_rejects_vision_before_secret_or_network() {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let config = test_loopback_vision_config(&listener);
+        let store = InMemorySecretStore::new();
+        let request = ProviderJsonRequest::new(br#"{"synthetic":true}"#.to_vec()).unwrap();
+        let error = OpenAiCompatibleProvider::new(&store)
+            .execute(&config, request)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ProviderErrorKind::InvalidConfiguration);
+        assert_eq!(
+            error.disposition(),
+            crate::model::transport::http1::SendDisposition::DefinitelyNotSent
+        );
     }
 
     #[tokio::test]

@@ -28,6 +28,7 @@ pub enum SecretPurpose {
     ChatModelApiKey,
     EmbeddingModelApiKey,
     CandidateExtractionModelApiKey,
+    VisionModelApiKey,
 }
 
 impl SecretPurpose {
@@ -36,6 +37,7 @@ impl SecretPurpose {
             Self::ChatModelApiKey => "chat-model-api-key",
             Self::EmbeddingModelApiKey => "embedding-model-api-key",
             Self::CandidateExtractionModelApiKey => "candidate-extraction-model-api-key",
+            Self::VisionModelApiKey => "vision-model-api-key",
         }
     }
 }
@@ -414,6 +416,7 @@ mod tests {
         let chat_b = identifier(SecretPurpose::ChatModelApiKey, "profile-b");
         let embedding_a = identifier(SecretPurpose::EmbeddingModelApiKey, "profile-a");
         let candidate_a = identifier(SecretPurpose::CandidateExtractionModelApiKey, "profile-a");
+        let vision_a = identifier(SecretPurpose::VisionModelApiKey, "profile-a");
 
         assert!(!store.has_secret(&chat_a).unwrap());
         assert!(
@@ -436,6 +439,7 @@ mod tests {
         assert!(!store.has_secret(&chat_b).unwrap());
         assert!(!store.has_secret(&embedding_a).unwrap());
         assert!(!store.has_secret(&candidate_a).unwrap());
+        assert!(!store.has_secret(&vision_a).unwrap());
     }
 
     #[test]
@@ -475,6 +479,37 @@ mod tests {
         );
         assert!(store.delete_secret(&candidate).unwrap().deleted);
         assert!(!store.has_secret(&candidate).unwrap());
+    }
+
+    #[test]
+    fn vision_credential_crud_and_wire_purpose_are_isolated_from_chat() {
+        let store = InMemorySecretStore::new();
+        let profile_id = "shared-profile";
+        let vision = identifier(SecretPurpose::VisionModelApiKey, profile_id);
+        let chat = identifier(SecretPurpose::ChatModelApiKey, profile_id);
+        let candidate = identifier(SecretPurpose::CandidateExtractionModelApiKey, profile_id);
+
+        assert_eq!(
+            serde_json::to_string(&SecretPurpose::VisionModelApiKey).unwrap(),
+            "\"VISION_MODEL_API_KEY\""
+        );
+        assert_eq!(
+            SecretPurpose::VisionModelApiKey.canonical_name(),
+            "vision-model-api-key"
+        );
+        assert!(!store.has_secret(&vision).unwrap());
+        store
+            .set_secret(&vision, SecretValue::new(PLACEHOLDER.into()).unwrap())
+            .unwrap();
+        assert!(store.has_secret(&vision).unwrap());
+        assert!(!store.has_secret(&chat).unwrap());
+        assert!(!store.has_secret(&candidate).unwrap());
+        assert_eq!(
+            format!("{:?}", store.get_secret(&vision).unwrap()),
+            "[REDACTED]"
+        );
+        assert!(store.delete_secret(&vision).unwrap().deleted);
+        assert!(!store.has_secret(&vision).unwrap());
     }
 
     #[test]

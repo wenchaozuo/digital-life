@@ -231,11 +231,19 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
+        let vision = store
+            .target_name(
+                &SecretIdentifier::new(SecretPurpose::VisionModelApiKey, profile_id).unwrap(),
+            )
+            .unwrap();
 
         assert_ne!(chat, embedding);
         assert_ne!(chat, candidate);
+        assert_ne!(chat, vision);
         assert_ne!(embedding, candidate);
-        for target in [chat, embedding, candidate] {
+        assert_ne!(embedding, vision);
+        assert_ne!(candidate, vision);
+        for target in [chat, embedding, candidate, vision] {
             let target = String::from_utf16_lossy(&target);
             assert!(target.starts_with(PRODUCTION_NAMESPACE));
             assert!(!target.contains(profile_id));

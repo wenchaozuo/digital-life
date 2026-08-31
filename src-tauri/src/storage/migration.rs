@@ -4,8 +4,8 @@ use rusqlite::{backup::Backup, params, Connection, OptionalExtension, Transactio
 
 use super::{
     autonomy, body_package, connection, experience_episode, generation_lifecycle_authority,
-    life_intent, live2d_core, perception, screen_perception, writer_fence_manifest, StorageError,
-    MIGRATIONS,
+    life_intent, live2d_core, perception, screen_perception, screen_vision_outbound_policy,
+    writer_fence_manifest, StorageError, MIGRATIONS,
 };
 
 pub(super) const LAST_STATIC_MIGRATION_VERSION: i64 = 12;
@@ -58,6 +58,9 @@ pub(super) const LIVE2D_CORE_AUTHORITY_SCHEMA_VERSION: i64 = 26;
 const LIVE2D_CORE_AUTHORITY_MIGRATION_NAME: &str = "026_live2d_core_component_authority";
 pub(super) const SCREEN_PERCEPTION_AUTHORITY_SCHEMA_VERSION: i64 = 27;
 const SCREEN_PERCEPTION_AUTHORITY_MIGRATION_NAME: &str = "027_screen_perception_authority";
+pub(super) const SCREEN_VISION_OUTBOUND_POLICY_AUTHORITY_SCHEMA_VERSION: i64 = 28;
+const SCREEN_VISION_OUTBOUND_POLICY_AUTHORITY_MIGRATION_NAME: &str =
+    "028_screen_vision_outbound_policy";
 const ADD_CLAIMED_GENERATION_AUTHORITY_EPOCH_SQL: &str = "ALTER TABLE memory_vector_sync_outbox ADD COLUMN claimed_generation_authority_epoch INTEGER NULL CHECK (claimed_generation_authority_epoch IS NULL OR claimed_generation_authority_epoch >= 1)";
 const CREATE_GENERATION_AUTHORITY_TABLE_SQL: &str =
     "CREATE TABLE memory_vector_generation_authority (
@@ -273,6 +276,11 @@ pub(super) enum Live2DCoreAuthoritySchemaUpgrade {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ScreenPerceptionAuthoritySchemaUpgrade {
+    Applied,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ScreenVisionOutboundPolicyAuthoritySchemaUpgrade {
     Applied,
 }
 
@@ -2104,6 +2112,68 @@ fn validate_screen_perception_schema_objects(connection: &Connection) -> Result<
     screen_perception::validate_schema_objects(connection)
 }
 
+/// Schema 28 adds only the independent D25-A Life-scoped outbound policy and
+/// its immutable explicit-user event evidence. It performs no backfill and
+/// does not inspect any D23 consent, session, target, candidate, grant, or
+/// attachment state.
+pub(super) fn apply_screen_vision_outbound_policy_schema_upgrade(
+    transaction: &Transaction<'_>,
+) -> Result<ScreenVisionOutboundPolicyAuthoritySchemaUpgrade, StorageError> {
+    if connection::read_schema_version(transaction)? != SCREEN_PERCEPTION_AUTHORITY_SCHEMA_VERSION {
+        return Err(StorageError::migration_version_invariant_failed());
+    }
+
+    for table_sql in screen_vision_outbound_policy::MIGRATION_028_TABLE_SQLS {
+        transaction
+            .execute_batch(table_sql)
+            .map_err(|_| StorageError::migration_transaction_failed())?;
+    }
+    for trigger_sql in screen_vision_outbound_policy::MIGRATION_028_TRIGGER_SQLS {
+        transaction
+            .execute_batch(trigger_sql)
+            .map_err(|_| StorageError::migration_transaction_failed())?;
+    }
+    writer_fence_manifest::install_screen_vision_outbound_policy_writer_fence_manifest_in_transaction(
+        transaction,
+    )?;
+
+    validate_screen_vision_outbound_policy_schema_objects(transaction)?;
+    let migration_now: String = transaction
+        .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", [], |row| {
+            row.get(0)
+        })
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    transaction
+        .execute(
+            "INSERT INTO schema_migration (version,name,applied_at) VALUES (?1,?2,?3)",
+            params![
+                SCREEN_VISION_OUTBOUND_POLICY_AUTHORITY_SCHEMA_VERSION,
+                SCREEN_VISION_OUTBOUND_POLICY_AUTHORITY_MIGRATION_NAME,
+                migration_now
+            ],
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    validate_screen_vision_outbound_policy_schema_objects(transaction)?;
+    Ok(ScreenVisionOutboundPolicyAuthoritySchemaUpgrade::Applied)
+}
+
+pub(super) fn validate_screen_vision_outbound_policy_schema(
+    connection: &Connection,
+) -> Result<(), StorageError> {
+    let schema_version = connection::read_schema_version(connection)?;
+    if schema_version < SCREEN_VISION_OUTBOUND_POLICY_AUTHORITY_SCHEMA_VERSION {
+        return Err(StorageError::migration_version_invariant_failed());
+    }
+    validate_screen_vision_outbound_policy_schema_objects(connection)?;
+    writer_fence_manifest::validate_writer_fence_manifest_for_schema(connection, schema_version)
+}
+
+fn validate_screen_vision_outbound_policy_schema_objects(
+    connection: &Connection,
+) -> Result<(), StorageError> {
+    screen_vision_outbound_policy::validate_schema_objects(connection)
+}
+
 pub(super) fn validate_experience_episode_schema(
     connection: &Connection,
 ) -> Result<(), StorageError> {
@@ -2797,6 +2867,9 @@ pub(super) fn verify_schema_after_upgrade(
     }
     if expected_schema_version >= SCREEN_PERCEPTION_AUTHORITY_SCHEMA_VERSION {
         validate_screen_perception_schema(connection)?;
+    }
+    if expected_schema_version >= SCREEN_VISION_OUTBOUND_POLICY_AUTHORITY_SCHEMA_VERSION {
+        validate_screen_vision_outbound_policy_schema(connection)?;
     }
     if expected_schema_version >= writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION {
         #[cfg(test)]
@@ -3575,6 +3648,9 @@ pub fn verify_database(
     }
     if expected_schema_version >= SCREEN_PERCEPTION_AUTHORITY_SCHEMA_VERSION {
         validate_screen_perception_schema(connection)?;
+    }
+    if expected_schema_version >= SCREEN_VISION_OUTBOUND_POLICY_AUTHORITY_SCHEMA_VERSION {
+        validate_screen_vision_outbound_policy_schema(connection)?;
     }
     if expected_schema_version >= writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION {
         writer_fence_manifest::validate_writer_fence_manifest(connection)?;
@@ -4929,10 +5005,10 @@ mod transaction_tests {
     }
 
     #[test]
-    fn migration_027_is_present_twenty_seven_is_current_and_twenty_eight_is_absent() {
+    fn migration_028_is_present_twenty_eight_is_current_and_twenty_nine_is_absent() {
         assert_eq!(
             super::super::connection::MAX_SUPPORTED_SCHEMA_VERSION,
-            SCREEN_PERCEPTION_AUTHORITY_SCHEMA_VERSION
+            SCREEN_VISION_OUTBOUND_POLICY_AUTHORITY_SCHEMA_VERSION
         );
         let migrations_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/storage/migrations");
         let entries = std::fs::read_dir(&migrations_dir).unwrap();
@@ -4947,20 +5023,20 @@ mod transaction_tests {
                 highest = highest.max(version);
             }
         }
-        assert_eq!(highest, 27, "Migration 027 must be the current migration");
+        assert_eq!(highest, 28, "Migration 028 must be the current migration");
         let names = std::fs::read_dir(&migrations_dir)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .collect::<Vec<_>>();
-        for version in ["022", "023", "024", "025", "026", "027"] {
+        for version in ["022", "023", "024", "025", "026", "027", "028"] {
             assert!(
                 names.iter().any(|name| name.starts_with(version)),
                 "Migration {version} must exist"
             );
         }
         assert!(
-            !names.iter().any(|name| name.starts_with("028")),
-            "Migration 028 must not exist"
+            !names.iter().any(|name| name.starts_with("029")),
+            "Migration 029 must not exist"
         );
     }
 
@@ -6290,6 +6366,23 @@ mod transaction_tests {
         (connection, life_id)
     }
 
+    fn apply_screen_vision_outbound_policy_authority_upgrade(connection: &mut Connection) {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert_eq!(
+            apply_screen_vision_outbound_policy_schema_upgrade(&transaction).unwrap(),
+            ScreenVisionOutboundPolicyAuthoritySchemaUpgrade::Applied
+        );
+        transaction.commit().unwrap();
+    }
+
+    fn schema_twenty_eight_connection_with_current_life() -> (Connection, &'static str) {
+        let (mut connection, life_id) = schema_twenty_seven_connection_with_current_life();
+        apply_screen_vision_outbound_policy_authority_upgrade(&mut connection);
+        (connection, life_id)
+    }
+
     #[test]
     fn migration_027_creates_two_consent_tables_once_without_backfill() {
         let mut connection = schema_twenty_six_connection_with_current_life().0;
@@ -6616,6 +6709,177 @@ mod transaction_tests {
         )
         .unwrap();
         assert_eq!(writer_fence_count(&connection), 108);
+    }
+
+    #[test]
+    fn migration_028_upgrades_schema_twenty_seven_without_backfill_and_rejects_reapply() {
+        let (mut connection, life_id) = schema_twenty_seven_connection_with_current_life();
+        assert!(validate_screen_vision_outbound_policy_schema(&connection).is_err());
+        apply_screen_vision_outbound_policy_authority_upgrade(&mut connection);
+
+        assert_eq!(
+            schema_version(&connection),
+            SCREEN_VISION_OUTBOUND_POLICY_AUTHORITY_SCHEMA_VERSION
+        );
+        validate_screen_perception_schema(&connection).unwrap();
+        validate_screen_vision_outbound_policy_schema(&connection).unwrap();
+        verify_schema_after_upgrade(
+            &connection,
+            SCREEN_VISION_OUTBOUND_POLICY_AUTHORITY_SCHEMA_VERSION,
+        )
+        .unwrap();
+        verify_database(
+            &connection,
+            SCREEN_VISION_OUTBOUND_POLICY_AUTHORITY_SCHEMA_VERSION,
+            life_id,
+        )
+        .unwrap();
+        assert_eq!(writer_fence_count(&connection), 114);
+
+        for table in [
+            "life_screen_vision_outbound_policy",
+            "life_screen_vision_outbound_policy_event",
+        ] {
+            let count: i64 = connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "Migration028 must synthesize no {table} rows");
+        }
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM life_screen_perception_policy",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+            "D23 local consent must not be converted into D25-A rows"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migration WHERE version=?1",
+                    [SCREEN_VISION_OUTBOUND_POLICY_AUTHORITY_SCHEMA_VERSION],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let error = apply_screen_vision_outbound_policy_schema_upgrade(&transaction).unwrap_err();
+        assert_eq!(error.code, "MIGRATION_VERSION_INVARIANT_FAILED");
+        drop(transaction);
+        assert_eq!(writer_fence_count(&connection), 114);
+    }
+
+    #[test]
+    fn migration_028_schema_has_only_durable_policy_columns_and_exact_foreign_keys() {
+        let (connection, _life_id) = schema_twenty_eight_connection_with_current_life();
+        let expected_columns = [
+            (
+                "life_screen_vision_outbound_policy",
+                vec![
+                    "life_id",
+                    "screen_vision_outbound_enabled",
+                    "revision",
+                    "created_at",
+                    "updated_at",
+                    "policy_version",
+                ],
+            ),
+            (
+                "life_screen_vision_outbound_policy_event",
+                vec![
+                    "event_id",
+                    "life_id",
+                    "old_screen_vision_outbound_enabled",
+                    "new_screen_vision_outbound_enabled",
+                    "expected_revision",
+                    "applied_revision",
+                    "actor_kind",
+                    "occurred_at",
+                    "event_version",
+                ],
+            ),
+        ];
+        for (table, expected) in expected_columns {
+            let mut statement = connection
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .unwrap();
+            let columns: Vec<String> = statement
+                .query_map([], |row| row.get(1))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(columns, expected);
+        }
+        for (child, parent, from, to) in [
+            (
+                "life_screen_vision_outbound_policy",
+                "life_identity",
+                "life_id",
+                "id",
+            ),
+            (
+                "life_screen_vision_outbound_policy_event",
+                "life_screen_vision_outbound_policy",
+                "life_id",
+                "life_id",
+            ),
+        ] {
+            let count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_foreign_key_list(?1)
+                     WHERE \"table\"=?2 AND \"from\"=?3 AND \"to\"=?4
+                       AND on_delete='CASCADE'",
+                    params![child, parent, from, to],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "{child} must cascade from {parent}");
+        }
+        let forbidden = [
+            "image",
+            "pixel",
+            "screenshot",
+            "ocr",
+            "capture",
+            "window",
+            "process",
+            "pid",
+            "hwnd",
+            "provider",
+            "url",
+            "base64",
+            "multipart",
+        ];
+        for table in [
+            "life_screen_vision_outbound_policy",
+            "life_screen_vision_outbound_policy_event",
+        ] {
+            let mut statement = connection
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .unwrap();
+            let columns: Vec<String> = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            for column in columns {
+                assert!(
+                    !forbidden
+                        .iter()
+                        .any(|word| column.to_ascii_lowercase().contains(word)),
+                    "D25-A table must not carry {column}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -4,7 +4,7 @@ use rusqlite::{functions::FunctionFlags, Connection, OptionalExtension};
 
 use super::StorageError;
 
-pub(super) const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 27;
+pub(super) const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 28;
 
 const WRITER_EPOCH_FUNCTION: &str = "digital_life_writer_epoch";
 const WRITER_EPOCH: i64 = 1;

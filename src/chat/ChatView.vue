@@ -533,8 +533,18 @@ async function registerScreenContextAttachmentListener(runtimeEpoch: number): Pr
     }
     unlistenScreenContextAttachmentChanged = unlisten;
   } catch {
-    // Mount/focus rereads remain the recovery path when event registration is
-    // unavailable or the event is delivered before registration completes.
+    // Registration failure is bounded; the post-attempt reread below remains
+    // the authoritative recovery path.
+  } finally {
+    // The event is only a refresh hint. Once registration reaches a terminal
+    // result, reread backend state to close the startup race. A destroyed or
+    // superseded registration must not start work for the old runtime.
+    if (
+      isChatRuntimeActive(runtimeEpoch) &&
+      listenerGeneration === screenContextAttachmentListenerGeneration
+    ) {
+      void refreshPendingScreenContextAttachment(runtimeEpoch);
+    }
   }
 }
 

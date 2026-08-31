@@ -7,6 +7,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 type AttachmentEvent = { payload: unknown };
 type AttachmentEventHandler = (event: AttachmentEvent) => void;
 
+function createDeferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
 const mocks = vi.hoisted(() => ({
   conversationId: "conversation-a" as string | undefined,
   getPending: vi.fn(),
@@ -142,10 +150,10 @@ describe("D24-C2 Chat screen-context attachment", () => {
     const wrapper = mountChatView();
     await flushPromises();
     try {
-      expect(mocks.getPending).toHaveBeenCalledTimes(1);
+      expect(mocks.getPending).toHaveBeenCalledTimes(2);
       window.dispatchEvent(new Event("focus"));
       await flushPromises();
-      expect(mocks.getPending).toHaveBeenCalledTimes(2);
+      expect(mocks.getPending).toHaveBeenCalledTimes(3);
       expect(mocks.dismiss).not.toHaveBeenCalled();
       expect(wrapper.find("[data-testid='screen-context-attachment']").exists()).toBe(false);
     } finally {
@@ -265,7 +273,7 @@ describe("D24-C2 Chat screen-context attachment", () => {
       await wrapper.get("[data-testid='screen-context-attachment-remove']").trigger("click");
       await flushPromises();
 
-      expect(mocks.getPending).toHaveBeenCalledTimes(2);
+      expect(mocks.getPending).toHaveBeenCalledTimes(3);
       expect(wrapper.find("[data-testid='screen-context-attachment']").exists()).toBe(false);
       expect(wrapper.text()).not.toContain("raw not-found detail");
     } finally {
@@ -330,6 +338,85 @@ describe("D24-C2 Chat screen-context attachment", () => {
 
     wrapper.unmount();
     mountedWrappers.splice(mountedWrappers.indexOf(wrapper), 1);
+  });
+
+  it("rereads after delayed listener registration and discovers an attachment", async () => {
+    const delayedListener = createDeferred<() => void>();
+    mocks.listen.mockImplementationOnce(
+      async (_event: string, handler: AttachmentEventHandler) => {
+        mocks.eventHandler = handler;
+        return delayedListener.promise;
+      },
+    );
+    const wrapper = mountChatView();
+    await flushPromises();
+    try {
+      expect(mocks.getPending).toHaveBeenCalledTimes(1);
+      expect(wrapper.find("[data-testid='screen-context-attachment']").exists()).toBe(false);
+
+      mocks.getPending.mockResolvedValueOnce({
+        available: true,
+        attachmentId: "startup-attachment",
+      });
+      delayedListener.resolve(mocks.unlisten);
+      await flushPromises();
+
+      expect(mocks.getPending).toHaveBeenCalledTimes(2);
+      expect(wrapper.find("[data-testid='screen-context-attachment']").exists()).toBe(true);
+      expect(wrapper.text()).not.toContain("startup-attachment");
+    } finally {
+      wrapper.unmount();
+      mountedWrappers.splice(mountedWrappers.indexOf(wrapper), 1);
+    }
+  });
+
+  it("rereads authoritatively after listener registration fails", async () => {
+    mocks.listen.mockRejectedValueOnce(new Error("listener unavailable"));
+    let statusCalls = 0;
+    mocks.getPending.mockImplementation(() => {
+      statusCalls += 1;
+      return Promise.resolve(
+        statusCalls === 1
+          ? { available: false }
+          : { available: true, attachmentId: "failure-recovery-attachment" },
+      );
+    });
+    const wrapper = mountChatView();
+    await flushPromises();
+    try {
+      expect(mocks.getPending).toHaveBeenCalledTimes(2);
+      expect(wrapper.find("[data-testid='screen-context-attachment']").exists()).toBe(true);
+      expect(wrapper.text()).not.toContain("failure-recovery-attachment");
+    } finally {
+      wrapper.unmount();
+      mountedWrappers.splice(mountedWrappers.indexOf(wrapper), 1);
+    }
+  });
+
+  it("unlistens a delayed registration without rereading after unmount", async () => {
+    const delayedListener = createDeferred<() => void>();
+    mocks.listen.mockImplementationOnce(
+      async (_event: string, handler: AttachmentEventHandler) => {
+        mocks.eventHandler = handler;
+        return delayedListener.promise;
+      },
+    );
+    const wrapper = mountChatView();
+    await flushPromises();
+    expect(mocks.getPending).toHaveBeenCalledTimes(1);
+
+    wrapper.unmount();
+    mountedWrappers.splice(mountedWrappers.indexOf(wrapper), 1);
+    mocks.getPending.mockResolvedValue({
+      available: true,
+      attachmentId: "late-attachment",
+    });
+    delayedListener.resolve(mocks.unlisten);
+    await flushPromises();
+
+    expect(mocks.unlisten).toHaveBeenCalledTimes(1);
+    expect(mocks.getPending).toHaveBeenCalledTimes(1);
+    expect(document.body.textContent ?? "").not.toContain("Screen context attached");
   });
 
   it("keeps C2 out of conversation requests, persistence, and screen authority", () => {

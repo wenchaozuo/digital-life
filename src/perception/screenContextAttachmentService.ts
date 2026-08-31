@@ -18,6 +18,8 @@ const CHAT_ATTACHMENT_ERROR_MESSAGES: Record<string, string> = {
     "The screen context attachment is no longer available.",
   SCREEN_CONTEXT_ATTACHMENT_BROKER_UNAVAILABLE:
     "The screen context attachment is temporarily unavailable. Try again.",
+  SCREEN_CONTEXT_ATTACHMENT_IN_USE:
+    "This screen context is currently reserved for a conversation retry.",
   SCREEN_CONTEXT_LIFE_UNAVAILABLE:
     "The current Life could not be verified. Try again.",
   SCREEN_CONTEXT_CONSENT_UNAVAILABLE:

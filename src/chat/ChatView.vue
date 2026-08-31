@@ -70,6 +70,7 @@ const manualExtractionDisabled = computed(() =>
 const screenContextAttachmentId = ref<string>();
 const screenContextAttachmentDismissing = ref(false);
 const screenContextAttachmentError = ref<ChatScreenContextAttachmentError>();
+let consumedScreenContextAttachmentId: string | undefined;
 let chatLifecycleEpoch = 0;
 let screenContextAttachmentStatusGeneration = 0;
 let screenContextAttachmentMutationGeneration = 0;
@@ -293,24 +294,69 @@ async function send(content: string): Promise<void> {
     return;
   }
 
+  // Capture the current authoritative C2 marker at the exact user-send
+  // boundary.  The ConversationService receives only this opaque locator;
+  // no screen content or native authority is reread here.
+  const capturedAttachmentId = screenContextAttachmentId.value;
+  const runtimeEpoch = chatLifecycleEpoch;
+  if (capturedAttachmentId !== undefined) {
+    // Fence status work that started before this attached send.  Its late
+    // result must not restore the consumed marker after a successful turn.
+    screenContextAttachmentStatusGeneration += 1;
+    screenContextAttachmentMutationGeneration += 1;
+  }
+
   const expression = conversationExpression.begin("thinking");
   conversationState.value = "sending";
   error.value = undefined;
 
   try {
-    const response = await conversationService.send({
-      userInput: content,
-    });
+    const response = await conversationService.send(
+      capturedAttachmentId === undefined
+        ? { userInput: content }
+        : { userInput: content, perceptionAttachmentId: capturedAttachmentId },
+    );
+
+    if (capturedAttachmentId !== undefined && isChatRuntimeActive(runtimeEpoch)) {
+      // The governed response (including replayed success) consumed this
+      // exact attachment.  Keep a local tombstone so a stale status response
+      // cannot reattach the old ID; a genuinely newer backend attachment is
+      // still accepted by the normal status path.
+      consumedScreenContextAttachmentId = capturedAttachmentId;
+      if (isChatRuntimeActive(runtimeEpoch)) {
+        screenContextAttachmentStatusGeneration += 1;
+        screenContextAttachmentMutationGeneration += 1;
+        if (screenContextAttachmentId.value === capturedAttachmentId) {
+          screenContextAttachmentId.value = undefined;
+          screenContextAttachmentError.value = undefined;
+        }
+      }
+      // D24-D1 owns backend retirement/removal.  This reread is best-effort
+      // presentation convergence and must never turn a successful send into
+      // a failed conversation result.
+      await refreshPendingScreenContextAttachment(runtimeEpoch);
+    }
+
     clearSignal.value += 1;
     memoryNotice.value = memoryNoticeFor(response.memory.degradationCodes, response.memory.rebuildRecommended);
     await refreshConversations();
     conversationExpression.complete(expression, "idle");
   } catch (caught) {
     conversationExpression.complete(expression, "error");
-    error.value = caught instanceof ConversationError
+    const boundedError = caught instanceof ConversationError
       ? { code: caught.code, message: caught.message }
       : { code: "CONVERSATION_MODEL_FAILED", message: "The model request could not be completed." };
+    error.value = boundedError;
     conversationState.value = "error";
+    if (
+      capturedAttachmentId !== undefined
+      && boundedError.code === "PERCEPTION_CONTEXT_UNAVAILABLE"
+      && isChatRuntimeActive(runtimeEpoch)
+    ) {
+      // This is a real attached-request failure.  Re-read authority for
+      // presentation only; never silently retry as ordinary text-only chat.
+      await refreshPendingScreenContextAttachment(runtimeEpoch);
+    }
   } finally {
     refreshMessages();
     if (conversationState.value === "sending") conversationState.value = "idle";
@@ -493,9 +539,20 @@ async function refreshPendingScreenContextAttachment(runtimeEpoch: number): Prom
       return false;
     }
 
-    screenContextAttachmentId.value = normalized.available
-      ? normalized.attachmentId
-      : undefined;
+    if (!normalized.available) {
+      consumedScreenContextAttachmentId = undefined;
+      screenContextAttachmentId.value = undefined;
+    } else if (normalized.attachmentId === consumedScreenContextAttachmentId) {
+      // A stale/late reread may still report the just-consumed ID.  Keep the
+      // presentation clear until backend authority reports unavailable or a
+      // genuinely new attachment.
+      if (screenContextAttachmentId.value === normalized.attachmentId) {
+        screenContextAttachmentId.value = undefined;
+      }
+    } else {
+      consumedScreenContextAttachmentId = undefined;
+      screenContextAttachmentId.value = normalized.attachmentId;
+    }
     screenContextAttachmentError.value = undefined;
     return true;
   } catch (caught: unknown) {

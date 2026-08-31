@@ -419,16 +419,23 @@ describe("D24-C2 Chat screen-context attachment", () => {
     expect(document.body.textContent ?? "").not.toContain("Screen context attached");
   });
 
-  it("keeps C2 out of conversation requests, persistence, and screen authority", () => {
+  it("keeps the attachment handoff bounded and out of screen authority", () => {
     const chatView = fs.readFileSync(path.join(process.cwd(), "src/chat/ChatView.vue"), "utf8");
     const attachmentService = fs.readFileSync(
       path.join(process.cwd(), "src/perception/screenContextAttachmentService.ts"),
       "utf8",
     );
 
-    expect(chatView).not.toContain("perceptionAttachmentId");
+    expect(chatView).toContain("perceptionAttachmentId");
     expect(chatView).not.toMatch(/observe_screen_now|prepare_main_screen_context_for_chat|offer_main_screen_context_to_chat/);
     expect(chatView).not.toMatch(/localStorage|sessionStorage|indexedDB|console\.(log|info|warn|error)/);
+    const sendStart = chatView.indexOf("async function send(content: string): Promise<void> {");
+    const sendEnd = chatView.indexOf("async function createConversation", sendStart);
+    expect(sendStart).toBeGreaterThanOrEqual(0);
+    expect(sendEnd).toBeGreaterThan(sendStart);
+    const sendSource = chatView.slice(sendStart, sendEnd);
+    expect(sendSource).toContain("perceptionAttachmentId");
+    expect(sendSource).not.toMatch(/screenText|ocrText|candidateId|grantId/);
     expect(attachmentService).not.toContain("perceptionAttachmentId");
     expect(attachmentService).not.toMatch(/localStorage|sessionStorage|indexedDB|console\.(log|info|warn|error)/);
     expect(attachmentService).toContain("get_pending_screen_context_attachment");

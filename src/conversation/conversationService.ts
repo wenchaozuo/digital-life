@@ -29,6 +29,18 @@ export class ConversationError extends Error {
 interface ConversationModelPort {
   chatWithGovernedContext(request: GovernedConversationRequest): Promise<GovernedConversationResponse>;
 }
+
+interface PendingPerceptionRetry {
+  requestId: string;
+  conversationId: string;
+  currentMessage: string;
+  perceptionAttachmentId: string;
+}
+
+const PERCEPTION_CONTEXT_RETRY_MISMATCH_CODE = "PERCEPTION_CONTEXT_RETRY_MISMATCH";
+const PERCEPTION_CONTEXT_RETRY_MISMATCH_MESSAGE =
+  "This attached screen context is reserved for the previous failed message. Retry that message unchanged or observe and attach the screen again.";
+
 interface ConversationLifePort { getCurrent(): Promise<LifeIdentity | undefined>; }
 interface ConversationBodyPort {
   transition(state: "thinking" | "speaking" | "idle" | "error"): unknown;
@@ -49,6 +61,7 @@ export class ConversationService {
   private isDeleting = false;
   private isRestoring = false;
   private currentConversation?: ConversationSummary;
+  private pendingPerceptionRetry?: PendingPerceptionRetry;
 
   constructor(dependencies: Partial<ConversationServiceDependencies> = {}) {
     this.dependencies = {
@@ -150,11 +163,27 @@ export class ConversationService {
       if (!this.currentConversation) {
         this.currentConversation = await this.dependencies.history.create("新对话");
       }
-      const runtime = await this.dependencies.model.chatWithGovernedContext({
-        requestId: crypto.randomUUID(),
+      const perceptionAttachmentId = request.perceptionAttachmentId;
+      const pendingPerceptionRetry = perceptionAttachmentId === undefined
+        ? undefined
+        : this.establishPerceptionRetry(
+          this.currentConversation.id,
+          userInput,
+          perceptionAttachmentId,
+        );
+      const requestId = pendingPerceptionRetry?.requestId ?? crypto.randomUUID();
+      const governedRequest: GovernedConversationRequest = {
+        requestId,
         conversationId: this.currentConversation.id,
         currentMessage: userInput,
+        ...(perceptionAttachmentId === undefined ? {} : { perceptionAttachmentId }),
+      };
+      const runtime = await this.dependencies.model.chatWithGovernedContext({
+        ...governedRequest,
       });
+      if (pendingPerceptionRetry !== undefined) {
+        this.clearMatchingPerceptionRetry(pendingPerceptionRetry);
+      }
       this.dependencies.session.appendPersistedTurn(runtime.persistedMessages);
       const [userMessage, assistantMessage] = runtime.persistedMessages.map((message) => ({
         role: message.role,
@@ -170,6 +199,48 @@ export class ConversationService {
     } finally {
       if (this.dependencies.body.getState() === "speaking") this.dependencies.body.transition("idle");
       this.isSending = false;
+    }
+  }
+
+  private establishPerceptionRetry(
+    conversationId: string,
+    currentMessage: string,
+    perceptionAttachmentId: string,
+  ): PendingPerceptionRetry {
+    const existing = this.pendingPerceptionRetry;
+    if (existing?.perceptionAttachmentId === perceptionAttachmentId) {
+      if (
+        existing.conversationId !== conversationId
+        || existing.currentMessage !== currentMessage
+      ) {
+        throw new ConversationError(
+          PERCEPTION_CONTEXT_RETRY_MISMATCH_CODE,
+          PERCEPTION_CONTEXT_RETRY_MISMATCH_MESSAGE,
+          true,
+        );
+      }
+      return existing;
+    }
+
+    const next: PendingPerceptionRetry = {
+      requestId: crypto.randomUUID(),
+      conversationId,
+      currentMessage,
+      perceptionAttachmentId,
+    };
+    this.pendingPerceptionRetry = next;
+    return next;
+  }
+
+  private clearMatchingPerceptionRetry(retry: PendingPerceptionRetry): void {
+    const current = this.pendingPerceptionRetry;
+    if (
+      current?.requestId === retry.requestId
+      && current.conversationId === retry.conversationId
+      && current.currentMessage === retry.currentMessage
+      && current.perceptionAttachmentId === retry.perceptionAttachmentId
+    ) {
+      this.pendingPerceptionRetry = undefined;
     }
   }
 

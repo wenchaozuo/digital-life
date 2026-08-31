@@ -11,6 +11,7 @@ export interface GovernedConversationRequest {
   requestId: string;
   conversationId: string;
   currentMessage: string;
+  perceptionAttachmentId?: string;
 }
 
 export type ConversationDegradationCode =

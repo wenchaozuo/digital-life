@@ -11,6 +11,7 @@ export interface ConversationMessage {
 
 export interface ConversationRequest {
   userInput: string;
+  perceptionAttachmentId?: string;
 }
 
 export interface ConversationResponse {

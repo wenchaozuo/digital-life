@@ -33,12 +33,14 @@
 //!   expiry, or retirement removes the authority;
 //! - cancellation clears any current state; retirement clears only a bound
 //!   grant whose binding matches the expected scope;
-//! - D24-C1 adds two narrow crate-internal seams for the Chat attachment
-//!   bridge: `validate_pending_grant` verifies an exact, non-expired Pending
-//!   Grant tuple without binding, refreshing, or returning any payload, and
-//!   `cancel_pending_grant` exact-cancels only the Pending Grant whose grant
-//!   ID and Life match exactly (never a Candidate, a different/newer Pending
-//!   Grant, or a Bound Grant);
+//! - D24-C1 adds narrow crate-internal seams for the Chat attachment bridge:
+//!   `validate_pending_grant` verifies an exact, non-expired Pending Grant
+//!   tuple without binding, refreshing, or returning any payload,
+//!   `validate_attachment_grant_alive` verifies the exact non-expired
+//!   Pending-or-Bound Grant tuple without exposing payload or binding scope,
+//!   and `cancel_pending_grant` exact-cancels only the Pending Grant whose
+//!   grant ID and Life match exactly (never a Candidate, a different/newer
+//!   Pending Grant, or a Bound Grant);
 //! - no Candidate or Grant survives broker reconstruction; a freshly
 //!   constructed broker is always `EMPTY` and nothing is persisted;
 //! - every state transition is guarded by one canonical mutex; authority-
@@ -507,6 +509,64 @@ impl ScreenContextHandoffBroker {
             .map_err(|_| ScreenContextError::synchronization_unavailable())?;
         match &mut *state {
             ScreenContextState::GrantPending {
+                grant_id: stored_grant_id,
+                life_id: grant_life_id,
+                session_fence: grant_fence,
+                deadline,
+                ..
+            } => {
+                if now >= *deadline {
+                    *state = ScreenContextState::Empty;
+                    return Err(ScreenContextError::expired());
+                }
+                if grant_id != stored_grant_id.as_str() {
+                    return Err(ScreenContextError::no_current_context());
+                }
+                if life_id != *grant_life_id {
+                    return Err(ScreenContextError::life_mismatch());
+                }
+                if session_fence != *grant_fence {
+                    return Err(ScreenContextError::session_fence_mismatch());
+                }
+                Ok(())
+            }
+            _ => Err(ScreenContextError::no_current_context()),
+        }
+    }
+
+    /// Validates that the current state is exactly the non-expired Grant for
+    /// the supplied grant / Life / session-fence tuple.  Both `GrantPending`
+    /// and `GrantBound` are valid because the Chat attachment marker remains
+    /// authoritative presentation state while a governed request is using
+    /// the grant.
+    ///
+    /// D24-D1-R1 narrow authority seam: this method returns no payload and no
+    /// conversation/request binding metadata; it never binds, refreshes, or
+    /// widens authority.  A Candidate, a missing/replaced grant, or any
+    /// mismatched tuple fails closed.  Expiry clears the underlying state to
+    /// `EMPTY` for both Pending and Bound grants and cannot resurrect it.
+    pub(crate) fn validate_attachment_grant_alive(
+        &self,
+        grant_id: &str,
+        life_id: &str,
+        session_fence: ScreenContextSessionFence,
+    ) -> Result<(), ScreenContextError> {
+        validate_scope_id("grant identity", grant_id)?;
+        validate_life_id(life_id)?;
+        let now = self.clock.now();
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ScreenContextError::synchronization_unavailable())?;
+        match &mut *state {
+            ScreenContextState::GrantPending {
+                grant_id: stored_grant_id,
+                life_id: grant_life_id,
+                session_fence: grant_fence,
+                deadline,
+                ..
+            }
+            | ScreenContextState::GrantBound {
                 grant_id: stored_grant_id,
                 life_id: grant_life_id,
                 session_fence: grant_fence,
@@ -1568,6 +1628,125 @@ mod tests {
             REQUEST_1,
         );
         assert_eq!(payload.text, "hello");
+    }
+
+    #[test]
+    fn attachment_grant_liveness_accepts_pending_without_binding_or_payload() {
+        let (broker, _clock) = broker_with_manual_clock();
+        let candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("hello"));
+        let grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
+
+        // The liveness seam returns only unit: it cannot expose payload or
+        // conversation/request binding data, and it must not bind the grant.
+        broker
+            .validate_attachment_grant_alive(&grant_id, LIFE_A, FENCE_1)
+            .expect("the exact Pending Grant must be live");
+        assert!(matches!(
+            &*broker.state.lock().unwrap(),
+            ScreenContextState::GrantPending { .. }
+        ));
+        let payload = claim_ok(
+            &broker,
+            &grant_id,
+            LIFE_A,
+            FENCE_1,
+            CONVERSATION_1,
+            REQUEST_1,
+        );
+        assert_eq!(payload.text, "hello");
+    }
+
+    #[test]
+    fn attachment_grant_liveness_accepts_bound_without_binding_scope() {
+        let (broker, _clock) = broker_with_manual_clock();
+        let candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("bound"));
+        let grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
+        let _payload = claim_ok(
+            &broker,
+            &grant_id,
+            LIFE_A,
+            FENCE_1,
+            CONVERSATION_1,
+            REQUEST_1,
+        );
+
+        broker
+            .validate_attachment_grant_alive(&grant_id, LIFE_A, FENCE_1)
+            .expect("the exact Bound Grant must remain live");
+        // Liveness did not consume or alter the bound authority: the same
+        // request scope can still perform its normal retry claim.
+        let retry = claim_ok(
+            &broker,
+            &grant_id,
+            LIFE_A,
+            FENCE_1,
+            CONVERSATION_1,
+            REQUEST_1,
+        );
+        assert_eq!(retry.text, "bound");
+    }
+
+    #[test]
+    fn attachment_grant_liveness_rejects_candidate_and_wrong_tuple() {
+        let (broker, _clock) = broker_with_manual_clock();
+        let candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("hello"));
+        let error = broker
+            .validate_attachment_grant_alive(&candidate_id, LIFE_A, FENCE_1)
+            .expect_err("a Candidate is not a live attachment Grant");
+        assert_eq!(error.code, ScreenContextErrorCode::NoCurrentContext);
+
+        let grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
+        let error = broker
+            .validate_attachment_grant_alive("wrong-grant", LIFE_A, FENCE_1)
+            .expect_err("a wrong grant identity must not validate");
+        assert_eq!(error.code, ScreenContextErrorCode::NoCurrentContext);
+        let error = broker
+            .validate_attachment_grant_alive(&grant_id, LIFE_B, FENCE_1)
+            .expect_err("a wrong Life must not validate");
+        assert_eq!(error.code, ScreenContextErrorCode::LifeMismatch);
+        let error = broker
+            .validate_attachment_grant_alive(&grant_id, LIFE_A, FENCE_2)
+            .expect_err("a wrong session fence must not validate");
+        assert_eq!(error.code, ScreenContextErrorCode::SessionFenceMismatch);
+        broker
+            .validate_attachment_grant_alive(&grant_id, LIFE_A, FENCE_1)
+            .expect("the exact Pending Grant must remain live");
+    }
+
+    #[test]
+    fn expired_pending_attachment_grant_liveness_clears_underlying_state() {
+        let (broker, clock) = broker_with_manual_clock();
+        let candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("pending"));
+        let grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
+        clock.advance(SCREEN_CONTEXT_HANDOFF_TTL);
+
+        let error = broker
+            .validate_attachment_grant_alive(&grant_id, LIFE_A, FENCE_1)
+            .expect_err("an expired Pending Grant must fail closed");
+        assert_eq!(error.code, ScreenContextErrorCode::Expired);
+        assert_empty(&broker);
+    }
+
+    #[test]
+    fn expired_bound_attachment_grant_liveness_clears_underlying_state() {
+        let (broker, clock) = broker_with_manual_clock();
+        let candidate_id = install(&broker, LIFE_A, FENCE_1, recognized("bound"));
+        let grant_id = issue(&broker, &candidate_id, LIFE_A, FENCE_1);
+        let _payload = claim_ok(
+            &broker,
+            &grant_id,
+            LIFE_A,
+            FENCE_1,
+            CONVERSATION_1,
+            REQUEST_1,
+        );
+        clock.advance(SCREEN_CONTEXT_HANDOFF_TTL);
+
+        let error = broker
+            .validate_attachment_grant_alive(&grant_id, LIFE_A, FENCE_1)
+            .expect_err("an expired Bound Grant must fail closed");
+        assert_eq!(error.code, ScreenContextErrorCode::Expired);
+        assert_empty(&broker);
     }
 
     #[test]

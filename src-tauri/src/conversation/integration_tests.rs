@@ -30,7 +30,9 @@ use crate::{
         runtime::ModelRuntimeCoordinator,
     },
     perception::{
-        screen_chat_attachment::ScreenContextChatAttachmentBroker,
+        screen_chat_attachment::{
+            get_pending_screen_context_attachment_service, ScreenContextChatAttachmentBroker,
+        },
         screen_context::{
             BrokerClock, ScreenContextCandidateInput, ScreenContextErrorCode,
             ScreenContextHandoffBroker, ScreenContextIds, ScreenContextSessionFence,
@@ -3822,6 +3824,23 @@ fn d24_d1_provider_failure_leaves_bound_grant_for_same_scope_retry_only() {
             .screen_attachment_broker
             .get_exact(&attachment_id)
             .is_ok());
+
+        // The provider failure leaves the grant Bound for an exact same-scope
+        // retry.  A status reread must preserve that marker while the Bound
+        // grant is still live; it must not treat Bound as stale Pending state.
+        let status = get_pending_screen_context_attachment_service(
+            fixture.storage.as_ref(),
+            fixture.storage.as_ref(),
+            fixture.screen_session_gate.as_ref(),
+            fixture.screen_handoff_broker.as_ref(),
+            fixture.screen_attachment_broker.as_ref(),
+        )
+        .expect("status reread must remain authoritative after provider failure");
+        assert!(status.available);
+        assert_eq!(
+            status.attachment_id.as_deref(),
+            Some(attachment_id.as_str())
+        );
 
         let same_scope_payload = fixture
             .screen_handoff_broker

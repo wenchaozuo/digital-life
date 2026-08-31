@@ -1,8 +1,9 @@
 //! D24-C1 Chat attachment ownership bridge (process-local presentation state).
 //!
 //! This module owns the ONE App-managed [`ScreenContextChatAttachmentBroker`]:
-//! a single-slot marker that links a validated `GrantPending` from the D24-A
-//! [`ScreenContextHandoffBroker`] to an opaque Chat-facing attachment ID.
+//! a single-slot marker that links a validated `GrantPending` or `GrantBound`
+//! from the D24-A [`ScreenContextHandoffBroker`] to an opaque Chat-facing
+//! attachment ID.
 //!
 //! Frozen contract:
 //!
@@ -19,7 +20,8 @@
 //!   offer replaces the stale marker;
 //! - Chat-facing commands never accept authoritative screen data: the status
 //!   command re-reads the authoritative current Life, durable consent, and
-//!   current session fence, then re-validates the underlying Pending Grant;
+//!   current session fence, then re-validates the underlying Pending-or-Bound
+//!   Grant;
 //! - every exact removal cancels the matching Pending Grant only — never a
 //!   newer handoff, never the global broker `cancel()`.
 //!
@@ -378,6 +380,58 @@ pub(crate) fn clear_current_attachment_and_cancel_grant(
     cancel_and_remove_exact_attachment(handoff_broker, attachment_broker, &attachment_id).is_ok()
 }
 
+/// Chat dismiss path for one exact attachment.  A Pending Grant is cancelled
+/// before its marker is removed.  When cancellation reports no current
+/// Pending Grant, the attachment-specific liveness seam distinguishes an
+/// exact live Bound Grant (keep the marker and return a bounded recoverable
+/// error) from an absent/replaced/expired grant (remove only the old marker).
+/// Synchronization uncertainty never removes the marker.
+fn dismiss_exact_attachment(
+    handoff_broker: &ScreenContextHandoffBroker,
+    attachment_broker: &ScreenContextChatAttachmentBroker,
+    attachment_id: &str,
+) -> Result<(), ChatScreenContextAttachmentErrorDto> {
+    let attachment = attachment_broker
+        .get_exact(attachment_id)
+        .map_err(chat_attachment_error_dto)?;
+    match handoff_broker.cancel_pending_grant(&attachment.grant_id, &attachment.life_id) {
+        Ok(()) => attachment_broker
+            .remove_exact(&attachment.attachment_id)
+            .map(|_| ())
+            .map_err(chat_attachment_error_dto),
+        Err(error)
+            if matches!(
+                error.code,
+                ScreenContextErrorCode::NoCurrentContext | ScreenContextErrorCode::LifeMismatch
+            ) =>
+        {
+            match handoff_broker.validate_attachment_grant_alive(
+                &attachment.grant_id,
+                &attachment.life_id,
+                attachment.session_fence,
+            ) {
+                Ok(()) => Err(ChatScreenContextAttachmentErrorDto::attachment_in_use()),
+                Err(error)
+                    if matches!(
+                        error.code,
+                        ScreenContextErrorCode::SynchronizationUnavailable
+                    ) =>
+                {
+                    Err(chat_handoff_attachment_error_dto(error))
+                }
+                Err(error) if error.code == ScreenContextErrorCode::InvalidArgument => {
+                    Err(chat_handoff_attachment_error_dto(error))
+                }
+                Err(_) => attachment_broker
+                    .remove_exact(&attachment.attachment_id)
+                    .map(|_| ())
+                    .map_err(chat_attachment_error_dto),
+            }
+        }
+        Err(error) => Err(chat_handoff_attachment_error_dto(error)),
+    }
+}
+
 /// Bounded Chat-facing status: only `available` plus the opaque
 /// `attachmentId` when available.  No grantId, candidateId, OCR, capturedAt,
 /// session fence, target, PID, HWND, or window details ever leave the
@@ -463,6 +517,14 @@ impl ChatScreenContextAttachmentErrorDto {
         )
     }
 
+    fn attachment_in_use() -> Self {
+        Self::new(
+            "SCREEN_CONTEXT_ATTACHMENT_IN_USE",
+            "The screen context attachment is currently in use and cannot be dismissed yet.",
+            true,
+        )
+    }
+
     fn life_unavailable() -> Self {
         Self::new(
             "SCREEN_CONTEXT_LIFE_UNAVAILABLE",
@@ -505,6 +567,12 @@ fn chat_handoff_attachment_error(error: ScreenContextError) -> ScreenContextChat
         }
         _ => ScreenContextChatAttachmentError::synchronization_unavailable(),
     }
+}
+
+fn chat_handoff_attachment_error_dto(
+    error: ScreenContextError,
+) -> ChatScreenContextAttachmentErrorDto {
+    chat_attachment_error_dto(chat_handoff_attachment_error(error))
 }
 
 /// Rejects any caller that is not the Chat window.  The label is assigned by
@@ -594,7 +662,7 @@ pub(crate) fn get_pending_screen_context_attachment_service(
         return Ok(ChatScreenContextAttachmentStatusDto::unavailable());
     }
 
-    match handoff_broker.validate_pending_grant(
+    match handoff_broker.validate_attachment_grant_alive(
         &attachment.grant_id,
         &current_life_id,
         ScreenContextSessionFence(fence),
@@ -612,15 +680,16 @@ pub(crate) fn get_pending_screen_context_attachment_service(
 }
 
 /// Chat-only dismiss.  Exact-cancels the matching underlying Pending Grant
-/// before removing the attachment marker.  There is no UI-only dismissal and
-/// no global cancel; a newer unrelated offer is never removed.
+/// before removing the attachment marker.  A live Bound Grant remains marked
+/// and returns a bounded recoverable in-use error; there is no UI-only
+/// dismissal and no global cancel, and a newer unrelated offer is never
+/// removed.
 pub(crate) fn dismiss_pending_screen_context_attachment_service(
     handoff_broker: &ScreenContextHandoffBroker,
     attachment_broker: &ScreenContextChatAttachmentBroker,
     attachment_id: &str,
 ) -> Result<(), ChatScreenContextAttachmentErrorDto> {
-    cancel_and_remove_exact_attachment(handoff_broker, attachment_broker, attachment_id)
-        .map_err(chat_attachment_error_dto)
+    dismiss_exact_attachment(handoff_broker, attachment_broker, attachment_id)
 }
 
 /// Chat-only: reads the current attachment status through full backend
@@ -662,7 +731,7 @@ pub fn dismiss_pending_screen_context_attachment(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::perception::screen_context::ScreenContextCandidateInput;
+    use crate::perception::screen_context::{ScreenContextCandidateInput, ScreenContextIds};
     use crate::perception::screen_ocr::{ScreenObservation, ScreenObservationStatus};
 
     const LIFE_A: &str = "life-a";
@@ -1093,6 +1162,39 @@ mod tests {
     }
 
     #[test]
+    fn status_preserves_attachment_when_grant_is_bound() {
+        let fixture = StatusFixture::armed();
+        let attachment_id = fixture.offer_current_grant();
+        let attachment = fixture
+            .attachment_broker
+            .get_exact(&attachment_id)
+            .expect("the offered attachment must be readable");
+        fixture
+            .handoff_broker
+            .claim_grant(ScreenContextIds {
+                grant_id: attachment.grant_id.clone(),
+                life_id: LIFE_A.to_string(),
+                session_fence: attachment.session_fence,
+                conversation_id: "bound-conversation".to_string(),
+                request_id: "bound-request".to_string(),
+            })
+            .expect("the attachment grant must bind");
+
+        assert_eq!(
+            fixture.status().unwrap(),
+            ChatScreenContextAttachmentStatusDto::available(attachment_id.clone())
+        );
+        assert_eq!(
+            fixture
+                .attachment_broker
+                .current()
+                .expect("a live Bound Grant must preserve its marker")
+                .attachment_id,
+            attachment_id
+        );
+    }
+
+    #[test]
     fn status_invalidates_stale_attachment_for_wrong_life() {
         let fixture = StatusFixture::armed();
         let _attachment_id = fixture.offer_current_grant();
@@ -1179,6 +1281,47 @@ mod tests {
     }
 
     #[test]
+    fn status_clears_attachment_when_bound_grant_expires() {
+        let clock = ManualClock::new();
+        let handoff_broker = ScreenContextHandoffBroker::with_clock(Box::new(clock.clone()));
+        let session_gate = ScreenPerceptionSessionGate::new();
+        session_gate.arm_for_life(LIFE_A);
+        let fence = session_gate.life_fence_for(LIFE_A).unwrap();
+        let grant_id = install_and_issue(&handoff_broker, LIFE_A, ScreenContextSessionFence(fence));
+        let attachment_broker = ScreenContextChatAttachmentBroker::new();
+        let attachment_id = offer(
+            &attachment_broker,
+            &grant_id,
+            LIFE_A,
+            ScreenContextSessionFence(fence),
+        );
+        handoff_broker
+            .claim_grant(ScreenContextIds {
+                grant_id,
+                life_id: LIFE_A.to_string(),
+                session_fence: ScreenContextSessionFence(fence),
+                conversation_id: "bound-conversation".to_string(),
+                request_id: "bound-request".to_string(),
+            })
+            .expect("the attachment grant must bind");
+        clock.advance(super::super::screen_context::SCREEN_CONTEXT_HANDOFF_TTL);
+
+        let fixture = StatusFixture {
+            current_life: FakeCurrentLife::for_life(LIFE_A),
+            repository: FakeRepository::with_policy(true),
+            session_gate,
+            handoff_broker,
+            attachment_broker,
+        };
+        assert_eq!(
+            fixture.status().unwrap(),
+            ChatScreenContextAttachmentStatusDto::unavailable()
+        );
+        assert_broker_empty(&fixture.attachment_broker);
+        let _ = attachment_id;
+    }
+
+    #[test]
     fn status_clears_attachment_when_grant_replaced_by_newer_candidate() {
         let fixture = StatusFixture::armed();
         let fence = fixture
@@ -1190,12 +1333,26 @@ mod tests {
             LIFE_A,
             ScreenContextSessionFence(fence),
         );
-        offer(
+        let attachment_id = offer(
             &fixture.attachment_broker,
             &grant_id,
             LIFE_A,
             ScreenContextSessionFence(fence),
         );
+        let attachment = fixture
+            .attachment_broker
+            .get_exact(&attachment_id)
+            .expect("the offered attachment must be readable");
+        fixture
+            .handoff_broker
+            .claim_grant(ScreenContextIds {
+                grant_id: attachment.grant_id,
+                life_id: LIFE_A.to_string(),
+                session_fence: attachment.session_fence,
+                conversation_id: "bound-conversation".to_string(),
+                request_id: "bound-request".to_string(),
+            })
+            .expect("the old attachment grant must bind before replacement");
         // A newer Candidate installation replaces the grant: the marker is stale.
         let newer_candidate_id = fixture
             .handoff_broker
@@ -1381,6 +1538,55 @@ mod tests {
             .validate_pending_grant(&grant_id, LIFE_A, ScreenContextSessionFence(fence))
             .expect_err("the dismissed grant must no longer be pending");
         assert_eq!(error.code, ScreenContextErrorCode::NoCurrentContext);
+    }
+
+    #[test]
+    fn dismiss_keeps_live_bound_attachment_and_returns_bounded_in_use_error() {
+        let fixture = StatusFixture::armed();
+        let attachment_id = fixture.offer_current_grant();
+        let attachment = fixture
+            .attachment_broker
+            .get_exact(&attachment_id)
+            .expect("the offered attachment must be readable");
+        fixture
+            .handoff_broker
+            .claim_grant(ScreenContextIds {
+                grant_id: attachment.grant_id.clone(),
+                life_id: LIFE_A.to_string(),
+                session_fence: attachment.session_fence,
+                conversation_id: "bound-conversation".to_string(),
+                request_id: "bound-request".to_string(),
+            })
+            .expect("the attachment grant must bind");
+
+        let error = dismiss_pending_screen_context_attachment_service(
+            &fixture.handoff_broker,
+            &fixture.attachment_broker,
+            &attachment_id,
+        )
+        .expect_err("a live Bound Grant must not be dismissed");
+        assert_eq!(error.code, "SCREEN_CONTEXT_ATTACHMENT_IN_USE");
+        assert!(error.recoverable);
+        assert!(error.message.contains("currently in use"));
+        assert!(!error.message.contains(&attachment.grant_id));
+        assert_eq!(
+            fixture
+                .attachment_broker
+                .current()
+                .expect("the live Bound Grant marker must remain retryable")
+                .attachment_id,
+            attachment_id
+        );
+        fixture
+            .handoff_broker
+            .claim_grant(ScreenContextIds {
+                grant_id: attachment.grant_id,
+                life_id: LIFE_A.to_string(),
+                session_fence: attachment.session_fence,
+                conversation_id: "bound-conversation".to_string(),
+                request_id: "bound-request".to_string(),
+            })
+            .expect("dismiss must not cancel the Bound Grant");
     }
 
     #[test]

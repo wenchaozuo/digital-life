@@ -79,6 +79,12 @@ pub fn run() {
             app.manage(
                 perception::screen_chat_attachment::ScreenContextChatAttachmentBroker::new(),
             );
+            // D25-C2: the single process-local screen-vision outbound
+            // candidate authority.  It owns at most one C1 projection and is
+            // deliberately not exposed through a Tauri command or ACL.
+            app.manage(
+                perception::screen_vision_outbound_candidate::ScreenVisionOutboundCandidateBroker::new(),
+            );
             app.manage(storage::LlmCandidateExtractionCoordinator::default());
             app.manage(model::runtime::ModelRuntimeCoordinator::default());
             app.manage(conversation::ConversationCognitionCoordinator::default());

@@ -1,7 +1,7 @@
 //! D25-D2 process-local one-shot screen-vision outbound authorization.
 //!
-//! This module owns one exact READY/BOUND authorization slot for a future
-//! delivery.  It composes existing local authorities and the frozen D1
+//! This module owns one exact READY/BOUND/CONSUMED authorization slot for a
+//! future delivery.  It composes existing local authorities and the frozen D1
 //! destination value, but it never performs transport, resolves credentials,
 //! reads image bytes, or exposes an IPC surface.
 
@@ -38,6 +38,8 @@ pub(crate) enum ScreenVisionOutboundGrantErrorCode {
     ConfirmationEventConflict,
     GrantMismatch,
     GrantExpired,
+    GrantConsumed,
+    CandidateConsumed,
     GrantInUse,
     DeliveryConflict,
     DestinationMismatch,
@@ -64,6 +66,13 @@ impl ScreenVisionOutboundGrantError {
 pub(crate) enum ScreenVisionOutboundGrantState {
     Ready,
     Bound,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScreenVisionOutboundGrantTerminalReason {
+    Expired,
+    Revoked,
+    Succeeded,
 }
 
 /// Bounded grant metadata.  Destination URL/model details are intentionally
@@ -108,6 +117,10 @@ enum ScreenVisionOutboundGrantStateSlot {
     Bound {
         grant: ScreenVisionOutboundGrantRecord,
         delivery_id: String,
+    },
+    Consumed {
+        grant: ScreenVisionOutboundGrantRecord,
+        terminal_reason: ScreenVisionOutboundGrantTerminalReason,
     },
 }
 
@@ -220,7 +233,7 @@ impl ScreenVisionOutboundGrantBroker {
 
         let mut state = self.lock_state()?;
         let now = self.clock.now();
-        expire_ready_if_needed(&mut state, now);
+        consume_ready_if_needed(&mut state, now);
 
         if let ScreenVisionOutboundGrantStateSlot::Bound { .. } = &*state {
             return Err(grant_error(ScreenVisionOutboundGrantErrorCode::GrantInUse));
@@ -240,6 +253,35 @@ impl ScreenVisionOutboundGrantBroker {
                 }
                 return Err(grant_error(
                     ScreenVisionOutboundGrantErrorCode::ConfirmationEventConflict,
+                ));
+            }
+            if current.candidate_id == candidate_id {
+                return Err(grant_error(ScreenVisionOutboundGrantErrorCode::GrantInUse));
+            }
+        }
+
+        if let ScreenVisionOutboundGrantStateSlot::Consumed {
+            grant,
+            terminal_reason,
+        } = &*state
+        {
+            if grant.confirmation_event_id == confirmation_event_id {
+                return Err(
+                    if grant.candidate_id == candidate_id
+                        && grant.life_id == life_id
+                        && grant.screen_session_fence == canonical_fence
+                        && grant.outbound_policy_revision == candidate_revision
+                        && grant.destination_binding == destination_binding
+                    {
+                        terminal_error(*terminal_reason)
+                    } else {
+                        grant_error(ScreenVisionOutboundGrantErrorCode::ConfirmationEventConflict)
+                    },
+                );
+            }
+            if grant.candidate_id == candidate_id {
+                return Err(grant_error(
+                    ScreenVisionOutboundGrantErrorCode::CandidateConsumed,
                 ));
             }
         }
@@ -271,7 +313,8 @@ impl ScreenVisionOutboundGrantBroker {
     }
 
     /// Returns bounded metadata only.  READY expires at the exact monotonic
-    /// TTL; BOUND is never auto-expired by that TTL.
+    /// TTL and becomes a terminal tombstone; BOUND is never auto-expired by
+    /// that TTL.
     pub(crate) fn get_exact(
         &self,
         grant_id: &str,
@@ -279,11 +322,7 @@ impl ScreenVisionOutboundGrantBroker {
         validate_id(grant_id)?;
         let mut state = self.lock_state()?;
         let now = self.clock.now();
-        if expire_ready_if_needed(&mut state, now) {
-            return Err(grant_error(
-                ScreenVisionOutboundGrantErrorCode::GrantExpired,
-            ));
-        }
+        consume_ready_if_needed(&mut state, now);
 
         match &*state {
             ScreenVisionOutboundGrantStateSlot::Empty => Err(grant_error(
@@ -313,6 +352,17 @@ impl ScreenVisionOutboundGrantBroker {
                     now,
                 ))
             }
+            ScreenVisionOutboundGrantStateSlot::Consumed {
+                grant,
+                terminal_reason,
+            } => {
+                if grant.grant_id != grant_id {
+                    return Err(grant_error(
+                        ScreenVisionOutboundGrantErrorCode::GrantMismatch,
+                    ));
+                }
+                Err(terminal_error(*terminal_reason))
+            }
         }
     }
 
@@ -325,15 +375,20 @@ impl ScreenVisionOutboundGrantBroker {
         validate_id(grant_id)?;
         let mut state = self.lock_state()?;
         let now = self.clock.now();
-        if expire_ready_if_needed(&mut state, now) {
-            return Err(grant_error(
-                ScreenVisionOutboundGrantErrorCode::GrantExpired,
-            ));
-        }
+        consume_ready_if_needed(&mut state, now);
 
         match &*state {
             ScreenVisionOutboundGrantStateSlot::Ready(grant) if grant.grant_id == grant_id => {
-                *state = ScreenVisionOutboundGrantStateSlot::Empty;
+                let grant =
+                    match std::mem::replace(&mut *state, ScreenVisionOutboundGrantStateSlot::Empty)
+                    {
+                        ScreenVisionOutboundGrantStateSlot::Ready(grant) => grant,
+                        _ => unreachable!("grant state cannot change while its mutex is held"),
+                    };
+                *state = ScreenVisionOutboundGrantStateSlot::Consumed {
+                    grant,
+                    terminal_reason: ScreenVisionOutboundGrantTerminalReason::Revoked,
+                };
                 Ok(())
             }
             ScreenVisionOutboundGrantStateSlot::Bound { grant, .. }
@@ -341,6 +396,10 @@ impl ScreenVisionOutboundGrantBroker {
             {
                 Err(grant_error(ScreenVisionOutboundGrantErrorCode::GrantInUse))
             }
+            ScreenVisionOutboundGrantStateSlot::Consumed {
+                grant,
+                terminal_reason,
+            } if grant.grant_id == grant_id => Err(terminal_error(*terminal_reason)),
             _ => Err(grant_error(
                 ScreenVisionOutboundGrantErrorCode::GrantMismatch,
             )),
@@ -364,11 +423,7 @@ impl ScreenVisionOutboundGrantBroker {
 
         let mut state = self.lock_state()?;
         let now = self.clock.now();
-        if expire_ready_if_needed(&mut state, now) {
-            return Err(grant_error(
-                ScreenVisionOutboundGrantErrorCode::GrantExpired,
-            ));
-        }
+        consume_ready_if_needed(&mut state, now);
 
         match &*state {
             ScreenVisionOutboundGrantStateSlot::Empty => {
@@ -421,6 +476,17 @@ impl ScreenVisionOutboundGrantBroker {
                     ScreenVisionOutboundGrantErrorCode::DeliveryConflict,
                 ));
             }
+            ScreenVisionOutboundGrantStateSlot::Consumed {
+                grant,
+                terminal_reason,
+            } => {
+                if grant.grant_id != grant_id {
+                    return Err(grant_error(
+                        ScreenVisionOutboundGrantErrorCode::GrantMismatch,
+                    ));
+                }
+                return Err(terminal_error(*terminal_reason));
+            }
         }
 
         let ready_grant =
@@ -441,8 +507,9 @@ impl ScreenVisionOutboundGrantBroker {
         ))
     }
 
-    /// Clears only an exact BOUND grant owned by the exact delivery identity.
-    /// Wrong or stale completion identities cannot clear newer state.
+    /// Retires only an exact BOUND grant owned by the exact delivery identity
+    /// and records it as a terminal tombstone.  Wrong or stale completion
+    /// identities cannot clear newer state.
     pub(crate) fn retire_bound_after_success(
         &self,
         grant_id: &str,
@@ -457,7 +524,16 @@ impl ScreenVisionOutboundGrantBroker {
                 grant,
                 delivery_id: bound_delivery_id,
             } if grant.grant_id == grant_id && bound_delivery_id == delivery_id => {
-                *state = ScreenVisionOutboundGrantStateSlot::Empty;
+                let grant =
+                    match std::mem::replace(&mut *state, ScreenVisionOutboundGrantStateSlot::Empty)
+                    {
+                        ScreenVisionOutboundGrantStateSlot::Bound { grant, .. } => grant,
+                        _ => unreachable!("grant state cannot change while its mutex is held"),
+                    };
+                *state = ScreenVisionOutboundGrantStateSlot::Consumed {
+                    grant,
+                    terminal_reason: ScreenVisionOutboundGrantTerminalReason::Succeeded,
+                };
                 Ok(())
             }
             ScreenVisionOutboundGrantStateSlot::Bound { grant, .. }
@@ -470,6 +546,10 @@ impl ScreenVisionOutboundGrantBroker {
             ScreenVisionOutboundGrantStateSlot::Bound { .. } => Err(grant_error(
                 ScreenVisionOutboundGrantErrorCode::DeliveryConflict,
             )),
+            ScreenVisionOutboundGrantStateSlot::Consumed {
+                grant,
+                terminal_reason,
+            } if grant.grant_id == grant_id => Err(terminal_error(*terminal_reason)),
             _ => Err(grant_error(
                 ScreenVisionOutboundGrantErrorCode::GrantMismatch,
             )),
@@ -513,6 +593,21 @@ fn grant_error(code: ScreenVisionOutboundGrantErrorCode) -> ScreenVisionOutbound
     ScreenVisionOutboundGrantError::new(code)
 }
 
+fn terminal_error(
+    terminal_reason: ScreenVisionOutboundGrantTerminalReason,
+) -> ScreenVisionOutboundGrantError {
+    let code = match terminal_reason {
+        ScreenVisionOutboundGrantTerminalReason::Expired => {
+            ScreenVisionOutboundGrantErrorCode::GrantExpired
+        }
+        ScreenVisionOutboundGrantTerminalReason::Revoked
+        | ScreenVisionOutboundGrantTerminalReason::Succeeded => {
+            ScreenVisionOutboundGrantErrorCode::GrantConsumed
+        }
+    };
+    grant_error(code)
+}
+
 fn validate_id(value: &str) -> Result<(), ScreenVisionOutboundGrantError> {
     if value.trim().is_empty() || value.chars().count() > MAX_ID_CHARACTERS {
         return Err(grant_error(
@@ -549,17 +644,25 @@ fn read_outbound_policy_revision(
     Ok(policy.revision)
 }
 
-fn expire_ready_if_needed(state: &mut ScreenVisionOutboundGrantStateSlot, now: Instant) -> bool {
+fn consume_ready_if_needed(state: &mut ScreenVisionOutboundGrantStateSlot, now: Instant) -> bool {
     let expired = match state {
         ScreenVisionOutboundGrantStateSlot::Ready(grant) => {
             now.saturating_duration_since(grant.created_at)
                 >= SCREEN_VISION_OUTBOUND_READY_GRANT_TTL
         }
         ScreenVisionOutboundGrantStateSlot::Empty
-        | ScreenVisionOutboundGrantStateSlot::Bound { .. } => false,
+        | ScreenVisionOutboundGrantStateSlot::Bound { .. }
+        | ScreenVisionOutboundGrantStateSlot::Consumed { .. } => false,
     };
     if expired {
-        *state = ScreenVisionOutboundGrantStateSlot::Empty;
+        let grant = match std::mem::replace(state, ScreenVisionOutboundGrantStateSlot::Empty) {
+            ScreenVisionOutboundGrantStateSlot::Ready(grant) => grant,
+            _ => unreachable!("READY state cannot change while its mutex is held"),
+        };
+        *state = ScreenVisionOutboundGrantStateSlot::Consumed {
+            grant,
+            terminal_reason: ScreenVisionOutboundGrantTerminalReason::Expired,
+        };
     }
     expired
 }
@@ -789,6 +892,13 @@ mod tests {
             Self {
                 outputs: Mutex::new(outputs),
             }
+        }
+
+        fn remaining(&self) -> usize {
+            self.outputs
+                .lock()
+                .expect("grant id source should lock")
+                .len()
         }
     }
 
@@ -1190,23 +1300,23 @@ mod tests {
                 .issue("event-old", destination())
                 .expect("initial issue should succeed"),
         );
-        let newer = issue_metadata(
-            replace_fixture
-                .issue("event-new", destination())
-                .expect("different event should replace unused READY"),
-        );
-        assert_ne!(old.grant_id, newer.grant_id);
         assert_error_code(
-            replace_fixture.grant_broker.get_exact(&old.grant_id),
-            ScreenVisionOutboundGrantErrorCode::GrantMismatch,
+            replace_fixture.issue("event-new", destination()),
+            ScreenVisionOutboundGrantErrorCode::GrantInUse,
         );
+        let replayed = issue_metadata(
+            replace_fixture
+                .issue("event-old", destination())
+                .expect("same READY evidence should replay"),
+        );
+        assert_eq!(old.grant_id, replayed.grant_id);
         assert_eq!(
             replace_fixture
                 .grant_broker
-                .get_exact(&newer.grant_id)
-                .expect("new READY should remain live")
+                .get_exact(&old.grant_id)
+                .expect("original READY should remain live")
                 .grant_id,
-            newer.grant_id
+            old.grant_id
         );
     }
 
@@ -1235,6 +1345,23 @@ mod tests {
             bound_fixture.issue("event-replacement", destination()),
             ScreenVisionOutboundGrantErrorCode::GrantInUse,
         );
+        let bound_replacement_fence = bound_fixture
+            .session_gate
+            .life_fence_for(LIFE_A)
+            .expect("test session should be armed")
+            .to_string();
+        let bound_replacement_candidate = bound_fixture
+            .candidate_broker
+            .replace_candidate(LIFE_A, &bound_replacement_fence, REVISION_A, projection())
+            .expect("replacement candidate should install");
+        assert_error_code(
+            bound_fixture.issue_with(
+                "event-replacement-new-candidate",
+                &bound_replacement_candidate,
+                destination(),
+            ),
+            ScreenVisionOutboundGrantErrorCode::GrantInUse,
+        );
         assert_eq!(
             bound_fixture
                 .grant_broker
@@ -1246,15 +1373,15 @@ mod tests {
 
         let first_id = "a".repeat(GRANT_ID_HEX_LENGTH);
         let clock = ManualClock::new();
-        let scripted_source = ScriptedGrantIdSource::new(vec![
+        let scripted_source = Arc::new(ScriptedGrantIdSource::new(vec![
             Ok(first_id.clone()),
             Err(grant_error(
                 ScreenVisionOutboundGrantErrorCode::RandomUnavailable,
             )),
-        ]);
+        ]));
         let scripted_broker = ScreenVisionOutboundGrantBroker::with_clock_and_id_source(
             Arc::new(clock),
-            Arc::new(scripted_source),
+            scripted_source,
         );
         let random_fixture = Fixture::with_grant_broker(scripted_broker);
         let issued = issue_metadata(
@@ -1263,8 +1390,17 @@ mod tests {
                 .expect("scripted first ID should issue"),
         );
         assert_eq!(issued.grant_id, first_id);
+        let replacement_fence = random_fixture
+            .session_gate
+            .life_fence_for(LIFE_A)
+            .expect("test session should be armed")
+            .to_string();
+        let replacement_candidate = random_fixture
+            .candidate_broker
+            .replace_candidate(LIFE_A, &replacement_fence, REVISION_A, projection())
+            .expect("replacement candidate should install");
         assert_error_code(
-            random_fixture.issue("event-random-second", destination()),
+            random_fixture.issue_with("event-random-second", &replacement_candidate, destination()),
             ScreenVisionOutboundGrantErrorCode::RandomUnavailable,
         );
         assert_eq!(
@@ -1274,6 +1410,55 @@ mod tests {
                 .expect("random failure must preserve READY")
                 .grant_id,
             first_id
+        );
+
+        let consumed_first_id = "c".repeat(GRANT_ID_HEX_LENGTH);
+        let consumed_clock = ManualClock::new();
+        let consumed_source = ScriptedGrantIdSource::new(vec![
+            Ok(consumed_first_id.clone()),
+            Err(grant_error(
+                ScreenVisionOutboundGrantErrorCode::RandomUnavailable,
+            )),
+        ]);
+        let consumed_broker = ScreenVisionOutboundGrantBroker::with_clock_and_id_source(
+            Arc::new(consumed_clock),
+            Arc::new(consumed_source),
+        );
+        let consumed_fixture = Fixture::with_grant_broker(consumed_broker);
+        let consumed = issue_metadata(
+            consumed_fixture
+                .issue("event-random-consumed-first", destination())
+                .expect("scripted consumed issue should succeed"),
+        );
+        consumed_fixture
+            .grant_broker
+            .revoke_ready_exact(&consumed.grant_id)
+            .expect("READY should become consumed");
+        let consumed_replacement_fence = consumed_fixture
+            .session_gate
+            .life_fence_for(LIFE_A)
+            .expect("test session should be armed")
+            .to_string();
+        let consumed_replacement_candidate = consumed_fixture
+            .candidate_broker
+            .replace_candidate(
+                LIFE_A,
+                &consumed_replacement_fence,
+                REVISION_A,
+                projection(),
+            )
+            .expect("replacement candidate should install");
+        assert_error_code(
+            consumed_fixture.issue_with(
+                "event-random-consumed-second",
+                &consumed_replacement_candidate,
+                destination(),
+            ),
+            ScreenVisionOutboundGrantErrorCode::RandomUnavailable,
+        );
+        assert_error_code(
+            consumed_fixture.grant_broker.get_exact(&consumed_first_id),
+            ScreenVisionOutboundGrantErrorCode::GrantConsumed,
         );
 
         let sync_fixture = Fixture::new();
@@ -1358,7 +1543,7 @@ mod tests {
         );
         assert_error_code(
             ready_fixture.grant_broker.get_exact(&ready.grant_id),
-            ScreenVisionOutboundGrantErrorCode::GrantMismatch,
+            ScreenVisionOutboundGrantErrorCode::GrantExpired,
         );
 
         let read_clock = ManualClock::new();
@@ -1538,7 +1723,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_retirement_only_clears_exact_bound_state_and_stale_cleanup_cannot_touch_newer_state() {
+    fn exact_retirement_consumes_bound_state_and_stale_cleanup_cannot_touch_newer_state() {
         let fixture = Fixture::new();
         let first = issue_metadata(
             fixture
@@ -1574,7 +1759,7 @@ mod tests {
             .expect("exact retirement should clear BOUND");
         assert_error_code(
             fixture.grant_broker.get_exact(&first.grant_id),
-            ScreenVisionOutboundGrantErrorCode::GrantMismatch,
+            ScreenVisionOutboundGrantErrorCode::GrantConsumed,
         );
 
         let ready_fixture = Fixture::new();
@@ -1583,10 +1768,23 @@ mod tests {
                 .issue("event-ready-old", destination())
                 .expect("initial issue should succeed"),
         );
+        let ready_replacement_fence = ready_fixture
+            .session_gate
+            .life_fence_for(LIFE_A)
+            .expect("test session should be armed")
+            .to_string();
+        let ready_replacement_candidate = ready_fixture
+            .candidate_broker
+            .replace_candidate(LIFE_A, &ready_replacement_fence, REVISION_A, projection())
+            .expect("replacement candidate should install");
         let new_ready = issue_metadata(
             ready_fixture
-                .issue("event-ready-new", destination())
-                .expect("different event should replace READY"),
+                .issue_with(
+                    "event-ready-new",
+                    &ready_replacement_candidate,
+                    destination(),
+                )
+                .expect("new candidate should replace READY"),
         );
         assert_error_code(
             ready_fixture
@@ -1622,9 +1820,18 @@ mod tests {
             .grant_broker
             .retire_bound_after_success(&old_bound.grant_id, "delivery-old")
             .expect("old bound state should retire");
+        let replacement_fence = stale_bound_fixture
+            .session_gate
+            .life_fence_for(LIFE_A)
+            .expect("test session should be armed")
+            .to_string();
+        let replacement_candidate = stale_bound_fixture
+            .candidate_broker
+            .replace_candidate(LIFE_A, &replacement_fence, REVISION_A, projection())
+            .expect("replacement candidate should install");
         let new_ready = issue_metadata(
             stale_bound_fixture
-                .issue("event-bound-new", destination())
+                .issue_with("event-bound-new", &replacement_candidate, destination())
                 .expect("new READY should issue"),
         );
         assert_error_code(
@@ -1640,6 +1847,221 @@ mod tests {
                 .expect("stale retirement must preserve newer READY")
                 .grant_id,
             new_ready.grant_id
+        );
+    }
+
+    #[test]
+    fn expired_confirmation_is_consumed_without_a_second_id_generation() {
+        let first_id = "a".repeat(GRANT_ID_HEX_LENGTH);
+        let second_id = "b".repeat(GRANT_ID_HEX_LENGTH);
+        let clock = ManualClock::new();
+        let id_source = Arc::new(ScriptedGrantIdSource::new(vec![
+            Ok(first_id.clone()),
+            Ok(second_id),
+        ]));
+        let broker = ScreenVisionOutboundGrantBroker::with_clock_and_id_source(
+            Arc::new(clock.clone()),
+            id_source.clone(),
+        );
+        let fixture = Fixture::with_grant_broker(broker);
+        let first = issue_metadata(
+            fixture
+                .issue("event-expiring", destination())
+                .expect("initial issue should succeed"),
+        );
+        clock.advance(SCREEN_VISION_OUTBOUND_READY_GRANT_TTL);
+
+        assert_error_code(
+            fixture.issue("event-expiring", destination()),
+            ScreenVisionOutboundGrantErrorCode::GrantExpired,
+        );
+        assert_eq!(id_source.remaining(), 1);
+        assert_error_code(
+            fixture.grant_broker.get_exact(&first.grant_id),
+            ScreenVisionOutboundGrantErrorCode::GrantExpired,
+        );
+        assert_error_code(
+            fixture.grant_broker.claim_exact_for_delivery(
+                &first.grant_id,
+                "delivery-expired",
+                &fixture.candidate_id,
+                destination(),
+            ),
+            ScreenVisionOutboundGrantErrorCode::GrantExpired,
+        );
+    }
+
+    #[test]
+    fn successful_delivery_consumes_confirmation_and_candidate() {
+        let fixture = Fixture::new();
+        let issued = issue_metadata(
+            fixture
+                .issue("event-success", destination())
+                .expect("initial issue should succeed"),
+        );
+        fixture
+            .grant_broker
+            .claim_exact_for_delivery(
+                &issued.grant_id,
+                "delivery-success",
+                &fixture.candidate_id,
+                destination(),
+            )
+            .expect("exact claim should succeed");
+        fixture
+            .grant_broker
+            .retire_bound_after_success(&issued.grant_id, "delivery-success")
+            .expect("exact success retirement should succeed");
+
+        assert_error_code(
+            fixture.grant_broker.get_exact(&issued.grant_id),
+            ScreenVisionOutboundGrantErrorCode::GrantConsumed,
+        );
+        assert_error_code(
+            fixture.issue("event-success", destination()),
+            ScreenVisionOutboundGrantErrorCode::GrantConsumed,
+        );
+        assert_error_code(
+            fixture.grant_broker.claim_exact_for_delivery(
+                &issued.grant_id,
+                "delivery-success",
+                &fixture.candidate_id,
+                destination(),
+            ),
+            ScreenVisionOutboundGrantErrorCode::GrantConsumed,
+        );
+    }
+
+    #[test]
+    fn revoked_confirmation_cannot_reissue_for_same_candidate() {
+        let fixture = Fixture::new();
+        let issued = issue_metadata(
+            fixture
+                .issue("event-revoked", destination())
+                .expect("initial issue should succeed"),
+        );
+        fixture
+            .grant_broker
+            .revoke_ready_exact(&issued.grant_id)
+            .expect("exact READY revoke should succeed");
+
+        assert_error_code(
+            fixture.issue("event-revoked", destination()),
+            ScreenVisionOutboundGrantErrorCode::GrantConsumed,
+        );
+        assert_error_code(
+            fixture.issue("event-new-on-same-candidate", destination()),
+            ScreenVisionOutboundGrantErrorCode::CandidateConsumed,
+        );
+        assert_error_code(
+            fixture.grant_broker.claim_exact_for_delivery(
+                &issued.grant_id,
+                "delivery-revoked",
+                &fixture.candidate_id,
+                destination(),
+            ),
+            ScreenVisionOutboundGrantErrorCode::GrantConsumed,
+        );
+        assert_error_code(
+            fixture.grant_broker.get_exact(&issued.grant_id),
+            ScreenVisionOutboundGrantErrorCode::GrantConsumed,
+        );
+    }
+
+    #[test]
+    fn same_candidate_ready_rejects_confirmation_ping_pong() {
+        let fixture = Fixture::new();
+        let issued = issue_metadata(
+            fixture
+                .issue("event-ping-a", destination())
+                .expect("initial issue should succeed"),
+        );
+
+        assert_error_code(
+            fixture.issue("event-ping-b", destination()),
+            ScreenVisionOutboundGrantErrorCode::GrantInUse,
+        );
+        let replayed = issue_metadata(
+            fixture
+                .issue("event-ping-a", destination())
+                .expect("original confirmation should replay"),
+        );
+        assert_eq!(replayed.grant_id, issued.grant_id);
+    }
+
+    #[test]
+    fn new_candidate_can_progress_after_terminal_state_and_stale_ids_cannot_touch_it() {
+        let fixture = Fixture::new();
+        let old = issue_metadata(
+            fixture
+                .issue("event-candidate-a", destination())
+                .expect("initial issue should succeed"),
+        );
+        fixture
+            .grant_broker
+            .revoke_ready_exact(&old.grant_id)
+            .expect("candidate A should become consumed");
+
+        let fence = fixture
+            .session_gate
+            .life_fence_for(LIFE_A)
+            .expect("test session should be armed")
+            .to_string();
+        let new_candidate = fixture
+            .candidate_broker
+            .replace_candidate(LIFE_A, &fence, REVISION_A, projection())
+            .expect("candidate B should install");
+        let new_ready = issue_metadata(
+            fixture
+                .issue_with("event-candidate-b", &new_candidate, destination())
+                .expect("new candidate should issue a new READY"),
+        );
+        assert_ne!(old.grant_id, new_ready.grant_id);
+        assert_eq!(new_ready.candidate_id, new_candidate);
+
+        assert_error_code(
+            fixture.grant_broker.revoke_ready_exact(&old.grant_id),
+            ScreenVisionOutboundGrantErrorCode::GrantMismatch,
+        );
+        assert_error_code(
+            fixture
+                .grant_broker
+                .retire_bound_after_success(&old.grant_id, "delivery-a"),
+            ScreenVisionOutboundGrantErrorCode::GrantMismatch,
+        );
+        assert_eq!(
+            fixture
+                .grant_broker
+                .get_exact(&new_ready.grant_id)
+                .expect("stale cleanup must preserve candidate B READY")
+                .candidate_id,
+            new_candidate
+        );
+    }
+
+    #[test]
+    fn consumed_same_confirmation_with_changed_destination_is_a_conflict() {
+        let fixture = Fixture::new();
+        let issued = issue_metadata(
+            fixture
+                .issue("event-consumed-conflict", destination())
+                .expect("initial issue should succeed"),
+        );
+        fixture
+            .grant_broker
+            .revoke_ready_exact(&issued.grant_id)
+            .expect("exact READY revoke should succeed");
+
+        assert_error_code(
+            fixture.issue(
+                "event-consumed-conflict",
+                destination_with("profile-b", BASE_URL_A, MODEL_NAME_A, PROFILE_UPDATED_AT_A),
+            ),
+            ScreenVisionOutboundGrantErrorCode::ConfirmationEventConflict,
+        );
+        assert_error_code(
+            fixture.issue("event-consumed-conflict", destination()),
+            ScreenVisionOutboundGrantErrorCode::GrantConsumed,
         );
     }
 

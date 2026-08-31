@@ -90,6 +90,16 @@ const canSelectTarget = computed(
     !targetLoading.value,
 );
 
+const currentOutboundPolicy = computed<
+  ScreenVisionOutboundPolicy | null | undefined
+>(() => {
+  const lifeId = currentLife.value?.id;
+  const candidate = outboundPolicy.value;
+  if (!lifeId || candidate === undefined) return undefined;
+  if (candidate === null) return null;
+  return candidate.lifeId === lifeId ? candidate : undefined;
+});
+
 const consentLabel = computed(() => {
   if (!currentLife.value) return "No current Life";
   if (!policy.value) return "Not configured";
@@ -99,8 +109,9 @@ const consentLabel = computed(() => {
 const outboundConsentLabel = computed(() => {
   if (!currentLife.value) return "No current Life";
   if (outboundPhase.value === "loading") return "Loading…";
-  if (outboundPolicy.value === undefined) return "Unavailable";
-  return outboundPolicy.value?.enabled ? "Enabled" : "Disabled";
+  const displayedPolicy = currentOutboundPolicy.value;
+  if (displayedPolicy === undefined) return "Unavailable";
+  return displayedPolicy?.enabled ? "Enabled" : "Disabled";
 });
 
 const sessionLabel = computed(() => {
@@ -136,6 +147,32 @@ function isCurrentOutboundMutation(
   );
 }
 
+function markOutboundUnavailable(): void {
+  outboundPolicy.value = undefined;
+  outboundPhase.value = "failed";
+  outboundError.value = {
+    code: "SCREEN_VISION_OUTBOUND_SETTINGS_UNAVAILABLE",
+    message:
+      "The current screen image sharing permission could not be verified. Refresh to try again.",
+    recoverable: true,
+  };
+  outboundOperation.value =
+    "The current permission state could not be verified. Refresh to try again.";
+}
+
+function publishOutboundPolicyForLife(
+  candidate: ScreenVisionOutboundPolicy | null,
+  lifeId: string,
+): boolean {
+  if (candidate !== null && candidate.lifeId !== lifeId) {
+    markOutboundUnavailable();
+    return false;
+  }
+
+  outboundPolicy.value = candidate;
+  return true;
+}
+
 async function refresh(): Promise<void> {
   const epoch = componentEpoch;
   const generation = ++refreshGeneration;
@@ -150,6 +187,12 @@ async function refresh(): Promise<void> {
     const life = await storageService.getCurrentLife();
     if (!isCurrentRefresh(epoch, generation)) return;
 
+    const previousLifeId = currentLife.value?.id;
+    if (!life || previousLifeId !== life.id) {
+      // A missing result is not evidence that the newly displayed Life has no
+      // policy. Keep that distinction until the new Life's read completes.
+      outboundPolicy.value = undefined;
+    }
     currentLife.value = life;
 
     const perceptionLoad = Promise.all([
@@ -180,8 +223,12 @@ async function refresh(): Promise<void> {
     const [outboundResult] = await Promise.allSettled([outboundLoad]);
     if (isCurrentRefresh(epoch, generation, life?.id)) {
       if (outboundResult.status === "fulfilled") {
-        outboundPolicy.value = outboundResult.value;
-        outboundPhase.value = "ready";
+        if (!life) {
+          outboundPolicy.value = undefined;
+          outboundPhase.value = "ready";
+        } else if (publishOutboundPolicyForLife(outboundResult.value, life.id)) {
+          outboundPhase.value = "ready";
+        }
       } else {
         outboundError.value = screenVisionOutboundErrorFromUnknown(
           outboundResult.reason,
@@ -232,7 +279,7 @@ async function rereadOutboundPolicyAfterUpdateFailure(
       await screenVisionOutboundSettingsService.getPolicy(lifeId);
     if (!isCurrentOutboundMutation(epoch, mutationGeneration, lifeId)) return;
 
-    outboundPolicy.value = refreshedPolicy;
+    if (!publishOutboundPolicyForLife(refreshedPolicy, lifeId)) return;
     outboundPhase.value = "ready";
     outboundError.value = updateError;
     outboundOperation.value =
@@ -251,11 +298,12 @@ async function rereadOutboundPolicyAfterUpdateFailure(
 
 async function updateOutboundConsent(enabled: boolean): Promise<void> {
   const life = currentLife.value;
-  const existingPolicy = outboundPolicy.value;
+  const existingPolicy = currentOutboundPolicy.value;
   if (
     !life ||
     outboundLoading.value ||
     outboundPhase.value !== "ready" ||
+    existingPolicy === undefined ||
     (!enabled && !existingPolicy?.enabled)
   ) {
     return;
@@ -271,14 +319,15 @@ async function updateOutboundConsent(enabled: boolean): Promise<void> {
   try {
     let policyForUpdate = existingPolicy;
     if (!policyForUpdate) {
-      policyForUpdate = await screenVisionOutboundSettingsService.createPolicy(
+      const createdPolicy = await screenVisionOutboundSettingsService.createPolicy(
         life.id,
       );
       if (!isCurrentOutboundMutation(epoch, mutationGeneration, life.id)) return;
+      if (!publishOutboundPolicyForLife(createdPolicy, life.id)) return;
 
       // Creation is deliberately disabled-only. The explicit user action then
       // performs the separate enabled transition using the returned revision.
-      outboundPolicy.value = policyForUpdate;
+      policyForUpdate = createdPolicy;
     }
 
     if (!isCurrentOutboundMutation(epoch, mutationGeneration, life.id)) return;
@@ -290,8 +339,8 @@ async function updateOutboundConsent(enabled: boolean): Promise<void> {
       policyForUpdate.revision,
     );
     if (!isCurrentOutboundMutation(epoch, mutationGeneration, life.id)) return;
+    if (!publishOutboundPolicyForLife(updatedPolicy, life.id)) return;
 
-    outboundPolicy.value = updatedPolicy;
     outboundPhase.value = "ready";
     outboundOperation.value = enabled
       ? "Screen image sharing permission enabled for this Life. Enabling this permission does not send any images by itself."
@@ -611,16 +660,16 @@ onUnmounted(() => {
           <dt>Screen image sharing permission</dt>
           <dd data-testid="screen-vision-outbound-status">{{ outboundConsentLabel }}</dd>
         </div>
-        <div v-if="outboundPolicy">
+        <div v-if="currentOutboundPolicy">
           <dt>Permission revision</dt>
-          <dd data-testid="screen-vision-outbound-revision">{{ outboundPolicy.revision }}</dd>
+          <dd data-testid="screen-vision-outbound-revision">{{ currentOutboundPolicy.revision }}</dd>
         </div>
       </dl>
       <p class="important">
         Enabling this permission does not send any images by itself.
       </p>
       <p>Cloud Vision image transmission is not active yet.</p>
-      <p v-if="outboundPolicy?.enabled" data-testid="screen-vision-outbound-enabled-copy">
+      <p v-if="currentOutboundPolicy?.enabled" data-testid="screen-vision-outbound-enabled-copy">
         This permission only allows a future explicit Vision action to become eligible. No screen
         image is being uploaded by this setting alone.
       </p>
@@ -630,20 +679,20 @@ onUnmounted(() => {
       <p v-else-if="!currentLife" class="phase" data-testid="screen-vision-outbound-no-life">
         Create or restore a Life before configuring screen image sharing.
       </p>
-      <p v-else-if="outboundPolicy === null" class="phase" data-testid="screen-vision-outbound-no-policy">
+      <p v-else-if="currentOutboundPolicy === null" class="phase" data-testid="screen-vision-outbound-no-policy">
         No screen-image sharing permission has been granted for this Life.
       </p>
-      <p v-else-if="outboundPolicy === undefined" class="phase" data-testid="screen-vision-outbound-unavailable">
+      <p v-else-if="currentOutboundPolicy === undefined" class="phase" data-testid="screen-vision-outbound-unavailable">
         The current screen image sharing permission could not be loaded. Refresh to try again.
       </p>
 
       <div class="actions" aria-label="Screen image sharing permission actions">
         <button
-          v-if="!outboundPolicy?.enabled"
+          v-if="!currentOutboundPolicy?.enabled"
           type="button"
           class="primary"
           data-testid="screen-vision-outbound-enable"
-          :disabled="outboundLoading || outboundPhase !== 'ready' || !currentLife"
+          :disabled="outboundLoading || outboundPhase !== 'ready' || !currentLife || currentOutboundPolicy === undefined"
           @click="enableOutboundConsent"
         >
           Enable screen image sharing

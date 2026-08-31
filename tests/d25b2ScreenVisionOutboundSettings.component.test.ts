@@ -90,7 +90,7 @@ async function mountSettings(options: {
   session?: ScreenPerceptionSessionStatus;
   outboundPolicy?: ScreenVisionOutboundPolicy | null;
 } = {}) {
-  vi.spyOn(storageService, "getCurrentLife").mockResolvedValue(
+  const getCurrentLife = vi.spyOn(storageService, "getCurrentLife").mockResolvedValue(
     options.life ?? makeLife(),
   );
   vi.spyOn(screenPerceptionSettingsService, "getPolicy").mockResolvedValue(
@@ -112,7 +112,7 @@ async function mountSettings(options: {
 
   const wrapper = mount(ScreenPerceptionSettingsView);
   await flushMicrotasks();
-  return { wrapper, getOutboundPolicy };
+  return { wrapper, getOutboundPolicy, getCurrentLife };
 }
 
 afterEach(() => {
@@ -408,6 +408,165 @@ describe("D25-B2 outbound Settings UX", () => {
         "could not be refreshed",
       );
       expect(wrapper.text()).not.toContain("private database path");
+    } finally {
+      wrapper.unmount();
+    }
+  });
+
+  it("clears a previous Life policy before the new Life read fails", async () => {
+    const lifeB = makeLife("life-b", "Life B");
+    const { wrapper, getOutboundPolicy, getCurrentLife } = await mountSettings({
+      life: makeLife("life-a", "Life A"),
+      outboundPolicy: makeOutboundPolicy("life-a", true, 4),
+    });
+    getCurrentLife.mockResolvedValue(lifeB);
+    getOutboundPolicy.mockRejectedValueOnce({
+      code: "SCREEN_VISION_OUTBOUND_DATABASE_UNAVAILABLE",
+      message: "private B database details",
+    });
+    const createPolicy = vi.spyOn(
+      screenVisionOutboundSettingsService,
+      "createPolicy",
+    );
+    const updatePolicy = vi.spyOn(
+      screenVisionOutboundSettingsService,
+      "updatePolicy",
+    );
+    try {
+      await wrapper.get("[data-testid='screen-perception-refresh']").trigger("click");
+      await flushMicrotasks();
+
+      expect(wrapper.get("[data-testid='screen-perception-current-life']").text()).toBe(
+        "Life B",
+      );
+      expect(wrapper.get("[data-testid='screen-vision-outbound-status']").text()).toBe(
+        "Unavailable",
+      );
+      expect(wrapper.find("[data-testid='screen-vision-outbound-revision']").exists()).toBe(
+        false,
+      );
+      expect(wrapper.find("[data-testid='screen-vision-outbound-enabled-copy']").exists()).toBe(
+        false,
+      );
+      expect((wrapper.get("[data-testid='screen-vision-outbound-enable']").element as HTMLButtonElement).disabled).toBe(true);
+      expect(createPolicy).not.toHaveBeenCalled();
+      expect(updatePolicy).not.toHaveBeenCalled();
+      expect(getOutboundPolicy).toHaveBeenLastCalledWith("life-b");
+      expect(wrapper.text()).not.toContain("private B database details");
+    } finally {
+      wrapper.unmount();
+    }
+  });
+
+  it("retains a same-Life last-known policy when that Life read fails", async () => {
+    const lifeA = makeLife("life-a", "Life A");
+    const { wrapper, getOutboundPolicy, getCurrentLife } = await mountSettings({
+      life: lifeA,
+      outboundPolicy: makeOutboundPolicy("life-a", true, 4),
+    });
+    getCurrentLife.mockResolvedValue(lifeA);
+    getOutboundPolicy.mockRejectedValueOnce({
+      code: "SCREEN_VISION_OUTBOUND_DATABASE_UNAVAILABLE",
+      message: "private A database details",
+    });
+    try {
+      await wrapper.get("[data-testid='screen-perception-refresh']").trigger("click");
+      await flushMicrotasks();
+
+      expect(wrapper.get("[data-testid='screen-perception-current-life']").text()).toBe(
+        "Life A",
+      );
+      expect(wrapper.get("[data-testid='screen-vision-outbound-status']").text()).toBe(
+        "Enabled",
+      );
+      expect(wrapper.get("[data-testid='screen-vision-outbound-revision']").text()).toBe(
+        "4",
+      );
+      expect(wrapper.get("[data-testid='screen-vision-outbound-enabled-copy']").exists()).toBe(
+        true,
+      );
+      expect(wrapper.get("[data-testid='screen-vision-outbound-error']").text()).toContain(
+        "temporarily unavailable",
+      );
+      expect(wrapper.text()).not.toContain("private A database details");
+    } finally {
+      wrapper.unmount();
+    }
+  });
+
+  it("rejects a foreign Life returned by getPolicy", async () => {
+    const { wrapper, getOutboundPolicy } = await mountSettings({
+      outboundPolicy: makeOutboundPolicy("life-a", true, 4),
+    });
+    getOutboundPolicy.mockResolvedValueOnce(
+      makeOutboundPolicy("life-b", true, 99),
+    );
+    try {
+      await wrapper.get("[data-testid='screen-perception-refresh']").trigger("click");
+      await flushMicrotasks();
+
+      expect(wrapper.get("[data-testid='screen-vision-outbound-status']").text()).toBe(
+        "Unavailable",
+      );
+      expect(wrapper.find("[data-testid='screen-vision-outbound-revision']").exists()).toBe(
+        false,
+      );
+      expect(wrapper.find("[data-testid='screen-vision-outbound-enabled-copy']").exists()).toBe(
+        false,
+      );
+      expect(wrapper.text()).not.toContain("life-b");
+    } finally {
+      wrapper.unmount();
+    }
+  });
+
+  it("rejects a foreign Life returned by the first-enable create", async () => {
+    const { wrapper } = await mountSettings({ outboundPolicy: null });
+    const createPolicy = vi
+      .spyOn(screenVisionOutboundSettingsService, "createPolicy")
+      .mockResolvedValue(makeOutboundPolicy("life-b", false, 7));
+    const updatePolicy = vi.spyOn(
+      screenVisionOutboundSettingsService,
+      "updatePolicy",
+    );
+    try {
+      await wrapper.get("[data-testid='screen-vision-outbound-enable']").trigger("click");
+      await flushMicrotasks();
+
+      expect(createPolicy).toHaveBeenCalledWith("life-a");
+      expect(updatePolicy).not.toHaveBeenCalled();
+      expect(wrapper.get("[data-testid='screen-vision-outbound-status']").text()).toBe(
+        "Unavailable",
+      );
+      expect(wrapper.find("[data-testid='screen-vision-outbound-revision']").exists()).toBe(
+        false,
+      );
+      expect(wrapper.text()).not.toContain("life-b");
+    } finally {
+      wrapper.unmount();
+    }
+  });
+
+  it("rejects a foreign Life returned by an update", async () => {
+    const { wrapper, getOutboundPolicy } = await mountSettings({
+      outboundPolicy: makeOutboundPolicy("life-a", true, 4),
+    });
+    const updatePolicy = vi
+      .spyOn(screenVisionOutboundSettingsService, "updatePolicy")
+      .mockResolvedValue(makeOutboundPolicy("life-b", false, 8));
+    try {
+      await wrapper.get("[data-testid='screen-vision-outbound-disable']").trigger("click");
+      await flushMicrotasks();
+
+      expect(updatePolicy).toHaveBeenCalledWith("life-a", false, 4);
+      expect(getOutboundPolicy).toHaveBeenCalledTimes(1);
+      expect(wrapper.get("[data-testid='screen-vision-outbound-status']").text()).toBe(
+        "Unavailable",
+      );
+      expect(wrapper.find("[data-testid='screen-vision-outbound-revision']").exists()).toBe(
+        false,
+      );
+      expect(wrapper.text()).not.toContain("life-b");
     } finally {
       wrapper.unmount();
     }

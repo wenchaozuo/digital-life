@@ -4,6 +4,8 @@ use std::sync::Arc;
 // production caller until the D11-B2+ policy/conversation stages, so the
 // frozen surface is allowed as dead code outside test builds. D12-B1 is the
 // same foundation stage for the relationship domain.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod capability;
 pub mod conversation;
 pub mod embedding;
 #[cfg_attr(not(test), allow(dead_code))]
@@ -65,6 +67,9 @@ pub fn run() {
             let storage = storage::StorageService::initialize(app.handle())
                 .map_err(|error| std::io::Error::other(error.message))?;
             app.manage(storage);
+            let capability_registry = capability::CapabilityRegistry::production()
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            app.manage(capability_registry);
             app.manage(secrets::WindowsCredentialSecretStore::new());
             app.manage(perception::screen_policy::ScreenPerceptionSessionGate::new());
             app.manage(perception::screen_capture::target::ScreenCaptureTargetBroker::new());

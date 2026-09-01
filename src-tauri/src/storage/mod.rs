@@ -3,6 +3,8 @@ mod autonomy;
 pub(crate) mod body_package;
 mod candidate_extraction;
 mod candidate_memory;
+#[cfg_attr(not(test), allow(dead_code))]
+mod capability_authorization;
 mod connection;
 mod conversation;
 pub(crate) mod conversation_emotion;
@@ -1947,11 +1949,11 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(writer_fence_count, 114);
+        assert_eq!(writer_fence_count, 120);
         migration::validate_attempt_claim_identity_schema(&state.connection).unwrap();
-        // The database is at Schema 28; validate the exact Schema-20 relationship
+        // The database is at Schema 30; validate the exact Schema-20 relationship
         // authority (which re-validates the emotion authority, the Schema-18
-        // catch-up objects, and proves the full 114-trigger writer fence).
+        // catch-up objects, and proves the full 120-trigger writer fence).
         migration::validate_emotion_authority_schema(&state.connection).unwrap();
         migration::validate_relationship_authority_schema(&state.connection).unwrap();
         assert_eq!(
@@ -2106,7 +2108,7 @@ mod tests {
         // target as an INDEPENDENT database.
         let restored = StorageService::initialize_with_roots(target.clone(), None).unwrap();
 
-        // Schema 28 and writer fences preserved. Schema version 28 is the
+        // Schema 30 and writer fences preserved. Schema version 30 is the
         // current runtime schema; LAST_STATIC_MIGRATION_VERSION = 12 is only the
         // ceiling of the statically-replayed migration list.
         {
@@ -2114,7 +2116,7 @@ mod tests {
             assert_eq!(
                 connection::read_schema_version(&restored_conn.connection).unwrap(),
                 connection::MAX_SUPPORTED_SCHEMA_VERSION,
-                "restored schema version must be 25"
+                "restored schema version must be 30"
             );
             assert_eq!(
                 super::migration::LAST_STATIC_MIGRATION_VERSION,
@@ -2146,7 +2148,7 @@ mod tests {
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert_eq!(fence_count, 114);
+            assert_eq!(fence_count, 120);
         }
 
         // All 8 outbox states preserved with full epoch evidence.

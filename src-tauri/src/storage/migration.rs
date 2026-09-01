@@ -3,9 +3,10 @@ use std::{fs, path::Path, time::Duration};
 use rusqlite::{backup::Backup, params, Connection, OptionalExtension, Transaction};
 
 use super::{
-    autonomy, body_package, connection, experience_episode, generation_lifecycle_authority,
-    life_intent, live2d_core, model_profile, perception, screen_perception,
-    screen_vision_outbound_policy, writer_fence_manifest, StorageError, MIGRATIONS,
+    autonomy, body_package, capability_authorization, connection, experience_episode,
+    generation_lifecycle_authority, life_intent, live2d_core, model_profile, perception,
+    screen_perception, screen_vision_outbound_policy, writer_fence_manifest, StorageError,
+    MIGRATIONS,
 };
 
 pub(super) const LAST_STATIC_MIGRATION_VERSION: i64 = 12;
@@ -65,6 +66,8 @@ pub(super) const VISION_MODEL_PROFILE_SCHEMA_VERSION: i64 = 29;
 const VISION_MODEL_PROFILE_MIGRATION_NAME: &str = "029_vision_model_profiles";
 const VISION_MODEL_PROFILE_MIGRATION_SQL: &str =
     include_str!("migrations/029_vision_model_profiles.sql");
+pub(super) const CAPABILITY_AUTHORIZATION_SCHEMA_VERSION: i64 = 30;
+const CAPABILITY_AUTHORIZATION_MIGRATION_NAME: &str = "030_capability_authorization_root";
 const ADD_CLAIMED_GENERATION_AUTHORITY_EPOCH_SQL: &str = "ALTER TABLE memory_vector_sync_outbox ADD COLUMN claimed_generation_authority_epoch INTEGER NULL CHECK (claimed_generation_authority_epoch IS NULL OR claimed_generation_authority_epoch >= 1)";
 const CREATE_GENERATION_AUTHORITY_TABLE_SQL: &str =
     "CREATE TABLE memory_vector_generation_authority (
@@ -290,6 +293,11 @@ pub(super) enum ScreenVisionOutboundPolicyAuthoritySchemaUpgrade {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum VisionModelProfileSchemaUpgrade {
+    Applied,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CapabilityAuthorizationSchemaUpgrade {
     Applied,
 }
 
@@ -2228,6 +2236,58 @@ pub(super) fn validate_model_profile_schema(connection: &Connection) -> Result<(
     model_profile::validate_schema_029(connection)
 }
 
+/// Schema 30 adds only the durable, Life-scoped user authorization root and
+/// its immutable transition evidence. It performs no backfill and creates no
+/// authorization rows; missing rows therefore remain denied.
+pub(super) fn apply_capability_authorization_schema_upgrade(
+    transaction: &Transaction<'_>,
+) -> Result<CapabilityAuthorizationSchemaUpgrade, StorageError> {
+    if connection::read_schema_version(transaction)? != VISION_MODEL_PROFILE_SCHEMA_VERSION {
+        return Err(StorageError::migration_version_invariant_failed());
+    }
+
+    transaction
+        .execute_batch(capability_authorization::MIGRATION_030_SQL)
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    writer_fence_manifest::install_capability_authorization_writer_fence_manifest_in_transaction(
+        transaction,
+    )?;
+
+    capability_authorization::validate_schema_objects(transaction)?;
+    let migration_now: String = transaction
+        .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", [], |row| {
+            row.get(0)
+        })
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    transaction
+        .execute(
+            "INSERT INTO schema_migration(version,name,applied_at) VALUES (?1,?2,?3)",
+            params![
+                CAPABILITY_AUTHORIZATION_SCHEMA_VERSION,
+                CAPABILITY_AUTHORIZATION_MIGRATION_NAME,
+                migration_now
+            ],
+        )
+        .map_err(|_| StorageError::migration_transaction_failed())?;
+    capability_authorization::validate_schema_objects(transaction)?;
+    writer_fence_manifest::validate_writer_fence_manifest_for_schema(
+        transaction,
+        CAPABILITY_AUTHORIZATION_SCHEMA_VERSION,
+    )?;
+    Ok(CapabilityAuthorizationSchemaUpgrade::Applied)
+}
+
+pub(super) fn validate_capability_authorization_schema(
+    connection: &Connection,
+) -> Result<(), StorageError> {
+    let schema_version = connection::read_schema_version(connection)?;
+    if schema_version < CAPABILITY_AUTHORIZATION_SCHEMA_VERSION {
+        return Err(StorageError::migration_version_invariant_failed());
+    }
+    capability_authorization::validate_schema_objects(connection)?;
+    writer_fence_manifest::validate_writer_fence_manifest_for_schema(connection, schema_version)
+}
+
 pub(super) fn validate_experience_episode_schema(
     connection: &Connection,
 ) -> Result<(), StorageError> {
@@ -2927,6 +2987,9 @@ pub(super) fn verify_schema_after_upgrade(
     }
     if expected_schema_version >= VISION_MODEL_PROFILE_SCHEMA_VERSION {
         validate_model_profile_schema(connection)?;
+    }
+    if expected_schema_version >= CAPABILITY_AUTHORIZATION_SCHEMA_VERSION {
+        validate_capability_authorization_schema(connection)?;
     }
     if expected_schema_version >= writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION {
         #[cfg(test)]
@@ -3711,6 +3774,9 @@ pub fn verify_database(
     }
     if expected_schema_version >= VISION_MODEL_PROFILE_SCHEMA_VERSION {
         validate_model_profile_schema(connection)?;
+    }
+    if expected_schema_version >= CAPABILITY_AUTHORIZATION_SCHEMA_VERSION {
+        validate_capability_authorization_schema(connection)?;
     }
     if expected_schema_version >= writer_fence_manifest::WRITER_FENCE_SCHEMA_VERSION {
         writer_fence_manifest::validate_writer_fence_manifest(connection)?;
@@ -5065,10 +5131,10 @@ mod transaction_tests {
     }
 
     #[test]
-    fn migration_029_is_present_twenty_nine_is_current_and_thirty_is_absent() {
+    fn migration_030_is_present_thirty_is_current_and_thirty_one_is_absent() {
         assert_eq!(
             super::super::connection::MAX_SUPPORTED_SCHEMA_VERSION,
-            VISION_MODEL_PROFILE_SCHEMA_VERSION
+            CAPABILITY_AUTHORIZATION_SCHEMA_VERSION
         );
         let migrations_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/storage/migrations");
         let entries = std::fs::read_dir(&migrations_dir).unwrap();
@@ -5083,20 +5149,22 @@ mod transaction_tests {
                 highest = highest.max(version);
             }
         }
-        assert_eq!(highest, 29, "Migration 029 must be the current migration");
+        assert_eq!(highest, 30, "Migration 030 must be the current migration");
         let names = std::fs::read_dir(&migrations_dir)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .collect::<Vec<_>>();
-        for version in ["022", "023", "024", "025", "026", "027", "028", "029"] {
+        for version in [
+            "022", "023", "024", "025", "026", "027", "028", "029", "030",
+        ] {
             assert!(
                 names.iter().any(|name| name.starts_with(version)),
                 "Migration {version} must exist"
             );
         }
         assert!(
-            !names.iter().any(|name| name.starts_with("030")),
-            "Migration 030 must not exist"
+            !names.iter().any(|name| name.starts_with("031")),
+            "Migration 031 must not exist"
         );
     }
 
@@ -6454,6 +6522,17 @@ mod transaction_tests {
         transaction.commit().unwrap();
     }
 
+    fn apply_capability_authorization_authority_upgrade(connection: &mut Connection) {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert_eq!(
+            apply_capability_authorization_schema_upgrade(&transaction).unwrap(),
+            CapabilityAuthorizationSchemaUpgrade::Applied
+        );
+        transaction.commit().unwrap();
+    }
+
     fn model_profile_identity_rows(connection: &Connection) -> Vec<(i64, String)> {
         let mut statement = connection
             .prepare("SELECT rowid, id FROM model_profile ORDER BY rowid")
@@ -6644,6 +6723,118 @@ mod transaction_tests {
             .unwrap();
 
         assert!(validate_model_profile_schema(&connection).is_err());
+    }
+
+    #[test]
+    fn migration_030_preserves_schema_29_adds_empty_default_deny_root_and_rejects_malformed_schema()
+    {
+        let (mut connection, life_id) = schema_twenty_eight_connection_with_current_life();
+        apply_vision_model_profile_authority_upgrade(&mut connection);
+        connection
+            .execute(
+                "INSERT INTO model_profile (
+                    id, purpose, provider_kind, display_name, base_url, model_name,
+                    temperature, max_tokens, embedding_dimension, created_at, updated_at
+                 ) VALUES ('d28-preserved', 'vision', 'openai_compatible', 'D28 Preserved',
+                    'https://vision.example.invalid/v1', 'vision-model', 0.0, 1024, NULL,
+                    '2026-09-01T00:00:00.001Z', '2026-09-01T00:00:00.002Z')",
+                [],
+            )
+            .unwrap();
+
+        apply_capability_authorization_authority_upgrade(&mut connection);
+        assert_eq!(
+            schema_version(&connection),
+            CAPABILITY_AUTHORIZATION_SCHEMA_VERSION
+        );
+        validate_capability_authorization_schema(&connection).unwrap();
+        verify_schema_after_upgrade(&connection, CAPABILITY_AUTHORIZATION_SCHEMA_VERSION).unwrap();
+        verify_database(
+            &connection,
+            CAPABILITY_AUTHORIZATION_SCHEMA_VERSION,
+            life_id,
+        )
+        .unwrap();
+        assert_eq!(writer_fence_count(&connection), 120);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM life_capability_authorization",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM life_capability_authorization_event",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM model_profile WHERE id='d28-preserved'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migration
+                     WHERE version=?1 AND name='030_capability_authorization_root'",
+                    [CAPABILITY_AUTHORIZATION_SCHEMA_VERSION],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let error = apply_capability_authorization_schema_upgrade(&transaction).unwrap_err();
+        assert_eq!(error.code, "MIGRATION_VERSION_INVARIANT_FAILED");
+        drop(transaction);
+
+        let original_sql: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema
+                 WHERE type='table' AND name='life_capability_authorization'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let weakened_sql = original_sql.replacen("revision >= 1", "revision >= 0", 1);
+        assert_ne!(weakened_sql, original_sql);
+        let schema_cookie: i64 = connection
+            .query_row("PRAGMA schema_version", [], |row| row.get(0))
+            .unwrap();
+        connection
+            .pragma_update(None, "writable_schema", "ON")
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE sqlite_schema SET sql=?1
+                 WHERE type='table' AND name='life_capability_authorization'",
+                [&weakened_sql],
+            )
+            .unwrap();
+        connection
+            .pragma_update(None, "schema_version", schema_cookie + 1)
+            .unwrap();
+        connection
+            .pragma_update(None, "writable_schema", "OFF")
+            .unwrap();
+        assert!(validate_capability_authorization_schema(&connection).is_err());
     }
 
     #[test]

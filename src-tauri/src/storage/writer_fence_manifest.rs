@@ -21,6 +21,7 @@ pub(super) const BODY_PACKAGE_WRITER_FENCE_SCHEMA_VERSION: i64 = 25;
 pub(super) const LIVE2D_CORE_WRITER_FENCE_SCHEMA_VERSION: i64 = 26;
 pub(super) const SCREEN_PERCEPTION_WRITER_FENCE_SCHEMA_VERSION: i64 = 27;
 pub(super) const SCREEN_VISION_OUTBOUND_POLICY_WRITER_FENCE_SCHEMA_VERSION: i64 = 28;
+pub(super) const CAPABILITY_AUTHORIZATION_WRITER_FENCE_SCHEMA_VERSION: i64 = 30;
 const WRITER_FENCE_TRIGGER_PREFIX: &str = "digital_life_writer_epoch_";
 const HISTORICAL_WRITER_FENCE_TRIGGER_COUNT: usize = 18;
 const LATE_DELETE_WRITER_FENCE_TRIGGER_COUNT: usize = 24;
@@ -36,6 +37,7 @@ const BODY_PACKAGE_WRITER_FENCE_TRIGGER_COUNT: usize = 99;
 const LIVE2D_CORE_WRITER_FENCE_TRIGGER_COUNT: usize = 102;
 const SCREEN_PERCEPTION_WRITER_FENCE_TRIGGER_COUNT: usize = 108;
 const SCREEN_VISION_OUTBOUND_POLICY_WRITER_FENCE_TRIGGER_COUNT: usize = 114;
+const CAPABILITY_AUTHORIZATION_WRITER_FENCE_TRIGGER_COUNT: usize = 120;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(super) enum WriterFenceOperation {
@@ -756,6 +758,42 @@ const WRITER_FENCE_TRIGGER_SPECS: &[WriterFenceTriggerSpec] = &[
         Delete,
         "DELETE"
     ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_life_capability_authorization_insert",
+        "life_capability_authorization",
+        Insert,
+        "INSERT"
+    ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_life_capability_authorization_update",
+        "life_capability_authorization",
+        Update,
+        "UPDATE"
+    ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_life_capability_authorization_delete",
+        "life_capability_authorization",
+        Delete,
+        "DELETE"
+    ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_life_capability_authorization_event_insert",
+        "life_capability_authorization_event",
+        Insert,
+        "INSERT"
+    ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_life_capability_authorization_event_update",
+        "life_capability_authorization_event",
+        Update,
+        "UPDATE"
+    ),
+    writer_fence_trigger_spec!(
+        "digital_life_writer_epoch_life_capability_authorization_event_delete",
+        "life_capability_authorization_event",
+        Delete,
+        "DELETE"
+    ),
 ];
 
 pub(super) fn writer_fence_trigger_specs() -> &'static [WriterFenceTriggerSpec] {
@@ -829,6 +867,12 @@ pub(super) fn screen_vision_outbound_policy_writer_fence_trigger_specs(
         ..SCREEN_VISION_OUTBOUND_POLICY_WRITER_FENCE_TRIGGER_COUNT]
 }
 
+pub(super) fn capability_authorization_writer_fence_trigger_specs(
+) -> &'static [WriterFenceTriggerSpec] {
+    &WRITER_FENCE_TRIGGER_SPECS[SCREEN_VISION_OUTBOUND_POLICY_WRITER_FENCE_TRIGGER_COUNT
+        ..CAPABILITY_AUTHORIZATION_WRITER_FENCE_TRIGGER_COUNT]
+}
+
 pub(super) fn install_screen_perception_writer_fence_manifest_in_transaction(
     transaction: &Transaction<'_>,
 ) -> Result<(), StorageError> {
@@ -863,6 +907,28 @@ pub(super) fn install_screen_vision_outbound_policy_writer_fence_manifest_in_tra
         #[cfg(test)]
         if should_fail_trigger_install_at_for_test(
             SCREEN_PERCEPTION_WRITER_FENCE_TRIGGER_COUNT + index + 1,
+        ) {
+            return Err(StorageError::migration_transaction_failed());
+        }
+        transaction
+            .execute_batch(spec.ddl)
+            .map_err(|_| StorageError::migration_transaction_failed())?;
+    }
+    Ok(())
+}
+
+pub(super) fn install_capability_authorization_writer_fence_manifest_in_transaction(
+    transaction: &Transaction<'_>,
+) -> Result<(), StorageError> {
+    for (index, spec) in capability_authorization_writer_fence_trigger_specs()
+        .iter()
+        .enumerate()
+    {
+        #[cfg(not(test))]
+        let _ = index;
+        #[cfg(test)]
+        if should_fail_trigger_install_at_for_test(
+            SCREEN_VISION_OUTBOUND_POLICY_WRITER_FENCE_TRIGGER_COUNT + index + 1,
         ) {
             return Err(StorageError::migration_transaction_failed());
         }
@@ -1137,8 +1203,10 @@ pub(super) fn validate_writer_fence_manifest_for_schema(
         })
         .map_err(|_| StorageError::writer_fence_manifest_mismatch())?;
 
-    let expected = if schema_version >= SCREEN_VISION_OUTBOUND_POLICY_WRITER_FENCE_SCHEMA_VERSION {
+    let expected = if schema_version >= CAPABILITY_AUTHORIZATION_WRITER_FENCE_SCHEMA_VERSION {
         WRITER_FENCE_TRIGGER_SPECS
+    } else if schema_version >= SCREEN_VISION_OUTBOUND_POLICY_WRITER_FENCE_SCHEMA_VERSION {
+        &WRITER_FENCE_TRIGGER_SPECS[..SCREEN_VISION_OUTBOUND_POLICY_WRITER_FENCE_TRIGGER_COUNT]
     } else if schema_version >= SCREEN_PERCEPTION_WRITER_FENCE_SCHEMA_VERSION {
         &WRITER_FENCE_TRIGGER_SPECS[..SCREEN_PERCEPTION_WRITER_FENCE_TRIGGER_COUNT]
     } else if schema_version >= LIVE2D_CORE_WRITER_FENCE_SCHEMA_VERSION {
@@ -2008,7 +2076,7 @@ mod tests {
         assert_eq!(body_package_writer_fence_trigger_specs().len(), 6);
         assert_eq!(live2d_core_writer_fence_trigger_specs().len(), 3);
         assert_eq!(screen_perception_writer_fence_trigger_specs().len(), 6);
-        assert_eq!(WRITER_FENCE_TRIGGER_SPECS.len(), 114);
+        assert_eq!(WRITER_FENCE_TRIGGER_SPECS.len(), 120);
         let resolution_id = late_delete_resolution_insert(&authorized).unwrap();
         assert_eq!(resolution_id, 1);
         assert_eq!(authorized.execute("UPDATE memory_vector_late_delete_resolution SET updated_at='2026-01-02T00:00:00.000Z' WHERE memory_id='late-resolution'", []).unwrap(), 1);
@@ -2312,9 +2380,9 @@ mod tests {
         let (_root, path) = initialized_fenced_database();
         let authorized = authorized_connection(&path);
         seed_protected_rows(&authorized);
-        assert_eq!(WRITER_FENCE_TRIGGER_SPECS.len(), 114);
+        assert_eq!(WRITER_FENCE_TRIGGER_SPECS.len(), 120);
         let reserved: i64 = authorized.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type='trigger' AND name LIKE 'digital_life_writer_epoch_%'", [], |r| r.get(0)).unwrap();
-        assert_eq!(reserved, 114);
+        assert_eq!(reserved, 120);
         for name in [
             "memory_vector_generation_semantic_delete_guard",
             "memory_vector_generation_semantic_identity_guard",
@@ -2548,7 +2616,7 @@ mod tests {
         validate_writer_fence_manifest(&authorized).unwrap();
         assert_eq!(autonomy_writer_fence_trigger_specs().len(), 12);
         assert_eq!(perception_writer_fence_trigger_specs().len(), 6);
-        assert_eq!(WRITER_FENCE_TRIGGER_SPECS.len(), 114);
+        assert_eq!(WRITER_FENCE_TRIGGER_SPECS.len(), 120);
         for table in ["life_perception_policy", "life_perception_policy_event"] {
             for operation in ["insert", "update", "delete"] {
                 let count: i64 = authorized
@@ -2599,7 +2667,7 @@ mod tests {
         assert_eq!(body_package_writer_fence_trigger_specs().len(), 6);
         assert_eq!(live2d_core_writer_fence_trigger_specs().len(), 3);
         assert_eq!(screen_perception_writer_fence_trigger_specs().len(), 6);
-        assert_eq!(WRITER_FENCE_TRIGGER_SPECS.len(), 114);
+        assert_eq!(WRITER_FENCE_TRIGGER_SPECS.len(), 120);
         for operation in ["insert", "update", "delete"] {
             let count: i64 = authorized
                 .query_row(
@@ -2635,7 +2703,7 @@ mod tests {
             screen_vision_outbound_policy_writer_fence_trigger_specs().len(),
             6
         );
-        assert_eq!(WRITER_FENCE_TRIGGER_SPECS.len(), 114);
+        assert_eq!(WRITER_FENCE_TRIGGER_SPECS.len(), 120);
         for table in [
             "life_screen_vision_outbound_policy",
             "life_screen_vision_outbound_policy_event",

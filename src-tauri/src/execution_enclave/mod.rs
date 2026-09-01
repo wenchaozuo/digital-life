@@ -1722,8 +1722,19 @@ impl CodexProtocolClient {
                     ..
                 }) if id == RpcId::Number(request_id.into()) => {
                     if error_code.is_some() {
+                        let remote_mutation_observed =
+                            !self.provisional_turn_notifications.is_empty();
                         self.provisional_turn_notifications.clear();
-                        self.state = CodexProtocolState::ThreadReady { thread_id };
+                        self.state = if remote_mutation_observed {
+                            // A contradictory turn/start error cannot erase
+                            // lifecycle evidence that the remote turn was
+                            // already created or advanced.  Retire the whole
+                            // session so no later call can issue another
+                            // mutating request.
+                            CodexProtocolState::Retired
+                        } else {
+                            CodexProtocolState::ThreadReady { thread_id }
+                        };
                         return Err(CodexRuntimeError::ProtocolError);
                     }
                     if !result_is_object {
@@ -3905,6 +3916,105 @@ mod tests {
         }
         assert_eq!(client.state, CodexProtocolState::Retired);
         client.shutdown().expect("turn timeout cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn turn_start_error_without_provisional_evidence_returns_thread_ready() {
+        let (_directory, _root, mut client) =
+            client_with_args(&["d29-b-turn-start-error-no-provisional"]);
+        let thread_id = initialize_and_start_thread(&mut client);
+        let _ = next_lifecycle_event(&mut client, Duration::from_secs(2));
+
+        assert_eq!(
+            client
+                .start_turn("safe turn/start error", Duration::from_secs(2))
+                .unwrap_err(),
+            CodexRuntimeError::ProtocolError
+        );
+        assert_eq!(client.provisional_turn_notifications.len(), 0);
+        assert_eq!(client.state, CodexProtocolState::ThreadReady { thread_id });
+        client.shutdown().expect("safe turn/start error cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn turn_start_error_after_provisional_turn_started_retires() {
+        let (_directory, root, mut client) =
+            client_with_args(&["d29-b-turn-start-error-after-provisional"]);
+        initialize_and_start_thread(&mut client);
+        let _ = next_lifecycle_event(&mut client, Duration::from_secs(2));
+
+        assert_eq!(
+            client
+                .start_turn("contradictory turn/start error", Duration::from_secs(2))
+                .unwrap_err(),
+            CodexRuntimeError::ProtocolError
+        );
+        assert_eq!(client.state, CodexProtocolState::Retired);
+        assert!(client.provisional_turn_notifications.is_empty());
+        assert_eq!(
+            client
+                .start_turn(
+                    "must not retry after remote evidence",
+                    Duration::from_secs(2)
+                )
+                .unwrap_err(),
+            CodexRuntimeError::SessionRetired
+        );
+        assert!(wait_for_file_contents(
+            &root.path().join("d29-turn-start-error-count.txt"),
+            "1",
+            Duration::from_secs(1)
+        ));
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            fs::read_to_string(root.path().join("d29-turn-start-error-count.txt"))
+                .expect("turn/start error count remains readable"),
+            "1"
+        );
+        client.shutdown().expect("provisional error cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn turn_start_error_after_fast_provisional_terminal_retires() {
+        let (_directory, root, mut client) =
+            client_with_args(&["d29-b-turn-start-error-after-fast-provisional-terminal"]);
+        initialize_and_start_thread(&mut client);
+        let _ = next_lifecycle_event(&mut client, Duration::from_secs(2));
+
+        assert_eq!(
+            client
+                .start_turn("terminal evidence before error", Duration::from_secs(2))
+                .unwrap_err(),
+            CodexRuntimeError::ProtocolError
+        );
+        assert_eq!(client.state, CodexProtocolState::Retired);
+        assert!(client.provisional_turn_notifications.is_empty());
+        assert_eq!(
+            client
+                .start_turn(
+                    "must not retry after terminal evidence",
+                    Duration::from_secs(2)
+                )
+                .unwrap_err(),
+            CodexRuntimeError::SessionRetired
+        );
+        assert!(wait_for_file_contents(
+            &root.path().join("d29-turn-start-error-count.txt"),
+            "1",
+            Duration::from_secs(1)
+        ));
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            fs::read_to_string(root.path().join("d29-turn-start-error-count.txt"))
+                .expect("terminal turn/start error count remains readable"),
+            "1"
+        );
+        client
+            .shutdown()
+            .expect("terminal provisional error cleanup");
     }
 
     #[cfg(windows)]

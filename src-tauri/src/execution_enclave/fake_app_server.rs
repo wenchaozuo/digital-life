@@ -220,6 +220,17 @@ fn main() {
                 // this regression must fence off.
                 thread::sleep(Duration::from_millis(200));
             }
+            let provisional_error_mode = matches!(
+                mode.as_str(),
+                "d29-b-turn-start-error-after-provisional"
+                    | "d29-b-turn-start-error-after-fast-provisional-terminal"
+            );
+            if mode == "d29-b-turn-start-error-no-provisional" || provisional_error_mode {
+                let _ = fs::write(
+                    "d29-turn-start-error-count.txt",
+                    turn_number.to_string().as_bytes(),
+                );
+            }
             let turn_id = if mode == "d29-b-stale-old-turn-event" && turn_number > 1 {
                 "turn-d29-2"
             } else {
@@ -236,6 +247,8 @@ fn main() {
                     | "d29-b-pre-response-wrong-turn"
                     | "d29-b-pre-response-wrong-thread"
                     | "d29-b-pre-response-provisional-overflow"
+                    | "d29-b-turn-start-error-after-provisional"
+                    | "d29-b-turn-start-error-after-fast-provisional-terminal"
             );
             if provisional_mode {
                 match mode.as_str() {
@@ -316,6 +329,24 @@ fn main() {
                             thread::sleep(Duration::from_millis(5));
                         }
                     }
+                    "d29-b-turn-start-error-after-provisional" => write_line(
+                        &mut stdout,
+                        format_turn_started_notification("thread-d29-ephemeral-1", turn_id),
+                    ),
+                    "d29-b-turn-start-error-after-fast-provisional-terminal" => {
+                        write_line(
+                            &mut stdout,
+                            format_turn_started_notification("thread-d29-ephemeral-1", turn_id),
+                        );
+                        write_line(
+                            &mut stdout,
+                            format_turn_completed_notification(
+                                "thread-d29-ephemeral-1",
+                                turn_id,
+                                "completed",
+                            ),
+                        );
+                    }
                     _ => {}
                 }
                 let _ = stdout.flush();
@@ -323,7 +354,11 @@ fn main() {
                     thread::sleep(Duration::from_secs(5));
                 }
             }
-            write_line(&mut stdout, format_turn_start_response(request_id, turn_id));
+            if provisional_error_mode || mode == "d29-b-turn-start-error-no-provisional" {
+                write_line(&mut stdout, format_turn_start_error_response(request_id));
+            } else {
+                write_line(&mut stdout, format_turn_start_response(request_id, turn_id));
+            }
 
             if !provisional_mode && mode == "d29-b-crash-during-turn" {
                 let _ = stdout.flush();
@@ -619,6 +654,13 @@ fn format_turn_start_response(request_id: i64, turn_id: &str) -> String {
         r#"{{"id":{},"result":{{"turn":{}}}}}"#,
         request_id,
         turn_object(turn_id, "inProgress")
+    )
+}
+
+fn format_turn_start_error_response(request_id: i64) -> String {
+    format!(
+        r#"{{"id":{},"error":{{"code":-32000,"message":"turn rejected"}}}}"#,
+        request_id
     )
 }
 

@@ -17,10 +17,12 @@ use std::{
 };
 
 #[cfg(windows)]
-use std::os::windows::fs::MetadataExt;
+use std::os::windows::{ffi::OsStrExt, fs::MetadataExt};
 
 #[cfg(windows)]
-use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+use windows_sys::Win32::Storage::FileSystem::{
+    MoveFileExW, FILE_ATTRIBUTE_REPARSE_POINT, MOVEFILE_WRITE_THROUGH,
+};
 
 const FINAL_EXECUTABLE_NAME: &str = "codex-app-server.exe";
 const PRIVATE_CODEX_HOME_NAME: &str = "codex-home";
@@ -124,21 +126,27 @@ impl TrustedCodexRuntimeProvisioner {
                 reused: true,
             });
         }
-        if fs::symlink_metadata(&self.layout.executable).is_ok() {
-            return Err(CodexRuntimeError::RuntimeIdentityMismatch);
+        match publish_staged_file_no_replace(staging_path, &self.layout.executable) {
+            Ok(()) => {
+                staging_guard.disarm();
+                verify_runtime_file(&self.layout.executable, self.descriptor)
+                    .map_err(|_| CodexRuntimeError::RuntimeIdentityMismatch)?;
+                Ok(TrustedCodexRuntime {
+                    descriptor: self.descriptor,
+                    layout: self.layout.clone(),
+                    reused: false,
+                })
+            }
+            Err(CodexRuntimeError::AtomicFinalizeFailed) => {
+                reuse_exact_runtime_after_failed_publish(&self.layout.executable, self.descriptor)?;
+                Ok(TrustedCodexRuntime {
+                    descriptor: self.descriptor,
+                    layout: self.layout.clone(),
+                    reused: true,
+                })
+            }
+            Err(error) => Err(error),
         }
-
-        fs::rename(staging_path, &self.layout.executable)
-            .map_err(|_| CodexRuntimeError::AtomicFinalizeFailed)?;
-        staging_guard.disarm();
-
-        verify_runtime_file(&self.layout.executable, self.descriptor)
-            .map_err(|_| CodexRuntimeError::RuntimeIdentityMismatch)?;
-        Ok(TrustedCodexRuntime {
-            descriptor: self.descriptor,
-            layout: self.layout.clone(),
-            reused: false,
-        })
     }
 }
 
@@ -485,6 +493,43 @@ fn copy_and_verify_source(
     Ok(())
 }
 
+#[cfg(windows)]
+fn publish_staged_file_no_replace(
+    staging: &Path,
+    final_path: &Path,
+) -> Result<(), CodexRuntimeError> {
+    let mut staging_wide = staging.as_os_str().encode_wide().collect::<Vec<_>>();
+    let mut final_wide = final_path.as_os_str().encode_wide().collect::<Vec<_>>();
+    if staging_wide.iter().any(|unit| *unit == 0) || final_wide.iter().any(|unit| *unit == 0) {
+        return Err(CodexRuntimeError::AtomicFinalizeFailed);
+    }
+    staging_wide.push(0);
+    final_wide.push(0);
+
+    // Deliberately omit the Windows replace-destination flag.  Windows then
+    // fails when the destination already exists instead of replacing an
+    // unknown file.
+    let published = unsafe {
+        MoveFileExW(
+            staging_wide.as_ptr(),
+            final_wide.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
+        ) != 0
+    };
+    published
+        .then_some(())
+        .ok_or(CodexRuntimeError::AtomicFinalizeFailed)
+}
+
+#[cfg(not(windows))]
+fn publish_staged_file_no_replace(
+    staging: &Path,
+    final_path: &Path,
+) -> Result<(), CodexRuntimeError> {
+    let _ = (staging, final_path);
+    Err(CodexRuntimeError::UnsupportedPlatform)
+}
+
 fn existing_runtime_is_exact(
     executable: &Path,
     descriptor: TrustedCodexRuntimeDescriptor,
@@ -497,6 +542,16 @@ fn existing_runtime_is_exact(
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(_) => Err(CodexRuntimeError::RuntimeIdentityMismatch),
+    }
+}
+
+fn reuse_exact_runtime_after_failed_publish(
+    executable: &Path,
+    descriptor: TrustedCodexRuntimeDescriptor,
+) -> Result<(), CodexRuntimeError> {
+    match existing_runtime_is_exact(executable, descriptor)? {
+        true => Ok(()),
+        false => Err(CodexRuntimeError::AtomicFinalizeFailed),
     }
 }
 
@@ -751,6 +806,82 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn atomic_publish_never_replaces_existing_mismatched_final() {
+        let root = tempfile::tempdir().expect("fixture temp root");
+        let app_data = root.path().join("digital-life-app-data");
+        let descriptor = fixture_descriptor(b"trusted");
+        let provisioner = TrustedCodexRuntimeProvisioner::new_for_test(&app_data, descriptor)
+            .expect("fixture app-data root validates");
+        let source = source_file(root.path(), "candidate.bin", b"trusted");
+        provisioner
+            .layout()
+            .ensure_directories()
+            .expect("runtime directories prepare");
+        let staging = provisioner
+            .layout()
+            .trusted_runtime_root()
+            .join("verified-candidate.staging");
+        copy_and_verify_source(&source, &staging, descriptor)
+            .expect("verified staging candidate created");
+        let final_path = provisioner.layout().executable().to_path_buf();
+        let original_final = b"existing-unknown-final";
+        fs::write(&final_path, original_final).expect("create mismatched final");
+        let publish_result;
+        {
+            let _staging_guard = StagingPathGuard::new(staging.clone());
+            publish_result = publish_staged_file_no_replace(&staging, &final_path);
+        }
+        assert_eq!(
+            publish_result.unwrap_err(),
+            CodexRuntimeError::AtomicFinalizeFailed
+        );
+        assert_eq!(fs::read(&final_path).expect("read final"), original_final);
+        assert!(!staging.exists(), "failed publish must clean staging");
+        assert_eq!(
+            reuse_exact_runtime_after_failed_publish(&final_path, descriptor).unwrap_err(),
+            CodexRuntimeError::RuntimeIdentityMismatch
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn concurrent_exact_final_is_reused_without_replacement() {
+        let root = tempfile::tempdir().expect("fixture temp root");
+        let app_data = root.path().join("digital-life-app-data");
+        let descriptor = fixture_descriptor(b"trusted");
+        let provisioner = TrustedCodexRuntimeProvisioner::new_for_test(&app_data, descriptor)
+            .expect("fixture app-data root validates");
+        let source = source_file(root.path(), "candidate.bin", b"trusted");
+        provisioner
+            .layout()
+            .ensure_directories()
+            .expect("runtime directories prepare");
+        let staging = provisioner
+            .layout()
+            .trusted_runtime_root()
+            .join("verified-candidate.staging");
+        copy_and_verify_source(&source, &staging, descriptor)
+            .expect("verified staging candidate created");
+        let final_path = provisioner.layout().executable().to_path_buf();
+        fs::write(&final_path, b"trusted").expect("create exact concurrent final");
+        let final_before = fs::read(&final_path).expect("read exact final");
+        let publish_result;
+        {
+            let _staging_guard = StagingPathGuard::new(staging.clone());
+            publish_result = publish_staged_file_no_replace(&staging, &final_path);
+        }
+        assert_eq!(
+            publish_result.unwrap_err(),
+            CodexRuntimeError::AtomicFinalizeFailed
+        );
+        reuse_exact_runtime_after_failed_publish(&final_path, descriptor)
+            .expect("exact concurrent final is reusable");
+        assert_eq!(fs::read(&final_path).expect("read final"), final_before);
+        assert!(!staging.exists(), "reused final must clean staging");
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn source_filename_cannot_choose_destination() {
         let (root, _app_data, provisioner) = fixture_root();
         let source = source_file(root.path(), "attacker-selected.exe", b"trusted");
@@ -970,12 +1101,10 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[ignore = "requires exact official pinned D29-C App Server fixture"]
     fn official_pinned_app_server_initialize_smoke() {
-        let Some(source) = std::env::var_os("DIGITAL_LIFE_D29_C_OFFICIAL_APP_SERVER_FIXTURE")
-        else {
-            eprintln!("SKIPPED: official D29-C asset fixture environment variable is absent");
-            return;
-        };
+        let source = std::env::var_os("DIGITAL_LIFE_D29_C_OFFICIAL_APP_SERVER_FIXTURE")
+            .expect("DIGITAL_LIFE_D29_C_OFFICIAL_APP_SERVER_FIXTURE must be set");
         let source = PathBuf::from(source);
         let descriptor = TrustedCodexRuntimeDescriptor::pinned();
         let (size, digest) = independent_sha256(&source);

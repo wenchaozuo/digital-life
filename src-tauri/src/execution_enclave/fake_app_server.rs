@@ -7,11 +7,15 @@ use std::{
     time::Duration,
 };
 
+const D29_B_BACKLOG_NOTIFICATION_COUNT: usize = 33;
+
 fn main() {
     let mut arguments = env::args();
     let _program = arguments.next();
     let mode = arguments.next().unwrap_or_else(|| "success".to_owned());
     let extra_argument = arguments.next();
+    let mut initialize_number = 0_u32;
+    let mut thread_start_number = 0_u32;
     let mut turn_number = 0_u32;
 
     if mode == "descendant-retains-pipes-child" {
@@ -31,9 +35,19 @@ fn main() {
         };
 
         if line.contains("\"method\":\"initialize\"") {
+            if mode == "timeout" || mode == "d29-b-initialize-delayed" {
+                initialize_number += 1;
+                let _ = fs::write(
+                    "d29-initialize-count.txt",
+                    initialize_number.to_string().as_bytes(),
+                );
+            }
             if mode == "timeout" {
                 thread::sleep(Duration::from_secs(5));
                 return;
+            }
+            if mode == "d29-b-initialize-delayed" {
+                thread::sleep(Duration::from_millis(200));
             }
             if mode == "malformed" {
                 let _ = writeln!(stdout, "{{malformed");
@@ -141,9 +155,6 @@ fn main() {
                 let _ = stdout.flush();
             }
         } else if line.contains("\"method\":\"thread/start\"") {
-            if mode == "d29-b-thread-start-delayed" {
-                thread::sleep(Duration::from_secs(5));
-            }
             let request_id = request_id(&line);
             let cwd = request_string(&line, "cwd").unwrap_or_else(|| {
                 env::current_dir()
@@ -153,6 +164,14 @@ fn main() {
             });
             if mode == "d29-b" || mode.starts_with("d29-b-") {
                 let _ = fs::write("d29-thread-start-request.txt", &line);
+            }
+            if mode == "d29-b-thread-start-delayed" {
+                thread_start_number += 1;
+                let _ = fs::write(
+                    "d29-thread-start-count.txt",
+                    thread_start_number.to_string().as_bytes(),
+                );
+                thread::sleep(Duration::from_millis(200));
             }
             if mode == "d29-b-wrong-thread-rpc-id" {
                 write_line(
@@ -180,6 +199,16 @@ fn main() {
             let request_id = request_id(&line);
             if mode == "d29-b" || mode.starts_with("d29-b-") {
                 let _ = fs::write("d29-turn-start-request.txt", &line);
+            }
+            if mode == "d29-b-turn-start-timeout" {
+                let _ = fs::write(
+                    "d29-turn-start-count.txt",
+                    turn_number.to_string().as_bytes(),
+                );
+                // The fake accepts and creates the remote turn before
+                // delaying its response, matching the upstream ambiguity that
+                // this regression must fence off.
+                thread::sleep(Duration::from_millis(200));
             }
             let turn_id = if mode == "d29-b-stale-old-turn-event" && turn_number > 1 {
                 "turn-d29-2"
@@ -219,7 +248,9 @@ fn main() {
                     &mut stdout,
                     r#"{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thread-d29-ephemeral-1"}}"#.to_owned(),
                 );
-            } else if mode == "d29-b-interrupt" {
+            } else if mode == "d29-b-interrupt"
+                || mode == "d29-b-interrupt-backlog-saturation"
+            {
                 write_line(
                     &mut stdout,
                     format_turn_started_notification("thread-d29-ephemeral-1", turn_id),
@@ -309,10 +340,32 @@ fn main() {
             if mode == "d29-b" || mode.starts_with("d29-b-") {
                 let _ = fs::write("d29-turn-interrupt-request.txt", &line);
             }
-            write_line(
-                &mut stdout,
-                format!(r#"{{"jsonrpc":"2.0","id":{request_id},"result":{{}}}}"#),
-            );
+            if mode == "d29-b-interrupt-backlog-saturation" {
+                for _ in 0..D29_B_BACKLOG_NOTIFICATION_COUNT {
+                    write_line(
+                        &mut stdout,
+                        format_item_notification(
+                            "item/started",
+                            "thread-d29-ephemeral-1",
+                            "turn-d29-1",
+                        ),
+                    );
+                    let _ = stdout.flush();
+                    // Pace the producer so the client's bounded reader queue
+                    // does not mask the pending-projection queue regression.
+                    thread::sleep(Duration::from_millis(5));
+                }
+                thread::sleep(Duration::from_secs(5));
+                write_line(
+                    &mut stdout,
+                    format!(r#"{{"jsonrpc":"2.0","id":{request_id},"result":{{}}}}"#),
+                );
+            } else {
+                write_line(
+                    &mut stdout,
+                    format!(r#"{{"jsonrpc":"2.0","id":{request_id},"result":{{}}}}"#),
+                );
+            }
             if mode == "d29-b-interrupt" {
                 write_line(
                     &mut stdout,

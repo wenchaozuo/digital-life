@@ -80,6 +80,7 @@ const MAX_PROTOCOL_FRAME_BYTES: usize = 64 * 1024;
 const MAX_METHOD_BYTES: usize = 128;
 const MAX_PROTOCOL_STRING_BYTES: usize = 1024;
 const EVENT_QUEUE_CAPACITY: usize = 32;
+const PENDING_LIFECYCLE_EVENT_CAPACITY: usize = EVENT_QUEUE_CAPACITY;
 const MAX_STDERR_CAPTURE_BYTES: usize = 16 * 1024;
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
 const KILL_REAP_ATTEMPTS: usize = 2;
@@ -1198,6 +1199,7 @@ impl CodexProtocolClient {
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
+                self.retire_after_ambiguous_request_timeout();
                 return Err(CodexRuntimeError::InitializeTimeout);
             }
             let event = self.next_process_event(remaining.min(Duration::from_millis(25)))?;
@@ -1267,7 +1269,7 @@ impl CodexProtocolClient {
                 }
                 ProcessEvent::Message(ProtocolMessage::Notification { notification }) => {
                     if let Some(event) = self.apply_notification(notification)? {
-                        self.pending_lifecycle_events.push_back(event);
+                        self.enqueue_lifecycle_event(event)?;
                     }
                 }
                 ProcessEvent::Message(ProtocolMessage::Response { .. }) => {}
@@ -1311,6 +1313,7 @@ impl CodexProtocolClient {
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
+                self.retire_after_ambiguous_request_timeout();
                 return Err(CodexRuntimeError::ProtocolRequestTimeout);
             }
             let event = self.next_process_event(remaining.min(Duration::from_millis(25)))?;
@@ -1351,7 +1354,7 @@ impl CodexProtocolClient {
                 }
                 ProcessEvent::Message(ProtocolMessage::Notification { notification }) => {
                     if let Some(event) = self.apply_notification(notification)? {
-                        self.pending_lifecycle_events.push_back(event);
+                        self.enqueue_lifecycle_event(event)?;
                     }
                 }
                 ProcessEvent::Message(ProtocolMessage::Response { .. }) => {}
@@ -1412,7 +1415,7 @@ impl CodexProtocolClient {
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                self.state = CodexProtocolState::ThreadReady { thread_id };
+                self.retire_after_ambiguous_request_timeout();
                 return Err(CodexRuntimeError::ProtocolRequestTimeout);
             }
             let event = self.next_process_event(remaining.min(Duration::from_millis(25)))?;
@@ -1463,7 +1466,7 @@ impl CodexProtocolClient {
                 }
                 ProcessEvent::Message(ProtocolMessage::Notification { notification }) => {
                     if let Some(event) = self.apply_notification(notification)? {
-                        self.pending_lifecycle_events.push_back(event);
+                        self.enqueue_lifecycle_event(event)?;
                     }
                 }
                 ProcessEvent::Message(ProtocolMessage::Response { .. }) => {}
@@ -1540,7 +1543,7 @@ impl CodexProtocolClient {
                 }
                 ProcessEvent::Message(ProtocolMessage::Notification { notification }) => {
                     if let Some(event) = self.apply_notification(notification)? {
-                        self.pending_lifecycle_events.push_back(event);
+                        self.enqueue_lifecycle_event(event)?;
                     }
                 }
                 ProcessEvent::Message(ProtocolMessage::Response { .. }) => {}
@@ -1564,6 +1567,25 @@ impl CodexProtocolClient {
         let request_id = self.next_request_id;
         self.next_request_id += 1;
         Ok(request_id)
+    }
+
+    fn retire_after_ambiguous_request_timeout(&mut self) {
+        // The request was written successfully, so a timeout cannot establish
+        // that the remote mutation did not happen.  Retire the whole session
+        // instead of restoring any state that would permit a duplicate RPC.
+        self.state = CodexProtocolState::Retired;
+    }
+
+    fn enqueue_lifecycle_event(
+        &mut self,
+        event: CodexLifecycleEvent,
+    ) -> Result<(), CodexRuntimeError> {
+        if self.pending_lifecycle_events.len() >= PENDING_LIFECYCLE_EVENT_CAPACITY {
+            self.state = CodexProtocolState::Retired;
+            return Err(CodexRuntimeError::EventQueueSaturated);
+        }
+        self.pending_lifecycle_events.push_back(event);
+        Ok(())
     }
 
     fn send_client_request(
@@ -2611,6 +2633,22 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn wait_for_file_contents(path: &Path, expected: &str, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Ok(contents) = fs::read_to_string(path) {
+                if contents == expected {
+                    return true;
+                }
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(windows)]
     fn wait_for_descendant_pid(path: &Path, timeout: Duration) -> Option<u32> {
         let deadline = Instant::now() + timeout;
         loop {
@@ -3226,6 +3264,170 @@ mod tests {
             CodexProtocolState::ThreadReady { .. }
         ));
         client.shutdown().expect("wrong response cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn initialize_timeout_retires_session_without_retry() {
+        let (_directory, root, mut client) = client_with_args(&["d29-b-initialize-delayed"]);
+        assert_eq!(
+            client.initialize(Duration::from_millis(40)).unwrap_err(),
+            CodexRuntimeError::InitializeTimeout
+        );
+        assert_eq!(client.state, CodexProtocolState::Retired);
+        assert_eq!(
+            client.initialize(Duration::from_secs(2)).unwrap_err(),
+            CodexRuntimeError::SessionRetired
+        );
+        assert!(wait_for_file_contents(
+            &root.path().join("d29-initialize-count.txt"),
+            "1",
+            Duration::from_secs(1)
+        ));
+        assert!(client
+            .pump_once(Duration::from_secs(1))
+            .expect("late initialize response is inert after retirement"));
+        assert_eq!(client.state, CodexProtocolState::Retired);
+        client.shutdown().expect("initialize timeout cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn thread_start_timeout_retires_session_without_retry() {
+        let (_directory, root, mut client) = client_with_args(&["d29-b-thread-start-delayed"]);
+        client
+            .initialize(Duration::from_secs(2))
+            .expect("initialize before delayed thread/start");
+        assert_eq!(
+            client.start_thread(Duration::from_millis(40)).unwrap_err(),
+            CodexRuntimeError::ProtocolRequestTimeout
+        );
+        assert_eq!(client.state, CodexProtocolState::Retired);
+        assert_eq!(
+            client.start_thread(Duration::from_secs(2)).unwrap_err(),
+            CodexRuntimeError::SessionRetired
+        );
+        assert!(wait_for_file_contents(
+            &root.path().join("d29-thread-start-count.txt"),
+            "1",
+            Duration::from_secs(1)
+        ));
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            fs::read_to_string(root.path().join("d29-thread-start-count.txt"))
+                .expect("thread/start count remains readable"),
+            "1"
+        );
+        client.shutdown().expect("thread timeout cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn turn_start_timeout_retires_session_without_duplicate_remote_turn() {
+        let (_directory, root, mut client) = client_with_args(&["d29-b-turn-start-timeout"]);
+        initialize_and_start_thread(&mut client);
+        let _ = next_lifecycle_event(&mut client, Duration::from_secs(2));
+        assert_eq!(
+            client
+                .start_turn("ambiguous timeout fixture", Duration::from_millis(40))
+                .unwrap_err(),
+            CodexRuntimeError::ProtocolRequestTimeout
+        );
+        assert_eq!(client.state, CodexProtocolState::Retired);
+        assert_eq!(
+            client
+                .start_turn("must not retry", Duration::from_secs(2))
+                .unwrap_err(),
+            CodexRuntimeError::SessionRetired
+        );
+        assert!(wait_for_file_contents(
+            &root.path().join("d29-turn-start-count.txt"),
+            "1",
+            Duration::from_secs(1)
+        ));
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            fs::read_to_string(root.path().join("d29-turn-start-count.txt"))
+                .expect("turn/start count remains readable"),
+            "1"
+        );
+        for _ in 0..5 {
+            assert!(client
+                .pump_once(Duration::from_secs(1))
+                .expect("late turn response and notifications remain inert"));
+        }
+        assert_eq!(client.state, CodexProtocolState::Retired);
+        client.shutdown().expect("turn timeout cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pending_lifecycle_queue_is_bounded() {
+        let (_directory, _root, mut client) = client_with_args(&["d29-b"]);
+        client.state = CodexProtocolState::TurnRunning {
+            thread_id: "thread-d29-ephemeral-1".to_owned(),
+            turn_id: "turn-d29-1".to_owned(),
+            started_event_seen: true,
+        };
+
+        let mut max_observed = 0;
+        for index in 0..PENDING_LIFECYCLE_EVENT_CAPACITY {
+            client
+                .enqueue_lifecycle_event(CodexLifecycleEvent::ItemStarted {
+                    thread_id: "thread-d29-ephemeral-1".to_owned(),
+                    turn_id: "turn-d29-1".to_owned(),
+                    item_id: format!("item-{index}"),
+                })
+                .expect("capacity-sized pending queue accepts event");
+            max_observed = max_observed.max(client.pending_lifecycle_events.len());
+        }
+        assert_eq!(max_observed, PENDING_LIFECYCLE_EVENT_CAPACITY);
+        assert_eq!(
+            client.pending_lifecycle_events.len(),
+            PENDING_LIFECYCLE_EVENT_CAPACITY
+        );
+        assert_eq!(
+            client
+                .enqueue_lifecycle_event(CodexLifecycleEvent::ItemStarted {
+                    thread_id: "thread-d29-ephemeral-1".to_owned(),
+                    turn_id: "turn-d29-1".to_owned(),
+                    item_id: "overflow".to_owned(),
+                })
+                .unwrap_err(),
+            CodexRuntimeError::EventQueueSaturated
+        );
+        assert_eq!(client.state, CodexProtocolState::Retired);
+        assert_eq!(
+            client.pending_lifecycle_events.len(),
+            PENDING_LIFECYCLE_EVENT_CAPACITY
+        );
+        client.shutdown().expect("pending queue saturation cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn interrupt_backlog_saturates_pending_queue_and_retires() {
+        let (_directory, _root, mut client) =
+            client_with_args(&["d29-b-interrupt-backlog-saturation"]);
+        initialize_and_start_thread(&mut client);
+        let _ = next_lifecycle_event(&mut client, Duration::from_secs(2));
+        client
+            .start_turn("interrupt backlog fixture", Duration::from_secs(2))
+            .expect("turn starts before interrupt backlog");
+        assert!(matches!(
+            next_lifecycle_event(&mut client, Duration::from_secs(2)),
+            CodexLifecycleEvent::TurnStarted { .. }
+        ));
+        assert_eq!(
+            client.interrupt_turn(Duration::from_secs(2)).unwrap_err(),
+            CodexRuntimeError::EventQueueSaturated
+        );
+        assert_eq!(client.state, CodexProtocolState::Retired);
+        assert_eq!(
+            client.pending_lifecycle_events.len(),
+            PENDING_LIFECYCLE_EVENT_CAPACITY
+        );
+        client.shutdown().expect("interrupt backlog cleanup");
     }
 
     #[cfg(windows)]

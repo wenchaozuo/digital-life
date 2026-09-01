@@ -44,6 +44,9 @@ const CREATE_EVENT_TABLE_SQL: &str = r#"CREATE TABLE life_capability_authorizati
     old_revision INTEGER NOT NULL CHECK (old_revision >= 1 AND old_revision < 9223372036854775807),
     new_revision INTEGER NOT NULL CHECK (new_revision = old_revision + 1),
     changed_at TEXT NOT NULL CHECK (length(trim(changed_at)) > 0),
+    actor_kind TEXT NOT NULL CHECK (actor_kind = 'user_explicit'),
+    provenance_kind TEXT NOT NULL CHECK (provenance_kind = 'user_authorization_root'),
+    evidence_version INTEGER NOT NULL CHECK (evidence_version = 1),
     CHECK (old_enabled <> new_enabled),
     UNIQUE (life_id, capability_id, new_revision),
     FOREIGN KEY (life_id, capability_id)
@@ -71,7 +74,7 @@ END"#;
 const AUTHORIZATION_COLUMNS: &str =
     "life_id, capability_id, enabled, revision, created_at, updated_at";
 const EVENT_COLUMNS: &str =
-    "event_id, life_id, capability_id, old_enabled, new_enabled, old_revision, new_revision, changed_at";
+    "event_id, life_id, capability_id, old_enabled, new_enabled, old_revision, new_revision, changed_at, actor_kind, provenance_kind, evidence_version";
 
 fn read_authorization(row: &Row<'_>) -> rusqlite::Result<LifeCapabilityAuthorization> {
     Ok(LifeCapabilityAuthorization {
@@ -91,22 +94,22 @@ fn read_authorization(row: &Row<'_>) -> rusqlite::Result<LifeCapabilityAuthoriza
 }
 
 fn read_event(row: &Row<'_>) -> rusqlite::Result<LifeCapabilityAuthorizationEvent> {
-    Ok(LifeCapabilityAuthorizationEvent {
-        event_id: row.get(0)?,
-        life_id: row.get(1)?,
-        capability_id: CapabilityId::try_from(row.get::<_, String>(2)?).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(
-                2,
-                rusqlite::types::Type::Text,
-                Box::new(error),
-            )
-        })?,
-        old_enabled: row.get::<_, bool>(3)?,
-        new_enabled: row.get::<_, bool>(4)?,
-        old_revision: row.get(5)?,
-        new_revision: row.get(6)?,
-        changed_at: row.get(7)?,
-    })
+    let capability_id = CapabilityId::try_from(row.get::<_, String>(2)?).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(LifeCapabilityAuthorizationEvent::from_persisted(
+        row.get(0)?,
+        row.get(1)?,
+        capability_id,
+        row.get::<_, bool>(3)?,
+        row.get::<_, bool>(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+    ))
 }
 
 fn validate_lookup_identity(name: &str, value: &str) -> Result<(), CapabilityAuthorizationError> {
@@ -191,13 +194,16 @@ fn event_evidence_matches(
     request: &LifeCapabilityAuthorizationUpdateRequest,
     applied_revision: i64,
 ) -> bool {
-    event.event_id == request.event_id
-        && event.life_id == request.life_id
-        && event.capability_id == request.capability_id
-        && event.old_enabled != request.enabled
-        && event.new_enabled == request.enabled
-        && event.old_revision == request.expected_revision
-        && event.new_revision == applied_revision
+    event.event_id() == request.event_id()
+        && event.life_id() == request.life_id()
+        && event.capability_id() == request.capability_id()
+        && event.old_enabled() != request.enabled()
+        && event.new_enabled() == request.enabled()
+        && event.old_revision() == request.expected_revision()
+        && event.new_revision() == applied_revision
+        && event.actor_kind() == request.user_explicit_evidence().actor_kind()
+        && event.provenance_kind() == request.user_explicit_evidence().provenance_kind()
+        && event.evidence_version() == request.user_explicit_evidence().evidence_version()
 }
 
 fn require_life(
@@ -253,16 +259,16 @@ fn update_authorization_in_transaction(
     request: LifeCapabilityAuthorizationUpdateRequest,
 ) -> Result<CapabilityAuthorizationUpdateOutcome, CapabilityAuthorizationError> {
     validate_update_request(&request)?;
-    let applied_revision = next_revision(request.expected_revision)?;
-    require_life(transaction, &request.life_id)?;
+    let applied_revision = next_revision(request.expected_revision())?;
+    require_life(transaction, request.life_id())?;
 
     // Event identity is checked before the current revision so an already
     // committed exact event remains replayable after later updates.
-    if let Some(existing_event) = load_event_by_id(transaction, &request.event_id)? {
+    if let Some(existing_event) = load_event_by_id(transaction, request.event_id())? {
         validate_event_state(&existing_event)?;
         if event_evidence_matches(&existing_event, &request, applied_revision) {
             let current =
-                load_authorization(transaction, &request.life_id, &request.capability_id)?
+                load_authorization(transaction, request.life_id(), request.capability_id())?
                     .ok_or_else(CapabilityAuthorizationError::authorization_not_found)?;
             validate_authorization_state(&current)?;
             return Ok(CapabilityAuthorizationUpdateOutcome::Replayed {
@@ -273,13 +279,13 @@ fn update_authorization_in_transaction(
         return Err(CapabilityAuthorizationError::event_conflict());
     }
 
-    let current = load_authorization(transaction, &request.life_id, &request.capability_id)?
+    let current = load_authorization(transaction, request.life_id(), request.capability_id())?
         .ok_or_else(CapabilityAuthorizationError::authorization_not_found)?;
     validate_authorization_state(&current)?;
-    if current.revision != request.expected_revision {
+    if current.revision != request.expected_revision() {
         return Err(CapabilityAuthorizationError::revision_conflict());
     }
-    if current.enabled == request.enabled {
+    if current.enabled == request.enabled() {
         return Err(CapabilityAuthorizationError::invalid_transition());
     }
 
@@ -291,12 +297,12 @@ fn update_authorization_in_transaction(
              WHERE life_id = ?4 AND capability_id = ?5
                AND revision = ?6 AND enabled = ?7",
             params![
-                request.enabled,
+                request.enabled(),
                 applied_revision,
                 &now,
-                &request.life_id,
-                request.capability_id.as_str(),
-                request.expected_revision,
+                request.life_id(),
+                request.capability_id().as_str(),
+                request.expected_revision(),
                 current.enabled,
             ],
         )
@@ -305,40 +311,39 @@ fn update_authorization_in_transaction(
         return Err(CapabilityAuthorizationError::revision_conflict());
     }
 
-    let event = LifeCapabilityAuthorizationEvent {
-        event_id: request.event_id,
-        life_id: request.life_id,
-        capability_id: request.capability_id,
-        old_enabled: current.enabled,
-        new_enabled: request.enabled,
-        old_revision: current.revision,
-        new_revision: applied_revision,
-        changed_at: now,
-    };
+    let event = LifeCapabilityAuthorizationEvent::from_update(
+        &request,
+        current.enabled,
+        current.revision,
+        now,
+    );
     validate_event_state(&event)?;
     transaction
         .execute(
             &format!(
                 "INSERT INTO life_capability_authorization_event ({EVENT_COLUMNS})
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
             ),
             params![
-                &event.event_id,
-                &event.life_id,
-                event.capability_id.as_str(),
-                event.old_enabled,
-                event.new_enabled,
-                event.old_revision,
-                event.new_revision,
-                &event.changed_at,
+                event.event_id(),
+                event.life_id(),
+                event.capability_id().as_str(),
+                event.old_enabled(),
+                event.new_enabled(),
+                event.old_revision(),
+                event.new_revision(),
+                event.changed_at(),
+                event.actor_kind(),
+                event.provenance_kind(),
+                event.evidence_version(),
             ],
         )
         .map_err(|_| CapabilityAuthorizationError::database())?;
 
-    let persisted_event = load_event_by_id(transaction, &event.event_id)?
+    let persisted_event = load_event_by_id(transaction, event.event_id())?
         .ok_or_else(CapabilityAuthorizationError::database)?;
     let persisted_authorization =
-        load_authorization(transaction, &event.life_id, &event.capability_id)?
+        load_authorization(transaction, event.life_id(), event.capability_id())?
             .ok_or_else(CapabilityAuthorizationError::authorization_not_found)?;
     validate_event_state(&persisted_event)?;
     validate_authorization_state(&persisted_authorization)?;
@@ -502,6 +507,9 @@ pub(super) fn validate_schema_objects(connection: &Connection) -> Result<(), Sto
             "old_revision",
             "new_revision",
             "changed_at",
+            "actor_kind",
+            "provenance_kind",
+            "evidence_version",
         ]
     {
         return Err(StorageError::migration_transaction_failed());
@@ -591,7 +599,8 @@ mod tests {
     use crate::{
         capability::{
             authorization::{
-                evaluate_capability_authorization, CapabilityAuthorizationDecisionCode,
+                evaluate_capability_authorization, issue_capability_grant_candidate,
+                CapabilityAuthorizationCreateOutcome, CapabilityAuthorizationDecisionCode,
                 CapabilityAuthorizationDecisionKind, CapabilityAuthorizationErrorCode,
                 CapabilityAuthorizationRepository, CapabilityAuthorizationUpdateOutcome,
                 LifeCapabilityAuthorizationCreateRequest, LifeCapabilityAuthorizationUpdateRequest,
@@ -669,14 +678,15 @@ mod tests {
             enabled: bool,
             expected_revision: i64,
         ) -> Result<CapabilityAuthorizationUpdateOutcome, CapabilityAuthorizationError> {
-            self.storage
-                .update_capability_authorization(LifeCapabilityAuthorizationUpdateRequest {
-                    event_id: event_id.into(),
-                    life_id: "d28-life".into(),
-                    capability_id: self.capability_id(),
+            self.storage.update_capability_authorization(
+                LifeCapabilityAuthorizationUpdateRequest::for_test(
+                    event_id,
+                    "d28-life",
+                    self.capability_id(),
                     enabled,
                     expected_revision,
-                })
+                ),
+            )
         }
     }
 
@@ -720,9 +730,9 @@ mod tests {
                 panic!("the first D28 update must apply")
             }
         };
-        assert!(!event.old_enabled);
-        assert!(event.new_enabled);
-        assert_eq!((event.old_revision, event.new_revision), (1, 2));
+        assert!(!event.old_enabled());
+        assert!(event.new_enabled());
+        assert_eq!((event.old_revision(), event.new_revision()), (1, 2));
         assert_eq!(
             fixture
                 .storage
@@ -751,9 +761,9 @@ mod tests {
                 event,
                 authorization,
             } => {
-                assert!(event.old_enabled);
-                assert!(!event.new_enabled);
-                assert_eq!((event.old_revision, event.new_revision), (2, 3));
+                assert!(event.old_enabled());
+                assert!(!event.new_enabled());
+                assert_eq!((event.old_revision(), event.new_revision()), (2, 3));
                 assert!(!authorization.enabled);
                 assert_eq!(authorization.revision, 3);
             }
@@ -816,63 +826,116 @@ mod tests {
     fn evaluator_reads_fresh_sqlite_state_and_returns_current_revision_evidence() {
         let fixture = Fixture::new();
         fixture.create();
-        let descriptor = CapabilityDescriptor::new(
-            fixture.capability_id(),
+        let capability_id = fixture.capability_id();
+        let descriptor = CapabilityDescriptor::synthetic(
+            capability_id.clone(),
             "Synthetic capability",
             RiskClass::Low,
             ApprovalFloor::RootEnabled,
             ScopeRequirement::None,
         )
         .unwrap();
-        let registry = CapabilityRegistry::from_trusted_descriptors([descriptor.clone()]).unwrap();
+        let registry = CapabilityRegistry::synthetic([descriptor.clone()]).unwrap();
 
         let disabled = evaluate_capability_authorization(
             &fixture.storage,
             &registry,
             "d28-life",
-            &descriptor,
+            &capability_id,
             RequestedCapabilityScope::None,
         )
         .unwrap();
         assert_eq!(
-            disabled.outcome,
+            disabled.outcome(),
             CapabilityAuthorizationDecisionKind::RootDisabled
         );
-        assert_eq!(disabled.authorization_revision, Some(1));
+        assert_eq!(disabled.authorization_revision(), Some(1));
 
         fixture.update("d28-event-enable", true, 1).unwrap();
         let enabled = evaluate_capability_authorization(
             &fixture.storage,
             &registry,
             "d28-life",
-            &descriptor,
+            &capability_id,
             RequestedCapabilityScope::None,
         )
         .unwrap();
         assert_eq!(
-            enabled.outcome,
+            enabled.outcome(),
             CapabilityAuthorizationDecisionKind::Eligible
         );
         assert_eq!(
-            enabled.decision_code,
+            enabled.decision_code(),
             CapabilityAuthorizationDecisionCode::Eligible
         );
-        assert_eq!(enabled.authorization_revision, Some(2));
+        assert_eq!(enabled.authorization_revision(), Some(2));
 
         fixture.update("d28-event-disable", false, 2).unwrap();
         let disabled_again = evaluate_capability_authorization(
             &fixture.storage,
             &registry,
             "d28-life",
-            &descriptor,
+            &capability_id,
             RequestedCapabilityScope::None,
         )
         .unwrap();
         assert_eq!(
-            disabled_again.outcome,
+            disabled_again.outcome(),
             CapabilityAuthorizationDecisionKind::RootDisabled
         );
-        assert_eq!(disabled_again.authorization_revision, Some(3));
+        assert_eq!(disabled_again.authorization_revision(), Some(3));
+    }
+
+    #[test]
+    fn candidate_issuance_re_reads_sqlite_and_retires_stale_enabled_decision() {
+        let fixture = Fixture::new();
+        fixture.create();
+        fixture.update("d28-event-enable", true, 1).unwrap();
+        let capability_id = fixture.capability_id();
+        let descriptor = CapabilityDescriptor::synthetic(
+            capability_id.clone(),
+            "Synthetic capability",
+            RiskClass::Low,
+            ApprovalFloor::RootEnabled,
+            ScopeRequirement::None,
+        )
+        .unwrap();
+        let registry = CapabilityRegistry::synthetic([descriptor]).unwrap();
+
+        let stale_enabled_decision = evaluate_capability_authorization(
+            &fixture.storage,
+            &registry,
+            "d28-life",
+            &capability_id,
+            RequestedCapabilityScope::None,
+        )
+        .unwrap();
+        assert_eq!(stale_enabled_decision.authorization_revision(), Some(2));
+        let candidate = issue_capability_grant_candidate(
+            &fixture.storage,
+            &registry,
+            "d28-life",
+            "task-1",
+            &capability_id,
+            RequestedCapabilityScope::None,
+        )
+        .unwrap();
+        assert_eq!(candidate.life_id(), "d28-life");
+        assert_eq!(candidate.task_id(), "task-1");
+        assert_eq!(candidate.capability_id(), &capability_id);
+        assert_eq!(candidate.authorization_revision(), 2);
+        assert_eq!(candidate.approval_floor(), ApprovalFloor::RootEnabled);
+
+        fixture.update("d28-event-disable", false, 2).unwrap();
+        assert!(issue_capability_grant_candidate(
+            &fixture.storage,
+            &registry,
+            "d28-life",
+            "task-2",
+            &capability_id,
+            RequestedCapabilityScope::None,
+        )
+        .is_err());
     }
 
     #[test]
@@ -886,14 +949,33 @@ mod tests {
             })
             .unwrap_err();
         assert_eq!(error.code, CapabilityAuthorizationErrorCode::LifeNotFound);
+        {
+            let state = fixture.storage.state().unwrap();
+            assert!(state
+                .connection
+                .execute(
+                    "INSERT INTO life_capability_authorization_event
+                     (event_id, life_id, capability_id, old_enabled, new_enabled,
+                      old_revision, new_revision, changed_at, actor_kind,
+                      provenance_kind, evidence_version)
+                     VALUES ('orphan', 'missing-life', 'test.one', 0, 1, 1, 2, 'now',
+                             'user_explicit', 'user_authorization_root', 1)",
+                    [],
+                )
+                .is_err());
+        }
+
+        fixture.create();
         let state = fixture.storage.state().unwrap();
         assert!(state
             .connection
             .execute(
                 "INSERT INTO life_capability_authorization_event
                  (event_id, life_id, capability_id, old_enabled, new_enabled,
-                  old_revision, new_revision, changed_at)
-                 VALUES ('orphan', 'missing-life', 'test.one', 0, 1, 1, 2, 'now')",
+                  old_revision, new_revision, changed_at, actor_kind,
+                  provenance_kind, evidence_version)
+                 VALUES ('wrong-evidence', 'd28-life', 'test.one', 0, 1, 1, 2, 'now',
+                         'model_output', 'user_authorization_root', 1)",
                 [],
             )
             .is_err());

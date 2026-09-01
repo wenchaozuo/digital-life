@@ -98,15 +98,15 @@ pub(crate) enum ScopeRequirement {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CapabilityDescriptor {
-    pub(crate) capability_id: CapabilityId,
-    pub(crate) display_name: String,
-    pub(crate) risk_class: RiskClass,
-    pub(crate) approval_floor: ApprovalFloor,
-    pub(crate) scope_requirement: ScopeRequirement,
+    capability_id: CapabilityId,
+    display_name: String,
+    risk_class: RiskClass,
+    approval_floor: ApprovalFloor,
+    scope_requirement: ScopeRequirement,
 }
 
 impl CapabilityDescriptor {
-    pub(crate) fn new(
+    fn new(
         capability_id: CapabilityId,
         display_name: impl Into<String>,
         risk_class: RiskClass,
@@ -127,6 +127,43 @@ impl CapabilityDescriptor {
             approval_floor,
             scope_requirement,
         })
+    }
+
+    pub(crate) fn capability_id(&self) -> &CapabilityId {
+        &self.capability_id
+    }
+
+    pub(crate) fn display_name(&self) -> &str {
+        &self.display_name
+    }
+
+    pub(crate) fn risk_class(&self) -> RiskClass {
+        self.risk_class
+    }
+
+    pub(crate) fn approval_floor(&self) -> ApprovalFloor {
+        self.approval_floor
+    }
+
+    pub(crate) fn scope_requirement(&self) -> ScopeRequirement {
+        self.scope_requirement
+    }
+
+    #[cfg(test)]
+    pub(crate) fn synthetic(
+        capability_id: CapabilityId,
+        display_name: impl Into<String>,
+        risk_class: RiskClass,
+        approval_floor: ApprovalFloor,
+        scope_requirement: ScopeRequirement,
+    ) -> Result<Self, CapabilityDescriptorError> {
+        Self::new(
+            capability_id,
+            display_name,
+            risk_class,
+            approval_floor,
+            scope_requirement,
+        )
     }
 }
 
@@ -151,13 +188,13 @@ impl std::error::Error for CapabilityDescriptorError {}
 /// Immutable process-local registry built only from trusted static code.
 /// There is deliberately no registration or replacement method after
 /// construction.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CapabilityRegistry {
     descriptors: BTreeMap<CapabilityId, CapabilityDescriptor>,
 }
 
 impl CapabilityRegistry {
-    pub(crate) fn from_trusted_descriptors(
+    fn from_trusted_descriptors(
         descriptors: impl IntoIterator<Item = CapabilityDescriptor>,
     ) -> Result<Self, CapabilityRegistryError> {
         let mut registry = BTreeMap::new();
@@ -179,12 +216,15 @@ impl CapabilityRegistry {
         Self::from_trusted_descriptors([])
     }
 
-    pub(crate) fn descriptor(&self, capability_id: &CapabilityId) -> Option<&CapabilityDescriptor> {
-        self.descriptors.get(capability_id)
+    #[cfg(test)]
+    pub(crate) fn synthetic(
+        descriptors: impl IntoIterator<Item = CapabilityDescriptor>,
+    ) -> Result<Self, CapabilityRegistryError> {
+        Self::from_trusted_descriptors(descriptors)
     }
 
-    pub(crate) fn contains_exact(&self, descriptor: &CapabilityDescriptor) -> bool {
-        self.descriptor(&descriptor.capability_id) == Some(descriptor)
+    pub(crate) fn descriptor(&self, capability_id: &CapabilityId) -> Option<&CapabilityDescriptor> {
+        self.descriptors.get(capability_id)
     }
 
     #[cfg(test)]
@@ -215,7 +255,7 @@ mod tests {
     use super::*;
 
     fn descriptor(id: &str) -> CapabilityDescriptor {
-        CapabilityDescriptor::new(
+        CapabilityDescriptor::synthetic(
             CapabilityId::try_from(id).unwrap(),
             "Synthetic capability",
             RiskClass::Low,
@@ -248,11 +288,8 @@ mod tests {
 
     #[test]
     fn trusted_registry_rejects_duplicates_and_has_no_runtime_registration_surface() {
-        let error = CapabilityRegistry::from_trusted_descriptors([
-            descriptor("test.one"),
-            descriptor("test.one"),
-        ])
-        .unwrap_err();
+        let error = CapabilityRegistry::synthetic([descriptor("test.one"), descriptor("test.one")])
+            .unwrap_err();
         assert!(matches!(
             error,
             CapabilityRegistryError::DuplicateCapabilityId(_)
@@ -264,7 +301,7 @@ mod tests {
     #[test]
     fn trusted_registry_reconstruction_is_deterministic_and_descriptor_owned() {
         let low = descriptor("test.low");
-        let high = CapabilityDescriptor::new(
+        let high = CapabilityDescriptor::synthetic(
             CapabilityId::try_from("test.high").unwrap(),
             "Synthetic high-risk capability",
             RiskClass::High,
@@ -272,20 +309,19 @@ mod tests {
             ScopeRequirement::ExternalResourceRequired,
         )
         .unwrap();
-        let first =
-            CapabilityRegistry::from_trusted_descriptors([high.clone(), low.clone()]).unwrap();
-        let second = CapabilityRegistry::from_trusted_descriptors([low, high.clone()]).unwrap();
+        let first = CapabilityRegistry::synthetic([high.clone(), low.clone()]).unwrap();
+        let second = CapabilityRegistry::synthetic([low, high.clone()]).unwrap();
         assert_eq!(first, second);
-        assert_eq!(first.descriptor(&high.capability_id), Some(&high));
+        assert_eq!(first.descriptor(high.capability_id()), Some(&high));
 
-        let altered = CapabilityDescriptor::new(
-            high.capability_id.clone(),
-            high.display_name.clone(),
+        let altered = CapabilityDescriptor::synthetic(
+            high.capability_id().clone(),
+            high.display_name().to_owned(),
             RiskClass::Critical,
             ApprovalFloor::RootEnabled,
             ScopeRequirement::None,
         )
         .unwrap();
-        assert!(!first.contains_exact(&altered));
+        assert_ne!(first.descriptor(altered.capability_id()), Some(&altered));
     }
 }

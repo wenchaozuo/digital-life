@@ -24,6 +24,9 @@ CREATE TABLE life_capability_authorization_event (
     old_revision INTEGER NOT NULL CHECK (old_revision >= 1 AND old_revision < 9223372036854775807),
     new_revision INTEGER NOT NULL CHECK (new_revision = old_revision + 1),
     changed_at TEXT NOT NULL CHECK (length(trim(changed_at)) > 0),
+    actor_kind TEXT NOT NULL CHECK (actor_kind = 'user_explicit'),
+    provenance_kind TEXT NOT NULL CHECK (provenance_kind = 'user_authorization_root'),
+    evidence_version INTEGER NOT NULL CHECK (evidence_version = 1),
     CHECK (old_enabled <> new_enabled),
     UNIQUE (life_id, capability_id, new_revision),
     FOREIGN KEY (life_id, capability_id)

@@ -2,6 +2,7 @@ use std::{
     env,
     fs,
     io::{self, BufRead, Write},
+    process::{Command, Stdio},
     thread,
     time::Duration,
 };
@@ -11,6 +12,11 @@ fn main() {
     let _program = arguments.next();
     let mode = arguments.next().unwrap_or_else(|| "success".to_owned());
     let extra_argument = arguments.next();
+
+    if mode == "descendant-retains-pipes-child" {
+        thread::sleep(Duration::from_secs(10));
+        return;
+    }
 
     if mode == "crash" {
         std::process::exit(19);
@@ -109,6 +115,20 @@ fn main() {
             }
         } else if line.contains("\"method\":\"initialized\"") {
             if mode == "close-after-init" {
+                return;
+            }
+            if mode == "descendant-retains-pipes" {
+                let descendant = Command::new(env::current_exe().expect("fake executable path"))
+                    .arg("descendant-retains-pipes-child")
+                    .stdin(Stdio::inherit())
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .spawn()
+                    .expect("spawn pipe-retaining descendant");
+                let _ = fs::write(
+                    "d29-descendant-pid.txt",
+                    descendant.id().to_string().as_bytes(),
+                );
                 return;
             }
             if mode == "server-request-after-init" {

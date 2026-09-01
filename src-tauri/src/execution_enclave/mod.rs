@@ -37,6 +37,11 @@ use windows_sys::Win32::{
 #[cfg(all(windows, test))]
 use windows_sys::Win32::System::JobObjects::{IsProcessInJob, QueryInformationJobObject};
 
+#[cfg(all(windows, test))]
+use windows_sys::Win32::System::Threading::{
+    GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+};
+
 /// The only upstream release accepted by this foundation.
 pub(crate) const CODEX_UPSTREAM_REPOSITORY: &str = "https://github.com/openai/codex.git";
 pub(crate) const CODEX_UPSTREAM_RELEASE: &str = "rust-v0.152.0";
@@ -254,6 +259,12 @@ impl OwnedJobHandle {
         })
     }
 }
+
+// SAFETY: a Windows HANDLE is a process-local kernel reference that can be
+// moved between threads.  This type keeps the only owner of that reference;
+// it is not Clone or Sync, so CloseHandle still has one serialized owner.
+#[cfg(windows)]
+unsafe impl Send for OwnedJobHandle {}
 
 #[cfg(windows)]
 impl Drop for OwnedJobHandle {
@@ -622,6 +633,32 @@ struct CodexAppServerProcess {
     child_exit_reported: bool,
 }
 
+trait ReapedProcessLifecycle {
+    fn close_containment(&mut self);
+    fn join_readers(&mut self);
+    fn clear_child(&mut self);
+}
+
+fn finalize_reaped_process<T: ReapedProcessLifecycle>(process: &mut T) {
+    process.close_containment();
+    process.join_readers();
+    process.clear_child();
+}
+
+impl ReapedProcessLifecycle for CodexAppServerProcess {
+    fn close_containment(&mut self) {
+        self.containment.take();
+    }
+
+    fn join_readers(&mut self) {
+        self.stop_and_join_readers();
+    }
+
+    fn clear_child(&mut self) {
+        self.child.take();
+    }
+}
+
 impl CodexAppServerProcess {
     fn new(
         child: Child,
@@ -790,8 +827,7 @@ impl CodexAppServerProcess {
 
     fn terminate(&mut self, intent: TerminationIntent) -> Result<(), CodexRuntimeError> {
         if self.child.is_none() {
-            self.stop_and_join_readers();
-            self.containment.take();
+            finalize_reaped_process(self);
             return Ok(());
         }
 
@@ -841,9 +877,7 @@ impl CodexAppServerProcess {
             }
         }
 
-        self.stop_and_join_readers();
-        self.child.take();
-        self.containment.take();
+        finalize_reaped_process(self);
         Ok(())
     }
 
@@ -885,8 +919,7 @@ impl CodexAppServerProcess {
             match wait_result {
                 Ok(Some(exit_status)) => {
                     self.apply_exit_status(exit_status);
-                    self.stop_and_join_readers();
-                    self.child.take();
+                    finalize_reaped_process(self);
                     return;
                 }
                 Ok(None) if attempt + 1 < DROP_CLEANUP_ATTEMPTS => {
@@ -1458,8 +1491,15 @@ fn has_dedicated_root_marker(_path: &Path) -> bool {
 mod tests {
     use super::*;
     use std::{
-        cell::RefCell, collections::VecDeque, fs, path::PathBuf, process::Command, rc::Rc,
-        sync::OnceLock, thread, time::Duration,
+        cell::RefCell,
+        collections::VecDeque,
+        fs,
+        path::PathBuf,
+        process::Command,
+        rc::Rc,
+        sync::{mpsc, OnceLock},
+        thread,
+        time::Duration,
     };
 
     #[cfg(windows)]
@@ -1517,6 +1557,62 @@ mod tests {
             .spawn(spec)
             .expect("fake app server must spawn");
         (directory, root, CodexProtocolClient::new(process))
+    }
+
+    #[cfg(windows)]
+    fn wait_for_descendant_pid(path: &Path, timeout: Duration) -> Option<u32> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Ok(contents) = fs::read_to_string(path) {
+                if let Ok(pid) = contents.trim().parse::<u32>() {
+                    return Some(pid);
+                }
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(windows)]
+    fn wait_for_direct_child_exit(client: &mut CodexProtocolClient, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            client.process.refresh_child_status();
+            if client.status() == CodexProcessStatus::Exited {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    #[cfg(windows)]
+    fn windows_process_is_alive(pid: u32) -> bool {
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if process.is_null() {
+            return false;
+        }
+
+        let mut exit_code = 0_u32;
+        let queried = unsafe { GetExitCodeProcess(process, &mut exit_code) != 0 };
+        unsafe {
+            let _ = CloseHandle(process);
+        }
+        queried && exit_code == 259
+    }
+
+    #[cfg(windows)]
+    fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if !windows_process_is_alive(pid) {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        !windows_process_is_alive(pid)
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1580,6 +1676,25 @@ mod tests {
                 self.closed = true;
                 self.close_calls += 1;
             }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct FakeReapedProcessLifecycle {
+        events: Vec<&'static str>,
+    }
+
+    impl ReapedProcessLifecycle for FakeReapedProcessLifecycle {
+        fn close_containment(&mut self) {
+            self.events.push("containment-close");
+        }
+
+        fn join_readers(&mut self) {
+            self.events.push("reader-join");
+        }
+
+        fn clear_child(&mut self) {
+            self.events.push("child-clear");
         }
     }
 
@@ -1676,6 +1791,18 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn containment_closes_before_reader_join_after_reap() {
+        let mut lifecycle = FakeReapedProcessLifecycle::default();
+
+        finalize_reaped_process(&mut lifecycle);
+
+        assert_eq!(
+            lifecycle.events,
+            vec!["containment-close", "reader-join", "child-clear"]
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn job_object_is_configured_to_kill_on_close() {
@@ -1701,6 +1828,55 @@ mod tests {
             .expect("exposed process retains child");
         assert!(containment.child_is_assigned_for_test(child));
         process.shutdown().expect("assigned child cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn process_tree_shutdown_closes_containment_before_joining_readers() {
+        let (directory, root, mut client) = client_with_args(&["descendant-retains-pipes"]);
+        client
+            .initialize(Duration::from_secs(2))
+            .expect("root fake app server initializes");
+
+        let descendant_pid_path = root.path().join("d29-descendant-pid.txt");
+        let descendant_pid = wait_for_descendant_pid(&descendant_pid_path, Duration::from_secs(2))
+            .expect("descendant pid is published before root exits");
+        assert!(windows_process_is_alive(descendant_pid));
+        assert!(wait_for_direct_child_exit(
+            &mut client,
+            Duration::from_secs(2)
+        ));
+        assert!(windows_process_is_alive(descendant_pid));
+
+        let close_count = client
+            .process
+            .containment
+            .as_ref()
+            .expect("shutdown starts with live containment")
+            .close_counter_for_test();
+        let (done_sender, done_receiver) = mpsc::sync_channel(1);
+        let _shutdown_worker = thread::spawn(move || {
+            let result = client.shutdown();
+            let _ = done_sender.send((result, client));
+        });
+
+        let (shutdown_result, client) = done_receiver
+            .recv_timeout(Duration::from_secs(3))
+            .expect("process-tree shutdown must not block on inherited pipes");
+        assert!(
+            shutdown_result.is_ok(),
+            "shutdown result: {shutdown_result:?}"
+        );
+        assert_eq!(close_count.load(Ordering::Acquire), 1);
+        assert!(client.process.containment.is_none());
+        assert!(!client.has_child());
+        assert!(client.process.stdout_reader.is_none());
+        assert!(client.process.stderr_reader.is_none());
+        assert!(wait_for_process_exit(
+            descendant_pid,
+            Duration::from_secs(2)
+        ));
+        assert!(directory.path().join(".d29-dedicated-root").is_file());
     }
 
     #[cfg(windows)]

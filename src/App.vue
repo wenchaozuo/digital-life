@@ -56,6 +56,7 @@ const screenVisionError = ref<MainScreenVisionDeliveryError>();
 const screenVisionPreparing = ref(false);
 const screenVisionSending = ref(false);
 const screenVisionAbandoning = ref(false);
+const screenVisionOffering = ref(false);
 const screenVisionAttempt = ref<MainScreenVisionAttempt>();
 let unsubscribe: (() => void) | undefined;
 let bodyRuntimeBinding: BodyRuntimeBindingController | undefined;
@@ -156,6 +157,7 @@ const screenVisionCanPrepare = computed(() => {
     screenVisionPreparing.value ||
     screenVisionSending.value ||
     screenVisionAbandoning.value
+    || screenVisionOffering.value
   ) {
     return false;
   }
@@ -173,7 +175,8 @@ const screenVisionCanSend = computed(() => {
   if (
     screenVisionPreparing.value ||
     screenVisionSending.value ||
-    screenVisionAbandoning.value
+    screenVisionAbandoning.value ||
+    screenVisionOffering.value
   ) {
     return false;
   }
@@ -211,6 +214,16 @@ const screenVisionCanAbandon = computed(() => {
     !screenVisionAbandoning.value
   );
 });
+
+const screenVisionCanUseInChat = computed(
+  () =>
+    screenVisionResult.value?.visionResultId !== null &&
+    screenVisionResult.value?.visionResultId !== undefined &&
+    !screenVisionPreparing.value &&
+    !screenVisionSending.value &&
+    !screenVisionAbandoning.value &&
+    !screenVisionOffering.value,
+);
 
 // D17-C: the listener registration race with unmount is fenced by this
 // controller, so a registration promise resolving after unmount is
@@ -306,6 +319,7 @@ function invalidateScreenVision(): void {
   screenVisionPreparing.value = false;
   screenVisionSending.value = false;
   screenVisionAbandoning.value = false;
+  screenVisionOffering.value = false;
 }
 
 // Backend ScreenVision status is the authoritative delivery lifecycle.
@@ -482,6 +496,41 @@ async function executeScreenVisionReview(): Promise<void> {
     if (isCurrentScreenVisionRequest(runtimeEpoch, lifeId, requestGeneration)) {
       screenVisionSending.value = false;
       void refreshScreenVisionStatus(runtimeEpoch);
+    }
+  }
+}
+
+async function useScreenVisionAnalysisInChat(): Promise<void> {
+  const lifeId = lifeIdentity.value?.id;
+  const visionResultId = screenVisionResult.value?.visionResultId;
+  if (
+    lifeId === undefined ||
+    visionResultId === undefined ||
+    visionResultId === null ||
+    !screenVisionCanUseInChat.value
+  ) {
+    return;
+  }
+
+  const runtimeEpoch = lifecycleEpoch;
+  const requestGeneration = ++screenVisionRequestGeneration;
+  screenVisionOffering.value = true;
+  screenVisionError.value = undefined;
+  try {
+    await mainScreenVisionDeliveryService.offerVisionResultToChat(visionResultId);
+    if (isCurrentScreenVisionRequest(runtimeEpoch, lifeId, requestGeneration)) {
+      // The backend emitted the existing presentation-only attachment hint;
+      // opening Chat is the only UI transition here. No Vision request is
+      // performed by this explicit second-consent action.
+      await openChat();
+    }
+  } catch (error: unknown) {
+    if (isCurrentScreenVisionRequest(runtimeEpoch, lifeId, requestGeneration)) {
+      screenVisionError.value = screenVisionDeliveryErrorFromUnknown(error);
+    }
+  } finally {
+    if (isCurrentScreenVisionRequest(runtimeEpoch, lifeId, requestGeneration)) {
+      screenVisionOffering.value = false;
     }
   }
 }
@@ -1162,6 +1211,28 @@ onUnmounted(() => {
               {{ observation }}
             </li>
           </ul>
+          <div class="screen-vision-chat-handoff">
+            <template v-if="screenVisionResult.visionResultId !== null">
+              <p>This attaches the AI-generated screen interpretation to your next Chat message.</p>
+              <p>The screenshot itself will not be attached.</p>
+            </template>
+            <p v-else>Chat handoff is unavailable for this analysis. Prepare a new analysis.</p>
+            <button
+              type="button"
+              data-testid="screen-vision-use-in-chat"
+              :disabled="!screenVisionCanUseInChat"
+              :aria-busy="screenVisionOffering"
+              @click="useScreenVisionAnalysisInChat"
+            >
+              {{
+                screenVisionResult.visionResultId === null
+                  ? "Vision analysis unavailable in chat"
+                  : screenVisionOffering
+                    ? "Attaching…"
+                    : "Use Vision analysis in chat"
+              }}
+            </button>
+          </div>
         </section>
       </section>
     </section>

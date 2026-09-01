@@ -210,6 +210,31 @@ describe("D24-C2 Chat screen-context attachment", () => {
     }
   });
 
+  it("renders Cloud Vision as a bounded source label without semantic text", async () => {
+    mocks.getPending.mockResolvedValue({
+      available: true,
+      attachmentId: "vision-attachment-opaque",
+      sourceKind: "cloudVision",
+      summary: "secret semantic summary that must stay backend-owned",
+      observations: ["secret observation"],
+    });
+    const wrapper = mountChatView();
+    await flushPromises();
+    try {
+      const attachment = wrapper.get("[data-testid='screen-context-attachment']");
+      expect(attachment.text()).toContain("Vision screen analysis attached");
+      expect(attachment.text()).toContain(
+        "AI-generated interpretation; the screenshot itself is not attached.",
+      );
+      expect(wrapper.text()).not.toContain("secret semantic summary");
+      expect(wrapper.text()).not.toContain("secret observation");
+      expect(wrapper.text()).not.toContain("vision-attachment-opaque");
+    } finally {
+      wrapper.unmount();
+      mountedWrappers.splice(mountedWrappers.indexOf(wrapper), 1);
+    }
+  });
+
   it("removes the indicator only after the backend confirms dismissal", async () => {
     mocks.getPending.mockResolvedValue({ available: true, attachmentId: "opaque-attachment" });
     let resolveDismiss!: () => void;

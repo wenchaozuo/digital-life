@@ -758,6 +758,11 @@ fn attachment_offer_error_dto(
             "The screen context attachment is currently in use and cannot be dismissed yet.",
             true,
         ),
+        ScreenContextChatAttachmentErrorCode::PerceptionAttachmentInUse => bounded_error(
+            "PERCEPTION_ATTACHMENT_IN_USE",
+            "Another screen perception attachment is already reserved for Chat.",
+            true,
+        ),
     }
 }
 

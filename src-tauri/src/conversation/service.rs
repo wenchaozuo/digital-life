@@ -42,6 +42,7 @@ use crate::{
         screen_policy::{
             authorize_screen_perception, ScreenPerceptionRepository, ScreenPerceptionSessionGate,
         },
+        screen_vision_context_handoff::ScreenVisionContextHandoffBroker,
         CurrentLifeAuthority,
     },
     prompt::{
@@ -295,13 +296,28 @@ struct ScreenPerceptionAuthorities<'a> {
     session_gate: &'a ScreenPerceptionSessionGate,
     handoff_broker: &'a ScreenContextHandoffBroker,
     attachment_broker: &'a ScreenContextChatAttachmentBroker,
+    vision_handoff_broker: Option<&'a ScreenVisionContextHandoffBroker>,
 }
 
-struct ClaimedScreenPerception {
-    attachment_id: String,
-    grant_id: String,
-    life_id: String,
-    prompt: PromptCurrentPerception,
+enum ClaimedPerceptionAuthority {
+    LocalOcr {
+        attachment_id: String,
+        grant_id: String,
+        life_id: String,
+        prompt: PromptCurrentPerception,
+    },
+    CloudVision {
+        attachment_id: String,
+        prompt: PromptCurrentPerception,
+    },
+}
+
+impl ClaimedPerceptionAuthority {
+    fn prompt(&self) -> PromptCurrentPerception {
+        match self {
+            Self::LocalOcr { prompt, .. } | Self::CloudVision { prompt, .. } => prompt.clone(),
+        }
+    }
 }
 
 impl<'a, S> ConversationCognitionService<'a, S>
@@ -339,6 +355,34 @@ where
         handoff_broker: &'a ScreenContextHandoffBroker,
         attachment_broker: &'a ScreenContextChatAttachmentBroker,
     ) -> Self {
+        Self::new_with_screen_perception_and_vision(
+            storage,
+            secrets,
+            model_coordinator,
+            retrieval_registry,
+            coordinator,
+            current_life,
+            repository,
+            session_gate,
+            handoff_broker,
+            attachment_broker,
+            None,
+        )
+    }
+
+    pub(crate) fn new_with_screen_perception_and_vision(
+        storage: &'a StorageService,
+        secrets: &'a S,
+        model_coordinator: &'a ModelRuntimeCoordinator,
+        retrieval_registry: &'a LanceDbVectorStoreRegistry,
+        coordinator: &'a ConversationCognitionCoordinator,
+        current_life: &'a dyn CurrentLifeAuthority,
+        repository: &'a dyn ScreenPerceptionRepository,
+        session_gate: &'a ScreenPerceptionSessionGate,
+        handoff_broker: &'a ScreenContextHandoffBroker,
+        attachment_broker: &'a ScreenContextChatAttachmentBroker,
+        vision_handoff_broker: Option<&'a ScreenVisionContextHandoffBroker>,
+    ) -> Self {
         Self {
             storage,
             secrets,
@@ -351,6 +395,7 @@ where
                 session_gate,
                 handoff_broker,
                 attachment_broker,
+                vision_handoff_broker,
             }),
             #[cfg(test)]
             pre_composite_hook: None,
@@ -545,6 +590,8 @@ where
                     error(ConversationCognitionErrorCode::EmotionIntegrationFailure)
                 } else if compile_error.code == PromptCompilerErrorCode::InvalidRelationship {
                     error(ConversationCognitionErrorCode::RelationshipIntegrationFailure)
+                } else if compile_error.code == PromptCompilerErrorCode::InvalidPerception {
+                    error(ConversationCognitionErrorCode::PerceptionContextUnavailable)
                 } else {
                     error(ConversationCognitionErrorCode::PersonaNotFound)
                 }
@@ -562,7 +609,7 @@ where
                 let authorities = self.screen_perception.as_ref().ok_or_else(|| {
                     error(ConversationCognitionErrorCode::PerceptionContextUnavailable)
                 })?;
-                let claimed = claim_screen_perception(
+                let claimed = claim_perception(
                     authorities,
                     attachment_id,
                     &life.id,
@@ -570,7 +617,7 @@ where
                     &request.request_id,
                 )?;
                 let compilation = compile_prompt(PromptCompilationRequest {
-                    current_perception: Some(claimed.prompt.clone()),
+                    current_perception: Some(claimed.prompt()),
                     ..prompt_request
                 })?;
                 (resolved, compilation, Some(claimed))
@@ -772,7 +819,7 @@ where
         ));
         if let Some(claimed) = claimed_perception.as_ref() {
             if let Some(authorities) = self.screen_perception.as_ref() {
-                retire_claimed_screen_perception(
+                retire_claimed_perception(
                     claimed,
                     &request.conversation_id,
                     &request.request_id,
@@ -826,9 +873,10 @@ pub async fn chat_with_governed_context(
     session_gate: State<'_, ScreenPerceptionSessionGate>,
     handoff_broker: State<'_, ScreenContextHandoffBroker>,
     attachment_broker: State<'_, ScreenContextChatAttachmentBroker>,
+    vision_handoff_broker: State<'_, ScreenVisionContextHandoffBroker>,
     request: GovernedConversationRequest,
 ) -> Result<GovernedConversationResponse, ConversationCognitionError> {
-    ConversationCognitionService::new_with_screen_perception(
+    ConversationCognitionService::new_with_screen_perception_and_vision(
         storage.inner(),
         secrets.inner(),
         model_coordinator.inner(),
@@ -839,6 +887,7 @@ pub async fn chat_with_governed_context(
         session_gate.inner(),
         handoff_broker.inner(),
         attachment_broker.inner(),
+        Some(vision_handoff_broker.inner()),
     )
     .chat(request)
     .await
@@ -916,13 +965,13 @@ fn parse_persona(
     })
 }
 
-fn claim_screen_perception(
+fn claim_perception(
     authorities: &ScreenPerceptionAuthorities<'_>,
     attachment_id: &str,
     original_life_id: &str,
     conversation_id: &str,
     request_id: &str,
-) -> Result<ClaimedScreenPerception, ConversationCognitionError> {
+) -> Result<ClaimedPerceptionAuthority, ConversationCognitionError> {
     let current_life_id = authorities
         .current_life
         .current_life_id()
@@ -944,33 +993,90 @@ fn claim_screen_perception(
         .life_fence_for(original_life_id)
         .ok_or_else(|| error(ConversationCognitionErrorCode::PerceptionContextUnavailable))?;
     let expected_fence = ScreenContextSessionFence(session_fence);
-    let attachment = authorities
-        .attachment_broker
-        .get_exact(attachment_id)
-        .map_err(|_| error(ConversationCognitionErrorCode::PerceptionContextUnavailable))?;
-    if attachment.life_id != original_life_id || attachment.session_fence != expected_fence {
+    let ocr_attachment = match authorities.attachment_broker.get_exact(attachment_id) {
+        Ok(attachment) => Some(attachment),
+        Err(error)
+            if error.code
+                == crate::perception::screen_chat_attachment::
+                    ScreenContextChatAttachmentErrorCode::AttachmentNotFound => None,
+        Err(_) => {
+            return Err(error(
+                ConversationCognitionErrorCode::PerceptionContextUnavailable,
+            ));
+        }
+    };
+    let vision_attachment = match authorities.vision_handoff_broker {
+        Some(broker) => match broker.get_exact(attachment_id) {
+            Ok(status) => Some(status),
+            Err(error)
+                if error.code
+                    == crate::perception::screen_vision_context_handoff::
+                        ScreenVisionContextHandoffErrorCode::AttachmentNotFound => None,
+            Err(_) => {
+                return Err(error(
+                    ConversationCognitionErrorCode::PerceptionContextUnavailable,
+                ));
+            }
+        },
+        None => None,
+    };
+    if ocr_attachment.is_some() && vision_attachment.is_some() {
         return Err(error(
             ConversationCognitionErrorCode::PerceptionContextUnavailable,
         ));
     }
 
-    let payload = authorities
-        .handoff_broker
-        .claim_grant(ScreenContextIds {
-            grant_id: attachment.grant_id.clone(),
-            life_id: original_life_id.to_string(),
-            session_fence: expected_fence,
-            conversation_id: conversation_id.to_string(),
-            request_id: request_id.to_string(),
-        })
-        .map_err(|_| error(ConversationCognitionErrorCode::PerceptionContextUnavailable))?;
-    let prompt = prompt_perception_from_payload(payload)?;
+    if let Some(attachment) = ocr_attachment {
+        if attachment.life_id != original_life_id || attachment.session_fence != expected_fence {
+            return Err(error(
+                ConversationCognitionErrorCode::PerceptionContextUnavailable,
+            ));
+        }
 
-    Ok(ClaimedScreenPerception {
-        attachment_id: attachment.attachment_id,
-        grant_id: attachment.grant_id,
-        life_id: original_life_id.to_string(),
-        prompt,
+        let payload = authorities
+            .handoff_broker
+            .claim_grant(ScreenContextIds {
+                grant_id: attachment.grant_id.clone(),
+                life_id: original_life_id.to_string(),
+                session_fence: expected_fence,
+                conversation_id: conversation_id.to_string(),
+                request_id: request_id.to_string(),
+            })
+            .map_err(|_| error(ConversationCognitionErrorCode::PerceptionContextUnavailable))?;
+        let prompt = prompt_perception_from_payload(payload)?;
+        authorities
+            .attachment_broker
+            .mark_bound(&attachment.attachment_id)
+            .map_err(|_| error(ConversationCognitionErrorCode::PerceptionContextUnavailable))?;
+
+        return Ok(ClaimedPerceptionAuthority::LocalOcr {
+            attachment_id: attachment.attachment_id,
+            grant_id: attachment.grant_id,
+            life_id: original_life_id.to_string(),
+            prompt,
+        });
+    }
+
+    let Some(vision_handoff_broker) = authorities.vision_handoff_broker else {
+        return Err(error(
+            ConversationCognitionErrorCode::PerceptionContextUnavailable,
+        ));
+    };
+    let vision = vision_handoff_broker
+        .claim_exact(
+            attachment_id,
+            original_life_id,
+            &session_fence.to_string(),
+            conversation_id,
+            request_id,
+        )
+        .map_err(|_| error(ConversationCognitionErrorCode::PerceptionContextUnavailable))?;
+    Ok(ClaimedPerceptionAuthority::CloudVision {
+        attachment_id: vision.attachment_id,
+        prompt: PromptCurrentPerception::CloudVision {
+            summary: vision.summary,
+            observations: vision.observations,
+        },
     })
 }
 
@@ -982,34 +1088,53 @@ fn prompt_perception_from_payload(
             ConversationCognitionErrorCode::PerceptionContextUnavailable,
         ));
     }
-    Ok(PromptCurrentPerception {
+    Ok(PromptCurrentPerception::LocalOcr {
         text: payload.text,
         truncated: payload.truncated,
     })
 }
 
-fn retire_claimed_screen_perception(
-    claimed: &ClaimedScreenPerception,
+fn retire_claimed_perception(
+    claimed: &ClaimedPerceptionAuthority,
     conversation_id: &str,
     request_id: &str,
     authorities: &ScreenPerceptionAuthorities<'_>,
 ) {
-    let may_remove_attachment = match authorities.handoff_broker.retire_bound_grant(
-        &claimed.grant_id,
-        &claimed.life_id,
-        conversation_id,
-        request_id,
-    ) {
-        Ok(()) => true,
-        // A newer Observe may have replaced the old bound grant. The old
-        // grant is then definitively absent; exact attachment removal still
-        // cannot touch a newer attachment ID.
-        Err(error) => error.code == ScreenContextErrorCode::NoCurrentContext,
-    };
-    if may_remove_attachment {
-        let _ = authorities
-            .attachment_broker
-            .remove_exact(&claimed.attachment_id);
+    match claimed {
+        ClaimedPerceptionAuthority::LocalOcr {
+            attachment_id,
+            grant_id,
+            life_id,
+            ..
+        } => {
+            let may_remove_attachment = match authorities.handoff_broker.retire_bound_grant(
+                grant_id,
+                life_id,
+                conversation_id,
+                request_id,
+            ) {
+                Ok(()) => true,
+                // A newer Observe may have replaced the old bound grant. The
+                // old grant is then definitively absent; exact attachment
+                // removal still cannot touch a newer attachment ID.
+                Err(error) => error.code == ScreenContextErrorCode::NoCurrentContext,
+            };
+            if may_remove_attachment {
+                let _ = authorities
+                    .attachment_broker
+                    .clear_bound_exact(attachment_id);
+                let _ = authorities.attachment_broker.remove_exact(attachment_id);
+            }
+        }
+        ClaimedPerceptionAuthority::CloudVision { attachment_id, .. } => {
+            if let Some(vision_handoff_broker) = authorities.vision_handoff_broker {
+                let _ = vision_handoff_broker.retire_bound_exact(
+                    attachment_id,
+                    conversation_id,
+                    request_id,
+                );
+            }
+        }
     }
 }
 

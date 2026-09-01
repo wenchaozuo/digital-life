@@ -10,6 +10,7 @@
 //! consent below.
 
 pub(crate) mod foreground_focus;
+pub(crate) mod perception_chat_offer_gate;
 pub(crate) mod screen_capture;
 pub(crate) mod screen_chat_attachment;
 pub(crate) mod screen_context;
@@ -17,6 +18,7 @@ pub(crate) mod screen_observation;
 pub(crate) mod screen_ocr;
 pub(crate) mod screen_policy;
 pub(crate) mod screen_settings;
+pub(crate) mod screen_vision_context_handoff;
 pub(crate) mod screen_vision_delivery;
 pub(crate) mod screen_vision_outbound_candidate;
 pub(crate) mod screen_vision_outbound_delivery_claim;
@@ -27,6 +29,7 @@ pub(crate) mod screen_vision_outbound_preparation;
 pub(crate) mod screen_vision_outbound_projection;
 pub(crate) mod screen_vision_outbound_resolver;
 pub(crate) mod screen_vision_outbound_settings;
+pub(crate) mod screen_vision_semantic_result;
 
 pub(crate) const PERCEPTION_POLICY_VERSION: i64 = 1;
 pub(crate) const PERCEPTION_POLICY_EVENT_VERSION: i64 = 1;

@@ -1,4 +1,5 @@
 mod candidate_memory_internal;
+use std::sync::Arc;
 // D11-B1 is the emotion authority foundation; the emotion domain has no
 // production caller until the D11-B2+ policy/conversation stages, so the
 // frozen surface is allowed as dead code outside test builds. D12-B1 is the
@@ -68,6 +69,11 @@ pub fn run() {
             app.manage(perception::screen_policy::ScreenPerceptionSessionGate::new());
             app.manage(perception::screen_capture::target::ScreenCaptureTargetBroker::new());
             app.manage(perception::screen_capture::operation::ScreenCaptureOperationGate::new());
+            // D27: one process-local cross-source Chat perception offer
+            // gate.  OCR and Cloud Vision keep separate source authorities,
+            // but neither may occupy the unified Chat slot concurrently.
+            let chat_offer_gate = Arc::new(perception::perception_chat_offer_gate::PerceptionChatOfferGate::new());
+            app.manage(Arc::clone(&chat_offer_gate));
             // D24-A/B1: the single App-managed process-local screen-context
             // handoff broker.  Main observation and explicit handoff commands
             // consume it; Chat integration remains a later stage.
@@ -76,9 +82,16 @@ pub fn run() {
             // bridging a validated Pending Grant to an opaque Chat-facing
             // attachment ID.  Presentation-only; the handoff broker above
             // remains the actual grant authority.
-            app.manage(
-                perception::screen_chat_attachment::ScreenContextChatAttachmentBroker::new(),
-            );
+            app.manage(perception::screen_chat_attachment::ScreenContextChatAttachmentBroker::new_with_offer_gate(
+                Arc::clone(&chat_offer_gate),
+            ));
+            // D27: bounded semantic result and the separate Vision → Chat
+            // handoff are process-local single-slot authorities.  Neither
+            // stores image bytes or survives process restart.
+            app.manage(perception::screen_vision_semantic_result::ScreenVisionSemanticResultBroker::new());
+            app.manage(perception::screen_vision_context_handoff::ScreenVisionContextHandoffBroker::new_with_offer_gate(
+                chat_offer_gate,
+            ));
             // D25-C2: the single process-local screen-vision outbound
             // candidate authority.  It owns at most one C1 projection and is
             // deliberately not exposed through a Tauri command or ACL.
@@ -205,6 +218,7 @@ pub fn run() {
             perception::screen_vision_delivery::get_main_screen_vision_status,
             perception::screen_vision_delivery::execute_main_screen_vision_review,
             perception::screen_vision_delivery::abandon_main_screen_vision_delivery,
+            perception::screen_vision_delivery::offer_screen_vision_result_to_chat,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

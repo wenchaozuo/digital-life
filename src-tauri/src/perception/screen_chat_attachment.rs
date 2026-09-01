@@ -32,20 +32,27 @@
 //! attachment invalidation.  Chat never treats that event as authority;
 //! D24-C2 uses it only to trigger a backend status reread.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use tauri::{Emitter, State, WebviewWindow};
 
-use super::screen_context::{
-    generate_opaque_identity, ScreenContextError, ScreenContextErrorCode,
-    ScreenContextHandoffBroker, ScreenContextSessionFence,
-};
 use super::screen_policy::{
     authorize_screen_perception, ScreenPerceptionErrorCode, ScreenPerceptionRepository,
     ScreenPerceptionSessionGate,
 };
 use super::CurrentLifeAuthority;
+use super::{
+    perception_chat_offer_gate::{
+        PerceptionChatOfferGate, PerceptionChatOfferGateError, PerceptionChatOfferGateErrorCode,
+        PerceptionChatSourceKind,
+    },
+    screen_context::{
+        generate_opaque_identity, ScreenContextError, ScreenContextErrorCode,
+        ScreenContextHandoffBroker, ScreenContextSessionFence,
+    },
+    screen_vision_context_handoff::ScreenVisionContextHandoffBroker,
+};
 use crate::storage::StorageService;
 
 /// The only window permitted to read or dismiss Chat screen attachments.
@@ -64,6 +71,7 @@ pub(crate) enum ScreenContextChatAttachmentErrorCode {
     InvalidArgument,
     AttachmentNotFound,
     AttachmentInUse,
+    PerceptionAttachmentInUse,
     SynchronizationUnavailable,
 }
 
@@ -99,6 +107,13 @@ impl ScreenContextChatAttachmentError {
         Self::new(
             ScreenContextChatAttachmentErrorCode::AttachmentInUse,
             "The screen context attachment is currently in use and cannot be dismissed yet.",
+        )
+    }
+
+    fn perception_attachment_in_use() -> Self {
+        Self::new(
+            ScreenContextChatAttachmentErrorCode::PerceptionAttachmentInUse,
+            "Another screen perception attachment is already reserved for Chat.",
         )
     }
 
@@ -140,13 +155,23 @@ enum ChatAttachmentState {
 /// binding, and no Provider integration.
 pub(crate) struct ScreenContextChatAttachmentBroker {
     state: Mutex<ChatAttachmentState>,
+    offer_gate: Arc<PerceptionChatOfferGate>,
 }
 
 impl ScreenContextChatAttachmentBroker {
     pub(crate) fn new() -> Self {
+        Self::new_with_offer_gate(Arc::new(PerceptionChatOfferGate::new()))
+    }
+
+    pub(crate) fn new_with_offer_gate(offer_gate: Arc<PerceptionChatOfferGate>) -> Self {
         Self {
             state: Mutex::new(ChatAttachmentState::Empty),
+            offer_gate,
         }
+    }
+
+    pub(crate) fn offer_gate(&self) -> Arc<PerceptionChatOfferGate> {
+        Arc::clone(&self.offer_gate)
     }
 
     /// Offers one validated Pending Grant into the single attachment slot.
@@ -184,15 +209,51 @@ impl ScreenContextChatAttachmentBroker {
                 return Ok(attachment_id.clone());
             }
         }
-        let attachment_id = generate_opaque_identity()
-            .map_err(|_| ScreenContextChatAttachmentError::synchronization_unavailable())?;
+        let previous_state = state.clone();
+        let reservation = self
+            .offer_gate
+            .begin_offer(PerceptionChatSourceKind::LocalOcr)
+            .map_err(map_offer_gate_error)?;
+        let attachment_id = match generate_opaque_identity() {
+            Ok(attachment_id) => attachment_id,
+            Err(_) => {
+                let _ = self.offer_gate.abort_offer(&reservation);
+                return Err(ScreenContextChatAttachmentError::synchronization_unavailable());
+            }
+        };
         *state = ChatAttachmentState::Offered {
             attachment_id: attachment_id.clone(),
             grant_id: grant_id.to_string(),
             life_id: life_id.to_string(),
             session_fence,
         };
+        if let Err(error) = self
+            .offer_gate
+            .commit_offer(&reservation, attachment_id.clone())
+        {
+            *state = previous_state;
+            let _ = self.offer_gate.abort_offer(&reservation);
+            return Err(map_offer_gate_error(error));
+        }
         Ok(attachment_id)
+    }
+
+    pub(crate) fn mark_bound(
+        &self,
+        attachment_id: &str,
+    ) -> Result<(), ScreenContextChatAttachmentError> {
+        self.offer_gate
+            .mark_bound(PerceptionChatSourceKind::LocalOcr, attachment_id)
+            .map_err(map_offer_gate_error)
+    }
+
+    pub(crate) fn clear_bound_exact(
+        &self,
+        attachment_id: &str,
+    ) -> Result<bool, ScreenContextChatAttachmentError> {
+        self.offer_gate
+            .clear_bound_exact(PerceptionChatSourceKind::LocalOcr, attachment_id)
+            .map_err(map_offer_gate_error)
     }
 
     /// Read-only view of the current marker, if any.  A poisoned lock fails
@@ -261,6 +322,9 @@ impl ScreenContextChatAttachmentBroker {
                 attachment_id: current_attachment_id,
                 ..
             } if current_attachment_id == attachment_id => {
+                self.offer_gate
+                    .clear_offered_exact(PerceptionChatSourceKind::LocalOcr, attachment_id)
+                    .map_err(map_offer_gate_error)?;
                 let ChatAttachmentState::Offered {
                     attachment_id,
                     grant_id,
@@ -278,6 +342,20 @@ impl ScreenContextChatAttachmentBroker {
                 })
             }
             _ => Err(ScreenContextChatAttachmentError::attachment_not_found()),
+        }
+    }
+}
+
+fn map_offer_gate_error(error: PerceptionChatOfferGateError) -> ScreenContextChatAttachmentError {
+    match error.code {
+        PerceptionChatOfferGateErrorCode::AttachmentInUse => {
+            ScreenContextChatAttachmentError::attachment_in_use()
+        }
+        PerceptionChatOfferGateErrorCode::CrossSourceInUse => {
+            ScreenContextChatAttachmentError::perception_attachment_in_use()
+        }
+        PerceptionChatOfferGateErrorCode::SynchronizationUnavailable => {
+            ScreenContextChatAttachmentError::synchronization_unavailable()
         }
     }
 }
@@ -331,6 +409,11 @@ where
     cancel_exact_pending_grant_or_confirm_absent(handoff_broker, &attachment)
         .map_err(chat_handoff_attachment_error)?;
     after_cancel();
+    // The underlying handoff may already have been BOUND and then invalidated
+    // by a Life/session transition or expiry. Once that exact authority is
+    // confirmed absent, clear the shared BOUND marker before removing the
+    // presentation marker so a stale source cannot orphan the global gate.
+    attachment_broker.clear_bound_exact(&attachment.attachment_id)?;
     attachment_broker
         .remove_exact(&attachment.attachment_id)
         .map(|_| ())
@@ -501,6 +584,8 @@ pub(crate) struct ChatScreenContextAttachmentStatusDto {
     pub(crate) available: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) attachment_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) source_kind: Option<String>,
 }
 
 impl ChatScreenContextAttachmentStatusDto {
@@ -508,13 +593,19 @@ impl ChatScreenContextAttachmentStatusDto {
         Self {
             available: false,
             attachment_id: None,
+            source_kind: None,
         }
     }
 
     fn available(attachment_id: String) -> Self {
+        Self::available_from_source(attachment_id, PerceptionChatSourceKind::LocalOcr)
+    }
+
+    fn available_from_source(attachment_id: String, source: PerceptionChatSourceKind) -> Self {
         Self {
             available: true,
             attachment_id: Some(attachment_id),
+            source_kind: Some(source.as_str().to_string()),
         }
     }
 }
@@ -614,6 +705,13 @@ fn chat_attachment_error_dto(
         ScreenContextChatAttachmentErrorCode::AttachmentInUse => {
             ChatScreenContextAttachmentErrorDto::attachment_in_use()
         }
+        ScreenContextChatAttachmentErrorCode::PerceptionAttachmentInUse => {
+            ChatScreenContextAttachmentErrorDto::new(
+                "PERCEPTION_ATTACHMENT_IN_USE",
+                "Another screen perception attachment is already reserved for Chat.",
+                true,
+            )
+        }
         ScreenContextChatAttachmentErrorCode::SynchronizationUnavailable => {
             ChatScreenContextAttachmentErrorDto::broker_unavailable()
         }
@@ -675,11 +773,32 @@ pub(crate) fn get_pending_screen_context_attachment_service(
     handoff_broker: &ScreenContextHandoffBroker,
     attachment_broker: &ScreenContextChatAttachmentBroker,
 ) -> Result<ChatScreenContextAttachmentStatusDto, ChatScreenContextAttachmentErrorDto> {
+    get_pending_screen_context_attachment_service_with_vision(
+        current_life,
+        repository,
+        session_gate,
+        handoff_broker,
+        attachment_broker,
+        None,
+    )
+}
+
+pub(crate) fn get_pending_screen_context_attachment_service_with_vision(
+    current_life: &dyn CurrentLifeAuthority,
+    repository: &dyn ScreenPerceptionRepository,
+    session_gate: &ScreenPerceptionSessionGate,
+    handoff_broker: &ScreenContextHandoffBroker,
+    attachment_broker: &ScreenContextChatAttachmentBroker,
+    vision_handoff_broker: Option<&ScreenVisionContextHandoffBroker>,
+) -> Result<ChatScreenContextAttachmentStatusDto, ChatScreenContextAttachmentErrorDto> {
     let current_life_id = match current_life.current_life_id() {
         Ok(Some(life_id)) => life_id,
         Ok(None) => {
             // No current Life: any stored marker is stale by definition.
             clear_current_attachment_and_cancel_grant(handoff_broker, attachment_broker);
+            if let Some(vision_handoff_broker) = vision_handoff_broker {
+                let _ = vision_handoff_broker.clear_offered_current();
+            }
             return Ok(ChatScreenContextAttachmentStatusDto::unavailable());
         }
         Err(()) => return Err(ChatScreenContextAttachmentErrorDto::life_unavailable()),
@@ -698,6 +817,9 @@ pub(crate) fn get_pending_screen_context_attachment_service(
                 // Disabled consent, missing policy, or a session not armed
                 // for this Life: the attachment must not be exposed; clear it.
                 clear_current_attachment_and_cancel_grant(handoff_broker, attachment_broker);
+                if let Some(vision_handoff_broker) = vision_handoff_broker {
+                    let _ = vision_handoff_broker.clear_offered_current();
+                }
                 return Ok(ChatScreenContextAttachmentStatusDto::unavailable());
             }
         },
@@ -706,32 +828,77 @@ pub(crate) fn get_pending_screen_context_attachment_service(
     let Some(fence) = session_gate.life_fence_for(&current_life_id) else {
         // Authorization passed but the fence disappeared (race): fail closed.
         clear_current_attachment_and_cancel_grant(handoff_broker, attachment_broker);
+        if let Some(vision_handoff_broker) = vision_handoff_broker {
+            let _ = vision_handoff_broker.clear_offered_current();
+        }
         return Ok(ChatScreenContextAttachmentStatusDto::unavailable());
     };
-    let Some(attachment) = attachment_broker.current() else {
-        return Ok(ChatScreenContextAttachmentStatusDto::unavailable());
+    let ocr_attachment = attachment_broker.current();
+    let vision_status = match vision_handoff_broker {
+        Some(vision_handoff_broker) => vision_handoff_broker
+            .status()
+            .map_err(|_| ChatScreenContextAttachmentErrorDto::broker_unavailable())?,
+        None => None,
     };
-    if attachment.life_id != current_life_id
-        || attachment.session_fence != ScreenContextSessionFence(fence)
-    {
-        clear_current_attachment_and_cancel_grant(handoff_broker, attachment_broker);
-        return Ok(ChatScreenContextAttachmentStatusDto::unavailable());
+    if ocr_attachment.is_some() && vision_status.is_some() {
+        // Two active locators violate the unified Chat slot.  Never select an
+        // arbitrary source when authority state is ambiguous.
+        return Err(ChatScreenContextAttachmentErrorDto::broker_unavailable());
     }
 
-    match handoff_broker.validate_attachment_grant_alive(
-        &attachment.grant_id,
-        &current_life_id,
-        ScreenContextSessionFence(fence),
-    ) {
-        Ok(()) => Ok(ChatScreenContextAttachmentStatusDto::available(
-            attachment.attachment_id,
-        )),
-        Err(_) => {
-            // Underlying grant is stale or expired (expiry also clears the
-            // handoff state to EMPTY).
+    if let Some(attachment) = ocr_attachment {
+        if attachment.life_id != current_life_id
+            || attachment.session_fence != ScreenContextSessionFence(fence)
+        {
             clear_current_attachment_and_cancel_grant(handoff_broker, attachment_broker);
+            return Ok(ChatScreenContextAttachmentStatusDto::unavailable());
+        }
+
+        return match handoff_broker.validate_attachment_grant_alive(
+            &attachment.grant_id,
+            &current_life_id,
+            ScreenContextSessionFence(fence),
+        ) {
+            Ok(()) => Ok(ChatScreenContextAttachmentStatusDto::available(
+                attachment.attachment_id,
+            )),
+            Err(_) => {
+                // Underlying grant is stale or expired (expiry also clears
+                // the handoff state to EMPTY).
+                clear_current_attachment_and_cancel_grant(handoff_broker, attachment_broker);
+                Ok(ChatScreenContextAttachmentStatusDto::unavailable())
+            }
+        };
+    }
+
+    let Some(vision_status) = vision_status else {
+        return Ok(ChatScreenContextAttachmentStatusDto::unavailable());
+    };
+    let Some(vision_handoff_broker) = vision_handoff_broker else {
+        return Err(ChatScreenContextAttachmentErrorDto::broker_unavailable());
+    };
+    match vision_handoff_broker.validate_for_presentation(
+        &vision_status.attachment_id,
+        &current_life_id,
+        &fence.to_string(),
+    ) {
+        Ok(()) => Ok(ChatScreenContextAttachmentStatusDto::available_from_source(
+            vision_status.attachment_id,
+            PerceptionChatSourceKind::CloudVision,
+        )),
+        Err(error)
+            if matches!(
+                error.code,
+                super::screen_vision_context_handoff::ScreenVisionContextHandoffErrorCode::AttachmentNotFound
+                    | super::screen_vision_context_handoff::ScreenVisionContextHandoffErrorCode::ResultExpired
+                    | super::screen_vision_context_handoff::ScreenVisionContextHandoffErrorCode::LifeMismatch
+                    | super::screen_vision_context_handoff::ScreenVisionContextHandoffErrorCode::SessionFenceMismatch
+            ) =>
+        {
+            let _ = vision_handoff_broker.clear_offered_current();
             Ok(ChatScreenContextAttachmentStatusDto::unavailable())
         }
+        Err(_) => Err(ChatScreenContextAttachmentErrorDto::broker_unavailable()),
     }
 }
 
@@ -745,6 +912,68 @@ pub(crate) fn dismiss_pending_screen_context_attachment_service(
     attachment_broker: &ScreenContextChatAttachmentBroker,
     attachment_id: &str,
 ) -> Result<(), ChatScreenContextAttachmentErrorDto> {
+    dismiss_pending_screen_context_attachment_service_with_vision(
+        handoff_broker,
+        attachment_broker,
+        None,
+        attachment_id,
+    )
+}
+
+pub(crate) fn dismiss_pending_screen_context_attachment_service_with_vision(
+    handoff_broker: &ScreenContextHandoffBroker,
+    attachment_broker: &ScreenContextChatAttachmentBroker,
+    vision_handoff_broker: Option<&ScreenVisionContextHandoffBroker>,
+    attachment_id: &str,
+) -> Result<(), ChatScreenContextAttachmentErrorDto> {
+    let ocr_match = match attachment_broker.get_exact(attachment_id) {
+        Ok(attachment) => Some(attachment),
+        Err(error) if error.code == ScreenContextChatAttachmentErrorCode::AttachmentNotFound => {
+            None
+        }
+        Err(error) if error.code == ScreenContextChatAttachmentErrorCode::InvalidArgument => {
+            return Err(ChatScreenContextAttachmentErrorDto::invalid_argument());
+        }
+        Err(_) => return Err(ChatScreenContextAttachmentErrorDto::broker_unavailable()),
+    };
+    let vision_match = match vision_handoff_broker {
+        Some(vision_handoff_broker) => match vision_handoff_broker.get_exact(attachment_id) {
+            Ok(status) => Some(status),
+            Err(error)
+                if error.code
+                    == super::screen_vision_context_handoff::
+                        ScreenVisionContextHandoffErrorCode::AttachmentNotFound
+                    || error.code
+                        == super::screen_vision_context_handoff::
+                            ScreenVisionContextHandoffErrorCode::ResultExpired => None,
+            Err(error)
+                if error.code
+                    == super::screen_vision_context_handoff::
+                        ScreenVisionContextHandoffErrorCode::InvalidArgument =>
+            {
+                return Err(ChatScreenContextAttachmentErrorDto::invalid_argument());
+            }
+            Err(_) => return Err(ChatScreenContextAttachmentErrorDto::broker_unavailable()),
+        },
+        None => None,
+    };
+    if ocr_match.is_some() && vision_match.is_some() {
+        return Err(ChatScreenContextAttachmentErrorDto::broker_unavailable());
+    }
+    if vision_match.is_some() {
+        return vision_handoff_broker
+            .expect("Vision match requires the Vision broker")
+            .dismiss_exact(attachment_id)
+            .map_err(|error| match error.code {
+                super::screen_vision_context_handoff::ScreenVisionContextHandoffErrorCode::AttachmentInUse => {
+                    ChatScreenContextAttachmentErrorDto::attachment_in_use()
+                }
+                super::screen_vision_context_handoff::ScreenVisionContextHandoffErrorCode::SynchronizationUnavailable => {
+                    ChatScreenContextAttachmentErrorDto::broker_unavailable()
+                }
+                _ => ChatScreenContextAttachmentErrorDto::not_found(),
+            });
+    }
     dismiss_exact_attachment(handoff_broker, attachment_broker, attachment_id)
 }
 
@@ -757,14 +986,16 @@ pub fn get_pending_screen_context_attachment(
     session_gate: State<'_, ScreenPerceptionSessionGate>,
     handoff_broker: State<'_, ScreenContextHandoffBroker>,
     attachment_broker: State<'_, ScreenContextChatAttachmentBroker>,
+    vision_handoff_broker: State<'_, ScreenVisionContextHandoffBroker>,
 ) -> Result<ChatScreenContextAttachmentStatusDto, ChatScreenContextAttachmentErrorDto> {
     require_chat_window(&window)?;
-    get_pending_screen_context_attachment_service(
+    get_pending_screen_context_attachment_service_with_vision(
         storage.inner(),
         storage.inner(),
         session_gate.inner(),
         handoff_broker.inner(),
         attachment_broker.inner(),
+        Some(vision_handoff_broker.inner()),
     )
 }
 
@@ -774,12 +1005,14 @@ pub fn dismiss_pending_screen_context_attachment(
     window: WebviewWindow,
     handoff_broker: State<'_, ScreenContextHandoffBroker>,
     attachment_broker: State<'_, ScreenContextChatAttachmentBroker>,
+    vision_handoff_broker: State<'_, ScreenVisionContextHandoffBroker>,
     attachment_id: String,
 ) -> Result<(), ChatScreenContextAttachmentErrorDto> {
     require_chat_window(&window)?;
-    dismiss_pending_screen_context_attachment_service(
+    dismiss_pending_screen_context_attachment_service_with_vision(
         handoff_broker.inner(),
         attachment_broker.inner(),
+        Some(vision_handoff_broker.inner()),
         &attachment_id,
     )
 }
@@ -1004,7 +1237,6 @@ mod tests {
         for token in [
             "ScreenContextPayload",
             "ScreenObservation",
-            "Ocr",
             "captured_at",
             "truncated",
             "recognized",
@@ -1529,7 +1761,7 @@ mod tests {
     }
 
     #[test]
-    fn status_serializes_only_available_and_attachment_id() {
+    fn status_serializes_only_bounded_presentation_fields() {
         let unavailable = ChatScreenContextAttachmentStatusDto::unavailable();
         assert_eq!(
             serde_json::to_value(unavailable).unwrap(),
@@ -1540,12 +1772,15 @@ mod tests {
         let encoded = serde_json::to_string(&available).unwrap();
         assert_eq!(
             serde_json::to_value(&available).unwrap(),
-            serde_json::json!({ "available": true, "attachmentId": "opaque-attachment" })
+            serde_json::json!({
+                "available": true,
+                "attachmentId": "opaque-attachment",
+                "sourceKind": "localOcr"
+            })
         );
         for forbidden in [
             "grant",
             "candidate",
-            "ocr",
             "capturedAt",
             "fence",
             "target",

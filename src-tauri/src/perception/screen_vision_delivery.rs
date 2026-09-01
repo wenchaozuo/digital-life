@@ -19,7 +19,7 @@ use std::sync::atomic::AtomicUsize;
 
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use tauri::Manager;
+use tauri::{Manager, WebviewWindow};
 use zeroize::Zeroizing;
 
 use crate::{
@@ -73,6 +73,7 @@ use super::{
         resolve_active_screen_vision_destination, ResolvedScreenVisionDestination,
         ScreenVisionDestinationResolverError, ScreenVisionDestinationResolverErrorCode,
     },
+    screen_vision_semantic_result::ScreenVisionSemanticResultBroker,
     CurrentLifeAuthority,
 };
 
@@ -113,6 +114,8 @@ pub(crate) enum MainScreenVisionErrorCode {
     ResponseInvalidAfterSend,
     TerminalSettlementUnavailableAfterSend,
     AbandonUnavailable,
+    PerceptionAttachmentInUse,
+    VisionResultUnavailable,
     SynchronizationUnavailable,
 }
 
@@ -167,6 +170,8 @@ impl MainScreenVisionErrorCode {
                 "VISION_TERMINAL_SETTLEMENT_UNAVAILABLE_AFTER_SEND"
             }
             Self::AbandonUnavailable => "VISION_ABANDON_UNAVAILABLE",
+            Self::PerceptionAttachmentInUse => "PERCEPTION_ATTACHMENT_IN_USE",
+            Self::VisionResultUnavailable => "VISION_RESULT_UNAVAILABLE",
             Self::SynchronizationUnavailable => "VISION_SYNCHRONIZATION_UNAVAILABLE",
         }
     }
@@ -219,6 +224,12 @@ impl MainScreenVisionErrorCode {
                 "The Vision provider received this image, but local one-shot finalization could not be completed. This attempt will not be resent automatically."
             }
             Self::AbandonUnavailable => "This Vision attempt can no longer be abandoned.",
+            Self::PerceptionAttachmentInUse => {
+                "Another screen perception attachment is already reserved for Chat."
+            }
+            Self::VisionResultUnavailable => {
+                "This Vision analysis is no longer available for Chat. Prepare a new analysis."
+            }
             Self::SynchronizationUnavailable => "Vision delivery is temporarily unavailable.",
         }
     }
@@ -269,6 +280,7 @@ pub(crate) struct MainScreenVisionAnalysisDto {
     pub(crate) observations: Vec<String>,
     pub(crate) provider_display_name: String,
     pub(crate) model_name: String,
+    pub(crate) vision_result_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -283,6 +295,18 @@ pub(crate) struct ExecuteMainScreenVisionReviewRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct AbandonMainScreenVisionDeliveryRequest {
     pub(crate) review_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct OfferScreenVisionResultToChatRequest {
+    pub(crate) vision_result_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MainScreenVisionContextHandoffOfferDto {
+    pub(crate) attachment_id: String,
 }
 
 #[derive(Clone)]
@@ -1055,6 +1079,7 @@ pub async fn execute_main_screen_vision_review(
     let candidate_broker = app.state::<ScreenVisionOutboundCandidateBroker>();
     let grant_broker = app.state::<ScreenVisionOutboundGrantBroker>();
     let review_broker = app.state::<ScreenVisionReviewBroker>();
+    let semantic_result_broker = app.state::<ScreenVisionSemanticResultBroker>();
     execute_main_screen_vision_review_service(
         storage.inner(),
         secrets.inner(),
@@ -1062,6 +1087,7 @@ pub async fn execute_main_screen_vision_review(
         candidate_broker.inner(),
         grant_broker.inner(),
         review_broker.inner(),
+        semantic_result_broker.inner(),
         delivery_permit,
         request,
     )
@@ -1076,6 +1102,7 @@ async fn execute_main_screen_vision_review_service(
     candidate_broker: &ScreenVisionOutboundCandidateBroker,
     grant_broker: &ScreenVisionOutboundGrantBroker,
     review_broker: &ScreenVisionReviewBroker,
+    semantic_result_broker: &ScreenVisionSemanticResultBroker,
     _delivery_permit: ScreenVisionDeliveryOperationPermit,
     request: ExecuteMainScreenVisionReviewRequest,
 ) -> Result<MainScreenVisionAnalysisDto, MainScreenVisionError> {
@@ -1271,11 +1298,25 @@ async fn execute_main_screen_vision_review_service(
                     true,
                 )
             })?;
+            // D26's terminal consume/settlement is complete before any
+            // semantic result is installed.  A local result-slot failure is
+            // deliberately represented by a null handoff locator while the
+            // valid Main preview remains successful; it never rewrites the
+            // already-observed provider outcome as a send failure.
+            let vision_result_id = semantic_result_broker
+                .install(
+                    evidence.life_id.clone(),
+                    final_fence.clone(),
+                    analysis.summary().to_string(),
+                    analysis.observations().to_vec(),
+                )
+                .ok();
             Ok(MainScreenVisionAnalysisDto {
                 summary: analysis.summary().to_string(),
                 observations: analysis.observations().to_vec(),
                 provider_display_name: resolved.profile.display_name,
                 model_name: resolved.profile.model_name,
+                vision_result_id,
             })
         }
         Err(SensitiveProviderExecutionError::PreSendGuard(_)) => {
@@ -1324,6 +1365,115 @@ async fn execute_main_screen_vision_review_service(
             }
         }
     }
+}
+
+/// Main-only explicit second-consent action.  It moves bounded semantic
+/// output into the process-local Vision → Chat handoff slot and performs no
+/// Vision or Chat provider request.
+#[tauri::command]
+pub fn offer_screen_vision_result_to_chat(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    request: OfferScreenVisionResultToChatRequest,
+) -> Result<MainScreenVisionContextHandoffOfferDto, MainScreenVisionErrorDto> {
+    if window.label() != "main" {
+        return Err(
+            MainScreenVisionError::new(MainScreenVisionErrorCode::InvalidArgument, false).dto(),
+        );
+    }
+    let storage = app.state::<StorageService>();
+    let session_gate = app.state::<ScreenPerceptionSessionGate>();
+    let semantic_result_broker = app.state::<ScreenVisionSemanticResultBroker>();
+    let handoff_broker =
+        app.state::<super::screen_vision_context_handoff::ScreenVisionContextHandoffBroker>();
+    let result = offer_screen_vision_result_to_chat_service(
+        storage.inner(),
+        session_gate.inner(),
+        semantic_result_broker.inner(),
+        handoff_broker.inner(),
+        request,
+    );
+    if result.is_ok() {
+        super::screen_chat_attachment::emit_chat_attachment_changed(&app);
+    }
+    result.map_err(MainScreenVisionError::dto)
+}
+
+fn offer_screen_vision_result_to_chat_service(
+    storage: &StorageService,
+    session_gate: &ScreenPerceptionSessionGate,
+    semantic_result_broker: &ScreenVisionSemanticResultBroker,
+    handoff_broker: &super::screen_vision_context_handoff::ScreenVisionContextHandoffBroker,
+    request: OfferScreenVisionResultToChatRequest,
+) -> Result<MainScreenVisionContextHandoffOfferDto, MainScreenVisionError> {
+    validate_id(&request.vision_result_id).map_err(|_| {
+        MainScreenVisionError::new(MainScreenVisionErrorCode::InvalidArgument, false)
+    })?;
+    let life_id = storage
+        .current_life_id()
+        .map_err(|_| MainScreenVisionError::new(MainScreenVisionErrorCode::LifeUnavailable, true))?
+        .ok_or_else(|| {
+            MainScreenVisionError::new(MainScreenVisionErrorCode::LifeUnavailable, true)
+        })?;
+    authorize_screen_perception(storage, session_gate, &life_id).map_err(|_| {
+        MainScreenVisionError::new(MainScreenVisionErrorCode::LocalScreenUnavailable, true)
+    })?;
+    let current_fence = session_gate.life_fence_for(&life_id).ok_or_else(|| {
+        MainScreenVisionError::new(MainScreenVisionErrorCode::LocalScreenUnavailable, true)
+    })?;
+    let result = semantic_result_broker
+        .get_exact(&request.vision_result_id)
+        .map_err(|error| {
+            use super::screen_vision_semantic_result::ScreenVisionSemanticResultErrorCode;
+            match error.code {
+                ScreenVisionSemanticResultErrorCode::ResultExpired => MainScreenVisionError::new(
+                    MainScreenVisionErrorCode::VisionResultUnavailable,
+                    true,
+                ),
+                ScreenVisionSemanticResultErrorCode::ResultUnavailable
+                | ScreenVisionSemanticResultErrorCode::InvalidArgument => {
+                    MainScreenVisionError::new(
+                        MainScreenVisionErrorCode::VisionResultUnavailable,
+                        true,
+                    )
+                }
+                ScreenVisionSemanticResultErrorCode::SynchronizationUnavailable
+                | ScreenVisionSemanticResultErrorCode::RandomUnavailable => {
+                    MainScreenVisionError::new(
+                        MainScreenVisionErrorCode::SynchronizationUnavailable,
+                        true,
+                    )
+                }
+            }
+        })?;
+    if result.life_id != life_id || result.screen_session_fence != current_fence.to_string() {
+        return Err(MainScreenVisionError::new(
+            MainScreenVisionErrorCode::VisionResultUnavailable,
+            true,
+        ));
+    }
+    let attachment_id = handoff_broker.offer_result(result).map_err(|error| {
+        use super::screen_vision_context_handoff::ScreenVisionContextHandoffErrorCode;
+        match error.code {
+            ScreenVisionContextHandoffErrorCode::AttachmentInUse => MainScreenVisionError::new(
+                MainScreenVisionErrorCode::PerceptionAttachmentInUse,
+                true,
+            ),
+            ScreenVisionContextHandoffErrorCode::ResultExpired
+            | ScreenVisionContextHandoffErrorCode::ResultUnavailable => {
+                MainScreenVisionError::new(MainScreenVisionErrorCode::VisionResultUnavailable, true)
+            }
+            ScreenVisionContextHandoffErrorCode::SynchronizationUnavailable
+            | ScreenVisionContextHandoffErrorCode::RandomUnavailable => MainScreenVisionError::new(
+                MainScreenVisionErrorCode::SynchronizationUnavailable,
+                true,
+            ),
+            _ => {
+                MainScreenVisionError::new(MainScreenVisionErrorCode::VisionResultUnavailable, true)
+            }
+        }
+    })?;
+    Ok(MainScreenVisionContextHandoffOfferDto { attachment_id })
 }
 
 const fn terminal_settlement_error() -> MainScreenVisionError {

@@ -68,6 +68,7 @@ const manualExtractionDisabled = computed(() =>
 );
 
 const screenContextAttachmentId = ref<string>();
+const screenContextAttachmentSourceKind = ref<"localOcr" | "cloudVision">("localOcr");
 const screenContextAttachmentDismissing = ref(false);
 const screenContextAttachmentError = ref<ChatScreenContextAttachmentError>();
 interface ScreenContextRetryReservation {
@@ -349,6 +350,7 @@ async function send(content: string): Promise<void> {
         screenContextAttachmentMutationGeneration += 1;
         if (screenContextAttachmentId.value === capturedAttachmentId) {
           screenContextAttachmentId.value = undefined;
+          screenContextAttachmentSourceKind.value = "localOcr";
           screenContextAttachmentError.value = undefined;
         }
       }
@@ -573,11 +575,18 @@ function isAttachmentRefreshHint(payload: unknown): boolean {
 
 function normalizeAttachmentStatus(
   status: unknown,
-): { available: false } | { available: true; attachmentId: string } | undefined {
+):
+  | { available: false }
+  | { available: true; attachmentId: string; sourceKind: "localOcr" | "cloudVision" }
+  | undefined {
   if (typeof status !== "object" || status === null) {
     return undefined;
   }
-  const record = status as { available?: unknown; attachmentId?: unknown };
+  const record = status as {
+    available?: unknown;
+    attachmentId?: unknown;
+    sourceKind?: unknown;
+  };
   if (record.available === false) {
     return { available: false };
   }
@@ -586,7 +595,18 @@ function normalizeAttachmentStatus(
     typeof record.attachmentId === "string" &&
     record.attachmentId.trim().length > 0
   ) {
-    return { available: true, attachmentId: record.attachmentId };
+    const sourceKind =
+      record.sourceKind === undefined
+        ? "localOcr"
+        : record.sourceKind === "cloudVision"
+          ? "cloudVision"
+          : record.sourceKind === "localOcr"
+            ? "localOcr"
+            : undefined;
+    if (sourceKind === undefined) {
+      return undefined;
+    }
+    return { available: true, attachmentId: record.attachmentId, sourceKind };
   }
   return undefined;
 }
@@ -613,6 +633,7 @@ async function refreshPendingScreenContextAttachment(runtimeEpoch: number): Prom
     if (!normalized.available) {
       consumedScreenContextAttachmentId = undefined;
       screenContextAttachmentId.value = undefined;
+      screenContextAttachmentSourceKind.value = "localOcr";
     } else {
       if (
         screenContextRetryReservation.value !== undefined
@@ -633,6 +654,7 @@ async function refreshPendingScreenContextAttachment(runtimeEpoch: number): Prom
       } else {
         consumedScreenContextAttachmentId = undefined;
         screenContextAttachmentId.value = normalized.attachmentId;
+        screenContextAttachmentSourceKind.value = normalized.sourceKind;
       }
     }
     screenContextAttachmentError.value = undefined;
@@ -716,6 +738,7 @@ async function dismissPendingScreenContextAttachment(): Promise<void> {
       screenContextAttachmentMutationGeneration += 1;
       screenContextAttachmentStatusGeneration += 1;
       screenContextAttachmentId.value = undefined;
+      screenContextAttachmentSourceKind.value = "localOcr";
       screenContextAttachmentError.value = undefined;
       screenContextAttachmentDismissing.value = false;
     }
@@ -832,8 +855,14 @@ onUnmounted(() => {
       aria-live="polite"
     >
       <div v-if="screenContextAttachmentId !== undefined" class="screen-context-attachment-copy">
-        <strong>Screen context attached</strong>
-        <span>Will be used with your next message</span>
+        <strong v-if="screenContextAttachmentSourceKind === 'cloudVision'">
+          Vision screen analysis attached
+        </strong>
+        <strong v-else>Screen context attached</strong>
+        <span v-if="screenContextAttachmentSourceKind === 'cloudVision'">
+          AI-generated interpretation; the screenshot itself is not attached.
+        </span>
+        <span v-else>Will be used with your next message</span>
       </div>
       <div v-else class="screen-context-attachment-copy" data-testid="screen-context-retry-reservation">
         <strong>Screen-context retry reserved</strong>

@@ -34,6 +34,11 @@ export interface MainScreenVisionAnalysis {
   readonly observations: readonly string[];
   readonly providerDisplayName: string;
   readonly modelName: string;
+  readonly visionResultId: string | null;
+}
+
+export interface MainScreenVisionContextHandoffOffer {
+  readonly attachmentId: string;
 }
 
 export interface MainScreenVisionDeliveryError {
@@ -50,6 +55,10 @@ interface ExecuteMainScreenVisionReviewRequest {
 
 interface AbandonMainScreenVisionDeliveryRequest {
   readonly reviewId: string;
+}
+
+interface OfferScreenVisionResultToChatRequest {
+  readonly visionResultId: string;
 }
 
 const SCREEN_VISION_DELIVERY_ERROR_MESSAGES: Readonly<Record<string, string>> = {
@@ -98,6 +107,10 @@ const SCREEN_VISION_DELIVERY_ERROR_MESSAGES: Readonly<Record<string, string>> = 
   VISION_TERMINAL_SETTLEMENT_UNAVAILABLE_AFTER_SEND:
     "The Vision provider received this image, but local one-shot finalization could not be completed. This attempt will not be resent automatically.",
   VISION_ABANDON_UNAVAILABLE: "This Vision attempt can no longer be abandoned.",
+  PERCEPTION_ATTACHMENT_IN_USE:
+    "Another screen perception attachment is already reserved for Chat.",
+  VISION_RESULT_UNAVAILABLE:
+    "This Vision analysis is no longer available for Chat. Prepare a new analysis.",
   VISION_SYNCHRONIZATION_UNAVAILABLE:
     "Vision delivery is temporarily unavailable.",
 };
@@ -179,6 +192,16 @@ export class MainScreenVisionDeliveryService {
   async abandonDelivery(reviewId: string): Promise<void> {
     const request: AbandonMainScreenVisionDeliveryRequest = { reviewId };
     return invoke<void>("abandon_main_screen_vision_delivery", { request });
+  }
+
+  async offerVisionResultToChat(
+    visionResultId: string,
+  ): Promise<MainScreenVisionContextHandoffOffer> {
+    const request: OfferScreenVisionResultToChatRequest = { visionResultId };
+    return invoke<MainScreenVisionContextHandoffOffer>(
+      "offer_screen_vision_result_to_chat",
+      { request },
+    );
   }
 }
 

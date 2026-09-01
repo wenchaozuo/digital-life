@@ -91,6 +91,7 @@ const analysis: MainScreenVisionAnalysis = {
   observations: ["A visible application window."],
   providerDisplayName: "Work Vision",
   modelName: "vision-model",
+  visionResultId: "vision-result-opaque",
 };
 
 const idleStatus: MainScreenVisionStatus = { status: "idle", review: null };
@@ -209,6 +210,9 @@ async function mountMain() {
   const executeVisionReview = vi
     .spyOn(visionModule.mainScreenVisionDeliveryService, "executeReview")
     .mockResolvedValue(analysis);
+  const offerVisionResultToChat = vi
+    .spyOn(visionModule.mainScreenVisionDeliveryService, "offerVisionResultToChat")
+    .mockResolvedValue({ attachmentId: "vision-attachment-opaque" });
   const abandonVisionDelivery = vi
     .spyOn(visionModule.mainScreenVisionDeliveryService, "abandonDelivery")
     .mockResolvedValue();
@@ -220,9 +224,10 @@ async function mountMain() {
   return {
     wrapper,
     getVisionStatus,
-    prepareVisionReview,
-    executeVisionReview,
-    abandonVisionDelivery,
+      prepareVisionReview,
+      executeVisionReview,
+      offerVisionResultToChat,
+      abandonVisionDelivery,
     setVisionStatus: (status: MainScreenVisionStatus) => {
       visionStatus = status;
     },
@@ -287,6 +292,62 @@ describe("D26-B Main explicit governed Vision delivery", () => {
       expect(wrapper.get("[data-testid='screen-vision-result']").text()).toContain(
         "A bounded screen summary.",
       );
+    } finally {
+      wrapper.unmount();
+    }
+  });
+
+  it("exposes explicit Vision use-in-chat only after a result locator exists", async () => {
+    const mounted = await mountMain();
+    const { wrapper, executeVisionReview, offerVisionResultToChat, setVisionStatus } = mounted;
+    try {
+      setVisionStatus({ status: "reviewReady", review });
+      await wrapper.get("[data-testid='screen-vision-prepare']").trigger("click");
+      await flushMicrotasks();
+      await wrapper.get("[data-testid='screen-vision-analyze']").trigger("click");
+      await flushMicrotasks();
+
+      const handoff = wrapper.get("[data-testid='screen-vision-use-in-chat']");
+      expect(handoff.text()).toContain("Use Vision analysis in chat");
+      expect(wrapper.get("[data-testid='screen-vision-result']").text()).toContain(
+        "This attaches the AI-generated screen interpretation to your next Chat message.",
+      );
+      expect(wrapper.get("[data-testid='screen-vision-result']").text()).toContain(
+        "The screenshot itself will not be attached.",
+      );
+
+      await handoff.trigger("click");
+      await flushMicrotasks();
+      expect(offerVisionResultToChat).toHaveBeenCalledWith("vision-result-opaque");
+      expect(executeVisionReview).toHaveBeenCalledTimes(1);
+    } finally {
+      wrapper.unmount();
+    }
+  });
+
+  it("keeps the valid Vision preview while disabling handoff without a result locator", async () => {
+    const mounted = await mountMain();
+    const { wrapper, offerVisionResultToChat, setVisionStatus } = mounted;
+    const unavailableAnalysis: MainScreenVisionAnalysis = {
+      ...analysis,
+      visionResultId: null,
+    };
+    mounted.executeVisionReview.mockResolvedValue(unavailableAnalysis);
+    try {
+      setVisionStatus({ status: "reviewReady", review });
+      await wrapper.get("[data-testid='screen-vision-prepare']").trigger("click");
+      await flushMicrotasks();
+      await wrapper.get("[data-testid='screen-vision-analyze']").trigger("click");
+      await flushMicrotasks();
+
+      expect(wrapper.get("[data-testid='screen-vision-result']").text()).toContain(
+        "A bounded screen summary.",
+      );
+      const handoff = wrapper.get("[data-testid='screen-vision-use-in-chat']");
+      expect(handoff.attributes("disabled")).toBe("");
+      await handoff.trigger("click");
+      await flushMicrotasks();
+      expect(offerVisionResultToChat).not.toHaveBeenCalled();
     } finally {
       wrapper.unmount();
     }

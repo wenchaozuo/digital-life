@@ -23,4 +23,5 @@ commands.allow = [
     "get_main_screen_vision_status",
     "execute_main_screen_vision_review",
     "abandon_main_screen_vision_delivery",
+    "offer_screen_vision_result_to_chat",
 ]

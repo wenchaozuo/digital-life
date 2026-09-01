@@ -1,4 +1,4 @@
-//! D29-A: isolated Codex App Server protocol/process foundation.
+//! D29-B: private ephemeral Codex App Server thread/turn protocol foundation.
 //!
 //! This module deliberately has no production caller.  It records the exact
 //! upstream contract and provides a private, testable process boundary for a
@@ -7,6 +7,7 @@
 
 use serde_json::{json, Value};
 use std::{
+    collections::VecDeque,
     ffi::OsString,
     fmt, fs,
     io::{Read, Write},
@@ -55,17 +56,25 @@ pub(crate) const CODEX_PROTOCOL_SCHEMA_SOURCE: &str =
 pub(crate) const CODEX_PROTOCOL_SCHEMA_VERSION: &str = "v1";
 /// Digital Life's deliberately narrow client-side contract over the upstream
 /// App Server protocol.
-pub(crate) const CODEX_CLIENT_CONTRACT_VERSION: &str = "d29-a.codex-app-server.v1";
+pub(crate) const CODEX_CLIENT_CONTRACT_VERSION: &str = "d29-b.codex-app-server.v2";
 
-/// Exact upstream methods mapped by the initial lifecycle contract.
-pub(crate) const ALLOWED_CLIENT_REQUEST_METHODS: &[&str] = &["initialize"];
+/// Exact upstream methods mapped by the private D29-B lifecycle contract.
+pub(crate) const ALLOWED_CLIENT_REQUEST_METHODS: &[&str] =
+    &["initialize", "thread/start", "turn/start", "turn/interrupt"];
 pub(crate) const ALLOWED_CLIENT_NOTIFICATION_METHODS: &[&str] = &["initialized"];
-/// No server request is trusted in D29-A.  Every server request is answered
+/// No server request is trusted in D29-B.  Every server request is answered
 /// with a protocol-level denial, never an approval.
 pub(crate) const ALLOWED_SERVER_REQUEST_METHODS: &[&str] = &[];
-/// `error` is retained only as bounded operational metadata; it never invokes
-/// a tool or changes authority.  All other server notifications are ignored.
-pub(crate) const ALLOWED_SERVER_NOTIFICATION_METHODS: &[&str] = &["error"];
+/// Only bounded thread/turn/item lifecycle notifications are mapped.  `error`
+/// remains informational.  All other server notifications are ignored.
+pub(crate) const ALLOWED_SERVER_NOTIFICATION_METHODS: &[&str] = &[
+    "error",
+    "thread/started",
+    "turn/started",
+    "item/started",
+    "item/completed",
+    "turn/completed",
+];
 
 const MAX_PROTOCOL_FRAME_BYTES: usize = 64 * 1024;
 const MAX_METHOD_BYTES: usize = 128;
@@ -397,6 +406,7 @@ pub(crate) enum CodexRuntimeError {
     UnsupportedMethod,
     AlreadyInitialized,
     InitializeTimeout,
+    ProtocolRequestTimeout,
     MalformedProtocol,
     ProtocolError,
     EventQueueSaturated,
@@ -404,6 +414,10 @@ pub(crate) enum CodexRuntimeError {
     ChildExited,
     ShutdownFailed,
     ProtocolEncoding,
+    ProtocolStateViolation,
+    SessionRetired,
+    RequestIdExhausted,
+    InvalidTurnInput,
 }
 
 impl fmt::Display for CodexRuntimeError {
@@ -430,6 +444,7 @@ impl fmt::Display for CodexRuntimeError {
             Self::UnsupportedMethod => "codex app server method is outside the mapped contract",
             Self::AlreadyInitialized => "codex app server protocol is already initialized",
             Self::InitializeTimeout => "codex app server initialize timed out",
+            Self::ProtocolRequestTimeout => "codex app server protocol request timed out",
             Self::MalformedProtocol => "codex app server emitted malformed protocol",
             Self::ProtocolError => "codex app server returned a protocol error",
             Self::EventQueueSaturated => "codex app server event queue is saturated",
@@ -437,6 +452,12 @@ impl fmt::Display for CodexRuntimeError {
             Self::ChildExited => "codex app server process exited before readiness",
             Self::ShutdownFailed => "codex app server process cleanup failed",
             Self::ProtocolEncoding => "codex app server protocol frame could not be encoded",
+            Self::ProtocolStateViolation => {
+                "codex app server lifecycle state rejected the operation"
+            }
+            Self::SessionRetired => "codex app server protocol session is retired",
+            Self::RequestIdExhausted => "codex app server request id space is exhausted",
+            Self::InvalidTurnInput => "codex app server turn input is not bounded text",
         };
         formatter.write_str(message)
     }
@@ -708,6 +729,10 @@ impl CodexAppServerProcess {
         self.status
     }
 
+    fn isolation_root_path(&self) -> &Path {
+        self._isolation_root.path()
+    }
+
     fn mark_ready(&mut self) {
         if !self.status.is_terminal() {
             self.status = CodexProcessStatus::Ready;
@@ -973,10 +998,160 @@ enum TerminationIntent {
     Shutdown,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CodexProtocolState {
+    Uninitialized,
+    Initialized,
+    ThreadReady {
+        thread_id: String,
+    },
+    TurnStarting {
+        thread_id: String,
+    },
+    TurnRunning {
+        thread_id: String,
+        turn_id: String,
+        started_event_seen: bool,
+    },
+    TurnCompleted {
+        thread_id: String,
+        turn_id: String,
+    },
+    TurnInterrupted {
+        thread_id: String,
+        turn_id: String,
+    },
+    TurnFailed {
+        thread_id: String,
+        turn_id: String,
+    },
+    Retired,
+}
+
+impl CodexProtocolState {
+    fn thread_id(&self) -> Option<&str> {
+        match self {
+            Self::ThreadReady { thread_id }
+            | Self::TurnStarting { thread_id }
+            | Self::TurnRunning { thread_id, .. }
+            | Self::TurnCompleted { thread_id, .. }
+            | Self::TurnInterrupted { thread_id, .. }
+            | Self::TurnFailed { thread_id, .. } => Some(thread_id),
+            Self::Uninitialized | Self::Initialized | Self::Retired => None,
+        }
+    }
+
+    fn active_turn(&self) -> Option<(&str, &str, bool)> {
+        match self {
+            Self::TurnRunning {
+                thread_id,
+                turn_id,
+                started_event_seen,
+            } => Some((thread_id, turn_id, *started_event_seen)),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CodexThreadStartResult {
+    pub(crate) thread_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CodexTurnStartResult {
+    pub(crate) turn_id: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CodexTurnTerminal {
+    Completed,
+    Interrupted,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CodexLifecycleEvent {
+    ThreadStarted {
+        thread_id: String,
+    },
+    TurnStarted {
+        thread_id: String,
+        turn_id: String,
+    },
+    ItemStarted {
+        thread_id: String,
+        turn_id: String,
+        item_id: String,
+    },
+    ItemCompleted {
+        thread_id: String,
+        turn_id: String,
+        item_id: String,
+    },
+    TurnCompleted {
+        thread_id: String,
+        turn_id: String,
+        terminal: CodexTurnTerminal,
+    },
+}
+
+#[derive(Clone, Debug)]
+enum ClientRequest {
+    Initialize,
+    ThreadStart { cwd: String },
+    TurnStart { thread_id: String, text: String },
+    TurnInterrupt { thread_id: String, turn_id: String },
+}
+
+impl ClientRequest {
+    fn method(&self) -> &'static str {
+        match self {
+            Self::Initialize => "initialize",
+            Self::ThreadStart { .. } => "thread/start",
+            Self::TurnStart { .. } => "turn/start",
+            Self::TurnInterrupt { .. } => "turn/interrupt",
+        }
+    }
+
+    fn params(&self) -> Value {
+        match self {
+            Self::Initialize => json!({
+                "clientInfo": {
+                    "name": "digital-life-codex-enclave",
+                    "version": CODEX_CLIENT_CONTRACT_VERSION,
+                },
+                "capabilities": {
+                    "experimentalApi": false,
+                    "mcpServerOpenaiFormElicitation": false,
+                    "requestAttestation": false,
+                },
+            }),
+            Self::ThreadStart { cwd } => json!({
+                "cwd": cwd,
+                "ephemeral": true,
+            }),
+            Self::TurnStart { thread_id, text } => json!({
+                "threadId": thread_id,
+                "input": [{
+                    "type": "text",
+                    "text": text,
+                }],
+            }),
+            Self::TurnInterrupt { thread_id, turn_id } => json!({
+                "threadId": thread_id,
+                "turnId": turn_id,
+            }),
+        }
+    }
+}
+
 struct CodexProtocolClient {
     process: CodexAppServerProcess,
     next_request_id: u64,
-    initialized: bool,
+    state: CodexProtocolState,
+    retired_turn_ids: VecDeque<String>,
+    pending_lifecycle_events: VecDeque<CodexLifecycleEvent>,
 }
 
 impl CodexProtocolClient {
@@ -984,7 +1159,22 @@ impl CodexProtocolClient {
         Self {
             process,
             next_request_id: 1,
-            initialized: false,
+            state: CodexProtocolState::Uninitialized,
+            retired_turn_ids: VecDeque::new(),
+            pending_lifecycle_events: VecDeque::new(),
+        }
+    }
+
+    fn next_process_event(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<ProcessEvent>, CodexRuntimeError> {
+        match self.process.next_event(timeout) {
+            Ok(event) => Ok(event),
+            Err(error) => {
+                self.state = CodexProtocolState::Retired;
+                Err(error)
+            }
         }
     }
 
@@ -992,24 +1182,17 @@ impl CodexProtocolClient {
         &mut self,
         timeout: Duration,
     ) -> Result<CodexInitializeResult, CodexRuntimeError> {
-        if self.initialized {
-            return Err(CodexRuntimeError::AlreadyInitialized);
+        match self.state {
+            CodexProtocolState::Uninitialized => {}
+            CodexProtocolState::Retired => return Err(CodexRuntimeError::SessionRetired),
+            _ => return Err(CodexRuntimeError::AlreadyInitialized),
         }
 
-        let request_id = self.next_request_id;
-        self.next_request_id = self.next_request_id.saturating_add(1);
-        let params = json!({
-            "clientInfo": {
-                "name": "digital-life-codex-enclave",
-                "version": CODEX_CLIENT_CONTRACT_VERSION,
-            },
-            "capabilities": {
-                "experimentalApi": false,
-                "mcpServerOpenaiFormElicitation": false,
-                "requestAttestation": false,
-            },
-        });
-        self.send_request(request_id, "initialize", params)?;
+        let request_id = self.allocate_request_id()?;
+        if let Err(error) = self.send_client_request(request_id, ClientRequest::Initialize) {
+            self.state = CodexProtocolState::Retired;
+            return Err(error);
+        }
 
         let deadline = Instant::now() + timeout;
         loop {
@@ -1017,9 +1200,7 @@ impl CodexProtocolClient {
             if remaining.is_zero() {
                 return Err(CodexRuntimeError::InitializeTimeout);
             }
-            let event = self
-                .process
-                .next_event(remaining.min(Duration::from_millis(25)))?;
+            let event = self.next_process_event(remaining.min(Duration::from_millis(25)))?;
             let Some(event) = event else {
                 continue;
             };
@@ -1027,57 +1208,370 @@ impl CodexProtocolClient {
                 ProcessEvent::Message(ProtocolMessage::Response {
                     id,
                     initialize_result,
+                    result_is_object,
                     error_code,
+                    ..
                 }) if id == RpcId::Number(request_id.into()) => {
                     if error_code.is_some() {
+                        self.state = CodexProtocolState::Retired;
                         return Err(CodexRuntimeError::ProtocolError);
                     }
-                    let result = initialize_result.ok_or(CodexRuntimeError::MalformedProtocol)?;
+                    if !result_is_object {
+                        self.state = CodexProtocolState::Retired;
+                        return Err(CodexRuntimeError::MalformedProtocol);
+                    }
+                    let result = match initialize_result {
+                        Some(result) => result,
+                        None => {
+                            self.state = CodexProtocolState::Retired;
+                            return Err(CodexRuntimeError::MalformedProtocol);
+                        }
+                    };
                     if !result.codex_home_is_bounded_string {
+                        self.state = CodexProtocolState::Retired;
                         return Err(CodexRuntimeError::MalformedProtocol);
                     }
                     let result = CodexInitializeResult {
-                        platform_family: result
-                            .platform_family
-                            .ok_or(CodexRuntimeError::MalformedProtocol)?,
-                        platform_os: result
-                            .platform_os
-                            .ok_or(CodexRuntimeError::MalformedProtocol)?,
-                        user_agent: result
-                            .user_agent
-                            .ok_or(CodexRuntimeError::MalformedProtocol)?,
+                        platform_family: match result.platform_family {
+                            Some(value) => value,
+                            None => {
+                                self.state = CodexProtocolState::Retired;
+                                return Err(CodexRuntimeError::MalformedProtocol);
+                            }
+                        },
+                        platform_os: match result.platform_os {
+                            Some(value) => value,
+                            None => {
+                                self.state = CodexProtocolState::Retired;
+                                return Err(CodexRuntimeError::MalformedProtocol);
+                            }
+                        },
+                        user_agent: match result.user_agent {
+                            Some(value) => value,
+                            None => {
+                                self.state = CodexProtocolState::Retired;
+                                return Err(CodexRuntimeError::MalformedProtocol);
+                            }
+                        },
                     };
-                    self.send_notification("initialized")?;
-                    self.initialized = true;
+                    if let Err(error) = self.send_initialized_notification() {
+                        self.state = CodexProtocolState::Retired;
+                        return Err(error);
+                    }
+                    self.state = CodexProtocolState::Initialized;
                     self.process.mark_ready();
                     return Ok(result);
                 }
                 ProcessEvent::Message(ProtocolMessage::ServerRequest { id }) => {
                     self.deny_server_request(id)?;
                 }
-                ProcessEvent::Message(ProtocolMessage::Notification { method }) => {
-                    // `error` is informational only.  Unknown notifications
-                    // are not authority and are intentionally discarded.
-                    let _ = ALLOWED_SERVER_NOTIFICATION_METHODS.contains(&method.as_str());
+                ProcessEvent::Message(ProtocolMessage::Notification { notification }) => {
+                    if let Some(event) = self.apply_notification(notification)? {
+                        self.pending_lifecycle_events.push_back(event);
+                    }
                 }
                 ProcessEvent::Message(ProtocolMessage::Response { .. }) => {}
                 ProcessEvent::MalformedProtocol | ProcessEvent::FrameTooLarge => {
+                    self.state = CodexProtocolState::Retired;
                     return Err(CodexRuntimeError::MalformedProtocol);
                 }
                 ProcessEvent::OutputClosed | ProcessEvent::ChildExited => {
-                    self.process.refresh_child_status();
+                    self.retire_after_process_failure();
                     return Err(CodexRuntimeError::ChildExited);
                 }
             }
         }
     }
 
-    fn send_request(
+    fn start_thread(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<CodexThreadStartResult, CodexRuntimeError> {
+        match self.state {
+            CodexProtocolState::Initialized => {}
+            CodexProtocolState::Retired => return Err(CodexRuntimeError::SessionRetired),
+            _ => return Err(CodexRuntimeError::ProtocolStateViolation),
+        }
+
+        let cwd = self
+            .process
+            .isolation_root_path()
+            .to_str()
+            .ok_or(CodexRuntimeError::InvalidIsolationRoot)?
+            .to_owned();
+        let request_id = self.allocate_request_id()?;
+        if let Err(error) =
+            self.send_client_request(request_id, ClientRequest::ThreadStart { cwd: cwd.clone() })
+        {
+            self.state = CodexProtocolState::Retired;
+            return Err(error);
+        }
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(CodexRuntimeError::ProtocolRequestTimeout);
+            }
+            let event = self.next_process_event(remaining.min(Duration::from_millis(25)))?;
+            let Some(event) = event else {
+                continue;
+            };
+            match event {
+                ProcessEvent::Message(ProtocolMessage::Response {
+                    id,
+                    thread_start_result,
+                    error_code,
+                    result_is_object,
+                    ..
+                }) if id == RpcId::Number(request_id.into()) => {
+                    if error_code.is_some() {
+                        self.state = CodexProtocolState::Retired;
+                        return Err(CodexRuntimeError::ProtocolError);
+                    }
+                    if !result_is_object {
+                        self.state = CodexProtocolState::Retired;
+                        return Err(CodexRuntimeError::MalformedProtocol);
+                    }
+                    let result = match thread_start_result {
+                        Some(result) if result.ephemeral && result.cwd == cwd => result,
+                        _ => {
+                            self.state = CodexProtocolState::Retired;
+                            return Err(CodexRuntimeError::MalformedProtocol);
+                        }
+                    };
+                    let thread_id = result.thread_id;
+                    self.state = CodexProtocolState::ThreadReady {
+                        thread_id: thread_id.clone(),
+                    };
+                    return Ok(CodexThreadStartResult { thread_id });
+                }
+                ProcessEvent::Message(ProtocolMessage::ServerRequest { id }) => {
+                    self.deny_server_request(id)?;
+                }
+                ProcessEvent::Message(ProtocolMessage::Notification { notification }) => {
+                    if let Some(event) = self.apply_notification(notification)? {
+                        self.pending_lifecycle_events.push_back(event);
+                    }
+                }
+                ProcessEvent::Message(ProtocolMessage::Response { .. }) => {}
+                ProcessEvent::MalformedProtocol | ProcessEvent::FrameTooLarge => {
+                    self.state = CodexProtocolState::Retired;
+                    return Err(CodexRuntimeError::MalformedProtocol);
+                }
+                ProcessEvent::OutputClosed | ProcessEvent::ChildExited => {
+                    self.retire_after_process_failure();
+                    return Err(CodexRuntimeError::ChildExited);
+                }
+            }
+        }
+    }
+
+    fn start_turn(
+        &mut self,
+        text: &str,
+        timeout: Duration,
+    ) -> Result<CodexTurnStartResult, CodexRuntimeError> {
+        if text.is_empty() || text.len() > MAX_PROTOCOL_STRING_BYTES {
+            return Err(CodexRuntimeError::InvalidTurnInput);
+        }
+        if text.chars().any(char::is_control) {
+            return Err(CodexRuntimeError::InvalidTurnInput);
+        }
+
+        let thread_id = match &self.state {
+            CodexProtocolState::ThreadReady { thread_id }
+            | CodexProtocolState::TurnCompleted { thread_id, .. }
+            | CodexProtocolState::TurnInterrupted { thread_id, .. }
+            | CodexProtocolState::TurnFailed { thread_id, .. } => thread_id.clone(),
+            CodexProtocolState::Retired => return Err(CodexRuntimeError::SessionRetired),
+            CodexProtocolState::Uninitialized | CodexProtocolState::Initialized => {
+                return Err(CodexRuntimeError::ProtocolStateViolation)
+            }
+            CodexProtocolState::TurnStarting { .. } | CodexProtocolState::TurnRunning { .. } => {
+                return Err(CodexRuntimeError::ProtocolStateViolation)
+            }
+        };
+
+        let request_id = self.allocate_request_id()?;
+        self.state = CodexProtocolState::TurnStarting {
+            thread_id: thread_id.clone(),
+        };
+        if let Err(error) = self.send_client_request(
+            request_id,
+            ClientRequest::TurnStart {
+                thread_id: thread_id.clone(),
+                text: text.to_owned(),
+            },
+        ) {
+            self.state = CodexProtocolState::Retired;
+            return Err(error);
+        }
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                self.state = CodexProtocolState::ThreadReady { thread_id };
+                return Err(CodexRuntimeError::ProtocolRequestTimeout);
+            }
+            let event = self.next_process_event(remaining.min(Duration::from_millis(25)))?;
+            let Some(event) = event else {
+                continue;
+            };
+            match event {
+                ProcessEvent::Message(ProtocolMessage::Response {
+                    id,
+                    turn_start_result,
+                    error_code,
+                    result_is_object,
+                    ..
+                }) if id == RpcId::Number(request_id.into()) => {
+                    if error_code.is_some() {
+                        self.state = CodexProtocolState::ThreadReady { thread_id };
+                        return Err(CodexRuntimeError::ProtocolError);
+                    }
+                    if !result_is_object {
+                        self.state = CodexProtocolState::Retired;
+                        return Err(CodexRuntimeError::MalformedProtocol);
+                    }
+                    let result = match turn_start_result {
+                        Some(result) if result.status == WireTurnStatus::InProgress => result,
+                        _ => {
+                            self.state = CodexProtocolState::Retired;
+                            return Err(CodexRuntimeError::MalformedProtocol);
+                        }
+                    };
+                    let turn_id = result.turn_id;
+                    if self
+                        .retired_turn_ids
+                        .iter()
+                        .any(|retired| retired == &turn_id)
+                    {
+                        self.state = CodexProtocolState::Retired;
+                        return Err(CodexRuntimeError::MalformedProtocol);
+                    }
+                    self.state = CodexProtocolState::TurnRunning {
+                        thread_id: thread_id.clone(),
+                        turn_id: turn_id.clone(),
+                        started_event_seen: false,
+                    };
+                    return Ok(CodexTurnStartResult { turn_id });
+                }
+                ProcessEvent::Message(ProtocolMessage::ServerRequest { id }) => {
+                    self.deny_server_request(id)?;
+                }
+                ProcessEvent::Message(ProtocolMessage::Notification { notification }) => {
+                    if let Some(event) = self.apply_notification(notification)? {
+                        self.pending_lifecycle_events.push_back(event);
+                    }
+                }
+                ProcessEvent::Message(ProtocolMessage::Response { .. }) => {}
+                ProcessEvent::MalformedProtocol | ProcessEvent::FrameTooLarge => {
+                    self.state = CodexProtocolState::Retired;
+                    return Err(CodexRuntimeError::MalformedProtocol);
+                }
+                ProcessEvent::OutputClosed | ProcessEvent::ChildExited => {
+                    self.retire_after_process_failure();
+                    return Err(CodexRuntimeError::ChildExited);
+                }
+            }
+        }
+    }
+
+    fn interrupt_turn(&mut self, timeout: Duration) -> Result<(), CodexRuntimeError> {
+        let (thread_id, turn_id, started_event_seen) = self
+            .state
+            .active_turn()
+            .map(|(thread_id, turn_id, started_event_seen)| {
+                (thread_id.to_owned(), turn_id.to_owned(), started_event_seen)
+            })
+            .ok_or_else(|| {
+                if self.state == CodexProtocolState::Retired {
+                    CodexRuntimeError::SessionRetired
+                } else {
+                    CodexRuntimeError::ProtocolStateViolation
+                }
+            })?;
+        if !started_event_seen {
+            return Err(CodexRuntimeError::ProtocolStateViolation);
+        }
+
+        let request_id = self.allocate_request_id()?;
+        if let Err(error) = self.send_client_request(
+            request_id,
+            ClientRequest::TurnInterrupt {
+                thread_id: thread_id.clone(),
+                turn_id: turn_id.clone(),
+            },
+        ) {
+            self.state = CodexProtocolState::Retired;
+            return Err(error);
+        }
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(CodexRuntimeError::ProtocolRequestTimeout);
+            }
+            let event = self.next_process_event(remaining.min(Duration::from_millis(25)))?;
+            let Some(event) = event else {
+                continue;
+            };
+            match event {
+                ProcessEvent::Message(ProtocolMessage::Response {
+                    id,
+                    error_code,
+                    result_is_object,
+                    ..
+                }) if id == RpcId::Number(request_id.into()) => {
+                    if error_code.is_some() {
+                        return Err(CodexRuntimeError::ProtocolError);
+                    }
+                    if !result_is_object {
+                        self.state = CodexProtocolState::Retired;
+                        return Err(CodexRuntimeError::MalformedProtocol);
+                    }
+                    return Ok(());
+                }
+                ProcessEvent::Message(ProtocolMessage::ServerRequest { id }) => {
+                    self.deny_server_request(id)?;
+                }
+                ProcessEvent::Message(ProtocolMessage::Notification { notification }) => {
+                    if let Some(event) = self.apply_notification(notification)? {
+                        self.pending_lifecycle_events.push_back(event);
+                    }
+                }
+                ProcessEvent::Message(ProtocolMessage::Response { .. }) => {}
+                ProcessEvent::MalformedProtocol | ProcessEvent::FrameTooLarge => {
+                    self.state = CodexProtocolState::Retired;
+                    return Err(CodexRuntimeError::MalformedProtocol);
+                }
+                ProcessEvent::OutputClosed | ProcessEvent::ChildExited => {
+                    self.retire_after_process_failure();
+                    return Err(CodexRuntimeError::ChildExited);
+                }
+            }
+        }
+    }
+
+    fn allocate_request_id(&mut self) -> Result<u64, CodexRuntimeError> {
+        if self.next_request_id == u64::MAX {
+            self.state = CodexProtocolState::Retired;
+            return Err(CodexRuntimeError::RequestIdExhausted);
+        }
+        let request_id = self.next_request_id;
+        self.next_request_id += 1;
+        Ok(request_id)
+    }
+
+    fn send_client_request(
         &mut self,
         request_id: u64,
-        method: &str,
-        params: Value,
+        request: ClientRequest,
     ) -> Result<(), CodexRuntimeError> {
+        let method = request.method();
         if !ALLOWED_CLIENT_REQUEST_METHODS.contains(&method) {
             return Err(CodexRuntimeError::UnsupportedMethod);
         }
@@ -1085,11 +1579,12 @@ impl CodexProtocolClient {
             "jsonrpc": "2.0",
             "id": request_id,
             "method": method,
-            "params": params,
+            "params": request.params(),
         }))
     }
 
-    fn send_notification(&mut self, method: &str) -> Result<(), CodexRuntimeError> {
+    fn send_initialized_notification(&mut self) -> Result<(), CodexRuntimeError> {
+        let method = "initialized";
         if !ALLOWED_CLIENT_NOTIFICATION_METHODS.contains(&method) {
             return Err(CodexRuntimeError::UnsupportedMethod);
         }
@@ -1112,28 +1607,280 @@ impl CodexProtocolClient {
         }))
     }
 
+    fn next_lifecycle_event(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<CodexLifecycleEvent>, CodexRuntimeError> {
+        if let Some(event) = self.pending_lifecycle_events.pop_front() {
+            return Ok(Some(event));
+        }
+        let event = self.next_process_event(timeout)?;
+        let Some(event) = event else {
+            return Ok(None);
+        };
+        self.consume_process_event(event)
+    }
+
     fn pump_once(&mut self, timeout: Duration) -> Result<bool, CodexRuntimeError> {
-        let Some(event) = self.process.next_event(timeout)? else {
+        if self.pending_lifecycle_events.pop_front().is_some() {
+            return Ok(true);
+        }
+        let event = self.next_process_event(timeout)?;
+        let Some(event) = event else {
             return Ok(false);
         };
+        self.consume_process_event(event)?;
+        Ok(true)
+    }
+
+    fn consume_process_event(
+        &mut self,
+        event: ProcessEvent,
+    ) -> Result<Option<CodexLifecycleEvent>, CodexRuntimeError> {
         match event {
             ProcessEvent::Message(ProtocolMessage::ServerRequest { id }) => {
                 self.deny_server_request(id)?;
-                Ok(true)
+                Ok(None)
             }
-            ProcessEvent::Message(ProtocolMessage::Notification { method }) => {
-                let _ = ALLOWED_SERVER_NOTIFICATION_METHODS.contains(&method.as_str());
-                Ok(true)
+            ProcessEvent::Message(ProtocolMessage::Notification { notification }) => {
+                self.apply_notification(notification)
             }
-            ProcessEvent::Message(ProtocolMessage::Response { .. }) => Ok(true),
+            ProcessEvent::Message(ProtocolMessage::Response { .. }) => Ok(None),
             ProcessEvent::MalformedProtocol | ProcessEvent::FrameTooLarge => {
+                self.state = CodexProtocolState::Retired;
                 Err(CodexRuntimeError::MalformedProtocol)
             }
             ProcessEvent::OutputClosed | ProcessEvent::ChildExited => {
-                self.process.refresh_child_status();
+                self.retire_after_process_failure();
                 Err(CodexRuntimeError::ChildExited)
             }
         }
+    }
+
+    fn apply_notification(
+        &mut self,
+        notification: ProtocolNotification,
+    ) -> Result<Option<CodexLifecycleEvent>, CodexRuntimeError> {
+        match notification {
+            ProtocolNotification::Unknown | ProtocolNotification::Error => Ok(None),
+            ProtocolNotification::ThreadStarted { thread_id } => match self.state.thread_id() {
+                Some(current_thread_id) if current_thread_id == thread_id => {
+                    Ok(Some(CodexLifecycleEvent::ThreadStarted { thread_id }))
+                }
+                Some(_) => {
+                    self.state = CodexProtocolState::Retired;
+                    Err(CodexRuntimeError::MalformedProtocol)
+                }
+                None => Ok(None),
+            },
+            ProtocolNotification::TurnStarted { thread_id, turn_id } => {
+                let state = self.state.clone();
+                match state {
+                    CodexProtocolState::TurnRunning {
+                        thread_id: current_thread_id,
+                        turn_id: current_turn_id,
+                        started_event_seen,
+                    } if current_thread_id == thread_id && current_turn_id == turn_id => {
+                        if started_event_seen {
+                            return Ok(None);
+                        }
+                        if let CodexProtocolState::TurnRunning {
+                            started_event_seen, ..
+                        } = &mut self.state
+                        {
+                            *started_event_seen = true;
+                        }
+                        Ok(Some(CodexLifecycleEvent::TurnStarted {
+                            thread_id,
+                            turn_id,
+                        }))
+                    }
+                    CodexProtocolState::TurnRunning { .. }
+                    | CodexProtocolState::TurnCompleted { .. }
+                    | CodexProtocolState::TurnInterrupted { .. }
+                    | CodexProtocolState::TurnFailed { .. }
+                        if self.is_stale_turn(&thread_id, &turn_id) =>
+                    {
+                        Ok(None)
+                    }
+                    CodexProtocolState::TurnStarting { .. } => {
+                        self.state = CodexProtocolState::Retired;
+                        Err(CodexRuntimeError::MalformedProtocol)
+                    }
+                    CodexProtocolState::ThreadReady { .. } => {
+                        self.state = CodexProtocolState::Retired;
+                        Err(CodexRuntimeError::MalformedProtocol)
+                    }
+                    CodexProtocolState::TurnRunning { .. }
+                    | CodexProtocolState::TurnCompleted { .. }
+                    | CodexProtocolState::TurnInterrupted { .. }
+                    | CodexProtocolState::TurnFailed { .. } => {
+                        self.state = CodexProtocolState::Retired;
+                        Err(CodexRuntimeError::MalformedProtocol)
+                    }
+                    _ => Ok(None),
+                }
+            }
+            ProtocolNotification::ItemStarted {
+                thread_id,
+                turn_id,
+                item_id,
+            } => self.apply_item_notification(true, thread_id, turn_id, item_id),
+            ProtocolNotification::ItemCompleted {
+                thread_id,
+                turn_id,
+                item_id,
+            } => self.apply_item_notification(false, thread_id, turn_id, item_id),
+            ProtocolNotification::TurnCompleted {
+                thread_id,
+                turn_id,
+                status,
+            } => {
+                let state = self.state.clone();
+                match state {
+                    CodexProtocolState::TurnRunning {
+                        thread_id: current_thread_id,
+                        turn_id: current_turn_id,
+                        started_event_seen,
+                    } if current_thread_id == thread_id && current_turn_id == turn_id => {
+                        if !started_event_seen {
+                            self.state = CodexProtocolState::Retired;
+                            return Err(CodexRuntimeError::MalformedProtocol);
+                        }
+                        self.remember_retired_turn(&turn_id);
+                        self.state = match status {
+                            WireTurnStatus::Completed => CodexProtocolState::TurnCompleted {
+                                thread_id: thread_id.clone(),
+                                turn_id: turn_id.clone(),
+                            },
+                            WireTurnStatus::Interrupted => CodexProtocolState::TurnInterrupted {
+                                thread_id: thread_id.clone(),
+                                turn_id: turn_id.clone(),
+                            },
+                            WireTurnStatus::Failed => CodexProtocolState::TurnFailed {
+                                thread_id: thread_id.clone(),
+                                turn_id: turn_id.clone(),
+                            },
+                            WireTurnStatus::InProgress => {
+                                self.state = CodexProtocolState::Retired;
+                                return Err(CodexRuntimeError::MalformedProtocol);
+                            }
+                        };
+                        Ok(Some(CodexLifecycleEvent::TurnCompleted {
+                            thread_id,
+                            turn_id,
+                            terminal: status.into_terminal().expect("checked terminal status"),
+                        }))
+                    }
+                    CodexProtocolState::TurnCompleted {
+                        thread_id: current_thread_id,
+                        turn_id: current_turn_id,
+                    }
+                    | CodexProtocolState::TurnInterrupted {
+                        thread_id: current_thread_id,
+                        turn_id: current_turn_id,
+                    }
+                    | CodexProtocolState::TurnFailed {
+                        thread_id: current_thread_id,
+                        turn_id: current_turn_id,
+                    } if current_thread_id == thread_id && current_turn_id == turn_id => {
+                        // A repeated terminal notification is harmless but can
+                        // never settle the same turn a second time.
+                        Ok(None)
+                    }
+                    CodexProtocolState::TurnRunning { .. }
+                    | CodexProtocolState::TurnCompleted { .. }
+                    | CodexProtocolState::TurnInterrupted { .. }
+                    | CodexProtocolState::TurnFailed { .. }
+                        if self.is_stale_turn(&thread_id, &turn_id) =>
+                    {
+                        Ok(None)
+                    }
+                    CodexProtocolState::TurnStarting { .. } => {
+                        self.state = CodexProtocolState::Retired;
+                        Err(CodexRuntimeError::MalformedProtocol)
+                    }
+                    CodexProtocolState::ThreadReady { .. } => {
+                        self.state = CodexProtocolState::Retired;
+                        Err(CodexRuntimeError::MalformedProtocol)
+                    }
+                    CodexProtocolState::TurnRunning { .. }
+                    | CodexProtocolState::TurnCompleted { .. }
+                    | CodexProtocolState::TurnInterrupted { .. }
+                    | CodexProtocolState::TurnFailed { .. } => {
+                        self.state = CodexProtocolState::Retired;
+                        Err(CodexRuntimeError::MalformedProtocol)
+                    }
+                    _ => Ok(None),
+                }
+            }
+        }
+    }
+
+    fn apply_item_notification(
+        &mut self,
+        started: bool,
+        thread_id: String,
+        turn_id: String,
+        item_id: String,
+    ) -> Result<Option<CodexLifecycleEvent>, CodexRuntimeError> {
+        match self.state.active_turn() {
+            Some((current_thread_id, current_turn_id, true))
+                if current_thread_id == thread_id && current_turn_id == turn_id =>
+            {
+                if started {
+                    Ok(Some(CodexLifecycleEvent::ItemStarted {
+                        thread_id,
+                        turn_id,
+                        item_id,
+                    }))
+                } else {
+                    Ok(Some(CodexLifecycleEvent::ItemCompleted {
+                        thread_id,
+                        turn_id,
+                        item_id,
+                    }))
+                }
+            }
+            Some(_) if self.is_stale_turn(&thread_id, &turn_id) => Ok(None),
+            Some(_) => {
+                self.state = CodexProtocolState::Retired;
+                Err(CodexRuntimeError::MalformedProtocol)
+            }
+            None if self.is_stale_turn(&thread_id, &turn_id) => Ok(None),
+            None if self.state.thread_id().is_none() => Ok(None),
+            None => {
+                self.state = CodexProtocolState::Retired;
+                Err(CodexRuntimeError::MalformedProtocol)
+            }
+        }
+    }
+
+    fn is_stale_turn(&self, thread_id: &str, turn_id: &str) -> bool {
+        self.state.thread_id() == Some(thread_id)
+            && self
+                .retired_turn_ids
+                .iter()
+                .any(|retired| retired == turn_id)
+    }
+
+    fn remember_retired_turn(&mut self, turn_id: &str) {
+        if self
+            .retired_turn_ids
+            .iter()
+            .any(|retired| retired == turn_id)
+        {
+            return;
+        }
+        self.retired_turn_ids.push_back(turn_id.to_owned());
+        while self.retired_turn_ids.len() > 16 {
+            let _ = self.retired_turn_ids.pop_front();
+        }
+    }
+
+    fn retire_after_process_failure(&mut self) {
+        self.process.refresh_child_status();
+        self.state = CodexProtocolState::Retired;
     }
 
     fn interrupt(&mut self) -> Result<(), CodexRuntimeError> {
@@ -1150,12 +1897,16 @@ impl CodexProtocolClient {
 
     #[cfg(test)]
     fn request_for_test(&mut self, method: &str) -> Result<(), CodexRuntimeError> {
-        self.send_request(99, method, json!({}))
+        if ALLOWED_CLIENT_REQUEST_METHODS.contains(&method) {
+            Err(CodexRuntimeError::ProtocolStateViolation)
+        } else {
+            Err(CodexRuntimeError::UnsupportedMethod)
+        }
     }
 
     #[cfg(test)]
     fn send_allowed_notification_for_test(&mut self) -> Result<(), CodexRuntimeError> {
-        self.send_notification("initialized")
+        self.send_initialized_notification()
     }
 
     #[cfg(test)]
@@ -1188,13 +1939,44 @@ enum ProtocolMessage {
     Response {
         id: RpcId,
         initialize_result: Option<InitializeWireResult>,
+        thread_start_result: Option<ThreadStartWireResult>,
+        turn_start_result: Option<TurnStartWireResult>,
+        result_is_object: bool,
         error_code: Option<i64>,
     },
     Notification {
-        method: String,
+        notification: ProtocolNotification,
     },
     ServerRequest {
         id: RpcId,
+    },
+}
+
+#[derive(Clone, Debug)]
+enum ProtocolNotification {
+    Unknown,
+    Error,
+    ThreadStarted {
+        thread_id: String,
+    },
+    TurnStarted {
+        thread_id: String,
+        turn_id: String,
+    },
+    ItemStarted {
+        thread_id: String,
+        turn_id: String,
+        item_id: String,
+    },
+    ItemCompleted {
+        thread_id: String,
+        turn_id: String,
+        item_id: String,
+    },
+    TurnCompleted {
+        thread_id: String,
+        turn_id: String,
+        status: WireTurnStatus,
     },
 }
 
@@ -1219,6 +2001,38 @@ struct InitializeWireResult {
     platform_family: Option<String>,
     platform_os: Option<String>,
     user_agent: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ThreadStartWireResult {
+    thread_id: String,
+    ephemeral: bool,
+    cwd: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WireTurnStatus {
+    Completed,
+    Interrupted,
+    Failed,
+    InProgress,
+}
+
+impl WireTurnStatus {
+    fn into_terminal(self) -> Option<CodexTurnTerminal> {
+        match self {
+            Self::Completed => Some(CodexTurnTerminal::Completed),
+            Self::Interrupted => Some(CodexTurnTerminal::Interrupted),
+            Self::Failed => Some(CodexTurnTerminal::Failed),
+            Self::InProgress => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TurnStartWireResult {
+    turn_id: String,
+    status: WireTurnStatus,
 }
 
 fn spawn_stdout_reader(
@@ -1367,10 +2181,15 @@ fn parse_protocol_frame(frame: &[u8]) -> ProcessEvent {
             return ProcessEvent::MalformedProtocol;
         };
         if let Some(id) = id {
-            let _ = method;
+            // Server requests are denied without retaining method or params.
+            // This keeps approval, tool, MCP, auth, and permission surfaces
+            // outside the typed D29-B client contract.
             return ProcessEvent::Message(ProtocolMessage::ServerRequest { id });
         }
-        return ProcessEvent::Message(ProtocolMessage::Notification { method });
+        let Some(notification) = parse_protocol_notification(&method, object.get("params")) else {
+            return ProcessEvent::MalformedProtocol;
+        };
+        return ProcessEvent::Message(ProtocolMessage::Notification { notification });
     }
 
     let has_result = object.contains_key("result");
@@ -1389,21 +2208,28 @@ fn parse_protocol_frame(frame: &[u8]) -> ProcessEvent {
         return ProcessEvent::Message(ProtocolMessage::Response {
             id: id.expect("checked above"),
             initialize_result: None,
+            thread_start_result: None,
+            turn_start_result: None,
+            result_is_object: false,
             error_code: Some(error_code),
         });
     }
 
+    let result = object.get("result");
     ProcessEvent::Message(ProtocolMessage::Response {
         id: id.expect("checked above"),
-        initialize_result: parse_initialize_wire_result(object.get("result")),
+        initialize_result: parse_initialize_wire_result(result),
+        thread_start_result: parse_thread_start_wire_result(result),
+        turn_start_result: parse_turn_start_wire_result(result),
+        result_is_object: result.is_some_and(Value::is_object),
         error_code: None,
     })
 }
 
 fn parse_rpc_id(value: &Value) -> Option<RpcId> {
     match value {
-        Value::Number(number) => Some(RpcId::Number(number.clone())),
-        Value::String(value) if value.len() <= MAX_PROTOCOL_STRING_BYTES => {
+        Value::Number(number) if number.as_i64().is_some() => Some(RpcId::Number(number.clone())),
+        Value::String(value) if !value.is_empty() && value.len() <= MAX_PROTOCOL_STRING_BYTES => {
             Some(RpcId::String(value.clone()))
         }
         _ => None,
@@ -1422,6 +2248,182 @@ fn parse_initialize_wire_result(value: Option<&Value>) -> Option<InitializeWireR
         platform_os: bounded_string(object.get("platformOs")?, MAX_PROTOCOL_STRING_BYTES),
         user_agent: bounded_string(object.get("userAgent")?, MAX_PROTOCOL_STRING_BYTES),
     })
+}
+
+fn parse_thread_start_wire_result(value: Option<&Value>) -> Option<ThreadStartWireResult> {
+    let object = value?.as_object()?;
+    for required in [
+        "approvalPolicy",
+        "approvalsReviewer",
+        "cwd",
+        "model",
+        "modelProvider",
+        "sandbox",
+    ] {
+        if !object.contains_key(required) {
+            return None;
+        }
+    }
+    let response_cwd = bounded_string(object.get("cwd")?, MAX_PROTOCOL_STRING_BYTES)?;
+    let thread = object.get("thread")?.as_object()?;
+    let (thread_id, ephemeral, cwd) = parse_thread_wire_object(thread)?;
+    if response_cwd != cwd {
+        return None;
+    }
+    Some(ThreadStartWireResult {
+        thread_id,
+        ephemeral,
+        cwd,
+    })
+}
+
+fn parse_turn_start_wire_result(value: Option<&Value>) -> Option<TurnStartWireResult> {
+    let object = value?.as_object()?;
+    let turn = object.get("turn")?.as_object()?;
+    let (turn_id, status) = parse_turn_wire_object(turn)?;
+    Some(TurnStartWireResult { turn_id, status })
+}
+
+fn parse_thread_wire_object(
+    object: &serde_json::Map<String, Value>,
+) -> Option<(String, bool, String)> {
+    for required in [
+        "cliVersion",
+        "createdAt",
+        "cwd",
+        "ephemeral",
+        "id",
+        "modelProvider",
+        "preview",
+        "projectId",
+        "sessionId",
+        "source",
+        "status",
+        "turns",
+        "updatedAt",
+    ] {
+        if !object.contains_key(required) {
+            return None;
+        }
+    }
+    let thread_id = bounded_opaque_id(object.get("id")?)?;
+    let ephemeral = object.get("ephemeral")?.as_bool()?;
+    let cwd = bounded_string(object.get("cwd")?, MAX_PROTOCOL_STRING_BYTES)?;
+    if object.get("cliVersion")?.as_str()?.len() > MAX_PROTOCOL_STRING_BYTES
+        || object.get("modelProvider")?.as_str()?.len() > MAX_PROTOCOL_STRING_BYTES
+        || object.get("preview")?.as_str()?.len() > MAX_PROTOCOL_STRING_BYTES
+        || object.get("sessionId")?.as_str()?.len() > MAX_PROTOCOL_STRING_BYTES
+        || object.get("createdAt")?.as_i64().is_none()
+        || object.get("updatedAt")?.as_i64().is_none()
+        || !object.get("turns")?.is_array()
+        || !object.get("status")?.is_object()
+    {
+        return None;
+    }
+    Some((thread_id, ephemeral, cwd))
+}
+
+fn parse_turn_wire_object(
+    object: &serde_json::Map<String, Value>,
+) -> Option<(String, WireTurnStatus)> {
+    if !object.get("items")?.is_array() {
+        return None;
+    }
+    Some((
+        bounded_opaque_id(object.get("id")?)?,
+        parse_wire_turn_status(object.get("status")?)?,
+    ))
+}
+
+fn parse_protocol_notification(
+    method: &str,
+    params: Option<&Value>,
+) -> Option<ProtocolNotification> {
+    if !ALLOWED_SERVER_NOTIFICATION_METHODS.contains(&method) {
+        return Some(ProtocolNotification::Unknown);
+    }
+
+    match method {
+        "error" => Some(ProtocolNotification::Error),
+        "thread/started" => {
+            let object = params?.as_object()?;
+            let thread = object.get("thread")?.as_object()?;
+            let (thread_id, _, _) = parse_thread_wire_object(thread)?;
+            Some(ProtocolNotification::ThreadStarted { thread_id })
+        }
+        "turn/started" => {
+            let object = params?.as_object()?;
+            let thread_id = bounded_opaque_id(object.get("threadId")?)?;
+            let turn = object.get("turn")?.as_object()?;
+            let (turn_id, status) = parse_turn_wire_object(turn)?;
+            if status != WireTurnStatus::InProgress {
+                return None;
+            }
+            Some(ProtocolNotification::TurnStarted { thread_id, turn_id })
+        }
+        "item/started" | "item/completed" => {
+            let object = params?.as_object()?;
+            let thread_id = bounded_opaque_id(object.get("threadId")?)?;
+            let turn_id = bounded_opaque_id(object.get("turnId")?)?;
+            let item = object.get("item")?.as_object()?;
+            let item_id = bounded_opaque_id(item.get("id")?)?;
+            let _item_type = bounded_string(item.get("type")?, MAX_METHOD_BYTES)?;
+            let timestamp_key = if method == "item/started" {
+                "startedAtMs"
+            } else {
+                "completedAtMs"
+            };
+            if object.get(timestamp_key)?.as_i64().is_none() {
+                return None;
+            }
+            if method == "item/started" {
+                Some(ProtocolNotification::ItemStarted {
+                    thread_id,
+                    turn_id,
+                    item_id,
+                })
+            } else {
+                Some(ProtocolNotification::ItemCompleted {
+                    thread_id,
+                    turn_id,
+                    item_id,
+                })
+            }
+        }
+        "turn/completed" => {
+            let object = params?.as_object()?;
+            let thread_id = bounded_opaque_id(object.get("threadId")?)?;
+            let turn = object.get("turn")?.as_object()?;
+            let (turn_id, status) = parse_turn_wire_object(turn)?;
+            if status == WireTurnStatus::InProgress {
+                return None;
+            }
+            Some(ProtocolNotification::TurnCompleted {
+                thread_id,
+                turn_id,
+                status,
+            })
+        }
+        _ => Some(ProtocolNotification::Unknown),
+    }
+}
+
+fn parse_wire_turn_status(value: &Value) -> Option<WireTurnStatus> {
+    match value.as_str()? {
+        "completed" => Some(WireTurnStatus::Completed),
+        "interrupted" => Some(WireTurnStatus::Interrupted),
+        "failed" => Some(WireTurnStatus::Failed),
+        "inProgress" => Some(WireTurnStatus::InProgress),
+        _ => None,
+    }
+}
+
+fn bounded_opaque_id(value: &Value) -> Option<String> {
+    let value = bounded_string(value, MAX_PROTOCOL_STRING_BYTES)?;
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return None;
+    }
+    Some(value)
 }
 
 fn bounded_string(value: &Value, max_bytes: usize) -> Option<String> {
@@ -1557,6 +2559,55 @@ mod tests {
             .spawn(spec)
             .expect("fake app server must spawn");
         (directory, root, CodexProtocolClient::new(process))
+    }
+
+    #[cfg(windows)]
+    fn initialize_and_start_thread(client: &mut CodexProtocolClient) -> String {
+        client
+            .initialize(Duration::from_secs(2))
+            .expect("initialize succeeds");
+        client
+            .start_thread(Duration::from_secs(2))
+            .expect("ephemeral thread starts")
+            .thread_id
+    }
+
+    #[cfg(windows)]
+    fn next_lifecycle_event(
+        client: &mut CodexProtocolClient,
+        timeout: Duration,
+    ) -> CodexLifecycleEvent {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "expected a lifecycle event");
+            if let Some(event) = client
+                .next_lifecycle_event(remaining)
+                .expect("lifecycle event remains well-formed")
+            {
+                return event;
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn next_lifecycle_event_or_none(
+        client: &mut CodexProtocolClient,
+        timeout: Duration,
+    ) -> Option<CodexLifecycleEvent> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            if let Some(event) = client
+                .next_lifecycle_event(remaining)
+                .expect("lifecycle stream remains well-formed")
+            {
+                return Some(event);
+            }
+        }
     }
 
     #[cfg(windows)]
@@ -2034,9 +3085,12 @@ mod tests {
             CODEX_UPSTREAM_REPOSITORY,
             "https://github.com/openai/codex.git"
         );
-        assert_eq!(pin.client_contract_version(), "d29-a.codex-app-server.v1");
+        assert_eq!(pin.client_contract_version(), "d29-b.codex-app-server.v2");
         assert_eq!(CodexRuntimeAdapter::pinned().upstream_pin(), pin);
-        assert_eq!(ALLOWED_CLIENT_REQUEST_METHODS, &["initialize"]);
+        assert_eq!(
+            ALLOWED_CLIENT_REQUEST_METHODS,
+            &["initialize", "thread/start", "turn/start", "turn/interrupt"]
+        );
         assert_eq!(ALLOWED_CLIENT_NOTIFICATION_METHODS, &["initialized"]);
         assert!(ALLOWED_SERVER_REQUEST_METHODS.is_empty());
     }
@@ -2100,7 +3154,7 @@ mod tests {
     fn initialize_success_and_unknown_client_method_are_handled() {
         let (_directory, _root, mut client) = client_with_args(&["success"]);
         assert_eq!(
-            client.request_for_test("thread/start").unwrap_err(),
+            client.request_for_test("thread/resume").unwrap_err(),
             CodexRuntimeError::UnsupportedMethod
         );
         let result = client
@@ -2114,6 +3168,547 @@ mod tests {
         client.shutdown().expect("double shutdown is idempotent");
         assert_eq!(client.status(), CodexProcessStatus::Exited);
         assert!(!client.has_child());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn no_thread_before_initialize() {
+        let (_directory, _root, mut client) = client_with_args(&["d29-b"]);
+        assert_eq!(
+            client.start_thread(Duration::from_secs(2)).unwrap_err(),
+            CodexRuntimeError::ProtocolStateViolation
+        );
+        client
+            .initialize(Duration::from_secs(2))
+            .expect("initialize remains the first protocol operation");
+        client.shutdown().expect("state guard cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn thread_start_is_ephemeral_and_isolation_bound() {
+        let (_directory, root, mut client) = client_with_args(&["d29-b"]);
+        let thread_id = initialize_and_start_thread(&mut client);
+        assert_eq!(thread_id, "thread-d29-ephemeral-1");
+        let request = fs::read_to_string(root.path().join("d29-thread-start-request.txt"))
+            .expect("fake records the typed thread/start request");
+        assert!(request.contains("\"ephemeral\":true"));
+        assert!(request.contains("\"cwd\":"));
+        for forbidden in [
+            "\"config\"",
+            "\"dynamicTools\"",
+            "\"projectId\"",
+            "\"historyMode\"",
+            "\"sandbox\"",
+            "\"approvalPolicy\"",
+        ] {
+            assert!(
+                !request.contains(forbidden),
+                "unexpected thread field: {forbidden}"
+            );
+        }
+        client.shutdown().expect("ephemeral thread cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wrong_rpc_id_does_not_complete_thread_start() {
+        let (_directory, _root, mut client) = client_with_args(&["d29-b-wrong-thread-rpc-id"]);
+        client
+            .initialize(Duration::from_secs(2))
+            .expect("initialize succeeds");
+        let result = client
+            .start_thread(Duration::from_secs(2))
+            .expect("only the matching thread/start response completes the request");
+        assert_eq!(result.thread_id, "thread-d29-ephemeral-1");
+        assert!(matches!(
+            client.state,
+            CodexProtocolState::ThreadReady { .. }
+        ));
+        client.shutdown().expect("wrong response cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn request_id_exhaustion_fails_closed_without_collision() {
+        let (_directory, _root, mut client) = client_with_args(&["d29-b"]);
+        client.next_request_id = u64::MAX;
+        assert_eq!(
+            client.initialize(Duration::from_secs(2)).unwrap_err(),
+            CodexRuntimeError::RequestIdExhausted
+        );
+        assert_eq!(client.state, CodexProtocolState::Retired);
+        client.shutdown().expect("request id exhaustion cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn no_turn_before_thread() {
+        let (_directory, _root, mut client) = client_with_args(&["d29-b"]);
+        client
+            .initialize(Duration::from_secs(2))
+            .expect("initialize succeeds");
+        assert_eq!(
+            client
+                .start_turn("bounded fixture", Duration::from_secs(2))
+                .unwrap_err(),
+            CodexRuntimeError::ProtocolStateViolation
+        );
+        client.shutdown().expect("no-turn state cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn turn_start_binds_current_thread() {
+        let (_directory, root, mut client) = client_with_args(&["d29-b"]);
+        let thread_id = initialize_and_start_thread(&mut client);
+        assert_eq!(
+            next_lifecycle_event(&mut client, Duration::from_secs(2)),
+            CodexLifecycleEvent::ThreadStarted {
+                thread_id: thread_id.clone()
+            }
+        );
+        let turn_id = client
+            .start_turn("bounded fixture", Duration::from_secs(2))
+            .expect("turn starts only on the current thread")
+            .turn_id;
+        assert_eq!(
+            client.state,
+            CodexProtocolState::TurnRunning {
+                thread_id: thread_id.clone(),
+                turn_id: turn_id.clone(),
+                started_event_seen: false,
+            }
+        );
+        assert_eq!(
+            client
+                .start_turn("second active fixture", Duration::from_secs(2))
+                .unwrap_err(),
+            CodexRuntimeError::ProtocolStateViolation
+        );
+        assert_eq!(
+            next_lifecycle_event(&mut client, Duration::from_secs(2)),
+            CodexLifecycleEvent::TurnStarted {
+                thread_id: thread_id.clone(),
+                turn_id: turn_id.clone(),
+            }
+        );
+        let request = fs::read_to_string(root.path().join("d29-turn-start-request.txt"))
+            .expect("fake records the typed turn/start request");
+        assert!(request.contains("\"threadId\":\"thread-d29-ephemeral-1\""));
+        assert!(request.contains("\"input\":[{"));
+        assert!(request.contains("\"type\":\"text\""));
+        assert!(request.contains("\"text\":\"bounded fixture\""));
+        for forbidden in [
+            "\"cwd\"",
+            "\"model\"",
+            "\"sandboxPolicy\"",
+            "\"approvalPolicy\"",
+            "\"metadata\"",
+            "\"toolOutput\"",
+        ] {
+            assert!(
+                !request.contains(forbidden),
+                "unexpected turn field: {forbidden}"
+            );
+        }
+        client.shutdown().expect("turn binding cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn turn_started_binds_exact_turn() {
+        let (_directory, _root, mut client) = client_with_args(&["d29-b-wrong-binding"]);
+        initialize_and_start_thread(&mut client);
+        assert!(matches!(
+            next_lifecycle_event(&mut client, Duration::from_secs(2)),
+            CodexLifecycleEvent::ThreadStarted { .. }
+        ));
+        client
+            .start_turn("bounded fixture", Duration::from_secs(2))
+            .expect("turn start response succeeds");
+        assert_eq!(
+            client
+                .next_lifecycle_event(Duration::from_secs(2))
+                .unwrap_err(),
+            CodexRuntimeError::MalformedProtocol
+        );
+        assert_eq!(client.state, CodexProtocolState::Retired);
+        client.shutdown().expect("wrong binding cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bounded_lifecycle_event_streaming() {
+        let (_directory, _root, mut client) = client_with_args(&["d29-b"]);
+        let thread_id = initialize_and_start_thread(&mut client);
+        let _ = next_lifecycle_event(&mut client, Duration::from_secs(2));
+        let turn_id = client
+            .start_turn("bounded fixture", Duration::from_secs(2))
+            .expect("turn start response succeeds")
+            .turn_id;
+        let events = [
+            next_lifecycle_event(&mut client, Duration::from_secs(2)),
+            next_lifecycle_event(&mut client, Duration::from_secs(2)),
+            next_lifecycle_event(&mut client, Duration::from_secs(2)),
+            next_lifecycle_event(&mut client, Duration::from_secs(2)),
+        ];
+        assert_eq!(
+            events,
+            [
+                CodexLifecycleEvent::TurnStarted {
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                },
+                CodexLifecycleEvent::ItemStarted {
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                    item_id: "item-d29-1".to_owned(),
+                },
+                CodexLifecycleEvent::ItemCompleted {
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                    item_id: "item-d29-1".to_owned(),
+                },
+                CodexLifecycleEvent::TurnCompleted {
+                    thread_id,
+                    turn_id,
+                    terminal: CodexTurnTerminal::Completed,
+                },
+            ]
+        );
+        assert!(!format!("{:?}", events).contains("fixture"));
+        client.shutdown().expect("bounded lifecycle cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn turn_completed_terminal() {
+        let (_directory, _root, mut client) = client_with_args(&["d29-b"]);
+        initialize_and_start_thread(&mut client);
+        let _ = next_lifecycle_event(&mut client, Duration::from_secs(2));
+        let first_turn_id = client
+            .start_turn("first fixture", Duration::from_secs(2))
+            .expect("first turn starts")
+            .turn_id;
+        for _ in 0..4 {
+            let _ = next_lifecycle_event(&mut client, Duration::from_secs(2));
+        }
+        assert_eq!(
+            client.state,
+            CodexProtocolState::TurnCompleted {
+                thread_id: "thread-d29-ephemeral-1".to_owned(),
+                turn_id: first_turn_id,
+            }
+        );
+        assert_eq!(
+            client.interrupt_turn(Duration::from_secs(2)).unwrap_err(),
+            CodexRuntimeError::ProtocolStateViolation
+        );
+        client.shutdown().expect("terminal turn cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn turn_interrupt_exact_binding() {
+        let (_directory, root, mut client) = client_with_args(&["d29-b-interrupt"]);
+        let thread_id = initialize_and_start_thread(&mut client);
+        let _ = next_lifecycle_event(&mut client, Duration::from_secs(2));
+        let turn_id = client
+            .start_turn("interrupt fixture", Duration::from_secs(2))
+            .expect("interruptible turn starts")
+            .turn_id;
+        assert_eq!(
+            next_lifecycle_event(&mut client, Duration::from_secs(2)),
+            CodexLifecycleEvent::TurnStarted {
+                thread_id: thread_id.clone(),
+                turn_id: turn_id.clone(),
+            }
+        );
+        client
+            .interrupt_turn(Duration::from_secs(2))
+            .expect("turn/interrupt uses the exact active binding");
+        let request = fs::read_to_string(root.path().join("d29-turn-interrupt-request.txt"))
+            .expect("fake records the typed turn/interrupt request");
+        assert!(request.contains("\"threadId\":\"thread-d29-ephemeral-1\""));
+        assert!(request.contains("\"turnId\":\"turn-d29-1\""));
+        assert!(!request.contains("\"input\""));
+        client.shutdown().expect("interrupt request cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn interrupted_terminal() {
+        let (_directory, _root, mut client) = client_with_args(&["d29-b-interrupt"]);
+        initialize_and_start_thread(&mut client);
+        let _ = next_lifecycle_event(&mut client, Duration::from_secs(2));
+        let turn_id = client
+            .start_turn("interrupt fixture", Duration::from_secs(2))
+            .expect("interruptible turn starts")
+            .turn_id;
+        let _ = next_lifecycle_event(&mut client, Duration::from_secs(2));
+        client
+            .interrupt_turn(Duration::from_secs(2))
+            .expect("interrupt response succeeds");
+        assert_eq!(
+            next_lifecycle_event(&mut client, Duration::from_secs(2)),
+            CodexLifecycleEvent::TurnCompleted {
+                thread_id: "thread-d29-ephemeral-1".to_owned(),
+                turn_id: turn_id.clone(),
+                terminal: CodexTurnTerminal::Interrupted,
+            }
+        );
+        assert_eq!(
+            client.state,
+            CodexProtocolState::TurnInterrupted {
+                thread_id: "thread-d29-ephemeral-1".to_owned(),
+                turn_id,
+            }
+        );
+        client.shutdown().expect("interrupted turn cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn duplicate_terminal_no_double_settlement() {
+        let (_directory, _root, mut client) = client_with_args(&["d29-b-duplicate-terminal"]);
+        initialize_and_start_thread(&mut client);
+        let _ = next_lifecycle_event(&mut client, Duration::from_secs(2));
+        client
+            .start_turn("duplicate fixture", Duration::from_secs(2))
+            .expect("turn starts");
+        for _ in 0..3 {
+            let _ = next_lifecycle_event(&mut client, Duration::from_secs(2));
+        }
+        let terminal = next_lifecycle_event(&mut client, Duration::from_secs(2));
+        assert!(matches!(
+            terminal,
+            CodexLifecycleEvent::TurnCompleted {
+                terminal: CodexTurnTerminal::Completed,
+                ..
+            }
+        ));
+        assert!(next_lifecycle_event_or_none(&mut client, Duration::from_millis(100)).is_none());
+        assert!(matches!(
+            client.state,
+            CodexProtocolState::TurnCompleted { .. }
+        ));
+        client.shutdown().expect("duplicate terminal cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stale_old_turn_event_does_not_mutate_new_turn() {
+        let (_directory, _root, mut client) = client_with_args(&["d29-b-stale-old-turn-event"]);
+        initialize_and_start_thread(&mut client);
+        let _ = next_lifecycle_event(&mut client, Duration::from_secs(2));
+        client
+            .start_turn("first fixture", Duration::from_secs(2))
+            .expect("first turn starts");
+        for _ in 0..4 {
+            let _ = next_lifecycle_event(&mut client, Duration::from_secs(2));
+        }
+        client
+            .start_turn("second fixture", Duration::from_secs(2))
+            .expect("new turn starts on the same ephemeral thread");
+        assert_eq!(
+            next_lifecycle_event(&mut client, Duration::from_secs(2)),
+            CodexLifecycleEvent::TurnStarted {
+                thread_id: "thread-d29-ephemeral-1".to_owned(),
+                turn_id: "turn-d29-2".to_owned(),
+            }
+        );
+        assert_eq!(
+            next_lifecycle_event(&mut client, Duration::from_secs(2)),
+            CodexLifecycleEvent::TurnCompleted {
+                thread_id: "thread-d29-ephemeral-1".to_owned(),
+                turn_id: "turn-d29-2".to_owned(),
+                terminal: CodexTurnTerminal::Completed,
+            }
+        );
+        assert!(matches!(
+            client.state,
+            CodexProtocolState::TurnCompleted { ref turn_id, .. } if turn_id == "turn-d29-2"
+        ));
+        client.shutdown().expect("stale event cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn server_request_during_turn_denied() {
+        let (directory, _root, mut client) = client_with_args(&["d29-b-server-request"]);
+        initialize_and_start_thread(&mut client);
+        let _ = next_lifecycle_event(&mut client, Duration::from_secs(2));
+        client
+            .start_turn("server request fixture", Duration::from_secs(2))
+            .expect("turn starts");
+        let _ = next_lifecycle_event(&mut client, Duration::from_secs(2));
+        let terminal = next_lifecycle_event(&mut client, Duration::from_secs(2));
+        assert!(matches!(
+            terminal,
+            CodexLifecycleEvent::TurnCompleted {
+                terminal: CodexTurnTerminal::Completed,
+                ..
+            }
+        ));
+        assert!(directory
+            .path()
+            .join("d29-server-request-denied.txt")
+            .is_file());
+        client.shutdown().expect("denied server request cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unknown_notification_has_no_authority_effect() {
+        let (_directory, _root, mut client) = client_with_args(&["d29-b-unknown-notification"]);
+        initialize_and_start_thread(&mut client);
+        let _ = next_lifecycle_event(&mut client, Duration::from_secs(2));
+        client
+            .start_turn("unknown notification fixture", Duration::from_secs(2))
+            .expect("turn starts");
+        assert!(matches!(
+            next_lifecycle_event(&mut client, Duration::from_secs(2)),
+            CodexLifecycleEvent::TurnStarted { .. }
+        ));
+        assert!(matches!(
+            next_lifecycle_event(&mut client, Duration::from_secs(2)),
+            CodexLifecycleEvent::TurnCompleted {
+                terminal: CodexTurnTerminal::Completed,
+                ..
+            }
+        ));
+        assert!(matches!(
+            client.state,
+            CodexProtocolState::TurnCompleted { .. }
+        ));
+        client.shutdown().expect("unknown notification cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn malformed_lifecycle_fails_closed() {
+        let (_directory, _root, mut client) = client_with_args(&["d29-b-malformed-lifecycle"]);
+        initialize_and_start_thread(&mut client);
+        let _ = next_lifecycle_event(&mut client, Duration::from_secs(2));
+        client
+            .start_turn("malformed fixture", Duration::from_secs(2))
+            .expect("turn start response succeeds before lifecycle failure");
+        assert_eq!(
+            client
+                .next_lifecycle_event(Duration::from_secs(2))
+                .unwrap_err(),
+            CodexRuntimeError::MalformedProtocol
+        );
+        assert_eq!(client.state, CodexProtocolState::Retired);
+        client.shutdown().expect("malformed lifecycle cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn out_of_order_event_fails_closed() {
+        let (_directory, _root, mut client) = client_with_args(&["d29-b-out-of-order"]);
+        initialize_and_start_thread(&mut client);
+        let _ = next_lifecycle_event(&mut client, Duration::from_secs(2));
+        client
+            .start_turn("out of order fixture", Duration::from_secs(2))
+            .expect("turn start response succeeds before ordering failure");
+        assert_eq!(
+            client
+                .next_lifecycle_event(Duration::from_secs(2))
+                .unwrap_err(),
+            CodexRuntimeError::MalformedProtocol
+        );
+        assert_eq!(client.state, CodexProtocolState::Retired);
+        client.shutdown().expect("out-of-order cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn crash_retires_thread_and_turn() {
+        let (_directory, _root, mut client) = client_with_args(&["d29-b-crash-during-turn"]);
+        initialize_and_start_thread(&mut client);
+        let _ = next_lifecycle_event(&mut client, Duration::from_secs(2));
+        client
+            .start_turn("crash fixture", Duration::from_secs(2))
+            .expect("turn start response is observed before process crash");
+        assert_eq!(
+            client
+                .next_lifecycle_event(Duration::from_secs(2))
+                .unwrap_err(),
+            CodexRuntimeError::ChildExited
+        );
+        assert_eq!(client.state, CodexProtocolState::Retired);
+        assert_eq!(
+            client.start_thread(Duration::from_secs(2)).unwrap_err(),
+            CodexRuntimeError::SessionRetired
+        );
+        client.shutdown().expect("crashed turn cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restart_requires_new_initialize_and_thread() {
+        let (_directory, _root, mut crashed) = client_with_args(&["d29-b-crash-during-turn"]);
+        initialize_and_start_thread(&mut crashed);
+        let _ = next_lifecycle_event(&mut crashed, Duration::from_secs(2));
+        crashed
+            .start_turn("crash fixture", Duration::from_secs(2))
+            .expect("turn starts before crash");
+        let _ = crashed.next_lifecycle_event(Duration::from_secs(2));
+        assert_eq!(crashed.state, CodexProtocolState::Retired);
+        crashed.shutdown().expect("retired process cleanup");
+
+        let (_directory, _root, mut restarted) = client_with_args(&["d29-b"]);
+        assert_eq!(
+            restarted.start_thread(Duration::from_secs(2)).unwrap_err(),
+            CodexRuntimeError::ProtocolStateViolation
+        );
+        let new_thread_id = initialize_and_start_thread(&mut restarted);
+        assert_eq!(new_thread_id, "thread-d29-ephemeral-1");
+        restarted.shutdown().expect("new process cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn no_durable_state_or_files_outside_test_root() {
+        let (directory, root, mut client) = client_with_args(&["d29-b"]);
+        initialize_and_start_thread(&mut client);
+        let _ = next_lifecycle_event(&mut client, Duration::from_secs(2));
+        client
+            .start_turn("ephemeral fixture", Duration::from_secs(2))
+            .expect("turn starts");
+        for _ in 0..4 {
+            let _ = next_lifecycle_event(&mut client, Duration::from_secs(2));
+        }
+        client.shutdown().expect("no-durable-state cleanup");
+
+        let names = fs::read_dir(root.path())
+            .expect("isolated root remains readable")
+            .map(|entry| entry.expect("root entry").file_name())
+            .collect::<Vec<_>>();
+        assert!(names.iter().any(|name| name == ".d29-dedicated-root"));
+        assert!(names
+            .iter()
+            .any(|name| name == "d29-thread-start-request.txt"));
+        assert!(names
+            .iter()
+            .any(|name| name == "d29-turn-start-request.txt"));
+        for forbidden in [
+            "d29-thread-history",
+            "d29-session.json",
+            "codex-home",
+            "conversation.db",
+        ] {
+            assert!(
+                !names.iter().any(|name| name == forbidden),
+                "durable artifact: {forbidden}"
+            );
+            assert!(!Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(forbidden)
+                .exists());
+        }
+        assert!(directory.path().join(".d29-dedicated-root").is_file());
     }
 
     #[cfg(windows)]
@@ -2216,7 +3811,7 @@ mod tests {
                 &sender,
                 &overflowed,
                 ProcessEvent::Message(ProtocolMessage::Notification {
-                    method: "unknown/notification".to_owned(),
+                    notification: ProtocolNotification::Unknown,
                 }),
             );
         }

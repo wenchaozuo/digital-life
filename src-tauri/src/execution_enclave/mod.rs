@@ -52,6 +52,9 @@ const MAX_PROTOCOL_STRING_BYTES: usize = 1024;
 const EVENT_QUEUE_CAPACITY: usize = 32;
 const MAX_STDERR_CAPTURE_BYTES: usize = 16 * 1024;
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
+const KILL_REAP_ATTEMPTS: usize = 2;
+const DROP_CLEANUP_ATTEMPTS: usize = 2;
+const KILL_REAP_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CodexUpstreamPin {
@@ -98,6 +101,7 @@ pub(crate) enum CodexProcessStatus {
     Ready,
     Interrupting,
     ShuttingDown,
+    CleanupFailed,
     Exited,
     Crashed,
     BrokenPipe,
@@ -107,6 +111,79 @@ impl CodexProcessStatus {
     fn is_terminal(self) -> bool {
         matches!(self, Self::Exited | Self::Crashed | Self::BrokenPipe)
     }
+
+    fn rejects_protocol_io(self) -> bool {
+        self.is_terminal() || matches!(self, Self::CleanupFailed)
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum ChildControlObservation<S> {
+    Running,
+    Exited(S),
+    Failed,
+}
+
+trait ProcessControl {
+    type ExitStatus;
+
+    fn try_wait_control(&mut self) -> ChildControlObservation<Self::ExitStatus>;
+    fn kill_control(&mut self) -> bool;
+}
+
+impl ProcessControl for Child {
+    type ExitStatus = ExitStatus;
+
+    fn try_wait_control(&mut self) -> ChildControlObservation<Self::ExitStatus> {
+        match self.try_wait() {
+            Ok(Some(status)) => ChildControlObservation::Exited(status),
+            Ok(None) => ChildControlObservation::Running,
+            Err(_) => ChildControlObservation::Failed,
+        }
+    }
+
+    fn kill_control(&mut self) -> bool {
+        self.kill().is_ok()
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum ReapDecision<S> {
+    Reaped(S),
+    RetainOwnership,
+}
+
+/// Bounded process-control decision logic shared by the native Child path and
+/// deterministic tests.  A kill error is never treated as proof that the
+/// child is still alive: the child is observed first, then a short retry
+/// window is used before ownership is retained with an error.
+fn bounded_kill_reap<C: ProcessControl>(
+    control: &mut C,
+    max_attempts: usize,
+) -> ReapDecision<C::ExitStatus> {
+    bounded_kill_reap_with_delay(control, max_attempts, Duration::ZERO)
+}
+
+fn bounded_kill_reap_with_delay<C: ProcessControl>(
+    control: &mut C,
+    max_attempts: usize,
+    retry_delay: Duration,
+) -> ReapDecision<C::ExitStatus> {
+    let attempts = max_attempts.max(1);
+    for attempt in 0..attempts {
+        let _kill_succeeded = control.kill_control();
+        match control.try_wait_control() {
+            ChildControlObservation::Exited(status) => return ReapDecision::Reaped(status),
+            ChildControlObservation::Failed => return ReapDecision::RetainOwnership,
+            ChildControlObservation::Running if attempt + 1 < attempts => {
+                if !retry_delay.is_zero() {
+                    thread::sleep(retry_delay);
+                }
+            }
+            ChildControlObservation::Running => return ReapDecision::RetainOwnership,
+        }
+    }
+    ReapDecision::RetainOwnership
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -368,7 +445,7 @@ impl CodexAppServerProcess {
     }
 
     fn write_json(&mut self, value: Value) -> Result<(), CodexRuntimeError> {
-        if self.status.is_terminal() {
+        if self.status.rejects_protocol_io() {
             return Err(CodexRuntimeError::BrokenPipe);
         }
         let encoded =
@@ -377,7 +454,7 @@ impl CodexAppServerProcess {
             return Err(CodexRuntimeError::ProtocolEncoding);
         }
         self.refresh_child_status();
-        if self.status.is_terminal() {
+        if self.status.rejects_protocol_io() {
             return Err(CodexRuntimeError::BrokenPipe);
         }
         let stdin = self.stdin.as_mut().ok_or(CodexRuntimeError::BrokenPipe)?;
@@ -512,18 +589,21 @@ impl CodexAppServerProcess {
         }
 
         if !exited {
-            let child = self.child.as_mut().expect("child exists until reap");
-            if child.kill().is_err() {
-                return Err(CodexRuntimeError::ShutdownFailed);
-            }
-            if child.wait().is_err() {
-                return Err(CodexRuntimeError::ShutdownFailed);
-            }
-            if !matches!(
-                self.status,
-                CodexProcessStatus::Crashed | CodexProcessStatus::BrokenPipe
-            ) {
-                self.status = CodexProcessStatus::Exited;
+            let reap_decision = {
+                let child = self.child.as_mut().expect("child exists until reap");
+                bounded_kill_reap_with_delay(child, KILL_REAP_ATTEMPTS, KILL_REAP_RETRY_DELAY)
+            };
+            match reap_decision {
+                ReapDecision::Reaped(exit_status) => {
+                    self.apply_exit_status(exit_status);
+                }
+                ReapDecision::RetainOwnership => {
+                    self.status = CodexProcessStatus::CleanupFailed;
+                    // The child and both reader handles remain owned by this
+                    // object.  A caller may retry, and Drop gets a final
+                    // bounded retry opportunity.
+                    return Err(CodexRuntimeError::ShutdownFailed);
+                }
             }
         }
 
@@ -539,6 +619,14 @@ impl CodexAppServerProcess {
         }
         if let Some(reader) = self.stderr_reader.take() {
             let _ = reader.join();
+        }
+    }
+
+    fn terminate_for_drop(&mut self) {
+        for _ in 0..DROP_CLEANUP_ATTEMPTS {
+            if self.terminate(TerminationIntent::Shutdown).is_ok() {
+                return;
+            }
         }
     }
 
@@ -569,7 +657,7 @@ impl CodexAppServerProcess {
 
 impl Drop for CodexAppServerProcess {
     fn drop(&mut self) {
-        let _ = self.terminate(TerminationIntent::Shutdown);
+        self.terminate_for_drop();
     }
 }
 
@@ -1096,7 +1184,10 @@ fn has_dedicated_root_marker(_path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, path::PathBuf, process::Command, sync::OnceLock, thread, time::Duration};
+    use std::{
+        collections::VecDeque, fs, path::PathBuf, process::Command, sync::OnceLock, thread,
+        time::Duration,
+    };
 
     static FAKE_EXECUTABLE: OnceLock<PathBuf> = OnceLock::new();
 
@@ -1149,6 +1240,201 @@ mod tests {
             .spawn(spec)
             .expect("fake app server must spawn");
         (directory, root, CodexProtocolClient::new(process))
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct FakeExitStatus {
+        success: bool,
+    }
+
+    #[derive(Debug)]
+    enum FakeOperation {
+        Kill { succeeds: bool },
+        Observe(ChildControlObservation<FakeExitStatus>),
+    }
+
+    #[derive(Debug)]
+    struct FakeProcessControl {
+        operations: VecDeque<FakeOperation>,
+        kill_calls: usize,
+        observe_calls: usize,
+    }
+
+    impl FakeProcessControl {
+        fn new(operations: impl IntoIterator<Item = FakeOperation>) -> Self {
+            Self {
+                operations: operations.into_iter().collect(),
+                kill_calls: 0,
+                observe_calls: 0,
+            }
+        }
+    }
+
+    impl ProcessControl for FakeProcessControl {
+        type ExitStatus = FakeExitStatus;
+
+        fn try_wait_control(&mut self) -> ChildControlObservation<Self::ExitStatus> {
+            self.observe_calls += 1;
+            match self.operations.pop_front() {
+                Some(FakeOperation::Observe(observation)) => observation,
+                _ => ChildControlObservation::Failed,
+            }
+        }
+
+        fn kill_control(&mut self) -> bool {
+            self.kill_calls += 1;
+            match self.operations.pop_front() {
+                Some(FakeOperation::Kill { succeeds }) => succeeds,
+                _ => false,
+            }
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum FakeOwnerStatus {
+        Running,
+        CleanupFailed,
+        Exited,
+    }
+
+    #[derive(Debug)]
+    struct FakeOwnedChild {
+        control: FakeProcessControl,
+        child_owned: bool,
+        readers_joined: bool,
+        status: FakeOwnerStatus,
+    }
+
+    impl FakeOwnedChild {
+        fn new(operations: impl IntoIterator<Item = FakeOperation>) -> Self {
+            Self {
+                control: FakeProcessControl::new(operations),
+                child_owned: true,
+                readers_joined: false,
+                status: FakeOwnerStatus::Running,
+            }
+        }
+
+        fn cleanup_once(&mut self) -> Result<(), CodexRuntimeError> {
+            if !self.child_owned {
+                return Ok(());
+            }
+            match bounded_kill_reap(&mut self.control, KILL_REAP_ATTEMPTS) {
+                ReapDecision::Reaped(_) => {
+                    self.child_owned = false;
+                    self.readers_joined = true;
+                    self.status = FakeOwnerStatus::Exited;
+                    Ok(())
+                }
+                ReapDecision::RetainOwnership => {
+                    self.status = FakeOwnerStatus::CleanupFailed;
+                    Err(CodexRuntimeError::ShutdownFailed)
+                }
+            }
+        }
+
+        fn drop_cleanup(&mut self) {
+            for _ in 0..DROP_CLEANUP_ATTEMPTS {
+                if self.cleanup_once().is_ok() {
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn kill_error_then_child_already_exited_is_reaped() {
+        let mut control = FakeProcessControl::new([
+            FakeOperation::Kill { succeeds: false },
+            FakeOperation::Observe(ChildControlObservation::Exited(FakeExitStatus {
+                success: true,
+            })),
+        ]);
+        assert_eq!(
+            bounded_kill_reap(&mut control, KILL_REAP_ATTEMPTS),
+            ReapDecision::Reaped(FakeExitStatus { success: true })
+        );
+        assert_eq!(control.kill_calls, 1);
+        assert_eq!(control.observe_calls, 1);
+    }
+
+    #[test]
+    fn kill_error_while_child_alive_does_not_abandon_child() {
+        let mut owner = FakeOwnedChild::new([
+            FakeOperation::Kill { succeeds: false },
+            FakeOperation::Observe(ChildControlObservation::Running),
+            FakeOperation::Kill { succeeds: false },
+            FakeOperation::Observe(ChildControlObservation::Running),
+        ]);
+        assert_eq!(
+            owner.cleanup_once().unwrap_err(),
+            CodexRuntimeError::ShutdownFailed
+        );
+        assert!(owner.child_owned);
+        assert!(!owner.readers_joined);
+        assert_eq!(owner.status, FakeOwnerStatus::CleanupFailed);
+    }
+
+    #[test]
+    fn failed_shutdown_retains_child_for_retry() {
+        let mut owner = FakeOwnedChild::new([
+            FakeOperation::Kill { succeeds: false },
+            FakeOperation::Observe(ChildControlObservation::Running),
+            FakeOperation::Kill { succeeds: false },
+            FakeOperation::Observe(ChildControlObservation::Running),
+        ]);
+        let _ = owner.cleanup_once();
+        assert!(owner.child_owned);
+        assert!(!owner.readers_joined);
+        assert_eq!(owner.control.kill_calls, KILL_REAP_ATTEMPTS);
+    }
+
+    #[test]
+    fn retry_cleanup_eventually_clears_child_and_joins_readers() {
+        let mut owner = FakeOwnedChild::new([
+            FakeOperation::Kill { succeeds: false },
+            FakeOperation::Observe(ChildControlObservation::Running),
+            FakeOperation::Kill { succeeds: false },
+            FakeOperation::Observe(ChildControlObservation::Running),
+            FakeOperation::Kill { succeeds: true },
+            FakeOperation::Observe(ChildControlObservation::Exited(FakeExitStatus {
+                success: true,
+            })),
+        ]);
+        assert_eq!(
+            owner.cleanup_once().unwrap_err(),
+            CodexRuntimeError::ShutdownFailed
+        );
+        owner.cleanup_once().expect("retry reaps child");
+        assert!(!owner.child_owned);
+        assert!(owner.readers_joined);
+        assert_eq!(owner.status, FakeOwnerStatus::Exited);
+    }
+
+    #[test]
+    fn drop_cleanup_uses_bounded_final_retry() {
+        let mut owner = FakeOwnedChild::new([
+            FakeOperation::Kill { succeeds: false },
+            FakeOperation::Observe(ChildControlObservation::Running),
+            FakeOperation::Kill { succeeds: false },
+            FakeOperation::Observe(ChildControlObservation::Running),
+            FakeOperation::Kill { succeeds: false },
+            FakeOperation::Observe(ChildControlObservation::Running),
+            FakeOperation::Kill { succeeds: false },
+            FakeOperation::Observe(ChildControlObservation::Running),
+        ]);
+        owner.drop_cleanup();
+        assert!(owner.child_owned);
+        assert!(!owner.readers_joined);
+        assert_eq!(owner.status, FakeOwnerStatus::CleanupFailed);
+        assert_eq!(
+            owner.control.kill_calls,
+            DROP_CLEANUP_ATTEMPTS * KILL_REAP_ATTEMPTS
+        );
+        assert_eq!(
+            owner.control.observe_calls,
+            DROP_CLEANUP_ATTEMPTS * KILL_REAP_ATTEMPTS
+        );
     }
 
     #[test]

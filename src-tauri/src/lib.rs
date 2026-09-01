@@ -10,6 +10,11 @@ pub mod conversation;
 pub mod embedding;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod emotion;
+// D29-A: the Codex App Server process/protocol foundation is intentionally
+// private and has no production caller until a later governed execution
+// stage.  Keeping it outside capability/autonomy preserves the D28 firewall.
+#[cfg_attr(not(test), allow(dead_code))]
+mod execution_enclave;
 pub(crate) mod experience;
 // D14-B1 is the goal / plan / action-intent authority foundation; the domain
 // has no production caller until the D14-B2+ lifecycle stages, so the frozen

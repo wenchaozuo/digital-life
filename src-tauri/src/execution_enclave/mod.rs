@@ -5,6 +5,8 @@
 //! later governed execution stage.  In particular, this is not a capability,
 //! autonomy, Chat, or Tauri command surface.
 
+mod runtime_provisioning;
+
 use serde_json::{json, Value};
 use std::{
     collections::VecDeque,
@@ -140,6 +142,87 @@ impl CodexUpstreamPin {
 
     fn accepts_identity(self, release: &str, commit: &str) -> bool {
         release == self.release && commit == self.commit
+    }
+}
+
+/// Compile-time identity for the only official Codex runtime that Digital
+/// Life may provision in this stage.  The fields are private and the only
+/// constructor is the pinned descriptor below; callers cannot substitute an
+/// asset, release, or target through runtime input.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TrustedCodexRuntimeDescriptor {
+    repository: &'static str,
+    release: &'static str,
+    upstream_commit: &'static str,
+    protocol_schema_hash: &'static str,
+    client_contract_version: &'static str,
+    target_os: &'static str,
+    target_arch: &'static str,
+    asset_name: &'static str,
+    asset_id: u64,
+    asset_size: u64,
+    asset_sha256: &'static str,
+}
+
+impl TrustedCodexRuntimeDescriptor {
+    pub(crate) const fn pinned() -> Self {
+        Self {
+            repository: CODEX_UPSTREAM_REPOSITORY,
+            release: CODEX_UPSTREAM_RELEASE,
+            upstream_commit: CODEX_UPSTREAM_COMMIT,
+            protocol_schema_hash: CODEX_PROTOCOL_SCHEMA_HASH,
+            client_contract_version: CODEX_CLIENT_CONTRACT_VERSION,
+            target_os: "windows",
+            target_arch: "x86_64",
+            asset_name: "codex-app-server-x86_64-pc-windows-msvc.exe",
+            asset_id: 538_792_479,
+            asset_size: 227_369_264,
+            asset_sha256: "cb8e6cd9996b0647ccecd37d324438c8625738deca754faa74d98e4d7398a98c",
+        }
+    }
+
+    pub(crate) const fn repository(self) -> &'static str {
+        self.repository
+    }
+
+    pub(crate) const fn release(self) -> &'static str {
+        self.release
+    }
+
+    pub(crate) const fn upstream_commit(self) -> &'static str {
+        self.upstream_commit
+    }
+
+    pub(crate) const fn protocol_schema_hash(self) -> &'static str {
+        self.protocol_schema_hash
+    }
+
+    pub(crate) const fn client_contract_version(self) -> &'static str {
+        self.client_contract_version
+    }
+
+    pub(crate) const fn target_os(self) -> &'static str {
+        self.target_os
+    }
+
+    pub(crate) const fn target_arch(self) -> &'static str {
+        self.target_arch
+    }
+
+    pub(crate) const fn asset_name(self) -> &'static str {
+        self.asset_name
+    }
+
+    pub(crate) const fn asset_id(self) -> u64 {
+        self.asset_id
+    }
+
+    pub(crate) const fn asset_size(self) -> u64 {
+        self.asset_size
+    }
+
+    pub(crate) const fn asset_sha256(self) -> &'static str {
+        self.asset_sha256
     }
 }
 
@@ -471,6 +554,14 @@ pub(crate) enum CodexRuntimeError {
     SessionRetired,
     RequestIdExhausted,
     InvalidTurnInput,
+    UnsupportedPlatform,
+    RuntimePathRejected,
+    SourcePathRejected,
+    SourceSizeMismatch,
+    SourceHashMismatch,
+    RuntimeIdentityMismatch,
+    StagingFailed,
+    AtomicFinalizeFailed,
 }
 
 impl fmt::Display for CodexRuntimeError {
@@ -505,6 +596,18 @@ impl fmt::Display for CodexRuntimeError {
             Self::SessionRetired => "codex app server protocol session is retired",
             Self::RequestIdExhausted => "codex app server request id space is exhausted",
             Self::InvalidTurnInput => "codex app server turn input is not bounded text",
+            Self::UnsupportedPlatform => {
+                "codex trusted runtime is unsupported on this platform or architecture"
+            }
+            Self::RuntimePathRejected => "codex trusted runtime path was rejected",
+            Self::SourcePathRejected => "codex trusted runtime source path was rejected",
+            Self::SourceSizeMismatch => "codex trusted runtime source size did not match",
+            Self::SourceHashMismatch => "codex trusted runtime source hash did not match",
+            Self::RuntimeIdentityMismatch => {
+                "codex trusted runtime executable identity did not match"
+            }
+            Self::StagingFailed => "codex trusted runtime staging failed",
+            Self::AtomicFinalizeFailed => "codex trusted runtime atomic finalize failed",
         };
         formatter.write_str(message)
     }
@@ -538,6 +641,14 @@ impl CodexRuntimeAdapter {
         self.pin
     }
 
+    fn spawn_trusted_runtime(
+        &self,
+        runtime: &runtime_provisioning::TrustedCodexRuntime,
+        isolation_root: IsolatedExecutionRoot,
+    ) -> Result<CodexAppServerProcess, CodexRuntimeError> {
+        self.spawn(runtime.launch_spec(isolation_root))
+    }
+
     fn spawn(&self, spec: CodexLaunchSpec) -> Result<CodexAppServerProcess, CodexRuntimeError> {
         #[cfg(not(windows))]
         {
@@ -563,11 +674,35 @@ impl CodexRuntimeAdapter {
             return Err(CodexRuntimeError::InvalidUpstreamPin);
         }
 
-        let executable =
-            fs::canonicalize(&spec.executable).map_err(|_| CodexRuntimeError::SpawnFailed)?;
-        if !executable.is_file() || is_inside_repository(&executable) {
-            return Err(CodexRuntimeError::UntrustedExecutable);
-        }
+        let (executable, private_codex_home) = if let Some(descriptor) =
+            spec.trusted_runtime_descriptor
+        {
+            let runtime_root = spec
+                .trusted_runtime_root
+                .as_deref()
+                .ok_or(CodexRuntimeError::RuntimeIdentityMismatch)?;
+            let executable = runtime_provisioning::verify_runtime_identity_before_spawn(
+                &spec.executable,
+                runtime_root,
+                descriptor,
+            )?;
+            let private_codex_home = spec
+                .private_codex_home
+                .as_deref()
+                .ok_or(CodexRuntimeError::RuntimePathRejected)?;
+            let private_codex_home = runtime_provisioning::verify_private_codex_home_before_spawn(
+                private_codex_home,
+                runtime_root,
+            )?;
+            (executable, Some(private_codex_home))
+        } else {
+            let executable =
+                fs::canonicalize(&spec.executable).map_err(|_| CodexRuntimeError::SpawnFailed)?;
+            if !executable.is_file() || is_inside_repository(&executable) {
+                return Err(CodexRuntimeError::UntrustedExecutable);
+            }
+            (executable, None)
+        };
 
         let containment = CodexProcessContainment::create()?;
         let (child, stdin, stdout, stderr) = create_contained_process(
@@ -576,6 +711,7 @@ impl CodexRuntimeAdapter {
             spec.isolation_root.path(),
             &containment,
             self.pin,
+            private_codex_home.as_deref(),
         )?;
 
         Ok(CodexAppServerProcess::new(
@@ -718,17 +854,22 @@ fn windows_wide_string(value: &OsStr) -> Result<Vec<u16>, CodexRuntimeError> {
 }
 
 #[cfg(windows)]
-fn windows_environment_block(pin: CodexUpstreamPin) -> Vec<u16> {
-    let entries = [
-        format!(
+fn windows_environment_block(pin: CodexUpstreamPin, private_codex_home: Option<&Path>) -> Vec<u16> {
+    let mut entries = vec![
+        OsString::from(format!(
             "CODEX_D29_CLIENT_CONTRACT_VERSION={}",
             pin.client_contract_version()
-        ),
-        format!("CODEX_D29_UPSTREAM_COMMIT={}", pin.commit()),
+        )),
+        OsString::from(format!("CODEX_D29_UPSTREAM_COMMIT={}", pin.commit())),
     ];
+    if let Some(private_codex_home) = private_codex_home {
+        let mut entry = OsString::from("CODEX_HOME=");
+        entry.push(private_codex_home.as_os_str());
+        entries.push(entry);
+    }
     let mut block = Vec::new();
     for entry in entries {
-        block.extend(OsStr::new(&entry).encode_wide());
+        block.extend(entry.encode_wide());
         block.push(0);
     }
     block.push(0);
@@ -742,6 +883,7 @@ fn create_contained_process(
     isolation_root: &Path,
     containment: &CodexProcessContainment,
     pin: CodexUpstreamPin,
+    private_codex_home: Option<&Path>,
 ) -> Result<(CodexProcessChild, fs::File, fs::File, fs::File), CodexRuntimeError> {
     let (stdin_child, stdin_parent) = create_inheritable_pipe()?;
     let (stdout_parent, stdout_child) = create_inheritable_pipe()?;
@@ -817,7 +959,7 @@ fn create_contained_process(
     let executable_wide = windows_wide_string(executable.as_os_str())?;
     let mut command_line = windows_command_line(executable, arguments)?;
     let isolation_root_wide = windows_wide_string(isolation_root.as_os_str())?;
-    let environment_block = windows_environment_block(pin);
+    let environment_block = windows_environment_block(pin, private_codex_home);
 
     let mut startup = STARTUPINFOEXW::default();
     startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
@@ -868,6 +1010,9 @@ struct CodexLaunchSpec {
     isolation_root: IsolatedExecutionRoot,
     upstream_release: String,
     upstream_commit: String,
+    private_codex_home: Option<PathBuf>,
+    trusted_runtime_root: Option<PathBuf>,
+    trusted_runtime_descriptor: Option<TrustedCodexRuntimeDescriptor>,
 }
 
 #[derive(Clone, Debug)]
@@ -903,6 +1048,9 @@ impl CodexLaunchSpec {
             isolation_root,
             upstream_release: CODEX_UPSTREAM_RELEASE.to_owned(),
             upstream_commit: CODEX_UPSTREAM_COMMIT.to_owned(),
+            private_codex_home: None,
+            trusted_runtime_root: None,
+            trusted_runtime_descriptor: None,
         }
     }
 
@@ -920,6 +1068,9 @@ impl CodexLaunchSpec {
             isolation_root,
             upstream_release: upstream_release.to_owned(),
             upstream_commit: upstream_commit.to_owned(),
+            private_codex_home: None,
+            trusted_runtime_root: None,
+            trusted_runtime_descriptor: None,
         }
     }
 }

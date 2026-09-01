@@ -21,6 +21,22 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+
+#[cfg(windows)]
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, HANDLE},
+    System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    },
+};
+
+#[cfg(all(windows, test))]
+use windows_sys::Win32::System::JobObjects::{IsProcessInJob, QueryInformationJobObject};
+
 /// The only upstream release accepted by this foundation.
 pub(crate) const CODEX_UPSTREAM_REPOSITORY: &str = "https://github.com/openai/codex.git";
 pub(crate) const CODEX_UPSTREAM_RELEASE: &str = "rust-v0.152.0";
@@ -186,11 +202,185 @@ fn bounded_kill_reap_with_delay<C: ProcessControl>(
     ReapDecision::RetainOwnership
 }
 
+/// A process is never exposed to the protocol client until this admission
+/// result succeeds.  The cleanup and close callbacks deliberately run in
+/// this order when assignment fails, so an assignment failure cannot return
+/// an uncontained child to a caller.
+fn fail_closed_containment_assignment(
+    assignment: Result<(), ()>,
+    terminate_and_reap_child: impl FnOnce() -> bool,
+    close_containment: impl FnOnce(),
+) -> Result<(), CodexRuntimeError> {
+    if assignment.is_ok() {
+        return Ok(());
+    }
+
+    let child_reaped = terminate_and_reap_child();
+    close_containment();
+    if child_reaped {
+        Err(CodexRuntimeError::ContainmentAssignmentFailed)
+    } else {
+        Err(CodexRuntimeError::ContainmentAssignmentCleanupFailed)
+    }
+}
+
+/// Assignment failure happens immediately after spawn, before protocol pipes
+/// are handed to `CodexAppServerProcess`.  A direct kill followed by wait is
+/// intentional here: an unassigned process cannot rely on Job Object close
+/// for cleanup.
+fn terminate_and_reap_spawned_child(child: &mut Child) -> bool {
+    let _ = child.kill();
+    child.wait().is_ok()
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct OwnedJobHandle {
+    raw: HANDLE,
+    #[cfg(test)]
+    close_count: Arc<AtomicUsize>,
+}
+
+#[cfg(windows)]
+impl OwnedJobHandle {
+    fn new(raw: HANDLE) -> Option<Self> {
+        if raw.is_null() {
+            return None;
+        }
+        Some(Self {
+            raw,
+            #[cfg(test)]
+            close_count: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for OwnedJobHandle {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        self.close_count.fetch_add(1, Ordering::AcqRel);
+
+        let raw = std::mem::replace(&mut self.raw, std::ptr::null_mut());
+        if !raw.is_null() {
+            unsafe {
+                let _ = CloseHandle(raw);
+            }
+        }
+    }
+}
+
+/// Private, process-local Windows containment.  The job handle is owned by
+/// this type only; it is never cloned, serialized, persisted, sent over IPC,
+/// or exposed as a raw handle outside this module.
+#[cfg(windows)]
+#[derive(Debug)]
+struct CodexProcessContainment {
+    job: Option<OwnedJobHandle>,
+}
+
+#[cfg(windows)]
+impl CodexProcessContainment {
+    fn create() -> Result<Self, CodexRuntimeError> {
+        let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        let Some(job) = OwnedJobHandle::new(raw) else {
+            return Err(CodexRuntimeError::ContainmentCreateFailed);
+        };
+
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = unsafe {
+            SetInformationJobObject(
+                job.raw,
+                JobObjectExtendedLimitInformation,
+                std::ptr::addr_of!(limits).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            ) != 0
+        };
+        if !configured {
+            return Err(CodexRuntimeError::ContainmentConfigurationFailed);
+        }
+
+        Ok(Self { job: Some(job) })
+    }
+
+    fn assign_child(&mut self, child: &Child) -> Result<(), ()> {
+        let Some(job) = self.job.as_ref() else {
+            return Err(());
+        };
+        let assigned = unsafe { AssignProcessToJobObject(job.raw, child.as_raw_handle()) != 0 };
+        assigned.then_some(()).ok_or(())
+    }
+
+    fn close(&mut self) {
+        self.job.take();
+    }
+
+    #[cfg(test)]
+    fn close_counter_for_test(&self) -> Arc<AtomicUsize> {
+        Arc::clone(
+            &self
+                .job
+                .as_ref()
+                .expect("test containment must own its job")
+                .close_count,
+        )
+    }
+
+    #[cfg(test)]
+    fn has_kill_on_close_limit_for_test(&self) -> bool {
+        let Some(job) = self.job.as_ref() else {
+            return false;
+        };
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        let mut returned_length = 0_u32;
+        let queried = unsafe {
+            QueryInformationJobObject(
+                job.raw,
+                JobObjectExtendedLimitInformation,
+                std::ptr::addr_of_mut!(limits).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                &mut returned_length,
+            ) != 0
+        };
+        queried && limits.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE != 0
+    }
+
+    #[cfg(test)]
+    fn child_is_assigned_for_test(&self, child: &Child) -> bool {
+        let Some(job) = self.job.as_ref() else {
+            return false;
+        };
+        let mut is_in_job = 0_i32;
+        let queried =
+            unsafe { IsProcessInJob(child.as_raw_handle(), job.raw, &mut is_in_job) != 0 };
+        queried && is_in_job != 0
+    }
+}
+
+#[cfg(not(windows))]
+#[derive(Debug)]
+struct CodexProcessContainment;
+
+#[cfg(not(windows))]
+impl CodexProcessContainment {
+    fn create() -> Result<Self, CodexRuntimeError> {
+        Err(CodexRuntimeError::ContainmentUnavailable)
+    }
+
+    fn close(&mut self) {}
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CodexRuntimeError {
     InvalidUpstreamPin,
     InvalidIsolationRoot,
     UntrustedExecutable,
+    ContainmentUnavailable,
+    ContainmentCreateFailed,
+    ContainmentConfigurationFailed,
+    ContainmentAssignmentFailed,
+    ContainmentAssignmentCleanupFailed,
     SpawnFailed,
     MissingChildPipe,
     UnsupportedMethod,
@@ -211,6 +401,19 @@ impl fmt::Display for CodexRuntimeError {
             Self::InvalidUpstreamPin => "codex upstream identity is not the pinned release",
             Self::InvalidIsolationRoot => "codex runtime isolation root is not dedicated",
             Self::UntrustedExecutable => "codex runtime executable is outside the trusted boundary",
+            Self::ContainmentUnavailable => {
+                "codex app server process containment is unavailable on this platform"
+            }
+            Self::ContainmentCreateFailed => "codex app server Job Object could not be created",
+            Self::ContainmentConfigurationFailed => {
+                "codex app server Job Object could not be configured"
+            }
+            Self::ContainmentAssignmentFailed => {
+                "codex app server process could not be assigned to its Job Object"
+            }
+            Self::ContainmentAssignmentCleanupFailed => {
+                "codex app server process containment assignment cleanup failed"
+            }
             Self::SpawnFailed => "codex app server process could not be started",
             Self::MissingChildPipe => "codex app server process did not expose required pipes",
             Self::UnsupportedMethod => "codex app server method is outside the mapped contract",
@@ -257,6 +460,23 @@ impl CodexRuntimeAdapter {
     }
 
     fn spawn(&self, spec: CodexLaunchSpec) -> Result<CodexAppServerProcess, CodexRuntimeError> {
+        #[cfg(not(windows))]
+        {
+            let _ = spec;
+            return Err(CodexRuntimeError::ContainmentUnavailable);
+        }
+
+        #[cfg(windows)]
+        {
+            self.spawn_windows(spec)
+        }
+    }
+
+    #[cfg(windows)]
+    fn spawn_windows(
+        &self,
+        spec: CodexLaunchSpec,
+    ) -> Result<CodexAppServerProcess, CodexRuntimeError> {
         if !self
             .pin
             .accepts_identity(&spec.upstream_release, &spec.upstream_commit)
@@ -269,6 +489,8 @@ impl CodexRuntimeAdapter {
         if !executable.is_file() || is_inside_repository(&executable) {
             return Err(CodexRuntimeError::UntrustedExecutable);
         }
+
+        let mut containment = CodexProcessContainment::create()?;
 
         let mut command = Command::new(&executable);
         command
@@ -290,14 +512,21 @@ impl CodexRuntimeAdapter {
         let mut child = command
             .spawn()
             .map_err(|_| CodexRuntimeError::SpawnFailed)?;
+
+        fail_closed_containment_assignment(
+            containment.assign_child(&child),
+            || terminate_and_reap_spawned_child(&mut child),
+            || containment.close(),
+        )?;
+
         let stdin = child.stdin.take();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let (stdin, stdout, stderr) = match (stdin, stdout, stderr) {
             (Some(stdin), Some(stdout), Some(stderr)) => (stdin, stdout, stderr),
             _ => {
-                let _ = child.kill();
-                let _ = child.wait();
+                let _ = terminate_and_reap_spawned_child(&mut child);
+                containment.close();
                 return Err(CodexRuntimeError::MissingChildPipe);
             }
         };
@@ -307,6 +536,7 @@ impl CodexRuntimeAdapter {
             stdin,
             stdout,
             stderr,
+            containment,
             spec.isolation_root,
         ))
     }
@@ -379,6 +609,7 @@ impl CodexLaunchSpec {
 struct CodexAppServerProcess {
     child: Option<Child>,
     stdin: Option<ChildStdin>,
+    containment: Option<CodexProcessContainment>,
     events: Receiver<ProcessEvent>,
     stop_readers: Arc<AtomicBool>,
     event_queue_overflowed: Arc<AtomicBool>,
@@ -397,6 +628,7 @@ impl CodexAppServerProcess {
         stdin: ChildStdin,
         stdout: ChildStdout,
         stderr: ChildStderr,
+        containment: CodexProcessContainment,
         isolation_root: IsolatedExecutionRoot,
     ) -> Self {
         let (event_sender, events) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
@@ -421,6 +653,7 @@ impl CodexAppServerProcess {
         Self {
             child: Some(child),
             stdin: Some(stdin),
+            containment: Some(containment),
             events,
             stop_readers,
             event_queue_overflowed,
@@ -558,6 +791,7 @@ impl CodexAppServerProcess {
     fn terminate(&mut self, intent: TerminationIntent) -> Result<(), CodexRuntimeError> {
         if self.child.is_none() {
             self.stop_and_join_readers();
+            self.containment.take();
             return Ok(());
         }
 
@@ -600,15 +834,16 @@ impl CodexAppServerProcess {
                 ReapDecision::RetainOwnership => {
                     self.status = CodexProcessStatus::CleanupFailed;
                     // The child and both reader handles remain owned by this
-                    // object.  A caller may retry, and Drop gets a final
-                    // bounded retry opportunity.
+                    // object.  A caller may retry, and Drop retains the child
+                    // until its final bounded cleanup and containment close.
                     return Err(CodexRuntimeError::ShutdownFailed);
                 }
             }
         }
 
-        self.child.take();
         self.stop_and_join_readers();
+        self.child.take();
+        self.containment.take();
         Ok(())
     }
 
@@ -628,6 +863,44 @@ impl CodexAppServerProcess {
                 return;
             }
         }
+
+        if self.child.is_some() {
+            // Keep Child owned while closing the Job Object.  The kernel's
+            // KILL_ON_JOB_CLOSE rule is the final containment boundary; only
+            // after it is closed do we make the short final wait/reap.
+            self.containment.take();
+            self.reap_after_containment_close();
+        } else {
+            self.containment.take();
+        }
+    }
+
+    fn reap_after_containment_close(&mut self) {
+        for attempt in 0..DROP_CLEANUP_ATTEMPTS {
+            let wait_result = self
+                .child
+                .as_mut()
+                .expect("child remains owned until final containment reap")
+                .try_wait();
+            match wait_result {
+                Ok(Some(exit_status)) => {
+                    self.apply_exit_status(exit_status);
+                    self.stop_and_join_readers();
+                    self.child.take();
+                    return;
+                }
+                Ok(None) if attempt + 1 < DROP_CLEANUP_ATTEMPTS => {
+                    thread::sleep(KILL_REAP_RETRY_DELAY);
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        // Do not turn a containment cleanup timeout into an Exited claim.  The
+        // child remains locally owned until normal field destruction, but its
+        // Job Object has already been closed and therefore remains kernel
+        // contained during that destruction.
+        self.status = CodexProcessStatus::CleanupFailed;
     }
 
     #[cfg(test)]
@@ -1185,12 +1458,14 @@ fn has_dedicated_root_marker(_path: &Path) -> bool {
 mod tests {
     use super::*;
     use std::{
-        collections::VecDeque, fs, path::PathBuf, process::Command, sync::OnceLock, thread,
-        time::Duration,
+        cell::RefCell, collections::VecDeque, fs, path::PathBuf, process::Command, rc::Rc,
+        sync::OnceLock, thread, time::Duration,
     };
 
+    #[cfg(windows)]
     static FAKE_EXECUTABLE: OnceLock<PathBuf> = OnceLock::new();
 
+    #[cfg(windows)]
     fn fake_executable() -> PathBuf {
         FAKE_EXECUTABLE
             .get_or_init(|| {
@@ -1218,6 +1493,7 @@ mod tests {
             .clone()
     }
 
+    #[cfg(windows)]
     fn dedicated_root() -> (tempfile::TempDir, IsolatedExecutionRoot) {
         let directory = tempfile::tempdir().expect("dedicated test root");
         fs::write(directory.path().join(".d29-dedicated-root"), b"d29")
@@ -1227,6 +1503,7 @@ mod tests {
         (directory, root)
     }
 
+    #[cfg(windows)]
     fn client_with_args(
         args: &[&str],
     ) -> (
@@ -1290,6 +1567,22 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct FakeContainment {
+        close_calls: usize,
+        closed: bool,
+        closed_before_final_reap: bool,
+    }
+
+    impl FakeContainment {
+        fn close(&mut self) {
+            if !self.closed {
+                self.closed = true;
+                self.close_calls += 1;
+            }
+        }
+    }
+
     #[derive(Debug, PartialEq)]
     enum FakeOwnerStatus {
         Running,
@@ -1303,6 +1596,7 @@ mod tests {
         child_owned: bool,
         readers_joined: bool,
         status: FakeOwnerStatus,
+        containment: FakeContainment,
     }
 
     impl FakeOwnedChild {
@@ -1312,6 +1606,7 @@ mod tests {
                 child_owned: true,
                 readers_joined: false,
                 status: FakeOwnerStatus::Running,
+                containment: FakeContainment::default(),
             }
         }
 
@@ -1339,7 +1634,84 @@ mod tests {
                     break;
                 }
             }
+
+            if self.child_owned {
+                self.containment.close();
+                self.containment.closed_before_final_reap = self.containment.closed;
+                match self.control.try_wait_control() {
+                    ChildControlObservation::Exited(_) => {
+                        self.child_owned = false;
+                        self.readers_joined = true;
+                        self.status = FakeOwnerStatus::Exited;
+                    }
+                    ChildControlObservation::Running | ChildControlObservation::Failed => {
+                        self.status = FakeOwnerStatus::CleanupFailed;
+                    }
+                }
+            }
         }
+    }
+
+    #[test]
+    fn containment_assignment_failure_reaps_and_closes_before_exposure() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let cleanup_events = Rc::clone(&events);
+        let close_events = Rc::clone(&events);
+        let result = fail_closed_containment_assignment(
+            Err(()),
+            || {
+                cleanup_events.borrow_mut().push("terminate-and-reap-child");
+                true
+            },
+            || close_events.borrow_mut().push("close-job-object"),
+        );
+
+        assert_eq!(result, Err(CodexRuntimeError::ContainmentAssignmentFailed));
+        assert_eq!(
+            *events.borrow(),
+            vec!["terminate-and-reap-child", "close-job-object"]
+        );
+        // The helper returns an error, so the caller cannot construct or
+        // expose a protocol process after a failed assignment.
+        assert!(result.is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn job_object_is_configured_to_kill_on_close() {
+        let containment = CodexProcessContainment::create().expect("create containment job");
+        assert!(containment.has_kill_on_close_limit_for_test());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn child_is_assigned_before_process_is_exposed_to_protocol_client() {
+        let (_directory, root) = dedicated_root();
+        let spec = CodexLaunchSpec::test(&fake_executable(), &["success"], root);
+        let mut process = CodexRuntimeAdapter::pinned()
+            .spawn(spec)
+            .expect("contained fake app server must spawn");
+        let containment = process
+            .containment
+            .as_ref()
+            .expect("exposed process retains containment");
+        let child = process
+            .child
+            .as_ref()
+            .expect("exposed process retains child");
+        assert!(containment.child_is_assigned_for_test(child));
+        process.shutdown().expect("assigned child cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn job_containment_raii_closes_exactly_once() {
+        let mut containment = CodexProcessContainment::create().expect("create containment job");
+        let close_count = containment.close_counter_for_test();
+        containment.close();
+        assert_eq!(close_count.load(Ordering::Acquire), 1);
+        drop(containment);
+        assert_eq!(close_count.load(Ordering::Acquire), 1);
     }
 
     #[test]
@@ -1433,6 +1805,37 @@ mod tests {
         );
         assert_eq!(
             owner.control.observe_calls,
+            DROP_CLEANUP_ATTEMPTS * KILL_REAP_ATTEMPTS + 1
+        );
+        assert!(owner.containment.closed);
+        assert_eq!(owner.containment.close_calls, 1);
+    }
+
+    #[test]
+    fn drop_cleanup_exhausted_uses_os_containment() {
+        let mut owner = FakeOwnedChild::new([
+            FakeOperation::Kill { succeeds: false },
+            FakeOperation::Observe(ChildControlObservation::Running),
+            FakeOperation::Kill { succeeds: false },
+            FakeOperation::Observe(ChildControlObservation::Running),
+            FakeOperation::Kill { succeeds: false },
+            FakeOperation::Observe(ChildControlObservation::Running),
+            FakeOperation::Kill { succeeds: false },
+            FakeOperation::Observe(ChildControlObservation::Running),
+            FakeOperation::Observe(ChildControlObservation::Exited(FakeExitStatus {
+                success: false,
+            })),
+        ]);
+
+        owner.drop_cleanup();
+
+        assert!(owner.containment.closed_before_final_reap);
+        assert_eq!(owner.containment.close_calls, 1);
+        assert!(!owner.child_owned);
+        assert!(owner.readers_joined);
+        assert_eq!(owner.status, FakeOwnerStatus::Exited);
+        assert_eq!(
+            owner.control.kill_calls,
             DROP_CLEANUP_ATTEMPTS * KILL_REAP_ATTEMPTS
         );
     }
@@ -1462,6 +1865,7 @@ mod tests {
         assert!(ALLOWED_SERVER_REQUEST_METHODS.is_empty());
     }
 
+    #[cfg(windows)]
     #[test]
     fn identity_and_executable_checks_fail_closed_before_spawn() {
         let (_directory, root) = dedicated_root();
@@ -1499,6 +1903,23 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn non_windows_launch_fails_closed_before_process_spawn() {
+        let spec = CodexLaunchSpec::test(
+            Path::new("d29-non-windows-launch-must-not-start"),
+            &[],
+            IsolatedExecutionRoot {
+                canonical_path: PathBuf::from("."),
+            },
+        );
+        assert_eq!(
+            CodexRuntimeAdapter::pinned().spawn(spec).unwrap_err(),
+            CodexRuntimeError::ContainmentUnavailable
+        );
+    }
+
+    #[cfg(windows)]
     #[test]
     fn initialize_success_and_unknown_client_method_are_handled() {
         let (_directory, _root, mut client) = client_with_args(&["success"]);
@@ -1519,6 +1940,7 @@ mod tests {
         assert!(!client.has_child());
     }
 
+    #[cfg(windows)]
     #[test]
     fn initialize_timeout_can_be_interrupted_without_orphaning_child() {
         let (_directory, _root, mut client) = client_with_args(&["timeout"]);
@@ -1531,6 +1953,7 @@ mod tests {
         assert!(!client.has_child());
     }
 
+    #[cfg(windows)]
     #[test]
     fn malformed_json_is_rejected_and_can_be_cleaned_up() {
         let (_directory, _root, mut client) = client_with_args(&["malformed"]);
@@ -1542,6 +1965,7 @@ mod tests {
         assert!(!client.has_child());
     }
 
+    #[cfg(windows)]
     #[test]
     fn server_request_is_denied_without_auto_approval() {
         let (directory, _root, mut client) = client_with_args(&["server-request"]);
@@ -1555,6 +1979,7 @@ mod tests {
             .is_file());
     }
 
+    #[cfg(windows)]
     #[test]
     fn unknown_server_request_is_denied_without_auto_approval() {
         let (directory, _root, mut client) = client_with_args(&["unknown-server-request"]);
@@ -1568,6 +1993,7 @@ mod tests {
             .is_file());
     }
 
+    #[cfg(windows)]
     #[test]
     fn unknown_server_notification_is_ignored_without_authority_effect() {
         let (_directory, _root, mut client) = client_with_args(&["unknown-notification"]);
@@ -1577,6 +2003,7 @@ mod tests {
         client.shutdown().expect("unknown notification cleanup");
     }
 
+    #[cfg(windows)]
     #[test]
     fn server_request_after_ready_is_still_denied() {
         let (directory, _root, mut client) = client_with_args(&["server-request-after-init"]);
@@ -1593,6 +2020,7 @@ mod tests {
             .is_file());
     }
 
+    #[cfg(windows)]
     #[test]
     fn stdout_frame_is_bounded() {
         let (_directory, _root, mut client) = client_with_args(&["oversized"]);
@@ -1620,6 +2048,7 @@ mod tests {
         assert!(overflowed.load(Ordering::Acquire));
     }
 
+    #[cfg(windows)]
     #[test]
     fn crash_and_broken_pipe_reach_terminal_states() {
         let (_directory, _root, mut crashed) = client_with_args(&["crash"]);
@@ -1643,6 +2072,7 @@ mod tests {
         closed.shutdown().expect("closed child cleanup");
     }
 
+    #[cfg(windows)]
     #[test]
     fn working_directory_and_environment_are_isolated_and_stderr_is_bounded() {
         let (directory, root, mut writer) =
@@ -1690,6 +2120,7 @@ mod tests {
         assert!(truncated);
     }
 
+    #[cfg(windows)]
     #[test]
     fn dedicated_root_rejects_repository_root_and_drop_reaps_child() {
         let repository_root = Path::new(env!("CARGO_MANIFEST_DIR"));

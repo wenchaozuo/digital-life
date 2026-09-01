@@ -7,6 +7,9 @@
 
 use std::sync::Mutex;
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
+
 const MAX_ATTACHMENT_ID_CHARACTERS: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -86,12 +89,16 @@ enum GateState {
 /// attachment is still OFFERED; a BOUND attachment blocks every new offer.
 pub(crate) struct PerceptionChatOfferGate {
     state: Mutex<GateState>,
+    #[cfg(test)]
+    fail_next_bound_clear: AtomicBool,
 }
 
 impl PerceptionChatOfferGate {
     pub(crate) fn new() -> Self {
         Self {
             state: Mutex::new(GateState::Empty),
+            #[cfg(test)]
+            fail_next_bound_clear: AtomicBool::new(false),
         }
     }
 
@@ -248,6 +255,10 @@ impl PerceptionChatOfferGate {
         attachment_id: &str,
     ) -> Result<bool, PerceptionChatOfferGateError> {
         validate_attachment_id(attachment_id)?;
+        #[cfg(test)]
+        if self.fail_next_bound_clear.swap(false, Ordering::AcqRel) {
+            return Err(PerceptionChatOfferGateError::synchronization_unavailable());
+        }
         let mut state = self
             .state
             .lock()
@@ -263,6 +274,11 @@ impl PerceptionChatOfferGate {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_bound_clear_for_test(&self) {
+        self.fail_next_bound_clear.store(true, Ordering::Release);
     }
 
     pub(crate) fn is_bound_exact(

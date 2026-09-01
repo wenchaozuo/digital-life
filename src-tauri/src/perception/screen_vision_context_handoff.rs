@@ -14,6 +14,7 @@ use super::{
     perception_chat_offer_gate::{
         PerceptionChatOfferGate, PerceptionChatOfferGateErrorCode, PerceptionChatSourceKind,
     },
+    screen_context::ScreenContextSessionFence,
     screen_vision_semantic_result::{
         validate_analysis, ScreenVisionSemanticAnalysis, ScreenVisionSemanticResult,
         ScreenVisionSemanticResultErrorCode, SCREEN_VISION_SEMANTIC_RESULT_TTL,
@@ -400,6 +401,52 @@ impl ScreenVisionContextHandoffBroker {
         Ok(true)
     }
 
+    /// Invalidates only the current Cloud Vision BOUND authority when backend
+    /// evidence proves that its Life/session scope is stale.  `None` for
+    /// either piece of scope is reserved for an explicit backend conclusion
+    /// that no usable current scope exists (for example no current Life,
+    /// consent revoked, or a disarmed session); callers must not use it for a
+    /// transient authority read failure.
+    ///
+    /// The gate is cleared before the handoff state is changed.  If the exact
+    /// gate marker cannot be cleared, this method returns an error and leaves
+    /// the BOUND state intact so the two authorities cannot diverge.
+    pub(crate) fn invalidate_bound_if_scope_stale(
+        &self,
+        current_life_id: Option<&str>,
+        current_session_fence: Option<ScreenContextSessionFence>,
+    ) -> Result<bool, ScreenVisionContextHandoffError> {
+        if let Some(life_id) = current_life_id {
+            validate_id("current life identity", life_id)?;
+        }
+        let mut state = self.lock_state()?;
+        let (bound_life_id, bound_fence, attachment_id) = match &*state {
+            VisionHandoffState::Bound(bound) => (
+                bound.payload.life_id.clone(),
+                bound.payload.screen_session_fence.clone(),
+                bound.payload.attachment_id.clone(),
+            ),
+            VisionHandoffState::Empty | VisionHandoffState::Offered(_) => return Ok(false),
+        };
+        if current_life_id == Some(bound_life_id.as_str())
+            && current_session_fence.is_some_and(|fence| fence.0.to_string() == bound_fence)
+        {
+            return Ok(false);
+        }
+
+        let cleared = self
+            .offer_gate
+            .clear_bound_exact(PerceptionChatSourceKind::CloudVision, &attachment_id)
+            .map_err(map_gate_error)?;
+        if !cleared {
+            return Err(ScreenVisionContextHandoffError::new(
+                ScreenVisionContextHandoffErrorCode::SynchronizationUnavailable,
+            ));
+        }
+        *state = VisionHandoffState::Empty;
+        Ok(true)
+    }
+
     /// Claims an exact OFFERED locator or replays the exact BOUND request.
     /// Authority (current Life, D23 permission, and canonical fence) is
     /// supplied by the caller after it has been freshly re-read.
@@ -752,6 +799,117 @@ mod tests {
             .retire_bound_exact(&attachment_id, "conversation-a", "request-a")
             .expect("exact successful retirement should empty the handoff");
         assert!(broker.status().unwrap().is_none());
+    }
+
+    #[test]
+    fn stale_bound_scope_releases_the_gate_and_allows_new_sources() {
+        let clock = ManualClock::new();
+        let gate = Arc::new(PerceptionChatOfferGate::new());
+        let broker = broker(
+            clock.clone(),
+            &["vision-bound", "vision-replacement"],
+            gate.clone(),
+        );
+        let old_attachment = broker
+            .offer_result(result("result-bound", clock.now()))
+            .unwrap();
+        broker
+            .claim_exact(
+                &old_attachment,
+                "life-a",
+                "7",
+                "conversation-a",
+                "request-a",
+            )
+            .unwrap();
+
+        assert!(broker
+            .invalidate_bound_if_scope_stale(Some("life-a"), Some(ScreenContextSessionFence(8)))
+            .unwrap());
+        assert!(broker.status().unwrap().is_none());
+        assert!(gate.snapshot().is_none());
+        assert_eq!(
+            broker
+                .claim_exact(
+                    &old_attachment,
+                    "life-a",
+                    "8",
+                    "conversation-a",
+                    "request-a"
+                )
+                .unwrap_err()
+                .code,
+            ScreenVisionContextHandoffErrorCode::AttachmentNotFound
+        );
+
+        let replacement = broker
+            .offer_result(result("result-replacement", clock.now()))
+            .unwrap();
+        assert_ne!(replacement, old_attachment);
+        broker.dismiss_exact(&replacement).unwrap();
+
+        let ocr = ScreenContextChatAttachmentBroker::new_with_offer_gate(gate);
+        assert!(ocr
+            .offer("grant-after-stale", "life-a", ScreenContextSessionFence(8))
+            .is_ok());
+    }
+
+    #[test]
+    fn same_scope_bound_reconciliation_preserves_exact_retry_and_gate() {
+        let clock = ManualClock::new();
+        let gate = Arc::new(PerceptionChatOfferGate::new());
+        let broker = broker(clock.clone(), &["vision-same-scope"], gate.clone());
+        let attachment_id = broker
+            .offer_result(result("result-same-scope", clock.now()))
+            .unwrap();
+        broker
+            .claim_exact(&attachment_id, "life-a", "7", "conversation-a", "request-a")
+            .unwrap();
+
+        assert!(!broker
+            .invalidate_bound_if_scope_stale(Some("life-a"), Some(ScreenContextSessionFence(7)))
+            .unwrap());
+        broker
+            .claim_exact(&attachment_id, "life-a", "7", "conversation-a", "request-a")
+            .expect("same-scope exact retry must remain usable");
+        assert_eq!(
+            gate.snapshot(),
+            Some((PerceptionChatSourceKind::CloudVision, attachment_id, true))
+        );
+    }
+
+    #[test]
+    fn gate_cleanup_failure_preserves_stale_bound_state_for_retry() {
+        let clock = ManualClock::new();
+        let gate = Arc::new(PerceptionChatOfferGate::new());
+        let broker = broker(clock.clone(), &["vision-cleanup-failure"], gate.clone());
+        let attachment_id = broker
+            .offer_result(result("result-cleanup-failure", clock.now()))
+            .unwrap();
+        broker
+            .claim_exact(&attachment_id, "life-a", "7", "conversation-a", "request-a")
+            .unwrap();
+        gate.fail_next_bound_clear_for_test();
+
+        let error = broker
+            .invalidate_bound_if_scope_stale(Some("life-a"), Some(ScreenContextSessionFence(8)))
+            .expect_err("gate failure must not clear the Vision BOUND state");
+        assert_eq!(
+            error.code,
+            ScreenVisionContextHandoffErrorCode::SynchronizationUnavailable
+        );
+        assert!(broker.status().unwrap().is_some_and(|status| status.bound));
+        assert_eq!(
+            gate.snapshot(),
+            Some((
+                PerceptionChatSourceKind::CloudVision,
+                attachment_id.clone(),
+                true
+            ))
+        );
+        broker
+            .claim_exact(&attachment_id, "life-a", "7", "conversation-a", "request-a")
+            .expect("the preserved BOUND state must still support exact retry");
     }
 
     #[test]

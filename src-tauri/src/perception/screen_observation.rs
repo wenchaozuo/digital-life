@@ -15,9 +15,10 @@ use super::{
         target::ScreenCaptureTargetBroker,
     },
     screen_chat_attachment::{
-        cancel_and_remove_exact_attachment, revoke_exact_attachment_preserving_bound,
-        MainScreenContextAttachmentOfferDto, ScreenContextChatAttachmentBroker,
-        ScreenContextChatAttachmentError, ScreenContextChatAttachmentErrorCode,
+        cancel_and_remove_exact_attachment, reconcile_stale_chat_perception_before_offer,
+        revoke_exact_attachment_preserving_bound, MainScreenContextAttachmentOfferDto,
+        ScreenContextChatAttachmentBroker, ScreenContextChatAttachmentError,
+        ScreenContextChatAttachmentErrorCode,
     },
     screen_context::{
         ScreenContextCandidateInput, ScreenContextError, ScreenContextErrorCode,
@@ -31,6 +32,7 @@ use super::{
         authorize_screen_perception, LifeScreenPerceptionPolicy, ScreenPerceptionErrorCode,
         ScreenPerceptionRepository, ScreenPerceptionSessionGate,
     },
+    screen_vision_context_handoff::ScreenVisionContextHandoffBroker,
     CurrentLifeAuthority,
 };
 use crate::storage::StorageService;
@@ -102,6 +104,7 @@ struct OfferAuthorities<'a> {
     session_gate: &'a ScreenPerceptionSessionGate,
     handoff_broker: &'a ScreenContextHandoffBroker,
     attachment_broker: &'a ScreenContextChatAttachmentBroker,
+    vision_handoff_broker: Option<&'a ScreenVisionContextHandoffBroker>,
 }
 
 /// Presentation-only readiness metadata.  No target identity, native handle,
@@ -692,6 +695,15 @@ where
         .validate_pending_grant(grant_id, life_id, ScreenContextSessionFence(fence_before))
         .map_err(screen_context_error_dto)?;
 
+    reconcile_stale_chat_perception_before_offer(
+        authorities.handoff_broker,
+        authorities.attachment_broker,
+        authorities.vision_handoff_broker,
+        life_id,
+        ScreenContextSessionFence(fence_before),
+    )
+    .map_err(attachment_offer_error_dto)?;
+
     let attachment_id = authorities
         .attachment_broker
         .offer(grant_id, life_id, ScreenContextSessionFence(fence_before))
@@ -800,12 +812,14 @@ async fn dispatch_offer_blocking(
         let session_gate = app.state::<ScreenPerceptionSessionGate>();
         let handoff_broker = app.state::<ScreenContextHandoffBroker>();
         let attachment_broker = app.state::<ScreenContextChatAttachmentBroker>();
+        let vision_handoff_broker = app.state::<ScreenVisionContextHandoffBroker>();
         let authorities = OfferAuthorities {
             current_life: storage.inner(),
             repository: storage.inner(),
             session_gate: session_gate.inner(),
             handoff_broker: handoff_broker.inner(),
             attachment_broker: attachment_broker.inner(),
+            vision_handoff_broker: Some(vision_handoff_broker.inner()),
         };
         let result = offer_main_screen_context_to_chat_service_with_post_offer(
             &authorities,
@@ -1208,6 +1222,7 @@ mod tests {
             session_gate,
             handoff_broker,
             attachment_broker,
+            vision_handoff_broker: None,
         };
         let result = offer_main_screen_context_to_chat_service_with_post_offer(
             &authorities,

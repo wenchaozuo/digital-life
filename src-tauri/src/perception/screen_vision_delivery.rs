@@ -42,6 +42,11 @@ use super::{
         operation::{ScreenCaptureOperationGate, ScreenCaptureOperationPermit},
         target::ScreenCaptureTargetBroker,
     },
+    screen_chat_attachment::{
+        reconcile_stale_chat_perception_before_offer, ScreenContextChatAttachmentBroker,
+        ScreenContextChatAttachmentError, ScreenContextChatAttachmentErrorCode,
+    },
+    screen_context::{ScreenContextHandoffBroker, ScreenContextSessionFence},
     screen_policy::{authorize_screen_perception, ScreenPerceptionSessionGate},
     screen_vision_outbound_candidate::{
         ScreenVisionOutboundCandidateBroker, ScreenVisionOutboundCandidateDeliveryLease,
@@ -1384,13 +1389,17 @@ pub fn offer_screen_vision_result_to_chat(
     let storage = app.state::<StorageService>();
     let session_gate = app.state::<ScreenPerceptionSessionGate>();
     let semantic_result_broker = app.state::<ScreenVisionSemanticResultBroker>();
-    let handoff_broker =
+    let vision_handoff_broker =
         app.state::<super::screen_vision_context_handoff::ScreenVisionContextHandoffBroker>();
+    let ocr_handoff_broker = app.state::<ScreenContextHandoffBroker>();
+    let attachment_broker = app.state::<ScreenContextChatAttachmentBroker>();
     let result = offer_screen_vision_result_to_chat_service(
         storage.inner(),
         session_gate.inner(),
         semantic_result_broker.inner(),
-        handoff_broker.inner(),
+        vision_handoff_broker.inner(),
+        ocr_handoff_broker.inner(),
+        attachment_broker.inner(),
         request,
     );
     if result.is_ok() {
@@ -1403,7 +1412,9 @@ fn offer_screen_vision_result_to_chat_service(
     storage: &StorageService,
     session_gate: &ScreenPerceptionSessionGate,
     semantic_result_broker: &ScreenVisionSemanticResultBroker,
-    handoff_broker: &super::screen_vision_context_handoff::ScreenVisionContextHandoffBroker,
+    vision_handoff_broker: &super::screen_vision_context_handoff::ScreenVisionContextHandoffBroker,
+    ocr_handoff_broker: &ScreenContextHandoffBroker,
+    attachment_broker: &ScreenContextChatAttachmentBroker,
     request: OfferScreenVisionResultToChatRequest,
 ) -> Result<MainScreenVisionContextHandoffOfferDto, MainScreenVisionError> {
     validate_id(&request.vision_result_id).map_err(|_| {
@@ -1452,28 +1463,63 @@ fn offer_screen_vision_result_to_chat_service(
             true,
         ));
     }
-    let attachment_id = handoff_broker.offer_result(result).map_err(|error| {
-        use super::screen_vision_context_handoff::ScreenVisionContextHandoffErrorCode;
-        match error.code {
-            ScreenVisionContextHandoffErrorCode::AttachmentInUse => MainScreenVisionError::new(
-                MainScreenVisionErrorCode::PerceptionAttachmentInUse,
-                true,
-            ),
-            ScreenVisionContextHandoffErrorCode::ResultExpired
-            | ScreenVisionContextHandoffErrorCode::ResultUnavailable => {
-                MainScreenVisionError::new(MainScreenVisionErrorCode::VisionResultUnavailable, true)
+    reconcile_stale_chat_perception_before_offer(
+        ocr_handoff_broker,
+        attachment_broker,
+        Some(vision_handoff_broker),
+        &life_id,
+        ScreenContextSessionFence(current_fence),
+    )
+    .map_err(map_chat_attachment_reconciliation_error)?;
+
+    let attachment_id = vision_handoff_broker
+        .offer_result(result)
+        .map_err(|error| {
+            use super::screen_vision_context_handoff::ScreenVisionContextHandoffErrorCode;
+            match error.code {
+                ScreenVisionContextHandoffErrorCode::AttachmentInUse => MainScreenVisionError::new(
+                    MainScreenVisionErrorCode::PerceptionAttachmentInUse,
+                    true,
+                ),
+                ScreenVisionContextHandoffErrorCode::ResultExpired
+                | ScreenVisionContextHandoffErrorCode::ResultUnavailable => {
+                    MainScreenVisionError::new(
+                        MainScreenVisionErrorCode::VisionResultUnavailable,
+                        true,
+                    )
+                }
+                ScreenVisionContextHandoffErrorCode::SynchronizationUnavailable
+                | ScreenVisionContextHandoffErrorCode::RandomUnavailable => {
+                    MainScreenVisionError::new(
+                        MainScreenVisionErrorCode::SynchronizationUnavailable,
+                        true,
+                    )
+                }
+                _ => MainScreenVisionError::new(
+                    MainScreenVisionErrorCode::VisionResultUnavailable,
+                    true,
+                ),
             }
-            ScreenVisionContextHandoffErrorCode::SynchronizationUnavailable
-            | ScreenVisionContextHandoffErrorCode::RandomUnavailable => MainScreenVisionError::new(
-                MainScreenVisionErrorCode::SynchronizationUnavailable,
-                true,
-            ),
-            _ => {
-                MainScreenVisionError::new(MainScreenVisionErrorCode::VisionResultUnavailable, true)
-            }
-        }
-    })?;
+        })?;
     Ok(MainScreenVisionContextHandoffOfferDto { attachment_id })
+}
+
+fn map_chat_attachment_reconciliation_error(
+    error: ScreenContextChatAttachmentError,
+) -> MainScreenVisionError {
+    match error.code {
+        ScreenContextChatAttachmentErrorCode::PerceptionAttachmentInUse
+        | ScreenContextChatAttachmentErrorCode::AttachmentInUse => {
+            MainScreenVisionError::new(MainScreenVisionErrorCode::PerceptionAttachmentInUse, true)
+        }
+        ScreenContextChatAttachmentErrorCode::SynchronizationUnavailable => {
+            MainScreenVisionError::new(MainScreenVisionErrorCode::SynchronizationUnavailable, true)
+        }
+        ScreenContextChatAttachmentErrorCode::InvalidArgument
+        | ScreenContextChatAttachmentErrorCode::AttachmentNotFound => {
+            MainScreenVisionError::new(MainScreenVisionErrorCode::VisionResultUnavailable, true)
+        }
+    }
 }
 
 const fn terminal_settlement_error() -> MainScreenVisionError {

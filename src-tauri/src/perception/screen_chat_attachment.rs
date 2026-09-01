@@ -51,7 +51,10 @@ use super::{
         generate_opaque_identity, ScreenContextError, ScreenContextErrorCode,
         ScreenContextHandoffBroker, ScreenContextSessionFence,
     },
-    screen_vision_context_handoff::ScreenVisionContextHandoffBroker,
+    screen_vision_context_handoff::{
+        ScreenVisionContextHandoffBroker, ScreenVisionContextHandoffError,
+        ScreenVisionContextHandoffErrorCode,
+    },
 };
 use crate::storage::StorageService;
 
@@ -563,6 +566,127 @@ pub(crate) fn clear_current_attachment_and_cancel_grant(
     cancel_and_remove_exact_attachment(handoff_broker, attachment_broker, &attachment_id).is_ok()
 }
 
+fn vision_handoff_attachment_error(
+    error: ScreenVisionContextHandoffError,
+) -> ScreenContextChatAttachmentError {
+    match error.code {
+        ScreenVisionContextHandoffErrorCode::InvalidArgument => {
+            ScreenContextChatAttachmentError::invalid_argument(
+                "The screen perception attachment request is invalid.",
+            )
+        }
+        ScreenVisionContextHandoffErrorCode::AttachmentInUse => {
+            ScreenContextChatAttachmentError::attachment_in_use()
+        }
+        ScreenVisionContextHandoffErrorCode::SynchronizationUnavailable => {
+            ScreenContextChatAttachmentError::synchronization_unavailable()
+        }
+        _ => ScreenContextChatAttachmentError::attachment_not_found(),
+    }
+}
+
+fn vision_offer_is_stale(error: &ScreenVisionContextHandoffError) -> bool {
+    matches!(
+        error.code,
+        ScreenVisionContextHandoffErrorCode::AttachmentNotFound
+            | ScreenVisionContextHandoffErrorCode::ResultExpired
+            | ScreenVisionContextHandoffErrorCode::LifeMismatch
+            | ScreenVisionContextHandoffErrorCode::SessionFenceMismatch
+    )
+}
+
+/// Reconciles the current Vision presentation marker against backend scope
+/// evidence.  A `None` scope is only supplied after backend authority has
+/// explicitly established that no usable current scope exists; transient
+/// authority failures must return before reaching this helper.
+fn reconcile_vision_attachment_for_scope(
+    vision_handoff_broker: &ScreenVisionContextHandoffBroker,
+    current_life_id: Option<&str>,
+    current_session_fence: Option<ScreenContextSessionFence>,
+) -> Result<(), ScreenContextChatAttachmentError> {
+    let Some(status) = vision_handoff_broker
+        .status()
+        .map_err(vision_handoff_attachment_error)?
+    else {
+        return Ok(());
+    };
+
+    if status.bound {
+        vision_handoff_broker
+            .invalidate_bound_if_scope_stale(current_life_id, current_session_fence)
+            .map_err(vision_handoff_attachment_error)?;
+        if current_life_id.is_none() || current_session_fence.is_none() {
+            vision_handoff_broker
+                .clear_offered_current()
+                .map_err(vision_handoff_attachment_error)?;
+        }
+        return Ok(());
+    }
+
+    let (Some(current_life_id), Some(current_session_fence)) =
+        (current_life_id, current_session_fence)
+    else {
+        vision_handoff_broker
+            .clear_offered_current()
+            .map_err(vision_handoff_attachment_error)?;
+        return Ok(());
+    };
+
+    match vision_handoff_broker.validate_for_presentation(
+        &status.attachment_id,
+        current_life_id,
+        &current_session_fence.0.to_string(),
+    ) {
+        Ok(()) => Ok(()),
+        Err(error) if vision_offer_is_stale(&error) => vision_handoff_broker
+            .clear_offered_current()
+            .map(|_| ())
+            .map_err(vision_handoff_attachment_error),
+        Err(error) => Err(vision_handoff_attachment_error(error)),
+    }
+}
+
+/// Runs the stale-scope preflight shared by both Main perception offer paths.
+/// It completes before either source calls `PerceptionChatOfferGate::begin_offer`.
+/// Valid same-scope BOUND authority is untouched; stale OCR uses the existing
+/// exact D24 cleanup path, while stale Vision BOUND uses its exact reconciliation
+/// seam.
+pub(crate) fn reconcile_stale_chat_perception_before_offer(
+    handoff_broker: &ScreenContextHandoffBroker,
+    attachment_broker: &ScreenContextChatAttachmentBroker,
+    vision_handoff_broker: Option<&ScreenVisionContextHandoffBroker>,
+    current_life_id: &str,
+    current_session_fence: ScreenContextSessionFence,
+) -> Result<(), ScreenContextChatAttachmentError> {
+    if let Some(vision_handoff_broker) = vision_handoff_broker {
+        reconcile_vision_attachment_for_scope(
+            vision_handoff_broker,
+            Some(current_life_id),
+            Some(current_session_fence),
+        )?;
+    }
+
+    if let Some(attachment) = attachment_broker.current() {
+        if attachment.life_id != current_life_id
+            || attachment.session_fence != current_session_fence
+        {
+            match cancel_and_remove_exact_attachment(
+                handoff_broker,
+                attachment_broker,
+                &attachment.attachment_id,
+            ) {
+                Ok(())
+                | Err(ScreenContextChatAttachmentError {
+                    code: ScreenContextChatAttachmentErrorCode::AttachmentNotFound,
+                    ..
+                }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Chat dismiss path for one exact attachment.  It maps the shared internal
 /// Bound-aware revoke outcome to the Chat-facing bounded DTO.
 fn dismiss_exact_attachment(
@@ -795,10 +919,11 @@ pub(crate) fn get_pending_screen_context_attachment_service_with_vision(
         Ok(Some(life_id)) => life_id,
         Ok(None) => {
             // No current Life: any stored marker is stale by definition.
-            clear_current_attachment_and_cancel_grant(handoff_broker, attachment_broker);
             if let Some(vision_handoff_broker) = vision_handoff_broker {
-                let _ = vision_handoff_broker.clear_offered_current();
+                reconcile_vision_attachment_for_scope(vision_handoff_broker, None, None)
+                    .map_err(chat_attachment_error_dto)?;
             }
+            clear_current_attachment_and_cancel_grant(handoff_broker, attachment_broker);
             return Ok(ChatScreenContextAttachmentStatusDto::unavailable());
         }
         Err(()) => return Err(ChatScreenContextAttachmentErrorDto::life_unavailable()),
@@ -816,10 +941,11 @@ pub(crate) fn get_pending_screen_context_attachment_service_with_vision(
             _ => {
                 // Disabled consent, missing policy, or a session not armed
                 // for this Life: the attachment must not be exposed; clear it.
-                clear_current_attachment_and_cancel_grant(handoff_broker, attachment_broker);
                 if let Some(vision_handoff_broker) = vision_handoff_broker {
-                    let _ = vision_handoff_broker.clear_offered_current();
+                    reconcile_vision_attachment_for_scope(vision_handoff_broker, None, None)
+                        .map_err(chat_attachment_error_dto)?;
                 }
+                clear_current_attachment_and_cancel_grant(handoff_broker, attachment_broker);
                 return Ok(ChatScreenContextAttachmentStatusDto::unavailable());
             }
         },
@@ -827,12 +953,25 @@ pub(crate) fn get_pending_screen_context_attachment_service_with_vision(
 
     let Some(fence) = session_gate.life_fence_for(&current_life_id) else {
         // Authorization passed but the fence disappeared (race): fail closed.
-        clear_current_attachment_and_cancel_grant(handoff_broker, attachment_broker);
         if let Some(vision_handoff_broker) = vision_handoff_broker {
-            let _ = vision_handoff_broker.clear_offered_current();
+            reconcile_vision_attachment_for_scope(
+                vision_handoff_broker,
+                Some(&current_life_id),
+                None,
+            )
+            .map_err(chat_attachment_error_dto)?;
         }
+        clear_current_attachment_and_cancel_grant(handoff_broker, attachment_broker);
         return Ok(ChatScreenContextAttachmentStatusDto::unavailable());
     };
+    if let Some(vision_handoff_broker) = vision_handoff_broker {
+        reconcile_vision_attachment_for_scope(
+            vision_handoff_broker,
+            Some(&current_life_id),
+            Some(ScreenContextSessionFence(fence)),
+        )
+        .map_err(chat_attachment_error_dto)?;
+    }
     let ocr_attachment = attachment_broker.current();
     let vision_status = match vision_handoff_broker {
         Some(vision_handoff_broker) => vision_handoff_broker
@@ -1020,8 +1159,15 @@ pub fn dismiss_pending_screen_context_attachment(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::perception::screen_context::{ScreenContextCandidateInput, ScreenContextIds};
     use crate::perception::screen_ocr::{ScreenObservation, ScreenObservationStatus};
+    use crate::perception::{
+        perception_chat_offer_gate::PerceptionChatOfferGate,
+        screen_context::{ScreenContextCandidateInput, ScreenContextIds},
+        screen_vision_context_handoff::{
+            ScreenVisionContextHandoffBroker, ScreenVisionContextHandoffErrorCode,
+        },
+        screen_vision_semantic_result::{ScreenVisionSemanticAnalysis, ScreenVisionSemanticResult},
+    };
 
     const LIFE_A: &str = "life-a";
     const LIFE_B: &str = "life-b";
@@ -1284,6 +1430,7 @@ mod tests {
                 super::super::screen_policy::LifeScreenPerceptionPolicy,
             >,
         >,
+        database_failure: bool,
     }
 
     impl FakeRepository {
@@ -1302,7 +1449,24 @@ mod tests {
             );
             Self {
                 policies: std::sync::Mutex::new(policies),
+                database_failure: false,
             }
+        }
+
+        fn failing() -> Self {
+            Self {
+                policies: std::sync::Mutex::new(std::collections::HashMap::new()),
+                database_failure: true,
+            }
+        }
+
+        fn set_policy_enabled(&self, enabled: bool) {
+            self.policies
+                .lock()
+                .unwrap()
+                .get_mut(LIFE_A)
+                .expect("fixture policy should exist")
+                .screen_perception_enabled = enabled;
         }
     }
 
@@ -1316,6 +1480,9 @@ mod tests {
             >,
             super::super::screen_policy::ScreenPerceptionError,
         > {
+            if self.database_failure {
+                return Err(super::super::screen_policy::ScreenPerceptionError::database());
+            }
             Err(super::super::screen_policy::ScreenPerceptionError::database())
         }
 
@@ -1326,6 +1493,9 @@ mod tests {
             Option<super::super::screen_policy::LifeScreenPerceptionPolicy>,
             super::super::screen_policy::ScreenPerceptionError,
         > {
+            if self.database_failure {
+                return Err(super::super::screen_policy::ScreenPerceptionError::database());
+            }
             Ok(self.policies.lock().unwrap().get(life_id).cloned())
         }
 
@@ -1336,6 +1506,9 @@ mod tests {
             super::super::screen_policy::LifeScreenPerceptionPolicyUpdateOutcome,
             super::super::screen_policy::ScreenPerceptionError,
         > {
+            if self.database_failure {
+                return Err(super::super::screen_policy::ScreenPerceptionError::database());
+            }
             Err(super::super::screen_policy::ScreenPerceptionError::database())
         }
 
@@ -1347,6 +1520,9 @@ mod tests {
             Option<super::super::screen_policy::LifeScreenPerceptionPolicyEvent>,
             super::super::screen_policy::ScreenPerceptionError,
         > {
+            if self.database_failure {
+                return Err(super::super::screen_policy::ScreenPerceptionError::database());
+            }
             Ok(None)
         }
     }
@@ -1430,6 +1606,82 @@ mod tests {
         }
     }
 
+    struct VisionStatusFixture {
+        current_life: FakeCurrentLife,
+        repository: FakeRepository,
+        session_gate: ScreenPerceptionSessionGate,
+        handoff_broker: ScreenContextHandoffBroker,
+        attachment_broker: ScreenContextChatAttachmentBroker,
+        vision_handoff_broker: ScreenVisionContextHandoffBroker,
+        offer_gate: std::sync::Arc<PerceptionChatOfferGate>,
+    }
+
+    impl VisionStatusFixture {
+        fn armed() -> Self {
+            let session_gate = ScreenPerceptionSessionGate::new();
+            session_gate.arm_for_life(LIFE_A);
+            let offer_gate = std::sync::Arc::new(PerceptionChatOfferGate::new());
+            Self {
+                current_life: FakeCurrentLife::for_life(LIFE_A),
+                repository: FakeRepository::with_policy(true),
+                session_gate,
+                handoff_broker: ScreenContextHandoffBroker::new(),
+                attachment_broker: ScreenContextChatAttachmentBroker::new_with_offer_gate(
+                    offer_gate.clone(),
+                ),
+                vision_handoff_broker: ScreenVisionContextHandoffBroker::new_with_offer_gate(
+                    offer_gate.clone(),
+                ),
+                offer_gate,
+            }
+        }
+
+        fn status(
+            &self,
+        ) -> Result<ChatScreenContextAttachmentStatusDto, ChatScreenContextAttachmentErrorDto>
+        {
+            get_pending_screen_context_attachment_service_with_vision(
+                &self.current_life,
+                &self.repository,
+                &self.session_gate,
+                &self.handoff_broker,
+                &self.attachment_broker,
+                Some(&self.vision_handoff_broker),
+            )
+        }
+
+        fn offer_vision(&self, result_id: &str) -> String {
+            let fence = self
+                .session_gate
+                .life_fence_for(LIFE_A)
+                .expect("fixture gate is armed");
+            self.vision_handoff_broker
+                .offer_result(ScreenVisionSemanticResult {
+                    result_id: result_id.to_string(),
+                    life_id: LIFE_A.to_string(),
+                    screen_session_fence: fence.to_string(),
+                    analysis: ScreenVisionSemanticAnalysis {
+                        summary: "bounded Vision summary".to_string(),
+                        observations: vec!["bounded Vision observation".to_string()],
+                    },
+                    created_at: std::time::Instant::now(),
+                })
+                .expect("Vision result should be offered")
+        }
+
+        fn bind_vision(&self, attachment_id: &str) {
+            self.vision_handoff_broker
+                .claim_exact(
+                    attachment_id,
+                    LIFE_A,
+                    "1",
+                    "bound-conversation",
+                    "bound-request",
+                )
+                .expect("Vision attachment should bind");
+        }
+    }
+
     #[test]
     fn status_is_unavailable_when_no_attachment_exists() {
         let fixture = StatusFixture::armed();
@@ -1446,6 +1698,239 @@ mod tests {
         assert_eq!(
             fixture.status().unwrap(),
             ChatScreenContextAttachmentStatusDto::available(attachment_id)
+        );
+    }
+
+    #[test]
+    fn status_reconciles_bound_vision_after_session_rearm() {
+        let fixture = VisionStatusFixture::armed();
+        let attachment_id = fixture.offer_vision("result-rearm");
+        fixture.bind_vision(&attachment_id);
+
+        fixture.session_gate.disarm();
+        fixture.session_gate.arm_for_life(LIFE_A);
+        assert_eq!(
+            fixture.status().unwrap(),
+            ChatScreenContextAttachmentStatusDto::unavailable()
+        );
+        assert!(fixture.vision_handoff_broker.status().unwrap().is_none());
+        assert!(fixture.offer_gate.snapshot().is_none());
+        assert_eq!(
+            fixture
+                .vision_handoff_broker
+                .claim_exact(
+                    &attachment_id,
+                    LIFE_A,
+                    "3",
+                    "bound-conversation",
+                    "bound-request"
+                )
+                .unwrap_err()
+                .code,
+            ScreenVisionContextHandoffErrorCode::AttachmentNotFound
+        );
+
+        let current_fence = fixture
+            .session_gate
+            .life_fence_for(LIFE_A)
+            .expect("rearmed fixture should have a current fence");
+        assert!(fixture
+            .attachment_broker
+            .offer(
+                "grant-after-rearm",
+                LIFE_A,
+                ScreenContextSessionFence(current_fence)
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn status_reconciles_bound_vision_after_life_switch() {
+        let fixture = VisionStatusFixture::armed();
+        let attachment_id = fixture.offer_vision("result-life-switch");
+        fixture.bind_vision(&attachment_id);
+
+        fixture.current_life.set(Some(LIFE_B));
+        fixture.session_gate.arm_for_life(LIFE_B);
+        assert_eq!(
+            fixture.status().unwrap(),
+            ChatScreenContextAttachmentStatusDto::unavailable()
+        );
+        assert!(fixture.vision_handoff_broker.status().unwrap().is_none());
+        assert!(fixture.offer_gate.snapshot().is_none());
+        let current_fence = fixture
+            .session_gate
+            .life_fence_for(LIFE_B)
+            .expect("switched fixture should have a current fence");
+        assert!(fixture
+            .attachment_broker
+            .offer(
+                "grant-life-b",
+                LIFE_B,
+                ScreenContextSessionFence(current_fence)
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn status_reconciles_bound_vision_when_session_is_explicitly_disarmed() {
+        let fixture = VisionStatusFixture::armed();
+        let attachment_id = fixture.offer_vision("result-disarm");
+        fixture.bind_vision(&attachment_id);
+        fixture.session_gate.disarm();
+
+        assert_eq!(
+            fixture.status().unwrap(),
+            ChatScreenContextAttachmentStatusDto::unavailable()
+        );
+        assert!(fixture.vision_handoff_broker.status().unwrap().is_none());
+        assert!(fixture.offer_gate.snapshot().is_none());
+
+        fixture.session_gate.arm_for_life(LIFE_A);
+        let current_fence = fixture
+            .session_gate
+            .life_fence_for(LIFE_A)
+            .expect("rearmed fixture should have a current fence");
+        assert!(fixture
+            .attachment_broker
+            .offer(
+                "grant-after-disarm",
+                LIFE_A,
+                ScreenContextSessionFence(current_fence)
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn status_reconciles_bound_vision_after_durable_consent_revocation() {
+        let fixture = VisionStatusFixture::armed();
+        let attachment_id = fixture.offer_vision("result-consent-revoke");
+        fixture.bind_vision(&attachment_id);
+        fixture.repository.set_policy_enabled(false);
+
+        assert_eq!(
+            fixture.status().unwrap(),
+            ChatScreenContextAttachmentStatusDto::unavailable()
+        );
+        assert!(fixture.vision_handoff_broker.status().unwrap().is_none());
+        assert!(fixture.offer_gate.snapshot().is_none());
+    }
+
+    #[test]
+    fn status_preserves_same_scope_bound_vision_and_cross_source_offer_is_blocked() {
+        let fixture = VisionStatusFixture::armed();
+        let attachment_id = fixture.offer_vision("result-same-scope-status");
+        fixture.bind_vision(&attachment_id);
+
+        assert_eq!(
+            fixture.status().unwrap(),
+            ChatScreenContextAttachmentStatusDto::available_from_source(
+                attachment_id.clone(),
+                PerceptionChatSourceKind::CloudVision,
+            )
+        );
+        assert_eq!(
+            fixture
+                .attachment_broker
+                .offer("grant-blocked", LIFE_A, FENCE_1)
+                .unwrap_err()
+                .code,
+            ScreenContextChatAttachmentErrorCode::PerceptionAttachmentInUse
+        );
+        fixture
+            .vision_handoff_broker
+            .claim_exact(
+                &attachment_id,
+                LIFE_A,
+                "1",
+                "bound-conversation",
+                "bound-request",
+            )
+            .expect("same-scope exact Vision retry must remain valid");
+    }
+
+    #[test]
+    fn stale_ocr_bound_marker_is_reconciled_before_a_new_vision_offer() {
+        let fixture = VisionStatusFixture::armed();
+        let old_fence = fixture
+            .session_gate
+            .life_fence_for(LIFE_A)
+            .expect("fixture gate is armed");
+        let grant_id = install_and_issue(
+            &fixture.handoff_broker,
+            LIFE_A,
+            ScreenContextSessionFence(old_fence),
+        );
+        let attachment_id = offer(
+            &fixture.attachment_broker,
+            &grant_id,
+            LIFE_A,
+            ScreenContextSessionFence(old_fence),
+        );
+        fixture
+            .handoff_broker
+            .claim_grant(ScreenContextIds {
+                grant_id,
+                life_id: LIFE_A.to_string(),
+                session_fence: ScreenContextSessionFence(old_fence),
+                conversation_id: "ocr-bound-conversation".to_string(),
+                request_id: "ocr-bound-request".to_string(),
+            })
+            .expect("the old OCR grant should bind");
+        fixture
+            .attachment_broker
+            .mark_bound(&attachment_id)
+            .expect("the old OCR attachment should bind the shared gate");
+
+        fixture.session_gate.disarm();
+        fixture.session_gate.arm_for_life(LIFE_A);
+        let current_fence = fixture
+            .session_gate
+            .life_fence_for(LIFE_A)
+            .expect("rearmed fixture should have a current fence");
+        reconcile_stale_chat_perception_before_offer(
+            &fixture.handoff_broker,
+            &fixture.attachment_broker,
+            Some(&fixture.vision_handoff_broker),
+            LIFE_A,
+            ScreenContextSessionFence(current_fence),
+        )
+        .expect("stale OCR cleanup should complete before the new offer");
+
+        assert!(fixture.attachment_broker.current().is_none());
+        assert!(fixture.offer_gate.snapshot().is_none());
+        assert!(fixture
+            .vision_handoff_broker
+            .offer_result(ScreenVisionSemanticResult {
+                result_id: "vision-after-ocr-stale".to_string(),
+                life_id: LIFE_A.to_string(),
+                screen_session_fence: current_fence.to_string(),
+                analysis: ScreenVisionSemanticAnalysis {
+                    summary: "bounded Vision summary".to_string(),
+                    observations: vec!["bounded Vision observation".to_string()],
+                },
+                created_at: std::time::Instant::now(),
+            })
+            .is_ok());
+    }
+
+    #[test]
+    fn status_preserves_bound_vision_when_consent_read_is_transiently_unavailable() {
+        let mut fixture = VisionStatusFixture::armed();
+        let attachment_id = fixture.offer_vision("result-transient");
+        fixture.bind_vision(&attachment_id);
+        fixture.repository = FakeRepository::failing();
+
+        let error = fixture.status().unwrap_err();
+        assert_eq!(error.code, "SCREEN_CONTEXT_CONSENT_UNAVAILABLE");
+        assert!(fixture
+            .vision_handoff_broker
+            .status()
+            .unwrap()
+            .is_some_and(|status| status.bound));
+        assert_eq!(
+            fixture.offer_gate.snapshot(),
+            Some((PerceptionChatSourceKind::CloudVision, attachment_id, true))
         );
     }
 

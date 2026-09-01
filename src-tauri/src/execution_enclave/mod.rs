@@ -12,7 +12,7 @@ use std::{
     fmt, fs,
     io::{Read, Write},
     path::{Path, PathBuf},
-    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio},
+    process::{Child, ExitStatus},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError},
@@ -23,15 +23,33 @@ use std::{
 };
 
 #[cfg(windows)]
-use std::os::windows::io::AsRawHandle;
+use std::{
+    ffi::{c_void, OsStr},
+    os::windows::{
+        ffi::OsStrExt,
+        io::{AsRawHandle, FromRawHandle, IntoRawHandle, OwnedHandle},
+        process::ExitStatusExt,
+    },
+};
 
 #[cfg(windows)]
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, HANDLE},
+    Foundation::{
+        CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    },
+    Security::SECURITY_ATTRIBUTES,
     System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    },
+    System::Pipes::CreatePipe,
+    System::Threading::{
+        CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
+        InitializeProcThreadAttributeList, TerminateProcess, UpdateProcThreadAttribute,
+        WaitForSingleObject, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
+        EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
+        PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST, STARTF_USESTDHANDLES,
+        STARTUPINFOEXW,
     },
 };
 
@@ -39,9 +57,7 @@ use windows_sys::Win32::{
 use windows_sys::Win32::System::JobObjects::{IsProcessInJob, QueryInformationJobObject};
 
 #[cfg(all(windows, test))]
-use windows_sys::Win32::System::Threading::{
-    GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-};
+use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
 /// The only upstream release accepted by this foundation.
 pub(crate) const CODEX_UPSTREAM_REPOSITORY: &str = "https://github.com/openai/codex.git";
@@ -81,6 +97,7 @@ const MAX_METHOD_BYTES: usize = 128;
 const MAX_PROTOCOL_STRING_BYTES: usize = 1024;
 const EVENT_QUEUE_CAPACITY: usize = 32;
 const PENDING_LIFECYCLE_EVENT_CAPACITY: usize = EVENT_QUEUE_CAPACITY;
+const PROVISIONAL_TURN_NOTIFICATION_CAPACITY: usize = EVENT_QUEUE_CAPACITY;
 const MAX_STDERR_CAPTURE_BYTES: usize = 16 * 1024;
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
 const KILL_REAP_ATTEMPTS: usize = 2;
@@ -178,6 +195,64 @@ impl ProcessControl for Child {
     }
 }
 
+#[cfg(windows)]
+#[derive(Debug)]
+struct CodexProcessChild {
+    process: OwnedHandle,
+}
+
+#[cfg(windows)]
+impl CodexProcessChild {
+    fn from_raw_handle(raw: HANDLE) -> Option<Self> {
+        if raw.is_null() {
+            return None;
+        }
+        Some(Self {
+            // SAFETY: CreateProcessW transfers ownership of this process
+            // handle to the caller on success.  The wrapper becomes its sole
+            // owner and closes it exactly once.
+            process: unsafe { OwnedHandle::from_raw_handle(raw) },
+        })
+    }
+
+    fn raw_handle(&self) -> HANDLE {
+        self.process.as_raw_handle() as HANDLE
+    }
+}
+
+#[cfg(windows)]
+impl ProcessControl for CodexProcessChild {
+    type ExitStatus = ExitStatus;
+
+    fn try_wait_control(&mut self) -> ChildControlObservation<Self::ExitStatus> {
+        let wait_result = unsafe { WaitForSingleObject(self.raw_handle(), 0) };
+        if wait_result == WAIT_TIMEOUT {
+            return ChildControlObservation::Running;
+        }
+        if wait_result != WAIT_OBJECT_0 {
+            return ChildControlObservation::Failed;
+        }
+        let mut exit_code = 0_u32;
+        let queried = unsafe { GetExitCodeProcess(self.raw_handle(), &mut exit_code) != 0 };
+        if !queried {
+            return ChildControlObservation::Failed;
+        }
+        ChildControlObservation::Exited(ExitStatus::from_raw(exit_code))
+    }
+
+    fn kill_control(&mut self) -> bool {
+        let terminate_succeeded = unsafe { TerminateProcess(self.raw_handle(), 1) != 0 };
+        // TerminateProcess is asynchronous.  Give the kernel a bounded
+        // opportunity to signal the process handle before the caller's
+        // bounded reap loop makes its next observation.
+        let _ = unsafe { WaitForSingleObject(self.raw_handle(), 25) };
+        terminate_succeeded
+    }
+}
+
+#[cfg(not(windows))]
+type CodexProcessChild = Child;
+
 #[derive(Debug, PartialEq)]
 enum ReapDecision<S> {
     Reaped(S),
@@ -217,37 +292,8 @@ fn bounded_kill_reap_with_delay<C: ProcessControl>(
     ReapDecision::RetainOwnership
 }
 
-/// A process is never exposed to the protocol client until this admission
-/// result succeeds.  The cleanup and close callbacks deliberately run in
-/// this order when assignment fails, so an assignment failure cannot return
-/// an uncontained child to a caller.
-fn fail_closed_containment_assignment(
-    assignment: Result<(), ()>,
-    terminate_and_reap_child: impl FnOnce() -> bool,
-    close_containment: impl FnOnce(),
-) -> Result<(), CodexRuntimeError> {
-    if assignment.is_ok() {
-        return Ok(());
-    }
-
-    let child_reaped = terminate_and_reap_child();
-    close_containment();
-    if child_reaped {
-        Err(CodexRuntimeError::ContainmentAssignmentFailed)
-    } else {
-        Err(CodexRuntimeError::ContainmentAssignmentCleanupFailed)
-    }
-}
-
-/// Assignment failure happens immediately after spawn, before protocol pipes
-/// are handed to `CodexAppServerProcess`.  A direct kill followed by wait is
-/// intentional here: an unassigned process cannot rely on Job Object close
-/// for cleanup.
-fn terminate_and_reap_spawned_child(child: &mut Child) -> bool {
-    let _ = child.kill();
-    child.wait().is_ok()
-}
-
+/// Single-owner Job Object handle.  The process is admitted through the
+/// creation-time JOB_LIST attribute, so no post-spawn assignment state exists.
 #[cfg(windows)]
 #[derive(Debug)]
 struct OwnedJobHandle {
@@ -325,14 +371,6 @@ impl CodexProcessContainment {
         Ok(Self { job: Some(job) })
     }
 
-    fn assign_child(&mut self, child: &Child) -> Result<(), ()> {
-        let Some(job) = self.job.as_ref() else {
-            return Err(());
-        };
-        let assigned = unsafe { AssignProcessToJobObject(job.raw, child.as_raw_handle()) != 0 };
-        assigned.then_some(()).ok_or(())
-    }
-
     fn close(&mut self) {
         self.job.take();
     }
@@ -368,13 +406,29 @@ impl CodexProcessContainment {
     }
 
     #[cfg(test)]
-    fn child_is_assigned_for_test(&self, child: &Child) -> bool {
+    fn child_is_assigned_for_test(&self, child: &CodexProcessChild) -> bool {
         let Some(job) = self.job.as_ref() else {
             return false;
         };
         let mut is_in_job = 0_i32;
-        let queried =
-            unsafe { IsProcessInJob(child.as_raw_handle(), job.raw, &mut is_in_job) != 0 };
+        let queried = unsafe { IsProcessInJob(child.raw_handle(), job.raw, &mut is_in_job) != 0 };
+        queried && is_in_job != 0
+    }
+
+    #[cfg(test)]
+    fn process_id_is_assigned_for_test(&self, process_id: u32) -> bool {
+        let Some(job) = self.job.as_ref() else {
+            return false;
+        };
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
+        if process.is_null() {
+            return false;
+        }
+        let mut is_in_job = 0_i32;
+        let queried = unsafe { IsProcessInJob(process, job.raw, &mut is_in_job) != 0 };
+        unsafe {
+            let _ = CloseHandle(process);
+        }
         queried && is_in_job != 0
     }
 }
@@ -400,8 +454,6 @@ pub(crate) enum CodexRuntimeError {
     ContainmentUnavailable,
     ContainmentCreateFailed,
     ContainmentConfigurationFailed,
-    ContainmentAssignmentFailed,
-    ContainmentAssignmentCleanupFailed,
     SpawnFailed,
     MissingChildPipe,
     UnsupportedMethod,
@@ -433,12 +485,6 @@ impl fmt::Display for CodexRuntimeError {
             Self::ContainmentCreateFailed => "codex app server Job Object could not be created",
             Self::ContainmentConfigurationFailed => {
                 "codex app server Job Object could not be configured"
-            }
-            Self::ContainmentAssignmentFailed => {
-                "codex app server process could not be assigned to its Job Object"
-            }
-            Self::ContainmentAssignmentCleanupFailed => {
-                "codex app server process containment assignment cleanup failed"
             }
             Self::SpawnFailed => "codex app server process could not be started",
             Self::MissingChildPipe => "codex app server process did not expose required pipes",
@@ -523,46 +569,14 @@ impl CodexRuntimeAdapter {
             return Err(CodexRuntimeError::UntrustedExecutable);
         }
 
-        let mut containment = CodexProcessContainment::create()?;
-
-        let mut command = Command::new(&executable);
-        command
-            .args(&spec.args)
-            .current_dir(spec.isolation_root.path())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env_clear()
-            // These are protocol identity metadata, not credentials.  No
-            // parent environment, API key, token, home, or workspace value is
-            // inherited by the child.
-            .env("CODEX_D29_UPSTREAM_COMMIT", self.pin.commit())
-            .env(
-                "CODEX_D29_CLIENT_CONTRACT_VERSION",
-                self.pin.client_contract_version(),
-            );
-
-        let mut child = command
-            .spawn()
-            .map_err(|_| CodexRuntimeError::SpawnFailed)?;
-
-        fail_closed_containment_assignment(
-            containment.assign_child(&child),
-            || terminate_and_reap_spawned_child(&mut child),
-            || containment.close(),
+        let containment = CodexProcessContainment::create()?;
+        let (child, stdin, stdout, stderr) = create_contained_process(
+            &executable,
+            &spec.args,
+            spec.isolation_root.path(),
+            &containment,
+            self.pin,
         )?;
-
-        let stdin = child.stdin.take();
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-        let (stdin, stdout, stderr) = match (stdin, stdout, stderr) {
-            (Some(stdin), Some(stdout), Some(stderr)) => (stdin, stdout, stderr),
-            _ => {
-                let _ = terminate_and_reap_spawned_child(&mut child);
-                containment.close();
-                return Err(CodexRuntimeError::MissingChildPipe);
-            }
-        };
 
         Ok(CodexAppServerProcess::new(
             child,
@@ -573,6 +587,278 @@ impl CodexRuntimeAdapter {
             spec.isolation_root,
         ))
     }
+}
+
+#[cfg(windows)]
+const MAX_WINDOWS_COMMAND_LINE_UNITS: usize = 32_767;
+
+#[cfg(windows)]
+struct ProcThreadAttributeListGuard {
+    list: LPPROC_THREAD_ATTRIBUTE_LIST,
+}
+
+#[cfg(windows)]
+impl Drop for ProcThreadAttributeListGuard {
+    fn drop(&mut self) {
+        unsafe {
+            DeleteProcThreadAttributeList(self.list);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn create_inheritable_pipe() -> Result<(OwnedHandle, OwnedHandle), CodexRuntimeError> {
+    let mut read = std::ptr::null_mut();
+    let mut write = std::ptr::null_mut();
+    let security_attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: std::ptr::null_mut(),
+        bInheritHandle: 1,
+    };
+    let created = unsafe {
+        CreatePipe(
+            &mut read,
+            &mut write,
+            std::ptr::addr_of!(security_attributes),
+            0,
+        ) != 0
+    };
+    if !created || read.is_null() || write.is_null() {
+        if !read.is_null() {
+            unsafe {
+                let _ = CloseHandle(read);
+            }
+        }
+        if !write.is_null() {
+            unsafe {
+                let _ = CloseHandle(write);
+            }
+        }
+        return Err(CodexRuntimeError::SpawnFailed);
+    }
+
+    // SAFETY: CreatePipe returned two valid owned handles and no other owner
+    // exists before these wrappers are constructed.
+    Ok((unsafe { OwnedHandle::from_raw_handle(read) }, unsafe {
+        OwnedHandle::from_raw_handle(write)
+    }))
+}
+
+#[cfg(windows)]
+fn make_parent_pipe_handle_non_inheritable(handle: &OwnedHandle) -> Result<(), CodexRuntimeError> {
+    let changed = unsafe {
+        SetHandleInformation(handle.as_raw_handle() as HANDLE, HANDLE_FLAG_INHERIT, 0) != 0
+    };
+    changed.then_some(()).ok_or(CodexRuntimeError::SpawnFailed)
+}
+
+#[cfg(windows)]
+fn append_windows_quoted_argument(
+    output: &mut Vec<u16>,
+    argument: &OsStr,
+) -> Result<(), CodexRuntimeError> {
+    let units = argument.encode_wide().collect::<Vec<_>>();
+    if units.iter().any(|unit| *unit == 0) {
+        return Err(CodexRuntimeError::SpawnFailed);
+    }
+
+    output.push('"' as u16);
+    let mut backslashes = 0_usize;
+    for unit in units {
+        if unit == '\\' as u16 {
+            backslashes += 1;
+        } else {
+            if unit == '"' as u16 {
+                for _ in 0..backslashes.saturating_mul(2).saturating_add(1) {
+                    output.push('\\' as u16);
+                }
+                output.push('"' as u16);
+            } else {
+                for _ in 0..backslashes {
+                    output.push('\\' as u16);
+                }
+                output.push(unit);
+            }
+            backslashes = 0;
+        }
+    }
+    for _ in 0..backslashes.saturating_mul(2) {
+        output.push('\\' as u16);
+    }
+    output.push('"' as u16);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_command_line(
+    executable: &Path,
+    arguments: &[OsString],
+) -> Result<Vec<u16>, CodexRuntimeError> {
+    let mut output = Vec::new();
+    append_windows_quoted_argument(&mut output, executable.as_os_str())?;
+    for argument in arguments {
+        output.push(' ' as u16);
+        append_windows_quoted_argument(&mut output, argument.as_os_str())?;
+    }
+    if output.len() + 1 > MAX_WINDOWS_COMMAND_LINE_UNITS {
+        return Err(CodexRuntimeError::SpawnFailed);
+    }
+    output.push(0);
+    Ok(output)
+}
+
+#[cfg(windows)]
+fn windows_wide_string(value: &OsStr) -> Result<Vec<u16>, CodexRuntimeError> {
+    let mut output = value.encode_wide().collect::<Vec<_>>();
+    if output.iter().any(|unit| *unit == 0) {
+        return Err(CodexRuntimeError::SpawnFailed);
+    }
+    output.push(0);
+    Ok(output)
+}
+
+#[cfg(windows)]
+fn windows_environment_block(pin: CodexUpstreamPin) -> Vec<u16> {
+    let entries = [
+        format!(
+            "CODEX_D29_CLIENT_CONTRACT_VERSION={}",
+            pin.client_contract_version()
+        ),
+        format!("CODEX_D29_UPSTREAM_COMMIT={}", pin.commit()),
+    ];
+    let mut block = Vec::new();
+    for entry in entries {
+        block.extend(OsStr::new(&entry).encode_wide());
+        block.push(0);
+    }
+    block.push(0);
+    block
+}
+
+#[cfg(windows)]
+fn create_contained_process(
+    executable: &Path,
+    arguments: &[OsString],
+    isolation_root: &Path,
+    containment: &CodexProcessContainment,
+    pin: CodexUpstreamPin,
+) -> Result<(CodexProcessChild, fs::File, fs::File, fs::File), CodexRuntimeError> {
+    let (stdin_child, stdin_parent) = create_inheritable_pipe()?;
+    let (stdout_parent, stdout_child) = create_inheritable_pipe()?;
+    let (stderr_parent, stderr_child) = create_inheritable_pipe()?;
+
+    // The parent ends are retained locally and must not be inherited.  The
+    // child ends are explicitly listed in PROC_THREAD_ATTRIBUTE_HANDLE_LIST.
+    make_parent_pipe_handle_non_inheritable(&stdin_parent)?;
+    make_parent_pipe_handle_non_inheritable(&stdout_parent)?;
+    make_parent_pipe_handle_non_inheritable(&stderr_parent)?;
+
+    let mut attribute_size = 0_usize;
+    unsafe {
+        let _ = InitializeProcThreadAttributeList(std::ptr::null_mut(), 2, 0, &mut attribute_size);
+    }
+    if attribute_size == 0 {
+        return Err(CodexRuntimeError::SpawnFailed);
+    }
+    let attribute_words = attribute_size.saturating_add(std::mem::size_of::<usize>() - 1)
+        / std::mem::size_of::<usize>();
+    let mut attribute_storage = vec![0_usize; attribute_words];
+    let attribute_list = attribute_storage.as_mut_ptr().cast();
+    let initialized = unsafe {
+        InitializeProcThreadAttributeList(attribute_list, 2, 0, &mut attribute_size) != 0
+    };
+    if !initialized {
+        return Err(CodexRuntimeError::SpawnFailed);
+    }
+    let _attribute_list_guard = ProcThreadAttributeListGuard {
+        list: attribute_list,
+    };
+
+    let job = containment
+        .job
+        .as_ref()
+        .ok_or(CodexRuntimeError::ContainmentCreateFailed)?;
+    let job_handle = job.raw;
+    let job_attribute_updated = unsafe {
+        UpdateProcThreadAttribute(
+            attribute_list,
+            0,
+            PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
+            std::ptr::addr_of!(job_handle).cast::<c_void>(),
+            std::mem::size_of::<HANDLE>(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        ) != 0
+    };
+    if !job_attribute_updated {
+        return Err(CodexRuntimeError::SpawnFailed);
+    }
+
+    let inherited_handles = [
+        stdin_child.as_raw_handle() as HANDLE,
+        stdout_child.as_raw_handle() as HANDLE,
+        stderr_child.as_raw_handle() as HANDLE,
+    ];
+    let handle_attribute_updated = unsafe {
+        UpdateProcThreadAttribute(
+            attribute_list,
+            0,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+            inherited_handles.as_ptr().cast::<c_void>(),
+            std::mem::size_of_val(&inherited_handles),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        ) != 0
+    };
+    if !handle_attribute_updated {
+        return Err(CodexRuntimeError::SpawnFailed);
+    }
+
+    let executable_wide = windows_wide_string(executable.as_os_str())?;
+    let mut command_line = windows_command_line(executable, arguments)?;
+    let isolation_root_wide = windows_wide_string(isolation_root.as_os_str())?;
+    let environment_block = windows_environment_block(pin);
+
+    let mut startup = STARTUPINFOEXW::default();
+    startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup.StartupInfo.hStdInput = stdin_child.as_raw_handle() as HANDLE;
+    startup.StartupInfo.hStdOutput = stdout_child.as_raw_handle() as HANDLE;
+    startup.StartupInfo.hStdError = stderr_child.as_raw_handle() as HANDLE;
+    startup.lpAttributeList = attribute_list;
+
+    let mut process_information = PROCESS_INFORMATION::default();
+    let created = unsafe {
+        CreateProcessW(
+            executable_wide.as_ptr(),
+            command_line.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+            environment_block.as_ptr().cast::<c_void>(),
+            isolation_root_wide.as_ptr(),
+            std::ptr::addr_of!(startup.StartupInfo),
+            std::ptr::addr_of_mut!(process_information),
+        ) != 0
+    };
+    if !created {
+        return Err(CodexRuntimeError::SpawnFailed);
+    }
+
+    if !process_information.hThread.is_null() {
+        unsafe {
+            let _ = CloseHandle(process_information.hThread);
+        }
+    }
+    let Some(child) = CodexProcessChild::from_raw_handle(process_information.hProcess) else {
+        return Err(CodexRuntimeError::SpawnFailed);
+    };
+
+    let stdin = unsafe { fs::File::from_raw_handle(stdin_parent.into_raw_handle()) };
+    let stdout = unsafe { fs::File::from_raw_handle(stdout_parent.into_raw_handle()) };
+    let stderr = unsafe { fs::File::from_raw_handle(stderr_parent.into_raw_handle()) };
+    Ok((child, stdin, stdout, stderr))
 }
 
 #[derive(Debug)]
@@ -640,8 +926,8 @@ impl CodexLaunchSpec {
 
 #[derive(Debug)]
 struct CodexAppServerProcess {
-    child: Option<Child>,
-    stdin: Option<ChildStdin>,
+    child: Option<CodexProcessChild>,
+    stdin: Option<fs::File>,
     containment: Option<CodexProcessContainment>,
     events: Receiver<ProcessEvent>,
     stop_readers: Arc<AtomicBool>,
@@ -683,10 +969,10 @@ impl ReapedProcessLifecycle for CodexAppServerProcess {
 
 impl CodexAppServerProcess {
     fn new(
-        child: Child,
-        stdin: ChildStdin,
-        stdout: ChildStdout,
-        stderr: ChildStderr,
+        child: CodexProcessChild,
+        stdin: fs::File,
+        stdout: fs::File,
+        stderr: fs::File,
         containment: CodexProcessContainment,
         isolation_root: IsolatedExecutionRoot,
     ) -> Self {
@@ -819,10 +1105,10 @@ impl CodexAppServerProcess {
         let Some(child) = self.child.as_mut() else {
             return;
         };
-        match child.try_wait() {
-            Ok(Some(exit_status)) => self.apply_exit_status(exit_status),
-            Ok(None) => {}
-            Err(_) => {
+        match child.try_wait_control() {
+            ChildControlObservation::Exited(exit_status) => self.apply_exit_status(exit_status),
+            ChildControlObservation::Running => {}
+            ChildControlObservation::Failed => {
                 self.stdin.take();
                 self.status = CodexProcessStatus::BrokenPipe;
             }
@@ -872,15 +1158,15 @@ impl CodexAppServerProcess {
                 .child
                 .as_mut()
                 .expect("child exists until reap")
-                .try_wait();
+                .try_wait_control();
             match wait_result {
-                Ok(Some(exit_status)) => {
+                ChildControlObservation::Exited(exit_status) => {
                     self.apply_exit_status(exit_status);
                     exited = true;
                     break;
                 }
-                Ok(None) => thread::sleep(Duration::from_millis(5)),
-                Err(_) => break,
+                ChildControlObservation::Running => thread::sleep(Duration::from_millis(5)),
+                ChildControlObservation::Failed => break,
             }
         }
 
@@ -941,17 +1227,17 @@ impl CodexAppServerProcess {
                 .child
                 .as_mut()
                 .expect("child remains owned until final containment reap")
-                .try_wait();
+                .try_wait_control();
             match wait_result {
-                Ok(Some(exit_status)) => {
+                ChildControlObservation::Exited(exit_status) => {
                     self.apply_exit_status(exit_status);
                     finalize_reaped_process(self);
                     return;
                 }
-                Ok(None) if attempt + 1 < DROP_CLEANUP_ATTEMPTS => {
+                ChildControlObservation::Running if attempt + 1 < DROP_CLEANUP_ATTEMPTS => {
                     thread::sleep(KILL_REAP_RETRY_DELAY);
                 }
-                Ok(None) | Err(_) => break,
+                ChildControlObservation::Running | ChildControlObservation::Failed => break,
             }
         }
 
@@ -1008,6 +1294,7 @@ enum CodexProtocolState {
     },
     TurnStarting {
         thread_id: String,
+        request_id: i64,
     },
     TurnRunning {
         thread_id: String,
@@ -1033,7 +1320,7 @@ impl CodexProtocolState {
     fn thread_id(&self) -> Option<&str> {
         match self {
             Self::ThreadReady { thread_id }
-            | Self::TurnStarting { thread_id }
+            | Self::TurnStarting { thread_id, .. }
             | Self::TurnRunning { thread_id, .. }
             | Self::TurnCompleted { thread_id, .. }
             | Self::TurnInterrupted { thread_id, .. }
@@ -1149,10 +1436,11 @@ impl ClientRequest {
 
 struct CodexProtocolClient {
     process: CodexAppServerProcess,
-    next_request_id: u64,
+    next_request_id: i64,
     state: CodexProtocolState,
     retired_turn_ids: VecDeque<String>,
     pending_lifecycle_events: VecDeque<CodexLifecycleEvent>,
+    provisional_turn_notifications: VecDeque<ProtocolNotification>,
 }
 
 impl CodexProtocolClient {
@@ -1163,6 +1451,7 @@ impl CodexProtocolClient {
             state: CodexProtocolState::Uninitialized,
             retired_turn_ids: VecDeque::new(),
             pending_lifecycle_events: VecDeque::new(),
+            provisional_turn_notifications: VecDeque::new(),
         }
     }
 
@@ -1399,7 +1688,9 @@ impl CodexProtocolClient {
         let request_id = self.allocate_request_id()?;
         self.state = CodexProtocolState::TurnStarting {
             thread_id: thread_id.clone(),
+            request_id,
         };
+        self.provisional_turn_notifications.clear();
         if let Err(error) = self.send_client_request(
             request_id,
             ClientRequest::TurnStart {
@@ -1431,6 +1722,7 @@ impl CodexProtocolClient {
                     ..
                 }) if id == RpcId::Number(request_id.into()) => {
                     if error_code.is_some() {
+                        self.provisional_turn_notifications.clear();
                         self.state = CodexProtocolState::ThreadReady { thread_id };
                         return Err(CodexRuntimeError::ProtocolError);
                     }
@@ -1459,6 +1751,7 @@ impl CodexProtocolClient {
                         turn_id: turn_id.clone(),
                         started_event_seen: false,
                     };
+                    self.replay_provisional_turn_notifications(&thread_id, &turn_id)?;
                     return Ok(CodexTurnStartResult { turn_id });
                 }
                 ProcessEvent::Message(ProtocolMessage::ServerRequest { id }) => {
@@ -1559,13 +1852,19 @@ impl CodexProtocolClient {
         }
     }
 
-    fn allocate_request_id(&mut self) -> Result<u64, CodexRuntimeError> {
-        if self.next_request_id == u64::MAX {
+    fn allocate_request_id(&mut self) -> Result<i64, CodexRuntimeError> {
+        // The pinned App Server schema uses JSON integer request IDs whose
+        // accepted Rust representation is signed i64.  Retire before the
+        // terminal value so the allocator can never wrap, emit zero, or emit
+        // a negative ID.
+        if self.next_request_id <= 0 || self.next_request_id == i64::MAX {
             self.state = CodexProtocolState::Retired;
             return Err(CodexRuntimeError::RequestIdExhausted);
         }
         let request_id = self.next_request_id;
-        self.next_request_id += 1;
+        self.next_request_id = request_id
+            .checked_add(1)
+            .ok_or(CodexRuntimeError::RequestIdExhausted)?;
         Ok(request_id)
     }
 
@@ -1573,6 +1872,7 @@ impl CodexProtocolClient {
         // The request was written successfully, so a timeout cannot establish
         // that the remote mutation did not happen.  Retire the whole session
         // instead of restoring any state that would permit a duplicate RPC.
+        self.provisional_turn_notifications.clear();
         self.state = CodexProtocolState::Retired;
     }
 
@@ -1588,9 +1888,71 @@ impl CodexProtocolClient {
         Ok(())
     }
 
+    fn buffer_provisional_turn_notification(
+        &mut self,
+        notification: ProtocolNotification,
+    ) -> Result<Option<CodexLifecycleEvent>, CodexRuntimeError> {
+        let notification_thread_id = match &notification {
+            ProtocolNotification::TurnStarted { thread_id, .. }
+            | ProtocolNotification::ItemStarted { thread_id, .. }
+            | ProtocolNotification::ItemCompleted { thread_id, .. }
+            | ProtocolNotification::TurnCompleted { thread_id, .. } => thread_id,
+            ProtocolNotification::Unknown
+            | ProtocolNotification::Error
+            | ProtocolNotification::ThreadStarted { .. } => return Ok(None),
+        };
+        let expected_thread_id = match &self.state {
+            CodexProtocolState::TurnStarting { thread_id, .. } => thread_id,
+            _ => {
+                self.state = CodexProtocolState::Retired;
+                return Err(CodexRuntimeError::MalformedProtocol);
+            }
+        };
+        if expected_thread_id != notification_thread_id {
+            self.state = CodexProtocolState::Retired;
+            return Err(CodexRuntimeError::MalformedProtocol);
+        }
+        if self.provisional_turn_notifications.len() >= PROVISIONAL_TURN_NOTIFICATION_CAPACITY {
+            self.state = CodexProtocolState::Retired;
+            return Err(CodexRuntimeError::EventQueueSaturated);
+        }
+        self.provisional_turn_notifications.push_back(notification);
+        Ok(None)
+    }
+
+    fn replay_provisional_turn_notifications(
+        &mut self,
+        expected_thread_id: &str,
+        expected_turn_id: &str,
+    ) -> Result<(), CodexRuntimeError> {
+        let provisional = std::mem::take(&mut self.provisional_turn_notifications);
+        for notification in provisional {
+            if let Some(event) = self.apply_notification(notification)? {
+                self.enqueue_lifecycle_event(event)?;
+            }
+        }
+        match &self.state {
+            CodexProtocolState::TurnRunning {
+                thread_id, turn_id, ..
+            }
+            | CodexProtocolState::TurnCompleted { thread_id, turn_id }
+            | CodexProtocolState::TurnInterrupted { thread_id, turn_id }
+            | CodexProtocolState::TurnFailed { thread_id, turn_id }
+                if thread_id == expected_thread_id && turn_id == expected_turn_id =>
+            {
+                Ok(())
+            }
+            CodexProtocolState::Retired => Err(CodexRuntimeError::MalformedProtocol),
+            _ => {
+                self.state = CodexProtocolState::Retired;
+                Err(CodexRuntimeError::MalformedProtocol)
+            }
+        }
+    }
+
     fn send_client_request(
         &mut self,
-        request_id: u64,
+        request_id: i64,
         request: ClientRequest,
     ) -> Result<(), CodexRuntimeError> {
         let method = request.method();
@@ -1598,7 +1960,6 @@ impl CodexProtocolClient {
             return Err(CodexRuntimeError::UnsupportedMethod);
         }
         self.process.write_json(json!({
-            "jsonrpc": "2.0",
             "id": request_id,
             "method": method,
             "params": request.params(),
@@ -1611,7 +1972,6 @@ impl CodexProtocolClient {
             return Err(CodexRuntimeError::UnsupportedMethod);
         }
         self.process.write_json(json!({
-            "jsonrpc": "2.0",
             "method": method,
         }))
     }
@@ -1620,7 +1980,6 @@ impl CodexProtocolClient {
         // No server request is ever treated as an approval.  The method name
         // and params are not retained or executed.
         self.process.write_json(json!({
-            "jsonrpc": "2.0",
             "id": id.to_value(),
             "error": {
                 "code": -32601,
@@ -1726,8 +2085,9 @@ impl CodexProtocolClient {
                         Ok(None)
                     }
                     CodexProtocolState::TurnStarting { .. } => {
-                        self.state = CodexProtocolState::Retired;
-                        Err(CodexRuntimeError::MalformedProtocol)
+                        self.buffer_provisional_turn_notification(
+                            ProtocolNotification::TurnStarted { thread_id, turn_id },
+                        )
                     }
                     CodexProtocolState::ThreadReady { .. } => {
                         self.state = CodexProtocolState::Retired;
@@ -1818,10 +2178,14 @@ impl CodexProtocolClient {
                     {
                         Ok(None)
                     }
-                    CodexProtocolState::TurnStarting { .. } => {
-                        self.state = CodexProtocolState::Retired;
-                        Err(CodexRuntimeError::MalformedProtocol)
-                    }
+                    CodexProtocolState::TurnStarting { .. } => self
+                        .buffer_provisional_turn_notification(
+                            ProtocolNotification::TurnCompleted {
+                                thread_id,
+                                turn_id,
+                                status,
+                            },
+                        ),
                     CodexProtocolState::ThreadReady { .. } => {
                         self.state = CodexProtocolState::Retired;
                         Err(CodexRuntimeError::MalformedProtocol)
@@ -1846,6 +2210,23 @@ impl CodexProtocolClient {
         turn_id: String,
         item_id: String,
     ) -> Result<Option<CodexLifecycleEvent>, CodexRuntimeError> {
+        if matches!(self.state, CodexProtocolState::TurnStarting { .. }) {
+            let notification = if started {
+                ProtocolNotification::ItemStarted {
+                    thread_id,
+                    turn_id,
+                    item_id,
+                }
+            } else {
+                ProtocolNotification::ItemCompleted {
+                    thread_id,
+                    turn_id,
+                    item_id,
+                }
+            };
+            return self.buffer_provisional_turn_notification(notification);
+        }
+
         match self.state.active_turn() {
             Some((current_thread_id, current_turn_id, true))
                 if current_thread_id == thread_id && current_turn_id == turn_id =>
@@ -2058,7 +2439,7 @@ struct TurnStartWireResult {
 }
 
 fn spawn_stdout_reader(
-    mut stdout: ChildStdout,
+    mut stdout: fs::File,
     event_sender: SyncSender<ProcessEvent>,
     stop_readers: Arc<AtomicBool>,
     event_queue_overflowed: Arc<AtomicBool>,
@@ -2137,7 +2518,7 @@ fn spawn_stdout_reader(
 }
 
 fn spawn_stderr_reader(
-    mut stderr: ChildStderr,
+    mut stderr: fs::File,
     stop_readers: Arc<AtomicBool>,
     stderr_bytes: Arc<AtomicUsize>,
     stderr_truncated: Arc<AtomicBool>,
@@ -2184,10 +2565,6 @@ fn parse_protocol_frame(frame: &[u8]) -> ProcessEvent {
     let Some(object) = value.as_object() else {
         return ProcessEvent::MalformedProtocol;
     };
-    if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
-        return ProcessEvent::MalformedProtocol;
-    }
-
     let has_id = object.contains_key("id");
     let id = if has_id {
         match object.get("id").and_then(parse_rpc_id) {
@@ -2515,12 +2892,10 @@ fn has_dedicated_root_marker(_path: &Path) -> bool {
 mod tests {
     use super::*;
     use std::{
-        cell::RefCell,
         collections::VecDeque,
         fs,
         path::PathBuf,
         process::Command,
-        rc::Rc,
         sync::{mpsc, OnceLock},
         thread,
         time::Duration,
@@ -2583,6 +2958,49 @@ mod tests {
         (directory, root, CodexProtocolClient::new(process))
     }
 
+    #[test]
+    fn pinned_response_without_jsonrpc_is_accepted() {
+        let frame = br#"{"id":7,"result":{"codexHome":"C:/isolated","platformFamily":"windows","platformOs":"windows","userAgent":"codex-d29-fake"}}"#;
+        let ProcessEvent::Message(ProtocolMessage::Response { id, .. }) =
+            parse_protocol_frame(frame)
+        else {
+            panic!("pinned response without jsonrpc must parse as a response");
+        };
+        let RpcId::Number(number) = id else {
+            panic!("pinned response must retain an integer id");
+        };
+        assert_eq!(number.as_i64(), Some(7));
+    }
+
+    #[test]
+    fn pinned_notification_without_jsonrpc_is_accepted() {
+        let frame = br#"{"method":"turn/started","params":{"threadId":"thread-1","turn":{"id":"turn-1","items":[],"status":"inProgress"}}}"#;
+        let ProcessEvent::Message(ProtocolMessage::Notification { notification }) =
+            parse_protocol_frame(frame)
+        else {
+            panic!("pinned notification without jsonrpc must parse as a notification");
+        };
+        assert!(matches!(
+            notification,
+            ProtocolNotification::TurnStarted { thread_id, turn_id }
+                if thread_id == "thread-1" && turn_id == "turn-1"
+        ));
+    }
+
+    #[test]
+    fn request_id_boundary_matches_upstream_i64() {
+        let frame = format!(r#"{{"id":{},"result":{{}}}}"#, i64::MAX);
+        let ProcessEvent::Message(ProtocolMessage::Response { id, .. }) =
+            parse_protocol_frame(frame.as_bytes())
+        else {
+            panic!("i64 request id must remain a response id");
+        };
+        let RpcId::Number(number) = id else {
+            panic!("i64 request id must remain numeric");
+        };
+        assert_eq!(number.as_i64(), Some(i64::MAX));
+    }
+
     #[cfg(windows)]
     fn initialize_and_start_thread(client: &mut CodexProtocolClient) -> String {
         client
@@ -2638,6 +3056,22 @@ mod tests {
         loop {
             if let Ok(contents) = fs::read_to_string(path) {
                 if contents == expected {
+                    return true;
+                }
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(windows)]
+    fn wait_for_file_contains(path: &Path, expected: &str, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Ok(contents) = fs::read_to_string(path) {
+                if contents.contains(expected) {
                     return true;
                 }
             }
@@ -2857,30 +3291,6 @@ mod tests {
     }
 
     #[test]
-    fn containment_assignment_failure_reaps_and_closes_before_exposure() {
-        let events = Rc::new(RefCell::new(Vec::new()));
-        let cleanup_events = Rc::clone(&events);
-        let close_events = Rc::clone(&events);
-        let result = fail_closed_containment_assignment(
-            Err(()),
-            || {
-                cleanup_events.borrow_mut().push("terminate-and-reap-child");
-                true
-            },
-            || close_events.borrow_mut().push("close-job-object"),
-        );
-
-        assert_eq!(result, Err(CodexRuntimeError::ContainmentAssignmentFailed));
-        assert_eq!(
-            *events.borrow(),
-            vec!["terminate-and-reap-child", "close-job-object"]
-        );
-        // The helper returns an error, so the caller cannot construct or
-        // expose a protocol process after a failed assignment.
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn containment_closes_before_reader_join_after_reap() {
         let mut lifecycle = FakeReapedProcessLifecycle::default();
 
@@ -2921,7 +3331,88 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn process_tree_shutdown_closes_containment_before_joining_readers() {
+    fn process_is_contained_before_user_code_can_run() {
+        let (_directory, root) = dedicated_root();
+        let spec =
+            CodexLaunchSpec::test(&fake_executable(), &["d29-b-admission-probe"], root.clone());
+        let mut process = CodexRuntimeAdapter::pinned()
+            .spawn(spec)
+            .expect("atomically contained fake app server must spawn");
+        assert!(wait_for_file_contents(
+            &root.path().join("d29-admission-first-user-code.txt"),
+            "first-user-code",
+            Duration::from_secs(2)
+        ));
+        let containment = process
+            .containment
+            .as_ref()
+            .expect("first instruction retains containment");
+        let child = process
+            .child
+            .as_ref()
+            .expect("first instruction retains process handle");
+        assert!(containment.child_is_assigned_for_test(child));
+        process
+            .shutdown()
+            .expect("admission probe cleanup remains bounded");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_spawn_admission_failure_is_bounded() {
+        let (_directory, root) = dedicated_root();
+        let invalid_cwd = IsolatedExecutionRoot {
+            canonical_path: root.path().join("missing-admission-cwd"),
+        };
+        let spec =
+            CodexLaunchSpec::test(&fake_executable(), &["d29-b-admission-probe"], invalid_cwd);
+        let started = Instant::now();
+        let result = CodexRuntimeAdapter::pinned().spawn(spec);
+        assert_eq!(result.unwrap_err(), CodexRuntimeError::SpawnFailed);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!root
+            .path()
+            .join("d29-admission-first-user-code.txt")
+            .exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn no_unbounded_wait_on_admission_failure() {
+        let (_directory, root) = dedicated_root();
+        let invalid_cwd = IsolatedExecutionRoot {
+            canonical_path: root.path().join("missing-admission-cwd"),
+        };
+        let spec =
+            CodexLaunchSpec::test(&fake_executable(), &["d29-b-admission-probe"], invalid_cwd);
+        let started = Instant::now();
+        assert_eq!(
+            CodexRuntimeAdapter::pinned().spawn(spec).unwrap_err(),
+            CodexRuntimeError::SpawnFailed
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn no_uncontained_child_returned_on_failure() {
+        let (_directory, root) = dedicated_root();
+        let marker = root.path().join("d29-admission-first-user-code.txt");
+        let invalid_cwd = IsolatedExecutionRoot {
+            canonical_path: root.path().join("missing-admission-cwd"),
+        };
+        let spec =
+            CodexLaunchSpec::test(&fake_executable(), &["d29-b-admission-probe"], invalid_cwd);
+        assert_eq!(
+            CodexRuntimeAdapter::pinned().spawn(spec).unwrap_err(),
+            CodexRuntimeError::SpawnFailed
+        );
+        assert!(!marker.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn closing_job_kills_immediate_descendant() {
         let (directory, root, mut client) = client_with_args(&["descendant-retains-pipes"]);
         client
             .initialize(Duration::from_secs(2))
@@ -2931,6 +3422,12 @@ mod tests {
         let descendant_pid = wait_for_descendant_pid(&descendant_pid_path, Duration::from_secs(2))
             .expect("descendant pid is published before root exits");
         assert!(windows_process_is_alive(descendant_pid));
+        assert!(client
+            .process
+            .containment
+            .as_ref()
+            .expect("live root retains descendant containment")
+            .process_id_is_assigned_for_test(descendant_pid));
         assert!(wait_for_direct_child_exit(
             &mut client,
             Duration::from_secs(2)
@@ -2966,6 +3463,34 @@ mod tests {
             Duration::from_secs(2)
         ));
         assert!(directory.path().join(".d29-dedicated-root").is_file());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn immediate_descendant_is_in_same_job() {
+        let (_directory, root, mut client) = client_with_args(&["descendant-retains-pipes"]);
+        client
+            .initialize(Duration::from_secs(2))
+            .expect("root fake app server initializes");
+        let descendant_pid = wait_for_descendant_pid(
+            &root.path().join("d29-descendant-pid.txt"),
+            Duration::from_secs(2),
+        )
+        .expect("descendant pid is published before root exits");
+        assert!(windows_process_is_alive(descendant_pid));
+        assert!(client
+            .process
+            .containment
+            .as_ref()
+            .expect("live root retains descendant containment")
+            .process_id_is_assigned_for_test(descendant_pid));
+        client
+            .shutdown()
+            .expect("same-job descendant cleanup remains bounded");
+        assert!(wait_for_process_exit(
+            descendant_pid,
+            Duration::from_secs(2)
+        ));
     }
 
     #[cfg(windows)]
@@ -3210,6 +3735,27 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn outbound_initialize_and_initialized_omit_jsonrpc() {
+        let (_directory, root, mut client) = client_with_args(&["d29-b"]);
+        client
+            .initialize(Duration::from_secs(2))
+            .expect("initialize succeeds with the pinned wire envelope");
+        let initialize_request = fs::read_to_string(root.path().join("d29-initialize-request.txt"))
+            .expect("fake records initialize request");
+        assert!(!initialize_request.contains("jsonrpc"));
+        assert!(wait_for_file_contains(
+            &root.path().join("d29-initialized-notification.txt"),
+            "\"method\":\"initialized\"",
+            Duration::from_secs(1)
+        ));
+        let initialized = fs::read_to_string(root.path().join("d29-initialized-notification.txt"))
+            .expect("fake records initialized notification");
+        assert!(!initialized.contains("jsonrpc"));
+        client.shutdown().expect("wire envelope cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn no_thread_before_initialize() {
         let (_directory, _root, mut client) = client_with_args(&["d29-b"]);
         assert_eq!(
@@ -3224,12 +3770,13 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn thread_start_is_ephemeral_and_isolation_bound() {
+    fn outbound_thread_start_omits_jsonrpc() {
         let (_directory, root, mut client) = client_with_args(&["d29-b"]);
         let thread_id = initialize_and_start_thread(&mut client);
         assert_eq!(thread_id, "thread-d29-ephemeral-1");
         let request = fs::read_to_string(root.path().join("d29-thread-start-request.txt"))
             .expect("fake records the typed thread/start request");
+        assert!(!request.contains("jsonrpc"));
         assert!(request.contains("\"ephemeral\":true"));
         assert!(request.contains("\"cwd\":"));
         for forbidden in [
@@ -3406,6 +3953,202 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn provisional_lifecycle_queue_is_bounded() {
+        let (_directory, _root, mut client) = client_with_args(&["d29-b"]);
+        client.state = CodexProtocolState::TurnStarting {
+            thread_id: "thread-d29-ephemeral-1".to_owned(),
+            request_id: 1,
+        };
+
+        for index in 0..PROVISIONAL_TURN_NOTIFICATION_CAPACITY {
+            client
+                .buffer_provisional_turn_notification(ProtocolNotification::ItemStarted {
+                    thread_id: "thread-d29-ephemeral-1".to_owned(),
+                    turn_id: "turn-d29-1".to_owned(),
+                    item_id: format!("item-{index}"),
+                })
+                .expect("capacity-sized provisional queue accepts event");
+        }
+        assert_eq!(
+            client.provisional_turn_notifications.len(),
+            PROVISIONAL_TURN_NOTIFICATION_CAPACITY
+        );
+        assert!(matches!(
+            client.state,
+            CodexProtocolState::TurnStarting { .. }
+        ));
+        client.shutdown().expect("provisional queue cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn turn_started_before_response_is_correlated() {
+        let (_directory, _root, mut client) =
+            client_with_args(&["d29-b-turn-started-before-response"]);
+        initialize_and_start_thread(&mut client);
+        let _ = next_lifecycle_event(&mut client, Duration::from_secs(2));
+
+        let result = client
+            .start_turn("provisional start fixture", Duration::from_secs(2))
+            .expect("turn/start response correlates after provisional lifecycle");
+        assert_eq!(result.turn_id, "turn-d29-1");
+        assert_eq!(
+            next_lifecycle_event(&mut client, Duration::from_secs(2)),
+            CodexLifecycleEvent::TurnStarted {
+                thread_id: "thread-d29-ephemeral-1".to_owned(),
+                turn_id: "turn-d29-1".to_owned(),
+            }
+        );
+        assert!(matches!(
+            client.state,
+            CodexProtocolState::TurnRunning {
+                started_event_seen: true,
+                ..
+            }
+        ));
+        client.shutdown().expect("provisional start cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn item_lifecycle_before_response_is_replayed_in_order() {
+        let (_directory, _root, mut client) =
+            client_with_args(&["d29-b-pre-response-fast-terminal"]);
+        let thread_id = initialize_and_start_thread(&mut client);
+        let _ = next_lifecycle_event(&mut client, Duration::from_secs(2));
+        let turn_id = client
+            .start_turn("provisional item fixture", Duration::from_secs(2))
+            .expect("pre-response item lifecycle is replayed")
+            .turn_id;
+
+        let events = [
+            next_lifecycle_event(&mut client, Duration::from_secs(2)),
+            next_lifecycle_event(&mut client, Duration::from_secs(2)),
+            next_lifecycle_event(&mut client, Duration::from_secs(2)),
+            next_lifecycle_event(&mut client, Duration::from_secs(2)),
+        ];
+        assert_eq!(
+            events,
+            [
+                CodexLifecycleEvent::TurnStarted {
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                },
+                CodexLifecycleEvent::ItemStarted {
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                    item_id: "item-d29-1".to_owned(),
+                },
+                CodexLifecycleEvent::ItemCompleted {
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                    item_id: "item-d29-1".to_owned(),
+                },
+                CodexLifecycleEvent::TurnCompleted {
+                    thread_id,
+                    turn_id,
+                    terminal: CodexTurnTerminal::Completed,
+                },
+            ]
+        );
+        assert!(matches!(
+            client.state,
+            CodexProtocolState::TurnCompleted { .. }
+        ));
+        assert!(next_lifecycle_event_or_none(&mut client, Duration::from_millis(100)).is_none());
+        client.shutdown().expect("provisional item cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn turn_completed_before_response_settles_after_correlation() {
+        let (_directory, _root, mut client) =
+            client_with_args(&["d29-b-turn-completed-before-response"]);
+        let thread_id = initialize_and_start_thread(&mut client);
+        let _ = next_lifecycle_event(&mut client, Duration::from_secs(2));
+        let turn_id = client
+            .start_turn("provisional terminal fixture", Duration::from_secs(2))
+            .expect("terminal notification is replayed after response")
+            .turn_id;
+        assert_eq!(
+            next_lifecycle_event(&mut client, Duration::from_secs(2)),
+            CodexLifecycleEvent::TurnStarted {
+                thread_id: thread_id.clone(),
+                turn_id: turn_id.clone(),
+            }
+        );
+        assert_eq!(
+            next_lifecycle_event(&mut client, Duration::from_secs(2)),
+            CodexLifecycleEvent::TurnCompleted {
+                thread_id: thread_id.clone(),
+                turn_id: turn_id.clone(),
+                terminal: CodexTurnTerminal::Completed,
+            }
+        );
+        assert_eq!(
+            client.state,
+            CodexProtocolState::TurnCompleted { thread_id, turn_id }
+        );
+        assert!(next_lifecycle_event_or_none(&mut client, Duration::from_millis(100)).is_none());
+        client.shutdown().expect("provisional terminal cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wrong_turn_before_response_fails_closed() {
+        let (_directory, _root, mut client) = client_with_args(&["d29-b-pre-response-wrong-turn"]);
+        initialize_and_start_thread(&mut client);
+        let _ = next_lifecycle_event(&mut client, Duration::from_secs(2));
+        assert_eq!(
+            client
+                .start_turn("wrong provisional turn", Duration::from_secs(2))
+                .unwrap_err(),
+            CodexRuntimeError::MalformedProtocol
+        );
+        assert_eq!(client.state, CodexProtocolState::Retired);
+        client.shutdown().expect("wrong provisional turn cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wrong_thread_before_response_fails_closed() {
+        let (_directory, _root, mut client) =
+            client_with_args(&["d29-b-pre-response-wrong-thread"]);
+        initialize_and_start_thread(&mut client);
+        let _ = next_lifecycle_event(&mut client, Duration::from_secs(2));
+        assert_eq!(
+            client
+                .start_turn("wrong provisional thread", Duration::from_secs(2))
+                .unwrap_err(),
+            CodexRuntimeError::MalformedProtocol
+        );
+        assert_eq!(client.state, CodexProtocolState::Retired);
+        client.shutdown().expect("wrong provisional thread cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn provisional_overflow_retires() {
+        let (_directory, _root, mut client) =
+            client_with_args(&["d29-b-pre-response-provisional-overflow"]);
+        initialize_and_start_thread(&mut client);
+        let _ = next_lifecycle_event(&mut client, Duration::from_secs(2));
+        assert_eq!(
+            client
+                .start_turn("provisional overflow fixture", Duration::from_secs(2))
+                .unwrap_err(),
+            CodexRuntimeError::EventQueueSaturated
+        );
+        assert_eq!(client.state, CodexProtocolState::Retired);
+        assert_eq!(
+            client.provisional_turn_notifications.len(),
+            PROVISIONAL_TURN_NOTIFICATION_CAPACITY
+        );
+        client.shutdown().expect("provisional overflow cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn interrupt_backlog_saturates_pending_queue_and_retires() {
         let (_directory, _root, mut client) =
             client_with_args(&["d29-b-interrupt-backlog-saturation"]);
@@ -3434,9 +4177,16 @@ mod tests {
     #[test]
     fn request_id_exhaustion_fails_closed_without_collision() {
         let (_directory, _root, mut client) = client_with_args(&["d29-b"]);
-        client.next_request_id = u64::MAX;
+        client.next_request_id = i64::MAX - 1;
         assert_eq!(
-            client.initialize(Duration::from_secs(2)).unwrap_err(),
+            client
+                .allocate_request_id()
+                .expect("last positive i64 request id"),
+            i64::MAX - 1
+        );
+        assert_eq!(client.next_request_id, i64::MAX);
+        assert_eq!(
+            client.allocate_request_id().unwrap_err(),
             CodexRuntimeError::RequestIdExhausted
         );
         assert_eq!(client.state, CodexProtocolState::Retired);
@@ -3461,7 +4211,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn turn_start_binds_current_thread() {
+    fn outbound_turn_start_omits_jsonrpc() {
         let (_directory, root, mut client) = client_with_args(&["d29-b"]);
         let thread_id = initialize_and_start_thread(&mut client);
         assert_eq!(
@@ -3497,6 +4247,7 @@ mod tests {
         );
         let request = fs::read_to_string(root.path().join("d29-turn-start-request.txt"))
             .expect("fake records the typed turn/start request");
+        assert!(!request.contains("jsonrpc"));
         assert!(request.contains("\"threadId\":\"thread-d29-ephemeral-1\""));
         assert!(request.contains("\"input\":[{"));
         assert!(request.contains("\"type\":\"text\""));
@@ -3737,7 +4488,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn server_request_during_turn_denied() {
+    fn server_request_denial_omits_jsonrpc() {
         let (directory, _root, mut client) = client_with_args(&["d29-b-server-request"]);
         initialize_and_start_thread(&mut client);
         let _ = next_lifecycle_event(&mut client, Duration::from_secs(2));
@@ -3757,6 +4508,9 @@ mod tests {
             .path()
             .join("d29-server-request-denied.txt")
             .is_file());
+        let denial = fs::read_to_string(directory.path().join("d29-server-request-denial.txt"))
+            .expect("fake records the protocol denial");
+        assert!(!denial.contains("jsonrpc"));
         client.shutdown().expect("denied server request cleanup");
     }
 

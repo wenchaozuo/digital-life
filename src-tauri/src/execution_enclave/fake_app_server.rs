@@ -1,6 +1,5 @@
 use std::{
-    env,
-    fs,
+    env, fs,
     io::{self, BufRead, Write},
     process::{Command, Stdio},
     thread,
@@ -8,6 +7,7 @@ use std::{
 };
 
 const D29_B_BACKLOG_NOTIFICATION_COUNT: usize = 33;
+const D29_B_PROVISIONAL_ITEM_COUNT: usize = 32;
 
 fn main() {
     let mut arguments = env::args();
@@ -17,6 +17,10 @@ fn main() {
     let mut initialize_number = 0_u32;
     let mut thread_start_number = 0_u32;
     let mut turn_number = 0_u32;
+
+    if mode == "d29-b-admission-probe" {
+        let _ = fs::write("d29-admission-first-user-code.txt", b"first-user-code");
+    }
 
     if mode == "descendant-retains-pipes-child" {
         thread::sleep(Duration::from_secs(10));
@@ -35,6 +39,9 @@ fn main() {
         };
 
         if line.contains("\"method\":\"initialize\"") {
+            if mode == "d29-b" || mode.starts_with("d29-b-") {
+                let _ = fs::write("d29-initialize-request.txt", &line);
+            }
             if mode == "timeout" || mode == "d29-b-initialize-delayed" {
                 initialize_number += 1;
                 let _ = fs::write(
@@ -59,7 +66,7 @@ fn main() {
                     let _ = writeln!(
                         stdout,
                         "{}",
-                        r#"{"jsonrpc":"2.0","method":"unknown/notification","params":{}}"#
+                        r#"{"method":"unknown/notification","params":{}}"#
                     );
                 }
                 let _ = stdout.flush();
@@ -69,12 +76,12 @@ fn main() {
                 let _ = writeln!(
                     stdout,
                     "{}",
-                    r#"{"jsonrpc":"2.0","method":"unknown/notification","params":{}}"#
+                    r#"{"method":"unknown/notification","params":{}}"#
                 );
             }
             if mode == "oversized" {
                 let oversized = format!(
-                    r#"{{"jsonrpc":"2.0","id":1,"result":{{"codexHome":"C:/isolated","platformFamily":"windows","platformOs":"windows","userAgent":"{}"}}}}"#,
+                    r#"{{"id":1,"result":{{"codexHome":"C:/isolated","platformFamily":"windows","platformOs":"windows","userAgent":"{}"}}}}"#,
                     "x".repeat(70_000)
                 );
                 let _ = writeln!(stdout, "{oversized}");
@@ -89,7 +96,7 @@ fn main() {
                 };
                 let _ = writeln!(
                     stdout,
-                    r#"{{"jsonrpc":"2.0","id":99,"method":"{}","params":{{}}}}"#,
+                    r#"{{"id":99,"method":"{}","params":{{}}}}"#,
                     request_method
                 );
             }
@@ -122,13 +129,16 @@ fn main() {
             let _ = writeln!(
                 stdout,
                 "{}",
-                r#"{"jsonrpc":"2.0","id":1,"result":{"codexHome":"C:/isolated","platformFamily":"windows","platformOs":"windows","userAgent":"codex-d29-fake"}}"#
+                r#"{"id":1,"result":{"codexHome":"C:/isolated","platformFamily":"windows","platformOs":"windows","userAgent":"codex-d29-fake"}}"#
             );
             let _ = stdout.flush();
             if mode == "crash-after-init" {
                 std::process::exit(23);
             }
         } else if line.contains("\"method\":\"initialized\"") {
+            if mode == "d29-b" || mode.starts_with("d29-b-") {
+                let _ = fs::write("d29-initialized-notification.txt", &line);
+            }
             if mode == "close-after-init" {
                 return;
             }
@@ -150,7 +160,7 @@ fn main() {
                 let _ = writeln!(
                     stdout,
                     "{}",
-                    r#"{"jsonrpc":"2.0","id":99,"method":"item/commandExecution/requestApproval","params":{}}"#
+                    r#"{"id":99,"method":"item/commandExecution/requestApproval","params":{}}"#
                 );
                 let _ = stdout.flush();
             }
@@ -183,7 +193,7 @@ fn main() {
                 write_line(
                     &mut stdout,
                     format!(
-                        r#"{{"jsonrpc":"2.0","id":{request_id},"result":{{"thread":{{"id":"thread-d29-ephemeral-1","ephemeral":false,"cwd":"{}"}}}}}}"#,
+                        r#"{{"id":{request_id},"result":{{"thread":{{"id":"thread-d29-ephemeral-1","ephemeral":false,"cwd":"{}"}}}}}}"#,
                         json_escape(&cwd)
                     ),
                 );
@@ -218,112 +228,111 @@ fn main() {
                     _ => "turn-d29-2",
                 }
             };
-            write_line(
-                &mut stdout,
-                format_turn_start_response(request_id, turn_id),
+            let provisional_mode = matches!(
+                mode.as_str(),
+                "d29-b-turn-started-before-response"
+                    | "d29-b-pre-response-fast-terminal"
+                    | "d29-b-turn-completed-before-response"
+                    | "d29-b-pre-response-wrong-turn"
+                    | "d29-b-pre-response-wrong-thread"
+                    | "d29-b-pre-response-provisional-overflow"
             );
+            if provisional_mode {
+                match mode.as_str() {
+                    "d29-b-turn-started-before-response" => write_line(
+                        &mut stdout,
+                        format_turn_started_notification("thread-d29-ephemeral-1", turn_id),
+                    ),
+                    "d29-b-pre-response-fast-terminal" => {
+                        write_line(
+                            &mut stdout,
+                            format_turn_started_notification("thread-d29-ephemeral-1", turn_id),
+                        );
+                        write_line(
+                            &mut stdout,
+                            format_item_notification(
+                                "item/started",
+                                "thread-d29-ephemeral-1",
+                                turn_id,
+                            ),
+                        );
+                        write_line(
+                            &mut stdout,
+                            format_item_notification(
+                                "item/completed",
+                                "thread-d29-ephemeral-1",
+                                turn_id,
+                            ),
+                        );
+                        write_line(
+                            &mut stdout,
+                            format_turn_completed_notification(
+                                "thread-d29-ephemeral-1",
+                                turn_id,
+                                "completed",
+                            ),
+                        );
+                    }
+                    "d29-b-turn-completed-before-response" => {
+                        write_line(
+                            &mut stdout,
+                            format_turn_started_notification("thread-d29-ephemeral-1", turn_id),
+                        );
+                        write_line(
+                            &mut stdout,
+                            format_turn_completed_notification(
+                                "thread-d29-ephemeral-1",
+                                turn_id,
+                                "completed",
+                            ),
+                        );
+                    }
+                    "d29-b-pre-response-wrong-turn" => write_line(
+                        &mut stdout,
+                        format_turn_started_notification(
+                            "thread-d29-ephemeral-1",
+                            "turn-d29-wrong",
+                        ),
+                    ),
+                    "d29-b-pre-response-wrong-thread" => write_line(
+                        &mut stdout,
+                        format_turn_started_notification("thread-d29-wrong", turn_id),
+                    ),
+                    "d29-b-pre-response-provisional-overflow" => {
+                        write_line(
+                            &mut stdout,
+                            format_turn_started_notification("thread-d29-ephemeral-1", turn_id),
+                        );
+                        for _ in 0..D29_B_PROVISIONAL_ITEM_COUNT {
+                            write_line(
+                                &mut stdout,
+                                format_item_notification(
+                                    "item/started",
+                                    "thread-d29-ephemeral-1",
+                                    turn_id,
+                                ),
+                            );
+                            let _ = stdout.flush();
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                    }
+                    _ => {}
+                }
+                let _ = stdout.flush();
+                if mode == "d29-b-pre-response-provisional-overflow" {
+                    thread::sleep(Duration::from_secs(5));
+                }
+            }
+            write_line(&mut stdout, format_turn_start_response(request_id, turn_id));
 
-            if mode == "d29-b-crash-during-turn" {
+            if !provisional_mode && mode == "d29-b-crash-during-turn" {
                 let _ = stdout.flush();
                 thread::sleep(Duration::from_millis(100));
                 std::process::exit(29);
             }
 
-            if mode == "d29-b-out-of-order" {
-                write_line(
-                    &mut stdout,
-                    format_turn_completed_notification("thread-d29-ephemeral-1", turn_id, "completed"),
-                );
-                write_line(
-                    &mut stdout,
-                    format_turn_started_notification("thread-d29-ephemeral-1", turn_id),
-                );
-            } else if mode == "d29-b-wrong-binding" {
-                write_line(
-                    &mut stdout,
-                    format_turn_started_notification("thread-d29-wrong", "turn-d29-wrong"),
-                );
-            } else if mode == "d29-b-malformed-lifecycle" {
-                write_line(
-                    &mut stdout,
-                    r#"{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thread-d29-ephemeral-1"}}"#.to_owned(),
-                );
-            } else if mode == "d29-b-interrupt"
-                || mode == "d29-b-interrupt-backlog-saturation"
-            {
-                write_line(
-                    &mut stdout,
-                    format_turn_started_notification("thread-d29-ephemeral-1", turn_id),
-                );
-            } else if mode == "d29-b-server-request" {
-                write_line(
-                    &mut stdout,
-                    format_turn_started_notification("thread-d29-ephemeral-1", turn_id),
-                );
-                write_line(
-                    &mut stdout,
-                    r#"{"jsonrpc":"2.0","id":99,"method":"item/commandExecution/requestApproval","params":{}}"#.to_owned(),
-                );
-            } else if mode == "d29-b-unknown-notification" {
-                write_line(
-                    &mut stdout,
-                    format_turn_started_notification("thread-d29-ephemeral-1", turn_id),
-                );
-                write_line(
-                    &mut stdout,
-                    r#"{"jsonrpc":"2.0","method":"unknown/notification","params":{"presentationOnly":"ignored"}}"#.to_owned(),
-                );
-                write_line(
-                    &mut stdout,
-                    format_turn_completed_notification(
-                        "thread-d29-ephemeral-1",
-                        turn_id,
-                        "completed",
-                    ),
-                );
-            } else if mode == "d29-b-stale-old-turn-event" && turn_number > 1 {
-                write_line(
-                    &mut stdout,
-                    format_turn_completed_notification(
-                        "thread-d29-ephemeral-1",
-                        "turn-d29-1",
-                        "completed",
-                    ),
-                );
-                write_line(
-                    &mut stdout,
-                    format_turn_started_notification("thread-d29-ephemeral-1", turn_id),
-                );
-                write_line(
-                    &mut stdout,
-                    format_turn_completed_notification(
-                        "thread-d29-ephemeral-1",
-                        turn_id,
-                        "completed",
-                    ),
-                );
-            } else {
-                write_line(
-                    &mut stdout,
-                    format_turn_started_notification("thread-d29-ephemeral-1", turn_id),
-                );
-                write_line(
-                    &mut stdout,
-                    format_item_notification("item/started", "thread-d29-ephemeral-1", turn_id),
-                );
-                write_line(
-                    &mut stdout,
-                    format_item_notification("item/completed", "thread-d29-ephemeral-1", turn_id),
-                );
-                write_line(
-                    &mut stdout,
-                    format_turn_completed_notification(
-                        "thread-d29-ephemeral-1",
-                        turn_id,
-                        "completed",
-                    ),
-                );
-                if mode == "d29-b-duplicate-terminal" {
+            if !provisional_mode {
+                if mode == "d29-b-out-of-order" {
                     write_line(
                         &mut stdout,
                         format_turn_completed_notification(
@@ -332,6 +341,109 @@ fn main() {
                             "completed",
                         ),
                     );
+                    write_line(
+                        &mut stdout,
+                        format_turn_started_notification("thread-d29-ephemeral-1", turn_id),
+                    );
+                } else if mode == "d29-b-wrong-binding" {
+                    write_line(
+                        &mut stdout,
+                        format_turn_started_notification("thread-d29-wrong", "turn-d29-wrong"),
+                    );
+                } else if mode == "d29-b-malformed-lifecycle" {
+                    write_line(
+                    &mut stdout,
+                    r#"{"method":"turn/started","params":{"threadId":"thread-d29-ephemeral-1"}}"#.to_owned(),
+                );
+                } else if mode == "d29-b-interrupt" || mode == "d29-b-interrupt-backlog-saturation"
+                {
+                    write_line(
+                        &mut stdout,
+                        format_turn_started_notification("thread-d29-ephemeral-1", turn_id),
+                    );
+                } else if mode == "d29-b-server-request" {
+                    write_line(
+                        &mut stdout,
+                        format_turn_started_notification("thread-d29-ephemeral-1", turn_id),
+                    );
+                    write_line(
+                        &mut stdout,
+                        r#"{"id":99,"method":"item/commandExecution/requestApproval","params":{}}"#
+                            .to_owned(),
+                    );
+                } else if mode == "d29-b-unknown-notification" {
+                    write_line(
+                        &mut stdout,
+                        format_turn_started_notification("thread-d29-ephemeral-1", turn_id),
+                    );
+                    write_line(
+                    &mut stdout,
+                    r#"{"method":"unknown/notification","params":{"presentationOnly":"ignored"}}"#.to_owned(),
+                );
+                    write_line(
+                        &mut stdout,
+                        format_turn_completed_notification(
+                            "thread-d29-ephemeral-1",
+                            turn_id,
+                            "completed",
+                        ),
+                    );
+                } else if mode == "d29-b-stale-old-turn-event" && turn_number > 1 {
+                    write_line(
+                        &mut stdout,
+                        format_turn_completed_notification(
+                            "thread-d29-ephemeral-1",
+                            "turn-d29-1",
+                            "completed",
+                        ),
+                    );
+                    write_line(
+                        &mut stdout,
+                        format_turn_started_notification("thread-d29-ephemeral-1", turn_id),
+                    );
+                    write_line(
+                        &mut stdout,
+                        format_turn_completed_notification(
+                            "thread-d29-ephemeral-1",
+                            turn_id,
+                            "completed",
+                        ),
+                    );
+                } else {
+                    write_line(
+                        &mut stdout,
+                        format_turn_started_notification("thread-d29-ephemeral-1", turn_id),
+                    );
+                    write_line(
+                        &mut stdout,
+                        format_item_notification("item/started", "thread-d29-ephemeral-1", turn_id),
+                    );
+                    write_line(
+                        &mut stdout,
+                        format_item_notification(
+                            "item/completed",
+                            "thread-d29-ephemeral-1",
+                            turn_id,
+                        ),
+                    );
+                    write_line(
+                        &mut stdout,
+                        format_turn_completed_notification(
+                            "thread-d29-ephemeral-1",
+                            turn_id,
+                            "completed",
+                        ),
+                    );
+                    if mode == "d29-b-duplicate-terminal" {
+                        write_line(
+                            &mut stdout,
+                            format_turn_completed_notification(
+                                "thread-d29-ephemeral-1",
+                                turn_id,
+                                "completed",
+                            ),
+                        );
+                    }
                 }
             }
             let _ = stdout.flush();
@@ -358,12 +470,12 @@ fn main() {
                 thread::sleep(Duration::from_secs(5));
                 write_line(
                     &mut stdout,
-                    format!(r#"{{"jsonrpc":"2.0","id":{request_id},"result":{{}}}}"#),
+                    format!(r#"{{"id":{request_id},"result":{{}}}}"#),
                 );
             } else {
                 write_line(
                     &mut stdout,
-                    format!(r#"{{"jsonrpc":"2.0","id":{request_id},"result":{{}}}}"#),
+                    format!(r#"{{"id":{request_id},"result":{{}}}}"#),
                 );
             }
             if mode == "d29-b-interrupt" {
@@ -385,6 +497,7 @@ fn main() {
             && line.contains("\"error\"")
         {
             let _ = fs::write("d29-server-request-denied.txt", b"denied");
+            let _ = fs::write("d29-server-request-denial.txt", &line);
             if mode == "d29-b-server-request" {
                 write_line(
                     &mut stdout,
@@ -472,13 +585,14 @@ fn write_line(stdout: &mut io::BufWriter<io::Stdout>, line: String) {
 fn thread_object(cwd: &str, ephemeral: bool) -> String {
     format!(
         r#"{{"id":"thread-d29-ephemeral-1","cliVersion":"d29-fake","createdAt":0,"cwd":"{}","ephemeral":{},"modelProvider":"d29-fake","preview":"","projectId":null,"sessionId":"session-d29-1","source":"appServer","status":{{"type":"idle"}},"turns":[],"updatedAt":0}}"#,
-        json_escape(cwd), ephemeral
+        json_escape(cwd),
+        ephemeral
     )
 }
 
 fn format_thread_response(request_id: i64, cwd: &str, ephemeral: bool) -> String {
     format!(
-        r#"{{"jsonrpc":"2.0","id":{},"result":{{"approvalPolicy":"never","approvalsReviewer":"user","cwd":"{}","model":"d29-fake-model","modelProvider":"d29-fake","sandbox":{{"type":"readOnly"}},"thread":{}}}}}"#,
+        r#"{{"id":{},"result":{{"approvalPolicy":"never","approvalsReviewer":"user","cwd":"{}","model":"d29-fake-model","modelProvider":"d29-fake","sandbox":{{"type":"readOnly"}},"thread":{}}}}}"#,
         request_id,
         json_escape(cwd),
         thread_object(cwd, ephemeral)
@@ -487,7 +601,7 @@ fn format_thread_response(request_id: i64, cwd: &str, ephemeral: bool) -> String
 
 fn format_thread_started_notification(cwd: &str) -> String {
     format!(
-        r#"{{"jsonrpc":"2.0","method":"thread/started","params":{{"thread":{}}}}}"#,
+        r#"{{"method":"thread/started","params":{{"thread":{}}}}}"#,
         thread_object(cwd, true)
     )
 }
@@ -495,13 +609,14 @@ fn format_thread_started_notification(cwd: &str) -> String {
 fn turn_object(turn_id: &str, status: &str) -> String {
     format!(
         r#"{{"id":"{}","items":[],"status":"{}"}}"#,
-        json_escape(turn_id), status
+        json_escape(turn_id),
+        status
     )
 }
 
 fn format_turn_start_response(request_id: i64, turn_id: &str) -> String {
     format!(
-        r#"{{"jsonrpc":"2.0","id":{},"result":{{"turn":{}}}}}"#,
+        r#"{{"id":{},"result":{{"turn":{}}}}}"#,
         request_id,
         turn_object(turn_id, "inProgress")
     )
@@ -509,7 +624,7 @@ fn format_turn_start_response(request_id: i64, turn_id: &str) -> String {
 
 fn format_turn_started_notification(thread_id: &str, turn_id: &str) -> String {
     format!(
-        r#"{{"jsonrpc":"2.0","method":"turn/started","params":{{"threadId":"{}","turn":{}}}}}"#,
+        r#"{{"method":"turn/started","params":{{"threadId":"{}","turn":{}}}}}"#,
         json_escape(thread_id),
         turn_object(turn_id, "inProgress")
     )
@@ -517,9 +632,13 @@ fn format_turn_started_notification(thread_id: &str, turn_id: &str) -> String {
 
 fn format_item_notification(method: &str, thread_id: &str, turn_id: &str) -> String {
     format!(
-        r#"{{"jsonrpc":"2.0","method":"{}","params":{{"{}AtMs":0,"item":{{"type":"userMessage","id":"item-d29-1","content":[{{"type":"text","text":"fixture"}}]}},"threadId":"{}","turnId":"{}"}}}}"#,
+        r#"{{"method":"{}","params":{{"{}AtMs":0,"item":{{"type":"userMessage","id":"item-d29-1","content":[{{"type":"text","text":"fixture"}}]}},"threadId":"{}","turnId":"{}"}}}}"#,
         method,
-        if method == "item/started" { "started" } else { "completed" },
+        if method == "item/started" {
+            "started"
+        } else {
+            "completed"
+        },
         json_escape(thread_id),
         json_escape(turn_id)
     )
@@ -527,7 +646,7 @@ fn format_item_notification(method: &str, thread_id: &str, turn_id: &str) -> Str
 
 fn format_turn_completed_notification(thread_id: &str, turn_id: &str, status: &str) -> String {
     format!(
-        r#"{{"jsonrpc":"2.0","method":"turn/completed","params":{{"threadId":"{}","turn":{}}}}}"#,
+        r#"{{"method":"turn/completed","params":{{"threadId":"{}","turn":{}}}}}"#,
         json_escape(thread_id),
         turn_object(turn_id, status)
     )

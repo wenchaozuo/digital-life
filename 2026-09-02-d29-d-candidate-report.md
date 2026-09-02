@@ -127,6 +127,16 @@ At the latest read-only sample during this task, the following files were still 
 - `C:\Users\zuo\.codex\.codex-global-state.json` — present; latest observed size and write metadata changed during the verification window
 - `C:\Users\zuo\.codex\.codex-global-state.json.bak` — present; latest observed size and write metadata changed during the verification window
 
+The final non-isolated fingerprint sample (metadata and SHA-256 only; file contents were never read) was:
+
+| File | Exists | Size | SHA-256 |
+|---|---:|---:|---|
+| `C:\Users\zuo\.codex\config.toml` | yes | 3003 | `6d251deacbc08251c2777b82350390eaa49d3f3c61949515549a2dec6f58e89a` |
+| `C:\Users\zuo\.codex\auth.json` | yes | 4224 | `79d566bf7a7bba7e557f26460ffe9ceff32475b7c7abbdc76b1b917577298211` |
+| `C:\Users\zuo\.codex\.codex-global-state.json` | yes | 540069 | `ea52c85cea5a1610afd8d78f4fd7802be31488fa2ca2c15c0ae882d596786c48` |
+
+This sample is not a canary before/after result: active Codex writers were present, so it cannot establish isolation or causal attribution.
+
 The changing `config.toml` and global-state timestamps continued to coincide with active `codex`, `codex-code-mode-host`, `codex-command-runner-0.152.0`, and sandbox-helper processes. Project-source searches found no operation targeting the user Codex home. The most supported explanation is a normal Codex desktop/config or global-state writer, or another concurrently running Codex process, rewriting/recreating state while the task was active. A prior child that did not replace `CODEX_HOME` could also have reached the default user home; this is why D29-D now uses a complete child environment and a private home.
 
 The exact historical deleter cannot be proven from the available evidence: current files exist, Windows object-access auditing was not enabled for a file-specific attribution, and shell history was inaccessible. A future exact attribution would require a scoped Windows Process Monitor/Object Access audit around the Codex home. No such monitor was started by this task.

@@ -259,10 +259,31 @@ impl TrustedCodexRuntime {
         self.reused
     }
 
+    /// Test-only constructor: builds a trusted runtime over the real layout
+    /// (including the private Codex home path) without provisioning the
+    /// 227 MB official asset.  Used to exercise the anonymous preflight gate
+    /// before any process creation.  The private home directory is created by
+    /// the caller.
+    #[cfg(test)]
+    pub(super) fn empty_runtime_for_test(
+        app_data_root: &Path,
+        descriptor: TrustedCodexRuntimeDescriptor,
+    ) -> Result<Self, CodexRuntimeError> {
+        let provisioner = TrustedCodexRuntimeProvisioner::new_for_test(app_data_root, descriptor)?;
+        Ok(Self {
+            descriptor,
+            layout: provisioner.layout().clone(),
+            reused: false,
+        })
+    }
+
     pub(super) fn launch_spec(&self, isolation_root: IsolatedExecutionRoot) -> CodexLaunchSpec {
         CodexLaunchSpec {
             executable: self.executable().to_path_buf(),
-            args: Vec::new(),
+            // The anonymous profile owns these fixed overrides.  Callers
+            // cannot inject arbitrary config JSON into the trusted official
+            // runtime launch.
+            args: super::anonymous_runtime::anonymous_codex_launch_arguments(),
             isolation_root,
             upstream_release: self.descriptor.release().to_owned(),
             upstream_commit: self.descriptor.upstream_commit().to_owned(),
@@ -303,6 +324,26 @@ pub(super) fn verify_runtime_identity_before_spawn(
     verify_runtime_file(&canonical_executable, descriptor)
         .map_err(|_| CodexRuntimeError::RuntimeIdentityMismatch)?;
     Ok(canonical_executable)
+}
+
+/// Independently computes the size and SHA-256 of a file, without trusting any
+/// cached identity.  Used by the official pinned App Server smokes to verify
+/// the exact official asset before provisioning.
+#[cfg(windows)]
+pub(super) fn independent_sha256(path: &Path) -> (u64, String) {
+    let mut file = File::open(path).expect("official source file opens");
+    let mut hasher = Sha256::new();
+    let mut size = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let bytes_read = file.read(&mut buffer).expect("official source reads");
+        if bytes_read == 0 {
+            break;
+        }
+        size += bytes_read as u64;
+        hasher.update(&buffer[..bytes_read]);
+    }
+    (size, digest_hex(hasher.finalize()))
 }
 
 pub(super) fn verify_private_codex_home_before_spawn(
@@ -648,7 +689,6 @@ mod tests {
     use super::*;
     use std::{
         fs,
-        io::Read,
         path::{Path, PathBuf},
         time::Duration,
     };
@@ -1080,23 +1120,6 @@ mod tests {
             ensure_supported_platform_for(&descriptor, "windows", "aarch64").unwrap_err(),
             CodexRuntimeError::UnsupportedPlatform
         );
-    }
-
-    #[cfg(windows)]
-    fn independent_sha256(path: &Path) -> (u64, String) {
-        let mut file = File::open(path).expect("official source file opens");
-        let mut hasher = Sha256::new();
-        let mut size = 0_u64;
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            let bytes_read = file.read(&mut buffer).expect("official source reads");
-            if bytes_read == 0 {
-                break;
-            }
-            size += bytes_read as u64;
-            hasher.update(&buffer[..bytes_read]);
-        }
-        (size, digest_hex(hasher.finalize()))
     }
 
     #[cfg(windows)]

@@ -5,6 +5,7 @@
 //! later governed execution stage.  In particular, this is not a capability,
 //! autonomy, Chat, or Tauri command surface.
 
+mod anonymous_runtime;
 mod runtime_provisioning;
 
 use serde_json::{json, Value};
@@ -562,6 +563,7 @@ pub(crate) enum CodexRuntimeError {
     RuntimeIdentityMismatch,
     StagingFailed,
     AtomicFinalizeFailed,
+    AnonymousRuntimeViolation,
 }
 
 impl fmt::Display for CodexRuntimeError {
@@ -608,6 +610,9 @@ impl fmt::Display for CodexRuntimeError {
             }
             Self::StagingFailed => "codex trusted runtime staging failed",
             Self::AtomicFinalizeFailed => "codex trusted runtime atomic finalize failed",
+            Self::AnonymousRuntimeViolation => {
+                "codex anonymous runtime preflight rejected credential/config material"
+            }
         };
         formatter.write_str(message)
     }
@@ -617,6 +622,7 @@ impl std::error::Error for CodexRuntimeError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CodexInitializeResult {
+    pub(crate) codex_home: String,
     pub(crate) platform_family: String,
     pub(crate) platform_os: String,
     pub(crate) user_agent: String,
@@ -646,6 +652,25 @@ impl CodexRuntimeAdapter {
         runtime: &runtime_provisioning::TrustedCodexRuntime,
         isolation_root: IsolatedExecutionRoot,
     ) -> Result<CodexAppServerProcess, CodexRuntimeError> {
+        // D29-D: every anonymous spawn must first pass the anonymous runtime
+        // preflight.  The profile is fail-closed: any credential/config material
+        // in the private Codex home or any unclassifiable entry blocks the
+        // spawn before CreateProcessW is reached.  Parent environment values
+        // are not consulted here because the child environment is rebuilt
+        // from scratch below.
+        // Verify the path before opening it for preflight.  This keeps the
+        // preflight itself from following a swapped junction/reparse point
+        // between provisioning and the actual CreateProcessW boundary.
+        let private_codex_home = runtime_provisioning::verify_private_codex_home_before_spawn(
+            runtime.private_codex_home(),
+            runtime.trusted_runtime_root(),
+        )?;
+        let profile = anonymous_runtime::AnonymousCodexRuntimeProfile::preflight(
+            &private_codex_home,
+        );
+        if !profile.is_anonymous() {
+            return Err(CodexRuntimeError::AnonymousRuntimeViolation);
+        }
         self.spawn(runtime.launch_spec(isolation_root))
     }
 
@@ -855,18 +880,19 @@ fn windows_wide_string(value: &OsStr) -> Result<Vec<u16>, CodexRuntimeError> {
 
 #[cfg(windows)]
 fn windows_environment_block(pin: CodexUpstreamPin, private_codex_home: Option<&Path>) -> Vec<u16> {
-    let mut entries = vec![
+    let marker_entries = vec![
         OsString::from(format!(
             "CODEX_D29_CLIENT_CONTRACT_VERSION={}",
             pin.client_contract_version()
         )),
         OsString::from(format!("CODEX_D29_UPSTREAM_COMMIT={}", pin.commit())),
     ];
-    if let Some(private_codex_home) = private_codex_home {
-        let mut entry = OsString::from("CODEX_HOME=");
-        entry.push(private_codex_home.as_os_str());
-        entries.push(entry);
-    }
+    // The child environment is a complete replacement: it is rebuilt from the
+    // anonymous child-environment entries only and never inherits the host
+    // environment, so credential-bearing host variables cannot reach the
+    // official App Server.
+    let entries =
+        anonymous_runtime::anonymous_child_environment(private_codex_home, &marker_entries);
     let mut block = Vec::new();
     for entry in entries {
         block.extend(entry.encode_wide());
@@ -874,6 +900,25 @@ fn windows_environment_block(pin: CodexUpstreamPin, private_codex_home: Option<&
     }
     block.push(0);
     block
+}
+
+/// Reconstructs the exact child environment the anonymous spawn would receive.
+/// Used by the official smoke to re-report the child environment and to assert
+/// that no credential-bearing host variable leaked into it.
+fn child_environment_report(
+    pin: CodexUpstreamPin,
+    private_codex_home: Option<&Path>,
+) -> anonymous_runtime::AnonymousChildEnvironmentReport {
+    let marker_entries = vec![
+        OsString::from(format!(
+            "CODEX_D29_CLIENT_CONTRACT_VERSION={}",
+            pin.client_contract_version()
+        )),
+        OsString::from(format!("CODEX_D29_UPSTREAM_COMMIT={}", pin.commit())),
+    ];
+    anonymous_runtime::AnonymousChildEnvironmentReport::from_entries(
+        &anonymous_runtime::anonymous_child_environment(private_codex_home, &marker_entries),
+    )
 }
 
 #[cfg(windows)]
@@ -1031,11 +1076,32 @@ impl IsolatedExecutionRoot {
         if is_forbidden_location(&canonical_path) {
             return Err(CodexRuntimeError::InvalidIsolationRoot);
         }
+        // `std::fs::canonicalize` returns a `\\?\`-prefixed verbatim path on
+        // Windows, but the pinned official App Server normalizes thread cwd to
+        // the non-verbatim form (`dunce::simplified` in
+        // `codex-rs/utils/path-utils` `normalize_for_native_workdir`) and
+        // echoes that form in the `thread/start` response.  Normalize the
+        // isolation root to the same non-verbatim form so the D29-B strict
+        // `result.cwd == cwd` binding holds against the real official runtime.
+        #[cfg(windows)]
+        let canonical_path = strip_windows_verbatim_prefix(&canonical_path);
         Ok(Self { canonical_path })
     }
 
     fn path(&self) -> &Path {
         &self.canonical_path
+    }
+}
+
+/// Strips the `\\?\` verbatim prefix that `std::fs::canonicalize` adds on
+/// Windows, matching the form the official App Server reports for thread cwd.
+#[cfg(windows)]
+fn strip_windows_verbatim_prefix(path: &Path) -> PathBuf {
+    let value = path.as_os_str().to_string_lossy();
+    if let Some(rest) = value.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        path.to_path_buf()
     }
 }
 
@@ -1592,6 +1658,8 @@ struct CodexProtocolClient {
     retired_turn_ids: VecDeque<String>,
     pending_lifecycle_events: VecDeque<CodexLifecycleEvent>,
     provisional_turn_notifications: VecDeque<ProtocolNotification>,
+    #[cfg(test)]
+    sent_client_methods: Vec<String>,
 }
 
 impl CodexProtocolClient {
@@ -1603,6 +1671,8 @@ impl CodexProtocolClient {
             retired_turn_ids: VecDeque::new(),
             pending_lifecycle_events: VecDeque::new(),
             provisional_turn_notifications: VecDeque::new(),
+            #[cfg(test)]
+            sent_client_methods: Vec::new(),
         }
     }
 
@@ -1669,11 +1739,14 @@ impl CodexProtocolClient {
                             return Err(CodexRuntimeError::MalformedProtocol);
                         }
                     };
-                    if !result.codex_home_is_bounded_string {
-                        self.state = CodexProtocolState::Retired;
-                        return Err(CodexRuntimeError::MalformedProtocol);
-                    }
                     let result = CodexInitializeResult {
+                        codex_home: match result.codex_home {
+                            Some(value) => value,
+                            None => {
+                                self.state = CodexProtocolState::Retired;
+                                return Err(CodexRuntimeError::MalformedProtocol);
+                            }
+                        },
                         platform_family: match result.platform_family {
                             Some(value) => value,
                             None => {
@@ -2121,6 +2194,8 @@ impl CodexProtocolClient {
         if !ALLOWED_CLIENT_REQUEST_METHODS.contains(&method) {
             return Err(CodexRuntimeError::UnsupportedMethod);
         }
+        #[cfg(test)]
+        self.sent_client_methods.push(method.to_owned());
         self.process.write_json(json!({
             "id": request_id,
             "method": method,
@@ -2133,9 +2208,16 @@ impl CodexProtocolClient {
         if !ALLOWED_CLIENT_NOTIFICATION_METHODS.contains(&method) {
             return Err(CodexRuntimeError::UnsupportedMethod);
         }
+        #[cfg(test)]
+        self.sent_client_methods.push(method.to_owned());
         self.process.write_json(json!({
             "method": method,
         }))
+    }
+
+    #[cfg(test)]
+    fn sent_client_methods(&self) -> &[String] {
+        &self.sent_client_methods
     }
 
     fn deny_server_request(&mut self, id: RpcId) -> Result<(), CodexRuntimeError> {
@@ -2562,7 +2644,7 @@ impl RpcId {
 
 #[derive(Clone, Debug)]
 struct InitializeWireResult {
-    codex_home_is_bounded_string: bool,
+    codex_home: Option<String>,
     platform_family: Option<String>,
     platform_os: Option<String>,
     user_agent: Option<String>,
@@ -2800,11 +2882,7 @@ fn parse_rpc_id(value: &Value) -> Option<RpcId> {
 fn parse_initialize_wire_result(value: Option<&Value>) -> Option<InitializeWireResult> {
     let object = value?.as_object()?;
     Some(InitializeWireResult {
-        codex_home_is_bounded_string: bounded_string(
-            object.get("codexHome")?,
-            MAX_PROTOCOL_STRING_BYTES,
-        )
-        .is_some(),
+        codex_home: bounded_string(object.get("codexHome")?, MAX_PROTOCOL_STRING_BYTES),
         platform_family: bounded_string(object.get("platformFamily")?, MAX_PROTOCOL_STRING_BYTES),
         platform_os: bounded_string(object.get("platformOs")?, MAX_PROTOCOL_STRING_BYTES),
         user_agent: bounded_string(object.get("userAgent")?, MAX_PROTOCOL_STRING_BYTES),
@@ -3008,6 +3086,7 @@ fn is_inside_repository(path: &Path) -> bool {
     path.starts_with(&repository_root)
 }
 
+#[cfg(test)]
 fn is_forbidden_location(path: &Path) -> bool {
     let Some(repository_root) = repository_root() else {
         return true;
@@ -3885,6 +3964,7 @@ mod tests {
         let result = client
             .initialize(Duration::from_secs(2))
             .expect("initialize succeeds");
+        assert_eq!(result.codex_home, "C:/isolated");
         assert_eq!(result.platform_family, "windows");
         assert_eq!(result.platform_os, "windows");
         assert_eq!(result.user_agent, "codex-d29-fake");
@@ -5130,5 +5210,575 @@ mod tests {
         }
         assert!(root.path().join("d29-drop-observed.txt").is_file());
         assert!(directory.path().join(".d29-dedicated-root").is_file());
+    }
+
+    // ---------------------------------------------------------------
+    // D29-D anonymous runtime regressions
+    // ---------------------------------------------------------------
+
+    #[cfg(windows)]
+    fn private_home_entries(path: &Path) -> Vec<String> {
+        let mut entries = std::fs::read_dir(path)
+            .expect("private home is readable")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        entries.sort();
+        entries
+    }
+
+    fn assert_preflight_rejects(profile: &anonymous_runtime::AnonymousCodexRuntimeProfile) {
+        assert!(
+            !profile.is_anonymous(),
+            "anonymous profile must fail closed: {profile:?}"
+        );
+        assert!(
+            !profile.violations().is_empty(),
+            "violations must be recorded: {profile:?}"
+        );
+    }
+
+    #[test]
+    fn anonymous_profile_rejects_private_auth_material() {
+        let home = tempfile::tempdir().expect("private home temp dir");
+        for forbidden in ["auth.json", ".credentials.json", "secrets"] {
+            let path = home.path().join(forbidden);
+            if forbidden == "secrets" {
+                std::fs::create_dir_all(&path).expect("create secrets dir");
+            } else {
+                std::fs::write(&path, b"{}").expect("write forbidden material");
+            }
+            let profile =
+                anonymous_runtime::AnonymousCodexRuntimeProfile::preflight(home.path());
+            assert_preflight_rejects(&profile);
+            assert!(
+                profile
+                    .violations()
+                    .iter()
+                    .any(|violation| violation.contains(forbidden)),
+                "expected violation mentioning {forbidden}: {profile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn anonymous_profile_rejects_private_network_enabling_config() {
+        let home = tempfile::tempdir().expect("private home temp dir");
+        for forbidden in [
+            "config.toml",
+            "environments.toml",
+            "managed_config.toml",
+            "AGENTS.md",
+        ] {
+            std::fs::write(home.path().join(forbidden), b"x = 1").expect("write config material");
+            let profile =
+                anonymous_runtime::AnonymousCodexRuntimeProfile::preflight(home.path());
+            assert_preflight_rejects(&profile);
+            assert!(
+                profile
+                    .violations()
+                    .iter()
+                    .any(|violation| violation.contains(forbidden)),
+                "expected violation mentioning {forbidden}: {profile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn anonymous_profile_does_not_consult_user_codex_home() {
+        // The preflight only ever reads the private home passed to it; it must
+        // not inspect `~/.codex` or any other user Codex home.  The host home
+        // is intentionally left untouched: the profile has no path to it.
+        let private_home = tempfile::tempdir().expect("private home temp dir");
+        let profile =
+            anonymous_runtime::AnonymousCodexRuntimeProfile::preflight(private_home.path());
+        assert!(
+            profile.is_anonymous(),
+            "empty private home must be anonymous: {profile:?}"
+        );
+        assert!(profile.private_home_entries().is_empty());
+        assert!(profile.violations().is_empty());
+    }
+
+    #[test]
+    fn anonymous_profile_does_not_consult_user_environment_credentials() {
+        // The profile never reads the host environment.  The child environment
+        // is rebuilt from scratch; this test asserts that the exact child
+        // report contains no credential-bearing variables.
+        let private_home = tempfile::tempdir().expect("private home temp dir");
+        let report = child_environment_report(
+            CodexUpstreamPin::pinned(),
+            Some(private_home.path()),
+        );
+        for forbidden in [
+            "OPENAI_API_KEY",
+            "CODEX_API_KEY",
+            "CODEX_ACCESS_TOKEN",
+            "CODEX_EXEC_SERVER_URL",
+            "CODEX_SQLITE_HOME",
+            "CODEX_REFRESH_TOKEN_URL_OVERRIDE",
+            "CODEX_REVOKE_TOKEN_URL_OVERRIDE",
+            "CODEX_APP_SERVER_LOGIN_CLIENT_ID",
+        ] {
+            assert!(
+                !report.contains(forbidden),
+                "child environment must never carry {forbidden}: {report:?}"
+            );
+        }
+        assert!(
+            report.contains("CODEX_HOME="),
+            "child environment must carry the private CODEX_HOME: {report:?}"
+        );
+        assert!(
+            report.contains("CODEX_D29_CLIENT_CONTRACT_VERSION="),
+            "child environment must carry the client contract marker: {report:?}"
+        );
+    }
+
+    #[test]
+    fn anonymous_launch_arguments_are_fixed_and_disable_user_state_inputs() {
+        let args = anonymous_runtime::anonymous_codex_launch_arguments();
+        let args = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            vec![
+                "--config",
+                r#"cli_auth_credentials_store="file""#,
+                "--config",
+                r#"mcp_oauth_credentials_store="file""#,
+                "--config",
+                r#"sandbox_mode="read-only""#,
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_snapshot_delta_identifies_durable_thread_artifacts() {
+        let root = tempfile::tempdir().expect("snapshot temp dir");
+        let before = anonymous_runtime::RuntimeFilesystemSnapshot::capture(root.path())
+            .expect("empty snapshot");
+        std::fs::create_dir_all(root.path().join("sessions")).expect("sessions dir");
+        std::fs::write(root.path().join("sessions/thread-1.jsonl"), b"thread")
+            .expect("durable thread artifact");
+        std::fs::write(root.path().join("models_cache.json"), b"cache")
+            .expect("runtime cache");
+        let after = anonymous_runtime::RuntimeFilesystemSnapshot::capture(root.path())
+            .expect("populated snapshot");
+        let delta = after.delta_from(&before);
+        assert!(
+            delta
+                .durable_paths()
+                .iter()
+                .any(|path| path == "sessions/thread-1.jsonl"),
+            "session rollout must be classified as durable: {delta:?}"
+        );
+        assert!(!delta.is_empty());
+        assert!(anonymous_runtime::is_durable_thread_artifact("rollout-x.jsonl"));
+        assert!(!anonymous_runtime::is_durable_thread_artifact("models_cache.json"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn anonymous_violation_prevents_process_creation() {
+        // A private Codex home carrying credential material must block the
+        // trusted-runtime spawn at the anonymous preflight, before any
+        // CreateProcessW.  This exercises the exact production gate used by
+        // the official smoke.
+        let app_data = tempfile::tempdir().expect("anonymous violation app-data root");
+        let runtime = runtime_provisioning::TrustedCodexRuntime::empty_runtime_for_test(
+            app_data.path(),
+            TrustedCodexRuntimeDescriptor::pinned(),
+        )
+        .expect("anonymous violation runtime layout validates");
+        fs::create_dir_all(runtime.private_codex_home()).expect("create private home");
+        fs::write(runtime.private_codex_home().join("auth.json"), b"{}")
+            .expect("inject auth material into private home");
+
+        let isolated_directory = tempfile::tempdir().expect("anonymous violation isolated root");
+        fs::write(
+            isolated_directory.path().join(".d29-dedicated-root"),
+            b"d29",
+        )
+        .expect("mark anonymous violation isolated root");
+        let isolated_root =
+            IsolatedExecutionRoot::from_dedicated_test_root(isolated_directory.path())
+                .expect("anonymous violation isolated root validates");
+        let error = CodexRuntimeAdapter::pinned()
+            .spawn_trusted_runtime(&runtime, isolated_root)
+            .expect_err("anonymous violation must prevent process creation");
+        assert_eq!(error, CodexRuntimeError::AnonymousRuntimeViolation);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn anonymous_preflight_allows_official_runtime_artifacts() {
+        let home = tempfile::tempdir().expect("private home temp dir");
+        for allowed in [
+            "installation_id",
+            "state_5.sqlite",
+            "logs_2.sqlite",
+            "goals_1.sqlite",
+            "memories_1.sqlite",
+            "queue_1.sqlite",
+            "thread_history_1.sqlite",
+            "models_cache.json",
+        ] {
+            std::fs::write(home.path().join(allowed), b"runtime state")
+                .expect("write allowed artifact");
+        }
+        std::fs::create_dir_all(home.path().join("log")).expect("create log dir");
+        std::fs::create_dir_all(home.path().join("sessions")).expect("create sessions dir");
+        std::fs::create_dir_all(home.path().join("archived_sessions"))
+            .expect("create archived sessions dir");
+        let profile =
+            anonymous_runtime::AnonymousCodexRuntimeProfile::preflight(home.path());
+        assert!(
+            profile.is_anonymous(),
+            "official runtime artifacts must not violate anonymity: {profile:?}"
+        );
+        assert!(
+            profile.violations().is_empty(),
+            "no violations expected: {profile:?}"
+        );
+        assert_eq!(
+            profile.private_home_entries().len(),
+            11,
+            "all allowed entries enumerated: {profile:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn anonymous_preflight_rejects_unclassifiable_entry() {
+        let home = tempfile::tempdir().expect("private home temp dir");
+        std::fs::write(home.path().join("unknown-caller-file.bin"), b"x")
+            .expect("write unclassifiable entry");
+        let profile =
+            anonymous_runtime::AnonymousCodexRuntimeProfile::preflight(home.path());
+        assert_preflight_rejects(&profile);
+        assert!(
+            profile
+                .violations()
+                .iter()
+                .any(|violation| violation.contains("unclassifiable")),
+            "unclassifiable entry must fail closed: {profile:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // D29-D official pinned App Server ephemeral thread smoke
+    // ---------------------------------------------------------------
+
+    /// Full D29-D real-official smoke:
+    /// exact official fixture -> SHA/size verify -> private provision ->
+    /// anonymous preflight -> trusted spawn -> initialize -> initialized ->
+    /// thread/start(ephemeral, isolated cwd) -> exact real thread response
+    /// + thread/started notification -> ephemeral persistence proof ->
+    /// clean shutdown.  No turn/start, no provider/model/tool execution.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires exact official pinned D29-C App Server fixture and a credential-free host"]
+    fn official_pinned_app_server_ephemeral_thread_smoke() {
+        use anonymous_runtime::{
+            is_durable_thread_artifact, AnonymousCodexRuntimeProfile,
+            RuntimeFilesystemSnapshot,
+        };
+
+        // The fixture env var names the test-harness source path only; it is
+        // never forwarded to the child.
+        let source = std::env::var_os("DIGITAL_LIFE_D29_C_OFFICIAL_APP_SERVER_FIXTURE")
+            .expect("DIGITAL_LIFE_D29_C_OFFICIAL_APP_SERVER_FIXTURE must be set");
+        let source = PathBuf::from(source);
+
+        // 1. Exact official asset identity (independent size + SHA-256).
+        let descriptor = TrustedCodexRuntimeDescriptor::pinned();
+        let (size, digest) = runtime_provisioning::independent_sha256(&source);
+        assert_eq!(size, descriptor.asset_size(), "official asset size mismatch");
+        assert_eq!(
+            digest,
+            descriptor.asset_sha256(),
+            "official asset SHA-256 mismatch"
+        );
+
+        // 2. Private provision (atomic no-replace publish).
+        let app_data = tempfile::tempdir().expect("official smoke app-data root");
+        let provisioner =
+            runtime_provisioning::TrustedCodexRuntimeProvisioner::new(app_data.path())
+                .expect("official smoke app-data root validates");
+        let runtime = provisioner
+            .provision_from_verified_source_file(&source)
+            .expect("official asset provisions into private runtime");
+
+        // 3. Anonymous preflight over the private Codex home (must pass).
+        let profile = AnonymousCodexRuntimeProfile::preflight(runtime.private_codex_home());
+        assert!(
+            profile.is_anonymous(),
+            "anonymous preflight must pass before spawn: {profile:?}"
+        );
+
+        // Capture both roots before CreateProcessW.  The post-run delta is
+        // the evidence boundary for durable thread/session side effects.
+        let private_home_before = RuntimeFilesystemSnapshot::capture(
+            runtime.private_codex_home(),
+        )
+        .expect("private Codex home snapshot before spawn");
+
+        // 4. Trusted spawn with the exact isolated test root as cwd.
+        let isolated_directory = tempfile::tempdir().expect("official smoke isolated root");
+        fs::write(
+            isolated_directory.path().join(".d29-dedicated-root"),
+            b"d29",
+        )
+        .expect("mark official smoke isolated root");
+        let isolated_root =
+            IsolatedExecutionRoot::from_dedicated_test_root(isolated_directory.path())
+                .expect("official smoke isolated root validates");
+        let isolated_root_before = RuntimeFilesystemSnapshot::capture(isolated_root.path())
+            .expect("isolated cwd snapshot before spawn");
+        let process = CodexRuntimeAdapter::pinned()
+            .spawn_trusted_runtime(&runtime, isolated_root.clone())
+            .expect("official pinned App Server spawns anonymously");
+
+        // 5. initialize -> initialized.
+        let mut client = CodexProtocolClient::new(process);
+        let initialize = client
+            .initialize(Duration::from_secs(30))
+            .expect("official pinned App Server initializes");
+        assert_eq!(
+            strip_windows_verbatim_prefix(Path::new(&initialize.codex_home))
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .replace('\\', "/"),
+            strip_windows_verbatim_prefix(runtime.private_codex_home())
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .replace('\\', "/"),
+            "official initialize must report the private CODEX_HOME, never the user home"
+        );
+        assert!(!initialize.platform_os.is_empty());
+        assert!(!initialize.user_agent.is_empty());
+
+        // 6. thread/start(ephemeral, cwd=isolated root) -> exact real thread.
+        let start = client
+            .start_thread(Duration::from_secs(30))
+            .expect("official ephemeral thread starts");
+        let thread_id = start.thread_id;
+        assert!(!thread_id.is_empty(), "returned thread id must be nonempty");
+        assert!(
+            thread_id.len() <= MAX_PROTOCOL_STRING_BYTES,
+            "returned thread id must be bounded"
+        );
+        assert_eq!(
+            client
+                .process
+                .isolation_root_path()
+                .to_str()
+                .expect("isolation root is utf-8"),
+            isolated_root.path().to_str().expect("root is utf-8"),
+            "start_thread must use the exact isolated cwd"
+        );
+        assert_eq!(
+            client.sent_client_methods(),
+            [
+                "initialize".to_owned(),
+                "initialized".to_owned(),
+                "thread/start".to_owned(),
+            ],
+            "anonymous smoke must send only initialize -> initialized -> thread/start"
+        );
+        assert!(
+            !client
+                .sent_client_methods()
+                .iter()
+                .any(|method| method == "turn/start"),
+            "anonymous smoke must never send turn/start"
+        );
+
+        // 7. thread/started notification matches the same exact thread id and
+        //    is accepted by the current protocol state machine.
+        let started = next_lifecycle_event(&mut client, Duration::from_secs(10));
+        assert_eq!(
+            started,
+            CodexLifecycleEvent::ThreadStarted {
+                thread_id: thread_id.clone()
+            },
+            "thread/started must carry the exact returned thread id"
+        );
+
+        // 8. Child exact environment re-report: the child env is rebuilt from
+        //    scratch and never carries user credentials.
+        let child_report = child_environment_report(
+            CodexUpstreamPin::pinned(),
+            Some(runtime.private_codex_home()),
+        );
+        assert_eq!(
+            child_report.entries().len(),
+            3,
+            "child environment must contain only CODEX_HOME and the two D29 markers"
+        );
+        for forbidden in anonymous_runtime::FORBIDDEN_CHILD_ENVIRONMENT_VARS {
+            assert!(
+                !child_report.contains(forbidden),
+                "child environment must never carry {forbidden}: {child_report:?}"
+            );
+        }
+        assert!(
+            child_report
+                .entries()
+                .iter()
+                .all(|entry| entry.starts_with("CODEX_HOME=")
+                    || entry.starts_with("CODEX_D29_CLIENT_CONTRACT_VERSION=")
+                    || entry.starts_with("CODEX_D29_UPSTREAM_COMMIT=")),
+            "child environment contains an unexpected entry: {child_report:?}"
+        );
+
+        // 9. Clean shutdown.
+        client
+            .shutdown()
+            .expect("official pinned App Server shuts down cleanly");
+
+        // 10. Ephemeral persistence proof: compare complete before/after
+        //     inventories and reject every durable thread/session artifact in
+        //     the added or changed set.  (The pinned upstream
+        //     `config.ephemeral` short-circuits `LiveThread` creation.)
+        let private_home_after = RuntimeFilesystemSnapshot::capture(
+            runtime.private_codex_home(),
+        )
+        .expect("private Codex home snapshot after shutdown");
+        let private_home_delta = private_home_after.delta_from(&private_home_before);
+        assert!(
+            private_home_delta.durable_paths().is_empty(),
+            "ephemeral thread changed durable private-home artifacts: added={:?} removed={:?} changed={:?}",
+            private_home_delta.added(),
+            private_home_delta.removed(),
+            private_home_delta.changed()
+        );
+
+        let isolated_root_after = RuntimeFilesystemSnapshot::capture(isolated_root.path())
+            .expect("isolated cwd snapshot after shutdown");
+        let isolated_root_delta = isolated_root_after.delta_from(&isolated_root_before);
+        assert!(
+            isolated_root_delta.durable_paths().is_empty(),
+            "ephemeral thread changed durable cwd artifacts: added={:?} removed={:?} changed={:?}",
+            isolated_root_delta.added(),
+            isolated_root_delta.removed(),
+            isolated_root_delta.changed()
+        );
+
+        let post_profile = AnonymousCodexRuntimeProfile::preflight(runtime.private_codex_home());
+        assert!(
+            post_profile.is_anonymous(),
+            "post-shutdown private home must remain anonymous: {post_profile:?}"
+        );
+        let home_entries = private_home_entries(runtime.private_codex_home());
+        for durable in ["sessions", "archived_sessions", "thread_history_1.sqlite"] {
+            assert!(
+                !home_entries.iter().any(|entry| entry == durable),
+                "ephemeral thread must not create durable artifact {durable}; found {home_entries:?}"
+            );
+        }
+        let workspace_entries = private_home_entries(isolated_root.path());
+        assert!(
+            workspace_entries
+                .iter()
+                .all(|entry| !is_durable_thread_artifact(entry)),
+            "no rollout/conversation artifact may appear in the isolated cwd: {workspace_entries:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "manual gate: close unrelated Codex processes and set DIGITAL_LIFE_D29_D_CANARY_PROCESSES_CLOSED=1"]
+    fn official_smoke_preserves_user_codex_global_canary() {
+        // This is a test-only observation gate.  It never creates, repairs,
+        // sanitizes, migrates, or deletes anything under the user's Codex
+        // home.  An operator must close unrelated Codex processes first;
+        // otherwise a concurrent writer makes hash equality non-attributable.
+        assert_eq!(
+            std::env::var_os("DIGITAL_LIFE_D29_D_CANARY_PROCESSES_CLOSED")
+                .as_deref()
+                .and_then(|value| value.to_str()),
+            Some("1"),
+            "set DIGITAL_LIFE_D29_D_CANARY_PROCESSES_CLOSED=1 only after unrelated Codex processes are closed"
+        );
+
+        let before = snapshot_user_codex_global_canary();
+        let smoke_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            official_pinned_app_server_ephemeral_thread_smoke();
+        }));
+        let after = snapshot_user_codex_global_canary();
+        assert_eq!(
+            before, after,
+            "Digital Life official smoke must not mutate the user Codex global canary"
+        );
+        if let Err(payload) = smoke_result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[cfg(windows)]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct UserCodexFileFingerprint {
+        exists: bool,
+        size: u64,
+        sha256: Option<String>,
+    }
+
+    #[cfg(windows)]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct UserCodexGlobalCanary {
+        config: UserCodexFileFingerprint,
+        auth: UserCodexFileFingerprint,
+        global_state: UserCodexFileFingerprint,
+    }
+
+    #[cfg(windows)]
+    fn snapshot_user_codex_global_canary() -> UserCodexGlobalCanary {
+        let user_home = std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(PathBuf::from)
+            .expect("USERPROFILE/HOME is required only for the test-only global canary");
+        let codex_home = user_home.join(".codex");
+        UserCodexGlobalCanary {
+            config: fingerprint_user_codex_file(&codex_home.join("config.toml")),
+            auth: fingerprint_user_codex_file(&codex_home.join("auth.json")),
+            global_state: fingerprint_user_codex_file(
+                &codex_home.join(".codex-global-state.json"),
+            ),
+        }
+    }
+
+    #[cfg(windows)]
+    fn fingerprint_user_codex_file(path: &Path) -> UserCodexFileFingerprint {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                assert!(
+                    metadata.is_file(),
+                    "user Codex canary target must be a regular file: {path:?}"
+                );
+                let (size, sha256) = runtime_provisioning::independent_sha256(path);
+                assert_eq!(
+                    size,
+                    metadata.len(),
+                    "user Codex canary size changed during its own hash read: {path:?}"
+                );
+                UserCodexFileFingerprint {
+                    exists: true,
+                    size,
+                    sha256: Some(sha256),
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                UserCodexFileFingerprint {
+                    exists: false,
+                    size: 0,
+                    sha256: None,
+                }
+            }
+            Err(error) => panic!("cannot inspect user Codex canary file {path:?}: {error}"),
+        }
     }
 }

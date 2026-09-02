@@ -843,8 +843,9 @@ impl VitaAgentEntrypoint {
     #[cfg(test)]
     pub(crate) async fn initialize_with_gateway_for_tests(
         profile: VitaAgentRuntimeProfile,
-        provider: &provider_gateway::DerivedCodexProvider,
+        ready: &provider_gateway::GatewayReadyProvider,
     ) -> Result<Self, VitaAgentError> {
+        let provider = ready.derived_codex_provider();
         profile.validate_private_namespace()?;
         ensure_vita_config_sources_absent(&profile)?;
         ensure_vita_auth_source_absent(&profile)?;

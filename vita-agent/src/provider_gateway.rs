@@ -1139,7 +1139,11 @@ fn map_responses_request_to_chat(
         messages,
         stream: request.options.stream,
         tools,
-        parallel_tool_calls: request.options.parallel_tools.then_some(true),
+        // A parallel-tool flag has no meaning when there are no tools.  Do
+        // not leak that Responses-only control to broad Chat Completions
+        // providers on the ordinary no-tools path.
+        parallel_tool_calls: (!request.options.tools.is_empty() && request.options.parallel_tools)
+            .then_some(true),
     })
 }
 
@@ -1634,6 +1638,31 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&mapped).unwrap(),
             r#"{"model":"mock-model","messages":[{"role":"user","content":"use the tool"}],"stream":false,"tools":[{"type":"function","function":{"name":"lookup","description":"Look up a value","parameters":{"properties":{},"type":"object"}}}],"parallel_tool_calls":true}"#
+        );
+    }
+
+    #[test]
+    fn empty_tools_omit_parallel_tool_calls_even_when_requested() {
+        let profile = profile(
+            "https://provider.example/v1",
+            None,
+            all_mapping_capabilities(),
+        );
+        let request = VitaResponsesRequest::new(
+            "mock-model",
+            vec![VitaMessage::text(VitaMessageRole::User, "hello")],
+            VitaResponsesRequestOptions {
+                parallel_tools: true,
+                ..VitaResponsesRequestOptions::default()
+            },
+        );
+
+        let mapped = map_responses_request_to_chat(&request, &profile).unwrap();
+        assert!(mapped.tools.is_empty());
+        assert_eq!(mapped.parallel_tool_calls, None);
+        assert_eq!(
+            serde_json::to_string(&mapped).unwrap(),
+            r#"{"model":"mock-model","messages":[{"role":"user","content":"hello"}],"stream":false}"#
         );
     }
 

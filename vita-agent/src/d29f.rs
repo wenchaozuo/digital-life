@@ -7,15 +7,19 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+};
 
 use codex_core_api::{
-    CodexAppsToolsCache, CodexAuth, EnvironmentManager, EventMsg, SessionSource,
-    StartThreadOptions, ThreadManager, TurnInputRequest, UserInput,
+    CodexAppsToolsCache, CodexAuth, EnvironmentManager, EventMsg, Op, SessionSource,
+    StartThreadOptions, ThreadId, ThreadManager, TurnInputRequest, UserInput,
 };
 use serde_json::{json, Value};
 use tempfile::{tempdir, TempDir};
@@ -24,7 +28,7 @@ use super::{
     CredentialRef, CredentialResolver, GatewayReadyProvider, ProviderCapabilities,
     ProviderEndpoint, ProviderGateway, ProviderProfile, ProviderProtocol, ProviderRequestTransport,
     ProviderRetryPolicy, VitaAgentError, VitaGatewayBinding, VitaMessage, VitaMessageRole,
-    VitaResponsesRequest, VitaResponsesRequestOptions,
+    VitaProviderState, VitaResponsesRequest, VitaResponsesRequestOptions,
 };
 
 use crate::{
@@ -38,24 +42,116 @@ const D29F_CREDENTIAL: &str = "d29f-in-memory-provider-credential";
 const D29F_PROVIDER_ID: &str = "d29f-local-chat-mock";
 const D29F_REQUEST_TIMEOUT: Duration = Duration::from_millis(250);
 const D29F_TURN_TIMEOUT: Duration = Duration::from_secs(5);
+const D29F_TRUE_TURN_DEADLINE: Duration = Duration::from_millis(900);
 const D29F_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+const D29F_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(100);
 const D29F_HTTP_MAX_BODY: usize = 2 * 1024 * 1024;
 const D29F_TEST_STACK_SIZE: usize = 32 * 1024 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
+enum UserCodexFileState {
+    Absent,
+    Present {
+        size: u64,
+        modified: Option<SystemTime>,
+    },
+    Unavailable,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct UserCodexState {
+    config: UserCodexFileState,
+    auth: UserCodexFileState,
+    global_state: UserCodexFileState,
+}
+
+#[derive(Clone, PartialEq, Eq)]
 struct HostCanary {
-    environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
-    codex_directory_exists: bool,
+    parent_environment_fingerprint: u64,
+    user_codex_state: UserCodexState,
+}
+
+impl std::fmt::Debug for HostCanary {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("HostCanary(<redacted>)")
+    }
 }
 
 fn host_canary() -> HostCanary {
     let mut environment = std::env::vars_os().collect::<Vec<_>>();
     environment.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut hasher = DefaultHasher::new();
+    environment.hash(&mut hasher);
     HostCanary {
-        environment,
-        // Only the directory's existence is sampled.  No user Codex file is
-        // opened, parsed, copied, or used as a runtime input.
-        codex_directory_exists: Path::new(r"C:\Users\zuo\.codex").exists(),
+        parent_environment_fingerprint: hasher.finish(),
+        user_codex_state: snapshot_user_codex_state(),
+    }
+}
+
+fn snapshot_user_codex_state() -> UserCodexState {
+    let root = std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .map(|path| path.join(".codex"));
+    UserCodexState {
+        config: snapshot_user_codex_file(root.as_deref(), "config.toml"),
+        auth: snapshot_user_codex_file(root.as_deref(), "auth.json"),
+        global_state: snapshot_user_codex_file(root.as_deref(), ".codex-global-state.json"),
+    }
+}
+
+fn snapshot_user_codex_file(root: Option<&Path>, file_name: &str) -> UserCodexFileState {
+    let Some(root) = root else {
+        return UserCodexFileState::Unavailable;
+    };
+    match std::fs::symlink_metadata(root.join(file_name)) {
+        Ok(metadata) => UserCodexFileState::Present {
+            size: metadata.len(),
+            modified: metadata.modified().ok(),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => UserCodexFileState::Absent,
+        Err(_) => UserCodexFileState::Unavailable,
+    }
+}
+
+fn canary_unchanged_result(before: &HostCanary, after: &HostCanary) -> Result<(), &'static str> {
+    if before.parent_environment_fingerprint != after.parent_environment_fingerprint {
+        return Err("parent environment changed");
+    }
+    if before.user_codex_state != after.user_codex_state {
+        return Err("user Codex state changed");
+    }
+    Ok(())
+}
+
+fn assert_canary_unchanged(before: &HostCanary, after: &HostCanary) {
+    if let Err(error) = canary_unchanged_result(before, after) {
+        panic!("{error}");
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponsesFieldHandling {
+    Absent,
+    EmptyObjectInert,
+    DefaultSummaryAutoInert,
+    SequentialCutoffInert,
+}
+
+impl Default for ResponsesFieldHandling {
+    fn default() -> Self {
+        Self::Absent
+    }
+}
+
+impl ResponsesFieldHandling {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::EmptyObjectInert => "empty-object-inert",
+            Self::DefaultSummaryAutoInert => "default-summary-auto-inert",
+            Self::SequentialCutoffInert => "sequential-cutoff-inert",
+        }
     }
 }
 
@@ -65,6 +161,12 @@ enum ChatMockMode {
     MalformedBody,
     UnexpectedToolCall,
     Delayed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatewayResponseMode {
+    Normal,
+    HoldTerminalResponse,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -91,8 +193,11 @@ struct GatewayObservation {
     input_item_types: Vec<String>,
     message_texts: Vec<String>,
     parallel_tool_calls: Option<bool>,
-    reasoning_present: bool,
+    reasoning_handling: ResponsesFieldHandling,
+    stream_options_handling: ResponsesFieldHandling,
+    text_handling: ResponsesFieldHandling,
     response_path: Option<String>,
+    terminal_response_emitted: bool,
     bridge_error: Option<String>,
 }
 
@@ -192,16 +297,19 @@ impl LocalChatMock {
         format!("http://127.0.0.1:{}/v1", self.address.port())
     }
 
-    fn shutdown(mut self) -> HttpObservation {
+    fn shutdown(mut self) -> (HttpObservation, bool) {
         self.stop.store(true, Ordering::Release);
         wake_loopback_listener(self.address);
-        if let Some(join) = self.join.take() {
-            join.join().expect("D29-F Chat mock thread join");
-        }
-        self.observation
+        let joined = match self.join.take() {
+            Some(join) => join_listener_thread(join),
+            None => true,
+        };
+        let observation = self
+            .observation
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+            .clone();
+        (observation, joined)
     }
 }
 
@@ -223,7 +331,11 @@ struct VitaGatewayServer {
 }
 
 impl VitaGatewayServer {
-    fn start(listener: TcpListener, ready: GatewayReadyProvider) -> Self {
+    fn start(
+        listener: TcpListener,
+        ready: GatewayReadyProvider,
+        response_mode: GatewayResponseMode,
+    ) -> Self {
         let address = listener.local_addr().expect("Vita gateway address");
         listener
             .set_nonblocking(true)
@@ -269,6 +381,8 @@ impl VitaGatewayServer {
                             peer,
                             &gateway,
                             &observation_for_thread,
+                            response_mode,
+                            &stop_for_thread,
                         );
                         return;
                     }
@@ -294,21 +408,19 @@ impl VitaGatewayServer {
         }
     }
 
-    fn binding(&self) -> VitaGatewayBinding {
-        VitaGatewayBinding::for_owned_private_listener(self.address.port())
-            .expect("D29-F gateway binding")
-    }
-
-    fn shutdown(mut self) -> GatewayObservation {
+    fn shutdown(mut self) -> (GatewayObservation, bool) {
         self.stop.store(true, Ordering::Release);
         wake_loopback_listener(self.address);
-        if let Some(join) = self.join.take() {
-            join.join().expect("D29-F Vita gateway thread join");
-        }
-        self.observation
+        let joined = match self.join.take() {
+            Some(join) => join_listener_thread(join),
+            None => true,
+        };
+        let observation = self
+            .observation
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+            .clone();
+        (observation, joined)
     }
 }
 
@@ -329,7 +441,9 @@ struct ParsedResponsesRequest {
     input_item_types: Vec<String>,
     message_texts: Vec<String>,
     parallel_tool_calls: Option<bool>,
-    reasoning_present: bool,
+    reasoning_handling: ResponsesFieldHandling,
+    stream_options_handling: ResponsesFieldHandling,
+    text_handling: ResponsesFieldHandling,
 }
 
 fn handle_gateway_request(
@@ -337,6 +451,8 @@ fn handle_gateway_request(
     peer: SocketAddr,
     gateway: &ProviderGateway<D29fCredentialResolver, D29fTcpLocalTransport>,
     observation: &Arc<Mutex<GatewayObservation>>,
+    response_mode: GatewayResponseMode,
+    stop: &Arc<AtomicBool>,
 ) {
     let request = match read_http_request(stream) {
         Ok(request) => request,
@@ -391,7 +507,9 @@ fn handle_gateway_request(
         observed.input_item_types = parsed.input_item_types.clone();
         observed.message_texts = parsed.message_texts.clone();
         observed.parallel_tool_calls = parsed.parallel_tool_calls;
-        observed.reasoning_present = parsed.reasoning_present;
+        observed.reasoning_handling = parsed.reasoning_handling;
+        observed.stream_options_handling = parsed.stream_options_handling;
+        observed.text_handling = parsed.text_handling;
     }
 
     let Some(parsed_request) = parsed.request.as_ref() else {
@@ -402,8 +520,21 @@ fn handle_gateway_request(
     };
     match gateway.execute_responses_request(parsed_request) {
         Ok(result) => {
-            set_gateway_response_path(observation, "responses-sse");
-            if let Err(error) = write_success_responses(stream, &result) {
+            let response_path = match response_mode {
+                GatewayResponseMode::Normal => "responses-sse",
+                GatewayResponseMode::HoldTerminalResponse => "responses-sse-held",
+            };
+            set_gateway_response_path(observation, response_path);
+            let response = match response_mode {
+                GatewayResponseMode::Normal => write_success_responses(stream, &result),
+                GatewayResponseMode::HoldTerminalResponse => {
+                    write_held_responses(stream, &result, stop)
+                }
+            };
+            if response.is_ok() && response_mode == GatewayResponseMode::Normal {
+                set_gateway_terminal_response_emitted(observation, true);
+            }
+            if let Err(error) = response {
                 set_gateway_error(observation, error);
             }
         }
@@ -496,6 +627,16 @@ fn set_gateway_response_path(observation: &Arc<Mutex<GatewayObservation>>, path:
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .response_path = Some(path.to_string());
+}
+
+fn set_gateway_terminal_response_emitted(
+    observation: &Arc<Mutex<GatewayObservation>>,
+    emitted: bool,
+) {
+    observation
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .terminal_response_emitted = emitted;
 }
 
 fn parse_codex_responses_request(body: &[u8]) -> Result<ParsedResponsesRequest, String> {
@@ -672,34 +813,14 @@ fn parse_codex_responses_request(body: &[u8]) -> Result<ParsedResponsesRequest, 
         return Err("unsupported Responses request field: store=true".to_string());
     }
 
-    let reasoning_present = object
-        .get("reasoning")
-        .is_some_and(|value| !value.is_null());
-    if let Some(reasoning) = object.get("reasoning").filter(|value| !value.is_null()) {
-        validate_reasoning_control(reasoning)?;
-    }
-    if let Some(stream_options) = object
-        .get("stream_options")
-        .filter(|value| !value.is_null())
-    {
-        let stream_options = stream_options
-            .as_object()
-            .ok_or_else(|| "Responses request stream_options must be an object".to_string())?;
-        let keys = stream_options.keys().collect::<Vec<_>>();
-        if keys
-            .iter()
-            .any(|key| key.as_str() != "reasoning_summary_delivery")
-            || stream_options
-                .get("reasoning_summary_delivery")
-                .and_then(Value::as_str)
-                .is_none_or(|value| value != "sequential_cutoff")
-        {
-            return Err(
-                "unsupported Responses request field: stream_options (unexpected shape)"
-                    .to_string(),
-            );
-        }
-    }
+    let reasoning_handling = match object.get("reasoning") {
+        None => ResponsesFieldHandling::Absent,
+        Some(value) => validate_reasoning_control(value)?,
+    };
+    let stream_options_handling = match object.get("stream_options") {
+        None => ResponsesFieldHandling::Absent,
+        Some(value) => validate_stream_options(value)?,
+    };
     validate_optional_string_field(object, "service_tier")?;
     validate_optional_string_field(object, "prompt_cache_key")?;
     if let Some(include) = object.get("include").filter(|value| !value.is_null()) {
@@ -726,11 +847,10 @@ fn parse_codex_responses_request(body: &[u8]) -> Result<ParsedResponsesRequest, 
             );
         }
     }
-    if let Some(text) = object.get("text").filter(|value| !value.is_null()) {
-        if !text.is_object() {
-            return Err("unsupported Responses request field: text (expected object)".to_string());
-        }
-    }
+    let text_handling = match object.get("text") {
+        None => ResponsesFieldHandling::Absent,
+        Some(value) => validate_text_control(value)?,
+    };
     if object
         .get("access_programs")
         .is_some_and(|value| !value.is_null())
@@ -754,29 +874,174 @@ fn parse_codex_responses_request(body: &[u8]) -> Result<ParsedResponsesRequest, 
         input_item_types,
         message_texts,
         parallel_tool_calls,
-        reasoning_present,
+        reasoning_handling,
+        stream_options_handling,
+        text_handling,
     })
 }
 
-fn validate_reasoning_control(value: &Value) -> Result<(), String> {
+fn validate_reasoning_control(value: &Value) -> Result<ResponsesFieldHandling, String> {
     let object = value.as_object().ok_or_else(|| {
-        "unsupported Responses request field: reasoning (expected object)".to_string()
+        "unsupported Responses reasoning control: expected exact empty object".to_string()
     })?;
+    if object.is_empty() {
+        // The pinned Codex client always serializes its Responses reasoning
+        // struct, while unsupported/default model metadata leaves every
+        // semantic member absent.  `{}` is therefore an inert shape here;
+        // forwarding it to Chat would not add a meaningful control.
+        return Ok(ResponsesFieldHandling::EmptyObjectInert);
+    }
+    if object.len() == 1 && object.get("summary").and_then(Value::as_str) == Some("auto") {
+        // The pinned D29-F model metadata selects `auto` as its default
+        // reasoning-summary mode.  This is an upstream default, not a Vita
+        // caller control; there is no reasoning-summary event to translate
+        // on this no-reasoning Chat proof, so it is inert at the gateway.
+        return Ok(ResponsesFieldHandling::DefaultSummaryAutoInert);
+    }
     for key in object.keys() {
-        if !matches!(key.as_str(), "effort" | "summary" | "context") {
-            return Err(format!("unsupported Responses reasoning field: {key}"));
+        if matches!(key.as_str(), "effort" | "summary" | "context") {
+            return Err(format!("unsupported Responses reasoning control: {key}"));
         }
+        return Err(format!("unsupported Responses reasoning field: {key}"));
     }
-    for key in ["effort", "summary", "context"] {
-        if let Some(value) = object.get(key).filter(|value| !value.is_null()) {
-            if !value.is_string() {
-                return Err(format!(
-                    "unsupported Responses reasoning field: {key} must be a string"
-                ));
+    Err("unsupported Responses reasoning control: non-empty object".to_string())
+}
+
+fn validate_stream_options(value: &Value) -> Result<ResponsesFieldHandling, String> {
+    let object = value.as_object().ok_or_else(|| {
+        "unsupported Responses stream control: expected exact sequential-cutoff object".to_string()
+    })?;
+    if object.len() == 1
+        && object
+            .get("reasoning_summary_delivery")
+            .and_then(Value::as_str)
+            == Some("sequential_cutoff")
+    {
+        // This pinned option only changes delivery ordering for reasoning
+        // summary events.  D29-F proves a no-reasoning text turn and Chat has
+        // no equivalent control, so this exact shape is safe to ignore.
+        return Ok(ResponsesFieldHandling::SequentialCutoffInert);
+    }
+    if object.contains_key("include_obfuscation") {
+        return Err("unsupported Responses stream control: include_obfuscation".to_string());
+    }
+    Err("unsupported Responses stream control: unexpected shape".to_string())
+}
+
+fn validate_text_control(value: &Value) -> Result<ResponsesFieldHandling, String> {
+    let object = value.as_object().ok_or_else(|| {
+        "unsupported Responses text control: expected exact empty object".to_string()
+    })?;
+    if object.is_empty() {
+        // An empty TextControls object contains neither verbosity nor an
+        // output format.  There is no Chat-side semantic to preserve.
+        return Ok(ResponsesFieldHandling::EmptyObjectInert);
+    }
+    for key in object.keys() {
+        match key.as_str() {
+            "verbosity" => return Err("unsupported Responses text control: verbosity".to_string()),
+            "format" => {
+                return Err(
+                    "unsupported Responses text control: format (structured output)".to_string(),
+                )
             }
+            "strict" => return Err("unsupported Responses text control: strict".to_string()),
+            _ => return Err(format!("unsupported Responses text field: {key}")),
         }
     }
-    Ok(())
+    Err("unsupported Responses text control: non-empty object".to_string())
+}
+
+#[cfg(test)]
+fn minimal_responses_request() -> Value {
+    json!({
+        "model": D29F_MODEL,
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "hello"}]
+        }],
+        "tool_choice": "auto",
+        "parallel_tool_calls": true,
+        "store": false,
+        "stream": true
+    })
+}
+
+#[cfg(test)]
+fn parse_request_with_field(field: &str, value: Value) -> Result<ParsedResponsesRequest, String> {
+    let mut object = minimal_responses_request()
+        .as_object()
+        .cloned()
+        .expect("minimal D29-F request object");
+    object.insert(field.to_string(), value);
+    parse_codex_responses_request(&Value::Object(object).to_string().into_bytes())
+}
+
+#[test]
+fn responses_semantic_fields_accept_only_documented_inert_shapes() {
+    let base = parse_codex_responses_request(&minimal_responses_request().to_string().into_bytes())
+        .expect("minimal Responses request should parse");
+    assert_eq!(base.reasoning_handling, ResponsesFieldHandling::Absent);
+    assert_eq!(base.stream_options_handling, ResponsesFieldHandling::Absent);
+    assert_eq!(base.text_handling, ResponsesFieldHandling::Absent);
+
+    let empty_reasoning = parse_request_with_field("reasoning", json!({}))
+        .expect("empty reasoning object should be accepted as inert");
+    assert_eq!(
+        empty_reasoning.reasoning_handling,
+        ResponsesFieldHandling::EmptyObjectInert
+    );
+    let default_reasoning = parse_request_with_field("reasoning", json!({"summary": "auto"}))
+        .expect("default auto reasoning summary should be accepted as inert");
+    assert_eq!(
+        default_reasoning.reasoning_handling,
+        ResponsesFieldHandling::DefaultSummaryAutoInert
+    );
+    for value in [
+        json!({"effort": "value"}),
+        json!({"summary": "value"}),
+        json!({"context": "value"}),
+    ] {
+        let error = parse_request_with_field("reasoning", value)
+            .expect_err("effective reasoning control must fail closed");
+        assert!(error.contains("unsupported Responses reasoning control"));
+    }
+
+    let empty_text = parse_request_with_field("text", json!({}))
+        .expect("empty text object should be accepted as inert");
+    assert_eq!(
+        empty_text.text_handling,
+        ResponsesFieldHandling::EmptyObjectInert
+    );
+    for value in [
+        json!({"verbosity": "low"}),
+        json!({"format": {"type": "json_schema", "strict": true, "name": "schema", "schema": {}}}),
+        json!({"strict": true}),
+    ] {
+        let error = parse_request_with_field("text", value)
+            .expect_err("effective text control must fail closed");
+        assert!(error.contains("unsupported Responses text control"));
+    }
+
+    let sequential_cutoff = parse_request_with_field(
+        "stream_options",
+        json!({"reasoning_summary_delivery": "sequential_cutoff"}),
+    )
+    .expect("pinned sequential cutoff should be accepted as inert");
+    assert_eq!(
+        sequential_cutoff.stream_options_handling,
+        ResponsesFieldHandling::SequentialCutoffInert
+    );
+    for value in [
+        json!({"include_obfuscation": false}),
+        json!({}),
+        json!({"reasoning_summary_delivery": "other"}),
+    ] {
+        let error = parse_request_with_field("stream_options", value)
+            .expect_err("unsupported stream control must fail closed");
+        assert!(error.contains("unsupported Responses stream control"));
+    }
 }
 
 fn validate_optional_string_field(
@@ -852,6 +1117,78 @@ fn write_success_responses(
         body.push_str("\n\n");
     }
     write_http_response(stream, "200 OK", "text/event-stream", body.as_bytes())
+}
+
+fn write_held_responses(
+    stream: &mut TcpStream,
+    result: &super::VitaResponsesResult,
+    stop: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    stream
+        .set_write_timeout(Some(D29F_REQUEST_TIMEOUT))
+        .map_err(|error| format!("set held Responses write timeout: {error}"))?;
+    stream
+        .write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: keep-alive\r\nCache-Control: no-cache\r\n\r\n",
+        )
+        .map_err(|error| format!("write held Responses headers: {error}"))?;
+    let created = json!({
+        "type": "response.created",
+        "response": {
+            "id": format!("resp-{}", result.id),
+            "object": "response",
+            "status": "in_progress",
+            "model": result.model
+        }
+    });
+    write_sse_event(stream, &created)?;
+    write_sse_event(
+        stream,
+        &json!({
+            "type": "response.output_item.added",
+            "item": {
+                "type": "message",
+                "id": "msg-d29f-held",
+                "role": "assistant",
+                "status": "in_progress",
+                "content": []
+            }
+        }),
+    )?;
+    write_sse_event(stream, &json!({"type": "response.content_part.added"}))?;
+
+    // Keep the connection active with empty, non-semantic delta events, but
+    // never emit response.completed.  SSE comments are invisible to the
+    // pinned event stream's `next()` idle timer; an empty delta keeps that
+    // timer alive without changing assistant text.  The Codex turn deadline,
+    // not this listener, is responsible for submitting the interrupt.
+    let deadline = Instant::now() + D29F_TURN_TIMEOUT;
+    while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
+        write_sse_event(
+            stream,
+            &json!({"type": "response.output_text.delta", "delta": ""}),
+        )?;
+        stream
+            .flush()
+            .map_err(|error| format!("flush held Responses heartbeat: {error}"))?;
+        thread::sleep(D29F_HEARTBEAT_INTERVAL);
+    }
+    Ok(())
+}
+
+fn write_sse_event(stream: &mut TcpStream, event: &Value) -> Result<(), String> {
+    let event_type = event
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "D29-F SSE event omitted type".to_string())?;
+    let body = format!(
+        "event: {event_type}\ndata: {}\n\n",
+        serde_json::to_string(event)
+            .map_err(|error| format!("serialize D29-F SSE event: {error}"))?
+    );
+    stream
+        .write_all(body.as_bytes())
+        .map_err(|error| format!("write D29-F SSE event: {error}"))
 }
 
 fn write_failed_responses(stream: &mut TcpStream, message: &str) -> Result<(), String> {
@@ -993,6 +1330,12 @@ fn find_header_end(bytes: &[u8]) -> Option<usize> {
     bytes.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
+fn join_listener_thread(join: JoinHandle<()>) -> bool {
+    let started = Instant::now();
+    let joined = join.join().is_ok();
+    joined && started.elapsed() <= D29F_CLEANUP_TIMEOUT
+}
+
 fn wake_loopback_listener(address: SocketAddr) {
     let _ = TcpStream::connect_timeout(&address, Duration::from_millis(50));
 }
@@ -1083,32 +1426,111 @@ struct CaseRuntime {
     _workspace: TempDir,
     manager: Arc<ThreadManager>,
     thread: Option<Arc<codex_core_api::CodexThread>>,
+    thread_id: Option<ThreadId>,
     gateway: Option<VitaGatewayServer>,
     chat: Option<LocalChatMock>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShutdownStatus {
+    NotAttempted,
+    Success,
+    TimedOut,
+    Failed,
+}
+
+impl ShutdownStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NotAttempted => "not-attempted",
+            Self::Success => "success",
+            Self::TimedOut => "timed-out",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CleanupEvidence {
+    initial_shutdown: ShutdownStatus,
+    interrupt_submitted: bool,
+    final_shutdown: ShutdownStatus,
+    manager_thread_count: usize,
+    gateway_listener_joined: Option<bool>,
+    chat_listener_joined: Option<bool>,
+}
+
+#[derive(Debug)]
+struct RuntimeShutdown {
+    cleanup: CleanupEvidence,
+    gateway: Option<GatewayObservation>,
+    chat: Option<HttpObservation>,
+}
+
 impl CaseRuntime {
-    async fn shutdown(mut self) -> (Option<GatewayObservation>, Option<HttpObservation>) {
+    async fn shutdown(mut self, turn_interrupt_submitted: bool) -> Result<RuntimeShutdown, String> {
+        let mut initial_shutdown = ShutdownStatus::NotAttempted;
+        let mut interrupt_submitted = turn_interrupt_submitted;
+        let mut final_shutdown = ShutdownStatus::NotAttempted;
+
         if let Some(thread) = self.thread.take() {
-            let shutdown =
-                tokio::time::timeout(D29F_CLEANUP_TIMEOUT, thread.shutdown_and_wait()).await;
-            if shutdown.is_err() {
-                let _ = tokio::time::timeout(
-                    D29F_CLEANUP_TIMEOUT,
-                    thread.submit(codex_core_api::Op::Interrupt),
-                )
-                .await;
-                let _ =
-                    tokio::time::timeout(D29F_CLEANUP_TIMEOUT, thread.shutdown_and_wait()).await;
+            initial_shutdown = shutdown_thread_once(&thread).await;
+            if initial_shutdown != ShutdownStatus::Success {
+                // A turn deadline may already have submitted an interrupt.  A
+                // second bounded submission here is intentional: cleanup
+                // must independently prove that the thread can be stopped.
+                interrupt_submitted |= submit_interrupt_bounded(&thread).await;
             }
-            let thread_id = self.manager.list_thread_ids().await.into_iter().next();
-            if let Some(thread_id) = thread_id {
-                let _ = self.manager.remove_thread(&thread_id).await;
+            final_shutdown = shutdown_thread_once(&thread).await;
+
+            // Do not remove a manager entry until the final shutdown result
+            // is known.  The identity check also avoids removing a replacement
+            // thread if a future manager implementation reuses an id.
+            if final_shutdown == ShutdownStatus::Success {
+                if let Some(thread_id) = self.thread_id.as_ref() {
+                    let _ = self
+                        .manager
+                        .remove_thread_if_matches(thread_id, &thread)
+                        .await;
+                }
             }
         }
-        let gateway = self.gateway.take().map(VitaGatewayServer::shutdown);
-        let chat = self.chat.take().map(LocalChatMock::shutdown);
-        (gateway, chat)
+
+        let manager_thread_count = self.manager.list_thread_ids().await.len();
+        let (gateway, gateway_listener_joined) = match self.gateway.take() {
+            Some(gateway) => {
+                let (observation, joined) = gateway.shutdown();
+                (Some(observation), Some(joined))
+            }
+            None => (None, None),
+        };
+        let (chat, chat_listener_joined) = match self.chat.take() {
+            Some(chat) => {
+                let (observation, joined) = chat.shutdown();
+                (Some(observation), Some(joined))
+            }
+            None => (None, None),
+        };
+        let cleanup = CleanupEvidence {
+            initial_shutdown,
+            interrupt_submitted,
+            final_shutdown,
+            manager_thread_count,
+            gateway_listener_joined,
+            chat_listener_joined,
+        };
+        if cleanup.final_shutdown != ShutdownStatus::Success
+            || cleanup.manager_thread_count != 0
+            || cleanup.gateway_listener_joined == Some(false)
+            || cleanup.chat_listener_joined == Some(false)
+        {
+            return Err("D29-F bounded cleanup failed".to_string());
+        }
+        Ok(RuntimeShutdown {
+            cleanup,
+            gateway,
+            chat,
+        })
     }
 }
 
@@ -1119,28 +1541,101 @@ struct TurnResult {
     terminal_message: Option<String>,
     terminal_error: Option<String>,
     event_count: usize,
+    turn_timed_out: bool,
+    interrupt_submitted: bool,
 }
 
-async fn collect_turn(thread: &codex_core_api::CodexThread) -> Result<TurnResult, String> {
+async fn shutdown_thread_once(thread: &Arc<codex_core_api::CodexThread>) -> ShutdownStatus {
+    match tokio::time::timeout(D29F_CLEANUP_TIMEOUT, thread.shutdown_and_wait()).await {
+        Ok(Ok(())) => ShutdownStatus::Success,
+        Ok(Err(_)) => ShutdownStatus::Failed,
+        Err(_) => ShutdownStatus::TimedOut,
+    }
+}
+
+async fn submit_interrupt_bounded(thread: &Arc<codex_core_api::CodexThread>) -> bool {
+    matches!(
+        tokio::time::timeout(D29F_CLEANUP_TIMEOUT, thread.submit(Op::Interrupt)).await,
+        Ok(Ok(_))
+    )
+}
+
+async fn collect_turn(
+    thread: &Arc<codex_core_api::CodexThread>,
+    turn_deadline: Duration,
+) -> Result<TurnResult, String> {
     let start = Instant::now();
-    tokio::time::timeout(
-        D29F_TURN_TIMEOUT,
+    let deadline = start + turn_deadline;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        let interrupt_submitted = submit_interrupt_bounded(thread).await;
+        return Ok(TurnResult {
+            elapsed: start.elapsed(),
+            assistant_messages: Vec::new(),
+            terminal_message: None,
+            terminal_error: Some("D29-F turn deadline expired".to_string()),
+            event_count: 0,
+            turn_timed_out: true,
+            interrupt_submitted,
+        });
+    }
+    match tokio::time::timeout(
+        remaining,
         thread.start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
             text: D29F_PROMPT.to_string(),
             text_elements: Vec::new(),
         }])),
     )
     .await
-    .map_err(|_| "D29-F turn submission timed out".to_string())?
-    .map_err(|error| format!("D29-F turn submission failed: {error}"))?;
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => return Err(format!("D29-F turn submission failed: {error}")),
+        Err(_) => {
+            let interrupt_submitted = submit_interrupt_bounded(thread).await;
+            return Ok(TurnResult {
+                elapsed: start.elapsed(),
+                assistant_messages: Vec::new(),
+                terminal_message: None,
+                terminal_error: Some("D29-F turn deadline expired".to_string()),
+                event_count: 0,
+                turn_timed_out: true,
+                interrupt_submitted,
+            });
+        }
+    }
 
     let mut assistant_messages = Vec::new();
     let mut event_count = 0;
     loop {
-        let event = tokio::time::timeout(D29F_TURN_TIMEOUT, thread.next_event())
-            .await
-            .map_err(|_| "D29-F waiting for terminal turn event timed out".to_string())?
-            .map_err(|error| format!("D29-F event stream failed: {error}"))?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            let interrupt_submitted = submit_interrupt_bounded(thread).await;
+            return Ok(TurnResult {
+                elapsed: start.elapsed(),
+                assistant_messages,
+                terminal_message: None,
+                terminal_error: Some("D29-F turn deadline expired".to_string()),
+                event_count,
+                turn_timed_out: true,
+                interrupt_submitted,
+            });
+        }
+        let event = match tokio::time::timeout(remaining, thread.next_event()).await {
+            Ok(Ok(event)) => event,
+            Ok(Err(error)) => return Err(format!("D29-F event stream failed: {error}")),
+            Err(_) => {
+                let interrupt_submitted = submit_interrupt_bounded(thread).await;
+                return Ok(TurnResult {
+                    elapsed: start.elapsed(),
+                    assistant_messages,
+                    terminal_message: None,
+                    terminal_error: Some("D29-F turn deadline expired".to_string()),
+                    event_count,
+                    turn_timed_out: true,
+                    interrupt_submitted,
+                });
+            }
+        };
         event_count += 1;
         match event.msg {
             EventMsg::AgentMessage(message) => assistant_messages.push(message.message),
@@ -1151,19 +1646,19 @@ async fn collect_turn(thread: &codex_core_api::CodexThread) -> Result<TurnResult
                     terminal_message: complete.last_agent_message,
                     terminal_error: complete.error.map(|error| error.message),
                     event_count,
+                    turn_timed_out: false,
+                    interrupt_submitted: false,
                 });
             }
             _ => {}
-        }
-        if start.elapsed() >= D29F_TURN_TIMEOUT {
-            return Err("D29-F turn exceeded its terminal deadline".to_string());
         }
     }
 }
 
 async fn start_runtime(
     mode: Option<ChatMockMode>,
-    start_gateway: bool,
+    listener_available: bool,
+    response_mode: GatewayResponseMode,
 ) -> Result<(CaseRuntime, VitaAgentRuntimeProfile, HostCanary), String> {
     let app_data = tempdir().map_err(|error| format!("create Vita app-data temp root: {error}"))?;
     let workspace =
@@ -1202,8 +1697,8 @@ async fn start_runtime(
         .map_err(|error| format!("configure D29-F provider: {error}"))?;
 
     // Reserve an ephemeral loopback port before deriving the provider.  When
-    // start_gateway is false the listener is intentionally dropped to prove a
-    // not-ready gateway fails boundedly and never falls back to OpenAI.
+    // listener_available is false, GatewayReady is still constructed and the
+    // listener is then dropped; this is the separate transport-negative case.
     let reservation = TcpListener::bind(("127.0.0.1", 0))
         .map_err(|error| format!("reserve D29-F gateway port: {error}"))?;
     let binding = VitaGatewayBinding::for_owned_private_listener(
@@ -1216,18 +1711,20 @@ async fn start_runtime(
     let ready = authority
         .prepare_gateway(binding)
         .map_err(|error| format!("prepare D29-F gateway: {error}"))?;
-    let gateway = if start_gateway {
-        Some(VitaGatewayServer::start(reservation, ready.clone()))
+    let gateway = if listener_available {
+        Some(VitaGatewayServer::start(
+            reservation,
+            ready.clone(),
+            response_mode,
+        ))
     } else {
         drop(reservation);
         None
     };
-    let entrypoint = VitaAgentEntrypoint::initialize_with_gateway_for_tests(
-        profile.clone(),
-        ready.derived_codex_provider(),
-    )
-    .await
-    .map_err(|error| format!("compile D29-F provider into Codex config: {error}"))?;
+    let entrypoint =
+        VitaAgentEntrypoint::initialize_with_gateway_for_tests(profile.clone(), &ready)
+            .await
+            .map_err(|error| format!("compile D29-F provider into Codex config: {error}"))?;
     assert_gateway_config(&entrypoint, ready.derived_codex_provider())?;
 
     let config = entrypoint.config().clone();
@@ -1266,6 +1763,7 @@ async fn start_runtime(
             _workspace: workspace,
             manager,
             thread: Some(new_thread.thread),
+            thread_id: Some(new_thread.thread_id),
             gateway,
             chat,
         },
@@ -1295,11 +1793,10 @@ fn assert_gateway_config(
     {
         return Err("D29-F actual Codex config did not match Vita gateway derivation".to_string());
     }
-    if config.codex_home.as_path() == Path::new(r"C:\Users\zuo\.codex")
-        || config.experimental_thread_store
-            != (codex_core_api::ThreadStoreConfig::InMemory {
-                id: VITA_AGENT_RUNTIME_ID.to_string(),
-            })
+    if config.experimental_thread_store
+        != (codex_core_api::ThreadStoreConfig::InMemory {
+            id: VITA_AGENT_RUNTIME_ID.to_string(),
+        })
         || config.check_for_update_on_startup
         || config.analytics_enabled != Some(false)
         || config.feedback_enabled
@@ -1320,23 +1817,70 @@ fn unused_loopback_base_url() -> String {
     format!("http://127.0.0.1:{port}/v1")
 }
 
-async fn run_case(mode: Option<ChatMockMode>, start_gateway: bool) -> Result<CaseReport, String> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NotReadyEvidence {
+    authority_state: VitaProviderState,
+    gateway_ready_constructed: bool,
+    codex_config_compiled: bool,
+    real_turn_started: bool,
+}
+
+fn prove_configured_but_not_ready() -> Result<NotReadyEvidence, String> {
+    let provider = ProviderProfile::new_for_test_localhost(
+        D29F_PROVIDER_ID,
+        "D29-F configured-only provider",
+        ProviderProtocol::OpenAiChatCompletions,
+        &unused_loopback_base_url(),
+        D29F_MODEL,
+        None,
+        D29F_REQUEST_TIMEOUT,
+        ProviderRetryPolicy::default(),
+        ProviderCapabilities::none(),
+    )
+    .map_err(|error| format!("create configured-only provider: {error}"))?;
+    let authority = super::VitaProviderAuthority::configure(provider)
+        .map_err(|error| format!("configure configured-only provider: {error}"))?;
+    if authority.state() != VitaProviderState::ConfiguredValidated {
+        return Err("D29-F configured-only authority did not remain validated".to_string());
+    }
+    // Deliberately do not call prepare_gateway.  The test-only Codex config
+    // compiler accepts GatewayReadyProvider, not DerivedCodexProvider, so this
+    // state has no executable Codex-start seam by construction.
+    Ok(NotReadyEvidence {
+        authority_state: authority.state(),
+        gateway_ready_constructed: false,
+        codex_config_compiled: false,
+        real_turn_started: false,
+    })
+}
+
+async fn run_case(
+    mode: Option<ChatMockMode>,
+    listener_available: bool,
+    response_mode: GatewayResponseMode,
+    turn_deadline: Duration,
+) -> Result<CaseReport, String> {
     let before = host_canary();
-    let (runtime, profile, runtime_canary) = start_runtime(mode, start_gateway).await?;
+    let (runtime, profile, runtime_canary) =
+        start_runtime(mode, listener_available, response_mode).await?;
     let turn = match runtime.thread.as_ref() {
-        Some(thread) => collect_turn(thread).await,
+        Some(thread) => collect_turn(thread, turn_deadline).await,
         None => Err("D29-F runtime did not contain a thread".to_string()),
     };
-    let (gateway, chat) = runtime.shutdown().await;
+    let turn_interrupt_submitted = turn
+        .as_ref()
+        .ok()
+        .is_some_and(|turn| turn.interrupt_submitted);
+    let shutdown = runtime.shutdown(turn_interrupt_submitted).await?;
     let after = host_canary();
-    if before != after || runtime_canary != before {
-        return Err("D29-F parent environment or user Codex directory canary changed".to_string());
-    }
+    canary_unchanged_result(&before, &runtime_canary)?;
+    canary_unchanged_result(&before, &after)?;
     Ok(CaseReport {
         profile,
         turn,
-        gateway,
-        chat,
+        cleanup: shutdown.cleanup,
+        gateway: shutdown.gateway,
+        chat: shutdown.chat,
     })
 }
 
@@ -1344,6 +1888,7 @@ async fn run_case(mode: Option<ChatMockMode>, start_gateway: bool) -> Result<Cas
 struct CaseReport {
     profile: VitaAgentRuntimeProfile,
     turn: Result<TurnResult, String>,
+    cleanup: CleanupEvidence,
     gateway: Option<GatewayObservation>,
     chat: Option<HttpObservation>,
 }
@@ -1366,9 +1911,14 @@ fn d29f_first_real_codex_turn_and_bounded_negative_paths() {
 }
 
 async fn d29f_first_real_codex_turn_and_bounded_negative_paths_body() {
-    let success = run_case(Some(ChatMockMode::Success), true)
-        .await
-        .expect("D29-F success case should run");
+    let success = run_case(
+        Some(ChatMockMode::Success),
+        true,
+        GatewayResponseMode::Normal,
+        D29F_TURN_TIMEOUT,
+    )
+    .await
+    .expect("D29-F success case should run");
     let success_turn = success.turn.expect("D29-F success turn should terminate");
     assert_eq!(success_turn.terminal_error, None);
     assert_eq!(success_turn.terminal_message.as_deref(), Some(D29F_REPLY));
@@ -1378,6 +1928,14 @@ async fn d29f_first_real_codex_turn_and_bounded_negative_paths_body() {
         .any(|message| message == D29F_REPLY));
     assert!(success_turn.elapsed < D29F_TURN_TIMEOUT);
     assert!(success_turn.event_count > 0);
+    assert!(!success_turn.turn_timed_out);
+    assert!(!success_turn.interrupt_submitted);
+    assert_eq!(success.cleanup.initial_shutdown, ShutdownStatus::Success);
+    assert_eq!(success.cleanup.final_shutdown, ShutdownStatus::Success);
+    assert!(!success.cleanup.interrupt_submitted);
+    assert_eq!(success.cleanup.manager_thread_count, 0);
+    assert_eq!(success.cleanup.gateway_listener_joined, Some(true));
+    assert_eq!(success.cleanup.chat_listener_joined, Some(true));
     let success_gateway = success.gateway.expect("D29-F success gateway evidence");
     let success_chat = success.chat.expect("D29-F success Chat evidence");
     assert_eq!(success_gateway.request_count, 1);
@@ -1388,9 +1946,22 @@ async fn d29f_first_real_codex_turn_and_bounded_negative_paths_body() {
     assert_eq!(success_gateway.request_model.as_deref(), Some(D29F_MODEL));
     assert_eq!(success_gateway.parallel_tool_calls, Some(true));
     assert_eq!(
+        success_gateway.reasoning_handling,
+        ResponsesFieldHandling::DefaultSummaryAutoInert
+    );
+    assert_eq!(
+        success_gateway.stream_options_handling,
+        ResponsesFieldHandling::Absent
+    );
+    assert_eq!(
+        success_gateway.text_handling,
+        ResponsesFieldHandling::Absent
+    );
+    assert_eq!(
         success_gateway.response_path.as_deref(),
         Some("responses-sse")
     );
+    assert!(success_gateway.terminal_response_emitted);
     assert!(success_gateway.bridge_error.is_none());
     assert!(success_gateway
         .message_texts
@@ -1408,7 +1979,7 @@ async fn d29f_first_real_codex_turn_and_bounded_negative_paths_body() {
             .as_ref()
             .and_then(|body| body.get("parallel_tool_calls"))
             .and_then(Value::as_bool),
-        Some(true)
+        None
     );
     assert!(success_chat
         .body
@@ -1416,7 +1987,7 @@ async fn d29f_first_real_codex_turn_and_bounded_negative_paths_body() {
         .and_then(|body| body.get("tools"))
         .is_none());
     println!(
-        "D29-F PASS codex_gateway={} codex_path=/v1/responses chat_gateway={} chat_path=/v1/chat/completions codex_requests={} chat_requests={} selected_model={} terminal_output={} external_endpoint_calls=0 listeners_shutdown=true",
+        "D29-F PASS codex_gateway={} codex_path=/v1/responses chat_gateway={} chat_path=/v1/chat/completions codex_requests={} chat_requests={} selected_model={} terminal_output={} reasoning={} stream_options={} text={} terminal_response=emitted external_endpoint_calls=0 listeners_shutdown=true manager_threads=0 raw_canary_values=none",
         success_gateway
             .bind
             .as_deref()
@@ -1428,44 +1999,138 @@ async fn d29f_first_real_codex_turn_and_bounded_negative_paths_body() {
         success_gateway.request_count,
         success_chat.request_count,
         D29F_MODEL,
-        D29F_REPLY
+        D29F_REPLY,
+        success_gateway.reasoning_handling.as_str(),
+        success_gateway.stream_options_handling.as_str(),
+        success_gateway.text_handling.as_str()
     );
 
-    let malformed = run_case(Some(ChatMockMode::MalformedBody), true)
-        .await
-        .expect("D29-F malformed case should run");
+    let malformed = run_case(
+        Some(ChatMockMode::MalformedBody),
+        true,
+        GatewayResponseMode::Normal,
+        D29F_TURN_TIMEOUT,
+    )
+    .await
+    .expect("D29-F malformed case should run");
     assert_case_failed(&malformed, "invalid chat completion JSON");
     assert_eq!(malformed.gateway.as_ref().unwrap().request_count, 1);
     assert_eq!(malformed.chat.as_ref().unwrap().request_count, 1);
 
-    let tool_call = run_case(Some(ChatMockMode::UnexpectedToolCall), true)
-        .await
-        .expect("D29-F tool-call case should run");
+    let tool_call = run_case(
+        Some(ChatMockMode::UnexpectedToolCall),
+        true,
+        GatewayResponseMode::Normal,
+        D29F_TURN_TIMEOUT,
+    )
+    .await
+    .expect("D29-F tool-call case should run");
     assert_case_failed(&tool_call, "tools");
     assert_eq!(tool_call.gateway.as_ref().unwrap().request_count, 1);
     assert_eq!(tool_call.chat.as_ref().unwrap().request_count, 1);
 
-    let timeout_case = run_case(Some(ChatMockMode::Delayed), true)
-        .await
-        .expect("D29-F timeout case should run");
+    let timeout_case = run_case(
+        Some(ChatMockMode::Delayed),
+        true,
+        GatewayResponseMode::Normal,
+        D29F_TURN_TIMEOUT,
+    )
+    .await
+    .expect("D29-F timeout case should run");
     assert_case_failed(&timeout_case, "timed out");
     assert!(timeout_case.turn.as_ref().err().is_none());
     assert!(timeout_case.gateway.as_ref().unwrap().request_count <= 1);
     assert_eq!(timeout_case.chat.as_ref().unwrap().request_count, 1);
 
-    let unavailable = run_case(None, true)
+    let unavailable = run_case(None, true, GatewayResponseMode::Normal, D29F_TURN_TIMEOUT)
         .await
         .expect("D29-F unavailable-provider case should run");
     assert_case_failed(&unavailable, "transport error");
     assert_eq!(unavailable.gateway.as_ref().unwrap().request_count, 1);
     assert!(unavailable.chat.is_none());
 
-    let not_ready = run_case(Some(ChatMockMode::Success), false)
-        .await
-        .expect("D29-F not-ready gateway case should run");
-    assert_case_failed(&not_ready, "503");
-    assert!(not_ready.gateway.is_none());
-    assert_eq!(not_ready.chat.as_ref().unwrap().request_count, 0);
+    let listener_unavailable = run_case(
+        Some(ChatMockMode::Success),
+        false,
+        GatewayResponseMode::Normal,
+        D29F_TURN_TIMEOUT,
+    )
+    .await
+    .expect("D29-F listener-unavailable case should run");
+    assert_case_failed(&listener_unavailable, "503");
+    assert!(listener_unavailable.gateway.is_none());
+    assert_eq!(listener_unavailable.chat.as_ref().unwrap().request_count, 0);
+    assert_eq!(
+        listener_unavailable.cleanup.final_shutdown,
+        ShutdownStatus::Success
+    );
+    assert_eq!(listener_unavailable.cleanup.manager_thread_count, 0);
+    assert_eq!(listener_unavailable.cleanup.gateway_listener_joined, None);
+    assert_eq!(
+        listener_unavailable.cleanup.chat_listener_joined,
+        Some(true)
+    );
+
+    let not_ready = prove_configured_but_not_ready().expect("D29-F not-ready proof should run");
+    assert_eq!(
+        not_ready.authority_state,
+        VitaProviderState::ConfiguredValidated
+    );
+    assert!(!not_ready.gateway_ready_constructed);
+    assert!(!not_ready.codex_config_compiled);
+    assert!(!not_ready.real_turn_started);
+    println!(
+        "D29-F NOT-READY PASS authority_state={} gateway_ready=false codex_config=false real_turn=false",
+        not_ready.authority_state
+    );
+
+    let true_timeout = run_case(
+        Some(ChatMockMode::Success),
+        true,
+        GatewayResponseMode::HoldTerminalResponse,
+        D29F_TRUE_TURN_DEADLINE,
+    )
+    .await
+    .expect("D29-F true-timeout case should run");
+    let true_timeout_turn = true_timeout
+        .turn
+        .as_ref()
+        .expect("D29-F true-timeout turn should produce bounded evidence");
+    assert!(true_timeout_turn.turn_timed_out);
+    assert!(true_timeout_turn.interrupt_submitted);
+    assert_case_failed(&true_timeout, "turn deadline expired");
+    assert_eq!(true_timeout.gateway.as_ref().unwrap().request_count, 1);
+    assert_eq!(
+        true_timeout
+            .gateway
+            .as_ref()
+            .unwrap()
+            .response_path
+            .as_deref(),
+        Some("responses-sse-held")
+    );
+    assert!(
+        !true_timeout
+            .gateway
+            .as_ref()
+            .unwrap()
+            .terminal_response_emitted
+    );
+    assert_eq!(true_timeout.chat.as_ref().unwrap().request_count, 1);
+    assert_eq!(
+        true_timeout.cleanup.initial_shutdown,
+        ShutdownStatus::Success
+    );
+    assert!(true_timeout.cleanup.interrupt_submitted);
+    assert_eq!(true_timeout.cleanup.final_shutdown, ShutdownStatus::Success);
+    assert_eq!(true_timeout.cleanup.manager_thread_count, 0);
+    assert_eq!(true_timeout.cleanup.gateway_listener_joined, Some(true));
+    assert_eq!(true_timeout.cleanup.chat_listener_joined, Some(true));
+    println!(
+        "D29-F TIMEOUT PASS whole_turn_deadline_expired=true interrupt_submitted=true initial_shutdown={} final_shutdown={} manager_threads=0 gateway_listener=joined chat_listener=joined",
+        true_timeout.cleanup.initial_shutdown.as_str(),
+        true_timeout.cleanup.final_shutdown.as_str()
+    );
 
     let authority = super::VitaProviderAuthority::not_configured();
     let binding = VitaGatewayBinding::for_owned_private_listener(1_234)
@@ -1520,7 +2185,10 @@ async fn d29f_first_real_codex_turn_and_bounded_negative_paths_body() {
         entrypoint.prepare_thread_start(),
         Err(VitaAgentError::NotConfiguredProvider)
     ));
-    assert_eq!(canary_before, host_canary());
+    assert_canary_unchanged(&canary_before, &host_canary());
+    println!(
+        "D29-F CANARY PASS parent_environment=unchanged user_codex_state=unchanged raw_values=none"
+    );
 }
 
 fn assert_case_failed(case: &CaseReport, expected: &str) {

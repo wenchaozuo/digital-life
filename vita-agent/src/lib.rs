@@ -29,6 +29,7 @@ pub use provider_gateway::{
 
 pub const VITA_AGENT_RUNTIME_ID: &str = "vita-agent";
 pub const VITA_UNCONFIGURED_PROVIDER_ID: &str = "vita-unconfigured";
+pub const VITA_GATEWAY_PROVIDER_ID: &str = "vita-gateway";
 pub const VITA_PLACEHOLDER_MODEL_ID: &str = "vita-unconfigured-model";
 pub const VITA_PLACEHOLDER_BASE_URL: &str = "http://127.0.0.1:9/v1";
 pub const VITA_OWNERSHIP_MARKER_FILE: &str = ".vita-agent-runtime";
@@ -364,6 +365,14 @@ impl VitaAgentRuntimeProfile {
             "apply_patch_freeform",
             "hooks",
             "request_permissions_tool",
+            "view_image",
+            "sleep_tool",
+            "deferred_executor",
+            "standalone_web_search",
+            "token_budget",
+            "current_time_reminder",
+            "memories",
+            "artifact",
             "remote_control",
             "remote_models",
             "network_proxy",
@@ -460,6 +469,19 @@ impl VitaAgentRuntimeProfile {
                 table([("enabled", TomlValue::Boolean(false))]),
             ),
             ("mcp_servers".to_string(), TomlValue::Table(Map::new())),
+            (
+                "tools".to_string(),
+                table([
+                    (
+                        "experimental_request_user_input",
+                        table([("enabled", TomlValue::Boolean(false))]),
+                    ),
+                    (
+                        "update_plan",
+                        table([("enabled", TomlValue::Boolean(false))]),
+                    ),
+                ]),
+            ),
             ("plugins".to_string(), TomlValue::Table(Map::new())),
             ("marketplaces".to_string(), TomlValue::Table(Map::new())),
             (
@@ -496,6 +518,63 @@ impl VitaAgentRuntimeProfile {
             ),
             ("features".to_string(), TomlValue::Table(features)),
         ]
+    }
+
+    #[cfg(test)]
+    fn cli_overrides_for_gateway(
+        &self,
+        provider: &provider_gateway::DerivedCodexProvider,
+    ) -> Vec<(String, TomlValue)> {
+        let mut overrides = self.cli_overrides();
+        let mut vita_provider = Map::new();
+        vita_provider.insert(
+            "name".to_string(),
+            TomlValue::String("Vita Gateway".to_string()),
+        );
+        vita_provider.insert(
+            "base_url".to_string(),
+            TomlValue::String(provider.base_url().to_string()),
+        );
+        vita_provider.insert(
+            "wire_api".to_string(),
+            TomlValue::String(provider.wire_api().to_string()),
+        );
+        vita_provider.insert(
+            "requires_openai_auth".to_string(),
+            TomlValue::Boolean(provider.requires_openai_auth()),
+        );
+        vita_provider.insert("request_max_retries".to_string(), TomlValue::Integer(0));
+        vita_provider.insert("stream_max_retries".to_string(), TomlValue::Integer(0));
+        vita_provider.insert(
+            "stream_idle_timeout_ms".to_string(),
+            TomlValue::Integer(500),
+        );
+        vita_provider.insert("supports_websockets".to_string(), TomlValue::Boolean(false));
+        vita_provider.insert(
+            "supports_standalone_web_search".to_string(),
+            TomlValue::Boolean(false),
+        );
+
+        for (key, value) in &mut overrides {
+            match key.as_str() {
+                "model_provider" => {
+                    *value = TomlValue::String(provider.model_provider_id().to_string());
+                }
+                "model" => {
+                    *value = TomlValue::String(provider.model().to_string());
+                }
+                "model_providers" => {
+                    let mut model_providers = Map::new();
+                    model_providers.insert(
+                        provider.model_provider_id().to_string(),
+                        TomlValue::Table(vita_provider.clone()),
+                    );
+                    *value = TomlValue::Table(model_providers);
+                }
+                _ => {}
+            }
+        }
+        overrides
     }
 }
 
@@ -740,6 +819,79 @@ impl VitaAgentEntrypoint {
         if config.permissions.network_sandbox_policy().is_enabled() {
             return Err(VitaAgentError::KernelInvariant(
                 "Vita network policy must remain closed",
+            ));
+        }
+
+        Ok(Self {
+            profile,
+            config: Arc::new(config),
+            initialize: InitializeParams {
+                client_info: ClientInfo {
+                    name: VITA_AGENT_RUNTIME_ID.to_string(),
+                    title: Some("Vita Agent".to_string()),
+                    version: env!("CARGO_PKG_VERSION").to_string(),
+                },
+                capabilities: Some(InitializeCapabilities::default()),
+            },
+        })
+    }
+
+    /// Builds the same private Codex configuration boundary for the D29-F
+    /// localhost proof.  The provider is already validated and the listener
+    /// binding is owned by the caller; this helper only compiles the derived
+    /// provider into the real upstream `Config` used by `ThreadManager`.
+    #[cfg(test)]
+    pub(crate) async fn initialize_with_gateway_for_tests(
+        profile: VitaAgentRuntimeProfile,
+        provider: &provider_gateway::DerivedCodexProvider,
+    ) -> Result<Self, VitaAgentError> {
+        profile.validate_private_namespace()?;
+        ensure_vita_config_sources_absent(&profile)?;
+        ensure_vita_auth_source_absent(&profile)?;
+        profile.ensure_private_runtime_layout()?;
+
+        let config = ConfigBuilder::default()
+            .codex_home(profile.kernel_home().to_path_buf())
+            .fallback_cwd(Some(profile.workspace_root().to_path_buf()))
+            .cli_overrides(profile.cli_overrides_for_gateway(provider))
+            .loader_overrides(profile.loader_overrides())
+            .strict_config(true)
+            .build()
+            .await
+            .map_err(VitaAgentError::KernelConfig)?;
+
+        if config.model_provider_id != provider.model_provider_id()
+            || config.model.as_deref() != Some(provider.model())
+            || config.model_provider.base_url.as_deref() != Some(provider.base_url())
+            || config.model_provider.wire_api.to_string() != provider.wire_api()
+            || config.model_provider.requires_openai_auth != provider.requires_openai_auth()
+        {
+            return Err(VitaAgentError::KernelInvariant(
+                "derived Vita gateway provider was not compiled into Codex config",
+            ));
+        }
+        if config.model_provider.env_key.is_some()
+            || config.model_provider.experimental_bearer_token.is_some()
+            || config.model_provider.auth.is_some()
+            || config.model_provider.aws.is_some()
+        {
+            return Err(VitaAgentError::KernelInvariant(
+                "Vita gateway provider must not use ambient or stock credential sources",
+            ));
+        }
+        if config.codex_home.as_path() != profile.kernel_home()
+            || config.cwd.as_path() != profile.workspace_root()
+            || config.check_for_update_on_startup
+            || config.analytics_enabled != Some(false)
+            || config.feedback_enabled
+            || !matches!(
+                &config.experimental_thread_store,
+                ThreadStoreConfig::InMemory { id } if id == VITA_AGENT_RUNTIME_ID
+            )
+            || config.permissions.network_sandbox_policy().is_enabled()
+        {
+            return Err(VitaAgentError::KernelInvariant(
+                "D29-F Codex config escaped the bounded Vita runtime profile",
             ));
         }
 

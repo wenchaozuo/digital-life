@@ -14,7 +14,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::{Host, Url};
 
-use super::{VitaAgentError, VITA_AGENT_RUNTIME_ID};
+use super::{VitaAgentError, VITA_AGENT_RUNTIME_ID, VITA_GATEWAY_PROVIDER_ID};
+
+#[cfg(test)]
+#[path = "d29f.rs"]
+mod d29f;
 
 /// The provider wire protocols owned by Digital Life's provider domain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -785,7 +789,7 @@ pub(crate) struct DerivedCodexProvider {
 impl DerivedCodexProvider {
     fn new(model: &str, binding: &VitaGatewayBinding) -> Self {
         Self {
-            model_provider_id: "vita-gateway",
+            model_provider_id: VITA_GATEWAY_PROVIDER_ID,
             model: model.to_string(),
             base_url: binding.base_url.clone(),
             wire_api: "responses",
@@ -908,13 +912,14 @@ where
                 protocol: self.ready.profile.protocol,
             });
         }
-        if request.options.stream {
-            return Err(VitaAgentError::GatewayProtocol(
-                "streaming transport is represented but not enabled in this foundation".to_string(),
-            ));
-        }
-
-        let mapped = map_responses_request_to_chat(request, &self.ready.profile)?;
+        // Codex's Responses client requires a streaming Responses response, but
+        // D29-F deliberately keeps the downstream Chat mock non-streaming.  The
+        // Vita listener owns that protocol boundary: validate the Codex request
+        // as streaming, then issue one bounded non-streaming Chat request and
+        // re-emit its result as Responses SSE.
+        let mut downstream_request = request.clone();
+        downstream_request.options.stream = false;
+        let mapped = map_responses_request_to_chat(&downstream_request, &self.ready.profile)?;
         let body = serde_json::to_vec(&mapped).map_err(|_| {
             VitaAgentError::GatewayProtocol(
                 "could not serialize chat completion request".to_string(),
@@ -947,6 +952,12 @@ where
                     "provider returned invalid chat completion JSON".to_string(),
                 )
             })?;
+        if response.model != self.ready.profile.model {
+            return Err(VitaAgentError::GatewayProtocol(
+                "provider response model must match the validated Digital Life provider profile"
+                    .to_string(),
+            ));
+        }
         map_chat_response_to_responses(response)
     }
 }
@@ -1096,12 +1107,7 @@ fn map_responses_request_to_chat(
         require_capability(profile.capabilities, ProviderCapability::Tools)?;
         require_gateway_capability(ProviderCapability::Tools)?;
     }
-    if request.options.parallel_tools {
-        if request.options.tools.is_empty() {
-            return Err(VitaAgentError::GatewayProtocol(
-                "parallel tool calls require at least one tool definition".to_string(),
-            ));
-        }
+    if request.options.parallel_tools && !request.options.tools.is_empty() {
         require_capability(profile.capabilities, ProviderCapability::ParallelTools)?;
         require_gateway_capability(ProviderCapability::ParallelTools)?;
     }

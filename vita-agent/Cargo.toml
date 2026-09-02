@@ -28,6 +28,7 @@ toml = "0.9.5"
 url = "=2.5.8"
 
 [dev-dependencies]
+codex-core-api = { git = "https://github.com/openai/codex.git", rev = "316795b3cf2a45e90d121d9f46499d4658b2645c" }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 

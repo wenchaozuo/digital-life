@@ -1782,6 +1782,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-arg0"
+version = "0.152.0"
+source = "git+https://github.com/openai/codex.git?rev=316795b3cf2a45e90d121d9f46499d4658b2645c#316795b3cf2a45e90d121d9f46499d4658b2645c"
+dependencies = [
+ "anyhow",
+ "codex-apply-patch",
+ "codex-async-utils",
+ "codex-exec-server",
+ "codex-install-context",
+ "codex-linux-sandbox",
+ "codex-sandboxing",
+ "codex-shell-escalation",
+ "codex-utils-absolute-path",
+ "codex-utils-home-dir",
+ "codex-windows-sandbox",
+ "dotenvy",
+ "pathdiff",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "codex-async-utils"
 version = "0.152.0"
 source = "git+https://github.com/openai/codex.git?rev=316795b3cf2a45e90d121d9f46499d4658b2645c#316795b3cf2a45e90d121d9f46499d4658b2645c"
@@ -2048,6 +2070,30 @@ dependencies = [
  "uuid",
  "which",
  "whoami 1.6.1",
+]
+
+[[package]]
+name = "codex-core-api"
+version = "0.152.0"
+source = "git+https://github.com/openai/codex.git?rev=316795b3cf2a45e90d121d9f46499d4658b2645c#316795b3cf2a45e90d121d9f46499d4658b2645c"
+dependencies = [
+ "codex-analytics",
+ "codex-app-server-protocol",
+ "codex-arg0",
+ "codex-config",
+ "codex-core",
+ "codex-exec-server",
+ "codex-extension-api",
+ "codex-features",
+ "codex-history",
+ "codex-home",
+ "codex-image-generation-extension",
+ "codex-login",
+ "codex-model-provider-info",
+ "codex-models-manager",
+ "codex-protocol",
+ "codex-state",
+ "codex-utils-absolute-path",
 ]
 
 [[package]]
@@ -2332,6 +2378,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-home"
+version = "0.152.0"
+source = "git+https://github.com/openai/codex.git?rev=316795b3cf2a45e90d121d9f46499d4658b2645c#316795b3cf2a45e90d121d9f46499d4658b2645c"
+dependencies = [
+ "codex-extension-api",
+ "codex-utils-absolute-path",
+ "tokio",
+]
+
+[[package]]
 name = "codex-hooks"
 version = "0.152.0"
 source = "git+https://github.com/openai/codex.git?rev=316795b3cf2a45e90d121d9f46499d4658b2645c#316795b3cf2a45e90d121d9f46499d4658b2645c"
@@ -2384,6 +2440,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-image-generation-extension"
+version = "0.152.0"
+source = "git+https://github.com/openai/codex.git?rev=316795b3cf2a45e90d121d9f46499d4658b2645c#316795b3cf2a45e90d121d9f46499d4658b2645c"
+dependencies = [
+ "base64 0.22.1",
+ "codex-api",
+ "codex-core",
+ "codex-exec-server",
+ "codex-extension-api",
+ "codex-extension-items",
+ "codex-login",
+ "codex-model-provider",
+ "codex-model-provider-info",
+ "codex-protocol",
+ "codex-tools",
+ "codex-utils-absolute-path",
+ "codex-utils-image",
+ "codex-utils-path-uri",
+ "http 1.4.0",
+ "schemars 0.8.22",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "codex-install-context"
 version = "0.152.0"
 source = "git+https://github.com/openai/codex.git?rev=316795b3cf2a45e90d121d9f46499d4658b2645c#316795b3cf2a45e90d121d9f46499d4658b2645c"
@@ -2402,6 +2484,29 @@ source = "git+https://github.com/openai/codex.git?rev=316795b3cf2a45e90d121d9f46
 dependencies = [
  "keyring",
  "tracing",
+]
+
+[[package]]
+name = "codex-linux-sandbox"
+version = "0.152.0"
+source = "git+https://github.com/openai/codex.git?rev=316795b3cf2a45e90d121d9f46499d4658b2645c#316795b3cf2a45e90d121d9f46499d4658b2645c"
+dependencies = [
+ "clap",
+ "codex-install-context",
+ "codex-network-proxy",
+ "codex-process-hardening",
+ "codex-protocol",
+ "codex-sandboxing",
+ "codex-utils-absolute-path",
+ "globset",
+ "landlock",
+ "libc",
+ "rustix",
+ "seccompiler",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "url",
 ]
 
 [[package]]
@@ -2615,6 +2720,14 @@ dependencies = [
  "codex-utils-plugins",
  "serde_json",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "codex-process-hardening"
+version = "0.152.0"
+source = "git+https://github.com/openai/codex.git?rev=316795b3cf2a45e90d121d9f46499d4658b2645c#316795b3cf2a45e90d121d9f46499d4658b2645c"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -3894,6 +4007,7 @@ dependencies = [
  "codex-app-server-protocol",
  "codex-config",
  "codex-core",
+ "codex-core-api",
  "rama-error",
  "serde",
  "serde_json",
@@ -7918,6 +8032,12 @@ name = "pastey"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b867cad97c0791bbd3aaa6472142568c6c9e8f71937e98379f584cfb0cf35bec"
+
+[[package]]
+name = "pathdiff"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
 
 [[package]]
 name = "pbkdf2"

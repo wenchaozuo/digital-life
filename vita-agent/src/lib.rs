@@ -1,11 +1,10 @@
 //! Digital Life-owned Vita Agent boundary over the pinned Codex execution kernel.
 //!
-//! D29-D2 adds the private Vita runtime namespace on top of the certified
-//! D29-C2 source-kernel boundary.  It does not start a model turn,
-//! authenticate an account, expose tools, or add a Tauri/frontend caller.  The
-//! public crate boundary remains intentionally small: a later Digital Life
-//! authority stage can supply a profile and cross an explicitly guarded
-//! execution seam.
+//! D29-E adds a provider-neutral Digital Life gateway foundation on top of the
+//! certified D29-D2 private Vita runtime.  It does not start a model turn,
+//! authenticate an account, expose production tools, or add a Tauri/frontend
+//! caller.  The user provider remains Digital Life authority; Codex stays a
+//! pinned Responses execution kernel.
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -20,6 +19,13 @@ use codex_core::config::{ConfigBuilder, ThreadStoreConfig};
 use codex_core::StartThreadOptions;
 use toml::map::Map;
 use toml::Value as TomlValue;
+
+mod provider_gateway;
+
+pub use provider_gateway::{
+    CredentialRef, ProviderCapabilities, ProviderCapability, ProviderProfile, ProviderProtocol,
+    ProviderRetryPolicy, VitaProviderState,
+};
 
 pub const VITA_AGENT_RUNTIME_ID: &str = "vita-agent";
 pub const VITA_UNCONFIGURED_PROVIDER_ID: &str = "vita-unconfigured";
@@ -514,6 +520,35 @@ pub enum VitaAgentError {
     UnexpectedVitaAuthSource {
         path: PathBuf,
     },
+    InvalidProviderProfile {
+        field: &'static str,
+        reason: &'static str,
+    },
+    InvalidProviderUrl {
+        url: String,
+        reason: &'static str,
+    },
+    CredentialBindingMismatch {
+        provider_id: String,
+        endpoint: String,
+    },
+    UnsupportedProviderCapability {
+        capability: ProviderCapability,
+    },
+    UnsupportedGatewayCapability {
+        capability: ProviderCapability,
+    },
+    UnsupportedProviderProtocol {
+        protocol: ProviderProtocol,
+    },
+    ProviderStateViolation {
+        expected: VitaProviderState,
+        actual: VitaProviderState,
+    },
+    GatewayNotReady,
+    GatewayProtocol(String),
+    GatewayTransport(std::io::Error),
+    CredentialResolution(&'static str),
     OwnershipViolation {
         path: PathBuf,
         reason: &'static str,
@@ -558,6 +593,47 @@ impl Display for VitaAgentError {
                 "Vita auth source must not exist before governed compilation: {}",
                 path.display()
             ),
+            Self::InvalidProviderProfile { field, reason } => {
+                write!(f, "invalid Digital Life provider profile {field}: {reason}")
+            }
+            Self::InvalidProviderUrl { url, reason } => {
+                write!(f, "invalid provider URL ({reason}): {url}")
+            }
+            Self::CredentialBindingMismatch {
+                provider_id,
+                endpoint,
+            } => write!(
+                f,
+                "credential reference is not bound to provider {provider_id} at {endpoint}"
+            ),
+            Self::UnsupportedProviderCapability { capability } => write!(
+                f,
+                "provider does not support requested capability: {capability}"
+            ),
+            Self::UnsupportedGatewayCapability { capability } => write!(
+                f,
+                "gateway mapping is not implemented for capability: {capability}"
+            ),
+            Self::UnsupportedProviderProtocol { protocol } => {
+                write!(
+                    f,
+                    "provider protocol is not enabled by this gateway: {protocol}"
+                )
+            }
+            Self::ProviderStateViolation { expected, actual } => write!(
+                f,
+                "provider state transition requires {expected}, found {actual}"
+            ),
+            Self::GatewayNotReady => write!(f, "Vita provider gateway is not ready"),
+            Self::GatewayProtocol(message) => {
+                write!(f, "provider gateway protocol error: {message}")
+            }
+            Self::GatewayTransport(error) => {
+                write!(f, "provider gateway transport error: {error}")
+            }
+            Self::CredentialResolution(reason) => {
+                write!(f, "provider credential resolution failed: {reason}")
+            }
             Self::OwnershipViolation { path, reason } => write!(
                 f,
                 "Vita ownership check failed ({reason}): {}",

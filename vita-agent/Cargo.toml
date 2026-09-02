@@ -22,7 +22,10 @@ codex-config = { git = "https://github.com/openai/codex.git", rev = "316795b3cf2
 # Without the exact constraint Cargo selects rama-error 0.3.0, whose public
 # exports are incompatible with rama-core 0.3.0-alpha.4.
 rama-error = "=0.3.0-alpha.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "0.9.5"
+url = "=2.5.8"
 
 [dev-dependencies]
 tempfile = "3"

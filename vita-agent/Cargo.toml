@@ -1,0 +1,32 @@
+[package]
+name = "digital-life-vita-agent"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "vita_agent"
+path = "src/lib.rs"
+
+[dependencies]
+# D29-C2 pins the source-kernel and protocol to the certified upstream commit.
+# The app-server executable/crate is intentionally not embedded here.
+codex-core = { git = "https://github.com/openai/codex.git", rev = "316795b3cf2a45e90d121d9f46499d4658b2645c" }
+codex-app-server-protocol = { git = "https://github.com/openai/codex.git", rev = "316795b3cf2a45e90d121d9f46499d4658b2645c" }
+codex-config = { git = "https://github.com/openai/codex.git", rev = "316795b3cf2a45e90d121d9f46499d4658b2645c" }
+# The pinned upstream workspace lock resolves this exact pre-1.0 release.
+# Without the exact constraint Cargo selects rama-error 0.3.0, whose public
+# exports are incompatible with rama-core 0.3.0-alpha.4.
+rama-error = "=0.3.0-alpha.4"
+toml = "0.9.5"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+# These are the same upstream compatibility patches used by the pinned Codex
+# workspace.  A git dependency does not inherit its own workspace-level patch
+# table, so the Digital Life crate must carry these resolver pins explicitly.
+[patch.crates-io]
+tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186" }
+tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f" }

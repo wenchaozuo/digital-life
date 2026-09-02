@@ -1,13 +1,16 @@
 //! Digital Life-owned Vita Agent boundary over the pinned Codex execution kernel.
 //!
-//! D29-C2 establishes the source-kernel boundary and its isolation rules.  It
-//! does not start a model turn, authenticate an account, expose tools, or add
-//! a Tauri/frontend caller.  The public crate boundary is intentionally small:
-//! a later Digital Life authority stage can supply a profile and ask for the
-//! official Codex thread-start options.
+//! D29-D2 adds the private Vita runtime namespace on top of the certified
+//! D29-C2 source-kernel boundary.  It does not start a model turn,
+//! authenticate an account, expose tools, or add a Tauri/frontend caller.  The
+//! public crate boundary remains intentionally small: a later Digital Life
+//! authority stage can supply a profile and cross an explicitly guarded
+//! execution seam.
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -22,6 +25,7 @@ pub const VITA_AGENT_RUNTIME_ID: &str = "vita-agent";
 pub const VITA_UNCONFIGURED_PROVIDER_ID: &str = "vita-unconfigured";
 pub const VITA_PLACEHOLDER_MODEL_ID: &str = "vita-unconfigured-model";
 pub const VITA_PLACEHOLDER_BASE_URL: &str = "http://127.0.0.1:9/v1";
+pub const VITA_OWNERSHIP_MARKER_FILE: &str = ".vita-agent-runtime";
 pub const CODEX_UPSTREAM_REPOSITORY: &str = "https://github.com/openai/codex.git";
 pub const CODEX_UPSTREAM_RELEASE: &str = "rust-v0.152.0";
 pub const CODEX_UPSTREAM_COMMIT: &str = "316795b3cf2a45e90d121d9f46499d4658b2645c";
@@ -46,10 +50,13 @@ pub enum VitaNetworkPolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VitaAgentRuntimeProfile {
     app_data_root: PathBuf,
+    vita_root: PathBuf,
     kernel_home: PathBuf,
     state_root: PathBuf,
     runtime_root: PathBuf,
     config_root: PathBuf,
+    tmp_root: PathBuf,
+    runs_root: PathBuf,
     workspace_root: PathBuf,
     runtime_identity: &'static str,
     provider_policy: VitaProviderPolicy,
@@ -70,25 +77,21 @@ impl VitaAgentRuntimeProfile {
     ) -> Result<Self, VitaAgentError> {
         validate_absolute_root("app_data_root", &app_data_root)?;
         validate_absolute_root("workspace_root", &workspace_root)?;
-        if contains_stock_codex_state(&app_data_root) {
-            return Err(VitaAgentError::ForbiddenStockPath {
-                field: "app_data_root",
-                path: app_data_root,
-            });
-        }
-        if contains_stock_codex_state(&workspace_root) {
-            return Err(VitaAgentError::ForbiddenStockPath {
-                field: "workspace_root",
-                path: workspace_root,
-            });
-        }
+        validate_trusted_path("app_data_root", &app_data_root)?;
+        validate_trusted_path("workspace_root", &workspace_root)?;
+
+        let vita_root = app_data_root.join("agent");
+        validate_trusted_path("vita_root", &vita_root)?;
 
         Ok(Self {
-            kernel_home: app_data_root.join("kernel"),
-            state_root: app_data_root.join("state"),
-            runtime_root: app_data_root.join("runtime"),
-            config_root: app_data_root.join("config"),
+            kernel_home: vita_root.join("kernel"),
+            state_root: vita_root.join("state"),
+            runtime_root: vita_root.join("runtime"),
+            config_root: vita_root.join("config"),
+            tmp_root: vita_root.join("tmp"),
+            runs_root: vita_root.join("runs"),
             app_data_root,
+            vita_root,
             workspace_root,
             runtime_identity: VITA_AGENT_RUNTIME_ID,
             provider_policy: VitaProviderPolicy::NotConfigured,
@@ -99,6 +102,10 @@ impl VitaAgentRuntimeProfile {
 
     pub fn app_data_root(&self) -> &Path {
         &self.app_data_root
+    }
+
+    pub fn vita_root(&self) -> &Path {
+        &self.vita_root
     }
 
     pub fn kernel_home(&self) -> &Path {
@@ -115,6 +122,14 @@ impl VitaAgentRuntimeProfile {
 
     pub fn config_root(&self) -> &Path {
         &self.config_root
+    }
+
+    pub fn tmp_root(&self) -> &Path {
+        &self.tmp_root
+    }
+
+    pub fn runs_root(&self) -> &Path {
+        &self.runs_root
     }
 
     pub fn workspace_root(&self) -> &Path {
@@ -137,8 +152,167 @@ impl VitaAgentRuntimeProfile {
         self.network_policy
     }
 
+    pub fn ownership_marker_path(&self) -> PathBuf {
+        self.vita_root.join(VITA_OWNERSHIP_MARKER_FILE)
+    }
+
+    /// Re-checks every path component that can participate in the private
+    /// namespace before the runtime is opened or created.
+    pub fn validate_private_namespace(&self) -> Result<(), VitaAgentError> {
+        for (field, path) in [
+            ("app_data_root", self.app_data_root.as_path()),
+            ("vita_root", self.vita_root.as_path()),
+            ("kernel_home", self.kernel_home.as_path()),
+            ("state_root", self.state_root.as_path()),
+            ("runtime_root", self.runtime_root.as_path()),
+            ("config_root", self.config_root.as_path()),
+            ("tmp_root", self.tmp_root.as_path()),
+            ("runs_root", self.runs_root.as_path()),
+            ("workspace_root", self.workspace_root.as_path()),
+        ] {
+            validate_trusted_path(field, path)?;
+        }
+
+        for (field, path) in [
+            ("kernel_home", self.kernel_home.as_path()),
+            ("state_root", self.state_root.as_path()),
+            ("runtime_root", self.runtime_root.as_path()),
+            ("config_root", self.config_root.as_path()),
+            ("tmp_root", self.tmp_root.as_path()),
+            ("runs_root", self.runs_root.as_path()),
+        ] {
+            if !is_strict_descendant(path, &self.vita_root) {
+                return Err(VitaAgentError::UnsafePath {
+                    field,
+                    path: path.to_path_buf(),
+                    reason: "layout path is outside the Vita root",
+                });
+            }
+        }
+        if !is_strict_descendant(&self.vita_root, &self.app_data_root) {
+            return Err(VitaAgentError::UnsafePath {
+                field: "vita_root",
+                path: self.vita_root.clone(),
+                reason: "Vita root is not a child of the explicit app-data root",
+            });
+        }
+        Ok(())
+    }
+
+    /// Creates only the fixed Vita-owned directories and their ownership
+    /// marker after the trusted namespace has been established.
+    pub fn ensure_private_runtime_layout(&self) -> Result<(), VitaAgentError> {
+        self.validate_private_namespace()?;
+        for path in [
+            &self.vita_root,
+            &self.kernel_home,
+            &self.state_root,
+            &self.runtime_root,
+            &self.config_root,
+            &self.tmp_root,
+            &self.runs_root,
+        ] {
+            fs::create_dir_all(path).map_err(VitaAgentError::KernelConfig)?;
+        }
+        fs::create_dir_all(self.runtime_root.join("log")).map_err(VitaAgentError::KernelConfig)?;
+        self.validate_private_namespace()?;
+        self.ensure_ownership_marker()?;
+        self.validate_private_namespace()?;
+        self.verify_ownership_marker()
+    }
+
+    /// Removes one empty test-owned run directory.  This intentionally is not
+    /// a general recursive cleanup facility.
+    pub fn cleanup_owned_test_dir(&self, target: &Path) -> Result<(), VitaAgentError> {
+        self.validate_private_namespace()?;
+        self.verify_ownership_marker()?;
+        validate_trusted_path("cleanup_target", target)?;
+
+        let trusted_runs_root =
+            fs::canonicalize(&self.runs_root).map_err(VitaAgentError::KernelConfig)?;
+        let trusted_target = fs::canonicalize(target).map_err(VitaAgentError::KernelConfig)?;
+        if !is_strict_descendant(&trusted_target, &trusted_runs_root) {
+            return Err(VitaAgentError::CleanupRejected {
+                path: target.to_path_buf(),
+                reason: "cleanup target is outside the Vita-owned runs root",
+            });
+        }
+
+        let metadata = fs::symlink_metadata(target).map_err(VitaAgentError::KernelConfig)?;
+        if !metadata.is_dir() || is_reparse_point(&metadata) {
+            return Err(VitaAgentError::CleanupRejected {
+                path: target.to_path_buf(),
+                reason: "cleanup target must be a non-reparse directory",
+            });
+        }
+        fs::remove_dir(target).map_err(|_| VitaAgentError::CleanupRejected {
+            path: target.to_path_buf(),
+            reason: "cleanup target must be an empty Vita-owned directory",
+        })
+    }
+
+    fn ensure_ownership_marker(&self) -> Result<(), VitaAgentError> {
+        let marker_path = self.ownership_marker_path();
+        match fs::symlink_metadata(&marker_path) {
+            Ok(metadata) => {
+                if is_reparse_point(&metadata) {
+                    return Err(VitaAgentError::OwnershipViolation {
+                        path: marker_path,
+                        reason: "ownership marker is a reparse point",
+                    });
+                }
+                self.verify_ownership_marker()
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let mut marker = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&marker_path)
+                    .map_err(VitaAgentError::KernelConfig)?;
+                marker
+                    .write_all(ownership_marker_contents())
+                    .map_err(VitaAgentError::KernelConfig)?;
+                marker.flush().map_err(VitaAgentError::KernelConfig)?;
+                self.verify_ownership_marker()
+            }
+            Err(error) => Err(VitaAgentError::KernelConfig(error)),
+        }
+    }
+
+    fn verify_ownership_marker(&self) -> Result<(), VitaAgentError> {
+        let marker_path = self.ownership_marker_path();
+        let metadata = match fs::symlink_metadata(&marker_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(VitaAgentError::OwnershipViolation {
+                    path: marker_path,
+                    reason: "ownership marker is missing",
+                });
+            }
+            Err(error) => return Err(VitaAgentError::KernelConfig(error)),
+        };
+        if is_reparse_point(&metadata) || !metadata.is_file() {
+            return Err(VitaAgentError::OwnershipViolation {
+                path: marker_path,
+                reason: "ownership marker is not a regular file",
+            });
+        }
+        let contents = fs::read(&marker_path).map_err(VitaAgentError::KernelConfig)?;
+        if contents != ownership_marker_contents() {
+            return Err(VitaAgentError::OwnershipViolation {
+                path: marker_path,
+                reason: "ownership marker identity does not match Vita Agent",
+            });
+        }
+        Ok(())
+    }
+
     fn system_config_path(&self) -> PathBuf {
         self.config_root.join("system.config.toml")
+    }
+
+    fn auth_path(&self) -> PathBuf {
+        self.kernel_home.join("auth.json")
     }
 
     fn system_requirements_path(&self) -> PathBuf {
@@ -321,9 +495,34 @@ impl VitaAgentRuntimeProfile {
 
 #[derive(Debug)]
 pub enum VitaAgentError {
-    InvalidPath { field: &'static str, path: PathBuf },
-    ForbiddenStockPath { field: &'static str, path: PathBuf },
-    UnexpectedVitaConfigSource { path: PathBuf },
+    InvalidPath {
+        field: &'static str,
+        path: PathBuf,
+    },
+    ForbiddenStockPath {
+        field: &'static str,
+        path: PathBuf,
+    },
+    UnsafePath {
+        field: &'static str,
+        path: PathBuf,
+        reason: &'static str,
+    },
+    UnexpectedVitaConfigSource {
+        path: PathBuf,
+    },
+    UnexpectedVitaAuthSource {
+        path: PathBuf,
+    },
+    OwnershipViolation {
+        path: PathBuf,
+        reason: &'static str,
+    },
+    CleanupRejected {
+        path: PathBuf,
+        reason: &'static str,
+    },
+    NotConfiguredProvider,
     KernelConfig(std::io::Error),
     KernelInvariant(&'static str),
 }
@@ -339,10 +538,37 @@ impl Display for VitaAgentError {
                 "{field} must not select stock Codex/OpenAI state: {}",
                 path.display()
             ),
+            Self::UnsafePath {
+                field,
+                path,
+                reason,
+            } => write!(
+                f,
+                "{field} is not a trusted Vita path ({}): {}",
+                reason,
+                path.display()
+            ),
             Self::UnexpectedVitaConfigSource { path } => write!(
                 f,
                 "Vita configuration source must not exist before governed compilation: {}",
                 path.display()
+            ),
+            Self::UnexpectedVitaAuthSource { path } => write!(
+                f,
+                "Vita auth source must not exist before governed compilation: {}",
+                path.display()
+            ),
+            Self::OwnershipViolation { path, reason } => write!(
+                f,
+                "Vita ownership check failed ({reason}): {}",
+                path.display()
+            ),
+            Self::CleanupRejected { path, reason } => {
+                write!(f, "Vita cleanup rejected ({reason}): {}", path.display())
+            }
+            Self::NotConfiguredProvider => write!(
+                f,
+                "model execution is forbidden while Vita provider policy is NotConfigured"
             ),
             Self::KernelConfig(error) => write!(f, "Vita kernel config failed: {error}"),
             Self::KernelInvariant(message) => write!(f, "Vita kernel invariant failed: {message}"),
@@ -364,10 +590,13 @@ impl VitaAgentEntrypoint {
     ///
     /// This deliberately stops before `ThreadManager` construction: that
     /// constructor also wires plugins, MCP, skills, and other host surfaces.
-    /// `prepare_thread_start` exposes the official Codex loop options for the
-    /// next governed stage without starting a turn in D29-C2.
+    /// The private layout is established before config loading, while the
+    /// `NotConfigured` provider policy still blocks thread execution.
     pub async fn initialize(profile: VitaAgentRuntimeProfile) -> Result<Self, VitaAgentError> {
+        profile.validate_private_namespace()?;
         ensure_vita_config_sources_absent(&profile)?;
+        ensure_vita_auth_source_absent(&profile)?;
+        profile.ensure_private_runtime_layout()?;
 
         let config = ConfigBuilder::default()
             .codex_home(profile.kernel_home().to_path_buf())
@@ -465,9 +694,16 @@ impl VitaAgentEntrypoint {
         &self.initialize
     }
 
-    /// Prepares an official Codex thread-loop boundary without starting it.
-    pub fn prepare_thread_start(&self) -> StartThreadOptions {
-        StartThreadOptions::new((*self.config).clone())
+    /// Checks the future execution seam without allowing `NotConfigured` to
+    /// reach a thread manager, model client, or HTTP request.
+    pub fn prepare_thread_start(&self) -> Result<StartThreadOptions, VitaAgentError> {
+        if matches!(
+            self.profile.provider_policy(),
+            VitaProviderPolicy::NotConfigured
+        ) {
+            return Err(VitaAgentError::NotConfiguredProvider);
+        }
+        Ok(StartThreadOptions::new((*self.config).clone()))
     }
 }
 
@@ -479,6 +715,121 @@ fn validate_absolute_root(field: &'static str, path: &Path) -> Result<(), VitaAg
         });
     }
     Ok(())
+}
+
+fn validate_trusted_path(field: &'static str, path: &Path) -> Result<(), VitaAgentError> {
+    validate_absolute_root(field, path)?;
+    if path
+        .components()
+        .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(VitaAgentError::UnsafePath {
+            field,
+            path: path.to_path_buf(),
+            reason: "dot path components are ambiguous",
+        });
+    }
+    if contains_stock_codex_state(path) {
+        return Err(VitaAgentError::ForbiddenStockPath {
+            field,
+            path: path.to_path_buf(),
+        });
+    }
+
+    let canonical_prefix = canonical_trusted_prefix(field, path)?;
+    if contains_stock_codex_state(&canonical_prefix) {
+        return Err(VitaAgentError::ForbiddenStockPath {
+            field,
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
+fn canonical_trusted_prefix(field: &'static str, path: &Path) -> Result<PathBuf, VitaAgentError> {
+    let mut cursor = path.to_path_buf();
+    let mut nearest_existing: Option<(PathBuf, bool)> = None;
+
+    loop {
+        match fs::symlink_metadata(&cursor) {
+            Ok(metadata) => {
+                if is_reparse_point(&metadata) {
+                    return Err(VitaAgentError::UnsafePath {
+                        field,
+                        path: cursor,
+                        reason: "reparse point or link component is not trusted",
+                    });
+                }
+                if nearest_existing.is_none() {
+                    nearest_existing = Some((cursor.clone(), metadata.is_dir()));
+                }
+                if cursor == path && !metadata.is_dir() {
+                    return Err(VitaAgentError::UnsafePath {
+                        field,
+                        path: path.to_path_buf(),
+                        reason: "trusted root must be a directory",
+                    });
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(VitaAgentError::KernelConfig(error)),
+        }
+
+        let Some(parent) = cursor.parent() else {
+            break;
+        };
+        if parent == cursor {
+            break;
+        }
+        cursor = parent.to_path_buf();
+    }
+
+    let Some((nearest, is_directory)) = nearest_existing else {
+        return Err(VitaAgentError::UnsafePath {
+            field,
+            path: path.to_path_buf(),
+            reason: "no existing trusted ancestor could be established",
+        });
+    };
+    if !is_directory {
+        return Err(VitaAgentError::UnsafePath {
+            field,
+            path: nearest,
+            reason: "trusted ancestor is not a directory",
+        });
+    }
+    fs::canonicalize(nearest).map_err(VitaAgentError::KernelConfig)
+}
+
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
+}
+
+fn is_strict_descendant(child: &Path, parent: &Path) -> bool {
+    let child = normalized_path_for_relationship(child);
+    let parent = normalized_path_for_relationship(parent);
+    child.len() > parent.len() && child.starts_with(&(parent + "/"))
+}
+
+fn normalized_path_for_relationship(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase()
+}
+
+fn ownership_marker_contents() -> &'static [u8] {
+    b"runtime_id=vita-agent\nlayout=v1\n"
 }
 
 fn ensure_vita_config_sources_absent(
@@ -498,17 +849,33 @@ fn ensure_vita_config_sources_absent(
     Ok(())
 }
 
+fn ensure_vita_auth_source_absent(profile: &VitaAgentRuntimeProfile) -> Result<(), VitaAgentError> {
+    match fs::symlink_metadata(profile.auth_path()) {
+        Ok(_) => Err(VitaAgentError::UnexpectedVitaAuthSource {
+            path: profile.auth_path(),
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(VitaAgentError::KernelConfig(error)),
+    }
+}
+
 fn contains_stock_codex_state(path: &Path) -> bool {
     let normalized = path
         .to_string_lossy()
         .replace('\\', "/")
         .to_ascii_lowercase();
+    let parts = normalized
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
     let has_dot_codex_component = path.components().any(|component| {
         matches!(component, Component::Normal(value) if value.eq_ignore_ascii_case(".codex"))
-    });
-    has_dot_codex_component
-        || normalized.contains("/programdata/openai/codex")
-        || normalized.ends_with("/openai/codex")
+    }) || parts.iter().any(|part| *part == ".codex");
+    let has_openai_codex_component = parts.windows(2).any(|window| window == ["openai", "codex"]);
+    let has_programdata_openai_codex = parts
+        .windows(3)
+        .any(|window| window == ["programdata", "openai", "codex"]);
+    has_dot_codex_component || has_programdata_openai_codex || has_openai_codex_component
 }
 
 fn table<const N: usize>(entries: [(&str, TomlValue); N]) -> TomlValue {
@@ -568,19 +935,13 @@ mod tests {
         assert_eq!(profile.provider_policy(), VitaProviderPolicy::NotConfigured);
         assert_eq!(profile.credential_policy(), VitaCredentialPolicy::NoLogin);
         assert_eq!(profile.network_policy(), VitaNetworkPolicy::Closed);
-        assert_eq!(
-            profile.kernel_home(),
-            profile.app_data_root().join("kernel")
-        );
-        assert_eq!(profile.state_root(), profile.app_data_root().join("state"));
-        assert_eq!(
-            profile.runtime_root(),
-            profile.app_data_root().join("runtime")
-        );
-        assert_eq!(
-            profile.config_root(),
-            profile.app_data_root().join("config")
-        );
+        assert_eq!(profile.vita_root(), &profile.app_data_root().join("agent"));
+        assert_eq!(profile.kernel_home(), profile.vita_root().join("kernel"));
+        assert_eq!(profile.state_root(), profile.vita_root().join("state"));
+        assert_eq!(profile.runtime_root(), profile.vita_root().join("runtime"));
+        assert_eq!(profile.config_root(), profile.vita_root().join("config"));
+        assert_eq!(profile.tmp_root(), profile.vita_root().join("tmp"));
+        assert_eq!(profile.runs_root(), profile.vita_root().join("runs"));
         assert!(!contains_stock_codex_state(profile.app_data_root()));
         assert!(contains_stock_codex_state(Path::new(
             r"C:\Users\TestUser\.codex"
@@ -621,6 +982,92 @@ mod tests {
             system_state_error,
             VitaAgentError::ForbiddenStockPath { .. }
         ));
+    }
+
+    #[test]
+    fn safe_vita_private_root_is_accepted_and_layout_is_owned() {
+        let (_app_data, _workspace, profile) = test_profile();
+
+        profile.validate_private_namespace().unwrap();
+        profile.ensure_private_runtime_layout().unwrap();
+
+        assert!(profile.vita_root().is_dir());
+        assert!(profile.kernel_home().is_dir());
+        assert!(profile.state_root().is_dir());
+        assert!(profile.runtime_root().is_dir());
+        assert!(profile.runtime_root().join("log").is_dir());
+        assert!(profile.config_root().is_dir());
+        assert!(profile.tmp_root().is_dir());
+        assert!(profile.runs_root().is_dir());
+        assert_eq!(
+            std::fs::read(profile.ownership_marker_path()).unwrap(),
+            ownership_marker_contents()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn junction_alias_into_forbidden_stock_state_is_rejected() {
+        use std::process::Command;
+
+        let app_data = tempdir().expect("app-data temp root");
+        let workspace = tempdir().expect("workspace temp root");
+        let forbidden = tempdir().expect("synthetic forbidden root");
+        let synthetic_stock = forbidden.path().join(".codex");
+        std::fs::create_dir_all(&synthetic_stock).expect("synthetic stock root");
+        let alias = app_data.path().join("alias");
+
+        let status = Command::new("cmd.exe")
+            .args([
+                "/d",
+                "/c",
+                "mklink",
+                "/J",
+                alias.to_str().expect("junction alias path"),
+                synthetic_stock.to_str().expect("synthetic stock path"),
+            ])
+            .status()
+            .expect("create synthetic junction");
+        assert!(status.success(), "mklink /J must create the test alias");
+
+        let error = VitaAgentRuntimeProfile::from_explicit_app_data_root(
+            alias,
+            workspace.path().to_path_buf(),
+        )
+        .expect_err("a reparse alias into stock state must fail closed");
+        assert!(matches!(
+            error,
+            VitaAgentError::UnsafePath {
+                field: "app_data_root",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn vita_layout_relationships_reject_stock_parent_and_child_aliases() {
+        let (_app_data, _workspace, profile) = test_profile();
+        assert!(is_strict_descendant(
+            profile.vita_root(),
+            profile.app_data_root()
+        ));
+        assert!(is_strict_descendant(
+            profile.runs_root(),
+            profile.vita_root()
+        ));
+
+        for stock_path in [
+            PathBuf::from(r"C:\Users\TestUser\.codex\vita"),
+            PathBuf::from(r"C:\ProgramData\OpenAI\Codex\vita"),
+            PathBuf::from(r"C:\ProgramData\OpenAI\Codex\agent"),
+        ] {
+            let error = VitaAgentRuntimeProfile::from_explicit_app_data_root(
+                stock_path,
+                profile.workspace_root().to_path_buf(),
+            )
+            .expect_err("Vita root must not equal or nest under stock state");
+            assert!(matches!(error, VitaAgentError::ForbiddenStockPath { .. }));
+        }
     }
 
     #[test]
@@ -742,6 +1189,11 @@ mod tests {
         assert!(!entrypoint.profile().system_config_path().exists());
         assert!(!entrypoint.profile().system_requirements_path().exists());
         assert!(!entrypoint.profile().managed_config_path().exists());
+        assert!(!entrypoint
+            .profile()
+            .kernel_home()
+            .join("auth.json")
+            .exists());
         assert_eq!(
             entrypoint.config().codex_home.as_path(),
             entrypoint.profile().kernel_home()
@@ -763,26 +1215,48 @@ mod tests {
             entrypoint.profile().network_policy(),
             VitaNetworkPolicy::Closed
         );
+        assert_eq!(
+            format!(
+                "{:?}",
+                entrypoint.config().permissions.network_sandbox_policy()
+            ),
+            "Restricted"
+        );
         assert!(matches!(
             &entrypoint.config().experimental_thread_store,
             ThreadStoreConfig::InMemory { id } if id == VITA_AGENT_RUNTIME_ID
         ));
+        assert!(entrypoint.profile().vita_root().is_dir());
+        assert!(entrypoint.profile().tmp_root().is_dir());
+        assert!(entrypoint.profile().runs_root().is_dir());
+        assert_eq!(
+            std::fs::read(entrypoint.profile().ownership_marker_path()).unwrap(),
+            ownership_marker_contents()
+        );
         assert_eq!(
             entrypoint.initialize_params().client_info.name,
             "vita-agent"
         );
 
-        // Type-check and prepare the official agent-loop boundary, but do not
-        // construct ThreadManager or start a real model turn in D29-C2.
-        let options = entrypoint.prepare_thread_start();
-        assert_eq!(
-            options.config.codex_home.as_path(),
-            entrypoint.profile().kernel_home()
-        );
-        assert!(matches!(
-            options.config.experimental_thread_store,
-            ThreadStoreConfig::InMemory { id } if id == VITA_AGENT_RUNTIME_ID
-        ));
+        // The NotConfigured policy stops before StartThreadOptions is built;
+        // no ThreadManager, model client, or real model turn can start here.
+        let error = match entrypoint.prepare_thread_start() {
+            Err(error) => error,
+            Ok(_) => panic!("NotConfigured must not cross the execution fence"),
+        };
+        assert!(matches!(error, VitaAgentError::NotConfiguredProvider));
+    }
+
+    #[tokio::test]
+    async fn unconfigured_provider_fence_does_not_construct_execution_options() {
+        let (_app_data, _workspace, profile) = test_profile();
+        let entrypoint = VitaAgentEntrypoint::initialize(profile).await.unwrap();
+
+        let error = match entrypoint.prepare_thread_start() {
+            Err(error) => error,
+            Ok(_) => panic!("NotConfigured must fail before the model execution seam"),
+        };
+        assert!(matches!(error, VitaAgentError::NotConfiguredProvider));
     }
 
     #[tokio::test]
@@ -819,18 +1293,91 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn preexisting_vita_auth_source_fails_closed_without_overwriting() {
+        let app_data = tempdir().expect("app-data temp root");
+        let workspace = tempdir().expect("workspace temp root");
+        let profile = VitaAgentRuntimeProfile::from_explicit_app_data_root(
+            app_data.path().to_path_buf(),
+            workspace.path().to_path_buf(),
+        )
+        .expect("valid explicit Vita profile");
+        std::fs::create_dir_all(profile.kernel_home()).expect("kernel root");
+        let auth_path = profile.kernel_home().join("auth.json");
+        let original = b"must not be read or overwritten\n";
+        std::fs::write(&auth_path, original).expect("sentinel auth source");
+
+        let result = VitaAgentEntrypoint::initialize(profile).await;
+        match result {
+            Err(VitaAgentError::UnexpectedVitaAuthSource { path }) => {
+                assert_eq!(path, auth_path);
+            }
+            Err(_) => panic!("existing Vita auth source must fail with the auth error"),
+            Ok(_) => panic!("existing Vita auth source must fail closed"),
+        }
+        assert_eq!(std::fs::read(&auth_path).unwrap(), original);
+    }
+
     #[test]
     fn host_codex_home_environment_is_not_an_input() {
         let (_app_data, _workspace, profile) = test_profile();
         // The constructor has no environment-derived branch: an inherited
         // CODEX_HOME cannot replace the explicit profile root.
-        assert_eq!(
-            profile.kernel_home(),
-            profile.app_data_root().join("kernel")
-        );
-        assert_ne!(
-            profile.kernel_home(),
-            Path::new(r"C:\Users\TestUser\.codex")
-        );
+        assert_eq!(profile.kernel_home(), profile.vita_root().join("kernel"));
+        assert_ne!(profile.vita_root(), Path::new(r"C:\Users\TestUser\.codex"));
+    }
+
+    #[test]
+    fn cleanup_requires_marker_and_vita_owned_descendant() {
+        let (_app_data, _workspace, profile) = test_profile();
+        profile.ensure_private_runtime_layout().unwrap();
+
+        let owned_run = profile.runs_root().join("test-run");
+        std::fs::create_dir(&owned_run).unwrap();
+        profile.cleanup_owned_test_dir(&owned_run).unwrap();
+        assert!(!owned_run.exists());
+
+        let outside = profile.app_data_root().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let error = profile
+            .cleanup_owned_test_dir(&outside)
+            .expect_err("cleanup outside runs root must fail closed");
+        assert!(matches!(error, VitaAgentError::CleanupRejected { .. }));
+        std::fs::remove_dir(&outside).unwrap();
+    }
+
+    #[test]
+    fn cleanup_rejects_missing_or_mismatched_marker() {
+        let (_app_data, _workspace, profile) = test_profile();
+        profile.ensure_private_runtime_layout().unwrap();
+        let owned_run = profile.runs_root().join("test-run");
+        std::fs::create_dir(&owned_run).unwrap();
+
+        std::fs::remove_file(profile.ownership_marker_path()).unwrap();
+        let missing_error = profile
+            .cleanup_owned_test_dir(&owned_run)
+            .expect_err("cleanup requires a present ownership marker");
+        assert!(matches!(
+            missing_error,
+            VitaAgentError::OwnershipViolation { .. }
+        ));
+
+        std::fs::write(profile.ownership_marker_path(), b"runtime_id=other\n").unwrap();
+        let mismatched_error = profile
+            .cleanup_owned_test_dir(&owned_run)
+            .expect_err("cleanup requires the matching ownership marker");
+        assert!(matches!(
+            mismatched_error,
+            VitaAgentError::OwnershipViolation { .. }
+        ));
+    }
+
+    #[test]
+    fn profile_validation_never_mutates_parent_environment() {
+        let before = std::env::vars_os().collect::<Vec<_>>();
+        let (_app_data, _workspace, profile) = test_profile();
+        profile.validate_private_namespace().unwrap();
+        let after = std::env::vars_os().collect::<Vec<_>>();
+        assert_eq!(before, after);
     }
 }

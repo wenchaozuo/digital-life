@@ -8,6 +8,10 @@ publish = false
 name = "vita_agent"
 path = "src/lib.rs"
 
+[[bin]]
+name = "vita-agent"
+path = "src/bin/vita-agent.rs"
+
 [dependencies]
 # D29-C2 pins the source-kernel and protocol to the certified upstream commit.
 # The app-server executable/crate is intentionally not embedded here.

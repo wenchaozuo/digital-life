@@ -5416,6 +5416,7 @@ mod tests {
         let home = tempfile::tempdir().expect("private home temp dir");
         for allowed in [
             "installation_id",
+            ".sandbox_migration",
             "state_5.sqlite",
             "logs_2.sqlite",
             "goals_1.sqlite",
@@ -5428,6 +5429,7 @@ mod tests {
                 .expect("write allowed artifact");
         }
         std::fs::create_dir_all(home.path().join("log")).expect("create log dir");
+        std::fs::create_dir_all(home.path().join("skills")).expect("create skills dir");
         std::fs::create_dir_all(home.path().join("sessions")).expect("create sessions dir");
         std::fs::create_dir_all(home.path().join("archived_sessions"))
             .expect("create archived sessions dir");
@@ -5442,7 +5444,7 @@ mod tests {
         );
         assert_eq!(
             profile.private_home_entries().len(),
-            11,
+            13,
             "all allowed entries enumerated: {profile:?}"
         );
     }

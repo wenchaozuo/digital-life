@@ -54,6 +54,8 @@ const FORBIDDEN_PRIVATE_HOME_ENTRIES: &[&str] = &[
 /// Grounded in the pinned upstream source:
 /// - `installation_id`              -> `codex-rs/core/src/installation_id.rs`
 ///   `INSTALLATION_ID_FILENAME`
+/// - `.sandbox_migration`           -> `codex-rs/execpolicy/src/sandbox_migration.rs`
+///   `MIGRATION_MARKER_FILENAME` (one-shot sandbox-policy migration marker)
 /// - `state_5.sqlite`               -> `codex-rs/state/src/sqlite.rs` `STATE_DB_FILENAME`
 /// - `logs_2.sqlite`                -> `codex-rs/state/src/sqlite.rs` `LOGS_DB_FILENAME`
 /// - `goals_1.sqlite`               -> `codex-rs/state/src/sqlite.rs` `GOALS_DB_FILENAME`
@@ -63,6 +65,8 @@ const FORBIDDEN_PRIVATE_HOME_ENTRIES: &[&str] = &[
 /// - `models_cache.json`            -> `codex-rs/models-manager/src/manager.rs`
 ///   `MODEL_CACHE_FILE`
 /// - `log/`                         -> `codex-rs/core/src/config/mod.rs` `log_dir`
+/// - `skills/`                      -> the pinned runtime's skills discovery root;
+///   D29-D does not provide caller skill content and never starts a turn
 /// - `sessions/`                    -> durable thread rollout store
 ///   (`codex-rs/rollout` `SESSIONS_SUBDIR`)
 /// - `archived_sessions/`           -> `codex-rs/rollout` `ARCHIVED_SESSIONS_SUBDIR`
@@ -75,6 +79,7 @@ const FORBIDDEN_PRIVATE_HOME_ENTRIES: &[&str] = &[
 /// `config.ephemeral` is true).
 const ALLOWED_PRIVATE_HOME_ENTRIES: &[&str] = &[
     "installation_id",
+    ".sandbox_migration",
     "state_5.sqlite",
     "logs_2.sqlite",
     "goals_1.sqlite",
@@ -83,6 +88,7 @@ const ALLOWED_PRIVATE_HOME_ENTRIES: &[&str] = &[
     "thread_history_1.sqlite",
     "models_cache.json",
     "log",
+    "skills",
     "sessions",
     "archived_sessions",
     ".tmp",

@@ -19,6 +19,9 @@ use toml::map::Map;
 use toml::Value as TomlValue;
 
 pub const VITA_AGENT_RUNTIME_ID: &str = "vita-agent";
+pub const VITA_UNCONFIGURED_PROVIDER_ID: &str = "vita-unconfigured";
+pub const VITA_PLACEHOLDER_MODEL_ID: &str = "vita-unconfigured-model";
+pub const VITA_PLACEHOLDER_BASE_URL: &str = "http://127.0.0.1:9/v1";
 pub const CODEX_UPSTREAM_REPOSITORY: &str = "https://github.com/openai/codex.git";
 pub const CODEX_UPSTREAM_RELEASE: &str = "rust-v0.152.0";
 pub const CODEX_UPSTREAM_COMMIT: &str = "316795b3cf2a45e90d121d9f46499d4658b2645c";
@@ -58,9 +61,9 @@ impl VitaAgentRuntimeProfile {
     /// Creates a profile only from roots explicitly supplied by Digital Life.
     ///
     /// No environment variable, stock Codex home, or system-wide OpenAI path
-    /// is consulted here.  `workspace_root` may be an ordinary project that
-    /// contains a `.codex` directory because the Codex project layer is later
-    /// disabled by `loader_overrides`.
+    /// is consulted here.  Both the app-data and workspace roots are checked
+    /// before the upstream config builder is reached, even though the Codex
+    /// project layer is later disabled by `loader_overrides`.
     pub fn from_explicit_app_data_root(
         app_data_root: PathBuf,
         workspace_root: PathBuf,
@@ -71,6 +74,12 @@ impl VitaAgentRuntimeProfile {
             return Err(VitaAgentError::ForbiddenStockPath {
                 field: "app_data_root",
                 path: app_data_root,
+            });
+        }
+        if contains_stock_codex_state(&workspace_root) {
+            return Err(VitaAgentError::ForbiddenStockPath {
+                field: "workspace_root",
+                path: workspace_root,
             });
         }
 
@@ -214,7 +223,42 @@ impl VitaAgentRuntimeProfile {
             TomlValue::String(VITA_AGENT_RUNTIME_ID.to_string()),
         );
 
+        let mut vita_provider = Map::new();
+        vita_provider.insert(
+            "name".to_string(),
+            TomlValue::String("Vita Unconfigured Provider".to_string()),
+        );
+        vita_provider.insert(
+            "base_url".to_string(),
+            TomlValue::String(VITA_PLACEHOLDER_BASE_URL.to_string()),
+        );
+        vita_provider.insert(
+            "wire_api".to_string(),
+            TomlValue::String("responses".to_string()),
+        );
+        vita_provider.insert(
+            "requires_openai_auth".to_string(),
+            TomlValue::Boolean(false),
+        );
+        let mut model_providers = Map::new();
+        model_providers.insert(
+            VITA_UNCONFIGURED_PROVIDER_ID.to_string(),
+            TomlValue::Table(vita_provider),
+        );
+
         vec![
+            (
+                "model_provider".to_string(),
+                TomlValue::String(VITA_UNCONFIGURED_PROVIDER_ID.to_string()),
+            ),
+            (
+                "model".to_string(),
+                TomlValue::String(VITA_PLACEHOLDER_MODEL_ID.to_string()),
+            ),
+            (
+                "model_providers".to_string(),
+                TomlValue::Table(model_providers),
+            ),
             (
                 "sandbox_mode".to_string(),
                 TomlValue::String("read-only".to_string()),
@@ -279,6 +323,7 @@ impl VitaAgentRuntimeProfile {
 pub enum VitaAgentError {
     InvalidPath { field: &'static str, path: PathBuf },
     ForbiddenStockPath { field: &'static str, path: PathBuf },
+    UnexpectedVitaConfigSource { path: PathBuf },
     KernelConfig(std::io::Error),
     KernelInvariant(&'static str),
 }
@@ -292,6 +337,11 @@ impl Display for VitaAgentError {
             Self::ForbiddenStockPath { field, path } => write!(
                 f,
                 "{field} must not select stock Codex/OpenAI state: {}",
+                path.display()
+            ),
+            Self::UnexpectedVitaConfigSource { path } => write!(
+                f,
+                "Vita configuration source must not exist before governed compilation: {}",
                 path.display()
             ),
             Self::KernelConfig(error) => write!(f, "Vita kernel config failed: {error}"),
@@ -317,6 +367,8 @@ impl VitaAgentEntrypoint {
     /// `prepare_thread_start` exposes the official Codex loop options for the
     /// next governed stage without starting a turn in D29-C2.
     pub async fn initialize(profile: VitaAgentRuntimeProfile) -> Result<Self, VitaAgentError> {
+        ensure_vita_config_sources_absent(&profile)?;
+
         let config = ConfigBuilder::default()
             .codex_home(profile.kernel_home().to_path_buf())
             .fallback_cwd(Some(profile.workspace_root().to_path_buf()))
@@ -327,6 +379,34 @@ impl VitaAgentEntrypoint {
             .await
             .map_err(VitaAgentError::KernelConfig)?;
 
+        if config.model_provider_id != VITA_UNCONFIGURED_PROVIDER_ID {
+            return Err(VitaAgentError::KernelInvariant(
+                "Vita must select the fixed unconfigured provider",
+            ));
+        }
+        if config.model.as_deref() != Some(VITA_PLACEHOLDER_MODEL_ID) {
+            return Err(VitaAgentError::KernelInvariant(
+                "Vita must select the fixed placeholder model",
+            ));
+        }
+        if config.model_provider.name != "Vita Unconfigured Provider"
+            || config.model_provider.base_url.as_deref() != Some(VITA_PLACEHOLDER_BASE_URL)
+            || config.model_provider.wire_api.to_string() != "responses"
+        {
+            return Err(VitaAgentError::KernelInvariant(
+                "Vita provider definition must remain fixed and non-production",
+            ));
+        }
+        if config.model_provider.requires_openai_auth
+            || config.model_provider.env_key.is_some()
+            || config.model_provider.experimental_bearer_token.is_some()
+            || config.model_provider.auth.is_some()
+            || config.model_provider.aws.is_some()
+        {
+            return Err(VitaAgentError::KernelInvariant(
+                "Vita provider must not use OpenAI or alternate credential sources",
+            ));
+        }
         if config.codex_home.as_path() != profile.kernel_home()
             || config.cwd.as_path() != profile.workspace_root()
         {
@@ -401,6 +481,23 @@ fn validate_absolute_root(field: &'static str, path: &Path) -> Result<(), VitaAg
     Ok(())
 }
 
+fn ensure_vita_config_sources_absent(
+    profile: &VitaAgentRuntimeProfile,
+) -> Result<(), VitaAgentError> {
+    for path in [
+        profile.system_config_path(),
+        profile.system_requirements_path(),
+        profile.managed_config_path(),
+    ] {
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => return Err(VitaAgentError::UnexpectedVitaConfigSource { path }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(VitaAgentError::KernelConfig(error)),
+        }
+    }
+    Ok(())
+}
+
 fn contains_stock_codex_state(path: &Path) -> bool {
     let normalized = path
         .to_string_lossy()
@@ -446,6 +543,9 @@ mod tests {
     #[test]
     fn exact_codex_pin_and_vita_identity_are_frozen() {
         assert_eq!(VITA_AGENT_RUNTIME_ID, "vita-agent");
+        assert_eq!(VITA_UNCONFIGURED_PROVIDER_ID, "vita-unconfigured");
+        assert_eq!(VITA_PLACEHOLDER_MODEL_ID, "vita-unconfigured-model");
+        assert_eq!(VITA_PLACEHOLDER_BASE_URL, "http://127.0.0.1:9/v1");
         assert_eq!(
             CODEX_UPSTREAM_REPOSITORY,
             "https://github.com/openai/codex.git"
@@ -483,20 +583,33 @@ mod tests {
         );
         assert!(!contains_stock_codex_state(profile.app_data_root()));
         assert!(contains_stock_codex_state(Path::new(
-            r"C:\Users\zuo\.codex"
+            r"C:\Users\TestUser\.codex"
         )));
         assert!(contains_stock_codex_state(Path::new(
             r"C:\ProgramData\OpenAI\Codex"
         )));
 
         let user_state_error = VitaAgentRuntimeProfile::from_explicit_app_data_root(
-            PathBuf::from(r"C:\Users\zuo\.codex"),
+            PathBuf::from(r"C:\Users\TestUser\.codex"),
             profile.workspace_root().to_path_buf(),
         )
         .expect_err("stock user Codex state must be rejected");
         assert!(matches!(
             user_state_error,
             VitaAgentError::ForbiddenStockPath { .. }
+        ));
+
+        let workspace_state_error = VitaAgentRuntimeProfile::from_explicit_app_data_root(
+            profile.app_data_root().to_path_buf(),
+            PathBuf::from(r"C:\Users\TestUser\.codex"),
+        )
+        .expect_err("stock workspace Codex state must be rejected");
+        assert!(matches!(
+            workspace_state_error,
+            VitaAgentError::ForbiddenStockPath {
+                field: "workspace_root",
+                ..
+            }
         ));
 
         let system_state_error = VitaAgentRuntimeProfile::from_explicit_app_data_root(
@@ -542,12 +655,93 @@ mod tests {
             .any(|(_, value)| value.to_string().contains(".codex")));
     }
 
+    #[test]
+    fn provider_override_is_vita_owned_and_has_no_auth_source() {
+        let (_app_data, _workspace, profile) = test_profile();
+        let overrides = profile.cli_overrides();
+        let provider_id = overrides
+            .iter()
+            .find(|(key, _)| key == "model_provider")
+            .and_then(|(_, value)| value.as_str());
+        assert_eq!(provider_id, Some(VITA_UNCONFIGURED_PROVIDER_ID));
+
+        let model = overrides
+            .iter()
+            .find(|(key, _)| key == "model")
+            .and_then(|(_, value)| value.as_str());
+        assert_eq!(model, Some(VITA_PLACEHOLDER_MODEL_ID));
+
+        let provider = overrides
+            .iter()
+            .find(|(key, _)| key == "model_providers")
+            .and_then(|(_, value)| value.as_table())
+            .and_then(|providers| providers.get(VITA_UNCONFIGURED_PROVIDER_ID))
+            .and_then(TomlValue::as_table)
+            .expect("Vita provider override");
+        assert_eq!(
+            provider.get("name").and_then(TomlValue::as_str),
+            Some("Vita Unconfigured Provider")
+        );
+        assert_eq!(
+            provider.get("base_url").and_then(TomlValue::as_str),
+            Some(VITA_PLACEHOLDER_BASE_URL)
+        );
+        assert_eq!(
+            provider.get("wire_api").and_then(TomlValue::as_str),
+            Some("responses")
+        );
+        assert_eq!(
+            provider
+                .get("requires_openai_auth")
+                .and_then(TomlValue::as_bool),
+            Some(false)
+        );
+        for auth_key in ["env_key", "experimental_bearer_token", "auth", "aws"] {
+            assert!(
+                !provider.contains_key(auth_key),
+                "provider must not contain {auth_key}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn entrypoint_reuses_core_without_auth_or_network_side_effects() {
         let (_app_data, _workspace, profile) = test_profile();
         let entrypoint = VitaAgentEntrypoint::initialize(profile).await.unwrap();
 
         assert_eq!(entrypoint.profile().runtime_identity(), "vita-agent");
+        assert_eq!(
+            entrypoint.config().model_provider_id,
+            VITA_UNCONFIGURED_PROVIDER_ID
+        );
+        assert_eq!(
+            entrypoint.config().model.as_deref(),
+            Some(VITA_PLACEHOLDER_MODEL_ID)
+        );
+        assert_eq!(
+            entrypoint.config().model_provider.name,
+            "Vita Unconfigured Provider"
+        );
+        assert_eq!(
+            entrypoint.config().model_provider.base_url.as_deref(),
+            Some(VITA_PLACEHOLDER_BASE_URL)
+        );
+        assert_eq!(
+            entrypoint.config().model_provider.wire_api.to_string(),
+            "responses"
+        );
+        assert!(!entrypoint.config().model_provider.requires_openai_auth);
+        assert!(entrypoint.config().model_provider.env_key.is_none());
+        assert!(entrypoint
+            .config()
+            .model_provider
+            .experimental_bearer_token
+            .is_none());
+        assert!(entrypoint.config().model_provider.auth.is_none());
+        assert!(entrypoint.config().model_provider.aws.is_none());
+        assert!(!entrypoint.profile().system_config_path().exists());
+        assert!(!entrypoint.profile().system_requirements_path().exists());
+        assert!(!entrypoint.profile().managed_config_path().exists());
         assert_eq!(
             entrypoint.config().codex_home.as_path(),
             entrypoint.profile().kernel_home()
@@ -566,6 +760,14 @@ mod tests {
             .network_sandbox_policy()
             .is_enabled());
         assert_eq!(
+            entrypoint.profile().network_policy(),
+            VitaNetworkPolicy::Closed
+        );
+        assert!(matches!(
+            &entrypoint.config().experimental_thread_store,
+            ThreadStoreConfig::InMemory { id } if id == VITA_AGENT_RUNTIME_ID
+        ));
+        assert_eq!(
             entrypoint.initialize_params().client_info.name,
             "vita-agent"
         );
@@ -577,6 +779,44 @@ mod tests {
             options.config.codex_home.as_path(),
             entrypoint.profile().kernel_home()
         );
+        assert!(matches!(
+            options.config.experimental_thread_store,
+            ThreadStoreConfig::InMemory { id } if id == VITA_AGENT_RUNTIME_ID
+        ));
+    }
+
+    #[tokio::test]
+    async fn redirected_vita_config_source_fails_closed_without_reading_or_overwriting() {
+        for file_name in [
+            "system.config.toml",
+            "system.requirements.toml",
+            "managed.config.toml",
+        ] {
+            let app_data = tempdir().expect("app-data temp root");
+            let workspace = tempdir().expect("workspace temp root");
+            let profile = VitaAgentRuntimeProfile::from_explicit_app_data_root(
+                app_data.path().to_path_buf(),
+                workspace.path().to_path_buf(),
+            )
+            .expect("valid explicit Vita profile");
+            let source_path = profile.config_root().join(file_name);
+            let original = b"not parsed by the C2 boundary\n";
+            std::fs::create_dir_all(profile.config_root()).expect("config root");
+            std::fs::write(&source_path, original).expect("sentinel config source");
+
+            let result = VitaAgentEntrypoint::initialize(profile).await;
+            match result {
+                Err(VitaAgentError::UnexpectedVitaConfigSource { path }) => {
+                    assert_eq!(path, source_path);
+                }
+                Err(_) => panic!("existing Vita config source must fail with the source error"),
+                Ok(_) => panic!("existing Vita config source must fail closed"),
+            }
+            assert_eq!(
+                std::fs::read(&source_path).expect("sentinel remains readable"),
+                original
+            );
+        }
     }
 
     #[test]
@@ -588,6 +828,9 @@ mod tests {
             profile.kernel_home(),
             profile.app_data_root().join("kernel")
         );
-        assert_ne!(profile.kernel_home(), Path::new(r"C:\Users\zuo\.codex"));
+        assert_ne!(
+            profile.kernel_home(),
+            Path::new(r"C:\Users\TestUser\.codex")
+        );
     }
 }

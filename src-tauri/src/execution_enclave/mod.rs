@@ -665,9 +665,8 @@ impl CodexRuntimeAdapter {
             runtime.private_codex_home(),
             runtime.trusted_runtime_root(),
         )?;
-        let profile = anonymous_runtime::AnonymousCodexRuntimeProfile::preflight(
-            &private_codex_home,
-        );
+        let profile =
+            anonymous_runtime::AnonymousCodexRuntimeProfile::preflight(&private_codex_home);
         if !profile.is_anonymous() {
             return Err(CodexRuntimeError::AnonymousRuntimeViolation);
         }
@@ -5248,8 +5247,7 @@ mod tests {
             } else {
                 std::fs::write(&path, b"{}").expect("write forbidden material");
             }
-            let profile =
-                anonymous_runtime::AnonymousCodexRuntimeProfile::preflight(home.path());
+            let profile = anonymous_runtime::AnonymousCodexRuntimeProfile::preflight(home.path());
             assert_preflight_rejects(&profile);
             assert!(
                 profile
@@ -5271,8 +5269,7 @@ mod tests {
             "AGENTS.md",
         ] {
             std::fs::write(home.path().join(forbidden), b"x = 1").expect("write config material");
-            let profile =
-                anonymous_runtime::AnonymousCodexRuntimeProfile::preflight(home.path());
+            let profile = anonymous_runtime::AnonymousCodexRuntimeProfile::preflight(home.path());
             assert_preflight_rejects(&profile);
             assert!(
                 profile
@@ -5306,10 +5303,8 @@ mod tests {
         // is rebuilt from scratch; this test asserts that the exact child
         // report contains no credential-bearing variables.
         let private_home = tempfile::tempdir().expect("private home temp dir");
-        let report = child_environment_report(
-            CodexUpstreamPin::pinned(),
-            Some(private_home.path()),
-        );
+        let report =
+            child_environment_report(CodexUpstreamPin::pinned(), Some(private_home.path()));
         for forbidden in [
             "OPENAI_API_KEY",
             "CODEX_API_KEY",
@@ -5363,8 +5358,7 @@ mod tests {
         std::fs::create_dir_all(root.path().join("sessions")).expect("sessions dir");
         std::fs::write(root.path().join("sessions/thread-1.jsonl"), b"thread")
             .expect("durable thread artifact");
-        std::fs::write(root.path().join("models_cache.json"), b"cache")
-            .expect("runtime cache");
+        std::fs::write(root.path().join("models_cache.json"), b"cache").expect("runtime cache");
         let after = anonymous_runtime::RuntimeFilesystemSnapshot::capture(root.path())
             .expect("populated snapshot");
         let delta = after.delta_from(&before);
@@ -5376,8 +5370,12 @@ mod tests {
             "session rollout must be classified as durable: {delta:?}"
         );
         assert!(!delta.is_empty());
-        assert!(anonymous_runtime::is_durable_thread_artifact("rollout-x.jsonl"));
-        assert!(!anonymous_runtime::is_durable_thread_artifact("models_cache.json"));
+        assert!(anonymous_runtime::is_durable_thread_artifact(
+            "rollout-x.jsonl"
+        ));
+        assert!(!anonymous_runtime::is_durable_thread_artifact(
+            "models_cache.json"
+        ));
     }
 
     #[cfg(windows)]
@@ -5433,8 +5431,7 @@ mod tests {
         std::fs::create_dir_all(home.path().join("sessions")).expect("create sessions dir");
         std::fs::create_dir_all(home.path().join("archived_sessions"))
             .expect("create archived sessions dir");
-        let profile =
-            anonymous_runtime::AnonymousCodexRuntimeProfile::preflight(home.path());
+        let profile = anonymous_runtime::AnonymousCodexRuntimeProfile::preflight(home.path());
         assert!(
             profile.is_anonymous(),
             "official runtime artifacts must not violate anonymity: {profile:?}"
@@ -5456,8 +5453,7 @@ mod tests {
         let home = tempfile::tempdir().expect("private home temp dir");
         std::fs::write(home.path().join("unknown-caller-file.bin"), b"x")
             .expect("write unclassifiable entry");
-        let profile =
-            anonymous_runtime::AnonymousCodexRuntimeProfile::preflight(home.path());
+        let profile = anonymous_runtime::AnonymousCodexRuntimeProfile::preflight(home.path());
         assert_preflight_rejects(&profile);
         assert!(
             profile
@@ -5483,8 +5479,7 @@ mod tests {
     #[ignore = "requires exact official pinned D29-C App Server fixture and a credential-free host"]
     fn official_pinned_app_server_ephemeral_thread_smoke() {
         use anonymous_runtime::{
-            is_durable_thread_artifact, AnonymousCodexRuntimeProfile,
-            RuntimeFilesystemSnapshot,
+            is_durable_thread_artifact, AnonymousCodexRuntimeProfile, RuntimeFilesystemSnapshot,
         };
 
         // The fixture env var names the test-harness source path only; it is
@@ -5496,7 +5491,11 @@ mod tests {
         // 1. Exact official asset identity (independent size + SHA-256).
         let descriptor = TrustedCodexRuntimeDescriptor::pinned();
         let (size, digest) = runtime_provisioning::independent_sha256(&source);
-        assert_eq!(size, descriptor.asset_size(), "official asset size mismatch");
+        assert_eq!(
+            size,
+            descriptor.asset_size(),
+            "official asset size mismatch"
+        );
         assert_eq!(
             digest,
             descriptor.asset_sha256(),
@@ -5521,10 +5520,8 @@ mod tests {
 
         // Capture both roots before CreateProcessW.  The post-run delta is
         // the evidence boundary for durable thread/session side effects.
-        let private_home_before = RuntimeFilesystemSnapshot::capture(
-            runtime.private_codex_home(),
-        )
-        .expect("private Codex home snapshot before spawn");
+        let private_home_before = RuntimeFilesystemSnapshot::capture(runtime.private_codex_home())
+            .expect("private Codex home snapshot before spawn");
 
         // 4. Trusted spawn with the exact isolated test root as cwd.
         let isolated_directory = tempfile::tempdir().expect("official smoke isolated root");
@@ -5644,10 +5641,8 @@ mod tests {
         //     inventories and reject every durable thread/session artifact in
         //     the added or changed set.  (The pinned upstream
         //     `config.ephemeral` short-circuits `LiveThread` creation.)
-        let private_home_after = RuntimeFilesystemSnapshot::capture(
-            runtime.private_codex_home(),
-        )
-        .expect("private Codex home snapshot after shutdown");
+        let private_home_after = RuntimeFilesystemSnapshot::capture(runtime.private_codex_home())
+            .expect("private Codex home snapshot after shutdown");
         let private_home_delta = private_home_after.delta_from(&private_home_before);
         assert!(
             private_home_delta.durable_paths().is_empty(),
@@ -5745,9 +5740,7 @@ mod tests {
         UserCodexGlobalCanary {
             config: fingerprint_user_codex_file(&codex_home.join("config.toml")),
             auth: fingerprint_user_codex_file(&codex_home.join("auth.json")),
-            global_state: fingerprint_user_codex_file(
-                &codex_home.join(".codex-global-state.json"),
-            ),
+            global_state: fingerprint_user_codex_file(&codex_home.join(".codex-global-state.json")),
         }
     }
 

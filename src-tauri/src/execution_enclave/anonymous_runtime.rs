@@ -13,13 +13,7 @@
 //! child environment is independently rebuilt and audited at the spawn
 //! boundary.  This profile never touches `~/.codex` or any user Codex home.
 
-use std::{
-    collections::BTreeMap,
-    ffi::OsString,
-    fmt,
-    fs,
-    path::Path,
-};
+use std::{collections::BTreeMap, ffi::OsString, fmt, fs, path::Path};
 
 /// A file name (or directory name) that the pinned upstream App Server treats
 /// as credential or user-configuration material, and which therefore must not
@@ -227,8 +221,9 @@ impl AnonymousCodexRuntimeProfile {
                 }
             };
             if file_type.is_symlink() {
-                self.violations
-                    .push(format!("reparse/symlink entry is forbidden: {child_relative}"));
+                self.violations.push(format!(
+                    "reparse/symlink entry is forbidden: {child_relative}"
+                ));
                 continue;
             }
 
@@ -490,7 +485,9 @@ fn collect_snapshot_entries(
             .file_type()
             .map_err(|error| format!("cannot type snapshot entry {child_relative}: {error}"))?;
         if file_type.is_symlink() {
-            return Err(format!("snapshot contains a reparse/symlink entry: {child_relative}"));
+            return Err(format!(
+                "snapshot contains a reparse/symlink entry: {child_relative}"
+            ));
         }
         if file_type.is_dir() {
             entries.insert(
@@ -514,7 +511,9 @@ fn collect_snapshot_entries(
                 },
             );
         } else {
-            return Err(format!("snapshot contains unsupported entry: {child_relative}"));
+            return Err(format!(
+                "snapshot contains unsupported entry: {child_relative}"
+            ));
         }
     }
     Ok(())

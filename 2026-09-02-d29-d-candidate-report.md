@@ -6,11 +6,11 @@ Status: **D29-D-V1 VERIFICATION CANDIDATE ONLY — NOT FROZEN**
 
 - Branch: `deepseek/d29-d-anonymous-ephemeral-thread-001`
 - Exact base / certified D29-C head: `43da2917ed4d474d1de47f4881002ff70fc727b0`
-- Candidate implementation SHA: `d2394f5cb2c8e47a7297a48084ea7752deae206e`
-- Candidate implementation parent: `43da2917ed4d474d1de47f4881002ff70fc727b0`
+- Candidate implementation SHA: `e6c4dda8b0ea09da1663a56af3a4cc3c5fd2e534`
+- Candidate implementation parent: `e97521406ae91b0371b3c0bf4e3d4811a6dce4b3`
 - Publication: local commit only; no GitHub push and no model-assignment/review dispatch was performed
 - Exact parent: `c6e98f7c7b77198afc4ddfa3ded1071d00492253`
-- Base comparison: ahead `0`, behind `0`; linear history; no merge, rebase, pull, or cleanup was performed
+- Base comparison at the implementation candidate: ahead `4`, behind `0`; linear history; no merge, rebase, pull, or cleanup was performed
 - Pinned upstream: `openai/codex` `rust-v0.152.0` at `316795b3cf2a45e90d121d9f46499d4658b2645c`
 - Protocol schema: `d8faa38d5f00aa7ddfe635a2d374ee5f871ffd217d4d175c72fbe7f009f4f669`
 
@@ -69,14 +69,15 @@ Recognized non-authority runtime artifacts are:
 - their `-wal` / `-shm` SQLite sidecars
 - `thread_history_1.sqlite` and its sidecars as a recognized official runtime name, but it is explicitly rejected by the official smoke if it exists after the ephemeral run
 - `models_cache.json`
-- `log/`, `.tmp/`, and `tmp/`
+- `.sandbox_migration` (the pinned upstream one-shot sandbox-policy migration marker)
+- `log/`, `skills/`, `.tmp/`, and `tmp/`
 - empty `sessions/` and `archived_sessions/` directories
 
 Any entry under `sessions/` or `archived_sessions/` is rejected by preflight. The official pinned rollout source uses `archived_sessions` with an underscore; the previous space-separated spelling is not accepted. Unknown direct entries fail closed.
 
-The smoke uses a complete before/after snapshot of both private `CODEX_HOME` and the isolated cwd. It rejects added or changed `sessions/`, `archived_sessions/`, `session_index.jsonl`, `thread_history_1.sqlite*`, and rollout JSONL/Zstandard artifacts. The exact official delta is **not claimed here because the real smoke has not run in this environment**.
+The smoke uses a complete before/after snapshot of both private `CODEX_HOME` and the isolated cwd. The real pinned smoke passed after classifying the two observed official runtime outputs (`.sandbox_migration` and `skills/`); it still rejects added or changed `sessions/`, `archived_sessions/`, `session_index.jsonl`, `thread_history_1.sqlite*`, and rollout JSONL/Zstandard artifacts. No durable private-home or isolated-cwd artifact was observed.
 
-Delta status is kept separate: (A) Digital Life-private `CODEX_HOME`: official-smoke delta not observed; (B) isolated workspace: official-smoke delta not observed; (C) user `~/.codex`: official canary delta not observed, and no Digital-Life-attributed mutation was found in the read-only source/process audit.
+Delta status is kept separate: (A) Digital Life-private `CODEX_HOME`: official smoke passed with no durable artifact; (B) isolated workspace: official smoke passed with no durable artifact; (C) user `~/.codex`: no valid isolated canary before/after pair was collected, and no Digital-Life-attributed mutation was found in the read-only source/process audit.
 
 ## Thread/start and side-effect audit
 
@@ -98,14 +99,14 @@ The initialize result is also typed to retain `codexHome`; the official smoke co
 - Asset id: `538792479`
 - Size: `227369264`
 - SHA-256: `cb8e6cd9996b0647ccecd37d324438c8625738deca754faa74d98e4d7398a98c`
-- Smoke: **NOT RUN / BLOCKED**
-- Blocking local conditions: `DIGITAL_LIFE_D29_C_OFFICIAL_APP_SERVER_FIXTURE` is unset and `cargo`/`rustc`/`rustup` are not installed or available on PATH
+- Smoke: **PASS** — `official_pinned_app_server_ephemeral_thread_smoke`
+- Fixture verification: exact size and SHA-256 passed; fixture was kept outside the repository in the system temporary directory
 
-The ignored test is present as `official_pinned_app_server_ephemeral_thread_smoke`; it performs independent size/hash verification, private provisioning, preflight, trusted spawn, initialize, `thread/start`, exact binding, child-environment audit, before/after snapshots, and clean shutdown when the pinned fixture and Rust toolchain are supplied.
+The ignored test `official_pinned_app_server_ephemeral_thread_smoke` performed independent size/hash verification, private provisioning, preflight, trusted spawn, initialize, `thread/start`, exact binding, child-environment audit, before/after snapshots, and clean shutdown. It passed with the exact pinned executable.
 
-The separate ignored `official_smoke_preserves_user_codex_global_canary` gate fingerprints only the three requested user-global files before and after the official smoke. It requires the operator to close unrelated Codex processes and set `DIGITAL_LIFE_D29_D_CANARY_PROCESSES_CLOSED=1`; it never stops processes or changes the files. Result in this environment: **NOT RUN / BLOCKED** because unrelated Codex processes are active, the Rust toolchain is unavailable, and the official fixture variable is unset.
+The separate ignored `official_smoke_preserves_user_codex_global_canary` gate fingerprints only the three requested user-global files before and after the official smoke. It requires the operator to close unrelated Codex processes and set `DIGITAL_LIFE_D29_D_CANARY_PROCESSES_CLOSED=1`; it never stops processes or changes the files. Result in this environment: **NOT RUN / BLOCKED** because the current Codex Desktop/host/runner processes are active. The test was not forced by setting the marker falsely.
 
-ProcMon incident audit: **NOT PERFORMED**. No process-level attribution is claimed.
+ProcMon incident audit: **NOT PERFORMED**. A safe path-filtered capture could not be established; an unfiltered launch was rejected by the execution safety boundary. No process-level attribution is claimed.
 
 ## Schema and production reachability
 
@@ -121,10 +122,10 @@ This investigation was read-only. No command or patch in this task deleted, rest
 
 At the latest read-only sample during this task, the following files were still present:
 
-- `C:\Users\zuo\.codex\config.toml` — 3003 bytes; latest observed creation/write metadata `2026-09-02 09:48:49` local time
+- `C:\Users\zuo\.codex\config.toml` — 3003 bytes; latest observed write metadata changed during the verification window
 - `C:\Users\zuo\.codex\auth.json` — 4224 bytes; observed metadata unchanged from `2026-09-01 22:53:19` local time
-- `C:\Users\zuo\.codex\.codex-global-state.json` — 539422 bytes; latest observed write metadata `2026-09-02 09:56:03`
-- `C:\Users\zuo\.codex\.codex-global-state.json.bak` — 539422 bytes; latest observed write metadata `2026-09-02 09:56:03`
+- `C:\Users\zuo\.codex\.codex-global-state.json` — present; latest observed size and write metadata changed during the verification window
+- `C:\Users\zuo\.codex\.codex-global-state.json.bak` — present; latest observed size and write metadata changed during the verification window
 
 The changing `config.toml` and global-state timestamps continued to coincide with active `codex`, `codex-code-mode-host`, `codex-command-runner-0.152.0`, and sandbox-helper processes. Project-source searches found no operation targeting the user Codex home. The most supported explanation is a normal Codex desktop/config or global-state writer, or another concurrently running Codex process, rewriting/recreating state while the task was active. A prior child that did not replace `CODEX_HOME` could also have reached the default user home; this is why D29-D now uses a complete child environment and a private home.
 
@@ -136,10 +137,11 @@ The public Codex configuration documentation confirms that `CODEX_HOME` defaults
 
 ## Verification status
 
-- `git diff --check`: passed; Git emitted only its existing LF/CRLF working-copy normalization warning.
-- `cargo test --lib execution_enclave`: blocked before the test harness started because `cargo` is unavailable; tests executed `0`, failures observed `0`, ignored observed `0`, warnings emitted `0`.
-- `cargo check --lib`: blocked before compilation because `cargo` is unavailable; no compiler diagnostics emitted.
-- `cargo fmt --all -- --check`: blocked before formatting because `cargo` is unavailable; no formatter diagnostics emitted.
-- Official smoke: blocked as stated above; no fabricated pass result.
+- `git diff --check`: passed; only the existing Git LF/CRLF working-copy normalization warning appeared during staging.
+- `cargo test --lib execution_enclave`: passed; `96` passed, `0` failed, `3` ignored, `0` measured, `2247` filtered out; the lib-test build emitted `8` existing dead-code warnings.
+- `cargo check --lib`: passed; the lib check emitted `1` existing dead-code warning.
+- `cargo fmt --all -- --check`: passed.
+- Official smoke: passed with the exact pinned asset and fixture.
+- User-global canary: not run because current Codex writers could not be closed safely; ProcMon fallback not completed.
 
 Final declaration: **D29-D-V1 VERIFICATION CANDIDATE ONLY — NOT FROZEN**

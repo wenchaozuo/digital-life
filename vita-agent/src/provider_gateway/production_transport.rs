@@ -8,7 +8,10 @@ use std::fmt::{self, Formatter};
 use std::io::Read;
 use std::marker::PhantomData;
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, OnceLock};
+#[cfg(test)]
+use std::sync::{Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -130,14 +133,32 @@ struct DnsWork {
     reply: mpsc::SyncSender<Result<Vec<SocketAddr>, VitaAgentError>>,
 }
 
-/// Owns one long-lived resolver worker for one production transport.
+struct DnsBusyGuard {
+    busy: Arc<AtomicBool>,
+    #[cfg(test)]
+    idle: Arc<(Mutex<()>, Condvar)>,
+}
+
+impl Drop for DnsBusyGuard {
+    fn drop(&mut self) {
+        self.busy.store(false, Ordering::Release);
+        #[cfg(test)]
+        self.idle.1.notify_all();
+    }
+}
+
+/// Owns one long-lived, bounded resolver worker.
 ///
-/// The rendezvous channel is intentional: while the resolver is blocked, a
-/// later request cannot enqueue another job and cannot create another thread.
-/// If the underlying OS resolver cannot be cancelled, at most this one worker
-/// remains occupied until it returns; callers fail closed while it is busy.
+/// `busy` is the logical ownership gate.  The capacity-one queue lets an idle
+/// worker accept a request even before its thread reaches `recv`, while the
+/// gate prevents a second outstanding job.  If the underlying OS resolver
+/// cannot be cancelled, the one worker remains occupied until it returns and
+/// callers fail closed while `busy` is true.
 struct BoundedDnsWorker<D> {
     sender: mpsc::SyncSender<DnsWork>,
+    busy: Arc<AtomicBool>,
+    #[cfg(test)]
+    idle: Arc<(Mutex<()>, Condvar)>,
     _thread: thread::JoinHandle<()>,
     _resolver: PhantomData<fn() -> D>,
 }
@@ -147,27 +168,36 @@ where
     D: DnsResolver,
 {
     fn new(resolver: D) -> Result<Self, VitaAgentError> {
-        let (sender, receiver) = mpsc::sync_channel::<DnsWork>(0);
-        let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+        let (sender, receiver) = mpsc::sync_channel::<DnsWork>(1);
+        let busy = Arc::new(AtomicBool::new(false));
+        let worker_busy = Arc::clone(&busy);
+        #[cfg(test)]
+        let idle = Arc::new((Mutex::new(()), Condvar::new()));
+        #[cfg(test)]
+        let worker_idle = Arc::clone(&idle);
         let thread = thread::Builder::new()
             .name("vita-provider-dns".to_string())
             .spawn(move || {
-                let _ = ready_sender.send(());
                 while let Ok(work) = receiver.recv() {
-                    let result = resolver.resolve(&work.host, work.port);
+                    let result = {
+                        let _busy_guard = DnsBusyGuard {
+                            busy: Arc::clone(&worker_busy),
+                            #[cfg(test)]
+                            idle: Arc::clone(&worker_idle),
+                        };
+                        resolver.resolve(&work.host, work.port)
+                    };
                     let _ = work.reply.send(result);
                 }
             })
             .map_err(|_| VitaAgentError::ProviderTransportRejected {
                 reason: "provider DNS resolver worker could not start",
             })?;
-        ready_receiver
-            .recv()
-            .map_err(|_| VitaAgentError::ProviderTransportRejected {
-                reason: "provider DNS resolver worker stopped during startup",
-            })?;
         Ok(Self {
             sender,
+            busy,
+            #[cfg(test)]
+            idle,
             _thread: thread,
             _resolver: PhantomData,
         })
@@ -179,21 +209,31 @@ where
         port: u16,
         timeout: Duration,
     ) -> Result<Vec<SocketAddr>, VitaAgentError> {
+        if self
+            .busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(VitaAgentError::ProviderTransportRejected {
+                reason: "provider DNS resolver is busy with another request",
+            });
+        }
         let (reply_sender, reply_receiver) = mpsc::sync_channel(1);
-        self.sender
-            .try_send(DnsWork {
-                host: host.to_string(),
-                port,
-                reply: reply_sender,
-            })
-            .map_err(|error| match error {
+        if let Err(error) = self.sender.try_send(DnsWork {
+            host: host.to_string(),
+            port,
+            reply: reply_sender,
+        }) {
+            self.busy.store(false, Ordering::Release);
+            return Err(match error {
                 mpsc::TrySendError::Full(_) => VitaAgentError::ProviderTransportRejected {
-                    reason: "provider DNS resolver is busy after an earlier timeout",
+                    reason: "provider DNS resolver queue is unexpectedly full",
                 },
                 mpsc::TrySendError::Disconnected(_) => VitaAgentError::ProviderTransportRejected {
                     reason: "provider DNS resolver stopped without a result",
                 },
-            })?;
+            });
+        }
         match reply_receiver.recv_timeout(timeout) {
             Ok(result) => result,
             Err(mpsc::RecvTimeoutError::Timeout) => Err(VitaAgentError::ProviderTransportTimeout {
@@ -206,6 +246,38 @@ where
             }
         }
     }
+
+    #[cfg(test)]
+    fn is_busy(&self) -> bool {
+        self.busy.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn wait_until_idle(&self, timeout: Duration) -> bool {
+        let (lock, wake) = &*self.idle;
+        let guard = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = wake
+            .wait_timeout_while(guard, timeout, |_| self.is_busy())
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        !self.is_busy()
+    }
+}
+
+static SYSTEM_DNS_WORKER: OnceLock<Result<Arc<BoundedDnsWorker<SystemDnsResolver>>, &'static str>> =
+    OnceLock::new();
+
+fn system_dns_worker() -> Result<Arc<BoundedDnsWorker<SystemDnsResolver>>, VitaAgentError> {
+    SYSTEM_DNS_WORKER
+        .get_or_init(|| {
+            BoundedDnsWorker::new(SystemDnsResolver)
+                .map(Arc::new)
+                .map_err(|_| "provider DNS resolver worker could not start")
+        })
+        .as_ref()
+        .map(Arc::clone)
+        .map_err(|reason| VitaAgentError::ProviderTransportRejected { reason })
 }
 
 /// The HTTP executor is separated from the policy so DNS/SSRF and retry tests
@@ -299,7 +371,7 @@ impl EffectiveTimeouts {
 /// Library-only production transport.  It is not constructed by the current
 /// Tauri or Chat route code; G1 only establishes the security foundation.
 struct ProductionProviderTransport<D = SystemDnsResolver, H = ReqwestHttpExecutor> {
-    dns: BoundedDnsWorker<D>,
+    dns: Arc<BoundedDnsWorker<D>>,
     http: H,
     limits: ProductionTransportLimits,
 }
@@ -310,7 +382,7 @@ impl ProductionProviderTransport<SystemDnsResolver, ReqwestHttpExecutor> {
     fn new(limits: ProductionTransportLimits) -> Result<Self, VitaAgentError> {
         limits.validate()?;
         Ok(Self {
-            dns: BoundedDnsWorker::new(SystemDnsResolver)?,
+            dns: system_dns_worker()?,
             http: ReqwestHttpExecutor,
             limits,
         })
@@ -325,10 +397,19 @@ where
     #[cfg(test)]
     fn with_components(dns: D, http: H, limits: ProductionTransportLimits) -> Self {
         Self {
-            dns: BoundedDnsWorker::new(dns).expect("test DNS worker should start"),
+            dns: Arc::new(BoundedDnsWorker::new(dns).expect("test DNS worker should start")),
             http,
             limits,
         }
+    }
+
+    #[cfg(test)]
+    fn with_shared_components(
+        dns: Arc<BoundedDnsWorker<D>>,
+        http: H,
+        limits: ProductionTransportLimits,
+    ) -> Self {
+        Self { dns, http, limits }
     }
 
     fn post_json_inner(
@@ -742,7 +823,7 @@ fn min_duration(left: Duration, right: Duration) -> Duration {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Condvar, Mutex};
 
     const PUBLIC_IP: [u8; 4] = [93, 184, 216, 34];
     const TEST_PORT: u16 = 443;
@@ -813,6 +894,57 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             stats.active -= 1;
+            Ok(vec![SocketAddr::from((PUBLIC_IP, TEST_PORT))])
+        }
+    }
+
+    #[derive(Clone)]
+    struct ControlledDns {
+        stats: Arc<Mutex<ResolverStats>>,
+        started: mpsc::Sender<()>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+        finished: mpsc::Sender<()>,
+    }
+
+    impl ControlledDns {
+        fn release(&self) {
+            let (released, wake) = &*self.release;
+            let mut released = released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *released = true;
+            wake.notify_one();
+        }
+    }
+
+    impl DnsResolver for ControlledDns {
+        fn resolve(&self, _host: &str, _port: u16) -> Result<Vec<SocketAddr>, VitaAgentError> {
+            {
+                let mut stats = self
+                    .stats
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                stats.calls += 1;
+                stats.active += 1;
+                stats.max_active = stats.max_active.max(stats.active);
+            }
+            let _ = self.started.send(());
+            let (released, wake) = &*self.release;
+            let mut released = released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while !*released {
+                released = wake
+                    .wait(released)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            drop(released);
+            let mut stats = self
+                .stats
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            stats.active -= 1;
+            let _ = self.finished.send(());
             Ok(vec![SocketAddr::from((PUBLIC_IP, TEST_PORT))])
         }
     }
@@ -925,6 +1057,276 @@ mod tests {
             http,
             ProductionTransportLimits::default(),
         )
+    }
+
+    fn controlled_dns() -> (
+        ControlledDns,
+        mpsc::Receiver<()>,
+        mpsc::Receiver<()>,
+        Arc<Mutex<ResolverStats>>,
+    ) {
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (finished_sender, finished_receiver) = mpsc::channel();
+        let stats = Arc::new(Mutex::new(ResolverStats::default()));
+        let dns = ControlledDns {
+            stats: stats.clone(),
+            started: started_sender,
+            release: Arc::new((Mutex::new(false), Condvar::new())),
+            finished: finished_sender,
+        };
+        (dns, started_receiver, finished_receiver, stats)
+    }
+
+    #[test]
+    fn fresh_idle_workers_do_not_report_false_busy_under_stress() {
+        for _ in 0..32 {
+            let worker = BoundedDnsWorker::new(TestDns::answers(vec![SocketAddr::from((
+                PUBLIC_IP, TEST_PORT,
+            ))]))
+            .expect("test DNS worker should start");
+            assert!(!worker.is_busy());
+            let addresses = worker
+                .resolve_with_timeout("provider.example", TEST_PORT, Duration::from_secs(1))
+                .expect("fresh idle worker should accept its first queued job");
+            assert_eq!(addresses.len(), 1);
+            assert!(!worker.is_busy());
+        }
+    }
+
+    #[test]
+    fn back_to_back_successful_dns_does_not_report_busy() {
+        let worker = BoundedDnsWorker::new(TestDns::answers(vec![SocketAddr::from((
+            PUBLIC_IP, TEST_PORT,
+        ))]))
+        .expect("test DNS worker should start");
+        for _ in 0..256 {
+            let addresses = worker
+                .resolve_with_timeout("provider.example", TEST_PORT, Duration::from_secs(1))
+                .expect("completed DNS must release the worker for the next job");
+            assert_eq!(addresses.len(), 1);
+            assert!(!worker.is_busy());
+        }
+    }
+
+    #[test]
+    fn timed_out_dns_keeps_worker_busy_until_resolver_finishes() {
+        let (dns, started, finished, stats) = controlled_dns();
+        let worker = BoundedDnsWorker::new(dns.clone()).expect("test DNS worker should start");
+        let error = worker
+            .resolve_with_timeout("provider.example", TEST_PORT, Duration::from_millis(10))
+            .expect_err("blocked resolver should exceed the caller DNS timeout");
+        assert!(matches!(
+            error,
+            VitaAgentError::ProviderTransportTimeout {
+                phase: "DNS resolution"
+            }
+        ));
+        started
+            .recv_timeout(Duration::from_millis(100))
+            .expect("resolver should have started");
+        assert!(worker.is_busy());
+        {
+            let stats = stats
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(stats.calls, 1);
+            assert_eq!(stats.active, 1);
+        }
+        dns.release();
+        finished
+            .recv_timeout(Duration::from_millis(100))
+            .expect("resolver should finish after release");
+        assert!(worker.wait_until_idle(Duration::from_millis(100)));
+        assert!(!worker.is_busy());
+    }
+
+    #[test]
+    fn repeated_requests_during_unresolved_timeout_do_not_invoke_resolver_again() {
+        let (dns, started, finished, stats) = controlled_dns();
+        let worker = BoundedDnsWorker::new(dns.clone()).expect("test DNS worker should start");
+        let _ = worker
+            .resolve_with_timeout("provider.example", TEST_PORT, Duration::from_millis(10))
+            .expect_err("first resolver call should time out for the caller");
+        started
+            .recv_timeout(Duration::from_millis(100))
+            .expect("resolver should have started");
+        for _ in 0..32 {
+            let error = worker
+                .resolve_with_timeout("provider.example", TEST_PORT, Duration::from_secs(1))
+                .expect_err("busy worker must fail closed");
+            assert!(matches!(
+                error,
+                VitaAgentError::ProviderTransportRejected {
+                    reason: "provider DNS resolver is busy with another request"
+                }
+            ));
+        }
+        {
+            let stats = stats
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(stats.calls, 1);
+            assert_eq!(stats.max_active, 1);
+        }
+        dns.release();
+        finished
+            .recv_timeout(Duration::from_millis(100))
+            .expect("resolver should finish after release");
+        assert!(worker.wait_until_idle(Duration::from_millis(100)));
+    }
+
+    #[test]
+    fn same_worker_recovers_after_blocked_resolver_returns() {
+        let (dns, started, finished, stats) = controlled_dns();
+        let worker = BoundedDnsWorker::new(dns.clone()).expect("test DNS worker should start");
+        let _ = worker
+            .resolve_with_timeout("provider.example", TEST_PORT, Duration::from_millis(10))
+            .expect_err("first resolver call should time out for the caller");
+        started
+            .recv_timeout(Duration::from_millis(100))
+            .expect("resolver should have started");
+        dns.release();
+        finished
+            .recv_timeout(Duration::from_millis(100))
+            .expect("resolver should finish after release");
+        assert!(worker.wait_until_idle(Duration::from_millis(100)));
+        let addresses = worker
+            .resolve_with_timeout("provider.example", TEST_PORT, Duration::from_secs(1))
+            .expect("same worker should accept the next request");
+        assert_eq!(addresses.len(), 1);
+        let stats = stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(stats.calls, 2);
+        assert_eq!(stats.max_active, 1);
+    }
+
+    #[test]
+    fn production_transport_instances_share_one_system_dns_worker() {
+        let first = ProductionProviderTransport::new(ProductionTransportLimits::default())
+            .expect("first production transport");
+        let second = ProductionProviderTransport::new(ProductionTransportLimits::default())
+            .expect("second production transport");
+        assert!(Arc::ptr_eq(&first.dns, &second.dns));
+        assert!(!first.dns.is_busy());
+        assert!(!second.dns.is_busy());
+    }
+
+    #[test]
+    fn drop_and_recreate_transport_keeps_shared_worker_bound_and_recovers() {
+        let (dns, started, finished, stats) = controlled_dns();
+        let shared_worker =
+            Arc::new(BoundedDnsWorker::new(dns.clone()).expect("test DNS worker should start"));
+        {
+            let first = ProductionProviderTransport::with_shared_components(
+                shared_worker.clone(),
+                TestHttp::with_responses([response(200, b"must-not-be-called")]),
+                ProductionTransportLimits::default(),
+            );
+            let error = first
+                .post_json(
+                    &endpoint(),
+                    None,
+                    b"{}",
+                    Duration::from_millis(10),
+                    ProviderRetryPolicy::default(),
+                )
+                .expect_err("first transport should time out in DNS");
+            assert!(matches!(
+                error,
+                VitaAgentError::ProviderTransportTimeout {
+                    phase: "DNS resolution"
+                }
+            ));
+        }
+        started
+            .recv_timeout(Duration::from_millis(100))
+            .expect("resolver should remain active after transport drop");
+        let second = ProductionProviderTransport::with_shared_components(
+            shared_worker.clone(),
+            TestHttp::with_responses([response(200, b"ok")]),
+            ProductionTransportLimits::default(),
+        );
+        let error = second
+            .post_json(
+                &endpoint(),
+                None,
+                b"{}",
+                Duration::from_secs(1),
+                ProviderRetryPolicy::default(),
+            )
+            .expect_err("recreated transport must fail closed while DNS is busy");
+        assert!(matches!(
+            error,
+            VitaAgentError::ProviderTransportRejected {
+                reason: "provider DNS resolver is busy with another request"
+            }
+        ));
+        {
+            let stats = stats
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(stats.calls, 1);
+            assert_eq!(stats.max_active, 1);
+        }
+        dns.release();
+        finished
+            .recv_timeout(Duration::from_millis(100))
+            .expect("resolver should finish after release");
+        assert!(shared_worker.wait_until_idle(Duration::from_millis(100)));
+        let body = second
+            .post_json(
+                &endpoint(),
+                None,
+                b"{}",
+                Duration::from_secs(1),
+                ProviderRetryPolicy::default(),
+            )
+            .expect("recreated transport should recover on the same worker");
+        assert_eq!(body, b"ok");
+        let stats = stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(stats.calls, 2);
+        assert_eq!(stats.max_active, 1);
+    }
+
+    #[test]
+    fn shared_worker_max_active_resolver_count_is_one() {
+        let (dns, started, finished, stats) = controlled_dns();
+        let worker = Arc::new(BoundedDnsWorker::new(dns.clone()).expect("test DNS worker"));
+        let mut callers = Vec::new();
+        for _ in 0..16 {
+            let worker = worker.clone();
+            callers.push(thread::spawn(move || {
+                worker.resolve_with_timeout(
+                    "provider.example",
+                    TEST_PORT,
+                    Duration::from_millis(30),
+                )
+            }));
+        }
+        started
+            .recv_timeout(Duration::from_millis(100))
+            .expect("one resolver should have started");
+        let results = callers
+            .into_iter()
+            .map(|caller| caller.join().expect("DNS caller should not panic"))
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 16);
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 0);
+        let stats = stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(stats.calls, 1);
+        assert_eq!(stats.active, 1);
+        assert_eq!(stats.max_active, 1);
+        drop(stats);
+        dns.release();
+        finished
+            .recv_timeout(Duration::from_millis(100))
+            .expect("resolver should finish after release");
+        assert!(worker.wait_until_idle(Duration::from_millis(100)));
     }
 
     #[test]
@@ -1281,7 +1683,7 @@ mod tests {
                 VitaAgentError::ProviderTransportTimeout {
                     phase: "DNS resolution"
                 } | VitaAgentError::ProviderTransportRejected {
-                    reason: "provider DNS resolver is busy after an earlier timeout"
+                    reason: "provider DNS resolver is busy with another request"
                 }
             ));
         }

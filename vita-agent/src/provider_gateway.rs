@@ -2,9 +2,9 @@
 
 //! Digital Life-owned provider authority and provider-neutral gateway.
 //!
-//! The module deliberately stops at an injected transport seam.  Production
-//! code has no external HTTP client here; the only HTTP transport below is a
-//! test-only loopback transport used to prove the deterministic mapping.
+//! The module owns the provider boundary and its transport seams.  The
+//! production HTTPS transport is library-only: it is not exposed through the
+//! Tauri/frontend, Chat Completions route, or autonomy surfaces in this stage.
 
 use std::fmt::{self, Display, Formatter};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -13,8 +13,11 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::{Host, Url};
+use zeroize::Zeroizing;
 
 use super::{VitaAgentError, VITA_AGENT_RUNTIME_ID, VITA_GATEWAY_PROVIDER_ID};
+
+mod production_transport;
 
 #[cfg(test)]
 #[path = "d29f.rs"]
@@ -854,25 +857,74 @@ impl GatewayReadyProvider {
 
 /// Resolves a Digital Life credential reference at request time.
 ///
-/// Implementations must keep any resolved secret ephemeral.  The trait is
-/// private to Vita until the Digital Life Secret Store is introduced.
+/// Implementations must keep any resolved secret ephemeral.  The production
+/// implementation is deliberately a seam for the future Digital Life Secret
+/// Store; it does not read ambient process credentials or stock Codex state.
 trait CredentialResolver {
-    fn resolve(&self, credential_ref: &CredentialRef) -> Result<String, VitaAgentError>;
+    fn resolve(&self, credential_ref: &CredentialRef)
+        -> Result<ResolvedCredential, VitaAgentError>;
+}
+
+/// A request-lifetime credential container.
+///
+/// The raw value is never serializable or persisted.  `zeroize` clears the
+/// owned string when this value is dropped, and the custom Debug output keeps
+/// the value out of diagnostics.  The HTTP transport creates a separate,
+/// typed Authorization header only for the duration of the request.
+pub(crate) struct ResolvedCredential(Zeroizing<String>);
+
+impl ResolvedCredential {
+    pub(crate) fn new(secret: impl Into<String>) -> Self {
+        Self(Zeroizing::new(secret.into()))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    fn validate_header_safety(&self) -> Result<(), VitaAgentError> {
+        if self
+            .as_bytes()
+            .iter()
+            .any(|byte| *byte <= 0x20 || *byte == 0x7f)
+        {
+            return Err(VitaAgentError::CredentialResolution(
+                "resolved credential contains unsafe HTTP header bytes",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for ResolvedCredential {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("ResolvedCredential")
+            .field(&"[redacted]")
+            .finish()
+    }
 }
 
 /// The minimum outbound provider transport seam.
 ///
-/// There is intentionally no production implementation in D29-E.  The
-/// endpoint and authorization header are supplied by the already validated
-/// Digital Life profile and credential reference, never by ambient process
-/// configuration.
+/// The endpoint and request-lifetime credential are supplied by the already
+/// validated Digital Life profile and credential reference, never by ambient
+/// process configuration.  Implementations must not follow redirects.
 trait ProviderRequestTransport {
     fn post_json(
         &self,
         endpoint: &ProviderEndpoint,
-        authorization: Option<&str>,
+        authorization: Option<&ResolvedCredential>,
         body: &[u8],
         timeout: Duration,
+        retry_policy: ProviderRetryPolicy,
     ) -> Result<Vec<u8>, VitaAgentError>;
 }
 
@@ -912,6 +964,11 @@ where
                 protocol: self.ready.profile.protocol,
             });
         }
+        // Re-check the provider-to-endpoint binding immediately before any
+        // credential lookup.  A future mutable profile store must not be able
+        // to move a reference to another provider or destination between
+        // configuration validation and request construction.
+        self.ready.profile.validate()?;
         // Codex's Responses client requires a streaming Responses response, but
         // D29-F deliberately keeps the downstream Chat mock non-streaming.  The
         // Vita listener owns that protocol boundary: validate the Codex request
@@ -932,19 +989,20 @@ where
             .as_ref()
             .map(|reference| self.credential_resolver.resolve(reference))
             .transpose()?;
-        if credential.as_deref().is_some_and(str::is_empty) {
+        if credential
+            .as_ref()
+            .is_some_and(ResolvedCredential::is_empty)
+        {
             return Err(VitaAgentError::CredentialResolution(
                 "resolved credential is empty",
             ));
         }
-        let authorization = credential
-            .as_deref()
-            .map(|credential| format!("Bearer {credential}"));
         let response = self.transport.post_json(
             &self.ready.profile.endpoint,
-            authorization.as_deref(),
+            credential.as_ref(),
             &body,
             self.ready.profile.timeout,
+            self.ready.profile.retry_policy,
         )?;
         let response =
             serde_json::from_slice::<ChatCompletionsResponse>(&response).map_err(|_| {
@@ -1932,13 +1990,16 @@ mod tests {
     }
 
     impl CredentialResolver for InMemoryTestCredential {
-        fn resolve(&self, credential_ref: &CredentialRef) -> Result<String, VitaAgentError> {
+        fn resolve(
+            &self,
+            credential_ref: &CredentialRef,
+        ) -> Result<ResolvedCredential, VitaAgentError> {
             if credential_ref != &self.reference {
                 return Err(VitaAgentError::CredentialResolution(
                     "credential reference was not found in the test store",
                 ));
             }
-            Ok(self.value.clone())
+            Ok(ResolvedCredential::new(self.value.clone()))
         }
     }
 
@@ -1948,9 +2009,10 @@ mod tests {
         fn post_json(
             &self,
             endpoint: &ProviderEndpoint,
-            authorization: Option<&str>,
+            authorization: Option<&ResolvedCredential>,
             body: &[u8],
             timeout: Duration,
+            _retry_policy: ProviderRetryPolicy,
         ) -> Result<Vec<u8>, VitaAgentError> {
             if !endpoint.is_test_localhost() {
                 return Err(VitaAgentError::GatewayProtocol(
@@ -1972,7 +2034,9 @@ mod tests {
             )
             .into_bytes();
             if let Some(authorization) = authorization {
-                request.extend_from_slice(format!("Authorization: {authorization}\r\n").as_bytes());
+                request.extend_from_slice(
+                    format!("Authorization: Bearer {}\r\n", authorization.as_str()).as_bytes(),
+                );
             }
             request.extend_from_slice(b"\r\n");
             request.extend_from_slice(body);

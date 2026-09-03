@@ -27,8 +27,8 @@ use tempfile::{tempdir, TempDir};
 use super::{
     CredentialRef, CredentialResolver, GatewayReadyProvider, ProviderCapabilities,
     ProviderEndpoint, ProviderGateway, ProviderProfile, ProviderProtocol, ProviderRequestTransport,
-    ProviderRetryPolicy, VitaAgentError, VitaGatewayBinding, VitaMessage, VitaMessageRole,
-    VitaProviderState, VitaResponsesRequest, VitaResponsesRequestOptions,
+    ProviderRetryPolicy, ResolvedCredential, VitaAgentError, VitaGatewayBinding, VitaMessage,
+    VitaMessageRole, VitaProviderState, VitaResponsesRequest, VitaResponsesRequestOptions,
 };
 
 use crate::{
@@ -1345,13 +1345,16 @@ struct D29fCredentialResolver {
 }
 
 impl CredentialResolver for D29fCredentialResolver {
-    fn resolve(&self, credential_ref: &CredentialRef) -> Result<String, VitaAgentError> {
+    fn resolve(
+        &self,
+        credential_ref: &CredentialRef,
+    ) -> Result<ResolvedCredential, VitaAgentError> {
         if credential_ref != &self.reference {
             return Err(VitaAgentError::CredentialResolution(
                 "D29-F credential reference was not found in the in-memory test store",
             ));
         }
-        Ok(D29F_CREDENTIAL.to_string())
+        Ok(ResolvedCredential::new(D29F_CREDENTIAL))
     }
 }
 
@@ -1361,9 +1364,10 @@ impl ProviderRequestTransport for D29fTcpLocalTransport {
     fn post_json(
         &self,
         endpoint: &ProviderEndpoint,
-        authorization: Option<&str>,
+        authorization: Option<&ResolvedCredential>,
         body: &[u8],
         timeout: Duration,
+        _retry_policy: ProviderRetryPolicy,
     ) -> Result<Vec<u8>, VitaAgentError> {
         if !endpoint.is_test_localhost() {
             return Err(VitaAgentError::GatewayProtocol(
@@ -1387,7 +1391,9 @@ impl ProviderRequestTransport for D29fTcpLocalTransport {
         )
         .into_bytes();
         if let Some(authorization) = authorization {
-            request.extend_from_slice(format!("Authorization: {authorization}\r\n").as_bytes());
+            request.extend_from_slice(
+                format!("Authorization: Bearer {}\r\n", authorization.as_str()).as_bytes(),
+            );
         }
         request.extend_from_slice(b"\r\n");
         request.extend_from_slice(body);
@@ -2212,7 +2218,10 @@ fn assert_case_failed(case: &CaseReport, expected: &str) {
 struct D29fNoCredentialResolver;
 
 impl CredentialResolver for D29fNoCredentialResolver {
-    fn resolve(&self, _credential_ref: &CredentialRef) -> Result<String, VitaAgentError> {
+    fn resolve(
+        &self,
+        _credential_ref: &CredentialRef,
+    ) -> Result<ResolvedCredential, VitaAgentError> {
         Err(VitaAgentError::CredentialResolution(
             "D29-F wrong-model test must fail before credential resolution",
         ))
@@ -2225,9 +2234,10 @@ impl ProviderRequestTransport for D29fNoNetworkTransport {
     fn post_json(
         &self,
         _endpoint: &ProviderEndpoint,
-        _authorization: Option<&str>,
+        _authorization: Option<&ResolvedCredential>,
         _body: &[u8],
         _timeout: Duration,
+        _retry_policy: ProviderRetryPolicy,
     ) -> Result<Vec<u8>, VitaAgentError> {
         Err(VitaAgentError::GatewayTransport(std::io::Error::new(
             std::io::ErrorKind::Other,

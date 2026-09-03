@@ -628,6 +628,25 @@ pub enum VitaAgentError {
     GatewayProtocol(String),
     GatewayTransport(std::io::Error),
     CredentialResolution(&'static str),
+    ProviderTransportRejected {
+        reason: &'static str,
+    },
+    ProviderTransportTimeout {
+        phase: &'static str,
+    },
+    ProviderRequestTooLarge {
+        limit: usize,
+    },
+    ProviderResponseTooLarge {
+        limit: usize,
+    },
+    ProviderHttpStatus {
+        status: u16,
+    },
+    ProviderRetryExhausted {
+        status: u16,
+        attempts: u8,
+    },
     OwnershipViolation {
         path: PathBuf,
         reason: &'static str,
@@ -713,6 +732,25 @@ impl Display for VitaAgentError {
             Self::CredentialResolution(reason) => {
                 write!(f, "provider credential resolution failed: {reason}")
             }
+            Self::ProviderTransportRejected { reason } => {
+                write!(f, "provider HTTPS transport rejected the request: {reason}")
+            }
+            Self::ProviderTransportTimeout { phase } => {
+                write!(f, "provider HTTPS transport timed out during {phase}")
+            }
+            Self::ProviderRequestTooLarge { limit } => {
+                write!(f, "provider request exceeds the {limit}-byte limit")
+            }
+            Self::ProviderResponseTooLarge { limit } => {
+                write!(f, "provider response exceeds the {limit}-byte limit")
+            }
+            Self::ProviderHttpStatus { status } => {
+                write!(f, "provider returned HTTP status {status}")
+            }
+            Self::ProviderRetryExhausted { status, attempts } => write!(
+                f,
+                "provider retry budget exhausted after {attempts} attempts for HTTP status {status}"
+            ),
             Self::OwnershipViolation { path, reason } => write!(
                 f,
                 "Vita ownership check failed ({reason}): {}",

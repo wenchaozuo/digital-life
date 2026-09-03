@@ -27,6 +27,10 @@ mod d29f;
 #[path = "d29g2.rs"]
 mod d29g2;
 
+#[cfg(test)]
+#[path = "d29h1.rs"]
+mod d29h1;
+
 /// The provider wire protocols owned by Digital Life's provider domain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderProtocol {

@@ -21,6 +21,7 @@ use toml::map::Map;
 use toml::Value as TomlValue;
 
 mod provider_gateway;
+mod tool_authority;
 
 pub use provider_gateway::{
     CredentialRef, ProviderCapabilities, ProviderCapability, ProviderInstructionRolePolicy,

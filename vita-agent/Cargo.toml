@@ -18,6 +18,7 @@ path = "src/bin/vita-agent.rs"
 codex-core = { git = "https://github.com/openai/codex.git", rev = "316795b3cf2a45e90d121d9f46499d4658b2645c" }
 codex-app-server-protocol = { git = "https://github.com/openai/codex.git", rev = "316795b3cf2a45e90d121d9f46499d4658b2645c" }
 codex-config = { git = "https://github.com/openai/codex.git", rev = "316795b3cf2a45e90d121d9f46499d4658b2645c" }
+codex-extension-api = { git = "https://github.com/openai/codex.git", rev = "316795b3cf2a45e90d121d9f46499d4658b2645c" }
 # The pinned upstream workspace lock resolves this exact pre-1.0 release.
 # Without the exact constraint Cargo selects rama-error 0.3.0, whose public
 # exports are incompatible with rama-core 0.3.0-alpha.4.

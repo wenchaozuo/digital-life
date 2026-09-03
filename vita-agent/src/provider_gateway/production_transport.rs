@@ -2060,6 +2060,12 @@ mod tests {
 
         let debug = format!("{detail:?}");
         let display = detail.to_string();
+        assert!(debug.contains("status: 400"));
+        assert!(debug.contains("code: Some(\"1211\")"));
+        assert!(debug.contains("message_present: true"));
+        assert!(!debug.contains("model"));
+        assert!(display.contains("provider error status=400 code=1211"));
+        assert!(!display.contains("model"));
         assert!(!debug.contains(raw));
         assert!(!display.contains(raw));
         assert!(!debug.contains("should_not"));
@@ -2084,28 +2090,58 @@ mod tests {
         assert_eq!(detail.kind(), Some("provider_error"));
         assert_eq!(detail.param(), Some("input"));
         assert_eq!(detail.message().map(str::len), Some(256));
-        assert!(!format!("{detail:?}").contains("arbitrary"));
+        let debug = format!("{detail:?}");
+        let display = detail.to_string();
+        assert!(!debug.contains("input"));
+        assert!(!debug.contains("xxxxxxxx"));
+        assert!(!display.contains("input"));
+        assert!(!display.contains("xxxxxxxx"));
+        assert!(!debug.contains("arbitrary"));
         assert!(parse_provider_error_detail(400, b"not-json", None).is_none());
     }
 
     #[test]
     fn provider_http_status_debug_and_display_use_only_safe_detail() {
-        let raw = "provider-status-secret";
+        let raw_message = "provider-status-secret-message";
+        let raw_param = "provider-status-secret-param";
         let detail = ProviderErrorDetail::from_parts(
             400,
             Some("bad_request"),
             Some("invalid_request_error"),
-            Some("model"),
-            Some(raw),
-            Some(raw),
+            Some(raw_param),
+            Some(raw_message),
+            None,
         );
         let error = VitaAgentError::ProviderHttpStatus {
             status: 400,
             detail: Some(detail),
         };
-        assert!(!format!("{error:?}").contains(raw));
-        assert!(!error.to_string().contains(raw));
-        assert!(error.to_string().contains("[redacted]"));
+        let error_debug = format!("{error:?}");
+        let error_display = error.to_string();
+        assert!(!error_debug.contains(raw_message));
+        assert!(!error_debug.contains(raw_param));
+        assert!(!error_display.contains(raw_message));
+        assert!(!error_display.contains(raw_param));
+        assert!(error_debug.contains("status: 400"));
+        assert!(error_debug.contains("code: Some(\"bad_request\")"));
+        assert!(error_display.contains("provider returned HTTP status 400 (code=bad_request)"));
+    }
+
+    #[test]
+    fn provider_error_detail_accessors_keep_bounded_sanitized_values() {
+        let detail = ProviderErrorDetail::from_parts(
+            400,
+            Some("code"),
+            Some("kind\r\nvalue"),
+            Some("param\tvalue"),
+            Some("message\r\nvalue"),
+            None,
+        );
+        assert_eq!(detail.kind(), Some("kind  value"));
+        assert_eq!(detail.param(), Some("param value"));
+        assert_eq!(detail.message(), Some("message  value"));
+        assert!(!format!("{detail:?}").contains("kind  value"));
+        assert!(!detail.to_string().contains("message  value"));
     }
 
     #[test]

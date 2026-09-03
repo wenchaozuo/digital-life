@@ -46,8 +46,9 @@ const REDACTED_PROVIDER_ERROR_VALUE: &str = "[redacted]";
 /// A bounded, allowlisted representation of a provider's error envelope.
 ///
 /// This type intentionally contains no arbitrary JSON and no request
-/// material.  Values are sanitized at construction time so Debug/Display can
-/// safely be used by a diagnostic report.
+/// material.  Values are sanitized at construction time.  Generic
+/// Debug/Display output remains conservative; the explicit accessors are
+/// reserved for the bounded D29-G2 diagnostic path.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ProviderErrorDetail {
     status: u16,
@@ -102,9 +103,9 @@ impl std::fmt::Debug for ProviderErrorDetail {
             .debug_struct("ProviderErrorDetail")
             .field("status", &self.status)
             .field("code", &self.code)
-            .field("kind", &self.kind)
-            .field("param", &self.param)
-            .field("message", &self.message)
+            .field("kind_present", &self.kind.is_some())
+            .field("param_present", &self.param.is_some())
+            .field("message_present", &self.message.is_some())
             .finish()
     }
 }
@@ -113,12 +114,9 @@ impl Display for ProviderErrorDetail {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "status={} code={} kind={} param={} message={}",
+            "provider error status={} code={}",
             self.status,
             self.code.as_deref().unwrap_or("none"),
-            self.kind.as_deref().unwrap_or("none"),
-            self.param.as_deref().unwrap_or("none"),
-            self.message.as_deref().unwrap_or("none"),
         )
     }
 }
@@ -849,7 +847,7 @@ impl Display for VitaAgentError {
             Self::ProviderHttpStatus { status, detail } => {
                 write!(f, "provider returned HTTP status {status}")?;
                 if let Some(detail) = detail {
-                    write!(f, " ({detail})")?;
+                    write!(f, " (code={})", detail.code().unwrap_or("none"))?;
                 }
                 Ok(())
             }

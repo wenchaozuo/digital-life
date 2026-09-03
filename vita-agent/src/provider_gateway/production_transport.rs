@@ -374,6 +374,15 @@ struct ProductionProviderTransport<D = SystemDnsResolver, H = ReqwestHttpExecuto
     dns: Arc<BoundedDnsWorker<D>>,
     http: H,
     limits: ProductionTransportLimits,
+    #[cfg(test)]
+    observer: Option<Arc<ProductionTransportObservation>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(super) struct ProductionTransportObservation {
+    pub(super) attempt_count: std::sync::atomic::AtomicUsize,
+    pub(super) last_status: std::sync::atomic::AtomicU16,
 }
 
 impl ProductionProviderTransport<SystemDnsResolver, ReqwestHttpExecutor> {
@@ -385,8 +394,36 @@ impl ProductionProviderTransport<SystemDnsResolver, ReqwestHttpExecutor> {
             dns: system_dns_worker()?,
             http: ReqwestHttpExecutor,
             limits,
+            #[cfg(test)]
+            observer: None,
         })
     }
+}
+
+#[cfg(test)]
+pub(super) fn new_for_d29g2() -> Result<
+    (
+        impl super::ProviderRequestTransport,
+        Arc<ProductionTransportObservation>,
+    ),
+    VitaAgentError,
+> {
+    let mut limits = ProductionTransportLimits::default();
+    // The real smoke is intentionally bounded more tightly than the library
+    // maximum so a refused or stalled provider cannot leave the test process
+    // waiting indefinitely.  This does not loosen any G1 transport policy.
+    limits.request_timeout = Duration::from_secs(30);
+    limits.body_timeout = Duration::from_secs(30);
+    limits.total_timeout = Duration::from_secs(30);
+    limits.validate()?;
+    let observer = Arc::new(ProductionTransportObservation::default());
+    let transport = ProductionProviderTransport {
+        dns: system_dns_worker()?,
+        http: ReqwestHttpExecutor,
+        limits,
+        observer: Some(Arc::clone(&observer)),
+    };
+    Ok((transport, observer))
 }
 
 impl<D, H> ProductionProviderTransport<D, H>
@@ -400,6 +437,7 @@ where
             dns: Arc::new(BoundedDnsWorker::new(dns).expect("test DNS worker should start")),
             http,
             limits,
+            observer: None,
         }
     }
 
@@ -409,7 +447,12 @@ where
         http: H,
         limits: ProductionTransportLimits,
     ) -> Self {
-        Self { dns, http, limits }
+        Self {
+            dns,
+            http,
+            limits,
+            observer: None,
+        }
     }
 
     fn post_json_inner(
@@ -491,6 +534,10 @@ where
                 body,
                 authorization,
             };
+            #[cfg(test)]
+            if let Some(observer) = &self.observer {
+                observer.attempt_count.fetch_add(1, Ordering::Relaxed);
+            }
             let response = match self.http.post_json(
                 &request,
                 EffectiveTimeouts::from_remaining(remaining, self.limits),
@@ -505,6 +552,13 @@ where
                 Err(HttpExecutionError::Retryable(error)) => return Err(error),
                 Err(HttpExecutionError::Fatal(error)) => return Err(error),
             };
+
+            #[cfg(test)]
+            if let Some(observer) = &self.observer {
+                observer
+                    .last_status
+                    .store(response.status, Ordering::Relaxed);
+            }
 
             if Instant::now() >= deadline {
                 return Err(VitaAgentError::ProviderTransportTimeout { phase: "request" });

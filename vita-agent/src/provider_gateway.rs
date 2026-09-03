@@ -23,6 +23,10 @@ mod production_transport;
 #[path = "d29f.rs"]
 mod d29f;
 
+#[cfg(test)]
+#[path = "d29g2.rs"]
+mod d29g2;
+
 /// The provider wire protocols owned by Digital Life's provider domain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderProtocol {

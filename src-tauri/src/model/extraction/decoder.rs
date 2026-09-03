@@ -66,7 +66,9 @@ enum LlmProposalDto {
         kind: LlmMemoryKindDto,
         content: String,
         summary: String,
+        #[serde(deserialize_with = "deserialize_json_number_as_f64")]
         confidence: f64,
+        #[serde(deserialize_with = "deserialize_json_number_as_f64")]
         importance: f64,
         sensitivity_hint: LlmSensitivityDto,
         conflict_hint: bool,
@@ -95,6 +97,16 @@ enum LlmSensitivityDto {
     NotSensitive,
     Sensitive,
     Unknown,
+}
+
+fn deserialize_json_number_as_f64<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let number = serde_json::Number::deserialize(deserializer)?;
+    number
+        .as_f64()
+        .ok_or_else(|| serde::de::Error::custom("invalid JSON number"))
 }
 
 pub(super) fn decode_response_envelope(

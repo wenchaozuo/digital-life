@@ -27,10 +27,6 @@ mod d29f;
 #[path = "d29g2.rs"]
 mod d29g2;
 
-#[cfg(test)]
-#[path = "d29h1.rs"]
-mod d29h1;
-
 /// The provider wire protocols owned by Digital Life's provider domain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderProtocol {
@@ -329,8 +325,8 @@ impl ProviderProfile {
         )
     }
 
-    #[cfg(test)]
-    fn new_for_test_localhost(
+    #[cfg(any(test, feature = "d29-h1-host-test"))]
+    pub fn new_for_test_localhost(
         provider_id: impl Into<String>,
         display_name: impl Into<String>,
         protocol: ProviderProtocol,
@@ -536,7 +532,7 @@ impl ProviderEndpoint {
         Ok(Self::from_normalized(normalized, EndpointScope::Production))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "d29-h1-host-test"))]
     fn parse_test_localhost(raw: &str) -> Result<Self, VitaAgentError> {
         let normalized = normalize_url(raw)?;
         if normalized.scheme != "http"
@@ -791,21 +787,22 @@ impl Display for VitaProviderState {
     }
 }
 
+#[doc(hidden)]
 #[derive(Debug, Clone)]
-pub(crate) struct VitaProviderAuthority {
+pub struct VitaProviderAuthority {
     state: VitaProviderState,
     profile: Option<ProviderProfile>,
 }
 
 impl VitaProviderAuthority {
-    pub(crate) fn not_configured() -> Self {
+    pub fn not_configured() -> Self {
         Self {
             state: VitaProviderState::NotConfigured,
             profile: None,
         }
     }
 
-    pub(crate) fn configure(profile: ProviderProfile) -> Result<Self, VitaAgentError> {
+    pub fn configure(profile: ProviderProfile) -> Result<Self, VitaAgentError> {
         profile.validate()?;
         Ok(Self {
             state: VitaProviderState::ConfiguredValidated,
@@ -813,15 +810,15 @@ impl VitaProviderAuthority {
         })
     }
 
-    pub(crate) fn state(&self) -> VitaProviderState {
+    pub fn state(&self) -> VitaProviderState {
         self.state
     }
 
-    pub(crate) fn profile(&self) -> Option<&ProviderProfile> {
+    pub fn profile(&self) -> Option<&ProviderProfile> {
         self.profile.as_ref()
     }
 
-    pub(crate) fn prepare_gateway(
+    pub fn prepare_gateway(
         &self,
         binding: VitaGatewayBinding,
     ) -> Result<GatewayReadyProvider, VitaAgentError> {
@@ -840,15 +837,16 @@ impl VitaProviderAuthority {
 }
 
 /// The private listener identity used by the derived Codex-facing provider.
+#[doc(hidden)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct VitaGatewayBinding {
+pub struct VitaGatewayBinding {
     base_url: String,
     port: u16,
     runtime_identity: &'static str,
 }
 
 impl VitaGatewayBinding {
-    pub(crate) fn for_owned_private_listener(port: u16) -> Result<Self, VitaAgentError> {
+    pub fn for_owned_private_listener(port: u16) -> Result<Self, VitaAgentError> {
         if port == 0 {
             return Err(VitaAgentError::GatewayProtocol(
                 "owned Vita gateway listener must have a non-zero port".to_string(),
@@ -861,15 +859,15 @@ impl VitaGatewayBinding {
         })
     }
 
-    pub(crate) fn base_url(&self) -> &str {
+    pub fn base_url(&self) -> &str {
         &self.base_url
     }
 
-    pub(crate) fn port(&self) -> u16 {
+    pub fn port(&self) -> u16 {
         self.port
     }
 
-    pub(crate) fn runtime_identity(&self) -> &'static str {
+    pub fn runtime_identity(&self) -> &'static str {
         self.runtime_identity
     }
 }
@@ -915,8 +913,9 @@ impl DerivedCodexProvider {
     }
 }
 
+#[doc(hidden)]
 #[derive(Debug, Clone)]
-pub(crate) struct GatewayReadyProvider {
+pub struct GatewayReadyProvider {
     profile: ProviderProfile,
     binding: VitaGatewayBinding,
     derived: DerivedCodexProvider,

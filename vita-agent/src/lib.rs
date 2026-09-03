@@ -24,9 +24,15 @@ mod provider_gateway;
 mod tool_authority;
 
 pub use provider_gateway::{
-    CredentialRef, ProviderCapabilities, ProviderCapability, ProviderInstructionRolePolicy,
-    ProviderModelIdentityPolicy, ProviderProfile, ProviderProtocol, ProviderRetryPolicy,
-    VitaProviderState,
+    CredentialRef, GatewayReadyProvider, ProviderCapabilities, ProviderCapability,
+    ProviderInstructionRolePolicy, ProviderModelIdentityPolicy, ProviderProfile, ProviderProtocol,
+    ProviderRetryPolicy, VitaGatewayBinding, VitaProviderAuthority, VitaProviderState,
+};
+pub use tool_authority::{
+    VitaAuthorityError, VitaAuthorityEvidenceSource, VitaAuthorityFuture, VitaAuthorityOutcome,
+    VitaAuthorityReason, VitaAuthorityVerdict, VitaBrokerSnapshot, VitaExecutionContext,
+    VitaRequestedScope, VitaToolAuthorityPort, VitaToolAuthorityRequest, VitaToolBroker,
+    VitaToolContributor, VITA_GOVERNED_ACTION_CAPABILITY_ID, VITA_GOVERNED_ACTION_TOOL_NAME,
 };
 
 pub const VITA_AGENT_RUNTIME_ID: &str = "vita-agent";
@@ -624,7 +630,7 @@ impl VitaAgentRuntimeProfile {
         ]
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "d29-h1-host-test"))]
     fn cli_overrides_for_gateway(
         &self,
         provider: &provider_gateway::DerivedCodexProvider,
@@ -979,8 +985,9 @@ impl VitaAgentEntrypoint {
     /// localhost proof.  The provider is already validated and the listener
     /// binding is owned by the caller; this helper only compiles the derived
     /// provider into the real upstream `Config` used by `ThreadManager`.
-    #[cfg(test)]
-    pub(crate) async fn initialize_with_gateway_for_tests(
+    #[cfg(any(test, feature = "d29-h1-host-test"))]
+    #[doc(hidden)]
+    pub async fn initialize_with_gateway_for_tests(
         profile: VitaAgentRuntimeProfile,
         ready: &provider_gateway::GatewayReadyProvider,
     ) -> Result<Self, VitaAgentError> {

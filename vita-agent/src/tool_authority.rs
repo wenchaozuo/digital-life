@@ -2,8 +2,8 @@
 //!
 //! The module owns the narrow Vita-side request/decision/result seam.  It
 //! deliberately has no executor, process, filesystem, browser, network, or
-//! plugin capability.  A future stage may install an adapter for the
-//! canonical D28 authority, but H1 cannot turn an authority decision into an
+//! plugin capability.  A future stage may install an adapter for the host's
+//! canonical authority, but H1 cannot turn an authority decision into an
 //! executable grant.
 #![allow(dead_code)]
 
@@ -22,9 +22,9 @@ use codex_extension_api::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-pub(crate) const D29_H1_TOOL_NAME: &str = "vita_governed_action";
-pub(crate) const D29_H1_CAPABILITY_ID: &str = "vita.governed_action";
-pub(crate) const D29_H1_MAX_TOOL_CALLS: usize = 8;
+pub const VITA_GOVERNED_ACTION_TOOL_NAME: &str = "vita_governed_action";
+pub const VITA_GOVERNED_ACTION_CAPABILITY_ID: &str = "vita.governed_action";
+pub(crate) const VITA_H1_MAX_TOOL_CALLS: usize = 8;
 
 const MAX_ID_CHARS: usize = 128;
 const MAX_OPERATION_CHARS: usize = 128;
@@ -35,13 +35,13 @@ const MAX_RESOURCE_CHARS: usize = 256;
 /// There is no constructor that fills either identity from a global, stock
 /// Codex, or process environment value.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct VitaExecutionContext {
+pub struct VitaExecutionContext {
     life_id: String,
     task_id: String,
 }
 
 impl VitaExecutionContext {
-    pub(crate) fn try_new(
+    pub fn try_new(
         life_id: impl Into<String>,
         task_id: impl Into<String>,
     ) -> Result<Self, VitaExecutionContextError> {
@@ -50,17 +50,17 @@ impl VitaExecutionContext {
         Ok(Self { life_id, task_id })
     }
 
-    pub(crate) fn life_id(&self) -> &str {
+    pub fn life_id(&self) -> &str {
         &self.life_id
     }
 
-    pub(crate) fn task_id(&self) -> &str {
+    pub fn task_id(&self) -> &str {
         &self.task_id
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum VitaExecutionContextError {
+pub enum VitaExecutionContextError {
     Empty(&'static str),
     TooLong(&'static str),
     InvalidCharacter(&'static str),
@@ -76,7 +76,7 @@ impl VitaExecutionContextError {
 
 /// The only scope values that can cross the H1 boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum VitaRequestedScope {
+pub enum VitaRequestedScope {
     None,
     Workspace,
     NetworkDestination,
@@ -94,7 +94,7 @@ impl VitaRequestedScope {
         }
     }
 
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::None => "none",
             Self::Workspace => "workspace",
@@ -119,7 +119,7 @@ impl VitaToolIdentity {
     }
 
     fn is_trusted_h1_tool(&self) -> bool {
-        self.name == D29_H1_TOOL_NAME
+        self.name == VITA_GOVERNED_ACTION_TOOL_NAME
             && ToolName::new(self.namespace.clone(), self.name.clone()).is_default_namespace()
     }
 
@@ -161,7 +161,7 @@ struct VitaRequestEvidence {
 
 /// The minimum typed request retained from a real Codex ToolCall.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct VitaToolRequest {
+pub struct VitaToolAuthorityRequest {
     tool_call_id: String,
     tool_identity: VitaToolIdentity,
     operation: String,
@@ -173,7 +173,7 @@ pub(crate) struct VitaToolRequest {
     evidence: VitaRequestEvidence,
 }
 
-impl VitaToolRequest {
+impl VitaToolAuthorityRequest {
     fn from_codex_call(
         call: &ToolCall<'_>,
         context: Option<&VitaExecutionContext>,
@@ -214,7 +214,7 @@ impl VitaToolRequest {
             tool_identity,
             operation,
             context: context.cloned(),
-            capability_id: D29_H1_CAPABILITY_ID.to_string(),
+            capability_id: VITA_GOVERNED_ACTION_CAPABILITY_ID.to_string(),
             requested_scope,
             requested_resource,
             expected_authorization_revision: arguments.expected_revision,
@@ -225,35 +225,35 @@ impl VitaToolRequest {
         })
     }
 
-    pub(crate) fn tool_call_id(&self) -> &str {
+    pub fn tool_call_id(&self) -> &str {
         &self.tool_call_id
     }
 
-    pub(crate) fn tool_identity(&self) -> String {
+    pub fn tool_identity(&self) -> String {
         self.tool_identity.display_name()
     }
 
-    pub(crate) fn operation(&self) -> &str {
+    pub fn operation(&self) -> &str {
         &self.operation
     }
 
-    pub(crate) fn context(&self) -> Option<&VitaExecutionContext> {
+    pub fn context(&self) -> Option<&VitaExecutionContext> {
         self.context.as_ref()
     }
 
-    pub(crate) fn capability_id(&self) -> &str {
+    pub fn capability_id(&self) -> &str {
         &self.capability_id
     }
 
-    pub(crate) fn requested_scope(&self) -> VitaRequestedScope {
+    pub fn requested_scope(&self) -> VitaRequestedScope {
         self.requested_scope
     }
 
-    pub(crate) fn requested_resource(&self) -> Option<&str> {
+    pub fn requested_resource(&self) -> Option<&str> {
         self.requested_resource.as_deref()
     }
 
-    pub(crate) fn expected_authorization_revision(&self) -> Option<i64> {
+    pub fn expected_authorization_revision(&self) -> Option<i64> {
         self.expected_authorization_revision
     }
 
@@ -271,9 +271,10 @@ impl VitaToolRequest {
             tool_identity: VitaToolIdentity::from_codex(&tool_name),
             operation: operation.to_string(),
             context,
-            capability_id: if tool_name.name == D29_H1_TOOL_NAME && tool_name.is_default_namespace()
+            capability_id: if tool_name.name == VITA_GOVERNED_ACTION_TOOL_NAME
+                && tool_name.is_default_namespace()
             {
-                D29_H1_CAPABILITY_ID.to_string()
+                VITA_GOVERNED_ACTION_CAPABILITY_ID.to_string()
             } else {
                 "vita.unknown".to_string()
             },
@@ -327,150 +328,182 @@ impl VitaRequestBuildError {
     }
 }
 
-/// The semantic decision vocabulary used by the existing D28 evaluator.
-/// H1 only consumes this authority result; it does not mint or persist a
-/// grant candidate.
+/// Neutral verdict vocabulary crossing the Vita authority port.
+///
+/// The host may map a canonical authority system into this bounded contract,
+/// but Vita does not own or recreate that authority system.  A verdict is
+/// evidence about one normalized request; it is never an executable grant.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum D28AuthorityDecisionKind {
+pub enum VitaAuthorityOutcome {
     Denied,
     Eligible,
 }
 
+impl VitaAuthorityOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Denied => "denied",
+            Self::Eligible => "eligible",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum D28AuthorityDecisionCode {
+pub enum VitaAuthorityReason {
+    UnknownCapabilityDescriptor,
+    AuthorizationUnavailable,
+    InvalidRequest,
+    NotEligible,
     Denied,
     RootDisabled,
     ExplicitConfirmationRequired,
     ScopeNotAvailable,
     Forbidden,
     Eligible,
+    InvalidVerdict,
 }
 
-impl D28AuthorityDecisionCode {
-    fn as_str(self) -> &'static str {
+impl VitaAuthorityReason {
+    pub fn as_str(self) -> &'static str {
         match self {
-            Self::Denied => "CAPABILITY_AUTHORIZATION_DENIED",
-            Self::RootDisabled => "CAPABILITY_ROOT_DISABLED",
-            Self::ExplicitConfirmationRequired => "CAPABILITY_CONFIRMATION_REQUIRED",
-            Self::ScopeNotAvailable => "CAPABILITY_SCOPE_NOT_AVAILABLE",
-            Self::Forbidden => "CAPABILITY_FORBIDDEN",
-            Self::Eligible => "CAPABILITY_ELIGIBLE",
+            Self::UnknownCapabilityDescriptor => "unknown_capability_descriptor",
+            Self::AuthorizationUnavailable => "authorization_unavailable",
+            Self::InvalidRequest => "invalid_authority_request",
+            Self::NotEligible => "not_eligible",
+            Self::Denied => "authorization_denied",
+            Self::RootDisabled => "root_disabled",
+            Self::ExplicitConfirmationRequired => "explicit_confirmation_required",
+            Self::ScopeNotAvailable => "scope_not_available",
+            Self::Forbidden => "forbidden",
+            Self::Eligible => "eligible",
+            Self::InvalidVerdict => "invalid_authority_verdict",
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum D28EvidenceSource {
-    CanonicalProductionCatalogEmpty,
+pub enum VitaAuthorityEvidenceSource {
+    HostCanonicalAuthority,
     TestFixture,
 }
 
-impl D28EvidenceSource {
-    fn as_str(self) -> &'static str {
+impl VitaAuthorityEvidenceSource {
+    pub fn as_str(self) -> &'static str {
         match self {
-            Self::CanonicalProductionCatalogEmpty => "d28_production_catalog_empty",
+            Self::HostCanonicalAuthority => "host_canonical_authority",
             Self::TestFixture => "test_fixture",
         }
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct D28AuthorityEvidence {
-    source: D28EvidenceSource,
+pub struct VitaAuthorityEvidence {
+    source: VitaAuthorityEvidenceSource,
     authorization_revision: Option<i64>,
 }
 
-impl D28AuthorityEvidence {
-    fn new(source: D28EvidenceSource, authorization_revision: Option<i64>) -> Self {
-        Self {
-            source,
-            authorization_revision,
-        }
-    }
-}
-
-/// Typed output of the D28 authority port.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct D28AuthorityDecision {
-    kind: D28AuthorityDecisionKind,
-    code: D28AuthorityDecisionCode,
-    life_id: String,
-    task_id: String,
-    capability_id: String,
-    requested_scope: VitaRequestedScope,
-    evidence: D28AuthorityEvidence,
-}
-
-impl D28AuthorityDecision {
-    #[cfg(test)]
-    fn for_request(
-        request: &VitaToolRequest,
-        kind: D28AuthorityDecisionKind,
-        code: D28AuthorityDecisionCode,
-        authorization_revision: Option<i64>,
-    ) -> Self {
-        let context = request.context.as_ref().expect("test request context");
-        Self {
-            kind,
-            code,
-            life_id: context.life_id.clone(),
-            task_id: context.task_id.clone(),
-            capability_id: request.capability_id.clone(),
-            requested_scope: request.requested_scope,
-            evidence: D28AuthorityEvidence::new(
-                D28EvidenceSource::TestFixture,
-                authorization_revision,
-            ),
-        }
+impl VitaAuthorityEvidence {
+    pub fn source(&self) -> VitaAuthorityEvidenceSource {
+        self.source
     }
 
-    fn production_denied(request: &VitaToolRequest) -> Self {
-        let context = request.context.as_ref().expect("validated request context");
-        Self {
-            kind: D28AuthorityDecisionKind::Denied,
-            code: D28AuthorityDecisionCode::Denied,
-            life_id: context.life_id.clone(),
-            task_id: context.task_id.clone(),
-            capability_id: request.capability_id.clone(),
-            requested_scope: request.requested_scope,
-            evidence: D28AuthorityEvidence::new(
-                D28EvidenceSource::CanonicalProductionCatalogEmpty,
-                None,
-            ),
-        }
+    pub fn authorization_revision(&self) -> Option<i64> {
+        self.authorization_revision
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum D28AuthorityError {
+pub enum VitaAuthorityError {
     Unavailable,
-    InvalidEvidence,
+    InvalidRequest,
+    InvalidVerdict,
 }
 
-/// Async-shaped adapter port so a future D28 integration can remain bounded
-/// without changing the Vita request/decision contract.  The port receives a
-/// fully normalized request and cannot mint authority from model arguments.
-pub(crate) type D28AuthorityFuture =
-    Pin<Box<dyn Future<Output = Result<D28AuthorityDecision, D28AuthorityError>> + Send + 'static>>;
-
-pub(crate) trait D28AuthorityPort: Send + Sync {
-    fn evaluate(&self, request: VitaToolRequest) -> D28AuthorityFuture;
-}
-
-/// H1's production authority adapter.  The canonical D28 production catalog
-/// is empty and has no explicit grant-mint path, so the adapter is deliberately
-/// deny-only.  It does not reimplement D28 SQLite evaluation or grant rules.
-pub(crate) struct D28ProductionAuthority;
-
-impl D28AuthorityPort for D28ProductionAuthority {
-    fn evaluate(&self, request: VitaToolRequest) -> D28AuthorityFuture {
-        Box::pin(async move { Ok(D28AuthorityDecision::production_denied(&request)) })
+impl std::fmt::Display for VitaAuthorityError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Unavailable => "authority unavailable",
+            Self::InvalidRequest => "authority request was invalid",
+            Self::InvalidVerdict => "authority verdict was invalid",
+        })
     }
+}
+
+impl std::error::Error for VitaAuthorityError {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VitaAuthorityVerdict {
+    outcome: VitaAuthorityOutcome,
+    reason: VitaAuthorityReason,
+    life_id: String,
+    capability_id: String,
+    requested_scope: VitaRequestedScope,
+    evidence: VitaAuthorityEvidence,
+}
+
+impl VitaAuthorityVerdict {
+    pub fn from_request(
+        request: &VitaToolAuthorityRequest,
+        outcome: VitaAuthorityOutcome,
+        reason: VitaAuthorityReason,
+        authorization_revision: Option<i64>,
+        source: VitaAuthorityEvidenceSource,
+    ) -> Result<Self, VitaAuthorityError> {
+        let Some(context) = request.context.as_ref() else {
+            return Err(VitaAuthorityError::InvalidRequest);
+        };
+        Ok(Self {
+            outcome,
+            reason,
+            life_id: context.life_id.clone(),
+            capability_id: request.capability_id.clone(),
+            requested_scope: request.requested_scope,
+            evidence: VitaAuthorityEvidence {
+                source,
+                authorization_revision,
+            },
+        })
+    }
+
+    pub fn outcome(&self) -> VitaAuthorityOutcome {
+        self.outcome
+    }
+
+    pub fn reason(&self) -> VitaAuthorityReason {
+        self.reason
+    }
+
+    pub fn life_id(&self) -> &str {
+        &self.life_id
+    }
+
+    pub fn capability_id(&self) -> &str {
+        &self.capability_id
+    }
+
+    pub fn requested_scope(&self) -> VitaRequestedScope {
+        self.requested_scope
+    }
+
+    pub fn evidence(&self) -> &VitaAuthorityEvidence {
+        &self.evidence
+    }
+}
+
+/// Async-shaped neutral authority port.  The host supplies the authority
+/// implementation; Vita only consumes the bounded verdict.
+pub type VitaAuthorityFuture = Pin<
+    Box<dyn Future<Output = Result<VitaAuthorityVerdict, VitaAuthorityError>> + Send + 'static>,
+>;
+
+pub trait VitaToolAuthorityPort: Send + Sync {
+    fn evaluate(&self, request: VitaToolAuthorityRequest) -> VitaAuthorityFuture;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum VitaDenyClassification {
     MissingContext,
+    UnknownCapabilityDescriptor,
     WrongLifeBinding,
     WrongTaskBinding,
     UnmappedTool,
@@ -493,10 +526,11 @@ impl VitaDenyClassification {
     fn as_str(self) -> &'static str {
         match self {
             Self::MissingContext => "missing_execution_context",
+            Self::UnknownCapabilityDescriptor => "unknown_capability_descriptor",
             Self::WrongLifeBinding => "wrong_life_binding",
             Self::WrongTaskBinding => "wrong_task_binding",
             Self::UnmappedTool => "unmapped_tool",
-            Self::MissingAuthorization => "missing_d28_authorization",
+            Self::MissingAuthorization => "missing_authorization",
             Self::StaleRevision => "stale_authorization_revision",
             Self::BroaderScope => "broader_requested_scope",
             Self::ScopeUnavailable => "scope_unavailable",
@@ -504,9 +538,9 @@ impl VitaDenyClassification {
             Self::TurnCancelled => "turn_cancelled",
             Self::LateAfterCancellation => "late_authority_after_cancellation",
             Self::TooManyToolCalls => "h1_tool_call_limit",
-            Self::AuthorityError => "d28_authority_error",
-            Self::AuthorityPanic => "d28_authority_panic",
-            Self::AuthorityEvidenceMismatch => "d28_evidence_mismatch",
+            Self::AuthorityError => "authority_error",
+            Self::AuthorityPanic => "authority_panic",
+            Self::AuthorityEvidenceMismatch => "authority_evidence_mismatch",
             Self::NoExecutableGrant => "no_executable_grant_in_h1",
             Self::MalformedToolRequest => "malformed_tool_request",
         }
@@ -516,18 +550,18 @@ impl VitaDenyClassification {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct VitaToolDecision {
     classification: VitaDenyClassification,
-    authority_kind: Option<D28AuthorityDecisionKind>,
-    authority_code: Option<D28AuthorityDecisionCode>,
+    authority_outcome: Option<VitaAuthorityOutcome>,
+    authority_reason: Option<VitaAuthorityReason>,
     authorization_revision: Option<i64>,
-    authority_evidence: Option<D28AuthorityEvidence>,
+    authority_evidence: Option<VitaAuthorityEvidence>,
 }
 
 impl VitaToolDecision {
     fn boundary_denied(classification: VitaDenyClassification) -> Self {
         Self {
             classification,
-            authority_kind: None,
-            authority_code: None,
+            authority_outcome: None,
+            authority_reason: None,
             authorization_revision: None,
             authority_evidence: None,
         }
@@ -535,14 +569,14 @@ impl VitaToolDecision {
 
     fn authority_denied(
         classification: VitaDenyClassification,
-        authority: &D28AuthorityDecision,
+        authority: &VitaAuthorityVerdict,
     ) -> Self {
         Self {
             classification,
-            authority_kind: Some(authority.kind),
-            authority_code: Some(authority.code),
-            authorization_revision: authority.evidence.authorization_revision,
-            authority_evidence: Some(authority.evidence.clone()),
+            authority_outcome: Some(authority.outcome()),
+            authority_reason: Some(authority.reason()),
+            authorization_revision: authority.evidence().authorization_revision(),
+            authority_evidence: Some(authority.evidence().clone()),
         }
     }
 }
@@ -550,14 +584,14 @@ impl VitaToolDecision {
 /// Bounded model-facing result.  H1 has no success/execution variant.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct VitaToolResult {
-    request: VitaToolRequest,
+    request: VitaToolAuthorityRequest,
     decision: VitaToolDecision,
     execution_started: bool,
     side_effect_count: u8,
 }
 
 impl VitaToolResult {
-    fn denied(request: VitaToolRequest, classification: VitaDenyClassification) -> Self {
+    fn denied(request: VitaToolAuthorityRequest, classification: VitaDenyClassification) -> Self {
         Self {
             request,
             decision: VitaToolDecision::boundary_denied(classification),
@@ -567,9 +601,9 @@ impl VitaToolResult {
     }
 
     fn denied_by_authority(
-        request: VitaToolRequest,
+        request: VitaToolAuthorityRequest,
         classification: VitaDenyClassification,
-        authority: &D28AuthorityDecision,
+        authority: &VitaAuthorityVerdict,
     ) -> Self {
         Self {
             request,
@@ -592,7 +626,7 @@ impl VitaToolResult {
     }
 
     pub(crate) fn authority_lookup_attempted(&self) -> bool {
-        self.decision.authority_kind.is_some()
+        self.decision.authority_outcome.is_some()
     }
 
     pub(crate) fn authority_revision(&self) -> Option<i64> {
@@ -614,7 +648,7 @@ impl VitaToolResult {
             "codex_turn_id": self.request.evidence.codex_turn_id,
             "source": self.request.evidence.source.as_str(),
             "deny_classification": self.decision.classification.as_str(),
-            "authority_code": self.decision.authority_code.map(D28AuthorityDecisionCode::as_str),
+            "authority_reason": self.decision.authority_reason.map(VitaAuthorityReason::as_str),
             "authority_revision": self.decision.authorization_revision,
             "authority_evidence": self.decision.authority_evidence.as_ref().map(|evidence| json!({
                 "source": evidence.source.as_str(),
@@ -647,32 +681,32 @@ struct VitaBrokerMetrics {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct VitaBrokerSnapshot {
-    pub(crate) attempted_requests: usize,
-    pub(crate) authority_lookups: usize,
-    pub(crate) duplicate_denials: usize,
-    pub(crate) late_denials: usize,
-    pub(crate) authority_errors: usize,
-    pub(crate) authority_panics: usize,
-    pub(crate) execution_started: usize,
-    pub(crate) side_effect_count: usize,
-    pub(crate) max_active_authority: usize,
+pub struct VitaBrokerSnapshot {
+    pub attempted_requests: usize,
+    pub authority_lookups: usize,
+    pub duplicate_denials: usize,
+    pub late_denials: usize,
+    pub authority_errors: usize,
+    pub authority_panics: usize,
+    pub execution_started: usize,
+    pub side_effect_count: usize,
+    pub max_active_authority: usize,
 }
 
 /// Thin deny-first broker.  It owns bounded duplicate/cancellation state but
 /// intentionally owns no side-effect executor.
-pub(crate) struct VitaToolBroker {
+pub struct VitaToolBroker {
     context: Option<VitaExecutionContext>,
-    authority: Arc<dyn D28AuthorityPort>,
+    authority: Arc<dyn VitaToolAuthorityPort>,
     state: Mutex<BrokerState>,
     cancelled: AtomicBool,
     metrics: Arc<VitaBrokerMetrics>,
 }
 
 impl VitaToolBroker {
-    pub(crate) fn new(
+    pub fn new(
         context: VitaExecutionContext,
-        authority: Arc<dyn D28AuthorityPort>,
+        authority: Arc<dyn VitaToolAuthorityPort>,
     ) -> Arc<Self> {
         Arc::new(Self {
             context: Some(context),
@@ -683,12 +717,8 @@ impl VitaToolBroker {
         })
     }
 
-    pub(crate) fn production(context: VitaExecutionContext) -> Arc<Self> {
-        Self::new(context, Arc::new(D28ProductionAuthority))
-    }
-
     #[cfg(test)]
-    fn without_context(authority: Arc<dyn D28AuthorityPort>) -> Arc<Self> {
+    fn without_context(authority: Arc<dyn VitaToolAuthorityPort>) -> Arc<Self> {
         Arc::new(Self {
             context: None,
             authority,
@@ -701,19 +731,19 @@ impl VitaToolBroker {
     fn request_from_call(
         &self,
         call: &ToolCall<'_>,
-    ) -> Result<VitaToolRequest, VitaRequestBuildError> {
-        VitaToolRequest::from_codex_call(call, self.context.as_ref())
+    ) -> Result<VitaToolAuthorityRequest, VitaRequestBuildError> {
+        VitaToolAuthorityRequest::from_codex_call(call, self.context.as_ref())
     }
 
-    pub(crate) fn cancel(&self) {
+    pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
     }
 
-    pub(crate) fn retire(&self) {
+    pub fn retire(&self) {
         self.cancel();
     }
 
-    pub(crate) fn snapshot(&self) -> VitaBrokerSnapshot {
+    pub fn snapshot(&self) -> VitaBrokerSnapshot {
         VitaBrokerSnapshot {
             attempted_requests: self.metrics.attempted_requests.load(Ordering::Acquire),
             authority_lookups: self.metrics.authority_lookups.load(Ordering::Acquire),
@@ -727,7 +757,7 @@ impl VitaToolBroker {
         }
     }
 
-    async fn authorize(&self, request: VitaToolRequest) -> VitaToolResult {
+    async fn authorize(&self, request: VitaToolAuthorityRequest) -> VitaToolResult {
         self.metrics
             .attempted_requests
             .fetch_add(1, Ordering::AcqRel);
@@ -749,7 +779,7 @@ impl VitaToolBroker {
             return VitaToolResult::denied(request, VitaDenyClassification::WrongTaskBinding);
         }
         if !request.tool_identity.is_trusted_h1_tool()
-            || request.capability_id != D29_H1_CAPABILITY_ID
+            || request.capability_id != VITA_GOVERNED_ACTION_CAPABILITY_ID
         {
             return VitaToolResult::denied(request, VitaDenyClassification::UnmappedTool);
         }
@@ -762,7 +792,7 @@ impl VitaToolBroker {
                     .fetch_add(1, Ordering::AcqRel);
                 return VitaToolResult::denied(request, VitaDenyClassification::DuplicateToolCall);
             }
-            if state.admitted_calls >= D29_H1_MAX_TOOL_CALLS {
+            if state.admitted_calls >= VITA_H1_MAX_TOOL_CALLS {
                 return VitaToolResult::denied(request, VitaDenyClassification::TooManyToolCalls);
             }
             state.seen_call_ids.insert(request.tool_call_id.clone());
@@ -813,7 +843,8 @@ impl VitaToolBroker {
                 &authority,
             );
         }
-        if request.expected_authorization_revision != authority.evidence.authorization_revision {
+        if request.expected_authorization_revision != authority.evidence().authorization_revision()
+        {
             return VitaToolResult::denied_by_authority(
                 request,
                 VitaDenyClassification::StaleRevision,
@@ -821,30 +852,35 @@ impl VitaToolBroker {
             );
         }
 
-        let classification = match authority.kind {
-            D28AuthorityDecisionKind::Denied => match authority.code {
-                D28AuthorityDecisionCode::Denied | D28AuthorityDecisionCode::RootDisabled => {
+        let classification = match authority.outcome() {
+            VitaAuthorityOutcome::Denied => match authority.reason() {
+                VitaAuthorityReason::UnknownCapabilityDescriptor => {
+                    VitaDenyClassification::UnknownCapabilityDescriptor
+                }
+                VitaAuthorityReason::AuthorizationUnavailable
+                | VitaAuthorityReason::InvalidRequest
+                | VitaAuthorityReason::NotEligible
+                | VitaAuthorityReason::InvalidVerdict => VitaDenyClassification::AuthorityError,
+                VitaAuthorityReason::Denied | VitaAuthorityReason::RootDisabled => {
                     VitaDenyClassification::MissingAuthorization
                 }
-                D28AuthorityDecisionCode::ExplicitConfirmationRequired => {
+                VitaAuthorityReason::ExplicitConfirmationRequired => {
                     VitaDenyClassification::MissingAuthorization
                 }
-                D28AuthorityDecisionCode::ScopeNotAvailable => {
-                    if authority.requested_scope != VitaRequestedScope::None {
+                VitaAuthorityReason::ScopeNotAvailable => {
+                    if authority.requested_scope() != VitaRequestedScope::None {
                         VitaDenyClassification::BroaderScope
                     } else {
                         VitaDenyClassification::ScopeUnavailable
                     }
                 }
-                D28AuthorityDecisionCode::Forbidden => VitaDenyClassification::MissingAuthorization,
-                D28AuthorityDecisionCode::Eligible => {
-                    VitaDenyClassification::AuthorityEvidenceMismatch
-                }
+                VitaAuthorityReason::Forbidden => VitaDenyClassification::MissingAuthorization,
+                VitaAuthorityReason::Eligible => VitaDenyClassification::AuthorityEvidenceMismatch,
             },
             // H1 has no executable grant path.  Even an injected eligible
             // authority response must remain a bounded deny.
-            D28AuthorityDecisionKind::Eligible => {
-                if authority.requested_scope != VitaRequestedScope::None {
+            VitaAuthorityOutcome::Eligible => {
+                if authority.requested_scope() != VitaRequestedScope::None {
                     VitaDenyClassification::BroaderScope
                 } else {
                     VitaDenyClassification::NoExecutableGrant
@@ -866,11 +902,11 @@ impl VitaToolBroker {
         let turn_id = bounded_identity("turn_id", call.turn_id.clone())
             .unwrap_or_else(|_| "[invalid-turn-id]".to_string());
         let capability_id = if tool_identity.is_trusted_h1_tool() {
-            D29_H1_CAPABILITY_ID.to_string()
+            VITA_GOVERNED_ACTION_CAPABILITY_ID.to_string()
         } else {
             "vita.unknown".to_string()
         };
-        let request = VitaToolRequest {
+        let request = VitaToolAuthorityRequest {
             tool_call_id,
             tool_identity,
             operation: "[unparsed]".to_string(),
@@ -888,12 +924,14 @@ impl VitaToolBroker {
     }
 }
 
-fn authority_matches_request(authority: &D28AuthorityDecision, request: &VitaToolRequest) -> bool {
+fn authority_matches_request(
+    authority: &VitaAuthorityVerdict,
+    request: &VitaToolAuthorityRequest,
+) -> bool {
     request.context.as_ref().is_some_and(|context| {
-        authority.life_id == context.life_id
-            && authority.task_id == context.task_id
-            && authority.capability_id == request.capability_id
-            && authority.requested_scope == request.requested_scope
+        authority.life_id() == context.life_id
+            && authority.capability_id() == request.capability_id
+            && authority.requested_scope() == request.requested_scope
     })
 }
 
@@ -958,12 +996,12 @@ where
 /// Registers exactly one direct, non-parallel Vita tool with the pinned Codex
 /// extension registry.  The normal Vita production entrypoint does not install
 /// this contributor in H1; the real Codex lifecycle proof injects it explicitly.
-pub(crate) struct VitaToolContributor {
+pub struct VitaToolContributor {
     broker: Arc<VitaToolBroker>,
 }
 
 impl VitaToolContributor {
-    pub(crate) fn new(broker: Arc<VitaToolBroker>) -> Self {
+    pub fn new(broker: Arc<VitaToolBroker>) -> Self {
         Self { broker }
     }
 }
@@ -986,7 +1024,7 @@ struct VitaGovernedActionTool {
 
 impl<'call> ToolExecutor<ToolCall<'call>> for VitaGovernedActionTool {
     fn tool_name(&self) -> ToolName {
-        ToolName::plain(D29_H1_TOOL_NAME)
+        ToolName::plain(VITA_GOVERNED_ACTION_TOOL_NAME)
     }
 
     fn spec(&self) -> ToolSpec {
@@ -1006,7 +1044,7 @@ impl<'call> ToolExecutor<ToolCall<'call>> for VitaGovernedActionTool {
         }))
         .expect("D29-H1 tool schema is static and valid");
         ToolSpec::Function(ResponsesApiTool {
-            name: D29_H1_TOOL_NAME.to_string(),
+            name: VITA_GOVERNED_ACTION_TOOL_NAME.to_string(),
             description: "Submit a bounded Digital Life operation for authority review; H1 never executes it.".to_string(),
             strict: false,
             defer_loading: None,
@@ -1099,8 +1137,8 @@ mod tests {
         tool_name: ToolName,
         scope: VitaRequestedScope,
         expected_revision: Option<i64>,
-    ) -> VitaToolRequest {
-        VitaToolRequest::synthetic(
+    ) -> VitaToolAuthorityRequest {
+        VitaToolAuthorityRequest::synthetic(
             call_id,
             tool_name,
             "observe-only",
@@ -1144,45 +1182,43 @@ mod tests {
             }
         }
 
-        fn decision(&self, request: &VitaToolRequest) -> D28AuthorityDecision {
-            match self.mode {
-                FixtureAuthorityMode::Missing => D28AuthorityDecision::for_request(
-                    request,
-                    D28AuthorityDecisionKind::Denied,
-                    D28AuthorityDecisionCode::Denied,
-                    self.current_revision,
+        fn decision(&self, request: &VitaToolAuthorityRequest) -> VitaAuthorityVerdict {
+            let (outcome, reason) = match self.mode {
+                FixtureAuthorityMode::Missing => {
+                    (VitaAuthorityOutcome::Denied, VitaAuthorityReason::Denied)
+                }
+                FixtureAuthorityMode::Eligible => (
+                    VitaAuthorityOutcome::Eligible,
+                    VitaAuthorityReason::Eligible,
                 ),
-                FixtureAuthorityMode::Eligible => D28AuthorityDecision::for_request(
-                    request,
-                    D28AuthorityDecisionKind::Eligible,
-                    D28AuthorityDecisionCode::Eligible,
-                    self.current_revision,
+                FixtureAuthorityMode::ScopeDenied => (
+                    VitaAuthorityOutcome::Denied,
+                    VitaAuthorityReason::ScopeNotAvailable,
                 ),
-                FixtureAuthorityMode::ScopeDenied => D28AuthorityDecision::for_request(
-                    request,
-                    D28AuthorityDecisionKind::Denied,
-                    D28AuthorityDecisionCode::ScopeNotAvailable,
-                    self.current_revision,
-                ),
-                FixtureAuthorityMode::Pending => D28AuthorityDecision::for_request(
-                    request,
-                    D28AuthorityDecisionKind::Denied,
-                    D28AuthorityDecisionCode::Denied,
-                    self.current_revision,
-                ),
+                FixtureAuthorityMode::Pending => {
+                    (VitaAuthorityOutcome::Denied, VitaAuthorityReason::Denied)
+                }
                 FixtureAuthorityMode::Error | FixtureAuthorityMode::Panic => unreachable!(),
-            }
+            };
+            VitaAuthorityVerdict::from_request(
+                request,
+                outcome,
+                reason,
+                self.current_revision,
+                VitaAuthorityEvidenceSource::TestFixture,
+            )
+            .expect("test request context")
         }
     }
 
-    impl D28AuthorityPort for FixtureAuthority {
-        fn evaluate(&self, request: VitaToolRequest) -> D28AuthorityFuture {
+    impl VitaToolAuthorityPort for FixtureAuthority {
+        fn evaluate(&self, request: VitaToolAuthorityRequest) -> VitaAuthorityFuture {
             self.calls.fetch_add(1, Ordering::AcqRel);
             let mode = self.mode;
             let authority = self.clone();
             Box::pin(async move {
                 match mode {
-                    FixtureAuthorityMode::Error => Err(D28AuthorityError::Unavailable),
+                    FixtureAuthorityMode::Error => Err(VitaAuthorityError::Unavailable),
                     FixtureAuthorityMode::Panic => panic!("fixture authority panic"),
                     FixtureAuthorityMode::Pending => {
                         let active = authority.active.fetch_add(1, Ordering::AcqRel) + 1;
@@ -1211,7 +1247,10 @@ mod tests {
         }
     }
 
-    async fn authorize(broker: &VitaToolBroker, request: VitaToolRequest) -> VitaToolResult {
+    async fn authorize(
+        broker: &VitaToolBroker,
+        request: VitaToolAuthorityRequest,
+    ) -> VitaToolResult {
         broker.authorize(request).await
     }
 
@@ -1241,7 +1280,7 @@ mod tests {
                 request(
                     None,
                     "call-a",
-                    ToolName::plain(D29_H1_TOOL_NAME),
+                    ToolName::plain(VITA_GOVERNED_ACTION_TOOL_NAME),
                     VitaRequestedScope::None,
                     Some(1),
                 ),
@@ -1251,7 +1290,7 @@ mod tests {
                 request(
                     Some(VitaExecutionContext::try_new("other-life", "task-h1").unwrap()),
                     "call-b",
-                    ToolName::plain(D29_H1_TOOL_NAME),
+                    ToolName::plain(VITA_GOVERNED_ACTION_TOOL_NAME),
                     VitaRequestedScope::None,
                     Some(1),
                 ),
@@ -1261,7 +1300,7 @@ mod tests {
                 request(
                     Some(VitaExecutionContext::try_new("life-h1", "other-task").unwrap()),
                     "call-c",
-                    ToolName::plain(D29_H1_TOOL_NAME),
+                    ToolName::plain(VITA_GOVERNED_ACTION_TOOL_NAME),
                     VitaRequestedScope::None,
                     Some(1),
                 ),
@@ -1281,7 +1320,7 @@ mod tests {
                 request(
                     Some(context()),
                     "call-e",
-                    ToolName::plain(D29_H1_TOOL_NAME),
+                    ToolName::plain(VITA_GOVERNED_ACTION_TOOL_NAME),
                     VitaRequestedScope::None,
                     Some(1),
                 ),
@@ -1291,7 +1330,7 @@ mod tests {
                 request(
                     Some(context()),
                     "call-f",
-                    ToolName::plain(D29_H1_TOOL_NAME),
+                    ToolName::plain(VITA_GOVERNED_ACTION_TOOL_NAME),
                     VitaRequestedScope::None,
                     Some(1),
                 ),
@@ -1301,7 +1340,7 @@ mod tests {
                 request(
                     Some(context()),
                     "call-g",
-                    ToolName::plain(D29_H1_TOOL_NAME),
+                    ToolName::plain(VITA_GOVERNED_ACTION_TOOL_NAME),
                     VitaRequestedScope::ExternalResource,
                     Some(1),
                 ),
@@ -1320,7 +1359,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_d28_authorization_is_a_typed_deny() {
+    async fn missing_authorization_is_a_typed_deny() {
         let authority = Arc::new(FixtureAuthority::new(FixtureAuthorityMode::Missing, None));
         let broker = VitaToolBroker::new(context(), authority.clone());
         let result = authorize(
@@ -1328,7 +1367,7 @@ mod tests {
             request(
                 Some(context()),
                 "missing-grant-call",
-                ToolName::plain(D29_H1_TOOL_NAME),
+                ToolName::plain(VITA_GOVERNED_ACTION_TOOL_NAME),
                 VitaRequestedScope::None,
                 None,
             ),
@@ -1352,7 +1391,7 @@ mod tests {
             request(
                 Some(context()),
                 "duplicate-call",
-                ToolName::plain(D29_H1_TOOL_NAME),
+                ToolName::plain(VITA_GOVERNED_ACTION_TOOL_NAME),
                 VitaRequestedScope::None,
                 None,
             ),
@@ -1363,7 +1402,7 @@ mod tests {
             request(
                 Some(context()),
                 "duplicate-call",
-                ToolName::plain(D29_H1_TOOL_NAME),
+                ToolName::plain(VITA_GOVERNED_ACTION_TOOL_NAME),
                 VitaRequestedScope::None,
                 None,
             ),
@@ -1393,7 +1432,7 @@ mod tests {
             request(
                 Some(context()),
                 "stale-call",
-                ToolName::plain(D29_H1_TOOL_NAME),
+                ToolName::plain(VITA_GOVERNED_ACTION_TOOL_NAME),
                 VitaRequestedScope::None,
                 Some(1),
             ),
@@ -1415,7 +1454,7 @@ mod tests {
             request(
                 Some(context()),
                 "scope-call",
-                ToolName::plain(D29_H1_TOOL_NAME),
+                ToolName::plain(VITA_GOVERNED_ACTION_TOOL_NAME),
                 VitaRequestedScope::ExternalResource,
                 Some(1),
             ),
@@ -1442,7 +1481,7 @@ mod tests {
                     request(
                         Some(context()),
                         "pending-call",
-                        ToolName::plain(D29_H1_TOOL_NAME),
+                        ToolName::plain(VITA_GOVERNED_ACTION_TOOL_NAME),
                         VitaRequestedScope::None,
                         Some(1),
                     ),
@@ -1483,7 +1522,7 @@ mod tests {
                 request(
                     Some(context()),
                     "error-call",
-                    ToolName::plain(D29_H1_TOOL_NAME),
+                    ToolName::plain(VITA_GOVERNED_ACTION_TOOL_NAME),
                     VitaRequestedScope::None,
                     None,
                 ),
@@ -1500,19 +1539,19 @@ mod tests {
     async fn call_limit_is_hard_and_no_parallel_execution_is_admitted() {
         let authority = Arc::new(FixtureAuthority::new(FixtureAuthorityMode::Missing, None));
         let broker = VitaToolBroker::new(context(), authority.clone());
-        for index in 0..(D29_H1_MAX_TOOL_CALLS + 2) {
+        for index in 0..(VITA_H1_MAX_TOOL_CALLS + 2) {
             let result = authorize(
                 &broker,
                 request(
                     Some(context()),
                     &format!("limit-{index}"),
-                    ToolName::plain(D29_H1_TOOL_NAME),
+                    ToolName::plain(VITA_GOVERNED_ACTION_TOOL_NAME),
                     VitaRequestedScope::None,
                     None,
                 ),
             )
             .await;
-            if index < D29_H1_MAX_TOOL_CALLS {
+            if index < VITA_H1_MAX_TOOL_CALLS {
                 assert_eq!(
                     result.deny_classification(),
                     VitaDenyClassification::MissingAuthorization
@@ -1526,7 +1565,7 @@ mod tests {
         }
         assert_eq!(
             authority.calls.load(Ordering::Acquire),
-            D29_H1_MAX_TOOL_CALLS
+            VITA_H1_MAX_TOOL_CALLS
         );
         assert_eq!(broker.snapshot().execution_started, 0);
         assert_eq!(broker.snapshot().side_effect_count, 0);
@@ -1535,19 +1574,28 @@ mod tests {
     #[test]
     fn h1_tool_is_direct_serial_and_uses_only_the_fixed_tool_name() {
         let tool = VitaGovernedActionTool {
-            broker: VitaToolBroker::production(context()),
+            broker: VitaToolBroker::new(
+                context(),
+                Arc::new(FixtureAuthority::new(FixtureAuthorityMode::Missing, None)),
+            ),
         };
-        assert_eq!(tool.tool_name(), ToolName::plain(D29_H1_TOOL_NAME));
+        assert_eq!(
+            tool.tool_name(),
+            ToolName::plain(VITA_GOVERNED_ACTION_TOOL_NAME)
+        );
         assert!(!tool.supports_parallel_tool_calls());
         let ToolSpec::Function(spec) = tool.spec() else {
             panic!("D29-H1 must expose one function tool");
         };
-        assert_eq!(spec.name, D29_H1_TOOL_NAME);
+        assert_eq!(spec.name, VITA_GOVERNED_ACTION_TOOL_NAME);
     }
 
     #[test]
     fn production_authority_is_deny_only_and_does_not_need_a_grant_mint_path() {
-        let broker = VitaToolBroker::production(context());
+        let broker = VitaToolBroker::new(
+            context(),
+            Arc::new(FixtureAuthority::new(FixtureAuthorityMode::Missing, None)),
+        );
         assert!(Arc::strong_count(&broker) >= 1);
         assert!(!broker.cancelled.load(Ordering::Acquire));
     }

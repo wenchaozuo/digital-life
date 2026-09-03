@@ -8,4 +8,10 @@
 pub(crate) mod authorization;
 pub(crate) mod descriptor;
 
+#[cfg(test)]
+mod d29h1;
+
+#[cfg(test)]
+mod vita_tool_adapter;
+
 pub(crate) use descriptor::CapabilityRegistry;

@@ -24,18 +24,19 @@ use codex_core_api::{
 use serde_json::{json, Value};
 use tempfile::{tempdir, TempDir};
 
-use super::{
-    GatewayReadyProvider, ProviderCapabilities, ProviderProfile, ProviderProtocol,
-    ProviderRetryPolicy, VitaGatewayBinding, VitaProviderAuthority,
+use vita_agent::{
+    ProviderCapabilities, ProviderProfile, ProviderProtocol, ProviderRetryPolicy,
+    VitaAgentEntrypoint, VitaAgentRuntimeProfile, VitaBrokerSnapshot, VitaExecutionContext,
+    VitaGatewayBinding, VitaProviderAuthority, VitaToolBroker, VitaToolContributor,
+    VITA_GOVERNED_ACTION_TOOL_NAME,
 };
-use crate::tool_authority::{
-    VitaBrokerSnapshot, VitaExecutionContext, VitaToolBroker, VitaToolContributor, D29_H1_TOOL_NAME,
-};
-use crate::{VitaAgentEntrypoint, VitaAgentRuntimeProfile};
+
+use super::vita_tool_adapter::{CanonicalVitaAuthorityAdapter, CanonicalVitaAuthoritySnapshot};
+use crate::storage::StorageService;
 
 const D29_H1_MODEL: &str = "d29h1-local-responses-model";
 const D29_H1_PROMPT: &str = "Submit the bounded Vita operation.";
-const D29_H1_REPLY: &str = "VITA_D29_H1_DENIED";
+const D29_H1_REPLY: &str = "VITA_D29H1_DENIED_OK";
 const D29_H1_CALL_ID: &str = "call-d29h1-governed";
 const D29_H1_PROVIDER_ID: &str = "d29h1-loopback-responses";
 const D29_H1_TURN_TIMEOUT: Duration = Duration::from_secs(6);
@@ -225,9 +226,9 @@ fn request_has_h1_tool(body: &[u8]) -> bool {
         .and_then(|body| body.get("tools").cloned())
         .and_then(|tools| tools.as_array().cloned())
         .is_some_and(|tools| {
-            tools
-                .iter()
-                .any(|tool| tool.get("name").and_then(Value::as_str) == Some(D29_H1_TOOL_NAME))
+            tools.iter().any(|tool| {
+                tool.get("name").and_then(Value::as_str) == Some(VITA_GOVERNED_ACTION_TOOL_NAME)
+            })
         })
 }
 
@@ -269,7 +270,7 @@ fn request_has_bounded_h1_deny(body: &[u8], call_id: &str) -> bool {
                 is_output
                     && output.get("status").and_then(Value::as_str) == Some("denied")
                     && output.get("deny_classification").and_then(Value::as_str)
-                        == Some("missing_d28_authorization")
+                        == Some("unknown_capability_descriptor")
                     && output.get("execution_started").and_then(Value::as_bool) == Some(false)
                     && output.get("side_effect_count").and_then(Value::as_u64) == Some(0)
             })
@@ -309,7 +310,7 @@ fn first_response_events() -> Vec<Value> {
             "item": {
                 "type": "function_call",
                 "call_id": D29_H1_CALL_ID,
-                "name": D29_H1_TOOL_NAME,
+                "name": VITA_GOVERNED_ACTION_TOOL_NAME,
                 "arguments": "{\"operation\":\"observe-only\",\"scope\":\"none\",\"resource\":\"loopback-fixture\"}"
             }
         }),
@@ -521,7 +522,15 @@ async fn shutdown_thread_once(thread: &Arc<codex_core_api::CodexThread>) -> Shut
     }
 }
 
-async fn start_runtime() -> Result<(H1Runtime, Arc<VitaToolBroker>, HostCanary), String> {
+async fn start_runtime() -> Result<
+    (
+        H1Runtime,
+        Arc<VitaToolBroker>,
+        Arc<CanonicalVitaAuthorityAdapter>,
+        HostCanary,
+    ),
+    String,
+> {
     let before = host_canary();
     let app_data = tempdir().map_err(|error| format!("create D29-H1 app data: {error}"))?;
     let workspace = tempdir().map_err(|error| format!("create D29-H1 workspace: {error}"))?;
@@ -551,7 +560,7 @@ async fn start_runtime() -> Result<(H1Runtime, Arc<VitaToolBroker>, HostCanary),
         .map_err(|error| format!("configure D29-H1 provider: {error}"))?;
     let binding = VitaGatewayBinding::for_owned_private_listener(fixture.address.port())
         .map_err(|error| format!("create D29-H1 private binding: {error}"))?;
-    let ready: GatewayReadyProvider = authority
+    let ready = authority
         .prepare_gateway(binding)
         .map_err(|error| format!("prepare D29-H1 gateway binding: {error}"))?;
     let entrypoint = VitaAgentEntrypoint::initialize_with_gateway_for_tests(profile, &ready)
@@ -559,9 +568,15 @@ async fn start_runtime() -> Result<(H1Runtime, Arc<VitaToolBroker>, HostCanary),
         .map_err(|error| format!("compile D29-H1 Codex config: {error}"))?;
     let config = entrypoint.config().clone();
 
+    let storage = Arc::new(
+        StorageService::initialize_with_roots(app_data.path().join("canonical-storage"), None)
+            .map_err(|error| format!("initialize D29-H1 canonical storage: {}", error.message))?,
+    );
+    let canonical_authority = CanonicalVitaAuthorityAdapter::production(Arc::clone(&storage))
+        .map_err(|error| format!("create D29-H1 canonical authority adapter: {error}"))?;
     let context = VitaExecutionContext::try_new("life-d29h1", "task-d29h1")
         .map_err(|error| format!("create D29-H1 execution context: {:?}", error))?;
-    let broker = VitaToolBroker::production(context);
+    let broker = VitaToolBroker::new(context, canonical_authority.clone());
     let mut extensions =
         codex_core_api::ExtensionRegistryBuilder::<codex_core::config::Config>::new();
     extensions.tool_contributor(Arc::new(VitaToolContributor::new(Arc::clone(&broker))));
@@ -604,6 +619,7 @@ async fn start_runtime() -> Result<(H1Runtime, Arc<VitaToolBroker>, HostCanary),
             fixture: Some(fixture),
         },
         broker,
+        canonical_authority,
         before,
     ))
 }
@@ -662,7 +678,8 @@ fn d29h1_real_codex_tool_request_is_denied_before_side_effect() {
 }
 
 async fn d29h1_real_codex_tool_request_body() {
-    let (runtime, broker, before) = start_runtime().await.expect("D29-H1 runtime should start");
+    let (runtime, broker, canonical_authority, before) =
+        start_runtime().await.expect("D29-H1 runtime should start");
     let turn = run_turn(
         runtime
             .thread
@@ -691,6 +708,10 @@ async fn d29h1_real_codex_tool_request_body() {
     assert_eq!(fixture.error, None);
 
     let snapshot: VitaBrokerSnapshot = broker.snapshot();
+    let canonical: CanonicalVitaAuthoritySnapshot = canonical_authority.snapshot();
+    assert_eq!(canonical.canonical_evaluations, 1);
+    assert_eq!(canonical.production_registry_size, 0);
+    assert_eq!(canonical.authorization_row_reads, 0);
     assert_eq!(snapshot.attempted_requests, 1);
     assert_eq!(snapshot.authority_lookups, 1);
     assert_eq!(snapshot.execution_started, 0);

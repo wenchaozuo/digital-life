@@ -437,7 +437,7 @@ impl ExtractionFence {
         hasher.update([0]);
         hasher.update(self.run_id.as_bytes());
         hasher.update(self.attempt_sequence.to_be_bytes());
-        hasher.update(self.raw_token.as_ref());
+        hasher.update(&self.raw_token[..]);
         hex(&hasher.finalize())
     }
 }

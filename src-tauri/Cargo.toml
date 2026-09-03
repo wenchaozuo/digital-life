@@ -23,7 +23,7 @@ tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rusqlite = { version = "0.37", features = ["backup", "bundled", "functions"] }
+rusqlite = { version = "=0.39.0", features = ["backup", "bundled", "functions"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 url = { version = "=2.5.8", default-features = false, features = ["std"] }
 lancedb = { version = "=0.31.0", default-features = false }
@@ -50,8 +50,21 @@ windows-future = "=0.2.1"
 getrandom = { version = "=0.3.4", default-features = false }
 
 [dev-dependencies]
+digital-life-vita-agent = { path = "../vita-agent", features = ["d29-h1-host-test"] }
+codex-core = { git = "https://github.com/openai/codex.git", rev = "316795b3cf2a45e90d121d9f46499d4658b2645c" }
+codex-core-api = { git = "https://github.com/openai/codex.git", rev = "316795b3cf2a45e90d121d9f46499d4658b2645c" }
+# Keep the pinned Codex networking stack on its matching pre-1.0 Rama
+# releases; the stable 0.3.0 macro/util crates are semver-compatible but not
+# API-compatible with the pinned alpha.4 crates.
+rama-macros = "=0.3.0-alpha.4"
+rama-utils = "=0.3.0-alpha.4"
 tempfile = "3"
 tokio = { version = "=1.52.3", default-features = false, features = ["macros", "rt-multi-thread"] }
+winapi = { version = "=0.3.9", features = ["std"] }
+
+[patch.crates-io]
+tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186" }
+tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_RestartManager", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }

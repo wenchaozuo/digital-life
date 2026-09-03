@@ -2413,7 +2413,7 @@ impl StorageService {
             .query_row(
                 "SELECT COUNT(*) FROM memory_vector_sync_outbox",
                 [],
-                |row| row.get(0),
+                |row| row.get::<_, i64>(0).map(|count| count as usize),
             )
             .map_err(|_| single_event_error())?;
         let row = state.connection.query_row(
@@ -2524,7 +2524,7 @@ impl StorageService {
             .query_row(
                 "SELECT COUNT(*) FROM memory_vector_generation_item",
                 [],
-                |r| r.get(0),
+                |r| r.get::<_, i64>(0).map(|count| count as usize),
             )
             .map_err(|_| single_event_error())
     }

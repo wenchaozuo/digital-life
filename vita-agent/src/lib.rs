@@ -39,6 +39,110 @@ pub const CODEX_UPSTREAM_COMMIT: &str = "316795b3cf2a45e90d121d9f46499d4658b2645
 pub const CODEX_PROTOCOL_SCHEMA_HASH: &str =
     "d8faa38d5f00aa7ddfe635a2d374ee5f871ffd217d4d175c72fbe7f009f4f669";
 
+const MAX_PROVIDER_ERROR_FIELD_CHARS: usize = 256;
+const REDACTED_PROVIDER_ERROR_VALUE: &str = "[redacted]";
+
+/// A bounded, allowlisted representation of a provider's error envelope.
+///
+/// This type intentionally contains no arbitrary JSON and no request
+/// material.  Values are sanitized at construction time so Debug/Display can
+/// safely be used by a diagnostic report.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProviderErrorDetail {
+    status: u16,
+    code: Option<String>,
+    kind: Option<String>,
+    param: Option<String>,
+    message: Option<String>,
+}
+
+impl ProviderErrorDetail {
+    pub(crate) fn from_parts(
+        status: u16,
+        code: Option<&str>,
+        kind: Option<&str>,
+        param: Option<&str>,
+        message: Option<&str>,
+        credential: Option<&str>,
+    ) -> Self {
+        Self {
+            status,
+            code: sanitize_provider_error_field(code, credential),
+            kind: sanitize_provider_error_field(kind, credential),
+            param: sanitize_provider_error_field(param, credential),
+            message: sanitize_provider_error_field(message, credential),
+        }
+    }
+
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+
+    pub fn code(&self) -> Option<&str> {
+        self.code.as_deref()
+    }
+
+    pub fn kind(&self) -> Option<&str> {
+        self.kind.as_deref()
+    }
+
+    pub fn param(&self) -> Option<&str> {
+        self.param.as_deref()
+    }
+
+    pub fn message(&self) -> Option<&str> {
+        self.message.as_deref()
+    }
+}
+
+impl std::fmt::Debug for ProviderErrorDetail {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProviderErrorDetail")
+            .field("status", &self.status)
+            .field("code", &self.code)
+            .field("kind", &self.kind)
+            .field("param", &self.param)
+            .field("message", &self.message)
+            .finish()
+    }
+}
+
+impl Display for ProviderErrorDetail {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "status={} code={} kind={} param={} message={}",
+            self.status,
+            self.code.as_deref().unwrap_or("none"),
+            self.kind.as_deref().unwrap_or("none"),
+            self.param.as_deref().unwrap_or("none"),
+            self.message.as_deref().unwrap_or("none"),
+        )
+    }
+}
+
+fn sanitize_provider_error_field(value: Option<&str>, credential: Option<&str>) -> Option<String> {
+    let value = value?;
+    if credential.is_some_and(|credential| !credential.is_empty() && value.contains(credential)) {
+        return Some(REDACTED_PROVIDER_ERROR_VALUE.to_string());
+    }
+
+    Some(
+        value
+            .chars()
+            .take(MAX_PROVIDER_ERROR_FIELD_CHARS)
+            .map(|character| {
+                if character.is_control() {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .collect(),
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VitaProviderPolicy {
     NotConfigured,
@@ -642,6 +746,7 @@ pub enum VitaAgentError {
     },
     ProviderHttpStatus {
         status: u16,
+        detail: Option<ProviderErrorDetail>,
     },
     OwnershipViolation {
         path: PathBuf,
@@ -740,8 +845,12 @@ impl Display for VitaAgentError {
             Self::ProviderResponseTooLarge { limit } => {
                 write!(f, "provider response exceeds the {limit}-byte limit")
             }
-            Self::ProviderHttpStatus { status } => {
-                write!(f, "provider returned HTTP status {status}")
+            Self::ProviderHttpStatus { status, detail } => {
+                write!(f, "provider returned HTTP status {status}")?;
+                if let Some(detail) = detail {
+                    write!(f, " ({detail})")?;
+                }
+                Ok(())
             }
             Self::OwnershipViolation { path, reason } => write!(
                 f,

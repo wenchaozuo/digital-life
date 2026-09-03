@@ -17,12 +17,14 @@ use std::time::{Duration, Instant};
 
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
+use serde_json::Value;
 use zeroize::Zeroizing;
 
 use super::{
     is_forbidden_ip, is_forbidden_network_host, ProviderEndpoint, ProviderRequestTransport,
     ProviderRetryPolicy, ResolvedCredential, VitaAgentError,
 };
+use crate::ProviderErrorDetail;
 
 const MAX_RETRY_COUNT: u8 = 2;
 const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(5);
@@ -580,6 +582,11 @@ where
             } else {
                 Err(VitaAgentError::ProviderHttpStatus {
                     status: response.status,
+                    detail: parse_provider_error_detail(
+                        response.status,
+                        &response.body,
+                        authorization,
+                    ),
                 })
             };
         }
@@ -776,6 +783,73 @@ fn enforce_response_limits(
     Ok(())
 }
 
+/// Extract only the small, documented diagnostic envelope from a bounded
+/// provider error body.  Unknown fields and nested values are intentionally
+/// discarded before the result can enter an error or test report.
+fn parse_provider_error_detail(
+    status: u16,
+    body: &[u8],
+    credential: Option<&ResolvedCredential>,
+) -> Option<ProviderErrorDetail> {
+    let value = serde_json::from_slice::<Value>(body).ok()?;
+    let root = value.as_object()?;
+    let nested_error = root.get("error").and_then(Value::as_object);
+    let code = extract_error_scalar(nested_error, root, &["code", "error_code", "errorCode"]);
+    let kind = extract_error_scalar(
+        nested_error,
+        root,
+        &["type", "kind", "error_type", "errorType"],
+    );
+    let param = extract_error_scalar(
+        nested_error,
+        root,
+        &["param", "parameter", "error_param", "errorParam"],
+    );
+    let message = extract_error_scalar(
+        nested_error,
+        root,
+        &["message", "msg", "error_message", "errorMessage"],
+    )
+    .or_else(|| root.get("error").and_then(scalar_error_text));
+
+    if code.is_none() && kind.is_none() && param.is_none() && message.is_none() {
+        return None;
+    }
+
+    Some(ProviderErrorDetail::from_parts(
+        status,
+        code.as_deref(),
+        kind.as_deref(),
+        param.as_deref(),
+        message.as_deref(),
+        credential.map(ResolvedCredential::as_str),
+    ))
+}
+
+fn extract_error_scalar(
+    nested_error: Option<&serde_json::Map<String, Value>>,
+    root: &serde_json::Map<String, Value>,
+    aliases: &[&str],
+) -> Option<String> {
+    nested_error
+        .and_then(|object| first_error_scalar(object, aliases))
+        .or_else(|| first_error_scalar(root, aliases))
+}
+
+fn first_error_scalar(object: &serde_json::Map<String, Value>, aliases: &[&str]) -> Option<String> {
+    aliases
+        .iter()
+        .find_map(|alias| object.get(*alias).and_then(scalar_error_text))
+}
+
+fn scalar_error_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
 fn response_header_bytes(headers: &HeaderMap) -> usize {
     headers
         .iter()
@@ -878,6 +952,8 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::sync::{Arc, Condvar, Mutex};
+
+    use serde_json::json;
 
     const PUBLIC_IP: [u8; 4] = [93, 184, 216, 34];
     const TEST_PORT: u16 = 443;
@@ -1796,7 +1872,7 @@ mod tests {
             .expect_err("401 must not be retried");
         assert!(matches!(
             error,
-            VitaAgentError::ProviderHttpStatus { status: 401 }
+            VitaAgentError::ProviderHttpStatus { status: 401, .. }
         ));
         assert_eq!(observations.observations().len(), 1);
     }
@@ -1823,7 +1899,7 @@ mod tests {
             .expect_err("429 must not replay the model POST");
         assert!(matches!(
             error,
-            VitaAgentError::ProviderHttpStatus { status: 429 }
+            VitaAgentError::ProviderHttpStatus { status: 429, .. }
         ));
         assert_eq!(observations.observations().len(), 1);
     }
@@ -1850,7 +1926,7 @@ mod tests {
             .expect_err("5xx retry budget must stop");
         assert!(matches!(
             error,
-            VitaAgentError::ProviderHttpStatus { status: 503 }
+            VitaAgentError::ProviderHttpStatus { status: 503, .. }
         ));
         assert_eq!(observations.observations().len(), 1);
     }
@@ -1877,7 +1953,7 @@ mod tests {
             .expect_err("408 must not replay the model POST");
         assert!(matches!(
             error,
-            VitaAgentError::ProviderHttpStatus { status: 408 }
+            VitaAgentError::ProviderHttpStatus { status: 408, .. }
         ));
         assert_eq!(observations.observations().len(), 1);
     }
@@ -1932,6 +2008,80 @@ mod tests {
             .expect_err("test unauthorized response");
         assert!(!format!("{error:?}").contains(raw));
         assert!(!error.to_string().contains(raw));
+    }
+
+    #[test]
+    fn provider_error_detail_is_allowlisted_bounded_and_secret_safe() {
+        let raw = "provider-diagnostic-secret";
+        let credential = ResolvedCredential::new(raw);
+        let body = serde_json::to_vec(&json!({
+            "error": {
+                "code": 1211,
+                "type": "invalid_request_error",
+                "param": "model",
+                "message": format!("invalid model; token={raw}"),
+                "nested": {"should_not": "be retained"}
+            },
+            "unknown": {"secret": "discarded"}
+        }))
+        .expect("error JSON should serialize");
+
+        let detail = parse_provider_error_detail(400, &body, Some(&credential))
+            .expect("allowlisted provider detail should be parsed");
+        assert_eq!(detail.status(), 400);
+        assert_eq!(detail.code(), Some("1211"));
+        assert_eq!(detail.kind(), Some("invalid_request_error"));
+        assert_eq!(detail.param(), Some("model"));
+        assert_eq!(detail.message(), Some("[redacted]"));
+
+        let debug = format!("{detail:?}");
+        let display = detail.to_string();
+        assert!(!debug.contains(raw));
+        assert!(!display.contains(raw));
+        assert!(!debug.contains("should_not"));
+        assert!(!debug.contains("discarded"));
+    }
+
+    #[test]
+    fn provider_error_detail_discards_unknown_fields_and_bounds_text() {
+        let long_message = "x".repeat(512);
+        let body = serde_json::to_vec(&json!({
+            "error_code": "E-400",
+            "error_type": "provider_error",
+            "parameter": "input",
+            "msg": long_message,
+            "debug": {"arbitrary": "unknown"}
+        }))
+        .expect("error JSON should serialize");
+
+        let detail = parse_provider_error_detail(400, &body, None)
+            .expect("provider-specific scalar aliases should be parsed");
+        assert_eq!(detail.code(), Some("E-400"));
+        assert_eq!(detail.kind(), Some("provider_error"));
+        assert_eq!(detail.param(), Some("input"));
+        assert_eq!(detail.message().map(str::len), Some(256));
+        assert!(!format!("{detail:?}").contains("arbitrary"));
+        assert!(parse_provider_error_detail(400, b"not-json", None).is_none());
+    }
+
+    #[test]
+    fn provider_http_status_debug_and_display_use_only_safe_detail() {
+        let raw = "provider-status-secret";
+        let detail = ProviderErrorDetail::from_parts(
+            400,
+            Some("bad_request"),
+            Some("invalid_request_error"),
+            Some("model"),
+            Some(raw),
+            Some(raw),
+        );
+        let error = VitaAgentError::ProviderHttpStatus {
+            status: 400,
+            detail: Some(detail),
+        };
+        assert!(!format!("{error:?}").contains(raw));
+        assert!(!error.to_string().contains(raw));
+        assert!(error.to_string().contains("[redacted]"));
     }
 
     #[test]

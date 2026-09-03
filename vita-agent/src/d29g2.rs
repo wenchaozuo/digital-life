@@ -32,13 +32,15 @@ use super::{
     VitaResponsesRequestOptions,
 };
 use crate::{
-    VitaAgentEntrypoint, VitaAgentRuntimeProfile, VITA_AGENT_RUNTIME_ID, VITA_GATEWAY_PROVIDER_ID,
+    ProviderErrorDetail, VitaAgentEntrypoint, VitaAgentRuntimeProfile, VITA_AGENT_RUNTIME_ID,
+    VITA_GATEWAY_PROVIDER_ID,
 };
 
 const D29G2_PROVIDER_ID_ENV: &str = "VITA_D29G2_PROVIDER_ID";
 const D29G2_BASE_URL_ENV: &str = "VITA_D29G2_BASE_URL";
 const D29G2_MODEL_ENV: &str = "VITA_D29G2_MODEL";
 const D29G2_API_KEY_ENV: &str = "VITA_D29G2_API_KEY";
+const D29G2_PROBE_PROMPT: &str = "Reply exactly with VITA_D29G2_PROBE_OK.";
 const D29G2_PROMPT: &str = "Reply exactly with VITA_D29G2_OK.";
 const D29G2_REPLY: &str = "VITA_D29G2_OK";
 const D29G2_PROVIDER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -209,6 +211,7 @@ struct GatewayObservation {
     provider_output_expected: bool,
     provider_finish_reason: Option<String>,
     provider_usage: Option<UsageObservation>,
+    provider_error_detail: Option<ProviderErrorDetail>,
     failure_class: Option<&'static str>,
 }
 
@@ -453,7 +456,17 @@ fn handle_gateway_request<T, R>(
             }
         }
         Err(error) => {
-            set_failure(observation, classify_provider_failure(&error));
+            let failure_class = classify_provider_failure(&error);
+            let provider_error_detail = match &error {
+                VitaAgentError::ProviderHttpStatus { detail, .. } => detail.clone(),
+                _ => None,
+            };
+            let mut observed = observation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            observed.provider_error_detail = provider_error_detail;
+            observed.failure_class = Some(failure_class);
+            drop(observed);
             let _ = write_failed_responses(stream, expected_model, b"provider smoke failed");
         }
     }
@@ -476,12 +489,12 @@ fn classify_parser_failure(error: &str) -> &'static str {
 
 fn classify_provider_failure(error: &VitaAgentError) -> &'static str {
     match error {
-        VitaAgentError::ProviderHttpStatus { status: 401 } => "HTTP_401",
-        VitaAgentError::ProviderHttpStatus { status: 403 } => "HTTP_403",
-        VitaAgentError::ProviderHttpStatus { status: 404 } => "HTTP_404",
-        VitaAgentError::ProviderHttpStatus { status: 408 } => "HTTP_408",
-        VitaAgentError::ProviderHttpStatus { status: 429 } => "HTTP_429",
-        VitaAgentError::ProviderHttpStatus { status } if *status >= 500 => "HTTP_5XX",
+        VitaAgentError::ProviderHttpStatus { status: 401, .. } => "HTTP_401",
+        VitaAgentError::ProviderHttpStatus { status: 403, .. } => "HTTP_403",
+        VitaAgentError::ProviderHttpStatus { status: 404, .. } => "HTTP_404",
+        VitaAgentError::ProviderHttpStatus { status: 408, .. } => "HTTP_408",
+        VitaAgentError::ProviderHttpStatus { status: 429, .. } => "HTTP_429",
+        VitaAgentError::ProviderHttpStatus { status, .. } if *status >= 500 => "HTTP_5XX",
         VitaAgentError::ProviderTransportTimeout { .. } => "TURN_TIMEOUT",
         VitaAgentError::CredentialResolution(_) => "CREDENTIAL_REJECTED",
         VitaAgentError::UnsupportedProviderCapability { .. }
@@ -1203,6 +1216,92 @@ async fn collect_turn(thread: &Arc<codex_core_api::CodexThread>) -> Result<TurnR
     }
 }
 
+#[derive(Debug)]
+struct MinimalProbeEvidence {
+    provider_status: u16,
+    provider_attempt_count: usize,
+    response_is_valid_chat_completion: bool,
+    provider_failure_class: Option<&'static str>,
+    error_detail: Option<ProviderErrorDetail>,
+}
+
+fn run_minimal_provider_probe(inputs: &G2Inputs) -> Result<MinimalProbeEvidence, String> {
+    let provider = ProviderProfile::new(
+        inputs.provider_id.clone(),
+        format!("D29-G2-R1 probe {}", inputs.provider_id),
+        ProviderProtocol::OpenAiChatCompletions,
+        &inputs.base_url,
+        inputs.model.clone(),
+        Some(inputs.credential_ref.clone()),
+        D29G2_PROVIDER_TIMEOUT,
+        ProviderRetryPolicy::default(),
+        ProviderCapabilities::none(),
+    )
+    .map_err(|_| "minimal probe provider profile validation failed".to_string())?;
+    let authority = super::VitaProviderAuthority::configure(provider)
+        .map_err(|_| "minimal probe provider configuration failed".to_string())?;
+    let reservation = TcpListener::bind(("127.0.0.1", 0))
+        .map_err(|_| "minimal probe listener reservation failed".to_string())?;
+    let binding = VitaGatewayBinding::for_owned_private_listener(
+        reservation
+            .local_addr()
+            .map_err(|_| "minimal probe listener address failed".to_string())?
+            .port(),
+    )
+    .map_err(|_| "minimal probe gateway binding failed".to_string())?;
+    let ready = authority
+        .prepare_gateway(binding)
+        .map_err(|_| "minimal probe gateway preparation failed".to_string())?;
+    drop(reservation);
+
+    let (transport, transport_observation) = super::production_transport::new_for_d29g2()
+        .map_err(|_| "minimal probe production transport creation failed".to_string())?;
+    let gateway = ProviderGateway::new(
+        ready,
+        G2CredentialResolver {
+            reference: inputs.credential_ref.clone(),
+            credential: ResolvedCredential::new(inputs.credential.as_str()),
+        },
+        transport,
+    );
+    let request = VitaResponsesRequest::new(
+        inputs.model.clone(),
+        vec![VitaMessage::text(VitaMessageRole::User, D29G2_PROBE_PROMPT)],
+        VitaResponsesRequestOptions::default(),
+    );
+    let result = gateway.execute_responses_request(&request);
+    let error_detail = match &result {
+        Err(VitaAgentError::ProviderHttpStatus { detail, .. }) => detail.clone(),
+        _ => None,
+    };
+    let provider_failure_class = result.as_ref().err().map(classify_provider_failure);
+    let provider_status = transport_observation.last_status.load(Ordering::Acquire);
+    let provider_attempt_count = transport_observation.attempt_count.load(Ordering::Acquire);
+
+    Ok(MinimalProbeEvidence {
+        provider_status,
+        provider_attempt_count,
+        response_is_valid_chat_completion: result.is_ok(),
+        provider_failure_class,
+        error_detail,
+    })
+}
+
+fn print_minimal_probe_report(evidence: &MinimalProbeEvidence) {
+    let detail = evidence.error_detail.as_ref();
+    println!(
+        "D29-G2-R1 MINIMAL_PROVIDER_PROBE status={} provider_requests={} valid_chat_completion={} provider_failure_class={} provider_error_code={} provider_error_type={} provider_error_param={} provider_error_message={} raw_credential_logged=NO",
+        evidence.provider_status,
+        evidence.provider_attempt_count,
+        evidence.response_is_valid_chat_completion,
+        evidence.provider_failure_class.unwrap_or("none"),
+        detail.and_then(ProviderErrorDetail::code).unwrap_or("none"),
+        detail.and_then(ProviderErrorDetail::kind).unwrap_or("none"),
+        detail.and_then(ProviderErrorDetail::param).unwrap_or("none"),
+        detail.and_then(ProviderErrorDetail::message).unwrap_or("none"),
+    );
+}
+
 async fn start_runtime(
     inputs: G2Inputs,
 ) -> Result<(G2Runtime, ProductionTransportObservationHandle, G2Canary), String> {
@@ -1510,8 +1609,9 @@ fn print_success_report(evidence: &SmokeEvidence) {
 }
 
 fn print_blocked_report(evidence: &SmokeEvidence) {
+    let detail = evidence.gateway.provider_error_detail.as_ref();
     println!(
-        "D29-G2 BLOCKED provider={} endpoint={} model={} provider_host={} provider_http_status={} provider_requests={} codex_to_vita_requests={} developer_role_present={} gateway_failure_class={} gateway_target={} gateway_response_path={} user_codex=UNCHANGED raw_credential_logged=NO",
+        "D29-G2 BLOCKED provider={} endpoint={} model={} provider_host={} provider_http_status={} provider_requests={} codex_to_vita_requests={} developer_role_present={} gateway_failure_class={} gateway_target={} gateway_response_path={} provider_error_code={} provider_error_type={} provider_error_param={} provider_error_message={} user_codex=UNCHANGED raw_credential_logged=NO",
         evidence.provider_id,
         evidence.base_url,
         evidence.model,
@@ -1523,6 +1623,10 @@ fn print_blocked_report(evidence: &SmokeEvidence) {
         evidence.gateway.failure_class.unwrap_or("none"),
         evidence.gateway.target.as_deref().unwrap_or("none"),
         evidence.gateway.response_path.as_deref().unwrap_or("none"),
+        detail.and_then(ProviderErrorDetail::code).unwrap_or("none"),
+        detail.and_then(ProviderErrorDetail::kind).unwrap_or("none"),
+        detail.and_then(ProviderErrorDetail::param).unwrap_or("none"),
+        detail.and_then(ProviderErrorDetail::message).unwrap_or("none"),
     );
 }
 
@@ -1549,4 +1653,30 @@ fn d29g2_real_provider_smoke() {
         .expect("D29-G2 test thread should start")
         .join()
         .expect("D29-G2 test thread should finish");
+}
+
+#[test]
+#[ignore = "requires explicit user-authorized VITA_D29G2_* inputs and one real provider request"]
+fn d29g2_r1_minimal_provider_probe() {
+    thread::Builder::new()
+        .name("d29g2-r1-minimal-provider-probe".to_string())
+        .stack_size(D29G2_TEST_STACK_SIZE)
+        .spawn(|| {
+            let inputs = load_inputs().unwrap_or_else(|error| panic!("D29-G2-R1 BLOCKED: {error}"));
+            let evidence = run_minimal_provider_probe(&inputs)
+                .unwrap_or_else(|error| panic!("D29-G2-R1 BLOCKED: {error}"));
+            print_minimal_probe_report(&evidence);
+            assert_eq!(
+                evidence.provider_attempt_count, 1,
+                "D29-G2-R1 minimal probe must issue exactly one provider request"
+            );
+            assert!(
+                (200..300).contains(&evidence.provider_status)
+                    && evidence.response_is_valid_chat_completion,
+                "D29-G2-R1 minimal provider probe failed"
+            );
+        })
+        .expect("D29-G2-R1 probe thread should start")
+        .join()
+        .expect("D29-G2-R1 probe thread should finish");
 }

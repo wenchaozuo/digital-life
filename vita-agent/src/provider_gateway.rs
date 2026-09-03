@@ -123,8 +123,9 @@ impl ProviderCapabilities {
     }
 }
 
-/// Bounded retry configuration.  Retrying itself is intentionally not wired
-/// to an external transport in D29-E.
+/// Bounded retry configuration for future-safe transport retries.  D29-G1-R1
+/// permits it only for a connection failure before an HTTP request is
+/// established; model-generation HTTP status responses are never replayed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderRetryPolicy {
     pub max_retries: u8,
@@ -870,7 +871,10 @@ trait CredentialResolver {
 /// The raw value is never serializable or persisted.  `zeroize` clears the
 /// owned string when this value is dropped, and the custom Debug output keeps
 /// the value out of diagnostics.  The HTTP transport creates a separate,
-/// typed Authorization header only for the duration of the request.
+/// typed Authorization header only for the duration of the request.  Digital
+/// Life-owned credential buffers are zeroized; reqwest/TLS internal transient
+/// header buffers are not guaranteed to be zeroized by Digital Life, but remain
+/// non-persistent and non-logged.
 pub(crate) struct ResolvedCredential(Zeroizing<String>);
 
 impl ResolvedCredential {

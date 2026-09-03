@@ -6,6 +6,7 @@
 
 use std::fmt::{self, Formatter};
 use std::io::Read;
+use std::marker::PhantomData;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::mpsc;
 use std::thread;
@@ -123,6 +124,90 @@ impl DnsResolver for SystemDnsResolver {
     }
 }
 
+struct DnsWork {
+    host: String,
+    port: u16,
+    reply: mpsc::SyncSender<Result<Vec<SocketAddr>, VitaAgentError>>,
+}
+
+/// Owns one long-lived resolver worker for one production transport.
+///
+/// The rendezvous channel is intentional: while the resolver is blocked, a
+/// later request cannot enqueue another job and cannot create another thread.
+/// If the underlying OS resolver cannot be cancelled, at most this one worker
+/// remains occupied until it returns; callers fail closed while it is busy.
+struct BoundedDnsWorker<D> {
+    sender: mpsc::SyncSender<DnsWork>,
+    _thread: thread::JoinHandle<()>,
+    _resolver: PhantomData<fn() -> D>,
+}
+
+impl<D> BoundedDnsWorker<D>
+where
+    D: DnsResolver,
+{
+    fn new(resolver: D) -> Result<Self, VitaAgentError> {
+        let (sender, receiver) = mpsc::sync_channel::<DnsWork>(0);
+        let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+        let thread = thread::Builder::new()
+            .name("vita-provider-dns".to_string())
+            .spawn(move || {
+                let _ = ready_sender.send(());
+                while let Ok(work) = receiver.recv() {
+                    let result = resolver.resolve(&work.host, work.port);
+                    let _ = work.reply.send(result);
+                }
+            })
+            .map_err(|_| VitaAgentError::ProviderTransportRejected {
+                reason: "provider DNS resolver worker could not start",
+            })?;
+        ready_receiver
+            .recv()
+            .map_err(|_| VitaAgentError::ProviderTransportRejected {
+                reason: "provider DNS resolver worker stopped during startup",
+            })?;
+        Ok(Self {
+            sender,
+            _thread: thread,
+            _resolver: PhantomData,
+        })
+    }
+
+    fn resolve_with_timeout(
+        &self,
+        host: &str,
+        port: u16,
+        timeout: Duration,
+    ) -> Result<Vec<SocketAddr>, VitaAgentError> {
+        let (reply_sender, reply_receiver) = mpsc::sync_channel(1);
+        self.sender
+            .try_send(DnsWork {
+                host: host.to_string(),
+                port,
+                reply: reply_sender,
+            })
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => VitaAgentError::ProviderTransportRejected {
+                    reason: "provider DNS resolver is busy after an earlier timeout",
+                },
+                mpsc::TrySendError::Disconnected(_) => VitaAgentError::ProviderTransportRejected {
+                    reason: "provider DNS resolver stopped without a result",
+                },
+            })?;
+        match reply_receiver.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(VitaAgentError::ProviderTransportTimeout {
+                phase: "DNS resolution",
+            }),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err(VitaAgentError::ProviderTransportRejected {
+                    reason: "provider DNS resolver stopped without a result",
+                })
+            }
+        }
+    }
+}
+
 /// The HTTP executor is separated from the policy so DNS/SSRF and retry tests
 /// can run without making an external request.
 trait HttpExecutor {
@@ -130,6 +215,7 @@ trait HttpExecutor {
         &self,
         request: &OutboundRequest<'_>,
         timeouts: EffectiveTimeouts,
+        deadline: Instant,
         limits: ProductionTransportLimits,
     ) -> Result<ProviderHttpResponse, HttpExecutionError>;
 }
@@ -213,7 +299,7 @@ impl EffectiveTimeouts {
 /// Library-only production transport.  It is not constructed by the current
 /// Tauri or Chat route code; G1 only establishes the security foundation.
 struct ProductionProviderTransport<D = SystemDnsResolver, H = ReqwestHttpExecutor> {
-    dns: D,
+    dns: BoundedDnsWorker<D>,
     http: H,
     limits: ProductionTransportLimits,
 }
@@ -224,7 +310,7 @@ impl ProductionProviderTransport<SystemDnsResolver, ReqwestHttpExecutor> {
     fn new(limits: ProductionTransportLimits) -> Result<Self, VitaAgentError> {
         limits.validate()?;
         Ok(Self {
-            dns: SystemDnsResolver,
+            dns: BoundedDnsWorker::new(SystemDnsResolver)?,
             http: ReqwestHttpExecutor,
             limits,
         })
@@ -238,7 +324,11 @@ where
 {
     #[cfg(test)]
     fn with_components(dns: D, http: H, limits: ProductionTransportLimits) -> Self {
-        Self { dns, http, limits }
+        Self {
+            dns: BoundedDnsWorker::new(dns).expect("test DNS worker should start"),
+            http,
+            limits,
+        }
     }
 
     fn post_json_inner(
@@ -250,6 +340,14 @@ where
         retry_policy: ProviderRetryPolicy,
     ) -> Result<Vec<u8>, VitaAgentError> {
         self.limits.validate()?;
+        let total_timeout = min_duration(timeout, self.limits.total_timeout);
+        if total_timeout.is_zero() {
+            return Err(VitaAgentError::ProviderTransportTimeout { phase: "request" });
+        }
+        // This absolute deadline is created before DNS and is shared by every
+        // later phase.  No phase, retry, or response-body read gets a fresh
+        // copy of the caller's timeout.
+        let deadline = Instant::now() + total_timeout;
         validate_production_endpoint(endpoint)?;
         validate_retry_policy(retry_policy)?;
         if body.len() > self.limits.max_request_body_bytes {
@@ -270,11 +368,16 @@ where
         // set to reqwest's resolver override.  The URL remains the hostname,
         // so TLS SNI/certificate validation is still performed for that host;
         // the connection cannot silently perform a fresh unchecked DNS lookup.
-        let mut addresses = resolve_with_timeout(
-            self.dns.clone(),
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(VitaAgentError::ProviderTransportTimeout {
+                phase: "DNS resolution",
+            });
+        }
+        let mut addresses = self.dns.resolve_with_timeout(
             endpoint.host.as_str(),
             endpoint.port,
-            self.limits.dns_timeout,
+            min_duration(self.limits.dns_timeout, remaining),
         )?;
         validate_resolved_addresses(endpoint, &addresses)?;
         addresses.sort_unstable();
@@ -291,11 +394,6 @@ where
             });
         }
         let path = endpoint.request_path("chat/completions");
-        let total_timeout = min_duration(timeout, self.limits.total_timeout);
-        if total_timeout.is_zero() {
-            return Err(VitaAgentError::ProviderTransportTimeout { phase: "request" });
-        }
-        let deadline = Instant::now() + total_timeout;
         let attempts = retry_policy.max_retries + 1;
 
         for attempt in 0..attempts {
@@ -315,6 +413,7 @@ where
             let response = match self.http.post_json(
                 &request,
                 EffectiveTimeouts::from_remaining(remaining, self.limits),
+                deadline,
                 self.limits,
             ) {
                 Ok(response) => response,
@@ -326,23 +425,19 @@ where
                 Err(HttpExecutionError::Fatal(error)) => return Err(error),
             };
 
+            if Instant::now() >= deadline {
+                return Err(VitaAgentError::ProviderTransportTimeout { phase: "request" });
+            }
             enforce_response_limits(&response, self.limits)?;
             if (200..300).contains(&response.status) {
                 return Ok(response.body);
             }
-            if is_retryable_status(response.status) && attempt + 1 < attempts {
-                wait_before_retry(retry_policy.backoff, deadline)?;
-                continue;
-            }
-            if is_retryable_status(response.status) && attempts > 1 {
-                return Err(VitaAgentError::ProviderRetryExhausted {
-                    status: response.status,
-                    attempts,
-                });
-            }
-            // This includes 3xx.  No Location header is surfaced and the
-            // reqwest executor is configured with Policy::none, so credentials
-            // cannot be forwarded to another host.
+            // This includes 3xx and all retryable status classes.  A model
+            // generation POST is not assumed idempotent, so an HTTP response
+            // is never replayed without a future explicit idempotency design.
+            // No Location header is followed and the reqwest executor is
+            // configured with Policy::none, so credentials cannot be forwarded
+            // to another host.
             return if (300..400).contains(&response.status) {
                 Err(VitaAgentError::ProviderTransportRejected {
                     reason: "provider redirects are disabled; explicit 3xx response rejected",
@@ -382,28 +477,10 @@ impl HttpExecutor for ReqwestHttpExecutor {
         &self,
         request: &OutboundRequest<'_>,
         timeouts: EffectiveTimeouts,
+        deadline: Instant,
         limits: ProductionTransportLimits,
     ) -> Result<ProviderHttpResponse, HttpExecutionError> {
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
-        headers.insert(
-            USER_AGENT,
-            HeaderValue::from_static("DigitalLife/VitaAgent"),
-        );
-        if let Some(credential) = request.authorization {
-            let mut authorization = Zeroizing::new(Vec::with_capacity(
-                b"Bearer ".len() + credential.as_bytes().len(),
-            ));
-            authorization.extend_from_slice(b"Bearer ");
-            authorization.extend_from_slice(credential.as_bytes());
-            let value = HeaderValue::from_bytes(authorization.as_slice()).map_err(|_| {
-                HttpExecutionError::Fatal(VitaAgentError::CredentialResolution(
-                    "resolved credential is not a valid HTTP header value",
-                ))
-            })?;
-            headers.insert(AUTHORIZATION, value);
-        }
+        let headers = build_request_headers(request.authorization)?;
 
         let connect_timeout = min_duration(timeouts.connect, timeouts.tls);
         let client = Client::builder()
@@ -451,13 +528,40 @@ impl HttpExecutor for ReqwestHttpExecutor {
                 },
             ));
         }
-        let body = read_bounded_response_body(response, timeouts, limits)?;
+        let body = read_bounded_response_body(response, timeouts, deadline, limits)?;
         Ok(ProviderHttpResponse {
             status,
             header_bytes,
             body,
         })
     }
+}
+
+fn build_request_headers(
+    credential: Option<&ResolvedCredential>,
+) -> Result<HeaderMap, HttpExecutionError> {
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    headers.insert(
+        USER_AGENT,
+        HeaderValue::from_static("DigitalLife/VitaAgent"),
+    );
+    if let Some(credential) = credential {
+        let mut authorization = Zeroizing::new(Vec::with_capacity(
+            b"Bearer ".len() + credential.as_bytes().len(),
+        ));
+        authorization.extend_from_slice(b"Bearer ");
+        authorization.extend_from_slice(credential.as_bytes());
+        let mut value = HeaderValue::from_bytes(authorization.as_slice()).map_err(|_| {
+            HttpExecutionError::Fatal(VitaAgentError::CredentialResolution(
+                "resolved credential is not a valid HTTP header value",
+            ))
+        })?;
+        value.set_sensitive(true);
+        headers.insert(AUTHORIZATION, value);
+    }
+    Ok(headers)
 }
 
 fn validate_production_endpoint(endpoint: &ProviderEndpoint) -> Result<(), VitaAgentError> {
@@ -492,35 +596,6 @@ fn validate_retry_policy(policy: ProviderRetryPolicy) -> Result<(), VitaAgentErr
         });
     }
     Ok(())
-}
-
-fn resolve_with_timeout<D: DnsResolver>(
-    resolver: D,
-    host: &str,
-    port: u16,
-    timeout: Duration,
-) -> Result<Vec<SocketAddr>, VitaAgentError> {
-    let host = host.to_string();
-    let (sender, receiver) = mpsc::sync_channel(1);
-    thread::Builder::new()
-        .name("vita-provider-dns".to_string())
-        .spawn(move || {
-            let _ = sender.send(resolver.resolve(&host, port));
-        })
-        .map_err(|_| VitaAgentError::ProviderTransportRejected {
-            reason: "provider DNS resolver worker could not start",
-        })?;
-    match receiver.recv_timeout(timeout) {
-        Ok(result) => result,
-        Err(mpsc::RecvTimeoutError::Timeout) => Err(VitaAgentError::ProviderTransportTimeout {
-            phase: "DNS resolution",
-        }),
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            Err(VitaAgentError::ProviderTransportRejected {
-                reason: "provider DNS resolver stopped without a result",
-            })
-        }
-    }
 }
 
 fn validate_resolved_addresses(
@@ -581,14 +656,18 @@ fn response_header_bytes(headers: &HeaderMap) -> usize {
 fn read_bounded_response_body(
     mut response: reqwest::blocking::Response,
     timeouts: EffectiveTimeouts,
+    overall_deadline: Instant,
     limits: ProductionTransportLimits,
 ) -> Result<Vec<u8>, HttpExecutionError> {
-    let body_deadline = Instant::now() + min_duration(timeouts.body, timeouts.total);
+    let body_deadline = min_instant(
+        overall_deadline,
+        Instant::now() + min_duration(timeouts.body, timeouts.total),
+    );
     let mut body = Vec::new();
     let mut buffer = [0_u8; 16 * 1024];
     loop {
         if Instant::now() >= body_deadline {
-            return Err(HttpExecutionError::Retryable(
+            return Err(HttpExecutionError::Fatal(
                 VitaAgentError::ProviderTransportTimeout {
                     phase: "response body",
                 },
@@ -604,6 +683,13 @@ fn read_bounded_response_body(
             // are eligible for the bounded retry policy.
             HttpExecutionError::Fatal(mapped)
         })?;
+        if Instant::now() >= body_deadline {
+            return Err(HttpExecutionError::Fatal(
+                VitaAgentError::ProviderTransportTimeout {
+                    phase: "response body",
+                },
+            ));
+        }
         if read == 0 {
             break;
         }
@@ -630,8 +716,8 @@ fn map_reqwest_error(error: reqwest::Error) -> HttpExecutionError {
     }
 }
 
-fn is_retryable_status(status: u16) -> bool {
-    status == 408 || status == 429 || (500..=599).contains(&status)
+fn min_instant(left: Instant, right: Instant) -> Instant {
+    left.min(right)
 }
 
 fn wait_before_retry(backoff: Duration, deadline: Instant) -> Result<(), VitaAgentError> {
@@ -697,6 +783,40 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct ResolverStats {
+        calls: usize,
+        active: usize,
+        max_active: usize,
+    }
+
+    #[derive(Clone)]
+    struct StressDns {
+        stats: Arc<Mutex<ResolverStats>>,
+        sleep: Duration,
+    }
+
+    impl DnsResolver for StressDns {
+        fn resolve(&self, _host: &str, _port: u16) -> Result<Vec<SocketAddr>, VitaAgentError> {
+            {
+                let mut stats = self
+                    .stats
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                stats.calls += 1;
+                stats.active += 1;
+                stats.max_active = stats.max_active.max(stats.active);
+            }
+            thread::sleep(self.sleep);
+            let mut stats = self
+                .stats
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            stats.active -= 1;
+            Ok(vec![SocketAddr::from((PUBLIC_IP, TEST_PORT))])
+        }
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct Observation {
         url: String,
@@ -712,15 +832,24 @@ mod tests {
     struct TestHttp {
         responses: Arc<Mutex<VecDeque<Result<ProviderHttpResponse, HttpExecutionError>>>>,
         observations: Arc<Mutex<Vec<Observation>>>,
+        delay: Duration,
     }
 
     impl TestHttp {
         fn with_responses(
             responses: impl IntoIterator<Item = Result<ProviderHttpResponse, HttpExecutionError>>,
         ) -> Self {
+            Self::with_delay(responses, Duration::ZERO)
+        }
+
+        fn with_delay(
+            responses: impl IntoIterator<Item = Result<ProviderHttpResponse, HttpExecutionError>>,
+            delay: Duration,
+        ) -> Self {
             Self {
                 responses: Arc::new(Mutex::new(responses.into_iter().collect())),
                 observations: Arc::new(Mutex::new(Vec::new())),
+                delay,
             }
         }
 
@@ -737,8 +866,12 @@ mod tests {
             &self,
             request: &OutboundRequest<'_>,
             timeouts: EffectiveTimeouts,
+            _deadline: Instant,
             _limits: ProductionTransportLimits,
         ) -> Result<ProviderHttpResponse, HttpExecutionError> {
+            if !self.delay.is_zero() {
+                thread::sleep(self.delay);
+            }
             self.observations
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1088,6 +1221,107 @@ mod tests {
     }
 
     #[test]
+    fn caller_deadline_caps_configured_dns_timeout() {
+        let http = TestHttp::with_responses([response(200, b"must-not-be-called")]);
+        let limits = ProductionTransportLimits {
+            dns_timeout: Duration::from_secs(1),
+            ..ProductionTransportLimits::default()
+        };
+        let transport = ProductionProviderTransport::with_components(
+            TestDns::sleep(Duration::from_millis(200)),
+            http,
+            limits,
+        );
+        let started = Instant::now();
+        let error = transport
+            .post_json(
+                &endpoint(),
+                None,
+                b"{}",
+                Duration::from_millis(20),
+                ProviderRetryPolicy::default(),
+            )
+            .expect_err("caller deadline must cap DNS");
+        assert!(matches!(
+            error,
+            VitaAgentError::ProviderTransportTimeout {
+                phase: "DNS resolution"
+            }
+        ));
+        assert!(started.elapsed() < Duration::from_millis(150));
+    }
+
+    #[test]
+    fn repeated_dns_timeouts_keep_one_worker_ownership_bound() {
+        let stats = Arc::new(Mutex::new(ResolverStats::default()));
+        let http = TestHttp::with_responses([response(200, b"must-not-be-called")]);
+        let transport = ProductionProviderTransport::with_components(
+            StressDns {
+                stats: stats.clone(),
+                sleep: Duration::from_millis(100),
+            },
+            http,
+            ProductionTransportLimits {
+                dns_timeout: Duration::from_millis(5),
+                ..ProductionTransportLimits::default()
+            },
+        );
+        for _ in 0..8 {
+            let error = transport
+                .post_json(
+                    &endpoint(),
+                    None,
+                    b"{}",
+                    Duration::from_millis(20),
+                    ProviderRetryPolicy::default(),
+                )
+                .expect_err("repeated DNS timeout must fail closed");
+            assert!(matches!(
+                error,
+                VitaAgentError::ProviderTransportTimeout {
+                    phase: "DNS resolution"
+                } | VitaAgentError::ProviderTransportRejected {
+                    reason: "provider DNS resolver is busy after an earlier timeout"
+                }
+            ));
+        }
+        thread::sleep(Duration::from_millis(120));
+        let stats = stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(stats.calls, 1);
+        assert_eq!(stats.max_active, 1);
+        assert_eq!(stats.active, 0);
+    }
+
+    #[test]
+    fn overall_deadline_is_shared_with_http_after_dns() {
+        let http = TestHttp::with_delay([response(200, b"late")], Duration::from_millis(35));
+        let observations = http.clone();
+        let transport = ProductionProviderTransport::with_components(
+            TestDns::sleep(Duration::from_millis(35)),
+            http,
+            ProductionTransportLimits::default(),
+        );
+        let error = transport
+            .post_json(
+                &endpoint(),
+                None,
+                b"{}",
+                Duration::from_millis(60),
+                ProviderRetryPolicy::default(),
+            )
+            .expect_err("HTTP must not receive a fresh caller budget after DNS");
+        assert!(matches!(
+            error,
+            VitaAgentError::ProviderTransportTimeout { phase: "request" }
+        ));
+        let observations = observations.observations();
+        assert_eq!(observations.len(), 1);
+        assert!(observations[0].timeouts.total < Duration::from_millis(35));
+    }
+
+    #[test]
     fn unauthorized_response_is_never_retried() {
         let http = TestHttp::with_responses([response(401, b"unauthorized"), response(200, b"ok")]);
         let observations = http.clone();
@@ -1112,11 +1346,9 @@ mod tests {
     }
 
     #[test]
-    fn too_many_requests_retry_is_bounded_by_the_policy() {
+    fn too_many_requests_are_not_retried_for_model_post() {
         let http = TestHttp::with_responses([
             response(429, b"retry"),
-            response(429, b"retry"),
-            response(200, b"ok"),
             response(200, b"must-not-be-called"),
         ]);
         let observations = http.clone();
@@ -1124,7 +1356,7 @@ mod tests {
             TestDns::answers(vec![SocketAddr::from((PUBLIC_IP, TEST_PORT))]),
             http,
         );
-        let body = transport
+        let error = transport
             .post_json(
                 &endpoint(),
                 None,
@@ -1132,15 +1364,17 @@ mod tests {
                 Duration::from_secs(1),
                 ProviderRetryPolicy::new(2, Duration::ZERO),
             )
-            .expect("429 retries should be bounded and succeed");
-        assert_eq!(body, b"ok");
-        assert_eq!(observations.observations().len(), 3);
+            .expect_err("429 must not replay the model POST");
+        assert!(matches!(
+            error,
+            VitaAgentError::ProviderHttpStatus { status: 429 }
+        ));
+        assert_eq!(observations.observations().len(), 1);
     }
 
     #[test]
-    fn server_error_retry_stops_at_the_configured_attempt_bound() {
+    fn server_error_is_not_retried_for_model_post() {
         let http = TestHttp::with_responses([
-            response(503, b"unavailable"),
             response(503, b"unavailable"),
             response(200, b"must-not-be-called"),
         ]);
@@ -1155,17 +1389,41 @@ mod tests {
                 None,
                 b"{}",
                 Duration::from_secs(1),
-                ProviderRetryPolicy::new(1, Duration::ZERO),
+                ProviderRetryPolicy::new(2, Duration::ZERO),
             )
             .expect_err("5xx retry budget must stop");
         assert!(matches!(
             error,
-            VitaAgentError::ProviderRetryExhausted {
-                status: 503,
-                attempts: 2
-            }
+            VitaAgentError::ProviderHttpStatus { status: 503 }
         ));
-        assert_eq!(observations.observations().len(), 2);
+        assert_eq!(observations.observations().len(), 1);
+    }
+
+    #[test]
+    fn request_timeout_status_is_not_retried_for_model_post() {
+        let http = TestHttp::with_responses([
+            response(408, b"timeout"),
+            response(200, b"must-not-be-called"),
+        ]);
+        let observations = http.clone();
+        let transport = transport(
+            TestDns::answers(vec![SocketAddr::from((PUBLIC_IP, TEST_PORT))]),
+            http,
+        );
+        let error = transport
+            .post_json(
+                &endpoint(),
+                None,
+                b"{}",
+                Duration::from_secs(1),
+                ProviderRetryPolicy::new(2, Duration::ZERO),
+            )
+            .expect_err("408 must not replay the model POST");
+        assert!(matches!(
+            error,
+            VitaAgentError::ProviderHttpStatus { status: 408 }
+        ));
+        assert_eq!(observations.observations().len(), 1);
     }
 
     #[test]
@@ -1218,6 +1476,18 @@ mod tests {
             .expect_err("test unauthorized response");
         assert!(!format!("{error:?}").contains(raw));
         assert!(!error.to_string().contains(raw));
+    }
+
+    #[test]
+    fn authorization_header_is_sensitive_without_exposing_credential() {
+        let headers = build_request_headers(Some(&ResolvedCredential::new("test-only-secret")))
+            .expect("valid test credential header");
+        let authorization_present = headers.contains_key(AUTHORIZATION);
+        let authorization_sensitive = headers
+            .get(AUTHORIZATION)
+            .is_some_and(HeaderValue::is_sensitive);
+        assert!(authorization_present);
+        assert!(authorization_sensitive);
     }
 
     #[test]

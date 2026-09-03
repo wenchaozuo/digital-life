@@ -643,10 +643,6 @@ pub enum VitaAgentError {
     ProviderHttpStatus {
         status: u16,
     },
-    ProviderRetryExhausted {
-        status: u16,
-        attempts: u8,
-    },
     OwnershipViolation {
         path: PathBuf,
         reason: &'static str,
@@ -747,10 +743,6 @@ impl Display for VitaAgentError {
             Self::ProviderHttpStatus { status } => {
                 write!(f, "provider returned HTTP status {status}")
             }
-            Self::ProviderRetryExhausted { status, attempts } => write!(
-                f,
-                "provider retry budget exhausted after {attempts} attempts for HTTP status {status}"
-            ),
             Self::OwnershipViolation { path, reason } => write!(
                 f,
                 "Vita ownership check failed ({reason}): {}",

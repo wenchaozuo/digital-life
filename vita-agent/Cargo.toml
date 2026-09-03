@@ -30,6 +30,19 @@ reqwest = { version = "=0.12.28", default-features = false, features = ["blockin
 url = "=2.5.8"
 zeroize = "=1.9.0"
 
+[target.'cfg(windows)'.dependencies]
+# H2's Windows-only authority uses kernel directory handles, final-handle
+# identity, and NtCreateFile RootDirectory/OBJ_DONT_REPARSE traversal.  Pin the
+# audited API surface so this security contract cannot drift silently.
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+] }
+
 [dev-dependencies]
 codex-core-api = { git = "https://github.com/openai/codex.git", rev = "316795b3cf2a45e90d121d9f46499d4658b2645c" }
 tempfile = "3"

@@ -22,6 +22,7 @@ use toml::Value as TomlValue;
 
 mod provider_gateway;
 mod tool_authority;
+mod workspace_capability;
 
 pub use provider_gateway::{
     CredentialRef, ProviderCapabilities, ProviderCapability, ProviderInstructionRolePolicy,
@@ -33,6 +34,10 @@ pub use tool_authority::{
     VitaAuthorityReason, VitaAuthorityVerdict, VitaBrokerSnapshot, VitaExecutionContext,
     VitaRequestedScope, VitaToolAuthorityPort, VitaToolAuthorityRequest, VitaToolBroker,
     VitaToolContributor, VITA_GOVERNED_ACTION_CAPABILITY_ID, VITA_GOVERNED_ACTION_TOOL_NAME,
+};
+pub use workspace_capability::{
+    PreparedWorkspaceTarget, PreparedWorkspaceTargetKind, TrustedWorkspaceRoot,
+    WorkspaceRelativePath, WorkspaceRootIdentity,
 };
 
 pub const VITA_AGENT_RUNTIME_ID: &str = "vita-agent";
@@ -175,6 +180,7 @@ pub struct VitaAgentRuntimeProfile {
     tmp_root: PathBuf,
     runs_root: PathBuf,
     workspace_root: PathBuf,
+    workspace_authority: Option<TrustedWorkspaceRoot>,
     runtime_identity: &'static str,
     provider_policy: VitaProviderPolicy,
     credential_policy: VitaCredentialPolicy,
@@ -197,6 +203,11 @@ impl VitaAgentRuntimeProfile {
         validate_trusted_path("app_data_root", &app_data_root)?;
         validate_trusted_path("workspace_root", &workspace_root)?;
 
+        #[cfg(windows)]
+        let workspace_authority = Some(TrustedWorkspaceRoot::acquire(&workspace_root)?);
+        #[cfg(not(windows))]
+        let workspace_authority = None;
+
         let vita_root = app_data_root.join("agent");
         validate_trusted_path("vita_root", &vita_root)?;
 
@@ -210,6 +221,7 @@ impl VitaAgentRuntimeProfile {
             app_data_root,
             vita_root,
             workspace_root,
+            workspace_authority,
             runtime_identity: VITA_AGENT_RUNTIME_ID,
             provider_policy: VitaProviderPolicy::NotConfigured,
             credential_policy: VitaCredentialPolicy::NoLogin,
@@ -253,6 +265,28 @@ impl VitaAgentRuntimeProfile {
         &self.workspace_root
     }
 
+    /// Returns the OS-backed workspace authority when this platform provides
+    /// the required handle-relative and reparse-safe semantics.  The
+    /// authority is intentionally separate from D28 authorization and grants.
+    pub fn workspace_authority(&self) -> Option<&TrustedWorkspaceRoot> {
+        self.workspace_authority.as_ref()
+    }
+
+    /// Prepares one relative workspace resource without opening it by a later
+    /// untrusted pathname.  This is an identity-only H2 primitive: it never
+    /// creates, truncates, reads, writes, executes, or grants access.
+    pub fn prepare_workspace_target(
+        &self,
+        requested: &Path,
+    ) -> Result<PreparedWorkspaceTarget, VitaAgentError> {
+        self.workspace_authority
+            .as_ref()
+            .ok_or(VitaAgentError::KernelInvariant(
+                "workspace capability is unavailable on this platform",
+            ))?
+            .prepare_target(requested)
+    }
+
     pub fn runtime_identity(&self) -> &'static str {
         self.runtime_identity
     }
@@ -288,6 +322,10 @@ impl VitaAgentRuntimeProfile {
             ("workspace_root", self.workspace_root.as_path()),
         ] {
             validate_trusted_path(field, path)?;
+        }
+
+        if let Some(authority) = &self.workspace_authority {
+            authority.verify_named_path_current()?;
         }
 
         for (field, path) in [
@@ -1233,7 +1271,7 @@ fn ensure_vita_auth_source_absent(profile: &VitaAgentRuntimeProfile) -> Result<(
     }
 }
 
-fn contains_stock_codex_state(path: &Path) -> bool {
+pub(crate) fn contains_stock_codex_state(path: &Path) -> bool {
     let normalized = path
         .to_string_lossy()
         .replace('\\', "/")

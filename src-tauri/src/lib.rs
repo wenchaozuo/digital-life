@@ -6,6 +6,11 @@ use std::sync::Arc;
 // same foundation stage for the relationship domain.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod capability;
+
+#[cfg(feature = "d29-h1-host-fixture")]
+pub fn run_d29h1_authority_fixture() -> Result<(), String> {
+    capability::d29h1_host_fixture::run_from_stdio()
+}
 pub mod conversation;
 pub mod embedding;
 #[cfg_attr(not(test), allow(dead_code))]

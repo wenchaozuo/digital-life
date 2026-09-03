@@ -1,48 +1,50 @@
-//! D29-H1's real pinned-Codex tool-request proof.
+//! D29-H1 process-isolated canonical-authority proof.
 //!
-//! The fixture is loopback-only and deterministic.  It returns one real
-//! Responses function call, observes the typed denial output on the next
-//! request, and never exposes a shell, filesystem, browser, plugin, or
-//! external-provider path.
+//! The Codex/Vita side of this test uses the pinned upstream execution graph.
+//! Its only authority transport is a bounded stdin/stdout request to the
+//! Host fixture, which is compiled in a separate process with the normal Host
+//! dependency graph and the canonical D28 evaluator.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
-use std::{
-    collections::hash_map::DefaultHasher,
-    hash::{Hash, Hasher},
-};
 
 use codex_core_api::{
     CodexAppsToolsCache, CodexAuth, EnvironmentManager, EventMsg, Op, SessionSource,
     StartThreadOptions, ThreadId, ThreadManager, TurnInputRequest, UserInput,
 };
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tempfile::{tempdir, TempDir};
 
-use vita_agent::{
-    ProviderCapabilities, ProviderProfile, ProviderProtocol, ProviderRetryPolicy,
-    VitaAgentEntrypoint, VitaAgentRuntimeProfile, VitaBrokerSnapshot, VitaExecutionContext,
-    VitaGatewayBinding, VitaProviderAuthority, VitaToolBroker, VitaToolContributor,
-    VITA_GOVERNED_ACTION_TOOL_NAME,
+use crate::{
+    VitaAgentEntrypoint, VitaAgentRuntimeProfile, VitaAuthorityError, VitaAuthorityEvidenceSource,
+    VitaAuthorityFuture, VitaAuthorityOutcome, VitaAuthorityReason, VitaAuthorityVerdict,
+    VitaBrokerSnapshot, VitaExecutionContext, VitaToolAuthorityPort, VitaToolAuthorityRequest,
+    VitaToolBroker, VitaToolContributor, VITA_GOVERNED_ACTION_TOOL_NAME,
 };
 
-use super::vita_tool_adapter::{CanonicalVitaAuthorityAdapter, CanonicalVitaAuthoritySnapshot};
-use crate::storage::StorageService;
+use super::{ProviderCapabilities, ProviderProfile, ProviderProtocol, ProviderRetryPolicy};
+use super::{VitaGatewayBinding, VitaProviderAuthority};
 
 const D29_H1_MODEL: &str = "d29h1-local-responses-model";
 const D29_H1_PROMPT: &str = "Submit the bounded Vita operation.";
 const D29_H1_REPLY: &str = "VITA_D29H1_DENIED_OK";
 const D29_H1_CALL_ID: &str = "call-d29h1-governed";
 const D29_H1_PROVIDER_ID: &str = "d29h1-loopback-responses";
-const D29_H1_TURN_TIMEOUT: Duration = Duration::from_secs(6);
-const D29_H1_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+const D29_H1_TURN_TIMEOUT: Duration = Duration::from_secs(12);
+const D29_H1_CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
 const D29_H1_HTTP_TIMEOUT: Duration = Duration::from_secs(2);
 const D29_H1_HTTP_MAX_BODY: usize = 2 * 1024 * 1024;
+const D29_H1_HOST_IPC_TIMEOUT: Duration = Duration::from_secs(600);
+const D29_H1_HOST_IPC_MAX_BODY: usize = 8 * 1024;
 const D29_H1_TEST_STACK_SIZE: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, PartialEq, Eq)]
@@ -138,7 +140,6 @@ impl ResponsesFixture {
         let observation = Arc::new(Mutex::new(FixtureObservation::default()));
         let stop_for_thread = Arc::clone(&stop);
         let observation_for_thread = Arc::clone(&observation);
-
         let join = thread::spawn(move || {
             let mut response_index = 0usize;
             while !stop_for_thread.load(Ordering::Acquire) && response_index < 2 {
@@ -155,7 +156,6 @@ impl ResponsesFixture {
                 if stop_for_thread.load(Ordering::Acquire) {
                     return;
                 }
-
                 let result = handle_fixture_request(&mut stream, peer, response_index);
                 {
                     let mut observed = observation_for_thread
@@ -180,7 +180,6 @@ impl ResponsesFixture {
                 response_index += 1;
             }
         });
-
         Self {
             address,
             stop,
@@ -298,30 +297,15 @@ fn first_response_events() -> Vec<Value> {
     vec![
         json!({
             "type": "response.created",
-            "response": {
-                "id": "resp-d29h1-1",
-                "object": "response",
-                "status": "in_progress",
-                "model": D29_H1_MODEL
-            }
+            "response": {"id": "resp-d29h1-1", "object": "response", "status": "in_progress", "model": D29_H1_MODEL}
         }),
         json!({
             "type": "response.output_item.done",
-            "item": {
-                "type": "function_call",
-                "call_id": D29_H1_CALL_ID,
-                "name": VITA_GOVERNED_ACTION_TOOL_NAME,
-                "arguments": "{\"operation\":\"observe-only\",\"scope\":\"none\",\"resource\":\"loopback-fixture\"}"
-            }
+            "item": {"type": "function_call", "call_id": D29_H1_CALL_ID, "name": VITA_GOVERNED_ACTION_TOOL_NAME, "arguments": "{\"operation\":\"observe-only\",\"scope\":\"none\",\"resource\":\"loopback-fixture\"}"}
         }),
         json!({
             "type": "response.completed",
-            "response": {
-                "id": "resp-d29h1-1",
-                "object": "response",
-                "status": "completed",
-                "model": D29_H1_MODEL
-            }
+            "response": {"id": "resp-d29h1-1", "object": "response", "status": "completed", "model": D29_H1_MODEL}
         }),
     ]
 }
@@ -330,22 +314,11 @@ fn completion_response_events() -> Vec<Value> {
     vec![
         json!({
             "type": "response.created",
-            "response": {
-                "id": "resp-d29h1-2",
-                "object": "response",
-                "status": "in_progress",
-                "model": D29_H1_MODEL
-            }
+            "response": {"id": "resp-d29h1-2", "object": "response", "status": "in_progress", "model": D29_H1_MODEL}
         }),
         json!({
             "type": "response.output_item.added",
-            "item": {
-                "type": "message",
-                "id": "msg-d29h1",
-                "role": "assistant",
-                "status": "in_progress",
-                "content": []
-            }
+            "item": {"type": "message", "id": "msg-d29h1", "role": "assistant", "status": "in_progress", "content": []}
         }),
         json!({"type": "response.content_part.added"}),
         json!({"type": "response.output_text.delta", "delta": D29_H1_REPLY}),
@@ -353,22 +326,11 @@ fn completion_response_events() -> Vec<Value> {
         json!({"type": "response.content_part.done"}),
         json!({
             "type": "response.output_item.done",
-            "item": {
-                "type": "message",
-                "id": "msg-d29h1",
-                "role": "assistant",
-                "status": "completed",
-                "content": [{"type": "output_text", "text": D29_H1_REPLY}]
-            }
+            "item": {"type": "message", "id": "msg-d29h1", "role": "assistant", "status": "completed", "content": [{"type": "output_text", "text": D29_H1_REPLY}]}
         }),
         json!({
             "type": "response.completed",
-            "response": {
-                "id": "resp-d29h1-2",
-                "object": "response",
-                "status": "completed",
-                "model": D29_H1_MODEL
-            }
+            "response": {"id": "resp-d29h1-2", "object": "response", "status": "completed", "model": D29_H1_MODEL}
         }),
     ]
 }
@@ -385,7 +347,7 @@ fn write_sse_response(stream: &mut TcpStream, events: Vec<Value>) -> Result<(), 
         body.push_str("\ndata: ");
         body.push_str(
             &serde_json::to_string(&event)
-                .map_err(|error| format!("serialize D29-H1 fixture event: {error}"))?,
+                .map_err(|_| "D29-H1 fixture event serialization failed".to_string())?,
         );
         body.push_str("\n\n");
     }
@@ -395,23 +357,23 @@ fn write_sse_response(stream: &mut TcpStream, events: Vec<Value>) -> Result<(), 
     );
     stream
         .set_write_timeout(Some(D29_H1_HTTP_TIMEOUT))
-        .map_err(|error| format!("set D29-H1 fixture write timeout: {error}"))?;
+        .map_err(|_| "D29-H1 fixture write timeout setup failed".to_string())?;
     stream
         .write_all(header.as_bytes())
         .and_then(|_| stream.write_all(body.as_bytes()))
-        .map_err(|error| format!("write D29-H1 fixture response: {error}"))
+        .map_err(|_| "D29-H1 fixture response write failed".to_string())
 }
 
 fn read_http_request(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
     stream
         .set_read_timeout(Some(D29_H1_HTTP_TIMEOUT))
-        .map_err(|error| format!("set D29-H1 fixture read timeout: {error}"))?;
+        .map_err(|_| "D29-H1 fixture read timeout setup failed".to_string())?;
     let mut bytes = Vec::new();
     let mut chunk = [0u8; 8192];
     let header_end = loop {
         let read = stream
             .read(&mut chunk)
-            .map_err(|error| format!("read D29-H1 fixture request: {error}"))?;
+            .map_err(|_| "D29-H1 fixture request read failed".to_string())?;
         if read == 0 {
             return Err("D29-H1 fixture request closed before headers".to_string());
         }
@@ -440,7 +402,7 @@ fn read_http_request(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
     while bytes.len() < header_end + content_length {
         let read = stream
             .read(&mut chunk)
-            .map_err(|error| format!("read D29-H1 fixture request body: {error}"))?;
+            .map_err(|_| "D29-H1 fixture request body read failed".to_string())?;
         if read == 0 {
             return Err("D29-H1 fixture request closed before body".to_string());
         }
@@ -450,6 +412,167 @@ fn read_http_request(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
         }
     }
     Ok(bytes[header_end..header_end + content_length].to_vec())
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HostAuthorityResponse {
+    canonical_evaluations: usize,
+    production_registry_size: usize,
+    authorization_row_reads: usize,
+    result: String,
+    life_id: String,
+    capability_id: String,
+    requested_scope: String,
+}
+
+struct ProcessIsolatedCanonicalAuthority {
+    repo_root: PathBuf,
+    observations: Arc<Mutex<Vec<HostAuthorityResponse>>>,
+}
+
+impl ProcessIsolatedCanonicalAuthority {
+    fn new() -> Self {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("D29-H1 Vita manifest must have the repository root as its parent")
+            .to_path_buf();
+        Self {
+            repo_root,
+            observations: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn snapshot(&self) -> Vec<HostAuthorityResponse> {
+        self.observations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl VitaToolAuthorityPort for ProcessIsolatedCanonicalAuthority {
+    fn evaluate(&self, request: VitaToolAuthorityRequest) -> VitaAuthorityFuture {
+        let repo_root = self.repo_root.clone();
+        let observations = Arc::clone(&self.observations);
+        Box::pin(async move {
+            let context = request
+                .context()
+                .ok_or(VitaAuthorityError::InvalidRequest)?;
+            let wire_request = json!({
+                "life_id": context.life_id(),
+                "capability_id": request.capability_id(),
+                "requested_scope": request.requested_scope().as_str(),
+            });
+            let response = invoke_host_fixture(&repo_root, &wire_request)?;
+            if response.canonical_evaluations != 1
+                || response.production_registry_size != 0
+                || response.authorization_row_reads != 0
+                || response.result != "UnknownCapability"
+                || response.life_id != context.life_id()
+                || response.capability_id != request.capability_id()
+                || response.requested_scope != request.requested_scope().as_str()
+            {
+                return Err(VitaAuthorityError::InvalidVerdict);
+            }
+            observations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(response);
+            VitaAuthorityVerdict::from_request(
+                &request,
+                VitaAuthorityOutcome::Denied,
+                VitaAuthorityReason::UnknownCapabilityDescriptor,
+                None,
+                VitaAuthorityEvidenceSource::HostCanonicalAuthority,
+            )
+        })
+    }
+}
+
+fn invoke_host_fixture(
+    repo_root: &Path,
+    request: &Value,
+) -> Result<HostAuthorityResponse, VitaAuthorityError> {
+    let manifest = repo_root.join("src-tauri").join("Cargo.toml");
+    let fixture_executable = repo_root
+        .join("src-tauri")
+        .join("target")
+        .join("debug")
+        .join(if cfg!(windows) {
+            "d29h1-authority-fixture.exe"
+        } else {
+            "d29h1-authority-fixture"
+        });
+    let mut command = if fixture_executable.is_file() {
+        Command::new(&fixture_executable)
+    } else {
+        let mut command = Command::new("cargo");
+        command
+            .current_dir(repo_root)
+            .args(["run", "--quiet", "--locked", "--manifest-path"])
+            .arg(&manifest)
+            .args([
+                "--bin",
+                "d29h1-authority-fixture",
+                "--features",
+                "d29-h1-host-fixture",
+            ]);
+        command
+    };
+    let mut child = command
+        .current_dir(repo_root)
+        .env("CARGO_BUILD_JOBS", "1")
+        .env("CARGO_INCREMENTAL", "0")
+        .env("CARGO_PROFILE_TEST_DEBUG", "0")
+        .env("RUSTFLAGS", "-C debuginfo=0")
+        .env("CARGO_TERM_COLOR", "never")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| VitaAuthorityError::Unavailable)?;
+
+    let mut stdin = child.stdin.take().ok_or(VitaAuthorityError::Unavailable)?;
+    serde_json::to_writer(&mut stdin, request).map_err(|_| VitaAuthorityError::Unavailable)?;
+    stdin
+        .write_all(b"\n")
+        .map_err(|_| VitaAuthorityError::Unavailable)?;
+    drop(stdin);
+
+    let deadline = Instant::now() + D29_H1_HOST_IPC_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                // This waits for the bounded fixture process, not for worker
+                // readiness.  The Host fixture itself has no worker loop.
+                thread::sleep(Duration::from_millis(10));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(VitaAuthorityError::Unavailable);
+            }
+        }
+    };
+    if !status.success() {
+        return Err(VitaAuthorityError::Unavailable);
+    }
+
+    let mut output = Vec::new();
+    child
+        .stdout
+        .take()
+        .ok_or(VitaAuthorityError::Unavailable)?
+        .take((D29_H1_HOST_IPC_MAX_BODY + 1) as u64)
+        .read_to_end(&mut output)
+        .map_err(|_| VitaAuthorityError::Unavailable)?;
+    if output.len() > D29_H1_HOST_IPC_MAX_BODY {
+        return Err(VitaAuthorityError::InvalidVerdict);
+    }
+    let output = std::str::from_utf8(&output).map_err(|_| VitaAuthorityError::InvalidVerdict)?;
+    serde_json::from_str(output.trim()).map_err(|_| VitaAuthorityError::InvalidVerdict)
 }
 
 struct H1Runtime {
@@ -526,14 +649,14 @@ async fn start_runtime() -> Result<
     (
         H1Runtime,
         Arc<VitaToolBroker>,
-        Arc<CanonicalVitaAuthorityAdapter>,
+        Arc<ProcessIsolatedCanonicalAuthority>,
         HostCanary,
     ),
     String,
 > {
     let before = host_canary();
-    let app_data = tempdir().map_err(|error| format!("create D29-H1 app data: {error}"))?;
-    let workspace = tempdir().map_err(|error| format!("create D29-H1 workspace: {error}"))?;
+    let app_data = tempdir().map_err(|_| "create D29-H1 app data failed".to_string())?;
+    let workspace = tempdir().map_err(|_| "create D29-H1 workspace failed".to_string())?;
     let profile = VitaAgentRuntimeProfile::from_explicit_app_data_root(
         app_data.path().to_path_buf(),
         workspace.path().to_path_buf(),
@@ -568,15 +691,11 @@ async fn start_runtime() -> Result<
         .map_err(|error| format!("compile D29-H1 Codex config: {error}"))?;
     let config = entrypoint.config().clone();
 
-    let storage = Arc::new(
-        StorageService::initialize_with_roots(app_data.path().join("canonical-storage"), None)
-            .map_err(|error| format!("initialize D29-H1 canonical storage: {}", error.message))?,
-    );
-    let canonical_authority = CanonicalVitaAuthorityAdapter::production(Arc::clone(&storage))
-        .map_err(|error| format!("create D29-H1 canonical authority adapter: {error}"))?;
     let context = VitaExecutionContext::try_new("life-d29h1", "task-d29h1")
-        .map_err(|error| format!("create D29-H1 execution context: {:?}", error))?;
-    let broker = VitaToolBroker::new(context, canonical_authority.clone());
+        .map_err(|error| format!("create D29-H1 execution context: {error:?}"))?;
+    let canonical_authority = Arc::new(ProcessIsolatedCanonicalAuthority::new());
+    let authority_port: Arc<dyn VitaToolAuthorityPort> = canonical_authority.clone();
+    let broker = VitaToolBroker::new(context, authority_port);
     let mut extensions =
         codex_core_api::ExtensionRegistryBuilder::<codex_core::config::Config>::new();
     extensions.tool_contributor(Arc::new(VitaToolContributor::new(Arc::clone(&broker))));
@@ -661,7 +780,7 @@ async fn run_turn(
 }
 
 #[test]
-fn d29h1_real_codex_tool_request_is_denied_before_side_effect() {
+fn d29h1_real_codex_tool_request_uses_isolated_host_authority() {
     thread::Builder::new()
         .name("d29h1-real-codex-tool".to_string())
         .stack_size(D29_H1_TEST_STACK_SIZE)
@@ -708,13 +827,20 @@ async fn d29h1_real_codex_tool_request_body() {
     assert_eq!(fixture.error, None);
 
     let snapshot: VitaBrokerSnapshot = broker.snapshot();
-    let canonical: CanonicalVitaAuthoritySnapshot = canonical_authority.snapshot();
-    assert_eq!(canonical.canonical_evaluations, 1);
-    assert_eq!(canonical.production_registry_size, 0);
-    assert_eq!(canonical.authorization_row_reads, 0);
     assert_eq!(snapshot.attempted_requests, 1);
     assert_eq!(snapshot.authority_lookups, 1);
     assert_eq!(snapshot.execution_started, 0);
     assert_eq!(snapshot.side_effect_count, 0);
     assert_eq!(snapshot.max_active_authority, 1);
+
+    let host_observations = canonical_authority.snapshot();
+    assert_eq!(host_observations.len(), 1);
+    let host = &host_observations[0];
+    assert_eq!(host.canonical_evaluations, 1);
+    assert_eq!(host.production_registry_size, 0);
+    assert_eq!(host.authorization_row_reads, 0);
+    assert_eq!(host.result, "UnknownCapability");
+    assert_eq!(host.life_id, "life-d29h1");
+    assert_eq!(host.capability_id, "vita.governed_action");
+    assert_eq!(host.requested_scope, "none");
 }

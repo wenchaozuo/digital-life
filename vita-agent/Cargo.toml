@@ -4,9 +4,6 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
-[features]
-d29-h1-host-test = []
-
 [lib]
 name = "vita_agent"
 path = "src/lib.rs"

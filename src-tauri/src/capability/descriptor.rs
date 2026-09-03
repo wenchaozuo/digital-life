@@ -227,7 +227,7 @@ impl CapabilityRegistry {
         self.descriptors.get(capability_id)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "d29-h1-host-fixture"))]
     pub(crate) fn len(&self) -> usize {
         self.descriptors.len()
     }

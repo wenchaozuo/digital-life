@@ -5819,7 +5819,7 @@ mod tests {
             .query_row(
                 "SELECT COUNT(*) FROM memory_vector_generation_item WHERE generation_id=?1 AND life_id=?2 AND memory_id=?3",
                 rusqlite::params![context.generation_id().as_str(), &third_life, &third_memory],
-                |row| row.get::<_, i64>(0).map(|count| count as usize),
+                |row| row.get(0),
             )
             .unwrap();
         assert_eq!(

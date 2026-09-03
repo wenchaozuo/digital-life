@@ -395,6 +395,15 @@ impl TrustedWorkspaceRoot {
 /// Identity-only preparation result.  Parent and target handles are retained
 /// privately so a future creation primitive can remain anchored to the same
 /// capability; no handle is exposed as an executable or readable object.
+///
+/// H3 existing-target operations must rebind the relative leaf through
+/// `parent_handle` with `NtCreateFile(RootDirectory = parent_handle)` and
+/// `OBJ_DONT_REPARSE`, request only the operation's access, inspect that same
+/// returned handle, and compare its identity and kind with this preparation.
+/// A mismatch or missing target must deny the operation.  The operation must
+/// then use that inspected handle directly; it must never validate a pathname,
+/// close the validation handle, and reopen the target by pathname before a
+/// side effect.
 pub struct PreparedWorkspaceTarget {
     root: TrustedWorkspaceRoot,
     relative_path: WorkspaceRelativePath,
@@ -534,8 +543,7 @@ mod platform {
 
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows_sys::Wdk::Storage::FileSystem::{
-        NtCreateFile, FILE_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_FOR_BACKUP_INTENT,
-        FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
+        NtCreateFile, FILE_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
     };
     use windows_sys::Win32::Foundation::{
         CloseHandle, HANDLE, INVALID_HANDLE_VALUE, NTSTATUS, OBJ_CASE_INSENSITIVE,
@@ -543,18 +551,22 @@ mod platform {
         STATUS_OBJECT_PATH_NOT_FOUND, UNICODE_STRING,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FileIdInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
-        GetFileType, GetFinalPathNameByHandleW, BY_HANDLE_FILE_INFORMATION,
-        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_INFO_BY_HANDLE_CLASS, FILE_LIST_DIRECTORY,
-        FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_TYPE_DISK, OPEN_EXISTING, SYNCHRONIZE,
+        CreateFileW, FileIdInfo, GetDriveTypeW, GetFileInformationByHandle,
+        GetFileInformationByHandleEx, GetFileType, GetFinalPathNameByHandleW,
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO,
+        FILE_INFO_BY_HANDLE_CLASS, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_TYPE_DISK, OPEN_EXISTING,
+    };
+    use windows_sys::Win32::System::WindowsProgramming::{
+        DRIVE_FIXED, DRIVE_NO_ROOT_DIR, DRIVE_RAMDISK, DRIVE_REMOTE, DRIVE_REMOVABLE, DRIVE_UNKNOWN,
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
-    const OPEN_DIRECTORY_ACCESS: u32 =
-        FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | FILE_TRAVERSE | SYNCHRONIZE;
-    const OPEN_TARGET_ACCESS: u32 = FILE_READ_ATTRIBUTES | FILE_TRAVERSE | SYNCHRONIZE;
+    // FILE_TRAVERSE is retained only for directory RootDirectory traversal.
+    // A regular target never receives FILE_TRAVERSE/FILE_EXECUTE.
+    const OPEN_DIRECTORY_ACCESS: u32 = FILE_READ_ATTRIBUTES | FILE_TRAVERSE;
+    const OPEN_TARGET_ACCESS: u32 = FILE_READ_ATTRIBUTES;
 
     pub(super) struct OwnedHandle(pub(super) HANDLE);
 
@@ -586,31 +598,84 @@ mod platform {
     pub(super) fn acquire_root(
         requested_path: &Path,
     ) -> Result<TrustedWorkspaceRoot, VitaAgentError> {
-        preflight_root_path(requested_path)?;
-        let expected_final =
-            std::fs::canonicalize(requested_path).map_err(VitaAgentError::KernelConfig)?;
-        let handle = open_named_root(requested_path)?;
-        let details = inspect_handle(&handle, true)?;
-        if !same_path(&expected_final, &details.final_path) {
+        acquire_root_impl(requested_path, || {})
+    }
+
+    #[cfg(test)]
+    pub(super) fn acquire_root_with_hook<F>(
+        requested_path: &Path,
+        hook: F,
+    ) -> Result<TrustedWorkspaceRoot, VitaAgentError>
+    where
+        F: FnMut(),
+    {
+        acquire_root_impl(requested_path, hook)
+    }
+
+    fn acquire_root_impl<F>(
+        requested_path: &Path,
+        mut after_drive_anchor: F,
+    ) -> Result<TrustedWorkspaceRoot, VitaAgentError>
+    where
+        F: FnMut(),
+    {
+        // This is input validation only.  The authority decision below is
+        // made by walking from the local-drive anchor, never by canonicalizing
+        // and reopening the full user pathname.
+        validate_explicit_root_path(requested_path)?;
+        let components = root_components(requested_path)?;
+        let (drive_anchor, anchor_details) = open_drive_anchor(requested_path)?;
+        ensure_allowed_local_final_path(&anchor_details.final_path, requested_path)?;
+        reject_resolved_stock_state(&anchor_details.final_path)?;
+
+        // The drive root is the only full-name open in the authority path.  It
+        // is derived from the validated local drive prefix and is itself the
+        // trusted parent for every user-selected component below.
+        after_drive_anchor();
+
+        let anchor_final_path = anchor_details.final_path.clone();
+        let mut parent_handle = Arc::new(drive_anchor);
+        let mut final_details = anchor_details;
+        for component in &components {
+            let child = match open_relative(&parent_handle, component, true) {
+                Ok(child) => child,
+                Err(error) => return Err(relative_open_error(requested_path, error)),
+            };
+            let details = inspect_handle(&child, true)?;
+            ensure_allowed_local_final_path(&details.final_path, requested_path)?;
+            if !is_same_or_descendant_path(&anchor_final_path, &details.final_path) {
+                return Err(unsafe_root_path(
+                    &details.final_path,
+                    "root component escaped the local drive anchor",
+                ));
+            }
+            final_details = details;
+            parent_handle = Arc::new(child);
+        }
+
+        if !is_same_or_descendant_path(&anchor_final_path, &final_details.final_path) {
             return Err(unsafe_root_path(
-                requested_path,
-                "root final path changed during capability acquisition",
+                &final_details.final_path,
+                "resolved root is outside the local drive anchor",
             ));
         }
+        reject_resolved_stock_state(&final_details.final_path)?;
 
         Ok(TrustedWorkspaceRoot::from_platform(
             requested_path.to_path_buf(),
-            details.final_path,
-            details.identity,
-            Arc::new(handle),
+            final_details.final_path,
+            final_details.identity,
+            parent_handle,
         ))
     }
 
     pub(super) fn verify_root_name(root: &TrustedWorkspaceRoot) -> Result<(), VitaAgentError> {
-        preflight_root_path(root.requested_path())?;
-        let handle = open_named_root(root.requested_path())?;
-        let details = inspect_handle(&handle, true)?;
-        if details.identity != root.identity() || !same_path(root.final_path(), &details.final_path)
+        // Revalidation uses the same handle-relative, no-reparse acquisition
+        // path as initial acquisition.  It never treats a full pathname open
+        // or canonicalize result as the authority.
+        let rebound = acquire_root(root.requested_path())?;
+        if rebound.identity() != root.identity()
+            || !same_path(root.final_path(), rebound.final_path())
         {
             return Err(unsafe_root_path(
                 root.requested_path(),
@@ -722,48 +787,19 @@ mod platform {
         })
     }
 
-    fn preflight_root_path(path: &Path) -> Result<(), VitaAgentError> {
-        let mut cursor = path.to_path_buf();
-        loop {
-            match std::fs::symlink_metadata(&cursor) {
-                Ok(metadata) => {
-                    if crate::is_reparse_point(&metadata) {
-                        return Err(unsafe_root_path(
-                            &cursor,
-                            "root or an ancestor is a reparse point",
-                        ));
-                    }
-                    if !metadata.is_dir() {
-                        return Err(unsafe_root_path(
-                            &cursor,
-                            "root or an ancestor is not a directory",
-                        ));
-                    }
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    return Err(VitaAgentError::KernelConfig(error));
-                }
-                Err(error) => return Err(VitaAgentError::KernelConfig(error)),
-            }
+    fn open_drive_anchor(
+        requested_path: &Path,
+    ) -> Result<(OwnedHandle, HandleDetails), VitaAgentError> {
+        let drive_root = drive_root_path(requested_path)?;
+        let drive_type = unsafe { GetDriveTypeW(nul_terminated(&drive_root).as_ptr()) };
+        validate_drive_type(&drive_root, drive_type)?;
 
-            let Some(parent) = cursor.parent() else {
-                break;
-            };
-            if parent == cursor {
-                break;
-            }
-            cursor = parent.to_path_buf();
-        }
-        Ok(())
-    }
-
-    fn open_named_root(path: &Path) -> Result<OwnedHandle, VitaAgentError> {
-        let wide = nul_terminated(path);
+        let wide = nul_terminated(&drive_root);
         let handle = unsafe {
             CreateFileW(
                 wide.as_ptr(),
                 OPEN_DIRECTORY_ACCESS,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
                 std::ptr::null(),
                 OPEN_EXISTING,
                 FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
@@ -773,7 +809,96 @@ mod platform {
         if is_invalid_handle(handle) {
             return Err(VitaAgentError::KernelConfig(io::Error::last_os_error()));
         }
-        Ok(OwnedHandle(handle))
+        let handle = OwnedHandle(handle);
+        let details = inspect_handle(&handle, true)?;
+        Ok((handle, details))
+    }
+
+    fn drive_root_path(path: &Path) -> Result<PathBuf, VitaAgentError> {
+        use std::path::Prefix;
+
+        match path.components().next() {
+            Some(Component::Prefix(prefix)) => match prefix.kind() {
+                Prefix::Disk(letter) => Ok(PathBuf::from(format!("{}:\\", letter as char))),
+                _ => Err(unsafe_root_path(
+                    path,
+                    "only a local disk drive can provide a workspace anchor",
+                )),
+            },
+            _ => Err(unsafe_root_path(
+                path,
+                "workspace root has no explicit local drive anchor",
+            )),
+        }
+    }
+
+    fn root_components(path: &Path) -> Result<Vec<OsString>, VitaAgentError> {
+        let mut components = Vec::new();
+        for component in path.components() {
+            if let Component::Normal(value) = component {
+                components.push(value.to_os_string());
+            }
+        }
+        Ok(components)
+    }
+
+    fn validate_drive_type(path: &Path, drive_type: u32) -> Result<(), VitaAgentError> {
+        match drive_type {
+            DRIVE_REMOTE => Err(unsafe_root_path(
+                path,
+                "mapped or remote drives are not allowed as workspace roots",
+            )),
+            DRIVE_FIXED | DRIVE_REMOVABLE | DRIVE_RAMDISK => Ok(()),
+            DRIVE_UNKNOWN | DRIVE_NO_ROOT_DIR => {
+                Err(unsafe_root_path(path, "drive type is indeterminate"))
+            }
+            _ => Err(unsafe_root_path(
+                path,
+                "drive type is not an allowed local filesystem",
+            )),
+        }
+    }
+
+    fn ensure_allowed_local_final_path(
+        path: &Path,
+        requested_path: &Path,
+    ) -> Result<(), VitaAgentError> {
+        let raw = path
+            .to_string_lossy()
+            .replace('/', "\\")
+            .to_ascii_lowercase();
+        let is_verbatim = raw.starts_with("\\\\?\\");
+        let without_verbatim = raw.strip_prefix("\\\\?\\").unwrap_or(&raw);
+        let is_unc = raw.starts_with("\\\\?\\unc\\") || (!is_verbatim && raw.starts_with("\\\\"));
+        let is_device = raw.starts_with("\\device\\")
+            || raw.starts_with("\\\\device\\")
+            || raw.starts_with("\\\\.\\")
+            || without_verbatim.starts_with("device\\")
+            || without_verbatim.starts_with("globalroot\\device\\");
+        if is_unc || is_device {
+            return Err(unsafe_root_path(
+                requested_path,
+                "resolved workspace path is UNC or device namespace",
+            ));
+        }
+
+        match without_verbatim.as_bytes() {
+            [drive, b':', ..] if drive.is_ascii_alphabetic() => Ok(()),
+            _ => Err(unsafe_root_path(
+                requested_path,
+                "resolved workspace path is not an allowed local drive path",
+            )),
+        }
+    }
+
+    fn reject_resolved_stock_state(path: &Path) -> Result<(), VitaAgentError> {
+        if contains_stock_codex_state(path) {
+            return Err(VitaAgentError::ForbiddenStockPath {
+                field: ROOT_FIELD,
+                path: path.to_path_buf(),
+            });
+        }
+        Ok(())
     }
 
     fn open_relative(
@@ -804,10 +929,8 @@ mod platform {
         };
         let mut status_block = IO_STATUS_BLOCK::default();
         let mut handle: HANDLE = std::ptr::null_mut();
-        let create_options = FILE_OPEN_FOR_BACKUP_INTENT
-            | FILE_OPEN_REPARSE_POINT
-            | FILE_SYNCHRONOUS_IO_NONALERT
-            | if directory { FILE_DIRECTORY_FILE } else { 0 };
+        let create_options =
+            FILE_OPEN_REPARSE_POINT | if directory { FILE_DIRECTORY_FILE } else { 0 };
         let status = unsafe {
             NtCreateFile(
                 &mut handle,
@@ -820,7 +943,7 @@ mod platform {
                 &mut status_block,
                 std::ptr::null(),
                 0,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
                 FILE_OPEN,
                 create_options,
                 std::ptr::null(),
@@ -958,6 +1081,17 @@ mod platform {
         normalize_path_for_comparison(left) == normalize_path_for_comparison(right)
     }
 
+    fn is_same_or_descendant_path(parent: &Path, child: &Path) -> bool {
+        let parent = normalize_path_for_comparison(parent);
+        let child = normalize_path_for_comparison(child);
+        let prefix = if parent.ends_with('\\') {
+            parent.clone()
+        } else {
+            format!("{parent}\\")
+        };
+        child == parent || child.starts_with(&prefix)
+    }
+
     fn verify_relative_parents(
         root: &TrustedWorkspaceRoot,
         components: &[&OsStr],
@@ -986,6 +1120,43 @@ mod platform {
             handle = Arc::new(child);
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn open_and_verify_existing_target(
+        root: &TrustedWorkspaceRoot,
+        parent: &Arc<OwnedHandle>,
+        leaf: &OsStr,
+        expected_identity: WorkspaceRootIdentity,
+        expected_kind: PreparedWorkspaceTargetKind,
+        requested: &Path,
+    ) -> Result<(OwnedHandle, HandleDetails), VitaAgentError> {
+        let handle = match open_relative(parent, leaf, false) {
+            Ok(handle) => handle,
+            Err(RelativeOpenError::Missing(_)) => {
+                return Err(VitaAgentError::UnsafePath {
+                    field: TARGET_FIELD,
+                    path: requested.to_path_buf(),
+                    reason: "workspace target disappeared during same-handle rebind",
+                })
+            }
+            Err(error) => return Err(relative_open_error(requested, error)),
+        };
+        let details = inspect_handle(&handle, false)?;
+        ensure_descendant(root, &details.final_path)?;
+        let actual_kind = if details.is_directory {
+            PreparedWorkspaceTargetKind::ExistingDirectory
+        } else {
+            PreparedWorkspaceTargetKind::ExistingFile
+        };
+        if details.identity != expected_identity || actual_kind != expected_kind {
+            return Err(VitaAgentError::UnsafePath {
+                field: TARGET_FIELD,
+                path: requested.to_path_buf(),
+                reason: "workspace target identity or kind changed during same-handle rebind",
+            });
+        }
+        Ok((handle, details))
     }
 
     fn verify_target_name_current(
@@ -1080,6 +1251,133 @@ mod platform {
     {
         prepare_target_impl(root, relative, hook)
     }
+
+    #[cfg(test)]
+    pub(super) fn root_with_requested_path_for_test(
+        root: &TrustedWorkspaceRoot,
+        requested_path: PathBuf,
+    ) -> TrustedWorkspaceRoot {
+        TrustedWorkspaceRoot {
+            inner: Arc::new(TrustedWorkspaceRootInner {
+                requested_path,
+                final_path: root.inner.final_path.clone(),
+                identity: root.inner.identity,
+                handle: Arc::clone(&root.inner.handle),
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn verify_parent_identities_for_test(
+        root: &TrustedWorkspaceRoot,
+        relative: &WorkspaceRelativePath,
+        expected_identities: &[WorkspaceRootIdentity],
+    ) -> Result<(), VitaAgentError> {
+        let components = relative.components().collect::<Vec<_>>();
+        verify_relative_parents(root, &components, expected_identities, relative.as_path())
+    }
+
+    #[cfg(test)]
+    pub(super) fn verify_target_identity_for_test(
+        root: &TrustedWorkspaceRoot,
+        relative: &WorkspaceRelativePath,
+        expected_identity: WorkspaceRootIdentity,
+    ) -> Result<(), VitaAgentError> {
+        let components = relative.components().collect::<Vec<_>>();
+        let leaf = components
+            .last()
+            .expect("WorkspaceRelativePath always has one component");
+        let mut parent_handle = Arc::clone(&root.inner.handle);
+        for component in components.iter().take(components.len().saturating_sub(1)) {
+            let child = match open_relative(&parent_handle, component, true) {
+                Ok(child) => child,
+                Err(error) => return Err(relative_open_error(relative.as_path(), error)),
+            };
+            let details = inspect_handle(&child, true)?;
+            ensure_descendant(root, &details.final_path)?;
+            parent_handle = Arc::new(child);
+        }
+
+        let handle = match open_relative(&parent_handle, leaf, false) {
+            Ok(handle) => handle,
+            Err(error) => return Err(relative_open_error(relative.as_path(), error)),
+        };
+        let details = inspect_handle(&handle, false)?;
+        let kind = if details.is_directory {
+            PreparedWorkspaceTargetKind::ExistingDirectory
+        } else {
+            PreparedWorkspaceTargetKind::ExistingFile
+        };
+        drop(handle);
+        verify_target_name_current(
+            root,
+            &parent_handle,
+            leaf,
+            Some(expected_identity),
+            kind,
+            relative.as_path(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn rebind_existing_target_for_test(
+        prepared: &PreparedWorkspaceTarget,
+    ) -> Result<WorkspaceRootIdentity, VitaAgentError> {
+        let expected_identity = prepared.target_identity.ok_or(VitaAgentError::UnsafePath {
+            field: TARGET_FIELD,
+            path: prepared.relative_path.to_path_buf(),
+            reason: "missing target has no existing identity to rebind",
+        })?;
+        if prepared.kind == PreparedWorkspaceTargetKind::Missing {
+            return Err(VitaAgentError::UnsafePath {
+                field: TARGET_FIELD,
+                path: prepared.relative_path.to_path_buf(),
+                reason: "missing target has no existing kind to rebind",
+            });
+        }
+
+        let parent_details = inspect_handle(&prepared.parent_handle, true)?;
+        ensure_descendant(&prepared.root, &parent_details.final_path)?;
+        if parent_details.identity != prepared.parent_identity {
+            return Err(VitaAgentError::UnsafePath {
+                field: TARGET_FIELD,
+                path: prepared.relative_path.to_path_buf(),
+                reason: "workspace parent identity changed before same-handle rebind",
+            });
+        }
+        let leaf = prepared
+            .relative_path
+            .components()
+            .last()
+            .expect("WorkspaceRelativePath always has one component");
+
+        // This H2 test helper intentionally requests only the metadata access
+        // available to H2.  A future H3 operation must replace this with the
+        // exact access mask for its operation and continue using the returned
+        // handle after these checks, without reopening the pathname.
+        let (handle, details) = open_and_verify_existing_target(
+            &prepared.root,
+            &prepared.parent_handle,
+            leaf,
+            expected_identity,
+            prepared.kind,
+            prepared.relative_path.as_path(),
+        )?;
+        prepared.root.verify_named_path_current()?;
+        let identity = details.identity;
+        drop(handle);
+        Ok(identity)
+    }
+
+    #[cfg(test)]
+    pub(super) fn access_masks_for_test() -> (u32, u32) {
+        (OPEN_DIRECTORY_ACCESS, OPEN_TARGET_ACCESS)
+    }
+
+    #[cfg(test)]
+    pub(super) fn validate_drive_type_for_test(drive_type: u32) -> Result<(), VitaAgentError> {
+        validate_drive_type(Path::new("C:\\"), drive_type)
+    }
 }
 
 #[cfg(test)]
@@ -1161,6 +1459,36 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn directory_and_target_access_masks_are_identity_only() {
+        use windows_sys::Win32::Storage::FileSystem::{FILE_READ_ATTRIBUTES, FILE_TRAVERSE};
+
+        let (directory_access, target_access) = platform::access_masks_for_test();
+        assert_eq!(
+            directory_access,
+            FILE_READ_ATTRIBUTES | FILE_TRAVERSE,
+            "directory handles may only inspect and traverse"
+        );
+        assert_eq!(
+            target_access, FILE_READ_ATTRIBUTES,
+            "regular targets must not receive traversal or execution access"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn indeterminate_and_remote_drive_types_fail_closed() {
+        use windows_sys::Win32::System::WindowsProgramming::{
+            DRIVE_FIXED, DRIVE_NO_ROOT_DIR, DRIVE_REMOTE, DRIVE_UNKNOWN,
+        };
+
+        assert!(platform::validate_drive_type_for_test(DRIVE_FIXED).is_ok());
+        assert!(platform::validate_drive_type_for_test(DRIVE_REMOTE).is_err());
+        assert!(platform::validate_drive_type_for_test(DRIVE_UNKNOWN).is_err());
+        assert!(platform::validate_drive_type_for_test(DRIVE_NO_ROOT_DIR).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn fresh_root_has_stable_identity_and_prepares_missing_without_creation() {
         let directory = tempdir().expect("tempdir");
         let root = TrustedWorkspaceRoot::acquire(directory.path()).expect("acquire root");
@@ -1229,6 +1557,28 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn acquisition_ancestor_replacement_race_fails_closed() {
+        let directory = tempdir().expect("directory");
+        let outside = tempdir().expect("outside");
+        let parent = directory.path().join("parent");
+        let requested = parent.join("workspace");
+        let moved_parent = directory.path().join("parent-old");
+        fs::create_dir(&parent).expect("parent");
+        fs::create_dir(&requested).expect("workspace");
+
+        let result = platform::acquire_root_with_hook(&requested, || {
+            fs::rename(&parent, &moved_parent).expect("rename ancestor");
+            native_dir_symlink(&parent, outside.path());
+        });
+
+        assert!(
+            result.is_err(),
+            "an ancestor replaced after anchor acquisition must not redirect the walk"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn intermediate_and_final_reparse_points_are_rejected() {
         let directory = tempdir().expect("tempdir");
         let outside = tempdir().expect("outside");
@@ -1265,7 +1615,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn root_replacement_fails_closed_without_changing_held_identity() {
+    fn root_rename_is_denied_until_root_capability_drops() {
         let directory = tempdir().expect("tempdir");
         let requested = directory.path().join("root");
         let replacement = directory.path().join("replacement");
@@ -1273,35 +1623,196 @@ mod tests {
         let root = TrustedWorkspaceRoot::acquire(&requested).expect("acquire root");
         let identity = root.identity();
         let final_path = root.final_path().to_path_buf();
-        fs::rename(&requested, &replacement).expect("rename root");
-        fs::create_dir(&requested).expect("replacement root");
-        assert!(root.verify_named_path_current().is_err());
+        assert!(
+            fs::rename(&requested, &replacement).is_err(),
+            "the retained root capability must block rename while alive"
+        );
+        assert!(root.verify_named_path_current().is_ok());
         assert_eq!(root.identity(), identity);
         assert_eq!(root.final_path(), final_path.as_path());
+
+        drop(root);
+        fs::rename(&requested, &replacement).expect("rename after root capability drop");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn root_identity_mismatch_fails_closed() {
+        let directory = tempdir().expect("directory");
+        let requested = directory.path().join("root");
+        let other = directory.path().join("other");
+        fs::create_dir(&requested).expect("root");
+        fs::create_dir(&other).expect("other");
+        let root = TrustedWorkspaceRoot::acquire(&requested).expect("acquire root");
+        let rebound = platform::root_with_requested_path_for_test(&root, other);
+
+        assert!(
+            rebound.verify_named_path_current().is_err(),
+            "a different current name must not validate against the held identity"
+        );
     }
 
     #[cfg(windows)]
     #[test]
     fn intermediate_replacement_cannot_escape_handle_walk() {
         let directory = tempdir().expect("tempdir");
-        let outside = tempdir().expect("outside");
         let nested = directory.path().join("nested");
         fs::create_dir(&nested).expect("nested");
-        fs::write(outside.path().join("secret.txt"), b"fixture").expect("outside fixture");
+        fs::write(nested.join("secret.txt"), b"nested fixture").expect("nested fixture");
         let root = TrustedWorkspaceRoot::acquire(directory.path()).expect("acquire root");
 
         let replacement = directory.path().join("nested-old");
-        let link = directory.path().join("nested");
-        let result = platform::prepare_target_with_hook(
+        let prepared = platform::prepare_target_with_hook(
             &root,
             WorkspaceRelativePath::parse(Path::new("nested\\secret.txt")).expect("relative"),
             || {
-                fs::rename(&link, &replacement).expect("rename intermediate");
-                native_dir_symlink(&link, outside.path());
+                assert!(
+                    fs::rename(&nested, &replacement).is_err(),
+                    "the retained parent capability must block intermediate rename"
+                );
             },
-        );
-        assert!(result.is_err(), "root name replacement must fail closed");
+        )
+        .expect("handle-relative preparation");
+        assert_eq!(prepared.kind(), PreparedWorkspaceTargetKind::ExistingFile);
+
+        drop(prepared);
+        fs::rename(&nested, &replacement).expect("rename after parent capability drop");
         assert!(!directory.path().join("secret.txt").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn prepared_parent_rename_is_denied_until_preparation_drops() {
+        let directory = tempdir().expect("directory");
+        let nested = directory.path().join("nested");
+        let moved = directory.path().join("nested-moved");
+        fs::create_dir(&nested).expect("nested");
+        let root = TrustedWorkspaceRoot::acquire(directory.path()).expect("acquire root");
+        let prepared = root
+            .prepare_target(Path::new("nested\\new.txt"))
+            .expect("missing target preparation");
+
+        assert!(
+            fs::rename(&nested, &moved).is_err(),
+            "the retained prepared parent must block rename while alive"
+        );
+        drop(prepared);
+        fs::rename(&nested, &moved).expect("rename after prepared parent drop");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn existing_target_metadata_capability_allows_external_rename() {
+        let directory = tempdir().expect("directory");
+        let target = directory.path().join("target.txt");
+        let moved = directory.path().join("target-moved.txt");
+        fs::write(&target, b"fixture").expect("target");
+        let root = TrustedWorkspaceRoot::acquire(directory.path()).expect("acquire root");
+        let prepared = root
+            .prepare_target(Path::new("target.txt"))
+            .expect("target preparation");
+
+        fs::rename(&target, &moved).expect("metadata-only H2 handle permits rename");
+        assert_eq!(prepared.kind(), PreparedWorkspaceTargetKind::ExistingFile);
+        assert!(prepared.target_identity().is_some());
+        drop(prepared);
+        assert!(moved.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn existing_target_rebind_rejects_replacement_identity() {
+        let directory = tempdir().expect("directory");
+        let target = directory.path().join("a.txt");
+        let moved = directory.path().join("old.txt");
+        fs::write(&target, b"original").expect("original target");
+        let root = TrustedWorkspaceRoot::acquire(directory.path()).expect("acquire root");
+        let prepared = root
+            .prepare_target(Path::new("a.txt"))
+            .expect("target preparation");
+        assert!(prepared.target_identity().is_some());
+
+        fs::rename(&target, &moved).expect("rename original target");
+        fs::write(&target, b"replacement").expect("replacement target");
+
+        assert!(
+            platform::rebind_existing_target_for_test(&prepared).is_err(),
+            "a replacement at the same relative name must fail identity rebind"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn existing_target_rebind_rejects_renamed_away_name() {
+        let directory = tempdir().expect("directory");
+        let target = directory.path().join("a.txt");
+        let moved = directory.path().join("old.txt");
+        fs::write(&target, b"original").expect("original target");
+        let root = TrustedWorkspaceRoot::acquire(directory.path()).expect("acquire root");
+        let prepared = root
+            .prepare_target(Path::new("a.txt"))
+            .expect("target preparation");
+
+        fs::rename(&target, &moved).expect("rename original target");
+
+        assert!(
+            platform::rebind_existing_target_for_test(&prepared).is_err(),
+            "a renamed-away target must fail identity rebind as missing"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn existing_target_rebind_accepts_unchanged_identity() {
+        let directory = tempdir().expect("directory");
+        let target = directory.path().join("a.txt");
+        fs::write(&target, b"original").expect("original target");
+        let root = TrustedWorkspaceRoot::acquire(directory.path()).expect("acquire root");
+        let prepared = root
+            .prepare_target(Path::new("a.txt"))
+            .expect("target preparation");
+        let expected_identity = prepared.target_identity().expect("target identity");
+
+        let rebound_identity =
+            platform::rebind_existing_target_for_test(&prepared).expect("unchanged target rebind");
+        assert_eq!(rebound_identity, expected_identity);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parent_identity_mismatch_fails_closed() {
+        let directory = tempdir().expect("directory");
+        let nested = directory.path().join("nested");
+        fs::create_dir(&nested).expect("nested");
+        fs::write(nested.join("file.txt"), b"fixture").expect("file");
+        let root = TrustedWorkspaceRoot::acquire(directory.path()).expect("acquire root");
+        let relative =
+            WorkspaceRelativePath::parse(Path::new("nested\\file.txt")).expect("relative");
+
+        assert!(
+            platform::verify_parent_identities_for_test(
+                &root,
+                &relative,
+                &[root.identity(), root.identity()]
+            )
+            .is_err(),
+            "a changed parent identity must fail closed"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn target_identity_mismatch_fails_closed() {
+        let directory = tempdir().expect("directory");
+        let target = directory.path().join("target.txt");
+        fs::write(&target, b"fixture").expect("target");
+        let root = TrustedWorkspaceRoot::acquire(directory.path()).expect("acquire root");
+        let relative = WorkspaceRelativePath::parse(Path::new("target.txt")).expect("relative");
+
+        assert!(
+            platform::verify_target_identity_for_test(&root, &relative, root.identity()).is_err(),
+            "a changed target identity must fail closed"
+        );
     }
 
     #[cfg(windows)]

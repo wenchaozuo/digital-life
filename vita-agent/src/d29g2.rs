@@ -26,10 +26,10 @@ use tempfile::{tempdir, TempDir};
 
 use super::{
     production_transport::ProductionTransportObservation, CredentialRef, CredentialResolver,
-    GatewayReadyProvider, ProviderCapabilities, ProviderGateway, ProviderProfile, ProviderProtocol,
-    ProviderRequestTransport, ProviderRetryPolicy, ResolvedCredential, VitaAgentError,
-    VitaGatewayBinding, VitaMessage, VitaMessageRole, VitaProviderState, VitaResponsesRequest,
-    VitaResponsesRequestOptions,
+    GatewayReadyProvider, ProviderCapabilities, ProviderGateway, ProviderInstructionRolePolicy,
+    ProviderModelIdentityPolicy, ProviderProfile, ProviderProtocol, ProviderRequestTransport,
+    ProviderRetryPolicy, ResolvedCredential, VitaAgentError, VitaGatewayBinding, VitaMessage,
+    VitaMessageRole, VitaProviderState, VitaResponsesRequest, VitaResponsesRequestOptions,
 };
 use crate::{
     ProviderErrorDetail, VitaAgentEntrypoint, VitaAgentRuntimeProfile, VITA_AGENT_RUNTIME_ID,
@@ -41,6 +41,7 @@ const D29G2_BASE_URL_ENV: &str = "VITA_D29G2_BASE_URL";
 const D29G2_MODEL_ENV: &str = "VITA_D29G2_MODEL";
 const D29G2_API_KEY_ENV: &str = "VITA_D29G2_API_KEY";
 const D29G2_PROBE_PROMPT: &str = "Reply exactly with VITA_D29G2_PROBE_OK.";
+const D29G2_ROLE_PROMPT: &str = "Reply exactly with VITA_D29G2_ROLE_OK.";
 const D29G2_PROMPT: &str = "Reply exactly with VITA_D29G2_OK.";
 const D29G2_REPLY: &str = "VITA_D29G2_OK";
 const D29G2_PROVIDER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1302,6 +1303,681 @@ fn print_minimal_probe_report(evidence: &MinimalProbeEvidence) {
     );
 }
 
+#[derive(Debug)]
+struct RoleDiagnosticEvidence {
+    label: &'static str,
+    provider_status: u16,
+    provider_attempt_count: usize,
+    error_detail: Option<ProviderErrorDetail>,
+}
+
+fn run_role_probe(
+    inputs: &G2Inputs,
+    label: &'static str,
+    messages: Vec<VitaMessage>,
+) -> Result<RoleDiagnosticEvidence, String> {
+    let provider = ProviderProfile::new(
+        inputs.provider_id.clone(),
+        format!("D29-G2-R2 role matrix {}", inputs.provider_id),
+        ProviderProtocol::OpenAiChatCompletions,
+        &inputs.base_url,
+        inputs.model.clone(),
+        Some(inputs.credential_ref.clone()),
+        D29G2_PROVIDER_TIMEOUT,
+        ProviderRetryPolicy::default(),
+        ProviderCapabilities {
+            developer_role: true,
+            ..ProviderCapabilities::none()
+        },
+    )
+    .map_err(|_| "role matrix provider profile validation failed".to_string())?;
+    let endpoint = provider.endpoint.clone();
+    let request = VitaResponsesRequest::new(
+        inputs.model.clone(),
+        messages,
+        VitaResponsesRequestOptions::default(),
+    );
+    let mapped = super::map_responses_request_to_chat(&request, &provider)
+        .map_err(|_| format!("role matrix {label} request mapping failed"))?;
+    let body = serde_json::to_vec(&mapped)
+        .map_err(|_| format!("role matrix {label} request serialization failed"))?;
+    let (transport, observation) = super::production_transport::new_for_d29g2()
+        .map_err(|_| "role matrix production transport creation failed".to_string())?;
+    let credential = G2CredentialResolver {
+        reference: inputs.credential_ref.clone(),
+        credential: ResolvedCredential::new(inputs.credential.as_str()),
+    }
+    .resolve(&inputs.credential_ref)
+    .map_err(|_| "role matrix credential binding failed".to_string())?;
+    let result = transport.post_json(
+        &endpoint,
+        Some(&credential),
+        &body,
+        provider.timeout(),
+        provider.retry_policy(),
+    );
+    let error_detail = match &result {
+        Err(VitaAgentError::ProviderHttpStatus { detail, .. }) => detail.clone(),
+        _ => None,
+    };
+    drop(result);
+    Ok(RoleDiagnosticEvidence {
+        label,
+        provider_status: observation.last_status.load(Ordering::Acquire),
+        provider_attempt_count: observation.attempt_count.load(Ordering::Acquire),
+        error_detail,
+    })
+}
+
+fn run_role_matrix(inputs: &G2Inputs) -> Result<Vec<RoleDiagnosticEvidence>, String> {
+    let system_and_user = run_role_probe(
+        inputs,
+        "system+user",
+        vec![
+            VitaMessage::text(VitaMessageRole::System, D29G2_ROLE_PROMPT),
+            VitaMessage::text(VitaMessageRole::User, D29G2_ROLE_PROMPT),
+        ],
+    )?;
+    let developer_and_user = run_role_probe(
+        inputs,
+        "developer+user",
+        vec![
+            VitaMessage::text(VitaMessageRole::Developer, D29G2_ROLE_PROMPT),
+            VitaMessage::text(VitaMessageRole::User, D29G2_ROLE_PROMPT),
+        ],
+    )?;
+    Ok(vec![system_and_user, developer_and_user])
+}
+
+fn print_role_matrix_report(evidence: &[RoleDiagnosticEvidence]) {
+    for result in evidence {
+        let detail = result.error_detail.as_ref();
+        println!(
+            "D29-G2-R2 ROLE_MATRIX roles={} status={} provider_requests={} code={} message={} raw_response_logged=NO",
+            result.label,
+            result.provider_status,
+            result.provider_attempt_count,
+            detail
+                .and_then(ProviderErrorDetail::code)
+                .unwrap_or("none"),
+            detail
+                .and_then(ProviderErrorDetail::message)
+                .unwrap_or("none"),
+        );
+    }
+}
+
+const MAX_STRUCTURAL_TEXT_CHARS: usize = 4_096;
+const MAX_STRUCTURAL_LIST_ITEMS: usize = 128;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum StructuralJsonType {
+    #[default]
+    InvalidJson,
+    Object,
+    Array,
+    String,
+    Number,
+    Boolean,
+    Null,
+}
+
+impl StructuralJsonType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidJson => "invalid-json",
+            Self::Object => "object",
+            Self::Array => "array",
+            Self::String => "string",
+            Self::Number => "number",
+            Self::Boolean => "boolean",
+            Self::Null => "null",
+        }
+    }
+}
+
+fn structural_json_type(value: &Value) -> StructuralJsonType {
+    match value {
+        Value::Object(_) => StructuralJsonType::Object,
+        Value::Array(_) => StructuralJsonType::Array,
+        Value::String(_) => StructuralJsonType::String,
+        Value::Number(_) => StructuralJsonType::Number,
+        Value::Bool(_) => StructuralJsonType::Boolean,
+        Value::Null => StructuralJsonType::Null,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct StructuralField {
+    present: bool,
+    value_type: Option<StructuralJsonType>,
+}
+
+impl StructuralField {
+    fn from_object(object: Option<&serde_json::Map<String, Value>>, name: &str) -> Self {
+        object
+            .and_then(|object| object.get(name))
+            .map(|value| Self {
+                present: true,
+                value_type: Some(structural_json_type(value)),
+            })
+            .unwrap_or_default()
+    }
+
+    fn label(self) -> &'static str {
+        if !self.present {
+            "absent"
+        } else {
+            self.value_type
+                .map(StructuralJsonType::as_str)
+                .unwrap_or("unknown")
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ContentStructure {
+    String {
+        bounded_length: usize,
+        capped: bool,
+    },
+    Array {
+        bounded_item_count: usize,
+        capped: bool,
+    },
+    Null,
+    Other(StructuralJsonType),
+}
+
+fn content_structure(value: &Value) -> ContentStructure {
+    match value {
+        Value::String(value) => {
+            let length = value.chars().count();
+            ContentStructure::String {
+                bounded_length: length.min(MAX_STRUCTURAL_TEXT_CHARS),
+                capped: length > MAX_STRUCTURAL_TEXT_CHARS,
+            }
+        }
+        Value::Array(value) => ContentStructure::Array {
+            bounded_item_count: value.len().min(MAX_STRUCTURAL_LIST_ITEMS),
+            capped: value.len() > MAX_STRUCTURAL_LIST_ITEMS,
+        },
+        Value::Null => ContentStructure::Null,
+        value => ContentStructure::Other(structural_json_type(value)),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct MessageStructure {
+    role: StructuralField,
+    content: StructuralField,
+    reasoning_content: StructuralField,
+    reasoning: StructuralField,
+    tool_calls: StructuralField,
+    content_detail: Option<ContentStructure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct ChoiceStructure {
+    index: StructuralField,
+    message: StructuralField,
+    delta: StructuralField,
+    finish_reason: StructuralField,
+    message_detail: Option<MessageStructure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct ChoicesStructure {
+    field: StructuralField,
+    is_array: bool,
+    bounded_length: Option<usize>,
+    length_capped: bool,
+    first_value_type: Option<StructuralJsonType>,
+    first: Option<ChoiceStructure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct ResponseStructure {
+    top_level_type: StructuralJsonType,
+    id: StructuralField,
+    object: StructuralField,
+    created: StructuralField,
+    model: StructuralField,
+    choices: ChoicesStructure,
+    usage: StructuralField,
+    code: StructuralField,
+    message: StructuralField,
+    data: StructuralField,
+    error: StructuralField,
+}
+
+fn describe_response_structure(value: &Value) -> ResponseStructure {
+    let top_level_type = structural_json_type(value);
+    let Some(root) = value.as_object() else {
+        return ResponseStructure {
+            top_level_type,
+            ..ResponseStructure::default()
+        };
+    };
+
+    let choices_value = root.get("choices");
+    let choices_array = choices_value.and_then(Value::as_array);
+    let choices = ChoicesStructure {
+        field: StructuralField::from_object(Some(root), "choices"),
+        is_array: choices_array.is_some(),
+        bounded_length: choices_array.map(|choices| choices.len().min(MAX_STRUCTURAL_LIST_ITEMS)),
+        length_capped: choices_array
+            .is_some_and(|choices| choices.len() > MAX_STRUCTURAL_LIST_ITEMS),
+        first_value_type: choices_array
+            .and_then(|choices| choices.first())
+            .map(structural_json_type),
+        first: choices_array
+            .and_then(|choices| choices.first())
+            .and_then(Value::as_object)
+            .map(|choice| {
+                let message_detail =
+                    choice
+                        .get("message")
+                        .and_then(Value::as_object)
+                        .map(|message| MessageStructure {
+                            role: StructuralField::from_object(Some(message), "role"),
+                            content: StructuralField::from_object(Some(message), "content"),
+                            reasoning_content: StructuralField::from_object(
+                                Some(message),
+                                "reasoning_content",
+                            ),
+                            reasoning: StructuralField::from_object(Some(message), "reasoning"),
+                            tool_calls: StructuralField::from_object(Some(message), "tool_calls"),
+                            content_detail: message.get("content").map(content_structure),
+                        });
+                ChoiceStructure {
+                    index: StructuralField::from_object(Some(choice), "index"),
+                    message: StructuralField::from_object(Some(choice), "message"),
+                    delta: StructuralField::from_object(Some(choice), "delta"),
+                    finish_reason: StructuralField::from_object(Some(choice), "finish_reason"),
+                    message_detail,
+                }
+            }),
+    };
+
+    ResponseStructure {
+        top_level_type,
+        id: StructuralField::from_object(Some(root), "id"),
+        object: StructuralField::from_object(Some(root), "object"),
+        created: StructuralField::from_object(Some(root), "created"),
+        model: StructuralField::from_object(Some(root), "model"),
+        choices,
+        usage: StructuralField::from_object(Some(root), "usage"),
+        code: StructuralField::from_object(Some(root), "code"),
+        message: StructuralField::from_object(Some(root), "message"),
+        data: StructuralField::from_object(Some(root), "data"),
+        error: StructuralField::from_object(Some(root), "error"),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct SseChunkStructure {
+    id: StructuralField,
+    object: StructuralField,
+    created: StructuralField,
+    model: StructuralField,
+    choices: StructuralField,
+    first_choice_index: StructuralField,
+    first_choice_delta: StructuralField,
+    first_choice_finish_reason: StructuralField,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct SseStructure {
+    event_names: Vec<String>,
+    chunk_count: usize,
+    data_done: bool,
+    first_chunk: Option<SseChunkStructure>,
+}
+
+fn safe_structural_text(value: &str, credential: Option<&str>) -> String {
+    if credential.is_some_and(|credential| !credential.is_empty() && value.contains(credential)) {
+        return "[redacted]".to_string();
+    }
+    value
+        .chars()
+        .take(MAX_STRUCTURAL_TEXT_CHARS)
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+fn describe_sse_chunk(value: &Value) -> Option<SseChunkStructure> {
+    let root = value.as_object()?;
+    let choices = root.get("choices").and_then(Value::as_array);
+    let first = choices
+        .and_then(|choices| choices.first())
+        .and_then(Value::as_object);
+    Some(SseChunkStructure {
+        id: StructuralField::from_object(Some(root), "id"),
+        object: StructuralField::from_object(Some(root), "object"),
+        created: StructuralField::from_object(Some(root), "created"),
+        model: StructuralField::from_object(Some(root), "model"),
+        choices: StructuralField::from_object(Some(root), "choices"),
+        first_choice_index: StructuralField::from_object(first, "index"),
+        first_choice_delta: StructuralField::from_object(first, "delta"),
+        first_choice_finish_reason: StructuralField::from_object(first, "finish_reason"),
+    })
+}
+
+fn describe_sse_response(body: &[u8], credential: Option<&str>) -> SseStructure {
+    let mut structure = SseStructure::default();
+    let text = String::from_utf8_lossy(body);
+    for line in text.lines() {
+        if let Some(event_name) = line.strip_prefix("event:") {
+            if structure.event_names.len() < MAX_STRUCTURAL_LIST_ITEMS {
+                structure
+                    .event_names
+                    .push(safe_structural_text(event_name.trim(), credential));
+            }
+            continue;
+        }
+        let Some(data) = line.strip_prefix("data:").map(str::trim) else {
+            continue;
+        };
+        if data == "[DONE]" {
+            structure.data_done = true;
+            continue;
+        }
+        structure.chunk_count = structure.chunk_count.saturating_add(1);
+        if structure.first_chunk.is_none() {
+            if let Ok(value) = serde_json::from_str::<Value>(data) {
+                structure.first_chunk = describe_sse_chunk(&value);
+            }
+        }
+    }
+    structure
+}
+
+fn classify_chat_response_structure(
+    value: &Value,
+    requested_model: &str,
+    model_identity_policy: ProviderModelIdentityPolicy,
+) -> &'static str {
+    let Some(root) = value.as_object() else {
+        return "top-level JSON is not an object";
+    };
+    if !root.get("id").is_some_and(Value::is_string) {
+        return "id missing or not a string";
+    }
+    let Some(returned_model) = root.get("model").and_then(Value::as_str) else {
+        return "model missing or not a string";
+    };
+    if !model_identity_policy.matches(requested_model, returned_model) {
+        return "response model differs from requested model";
+    }
+    let Some(choices) = root.get("choices").and_then(Value::as_array) else {
+        return "choices missing or not an array";
+    };
+    if choices.len() != 1 {
+        return "choices length is not exactly one";
+    }
+    let Some(choice) = choices[0].as_object() else {
+        return "choices[0] is not an object";
+    };
+    let Some(index) = choice.get("index").and_then(Value::as_u64) else {
+        return "choices[0].index missing or not an unsigned integer";
+    };
+    if index > u32::MAX as u64 {
+        return "choices[0].index exceeds u32";
+    }
+    let Some(message) = choice.get("message").and_then(Value::as_object) else {
+        return "choices[0].message missing or not an object";
+    };
+    let Some(role) = message.get("role").and_then(Value::as_str) else {
+        return "choices[0].message.role missing or not a string";
+    };
+    if role != "assistant" {
+        return "choices[0].message.role is not assistant";
+    }
+    if let Some(content) = message.get("content") {
+        if !content.is_string() && !content.is_null() {
+            return "choices[0].message.content has an unexpected type";
+        }
+        if content.is_null()
+            && ["reasoning_content", "reasoning"]
+                .iter()
+                .any(|field| message.get(*field).is_some_and(|value| !value.is_null()))
+        {
+            return "choices[0].message.content is null with a reasoning output field present";
+        }
+    }
+    if let Some(tool_calls) = message.get("tool_calls") {
+        let Some(tool_calls) = tool_calls.as_array() else {
+            return "choices[0].message.tool_calls has an unexpected type";
+        };
+        if !tool_calls.is_empty() {
+            return "choices[0].message.tool_calls returned";
+        }
+    }
+    if let Some(usage) = root.get("usage").filter(|usage| !usage.is_null()) {
+        let Some(usage) = usage.as_object() else {
+            return "usage is not an object";
+        };
+        for field in ["prompt_tokens", "completion_tokens", "total_tokens"] {
+            if !usage.get(field).and_then(Value::as_u64).is_some() {
+                return "usage token field missing or not an unsigned integer";
+            }
+        }
+    }
+
+    let response = match serde_json::from_value::<super::ChatCompletionsResponse>(value.clone()) {
+        Ok(response) => response,
+        Err(_) => return "other exact Chat Completion structural mismatch",
+    };
+    match super::map_chat_response_to_responses(response) {
+        Ok(_) => "accepted",
+        Err(VitaAgentError::UnsupportedProviderCapability { .. }) => {
+            "choices[0].message.tool_calls returned"
+        }
+        Err(VitaAgentError::GatewayProtocol(message)) if message.contains("exactly one choice") => {
+            "choices length is not exactly one"
+        }
+        Err(VitaAgentError::GatewayProtocol(message))
+            if message.contains("role must be assistant") =>
+        {
+            "choices[0].message.role is not assistant"
+        }
+        Err(_) => "other exact Chat Completion structural mismatch",
+    }
+}
+
+#[derive(Debug)]
+struct StructuralDiagnosticEvidence {
+    provider_status: u16,
+    provider_attempt_count: usize,
+    content_type: Option<String>,
+    requested_model: String,
+    returned_model: Option<String>,
+    body_is_json: bool,
+    response_structure: ResponseStructure,
+    parser_failure: &'static str,
+    sse_structure: Option<SseStructure>,
+}
+
+fn inspect_structural_response(
+    body: &[u8],
+    content_type: Option<String>,
+    requested_model: &str,
+    credential: Option<&str>,
+) -> StructuralDiagnosticEvidence {
+    let is_sse = content_type.as_deref().is_some_and(|content_type| {
+        content_type
+            .split(';')
+            .next()
+            .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/event-stream"))
+    });
+    if is_sse {
+        return StructuralDiagnosticEvidence {
+            provider_status: 0,
+            provider_attempt_count: 0,
+            content_type,
+            requested_model: safe_structural_text(requested_model, credential),
+            returned_model: None,
+            body_is_json: false,
+            response_structure: ResponseStructure::default(),
+            parser_failure: "provider returned text/event-stream for the non-stream probe",
+            sse_structure: Some(describe_sse_response(body, credential)),
+        };
+    }
+
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return StructuralDiagnosticEvidence {
+            provider_status: 0,
+            provider_attempt_count: 0,
+            content_type,
+            requested_model: safe_structural_text(requested_model, credential),
+            returned_model: None,
+            body_is_json: false,
+            response_structure: ResponseStructure::default(),
+            parser_failure: "response body is not valid JSON",
+            sse_structure: None,
+        };
+    };
+    let response_structure = describe_response_structure(&value);
+    let returned_model = value
+        .as_object()
+        .and_then(|root| root.get("model"))
+        .and_then(Value::as_str)
+        .map(|model| safe_structural_text(model, credential));
+    let parser_failure = classify_chat_response_structure(
+        &value,
+        requested_model,
+        ProviderModelIdentityPolicy::Exact,
+    );
+    StructuralDiagnosticEvidence {
+        provider_status: 0,
+        provider_attempt_count: 0,
+        content_type,
+        requested_model: safe_structural_text(requested_model, credential),
+        returned_model,
+        body_is_json: true,
+        response_structure,
+        parser_failure,
+        sse_structure: None,
+    }
+}
+
+fn model_identity_policy_for_provider(provider_id: &str) -> ProviderModelIdentityPolicy {
+    if provider_id.eq_ignore_ascii_case("bigmodel") {
+        ProviderModelIdentityPolicy::ProviderNormalized
+    } else {
+        ProviderModelIdentityPolicy::Exact
+    }
+}
+
+fn instruction_role_policy_for_provider(provider_id: &str) -> ProviderInstructionRolePolicy {
+    if provider_id.eq_ignore_ascii_case("bigmodel") {
+        ProviderInstructionRolePolicy::DeveloperAsSystem
+    } else {
+        ProviderInstructionRolePolicy::NativeDeveloper
+    }
+}
+
+fn safe_provider_error_summary(error: &VitaAgentError) -> String {
+    match error {
+        VitaAgentError::ProviderHttpStatus { status, detail } => {
+            let detail = detail.as_ref();
+            format!(
+                "HTTP_{} code={} type={} param={} message={}",
+                status,
+                detail.and_then(ProviderErrorDetail::code).unwrap_or("none"),
+                detail.and_then(ProviderErrorDetail::kind).unwrap_or("none"),
+                detail
+                    .and_then(ProviderErrorDetail::param)
+                    .unwrap_or("none"),
+                detail
+                    .and_then(ProviderErrorDetail::message)
+                    .unwrap_or("none"),
+            )
+        }
+        _ => classify_provider_failure(error).to_string(),
+    }
+}
+
+fn run_structural_diagnostic(inputs: &G2Inputs) -> Result<StructuralDiagnosticEvidence, String> {
+    let provider = ProviderProfile::new(
+        inputs.provider_id.clone(),
+        format!("D29-G2-R2 structure {}", inputs.provider_id),
+        ProviderProtocol::OpenAiChatCompletions,
+        &inputs.base_url,
+        inputs.model.clone(),
+        Some(inputs.credential_ref.clone()),
+        D29G2_PROVIDER_TIMEOUT,
+        ProviderRetryPolicy::default(),
+        ProviderCapabilities::none(),
+    )
+    .map_err(|_| "structural diagnostic provider profile validation failed".to_string())?;
+    let endpoint = provider.endpoint.clone();
+    let request = VitaResponsesRequest::new(
+        inputs.model.clone(),
+        vec![VitaMessage::text(VitaMessageRole::User, D29G2_PROBE_PROMPT)],
+        VitaResponsesRequestOptions::default(),
+    );
+    let mapped = super::map_responses_request_to_chat(&request, &provider)
+        .map_err(|_| "structural diagnostic request mapping failed".to_string())?;
+    let body = serde_json::to_vec(&mapped)
+        .map_err(|_| "structural diagnostic request serialization failed".to_string())?;
+    let (transport, observation) = super::production_transport::new_for_d29g2()
+        .map_err(|_| "structural diagnostic production transport creation failed".to_string())?;
+    let credential = G2CredentialResolver {
+        reference: inputs.credential_ref.clone(),
+        credential: ResolvedCredential::new(inputs.credential.as_str()),
+    }
+    .resolve(&inputs.credential_ref)
+    .map_err(|_| "structural diagnostic credential binding failed".to_string())?;
+    let response = transport.post_json(
+        &endpoint,
+        Some(&credential),
+        &body,
+        provider.timeout(),
+        provider.retry_policy(),
+    );
+    let provider_status = observation.last_status.load(Ordering::Acquire);
+    let provider_attempt_count = observation.attempt_count.load(Ordering::Acquire);
+    let content_type = observation.content_type();
+    let response_body = response.map_err(|error| {
+        format!(
+            "structural diagnostic provider request failed: {}",
+            safe_provider_error_summary(&error)
+        )
+    })?;
+    let mut evidence = inspect_structural_response(
+        &response_body,
+        content_type,
+        &inputs.model,
+        Some(inputs.credential.as_str()),
+    );
+    evidence.provider_status = provider_status;
+    evidence.provider_attempt_count = provider_attempt_count;
+    Ok(evidence)
+}
+
+fn print_structural_diagnostic_report(evidence: &StructuralDiagnosticEvidence) {
+    println!(
+        "D29-G2-R2 STRUCTURAL_DIAGNOSTIC status={} provider_requests={} content_type={} body_is_json={} requested_model={} returned_model={} exact_parser_failure={} response_structure={:?} sse_structure={:?} raw_response_logged=NO",
+        evidence.provider_status,
+        evidence.provider_attempt_count,
+        evidence.content_type.as_deref().unwrap_or("none"),
+        evidence.body_is_json,
+        evidence.requested_model,
+        evidence.returned_model.as_deref().unwrap_or("none"),
+        evidence.parser_failure,
+        evidence.response_structure,
+        evidence.sse_structure,
+    );
+}
+
 async fn start_runtime(
     inputs: G2Inputs,
 ) -> Result<(G2Runtime, ProductionTransportObservationHandle, G2Canary), String> {
@@ -1312,6 +1988,8 @@ async fn start_runtime(
         workspace.path().to_path_buf(),
     )
     .map_err(|_| "create Vita runtime profile failed".to_string())?;
+    let model_identity_policy = model_identity_policy_for_provider(&inputs.provider_id);
+    let instruction_role_policy = instruction_role_policy_for_provider(&inputs.provider_id);
 
     let provider = ProviderProfile::new(
         inputs.provider_id.clone(),
@@ -1323,15 +2001,20 @@ async fn start_runtime(
         D29G2_PROVIDER_TIMEOUT,
         ProviderRetryPolicy::default(),
         // The first smoke is deliberately text-only and non-streaming
-        // downstream.  The pinned Codex request uses a developer role; the
-        // certified adapter preserves that role exactly.  No other optional
-        // capability is enabled, so tools/reasoning controls still fail closed.
+        // downstream.  BigModel's role matrix proved that its Coding Plan
+        // endpoint rejects native developer but accepts system; the selected
+        // profile policy preserves the instruction boundary without merging
+        // messages.  No other optional capability is enabled, so
+        // tools/reasoning controls still fail closed.
         ProviderCapabilities {
-            developer_role: true,
+            developer_role: instruction_role_policy
+                == ProviderInstructionRolePolicy::NativeDeveloper,
             ..ProviderCapabilities::none()
         },
     )
-    .map_err(|_| "explicit G2 provider profile validation failed".to_string())?;
+    .map_err(|_| "explicit G2 provider profile validation failed".to_string())?
+    .with_model_identity_policy(model_identity_policy)
+    .with_instruction_role_policy(instruction_role_policy);
     let authority = super::VitaProviderAuthority::configure(provider)
         .map_err(|_| "configure explicit G2 provider failed".to_string())?;
     if authority.state() != VitaProviderState::ConfiguredValidated {
@@ -1475,6 +2158,8 @@ struct SmokeEvidence {
     cleanup: CleanupEvidence,
     elapsed: Duration,
     canary_unchanged: bool,
+    model_identity_policy: ProviderModelIdentityPolicy,
+    instruction_role_policy: ProviderInstructionRolePolicy,
 }
 
 async fn run_smoke() -> Result<SmokeEvidence, String> {
@@ -1483,6 +2168,8 @@ async fn run_smoke() -> Result<SmokeEvidence, String> {
     let provider_id = inputs.provider_id.clone();
     let base_url = inputs.base_url.clone();
     let model = inputs.model.clone();
+    let model_identity_policy = model_identity_policy_for_provider(&provider_id);
+    let instruction_role_policy = instruction_role_policy_for_provider(&provider_id);
     let provider_host = url::Url::parse(&base_url)
         .ok()
         .and_then(|url| url.host_str().map(str::to_string))
@@ -1524,6 +2211,8 @@ async fn run_smoke() -> Result<SmokeEvidence, String> {
         cleanup: shutdown.cleanup,
         elapsed: started.elapsed(),
         canary_unchanged: true,
+        model_identity_policy,
+        instruction_role_policy,
     })
 }
 
@@ -1581,10 +2270,12 @@ fn assert_smoke_success(evidence: &SmokeEvidence) -> Result<(), String> {
 fn print_success_report(evidence: &SmokeEvidence) {
     let usage = evidence.gateway.provider_usage.as_ref();
     println!(
-        "D29-G2 PASS provider={} endpoint={} model={} protocol=openai-chat-completions provider_host={} provider_http_status={} provider_requests={} codex_to_vita_requests={} vita_to_provider_requests={} developer_role_present={} terminal_output={} finish_reason={} usage_input_tokens={} usage_output_tokens={} usage_total_tokens={} elapsed_ms={} redirect_followed=NO proxy_used=NO raw_credential_persisted=NO raw_credential_logged=NO openai_account_dependency=NONE codex_login_dependency=NONE user_codex=UNTOUCHED thread_manager_final_count={} listener=CLOSED/JOINED codex_upstream_source_modifications=0 reasoning={} stream_options={} text={} external_hosts=provider_only",
+        "D29-G2 PASS provider={} endpoint={} model={} model_identity_policy={} instruction_role_policy={} protocol=openai-chat-completions provider_host={} provider_http_status={} provider_requests={} codex_to_vita_requests={} vita_to_provider_requests={} developer_role_present={} terminal_output={} finish_reason={} usage_input_tokens={} usage_output_tokens={} usage_total_tokens={} elapsed_ms={} redirect_followed=NO proxy_used=NO raw_credential_persisted=NO raw_credential_logged=NO openai_account_dependency=NONE codex_login_dependency=NONE user_codex=UNTOUCHED thread_manager_final_count={} listener=CLOSED/JOINED codex_upstream_source_modifications=0 reasoning={} stream_options={} text={} external_hosts=provider_only",
         evidence.provider_id,
         evidence.base_url,
         evidence.model,
+        evidence.model_identity_policy,
+        evidence.instruction_role_policy,
         evidence.provider_host,
         evidence.provider_status,
         evidence.provider_attempt_count,
@@ -1679,4 +2370,160 @@ fn d29g2_r1_minimal_provider_probe() {
         .expect("D29-G2-R1 probe thread should start")
         .join()
         .expect("D29-G2-R1 probe thread should finish");
+}
+
+#[test]
+#[ignore = "requires explicit user-authorized VITA_D29G2_* inputs and one real provider request"]
+fn d29g2_r2_structural_diagnostic() {
+    thread::Builder::new()
+        .name("d29g2-r2-structural-diagnostic".to_string())
+        .stack_size(D29G2_TEST_STACK_SIZE)
+        .spawn(|| {
+            let inputs = load_inputs().unwrap_or_else(|error| panic!("D29-G2-R2 BLOCKED: {error}"));
+            let evidence = run_structural_diagnostic(&inputs)
+                .unwrap_or_else(|error| panic!("D29-G2-R2 BLOCKED: {error}"));
+            print_structural_diagnostic_report(&evidence);
+            assert_eq!(
+                evidence.provider_attempt_count, 1,
+                "D29-G2-R2 structural diagnostic must issue exactly one provider request"
+            );
+            assert_eq!(
+                evidence.provider_status, 200,
+                "D29-G2-R2 structural diagnostic expected HTTP 200"
+            );
+        })
+        .expect("D29-G2-R2 diagnostic thread should start")
+        .join()
+        .expect("D29-G2-R2 diagnostic thread should finish");
+}
+
+#[test]
+#[ignore = "requires explicit user-authorized VITA_D29G2_* inputs and two real provider requests"]
+fn d29g2_r2_role_matrix() {
+    thread::Builder::new()
+        .name("d29g2-r2-role-matrix".to_string())
+        .stack_size(D29G2_TEST_STACK_SIZE)
+        .spawn(|| {
+            let inputs = load_inputs().unwrap_or_else(|error| panic!("D29-G2-R2 BLOCKED: {error}"));
+            let evidence = run_role_matrix(&inputs)
+                .unwrap_or_else(|error| panic!("D29-G2-R2 BLOCKED: {error}"));
+            print_role_matrix_report(&evidence);
+            assert_eq!(
+                evidence.len(),
+                2,
+                "D29-G2-R2 role matrix must issue exactly two provider requests"
+            );
+            for result in &evidence {
+                assert_eq!(
+                    result.provider_attempt_count, 1,
+                    "D29-G2-R2 role matrix request must not retry"
+                );
+            }
+            assert_eq!(evidence[0].label, "system+user");
+            assert_eq!(evidence[0].provider_status, 200);
+            assert_eq!(evidence[1].label, "developer+user");
+            assert_eq!(evidence[1].provider_status, 400);
+            assert_eq!(
+                evidence[1]
+                    .error_detail
+                    .as_ref()
+                    .and_then(ProviderErrorDetail::code),
+                Some("1214")
+            );
+        })
+        .expect("D29-G2-R2 role matrix thread should start")
+        .join()
+        .expect("D29-G2-R2 role matrix thread should finish");
+}
+
+#[test]
+fn observed_bigmodel_response_requires_explicit_model_normalization_policy() {
+    let response = json!({
+        "id": "chatcmpl-case-normalized",
+        "object": "chat.completion",
+        "created": 1,
+        "model": "glm-5.3-flash",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "bounded fixture output"
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": {
+            "prompt_tokens": 1,
+            "completion_tokens": 1,
+            "total_tokens": 2
+        }
+    });
+
+    assert_eq!(
+        classify_chat_response_structure(
+            &response,
+            "GLM-5.3-Flash",
+            ProviderModelIdentityPolicy::Exact,
+        ),
+        "response model differs from requested model"
+    );
+    assert_eq!(
+        classify_chat_response_structure(
+            &response,
+            "GLM-5.3-Flash",
+            ProviderModelIdentityPolicy::ProviderNormalized,
+        ),
+        "accepted"
+    );
+    assert!(!ProviderModelIdentityPolicy::ProviderNormalized
+        .matches("GLM-5.3-Flash", "glm-5.3-flash-1m"));
+
+    let structure = describe_response_structure(&response);
+    assert_eq!(structure.top_level_type, StructuralJsonType::Object);
+    assert_eq!(structure.choices.bounded_length, Some(1));
+    assert_eq!(
+        structure
+            .choices
+            .first
+            .as_ref()
+            .and_then(|choice| choice.message_detail.as_ref())
+            .and_then(|message| message.content_detail.as_ref()),
+        Some(&ContentStructure::String {
+            bounded_length: "bounded fixture output".chars().count(),
+            capped: false,
+        })
+    );
+}
+
+#[test]
+fn provider_model_identity_policy_defaults_to_exact_and_is_profile_selected() {
+    let profile = ProviderProfile::new(
+        "bigmodel",
+        "BigModel Coding Plan",
+        ProviderProtocol::OpenAiChatCompletions,
+        "https://open.bigmodel.cn/api/coding/paas/v4",
+        "GLM-5.3-Flash",
+        None,
+        D29G2_PROVIDER_TIMEOUT,
+        ProviderRetryPolicy::default(),
+        ProviderCapabilities::none(),
+    )
+    .expect("BigModel fixture profile");
+    assert_eq!(
+        profile.model_identity_policy(),
+        ProviderModelIdentityPolicy::Exact
+    );
+    let normalized =
+        profile.with_model_identity_policy(ProviderModelIdentityPolicy::ProviderNormalized);
+    assert_eq!(
+        normalized.model_identity_policy(),
+        ProviderModelIdentityPolicy::ProviderNormalized
+    );
+    assert_eq!(
+        model_identity_policy_for_provider("bigmodel"),
+        ProviderModelIdentityPolicy::ProviderNormalized
+    );
+    assert_eq!(
+        model_identity_policy_for_provider("commandcode"),
+        ProviderModelIdentityPolicy::Exact
+    );
 }

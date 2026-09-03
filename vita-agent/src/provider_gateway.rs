@@ -127,6 +127,65 @@ impl ProviderCapabilities {
     }
 }
 
+/// The explicit policy used when a provider echoes the requested model name
+/// in a response.
+///
+/// `ProviderNormalized` is intentionally narrow: it permits ASCII
+/// case-normalization only.  It does not accept aliases, version changes, or
+/// an arbitrary model name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProviderModelIdentityPolicy {
+    Exact,
+    ProviderNormalized,
+}
+
+impl Default for ProviderModelIdentityPolicy {
+    fn default() -> Self {
+        Self::Exact
+    }
+}
+
+impl Display for ProviderModelIdentityPolicy {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Exact => "exact",
+            Self::ProviderNormalized => "provider-normalized-ascii-case",
+        })
+    }
+}
+
+impl ProviderModelIdentityPolicy {
+    fn matches(self, requested: &str, returned: &str) -> bool {
+        match self {
+            Self::Exact => requested == returned,
+            Self::ProviderNormalized => requested.eq_ignore_ascii_case(returned),
+        }
+    }
+}
+
+/// The explicit policy used when a provider does not accept the native
+/// `developer` instruction role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProviderInstructionRolePolicy {
+    NativeDeveloper,
+    DeveloperAsSystem,
+}
+
+impl Default for ProviderInstructionRolePolicy {
+    fn default() -> Self {
+        Self::NativeDeveloper
+    }
+}
+
+impl Display for ProviderInstructionRolePolicy {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::NativeDeveloper => "native-developer",
+            Self::DeveloperAsSystem => "developer-as-system",
+        })
+    }
+}
+
 /// Bounded retry configuration for future-safe transport retries.  D29-G1-R1
 /// permits it only for a connection failure before an HTTP request is
 /// established; model-generation HTTP status responses are never replayed.
@@ -231,6 +290,8 @@ pub struct ProviderProfile {
     timeout: Duration,
     retry_policy: ProviderRetryPolicy,
     capabilities: ProviderCapabilities,
+    model_identity_policy: ProviderModelIdentityPolicy,
+    instruction_role_policy: ProviderInstructionRolePolicy,
 }
 
 impl ProviderProfile {
@@ -311,6 +372,8 @@ impl ProviderProfile {
             timeout,
             retry_policy,
             capabilities,
+            model_identity_policy: ProviderModelIdentityPolicy::default(),
+            instruction_role_policy: ProviderInstructionRolePolicy::default(),
         };
         profile.validate()?;
         Ok(profile)
@@ -400,6 +463,28 @@ impl ProviderProfile {
 
     pub fn capabilities(&self) -> ProviderCapabilities {
         self.capabilities
+    }
+
+    /// Selects an explicit response-model identity policy for this profile.
+    /// The default remains [`ProviderModelIdentityPolicy::Exact`].
+    pub fn with_model_identity_policy(mut self, policy: ProviderModelIdentityPolicy) -> Self {
+        self.model_identity_policy = policy;
+        self
+    }
+
+    pub fn model_identity_policy(&self) -> ProviderModelIdentityPolicy {
+        self.model_identity_policy
+    }
+
+    /// Selects an explicit instruction-role compatibility policy for this
+    /// profile.  The default preserves the native `developer` role.
+    pub fn with_instruction_role_policy(mut self, policy: ProviderInstructionRolePolicy) -> Self {
+        self.instruction_role_policy = policy;
+        self
+    }
+
+    pub fn instruction_role_policy(&self) -> ProviderInstructionRolePolicy {
+        self.instruction_role_policy
     }
 }
 
@@ -1018,7 +1103,12 @@ where
                     "provider returned invalid chat completion JSON".to_string(),
                 )
             })?;
-        if response.model != self.ready.profile.model {
+        if !self
+            .ready
+            .profile
+            .model_identity_policy
+            .matches(&self.ready.profile.model, &response.model)
+        {
             return Err(VitaAgentError::GatewayProtocol(
                 "provider response model must match the validated Digital Life provider profile"
                     .to_string(),
@@ -1037,9 +1127,12 @@ pub(crate) enum VitaMessageRole {
 }
 
 impl VitaMessageRole {
-    fn as_chat_role(self) -> &'static str {
+    fn as_chat_role(self, policy: ProviderInstructionRolePolicy) -> &'static str {
         match self {
             Self::System => "system",
+            Self::Developer if policy == ProviderInstructionRolePolicy::DeveloperAsSystem => {
+                "system"
+            }
             Self::Developer => "developer",
             Self::User => "user",
             Self::Assistant => "assistant",
@@ -1161,7 +1254,9 @@ fn map_responses_request_to_chat(
         .messages
         .iter()
         .any(|message| message.role == VitaMessageRole::Developer);
-    if has_developer_message {
+    if has_developer_message
+        && profile.instruction_role_policy == ProviderInstructionRolePolicy::NativeDeveloper
+    {
         require_capability(profile.capabilities, ProviderCapability::DeveloperRole)?;
         require_gateway_capability(ProviderCapability::DeveloperRole)?;
     }
@@ -1182,7 +1277,10 @@ fn map_responses_request_to_chat(
         .messages
         .iter()
         .map(|message| ChatCompletionsMessage {
-            role: message.role.as_chat_role().to_string(),
+            role: message
+                .role
+                .as_chat_role(profile.instruction_role_policy)
+                .to_string(),
             content: message.content.clone(),
         })
         .collect();
@@ -1673,6 +1771,40 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&first).unwrap(),
             r#"{"model":"mock-model","messages":[{"role":"system","content":"system"},{"role":"developer","content":"developer"},{"role":"user","content":"user"},{"role":"assistant","content":"assistant"}],"stream":true}"#
+        );
+    }
+
+    #[test]
+    fn developer_as_system_policy_preserves_order_and_content_explicitly() {
+        let profile = profile(
+            "https://provider.example/v1",
+            None,
+            ProviderCapabilities::none(),
+        )
+        .with_instruction_role_policy(ProviderInstructionRolePolicy::DeveloperAsSystem);
+        let request = VitaResponsesRequest::new(
+            "mock-model",
+            vec![
+                VitaMessage::text(VitaMessageRole::System, "system"),
+                VitaMessage::text(VitaMessageRole::Developer, "developer"),
+                VitaMessage::text(VitaMessageRole::User, "user"),
+            ],
+            VitaResponsesRequestOptions::default(),
+        );
+
+        let mapped = map_responses_request_to_chat(&request, &profile)
+            .expect("explicit developer-as-system mapping");
+        assert_eq!(
+            mapped
+                .messages
+                .iter()
+                .map(|message| (message.role.as_str(), message.content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("system", "system"),
+                ("system", "developer"),
+                ("user", "user"),
+            ]
         );
     }
 

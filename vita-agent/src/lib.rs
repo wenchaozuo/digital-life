@@ -23,8 +23,9 @@ use toml::Value as TomlValue;
 mod provider_gateway;
 
 pub use provider_gateway::{
-    CredentialRef, ProviderCapabilities, ProviderCapability, ProviderProfile, ProviderProtocol,
-    ProviderRetryPolicy, VitaProviderState,
+    CredentialRef, ProviderCapabilities, ProviderCapability, ProviderInstructionRolePolicy,
+    ProviderModelIdentityPolicy, ProviderProfile, ProviderProtocol, ProviderRetryPolicy,
+    VitaProviderState,
 };
 
 pub const VITA_AGENT_RUNTIME_ID: &str = "vita-agent";

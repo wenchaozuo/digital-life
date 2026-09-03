@@ -327,6 +327,7 @@ impl fmt::Debug for OutboundRequest<'_> {
 struct ProviderHttpResponse {
     status: u16,
     header_bytes: usize,
+    content_type: Option<String>,
     body: Vec<u8>,
 }
 
@@ -385,6 +386,17 @@ struct ProductionProviderTransport<D = SystemDnsResolver, H = ReqwestHttpExecuto
 pub(super) struct ProductionTransportObservation {
     pub(super) attempt_count: std::sync::atomic::AtomicUsize,
     pub(super) last_status: std::sync::atomic::AtomicU16,
+    pub(super) last_content_type: Mutex<Option<String>>,
+}
+
+#[cfg(test)]
+impl ProductionTransportObservation {
+    pub(super) fn content_type(&self) -> Option<String> {
+        self.last_content_type
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
 }
 
 impl ProductionProviderTransport<SystemDnsResolver, ReqwestHttpExecutor> {
@@ -560,6 +572,11 @@ where
                 observer
                     .last_status
                     .store(response.status, Ordering::Relaxed);
+                *observer
+                    .last_content_type
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    response.content_type.clone();
             }
 
             if Instant::now() >= deadline {
@@ -652,6 +669,11 @@ impl HttpExecutor for ReqwestHttpExecutor {
             .map_err(map_reqwest_error)?;
         let status = response.status().as_u16();
         let header_bytes = response_header_bytes(response.headers());
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.chars().take(128).collect::<String>());
         if header_bytes > limits.max_response_header_bytes {
             return Err(HttpExecutionError::Fatal(
                 VitaAgentError::ProviderResponseTooLarge {
@@ -674,6 +696,7 @@ impl HttpExecutor for ReqwestHttpExecutor {
         Ok(ProviderHttpResponse {
             status,
             header_bytes,
+            content_type,
             body,
         })
     }
@@ -1177,6 +1200,7 @@ mod tests {
         Ok(ProviderHttpResponse {
             status,
             header_bytes,
+            content_type: Some("application/json".to_string()),
             body: body.to_vec(),
         })
     }

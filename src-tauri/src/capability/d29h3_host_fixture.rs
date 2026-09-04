@@ -47,6 +47,7 @@ enum HostRequest {
         life_id: String,
         task_id: String,
         capability_id: String,
+        allowed_workspace_root_identity: String,
     },
     EvaluateAndIssueScopeGrant {
         life_id: String,
@@ -98,6 +99,8 @@ struct CanonicalWire {
     production_registry_size: usize,
     test_registry_size: usize,
     authorization_row_reads: usize,
+    host_scope_authority_present: bool,
+    requested_root_matched_authorized_root: bool,
     life_id: String,
     capability_id: String,
     outcome: &'static str,
@@ -125,6 +128,49 @@ struct ScopedGrantWire {
     turn_id: String,
     issued_at_unix_ms: u64,
     expires_at_unix_ms: u64,
+}
+
+/// Trusted Host state established before any tool operation is evaluated.
+/// The operation request may claim a root identity, but it cannot create or
+/// replace this authority-owned scope.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HostOwnedWorkspaceScope {
+    life_id: String,
+    task_id: String,
+    capability_id: CapabilityId,
+    allowed_workspace_root_identity: String,
+}
+
+impl HostOwnedWorkspaceScope {
+    fn provision(
+        life_id: String,
+        task_id: String,
+        capability_id: CapabilityId,
+        allowed_workspace_root_identity: String,
+    ) -> Result<Self, String> {
+        if !valid_identity(&allowed_workspace_root_identity) {
+            return Err("D29-H3 Host trusted workspace scope was invalid".to_string());
+        }
+        Ok(Self {
+            life_id,
+            task_id,
+            capability_id,
+            allowed_workspace_root_identity,
+        })
+    }
+
+    fn matches_request(
+        &self,
+        life_id: &str,
+        task_id: &str,
+        capability_id: &str,
+        workspace_root_identity: &str,
+    ) -> bool {
+        self.life_id == life_id
+            && self.task_id == task_id
+            && self.capability_id.as_str() == capability_id
+            && self.allowed_workspace_root_identity == workspace_root_identity
+    }
 }
 
 struct FixtureRoot(PathBuf);
@@ -161,6 +207,7 @@ struct HostSession {
     life_id: String,
     task_id: String,
     capability_id: CapabilityId,
+    workspace_scope_authority: HostOwnedWorkspaceScope,
     grants: HashMap<String, ScopedGrantWire>,
     next_grant_id: u64,
 }
@@ -171,6 +218,7 @@ impl HostSession {
         life_id: String,
         task_id: String,
         capability_id: String,
+        allowed_workspace_root_identity: String,
     ) -> Result<(Self, HostResponse), String> {
         if protocol_version != PROTOCOL_VERSION
             || !valid_identity(&life_id)
@@ -181,6 +229,12 @@ impl HostSession {
         }
         let capability_id = CapabilityId::try_from(capability_id)
             .map_err(|_| "D29-H3 Host capability ID was invalid".to_string())?;
+        let workspace_scope_authority = HostOwnedWorkspaceScope::provision(
+            life_id.clone(),
+            task_id.clone(),
+            capability_id.clone(),
+            allowed_workspace_root_identity,
+        )?;
         let root = FixtureRoot::create()?;
         let storage = Arc::new(
             StorageService::initialize_with_roots(root.path().to_path_buf(), None)
@@ -257,6 +311,7 @@ impl HostSession {
             life_id,
             task_id,
             capability_id,
+            workspace_scope_authority,
             grants: HashMap::new(),
             next_grant_id: 0,
         };
@@ -352,13 +407,24 @@ impl HostSession {
             &target_identity,
             &target_kind,
         )?;
+        let requested_root_matched_authorized_root = self
+            .workspace_scope_authority
+            .matches_request(&life_id, &task_id, &capability_id, &workspace_root_identity);
         let canonical = self.canonical_decision(&life_id, &capability_id)?;
         if canonical.decision.outcome() != CapabilityAuthorizationDecisionKind::ScopeRequired {
-            return Ok(canonical.response("evaluate_and_issue_scope_grant", None, "denied"));
+            return Ok(canonical.response(
+                "evaluate_and_issue_scope_grant",
+                None,
+                "denied",
+                requested_root_matched_authorized_root,
+            ));
         }
         self.ensure_scope_floor(&canonical.decision)?;
+        if !requested_root_matched_authorized_root {
+            return Ok(canonical.response("evaluate_and_issue_scope_grant", None, "denied", false));
+        }
         if self.grants.len() >= MAX_GRANTS {
-            return Ok(canonical.response("evaluate_and_issue_scope_grant", None, "denied"));
+            return Ok(canonical.response("evaluate_and_issue_scope_grant", None, "denied", true));
         }
         self.next_grant_id = self.next_grant_id.saturating_add(1);
         let issued_at_unix_ms = unix_millis();
@@ -384,7 +450,7 @@ impl HostSession {
         };
         self.grants
             .insert(evidence.grant_id.clone(), evidence.clone());
-        Ok(canonical.response("evaluate_and_issue_scope_grant", Some(evidence), "ok"))
+        Ok(canonical.response("evaluate_and_issue_scope_grant", Some(evidence), "ok", true))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -418,13 +484,24 @@ impl HostSession {
         if !valid_identity(&grant_id) || authorization_revision < 1 {
             return Err("D29-H3 Host revalidation binding was invalid".to_string());
         }
+        let requested_root_matched_authorized_root = self
+            .workspace_scope_authority
+            .matches_request(&life_id, &task_id, &capability_id, &workspace_root_identity);
         let canonical = self.canonical_decision(&life_id, &capability_id)?;
         if canonical.decision.outcome() != CapabilityAuthorizationDecisionKind::ScopeRequired {
-            return Ok(canonical.response("revalidate_grant", None, "denied"));
+            return Ok(canonical.response(
+                "revalidate_grant",
+                None,
+                "denied",
+                requested_root_matched_authorized_root,
+            ));
         }
         self.ensure_scope_floor(&canonical.decision)?;
+        if !requested_root_matched_authorized_root {
+            return Ok(canonical.response("revalidate_grant", None, "denied", false));
+        }
         let Some(evidence) = self.grants.get(&grant_id) else {
-            return Ok(canonical.response("revalidate_grant", None, "denied"));
+            return Ok(canonical.response("revalidate_grant", None, "denied", true));
         };
         let matches = evidence.life_id == life_id
             && evidence.task_id == task_id
@@ -440,9 +517,9 @@ impl HostSession {
             && evidence.turn_id == turn_id
             && evidence.expires_at_unix_ms > unix_millis();
         if !matches {
-            return Ok(canonical.response("revalidate_grant", None, "denied"));
+            return Ok(canonical.response("revalidate_grant", None, "denied", true));
         }
-        Ok(canonical.response("revalidate_grant", Some(evidence.clone()), "ok"))
+        Ok(canonical.response("revalidate_grant", Some(evidence.clone()), "ok", true))
     }
 
     fn disable_authorization(
@@ -565,6 +642,7 @@ impl CanonicalEvaluation {
         operation: &'static str,
         scope_grant: Option<ScopedGrantWire>,
         status: &'static str,
+        requested_root_matched_authorized_root: bool,
     ) -> HostResponse {
         HostResponse {
             operation,
@@ -574,6 +652,8 @@ impl CanonicalEvaluation {
                 production_registry_size: self.production_registry_size,
                 test_registry_size: self.test_registry_size,
                 authorization_row_reads: self.row_reads,
+                host_scope_authority_present: true,
+                requested_root_matched_authorized_root,
                 life_id: self.decision.life_id().to_string(),
                 capability_id: self.decision.capability_id().as_str().to_string(),
                 outcome: decision_outcome_name(self.decision.outcome()),
@@ -712,12 +792,18 @@ pub(crate) fn run_from_stdio() -> Result<(), String> {
         life_id,
         task_id,
         capability_id,
+        allowed_workspace_root_identity,
     } = first
     else {
         return Err("D29-H3 Host first operation was not initialize".to_string());
     };
-    let (mut session, response) =
-        HostSession::initialize(protocol_version, life_id, task_id, capability_id)?;
+    let (mut session, response) = HostSession::initialize(
+        protocol_version,
+        life_id,
+        task_id,
+        capability_id,
+        allowed_workspace_root_identity,
+    )?;
     write_frame(&mut writer, &response)?;
 
     loop {

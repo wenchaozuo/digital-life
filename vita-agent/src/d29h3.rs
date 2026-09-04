@@ -1795,6 +1795,7 @@ mod h3r1_tests {
             life_id: String,
             task_id: String,
             capability_id: String,
+            allowed_workspace_root_identity: String,
         },
         EvaluateAndIssueScopeGrant {
             life_id: String,
@@ -1848,6 +1849,8 @@ mod h3r1_tests {
         production_registry_size: usize,
         test_registry_size: usize,
         authorization_row_reads: usize,
+        host_scope_authority_present: bool,
+        requested_root_matched_authorized_root: bool,
         life_id: String,
         capability_id: String,
         outcome: String,
@@ -1888,7 +1891,10 @@ mod h3r1_tests {
     }
 
     impl PersistentHostProcess {
-        fn start(repo_root: &Path) -> Result<Arc<Self>, String> {
+        fn start(
+            repo_root: &Path,
+            allowed_workspace_root_identity: String,
+        ) -> Result<Arc<Self>, String> {
             let executable = host_fixture_executable(repo_root)?;
             let mut child = Command::new(executable)
                 .current_dir(repo_root)
@@ -1916,6 +1922,7 @@ mod h3r1_tests {
                     life_id: LIFE_ID.to_string(),
                     task_id: TASK_ID.to_string(),
                     capability_id: VITA_WORKSPACE_READ_CAPABILITY_ID.to_string(),
+                    allowed_workspace_root_identity,
                 })
                 .map_err(|error| {
                     process.abort();
@@ -2051,12 +2058,17 @@ mod h3r1_tests {
     }
 
     impl ProcessIsolatedH3Authority {
-        fn new() -> Result<Arc<Self>, String> {
+        fn new(
+            allowed_workspace_root_identity: super::super::WorkspaceRootIdentity,
+        ) -> Result<Arc<Self>, String> {
             let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .parent()
                 .ok_or_else(|| "D29-H3-R1 manifest has no repository parent".to_string())?
                 .to_path_buf();
-            let process = PersistentHostProcess::start(&repo_root)?;
+            let process = PersistentHostProcess::start(
+                &repo_root,
+                identity_wire(allowed_workspace_root_identity),
+            )?;
             Ok(Arc::new(Self {
                 process,
                 repo_root,
@@ -2131,6 +2143,20 @@ mod h3r1_tests {
         }
     }
 
+    struct RootMutatingAuthority {
+        host: Arc<ProcessIsolatedH3Authority>,
+        replacement_root: super::super::WorkspaceRootIdentity,
+    }
+
+    impl VitaH3AuthorityPort for RootMutatingAuthority {
+        fn evaluate(&self, mut request: H3AuthorityRequest) -> VitaH3AuthorityFuture {
+            if matches!(request.operation, H3AuthorityOperation::Revalidate { .. }) {
+                request.workspace_root_identity = self.replacement_root;
+            }
+            self.host.evaluate(request)
+        }
+    }
+
     fn wire_request(request: &H3AuthorityRequest) -> H3HostWireRequest {
         let common = (
             request.context.life_id().to_string(),
@@ -2202,6 +2228,7 @@ mod h3r1_tests {
             || canonical.production_registry_size != 0
             || canonical.test_registry_size != 1
             || canonical.authorization_row_reads != 1
+            || !canonical.host_scope_authority_present
             || canonical.life_id != request.context.life_id()
             || canonical.capability_id != request.capability_id
         {
@@ -2358,6 +2385,115 @@ mod h3r1_tests {
         }
     }
 
+    #[tokio::test]
+    async fn requester_root_cannot_self_authorize_against_host_owned_scope() {
+        let requester = Fixture::new(FILE_CONTENT.as_bytes());
+        let allowed = Fixture::new(FILE_CONTENT.as_bytes());
+        assert_ne!(requester.root.identity(), allowed.root.identity());
+        let authority = ProcessIsolatedH3Authority::new(allowed.root.identity())
+            .expect("persistent H3 Host authority");
+        let broker = requester.broker(Arc::clone(&authority) as Arc<dyn VitaH3AuthorityPort>);
+
+        let result = run(&broker, requester.request("call-root-self-authorize")).await;
+        assert_eq!(result.content, None);
+        assert_eq!(
+            result.classification,
+            Some(H3DenyClassification::ScopeUnavailable)
+        );
+        let snapshot = broker.snapshot();
+        assert_eq!(snapshot.grants_issued, 0);
+        assert_eq!(snapshot.execution_started, 0);
+        assert_eq!(snapshot.authorized_file_reads, 0);
+
+        let observations = authority.snapshot();
+        assert_eq!(observations.len(), 1);
+        let observation = &observations[0];
+        let canonical = observation.canonical.as_ref().expect("Host D28 result");
+        assert!(canonical.host_scope_authority_present);
+        assert!(!canonical.requested_root_matched_authorized_root);
+        assert_eq!(canonical.outcome, "ScopeRequired");
+        assert_eq!(canonical.decision_code, "CAPABILITY_SCOPE_NOT_AVAILABLE");
+        assert_eq!(canonical.scope_requirement, "WorkspaceRequired");
+        assert_eq!(canonical.authorization_revision, Some(REVISION));
+        assert!(observation.scope_grant.is_none());
+        assert!(authority.shutdown());
+    }
+
+    #[tokio::test]
+    async fn correct_host_owned_root_completes_scope_and_read() {
+        let fixture = Fixture::new(FILE_CONTENT.as_bytes());
+        let authority = ProcessIsolatedH3Authority::new(fixture.root.identity())
+            .expect("persistent H3 Host authority");
+        let broker = fixture.broker(Arc::clone(&authority) as Arc<dyn VitaH3AuthorityPort>);
+
+        let result = run(&broker, fixture.request("call-root-authorized")).await;
+        assert_eq!(result.content.as_deref(), Some(FILE_CONTENT));
+        assert_eq!(result.classification, None);
+        let snapshot = broker.snapshot();
+        assert_eq!(snapshot.grants_issued, 1);
+        assert_eq!(snapshot.execution_started, 1);
+        assert_eq!(snapshot.authorized_file_reads, 1);
+
+        let observations = authority.snapshot();
+        assert_eq!(observations.len(), 2);
+        for observation in observations {
+            let canonical = observation.canonical.expect("Host D28 result");
+            assert!(canonical.host_scope_authority_present);
+            assert!(canonical.requested_root_matched_authorized_root);
+            assert_eq!(canonical.outcome, "ScopeRequired");
+            assert_eq!(canonical.decision_code, "CAPABILITY_SCOPE_NOT_AVAILABLE");
+            assert_eq!(canonical.scope_requirement, "WorkspaceRequired");
+            assert_eq!(canonical.authorization_revision, Some(REVISION));
+            assert!(observation.scope_grant.is_some());
+        }
+        assert!(authority.shutdown());
+    }
+
+    #[tokio::test]
+    async fn altered_root_on_revalidation_is_denied_by_retained_host_scope() {
+        let fixture = Fixture::new(FILE_CONTENT.as_bytes());
+        let altered = Fixture::new(FILE_CONTENT.as_bytes());
+        assert_ne!(fixture.root.identity(), altered.root.identity());
+        let host = ProcessIsolatedH3Authority::new(fixture.root.identity())
+            .expect("persistent H3 Host authority");
+        let authority = Arc::new(RootMutatingAuthority {
+            host: Arc::clone(&host),
+            replacement_root: altered.root.identity(),
+        });
+        let broker = fixture.broker(authority as Arc<dyn VitaH3AuthorityPort>);
+
+        let result = run(&broker, fixture.request("call-root-revalidation-mutation")).await;
+        assert_eq!(result.content, None);
+        assert_eq!(
+            result.classification,
+            Some(H3DenyClassification::ScopeUnavailable)
+        );
+        let snapshot = broker.snapshot();
+        assert_eq!(snapshot.grants_issued, 1);
+        assert_eq!(snapshot.execution_started, 0);
+        assert_eq!(snapshot.authorized_file_reads, 0);
+
+        let observations = host.snapshot();
+        assert_eq!(observations.len(), 2);
+        let initial = observations[0]
+            .canonical
+            .as_ref()
+            .expect("issue D28 result");
+        assert!(initial.host_scope_authority_present);
+        assert!(initial.requested_root_matched_authorized_root);
+        assert!(observations[0].scope_grant.is_some());
+        let revalidation = observations[1]
+            .canonical
+            .as_ref()
+            .expect("revalidation D28 result");
+        assert!(revalidation.host_scope_authority_present);
+        assert!(!revalidation.requested_root_matched_authorized_root);
+        assert_eq!(revalidation.outcome, "ScopeRequired");
+        assert_eq!(revalidation.decision_code, "CAPABILITY_SCOPE_NOT_AVAILABLE");
+        assert!(observations[1].scope_grant.is_none());
+        assert!(host.shutdown());
+    }
+
     struct RevokingAuthority {
         host: Arc<ProcessIsolatedH3Authority>,
         calls: AtomicUsize,
@@ -2387,8 +2523,9 @@ mod h3r1_tests {
 
     #[tokio::test]
     async fn same_sqlite_state_revocation_fence_denies_before_read() {
-        let authority = ProcessIsolatedH3Authority::new().expect("persistent H3 Host authority");
         let fixture = Fixture::new(FILE_CONTENT.as_bytes());
+        let authority = ProcessIsolatedH3Authority::new(fixture.root.identity())
+            .expect("persistent H3 Host authority");
         let broker = fixture.broker(Arc::new(RevokingAuthority {
             host: Arc::clone(&authority),
             calls: AtomicUsize::new(0),
@@ -2430,8 +2567,9 @@ mod h3r1_tests {
 
     #[tokio::test]
     async fn same_sqlite_state_unchanged_revalidation_preserves_scope_evidence() {
-        let authority = ProcessIsolatedH3Authority::new().expect("persistent H3 Host authority");
         let fixture = Fixture::new(FILE_CONTENT.as_bytes());
+        let authority = ProcessIsolatedH3Authority::new(fixture.root.identity())
+            .expect("persistent H3 Host authority");
         let issue = fixture.authority_request(H3AuthorityOperation::IssueScopeGrant);
         let issued = authority.evaluate(issue.clone()).await.unwrap();
         assert_eq!(issued.canonical.outcome, H3CanonicalOutcome::ScopeRequired);
@@ -2929,7 +3067,7 @@ mod h3r1_tests {
             .workspace_authority()
             .cloned()
             .ok_or_else(|| "H3-R1 requires the Windows workspace authority".to_string())?;
-        let canonical_authority = ProcessIsolatedH3Authority::new()?;
+        let canonical_authority = ProcessIsolatedH3Authority::new(root.identity())?;
         let broker = VitaWorkspaceReadBroker::new(
             context,
             root,
@@ -3087,6 +3225,8 @@ mod h3r1_tests {
         for observation in observations {
             let canonical = observation.canonical.expect("Host canonical D28 result");
             assert_eq!(canonical.canonical_evaluations, 1);
+            assert!(canonical.host_scope_authority_present);
+            assert!(canonical.requested_root_matched_authorized_root);
             assert_eq!(canonical.production_registry_size, 0);
             assert_eq!(canonical.test_registry_size, 1);
             assert_eq!(canonical.authorization_row_reads, 1);

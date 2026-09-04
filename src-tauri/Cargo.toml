@@ -8,6 +8,7 @@ edition = "2021"
 [features]
 d29-h1-host-fixture = []
 d29-h3-host-fixture = []
+d29-h4-host-fixture = []
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -66,6 +67,11 @@ required-features = ["d29-h1-host-fixture"]
 name = "d29h3-authority-fixture"
 path = "src/bin/d29h3-authority-fixture.rs"
 required-features = ["d29-h3-host-fixture"]
+
+[[bin]]
+name = "d29h4-authority-fixture"
+path = "src/bin/d29h4-authority-fixture.rs"
+required-features = ["d29-h4-host-fixture"]
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_RestartManager", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }

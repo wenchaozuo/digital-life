@@ -70,7 +70,7 @@ impl UserExplicitCapabilityAuthorizationEvidence {
         USER_EXPLICIT_EVIDENCE_VERSION
     }
 
-    #[cfg(any(test, feature = "d29-h3-host-fixture"))]
+    #[cfg(any(test, feature = "d29-h3-host-fixture", feature = "d29-h4-host-fixture"))]
     pub(crate) fn for_test(event_id: impl Into<String>) -> Self {
         Self {
             event_id: event_id.into(),
@@ -106,7 +106,7 @@ impl LifeCapabilityAuthorizationUpdateRequest {
         &self.user_explicit_evidence
     }
 
-    #[cfg(any(test, feature = "d29-h3-host-fixture"))]
+    #[cfg(any(test, feature = "d29-h3-host-fixture", feature = "d29-h4-host-fixture"))]
     pub(crate) fn for_test(
         event_id: impl Into<String>,
         life_id: impl Into<String>,

@@ -17,10 +17,12 @@ use codex_app_server_protocol::{ClientInfo, InitializeCapabilities, InitializePa
 use codex_config::LoaderOverrides;
 use codex_core::config::{ConfigBuilder, ThreadStoreConfig};
 use codex_core::StartThreadOptions;
+use sha2::{Digest, Sha256};
 use toml::map::Map;
 use toml::Value as TomlValue;
 
 mod d29h3;
+mod d29h4;
 mod provider_gateway;
 mod tool_authority;
 mod workspace_capability;
@@ -52,6 +54,10 @@ pub const CODEX_UPSTREAM_RELEASE: &str = "rust-v0.152.0";
 pub const CODEX_UPSTREAM_COMMIT: &str = "316795b3cf2a45e90d121d9f46499d4658b2645c";
 pub const CODEX_PROTOCOL_SCHEMA_HASH: &str =
     "d8faa38d5f00aa7ddfe635a2d374ee5f871ffd217d4d175c72fbe7f009f4f669";
+
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
 
 const MAX_PROVIDER_ERROR_FIELD_CHARS: usize = 256;
 const REDACTED_PROVIDER_ERROR_VALUE: &str = "[redacted]";

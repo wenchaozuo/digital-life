@@ -350,6 +350,10 @@ impl VitaWorkspaceReadResult {
             "max_bytes": self.request.max_bytes,
             "bytes_read": self.bytes_read,
             "content": self.content,
+            "content_sha256": self
+                .content
+                .as_deref()
+                .map(|content| super::sha256_hex(content.as_bytes())),
             "deny_classification": self.classification.map(H3DenyClassification::as_str),
             "execution_started": self.execution_started,
             "grant_issued": self.grant_issued,
@@ -1154,6 +1158,17 @@ impl<'call> ToolExecutor<ToolCall<'call>> for VitaWorkspaceReadTool {
     }
 }
 
+/// Test-only bridge used by the D29-H4-A real-kernel canary.  It keeps the
+/// H3 authority implementation private while allowing the canary to install
+/// the already-certified read contributor beside the H4-A contributor.
+#[cfg(test)]
+pub(crate) fn canary_read_broker(
+    context: VitaExecutionContext,
+    root: super::TrustedWorkspaceRoot,
+) -> Arc<VitaWorkspaceReadBroker> {
+    h3r1_tests::canary_read_broker(context, root)
+}
+
 fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
@@ -1444,6 +1459,14 @@ mod h3r1_tests {
         }
     }
 
+    pub(super) fn canary_read_broker(
+        context: VitaExecutionContext,
+        root: super::super::TrustedWorkspaceRoot,
+    ) -> Arc<VitaWorkspaceReadBroker> {
+        let authority = ScriptedAuthority::new([]);
+        VitaWorkspaceReadBroker::new(context, root, authority)
+    }
+
     fn run<'a>(
         broker: &'a VitaWorkspaceReadBroker,
         request: VitaWorkspaceReadRequest,
@@ -1501,7 +1524,7 @@ mod h3r1_tests {
     }
 
     #[tokio::test]
-    async fn successful_read_uses_host_scoped_evidence_and_one_local_single_use_grant() {
+    async fn h3_success_adds_exact_content_sha256() {
         let fixture = Fixture::new(FILE_CONTENT.as_bytes());
         let authority = ScriptedAuthority::new([
             Ok(AuthorityReply::scope_required()),
@@ -1510,6 +1533,10 @@ mod h3r1_tests {
         let broker = fixture.broker(Arc::clone(&authority) as Arc<dyn VitaH3AuthorityPort>);
         let result = run(&broker, fixture.request("call-success")).await;
         assert_eq!(result.content.as_deref(), Some(FILE_CONTENT));
+        assert_eq!(
+            result.model_value()["content_sha256"],
+            json!(super::super::sha256_hex(FILE_CONTENT.as_bytes()))
+        );
         let snapshot = broker.snapshot();
         assert_eq!(snapshot.authority_evaluations, 2);
         assert_eq!(snapshot.grants_issued, 1);

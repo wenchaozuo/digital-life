@@ -149,7 +149,7 @@ impl CapabilityDescriptor {
         self.scope_requirement
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "d29-h3-host-fixture"))]
     pub(crate) fn synthetic(
         capability_id: CapabilityId,
         display_name: impl Into<String>,
@@ -216,7 +216,7 @@ impl CapabilityRegistry {
         Self::from_trusted_descriptors([])
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "d29-h3-host-fixture"))]
     pub(crate) fn synthetic(
         descriptors: impl IntoIterator<Item = CapabilityDescriptor>,
     ) -> Result<Self, CapabilityRegistryError> {
@@ -227,7 +227,7 @@ impl CapabilityRegistry {
         self.descriptors.get(capability_id)
     }
 
-    #[cfg(any(test, feature = "d29-h1-host-fixture"))]
+    #[cfg(any(test, feature = "d29-h1-host-fixture", feature = "d29-h3-host-fixture"))]
     pub(crate) fn len(&self) -> usize {
         self.descriptors.len()
     }

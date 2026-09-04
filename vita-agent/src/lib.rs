@@ -20,6 +20,7 @@ use codex_core::StartThreadOptions;
 use toml::map::Map;
 use toml::Value as TomlValue;
 
+mod d29h3;
 mod provider_gateway;
 mod tool_authority;
 mod workspace_capability;

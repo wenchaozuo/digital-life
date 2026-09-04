@@ -6,7 +6,7 @@
 //! information only; it has no read, write, execute, or authorization API.
 
 use std::ffi::{OsStr, OsString};
-use std::fmt;
+use std::fmt::{self, Display};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -272,6 +272,36 @@ pub enum PreparedWorkspaceTargetKind {
     Missing,
 }
 
+/// The hard ceiling for the first governed workspace read.  The limit is a
+/// kernel-side execution bound, not a hint supplied by the model.
+pub(crate) const WORKSPACE_READ_HARD_MAX_BYTES: usize = 64 * 1024;
+
+#[derive(Debug)]
+pub(crate) enum WorkspaceReadError {
+    InvalidTarget(&'static str),
+    TooLarge { limit: usize },
+    InvalidUtf8,
+    Kernel(VitaAgentError),
+}
+
+impl fmt::Display for WorkspaceReadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidTarget(reason) => write!(formatter, "workspace read denied: {reason}"),
+            Self::TooLarge { limit } => {
+                write!(
+                    formatter,
+                    "workspace file exceeds the {limit}-byte read limit"
+                )
+            }
+            Self::InvalidUtf8 => formatter.write_str("workspace file is not valid UTF-8"),
+            Self::Kernel(error) => Display::fmt(error, formatter),
+        }
+    }
+}
+
+impl std::error::Error for WorkspaceReadError {}
+
 /// A process-lifetime, OS-backed capability to one trusted workspace root.
 #[derive(Clone)]
 pub struct TrustedWorkspaceRoot {
@@ -456,6 +486,27 @@ impl PreparedWorkspaceTarget {
     pub fn kind(&self) -> PreparedWorkspaceTargetKind {
         self.kind
     }
+
+    /// Rebinds an existing regular file with the exact access needed by the
+    /// first H3 read and reads that same verified operation handle.  This is
+    /// intentionally crate-internal: callers receive text, never a raw
+    /// Windows handle, and the H2 identity-only API remains unchanged.
+    pub(crate) fn read_existing_file_utf8_bounded(
+        &self,
+        max_bytes: usize,
+    ) -> Result<String, WorkspaceReadError> {
+        #[cfg(windows)]
+        {
+            return platform::read_existing_file_utf8_bounded(self, max_bytes);
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = max_bytes;
+            Err(WorkspaceReadError::Kernel(VitaAgentError::KernelInvariant(
+                "workspace read is unavailable on this platform",
+            )))
+        }
+    }
 }
 
 fn validate_explicit_root_path(path: &Path) -> Result<(), VitaAgentError> {
@@ -543,7 +594,8 @@ mod platform {
 
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows_sys::Wdk::Storage::FileSystem::{
-        NtCreateFile, FILE_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
+        NtCreateFile, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
+        FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
     };
     use windows_sys::Win32::Foundation::{
         CloseHandle, HANDLE, INVALID_HANDLE_VALUE, NTSTATUS, OBJ_CASE_INSENSITIVE,
@@ -552,11 +604,12 @@ mod platform {
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FileIdInfo, GetDriveTypeW, GetFileInformationByHandle,
-        GetFileInformationByHandleEx, GetFileType, GetFinalPathNameByHandleW,
+        GetFileInformationByHandleEx, GetFileType, GetFinalPathNameByHandleW, ReadFile,
         BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO,
-        FILE_INFO_BY_HANDLE_CLASS, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_TYPE_DISK, OPEN_EXISTING,
+        FILE_INFO_BY_HANDLE_CLASS, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_TYPE_DISK, OPEN_EXISTING,
+        SYNCHRONIZE,
     };
     use windows_sys::Win32::System::WindowsProgramming::{
         DRIVE_FIXED, DRIVE_NO_ROOT_DIR, DRIVE_RAMDISK, DRIVE_REMOTE, DRIVE_REMOVABLE, DRIVE_UNKNOWN,
@@ -906,6 +959,42 @@ mod platform {
         component: &OsStr,
         directory: bool,
     ) -> Result<OwnedHandle, RelativeOpenError> {
+        let create_options =
+            FILE_OPEN_REPARSE_POINT | if directory { FILE_DIRECTORY_FILE } else { 0 };
+        open_relative_with_options(
+            parent,
+            component,
+            if directory {
+                OPEN_DIRECTORY_ACCESS
+            } else {
+                OPEN_TARGET_ACCESS
+            },
+            create_options,
+        )
+    }
+
+    fn open_read_relative(
+        parent: &Arc<OwnedHandle>,
+        component: &OsStr,
+    ) -> Result<OwnedHandle, RelativeOpenError> {
+        // The operation handle has only FILE_READ_DATA, FILE_READ_ATTRIBUTES,
+        // and SYNCHRONIZE.  It deliberately has no write, delete, or execute
+        // access, and omits FILE_SHARE_DELETE to keep the target namespace
+        // stable for the duration of the read.
+        open_relative_with_options(
+            parent,
+            component,
+            FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_OPEN_REPARSE_POINT | FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+        )
+    }
+
+    fn open_relative_with_options(
+        parent: &Arc<OwnedHandle>,
+        component: &OsStr,
+        desired_access: u32,
+        create_options: u32,
+    ) -> Result<OwnedHandle, RelativeOpenError> {
         let mut name = component.encode_wide().collect::<Vec<_>>();
         let byte_length = name
             .len()
@@ -929,16 +1018,10 @@ mod platform {
         };
         let mut status_block = IO_STATUS_BLOCK::default();
         let mut handle: HANDLE = std::ptr::null_mut();
-        let create_options =
-            FILE_OPEN_REPARSE_POINT | if directory { FILE_DIRECTORY_FILE } else { 0 };
         let status = unsafe {
             NtCreateFile(
                 &mut handle,
-                if directory {
-                    OPEN_DIRECTORY_ACCESS
-                } else {
-                    OPEN_TARGET_ACCESS
-                },
+                desired_access,
                 &object_attributes,
                 &mut status_block,
                 std::ptr::null(),
@@ -966,6 +1049,115 @@ mod platform {
             return Err(RelativeOpenError::Status(status));
         }
         Ok(OwnedHandle(handle))
+    }
+
+    pub(super) fn read_existing_file_utf8_bounded(
+        prepared: &PreparedWorkspaceTarget,
+        max_bytes: usize,
+    ) -> Result<String, WorkspaceReadError> {
+        if max_bytes == 0 || max_bytes > WORKSPACE_READ_HARD_MAX_BYTES {
+            return Err(WorkspaceReadError::TooLarge {
+                limit: WORKSPACE_READ_HARD_MAX_BYTES,
+            });
+        }
+        if prepared.kind != PreparedWorkspaceTargetKind::ExistingFile {
+            return Err(WorkspaceReadError::InvalidTarget(
+                "only an existing regular file may be read",
+            ));
+        }
+        let expected_identity =
+            prepared
+                .target_identity
+                .ok_or(WorkspaceReadError::InvalidTarget(
+                    "prepared file has no stable identity",
+                ))?;
+
+        verify_root_name(&prepared.root).map_err(WorkspaceReadError::Kernel)?;
+        let parent_details =
+            inspect_handle(&prepared.parent_handle, true).map_err(WorkspaceReadError::Kernel)?;
+        ensure_descendant(&prepared.root, &parent_details.final_path)
+            .map_err(WorkspaceReadError::Kernel)?;
+        if parent_details.identity != prepared.parent_identity {
+            return Err(WorkspaceReadError::InvalidTarget(
+                "workspace parent identity changed before read",
+            ));
+        }
+
+        let leaf = prepared
+            .relative_path
+            .components()
+            .last()
+            .expect("WorkspaceRelativePath always has one component");
+        let handle = match open_read_relative(&prepared.parent_handle, leaf) {
+            Ok(handle) => handle,
+            Err(RelativeOpenError::Missing(_)) => {
+                return Err(WorkspaceReadError::InvalidTarget(
+                    "workspace target disappeared before read",
+                ));
+            }
+            Err(error) => {
+                return Err(WorkspaceReadError::Kernel(relative_open_error(
+                    prepared.relative_path.as_path(),
+                    error,
+                )))
+            }
+        };
+
+        // These checks are deliberately performed on the exact operation
+        // handle that will be consumed by read_utf8_bounded below.
+        let details = inspect_handle(&handle, false).map_err(WorkspaceReadError::Kernel)?;
+        ensure_descendant(&prepared.root, &details.final_path)
+            .map_err(WorkspaceReadError::Kernel)?;
+        if details.is_directory {
+            return Err(WorkspaceReadError::InvalidTarget(
+                "workspace target is a directory",
+            ));
+        }
+        if details.identity != expected_identity {
+            return Err(WorkspaceReadError::InvalidTarget(
+                "workspace target identity changed before read",
+            ));
+        }
+        verify_root_name(&prepared.root).map_err(WorkspaceReadError::Kernel)?;
+        read_utf8_bounded(&handle, max_bytes)
+    }
+
+    fn read_utf8_bounded(
+        handle: &OwnedHandle,
+        max_bytes: usize,
+    ) -> Result<String, WorkspaceReadError> {
+        let mut bytes = Vec::with_capacity(max_bytes + 1);
+        let mut buffer = [0_u8; 8 * 1024];
+        loop {
+            let remaining = max_bytes + 1 - bytes.len();
+            if remaining == 0 {
+                return Err(WorkspaceReadError::TooLarge { limit: max_bytes });
+            }
+            let request = remaining.min(buffer.len()) as u32;
+            let mut read = 0_u32;
+            let ok = unsafe {
+                ReadFile(
+                    handle.0,
+                    buffer.as_mut_ptr(),
+                    request,
+                    &mut read,
+                    std::ptr::null_mut(),
+                )
+            } != 0;
+            if !ok {
+                return Err(WorkspaceReadError::Kernel(VitaAgentError::KernelConfig(
+                    io::Error::last_os_error(),
+                )));
+            }
+            if read == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..read as usize]);
+            if bytes.len() > max_bytes {
+                return Err(WorkspaceReadError::TooLarge { limit: max_bytes });
+            }
+        }
+        String::from_utf8(bytes).map_err(|_| WorkspaceReadError::InvalidUtf8)
     }
 
     fn inspect_handle(

@@ -330,7 +330,7 @@ impl ProviderProfile {
     }
 
     #[cfg(test)]
-    fn new_for_test_localhost(
+    pub(crate) fn new_for_test_localhost(
         provider_id: impl Into<String>,
         display_name: impl Into<String>,
         protocol: ProviderProtocol,

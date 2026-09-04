@@ -11,6 +11,11 @@ pub(crate) mod capability;
 pub fn run_d29h1_authority_fixture() -> Result<(), String> {
     capability::d29h1_host_fixture::run_from_stdio()
 }
+
+#[cfg(feature = "d29-h3-host-fixture")]
+pub fn run_d29h3_authority_fixture() -> Result<(), String> {
+    capability::d29h3_host_fixture::run_from_stdio()
+}
 pub mod conversation;
 pub mod embedding;
 #[cfg_attr(not(test), allow(dead_code))]

@@ -647,48 +647,6 @@ impl TrustedWorkspaceRoot {
         }
     }
 
-    /// Acquires one fixed child directory beneath this retained directory
-    /// capability.  This is crate-internal plumbing for app-owned namespaces;
-    /// it never exposes the underlying handle or accepts a model path.
-    #[cfg(windows)]
-    pub(crate) fn acquire_fixed_child_directory_for_namespace(
-        &self,
-        component: &OsStr,
-    ) -> Result<Self, VitaAgentError> {
-        platform::acquire_fixed_child_directory(self, component)
-    }
-
-    /// Creates one child file with `CREATE_NEW` relative to this retained
-    /// directory capability.  The caller owns the namespace decision; this
-    /// helper only supplies the native handle-relative primitive.
-    #[cfg(windows)]
-    pub(crate) fn create_new_file_relative_for_namespace(
-        &self,
-        component: &OsStr,
-        contents: &[u8],
-    ) -> io::Result<()> {
-        platform::create_new_file_relative(self, component, contents)
-    }
-
-    /// Opens and reads one child file relative to this retained directory
-    /// capability.  The exact returned handle is inspected before any bytes
-    /// are consumed, and reparse points are rejected.
-    #[cfg(windows)]
-    pub(crate) fn read_file_relative_for_namespace(
-        &self,
-        component: &OsStr,
-        max_bytes: usize,
-    ) -> io::Result<Vec<u8>> {
-        platform::read_file_relative(self, component, max_bytes)
-    }
-
-    /// Enumerates names from this retained directory handle.  No child path
-    /// is constructed by the enumeration primitive.
-    #[cfg(windows)]
-    pub(crate) fn enumerate_children_for_namespace(&self) -> io::Result<Vec<OsString>> {
-        platform::enumerate_children(self)
-    }
-
     #[cfg(windows)]
     fn from_platform(
         requested_path: PathBuf,
@@ -704,6 +662,126 @@ impl TrustedWorkspaceRoot {
                 handle,
             }),
         }
+    }
+}
+
+/// A crate-private capability to Vita's fixed, app-owned recovery namespace.
+///
+/// This is deliberately a different type from [`TrustedWorkspaceRoot`].  The
+/// latter represents a user-selected workspace identity and retained
+/// containment handle; this type owns only the process-lifetime handles needed
+/// for DigitalLife's own `Vita/recovery` storage.  There is no constructor that
+/// accepts an arbitrary child name or converts a workspace root into this
+/// capability.
+#[derive(Clone)]
+pub(crate) struct AppOwnedRecoveryNamespace {
+    #[cfg(windows)]
+    inner: Arc<AppOwnedRecoveryNamespaceInner>,
+}
+
+#[cfg(windows)]
+struct AppOwnedRecoveryNamespaceInner {
+    vita_root_path: PathBuf,
+    recovery_root_path: PathBuf,
+    vita_root_identity: WorkspaceRootIdentity,
+    recovery_root_identity: WorkspaceRootIdentity,
+    // Retained so the recovery child capability never outlives its acquired
+    // Vita root parent, even though journal operations use the child handle.
+    #[allow(dead_code)]
+    vita_root_handle: Arc<platform::OwnedHandle>,
+    recovery_root_handle: Arc<platform::OwnedHandle>,
+}
+
+impl fmt::Debug for AppOwnedRecoveryNamespace {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        #[cfg(windows)]
+        {
+            return formatter
+                .debug_struct("AppOwnedRecoveryNamespace")
+                .field("vita_root_path", &self.inner.vita_root_path)
+                .field("recovery_root_path", &self.inner.recovery_root_path)
+                .field("vita_root_identity", &self.inner.vita_root_identity)
+                .field("recovery_root_identity", &self.inner.recovery_root_identity)
+                .finish_non_exhaustive();
+        }
+        #[cfg(not(windows))]
+        {
+            formatter
+                .debug_struct("AppOwnedRecoveryNamespace")
+                .finish_non_exhaustive()
+        }
+    }
+}
+
+impl AppOwnedRecoveryNamespace {
+    /// Acquires only the fixed `Vita/recovery` namespace.  The recovery child
+    /// is selected inside the native implementation and cannot be supplied by
+    /// a caller or model.
+    #[cfg(windows)]
+    pub(crate) fn acquire_vita_recovery_namespace(
+        vita_root: &Path,
+    ) -> Result<Self, VitaAgentError> {
+        platform::acquire_vita_recovery_namespace(vita_root)
+    }
+
+    #[cfg(not(windows))]
+    pub(crate) fn acquire_vita_recovery_namespace(
+        _vita_root: &Path,
+    ) -> Result<Self, VitaAgentError> {
+        Err(VitaAgentError::KernelInvariant(
+            "recovery namespace capability is unavailable on this platform",
+        ))
+    }
+
+    #[cfg(windows)]
+    fn from_platform(
+        vita_root_path: PathBuf,
+        vita_root_identity: WorkspaceRootIdentity,
+        vita_root_handle: Arc<platform::OwnedHandle>,
+        recovery_root_path: PathBuf,
+        recovery_root_identity: WorkspaceRootIdentity,
+        recovery_root_handle: Arc<platform::OwnedHandle>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(AppOwnedRecoveryNamespaceInner {
+                vita_root_path,
+                recovery_root_path,
+                vita_root_identity,
+                recovery_root_identity,
+                vita_root_handle,
+                recovery_root_handle,
+            }),
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn create_new_journal(&self, file_name: &OsStr, contents: &[u8]) -> io::Result<()> {
+        platform::create_new_recovery_journal(self, file_name, contents)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn read_journal(&self, file_name: &OsStr, max_bytes: usize) -> io::Result<Vec<u8>> {
+        platform::read_recovery_journal(self, file_name, max_bytes)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn enumerate_journals(&self) -> io::Result<Vec<OsString>> {
+        platform::enumerate_recovery_journals(self)
+    }
+
+    #[cfg(all(windows, test))]
+    pub(crate) fn vita_root_path(&self) -> &Path {
+        &self.inner.vita_root_path
+    }
+
+    #[cfg(all(windows, test))]
+    pub(crate) fn recovery_root_path(&self) -> &Path {
+        &self.inner.recovery_root_path
+    }
+
+    #[cfg(all(windows, test))]
+    pub(crate) fn recovery_root_identity(&self) -> WorkspaceRootIdentity {
+        self.inner.recovery_root_identity
     }
 }
 
@@ -1267,8 +1345,31 @@ mod platform {
 
     fn acquire_root_impl<F>(
         requested_path: &Path,
-        mut after_drive_anchor: F,
+        after_drive_anchor: F,
     ) -> Result<TrustedWorkspaceRoot, VitaAgentError>
+    where
+        F: FnMut(),
+    {
+        let acquired = acquire_root_handle_impl(requested_path, after_drive_anchor)?;
+        Ok(TrustedWorkspaceRoot::from_platform(
+            acquired.requested_path,
+            acquired.final_path,
+            acquired.identity,
+            acquired.handle,
+        ))
+    }
+
+    struct AcquiredRootHandle {
+        requested_path: PathBuf,
+        final_path: PathBuf,
+        identity: WorkspaceRootIdentity,
+        handle: Arc<OwnedHandle>,
+    }
+
+    fn acquire_root_handle_impl<F>(
+        requested_path: &Path,
+        mut after_drive_anchor: F,
+    ) -> Result<AcquiredRootHandle, VitaAgentError>
     where
         F: FnMut(),
     {
@@ -1314,11 +1415,42 @@ mod platform {
         }
         reject_resolved_stock_state(&final_details.final_path)?;
 
-        Ok(TrustedWorkspaceRoot::from_platform(
-            requested_path.to_path_buf(),
-            final_details.final_path,
-            final_details.identity,
-            parent_handle,
+        Ok(AcquiredRootHandle {
+            requested_path: requested_path.to_path_buf(),
+            final_path: final_details.final_path,
+            identity: final_details.identity,
+            handle: parent_handle,
+        })
+    }
+
+    pub(super) fn acquire_vita_recovery_namespace(
+        vita_root: &Path,
+    ) -> Result<AppOwnedRecoveryNamespace, VitaAgentError> {
+        let vita = acquire_root_handle_impl(vita_root, || {})?;
+
+        // This is intentionally the only recovery child selection.  It is a
+        // fixed app-owned namespace and never accepts a caller-provided name.
+        let recovery_name = OsStr::new("recovery");
+        let recovery = open_relative_with_options_and_share_disposition(
+            &vita.handle,
+            recovery_name,
+            FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY | FILE_TRAVERSE | SYNCHRONIZE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN_IF,
+            FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+        )
+        .map_err(|error| relative_open_error(&vita.requested_path.join(recovery_name), error))?;
+        let recovery_details = inspect_handle(&recovery, true)?;
+        ensure_descendant_path(&vita.final_path, &recovery_details.final_path)?;
+
+        let recovery_requested_path = vita.requested_path.join(recovery_name);
+        Ok(AppOwnedRecoveryNamespace::from_platform(
+            vita.requested_path,
+            vita.identity,
+            vita.handle,
+            recovery_requested_path,
+            recovery_details.identity,
+            Arc::new(recovery),
         ))
     }
 
@@ -1701,38 +1833,14 @@ mod platform {
         Ok(OwnedHandle(handle))
     }
 
-    pub(super) fn acquire_fixed_child_directory(
-        parent: &TrustedWorkspaceRoot,
-        component: &OsStr,
-    ) -> Result<TrustedWorkspaceRoot, VitaAgentError> {
-        validate_namespace_child(component)?;
-        let child = open_relative_with_options_and_share_disposition(
-            &parent.inner.handle,
-            component,
-            FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY | FILE_TRAVERSE | SYNCHRONIZE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            FILE_OPEN_IF,
-            FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
-        )
-        .map_err(|error| relative_open_error(&parent.requested_path().join(component), error))?;
-        let details = inspect_handle(&child, true)?;
-        ensure_descendant(parent, &details.final_path)?;
-        Ok(TrustedWorkspaceRoot::from_platform(
-            parent.requested_path().join(component),
-            details.final_path,
-            details.identity,
-            Arc::new(child),
-        ))
-    }
-
-    pub(super) fn create_new_file_relative(
-        parent: &TrustedWorkspaceRoot,
+    pub(super) fn create_new_recovery_journal(
+        namespace: &AppOwnedRecoveryNamespace,
         component: &OsStr,
         contents: &[u8],
     ) -> io::Result<()> {
         validate_namespace_child_io(component)?;
         let handle = open_relative_with_options_and_share_disposition(
-            &parent.inner.handle,
+            &namespace.inner.recovery_root_handle,
             component,
             FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -1754,14 +1862,14 @@ mod platform {
         Ok(())
     }
 
-    pub(super) fn read_file_relative(
-        parent: &TrustedWorkspaceRoot,
+    pub(super) fn read_recovery_journal(
+        namespace: &AppOwnedRecoveryNamespace,
         component: &OsStr,
         max_bytes: usize,
     ) -> io::Result<Vec<u8>> {
         validate_namespace_child_io(component)?;
         let handle = open_relative_with_options_and_share_disposition(
-            &parent.inner.handle,
+            &namespace.inner.recovery_root_handle,
             component,
             FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -1779,10 +1887,11 @@ mod platform {
         read_file_bytes(&handle, max_bytes)
     }
 
-    pub(super) fn enumerate_children(
-        directory: &TrustedWorkspaceRoot,
+    pub(super) fn enumerate_recovery_journals(
+        namespace: &AppOwnedRecoveryNamespace,
     ) -> io::Result<Vec<OsString>> {
-        inspect_handle(&directory.inner.handle, true).map_err(namespace_kernel_io_error)?;
+        inspect_handle(&namespace.inner.recovery_root_handle, true)
+            .map_err(namespace_kernel_io_error)?;
 
         let mut names = Vec::new();
         let mut restart_scan = true;
@@ -1797,7 +1906,7 @@ mod platform {
             let mut status_block = IO_STATUS_BLOCK::default();
             let status = unsafe {
                 NtQueryDirectoryFile(
-                    directory.inner.handle.0,
+                    namespace.inner.recovery_root_handle.0,
                     std::ptr::null_mut(),
                     None,
                     std::ptr::null(),
@@ -2765,7 +2874,11 @@ mod platform {
     }
 
     fn ensure_descendant(root: &TrustedWorkspaceRoot, path: &Path) -> Result<(), VitaAgentError> {
-        let root_path = normalize_path_for_comparison(root.final_path());
+        ensure_descendant_path(root.final_path(), path)
+    }
+
+    fn ensure_descendant_path(root_path: &Path, path: &Path) -> Result<(), VitaAgentError> {
+        let root_path = normalize_path_for_comparison(root_path);
         let child_path = normalize_path_for_comparison(path);
         let root_prefix = if root_path.ends_with('\\') {
             root_path.clone()

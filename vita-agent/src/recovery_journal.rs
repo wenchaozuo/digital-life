@@ -22,10 +22,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-use crate::workspace_capability::WorkspaceReadError;
+use crate::workspace_capability::{AppOwnedRecoveryNamespace, WorkspaceReadError};
 use crate::{
-    PreparedWorkspaceTarget, PreparedWorkspaceTargetKind, TrustedWorkspaceRoot, VitaAgentError,
-    VitaAgentRuntimeProfile, WorkspaceRelativePath, WorkspaceRootIdentity,
+    PreparedWorkspaceTarget, PreparedWorkspaceTargetKind, VitaAgentError, VitaAgentRuntimeProfile,
+    WorkspaceRelativePath, WorkspaceRootIdentity,
 };
 
 pub const RECOVERY_JOURNAL_FORMAT_VERSION: u16 = 1;
@@ -872,16 +872,14 @@ pub enum RecoveryJournalReconciliation {
 /// workspace recovery.
 #[derive(Clone)]
 pub struct RecoveryJournalRootAuthority {
-    vita_root: TrustedWorkspaceRoot,
-    recovery_root: TrustedWorkspaceRoot,
+    namespace: AppOwnedRecoveryNamespace,
 }
 
 impl fmt::Debug for RecoveryJournalRootAuthority {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("RecoveryJournalRootAuthority")
-            .field("vita_root", &self.vita_root)
-            .field("recovery_root", &self.recovery_root)
+            .field("namespace", &self.namespace)
             .finish_non_exhaustive()
     }
 }
@@ -897,15 +895,10 @@ impl RecoveryJournalRootAuthority {
 
         #[cfg(windows)]
         {
-            let vita_root = TrustedWorkspaceRoot::acquire(profile.vita_root())
-                .map_err(RecoveryJournalError::Profile)?;
-            let recovery_root = vita_root
-                .acquire_fixed_child_directory_for_namespace(OsStr::new(RECOVERY_DIRECTORY_NAME))
-                .map_err(RecoveryJournalError::Profile)?;
-            return Ok(Self {
-                vita_root,
-                recovery_root,
-            });
+            let namespace =
+                AppOwnedRecoveryNamespace::acquire_vita_recovery_namespace(profile.vita_root())
+                    .map_err(RecoveryJournalError::Profile)?;
+            return Ok(Self { namespace });
         }
         #[cfg(not(windows))]
         {
@@ -923,8 +916,8 @@ impl RecoveryJournalRootAuthority {
         #[cfg(windows)]
         {
             return self
-                .recovery_root
-                .create_new_file_relative_for_namespace(OsStr::new(&name), bytes)
+                .namespace
+                .create_new_journal(OsStr::new(&name), bytes)
                 .map_err(|error| {
                     if error.kind() == io::ErrorKind::AlreadyExists {
                         RecoveryJournalError::DuplicateTransactionId
@@ -944,8 +937,8 @@ impl RecoveryJournalRootAuthority {
         #[cfg(windows)]
         {
             return self
-                .recovery_root
-                .read_file_relative_for_namespace(file_name, RECOVERY_JOURNAL_MAX_SIZE)
+                .namespace
+                .read_journal(file_name, RECOVERY_JOURNAL_MAX_SIZE)
                 .map_err(|error| io_error("open/read journal", error));
         }
         #[cfg(not(windows))]
@@ -959,8 +952,8 @@ impl RecoveryJournalRootAuthority {
         #[cfg(windows)]
         {
             return self
-                .recovery_root
-                .enumerate_children_for_namespace()
+                .namespace
+                .enumerate_journals()
                 .map_err(|error| io_error("enumerate recovery root", error));
         }
         #[cfg(not(windows))]
@@ -1749,10 +1742,12 @@ enum RecoveryJournalTestFault {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+    use std::any::type_name;
     use std::fs;
     use tempfile::{tempdir, TempDir};
 
-    use crate::{contains_stock_codex_state, CODEX_UPSTREAM_COMMIT};
+    use crate::workspace_capability::AppOwnedRecoveryNamespace;
+    use crate::{contains_stock_codex_state, TrustedWorkspaceRoot, CODEX_UPSTREAM_COMMIT};
 
     struct Fixture {
         _app_data: TempDir,
@@ -2081,18 +2076,18 @@ mod tests {
         let fixture = Fixture::new();
         let authority = &fixture.store.namespace_authority;
         assert_eq!(
-            authority.vita_root.requested_path(),
+            authority.namespace.vita_root_path(),
             fixture.profile.vita_root()
         );
         assert_eq!(
-            authority.recovery_root.requested_path(),
+            authority.namespace.recovery_root_path(),
             fixture.store.recovery_root()
         );
         assert_eq!(
-            authority.recovery_root.identity().file_id(),
+            authority.namespace.recovery_root_identity().file_id(),
             Some(
                 RecoveryJournalIdentity::from_workspace_identity(
-                    authority.recovery_root.identity()
+                    authority.namespace.recovery_root_identity()
                 )
                 .unwrap()
                 .file_id(),
@@ -2100,6 +2095,90 @@ mod tests {
         );
         let debug = format!("{authority:?}");
         assert!(!debug.contains("HANDLE"));
+    }
+
+    #[test]
+    fn trusted_workspace_root_remains_non_mutating_identity_capability() {
+        let source = include_str!("workspace_capability.rs");
+        let trusted_root_impl = source
+            .split("impl TrustedWorkspaceRoot {")
+            .nth(1)
+            .and_then(|body| body.split("/// Identity-only preparation result").next())
+            .expect("TrustedWorkspaceRoot impl surface");
+
+        for (prefix, suffix) in [
+            ("create_new_file_relative", "_for_namespace"),
+            ("read_file_relative", "_for_namespace"),
+            ("enumerate_children", "_for_namespace"),
+            ("acquire_fixed_child_directory", "_for_namespace"),
+        ] {
+            let forbidden = format!("{prefix}{suffix}");
+            assert!(
+                !trusted_root_impl.contains(&forbidden),
+                "TrustedWorkspaceRoot still exposes {forbidden}"
+            );
+        }
+        assert!(trusted_root_impl.contains("pub fn prepare_target"));
+    }
+
+    #[test]
+    fn recovery_namespace_is_distinct_from_workspace_root() {
+        let fixture = Fixture::new();
+        let namespace = &fixture.store.namespace_authority.namespace;
+
+        assert_ne!(
+            type_name::<AppOwnedRecoveryNamespace>(),
+            type_name::<TrustedWorkspaceRoot>()
+        );
+        assert_eq!(namespace.vita_root_path(), fixture.profile.vita_root());
+        assert_eq!(
+            namespace.recovery_root_path(),
+            fixture.store.recovery_root()
+        );
+        assert!(format!("{namespace:?}").contains("AppOwnedRecoveryNamespace"));
+    }
+
+    #[test]
+    fn recovery_namespace_acquisition_is_fixed_to_vita_recovery() {
+        let fixture = Fixture::new();
+        let namespace = &fixture.store.namespace_authority.namespace;
+        let expected_recovery_root = fixture.profile.vita_root().join(RECOVERY_DIRECTORY_NAME);
+
+        assert_eq!(namespace.vita_root_path(), fixture.profile.vita_root());
+        assert_eq!(namespace.recovery_root_path(), expected_recovery_root);
+
+        let source = include_str!("workspace_capability.rs");
+        assert!(source.contains("let recovery_name = OsStr::new(\"recovery\")"));
+    }
+
+    #[test]
+    fn recovery_namespace_cannot_be_constructed_from_workspace_root() {
+        let source = include_str!("workspace_capability.rs");
+        let conversion = format!(
+            "From<{}> for {}",
+            "TrustedWorkspaceRoot", "AppOwnedRecoveryNamespace"
+        );
+        let from_root = format!("{}::from_{}", "AppOwnedRecoveryNamespace", "root");
+        let from_trusted_workspace = ["from_trusted_workspace_", "root"].concat();
+
+        assert!(!source.contains(&conversion));
+        assert!(!source.contains(&from_root));
+        assert!(!source.contains(&from_trusted_workspace));
+    }
+
+    #[test]
+    fn recovery_journal_creation_cannot_receive_workspace_authority() {
+        let source = include_str!("recovery_journal.rs");
+        let persist_surface = source
+            .split("fn persist_prepared(")
+            .nth(1)
+            .and_then(|body| body.split("fn validate_scan_root").next())
+            .expect("H5-A journal persistence surface");
+
+        assert!(persist_surface.contains("namespace_authority"));
+        assert!(persist_surface.contains("create_new_file"));
+        assert!(!persist_surface.contains("workspace_authority"));
+        assert!(!persist_surface.contains("prepare_workspace_target"));
     }
 
     #[test]

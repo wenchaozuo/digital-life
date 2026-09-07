@@ -22,6 +22,8 @@ use codex_extension_api::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+#[cfg(all(test, windows))]
+use super::workspace_capability::WorkspaceReplaceTestFault;
 use super::workspace_capability::{
     PreparedWorkspaceTarget, PreparedWorkspaceTargetKind, WorkspaceReplaceError,
     WorkspaceReplaceEvidence,
@@ -29,6 +31,7 @@ use super::workspace_capability::{
 #[cfg(test)]
 use super::workspace_capability::{
     WorkspaceReplaceCommitOutcome, WorkspaceReplaceEvidenceEvent, WorkspaceReplaceFenceError,
+    WorkspaceReplaceMutationPhase, WorkspaceReplaceMutationTracker,
 };
 use super::{sha256_hex, VitaExecutionContext, VitaRequestedScope};
 
@@ -269,8 +272,16 @@ pub(crate) struct H4HostReplaceGrantEvidence {
     single_use: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+enum H4AuthorityResponseStatus {
+    Ok,
+    Denied,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct H4HostAuthorityResponse {
+    status: H4AuthorityResponseStatus,
     canonical: H4CanonicalDecision,
     confirmation: Option<HostExplicitActionConfirmationEvidence>,
     grant: Option<H4HostReplaceGrantEvidence>,
@@ -960,6 +971,8 @@ const H4C_NATIVE_FENCE_WAIT: Duration = Duration::from_secs(5);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum H4CNativeFault {
     AfterFirstWrite,
+    PanicBeforeFirstMutation,
+    PanicAfterFirstMutation,
 }
 
 #[cfg(test)]
@@ -1349,12 +1362,23 @@ impl VitaWorkspaceReplaceBroker {
                 self.metrics
                     .native_workers_joined
                     .fetch_add(1, Ordering::AcqRel);
+                let outcome = WorkspaceReplaceCommitOutcome::CommitUnknown {
+                    error: WorkspaceReplaceError::NativeWorkerJoin,
+                    evidence: WorkspaceReplaceEvidence {
+                        mutation_attempted: true,
+                        mutation_started: true,
+                        modifying_syscalls: 1,
+                        commit_unknown: true,
+                        fence_calls: 1,
+                        operation_handle_open_count: 1,
+                        ..WorkspaceReplaceEvidence::default()
+                    },
+                };
+                self.record_h4c_native_metrics(&outcome);
                 return VitaWorkspaceReplaceResult::governed(
                     request,
-                    VitaWorkspaceReplaceExecutionOutcome::Denied {
-                        classification: H4DenyClassification::AuthorityPanic,
-                    },
-                    Some(H4DenyClassification::AuthorityPanic),
+                    VitaWorkspaceReplaceExecutionOutcome::from_native(outcome),
+                    None,
                 );
             }
         };
@@ -1514,6 +1538,47 @@ fn execute_h4c_native_replace(
     cancellation: Arc<AtomicBool>,
     native_fault: Option<H4CNativeFault>,
 ) -> WorkspaceReplaceCommitOutcome {
+    let mut tracker = WorkspaceReplaceMutationTracker::new();
+    match catch_unwind(AssertUnwindSafe(|| {
+        execute_h4c_native_replace_inner(
+            grant,
+            request,
+            root,
+            &mut fence,
+            cancellation,
+            native_fault,
+            &mut tracker,
+        )
+    })) {
+        Ok(outcome) => outcome,
+        Err(_) => match tracker.phase() {
+            WorkspaceReplaceMutationPhase::NotStarted => WorkspaceReplaceCommitOutcome::Denied {
+                error: WorkspaceReplaceError::NativePanicBeforeMutation,
+                evidence: tracker.evidence_after_panic(),
+            },
+            WorkspaceReplaceMutationPhase::Started => {
+                WorkspaceReplaceCommitOutcome::CommitUnknown {
+                    error: WorkspaceReplaceError::NativePanicAfterMutation,
+                    evidence: tracker.evidence_after_panic(),
+                }
+            }
+            WorkspaceReplaceMutationPhase::Committed => WorkspaceReplaceCommitOutcome::Committed {
+                evidence: tracker.evidence_after_panic(),
+            },
+        },
+    }
+}
+
+#[cfg(test)]
+fn execute_h4c_native_replace_inner(
+    grant: VitaExecutableReplaceGrant,
+    request: VitaWorkspaceReplaceRequest,
+    root: super::TrustedWorkspaceRoot,
+    fence: &mut H4CCommitFence,
+    cancellation: Arc<AtomicBool>,
+    native_fault: Option<H4CNativeFault>,
+    tracker: &mut WorkspaceReplaceMutationTracker,
+) -> WorkspaceReplaceCommitOutcome {
     let prepared = match root.prepare_target(request.relative_path.as_path()) {
         Ok(prepared) => prepared,
         Err(_) => {
@@ -1540,22 +1605,42 @@ fn execute_h4c_native_replace(
     if let Some(native_fault) = native_fault {
         return match native_fault {
             H4CNativeFault::AfterFirstWrite => prepared
-                .replace_existing_file_utf8_bounded_with_test_fault(
+                .replace_existing_file_utf8_bounded_with_test_fault_and_tracker(
                     &expected_sha256,
                     &request.replacement_content,
-                    &mut fence,
+                    fence,
                     cancellation.as_ref(),
-                    super::workspace_capability::WorkspaceReplaceTestFault::AfterFirstWrite,
+                    tracker,
+                    WorkspaceReplaceTestFault::AfterFirstWrite,
+                ),
+            H4CNativeFault::PanicBeforeFirstMutation => prepared
+                .replace_existing_file_utf8_bounded_with_test_fault_and_tracker(
+                    &expected_sha256,
+                    &request.replacement_content,
+                    fence,
+                    cancellation.as_ref(),
+                    tracker,
+                    WorkspaceReplaceTestFault::PanicBeforeFirstMutation,
+                ),
+            H4CNativeFault::PanicAfterFirstMutation => prepared
+                .replace_existing_file_utf8_bounded_with_test_fault_and_tracker(
+                    &expected_sha256,
+                    &request.replacement_content,
+                    fence,
+                    cancellation.as_ref(),
+                    tracker,
+                    WorkspaceReplaceTestFault::PanicAfterFirstMutation,
                 ),
         };
     }
     #[cfg(not(windows))]
     let _ = native_fault;
-    prepared.replace_existing_file_utf8_bounded_with_cancellation(
+    prepared.replace_existing_file_utf8_bounded_with_cancellation_and_tracker(
         &expected_sha256,
         &request.replacement_content,
-        &mut fence,
+        fence,
         cancellation.as_ref(),
+        tracker,
     )
 }
 
@@ -1590,6 +1675,31 @@ fn validate_h4c_revalidation(
     request: &H4AuthorityRequest,
     binding: &H4CGrantBinding,
 ) -> Result<(), H4DenyClassification> {
+    match response.status {
+        H4AuthorityResponseStatus::Denied => {
+            if response.grant.is_some()
+                || response.confirmation.is_some()
+                || response.confirmation_consumed
+                || response.denial.is_none()
+            {
+                return Err(H4DenyClassification::AuthorityEvidenceMismatch);
+            }
+            return match validate_canonical_decision(&response.canonical, request) {
+                Ok(_) => Err(response.denial.expect("denial presence was checked above")),
+                Err(classification) => Err(classification),
+            };
+        }
+        H4AuthorityResponseStatus::Ok => {
+            if response.denial.is_some()
+                || response.confirmation.is_some()
+                || response.confirmation_consumed
+                || response.grant.is_none()
+            {
+                return Err(H4DenyClassification::AuthorityEvidenceMismatch);
+            }
+        }
+    }
+
     let revision = validate_canonical_decision(&response.canonical, request)?;
     let H4AuthorityOperation::Revalidate {
         grant_id,
@@ -1647,7 +1757,9 @@ fn native_error_classification(error: WorkspaceReplaceError) -> H4DenyClassifica
         | WorkspaceReplaceError::CommitFenceStale
         | WorkspaceReplaceError::CommitFenceCancelled
         | WorkspaceReplaceError::CommitFenceError
-        | WorkspaceReplaceError::CommitFencePanic => H4DenyClassification::RevalidationDenied,
+        | WorkspaceReplaceError::CommitFencePanic
+        | WorkspaceReplaceError::NativePanicAfterMutation
+        | WorkspaceReplaceError::NativeWorkerJoin => H4DenyClassification::RevalidationDenied,
         WorkspaceReplaceError::HardLinkAmbiguous
         | WorkspaceReplaceError::ReparseTarget
         | WorkspaceReplaceError::TargetBusy
@@ -1670,7 +1782,8 @@ fn native_error_classification(error: WorkspaceReplaceError) -> H4DenyClassifica
         | WorkspaceReplaceError::FlushFailed
         | WorkspaceReplaceError::PostWriteVerificationFailed
         | WorkspaceReplaceError::UnavailableOnThisPlatform
-        | WorkspaceReplaceError::ReparseParent => H4DenyClassification::TargetRejected,
+        | WorkspaceReplaceError::ReparseParent
+        | WorkspaceReplaceError::NativePanicBeforeMutation => H4DenyClassification::TargetRejected,
     }
 }
 
@@ -2509,11 +2622,17 @@ mod tests {
             if canonical.outcome != H4CanonicalOutcome::ScopeRequired
                 || !canonical.workspace_scope_matches
             {
+                let denial = if canonical.outcome == H4CanonicalOutcome::RootDisabled {
+                    H4DenyClassification::RootDisabled
+                } else {
+                    H4DenyClassification::WorkspaceScopeDenied
+                };
                 return H4HostAuthorityResponse {
+                    status: H4AuthorityResponseStatus::Denied,
                     canonical,
                     confirmation: None,
                     grant: None,
-                    denial: None,
+                    denial: Some(denial),
                     confirmation_consumed: false,
                 };
             }
@@ -2540,6 +2659,7 @@ mod tests {
                     .values()
                     .any(|confirmation| confirmation.expires_at_unix_ms <= unix_millis());
                 return H4HostAuthorityResponse {
+                    status: H4AuthorityResponseStatus::Denied,
                     canonical,
                     confirmation: None,
                     grant: None,
@@ -2579,6 +2699,7 @@ mod tests {
             };
             lock_unpoisoned(&self.grants).insert(grant.grant_id.clone(), grant.clone());
             H4HostAuthorityResponse {
+                status: H4AuthorityResponseStatus::Ok,
                 canonical,
                 confirmation: Some(confirmation),
                 grant: Some(grant),
@@ -2604,11 +2725,25 @@ mod tests {
                     lock_unpoisoned(&self.events).push(H4AuthorityEvent::RevalidationEvaluated);
                     let canonical = self.canonical(&request);
                     let grant = lock_unpoisoned(&self.grants).get(grant_id).cloned();
+                    let denial = if canonical.outcome == H4CanonicalOutcome::RootDisabled {
+                        Some(H4DenyClassification::RootDisabled)
+                    } else if !canonical.workspace_scope_matches {
+                        Some(H4DenyClassification::WorkspaceScopeDenied)
+                    } else if grant.is_none() {
+                        Some(H4DenyClassification::RevalidationDenied)
+                    } else {
+                        None
+                    };
                     H4HostAuthorityResponse {
+                        status: if denial.is_some() {
+                            H4AuthorityResponseStatus::Denied
+                        } else {
+                            H4AuthorityResponseStatus::Ok
+                        },
                         canonical,
                         confirmation: None,
-                        grant,
-                        denial: None,
+                        grant: if denial.is_some() { None } else { grant },
+                        denial,
                         confirmation_consumed: false,
                     }
                 }
@@ -3848,6 +3983,11 @@ mod tests {
         request: &H4AuthorityRequest,
         response: &H4HostResponse,
     ) -> Result<H4HostAuthorityResponse, VitaH4AuthorityError> {
+        let status = match response.status.as_str() {
+            "ok" => H4AuthorityResponseStatus::Ok,
+            "denied" => H4AuthorityResponseStatus::Denied,
+            _ => return Err(VitaH4AuthorityError::InvalidVerdict),
+        };
         let expected_operation = match request.operation {
             H4AuthorityOperation::IssueReplaceGrant => "issue_replace_grant",
             H4AuthorityOperation::Revalidate { .. } => "revalidate_replace_grant",
@@ -3892,21 +4032,68 @@ mod tests {
             .as_ref()
             .map(|grant| parse_h4_grant(request, grant))
             .transpose()?;
-        if response.status != "ok" && response.status != "denied" {
-            return Err(VitaH4AuthorityError::InvalidVerdict);
-        }
         let denial = response
             .denial
             .as_deref()
             .map(parse_h4_denial)
             .transpose()?;
+        validate_h4_wire_response_shape(
+            &request.operation,
+            status,
+            confirmation.as_ref(),
+            grant.as_ref(),
+            denial,
+            response.confirmation_consumed,
+        )?;
         Ok(H4HostAuthorityResponse {
+            status,
             canonical,
             confirmation,
             grant,
             denial,
             confirmation_consumed: response.confirmation_consumed,
         })
+    }
+
+    fn validate_h4_wire_response_shape(
+        operation: &H4AuthorityOperation,
+        status: H4AuthorityResponseStatus,
+        confirmation: Option<&HostExplicitActionConfirmationEvidence>,
+        grant: Option<&H4HostReplaceGrantEvidence>,
+        denial: Option<H4DenyClassification>,
+        confirmation_consumed: bool,
+    ) -> Result<(), VitaH4AuthorityError> {
+        let valid = match (operation, status) {
+            (H4AuthorityOperation::IssueReplaceGrant, H4AuthorityResponseStatus::Ok) => {
+                confirmation.is_some()
+                    && grant.is_some()
+                    && denial.is_none()
+                    && confirmation_consumed
+            }
+            (H4AuthorityOperation::IssueReplaceGrant, H4AuthorityResponseStatus::Denied) => {
+                confirmation.is_none()
+                    && grant.is_none()
+                    && denial.is_some()
+                    && !confirmation_consumed
+            }
+            (H4AuthorityOperation::Revalidate { .. }, H4AuthorityResponseStatus::Ok) => {
+                confirmation.is_none()
+                    && grant.is_some()
+                    && denial.is_none()
+                    && !confirmation_consumed
+            }
+            (H4AuthorityOperation::Revalidate { .. }, H4AuthorityResponseStatus::Denied) => {
+                confirmation.is_none()
+                    && grant.is_none()
+                    && denial.is_some()
+                    && !confirmation_consumed
+            }
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(VitaH4AuthorityError::InvalidVerdict)
+        }
     }
 
     fn parse_h4_confirmation(
@@ -4073,6 +4260,7 @@ mod tests {
             "confirmation_replay" => H4DenyClassification::ConfirmationReplay,
             "replace_grant_revalidation_denied" => H4DenyClassification::RevalidationDenied,
             "grant_capacity_exhausted" => H4DenyClassification::CallLimitExceeded,
+            "root_disabled" => H4DenyClassification::RootDisabled,
             _ => return Err(VitaH4AuthorityError::InvalidVerdict),
         })
     }
@@ -5234,6 +5422,57 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum H4CMalformedVerdict {
+        MixedDenialAndGrant,
+        UnexpectedConfirmation,
+        UnexpectedConfirmationConsumed,
+        OkStatusWithDenial,
+        DeniedStatusWithGrant,
+    }
+
+    struct H4CMalformedVerdictAuthority {
+        inner: Arc<TestHostAuthority>,
+        mode: H4CMalformedVerdict,
+    }
+
+    impl VitaH4AuthorityPort for H4CMalformedVerdictAuthority {
+        fn evaluate(&self, request: H4AuthorityRequest) -> VitaH4AuthorityFuture {
+            let inner = Arc::clone(&self.inner);
+            let mode = self.mode;
+            let is_revalidation =
+                matches!(&request.operation, H4AuthorityOperation::Revalidate { .. });
+            Box::pin(async move {
+                let mut response = inner.evaluate(request.clone()).await?;
+                if is_revalidation {
+                    match mode {
+                        H4CMalformedVerdict::MixedDenialAndGrant => {
+                            response.status = H4AuthorityResponseStatus::Denied;
+                            response.denial = Some(H4DenyClassification::RevalidationDenied);
+                        }
+                        H4CMalformedVerdict::UnexpectedConfirmation => {
+                            response.status = H4AuthorityResponseStatus::Ok;
+                            response.confirmation = Some(h4c_unexpected_confirmation(&request));
+                        }
+                        H4CMalformedVerdict::UnexpectedConfirmationConsumed => {
+                            response.status = H4AuthorityResponseStatus::Ok;
+                            response.confirmation_consumed = true;
+                        }
+                        H4CMalformedVerdict::OkStatusWithDenial => {
+                            response.status = H4AuthorityResponseStatus::Ok;
+                            response.denial = Some(H4DenyClassification::RevalidationDenied);
+                        }
+                        H4CMalformedVerdict::DeniedStatusWithGrant => {
+                            response.status = H4AuthorityResponseStatus::Denied;
+                            response.denial = Some(H4DenyClassification::RevalidationDenied);
+                        }
+                    }
+                }
+                Ok(response)
+            })
+        }
+    }
+
     struct H4CProcessRevokingAuthority {
         inner: Arc<ProcessIsolatedH4Authority>,
         revoked: AtomicBool,
@@ -5307,6 +5546,59 @@ mod tests {
                 "model output exposed authority field {field}"
             );
         }
+    }
+
+    fn h4c_unexpected_confirmation(
+        request: &H4AuthorityRequest,
+    ) -> HostExplicitActionConfirmationEvidence {
+        let issued_at_unix_ms = unix_millis();
+        HostExplicitActionConfirmationEvidence {
+            source: H4ConfirmationEvidenceSource::TrustedTestHarness,
+            confirmation_id: "unexpected-confirmation".to_string(),
+            life_id: request.context.life_id().to_string(),
+            task_id: request.context.task_id().to_string(),
+            capability_id: request.capability_id.clone(),
+            authorization_revision: REVISION,
+            workspace_root_identity: request.workspace_root_identity,
+            relative_path: request.relative_path.clone(),
+            target_identity: request.target_identity,
+            expected_sha256: request.expected_sha256.clone(),
+            replacement_sha256: request.replacement_sha256.clone(),
+            replacement_bytes: request.replacement_bytes,
+            tool_call_id: request.tool_call_id.clone(),
+            turn_id: request.turn_id.clone(),
+            issued_at_unix_ms,
+            expires_at_unix_ms: issued_at_unix_ms + GRANT_LIFETIME_MS,
+        }
+    }
+
+    async fn assert_h4c_malformed_verdict(mode: H4CMalformedVerdict, call_id: &str) {
+        let (fixture, authority, _unused_broker, request) = h4c_fixture(call_id);
+        let malformed = Arc::new(H4CMalformedVerdictAuthority {
+            inner: Arc::clone(&authority),
+            mode,
+        });
+        let broker = fixture.broker(malformed as Arc<dyn VitaH4AuthorityPort>);
+        let result = broker.execute_governed_request(request).await;
+        assert_eq!(
+            result.classification,
+            Some(H4DenyClassification::AuthorityEvidenceMismatch)
+        );
+        assert!(matches!(
+            result.execution,
+            Some(VitaWorkspaceReplaceExecutionOutcome::Denied { .. })
+        ));
+        h4c_assert_unmodified(&fixture);
+        let snapshot = broker.snapshot();
+        assert_eq!(snapshot.final_revalidations, 1);
+        assert_eq!(snapshot.final_revalidation_denials, 1);
+        assert_eq!(snapshot.filesystem_mutation_attempts, 0);
+        assert_eq!(snapshot.filesystem_mutations_committed, 0);
+        assert_eq!(snapshot.filesystem_commit_unknown, 0);
+        assert_eq!(snapshot.native_workers_started, 1);
+        assert_eq!(snapshot.native_workers_joined, 1);
+        assert_eq!(snapshot.automatic_mutation_retries, 0);
+        assert_eq!(authority.requests.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -6034,6 +6326,192 @@ mod tests {
             Some(H4DenyClassification::DuplicateToolCall)
         );
         assert_eq!(broker.snapshot().native_workers_started, 1);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn native_panic_before_first_mutation_is_denied_with_zero_side_effect() {
+        let (fixture, _authority, broker, request) = h4c_fixture("h4c-native-panic-before");
+        let result = broker
+            .execute_governed_request_with_fault(
+                request,
+                Some(H4CNativeFault::PanicBeforeFirstMutation),
+            )
+            .await;
+        assert_eq!(
+            result.classification,
+            Some(H4DenyClassification::TargetRejected)
+        );
+        assert!(matches!(
+            result.execution,
+            Some(VitaWorkspaceReplaceExecutionOutcome::Denied { .. })
+        ));
+        let value = result.model_value();
+        assert_eq!(value["status"], "denied");
+        assert_eq!(value["mutation_performed"], false);
+        assert_eq!(value["side_effect_count"], 0);
+        let snapshot = broker.snapshot();
+        assert_eq!(snapshot.filesystem_mutations_committed, 0);
+        assert_eq!(snapshot.filesystem_commit_unknown, 0);
+        assert_eq!(snapshot.automatic_mutation_retries, 0);
+        assert_eq!(snapshot.native_workers_started, 1);
+        assert_eq!(snapshot.native_workers_joined, 1);
+        let evidence = broker.native_evidence_snapshot();
+        assert_eq!(evidence.len(), 1);
+        assert!(!evidence[0].mutation_started);
+        assert_eq!(evidence[0].modifying_syscalls, 0);
+        assert_eq!(evidence[0].committed_mutations, 0);
+        assert!(!evidence[0].commit_unknown);
+        h4c_assert_unmodified(&fixture);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn native_panic_after_first_mutation_is_commit_unknown() {
+        let (_fixture, _authority, broker, request) = h4c_fixture("h4c-native-panic-after");
+        let result = broker
+            .execute_governed_request_with_fault(
+                request,
+                Some(H4CNativeFault::PanicAfterFirstMutation),
+            )
+            .await;
+        assert!(matches!(
+            result.execution,
+            Some(VitaWorkspaceReplaceExecutionOutcome::CommitUnknown { .. })
+        ));
+        let value = result.model_value();
+        assert_eq!(value["status"], "commit_outcome_unknown");
+        assert_eq!(value["commit_outcome"], "unknown");
+        assert_eq!(value["mutation_started"], true);
+        assert_eq!(value["automatic_retry"], false);
+        assert_eq!(value["side_effect_state"], "may_have_mutated");
+        assert_eq!(value["side_effect_count"], 1);
+        let snapshot = broker.snapshot();
+        assert_eq!(snapshot.filesystem_mutations_committed, 0);
+        assert_eq!(snapshot.filesystem_commit_unknown, 1);
+        assert_eq!(snapshot.automatic_mutation_retries, 0);
+        assert_eq!(snapshot.native_workers_started, 1);
+        assert_eq!(snapshot.native_workers_joined, 1);
+        let evidence = broker.native_evidence_snapshot();
+        assert_eq!(evidence.len(), 1);
+        assert!(evidence[0].mutation_started);
+        assert_eq!(evidence[0].modifying_syscalls, 1);
+        assert_eq!(evidence[0].committed_mutations, 0);
+        assert!(evidence[0].commit_unknown);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn native_panic_after_mutation_is_never_retried() {
+        let (_fixture, authority, broker, request) = h4c_fixture("h4c-native-panic-no-retry");
+        let result = broker
+            .execute_governed_request_with_fault(
+                request.clone(),
+                Some(H4CNativeFault::PanicAfterFirstMutation),
+            )
+            .await;
+        assert!(matches!(
+            result.execution,
+            Some(VitaWorkspaceReplaceExecutionOutcome::CommitUnknown { .. })
+        ));
+        let replay = broker.execute_governed_request(request).await;
+        assert_eq!(
+            replay.classification,
+            Some(H4DenyClassification::DuplicateToolCall)
+        );
+        let snapshot = broker.snapshot();
+        assert_eq!(snapshot.native_workers_started, 1);
+        assert_eq!(snapshot.native_workers_joined, 1);
+        assert_eq!(snapshot.filesystem_commit_unknown, 1);
+        assert_eq!(snapshot.automatic_mutation_retries, 0);
+        assert_eq!(authority.requests.lock().unwrap().len(), 2);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn native_panic_worker_is_joined() {
+        let (_fixture, _authority, broker, request) = h4c_fixture("h4c-native-panic-joined");
+        let result = broker
+            .execute_governed_request_with_fault(
+                request,
+                Some(H4CNativeFault::PanicBeforeFirstMutation),
+            )
+            .await;
+        assert!(matches!(
+            result.execution,
+            Some(VitaWorkspaceReplaceExecutionOutcome::Denied { .. })
+        ));
+        assert_eq!(broker.snapshot().native_workers_started, 1);
+        assert_eq!(broker.snapshot().native_workers_joined, 1);
+    }
+
+    #[tokio::test]
+    async fn final_revalidation_rejects_denial_plus_grant() {
+        assert_h4c_malformed_verdict(
+            H4CMalformedVerdict::MixedDenialAndGrant,
+            "h4c-malformed-denial-grant",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn final_revalidation_rejects_confirmation_payload() {
+        assert_h4c_malformed_verdict(
+            H4CMalformedVerdict::UnexpectedConfirmation,
+            "h4c-malformed-confirmation",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn final_revalidation_rejects_confirmation_consumed() {
+        assert_h4c_malformed_verdict(
+            H4CMalformedVerdict::UnexpectedConfirmationConsumed,
+            "h4c-malformed-confirmed",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn final_revalidation_rejects_malformed_status_grant_combination() {
+        assert_h4c_malformed_verdict(
+            H4CMalformedVerdict::OkStatusWithDenial,
+            "h4c-malformed-ok-denial",
+        )
+        .await;
+        assert_h4c_malformed_verdict(
+            H4CMalformedVerdict::DeniedStatusWithGrant,
+            "h4c-malformed-denied-grant",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn malformed_final_verdict_mutates_zero() {
+        for (mode, call_id) in [
+            (
+                H4CMalformedVerdict::MixedDenialAndGrant,
+                "h4c-malformed-zero-denial-grant",
+            ),
+            (
+                H4CMalformedVerdict::UnexpectedConfirmation,
+                "h4c-malformed-zero-confirmation",
+            ),
+            (
+                H4CMalformedVerdict::UnexpectedConfirmationConsumed,
+                "h4c-malformed-zero-consumed",
+            ),
+            (
+                H4CMalformedVerdict::OkStatusWithDenial,
+                "h4c-malformed-zero-ok-denial",
+            ),
+            (
+                H4CMalformedVerdict::DeniedStatusWithGrant,
+                "h4c-malformed-zero-denied-grant",
+            ),
+        ] {
+            assert_h4c_malformed_verdict(mode, call_id).await;
+        }
     }
 
     #[tokio::test]

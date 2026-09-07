@@ -543,7 +543,12 @@ impl HostSession {
         );
         let canonical = self.canonical_decision(&life_id, &capability_id, root_matches)?;
         if canonical.decision.outcome() != CapabilityAuthorizationDecisionKind::ScopeRequired {
-            return Ok(canonical.response("issue_replace_grant", None, false, None));
+            return Ok(canonical.response(
+                "issue_replace_grant",
+                None,
+                root_matches,
+                Some("root_disabled"),
+            ));
         }
         self.ensure_scope_floor(&canonical.decision)?;
         if !root_matches {
@@ -698,7 +703,12 @@ impl HostSession {
         );
         let canonical = self.canonical_decision(&life_id, &capability_id, root_matches)?;
         if canonical.decision.outcome() != CapabilityAuthorizationDecisionKind::ScopeRequired {
-            return Ok(canonical.response("revalidate_replace_grant", None, root_matches, None));
+            return Ok(canonical.response(
+                "revalidate_replace_grant",
+                None,
+                root_matches,
+                Some("root_disabled"),
+            ));
         }
         self.ensure_scope_floor(&canonical.decision)?;
         if !root_matches {

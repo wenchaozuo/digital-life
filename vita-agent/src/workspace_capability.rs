@@ -381,6 +381,9 @@ pub(crate) enum WorkspaceReplaceError {
     CommitFenceStale,
     CommitFenceError,
     CommitFencePanic,
+    NativePanicBeforeMutation,
+    NativePanicAfterMutation,
+    NativeWorkerJoin,
     CancellationBeforeMutation,
     FaultInjected,
     WriteFailed,
@@ -435,6 +438,85 @@ pub(crate) struct WorkspaceReplaceEvidence {
     pub(crate) events: Vec<WorkspaceReplaceEvidenceEvent>,
 }
 
+/// Native replacement state owned by the mutation boundary.  The state is
+/// deliberately not model-controlled: only the primitive advances it, and a
+/// caller can inspect it after a native panic to preserve truthful outcome
+/// semantics.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum WorkspaceReplaceMutationPhase {
+    #[default]
+    NotStarted,
+    Started,
+    Committed,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) struct WorkspaceReplaceMutationTracker {
+    phase: WorkspaceReplaceMutationPhase,
+    operation_handle_opened: bool,
+    fence_called: bool,
+    mutation_attempted: bool,
+}
+
+impl WorkspaceReplaceMutationTracker {
+    pub(crate) fn new() -> Self {
+        Self {
+            phase: WorkspaceReplaceMutationPhase::NotStarted,
+            operation_handle_opened: false,
+            fence_called: false,
+            mutation_attempted: false,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn phase(&self) -> WorkspaceReplaceMutationPhase {
+        self.phase
+    }
+
+    fn operation_handle_opened(&mut self) {
+        self.operation_handle_opened = true;
+    }
+
+    fn fence_called(&mut self) {
+        self.fence_called = true;
+    }
+
+    fn mutation_attempted(&mut self) {
+        self.mutation_attempted = true;
+    }
+
+    fn mark_started(&mut self) {
+        debug_assert_eq!(self.phase, WorkspaceReplaceMutationPhase::NotStarted);
+        self.phase = WorkspaceReplaceMutationPhase::Started;
+    }
+
+    fn mark_committed(&mut self) {
+        debug_assert_eq!(self.phase, WorkspaceReplaceMutationPhase::Started);
+        self.phase = WorkspaceReplaceMutationPhase::Committed;
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn evidence_after_panic(&self) -> WorkspaceReplaceEvidence {
+        let started = matches!(
+            self.phase,
+            WorkspaceReplaceMutationPhase::Started | WorkspaceReplaceMutationPhase::Committed
+        );
+        let committed = self.phase == WorkspaceReplaceMutationPhase::Committed;
+        WorkspaceReplaceEvidence {
+            mutation_attempted: self.mutation_attempted,
+            mutation_started: started,
+            modifying_syscalls: usize::from(started),
+            committed_mutations: usize::from(committed),
+            commit_unknown: started && !committed,
+            fence_calls: usize::from(self.fence_called),
+            operation_handle_open_count: usize::from(self.operation_handle_opened),
+            ..WorkspaceReplaceEvidence::default()
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
 pub(crate) enum WorkspaceReplaceCommitOutcome {
@@ -458,6 +540,8 @@ pub(crate) enum WorkspaceReplaceCommitOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WorkspaceReplaceTestFault {
     AfterFirstWrite,
+    PanicBeforeFirstMutation,
+    PanicAfterFirstMutation,
 }
 
 /// A process-lifetime, OS-backed capability to one trusted workspace root.
@@ -697,6 +781,24 @@ impl PreparedWorkspaceTarget {
         fence: &mut dyn WorkspaceReplaceCommitFence,
         cancellation: &dyn WorkspaceReplaceCancellation,
     ) -> WorkspaceReplaceCommitOutcome {
+        let mut tracker = WorkspaceReplaceMutationTracker::new();
+        self.replace_existing_file_utf8_bounded_with_cancellation_and_tracker(
+            expected_sha256,
+            replacement_content,
+            fence,
+            cancellation,
+            &mut tracker,
+        )
+    }
+
+    pub(crate) fn replace_existing_file_utf8_bounded_with_cancellation_and_tracker(
+        self,
+        expected_sha256: &str,
+        replacement_content: &str,
+        fence: &mut dyn WorkspaceReplaceCommitFence,
+        cancellation: &dyn WorkspaceReplaceCancellation,
+        tracker: &mut WorkspaceReplaceMutationTracker,
+    ) -> WorkspaceReplaceCommitOutcome {
         #[cfg(windows)]
         {
             return platform::replace_existing_file_utf8_bounded(
@@ -705,6 +807,7 @@ impl PreparedWorkspaceTarget {
                 replacement_content,
                 fence,
                 cancellation,
+                tracker,
             );
         }
         #[cfg(not(windows))]
@@ -732,17 +835,40 @@ impl PreparedWorkspaceTarget {
         cancellation: &dyn WorkspaceReplaceCancellation,
         faults: &mut platform::WorkspaceReplaceFaultPlan,
     ) -> WorkspaceReplaceCommitOutcome {
+        let mut tracker = WorkspaceReplaceMutationTracker::new();
+        self.replace_existing_file_utf8_bounded_with_faults_and_tracker(
+            expected_sha256,
+            replacement_content,
+            fence,
+            cancellation,
+            &mut tracker,
+            faults,
+        )
+    }
+
+    #[cfg(all(test, windows))]
+    fn replace_existing_file_utf8_bounded_with_faults_and_tracker(
+        self,
+        expected_sha256: &str,
+        replacement_content: &str,
+        fence: &mut dyn WorkspaceReplaceCommitFence,
+        cancellation: &dyn WorkspaceReplaceCancellation,
+        tracker: &mut WorkspaceReplaceMutationTracker,
+        faults: &mut platform::WorkspaceReplaceFaultPlan,
+    ) -> WorkspaceReplaceCommitOutcome {
         platform::replace_existing_file_utf8_bounded_with_faults(
             self,
             expected_sha256,
             replacement_content,
             fence,
             cancellation,
+            tracker,
             faults,
         )
     }
 
     #[cfg(all(test, windows))]
+    #[allow(dead_code)]
     pub(crate) fn replace_existing_file_utf8_bounded_with_test_fault(
         self,
         expected_sha256: &str,
@@ -751,9 +877,36 @@ impl PreparedWorkspaceTarget {
         cancellation: &dyn WorkspaceReplaceCancellation,
         fault: WorkspaceReplaceTestFault,
     ) -> WorkspaceReplaceCommitOutcome {
+        let mut tracker = WorkspaceReplaceMutationTracker::new();
+        self.replace_existing_file_utf8_bounded_with_test_fault_and_tracker(
+            expected_sha256,
+            replacement_content,
+            fence,
+            cancellation,
+            &mut tracker,
+            fault,
+        )
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn replace_existing_file_utf8_bounded_with_test_fault_and_tracker(
+        self,
+        expected_sha256: &str,
+        replacement_content: &str,
+        fence: &mut dyn WorkspaceReplaceCommitFence,
+        cancellation: &dyn WorkspaceReplaceCancellation,
+        tracker: &mut WorkspaceReplaceMutationTracker,
+        fault: WorkspaceReplaceTestFault,
+    ) -> WorkspaceReplaceCommitOutcome {
         let point = match fault {
             WorkspaceReplaceTestFault::AfterFirstWrite => {
                 platform::WorkspaceReplaceFaultPoint::AfterFirstWrite
+            }
+            WorkspaceReplaceTestFault::PanicBeforeFirstMutation => {
+                platform::WorkspaceReplaceFaultPoint::PanicBeforeFirstMutation
+            }
+            WorkspaceReplaceTestFault::PanicAfterFirstMutation => {
+                platform::WorkspaceReplaceFaultPoint::PanicAfterFirstMutation
             }
         };
         let mut faults = platform::WorkspaceReplaceFaultPlan::once(point);
@@ -763,6 +916,7 @@ impl PreparedWorkspaceTarget {
             replacement_content,
             fence,
             cancellation,
+            tracker,
             &mut faults,
         )
     }
@@ -927,7 +1081,9 @@ mod platform {
         AfterPostFenceHashCheck,
         AfterPostFenceCancellationCheck,
         AfterCommitFenceBeforeFirstWrite,
+        PanicBeforeFirstMutation,
         AfterFirstWrite,
+        PanicAfterFirstMutation,
         BeforeSetEndOfFile,
         AfterSetEndOfFile,
         BeforeFlush,
@@ -1558,6 +1714,7 @@ mod platform {
         replacement_content: &str,
         fence: &mut dyn WorkspaceReplaceCommitFence,
         cancellation: &dyn WorkspaceReplaceCancellation,
+        tracker: &mut WorkspaceReplaceMutationTracker,
     ) -> WorkspaceReplaceCommitOutcome {
         let mut faults = NoWorkspaceReplaceFaults;
         replace_existing_file_utf8_bounded_impl(
@@ -1566,6 +1723,7 @@ mod platform {
             replacement_content,
             fence,
             cancellation,
+            tracker,
             &mut faults,
         )
     }
@@ -1577,6 +1735,7 @@ mod platform {
         replacement_content: &str,
         fence: &mut dyn WorkspaceReplaceCommitFence,
         cancellation: &dyn WorkspaceReplaceCancellation,
+        tracker: &mut WorkspaceReplaceMutationTracker,
         faults: &mut WorkspaceReplaceFaultPlan,
     ) -> WorkspaceReplaceCommitOutcome {
         replace_existing_file_utf8_bounded_impl(
@@ -1585,6 +1744,7 @@ mod platform {
             replacement_content,
             fence,
             cancellation,
+            tracker,
             faults,
         )
     }
@@ -1595,6 +1755,7 @@ mod platform {
         replacement_content: &str,
         fence: &mut dyn WorkspaceReplaceCommitFence,
         cancellation: &dyn WorkspaceReplaceCancellation,
+        tracker: &mut WorkspaceReplaceMutationTracker,
         faults: &mut F,
     ) -> WorkspaceReplaceCommitOutcome
     where
@@ -1657,6 +1818,7 @@ mod platform {
             }
         };
         evidence.operation_handle_open_count = 1;
+        tracker.operation_handle_opened();
 
         let details =
             match verify_replace_operation_handle(&root, &operation_handle, expected_identity) {
@@ -1706,6 +1868,7 @@ mod platform {
         }
 
         evidence.fence_calls = 1;
+        tracker.fence_called();
         evidence
             .events
             .push(WorkspaceReplaceEvidenceEvent::CommitFence);
@@ -1728,6 +1891,7 @@ mod platform {
         }
 
         evidence.mutation_attempted = true;
+        tracker.mutation_attempted();
         if faults.fire(WorkspaceReplaceFaultPoint::AfterCommitFenceBeforePostFenceChecks) {
             return replace_denied(evidence, WorkspaceReplaceError::FaultInjected);
         }
@@ -1821,11 +1985,15 @@ mod platform {
         if !set_file_pointer(&operation_handle, 0) {
             return replace_denied(evidence, WorkspaceReplaceError::OperationHandleIo);
         }
+        if faults.fire(WorkspaceReplaceFaultPoint::PanicBeforeFirstMutation) {
+            panic!("test-only native panic before first mutation");
+        }
 
         if replacement_bytes.is_empty() {
             if faults.fire(WorkspaceReplaceFaultPoint::BeforeSetEndOfFile) {
                 return replace_denied(evidence, WorkspaceReplaceError::FaultInjected);
             }
+            tracker.mark_started();
             evidence.mutation_started = true;
             evidence.modifying_syscalls += 1;
             evidence
@@ -1835,6 +2003,9 @@ mod platform {
                 return replace_unknown(evidence, WorkspaceReplaceError::SetEndOfFileFailed);
             }
             faults.after_first_modifying_syscall();
+            if faults.fire(WorkspaceReplaceFaultPoint::PanicAfterFirstMutation) {
+                panic!("test-only native panic after first mutation");
+            }
             if faults.fire(WorkspaceReplaceFaultPoint::AfterSetEndOfFile) {
                 return replace_unknown(evidence, WorkspaceReplaceError::FaultInjected);
             }
@@ -1843,13 +2014,16 @@ mod platform {
             // immediately before the first modifying syscall.  A positive
             // short write continues from the same handle and current file
             // pointer; it never starts a second transaction.
-            evidence.mutation_started = true;
             let mut offset = 0_usize;
             let mut first_write = true;
             while offset < replacement_bytes.len() {
                 let remaining = replacement_bytes.len() - offset;
                 let request_len = faults.write_chunk_limit(remaining).min(remaining).max(1);
                 let mut written = 0_u32;
+                if first_write {
+                    tracker.mark_started();
+                    evidence.mutation_started = true;
+                }
                 evidence.modifying_syscalls += 1;
                 evidence.write_calls += 1;
                 if first_write {
@@ -1884,6 +2058,9 @@ mod platform {
                 if first_write {
                     first_write = false;
                     faults.after_first_modifying_syscall();
+                    if faults.fire(WorkspaceReplaceFaultPoint::PanicAfterFirstMutation) {
+                        panic!("test-only native panic after first mutation");
+                    }
                     if faults.fire(WorkspaceReplaceFaultPoint::AfterFirstWrite) {
                         return replace_unknown(evidence, WorkspaceReplaceError::FaultInjected);
                     }
@@ -1936,6 +2113,7 @@ mod platform {
             return replace_unknown(evidence, WorkspaceReplaceError::PostWriteVerificationFailed);
         }
 
+        tracker.mark_committed();
         evidence.committed_mutations = 1;
         WorkspaceReplaceCommitOutcome::Committed { evidence }
     }

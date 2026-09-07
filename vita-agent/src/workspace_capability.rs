@@ -7,6 +7,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fmt::{self, Display};
+use std::io;
 #[cfg(windows)]
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Component, Path, PathBuf};
@@ -646,6 +647,48 @@ impl TrustedWorkspaceRoot {
         }
     }
 
+    /// Acquires one fixed child directory beneath this retained directory
+    /// capability.  This is crate-internal plumbing for app-owned namespaces;
+    /// it never exposes the underlying handle or accepts a model path.
+    #[cfg(windows)]
+    pub(crate) fn acquire_fixed_child_directory_for_namespace(
+        &self,
+        component: &OsStr,
+    ) -> Result<Self, VitaAgentError> {
+        platform::acquire_fixed_child_directory(self, component)
+    }
+
+    /// Creates one child file with `CREATE_NEW` relative to this retained
+    /// directory capability.  The caller owns the namespace decision; this
+    /// helper only supplies the native handle-relative primitive.
+    #[cfg(windows)]
+    pub(crate) fn create_new_file_relative_for_namespace(
+        &self,
+        component: &OsStr,
+        contents: &[u8],
+    ) -> io::Result<()> {
+        platform::create_new_file_relative(self, component, contents)
+    }
+
+    /// Opens and reads one child file relative to this retained directory
+    /// capability.  The exact returned handle is inspected before any bytes
+    /// are consumed, and reparse points are rejected.
+    #[cfg(windows)]
+    pub(crate) fn read_file_relative_for_namespace(
+        &self,
+        component: &OsStr,
+        max_bytes: usize,
+    ) -> io::Result<Vec<u8>> {
+        platform::read_file_relative(self, component, max_bytes)
+    }
+
+    /// Enumerates names from this retained directory handle.  No child path
+    /// is constructed by the enumeration primitive.
+    #[cfg(windows)]
+    pub(crate) fn enumerate_children_for_namespace(&self) -> io::Result<Vec<OsString>> {
+        platform::enumerate_children(self)
+    }
+
     #[cfg(windows)]
     fn from_platform(
         requested_path: PathBuf,
@@ -1004,16 +1047,18 @@ mod platform {
     use std::ffi::c_void;
     use std::io;
     use std::mem::size_of;
-    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows_sys::Wdk::Storage::FileSystem::{
-        NtCreateFile, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
-        FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
+        FileBothDirectoryInformation, NtCreateFile, NtQueryDirectoryFile,
+        FILE_BOTH_DIR_INFORMATION, FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE,
+        FILE_OPEN, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
     };
     use windows_sys::Win32::Foundation::{
-        CloseHandle, HANDLE, INVALID_HANDLE_VALUE, NTSTATUS, OBJ_CASE_INSENSITIVE,
-        OBJ_DONT_REPARSE, STATUS_NO_SUCH_FILE, STATUS_OBJECT_NAME_NOT_FOUND,
+        CloseHandle, RtlNtStatusToDosError, HANDLE, INVALID_HANDLE_VALUE, NTSTATUS,
+        OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE, STATUS_NO_MORE_ENTRIES, STATUS_NO_MORE_FILES,
+        STATUS_NO_SUCH_FILE, STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND,
         STATUS_OBJECT_PATH_NOT_FOUND, UNICODE_STRING,
     };
     use windows_sys::Win32::Storage::FileSystem::{
@@ -1022,9 +1067,10 @@ mod platform {
         SetEndOfFile, SetFilePointerEx, WriteFile, BY_HANDLE_FILE_INFORMATION,
         FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_BEGIN,
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO,
-        FILE_INFO_BY_HANDLE_CLASS, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
-        FILE_SHARE_NONE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_TYPE_DISK,
-        FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, OPEN_EXISTING, SYNCHRONIZE,
+        FILE_INFO_BY_HANDLE_CLASS, FILE_LIST_DIRECTORY, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES,
+        FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_NONE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_TRAVERSE, FILE_TYPE_DISK, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, OPEN_EXISTING,
+        SYNCHRONIZE,
     };
     use windows_sys::Win32::System::WindowsProgramming::{
         DRIVE_FIXED, DRIVE_NO_ROOT_DIR, DRIVE_RAMDISK, DRIVE_REMOTE, DRIVE_REMOVABLE, DRIVE_UNKNOWN,
@@ -1581,6 +1627,24 @@ mod platform {
         share_access: u32,
         create_options: u32,
     ) -> Result<OwnedHandle, RelativeOpenError> {
+        open_relative_with_options_and_share_disposition(
+            parent,
+            component,
+            desired_access,
+            share_access,
+            FILE_OPEN,
+            create_options,
+        )
+    }
+
+    fn open_relative_with_options_and_share_disposition(
+        parent: &Arc<OwnedHandle>,
+        component: &OsStr,
+        desired_access: u32,
+        share_access: u32,
+        create_disposition: u32,
+        create_options: u32,
+    ) -> Result<OwnedHandle, RelativeOpenError> {
         let mut name = component.encode_wide().collect::<Vec<_>>();
         let byte_length = name
             .len()
@@ -1613,7 +1677,7 @@ mod platform {
                 std::ptr::null(),
                 0,
                 share_access,
-                FILE_OPEN,
+                create_disposition,
                 create_options,
                 std::ptr::null(),
                 0,
@@ -1635,6 +1699,337 @@ mod platform {
             return Err(RelativeOpenError::Status(status));
         }
         Ok(OwnedHandle(handle))
+    }
+
+    pub(super) fn acquire_fixed_child_directory(
+        parent: &TrustedWorkspaceRoot,
+        component: &OsStr,
+    ) -> Result<TrustedWorkspaceRoot, VitaAgentError> {
+        validate_namespace_child(component)?;
+        let child = open_relative_with_options_and_share_disposition(
+            &parent.inner.handle,
+            component,
+            FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY | FILE_TRAVERSE | SYNCHRONIZE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN_IF,
+            FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+        )
+        .map_err(|error| relative_open_error(&parent.requested_path().join(component), error))?;
+        let details = inspect_handle(&child, true)?;
+        ensure_descendant(parent, &details.final_path)?;
+        Ok(TrustedWorkspaceRoot::from_platform(
+            parent.requested_path().join(component),
+            details.final_path,
+            details.identity,
+            Arc::new(child),
+        ))
+    }
+
+    pub(super) fn create_new_file_relative(
+        parent: &TrustedWorkspaceRoot,
+        component: &OsStr,
+        contents: &[u8],
+    ) -> io::Result<()> {
+        validate_namespace_child_io(component)?;
+        let handle = open_relative_with_options_and_share_disposition(
+            &parent.inner.handle,
+            component,
+            FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_CREATE,
+            FILE_OPEN_REPARSE_POINT | FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+        )
+        .map_err(namespace_open_io_error)?;
+        let details = inspect_handle(&handle, false).map_err(namespace_kernel_io_error)?;
+        if details.is_directory {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "namespace child is a directory",
+            ));
+        }
+        write_file_bytes(&handle, contents)?;
+        if unsafe { FlushFileBuffers(handle.0) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    pub(super) fn read_file_relative(
+        parent: &TrustedWorkspaceRoot,
+        component: &OsStr,
+        max_bytes: usize,
+    ) -> io::Result<Vec<u8>> {
+        validate_namespace_child_io(component)?;
+        let handle = open_relative_with_options_and_share_disposition(
+            &parent.inner.handle,
+            component,
+            FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+        )
+        .map_err(namespace_open_io_error)?;
+        let details = inspect_handle(&handle, false).map_err(namespace_kernel_io_error)?;
+        if details.is_directory {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "namespace child is a directory",
+            ));
+        }
+        read_file_bytes(&handle, max_bytes)
+    }
+
+    pub(super) fn enumerate_children(
+        directory: &TrustedWorkspaceRoot,
+    ) -> io::Result<Vec<OsString>> {
+        inspect_handle(&directory.inner.handle, true).map_err(namespace_kernel_io_error)?;
+
+        let mut names = Vec::new();
+        let mut restart_scan = true;
+        let mut buffer = vec![0_u64; 8 * 1024];
+        let byte_buffer = unsafe {
+            std::slice::from_raw_parts_mut(
+                buffer.as_mut_ptr().cast::<u8>(),
+                buffer.len() * size_of::<u64>(),
+            )
+        };
+        loop {
+            let mut status_block = IO_STATUS_BLOCK::default();
+            let status = unsafe {
+                NtQueryDirectoryFile(
+                    directory.inner.handle.0,
+                    std::ptr::null_mut(),
+                    None,
+                    std::ptr::null(),
+                    &mut status_block,
+                    byte_buffer.as_mut_ptr().cast(),
+                    byte_buffer.len() as u32,
+                    FileBothDirectoryInformation,
+                    false,
+                    std::ptr::null(),
+                    restart_scan,
+                )
+            };
+            if status == STATUS_NO_MORE_FILES || status == STATUS_NO_MORE_ENTRIES {
+                break;
+            }
+            if status < 0 {
+                return Err(namespace_status_io_error(status));
+            }
+            let returned = usize::try_from(status_block.Information)
+                .ok()
+                .filter(|length| *length <= byte_buffer.len())
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "directory enumeration returned an invalid byte count",
+                    )
+                })?;
+            if returned == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "directory enumeration returned no entry bytes",
+                ));
+            }
+            parse_directory_names(byte_buffer, returned, &mut names)?;
+            restart_scan = false;
+        }
+        Ok(names)
+    }
+
+    fn validate_namespace_child(component: &OsStr) -> Result<(), VitaAgentError> {
+        if component.is_empty()
+            || component == OsStr::new(".")
+            || component == OsStr::new("..")
+            || component.to_string_lossy().chars().any(|character| {
+                character == '/' || character == '\\' || character == ':' || character.is_control()
+            })
+        {
+            return Err(VitaAgentError::UnsafePath {
+                field: ROOT_FIELD,
+                path: PathBuf::new(),
+                reason: "namespace child is not one fixed component",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_namespace_child_io(component: &OsStr) -> io::Result<()> {
+        validate_namespace_child(component)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))
+    }
+
+    fn namespace_open_io_error(error: RelativeOpenError) -> io::Error {
+        match error {
+            RelativeOpenError::Missing(status) | RelativeOpenError::Status(status) => {
+                namespace_status_io_error(status)
+            }
+        }
+    }
+
+    fn namespace_status_io_error(status: NTSTATUS) -> io::Error {
+        if status == STATUS_OBJECT_NAME_COLLISION {
+            return io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "namespace child already exists",
+            );
+        }
+        let error_code = unsafe { RtlNtStatusToDosError(status) } as i32;
+        if error_code == 0 {
+            io::Error::other(format!(
+                "native namespace operation failed with NTSTATUS {status:#x}"
+            ))
+        } else {
+            io::Error::from_raw_os_error(error_code)
+        }
+    }
+
+    fn namespace_kernel_io_error(error: VitaAgentError) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+    }
+
+    fn write_file_bytes(handle: &OwnedHandle, contents: &[u8]) -> io::Result<()> {
+        let mut offset = 0usize;
+        while offset < contents.len() {
+            let request = (contents.len() - offset).min(u32::MAX as usize) as u32;
+            let mut written = 0_u32;
+            let ok = unsafe {
+                WriteFile(
+                    handle.0,
+                    contents[offset..].as_ptr(),
+                    request,
+                    &mut written,
+                    std::ptr::null_mut(),
+                )
+            } != 0;
+            if !ok {
+                return Err(io::Error::last_os_error());
+            }
+            if written == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "native namespace write made no progress",
+                ));
+            }
+            offset += written as usize;
+        }
+        Ok(())
+    }
+
+    fn read_file_bytes(handle: &OwnedHandle, max_bytes: usize) -> io::Result<Vec<u8>> {
+        if max_bytes == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "bounded namespace read requires a positive limit",
+            ));
+        }
+        let mut bytes = Vec::with_capacity(max_bytes.min(8 * 1024));
+        let mut buffer = [0_u8; 8 * 1024];
+        loop {
+            let remaining = max_bytes
+                .checked_add(1)
+                .and_then(|limit| limit.checked_sub(bytes.len()))
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "read bound overflow"))?;
+            if remaining == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "namespace child exceeds its hard size bound",
+                ));
+            }
+            let request = remaining.min(buffer.len()) as u32;
+            let mut read = 0_u32;
+            let ok = unsafe {
+                ReadFile(
+                    handle.0,
+                    buffer.as_mut_ptr(),
+                    request,
+                    &mut read,
+                    std::ptr::null_mut(),
+                )
+            } != 0;
+            if !ok {
+                return Err(io::Error::last_os_error());
+            }
+            if read == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..read as usize]);
+            if bytes.len() > max_bytes {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "namespace child exceeds its hard size bound",
+                ));
+            }
+        }
+        Ok(bytes)
+    }
+
+    fn parse_directory_names(
+        buffer: &[u8],
+        returned: usize,
+        names: &mut Vec<OsString>,
+    ) -> io::Result<()> {
+        let header_bytes = size_of::<FILE_BOTH_DIR_INFORMATION>() - size_of::<u16>();
+        let mut offset = 0usize;
+        while offset < returned {
+            if returned - offset < header_bytes {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "directory entry header is truncated",
+                ));
+            }
+            let entry =
+                unsafe { &*(buffer.as_ptr().add(offset) as *const FILE_BOTH_DIR_INFORMATION) };
+            let name_length = usize::try_from(entry.FileNameLength).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "directory name length overflow")
+            })?;
+            if name_length % size_of::<u16>() != 0
+                || name_length / size_of::<u16>() > MAX_UTF16_UNITS
+                || header_bytes
+                    .checked_add(name_length)
+                    .and_then(|length| offset.checked_add(length))
+                    .filter(|end| *end <= returned)
+                    .is_none()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "directory entry name is outside the returned buffer",
+                ));
+            }
+            let name = unsafe {
+                std::slice::from_raw_parts(
+                    (entry.FileName.as_ptr()).cast::<u8>().add(0).cast::<u16>(),
+                    name_length / size_of::<u16>(),
+                )
+            };
+            let name = OsString::from_wide(name);
+            if name != OsStr::new(".") && name != OsStr::new("..") {
+                names.push(name);
+            }
+
+            let next = usize::try_from(entry.NextEntryOffset).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "directory entry offset overflow",
+                )
+            })?;
+            if next == 0 {
+                break;
+            }
+            if next < header_bytes + name_length
+                || offset
+                    .checked_add(next)
+                    .filter(|end| *end < returned)
+                    .is_none()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "directory entry offset is invalid",
+                ));
+            }
+            offset += next;
+        }
+        Ok(())
     }
 
     pub(super) fn read_existing_file_utf8_bounded(

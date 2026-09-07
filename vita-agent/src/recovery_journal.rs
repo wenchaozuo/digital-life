@@ -13,11 +13,9 @@
 //! malicious administrator who can rewrite the app-owned directory.
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::fmt::{self, Display, Formatter};
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
-#[cfg(test)]
-use std::io::{Seek, SeekFrom};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -26,8 +24,8 @@ use sha2::{Digest, Sha256};
 
 use crate::workspace_capability::WorkspaceReadError;
 use crate::{
-    PreparedWorkspaceTarget, PreparedWorkspaceTargetKind, VitaAgentError, VitaAgentRuntimeProfile,
-    WorkspaceRelativePath, WorkspaceRootIdentity,
+    PreparedWorkspaceTarget, PreparedWorkspaceTargetKind, TrustedWorkspaceRoot, VitaAgentError,
+    VitaAgentRuntimeProfile, WorkspaceRelativePath, WorkspaceRootIdentity,
 };
 
 pub const RECOVERY_JOURNAL_FORMAT_VERSION: u16 = 1;
@@ -826,6 +824,13 @@ impl RecoveryJournalScan {
         })
     }
 
+    /// Returns only unambiguous Prepared evidence.  A target with more than
+    /// one pending transaction is represented solely by
+    /// `AmbiguousPendingRecovery` and never appears in this iterator.
+    pub fn actionable_prepared_journals(&self) -> impl Iterator<Item = &RecoveryJournalV1> {
+        self.valid_prepared_journals()
+    }
+
     pub fn has_ambiguous_pending_recovery(&self) -> bool {
         self.items.iter().any(|item| {
             matches!(
@@ -850,7 +855,8 @@ impl RecoveryJournalScan {
 
 /// Current-state reconciliation is deliberately read-only and contains no
 /// recovery action.  `AlreadyReplacement` is evidence only; it does not mark
-/// a journal finalized.
+/// a journal finalized, and no reconciliation result is recovery
+/// authorization.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RecoveryJournalReconciliation {
     StillBefore,
@@ -860,6 +866,110 @@ pub enum RecoveryJournalReconciliation {
     TargetIdentityChanged,
 }
 
+/// A process-local capability to the one fixed Vita-owned recovery
+/// namespace.  This is namespace authority only: it is not D28 authority,
+/// does not contain a capability grant or confirmation, and cannot authorize
+/// workspace recovery.
+#[derive(Clone)]
+pub struct RecoveryJournalRootAuthority {
+    vita_root: TrustedWorkspaceRoot,
+    recovery_root: TrustedWorkspaceRoot,
+}
+
+impl fmt::Debug for RecoveryJournalRootAuthority {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RecoveryJournalRootAuthority")
+            .field("vita_root", &self.vita_root)
+            .field("recovery_root", &self.recovery_root)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RecoveryJournalRootAuthority {
+    fn acquire(profile: &VitaAgentRuntimeProfile) -> Result<Self, RecoveryJournalError> {
+        profile
+            .validate_private_namespace()
+            .map_err(RecoveryJournalError::Profile)?;
+        profile
+            .verify_private_runtime_ownership()
+            .map_err(RecoveryJournalError::Profile)?;
+
+        #[cfg(windows)]
+        {
+            let vita_root = TrustedWorkspaceRoot::acquire(profile.vita_root())
+                .map_err(RecoveryJournalError::Profile)?;
+            let recovery_root = vita_root
+                .acquire_fixed_child_directory_for_namespace(OsStr::new(RECOVERY_DIRECTORY_NAME))
+                .map_err(RecoveryJournalError::Profile)?;
+            return Ok(Self {
+                vita_root,
+                recovery_root,
+            });
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = profile;
+            Err(RecoveryJournalError::UnsupportedPlatform)
+        }
+    }
+
+    fn create_new_file(
+        &self,
+        transaction_id: &RecoveryTransactionId,
+        bytes: &[u8],
+    ) -> Result<(), RecoveryJournalError> {
+        let name = journal_file_name(transaction_id);
+        #[cfg(windows)]
+        {
+            return self
+                .recovery_root
+                .create_new_file_relative_for_namespace(OsStr::new(&name), bytes)
+                .map_err(|error| {
+                    if error.kind() == io::ErrorKind::AlreadyExists {
+                        RecoveryJournalError::DuplicateTransactionId
+                    } else {
+                        io_error("create-new journal", error)
+                    }
+                });
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (transaction_id, bytes);
+            Err(RecoveryJournalError::UnsupportedPlatform)
+        }
+    }
+
+    fn read_file(&self, file_name: &OsStr) -> Result<Vec<u8>, RecoveryJournalError> {
+        #[cfg(windows)]
+        {
+            return self
+                .recovery_root
+                .read_file_relative_for_namespace(file_name, RECOVERY_JOURNAL_MAX_SIZE)
+                .map_err(|error| io_error("open/read journal", error));
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = file_name;
+            Err(RecoveryJournalError::UnsupportedPlatform)
+        }
+    }
+
+    fn enumerate(&self) -> Result<Vec<std::ffi::OsString>, RecoveryJournalError> {
+        #[cfg(windows)]
+        {
+            return self
+                .recovery_root
+                .enumerate_children_for_namespace()
+                .map_err(|error| io_error("enumerate recovery root", error));
+        }
+        #[cfg(not(windows))]
+        {
+            Err(RecoveryJournalError::UnsupportedPlatform)
+        }
+    }
+}
+
 /// App-owned recovery journal store.  Its root is derived exclusively from an
 /// explicit Vita runtime profile; there is no constructor accepting a model
 /// path, transaction path, cwd, TEMP, `.codex`, or arbitrary environment.
@@ -867,6 +977,7 @@ pub enum RecoveryJournalReconciliation {
 pub struct RecoveryJournalStore {
     profile: VitaAgentRuntimeProfile,
     recovery_root: PathBuf,
+    namespace_authority: RecoveryJournalRootAuthority,
     workspace_root_identity: Option<RecoveryJournalIdentity>,
 }
 
@@ -890,6 +1001,7 @@ impl RecoveryJournalStore {
         profile
             .validate_private_namespace()
             .map_err(RecoveryJournalError::Profile)?;
+        let namespace_authority = RecoveryJournalRootAuthority::acquire(profile)?;
         let workspace_root_identity = profile
             .workspace_authority()
             .map(|root| RecoveryJournalIdentity::from_workspace_identity(root.identity()))
@@ -906,6 +1018,7 @@ impl RecoveryJournalStore {
         Ok(Self {
             profile: profile.clone(),
             recovery_root,
+            namespace_authority,
             workspace_root_identity,
         })
     }
@@ -937,29 +1050,14 @@ impl RecoveryJournalStore {
         self.profile
             .verify_private_runtime_ownership()
             .map_err(RecoveryJournalError::Profile)?;
-        let metadata = match fs::symlink_metadata(&self.recovery_root) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(RecoveryJournalScan::default())
-            }
-            Err(error) => return Err(io_error("scan recovery root", error)),
-        };
-        if !metadata.is_dir() || is_reparse_point(&metadata) {
-            return Err(RecoveryJournalError::TargetBindingMismatch(
-                "recovery root is not a non-reparse directory",
-            ));
-        }
         let mut items = Vec::new();
-        let mut entries = fs::read_dir(&self.recovery_root)
-            .map_err(|error| io_error("enumerate recovery root", error))?;
+        let entries = self.namespace_authority.enumerate()?;
         let mut entry_count = 0usize;
-        while let Some(entry) = entries.next() {
+        for file_name in entries {
             entry_count += 1;
             if entry_count > MAX_SCAN_ENTRIES {
                 return Err(RecoveryJournalError::ScanLimitExceeded);
             }
-            let entry = entry.map_err(|error| io_error("read recovery directory entry", error))?;
-            let file_name = entry.file_name();
             if Path::new(&file_name)
                 .extension()
                 .and_then(|extension| extension.to_str())
@@ -985,25 +1083,7 @@ impl RecoveryJournalStore {
                     continue;
                 }
             };
-            let path = entry.path();
-            let file_metadata = match fs::symlink_metadata(&path) {
-                Ok(metadata) => metadata,
-                Err(_) => {
-                    items.push(RecoveryJournalScanItem::CorruptJournal {
-                        file_name: display_name,
-                        reason: "journal disappeared during scan",
-                    });
-                    continue;
-                }
-            };
-            if !file_metadata.is_file() || is_reparse_point(&file_metadata) {
-                items.push(RecoveryJournalScanItem::CorruptJournal {
-                    file_name: display_name,
-                    reason: "journal is not a regular non-reparse file",
-                });
-                continue;
-            }
-            let bytes = match read_bounded_file(&path) {
+            let bytes = match self.namespace_authority.read_file(&file_name) {
                 Ok(bytes) => bytes,
                 Err(error) => {
                     items.push(RecoveryJournalScanItem::CorruptJournal {
@@ -1041,25 +1121,7 @@ impl RecoveryJournalStore {
             }
         }
 
-        let mut by_target: HashMap<RecoveryJournalTargetKey, Vec<RecoveryTransactionId>> =
-            HashMap::new();
-        for item in &items {
-            if let RecoveryJournalScanItem::ValidPreparedJournal(journal) = item {
-                by_target
-                    .entry(target_key(journal))
-                    .or_default()
-                    .push(journal.transaction_id().clone());
-            }
-        }
-        for (target, transactions) in by_target {
-            if transactions.len() > 1 {
-                items.push(RecoveryJournalScanItem::AmbiguousPendingRecovery {
-                    target,
-                    transactions,
-                });
-            }
-        }
-        Ok(RecoveryJournalScan { items })
+        Ok(finalize_scan_items(items))
     }
 
     /// Reconciles the fixed workspace target against one prepared record
@@ -1139,7 +1201,6 @@ impl RecoveryJournalStore {
         }
         let record =
             RecoveryJournalV1::from_preimage(transaction_id, target, context, before_content)?;
-        self.ensure_recovery_directory()?;
         self.persist_prepared(&record)
     }
 
@@ -1174,64 +1235,19 @@ impl RecoveryJournalStore {
         Ok(())
     }
 
-    fn ensure_recovery_directory(&self) -> Result<(), RecoveryJournalError> {
-        self.profile
-            .validate_private_namespace()
-            .map_err(RecoveryJournalError::Profile)?;
-        self.profile
-            .verify_private_runtime_ownership()
-            .map_err(RecoveryJournalError::Profile)?;
-        match fs::symlink_metadata(&self.recovery_root) {
-            Ok(metadata) => {
-                if !metadata.is_dir() || is_reparse_point(&metadata) {
-                    return Err(RecoveryJournalError::TargetBindingMismatch(
-                        "recovery directory is not a non-reparse directory",
-                    ));
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                fs::create_dir(&self.recovery_root)
-                    .map_err(|error| io_error("create recovery directory", error))?;
-                let metadata = fs::symlink_metadata(&self.recovery_root)
-                    .map_err(|error| io_error("verify recovery directory", error))?;
-                if !metadata.is_dir() || is_reparse_point(&metadata) {
-                    return Err(RecoveryJournalError::TargetBindingMismatch(
-                        "new recovery directory is not trusted",
-                    ));
-                }
-            }
-            Err(error) => return Err(io_error("inspect recovery directory", error)),
-        }
-        Ok(())
-    }
-
     fn persist_prepared(
         &self,
         record: &RecoveryJournalV1,
     ) -> Result<RecoveryJournalV1, RecoveryJournalError> {
         let bytes = record.to_bytes()?;
-        let path = self.journal_path(record.transaction_id());
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|error| {
-                if error.kind() == io::ErrorKind::AlreadyExists {
-                    RecoveryJournalError::DuplicateTransactionId
-                } else {
-                    io_error("create-new journal", error)
-                }
-            })?;
-        file.write_all(&bytes)
-            .map_err(|error| io_error("write journal", error))?;
-        file.flush()
-            .map_err(|error| io_error("flush journal", error))?;
-        file.sync_all()
-            .map_err(|error| io_error("sync journal", error))?;
-        drop(file);
+        self.namespace_authority
+            .create_new_file(record.transaction_id(), &bytes)?;
 
-        let verified = RecoveryJournalV1::from_bytes(&read_bounded_file(&path)?)
-            .map_err(|_| RecoveryJournalError::ReopenVerificationFailed)?;
+        let file_name = journal_file_name(record.transaction_id());
+        let verified = RecoveryJournalV1::from_bytes(
+            &self.namespace_authority.read_file(OsStr::new(&file_name))?,
+        )
+        .map_err(|_| RecoveryJournalError::ReopenVerificationFailed)?;
         if verified.record_state() != RecoveryJournalRecordState::Prepared || verified != *record {
             return Err(RecoveryJournalError::ReopenVerificationFailed);
         }
@@ -1244,9 +1260,9 @@ impl RecoveryJournalStore {
             .map_err(RecoveryJournalError::Profile)
     }
 
+    #[cfg(test)]
     fn journal_path(&self, transaction_id: &RecoveryTransactionId) -> PathBuf {
-        self.recovery_root
-            .join(format!("{}.dlrj", transaction_id.as_str()))
+        self.recovery_root.join(journal_file_name(transaction_id))
     }
 
     #[cfg(test)]
@@ -1280,7 +1296,6 @@ impl RecoveryJournalStore {
             context,
             before_content,
         )?;
-        self.ensure_recovery_directory()?;
         self.persist_prepared_with_fault(&record, fault)
     }
 
@@ -1291,67 +1306,83 @@ impl RecoveryJournalStore {
         fault: RecoveryJournalTestFault,
     ) -> Result<RecoveryJournalV1, RecoveryJournalError> {
         let bytes = record.to_bytes()?;
-        let path = self.journal_path(record.transaction_id());
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|error| {
-                if error.kind() == io::ErrorKind::AlreadyExists {
-                    RecoveryJournalError::DuplicateTransactionId
-                } else {
-                    io_error("create-new journal", error)
-                }
-            })?;
         if fault == RecoveryJournalTestFault::Write {
             return Err(RecoveryJournalError::InjectedFault("write"));
         }
-        file.write_all(&bytes)
-            .map_err(|error| io_error("write journal", error))?;
         if fault == RecoveryJournalTestFault::Truncate {
-            file.set_len((bytes.len() / 2) as u64)
-                .map_err(|error| io_error("truncate test journal", error))?;
+            self.namespace_authority
+                .create_new_file(record.transaction_id(), &bytes[..bytes.len() / 2])?;
+            return Err(RecoveryJournalError::InjectedFault("truncate"));
         }
         if fault == RecoveryJournalTestFault::Flush {
-            file.set_len(0)
-                .map_err(|error| io_error("invalidate flush test journal", error))?;
             return Err(RecoveryJournalError::InjectedFault("flush"));
         }
-        file.flush()
-            .map_err(|error| io_error("flush journal", error))?;
-        file.sync_all()
-            .map_err(|error| io_error("sync journal", error))?;
-        drop(file);
         if fault == RecoveryJournalTestFault::BadIntegrity {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .open(&path)
-                .map_err(|error| io_error("open integrity fault journal", error))?;
-            file.seek(SeekFrom::End(-1))
-                .map_err(|error| io_error("seek integrity fault journal", error))?;
-            file.write_all(&[0xff])
-                .map_err(|error| io_error("write integrity fault journal", error))?;
-            file.flush()
-                .map_err(|error| io_error("flush integrity fault journal", error))?;
-            file.sync_all()
-                .map_err(|error| io_error("sync integrity fault journal", error))?;
+            let mut invalid = bytes;
+            let last = invalid.len() - 1;
+            invalid[last] ^= 0xff;
+            self.namespace_authority
+                .create_new_file(record.transaction_id(), &invalid)?;
             return Err(RecoveryJournalError::InjectedFault("integrity"));
         }
         if fault == RecoveryJournalTestFault::Reopen {
-            let file = OpenOptions::new()
-                .write(true)
-                .open(&path)
-                .map_err(|error| io_error("open reopen fault journal", error))?;
-            file.set_len(0)
-                .map_err(|error| io_error("invalidate reopen fault journal", error))?;
+            self.namespace_authority
+                .create_new_file(record.transaction_id(), &[])?;
             return Err(RecoveryJournalError::InjectedFault("reopen"));
         }
-        let verified = RecoveryJournalV1::from_bytes(&read_bounded_file(&path)?)
-            .map_err(|_| RecoveryJournalError::ReopenVerificationFailed)?;
+        self.namespace_authority
+            .create_new_file(record.transaction_id(), &bytes)?;
+        let file_name = journal_file_name(record.transaction_id());
+        let verified = RecoveryJournalV1::from_bytes(
+            &self.namespace_authority.read_file(OsStr::new(&file_name))?,
+        )
+        .map_err(|_| RecoveryJournalError::ReopenVerificationFailed)?;
         if verified != *record {
             return Err(RecoveryJournalError::ReopenVerificationFailed);
         }
         Ok(verified)
+    }
+}
+
+fn journal_file_name(transaction_id: &RecoveryTransactionId) -> String {
+    format!("{}.dlrj", transaction_id.as_str())
+}
+
+fn finalize_scan_items(items: Vec<RecoveryJournalScanItem>) -> RecoveryJournalScan {
+    let mut by_target: HashMap<RecoveryJournalTargetKey, Vec<RecoveryJournalV1>> = HashMap::new();
+    let mut retained_items = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            RecoveryJournalScanItem::ValidPreparedJournal(journal) => {
+                by_target
+                    .entry(target_key(&journal))
+                    .or_default()
+                    .push(journal);
+            }
+            item => retained_items.push(item),
+        }
+    }
+    for (target, mut journals) in by_target {
+        journals.sort_by(|left, right| {
+            left.transaction_id()
+                .as_str()
+                .cmp(right.transaction_id().as_str())
+        });
+        if journals.len() > 1 {
+            let transactions = journals
+                .iter()
+                .map(|journal| journal.transaction_id().clone())
+                .collect();
+            retained_items.push(RecoveryJournalScanItem::AmbiguousPendingRecovery {
+                target,
+                transactions,
+            });
+        } else if let Some(journal) = journals.pop() {
+            retained_items.push(RecoveryJournalScanItem::ValidPreparedJournal(journal));
+        }
+    }
+    RecoveryJournalScan {
+        items: retained_items,
     }
 }
 
@@ -1695,57 +1726,6 @@ fn io_error(operation: &'static str, source: io::Error) -> RecoveryJournalError 
     RecoveryJournalError::Io { operation, source }
 }
 
-fn read_bounded_file(path: &Path) -> Result<Vec<u8>, RecoveryJournalError> {
-    let file = open_journal_read_only(path)?;
-    read_bounded_file_from_handle(file)
-}
-
-fn open_journal_read_only(path: &Path) -> Result<File, RecoveryJournalError> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        return OpenOptions::new()
-            .read(true)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(path)
-            .map_err(|error| io_error("open journal", error));
-    }
-    #[cfg(not(windows))]
-    {
-        File::open(path).map_err(|error| io_error("open journal", error))
-    }
-}
-
-fn read_bounded_file_from_handle(mut file: File) -> Result<Vec<u8>, RecoveryJournalError> {
-    let metadata = file
-        .metadata()
-        .map_err(|error| io_error("inspect journal", error))?;
-    if !metadata.is_file() || is_reparse_point(&metadata) {
-        return Err(RecoveryJournalError::Corrupt(
-            "journal handle is not a regular non-reparse file",
-        ));
-    }
-    if metadata.len() > RECOVERY_JOURNAL_MAX_SIZE as u64 {
-        return Err(RecoveryJournalError::Oversized {
-            limit: RECOVERY_JOURNAL_MAX_SIZE,
-        });
-    }
-    let mut bytes =
-        Vec::with_capacity(metadata.len().min(RECOVERY_JOURNAL_MAX_SIZE as u64) as usize);
-    Read::by_ref(&mut file)
-        .take((RECOVERY_JOURNAL_MAX_SIZE + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|error| io_error("read journal", error))?;
-    if bytes.len() > RECOVERY_JOURNAL_MAX_SIZE {
-        return Err(RecoveryJournalError::Oversized {
-            limit: RECOVERY_JOURNAL_MAX_SIZE,
-        });
-    }
-    Ok(bytes)
-}
-
 fn scan_error_reason(error: &RecoveryJournalError) -> &'static str {
     match error {
         RecoveryJournalError::Oversized { .. } => "journal exceeds the hard size bound",
@@ -1753,20 +1733,6 @@ fn scan_error_reason(error: &RecoveryJournalError) -> &'static str {
         RecoveryJournalError::Corrupt(reason) => reason,
         RecoveryJournalError::Io { .. } => "journal I/O failed",
         _ => "journal failed closed",
-    }
-}
-
-fn is_reparse_point(metadata: &fs::Metadata) -> bool {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-    }
-    #[cfg(not(windows))]
-    {
-        metadata.file_type().is_symlink()
     }
 }
 
@@ -1819,9 +1785,18 @@ mod tests {
         }
 
         fn target(&self) -> PreparedWorkspaceTarget {
+            self.target_named("target.txt")
+        }
+
+        fn target_named(&self, name: &str) -> PreparedWorkspaceTarget {
             self.profile
-                .prepare_workspace_target(Path::new("target.txt"))
+                .prepare_workspace_target(Path::new(name))
                 .expect("prepared target")
+        }
+
+        fn create_target(&self, name: &str, contents: &[u8]) -> PreparedWorkspaceTarget {
+            fs::write(self.workspace.path().join(name), contents).expect("workspace fixture");
+            self.target_named(name)
         }
 
         fn context(&self, replacement: &[u8]) -> RecoveryJournalContext {
@@ -1839,6 +1814,51 @@ mod tests {
 
         fn path_for(&self, journal: &RecoveryJournalV1) -> PathBuf {
             self.store.journal_path(journal.transaction_id())
+        }
+    }
+
+    struct RecoveryRootReplacement {
+        original: PathBuf,
+        moved: PathBuf,
+        alias: PathBuf,
+        _outside: TempDir,
+    }
+
+    impl Drop for RecoveryRootReplacement {
+        fn drop(&mut self) {
+            if self.alias.exists() {
+                let _ = fs::remove_dir(&self.alias);
+            }
+            if self.moved.exists() && !self.original.exists() {
+                let _ = fs::rename(&self.moved, &self.original);
+            }
+        }
+    }
+
+    fn replace_recovery_root_with_junction(fixture: &Fixture) -> RecoveryRootReplacement {
+        use std::process::Command;
+
+        let original = fixture.store.recovery_root().to_path_buf();
+        let moved = fixture.profile.vita_root().join("recovery-original");
+        let outside = tempdir().expect("outside recovery fixture");
+        fs::rename(&original, &moved).expect("rename retained recovery root fixture");
+        let status = Command::new("cmd.exe")
+            .args([
+                "/d",
+                "/c",
+                "mklink",
+                "/J",
+                original.to_str().expect("recovery junction path"),
+                outside.path().to_str().expect("outside junction target"),
+            ])
+            .status()
+            .expect("create recovery junction fixture");
+        assert!(status.success(), "recovery junction fixture must succeed");
+        RecoveryRootReplacement {
+            original: original.clone(),
+            moved,
+            alias: original,
+            _outside: outside,
         }
     }
 
@@ -2057,6 +2077,154 @@ mod tests {
     }
 
     #[test]
+    fn recovery_store_uses_retained_namespace_authority() {
+        let fixture = Fixture::new();
+        let authority = &fixture.store.namespace_authority;
+        assert_eq!(
+            authority.vita_root.requested_path(),
+            fixture.profile.vita_root()
+        );
+        assert_eq!(
+            authority.recovery_root.requested_path(),
+            fixture.store.recovery_root()
+        );
+        assert_eq!(
+            authority.recovery_root.identity().file_id(),
+            Some(
+                RecoveryJournalIdentity::from_workspace_identity(
+                    authority.recovery_root.identity()
+                )
+                .unwrap()
+                .file_id(),
+            )
+        );
+        let debug = format!("{authority:?}");
+        assert!(!debug.contains("HANDLE"));
+    }
+
+    #[test]
+    fn journal_create_is_handle_relative() {
+        let fixture = Fixture::new();
+        let replacement = replace_recovery_root_with_junction(&fixture);
+        let journal = fixture
+            .store
+            .create_prepared(&fixture.target(), fixture.context(b"after\n"))
+            .expect("handle-relative journal create");
+        let name = journal_file_name(journal.transaction_id());
+        assert!(replacement.moved.join(&name).is_file());
+        assert!(!replacement._outside.path().join(&name).exists());
+        assert!(!fixture.path_for(&journal).is_file());
+    }
+
+    #[test]
+    fn journal_reopen_is_handle_relative() {
+        let fixture = Fixture::new();
+        let journal = fixture
+            .store
+            .create_prepared(&fixture.target(), fixture.context(b"after\n"))
+            .expect("prepared journal");
+        let replacement = replace_recovery_root_with_junction(&fixture);
+        let name = journal_file_name(journal.transaction_id());
+        let reopened = RecoveryJournalV1::from_bytes(
+            &fixture
+                .store
+                .namespace_authority
+                .read_file(OsStr::new(&name))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reopened, journal);
+        assert!(!replacement._outside.path().join(&name).exists());
+        assert!(!fixture.path_for(&journal).is_file());
+    }
+
+    #[test]
+    fn scanner_enumerates_retained_recovery_root() {
+        let fixture = Fixture::new();
+        let journal = fixture
+            .store
+            .create_prepared(&fixture.target(), fixture.context(b"after\n"))
+            .expect("prepared journal");
+        let replacement = replace_recovery_root_with_junction(&fixture);
+        let name = std::ffi::OsString::from(journal_file_name(journal.transaction_id()));
+        let names = fixture
+            .store
+            .namespace_authority
+            .enumerate()
+            .expect("retained root enumeration");
+        assert!(names.iter().any(|candidate| candidate == &name));
+        assert!(!replacement._outside.path().join(&name).exists());
+    }
+
+    #[test]
+    fn recovery_root_replacement_cannot_redirect_create() {
+        let fixture = Fixture::new();
+        let replacement = replace_recovery_root_with_junction(&fixture);
+        let journal = fixture
+            .store
+            .create_prepared(&fixture.target(), fixture.context(b"after\n"))
+            .expect("create must remain on original retained root");
+        let name = journal_file_name(journal.transaction_id());
+        assert!(replacement.moved.join(&name).is_file());
+        assert!(!replacement._outside.path().join(&name).exists());
+    }
+
+    #[test]
+    fn recovery_root_replacement_cannot_redirect_scan() {
+        let fixture = Fixture::new();
+        let journal = fixture
+            .store
+            .create_prepared(&fixture.target(), fixture.context(b"after\n"))
+            .expect("prepared journal");
+        let name = journal_file_name(journal.transaction_id());
+        let replacement = replace_recovery_root_with_junction(&fixture);
+        fs::write(
+            replacement._outside.path().join(&name),
+            journal.to_bytes().unwrap(),
+        )
+        .expect("outside forged journal fixture");
+        let scan = fixture.store.scan().expect("retained root scan");
+        assert_eq!(scan.actionable_prepared_journals().count(), 1);
+        assert_eq!(scan.ambiguous_pending_recoveries().count(), 0);
+    }
+
+    #[test]
+    fn recovery_parent_reparse_is_rejected_at_acquisition() {
+        let fixture = Fixture::new();
+        let _replacement = replace_recovery_root_with_junction(&fixture);
+        let result = RecoveryJournalStore::from_runtime_profile(&fixture.profile);
+        assert!(
+            result.is_err(),
+            "a reparse recovery parent must not become namespace authority"
+        );
+    }
+
+    #[test]
+    fn journal_child_reparse_is_not_followed() {
+        use std::os::windows::fs::symlink_file;
+
+        let fixture = Fixture::new();
+        let journal = fixture
+            .store
+            .create_prepared(&fixture.target(), fixture.context(b"after\n"))
+            .expect("prepared journal");
+        let outside = tempdir().expect("outside child fixture");
+        let outside_file = outside.path().join("outside.dlrj");
+        fs::write(&outside_file, journal.to_bytes().unwrap()).expect("outside child payload");
+        let child = fixture.store.recovery_root().join("tx-child.dlrj");
+        symlink_file(&outside_file, &child).expect("create child reparse fixture");
+
+        let scan = fixture.store.scan().expect("child reparse scan");
+        assert_eq!(scan.actionable_prepared_journals().count(), 1);
+        assert!(scan.items().iter().any(|item| matches!(
+            item,
+            RecoveryJournalScanItem::CorruptJournal { file_name, .. }
+                if file_name == "tx-child.dlrj"
+        )));
+        assert_eq!(fs::read(outside_file).unwrap(), journal.to_bytes().unwrap());
+    }
+
+    #[test]
     fn prepared_requires_successful_flush_and_reopen_verify() {
         for fault in [
             RecoveryJournalTestFault::Write,
@@ -2110,6 +2278,23 @@ mod tests {
     }
 
     #[test]
+    fn restart_scan_still_mutates_workspace_zero() {
+        let fixture = Fixture::new();
+        let workspace_path = fixture.workspace.path().join("target.txt");
+        let before = fs::read(&workspace_path).unwrap();
+        let journal = fixture
+            .store
+            .create_prepared(&fixture.target(), fixture.context(b"after\n"))
+            .unwrap();
+        let _scan = RecoveryJournalStore::from_runtime_profile(&fixture.profile)
+            .unwrap()
+            .scan()
+            .unwrap();
+        assert_eq!(fs::read(&workspace_path).unwrap(), before);
+        assert!(fixture.path_for(&journal).is_file());
+    }
+
+    #[test]
     fn two_pending_journals_for_same_target_are_ambiguous() {
         let fixture = Fixture::new();
         fixture
@@ -2130,8 +2315,161 @@ mod tests {
             .unwrap();
         let scan = fixture.store.scan().unwrap();
         assert!(scan.has_ambiguous_pending_recovery());
+        assert_eq!(scan.actionable_prepared_journals().count(), 0);
         let ambiguity = scan.ambiguous_pending_recoveries().next().unwrap();
         assert_eq!(ambiguity.1.len(), 2);
+    }
+
+    #[test]
+    fn two_pending_same_target_have_zero_actionable_candidates() {
+        let fixture = Fixture::new();
+        for (transaction_id, replacement) in [
+            ("tx-two-a", b"after-a\n".as_slice()),
+            ("tx-two-b", b"after-b\n"),
+        ] {
+            fixture
+                .store
+                .create_prepared_with_transaction_id_for_test(
+                    &fixture.target(),
+                    fixture.context(replacement),
+                    transaction_id,
+                )
+                .unwrap();
+        }
+        let scan = fixture.store.scan().unwrap();
+        assert_eq!(scan.actionable_prepared_journals().count(), 0);
+        let ambiguity = scan.ambiguous_pending_recoveries().collect::<Vec<_>>();
+        assert_eq!(ambiguity.len(), 1);
+        assert_eq!(ambiguity[0].1.len(), 2);
+    }
+
+    #[test]
+    fn three_pending_same_target_have_zero_actionable_candidates() {
+        let fixture = Fixture::new();
+        for (transaction_id, replacement) in [
+            ("tx-three-a", b"after-a\n".as_slice()),
+            ("tx-three-b", b"after-b\n"),
+            ("tx-three-c", b"after-c\n"),
+        ] {
+            fixture
+                .store
+                .create_prepared_with_transaction_id_for_test(
+                    &fixture.target(),
+                    fixture.context(replacement),
+                    transaction_id,
+                )
+                .unwrap();
+        }
+        let scan = fixture.store.scan().unwrap();
+        assert_eq!(scan.actionable_prepared_journals().count(), 0);
+        let ambiguity = scan.ambiguous_pending_recoveries().collect::<Vec<_>>();
+        assert_eq!(ambiguity.len(), 1);
+        assert_eq!(ambiguity[0].1.len(), 3);
+    }
+
+    #[test]
+    fn unique_target_remains_actionable_beside_ambiguous_target() {
+        let fixture = Fixture::new();
+        let target_a = fixture.target();
+        let target_b = fixture.create_target("target-b.txt", b"before-b\n");
+        for (transaction_id, replacement) in [
+            ("tx-ambiguous-a", b"after-a\n".as_slice()),
+            ("tx-ambiguous-b", b"after-b\n"),
+        ] {
+            fixture
+                .store
+                .create_prepared_with_transaction_id_for_test(
+                    &target_a,
+                    fixture.context(replacement),
+                    transaction_id,
+                )
+                .unwrap();
+        }
+        fixture
+            .store
+            .create_prepared_with_transaction_id_for_test(
+                &target_b,
+                fixture.context(b"unique-after\n"),
+                "tx-unique",
+            )
+            .unwrap();
+
+        let scan = fixture.store.scan().unwrap();
+        let actionable = scan.actionable_prepared_journals().collect::<Vec<_>>();
+        assert_eq!(actionable.len(), 1);
+        assert_eq!(
+            actionable[0].relative_path().as_path(),
+            Path::new("target-b.txt")
+        );
+        let ambiguous = scan.ambiguous_pending_recoveries().collect::<Vec<_>>();
+        assert_eq!(ambiguous.len(), 1);
+        assert_eq!(ambiguous[0].0.relative_path(), "target.txt");
+    }
+
+    #[test]
+    fn ambiguity_result_is_independent_of_enumeration_order() {
+        let fixture = Fixture::new();
+        let first = fixture
+            .store
+            .create_prepared_with_transaction_id_for_test(
+                &fixture.target(),
+                fixture.context(b"first\n"),
+                "tx-order-a",
+            )
+            .unwrap();
+        let second = fixture
+            .store
+            .create_prepared_with_transaction_id_for_test(
+                &fixture.target(),
+                fixture.context(b"second\n"),
+                "tx-order-b",
+            )
+            .unwrap();
+
+        let forward = finalize_scan_items(vec![
+            RecoveryJournalScanItem::ValidPreparedJournal(first.clone()),
+            RecoveryJournalScanItem::ValidPreparedJournal(second.clone()),
+        ]);
+        let reverse = finalize_scan_items(vec![
+            RecoveryJournalScanItem::ValidPreparedJournal(second),
+            RecoveryJournalScanItem::ValidPreparedJournal(first),
+        ]);
+        assert_eq!(forward, reverse);
+        assert_eq!(forward.actionable_prepared_journals().count(), 0);
+        assert_eq!(reverse.actionable_prepared_journals().count(), 0);
+    }
+
+    #[test]
+    fn ambiguous_pending_never_selects_first_or_newest() {
+        let fixture = Fixture::new();
+        fixture
+            .store
+            .create_prepared_with_transaction_id_for_test(
+                &fixture.target(),
+                fixture.context(b"first\n"),
+                "tx-first",
+            )
+            .unwrap();
+        fixture
+            .store
+            .create_prepared_with_transaction_id_for_test(
+                &fixture.target(),
+                fixture.context(b"newest\n"),
+                "tx-newest",
+            )
+            .unwrap();
+
+        let scan = fixture.store.scan().unwrap();
+        assert_eq!(scan.valid_prepared_journals().count(), 0);
+        assert_eq!(scan.actionable_prepared_journals().count(), 0);
+        let transactions = scan
+            .ambiguous_pending_recoveries()
+            .next()
+            .expect("ambiguous pending target")
+            .1;
+        assert_eq!(transactions.len(), 2);
+        assert!(transactions.iter().any(|id| id.as_str() == "tx-first"));
+        assert!(transactions.iter().any(|id| id.as_str() == "tx-newest"));
     }
 
     #[test]

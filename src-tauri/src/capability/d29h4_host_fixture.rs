@@ -136,9 +136,18 @@ struct CanonicalWire {
     authorization_revision: Option<i64>,
 }
 
+/// A bounded Host-side provenance marker for the test-only confirmation
+/// control plane.  The normal Issue request cannot provide this value.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ConfirmationEvidenceSource {
+    TrustedTestHarness,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct ConfirmationWire {
+    source: ConfirmationEvidenceSource,
     confirmation_id: String,
     life_id: String,
     task_id: String,
@@ -388,6 +397,7 @@ impl HostSession {
                 issued_at_unix_ms,
                 expires_at_unix_ms,
             } => self.provision_confirmation(ConfirmationWire {
+                source: ConfirmationEvidenceSource::TrustedTestHarness,
                 confirmation_id,
                 life_id,
                 task_id,
@@ -995,7 +1005,8 @@ fn is_sha256_hex(value: &str) -> bool {
 }
 
 fn valid_confirmation_wire(confirmation: &ConfirmationWire) -> bool {
-    valid_identity(&confirmation.confirmation_id)
+    confirmation.source == ConfirmationEvidenceSource::TrustedTestHarness
+        && valid_identity(&confirmation.confirmation_id)
         && valid_identity(&confirmation.life_id)
         && valid_identity(&confirmation.task_id)
         && valid_identity(&confirmation.workspace_root_identity)

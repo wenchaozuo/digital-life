@@ -206,8 +206,19 @@ impl H4ReplaceOperation {
     }
 }
 
+/// The only confirmation provenance accepted by the H4-A boundary.
+///
+/// This marker is carried in Host-to-Vita evidence only.  It is deliberately
+/// not part of the model-visible request schema and cannot be supplied by a
+/// tool caller.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum H4ConfirmationEvidenceSource {
+    TrustedTestHarness,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct HostExplicitActionConfirmationEvidence {
+    source: H4ConfirmationEvidenceSource,
     confirmation_id: String,
     life_id: String,
     task_id: String,
@@ -897,7 +908,8 @@ fn validate_confirmation(
     revision: i64,
 ) -> Result<(), H4DenyClassification> {
     validate_common_action_binding(request)?;
-    if bounded_text(&confirmation.confirmation_id, MAX_CALL_ID_CHARS).is_none()
+    if confirmation.source != H4ConfirmationEvidenceSource::TrustedTestHarness
+        || bounded_text(&confirmation.confirmation_id, MAX_CALL_ID_CHARS).is_none()
         || confirmation.life_id != request.context.life_id()
         || confirmation.task_id != request.context.task_id()
         || confirmation.capability_id != VITA_WORKSPACE_REPLACE_CAPABILITY_ID
@@ -1274,6 +1286,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
     use std::sync::atomic::AtomicUsize;
+    use std::sync::Condvar;
     use std::thread;
     use std::time::{Duration, Instant, SystemTime};
 
@@ -1328,16 +1341,24 @@ mod tests {
 
         fn authority_request(&self, operation: H4AuthorityOperation) -> H4AuthorityRequest {
             let request = self.request("call-authority");
+            self.authority_request_for(&request, operation)
+        }
+
+        fn authority_request_for(
+            &self,
+            request: &VitaWorkspaceReplaceRequest,
+            operation: H4AuthorityOperation,
+        ) -> H4AuthorityRequest {
             H4AuthorityRequest {
                 context: self.context.clone(),
                 capability_id: VITA_WORKSPACE_REPLACE_CAPABILITY_ID.to_string(),
                 operation,
-                tool_call_id: request.tool_call_id,
-                turn_id: request.turn_id,
-                relative_path: request.relative_path,
-                expected_sha256: request.expected_sha256,
-                replacement_sha256: sha256_hex(REPLACEMENT_CONTENT.as_bytes()),
-                replacement_bytes: REPLACEMENT_CONTENT.as_bytes().len(),
+                tool_call_id: request.tool_call_id.clone(),
+                turn_id: request.turn_id.clone(),
+                relative_path: request.relative_path.clone(),
+                expected_sha256: request.expected_sha256.clone(),
+                replacement_sha256: sha256_hex(request.replacement_content.as_bytes()),
+                replacement_bytes: request.replacement_content.as_bytes().len(),
                 workspace_root_identity: self.root.identity(),
                 target_identity: self.target_identity,
                 target_kind: PreparedWorkspaceTargetKind::ExistingFile,
@@ -1367,6 +1388,20 @@ mod tests {
         Expired,
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum RequestAfterConfirmationMutation {
+        Path,
+        ExpectedHash,
+        ReplacementHash,
+        ReplacementBytes,
+        WorkspaceRoot,
+        Target,
+        Life,
+        Task,
+        ToolCall,
+        Turn,
+    }
+
     struct TestHostAuthority {
         root: super::super::WorkspaceRootIdentity,
         confirmations: Mutex<HashMap<String, HostExplicitActionConfirmationEvidence>>,
@@ -1376,21 +1411,33 @@ mod tests {
         disabled: AtomicBool,
         revision: AtomicUsize,
         mutation: ConfirmationMutation,
-        auto_provision: bool,
+        trusted_confirmations_provisioned: AtomicUsize,
+        request_derived_confirmations: AtomicUsize,
+        events: Mutex<Vec<H4AuthorityEvent>>,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum H4AuthorityEvent {
+        TrustedConfirmationProvisioned,
+        IssueEvaluated,
+        RevalidationEvaluated,
+    }
+
+    #[derive(Clone, Debug, Default, Eq, PartialEq)]
+    struct H4AuthorityProvenanceEvidence {
+        trusted_confirmations_provisioned: usize,
+        request_derived_confirmations: usize,
+        events: Vec<H4AuthorityEvent>,
     }
 
     impl TestHostAuthority {
         fn new(root: super::super::WorkspaceRootIdentity) -> Arc<Self> {
-            Self::with_auto_provision(root, true)
+            Self::with_mutation(root, ConfirmationMutation::None)
         }
 
-        fn new_without_provision(root: super::super::WorkspaceRootIdentity) -> Arc<Self> {
-            Self::with_auto_provision(root, false)
-        }
-
-        fn with_auto_provision(
+        fn with_mutation(
             root: super::super::WorkspaceRootIdentity,
-            auto_provision: bool,
+            mutation: ConfirmationMutation,
         ) -> Arc<Self> {
             Arc::new(Self {
                 root,
@@ -1400,15 +1447,22 @@ mod tests {
                 next_id: AtomicUsize::new(0),
                 disabled: AtomicBool::new(false),
                 revision: AtomicUsize::new(REVISION as usize),
-                mutation: ConfirmationMutation::None,
-                auto_provision,
+                mutation,
+                trusted_confirmations_provisioned: AtomicUsize::new(0),
+                request_derived_confirmations: AtomicUsize::new(0),
+                events: Mutex::new(Vec::new()),
             })
         }
 
-        fn provision(&self, request: &H4AuthorityRequest) {
+        fn provision_trusted_confirmation(&self, request: &H4AuthorityRequest) {
+            assert!(matches!(
+                &request.operation,
+                H4AuthorityOperation::IssueReplaceGrant
+            ));
             let id = self.next_id.fetch_add(1, Ordering::AcqRel);
             let now = unix_millis();
             let mut confirmation = HostExplicitActionConfirmationEvidence {
+                source: H4ConfirmationEvidenceSource::TrustedTestHarness,
                 confirmation_id: format!("confirmation-{id}"),
                 life_id: request.context.life_id().to_string(),
                 task_id: request.context.task_id().to_string(),
@@ -1454,6 +1508,21 @@ mod tests {
             }
             lock_unpoisoned(&self.confirmations)
                 .insert(confirmation.confirmation_id.clone(), confirmation);
+            self.trusted_confirmations_provisioned
+                .fetch_add(1, Ordering::AcqRel);
+            lock_unpoisoned(&self.events).push(H4AuthorityEvent::TrustedConfirmationProvisioned);
+        }
+
+        fn provenance_snapshot(&self) -> H4AuthorityProvenanceEvidence {
+            H4AuthorityProvenanceEvidence {
+                trusted_confirmations_provisioned: self
+                    .trusted_confirmations_provisioned
+                    .load(Ordering::Acquire),
+                request_derived_confirmations: self
+                    .request_derived_confirmations
+                    .load(Ordering::Acquire),
+                events: lock_unpoisoned(&self.events).clone(),
+            }
         }
 
         fn canonical(&self, request: &H4AuthorityRequest) -> H4CanonicalDecision {
@@ -1566,17 +1635,14 @@ mod tests {
             self.calls.fetch_add(1, Ordering::AcqRel);
             let response = match request.operation {
                 H4AuthorityOperation::IssueReplaceGrant => {
-                    if self.auto_provision && lock_unpoisoned(&self.confirmations).is_empty() {
-                        // The fixture's explicit provisioning is a trusted
-                        // Host action, never a field in the model request.
-                        self.provision(&request);
-                    }
+                    lock_unpoisoned(&self.events).push(H4AuthorityEvent::IssueEvaluated);
                     self.issue(request)
                 }
                 H4AuthorityOperation::Revalidate {
                     ref grant_id,
                     authorization_revision: _,
                 } => {
+                    lock_unpoisoned(&self.events).push(H4AuthorityEvent::RevalidationEvaluated);
                     let canonical = self.canonical(&request);
                     let grant = lock_unpoisoned(&self.grants).get(grant_id).cloned();
                     H4HostAuthorityResponse {
@@ -1596,7 +1662,7 @@ mod tests {
     async fn missing_confirmation_cannot_issue_grant() {
         let fixture = Fixture::new();
         let request = fixture.request("missing-confirmation");
-        let authority = TestHostAuthority::new_without_provision(fixture.root.identity());
+        let authority = TestHostAuthority::new(fixture.root.identity());
         let broker = fixture.broker(Arc::clone(&authority) as Arc<dyn VitaH4AuthorityPort>);
         let result = broker.execute_request(request).await;
         assert_eq!(
@@ -1610,13 +1676,249 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn correct_confirmation_issues_exact_single_use_grant() {
+    async fn request_arrival_never_auto_provisions_confirmation() {
         let fixture = Fixture::new();
         let authority = TestHostAuthority::new(fixture.root.identity());
         let broker = fixture.broker(Arc::clone(&authority) as Arc<dyn VitaH4AuthorityPort>);
         let result = broker
-            .execute_request(fixture.request("correct-confirmation"))
+            .execute_request(fixture.request("request-arrival-no-provision"))
             .await;
+        assert_eq!(
+            result.classification,
+            Some(H4DenyClassification::ConfirmationMissing)
+        );
+        assert!(!result.authorized_for_future_replace_foundation);
+        assert!(lock_unpoisoned(&authority.confirmations).is_empty());
+        assert_eq!(
+            authority
+                .provenance_snapshot()
+                .trusted_confirmations_provisioned,
+            0
+        );
+        assert_eq!(
+            authority
+                .provenance_snapshot()
+                .request_derived_confirmations,
+            0
+        );
+        assert_eq!(
+            authority.provenance_snapshot().events,
+            vec![H4AuthorityEvent::IssueEvaluated]
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_preprovisioned_confirmation_allows_exact_request() {
+        let fixture = Fixture::new();
+        let request = fixture.request("trusted-preprovisioned");
+        let authority = TestHostAuthority::new(fixture.root.identity());
+        let authority_request =
+            fixture.authority_request_for(&request, H4AuthorityOperation::IssueReplaceGrant);
+        authority.provision_trusted_confirmation(&authority_request);
+        let broker = fixture.broker(Arc::clone(&authority) as Arc<dyn VitaH4AuthorityPort>);
+        let result = broker.execute_request(request).await;
+        assert!(result.authorized_for_future_replace_foundation);
+        assert_eq!(broker.snapshot().confirmations_consumed, 1);
+        assert_eq!(broker.snapshot().grants_issued, 1);
+        assert_eq!(
+            authority.provenance_snapshot().events,
+            vec![
+                H4AuthorityEvent::TrustedConfirmationProvisioned,
+                H4AuthorityEvent::IssueEvaluated,
+                H4AuthorityEvent::RevalidationEvaluated,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn confirmation_provision_occurs_before_issue_evaluation() {
+        let fixture = Fixture::new();
+        let request = fixture.request("provision-order");
+        let authority = TestHostAuthority::new(fixture.root.identity());
+        let authority_request =
+            fixture.authority_request_for(&request, H4AuthorityOperation::IssueReplaceGrant);
+        authority.provision_trusted_confirmation(&authority_request);
+        let broker = fixture.broker(Arc::clone(&authority) as Arc<dyn VitaH4AuthorityPort>);
+        assert!(
+            broker
+                .execute_request(request)
+                .await
+                .authorized_for_future_replace_foundation
+        );
+        let evidence = authority.provenance_snapshot();
+        assert_eq!(
+            evidence.events[..2],
+            [
+                H4AuthorityEvent::TrustedConfirmationProvisioned,
+                H4AuthorityEvent::IssueEvaluated,
+            ]
+        );
+        assert_eq!(evidence.trusted_confirmations_provisioned, 1);
+        assert_eq!(evidence.request_derived_confirmations, 0);
+    }
+
+    #[tokio::test]
+    async fn three_valid_requests_with_empty_confirmation_store_all_deny() {
+        let fixture = Fixture::new();
+        let authority = TestHostAuthority::new(fixture.root.identity());
+        let broker = fixture.broker(Arc::clone(&authority) as Arc<dyn VitaH4AuthorityPort>);
+        for call_id in ["unconfirmed-one", "unconfirmed-two", "unconfirmed-three"] {
+            let result = broker.execute_request(fixture.request(call_id)).await;
+            assert_eq!(
+                result.classification,
+                Some(H4DenyClassification::ConfirmationMissing)
+            );
+        }
+        let snapshot = broker.snapshot();
+        assert_eq!(snapshot.attempted_requests, 3);
+        assert_eq!(snapshot.grants_issued, 0);
+        assert_eq!(snapshot.confirmations_consumed, 0);
+        assert!(lock_unpoisoned(&authority.confirmations).is_empty());
+        let evidence = authority.provenance_snapshot();
+        assert_eq!(evidence.trusted_confirmations_provisioned, 0);
+        assert_eq!(evidence.request_derived_confirmations, 0);
+        assert_eq!(
+            evidence
+                .events
+                .iter()
+                .filter(|event| **event == H4AuthorityEvent::IssueEvaluated)
+                .count(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn request_mutation_after_confirmation_is_denied_without_transforming_confirmation() {
+        for mutation in [
+            RequestAfterConfirmationMutation::Path,
+            RequestAfterConfirmationMutation::ExpectedHash,
+            RequestAfterConfirmationMutation::ReplacementHash,
+            RequestAfterConfirmationMutation::ReplacementBytes,
+            RequestAfterConfirmationMutation::WorkspaceRoot,
+            RequestAfterConfirmationMutation::Target,
+            RequestAfterConfirmationMutation::Life,
+            RequestAfterConfirmationMutation::Task,
+            RequestAfterConfirmationMutation::ToolCall,
+            RequestAfterConfirmationMutation::Turn,
+        ] {
+            let fixture = Fixture::new();
+            let authority = TestHostAuthority::new(fixture.root.identity());
+            let original = fixture.authority_request(H4AuthorityOperation::IssueReplaceGrant);
+            authority.provision_trusted_confirmation(&original);
+            let before = lock_unpoisoned(&authority.confirmations)
+                .values()
+                .next()
+                .cloned();
+            let mut mutated = original.clone();
+            match mutation {
+                RequestAfterConfirmationMutation::Path => {
+                    mutated.relative_path =
+                        super::super::WorkspaceRelativePath::parse(Path::new("other.txt")).unwrap();
+                }
+                RequestAfterConfirmationMutation::ExpectedHash => {
+                    mutated.expected_sha256 = "a".repeat(64)
+                }
+                RequestAfterConfirmationMutation::ReplacementHash => {
+                    mutated.replacement_sha256 = "b".repeat(64)
+                }
+                RequestAfterConfirmationMutation::ReplacementBytes => {
+                    mutated.replacement_bytes = mutated.replacement_bytes.saturating_add(1)
+                }
+                RequestAfterConfirmationMutation::WorkspaceRoot => {
+                    mutated.workspace_root_identity = fixture.target_identity
+                }
+                RequestAfterConfirmationMutation::Target => {
+                    mutated.target_identity = fixture.root.identity()
+                }
+                RequestAfterConfirmationMutation::Life => {
+                    mutated.context = VitaExecutionContext::try_new("other-life", TASK_ID).unwrap()
+                }
+                RequestAfterConfirmationMutation::Task => {
+                    mutated.context = VitaExecutionContext::try_new(LIFE_ID, "other-task").unwrap()
+                }
+                RequestAfterConfirmationMutation::ToolCall => {
+                    mutated.tool_call_id = "mutated-tool-call".to_string()
+                }
+                RequestAfterConfirmationMutation::Turn => {
+                    mutated.turn_id = "mutated-turn".to_string()
+                }
+            }
+            let response = authority.evaluate(mutated.clone()).await.unwrap();
+            assert!(
+                response.grant.is_none(),
+                "mutation {mutation:?} issued a grant"
+            );
+            assert!(!response.confirmation_consumed);
+            assert!(validate_issue_completion(&response, &mutated).is_err());
+            assert_eq!(lock_unpoisoned(&authority.confirmations).len(), 1);
+            assert_eq!(
+                lock_unpoisoned(&authority.confirmations)
+                    .values()
+                    .next()
+                    .cloned(),
+                before,
+                "mutation {mutation:?} transformed the pre-existing confirmation"
+            );
+            assert_eq!(lock_unpoisoned(&authority.grants).len(), 0);
+            let evidence = authority.provenance_snapshot();
+            assert_eq!(evidence.trusted_confirmations_provisioned, 1);
+            assert_eq!(evidence.request_derived_confirmations, 0);
+            assert_eq!(
+                evidence.events,
+                vec![
+                    H4AuthorityEvent::TrustedConfirmationProvisioned,
+                    H4AuthorityEvent::IssueEvaluated,
+                ]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn replacement_content_mutation_cannot_change_confirmation() {
+        let fixture = Fixture::new();
+        let original = fixture.request("replacement-content-mutation");
+        let authority = TestHostAuthority::new(fixture.root.identity());
+        let authority_request =
+            fixture.authority_request_for(&original, H4AuthorityOperation::IssueReplaceGrant);
+        authority.provision_trusted_confirmation(&authority_request);
+        let before = lock_unpoisoned(&authority.confirmations)
+            .values()
+            .next()
+            .cloned();
+        let mut mutated = original;
+        mutated.replacement_content.push('x');
+        let broker = fixture.broker(Arc::clone(&authority) as Arc<dyn VitaH4AuthorityPort>);
+        let result = broker.execute_request(mutated).await;
+        assert_eq!(
+            result.classification,
+            Some(H4DenyClassification::ConfirmationMissing)
+        );
+        assert!(!result.authorized_for_future_replace_foundation);
+        assert_eq!(broker.snapshot().grants_issued, 0);
+        assert_eq!(broker.snapshot().confirmations_consumed, 0);
+        assert_eq!(lock_unpoisoned(&authority.confirmations).len(), 1);
+        assert_eq!(
+            lock_unpoisoned(&authority.confirmations)
+                .values()
+                .next()
+                .cloned(),
+            before
+        );
+        let evidence = authority.provenance_snapshot();
+        assert_eq!(evidence.trusted_confirmations_provisioned, 1);
+        assert_eq!(evidence.request_derived_confirmations, 0);
+    }
+
+    #[tokio::test]
+    async fn correct_confirmation_issues_exact_single_use_grant() {
+        let fixture = Fixture::new();
+        let authority = TestHostAuthority::new(fixture.root.identity());
+        let request = fixture.request("correct-confirmation");
+        let authority_request =
+            fixture.authority_request_for(&request, H4AuthorityOperation::IssueReplaceGrant);
+        authority.provision_trusted_confirmation(&authority_request);
+        let broker = fixture.broker(Arc::clone(&authority) as Arc<dyn VitaH4AuthorityPort>);
+        let result = broker.execute_request(request).await;
         assert!(result.authorized_for_future_replace_foundation);
         let snapshot = broker.snapshot();
         assert_eq!(snapshot.grants_issued, 1);
@@ -1624,6 +1926,10 @@ mod tests {
         assert_eq!(snapshot.filesystem_mutations, 0);
         assert_eq!(snapshot.process_spawns, 0);
         assert_eq!(snapshot.external_network_requests, 0);
+        assert!(lock_unpoisoned(&authority.confirmations).is_empty());
+        let evidence = authority.provenance_snapshot();
+        assert_eq!(evidence.trusted_confirmations_provisioned, 1);
+        assert_eq!(evidence.request_derived_confirmations, 0);
     }
 
     #[tokio::test]
@@ -1632,6 +1938,9 @@ mod tests {
         let authority = TestHostAuthority::new(fixture.root.identity());
         let broker = fixture.broker(Arc::clone(&authority) as Arc<dyn VitaH4AuthorityPort>);
         let request = fixture.request("duplicate-call");
+        let authority_request =
+            fixture.authority_request_for(&request, H4AuthorityOperation::IssueReplaceGrant);
+        authority.provision_trusted_confirmation(&authority_request);
         assert!(
             broker
                 .execute_request(request.clone())
@@ -1644,21 +1953,49 @@ mod tests {
             Some(H4DenyClassification::DuplicateToolCall)
         );
         assert_eq!(broker.snapshot().grants_issued, 1);
+        assert!(lock_unpoisoned(&authority.confirmations).is_empty());
+        let evidence = authority.provenance_snapshot();
+        assert_eq!(evidence.trusted_confirmations_provisioned, 1);
+        assert_eq!(evidence.request_derived_confirmations, 0);
+        assert_eq!(
+            evidence.events,
+            vec![
+                H4AuthorityEvent::TrustedConfirmationProvisioned,
+                H4AuthorityEvent::IssueEvaluated,
+                H4AuthorityEvent::RevalidationEvaluated,
+            ]
+        );
     }
 
     #[tokio::test]
     async fn wrong_workspace_root_cannot_issue_grant() {
         let fixture = Fixture::new();
         let other = Fixture::new();
-        let authority = TestHostAuthority::new_without_provision(other.root.identity());
+        let authority = TestHostAuthority::new(other.root.identity());
+        let request = fixture.request("wrong-root");
+        let authority_request =
+            fixture.authority_request_for(&request, H4AuthorityOperation::IssueReplaceGrant);
+        authority.provision_trusted_confirmation(&authority_request);
         let broker = fixture.broker(Arc::clone(&authority) as Arc<dyn VitaH4AuthorityPort>);
-        let result = broker.execute_request(fixture.request("wrong-root")).await;
+        let result = broker.execute_request(request).await;
         assert_eq!(
             result.classification,
             Some(H4DenyClassification::WorkspaceScopeDenied)
         );
         assert_eq!(broker.snapshot().grants_issued, 0);
-        assert!(lock_unpoisoned(&authority.confirmations).is_empty());
+        assert_eq!(lock_unpoisoned(&authority.confirmations).len(), 1);
+        assert_eq!(
+            authority
+                .provenance_snapshot()
+                .trusted_confirmations_provisioned,
+            1
+        );
+        assert_eq!(
+            authority
+                .provenance_snapshot()
+                .request_derived_confirmations,
+            0
+        );
     }
 
     #[tokio::test]
@@ -1676,25 +2013,15 @@ mod tests {
             ConfirmationMutation::Expired,
         ] {
             let fixture = Fixture::new();
-            let authority = Arc::new(TestHostAuthority {
-                root: fixture.root.identity(),
-                confirmations: Mutex::new(HashMap::new()),
-                grants: Mutex::new(HashMap::new()),
-                calls: AtomicUsize::new(0),
-                next_id: AtomicUsize::new(0),
-                disabled: AtomicBool::new(false),
-                revision: AtomicUsize::new(REVISION as usize),
-                mutation,
-                auto_provision: false,
-            });
+            let authority = TestHostAuthority::with_mutation(fixture.root.identity(), mutation);
             // Provision a deliberately wrong Host record.  The requester has
             // no path to place this record in the Host store.
-            let request = fixture.authority_request(H4AuthorityOperation::IssueReplaceGrant);
-            authority.provision(&request);
+            let vita_request = fixture.request("wrong-binding");
+            let request = fixture
+                .authority_request_for(&vita_request, H4AuthorityOperation::IssueReplaceGrant);
+            authority.provision_trusted_confirmation(&request);
             let broker = fixture.broker(Arc::clone(&authority) as Arc<dyn VitaH4AuthorityPort>);
-            let result = broker
-                .execute_request(fixture.request("wrong-binding"))
-                .await;
+            let result = broker.execute_request(vita_request).await;
             assert!(matches!(
                 result.classification,
                 Some(
@@ -1711,19 +2038,12 @@ mod tests {
     #[tokio::test]
     async fn stale_confirmation_revision_cannot_issue_grant() {
         let fixture = Fixture::new();
-        let authority = Arc::new(TestHostAuthority {
-            root: fixture.root.identity(),
-            confirmations: Mutex::new(HashMap::new()),
-            grants: Mutex::new(HashMap::new()),
-            calls: AtomicUsize::new(0),
-            next_id: AtomicUsize::new(0),
-            disabled: AtomicBool::new(false),
-            revision: AtomicUsize::new(REVISION as usize),
-            mutation: ConfirmationMutation::WrongRevision,
-            auto_provision: false,
-        });
+        let authority = TestHostAuthority::with_mutation(
+            fixture.root.identity(),
+            ConfirmationMutation::WrongRevision,
+        );
         let request = fixture.authority_request(H4AuthorityOperation::IssueReplaceGrant);
-        authority.provision(&request);
+        authority.provision_trusted_confirmation(&request);
         let broker = fixture.broker(Arc::clone(&authority) as Arc<dyn VitaH4AuthorityPort>);
         let result = broker
             .execute_request(fixture.request("stale-confirmation-revision"))
@@ -1740,8 +2060,23 @@ mod tests {
         let fixture = Fixture::new();
         let authority = TestHostAuthority::new(fixture.root.identity());
         let request = fixture.authority_request(H4AuthorityOperation::IssueReplaceGrant);
-        authority.provision(&request);
+        authority.provision_trusted_confirmation(&request);
         let issue = authority.evaluate(request.clone()).await.unwrap();
+        assert!(issue.confirmation_consumed);
+        assert!(issue.confirmation.is_some());
+        assert!(lock_unpoisoned(&authority.confirmations).is_empty());
+        assert_eq!(
+            authority
+                .provenance_snapshot()
+                .trusted_confirmations_provisioned,
+            1
+        );
+        assert_eq!(
+            authority
+                .provenance_snapshot()
+                .request_derived_confirmations,
+            0
+        );
         let grant = issue.grant.clone().unwrap();
         authority.disabled.store(true, Ordering::Release);
         authority
@@ -1796,6 +2131,17 @@ mod tests {
             .unwrap_err(),
             H4DenyClassification::RootDisabled
         );
+        let evidence = authority.provenance_snapshot();
+        assert_eq!(evidence.trusted_confirmations_provisioned, 1);
+        assert_eq!(evidence.request_derived_confirmations, 0);
+        assert_eq!(
+            evidence.events,
+            vec![
+                H4AuthorityEvent::TrustedConfirmationProvisioned,
+                H4AuthorityEvent::IssueEvaluated,
+                H4AuthorityEvent::RevalidationEvaluated,
+            ]
+        );
     }
 
     #[test]
@@ -1816,6 +2162,7 @@ mod tests {
             "confirmation_id",
             "workspace_root_identity",
             "confirmed",
+            "source",
         ] {
             let mut value = json!({
                 "relative_path": "replace-me.txt",
@@ -1856,10 +2203,12 @@ mod tests {
         let arguments: Result<VitaWorkspaceReplaceArguments, _> = serde_json::from_str(&valid);
         assert!(arguments.is_err());
         let authority = TestHostAuthority::new(fixture.root.identity());
+        let request = fixture.request("requester-cannot-authorize");
+        let authority_request =
+            fixture.authority_request_for(&request, H4AuthorityOperation::IssueReplaceGrant);
+        authority.provision_trusted_confirmation(&authority_request);
         let broker = fixture.broker(Arc::clone(&authority) as Arc<dyn VitaH4AuthorityPort>);
-        let result = broker
-            .execute_request(fixture.request("requester-cannot-authorize"))
-            .await;
+        let result = broker.execute_request(request).await;
         assert!(result.authorized_for_future_replace_foundation);
         assert_eq!(broker.snapshot().filesystem_mutations, 0);
     }
@@ -1912,6 +2261,7 @@ mod tests {
             "workspace_root_identity",
             "target_identity",
             "grant_id",
+            "source",
         ] {
             let mut value = json!({
                 "relative_path": "replace-me.txt",
@@ -2031,6 +2381,7 @@ mod tests {
     #[derive(Clone, Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct H4ConfirmationWire {
+        source: String,
         confirmation_id: String,
         life_id: String,
         task_id: String,
@@ -2259,6 +2610,9 @@ mod tests {
     struct ProcessIsolatedH4Authority {
         process: Arc<PersistentH4HostProcess>,
         observations: Arc<Mutex<Vec<H4HostResponse>>>,
+        trusted_confirmations_provisioned: AtomicUsize,
+        request_derived_confirmations: AtomicUsize,
+        events: Arc<Mutex<Vec<H4AuthorityEvent>>>,
     }
 
     impl ProcessIsolatedH4Authority {
@@ -2276,11 +2630,42 @@ mod tests {
             Ok(Arc::new(Self {
                 process,
                 observations: Arc::new(Mutex::new(Vec::new())),
+                trusted_confirmations_provisioned: AtomicUsize::new(0),
+                request_derived_confirmations: AtomicUsize::new(0),
+                events: Arc::new(Mutex::new(Vec::new())),
             }))
         }
 
         fn snapshot(&self) -> Vec<H4HostResponse> {
             lock_unpoisoned(&self.observations).clone()
+        }
+
+        fn provenance_snapshot(&self) -> H4AuthorityProvenanceEvidence {
+            H4AuthorityProvenanceEvidence {
+                trusted_confirmations_provisioned: self
+                    .trusted_confirmations_provisioned
+                    .load(Ordering::Acquire),
+                request_derived_confirmations: self
+                    .request_derived_confirmations
+                    .load(Ordering::Acquire),
+                events: lock_unpoisoned(&self.events).clone(),
+            }
+        }
+
+        /// Test/integration-only trusted confirmation seam.  The caller must
+        /// establish the exact action intent before invoking this method; the
+        /// normal authority evaluation path never provisions confirmations.
+        fn provision_confirmation(&self, request: &H4AuthorityRequest) -> Result<(), String> {
+            if !matches!(&request.operation, H4AuthorityOperation::IssueReplaceGrant) {
+                return Err(
+                    "H4 confirmation provisioning requires an IssueReplaceGrant intent".to_string(),
+                );
+            }
+            provision_h4_confirmation(&self.process, request)?;
+            self.trusted_confirmations_provisioned
+                .fetch_add(1, Ordering::AcqRel);
+            lock_unpoisoned(&self.events).push(H4AuthorityEvent::TrustedConfirmationProvisioned);
+            Ok(())
         }
 
         fn shutdown(&self) -> bool {
@@ -2292,17 +2677,15 @@ mod tests {
         fn evaluate(&self, request: H4AuthorityRequest) -> VitaH4AuthorityFuture {
             let process = Arc::clone(&self.process);
             let observations = Arc::clone(&self.observations);
-            let request_for_io = request.clone();
+            let events = Arc::clone(&self.events);
             let wire = h4_wire_request(&request);
+            let event = match &request.operation {
+                H4AuthorityOperation::IssueReplaceGrant => H4AuthorityEvent::IssueEvaluated,
+                H4AuthorityOperation::Revalidate { .. } => H4AuthorityEvent::RevalidationEvaluated,
+            };
             Box::pin(async move {
                 let process_for_roundtrip = Arc::clone(&process);
                 let join = tokio::task::spawn_blocking(move || {
-                    if matches!(
-                        request_for_io.operation,
-                        H4AuthorityOperation::IssueReplaceGrant
-                    ) {
-                        provision_h4_confirmation(&process_for_roundtrip, &request_for_io)?;
-                    }
                     process_for_roundtrip.roundtrip_blocking(&wire)
                 });
                 let raw = match tokio::time::timeout(H4_HOST_IPC_TIMEOUT, join).await {
@@ -2326,10 +2709,38 @@ mod tests {
                         return Err(error);
                     }
                 };
+                lock_unpoisoned(&events).push(event);
                 lock_unpoisoned(&observations).push(response);
                 Ok(typed)
             })
         }
+    }
+
+    #[tokio::test]
+    async fn process_authority_issue_does_not_auto_provision_confirmation() {
+        let fixture = Fixture::new();
+        let authority = ProcessIsolatedH4Authority::new(fixture.root.identity()).unwrap();
+        let request = fixture.authority_request(H4AuthorityOperation::IssueReplaceGrant);
+        let response = authority.evaluate(request).await.unwrap();
+        let provenance = authority.provenance_snapshot();
+        let observations = authority.snapshot();
+        assert!(authority.shutdown());
+
+        assert_eq!(
+            response.denial,
+            Some(H4DenyClassification::ConfirmationMissing)
+        );
+        assert!(response.confirmation.is_none());
+        assert!(response.grant.is_none());
+        assert!(!response.confirmation_consumed);
+        assert_eq!(provenance.trusted_confirmations_provisioned, 0);
+        assert_eq!(provenance.request_derived_confirmations, 0);
+        assert_eq!(provenance.events, vec![H4AuthorityEvent::IssueEvaluated]);
+        assert_eq!(observations.len(), 1);
+        assert_eq!(
+            observations[0].denial.as_deref(),
+            Some("confirmation_missing")
+        );
     }
 
     fn provision_h4_confirmation(
@@ -2513,6 +2924,7 @@ mod tests {
             .filter(|bytes| *bytes <= H4_MAX_REPLACEMENT_BYTES)
             .ok_or(VitaH4AuthorityError::InvalidVerdict)?;
         if bounded_text(&confirmation.confirmation_id, MAX_CALL_ID_CHARS).is_none()
+            || confirmation.source != "trusted_test_harness"
             || confirmation.life_id != request.context.life_id()
             || confirmation.task_id != request.context.task_id()
             || confirmation.capability_id != request.capability_id
@@ -2528,6 +2940,7 @@ mod tests {
             return Err(VitaH4AuthorityError::InvalidVerdict);
         }
         Ok(HostExplicitActionConfirmationEvidence {
+            source: H4ConfirmationEvidenceSource::TrustedTestHarness,
             confirmation_id: confirmation.confirmation_id.clone(),
             life_id: confirmation.life_id.clone(),
             task_id: confirmation.task_id.clone(),
@@ -2700,10 +3113,105 @@ mod tests {
         error: Option<String>,
     }
 
+    #[derive(Default)]
+    struct H4CanaryGateState {
+        initial_turn_id: Option<String>,
+        error: Option<String>,
+        released: bool,
+    }
+
+    struct H4CanaryGate {
+        state: Mutex<H4CanaryGateState>,
+        changed: Condvar,
+    }
+
+    impl H4CanaryGate {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                state: Mutex::new(H4CanaryGateState::default()),
+                changed: Condvar::new(),
+            })
+        }
+
+        fn capture_initial_turn_id(&self, body: &[u8]) -> Result<(), String> {
+            let turn_id = serde_json::from_slice::<Value>(body)
+                .ok()
+                .and_then(|body| body.get("client_metadata").cloned())
+                .and_then(|metadata| metadata.get("turn_id").cloned())
+                .and_then(|turn_id| turn_id.as_str().map(str::to_string))
+                .filter(|turn_id| !turn_id.is_empty())
+                .ok_or_else(|| "H4-A first Responses request omitted client turn_id".to_string());
+            let mut state = lock_unpoisoned(&self.state);
+            let result = match turn_id {
+                Ok(turn_id) => {
+                    state.initial_turn_id = Some(turn_id);
+                    Ok(())
+                }
+                Err(error) => {
+                    state.error = Some(error.clone());
+                    Err(error)
+                }
+            };
+            self.changed.notify_all();
+            result
+        }
+
+        fn wait_for_initial_turn_id_blocking(&self) -> Result<String, String> {
+            let deadline = Instant::now() + H4_CANARY_TURN_TIMEOUT;
+            let mut state = lock_unpoisoned(&self.state);
+            loop {
+                if let Some(error) = state.error.clone() {
+                    return Err(error);
+                }
+                if let Some(turn_id) = state.initial_turn_id.clone() {
+                    return Ok(turn_id);
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err("H4-A first Responses request turn-id wait timed out".to_string());
+                }
+                let (next, timeout) = self
+                    .changed
+                    .wait_timeout(state, remaining)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state = next;
+                if timeout.timed_out() {
+                    return Err("H4-A first Responses request turn-id wait timed out".to_string());
+                }
+            }
+        }
+
+        fn wait_until_released(&self) -> Result<(), String> {
+            let deadline = Instant::now() + H4_CANARY_TURN_TIMEOUT;
+            let mut state = lock_unpoisoned(&self.state);
+            while !state.released {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err("H4-A first Responses request release wait timed out".to_string());
+                }
+                let (next, timeout) = self
+                    .changed
+                    .wait_timeout(state, remaining)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state = next;
+                if timeout.timed_out() && !state.released {
+                    return Err("H4-A first Responses request release wait timed out".to_string());
+                }
+            }
+            Ok(())
+        }
+
+        fn release(&self) {
+            lock_unpoisoned(&self.state).released = true;
+            self.changed.notify_all();
+        }
+    }
+
     struct H4ResponsesFixture {
         address: SocketAddr,
         stop: Arc<AtomicBool>,
         observation: Arc<Mutex<H4FixtureObservation>>,
+        gate: Arc<H4CanaryGate>,
         join: Option<thread::JoinHandle<()>>,
     }
 
@@ -2713,8 +3221,10 @@ mod tests {
             let address = listener.local_addr().expect("H4-A fixture address");
             let stop = Arc::new(AtomicBool::new(false));
             let observation = Arc::new(Mutex::new(H4FixtureObservation::default()));
+            let gate = H4CanaryGate::new();
             let stop_for_thread = Arc::clone(&stop);
             let observation_for_thread = Arc::clone(&observation);
+            let gate_for_thread = Arc::clone(&gate);
             let join = thread::spawn(move || {
                 let mut response_index = 0usize;
                 while !stop_for_thread.load(Ordering::Acquire) && response_index < 3 {
@@ -2729,7 +3239,12 @@ mod tests {
                     if stop_for_thread.load(Ordering::Acquire) {
                         break;
                     }
-                    let result = handle_h4_fixture_request(&mut stream, peer, response_index);
+                    let result = handle_h4_fixture_request(
+                        &mut stream,
+                        peer,
+                        response_index,
+                        &gate_for_thread,
+                    );
                     let mut observed = lock_unpoisoned(&observation_for_thread);
                     observed.request_count += 1;
                     if let Ok(body) = &result {
@@ -2763,6 +3278,7 @@ mod tests {
                 address,
                 stop,
                 observation,
+                gate,
                 join: Some(join),
             }
         }
@@ -2771,8 +3287,20 @@ mod tests {
             format!("http://127.0.0.1:{}/v1", self.address.port())
         }
 
+        async fn wait_for_initial_turn_id(&self) -> Result<String, String> {
+            let gate = Arc::clone(&self.gate);
+            tokio::task::spawn_blocking(move || gate.wait_for_initial_turn_id_blocking())
+                .await
+                .map_err(|_| "H4-A turn-id wait task failed".to_string())?
+        }
+
+        fn release_initial_request(&self) {
+            self.gate.release();
+        }
+
         fn shutdown(mut self) -> (H4FixtureObservation, bool) {
             self.stop.store(true, Ordering::Release);
+            self.gate.release();
             let _ = TcpStream::connect(self.address);
             let joined = self
                 .join
@@ -2786,6 +3314,7 @@ mod tests {
     impl Drop for H4ResponsesFixture {
         fn drop(&mut self) {
             self.stop.store(true, Ordering::Release);
+            self.gate.release();
             let _ = TcpStream::connect(self.address);
             if let Some(join) = self.join.take() {
                 let _ = join.join();
@@ -2869,6 +3398,7 @@ mod tests {
             "workspace_root_identity",
             "target_identity",
             "replacement_content",
+            "source",
         ]
         .into_iter()
         .all(|field| {
@@ -2882,11 +3412,16 @@ mod tests {
         stream: &mut TcpStream,
         peer: SocketAddr,
         response_index: usize,
+        gate: &H4CanaryGate,
     ) -> Result<Vec<u8>, String> {
         if !peer.ip().is_loopback() {
             return Err("H4-A fixture received a non-loopback peer".to_string());
         }
         let body = read_h4_http_request(stream)?;
+        if response_index == 0 {
+            gate.capture_initial_turn_id(&body)?;
+            gate.wait_until_released()?;
+        }
         let events = match response_index {
             0 => h4_canary_first_response_events(),
             1 => h4_canary_second_response_events(),
@@ -3261,10 +3796,8 @@ mod tests {
         ))
     }
 
-    async fn run_h4_turn(
-        thread: &Arc<codex_core_api::CodexThread>,
-    ) -> Result<(Option<String>, Option<String>, usize), String> {
-        tokio::time::timeout(
+    async fn start_h4_turn(thread: &Arc<codex_core_api::CodexThread>) -> Result<String, String> {
+        let submission = tokio::time::timeout(
             H4_CANARY_TURN_TIMEOUT,
             thread.start_or_steer_turn(codex_core_api::TurnInputRequest::user_input(vec![
                 codex_core_api::UserInput::Text {
@@ -3276,6 +3809,18 @@ mod tests {
         .await
         .map_err(|_| "H4-A turn submission timed out".to_string())?
         .map_err(|error| format!("H4-A turn submission failed: {error}"))?;
+        match submission {
+            codex_core_api::TurnInputSubmission::Started { turn_id }
+            | codex_core_api::TurnInputSubmission::Steered { turn_id } => Ok(turn_id),
+            codex_core_api::TurnInputSubmission::NotSubmitted { reason } => {
+                Err(format!("H4-A turn was not submitted: {reason:?}"))
+            }
+        }
+    }
+
+    async fn wait_h4_turn(
+        thread: &Arc<codex_core_api::CodexThread>,
+    ) -> Result<(Option<String>, Option<String>, usize), String> {
         let deadline = Instant::now() + H4_CANARY_TURN_TIMEOUT;
         let mut event_count = 0usize;
         loop {
@@ -3295,6 +3840,34 @@ mod tests {
                     event_count,
                 ));
             }
+        }
+    }
+
+    fn h4_canary_authority_request(
+        broker: &VitaWorkspaceReplaceBroker,
+        context: &VitaExecutionContext,
+        turn_id: String,
+    ) -> H4AuthorityRequest {
+        let prepared = broker
+            .root
+            .prepare_target(Path::new("replace-me.txt"))
+            .expect("H4-A canary target should prepare");
+        H4AuthorityRequest {
+            context: context.clone(),
+            capability_id: VITA_WORKSPACE_REPLACE_CAPABILITY_ID.to_string(),
+            operation: H4AuthorityOperation::IssueReplaceGrant,
+            tool_call_id: H4_CANARY_REPLACE_CALL_ID.to_string(),
+            turn_id,
+            relative_path: super::super::WorkspaceRelativePath::parse(Path::new("replace-me.txt"))
+                .expect("H4-A canary path should parse"),
+            expected_sha256: sha256_hex(H4_CANARY_FILE_CONTENT.as_bytes()),
+            replacement_sha256: sha256_hex(H4_CANARY_REPLACEMENT_CONTENT.as_bytes()),
+            replacement_bytes: H4_CANARY_REPLACEMENT_CONTENT.as_bytes().len(),
+            workspace_root_identity: prepared.root().identity(),
+            target_identity: prepared
+                .target_identity()
+                .expect("H4-A canary target identity should exist"),
+            target_kind: prepared.kind(),
         }
     }
 
@@ -3319,7 +3892,29 @@ mod tests {
         let (runtime, h3_broker, h4_broker, authority, before) =
             start_h4_runtime().await.expect("H4-A runtime should start");
         let file_path = runtime.workspace.path().join("replace-me.txt");
-        let turn = run_h4_turn(runtime.thread.as_ref().unwrap()).await;
+        let turn_id = start_h4_turn(runtime.thread.as_ref().unwrap())
+            .await
+            .expect("H4-A turn should start");
+        let observed_turn_id = runtime
+            .fixture
+            .as_ref()
+            .expect("H4-A Responses fixture should remain available")
+            .wait_for_initial_turn_id()
+            .await
+            .expect("H4-A fixture should expose the active turn id");
+        assert_eq!(observed_turn_id, turn_id);
+        let context = VitaExecutionContext::try_new(LIFE_ID, TASK_ID)
+            .expect("H4-A canary context should remain valid");
+        let authority_request = h4_canary_authority_request(&h4_broker, &context, turn_id);
+        authority
+            .provision_confirmation(&authority_request)
+            .expect("H4-A canary trusted confirmation should pre-provision");
+        runtime
+            .fixture
+            .as_ref()
+            .expect("H4-A Responses fixture should remain available")
+            .release_initial_request();
+        let turn = wait_h4_turn(runtime.thread.as_ref().unwrap()).await;
         let file_after = fs::read(&file_path).expect("H4-A canary target remains readable");
         let (cleanup, fixture_observation) = runtime.shutdown().await;
         let host_shutdown = authority.shutdown();
@@ -3369,6 +3964,17 @@ mod tests {
 
         let observations = authority.snapshot();
         assert_eq!(observations.len(), 2);
+        let provenance = authority.provenance_snapshot();
+        assert_eq!(provenance.trusted_confirmations_provisioned, 1);
+        assert_eq!(provenance.request_derived_confirmations, 0);
+        assert_eq!(
+            provenance.events,
+            vec![
+                H4AuthorityEvent::TrustedConfirmationProvisioned,
+                H4AuthorityEvent::IssueEvaluated,
+                H4AuthorityEvent::RevalidationEvaluated,
+            ]
+        );
         let issue = &observations[0];
         let revalidate = &observations[1];
         for observation in &observations {
@@ -3389,6 +3995,22 @@ mod tests {
             assert_eq!(canonical.approval_floor, H4_DESCRIPTOR_APPROVAL_FLOOR);
             assert_eq!(canonical.authorization_revision, Some(REVISION));
         }
+        assert_eq!(
+            issue
+                .confirmation
+                .as_ref()
+                .expect("H4-A issue confirmation")
+                .source,
+            "trusted_test_harness"
+        );
+        assert_ne!(
+            issue
+                .confirmation
+                .as_ref()
+                .expect("H4-A issue confirmation")
+                .source,
+            "tool_request"
+        );
         assert!(issue.confirmation.is_some());
         assert!(issue.action_grant.is_some());
         assert!(issue.confirmation_consumed);

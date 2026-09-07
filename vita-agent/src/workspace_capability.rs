@@ -385,17 +385,35 @@ pub(crate) enum WorkspaceReplaceError {
     FaultInjected,
     WriteFailed,
     ShortWrite,
+    ZeroProgressWrite,
     SetEndOfFileFailed,
     FlushFailed,
     PostWriteVerificationFailed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum WorkspaceReplaceEvidenceEvent {
+    InitialHashCheck,
+    CommitFence,
+    PostFenceRootCheck,
+    PostFenceParentCheck,
+    PostFenceTargetCheck,
+    PostFenceLinkCheck,
+    PostFenceHashCheck,
+    PostFenceCancellationCheck,
+    FirstModifyingSyscall,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct WorkspaceReplaceEvidence {
     pub(crate) before_sha256: Option<String>,
+    pub(crate) precommit_sha256: Option<String>,
+    pub(crate) post_fence_sha256: Option<String>,
     pub(crate) after_sha256: Option<String>,
     pub(crate) bytes_before: Option<usize>,
+    pub(crate) bytes_post_fence: Option<usize>,
     pub(crate) bytes_after: Option<usize>,
     pub(crate) mutation_attempted: bool,
     pub(crate) mutation_started: bool,
@@ -405,6 +423,16 @@ pub(crate) struct WorkspaceReplaceEvidence {
     pub(crate) fence_calls: usize,
     pub(crate) hard_link_count_after_open: Option<u32>,
     pub(crate) hard_link_count_before_fence: Option<u32>,
+    pub(crate) post_fence_root_verified: bool,
+    pub(crate) post_fence_parent_verified: bool,
+    pub(crate) post_fence_target_verified: bool,
+    pub(crate) hard_link_count_after_fence: Option<u32>,
+    pub(crate) post_fence_content_verified: bool,
+    pub(crate) post_fence_cancellation_checked: bool,
+    pub(crate) write_calls: usize,
+    pub(crate) operation_handle_open_count: usize,
+    pub(crate) automatic_retries: usize,
+    pub(crate) events: Vec<WorkspaceReplaceEvidenceEvent>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -652,8 +680,9 @@ impl PreparedWorkspaceTarget {
     }
 
     /// Cancellation-aware form used by the future H4 execution bridge and by
-    /// the native test harness.  Cancellation is checked only before the
-    /// commit fence and never after the first modifying syscall begins.
+    /// the native test harness.  Cancellation is checked before the commit
+    /// fence and once again after post-fence revalidation, never after the
+    /// first modifying syscall begins.
     #[allow(dead_code)]
     pub(crate) fn replace_existing_file_utf8_bounded_with_cancellation(
         self,
@@ -862,6 +891,10 @@ mod platform {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub(super) enum WorkspaceReplaceFaultPoint {
         BeforeCommitFence,
+        AfterCommitFenceBeforePostFenceChecks,
+        AfterPostFenceIdentityCheck,
+        AfterPostFenceHashCheck,
+        AfterPostFenceCancellationCheck,
         AfterCommitFenceBeforeFirstWrite,
         AfterFirstWrite,
         BeforeSetEndOfFile,
@@ -873,6 +906,20 @@ mod platform {
 
     trait WorkspaceReplaceFaultInjector {
         fn fire(&mut self, point: WorkspaceReplaceFaultPoint) -> bool;
+
+        fn write_chunk_limit(&mut self, requested: usize) -> usize {
+            requested
+        }
+
+        fn force_zero_progress(&mut self) -> bool {
+            false
+        }
+
+        fn after_first_modifying_syscall(&mut self) {}
+
+        fn force_post_fence_hash_mismatch(&mut self) -> bool {
+            false
+        }
     }
 
     struct NoWorkspaceReplaceFaults;
@@ -888,6 +935,10 @@ mod platform {
     pub(super) struct WorkspaceReplaceFaultPlan {
         point: Option<WorkspaceReplaceFaultPoint>,
         fired: bool,
+        max_write_chunk: Option<usize>,
+        zero_progress_on_write: bool,
+        post_fence_hash_mismatch: bool,
+        cancel_after_first_modifying_syscall: Option<Arc<AtomicBool>>,
     }
 
     #[cfg(test)]
@@ -896,7 +947,36 @@ mod platform {
             Self {
                 point: Some(point),
                 fired: false,
+                ..Self::default()
             }
+        }
+
+        pub(super) fn with_max_write_chunk(max_write_chunk: usize) -> Self {
+            Self {
+                max_write_chunk: Some(max_write_chunk.max(1)),
+                ..Self::default()
+            }
+        }
+
+        pub(super) fn zero_progress_once() -> Self {
+            Self {
+                zero_progress_on_write: true,
+                ..Self::default()
+            }
+        }
+
+        pub(super) fn post_fence_hash_mismatch() -> Self {
+            Self {
+                post_fence_hash_mismatch: true,
+                ..Self::default()
+            }
+        }
+
+        pub(super) fn cancel_after_first_modifying_syscall(
+            &mut self,
+            cancellation: Arc<AtomicBool>,
+        ) {
+            self.cancel_after_first_modifying_syscall = Some(cancellation);
         }
     }
 
@@ -908,6 +988,30 @@ mod platform {
             }
             self.fired = true;
             true
+        }
+
+        fn write_chunk_limit(&mut self, requested: usize) -> usize {
+            self.max_write_chunk
+                .map(|limit| limit.min(requested).max(1))
+                .unwrap_or(requested)
+        }
+
+        fn force_zero_progress(&mut self) -> bool {
+            let should_force = self.zero_progress_on_write;
+            self.zero_progress_on_write = false;
+            should_force
+        }
+
+        fn after_first_modifying_syscall(&mut self) {
+            if let Some(cancellation) = self.cancel_after_first_modifying_syscall.take() {
+                cancellation.store(true, Ordering::Release);
+            }
+        }
+
+        fn force_post_fence_hash_mismatch(&mut self) -> bool {
+            let should_force = self.post_fence_hash_mismatch;
+            self.post_fence_hash_mismatch = false;
+            should_force
         }
     }
 
@@ -1521,6 +1625,7 @@ mod platform {
                 return replace_denied(evidence, WorkspaceReplaceError::TargetBusy)
             }
         };
+        evidence.operation_handle_open_count = 1;
 
         let details =
             match verify_replace_operation_handle(&root, &operation_handle, expected_identity) {
@@ -1556,38 +1661,23 @@ mod platform {
         let current_hash = crate::sha256_hex(&current_bytes);
         evidence.bytes_before = Some(current_bytes.len());
         evidence.before_sha256 = Some(current_hash.clone());
+        evidence.precommit_sha256 = Some(current_hash.clone());
+        evidence.hard_link_count_before_fence = Some(details.number_of_links);
+        evidence
+            .events
+            .push(WorkspaceReplaceEvidenceEvent::InitialHashCheck);
         if current_hash != expected_sha256 {
             return replace_conflict(evidence);
         }
 
-        if verify_root_name(&root).is_err() {
-            return replace_denied(evidence, WorkspaceReplaceError::RootIdentityChanged);
-        }
-        if let Err(error) = verify_replace_parent(&root, &parent_handle, parent_identity) {
-            return replace_denied(evidence, error);
-        }
-        if cancellation.is_cancelled() {
-            return replace_denied(evidence, WorkspaceReplaceError::CancellationBeforeMutation);
-        }
-
-        // This is the final same-handle link check, immediately before the
-        // single final fence.  Re-inspecting the operation handle also keeps
-        // identity, regular-file, reparse, and final-path checks adjacent to
-        // the authority seam without reopening the pathname.
-        let before_fence_details =
-            match verify_replace_operation_handle(&root, &operation_handle, expected_identity) {
-                Ok(details) => details,
-                Err(error) => return replace_denied(evidence, error),
-            };
-        evidence.hard_link_count_before_fence = Some(before_fence_details.number_of_links);
-        if before_fence_details.number_of_links != 1 {
-            return replace_denied(evidence, WorkspaceReplaceError::HardLinkAmbiguous);
-        }
         if faults.fire(WorkspaceReplaceFaultPoint::BeforeCommitFence) {
             return replace_denied(evidence, WorkspaceReplaceError::FaultInjected);
         }
 
         evidence.fence_calls = 1;
+        evidence
+            .events
+            .push(WorkspaceReplaceEvidenceEvent::CommitFence);
         let fence_result = catch_unwind(AssertUnwindSafe(|| fence.check()));
         match fence_result {
             Ok(Ok(())) => {}
@@ -1607,6 +1697,93 @@ mod platform {
         }
 
         evidence.mutation_attempted = true;
+        if faults.fire(WorkspaceReplaceFaultPoint::AfterCommitFenceBeforePostFenceChecks) {
+            return replace_denied(evidence, WorkspaceReplaceError::FaultInjected);
+        }
+        if verify_root_name(&root).is_err() {
+            return replace_denied(evidence, WorkspaceReplaceError::RootIdentityChanged);
+        }
+        evidence.post_fence_root_verified = true;
+        evidence
+            .events
+            .push(WorkspaceReplaceEvidenceEvent::PostFenceRootCheck);
+        if let Err(error) = verify_replace_parent(&root, &parent_handle, parent_identity) {
+            return replace_denied(evidence, error);
+        }
+        evidence.post_fence_parent_verified = true;
+        evidence
+            .events
+            .push(WorkspaceReplaceEvidenceEvent::PostFenceParentCheck);
+
+        let post_fence_details =
+            match verify_replace_operation_handle(&root, &operation_handle, expected_identity) {
+                Ok(details) => details,
+                Err(error) => return replace_denied(evidence, error),
+            };
+        evidence.post_fence_target_verified = true;
+        evidence
+            .events
+            .push(WorkspaceReplaceEvidenceEvent::PostFenceTargetCheck);
+        if faults.fire(WorkspaceReplaceFaultPoint::AfterPostFenceIdentityCheck) {
+            return replace_denied(evidence, WorkspaceReplaceError::FaultInjected);
+        }
+        evidence.hard_link_count_after_fence = Some(post_fence_details.number_of_links);
+        evidence
+            .events
+            .push(WorkspaceReplaceEvidenceEvent::PostFenceLinkCheck);
+        if post_fence_details.number_of_links != 1 {
+            return replace_denied(evidence, WorkspaceReplaceError::HardLinkAmbiguous);
+        }
+
+        if !set_file_pointer(&operation_handle, 0) {
+            return replace_denied(evidence, WorkspaceReplaceError::OperationHandleIo);
+        }
+        let post_fence_bytes = match read_replace_utf8_bounded(&operation_handle) {
+            Ok(bytes) => bytes,
+            Err(ReplaceReadError::TooLarge) => {
+                return replace_denied(evidence, WorkspaceReplaceError::CurrentFileTooLarge)
+            }
+            Err(ReplaceReadError::InvalidUtf8) => {
+                return replace_denied(evidence, WorkspaceReplaceError::CurrentContentNotUtf8)
+            }
+            Err(ReplaceReadError::Io) => {
+                return replace_denied(evidence, WorkspaceReplaceError::OperationHandleIo)
+            }
+        };
+        let actual_post_fence_hash = crate::sha256_hex(&post_fence_bytes);
+        let post_fence_hash = if faults.force_post_fence_hash_mismatch() {
+            if expected_sha256 == "0".repeat(64) {
+                "1".repeat(64)
+            } else {
+                "0".repeat(64)
+            }
+        } else {
+            actual_post_fence_hash
+        };
+        evidence.bytes_post_fence = Some(post_fence_bytes.len());
+        evidence.post_fence_sha256 = Some(post_fence_hash.clone());
+        evidence
+            .events
+            .push(WorkspaceReplaceEvidenceEvent::PostFenceHashCheck);
+        if post_fence_hash != expected_sha256 {
+            return replace_conflict(evidence);
+        }
+        evidence.post_fence_content_verified = true;
+        if faults.fire(WorkspaceReplaceFaultPoint::AfterPostFenceHashCheck) {
+            return replace_denied(evidence, WorkspaceReplaceError::FaultInjected);
+        }
+
+        let post_fence_cancelled = cancellation.is_cancelled();
+        evidence.post_fence_cancellation_checked = true;
+        evidence
+            .events
+            .push(WorkspaceReplaceEvidenceEvent::PostFenceCancellationCheck);
+        if post_fence_cancelled {
+            return replace_denied(evidence, WorkspaceReplaceError::CancellationBeforeMutation);
+        }
+        if faults.fire(WorkspaceReplaceFaultPoint::AfterPostFenceCancellationCheck) {
+            return replace_denied(evidence, WorkspaceReplaceError::FaultInjected);
+        }
         if faults.fire(WorkspaceReplaceFaultPoint::AfterCommitFenceBeforeFirstWrite) {
             return replace_denied(evidence, WorkspaceReplaceError::FaultInjected);
         }
@@ -1620,35 +1797,66 @@ mod platform {
             }
             evidence.mutation_started = true;
             evidence.modifying_syscalls += 1;
+            evidence
+                .events
+                .push(WorkspaceReplaceEvidenceEvent::FirstModifyingSyscall);
             if !set_end_of_file(&operation_handle) {
                 return replace_unknown(evidence, WorkspaceReplaceError::SetEndOfFileFailed);
             }
+            faults.after_first_modifying_syscall();
             if faults.fire(WorkspaceReplaceFaultPoint::AfterSetEndOfFile) {
                 return replace_unknown(evidence, WorkspaceReplaceError::FaultInjected);
             }
         } else {
             // The operation handle is synchronous and its pointer was reset
-            // immediately before the first modifying syscall.
+            // immediately before the first modifying syscall.  A positive
+            // short write continues from the same handle and current file
+            // pointer; it never starts a second transaction.
             evidence.mutation_started = true;
-            evidence.modifying_syscalls += 1;
-            let mut written = 0_u32;
-            let write_ok = unsafe {
-                WriteFile(
-                    operation_handle.0,
-                    replacement_bytes.as_ptr(),
-                    replacement_bytes.len() as u32,
-                    &mut written,
-                    std::ptr::null_mut(),
-                ) != 0
-            };
-            if !write_ok {
-                return replace_unknown(evidence, WorkspaceReplaceError::WriteFailed);
-            }
-            if written as usize != replacement_bytes.len() {
-                return replace_unknown(evidence, WorkspaceReplaceError::ShortWrite);
-            }
-            if faults.fire(WorkspaceReplaceFaultPoint::AfterFirstWrite) {
-                return replace_unknown(evidence, WorkspaceReplaceError::FaultInjected);
+            let mut offset = 0_usize;
+            let mut first_write = true;
+            while offset < replacement_bytes.len() {
+                let remaining = replacement_bytes.len() - offset;
+                let request_len = faults.write_chunk_limit(remaining).min(remaining).max(1);
+                let mut written = 0_u32;
+                evidence.modifying_syscalls += 1;
+                evidence.write_calls += 1;
+                if first_write {
+                    evidence
+                        .events
+                        .push(WorkspaceReplaceEvidenceEvent::FirstModifyingSyscall);
+                }
+                let write_ok = unsafe {
+                    WriteFile(
+                        operation_handle.0,
+                        replacement_bytes[offset..].as_ptr(),
+                        request_len as u32,
+                        &mut written,
+                        std::ptr::null_mut(),
+                    ) != 0
+                };
+                if !write_ok {
+                    return replace_unknown(evidence, WorkspaceReplaceError::WriteFailed);
+                }
+                let reported_written = if faults.force_zero_progress() {
+                    0
+                } else {
+                    written as usize
+                };
+                if reported_written == 0 {
+                    return replace_unknown(evidence, WorkspaceReplaceError::ZeroProgressWrite);
+                }
+                if reported_written > request_len {
+                    return replace_unknown(evidence, WorkspaceReplaceError::ShortWrite);
+                }
+                offset += reported_written;
+                if first_write {
+                    first_write = false;
+                    faults.after_first_modifying_syscall();
+                    if faults.fire(WorkspaceReplaceFaultPoint::AfterFirstWrite) {
+                        return replace_unknown(evidence, WorkspaceReplaceError::FaultInjected);
+                    }
+                }
             }
             if faults.fire(WorkspaceReplaceFaultPoint::BeforeSetEndOfFile) {
                 return replace_unknown(evidence, WorkspaceReplaceError::SetEndOfFileFailed);
@@ -3326,6 +3534,316 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn post_fence_root_parent_target_rechecks_run() {
+        let initial = b"post-fence recheck fixture";
+        let replacement = "post-fence replacement";
+        let (_directory, _root, prepared) = prepared_fixture(initial);
+        let mut fence = allow_fence();
+        let outcome = prepared.replace_existing_file_utf8_bounded(
+            crate::sha256_hex(initial).as_str(),
+            replacement,
+            &mut fence,
+        );
+        let evidence = match outcome {
+            WorkspaceReplaceCommitOutcome::Committed { evidence } => evidence,
+            other => panic!("expected committed outcome, got {other:?}"),
+        };
+        assert!(evidence.post_fence_root_verified);
+        assert!(evidence.post_fence_parent_verified);
+        assert!(evidence.post_fence_target_verified);
+        assert_eq!(evidence.hard_link_count_after_fence, Some(1));
+        let event_position = |wanted| {
+            evidence
+                .events
+                .iter()
+                .position(|event| *event == wanted)
+                .expect("evidence event")
+        };
+        assert!(
+            event_position(WorkspaceReplaceEvidenceEvent::InitialHashCheck)
+                < event_position(WorkspaceReplaceEvidenceEvent::CommitFence)
+        );
+        assert!(
+            event_position(WorkspaceReplaceEvidenceEvent::CommitFence)
+                < event_position(WorkspaceReplaceEvidenceEvent::PostFenceTargetCheck)
+        );
+        assert!(
+            event_position(WorkspaceReplaceEvidenceEvent::PostFenceTargetCheck)
+                < event_position(WorkspaceReplaceEvidenceEvent::PostFenceLinkCheck)
+        );
+        assert!(
+            event_position(WorkspaceReplaceEvidenceEvent::PostFenceLinkCheck)
+                < event_position(WorkspaceReplaceEvidenceEvent::PostFenceHashCheck)
+        );
+        assert!(
+            event_position(WorkspaceReplaceEvidenceEvent::PostFenceHashCheck)
+                < event_position(WorkspaceReplaceEvidenceEvent::PostFenceCancellationCheck)
+        );
+        assert!(
+            event_position(WorkspaceReplaceEvidenceEvent::PostFenceCancellationCheck)
+                < event_position(WorkspaceReplaceEvidenceEvent::FirstModifyingSyscall)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn post_fence_hard_link_recheck_is_one() {
+        let initial = b"post-fence hard-link fixture";
+        let (_directory, _root, prepared) = prepared_fixture(initial);
+        let mut fence = allow_fence();
+        let outcome = prepared.replace_existing_file_utf8_bounded(
+            crate::sha256_hex(initial).as_str(),
+            "replacement",
+            &mut fence,
+        );
+        let evidence = match outcome {
+            WorkspaceReplaceCommitOutcome::Committed { evidence } => evidence,
+            other => panic!("expected committed outcome, got {other:?}"),
+        };
+        assert_eq!(evidence.hard_link_count_after_fence, Some(1));
+        assert_eq!(evidence.hard_link_count_after_open, Some(1));
+        assert_eq!(evidence.hard_link_count_before_fence, Some(1));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn post_fence_expected_hash_recheck_passes() {
+        let initial = b"post-fence hash fixture";
+        let (_directory, _root, prepared) = prepared_fixture(initial);
+        let mut fence = allow_fence();
+        let outcome = prepared.replace_existing_file_utf8_bounded(
+            crate::sha256_hex(initial).as_str(),
+            "replacement",
+            &mut fence,
+        );
+        let evidence = match outcome {
+            WorkspaceReplaceCommitOutcome::Committed { evidence } => evidence,
+            other => panic!("expected committed outcome, got {other:?}"),
+        };
+        let expected = crate::sha256_hex(initial);
+        assert_eq!(evidence.before_sha256.as_deref(), Some(expected.as_str()));
+        assert_eq!(
+            evidence.precommit_sha256.as_deref(),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            evidence.post_fence_sha256.as_deref(),
+            Some(expected.as_str())
+        );
+        assert!(evidence.post_fence_content_verified);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn post_fence_hash_mismatch_conflicts_without_mutation() {
+        let initial = b"post-fence hash mismatch fixture";
+        let (directory, _root, prepared) = prepared_fixture(initial);
+        let cancellation = std::sync::atomic::AtomicBool::new(false);
+        let mut fence = allow_fence();
+        let mut faults = platform::WorkspaceReplaceFaultPlan::post_fence_hash_mismatch();
+        let outcome = prepared.replace_existing_file_utf8_bounded_with_faults(
+            crate::sha256_hex(initial).as_str(),
+            "must not mutate",
+            &mut fence,
+            &cancellation,
+            &mut faults,
+        );
+        let evidence = match outcome {
+            WorkspaceReplaceCommitOutcome::Conflict { evidence } => evidence,
+            other => panic!("expected post-fence conflict, got {other:?}"),
+        };
+        assert_ne!(
+            evidence.post_fence_sha256.as_deref(),
+            Some(crate::sha256_hex(initial).as_str())
+        );
+        assert!(!evidence.post_fence_content_verified);
+        assert_eq!(evidence.modifying_syscalls, 0);
+        assert!(!evidence.mutation_started);
+        assert_eq!(
+            fs::read(directory.path().join("target.txt")).expect("target"),
+            initial
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn forced_partial_writes_continue_on_same_handle() {
+        let initial = b"partial original";
+        let replacement = "0123456789abcdef";
+        let (directory, _root, prepared) = prepared_fixture(initial);
+        let cancellation = std::sync::atomic::AtomicBool::new(false);
+        let mut fence = allow_fence();
+        let mut faults = platform::WorkspaceReplaceFaultPlan::with_max_write_chunk(3);
+        let outcome = prepared.replace_existing_file_utf8_bounded_with_faults(
+            crate::sha256_hex(initial).as_str(),
+            replacement,
+            &mut fence,
+            &cancellation,
+            &mut faults,
+        );
+        let evidence = match outcome {
+            WorkspaceReplaceCommitOutcome::Committed { evidence } => evidence,
+            other => panic!("expected partial-write commit, got {other:?}"),
+        };
+        assert!(evidence.write_calls > 1);
+        assert_eq!(evidence.operation_handle_open_count, 1);
+        assert_eq!(evidence.automatic_retries, 0);
+        assert_eq!(evidence.modifying_syscalls, evidence.write_calls + 2);
+        assert_eq!(
+            fs::read(directory.path().join("target.txt")).expect("target"),
+            replacement.as_bytes()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn forced_partial_writes_commit_exact_bytes() {
+        let initial = b"exact-byte original";
+        let replacement = "partial writes preserve every byte";
+        let (directory, _root, prepared) = prepared_fixture(initial);
+        let cancellation = std::sync::atomic::AtomicBool::new(false);
+        let mut fence = allow_fence();
+        let mut faults = platform::WorkspaceReplaceFaultPlan::with_max_write_chunk(3);
+        let outcome = prepared.replace_existing_file_utf8_bounded_with_faults(
+            crate::sha256_hex(initial).as_str(),
+            replacement,
+            &mut fence,
+            &cancellation,
+            &mut faults,
+        );
+        let evidence = match outcome {
+            WorkspaceReplaceCommitOutcome::Committed { evidence } => evidence,
+            other => panic!("expected partial-write commit, got {other:?}"),
+        };
+        assert_eq!(evidence.bytes_after, Some(replacement.len()));
+        assert_eq!(
+            evidence.after_sha256.as_deref(),
+            Some(crate::sha256_hex(replacement.as_bytes()).as_str())
+        );
+        assert_eq!(
+            fs::read(directory.path().join("target.txt")).expect("target"),
+            replacement.as_bytes()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn partial_write_continuation_is_not_transaction_retry() {
+        let initial = b"partial retry distinction";
+        let replacement = "abcdefghijklmno";
+        let (_directory, _root, prepared) = prepared_fixture(initial);
+        let cancellation = std::sync::atomic::AtomicBool::new(false);
+        let mut fence = allow_fence();
+        let mut faults = platform::WorkspaceReplaceFaultPlan::with_max_write_chunk(3);
+        let outcome = prepared.replace_existing_file_utf8_bounded_with_faults(
+            crate::sha256_hex(initial).as_str(),
+            replacement,
+            &mut fence,
+            &cancellation,
+            &mut faults,
+        );
+        let evidence = match outcome {
+            WorkspaceReplaceCommitOutcome::Committed { evidence } => evidence,
+            other => panic!("expected partial-write commit, got {other:?}"),
+        };
+        assert_eq!(evidence.fence_calls, 1);
+        assert_eq!(evidence.write_calls, replacement.len().div_ceil(3));
+        assert_eq!(evidence.automatic_retries, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn same_handle_preserved_across_partial_write_loop() {
+        let initial = b"same-handle original";
+        let replacement = "same-handle partial replacement";
+        let (_directory, _root, prepared) = prepared_fixture(initial);
+        let cancellation = std::sync::atomic::AtomicBool::new(false);
+        let mut fence = allow_fence();
+        let mut faults = platform::WorkspaceReplaceFaultPlan::with_max_write_chunk(3);
+        let outcome = prepared.replace_existing_file_utf8_bounded_with_faults(
+            crate::sha256_hex(initial).as_str(),
+            replacement,
+            &mut fence,
+            &cancellation,
+            &mut faults,
+        );
+        let evidence = match outcome {
+            WorkspaceReplaceCommitOutcome::Committed { evidence } => evidence,
+            other => panic!("expected partial-write commit, got {other:?}"),
+        };
+        assert!(evidence.write_calls > 1);
+        assert_eq!(evidence.operation_handle_open_count, 1);
+        assert_eq!(
+            evidence
+                .events
+                .iter()
+                .filter(|event| **event == WorkspaceReplaceEvidenceEvent::FirstModifyingSyscall)
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn zero_progress_write_is_commit_unknown() {
+        let initial = b"zero progress original";
+        let (directory, _root, prepared) = prepared_fixture(initial);
+        let cancellation = std::sync::atomic::AtomicBool::new(false);
+        let mut fence = allow_fence();
+        let mut faults = platform::WorkspaceReplaceFaultPlan::zero_progress_once();
+        let outcome = prepared.replace_existing_file_utf8_bounded_with_faults(
+            crate::sha256_hex(initial).as_str(),
+            "zero progress replacement",
+            &mut fence,
+            &cancellation,
+            &mut faults,
+        );
+        match outcome {
+            WorkspaceReplaceCommitOutcome::CommitUnknown { error, evidence } => {
+                assert_eq!(error, WorkspaceReplaceError::ZeroProgressWrite);
+                assert!(evidence.commit_unknown);
+                assert_eq!(evidence.write_calls, 1);
+                assert_eq!(evidence.modifying_syscalls, 1);
+                assert_eq!(evidence.automatic_retries, 0);
+            }
+            other => panic!("expected zero-progress unknown outcome, got {other:?}"),
+        }
+        assert_ne!(
+            fs::read(directory.path().join("target.txt")).expect("target"),
+            initial
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn post_fence_faults_have_zero_mutation() {
+        let points = [
+            platform::WorkspaceReplaceFaultPoint::AfterCommitFenceBeforePostFenceChecks,
+            platform::WorkspaceReplaceFaultPoint::AfterPostFenceIdentityCheck,
+            platform::WorkspaceReplaceFaultPoint::AfterPostFenceHashCheck,
+            platform::WorkspaceReplaceFaultPoint::AfterPostFenceCancellationCheck,
+            platform::WorkspaceReplaceFaultPoint::AfterCommitFenceBeforeFirstWrite,
+        ];
+        for point in points {
+            let initial = b"post-fence fault fixture";
+            let (directory, outcome) = run_fault(initial, "must not mutate", point);
+            match outcome {
+                WorkspaceReplaceCommitOutcome::Denied { error, evidence } => {
+                    assert_eq!(error, WorkspaceReplaceError::FaultInjected);
+                    assert_eq!(evidence.modifying_syscalls, 0);
+                    assert!(!evidence.mutation_started);
+                }
+                other => panic!("expected post-fence denial for {point:?}, got {other:?}"),
+            }
+            assert_eq!(
+                fs::read(directory.path().join("target.txt")).expect("target"),
+                initial
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn after_commit_fence_before_first_write_has_zero_mutation() {
         let initial = b"after fence fixture";
         let (directory, outcome) = run_fault(
@@ -3590,9 +4108,8 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn cancellation_after_mutation_start_is_not_reported_as_denied() {
-        let initial = b"cancel after fixture";
-        let replacement = "replacement after cancellation";
+    fn cancellation_after_fence_before_first_mutation_has_zero_side_effect() {
+        let initial = b"cancel after fence fixture";
         let (directory, _root, prepared) = prepared_fixture(initial);
         let cancellation = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cancellation_for_fence = std::sync::Arc::clone(&cancellation);
@@ -3602,15 +4119,49 @@ mod tests {
         };
         let outcome = prepared.replace_existing_file_utf8_bounded_with_cancellation(
             crate::sha256_hex(initial).as_str(),
+            "must not mutate",
+            &mut fence,
+            cancellation.as_ref(),
+        );
+        match outcome {
+            WorkspaceReplaceCommitOutcome::Denied { error, evidence } => {
+                assert_eq!(error, WorkspaceReplaceError::CancellationBeforeMutation);
+                assert_eq!(evidence.fence_calls, 1);
+                assert!(evidence.post_fence_cancellation_checked);
+                assert_eq!(evidence.modifying_syscalls, 0);
+                assert!(!evidence.mutation_started);
+            }
+            other => panic!("expected post-fence cancellation denial, got {other:?}"),
+        }
+        assert_eq!(
+            fs::read(directory.path().join("target.txt")).expect("target"),
+            initial
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cancellation_after_actual_first_mutation_is_not_reported_as_denied() {
+        let initial = b"cancel after fixture";
+        let replacement = "replacement after cancellation";
+        let (directory, _root, prepared) = prepared_fixture(initial);
+        let cancellation = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut faults = platform::WorkspaceReplaceFaultPlan::default();
+        faults.cancel_after_first_modifying_syscall(std::sync::Arc::clone(&cancellation));
+        let mut fence = allow_fence();
+        let outcome = prepared.replace_existing_file_utf8_bounded_with_faults(
+            crate::sha256_hex(initial).as_str(),
             replacement,
             &mut fence,
             cancellation.as_ref(),
+            &mut faults,
         );
         assert!(matches!(
             outcome,
             WorkspaceReplaceCommitOutcome::Committed { .. }
                 | WorkspaceReplaceCommitOutcome::CommitUnknown { .. }
         ));
+        assert!(cancellation.load(Ordering::Acquire));
         assert_eq!(
             fs::read(directory.path().join("target.txt")).unwrap(),
             replacement.as_bytes()

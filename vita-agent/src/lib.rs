@@ -24,6 +24,7 @@ use toml::Value as TomlValue;
 mod d29h3;
 mod d29h4;
 mod provider_gateway;
+pub mod recovery_journal;
 mod tool_authority;
 mod workspace_capability;
 
@@ -380,6 +381,13 @@ impl VitaAgentRuntimeProfile {
         self.validate_private_namespace()?;
         self.ensure_ownership_marker()?;
         self.validate_private_namespace()?;
+        self.verify_ownership_marker()
+    }
+
+    /// Verifies the existing Vita-owned runtime marker without creating or
+    /// changing any part of the private layout.  Recovery scanning uses this
+    /// read-only fence before inspecting the app-owned journal directory.
+    pub(crate) fn verify_private_runtime_ownership(&self) -> Result<(), VitaAgentError> {
         self.verify_ownership_marker()
     }
 

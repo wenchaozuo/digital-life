@@ -1,0 +1,2200 @@
+//! D29-H5-A recovery journal foundation.
+//!
+//! This module is deliberately an evidence-only boundary.  A journal records
+//! a bounded, exact preimage and the trusted facts that would be needed by a
+//! later recovery stage, but it never grants authority, proves a confirmation,
+//! or performs a workspace mutation.  H5-B is the first stage allowed to
+//! interpret a prepared record operationally.
+//!
+//! The on-disk format is a strict versioned binary frame rather than JSON.
+//! It is bounded before allocation, uses create-new file creation, and binds
+//! its canonical payload with SHA-256.  The digest is tamper evidence only;
+//! it is not an authorization signature and is not a defense against a
+//! malicious administrator who can rewrite the app-owned directory.
+
+use std::collections::HashMap;
+use std::fmt::{self, Display, Formatter};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
+#[cfg(test)]
+use std::io::{Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use sha2::{Digest, Sha256};
+
+use crate::workspace_capability::WorkspaceReadError;
+use crate::{
+    PreparedWorkspaceTarget, PreparedWorkspaceTargetKind, VitaAgentError, VitaAgentRuntimeProfile,
+    WorkspaceRelativePath, WorkspaceRootIdentity,
+};
+
+pub const RECOVERY_JOURNAL_FORMAT_VERSION: u16 = 1;
+pub const RECOVERY_JOURNAL_MAX_PREIMAGE_BYTES: usize = 64 * 1024;
+pub const RECOVERY_JOURNAL_MAX_REPLACEMENT_BYTES: usize = 64 * 1024;
+pub const RECOVERY_JOURNAL_MAX_SIZE: usize = 160 * 1024;
+
+const MAGIC: &[u8; 4] = b"DLRJ";
+const DOMAIN_SEPARATOR: &[u8] = b"DigitalLife.RecoveryJournalV1\0";
+const HEADER_BYTES: usize = 4 + 2 + 4;
+const INTEGRITY_HASH_BYTES: usize = 32;
+const MAX_PAYLOAD_BYTES: usize = RECOVERY_JOURNAL_MAX_SIZE - HEADER_BYTES - INTEGRITY_HASH_BYTES;
+const MAX_CONTEXT_FIELD_BYTES: usize = 512;
+const MAX_RELATIVE_PATH_BYTES: usize = 96 * 1024;
+const MAX_TRANSACTION_ID_BYTES: usize = 96;
+const MAX_SCAN_ENTRIES: usize = 256;
+const MAX_FILE_NAME_CHARS: usize = 256;
+const RECOVERY_DIRECTORY_NAME: &str = "recovery";
+
+static NEXT_TRANSACTION_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Errors are intentionally typed so malformed or incomplete evidence never
+/// gets silently treated as a prepared journal.
+#[derive(Debug)]
+pub enum RecoveryJournalError {
+    Profile(VitaAgentError),
+    Io {
+        operation: &'static str,
+        source: io::Error,
+    },
+    InvalidField {
+        field: &'static str,
+        reason: &'static str,
+    },
+    UnsupportedPlatform,
+    TargetBindingMismatch(&'static str),
+    TargetNotExisting,
+    TargetRead,
+    Corrupt(&'static str),
+    UnsupportedVersion(u16),
+    Oversized {
+        limit: usize,
+    },
+    DuplicateTransactionId,
+    ScanLimitExceeded,
+    ReopenVerificationFailed,
+    InjectedFault(&'static str),
+}
+
+impl Display for RecoveryJournalError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Profile(error) => Display::fmt(error, formatter),
+            Self::Io { operation, source } => {
+                write!(formatter, "recovery journal {operation} failed: {source}")
+            }
+            Self::InvalidField { field, reason } => {
+                write!(
+                    formatter,
+                    "recovery journal field {field} is invalid: {reason}"
+                )
+            }
+            Self::UnsupportedPlatform => formatter
+                .write_str("recovery journal requires the Windows workspace identity capability"),
+            Self::TargetBindingMismatch(reason) => {
+                write!(
+                    formatter,
+                    "recovery journal target binding denied: {reason}"
+                )
+            }
+            Self::TargetNotExisting => {
+                formatter.write_str("recovery journal requires an existing regular file")
+            }
+            Self::TargetRead => {
+                formatter.write_str("recovery journal could not read the target preimage")
+            }
+            Self::Corrupt(reason) => write!(formatter, "recovery journal is corrupt: {reason}"),
+            Self::UnsupportedVersion(version) => {
+                write!(
+                    formatter,
+                    "recovery journal version {version} is unsupported"
+                )
+            }
+            Self::Oversized { limit } => {
+                write!(formatter, "recovery journal exceeds the {limit}-byte limit")
+            }
+            Self::DuplicateTransactionId => {
+                formatter.write_str("recovery journal transaction id already exists")
+            }
+            Self::ScanLimitExceeded => formatter.write_str("recovery journal scan limit exceeded"),
+            Self::ReopenVerificationFailed => {
+                formatter.write_str("recovery journal reopen verification failed")
+            }
+            Self::InjectedFault(point) => {
+                write!(formatter, "injected recovery journal fault at {point}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RecoveryJournalError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Profile(error) => Some(error),
+            Self::Io { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+/// Stable identity evidence for a Windows volume/object pair.
+///
+/// This contains no raw HANDLE and has no authority methods.  It is used only
+/// to compare the identity captured by H4 with the identity persisted in the
+/// journal.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RecoveryJournalIdentity {
+    volume_serial_number: u64,
+    file_id: [u8; 16],
+}
+
+impl RecoveryJournalIdentity {
+    fn from_workspace_identity(
+        identity: WorkspaceRootIdentity,
+    ) -> Result<Self, RecoveryJournalError> {
+        match (identity.volume_serial_number(), identity.file_id()) {
+            (Some(volume_serial_number), Some(file_id)) => Ok(Self {
+                volume_serial_number,
+                file_id,
+            }),
+            _ => Err(RecoveryJournalError::UnsupportedPlatform),
+        }
+    }
+
+    pub fn volume_serial_number(&self) -> u64 {
+        self.volume_serial_number
+    }
+
+    pub fn file_id(&self) -> [u8; 16] {
+        self.file_id
+    }
+}
+
+/// Runtime-generated, filename-safe transaction identity.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct RecoveryTransactionId(String);
+
+impl RecoveryTransactionId {
+    /// Parses an on-disk identity.  This parser is for strict validation; the
+    /// normal creation path always generates the value locally.
+    pub fn parse(value: &str) -> Result<Self, RecoveryJournalError> {
+        if value.is_empty() || value.len() > MAX_TRANSACTION_ID_BYTES {
+            return Err(RecoveryJournalError::InvalidField {
+                field: "transaction_id",
+                reason: "empty or oversized",
+            });
+        }
+        if value == "." || value == ".." || value.ends_with('.') || value.ends_with(' ') {
+            return Err(RecoveryJournalError::InvalidField {
+                field: "transaction_id",
+                reason: "traversal or ambiguous filename",
+            });
+        }
+        if value.chars().any(|character| {
+            character.is_control()
+                || !character.is_ascii()
+                || matches!(
+                    character,
+                    '/' | '\\' | ':' | '.' | '"' | '<' | '>' | '|' | '?' | '*'
+                )
+        }) {
+            return Err(RecoveryJournalError::InvalidField {
+                field: "transaction_id",
+                reason: "not filename-safe",
+            });
+        }
+        let device_name = value.to_ascii_uppercase();
+        if matches!(
+            device_name.as_str(),
+            "CON"
+                | "PRN"
+                | "AUX"
+                | "NUL"
+                | "COM1"
+                | "COM2"
+                | "COM3"
+                | "COM4"
+                | "COM5"
+                | "COM6"
+                | "COM7"
+                | "COM8"
+                | "COM9"
+                | "LPT1"
+                | "LPT2"
+                | "LPT3"
+                | "LPT4"
+                | "LPT5"
+                | "LPT6"
+                | "LPT7"
+                | "LPT8"
+                | "LPT9"
+        ) {
+            return Err(RecoveryJournalError::InvalidField {
+                field: "transaction_id",
+                reason: "reserved Windows device name",
+            });
+        }
+        if !value
+            .bytes()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, b'-' | b'_'))
+        {
+            return Err(RecoveryJournalError::InvalidField {
+                field: "transaction_id",
+                reason: "only ASCII letters, digits, hyphen, and underscore are allowed",
+            });
+        }
+        Ok(Self(value.to_string()))
+    }
+
+    fn generate() -> Self {
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_millis());
+        let process = std::process::id();
+        let counter = NEXT_TRANSACTION_ID.fetch_add(1, Ordering::Relaxed);
+        // All components are generated by trusted local code and are ASCII
+        // filename-safe.  No caller/model value participates in the path.
+        Self(format!("tx-{millis:x}-{process:x}-{counter:x}"))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Trusted transaction facts supplied by the host-side integration seam.
+///
+/// The context intentionally has no confirmation, grant, authorization,
+/// credential, HANDLE, journal path, or replacement content field.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryJournalContext {
+    life_id: String,
+    task_id: String,
+    capability_id: String,
+    replacement_sha256: [u8; 32],
+    replacement_bytes: u32,
+    tool_call_id: String,
+    turn_id: String,
+    created_at_unix_ms: u64,
+}
+
+impl RecoveryJournalContext {
+    pub fn new(
+        life_id: &str,
+        task_id: &str,
+        capability_id: &str,
+        replacement_sha256: &str,
+        replacement_bytes: usize,
+        tool_call_id: &str,
+        turn_id: &str,
+    ) -> Result<Self, RecoveryJournalError> {
+        Ok(Self {
+            life_id: bounded_context_text("life_id", life_id)?,
+            task_id: bounded_context_text("task_id", task_id)?,
+            capability_id: bounded_context_text("capability_id", capability_id)?,
+            replacement_sha256: decode_sha256_hex("replacement_sha256", replacement_sha256)?,
+            replacement_bytes: bounded_bytes("replacement_bytes", replacement_bytes)?,
+            tool_call_id: bounded_context_text("tool_call_id", tool_call_id)?,
+            turn_id: bounded_context_text("turn_id", turn_id)?,
+            created_at_unix_ms: current_unix_millis(),
+        })
+    }
+
+    pub fn life_id(&self) -> &str {
+        &self.life_id
+    }
+
+    pub fn task_id(&self) -> &str {
+        &self.task_id
+    }
+
+    pub fn capability_id(&self) -> &str {
+        &self.capability_id
+    }
+
+    pub fn replacement_sha256(&self) -> String {
+        hex_encode(&self.replacement_sha256)
+    }
+
+    pub fn replacement_bytes(&self) -> usize {
+        self.replacement_bytes as usize
+    }
+
+    pub fn tool_call_id(&self) -> &str {
+        &self.tool_call_id
+    }
+
+    pub fn turn_id(&self) -> &str {
+        &self.turn_id
+    }
+}
+
+/// Extensible record state.  H5-A writes only `Prepared`; later states are
+/// decoded so a restart scanner can remain forward-compatible without
+/// treating an unknown state as safe.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryJournalRecordState {
+    Prepared,
+    MutationStarted,
+    Committed,
+    RecoveryRequired,
+    Recovered,
+    Finalized,
+}
+
+impl RecoveryJournalRecordState {
+    fn encode(self) -> u8 {
+        match self {
+            Self::Prepared => 1,
+            Self::MutationStarted => 2,
+            Self::Committed => 3,
+            Self::RecoveryRequired => 4,
+            Self::Recovered => 5,
+            Self::Finalized => 6,
+        }
+    }
+
+    fn decode(value: u8) -> Result<Self, RecoveryJournalError> {
+        match value {
+            1 => Ok(Self::Prepared),
+            2 => Ok(Self::MutationStarted),
+            3 => Ok(Self::Committed),
+            4 => Ok(Self::RecoveryRequired),
+            5 => Ok(Self::Recovered),
+            6 => Ok(Self::Finalized),
+            _ => Err(RecoveryJournalError::Corrupt("unknown record state")),
+        }
+    }
+}
+
+/// One complete H5-A record.  It is evidence, never an authority object.
+#[derive(Clone, Eq, PartialEq)]
+pub struct RecoveryJournalV1 {
+    transaction_id: RecoveryTransactionId,
+    life_id: String,
+    task_id: String,
+    capability_id: String,
+    workspace_root_identity: RecoveryJournalIdentity,
+    relative_path: WorkspaceRelativePath,
+    target_identity: RecoveryJournalIdentity,
+    before_sha256: [u8; 32],
+    before_bytes: u32,
+    before_content: String,
+    replacement_sha256: [u8; 32],
+    replacement_bytes: u32,
+    tool_call_id: String,
+    turn_id: String,
+    created_at_unix_ms: u64,
+    record_state: RecoveryJournalRecordState,
+    integrity_hash: [u8; 32],
+}
+
+impl fmt::Debug for RecoveryJournalV1 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RecoveryJournalV1")
+            .field("transaction_id", &self.transaction_id)
+            .field("life_id", &self.life_id)
+            .field("task_id", &self.task_id)
+            .field("capability_id", &self.capability_id)
+            .field("workspace_root_identity", &self.workspace_root_identity)
+            .field("relative_path", &self.relative_path)
+            .field("target_identity", &self.target_identity)
+            .field("before_sha256", &hex_encode(&self.before_sha256))
+            .field("before_bytes", &self.before_bytes)
+            .field("before_content_present", &true)
+            .field("replacement_sha256", &hex_encode(&self.replacement_sha256))
+            .field("replacement_bytes", &self.replacement_bytes)
+            .field("tool_call_id", &self.tool_call_id)
+            .field("turn_id", &self.turn_id)
+            .field("created_at_unix_ms", &self.created_at_unix_ms)
+            .field("record_state", &self.record_state)
+            .field("integrity_hash", &hex_encode(&self.integrity_hash))
+            .finish()
+    }
+}
+
+impl RecoveryJournalV1 {
+    pub fn transaction_id(&self) -> &RecoveryTransactionId {
+        &self.transaction_id
+    }
+
+    pub fn life_id(&self) -> &str {
+        &self.life_id
+    }
+
+    pub fn task_id(&self) -> &str {
+        &self.task_id
+    }
+
+    pub fn capability_id(&self) -> &str {
+        &self.capability_id
+    }
+
+    pub fn workspace_root_identity(&self) -> RecoveryJournalIdentity {
+        self.workspace_root_identity
+    }
+
+    pub fn relative_path(&self) -> &WorkspaceRelativePath {
+        &self.relative_path
+    }
+
+    pub fn target_identity(&self) -> RecoveryJournalIdentity {
+        self.target_identity
+    }
+
+    pub fn before_sha256(&self) -> String {
+        hex_encode(&self.before_sha256)
+    }
+
+    fn before_sha256_bytes(&self) -> [u8; 32] {
+        self.before_sha256
+    }
+
+    pub fn before_bytes(&self) -> usize {
+        self.before_bytes as usize
+    }
+
+    pub fn before_content(&self) -> &str {
+        &self.before_content
+    }
+
+    pub fn replacement_sha256(&self) -> String {
+        hex_encode(&self.replacement_sha256)
+    }
+
+    fn replacement_sha256_bytes(&self) -> [u8; 32] {
+        self.replacement_sha256
+    }
+
+    pub fn replacement_bytes(&self) -> usize {
+        self.replacement_bytes as usize
+    }
+
+    pub fn tool_call_id(&self) -> &str {
+        &self.tool_call_id
+    }
+
+    pub fn turn_id(&self) -> &str {
+        &self.turn_id
+    }
+
+    pub fn created_at_unix_ms(&self) -> u64 {
+        self.created_at_unix_ms
+    }
+
+    pub fn record_state(&self) -> RecoveryJournalRecordState {
+        self.record_state
+    }
+
+    pub fn integrity_hash(&self) -> String {
+        hex_encode(&self.integrity_hash)
+    }
+
+    /// Serializes the strict canonical frame.  It contains no replacement
+    /// content and cannot create or modify a filesystem object.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, RecoveryJournalError> {
+        if self.before_bytes as usize != self.before_content.len() {
+            return Err(RecoveryJournalError::Corrupt(
+                "record preimage length does not match before_bytes",
+            ));
+        }
+        if digest(self.before_content.as_bytes()) != self.before_sha256 {
+            return Err(RecoveryJournalError::Corrupt(
+                "record preimage hash does not match before_content",
+            ));
+        }
+        let payload = self.canonical_payload()?;
+        let integrity_hash = integrity_hash(&payload);
+        if integrity_hash != self.integrity_hash {
+            return Err(RecoveryJournalError::Corrupt(
+                "record integrity does not match canonical facts",
+            ));
+        }
+        let payload_length =
+            u32::try_from(payload.len()).map_err(|_| RecoveryJournalError::Oversized {
+                limit: MAX_PAYLOAD_BYTES,
+            })?;
+        let mut bytes = Vec::with_capacity(HEADER_BYTES + payload.len() + INTEGRITY_HASH_BYTES);
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&RECOVERY_JOURNAL_FORMAT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&payload_length.to_le_bytes());
+        bytes.extend_from_slice(&payload);
+        bytes.extend_from_slice(&integrity_hash);
+        if bytes.len() > RECOVERY_JOURNAL_MAX_SIZE {
+            return Err(RecoveryJournalError::Oversized {
+                limit: RECOVERY_JOURNAL_MAX_SIZE,
+            });
+        }
+        Ok(bytes)
+    }
+
+    /// Parses and verifies one complete frame without any filesystem side
+    /// effect.  Truncation, unknown versions, extra bytes, unknown states,
+    /// oversized lengths, and digest mismatches all fail closed.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, RecoveryJournalError> {
+        if bytes.len() > RECOVERY_JOURNAL_MAX_SIZE {
+            return Err(RecoveryJournalError::Oversized {
+                limit: RECOVERY_JOURNAL_MAX_SIZE,
+            });
+        }
+        if bytes.len() < HEADER_BYTES + INTEGRITY_HASH_BYTES {
+            return Err(RecoveryJournalError::Corrupt("truncated journal frame"));
+        }
+        if &bytes[..MAGIC.len()] != MAGIC {
+            return Err(RecoveryJournalError::Corrupt("invalid journal magic"));
+        }
+        let version = u16::from_le_bytes([bytes[4], bytes[5]]);
+        if version != RECOVERY_JOURNAL_FORMAT_VERSION {
+            return Err(RecoveryJournalError::UnsupportedVersion(version));
+        }
+        let payload_length = u32::from_le_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]) as usize;
+        if payload_length > MAX_PAYLOAD_BYTES {
+            return Err(RecoveryJournalError::Oversized {
+                limit: MAX_PAYLOAD_BYTES,
+            });
+        }
+        let expected_length = HEADER_BYTES
+            .checked_add(payload_length)
+            .and_then(|length| length.checked_add(INTEGRITY_HASH_BYTES))
+            .ok_or(RecoveryJournalError::Oversized {
+                limit: RECOVERY_JOURNAL_MAX_SIZE,
+            })?;
+        if bytes.len() < expected_length {
+            return Err(RecoveryJournalError::Corrupt("truncated journal payload"));
+        }
+        if bytes.len() > expected_length {
+            return Err(RecoveryJournalError::Corrupt(
+                "extra trailing journal bytes",
+            ));
+        }
+        let payload = &bytes[HEADER_BYTES..HEADER_BYTES + payload_length];
+        let stored_integrity = &bytes[HEADER_BYTES + payload_length..];
+        let expected_integrity = integrity_hash(payload);
+        if stored_integrity != expected_integrity {
+            return Err(RecoveryJournalError::Corrupt("integrity hash mismatch"));
+        }
+        let mut cursor = Cursor::new(payload);
+        let transaction_text = cursor.string("transaction_id", MAX_TRANSACTION_ID_BYTES, true)?;
+        let transaction_id = RecoveryTransactionId::parse(&transaction_text)?;
+        let life_id = cursor.string("life_id", MAX_CONTEXT_FIELD_BYTES, true)?;
+        let task_id = cursor.string("task_id", MAX_CONTEXT_FIELD_BYTES, true)?;
+        let capability_id = cursor.string("capability_id", MAX_CONTEXT_FIELD_BYTES, true)?;
+        let workspace_root_identity = cursor.identity("workspace_root_identity")?;
+        let relative_text = cursor.string("relative_path", MAX_RELATIVE_PATH_BYTES, true)?;
+        let relative_path =
+            WorkspaceRelativePath::parse(Path::new(&relative_text)).map_err(|_| {
+                RecoveryJournalError::InvalidField {
+                    field: "relative_path",
+                    reason: "not a valid H4 relative path",
+                }
+            })?;
+        let canonical_relative = canonical_relative_path(&relative_path)?;
+        if canonical_relative != relative_text {
+            return Err(RecoveryJournalError::Corrupt(
+                "relative path is not canonical",
+            ));
+        }
+        let target_identity = cursor.identity("target_identity")?;
+        let before_sha256 = cursor.hash("before_sha256")?;
+        let before_bytes = cursor.u32("before_bytes")?;
+        if before_bytes as usize > RECOVERY_JOURNAL_MAX_PREIMAGE_BYTES {
+            return Err(RecoveryJournalError::Oversized {
+                limit: RECOVERY_JOURNAL_MAX_PREIMAGE_BYTES,
+            });
+        }
+        let before_content_bytes =
+            cursor.bytes("before_content", RECOVERY_JOURNAL_MAX_PREIMAGE_BYTES)?;
+        if before_content_bytes.len() != before_bytes as usize {
+            return Err(RecoveryJournalError::Corrupt(
+                "before byte count does not match preimage",
+            ));
+        }
+        let before_content = String::from_utf8(before_content_bytes.to_vec())
+            .map_err(|_| RecoveryJournalError::Corrupt("preimage is not valid UTF-8"))?;
+        let replacement_sha256 = cursor.hash("replacement_sha256")?;
+        let replacement_bytes = cursor.u32("replacement_bytes")?;
+        if replacement_bytes as usize > RECOVERY_JOURNAL_MAX_REPLACEMENT_BYTES {
+            return Err(RecoveryJournalError::Oversized {
+                limit: RECOVERY_JOURNAL_MAX_REPLACEMENT_BYTES,
+            });
+        }
+        let tool_call_id = cursor.string("tool_call_id", MAX_CONTEXT_FIELD_BYTES, true)?;
+        let turn_id = cursor.string("turn_id", MAX_CONTEXT_FIELD_BYTES, true)?;
+        let created_at_unix_ms = cursor.u64("created_at_unix_ms")?;
+        let record_state = RecoveryJournalRecordState::decode(cursor.u8("record_state")?)?;
+        cursor.finish()?;
+        if digest(before_content.as_bytes()) != before_sha256 {
+            return Err(RecoveryJournalError::Corrupt(
+                "preimage hash does not match preimage bytes",
+            ));
+        }
+        let integrity_hash = array_from_slice(&expected_integrity);
+        Ok(Self {
+            transaction_id,
+            life_id,
+            task_id,
+            capability_id,
+            workspace_root_identity,
+            relative_path,
+            target_identity,
+            before_sha256,
+            before_bytes,
+            before_content,
+            replacement_sha256,
+            replacement_bytes,
+            tool_call_id,
+            turn_id,
+            created_at_unix_ms,
+            record_state,
+            integrity_hash,
+        })
+    }
+
+    fn from_preimage(
+        transaction_id: RecoveryTransactionId,
+        target: &PreparedWorkspaceTarget,
+        context: RecoveryJournalContext,
+        before_content: String,
+    ) -> Result<Self, RecoveryJournalError> {
+        let workspace_root_identity =
+            RecoveryJournalIdentity::from_workspace_identity(target.root().identity())?;
+        let target_identity = target
+            .target_identity()
+            .ok_or(RecoveryJournalError::TargetBindingMismatch(
+                "target identity is unavailable",
+            ))
+            .and_then(RecoveryJournalIdentity::from_workspace_identity)?;
+        let relative_path = canonical_relative_path_object(target.relative_path())?;
+        let before_bytes = bounded_bytes("before_bytes", before_content.len())?;
+        let before_sha256 = digest(before_content.as_bytes());
+        let mut record = Self {
+            transaction_id,
+            life_id: context.life_id,
+            task_id: context.task_id,
+            capability_id: context.capability_id,
+            workspace_root_identity,
+            relative_path,
+            target_identity,
+            before_sha256,
+            before_bytes,
+            before_content,
+            replacement_sha256: context.replacement_sha256,
+            replacement_bytes: context.replacement_bytes,
+            tool_call_id: context.tool_call_id,
+            turn_id: context.turn_id,
+            created_at_unix_ms: context.created_at_unix_ms,
+            record_state: RecoveryJournalRecordState::Prepared,
+            integrity_hash: [0; 32],
+        };
+        record.integrity_hash = integrity_hash(&record.canonical_payload()?);
+        Ok(record)
+    }
+
+    fn canonical_payload(&self) -> Result<Vec<u8>, RecoveryJournalError> {
+        let relative_path = canonical_relative_path(&self.relative_path)?;
+        let mut payload = Vec::new();
+        put_string(
+            &mut payload,
+            "transaction_id",
+            self.transaction_id.as_str(),
+            MAX_TRANSACTION_ID_BYTES,
+            true,
+        )?;
+        put_string(
+            &mut payload,
+            "life_id",
+            &self.life_id,
+            MAX_CONTEXT_FIELD_BYTES,
+            true,
+        )?;
+        put_string(
+            &mut payload,
+            "task_id",
+            &self.task_id,
+            MAX_CONTEXT_FIELD_BYTES,
+            true,
+        )?;
+        put_string(
+            &mut payload,
+            "capability_id",
+            &self.capability_id,
+            MAX_CONTEXT_FIELD_BYTES,
+            true,
+        )?;
+        put_identity(&mut payload, self.workspace_root_identity);
+        put_string(
+            &mut payload,
+            "relative_path",
+            &relative_path,
+            MAX_RELATIVE_PATH_BYTES,
+            true,
+        )?;
+        put_identity(&mut payload, self.target_identity);
+        payload.extend_from_slice(&self.before_sha256);
+        put_u32(&mut payload, self.before_bytes);
+        put_bytes(
+            &mut payload,
+            "before_content",
+            self.before_content.as_bytes(),
+            RECOVERY_JOURNAL_MAX_PREIMAGE_BYTES,
+        )?;
+        payload.extend_from_slice(&self.replacement_sha256);
+        put_u32(&mut payload, self.replacement_bytes);
+        put_string(
+            &mut payload,
+            "tool_call_id",
+            &self.tool_call_id,
+            MAX_CONTEXT_FIELD_BYTES,
+            true,
+        )?;
+        put_string(
+            &mut payload,
+            "turn_id",
+            &self.turn_id,
+            MAX_CONTEXT_FIELD_BYTES,
+            true,
+        )?;
+        payload.extend_from_slice(&self.created_at_unix_ms.to_le_bytes());
+        payload.push(self.record_state.encode());
+        if payload.len() > MAX_PAYLOAD_BYTES {
+            return Err(RecoveryJournalError::Oversized {
+                limit: MAX_PAYLOAD_BYTES,
+            });
+        }
+        Ok(payload)
+    }
+}
+
+/// Canonical duplicate-detection key for one target.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct RecoveryJournalTargetKey {
+    workspace_root_identity: RecoveryJournalIdentity,
+    relative_path: String,
+    target_identity: RecoveryJournalIdentity,
+}
+
+impl RecoveryJournalTargetKey {
+    pub fn workspace_root_identity(&self) -> RecoveryJournalIdentity {
+        self.workspace_root_identity
+    }
+
+    pub fn relative_path(&self) -> &str {
+        &self.relative_path
+    }
+
+    pub fn target_identity(&self) -> RecoveryJournalIdentity {
+        self.target_identity
+    }
+}
+
+/// Read-only restart classification.  No scanner item authorizes recovery or
+/// deletes a journal/workspace file.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RecoveryJournalScanItem {
+    ValidPreparedJournal(RecoveryJournalV1),
+    KnownNonPreparedJournal(RecoveryJournalV1),
+    CorruptJournal {
+        file_name: String,
+        reason: &'static str,
+    },
+    UnsupportedVersion {
+        file_name: String,
+        version: u16,
+    },
+    AmbiguousPendingRecovery {
+        target: RecoveryJournalTargetKey,
+        transactions: Vec<RecoveryTransactionId>,
+    },
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RecoveryJournalScan {
+    items: Vec<RecoveryJournalScanItem>,
+}
+
+impl RecoveryJournalScan {
+    pub fn items(&self) -> &[RecoveryJournalScanItem] {
+        &self.items
+    }
+
+    pub fn valid_prepared_journals(&self) -> impl Iterator<Item = &RecoveryJournalV1> {
+        self.items.iter().filter_map(|item| match item {
+            RecoveryJournalScanItem::ValidPreparedJournal(journal) => Some(journal),
+            _ => None,
+        })
+    }
+
+    pub fn has_ambiguous_pending_recovery(&self) -> bool {
+        self.items.iter().any(|item| {
+            matches!(
+                item,
+                RecoveryJournalScanItem::AmbiguousPendingRecovery { .. }
+            )
+        })
+    }
+
+    pub fn ambiguous_pending_recoveries(
+        &self,
+    ) -> impl Iterator<Item = (&RecoveryJournalTargetKey, &[RecoveryTransactionId])> {
+        self.items.iter().filter_map(|item| match item {
+            RecoveryJournalScanItem::AmbiguousPendingRecovery {
+                target,
+                transactions,
+            } => Some((target, transactions.as_slice())),
+            _ => None,
+        })
+    }
+}
+
+/// Current-state reconciliation is deliberately read-only and contains no
+/// recovery action.  `AlreadyReplacement` is evidence only; it does not mark
+/// a journal finalized.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryJournalReconciliation {
+    StillBefore,
+    AlreadyReplacement,
+    Diverged,
+    TargetMissing,
+    TargetIdentityChanged,
+}
+
+/// App-owned recovery journal store.  Its root is derived exclusively from an
+/// explicit Vita runtime profile; there is no constructor accepting a model
+/// path, transaction path, cwd, TEMP, `.codex`, or arbitrary environment.
+#[derive(Clone)]
+pub struct RecoveryJournalStore {
+    profile: VitaAgentRuntimeProfile,
+    recovery_root: PathBuf,
+    workspace_root_identity: Option<RecoveryJournalIdentity>,
+}
+
+impl fmt::Debug for RecoveryJournalStore {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RecoveryJournalStore")
+            .field("recovery_root", &self.recovery_root)
+            .field("workspace_root_identity", &self.workspace_root_identity)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RecoveryJournalStore {
+    /// Binds the store to `%LOCALAPPDATA%\DigitalLife\agent\recovery` (or
+    /// the equivalent explicit app-data root supplied by tests).  The path is
+    /// derived from `VitaAgentRuntimeProfile`; callers cannot provide it.
+    pub fn from_runtime_profile(
+        profile: &VitaAgentRuntimeProfile,
+    ) -> Result<Self, RecoveryJournalError> {
+        profile
+            .validate_private_namespace()
+            .map_err(RecoveryJournalError::Profile)?;
+        let workspace_root_identity = profile
+            .workspace_authority()
+            .map(|root| RecoveryJournalIdentity::from_workspace_identity(root.identity()))
+            .transpose()?;
+        let recovery_root = profile.vita_root().join(RECOVERY_DIRECTORY_NAME);
+        if recovery_root.parent() != Some(profile.vita_root())
+            || recovery_root.file_name().and_then(|name| name.to_str())
+                != Some(RECOVERY_DIRECTORY_NAME)
+        {
+            return Err(RecoveryJournalError::TargetBindingMismatch(
+                "recovery root is not the fixed Vita-owned child",
+            ));
+        }
+        Ok(Self {
+            profile: profile.clone(),
+            recovery_root,
+            workspace_root_identity,
+        })
+    }
+
+    pub fn recovery_root(&self) -> &Path {
+        &self.recovery_root
+    }
+
+    pub fn expected_workspace_root_identity(&self) -> Option<RecoveryJournalIdentity> {
+        self.workspace_root_identity
+    }
+
+    /// Captures the actual H4-prepared existing-file preimage and writes only
+    /// a `Prepared` evidence record.  The transaction identity and journal
+    /// path are generated internally.
+    pub fn create_prepared(
+        &self,
+        target: &PreparedWorkspaceTarget,
+        context: RecoveryJournalContext,
+    ) -> Result<RecoveryJournalV1, RecoveryJournalError> {
+        self.create_prepared_internal(target, context, RecoveryTransactionId::generate())
+    }
+
+    /// Performs a read-only restart scan of the fixed app-owned directory.
+    /// Missing directories are treated as an empty scan; no directory or file
+    /// is created, removed, retried, or modified by this method.
+    pub fn scan(&self) -> Result<RecoveryJournalScan, RecoveryJournalError> {
+        self.validate_scan_root()?;
+        self.profile
+            .verify_private_runtime_ownership()
+            .map_err(RecoveryJournalError::Profile)?;
+        let metadata = match fs::symlink_metadata(&self.recovery_root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(RecoveryJournalScan::default())
+            }
+            Err(error) => return Err(io_error("scan recovery root", error)),
+        };
+        if !metadata.is_dir() || is_reparse_point(&metadata) {
+            return Err(RecoveryJournalError::TargetBindingMismatch(
+                "recovery root is not a non-reparse directory",
+            ));
+        }
+        let mut items = Vec::new();
+        let mut entries = fs::read_dir(&self.recovery_root)
+            .map_err(|error| io_error("enumerate recovery root", error))?;
+        let mut entry_count = 0usize;
+        while let Some(entry) = entries.next() {
+            entry_count += 1;
+            if entry_count > MAX_SCAN_ENTRIES {
+                return Err(RecoveryJournalError::ScanLimitExceeded);
+            }
+            let entry = entry.map_err(|error| io_error("read recovery directory entry", error))?;
+            let file_name = entry.file_name();
+            if Path::new(&file_name)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                != Some("dlrj")
+            {
+                continue;
+            }
+            let display_name = file_name
+                .to_str()
+                .map(|name| name.chars().take(MAX_FILE_NAME_CHARS).collect::<String>())
+                .unwrap_or_else(|| "<non-utf8-file-name>".to_string());
+            let transaction_id = match file_name
+                .to_str()
+                .and_then(|name| name.strip_suffix(".dlrj"))
+                .map(RecoveryTransactionId::parse)
+            {
+                Some(Ok(transaction_id)) => transaction_id,
+                _ => {
+                    items.push(RecoveryJournalScanItem::CorruptJournal {
+                        file_name: display_name,
+                        reason: "invalid transaction filename",
+                    });
+                    continue;
+                }
+            };
+            let path = entry.path();
+            let file_metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(_) => {
+                    items.push(RecoveryJournalScanItem::CorruptJournal {
+                        file_name: display_name,
+                        reason: "journal disappeared during scan",
+                    });
+                    continue;
+                }
+            };
+            if !file_metadata.is_file() || is_reparse_point(&file_metadata) {
+                items.push(RecoveryJournalScanItem::CorruptJournal {
+                    file_name: display_name,
+                    reason: "journal is not a regular non-reparse file",
+                });
+                continue;
+            }
+            let bytes = match read_bounded_file(&path) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    items.push(RecoveryJournalScanItem::CorruptJournal {
+                        file_name: display_name,
+                        reason: scan_error_reason(&error),
+                    });
+                    continue;
+                }
+            };
+            match RecoveryJournalV1::from_bytes(&bytes) {
+                Ok(journal) if journal.transaction_id() != &transaction_id => {
+                    items.push(RecoveryJournalScanItem::CorruptJournal {
+                        file_name: display_name,
+                        reason: "filename and payload transaction ids differ",
+                    });
+                }
+                Ok(journal) if journal.record_state() == RecoveryJournalRecordState::Prepared => {
+                    items.push(RecoveryJournalScanItem::ValidPreparedJournal(journal));
+                }
+                Ok(journal) => {
+                    items.push(RecoveryJournalScanItem::KnownNonPreparedJournal(journal));
+                }
+                Err(RecoveryJournalError::UnsupportedVersion(version)) => {
+                    items.push(RecoveryJournalScanItem::UnsupportedVersion {
+                        file_name: display_name,
+                        version,
+                    });
+                }
+                Err(error) => {
+                    items.push(RecoveryJournalScanItem::CorruptJournal {
+                        file_name: display_name,
+                        reason: scan_error_reason(&error),
+                    });
+                }
+            }
+        }
+
+        let mut by_target: HashMap<RecoveryJournalTargetKey, Vec<RecoveryTransactionId>> =
+            HashMap::new();
+        for item in &items {
+            if let RecoveryJournalScanItem::ValidPreparedJournal(journal) = item {
+                by_target
+                    .entry(target_key(journal))
+                    .or_default()
+                    .push(journal.transaction_id().clone());
+            }
+        }
+        for (target, transactions) in by_target {
+            if transactions.len() > 1 {
+                items.push(RecoveryJournalScanItem::AmbiguousPendingRecovery {
+                    target,
+                    transactions,
+                });
+            }
+        }
+        Ok(RecoveryJournalScan { items })
+    }
+
+    /// Reconciles the fixed workspace target against one prepared record
+    /// without writing either the workspace or the journal directory.
+    pub fn reconcile_prepared(
+        &self,
+        journal: &RecoveryJournalV1,
+    ) -> Result<RecoveryJournalReconciliation, RecoveryJournalError> {
+        if journal.record_state() != RecoveryJournalRecordState::Prepared {
+            return Err(RecoveryJournalError::TargetBindingMismatch(
+                "only Prepared records can be reconciled by H5-A",
+            ));
+        }
+        let authority = self
+            .profile
+            .workspace_authority()
+            .ok_or(RecoveryJournalError::UnsupportedPlatform)?;
+        if authority.verify_named_path_current().is_err() {
+            return Ok(RecoveryJournalReconciliation::TargetIdentityChanged);
+        }
+        let current_root = RecoveryJournalIdentity::from_workspace_identity(authority.identity())?;
+        if Some(current_root) != self.workspace_root_identity
+            || current_root != journal.workspace_root_identity()
+        {
+            return Ok(RecoveryJournalReconciliation::TargetIdentityChanged);
+        }
+        let prepared = match authority.prepare_target(journal.relative_path().as_path()) {
+            Ok(prepared) => prepared,
+            Err(_) => return Ok(RecoveryJournalReconciliation::TargetMissing),
+        };
+        if prepared.kind() != PreparedWorkspaceTargetKind::ExistingFile {
+            return Ok(RecoveryJournalReconciliation::TargetMissing);
+        }
+        let current_target = match prepared.target_identity() {
+            Some(identity) => RecoveryJournalIdentity::from_workspace_identity(identity)?,
+            None => return Ok(RecoveryJournalReconciliation::TargetIdentityChanged),
+        };
+        if current_target != journal.target_identity() {
+            return Ok(RecoveryJournalReconciliation::TargetIdentityChanged);
+        }
+        let current =
+            match prepared.read_existing_file_utf8_bounded(RECOVERY_JOURNAL_MAX_PREIMAGE_BYTES) {
+                Ok(current) => current,
+                Err(WorkspaceReadError::InvalidTarget(_)) => {
+                    return Ok(RecoveryJournalReconciliation::TargetMissing)
+                }
+                Err(_) => return Ok(RecoveryJournalReconciliation::Diverged),
+            };
+        let current_hash = digest(current.as_bytes());
+        let current_bytes = current.len();
+        if current_bytes == journal.before_bytes() && current_hash == journal.before_sha256_bytes()
+        {
+            Ok(RecoveryJournalReconciliation::StillBefore)
+        } else if current_bytes == journal.replacement_bytes()
+            && current_hash == journal.replacement_sha256_bytes()
+        {
+            Ok(RecoveryJournalReconciliation::AlreadyReplacement)
+        } else {
+            Ok(RecoveryJournalReconciliation::Diverged)
+        }
+    }
+
+    fn create_prepared_internal(
+        &self,
+        target: &PreparedWorkspaceTarget,
+        context: RecoveryJournalContext,
+        transaction_id: RecoveryTransactionId,
+    ) -> Result<RecoveryJournalV1, RecoveryJournalError> {
+        self.validate_target_binding(target)?;
+        let before_content = target
+            .read_existing_file_utf8_bounded(RECOVERY_JOURNAL_MAX_PREIMAGE_BYTES)
+            .map_err(|_| RecoveryJournalError::TargetRead)?;
+        if before_content.len() > RECOVERY_JOURNAL_MAX_PREIMAGE_BYTES {
+            return Err(RecoveryJournalError::Oversized {
+                limit: RECOVERY_JOURNAL_MAX_PREIMAGE_BYTES,
+            });
+        }
+        let record =
+            RecoveryJournalV1::from_preimage(transaction_id, target, context, before_content)?;
+        self.ensure_recovery_directory()?;
+        self.persist_prepared(&record)
+    }
+
+    fn validate_target_binding(
+        &self,
+        target: &PreparedWorkspaceTarget,
+    ) -> Result<(), RecoveryJournalError> {
+        let authority = self
+            .profile
+            .workspace_authority()
+            .ok_or(RecoveryJournalError::UnsupportedPlatform)?;
+        let expected_root = self
+            .workspace_root_identity
+            .ok_or(RecoveryJournalError::UnsupportedPlatform)?;
+        let target_root =
+            RecoveryJournalIdentity::from_workspace_identity(target.root().identity())?;
+        if authority.identity() != target.root().identity() || target_root != expected_root {
+            return Err(RecoveryJournalError::TargetBindingMismatch(
+                "target is not bound to the explicit Host-owned workspace root",
+            ));
+        }
+        if authority.verify_named_path_current().is_err() {
+            return Err(RecoveryJournalError::TargetBindingMismatch(
+                "workspace root name no longer denotes the acquired root",
+            ));
+        }
+        if target.kind() != PreparedWorkspaceTargetKind::ExistingFile
+            || target.target_identity().is_none()
+        {
+            return Err(RecoveryJournalError::TargetNotExisting);
+        }
+        Ok(())
+    }
+
+    fn ensure_recovery_directory(&self) -> Result<(), RecoveryJournalError> {
+        self.profile
+            .validate_private_namespace()
+            .map_err(RecoveryJournalError::Profile)?;
+        self.profile
+            .verify_private_runtime_ownership()
+            .map_err(RecoveryJournalError::Profile)?;
+        match fs::symlink_metadata(&self.recovery_root) {
+            Ok(metadata) => {
+                if !metadata.is_dir() || is_reparse_point(&metadata) {
+                    return Err(RecoveryJournalError::TargetBindingMismatch(
+                        "recovery directory is not a non-reparse directory",
+                    ));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir(&self.recovery_root)
+                    .map_err(|error| io_error("create recovery directory", error))?;
+                let metadata = fs::symlink_metadata(&self.recovery_root)
+                    .map_err(|error| io_error("verify recovery directory", error))?;
+                if !metadata.is_dir() || is_reparse_point(&metadata) {
+                    return Err(RecoveryJournalError::TargetBindingMismatch(
+                        "new recovery directory is not trusted",
+                    ));
+                }
+            }
+            Err(error) => return Err(io_error("inspect recovery directory", error)),
+        }
+        Ok(())
+    }
+
+    fn persist_prepared(
+        &self,
+        record: &RecoveryJournalV1,
+    ) -> Result<RecoveryJournalV1, RecoveryJournalError> {
+        let bytes = record.to_bytes()?;
+        let path = self.journal_path(record.transaction_id());
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::AlreadyExists {
+                    RecoveryJournalError::DuplicateTransactionId
+                } else {
+                    io_error("create-new journal", error)
+                }
+            })?;
+        file.write_all(&bytes)
+            .map_err(|error| io_error("write journal", error))?;
+        file.flush()
+            .map_err(|error| io_error("flush journal", error))?;
+        file.sync_all()
+            .map_err(|error| io_error("sync journal", error))?;
+        drop(file);
+
+        let verified = RecoveryJournalV1::from_bytes(&read_bounded_file(&path)?)
+            .map_err(|_| RecoveryJournalError::ReopenVerificationFailed)?;
+        if verified.record_state() != RecoveryJournalRecordState::Prepared || verified != *record {
+            return Err(RecoveryJournalError::ReopenVerificationFailed);
+        }
+        Ok(verified)
+    }
+
+    fn validate_scan_root(&self) -> Result<(), RecoveryJournalError> {
+        self.profile
+            .validate_private_namespace()
+            .map_err(RecoveryJournalError::Profile)
+    }
+
+    fn journal_path(&self, transaction_id: &RecoveryTransactionId) -> PathBuf {
+        self.recovery_root
+            .join(format!("{}.dlrj", transaction_id.as_str()))
+    }
+
+    #[cfg(test)]
+    fn create_prepared_with_transaction_id_for_test(
+        &self,
+        target: &PreparedWorkspaceTarget,
+        context: RecoveryJournalContext,
+        transaction_id: &str,
+    ) -> Result<RecoveryJournalV1, RecoveryJournalError> {
+        self.create_prepared_internal(
+            target,
+            context,
+            RecoveryTransactionId::parse(transaction_id)?,
+        )
+    }
+
+    #[cfg(test)]
+    fn create_prepared_with_fault_for_test(
+        &self,
+        target: &PreparedWorkspaceTarget,
+        context: RecoveryJournalContext,
+        fault: RecoveryJournalTestFault,
+    ) -> Result<RecoveryJournalV1, RecoveryJournalError> {
+        self.validate_target_binding(target)?;
+        let before_content = target
+            .read_existing_file_utf8_bounded(RECOVERY_JOURNAL_MAX_PREIMAGE_BYTES)
+            .map_err(|_| RecoveryJournalError::TargetRead)?;
+        let record = RecoveryJournalV1::from_preimage(
+            RecoveryTransactionId::generate(),
+            target,
+            context,
+            before_content,
+        )?;
+        self.ensure_recovery_directory()?;
+        self.persist_prepared_with_fault(&record, fault)
+    }
+
+    #[cfg(test)]
+    fn persist_prepared_with_fault(
+        &self,
+        record: &RecoveryJournalV1,
+        fault: RecoveryJournalTestFault,
+    ) -> Result<RecoveryJournalV1, RecoveryJournalError> {
+        let bytes = record.to_bytes()?;
+        let path = self.journal_path(record.transaction_id());
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::AlreadyExists {
+                    RecoveryJournalError::DuplicateTransactionId
+                } else {
+                    io_error("create-new journal", error)
+                }
+            })?;
+        if fault == RecoveryJournalTestFault::Write {
+            return Err(RecoveryJournalError::InjectedFault("write"));
+        }
+        file.write_all(&bytes)
+            .map_err(|error| io_error("write journal", error))?;
+        if fault == RecoveryJournalTestFault::Truncate {
+            file.set_len((bytes.len() / 2) as u64)
+                .map_err(|error| io_error("truncate test journal", error))?;
+        }
+        if fault == RecoveryJournalTestFault::Flush {
+            file.set_len(0)
+                .map_err(|error| io_error("invalidate flush test journal", error))?;
+            return Err(RecoveryJournalError::InjectedFault("flush"));
+        }
+        file.flush()
+            .map_err(|error| io_error("flush journal", error))?;
+        file.sync_all()
+            .map_err(|error| io_error("sync journal", error))?;
+        drop(file);
+        if fault == RecoveryJournalTestFault::BadIntegrity {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .map_err(|error| io_error("open integrity fault journal", error))?;
+            file.seek(SeekFrom::End(-1))
+                .map_err(|error| io_error("seek integrity fault journal", error))?;
+            file.write_all(&[0xff])
+                .map_err(|error| io_error("write integrity fault journal", error))?;
+            file.flush()
+                .map_err(|error| io_error("flush integrity fault journal", error))?;
+            file.sync_all()
+                .map_err(|error| io_error("sync integrity fault journal", error))?;
+            return Err(RecoveryJournalError::InjectedFault("integrity"));
+        }
+        if fault == RecoveryJournalTestFault::Reopen {
+            let file = OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .map_err(|error| io_error("open reopen fault journal", error))?;
+            file.set_len(0)
+                .map_err(|error| io_error("invalidate reopen fault journal", error))?;
+            return Err(RecoveryJournalError::InjectedFault("reopen"));
+        }
+        let verified = RecoveryJournalV1::from_bytes(&read_bounded_file(&path)?)
+            .map_err(|_| RecoveryJournalError::ReopenVerificationFailed)?;
+        if verified != *record {
+            return Err(RecoveryJournalError::ReopenVerificationFailed);
+        }
+        Ok(verified)
+    }
+}
+
+fn bounded_context_text(field: &'static str, value: &str) -> Result<String, RecoveryJournalError> {
+    if value.is_empty() || value.len() > MAX_CONTEXT_FIELD_BYTES {
+        return Err(RecoveryJournalError::InvalidField {
+            field,
+            reason: "empty or oversized",
+        });
+    }
+    if value
+        .chars()
+        .any(|character| character == '\0' || character.is_control())
+    {
+        return Err(RecoveryJournalError::InvalidField {
+            field,
+            reason: "control characters are forbidden",
+        });
+    }
+    Ok(value.to_string())
+}
+
+fn bounded_bytes(field: &'static str, value: usize) -> Result<u32, RecoveryJournalError> {
+    if value > RECOVERY_JOURNAL_MAX_PREIMAGE_BYTES {
+        return Err(RecoveryJournalError::Oversized {
+            limit: if field == "replacement_bytes" {
+                RECOVERY_JOURNAL_MAX_REPLACEMENT_BYTES
+            } else {
+                RECOVERY_JOURNAL_MAX_PREIMAGE_BYTES
+            },
+        });
+    }
+    u32::try_from(value).map_err(|_| RecoveryJournalError::Oversized {
+        limit: RECOVERY_JOURNAL_MAX_SIZE,
+    })
+}
+
+fn decode_sha256_hex(field: &'static str, value: &str) -> Result<[u8; 32], RecoveryJournalError> {
+    if value.len() != 64 || !value.is_ascii() {
+        return Err(RecoveryJournalError::InvalidField {
+            field,
+            reason: "SHA-256 must be exactly 64 ASCII hex characters",
+        });
+    }
+    let mut result = [0u8; 32];
+    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+        let high = hex_digit(chunk[0]).ok_or(RecoveryJournalError::InvalidField {
+            field,
+            reason: "SHA-256 contains non-hex characters",
+        })?;
+        let low = hex_digit(chunk[1]).ok_or(RecoveryJournalError::InvalidField {
+            field,
+            reason: "SHA-256 contains non-hex characters",
+        })?;
+        result[index] = (high << 4) | low;
+    }
+    Ok(result)
+}
+
+fn hex_digit(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+fn digest(bytes: &[u8]) -> [u8; 32] {
+    let digest = Sha256::digest(bytes);
+    array_from_slice(&digest)
+}
+
+fn integrity_hash(payload: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(DOMAIN_SEPARATOR);
+    hasher.update(MAGIC);
+    hasher.update(RECOVERY_JOURNAL_FORMAT_VERSION.to_le_bytes());
+    hasher.update((payload.len() as u32).to_le_bytes());
+    hasher.update(payload);
+    array_from_slice(&hasher.finalize())
+}
+
+fn array_from_slice(bytes: &[u8]) -> [u8; 32] {
+    let mut result = [0u8; 32];
+    result.copy_from_slice(bytes);
+    result
+}
+
+fn array_from_slice_16(bytes: &[u8]) -> [u8; 16] {
+    let mut result = [0u8; 16];
+    result.copy_from_slice(bytes);
+    result
+}
+
+fn canonical_relative_path_object(
+    path: &WorkspaceRelativePath,
+) -> Result<WorkspaceRelativePath, RecoveryJournalError> {
+    let canonical = canonical_relative_path(path)?;
+    WorkspaceRelativePath::parse(Path::new(&canonical)).map_err(|_| {
+        RecoveryJournalError::InvalidField {
+            field: "relative_path",
+            reason: "canonical H4 relative path could not be parsed",
+        }
+    })
+}
+
+fn canonical_relative_path(path: &WorkspaceRelativePath) -> Result<String, RecoveryJournalError> {
+    let mut components = Vec::new();
+    for component in path.components() {
+        let component = component
+            .to_str()
+            .ok_or(RecoveryJournalError::InvalidField {
+                field: "relative_path",
+                reason: "path component is not UTF-8",
+            })?;
+        components.push(component);
+    }
+    let canonical = components.join("\\");
+    if canonical.is_empty() || canonical.len() > MAX_RELATIVE_PATH_BYTES {
+        return Err(RecoveryJournalError::InvalidField {
+            field: "relative_path",
+            reason: "empty or oversized",
+        });
+    }
+    Ok(canonical)
+}
+
+fn put_u32(payload: &mut Vec<u8>, value: u32) {
+    payload.extend_from_slice(&value.to_le_bytes());
+}
+
+fn put_string(
+    payload: &mut Vec<u8>,
+    field: &'static str,
+    value: &str,
+    limit: usize,
+    nonempty: bool,
+) -> Result<(), RecoveryJournalError> {
+    if value.len() > limit || (nonempty && value.is_empty()) {
+        return Err(RecoveryJournalError::InvalidField {
+            field,
+            reason: "empty or oversized",
+        });
+    }
+    if value
+        .chars()
+        .any(|character| character == '\0' || character.is_control())
+    {
+        return Err(RecoveryJournalError::InvalidField {
+            field,
+            reason: "control characters are forbidden",
+        });
+    }
+    let length = u32::try_from(value.len()).map_err(|_| RecoveryJournalError::Oversized {
+        limit: MAX_PAYLOAD_BYTES,
+    })?;
+    payload.extend_from_slice(&length.to_le_bytes());
+    payload.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+fn put_bytes(
+    payload: &mut Vec<u8>,
+    field: &'static str,
+    value: &[u8],
+    limit: usize,
+) -> Result<(), RecoveryJournalError> {
+    if value.len() > limit {
+        return Err(RecoveryJournalError::Oversized { limit });
+    }
+    let length = u32::try_from(value.len()).map_err(|_| RecoveryJournalError::Oversized {
+        limit: MAX_PAYLOAD_BYTES,
+    })?;
+    let _ = field;
+    payload.extend_from_slice(&length.to_le_bytes());
+    payload.extend_from_slice(value);
+    Ok(())
+}
+
+fn put_identity(payload: &mut Vec<u8>, identity: RecoveryJournalIdentity) {
+    payload.extend_from_slice(&identity.volume_serial_number.to_le_bytes());
+    payload.extend_from_slice(&identity.file_id);
+}
+
+struct Cursor<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn take(&mut self, length: usize) -> Result<&'a [u8], RecoveryJournalError> {
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or(RecoveryJournalError::Corrupt("payload length overflow"))?;
+        if end > self.bytes.len() {
+            return Err(RecoveryJournalError::Corrupt("truncated payload field"));
+        }
+        let result = &self.bytes[self.offset..end];
+        self.offset = end;
+        Ok(result)
+    }
+
+    fn u8(&mut self, _field: &'static str) -> Result<u8, RecoveryJournalError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u32(&mut self, _field: &'static str) -> Result<u32, RecoveryJournalError> {
+        let bytes = self.take(4)?;
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn u64(&mut self, _field: &'static str) -> Result<u64, RecoveryJournalError> {
+        let bytes = self.take(8)?;
+        Ok(u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]))
+    }
+
+    fn bytes(
+        &mut self,
+        field: &'static str,
+        limit: usize,
+    ) -> Result<&'a [u8], RecoveryJournalError> {
+        let length = self.u32(field)? as usize;
+        if length > limit {
+            return Err(RecoveryJournalError::Oversized { limit });
+        }
+        self.take(length)
+    }
+
+    fn string(
+        &mut self,
+        field: &'static str,
+        limit: usize,
+        nonempty: bool,
+    ) -> Result<String, RecoveryJournalError> {
+        let bytes = self.bytes(field, limit)?;
+        if nonempty && bytes.is_empty() {
+            return Err(RecoveryJournalError::InvalidField {
+                field,
+                reason: "empty",
+            });
+        }
+        let value = std::str::from_utf8(bytes)
+            .map_err(|_| RecoveryJournalError::Corrupt("length-prefixed string is not UTF-8"))?;
+        if value
+            .chars()
+            .any(|character| character == '\0' || character.is_control())
+        {
+            return Err(RecoveryJournalError::Corrupt(
+                "string contains a control character",
+            ));
+        }
+        Ok(value.to_string())
+    }
+
+    fn hash(&mut self, field: &'static str) -> Result<[u8; 32], RecoveryJournalError> {
+        Ok(array_from_slice(self.take(32).map_err(|_| {
+            RecoveryJournalError::Corrupt(match field {
+                "before_sha256" => "truncated before hash",
+                _ => "truncated replacement hash",
+            })
+        })?))
+    }
+
+    fn identity(
+        &mut self,
+        field: &'static str,
+    ) -> Result<RecoveryJournalIdentity, RecoveryJournalError> {
+        let volume_bytes = self.take(8).map_err(|_| {
+            RecoveryJournalError::Corrupt(match field {
+                "workspace_root_identity" => "truncated workspace root identity",
+                _ => "truncated target identity",
+            })
+        })?;
+        let file_id = self.take(16).map_err(|_| {
+            RecoveryJournalError::Corrupt(match field {
+                "workspace_root_identity" => "truncated workspace root file id",
+                _ => "truncated target file id",
+            })
+        })?;
+        Ok(RecoveryJournalIdentity {
+            volume_serial_number: u64::from_le_bytes([
+                volume_bytes[0],
+                volume_bytes[1],
+                volume_bytes[2],
+                volume_bytes[3],
+                volume_bytes[4],
+                volume_bytes[5],
+                volume_bytes[6],
+                volume_bytes[7],
+            ]),
+            file_id: array_from_slice_16(file_id),
+        })
+    }
+
+    fn finish(&self) -> Result<(), RecoveryJournalError> {
+        if self.offset != self.bytes.len() {
+            return Err(RecoveryJournalError::Corrupt(
+                "payload has extra trailing fields",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn target_key(journal: &RecoveryJournalV1) -> RecoveryJournalTargetKey {
+    RecoveryJournalTargetKey {
+        workspace_root_identity: journal.workspace_root_identity,
+        relative_path: canonical_relative_path(&journal.relative_path)
+            .unwrap_or_else(|_| String::new()),
+        target_identity: journal.target_identity,
+    }
+}
+
+fn current_unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            duration.as_millis().min(u64::MAX as u128) as u64
+        })
+}
+
+fn io_error(operation: &'static str, source: io::Error) -> RecoveryJournalError {
+    RecoveryJournalError::Io { operation, source }
+}
+
+fn read_bounded_file(path: &Path) -> Result<Vec<u8>, RecoveryJournalError> {
+    let file = open_journal_read_only(path)?;
+    read_bounded_file_from_handle(file)
+}
+
+fn open_journal_read_only(path: &Path) -> Result<File, RecoveryJournalError> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        return OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(|error| io_error("open journal", error));
+    }
+    #[cfg(not(windows))]
+    {
+        File::open(path).map_err(|error| io_error("open journal", error))
+    }
+}
+
+fn read_bounded_file_from_handle(mut file: File) -> Result<Vec<u8>, RecoveryJournalError> {
+    let metadata = file
+        .metadata()
+        .map_err(|error| io_error("inspect journal", error))?;
+    if !metadata.is_file() || is_reparse_point(&metadata) {
+        return Err(RecoveryJournalError::Corrupt(
+            "journal handle is not a regular non-reparse file",
+        ));
+    }
+    if metadata.len() > RECOVERY_JOURNAL_MAX_SIZE as u64 {
+        return Err(RecoveryJournalError::Oversized {
+            limit: RECOVERY_JOURNAL_MAX_SIZE,
+        });
+    }
+    let mut bytes =
+        Vec::with_capacity(metadata.len().min(RECOVERY_JOURNAL_MAX_SIZE as u64) as usize);
+    Read::by_ref(&mut file)
+        .take((RECOVERY_JOURNAL_MAX_SIZE + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| io_error("read journal", error))?;
+    if bytes.len() > RECOVERY_JOURNAL_MAX_SIZE {
+        return Err(RecoveryJournalError::Oversized {
+            limit: RECOVERY_JOURNAL_MAX_SIZE,
+        });
+    }
+    Ok(bytes)
+}
+
+fn scan_error_reason(error: &RecoveryJournalError) -> &'static str {
+    match error {
+        RecoveryJournalError::Oversized { .. } => "journal exceeds the hard size bound",
+        RecoveryJournalError::UnsupportedVersion(_) => "unsupported journal version",
+        RecoveryJournalError::Corrupt(reason) => reason,
+        RecoveryJournalError::Io { .. } => "journal I/O failed",
+        _ => "journal failed closed",
+    }
+}
+
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryJournalTestFault {
+    Write,
+    Flush,
+    Truncate,
+    BadIntegrity,
+    Reopen,
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::{tempdir, TempDir};
+
+    use crate::{contains_stock_codex_state, CODEX_UPSTREAM_COMMIT};
+
+    struct Fixture {
+        _app_data: TempDir,
+        workspace: TempDir,
+        profile: VitaAgentRuntimeProfile,
+        store: RecoveryJournalStore,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let app_data = tempdir().expect("app-data temp root");
+            let workspace = tempdir().expect("workspace temp root");
+            let profile = VitaAgentRuntimeProfile::from_explicit_app_data_root(
+                app_data.path().to_path_buf(),
+                workspace.path().to_path_buf(),
+            )
+            .expect("explicit Vita profile");
+            profile
+                .ensure_private_runtime_layout()
+                .expect("Vita private layout");
+            fs::write(workspace.path().join("target.txt"), "before\n").expect("workspace fixture");
+            let store =
+                RecoveryJournalStore::from_runtime_profile(&profile).expect("recovery store");
+            Self {
+                _app_data: app_data,
+                workspace,
+                profile,
+                store,
+            }
+        }
+
+        fn target(&self) -> PreparedWorkspaceTarget {
+            self.profile
+                .prepare_workspace_target(Path::new("target.txt"))
+                .expect("prepared target")
+        }
+
+        fn context(&self, replacement: &[u8]) -> RecoveryJournalContext {
+            RecoveryJournalContext::new(
+                "life-1",
+                "task-1",
+                "workspace.replace",
+                &hex_encode(&digest(replacement)),
+                replacement.len(),
+                "tool-call-1",
+                "turn-1",
+            )
+            .expect("journal context")
+        }
+
+        fn path_for(&self, journal: &RecoveryJournalV1) -> PathBuf {
+            self.store.journal_path(journal.transaction_id())
+        }
+    }
+
+    #[test]
+    fn journal_v1_roundtrips_exact_preimage() {
+        let fixture = Fixture::new();
+        let journal = fixture
+            .store
+            .create_prepared(&fixture.target(), fixture.context(b"after\n"))
+            .expect("prepared journal");
+        assert_eq!(journal.record_state(), RecoveryJournalRecordState::Prepared);
+        assert_eq!(journal.before_content(), "before\n");
+        assert_eq!(journal.before_bytes(), "before\n".len());
+        let parsed = RecoveryJournalV1::from_bytes(&journal.to_bytes().unwrap()).unwrap();
+        assert_eq!(parsed, journal);
+    }
+
+    #[test]
+    fn journal_binds_exact_target_identity() {
+        let fixture = Fixture::new();
+        let target = fixture.target();
+        let journal = fixture
+            .store
+            .create_prepared(&target, fixture.context(b"after\n"))
+            .expect("prepared journal");
+        let target_identity = target.target_identity().unwrap();
+        assert_eq!(
+            journal.target_identity().volume_serial_number(),
+            target_identity.volume_serial_number().unwrap()
+        );
+        assert_eq!(
+            journal.target_identity().file_id(),
+            target_identity.file_id().unwrap()
+        );
+        assert_eq!(
+            journal.workspace_root_identity(),
+            fixture.store.expected_workspace_root_identity().unwrap()
+        );
+    }
+
+    #[test]
+    fn journal_binds_before_and_replacement_hashes() {
+        let fixture = Fixture::new();
+        let replacement = b"after\n";
+        let journal = fixture
+            .store
+            .create_prepared(&fixture.target(), fixture.context(replacement))
+            .expect("prepared journal");
+        assert_eq!(journal.before_sha256(), hex_encode(&digest(b"before\n")));
+        assert_eq!(
+            journal.replacement_sha256(),
+            hex_encode(&digest(replacement))
+        );
+        assert_eq!(journal.replacement_bytes(), replacement.len());
+        assert!(!journal
+            .to_bytes()
+            .unwrap()
+            .windows(replacement.len())
+            .any(|window| window == replacement));
+    }
+
+    #[test]
+    fn journal_is_not_authority() {
+        let fixture = Fixture::new();
+        let journal = fixture
+            .store
+            .create_prepared(&fixture.target(), fixture.context(b"after\n"))
+            .expect("prepared evidence");
+        assert_eq!(journal.record_state(), RecoveryJournalRecordState::Prepared);
+        let bytes = journal.to_bytes().unwrap();
+        assert!(!bytes
+            .windows(b"confirmation_id".len())
+            .any(|window| window == b"confirmation_id"));
+        assert!(!bytes
+            .windows(b"grant_id".len())
+            .any(|window| window == b"grant_id"));
+    }
+
+    #[test]
+    fn journal_create_is_create_new_only() {
+        let fixture = Fixture::new();
+        let journal = fixture
+            .store
+            .create_prepared(&fixture.target(), fixture.context(b"after\n"))
+            .expect("prepared journal");
+        let original = fs::read(fixture.path_for(&journal)).unwrap();
+        let error = fixture
+            .store
+            .create_prepared_with_transaction_id_for_test(
+                &fixture.target(),
+                fixture.context(b"replacement-2\n"),
+                journal.transaction_id().as_str(),
+            )
+            .expect_err("existing transaction must fail closed");
+        assert!(matches!(
+            error,
+            RecoveryJournalError::DuplicateTransactionId
+        ));
+        assert_eq!(fs::read(fixture.path_for(&journal)).unwrap(), original);
+    }
+
+    #[test]
+    fn duplicate_transaction_id_cannot_overwrite() {
+        let fixture = Fixture::new();
+        let first = fixture
+            .store
+            .create_prepared_with_transaction_id_for_test(
+                &fixture.target(),
+                fixture.context(b"after\n"),
+                "tx-fixed",
+            )
+            .expect("first journal");
+        let original = fs::read(fixture.path_for(&first)).unwrap();
+        let result = fixture.store.create_prepared_with_transaction_id_for_test(
+            &fixture.target(),
+            fixture.context(b"different\n"),
+            "tx-fixed",
+        );
+        assert!(matches!(
+            result,
+            Err(RecoveryJournalError::DuplicateTransactionId)
+        ));
+        assert_eq!(fs::read(fixture.path_for(&first)).unwrap(), original);
+    }
+
+    #[test]
+    fn truncated_journal_fails_closed() {
+        let fixture = Fixture::new();
+        let journal = fixture
+            .store
+            .create_prepared(&fixture.target(), fixture.context(b"after\n"))
+            .unwrap();
+        let bytes = journal.to_bytes().unwrap();
+        assert!(matches!(
+            RecoveryJournalV1::from_bytes(&bytes[..bytes.len() - 1]),
+            Err(RecoveryJournalError::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn oversized_journal_fails_closed() {
+        assert!(matches!(
+            RecoveryJournalV1::from_bytes(&vec![0; RECOVERY_JOURNAL_MAX_SIZE + 1]),
+            Err(RecoveryJournalError::Oversized { .. })
+        ));
+    }
+
+    #[test]
+    fn unknown_version_fails_closed() {
+        let fixture = Fixture::new();
+        let journal = fixture
+            .store
+            .create_prepared(&fixture.target(), fixture.context(b"after\n"))
+            .unwrap();
+        let mut bytes = journal.to_bytes().unwrap();
+        bytes[4..6].copy_from_slice(&2u16.to_le_bytes());
+        assert!(matches!(
+            RecoveryJournalV1::from_bytes(&bytes),
+            Err(RecoveryJournalError::UnsupportedVersion(2))
+        ));
+    }
+
+    #[test]
+    fn integrity_mismatch_fails_closed() {
+        let fixture = Fixture::new();
+        let journal = fixture
+            .store
+            .create_prepared(&fixture.target(), fixture.context(b"after\n"))
+            .unwrap();
+        let mut bytes = journal.to_bytes().unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        assert!(matches!(
+            RecoveryJournalV1::from_bytes(&bytes),
+            Err(RecoveryJournalError::Corrupt("integrity hash mismatch"))
+        ));
+    }
+
+    #[test]
+    fn extra_trailing_bytes_fail_closed() {
+        let fixture = Fixture::new();
+        let journal = fixture
+            .store
+            .create_prepared(&fixture.target(), fixture.context(b"after\n"))
+            .unwrap();
+        let mut bytes = journal.to_bytes().unwrap();
+        bytes.push(0);
+        assert!(matches!(
+            RecoveryJournalV1::from_bytes(&bytes),
+            Err(RecoveryJournalError::Corrupt(
+                "extra trailing journal bytes"
+            ))
+        ));
+    }
+
+    #[test]
+    fn invalid_transaction_id_rejected() {
+        for value in ["", ".", "..", "a/b", "a\\b", "a:b", "CON", "a.dlrj", "a?"] {
+            assert!(RecoveryTransactionId::parse(value).is_err(), "{value:?}");
+        }
+        assert!(RecoveryTransactionId::parse("tx-valid_1").is_ok());
+    }
+
+    #[test]
+    fn recovery_path_is_app_owned_not_model_supplied() {
+        let fixture = Fixture::new();
+        assert_eq!(
+            fixture.store.recovery_root(),
+            fixture.profile.vita_root().join("recovery").as_path()
+        );
+        assert!(fixture
+            .store
+            .recovery_root()
+            .starts_with(fixture.profile.vita_root()));
+        assert!(!contains_stock_codex_state(fixture.store.recovery_root()));
+    }
+
+    #[test]
+    fn prepared_requires_successful_flush_and_reopen_verify() {
+        for fault in [
+            RecoveryJournalTestFault::Write,
+            RecoveryJournalTestFault::Flush,
+            RecoveryJournalTestFault::Truncate,
+            RecoveryJournalTestFault::BadIntegrity,
+            RecoveryJournalTestFault::Reopen,
+        ] {
+            let fixture = Fixture::new();
+            let result = fixture.store.create_prepared_with_fault_for_test(
+                &fixture.target(),
+                fixture.context(b"after\n"),
+                fault,
+            );
+            assert!(result.is_err(), "fault {fault:?} must not produce Prepared");
+            let scan = fixture.store.scan().unwrap();
+            assert_eq!(scan.valid_prepared_journals().count(), 0, "fault {fault:?}");
+        }
+    }
+
+    #[test]
+    fn restart_scan_finds_valid_prepared_journal() {
+        let fixture = Fixture::new();
+        let journal = fixture
+            .store
+            .create_prepared(&fixture.target(), fixture.context(b"after\n"))
+            .unwrap();
+        let restarted = RecoveryJournalStore::from_runtime_profile(&fixture.profile).unwrap();
+        let scan = restarted.scan().unwrap();
+        assert_eq!(scan.valid_prepared_journals().count(), 1);
+        assert_eq!(scan.valid_prepared_journals().next(), Some(&journal));
+    }
+
+    #[test]
+    fn restart_scan_does_not_mutate_workspace() {
+        let fixture = Fixture::new();
+        let journal = fixture
+            .store
+            .create_prepared(&fixture.target(), fixture.context(b"after\n"))
+            .unwrap();
+        let workspace_path = fixture.workspace.path().join("target.txt");
+        let before = fs::read(&workspace_path).unwrap();
+        let metadata_before = fs::metadata(&workspace_path).unwrap();
+        let _ = fixture.store.scan().unwrap();
+        assert_eq!(fs::read(&workspace_path).unwrap(), before);
+        assert_eq!(
+            fs::metadata(&workspace_path).unwrap().len(),
+            metadata_before.len()
+        );
+        assert!(fixture.path_for(&journal).is_file());
+    }
+
+    #[test]
+    fn two_pending_journals_for_same_target_are_ambiguous() {
+        let fixture = Fixture::new();
+        fixture
+            .store
+            .create_prepared_with_transaction_id_for_test(
+                &fixture.target(),
+                fixture.context(b"after-1\n"),
+                "tx-one",
+            )
+            .unwrap();
+        fixture
+            .store
+            .create_prepared_with_transaction_id_for_test(
+                &fixture.target(),
+                fixture.context(b"after-2\n"),
+                "tx-two",
+            )
+            .unwrap();
+        let scan = fixture.store.scan().unwrap();
+        assert!(scan.has_ambiguous_pending_recovery());
+        let ambiguity = scan.ambiguous_pending_recoveries().next().unwrap();
+        assert_eq!(ambiguity.1.len(), 2);
+    }
+
+    #[test]
+    fn target_divergence_is_read_only_classification() {
+        let fixture = Fixture::new();
+        let journal = fixture
+            .store
+            .create_prepared(&fixture.target(), fixture.context(b"after\n"))
+            .unwrap();
+        let workspace_path = fixture.workspace.path().join("target.txt");
+        fs::write(&workspace_path, "diverged\n").unwrap();
+        let result = fixture.store.reconcile_prepared(&journal).unwrap();
+        assert_eq!(result, RecoveryJournalReconciliation::Diverged);
+        assert_eq!(fs::read(&workspace_path).unwrap(), b"diverged\n");
+    }
+
+    #[test]
+    fn h5a_workspace_mutation_count_is_zero() {
+        let fixture = Fixture::new();
+        let workspace_path = fixture.workspace.path().join("target.txt");
+        let before = fs::read(&workspace_path).unwrap();
+        let journal = fixture
+            .store
+            .create_prepared(&fixture.target(), fixture.context(b"after\n"))
+            .unwrap();
+        let _ = fixture.store.reconcile_prepared(&journal).unwrap();
+        let after = fs::read(&workspace_path).unwrap();
+        assert_eq!(before, after);
+        // The only H5-A workspace operation is the H4 bounded read; no create,
+        // write, delete, rename, or replacement primitive is reachable here.
+    }
+
+    #[test]
+    fn production_registry_remains_zero() {
+        let source = fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .expect("Vita manifest has repository parent")
+                .join("src-tauri/src/capability/descriptor.rs"),
+        )
+        .unwrap();
+        assert!(source.contains("Self::from_trusted_descriptors([])"));
+    }
+
+    #[test]
+    fn schema30_migration031_absent() {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let connection =
+            fs::read_to_string(manifest.join("../src-tauri/src/storage/connection.rs")).unwrap();
+        let migration_dir = manifest.join("../src-tauri/src/storage/migrations");
+        assert!(connection.contains("MAX_SUPPORTED_SCHEMA_VERSION: i64 = 30"));
+        assert!(!connection.contains("Migration031"));
+        assert!(!migration_dir.join("031_recovery_journal.sql").exists());
+    }
+
+    #[test]
+    fn user_codex_untouched() {
+        assert_eq!(
+            CODEX_UPSTREAM_COMMIT,
+            "316795b3cf2a45e90d121d9f46499d4658b2645c"
+        );
+        let fixture = Fixture::new();
+        assert!(!contains_stock_codex_state(fixture.store.recovery_root()));
+        assert!(!contains_stock_codex_state(fixture.profile.kernel_home()));
+    }
+}

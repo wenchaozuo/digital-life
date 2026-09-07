@@ -7,7 +7,10 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fmt::{self, Display};
+#[cfg(windows)]
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::{contains_stock_codex_state, VitaAgentError};
@@ -276,6 +279,11 @@ pub enum PreparedWorkspaceTargetKind {
 /// kernel-side execution bound, not a hint supplied by the model.
 pub(crate) const WORKSPACE_READ_HARD_MAX_BYTES: usize = 64 * 1024;
 
+/// The hard ceiling for the H4-B in-place existing-file mutation primitive.
+/// It is deliberately independent from any caller-supplied value.
+#[allow(dead_code)]
+pub(crate) const WORKSPACE_REPLACE_HARD_MAX_BYTES: usize = 64 * 1024;
+
 #[derive(Debug)]
 pub(crate) enum WorkspaceReadError {
     InvalidTarget(&'static str),
@@ -301,6 +309,122 @@ impl fmt::Display for WorkspaceReadError {
 }
 
 impl std::error::Error for WorkspaceReadError {}
+
+/// A final, execution-time decision made while the exclusive operation handle
+/// is already verified and before the first modifying system call.
+#[allow(dead_code)]
+pub(crate) trait WorkspaceReplaceCommitFence {
+    fn check(&mut self) -> Result<(), WorkspaceReplaceFenceError>;
+}
+
+impl<F> WorkspaceReplaceCommitFence for F
+where
+    F: FnMut() -> Result<(), WorkspaceReplaceFenceError>,
+{
+    fn check(&mut self) -> Result<(), WorkspaceReplaceFenceError> {
+        self()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum WorkspaceReplaceFenceError {
+    Denied,
+    Cancelled,
+    Stale,
+    Error,
+}
+
+/// Cancellation is intentionally an observation only.  Once the first
+/// modifying syscall starts, the primitive never consults it again.
+#[allow(dead_code)]
+pub(crate) trait WorkspaceReplaceCancellation {
+    fn is_cancelled(&self) -> bool;
+}
+
+impl WorkspaceReplaceCancellation for AtomicBool {
+    fn is_cancelled(&self) -> bool {
+        self.load(Ordering::Acquire)
+    }
+}
+
+#[allow(dead_code)]
+struct NeverCancelled;
+
+impl WorkspaceReplaceCancellation for NeverCancelled {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum WorkspaceReplaceError {
+    UnavailableOnThisPlatform,
+    InvalidPreparedTarget,
+    InvalidExpectedHash,
+    ReplacementTooLarge,
+    TargetMissing,
+    TargetBusy,
+    TargetIdentityChanged,
+    ParentIdentityChanged,
+    RootIdentityChanged,
+    TargetOutsideRoot,
+    ReparseTarget,
+    ReparseParent,
+    HardLinkAmbiguous,
+    CurrentFileTooLarge,
+    CurrentContentNotUtf8,
+    OperationHandleIo,
+    CommitFenceDenied,
+    CommitFenceCancelled,
+    CommitFenceStale,
+    CommitFenceError,
+    CommitFencePanic,
+    CancellationBeforeMutation,
+    FaultInjected,
+    WriteFailed,
+    ShortWrite,
+    SetEndOfFileFailed,
+    FlushFailed,
+    PostWriteVerificationFailed,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct WorkspaceReplaceEvidence {
+    pub(crate) before_sha256: Option<String>,
+    pub(crate) after_sha256: Option<String>,
+    pub(crate) bytes_before: Option<usize>,
+    pub(crate) bytes_after: Option<usize>,
+    pub(crate) mutation_attempted: bool,
+    pub(crate) mutation_started: bool,
+    pub(crate) modifying_syscalls: usize,
+    pub(crate) committed_mutations: usize,
+    pub(crate) commit_unknown: bool,
+    pub(crate) fence_calls: usize,
+    pub(crate) hard_link_count_after_open: Option<u32>,
+    pub(crate) hard_link_count_before_fence: Option<u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum WorkspaceReplaceCommitOutcome {
+    Denied {
+        error: WorkspaceReplaceError,
+        evidence: WorkspaceReplaceEvidence,
+    },
+    Conflict {
+        evidence: WorkspaceReplaceEvidence,
+    },
+    Committed {
+        evidence: WorkspaceReplaceEvidence,
+    },
+    CommitUnknown {
+        error: WorkspaceReplaceError,
+        evidence: WorkspaceReplaceEvidence,
+    },
+}
 
 /// A process-lifetime, OS-backed capability to one trusted workspace root.
 #[derive(Clone)]
@@ -507,6 +631,81 @@ impl PreparedWorkspaceTarget {
             )))
         }
     }
+
+    /// Replaces one already-existing regular UTF-8 file in place.  The
+    /// prepared target is consumed so a caller cannot accidentally reuse a
+    /// stale capability after the one-shot mutation attempt.
+    #[allow(dead_code)]
+    pub(crate) fn replace_existing_file_utf8_bounded(
+        self,
+        expected_sha256: &str,
+        replacement_content: &str,
+        fence: &mut dyn WorkspaceReplaceCommitFence,
+    ) -> WorkspaceReplaceCommitOutcome {
+        let cancellation = NeverCancelled;
+        self.replace_existing_file_utf8_bounded_with_cancellation(
+            expected_sha256,
+            replacement_content,
+            fence,
+            &cancellation,
+        )
+    }
+
+    /// Cancellation-aware form used by the future H4 execution bridge and by
+    /// the native test harness.  Cancellation is checked only before the
+    /// commit fence and never after the first modifying syscall begins.
+    #[allow(dead_code)]
+    pub(crate) fn replace_existing_file_utf8_bounded_with_cancellation(
+        self,
+        expected_sha256: &str,
+        replacement_content: &str,
+        fence: &mut dyn WorkspaceReplaceCommitFence,
+        cancellation: &dyn WorkspaceReplaceCancellation,
+    ) -> WorkspaceReplaceCommitOutcome {
+        #[cfg(windows)]
+        {
+            return platform::replace_existing_file_utf8_bounded(
+                self,
+                expected_sha256,
+                replacement_content,
+                fence,
+                cancellation,
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (
+                self,
+                expected_sha256,
+                replacement_content,
+                fence,
+                cancellation,
+            );
+            WorkspaceReplaceCommitOutcome::Denied {
+                error: WorkspaceReplaceError::UnavailableOnThisPlatform,
+                evidence: WorkspaceReplaceEvidence::default(),
+            }
+        }
+    }
+
+    #[cfg(all(test, windows))]
+    fn replace_existing_file_utf8_bounded_with_faults(
+        self,
+        expected_sha256: &str,
+        replacement_content: &str,
+        fence: &mut dyn WorkspaceReplaceCommitFence,
+        cancellation: &dyn WorkspaceReplaceCancellation,
+        faults: &mut platform::WorkspaceReplaceFaultPlan,
+    ) -> WorkspaceReplaceCommitOutcome {
+        platform::replace_existing_file_utf8_bounded_with_faults(
+            self,
+            expected_sha256,
+            replacement_content,
+            fence,
+            cancellation,
+            faults,
+        )
+    }
 }
 
 fn validate_explicit_root_path(path: &Path) -> Result<(), VitaAgentError> {
@@ -585,6 +784,7 @@ fn normalize_path_for_comparison(path: &Path) -> String {
 }
 
 #[cfg(windows)]
+#[allow(dead_code)]
 mod platform {
     use super::*;
     use std::ffi::c_void;
@@ -603,13 +803,14 @@ mod platform {
         STATUS_OBJECT_PATH_NOT_FOUND, UNICODE_STRING,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FileIdInfo, GetDriveTypeW, GetFileInformationByHandle,
+        CreateFileW, FileIdInfo, FlushFileBuffers, GetDriveTypeW, GetFileInformationByHandle,
         GetFileInformationByHandleEx, GetFileType, GetFinalPathNameByHandleW, ReadFile,
-        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+        SetEndOfFile, SetFilePointerEx, WriteFile, BY_HANDLE_FILE_INFORMATION,
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_BEGIN,
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO,
         FILE_INFO_BY_HANDLE_CLASS, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_TYPE_DISK, OPEN_EXISTING,
-        SYNCHRONIZE,
+        FILE_SHARE_NONE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_TYPE_DISK,
+        FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, OPEN_EXISTING, SYNCHRONIZE,
     };
     use windows_sys::Win32::System::WindowsProgramming::{
         DRIVE_FIXED, DRIVE_NO_ROOT_DIR, DRIVE_RAMDISK, DRIVE_REMOTE, DRIVE_REMOVABLE, DRIVE_UNKNOWN,
@@ -620,6 +821,14 @@ mod platform {
     // A regular target never receives FILE_TRAVERSE/FILE_EXECUTE.
     const OPEN_DIRECTORY_ACCESS: u32 = FILE_READ_ATTRIBUTES | FILE_TRAVERSE;
     const OPEN_TARGET_ACCESS: u32 = FILE_READ_ATTRIBUTES;
+    const REPLACE_TARGET_ACCESS: u32 = FILE_READ_DATA
+        | FILE_WRITE_DATA
+        | FILE_READ_ATTRIBUTES
+        | FILE_WRITE_ATTRIBUTES
+        | SYNCHRONIZE;
+    const REPLACE_SHARE_ACCESS: u32 = FILE_SHARE_NONE;
+    const REPLACE_CREATE_OPTIONS: u32 =
+        FILE_OPEN_REPARSE_POINT | FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT;
 
     pub(super) struct OwnedHandle(pub(super) HANDLE);
 
@@ -646,6 +855,60 @@ mod platform {
         identity: WorkspaceRootIdentity,
         final_path: PathBuf,
         is_directory: bool,
+        is_reparse: bool,
+        number_of_links: u32,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) enum WorkspaceReplaceFaultPoint {
+        BeforeCommitFence,
+        AfterCommitFenceBeforeFirstWrite,
+        AfterFirstWrite,
+        BeforeSetEndOfFile,
+        AfterSetEndOfFile,
+        BeforeFlush,
+        AfterFlushBeforeVerify,
+        DuringPostVerify,
+    }
+
+    trait WorkspaceReplaceFaultInjector {
+        fn fire(&mut self, point: WorkspaceReplaceFaultPoint) -> bool;
+    }
+
+    struct NoWorkspaceReplaceFaults;
+
+    impl WorkspaceReplaceFaultInjector for NoWorkspaceReplaceFaults {
+        fn fire(&mut self, _point: WorkspaceReplaceFaultPoint) -> bool {
+            false
+        }
+    }
+
+    #[cfg(test)]
+    #[derive(Clone, Debug, Default)]
+    pub(super) struct WorkspaceReplaceFaultPlan {
+        point: Option<WorkspaceReplaceFaultPoint>,
+        fired: bool,
+    }
+
+    #[cfg(test)]
+    impl WorkspaceReplaceFaultPlan {
+        pub(super) fn once(point: WorkspaceReplaceFaultPoint) -> Self {
+            Self {
+                point: Some(point),
+                fired: false,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    impl WorkspaceReplaceFaultInjector for WorkspaceReplaceFaultPlan {
+        fn fire(&mut self, point: WorkspaceReplaceFaultPoint) -> bool {
+            if self.fired || self.point != Some(point) {
+                return false;
+            }
+            self.fired = true;
+            true
+        }
     }
 
     pub(super) fn acquire_root(
@@ -995,6 +1258,38 @@ mod platform {
         desired_access: u32,
         create_options: u32,
     ) -> Result<OwnedHandle, RelativeOpenError> {
+        open_relative_with_options_and_share(
+            parent,
+            component,
+            desired_access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            create_options,
+        )
+    }
+
+    fn open_exclusive_relative(
+        parent: &Arc<OwnedHandle>,
+        component: &OsStr,
+    ) -> Result<OwnedHandle, RelativeOpenError> {
+        // H4-B's operation handle is the only handle on which the mutation
+        // path is allowed to operate.  ShareAccess=0 makes a competing open
+        // fail closed instead of waiting or racing another writer.
+        open_relative_with_options_and_share(
+            parent,
+            component,
+            REPLACE_TARGET_ACCESS,
+            REPLACE_SHARE_ACCESS,
+            REPLACE_CREATE_OPTIONS,
+        )
+    }
+
+    fn open_relative_with_options_and_share(
+        parent: &Arc<OwnedHandle>,
+        component: &OsStr,
+        desired_access: u32,
+        share_access: u32,
+        create_options: u32,
+    ) -> Result<OwnedHandle, RelativeOpenError> {
         let mut name = component.encode_wide().collect::<Vec<_>>();
         let byte_length = name
             .len()
@@ -1026,7 +1321,7 @@ mod platform {
                 &mut status_block,
                 std::ptr::null(),
                 0,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                share_access,
                 FILE_OPEN,
                 create_options,
                 std::ptr::null(),
@@ -1122,6 +1417,406 @@ mod platform {
         read_utf8_bounded(&handle, max_bytes)
     }
 
+    pub(super) fn replace_existing_file_utf8_bounded(
+        prepared: PreparedWorkspaceTarget,
+        expected_sha256: &str,
+        replacement_content: &str,
+        fence: &mut dyn WorkspaceReplaceCommitFence,
+        cancellation: &dyn WorkspaceReplaceCancellation,
+    ) -> WorkspaceReplaceCommitOutcome {
+        let mut faults = NoWorkspaceReplaceFaults;
+        replace_existing_file_utf8_bounded_impl(
+            prepared,
+            expected_sha256,
+            replacement_content,
+            fence,
+            cancellation,
+            &mut faults,
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn replace_existing_file_utf8_bounded_with_faults(
+        prepared: PreparedWorkspaceTarget,
+        expected_sha256: &str,
+        replacement_content: &str,
+        fence: &mut dyn WorkspaceReplaceCommitFence,
+        cancellation: &dyn WorkspaceReplaceCancellation,
+        faults: &mut WorkspaceReplaceFaultPlan,
+    ) -> WorkspaceReplaceCommitOutcome {
+        replace_existing_file_utf8_bounded_impl(
+            prepared,
+            expected_sha256,
+            replacement_content,
+            fence,
+            cancellation,
+            faults,
+        )
+    }
+
+    fn replace_existing_file_utf8_bounded_impl<F>(
+        prepared: PreparedWorkspaceTarget,
+        expected_sha256: &str,
+        replacement_content: &str,
+        fence: &mut dyn WorkspaceReplaceCommitFence,
+        cancellation: &dyn WorkspaceReplaceCancellation,
+        faults: &mut F,
+    ) -> WorkspaceReplaceCommitOutcome
+    where
+        F: WorkspaceReplaceFaultInjector,
+    {
+        // The H2 metadata-only target handle is deliberately released before
+        // the exclusive operation open.  Keeping it alive would make the
+        // operation's ShareAccess=0 contract depend on H2's weaker sharing
+        // mode and would not establish one authoritative mutation handle.
+        let PreparedWorkspaceTarget {
+            root,
+            relative_path,
+            parent_identity,
+            target_identity,
+            final_path: _,
+            kind,
+            parent_handle,
+            target_handle,
+        } = prepared;
+        drop(target_handle);
+
+        let mut evidence = WorkspaceReplaceEvidence::default();
+        if cancellation.is_cancelled() {
+            return replace_denied(evidence, WorkspaceReplaceError::CancellationBeforeMutation);
+        }
+        if kind != PreparedWorkspaceTargetKind::ExistingFile {
+            return replace_denied(evidence, WorkspaceReplaceError::InvalidPreparedTarget);
+        }
+        let expected_identity = match target_identity {
+            Some(identity) => identity,
+            None => return replace_denied(evidence, WorkspaceReplaceError::InvalidPreparedTarget),
+        };
+        let expected_sha256 = match normalized_sha256(expected_sha256) {
+            Some(value) => value,
+            None => return replace_denied(evidence, WorkspaceReplaceError::InvalidExpectedHash),
+        };
+        let replacement_bytes = replacement_content.as_bytes();
+        if replacement_bytes.len() > WORKSPACE_REPLACE_HARD_MAX_BYTES {
+            return replace_denied(evidence, WorkspaceReplaceError::ReplacementTooLarge);
+        }
+
+        if verify_root_name(&root).is_err() {
+            return replace_denied(evidence, WorkspaceReplaceError::RootIdentityChanged);
+        }
+        if let Err(error) = verify_replace_parent(&root, &parent_handle, parent_identity) {
+            return replace_denied(evidence, error);
+        }
+
+        let leaf = relative_path
+            .components()
+            .last()
+            .expect("WorkspaceRelativePath always has one component");
+        let operation_handle = match open_exclusive_relative(&parent_handle, leaf) {
+            Ok(handle) => handle,
+            Err(RelativeOpenError::Missing(_)) => {
+                return replace_denied(evidence, WorkspaceReplaceError::TargetMissing)
+            }
+            Err(RelativeOpenError::Status(_)) => {
+                return replace_denied(evidence, WorkspaceReplaceError::TargetBusy)
+            }
+        };
+
+        let details =
+            match verify_replace_operation_handle(&root, &operation_handle, expected_identity) {
+                Ok(details) => details,
+                Err(error) => return replace_denied(evidence, error),
+            };
+        evidence.hard_link_count_after_open = Some(details.number_of_links);
+        if details.number_of_links != 1 {
+            return replace_denied(evidence, WorkspaceReplaceError::HardLinkAmbiguous);
+        }
+        if verify_root_name(&root).is_err() {
+            return replace_denied(evidence, WorkspaceReplaceError::RootIdentityChanged);
+        }
+        if let Err(error) = verify_replace_parent(&root, &parent_handle, parent_identity) {
+            return replace_denied(evidence, error);
+        }
+
+        if !set_file_pointer(&operation_handle, 0) {
+            return replace_denied(evidence, WorkspaceReplaceError::OperationHandleIo);
+        }
+        let current_bytes = match read_replace_utf8_bounded(&operation_handle) {
+            Ok(bytes) => bytes,
+            Err(ReplaceReadError::TooLarge) => {
+                return replace_denied(evidence, WorkspaceReplaceError::CurrentFileTooLarge)
+            }
+            Err(ReplaceReadError::InvalidUtf8) => {
+                return replace_denied(evidence, WorkspaceReplaceError::CurrentContentNotUtf8)
+            }
+            Err(ReplaceReadError::Io) => {
+                return replace_denied(evidence, WorkspaceReplaceError::OperationHandleIo)
+            }
+        };
+        let current_hash = crate::sha256_hex(&current_bytes);
+        evidence.bytes_before = Some(current_bytes.len());
+        evidence.before_sha256 = Some(current_hash.clone());
+        if current_hash != expected_sha256 {
+            return replace_conflict(evidence);
+        }
+
+        if verify_root_name(&root).is_err() {
+            return replace_denied(evidence, WorkspaceReplaceError::RootIdentityChanged);
+        }
+        if let Err(error) = verify_replace_parent(&root, &parent_handle, parent_identity) {
+            return replace_denied(evidence, error);
+        }
+        if cancellation.is_cancelled() {
+            return replace_denied(evidence, WorkspaceReplaceError::CancellationBeforeMutation);
+        }
+
+        // This is the final same-handle link check, immediately before the
+        // single final fence.  Re-inspecting the operation handle also keeps
+        // identity, regular-file, reparse, and final-path checks adjacent to
+        // the authority seam without reopening the pathname.
+        let before_fence_details =
+            match verify_replace_operation_handle(&root, &operation_handle, expected_identity) {
+                Ok(details) => details,
+                Err(error) => return replace_denied(evidence, error),
+            };
+        evidence.hard_link_count_before_fence = Some(before_fence_details.number_of_links);
+        if before_fence_details.number_of_links != 1 {
+            return replace_denied(evidence, WorkspaceReplaceError::HardLinkAmbiguous);
+        }
+        if faults.fire(WorkspaceReplaceFaultPoint::BeforeCommitFence) {
+            return replace_denied(evidence, WorkspaceReplaceError::FaultInjected);
+        }
+
+        evidence.fence_calls = 1;
+        let fence_result = catch_unwind(AssertUnwindSafe(|| fence.check()));
+        match fence_result {
+            Ok(Ok(())) => {}
+            Ok(Err(WorkspaceReplaceFenceError::Denied)) => {
+                return replace_denied(evidence, WorkspaceReplaceError::CommitFenceDenied)
+            }
+            Ok(Err(WorkspaceReplaceFenceError::Cancelled)) => {
+                return replace_denied(evidence, WorkspaceReplaceError::CommitFenceCancelled)
+            }
+            Ok(Err(WorkspaceReplaceFenceError::Stale)) => {
+                return replace_denied(evidence, WorkspaceReplaceError::CommitFenceStale)
+            }
+            Ok(Err(WorkspaceReplaceFenceError::Error)) => {
+                return replace_denied(evidence, WorkspaceReplaceError::CommitFenceError)
+            }
+            Err(_) => return replace_denied(evidence, WorkspaceReplaceError::CommitFencePanic),
+        }
+
+        evidence.mutation_attempted = true;
+        if faults.fire(WorkspaceReplaceFaultPoint::AfterCommitFenceBeforeFirstWrite) {
+            return replace_denied(evidence, WorkspaceReplaceError::FaultInjected);
+        }
+        if !set_file_pointer(&operation_handle, 0) {
+            return replace_denied(evidence, WorkspaceReplaceError::OperationHandleIo);
+        }
+
+        if replacement_bytes.is_empty() {
+            if faults.fire(WorkspaceReplaceFaultPoint::BeforeSetEndOfFile) {
+                return replace_denied(evidence, WorkspaceReplaceError::FaultInjected);
+            }
+            evidence.mutation_started = true;
+            evidence.modifying_syscalls += 1;
+            if !set_end_of_file(&operation_handle) {
+                return replace_unknown(evidence, WorkspaceReplaceError::SetEndOfFileFailed);
+            }
+            if faults.fire(WorkspaceReplaceFaultPoint::AfterSetEndOfFile) {
+                return replace_unknown(evidence, WorkspaceReplaceError::FaultInjected);
+            }
+        } else {
+            // The operation handle is synchronous and its pointer was reset
+            // immediately before the first modifying syscall.
+            evidence.mutation_started = true;
+            evidence.modifying_syscalls += 1;
+            let mut written = 0_u32;
+            let write_ok = unsafe {
+                WriteFile(
+                    operation_handle.0,
+                    replacement_bytes.as_ptr(),
+                    replacement_bytes.len() as u32,
+                    &mut written,
+                    std::ptr::null_mut(),
+                ) != 0
+            };
+            if !write_ok {
+                return replace_unknown(evidence, WorkspaceReplaceError::WriteFailed);
+            }
+            if written as usize != replacement_bytes.len() {
+                return replace_unknown(evidence, WorkspaceReplaceError::ShortWrite);
+            }
+            if faults.fire(WorkspaceReplaceFaultPoint::AfterFirstWrite) {
+                return replace_unknown(evidence, WorkspaceReplaceError::FaultInjected);
+            }
+            if faults.fire(WorkspaceReplaceFaultPoint::BeforeSetEndOfFile) {
+                return replace_unknown(evidence, WorkspaceReplaceError::SetEndOfFileFailed);
+            }
+            if !set_file_pointer(&operation_handle, replacement_bytes.len() as i64) {
+                return replace_unknown(evidence, WorkspaceReplaceError::OperationHandleIo);
+            }
+            evidence.modifying_syscalls += 1;
+            if !set_end_of_file(&operation_handle) {
+                return replace_unknown(evidence, WorkspaceReplaceError::SetEndOfFileFailed);
+            }
+            if faults.fire(WorkspaceReplaceFaultPoint::AfterSetEndOfFile) {
+                return replace_unknown(evidence, WorkspaceReplaceError::FaultInjected);
+            }
+        }
+
+        if faults.fire(WorkspaceReplaceFaultPoint::BeforeFlush) {
+            return replace_unknown(evidence, WorkspaceReplaceError::FlushFailed);
+        }
+        evidence.modifying_syscalls += 1;
+        if unsafe { FlushFileBuffers(operation_handle.0) == 0 } {
+            return replace_unknown(evidence, WorkspaceReplaceError::FlushFailed);
+        }
+        if faults.fire(WorkspaceReplaceFaultPoint::AfterFlushBeforeVerify) {
+            return replace_unknown(evidence, WorkspaceReplaceError::FaultInjected);
+        }
+        if !set_file_pointer(&operation_handle, 0) {
+            return replace_unknown(evidence, WorkspaceReplaceError::OperationHandleIo);
+        }
+        if faults.fire(WorkspaceReplaceFaultPoint::DuringPostVerify) {
+            return replace_unknown(evidence, WorkspaceReplaceError::PostWriteVerificationFailed);
+        }
+        let after_bytes = match read_replace_utf8_bounded(&operation_handle) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return replace_unknown(
+                    evidence,
+                    WorkspaceReplaceError::PostWriteVerificationFailed,
+                )
+            }
+        };
+        let after_hash = crate::sha256_hex(&after_bytes);
+        evidence.bytes_after = Some(after_bytes.len());
+        evidence.after_sha256 = Some(after_hash);
+        if after_bytes != replacement_bytes {
+            return replace_unknown(evidence, WorkspaceReplaceError::PostWriteVerificationFailed);
+        }
+
+        evidence.committed_mutations = 1;
+        WorkspaceReplaceCommitOutcome::Committed { evidence }
+    }
+
+    fn normalized_sha256(value: &str) -> Option<String> {
+        if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        Some(value.to_ascii_lowercase())
+    }
+
+    fn verify_replace_parent(
+        root: &TrustedWorkspaceRoot,
+        parent_handle: &Arc<OwnedHandle>,
+        expected_identity: WorkspaceRootIdentity,
+    ) -> Result<(), WorkspaceReplaceError> {
+        let details = inspect_handle_metadata(parent_handle)
+            .map_err(|_| WorkspaceReplaceError::OperationHandleIo)?;
+        if details.is_reparse {
+            return Err(WorkspaceReplaceError::ReparseParent);
+        }
+        if !details.is_directory || details.identity != expected_identity {
+            return Err(WorkspaceReplaceError::ParentIdentityChanged);
+        }
+        ensure_descendant(root, &details.final_path)
+            .map_err(|_| WorkspaceReplaceError::TargetOutsideRoot)
+    }
+
+    fn verify_replace_operation_handle(
+        root: &TrustedWorkspaceRoot,
+        operation_handle: &OwnedHandle,
+        expected_identity: WorkspaceRootIdentity,
+    ) -> Result<HandleDetails, WorkspaceReplaceError> {
+        let details = inspect_handle_metadata(operation_handle)
+            .map_err(|_| WorkspaceReplaceError::OperationHandleIo)?;
+        if details.is_reparse {
+            return Err(WorkspaceReplaceError::ReparseTarget);
+        }
+        if details.is_directory {
+            return Err(WorkspaceReplaceError::InvalidPreparedTarget);
+        }
+        if details.identity != expected_identity {
+            return Err(WorkspaceReplaceError::TargetIdentityChanged);
+        }
+        ensure_descendant(root, &details.final_path)
+            .map_err(|_| WorkspaceReplaceError::TargetOutsideRoot)?;
+        Ok(details)
+    }
+
+    enum ReplaceReadError {
+        TooLarge,
+        InvalidUtf8,
+        Io,
+    }
+
+    fn read_replace_utf8_bounded(handle: &OwnedHandle) -> Result<Vec<u8>, ReplaceReadError> {
+        let mut bytes = Vec::with_capacity(WORKSPACE_REPLACE_HARD_MAX_BYTES + 1);
+        let mut buffer = [0_u8; 8 * 1024];
+        loop {
+            let remaining = WORKSPACE_REPLACE_HARD_MAX_BYTES + 1 - bytes.len();
+            if remaining == 0 {
+                return Err(ReplaceReadError::TooLarge);
+            }
+            let request = remaining.min(buffer.len()) as u32;
+            let mut read = 0_u32;
+            let ok = unsafe {
+                ReadFile(
+                    handle.0,
+                    buffer.as_mut_ptr(),
+                    request,
+                    &mut read,
+                    std::ptr::null_mut(),
+                ) != 0
+            };
+            if !ok || read as usize > request as usize {
+                return Err(ReplaceReadError::Io);
+            }
+            if read == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..read as usize]);
+            if bytes.len() > WORKSPACE_REPLACE_HARD_MAX_BYTES {
+                return Err(ReplaceReadError::TooLarge);
+            }
+        }
+        std::str::from_utf8(&bytes).map_err(|_| ReplaceReadError::InvalidUtf8)?;
+        Ok(bytes)
+    }
+
+    fn set_file_pointer(handle: &OwnedHandle, position: i64) -> bool {
+        let mut new_position = 0_i64;
+        unsafe {
+            SetFilePointerEx(handle.0, position, &mut new_position, FILE_BEGIN) != 0
+                && new_position == position
+        }
+    }
+
+    fn set_end_of_file(handle: &OwnedHandle) -> bool {
+        unsafe { SetEndOfFile(handle.0) != 0 }
+    }
+
+    fn replace_denied(
+        evidence: WorkspaceReplaceEvidence,
+        error: WorkspaceReplaceError,
+    ) -> WorkspaceReplaceCommitOutcome {
+        WorkspaceReplaceCommitOutcome::Denied { error, evidence }
+    }
+
+    fn replace_conflict(evidence: WorkspaceReplaceEvidence) -> WorkspaceReplaceCommitOutcome {
+        WorkspaceReplaceCommitOutcome::Conflict { evidence }
+    }
+
+    fn replace_unknown(
+        mut evidence: WorkspaceReplaceEvidence,
+        error: WorkspaceReplaceError,
+    ) -> WorkspaceReplaceCommitOutcome {
+        evidence.commit_unknown = true;
+        WorkspaceReplaceCommitOutcome::CommitUnknown { error, evidence }
+    }
+
     fn read_utf8_bounded(
         handle: &OwnedHandle,
         max_bytes: usize,
@@ -1164,6 +1859,25 @@ mod platform {
         handle: &OwnedHandle,
         require_directory: bool,
     ) -> Result<HandleDetails, VitaAgentError> {
+        let details = inspect_handle_metadata(handle)?;
+        if details.is_reparse {
+            return Err(VitaAgentError::UnsafePath {
+                field: TARGET_FIELD,
+                path: PathBuf::new(),
+                reason: "reparse points are forbidden",
+            });
+        }
+        if require_directory && !details.is_directory {
+            return Err(VitaAgentError::UnsafePath {
+                field: TARGET_FIELD,
+                path: PathBuf::new(),
+                reason: "workspace path component is not a directory",
+            });
+        }
+        Ok(details)
+    }
+
+    fn inspect_handle_metadata(handle: &OwnedHandle) -> Result<HandleDetails, VitaAgentError> {
         let mut legacy = BY_HANDLE_FILE_INFORMATION::default();
         let ok = unsafe { GetFileInformationByHandle(handle.0, &mut legacy) } != 0;
         if !ok {
@@ -1178,27 +1892,14 @@ mod platform {
                 reason: "workspace handle is not a disk object",
             });
         }
-        if is_reparse {
-            return Err(VitaAgentError::UnsafePath {
-                field: TARGET_FIELD,
-                path: PathBuf::new(),
-                reason: "reparse points are forbidden",
-            });
-        }
-        if require_directory && !is_directory {
-            return Err(VitaAgentError::UnsafePath {
-                field: TARGET_FIELD,
-                path: PathBuf::new(),
-                reason: "workspace path component is not a directory",
-            });
-        }
-
         let identity = file_identity(handle, &legacy)?;
         let final_path = final_path_from_handle(handle)?;
         Ok(HandleDetails {
             identity,
             final_path,
             is_directory,
+            is_reparse,
+            number_of_links: legacy.nNumberOfLinks,
         })
     }
 
@@ -1564,6 +2265,15 @@ mod platform {
     #[cfg(test)]
     pub(super) fn access_masks_for_test() -> (u32, u32) {
         (OPEN_DIRECTORY_ACCESS, OPEN_TARGET_ACCESS)
+    }
+
+    #[cfg(test)]
+    pub(super) fn replacement_open_contract_for_test() -> (u32, u32, u32) {
+        (
+            REPLACE_TARGET_ACCESS,
+            REPLACE_SHARE_ACCESS,
+            REPLACE_CREATE_OPTIONS,
+        )
     }
 
     #[cfg(test)]
@@ -2024,5 +2734,941 @@ mod tests {
         // H2 prevents reparse traversal, not a second hard-link pathname for
         // the same inode.  A future creation policy must address that alias
         // explicitly when it needs a new object rather than an identity.
+    }
+
+    #[cfg(windows)]
+    fn prepared_fixture(
+        initial: &[u8],
+    ) -> (
+        tempfile::TempDir,
+        TrustedWorkspaceRoot,
+        PreparedWorkspaceTarget,
+    ) {
+        let directory = tempdir().expect("tempdir");
+        fs::write(directory.path().join("target.txt"), initial).expect("fixture file");
+        let root = TrustedWorkspaceRoot::acquire(directory.path()).expect("acquire root");
+        let prepared = root
+            .prepare_target(Path::new("target.txt"))
+            .expect("prepare target");
+        (directory, root, prepared)
+    }
+
+    #[cfg(windows)]
+    fn allow_fence() -> impl WorkspaceReplaceCommitFence {
+        || Ok(())
+    }
+
+    #[cfg(windows)]
+    fn run_fault(
+        initial: &[u8],
+        replacement: &str,
+        point: platform::WorkspaceReplaceFaultPoint,
+    ) -> (tempfile::TempDir, WorkspaceReplaceCommitOutcome) {
+        let (directory, _root, prepared) = prepared_fixture(initial);
+        let mut fence = allow_fence();
+        let cancellation = std::sync::atomic::AtomicBool::new(false);
+        let mut faults = platform::WorkspaceReplaceFaultPlan::once(point);
+        let outcome = prepared.replace_existing_file_utf8_bounded_with_faults(
+            &crate::sha256_hex(initial),
+            replacement,
+            &mut fence,
+            &cancellation,
+            &mut faults,
+        );
+        (directory, outcome)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replacement_open_contract_is_minimal_and_exclusive() {
+        use windows_sys::Wdk::Storage::FileSystem::{
+            FILE_NON_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_NONE, FILE_WRITE_ATTRIBUTES,
+            FILE_WRITE_DATA, SYNCHRONIZE,
+        };
+
+        let (access, share, options) = platform::replacement_open_contract_for_test();
+        assert_eq!(
+            access,
+            FILE_READ_DATA
+                | FILE_WRITE_DATA
+                | FILE_READ_ATTRIBUTES
+                | FILE_WRITE_ATTRIBUTES
+                | SYNCHRONIZE
+        );
+        assert_eq!(share, FILE_SHARE_NONE);
+        assert_eq!(
+            options,
+            FILE_OPEN_REPARSE_POINT | FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn exclusive_same_handle_replace_succeeds() {
+        let initial = b"VITA_H4B_ORIGINAL";
+        let replacement = "VITA_H4B_REPLACEMENT";
+        let (directory, root, prepared) = prepared_fixture(initial);
+        let before_identity = prepared.target_identity().expect("target identity");
+        let mut fence = allow_fence();
+        let outcome = prepared.replace_existing_file_utf8_bounded(
+            crate::sha256_hex(initial).as_str(),
+            replacement,
+            &mut fence,
+        );
+
+        let evidence = match outcome {
+            WorkspaceReplaceCommitOutcome::Committed { evidence } => evidence,
+            other => panic!("expected committed outcome, got {other:?}"),
+        };
+        assert_eq!(
+            evidence.before_sha256.as_deref(),
+            Some(crate::sha256_hex(initial).as_str())
+        );
+        assert_eq!(
+            evidence.after_sha256.as_deref(),
+            Some(crate::sha256_hex(replacement.as_bytes()).as_str())
+        );
+        assert_eq!(evidence.bytes_before, Some(initial.len()));
+        assert_eq!(evidence.bytes_after, Some(replacement.len()));
+        assert!(evidence.mutation_attempted);
+        assert!(evidence.mutation_started);
+        assert_eq!(evidence.modifying_syscalls, 3);
+        assert_eq!(evidence.committed_mutations, 1);
+        assert!(!evidence.commit_unknown);
+        assert_eq!(evidence.fence_calls, 1);
+        assert_eq!(evidence.hard_link_count_after_open, Some(1));
+        assert_eq!(evidence.hard_link_count_before_fence, Some(1));
+        assert_eq!(
+            fs::read(directory.path().join("target.txt")).expect("read target"),
+            replacement.as_bytes()
+        );
+        let after_identity = root
+            .prepare_target(Path::new("target.txt"))
+            .expect("reprepare target")
+            .target_identity()
+            .expect("after identity");
+        assert_eq!(before_identity, after_identity);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wrong_expected_hash_conflicts_without_mutation() {
+        let initial = b"unchanged fixture";
+        let (directory, _root, prepared) = prepared_fixture(initial);
+        let mut fence = allow_fence();
+        let outcome =
+            prepared.replace_existing_file_utf8_bounded(&"0".repeat(64), "replacement", &mut fence);
+        let evidence = match outcome {
+            WorkspaceReplaceCommitOutcome::Conflict { evidence } => evidence,
+            other => panic!("expected conflict, got {other:?}"),
+        };
+        assert_eq!(evidence.modifying_syscalls, 0);
+        assert!(!evidence.mutation_started);
+        assert_eq!(
+            fs::read(directory.path().join("target.txt")).expect("read target"),
+            initial
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn commit_fence_denial_has_zero_mutation() {
+        let initial = b"fence denial fixture";
+        let (directory, _root, prepared) = prepared_fixture(initial);
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_for_fence = std::sync::Arc::clone(&calls);
+        let mut fence = move || {
+            calls_for_fence.fetch_add(1, Ordering::SeqCst);
+            Err(WorkspaceReplaceFenceError::Denied)
+        };
+        let outcome = prepared.replace_existing_file_utf8_bounded(
+            crate::sha256_hex(initial).as_str(),
+            "replacement",
+            &mut fence,
+        );
+        match outcome {
+            WorkspaceReplaceCommitOutcome::Denied { error, evidence } => {
+                assert_eq!(error, WorkspaceReplaceError::CommitFenceDenied);
+                assert_eq!(evidence.fence_calls, 1);
+                assert_eq!(evidence.modifying_syscalls, 0);
+                assert!(!evidence.mutation_started);
+            }
+            other => panic!("expected denied outcome, got {other:?}"),
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fs::read(directory.path().join("target.txt")).unwrap(),
+            initial
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn commit_fence_panic_has_zero_mutation() {
+        let initial = b"fence panic fixture";
+        let (directory, _root, prepared) = prepared_fixture(initial);
+        let mut fence =
+            || -> Result<(), WorkspaceReplaceFenceError> { panic!("synthetic fence panic") };
+        let outcome = prepared.replace_existing_file_utf8_bounded(
+            crate::sha256_hex(initial).as_str(),
+            "replacement",
+            &mut fence,
+        );
+        match outcome {
+            WorkspaceReplaceCommitOutcome::Denied { error, evidence } => {
+                assert_eq!(error, WorkspaceReplaceError::CommitFencePanic);
+                assert_eq!(evidence.fence_calls, 1);
+                assert_eq!(evidence.modifying_syscalls, 0);
+            }
+            other => panic!("expected denied outcome, got {other:?}"),
+        }
+        assert_eq!(
+            fs::read(directory.path().join("target.txt")).unwrap(),
+            initial
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn target_identity_change_denies() {
+        let initial = b"original identity fixture";
+        let (directory, _root, mut prepared) = prepared_fixture(initial);
+        let target = directory.path().join("target.txt");
+        let moved = directory.path().join("target-old.txt");
+        // The H2 target handle is metadata-only.  Release it in this race
+        // fixture so the namespace replacement is deterministic on filesystems
+        // that enforce delete sharing on open handles.
+        prepared.target_handle = None;
+        fs::rename(&target, &moved).expect("move original target");
+        fs::write(&target, b"replacement namespace object").expect("new target");
+
+        let mut fence = allow_fence();
+        let outcome = prepared.replace_existing_file_utf8_bounded(
+            crate::sha256_hex(initial).as_str(),
+            "must not write replacement object",
+            &mut fence,
+        );
+        match outcome {
+            WorkspaceReplaceCommitOutcome::Denied { error, evidence } => {
+                assert_eq!(error, WorkspaceReplaceError::TargetIdentityChanged);
+                assert_eq!(evidence.modifying_syscalls, 0);
+            }
+            other => panic!("expected identity denial, got {other:?}"),
+        }
+        assert_eq!(fs::read(&target).unwrap(), b"replacement namespace object");
+        assert_eq!(fs::read(&moved).unwrap(), initial);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parent_identity_change_denies() {
+        let directory = tempdir().expect("tempdir");
+        let nested = directory.path().join("nested");
+        fs::create_dir(&nested).expect("nested directory");
+        let target = nested.join("target.txt");
+        fs::write(&target, b"parent identity fixture").expect("target");
+        let root = TrustedWorkspaceRoot::acquire(directory.path()).expect("root");
+        let mut prepared = root
+            .prepare_target(Path::new("nested\\target.txt"))
+            .expect("prepare");
+        prepared.parent_identity = root.identity();
+        let mut fence = allow_fence();
+        let outcome = prepared.replace_existing_file_utf8_bounded(
+            crate::sha256_hex(b"parent identity fixture").as_str(),
+            "must not mutate",
+            &mut fence,
+        );
+        match outcome {
+            WorkspaceReplaceCommitOutcome::Denied { error, evidence } => {
+                assert_eq!(error, WorkspaceReplaceError::ParentIdentityChanged);
+                assert_eq!(evidence.modifying_syscalls, 0);
+            }
+            other => panic!("expected parent denial, got {other:?}"),
+        }
+        assert_eq!(fs::read(target).unwrap(), b"parent identity fixture");
+    }
+
+    #[cfg(windows)]
+    struct BusyHandle(windows_sys::Win32::Foundation::HANDLE);
+
+    #[cfg(windows)]
+    impl Drop for BusyHandle {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = windows_sys::Win32::Foundation::CloseHandle(self.0);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn open_busy_target(path: &Path) -> BusyHandle {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_WRITE_DATA, OPEN_EXISTING,
+        };
+
+        let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        wide.push(0);
+        let handle: HANDLE = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES,
+                0,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(
+            !handle.is_null() && handle != INVALID_HANDLE_VALUE,
+            "busy fixture open failed"
+        );
+        BusyHandle(handle)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn busy_target_denies() {
+        let initial = b"busy fixture";
+        let (directory, _root, prepared) = prepared_fixture(initial);
+        let _busy = open_busy_target(&directory.path().join("target.txt"));
+        let mut fence = allow_fence();
+        let outcome = prepared.replace_existing_file_utf8_bounded(
+            crate::sha256_hex(initial).as_str(),
+            "must not mutate",
+            &mut fence,
+        );
+        match outcome {
+            WorkspaceReplaceCommitOutcome::Denied { error, evidence } => {
+                assert_eq!(error, WorkspaceReplaceError::TargetBusy);
+                assert_eq!(evidence.modifying_syscalls, 0);
+            }
+            other => panic!("expected busy denial, got {other:?}"),
+        }
+        drop(_busy);
+        assert_eq!(
+            fs::read(directory.path().join("target.txt")).unwrap(),
+            initial
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hard_link_count_gt_one_denies() {
+        let directory = tempdir().expect("tempdir");
+        let target = directory.path().join("target.txt");
+        let alias = directory.path().join("alias.txt");
+        let initial = b"hard link fixture";
+        fs::write(&target, initial).expect("target");
+        fs::hard_link(&target, &alias).expect("hard link");
+        let root = TrustedWorkspaceRoot::acquire(directory.path()).expect("root");
+        let prepared = root
+            .prepare_target(Path::new("target.txt"))
+            .expect("prepare");
+        let mut fence = allow_fence();
+        let outcome = prepared.replace_existing_file_utf8_bounded(
+            crate::sha256_hex(initial).as_str(),
+            "must not mutate",
+            &mut fence,
+        );
+        match outcome {
+            WorkspaceReplaceCommitOutcome::Denied { error, evidence } => {
+                assert_eq!(error, WorkspaceReplaceError::HardLinkAmbiguous);
+                assert_eq!(evidence.hard_link_count_after_open, Some(2));
+                assert_eq!(evidence.hard_link_count_before_fence, None);
+                assert_eq!(evidence.modifying_syscalls, 0);
+            }
+            other => panic!("expected hard-link denial, got {other:?}"),
+        }
+        assert_eq!(fs::read(&target).unwrap(), initial);
+        assert_eq!(fs::read(&alias).unwrap(), initial);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reparse_target_denies() {
+        let directory = tempdir().expect("directory");
+        let outside = tempdir().expect("outside");
+        let target = directory.path().join("target.txt");
+        let moved = directory.path().join("target-old.txt");
+        let outside_file = outside.path().join("outside.txt");
+        fs::write(&target, b"reparse original").expect("target");
+        fs::write(&outside_file, b"outside original").expect("outside");
+        let root = TrustedWorkspaceRoot::acquire(directory.path()).expect("root");
+        let mut prepared = root
+            .prepare_target(Path::new("target.txt"))
+            .expect("prepare");
+        prepared.target_handle = None;
+        fs::rename(&target, &moved).expect("move target");
+        native_file_symlink(&target, &outside_file);
+
+        let mut fence = allow_fence();
+        let outcome = prepared.replace_existing_file_utf8_bounded(
+            crate::sha256_hex(b"reparse original").as_str(),
+            "must not follow link",
+            &mut fence,
+        );
+        match outcome {
+            WorkspaceReplaceCommitOutcome::Denied { error, evidence } => {
+                assert_eq!(error, WorkspaceReplaceError::ReparseTarget);
+                assert_eq!(evidence.modifying_syscalls, 0);
+            }
+            other => panic!("expected reparse denial, got {other:?}"),
+        }
+        assert_eq!(fs::read(&outside_file).unwrap(), b"outside original");
+        assert_eq!(fs::read(&moved).unwrap(), b"reparse original");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn current_file_oversize_denies() {
+        let initial = vec![b'x'; WORKSPACE_REPLACE_HARD_MAX_BYTES + 1];
+        let (directory, _root, prepared) = prepared_fixture(&initial);
+        let mut fence = allow_fence();
+        let outcome = prepared.replace_existing_file_utf8_bounded(
+            crate::sha256_hex(&initial).as_str(),
+            "small",
+            &mut fence,
+        );
+        match outcome {
+            WorkspaceReplaceCommitOutcome::Denied { error, evidence } => {
+                assert_eq!(error, WorkspaceReplaceError::CurrentFileTooLarge);
+                assert_eq!(evidence.modifying_syscalls, 0);
+            }
+            other => panic!("expected oversize denial, got {other:?}"),
+        }
+        assert_eq!(
+            fs::metadata(directory.path().join("target.txt"))
+                .unwrap()
+                .len(),
+            65537
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replacement_oversize_denies() {
+        let initial = b"small fixture";
+        let replacement = "r".repeat(WORKSPACE_REPLACE_HARD_MAX_BYTES + 1);
+        let (directory, _root, prepared) = prepared_fixture(initial);
+        let mut fence = allow_fence();
+        let outcome = prepared.replace_existing_file_utf8_bounded(
+            crate::sha256_hex(initial).as_str(),
+            &replacement,
+            &mut fence,
+        );
+        match outcome {
+            WorkspaceReplaceCommitOutcome::Denied { error, evidence } => {
+                assert_eq!(error, WorkspaceReplaceError::ReplacementTooLarge);
+                assert_eq!(evidence.modifying_syscalls, 0);
+            }
+            other => panic!("expected replacement oversize denial, got {other:?}"),
+        }
+        assert_eq!(
+            fs::read(directory.path().join("target.txt")).unwrap(),
+            initial
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn invalid_current_utf8_denies() {
+        let initial = [0xff, 0xfe, 0xfd];
+        let (directory, _root, prepared) = prepared_fixture(&initial);
+        let mut fence = allow_fence();
+        let outcome = prepared.replace_existing_file_utf8_bounded(
+            crate::sha256_hex(&initial).as_str(),
+            "must not transcode",
+            &mut fence,
+        );
+        match outcome {
+            WorkspaceReplaceCommitOutcome::Denied { error, evidence } => {
+                assert_eq!(error, WorkspaceReplaceError::CurrentContentNotUtf8);
+                assert_eq!(evidence.modifying_syscalls, 0);
+            }
+            other => panic!("expected UTF-8 denial, got {other:?}"),
+        }
+        assert_eq!(
+            fs::read(directory.path().join("target.txt")).unwrap(),
+            initial
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shorter_replacement_sets_exact_eof() {
+        let initial = b"long original fixture with tail";
+        let replacement = "short";
+        let (directory, _root, prepared) = prepared_fixture(initial);
+        let mut fence = allow_fence();
+        let outcome = prepared.replace_existing_file_utf8_bounded(
+            crate::sha256_hex(initial).as_str(),
+            replacement,
+            &mut fence,
+        );
+        assert!(matches!(
+            outcome,
+            WorkspaceReplaceCommitOutcome::Committed { .. }
+        ));
+        assert_eq!(
+            fs::read(directory.path().join("target.txt")).unwrap(),
+            replacement.as_bytes()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn longer_replacement_sets_exact_length() {
+        let initial = b"short";
+        let replacement = "a longer replacement fixture";
+        let (directory, _root, prepared) = prepared_fixture(initial);
+        let mut fence = allow_fence();
+        let outcome = prepared.replace_existing_file_utf8_bounded(
+            crate::sha256_hex(initial).as_str(),
+            replacement,
+            &mut fence,
+        );
+        let evidence = match outcome {
+            WorkspaceReplaceCommitOutcome::Committed { evidence } => evidence,
+            other => panic!("expected committed outcome, got {other:?}"),
+        };
+        assert_eq!(evidence.bytes_after, Some(replacement.len()));
+        assert_eq!(
+            fs::read(directory.path().join("target.txt")).unwrap(),
+            replacement.as_bytes()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn empty_replacement_preserves_file_identity() {
+        let initial = b"truncate me";
+        let (directory, root, prepared) = prepared_fixture(initial);
+        let before_identity = prepared.target_identity().expect("identity");
+        let mut fence = allow_fence();
+        let outcome = prepared.replace_existing_file_utf8_bounded(
+            crate::sha256_hex(initial).as_str(),
+            "",
+            &mut fence,
+        );
+        let evidence = match outcome {
+            WorkspaceReplaceCommitOutcome::Committed { evidence } => evidence,
+            other => panic!("expected committed outcome, got {other:?}"),
+        };
+        assert_eq!(evidence.modifying_syscalls, 2);
+        assert_eq!(fs::read(directory.path().join("target.txt")).unwrap(), b"");
+        let after_identity = root
+            .prepare_target(Path::new("target.txt"))
+            .expect("reprepare")
+            .target_identity()
+            .expect("after identity");
+        assert_eq!(before_identity, after_identity);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn exact_64k_replacement_succeeds() {
+        let initial = b"small original";
+        let replacement = "x".repeat(WORKSPACE_REPLACE_HARD_MAX_BYTES);
+        let (directory, _root, prepared) = prepared_fixture(initial);
+        let mut fence = allow_fence();
+        let outcome = prepared.replace_existing_file_utf8_bounded(
+            crate::sha256_hex(initial).as_str(),
+            &replacement,
+            &mut fence,
+        );
+        let evidence = match outcome {
+            WorkspaceReplaceCommitOutcome::Committed { evidence } => evidence,
+            other => panic!("expected committed outcome, got {other:?}"),
+        };
+        assert_eq!(evidence.bytes_after, Some(WORKSPACE_REPLACE_HARD_MAX_BYTES));
+        assert_eq!(
+            evidence.after_sha256.as_deref(),
+            Some(crate::sha256_hex(replacement.as_bytes()).as_str())
+        );
+        assert_eq!(
+            fs::metadata(directory.path().join("target.txt"))
+                .unwrap()
+                .len(),
+            WORKSPACE_REPLACE_HARD_MAX_BYTES as u64
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn post_write_hash_matches() {
+        let initial = b"hash before";
+        let replacement = "hash after";
+        let (_directory, _root, prepared) = prepared_fixture(initial);
+        let mut fence = allow_fence();
+        let outcome = prepared.replace_existing_file_utf8_bounded(
+            crate::sha256_hex(initial).as_str(),
+            replacement,
+            &mut fence,
+        );
+        match outcome {
+            WorkspaceReplaceCommitOutcome::Committed { evidence } => {
+                assert_eq!(evidence.before_sha256, Some(crate::sha256_hex(initial)));
+                assert_eq!(
+                    evidence.after_sha256,
+                    Some(crate::sha256_hex(replacement.as_bytes()))
+                );
+                assert_eq!(evidence.bytes_after, Some(replacement.len()));
+            }
+            other => panic!("expected committed outcome, got {other:?}"),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn after_commit_fence_before_first_write_has_zero_mutation() {
+        let initial = b"after fence fixture";
+        let (directory, outcome) = run_fault(
+            initial,
+            "replacement",
+            platform::WorkspaceReplaceFaultPoint::AfterCommitFenceBeforeFirstWrite,
+        );
+        match outcome {
+            WorkspaceReplaceCommitOutcome::Denied { error, evidence } => {
+                assert_eq!(error, WorkspaceReplaceError::FaultInjected);
+                assert_eq!(evidence.fence_calls, 1);
+                assert!(evidence.mutation_attempted);
+                assert!(!evidence.mutation_started);
+                assert_eq!(evidence.modifying_syscalls, 0);
+            }
+            other => panic!("expected pre-mutation denial, got {other:?}"),
+        }
+        assert_eq!(
+            fs::read(directory.path().join("target.txt")).unwrap(),
+            initial
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn before_commit_fence_has_zero_mutation() {
+        let initial = b"before fence fixture";
+        let (directory, outcome) = run_fault(
+            initial,
+            "replacement",
+            platform::WorkspaceReplaceFaultPoint::BeforeCommitFence,
+        );
+        match outcome {
+            WorkspaceReplaceCommitOutcome::Denied { error, evidence } => {
+                assert_eq!(error, WorkspaceReplaceError::FaultInjected);
+                assert_eq!(evidence.fence_calls, 0);
+                assert_eq!(evidence.modifying_syscalls, 0);
+            }
+            other => panic!("expected pre-fence denial, got {other:?}"),
+        }
+        assert_eq!(
+            fs::read(directory.path().join("target.txt")).unwrap(),
+            initial
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failure_after_first_write_is_commit_unknown() {
+        let initial = b"after write fixture";
+        let (directory, outcome) = run_fault(
+            initial,
+            "replacement",
+            platform::WorkspaceReplaceFaultPoint::AfterFirstWrite,
+        );
+        match outcome {
+            WorkspaceReplaceCommitOutcome::CommitUnknown { error, evidence } => {
+                assert_eq!(error, WorkspaceReplaceError::FaultInjected);
+                assert!(evidence.mutation_started);
+                assert!(evidence.commit_unknown);
+                assert_eq!(evidence.modifying_syscalls, 1);
+            }
+            other => panic!("expected unknown outcome, got {other:?}"),
+        }
+        assert_ne!(
+            fs::read(directory.path().join("target.txt")).unwrap(),
+            initial
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn set_eof_failure_is_commit_unknown() {
+        let initial = b"set eof fixture with tail";
+        let (directory, outcome) = run_fault(
+            initial,
+            "short",
+            platform::WorkspaceReplaceFaultPoint::BeforeSetEndOfFile,
+        );
+        match outcome {
+            WorkspaceReplaceCommitOutcome::CommitUnknown { error, evidence } => {
+                assert_eq!(error, WorkspaceReplaceError::SetEndOfFileFailed);
+                assert!(evidence.commit_unknown);
+                assert_eq!(evidence.modifying_syscalls, 1);
+            }
+            other => panic!("expected EOF unknown outcome, got {other:?}"),
+        }
+        assert_ne!(
+            fs::read(directory.path().join("target.txt")).unwrap(),
+            initial
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn after_set_eof_is_commit_unknown() {
+        let initial = b"after EOF fixture with tail";
+        let (directory, outcome) = run_fault(
+            initial,
+            "short",
+            platform::WorkspaceReplaceFaultPoint::AfterSetEndOfFile,
+        );
+        match outcome {
+            WorkspaceReplaceCommitOutcome::CommitUnknown { error, evidence } => {
+                assert_eq!(error, WorkspaceReplaceError::FaultInjected);
+                assert!(evidence.commit_unknown);
+                assert_eq!(evidence.modifying_syscalls, 2);
+            }
+            other => panic!("expected EOF unknown outcome, got {other:?}"),
+        }
+        assert_ne!(
+            fs::read(directory.path().join("target.txt")).unwrap(),
+            initial
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn flush_failure_is_commit_unknown() {
+        let initial = b"flush fixture with tail";
+        let (directory, outcome) = run_fault(
+            initial,
+            "short",
+            platform::WorkspaceReplaceFaultPoint::BeforeFlush,
+        );
+        match outcome {
+            WorkspaceReplaceCommitOutcome::CommitUnknown { error, evidence } => {
+                assert_eq!(error, WorkspaceReplaceError::FlushFailed);
+                assert!(evidence.commit_unknown);
+                assert_eq!(evidence.modifying_syscalls, 2);
+            }
+            other => panic!("expected flush unknown outcome, got {other:?}"),
+        }
+        assert_ne!(
+            fs::read(directory.path().join("target.txt")).unwrap(),
+            initial
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn after_flush_before_verify_is_commit_unknown() {
+        let initial = b"after flush fixture";
+        let (directory, outcome) = run_fault(
+            initial,
+            "replacement",
+            platform::WorkspaceReplaceFaultPoint::AfterFlushBeforeVerify,
+        );
+        match outcome {
+            WorkspaceReplaceCommitOutcome::CommitUnknown { error, evidence } => {
+                assert_eq!(error, WorkspaceReplaceError::FaultInjected);
+                assert!(evidence.commit_unknown);
+                assert_eq!(evidence.modifying_syscalls, 3);
+            }
+            other => panic!("expected post-flush unknown outcome, got {other:?}"),
+        }
+        assert_ne!(
+            fs::read(directory.path().join("target.txt")).unwrap(),
+            initial
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn post_verify_failure_is_commit_unknown() {
+        let initial = b"post verify fixture";
+        let (directory, outcome) = run_fault(
+            initial,
+            "replacement",
+            platform::WorkspaceReplaceFaultPoint::DuringPostVerify,
+        );
+        match outcome {
+            WorkspaceReplaceCommitOutcome::CommitUnknown { error, evidence } => {
+                assert_eq!(error, WorkspaceReplaceError::PostWriteVerificationFailed);
+                assert!(evidence.commit_unknown);
+                assert_eq!(evidence.modifying_syscalls, 3);
+            }
+            other => panic!("expected post-verify unknown outcome, got {other:?}"),
+        }
+        assert_ne!(
+            fs::read(directory.path().join("target.txt")).unwrap(),
+            initial
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn no_automatic_retry_after_commit_unknown() {
+        let initial = b"no retry fixture";
+        let (directory, outcome) = run_fault(
+            initial,
+            "replacement",
+            platform::WorkspaceReplaceFaultPoint::AfterFirstWrite,
+        );
+        match outcome {
+            WorkspaceReplaceCommitOutcome::CommitUnknown { evidence, .. } => {
+                assert_eq!(evidence.fence_calls, 1);
+                assert_eq!(evidence.modifying_syscalls, 1);
+                assert_eq!(evidence.committed_mutations, 0);
+            }
+            other => panic!("expected unknown outcome, got {other:?}"),
+        }
+        assert_ne!(
+            fs::read(directory.path().join("target.txt")).unwrap(),
+            initial
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cancellation_before_fence_has_zero_mutation() {
+        let initial = b"cancel before fixture";
+        let (directory, _root, prepared) = prepared_fixture(initial);
+        let cancellation = std::sync::atomic::AtomicBool::new(true);
+        let mut fence = allow_fence();
+        let outcome = prepared.replace_existing_file_utf8_bounded_with_cancellation(
+            crate::sha256_hex(initial).as_str(),
+            "must not mutate",
+            &mut fence,
+            &cancellation,
+        );
+        match outcome {
+            WorkspaceReplaceCommitOutcome::Denied { error, evidence } => {
+                assert_eq!(error, WorkspaceReplaceError::CancellationBeforeMutation);
+                assert_eq!(evidence.fence_calls, 0);
+                assert_eq!(evidence.modifying_syscalls, 0);
+            }
+            other => panic!("expected cancellation denial, got {other:?}"),
+        }
+        assert_eq!(
+            fs::read(directory.path().join("target.txt")).unwrap(),
+            initial
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cancellation_at_fence_has_zero_mutation() {
+        let initial = b"cancel at fence fixture";
+        let (directory, _root, prepared) = prepared_fixture(initial);
+        let cancellation = std::sync::atomic::AtomicBool::new(false);
+        let mut fence = || Err(WorkspaceReplaceFenceError::Cancelled);
+        let outcome = prepared.replace_existing_file_utf8_bounded_with_cancellation(
+            crate::sha256_hex(initial).as_str(),
+            "must not mutate",
+            &mut fence,
+            &cancellation,
+        );
+        match outcome {
+            WorkspaceReplaceCommitOutcome::Denied { error, evidence } => {
+                assert_eq!(error, WorkspaceReplaceError::CommitFenceCancelled);
+                assert_eq!(evidence.fence_calls, 1);
+                assert_eq!(evidence.modifying_syscalls, 0);
+            }
+            other => panic!("expected fence cancellation, got {other:?}"),
+        }
+        assert_eq!(
+            fs::read(directory.path().join("target.txt")).unwrap(),
+            initial
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cancellation_after_mutation_start_is_not_reported_as_denied() {
+        let initial = b"cancel after fixture";
+        let replacement = "replacement after cancellation";
+        let (directory, _root, prepared) = prepared_fixture(initial);
+        let cancellation = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancellation_for_fence = std::sync::Arc::clone(&cancellation);
+        let mut fence = move || {
+            cancellation_for_fence.store(true, Ordering::Release);
+            Ok(())
+        };
+        let outcome = prepared.replace_existing_file_utf8_bounded_with_cancellation(
+            crate::sha256_hex(initial).as_str(),
+            replacement,
+            &mut fence,
+            cancellation.as_ref(),
+        );
+        assert!(matches!(
+            outcome,
+            WorkspaceReplaceCommitOutcome::Committed { .. }
+                | WorkspaceReplaceCommitOutcome::CommitUnknown { .. }
+        ));
+        assert_eq!(
+            fs::read(directory.path().join("target.txt")).unwrap(),
+            replacement.as_bytes()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn raw_handle_never_leaves_native_boundary() {
+        let (_directory, _root, prepared) = prepared_fixture(b"raw handle fixture");
+        let prepared_debug = format!("{prepared:?}");
+        assert!(!prepared_debug.contains("OwnedHandle"));
+        assert!(!prepared_debug.contains("HANDLE"));
+        let mut fence = allow_fence();
+        let outcome = prepared.replace_existing_file_utf8_bounded(
+            crate::sha256_hex(b"raw handle fixture").as_str(),
+            "replacement",
+            &mut fence,
+        );
+        let outcome_debug = format!("{outcome:?}");
+        assert!(!outcome_debug.contains("HANDLE"));
+        assert!(!outcome_debug.contains("OwnedHandle"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn non_windows_replace_fails_closed() {
+        let path = PathBuf::from("/vita-h4b-test.txt");
+        let root = TrustedWorkspaceRoot {
+            inner: Arc::new(TrustedWorkspaceRootInner {
+                requested_path: path.clone(),
+                final_path: path,
+                identity: WorkspaceRootIdentity::unavailable(),
+            }),
+        };
+        let relative = WorkspaceRelativePath::parse(Path::new("target.txt")).expect("relative");
+        let prepared = PreparedWorkspaceTarget {
+            root: root.clone(),
+            relative_path: relative,
+            parent_identity: root.identity(),
+            target_identity: Some(root.identity()),
+            final_path: None,
+            kind: PreparedWorkspaceTargetKind::ExistingFile,
+        };
+        let mut fence = || Ok(());
+        let cancellation = std::sync::atomic::AtomicBool::new(false);
+        let outcome = prepared.replace_existing_file_utf8_bounded_with_cancellation(
+            &"0".repeat(64),
+            "must not use std::fs::write",
+            &mut fence,
+            &cancellation,
+        );
+        assert!(matches!(
+            outcome,
+            WorkspaceReplaceCommitOutcome::Denied {
+                error: WorkspaceReplaceError::UnavailableOnThisPlatform,
+                ..
+            }
+        ));
     }
 }

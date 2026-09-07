@@ -11,6 +11,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+#[cfg(test)]
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use codex_extension_api::{
@@ -20,7 +22,14 @@ use codex_extension_api::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::workspace_capability::{PreparedWorkspaceTarget, PreparedWorkspaceTargetKind};
+use super::workspace_capability::{
+    PreparedWorkspaceTarget, PreparedWorkspaceTargetKind, WorkspaceReplaceError,
+    WorkspaceReplaceEvidence,
+};
+#[cfg(test)]
+use super::workspace_capability::{
+    WorkspaceReplaceCommitOutcome, WorkspaceReplaceEvidenceEvent, WorkspaceReplaceFenceError,
+};
 use super::{sha256_hex, VitaExecutionContext, VitaRequestedScope};
 
 pub(crate) const VITA_WORKSPACE_REPLACE_TOOL_NAME: &str = "vita_workspace_replace_file";
@@ -377,6 +386,24 @@ struct VitaWorkspaceReplaceResult {
     classification: Option<H4DenyClassification>,
     grant_issued: bool,
     authorized_for_future_replace_foundation: bool,
+    execution: Option<VitaWorkspaceReplaceExecutionOutcome>,
+}
+
+#[derive(Debug)]
+enum VitaWorkspaceReplaceExecutionOutcome {
+    Denied {
+        classification: H4DenyClassification,
+    },
+    Conflict {
+        evidence: WorkspaceReplaceEvidence,
+    },
+    Committed {
+        evidence: WorkspaceReplaceEvidence,
+    },
+    CommitUnknown {
+        error: WorkspaceReplaceError,
+        evidence: WorkspaceReplaceEvidence,
+    },
 }
 
 impl VitaWorkspaceReplaceResult {
@@ -386,6 +413,7 @@ impl VitaWorkspaceReplaceResult {
             classification: Some(classification),
             grant_issued: false,
             authorized_for_future_replace_foundation: false,
+            execution: None,
         }
     }
 
@@ -398,6 +426,7 @@ impl VitaWorkspaceReplaceResult {
             classification: Some(classification),
             grant_issued: true,
             authorized_for_future_replace_foundation: false,
+            execution: None,
         }
     }
 
@@ -407,10 +436,66 @@ impl VitaWorkspaceReplaceResult {
             classification: None,
             grant_issued: true,
             authorized_for_future_replace_foundation: true,
+            execution: None,
+        }
+    }
+
+    fn governed(
+        request: VitaWorkspaceReplaceRequest,
+        outcome: VitaWorkspaceReplaceExecutionOutcome,
+        classification: Option<H4DenyClassification>,
+    ) -> Self {
+        Self {
+            request,
+            classification,
+            grant_issued: true,
+            authorized_for_future_replace_foundation: false,
+            execution: Some(outcome),
         }
     }
 
     fn model_value(&self) -> Value {
+        if let Some(execution) = &self.execution {
+            return match execution {
+                VitaWorkspaceReplaceExecutionOutcome::Denied { classification } => json!({
+                    "status": "denied",
+                    "tool": VITA_WORKSPACE_REPLACE_TOOL_NAME,
+                    "relative_path": self.request.relative_path.as_path().to_string_lossy(),
+                    "deny_classification": classification.as_str(),
+                    "mutation_performed": false,
+                    "side_effect_count": 0,
+                }),
+                VitaWorkspaceReplaceExecutionOutcome::Conflict { .. } => json!({
+                    "status": "conflict",
+                    "tool": VITA_WORKSPACE_REPLACE_TOOL_NAME,
+                    "relative_path": self.request.relative_path.as_path().to_string_lossy(),
+                    "commit_outcome": "conflict",
+                    "mutation_performed": false,
+                    "side_effect_count": 0,
+                }),
+                VitaWorkspaceReplaceExecutionOutcome::Committed { evidence } => json!({
+                    "status": "committed",
+                    "tool": VITA_WORKSPACE_REPLACE_TOOL_NAME,
+                    "relative_path": self.request.relative_path.as_path().to_string_lossy(),
+                    "bytes_written": evidence.bytes_after.unwrap_or(0),
+                    "before_sha256": evidence.before_sha256,
+                    "after_sha256": evidence.after_sha256,
+                    "commit_outcome": "committed",
+                    "mutation_performed": true,
+                    "side_effect_count": 1,
+                }),
+                VitaWorkspaceReplaceExecutionOutcome::CommitUnknown { .. } => json!({
+                    "status": "commit_outcome_unknown",
+                    "tool": VITA_WORKSPACE_REPLACE_TOOL_NAME,
+                    "relative_path": self.request.relative_path.as_path().to_string_lossy(),
+                    "commit_outcome": "unknown",
+                    "mutation_started": true,
+                    "automatic_retry": false,
+                    "side_effect_state": "may_have_mutated",
+                    "side_effect_count": 1,
+                }),
+            };
+        }
         let status = if self.authorized_for_future_replace_foundation {
             "authorized_for_future_replace_foundation"
         } else {
@@ -433,6 +518,7 @@ impl VitaWorkspaceReplaceResult {
 #[derive(Default)]
 struct H4BrokerState {
     seen_call_ids: HashSet<String>,
+    consumed_grant_ids: HashSet<String>,
 }
 
 #[derive(Default)]
@@ -453,6 +539,16 @@ struct H4BrokerMetrics {
     external_network_requests: AtomicUsize,
     active_authority: AtomicUsize,
     max_active_authority: AtomicUsize,
+    native_workers_started: AtomicUsize,
+    native_workers_joined: AtomicUsize,
+    exclusive_operation_handles: AtomicUsize,
+    final_revalidations: AtomicUsize,
+    final_revalidation_denials: AtomicUsize,
+    filesystem_mutation_attempts: AtomicUsize,
+    filesystem_mutations_committed: AtomicUsize,
+    filesystem_commit_unknown: AtomicUsize,
+    content_conflicts: AtomicUsize,
+    automatic_mutation_retries: AtomicUsize,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -472,6 +568,16 @@ pub(crate) struct VitaWorkspaceReplaceSnapshot {
     pub process_spawns: usize,
     pub external_network_requests: usize,
     pub max_active_authority: usize,
+    pub native_workers_started: usize,
+    pub native_workers_joined: usize,
+    pub exclusive_operation_handles: usize,
+    pub final_revalidations: usize,
+    pub final_revalidation_denials: usize,
+    pub filesystem_mutation_attempts: usize,
+    pub filesystem_mutations_committed: usize,
+    pub filesystem_commit_unknown: usize,
+    pub content_conflicts: usize,
+    pub automatic_mutation_retries: usize,
 }
 
 /// H4-A's Vita-side boundary is test/integration-only.  It can import an
@@ -482,7 +588,11 @@ pub(crate) struct VitaWorkspaceReplaceBroker {
     root: super::TrustedWorkspaceRoot,
     authority: Arc<dyn VitaH4AuthorityPort>,
     state: Mutex<H4BrokerState>,
-    cancelled: AtomicBool,
+    cancelled: Arc<AtomicBool>,
+    #[cfg(test)]
+    cancellation_notify: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    native_evidence: Mutex<Vec<WorkspaceReplaceEvidence>>,
     metrics: Arc<H4BrokerMetrics>,
 }
 
@@ -497,13 +607,19 @@ impl VitaWorkspaceReplaceBroker {
             root,
             authority,
             state: Mutex::new(H4BrokerState::default()),
-            cancelled: AtomicBool::new(false),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            cancellation_notify: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            native_evidence: Mutex::new(Vec::new()),
             metrics: Arc::new(H4BrokerMetrics::default()),
         })
     }
 
     pub(crate) fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
+        #[cfg(test)]
+        self.cancellation_notify.notify_one();
     }
 
     pub(crate) fn snapshot(&self) -> VitaWorkspaceReplaceSnapshot {
@@ -538,7 +654,40 @@ impl VitaWorkspaceReplaceBroker {
                 .external_network_requests
                 .load(Ordering::Acquire),
             max_active_authority: self.metrics.max_active_authority.load(Ordering::Acquire),
+            native_workers_started: self.metrics.native_workers_started.load(Ordering::Acquire),
+            native_workers_joined: self.metrics.native_workers_joined.load(Ordering::Acquire),
+            exclusive_operation_handles: self
+                .metrics
+                .exclusive_operation_handles
+                .load(Ordering::Acquire),
+            final_revalidations: self.metrics.final_revalidations.load(Ordering::Acquire),
+            final_revalidation_denials: self
+                .metrics
+                .final_revalidation_denials
+                .load(Ordering::Acquire),
+            filesystem_mutation_attempts: self
+                .metrics
+                .filesystem_mutation_attempts
+                .load(Ordering::Acquire),
+            filesystem_mutations_committed: self
+                .metrics
+                .filesystem_mutations_committed
+                .load(Ordering::Acquire),
+            filesystem_commit_unknown: self
+                .metrics
+                .filesystem_commit_unknown
+                .load(Ordering::Acquire),
+            content_conflicts: self.metrics.content_conflicts.load(Ordering::Acquire),
+            automatic_mutation_retries: self
+                .metrics
+                .automatic_mutation_retries
+                .load(Ordering::Acquire),
         }
+    }
+
+    #[cfg(test)]
+    fn native_evidence_snapshot(&self) -> Vec<WorkspaceReplaceEvidence> {
+        lock_unpoisoned(&self.native_evidence).clone()
     }
 
     async fn execute_request(
@@ -800,6 +949,728 @@ impl VitaWorkspaceReplaceBroker {
                 },
             ),
         }
+    }
+}
+
+// D29-H4-C IMPLEMENTATION START
+#[cfg(test)]
+const H4C_NATIVE_FENCE_WAIT: Duration = Duration::from_secs(5);
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum H4CNativeFault {
+    AfterFirstWrite,
+}
+
+#[cfg(test)]
+type H4CNativeSetup = Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(test)]
+struct H4CFinalFenceRequest {
+    decision: std::sync::mpsc::SyncSender<Result<(), WorkspaceReplaceFenceError>>,
+}
+
+#[cfg(test)]
+struct H4CCommitFence {
+    requests: tokio::sync::mpsc::Sender<H4CFinalFenceRequest>,
+    cancellation: Arc<AtomicBool>,
+    sent: bool,
+}
+
+#[cfg(test)]
+impl H4CCommitFence {
+    fn new(
+        requests: tokio::sync::mpsc::Sender<H4CFinalFenceRequest>,
+        cancellation: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            requests,
+            cancellation,
+            sent: false,
+        }
+    }
+}
+
+#[cfg(test)]
+impl super::workspace_capability::WorkspaceReplaceCommitFence for H4CCommitFence {
+    fn check(&mut self) -> Result<(), WorkspaceReplaceFenceError> {
+        if self.sent {
+            return Err(WorkspaceReplaceFenceError::Error);
+        }
+        self.sent = true;
+        if self.cancellation.load(Ordering::Acquire) {
+            return Err(WorkspaceReplaceFenceError::Cancelled);
+        }
+        let (decision, result) = std::sync::mpsc::sync_channel(1);
+        self.requests
+            .blocking_send(H4CFinalFenceRequest { decision })
+            .map_err(|_| WorkspaceReplaceFenceError::Error)?;
+        let result = result
+            .recv_timeout(H4C_NATIVE_FENCE_WAIT)
+            .map_err(|_| WorkspaceReplaceFenceError::Error)?;
+        if self.cancellation.load(Ordering::Acquire) {
+            return Err(WorkspaceReplaceFenceError::Cancelled);
+        }
+        result
+    }
+}
+
+#[cfg(test)]
+struct H4CGrantBinding {
+    grant_id: String,
+    authorization_revision: i64,
+    confirmation_id: String,
+}
+
+#[cfg(test)]
+impl H4CGrantBinding {
+    fn from_grant(grant: &VitaExecutableReplaceGrant) -> Self {
+        Self {
+            grant_id: grant.grant_id.clone(),
+            authorization_revision: grant.authorization_revision,
+            confirmation_id: grant.confirmation_id.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+struct H4CRevalidationInput {
+    context: VitaExecutionContext,
+    capability_id: String,
+    tool_call_id: String,
+    turn_id: String,
+    relative_path: super::WorkspaceRelativePath,
+    expected_sha256: String,
+    replacement_sha256: String,
+    replacement_bytes: usize,
+    workspace_root_identity: super::WorkspaceRootIdentity,
+    target_identity: super::WorkspaceRootIdentity,
+    target_kind: PreparedWorkspaceTargetKind,
+}
+
+#[cfg(test)]
+impl H4CRevalidationInput {
+    fn from_grant(grant: &VitaExecutableReplaceGrant) -> Self {
+        Self {
+            context: VitaExecutionContext::try_new(&grant.life_id, &grant.task_id)
+                .expect("H4-C grant carries a valid execution context"),
+            capability_id: grant.capability_id.clone(),
+            tool_call_id: grant.tool_call_id.clone(),
+            turn_id: grant.turn_id.clone(),
+            relative_path: grant.relative_path.clone(),
+            expected_sha256: grant.expected_sha256.clone(),
+            replacement_sha256: grant.replacement_sha256.clone(),
+            replacement_bytes: grant.replacement_bytes,
+            workspace_root_identity: grant.workspace_root_identity,
+            target_identity: grant.target_identity,
+            target_kind: grant.target_kind,
+        }
+    }
+
+    fn into_request(self, binding: &H4CGrantBinding) -> H4AuthorityRequest {
+        H4AuthorityRequest {
+            context: self.context,
+            capability_id: self.capability_id,
+            operation: H4AuthorityOperation::Revalidate {
+                grant_id: binding.grant_id.clone(),
+                authorization_revision: binding.authorization_revision,
+            },
+            tool_call_id: self.tool_call_id,
+            turn_id: self.turn_id,
+            relative_path: self.relative_path,
+            expected_sha256: self.expected_sha256,
+            replacement_sha256: self.replacement_sha256,
+            replacement_bytes: self.replacement_bytes,
+            workspace_root_identity: self.workspace_root_identity,
+            target_identity: self.target_identity,
+            target_kind: self.target_kind,
+        }
+    }
+}
+
+#[cfg(test)]
+struct H4CFenceDecision {
+    fence: Result<(), WorkspaceReplaceFenceError>,
+    classification: Option<H4DenyClassification>,
+}
+
+#[cfg(test)]
+impl VitaWorkspaceReplaceBroker {
+    /// H4-C deliberately has a separate execution path from H4-A's
+    /// authorization-only `execute_request`.  The only blocking work below
+    /// is the already-frozen H4-B native primitive, and its synchronous fence
+    /// is bridged back to this async function through one bounded request and
+    /// one bounded decision.
+    async fn execute_governed_request(
+        &self,
+        request: VitaWorkspaceReplaceRequest,
+    ) -> VitaWorkspaceReplaceResult {
+        self.execute_governed_request_with_setup(request, None, None)
+            .await
+    }
+
+    async fn execute_governed_request_with_fault(
+        &self,
+        request: VitaWorkspaceReplaceRequest,
+        native_fault: Option<H4CNativeFault>,
+    ) -> VitaWorkspaceReplaceResult {
+        self.execute_governed_request_with_setup(request, native_fault, None)
+            .await
+    }
+
+    async fn execute_governed_request_with_setup(
+        &self,
+        request: VitaWorkspaceReplaceRequest,
+        native_fault: Option<H4CNativeFault>,
+        native_setup: Option<H4CNativeSetup>,
+    ) -> VitaWorkspaceReplaceResult {
+        self.metrics
+            .attempted_requests
+            .fetch_add(1, Ordering::AcqRel);
+        if self.cancelled.load(Ordering::Acquire) {
+            return VitaWorkspaceReplaceResult::denied(
+                request,
+                H4DenyClassification::TurnCancelled,
+            );
+        }
+
+        let Some(bound_context) = self.context.as_ref() else {
+            return VitaWorkspaceReplaceResult::denied(
+                request,
+                H4DenyClassification::MissingContext,
+            );
+        };
+        let Some(request_context) = request.context.as_ref() else {
+            return VitaWorkspaceReplaceResult::denied(
+                request,
+                H4DenyClassification::MissingContext,
+            );
+        };
+        if request_context.life_id() != bound_context.life_id() {
+            return VitaWorkspaceReplaceResult::denied(
+                request,
+                H4DenyClassification::WrongLifeBinding,
+            );
+        }
+        if request_context.task_id() != bound_context.task_id() {
+            return VitaWorkspaceReplaceResult::denied(
+                request,
+                H4DenyClassification::WrongTaskBinding,
+            );
+        }
+
+        let call_admission = {
+            let mut state = lock_unpoisoned(&self.state);
+            if state.seen_call_ids.contains(&request.tool_call_id) {
+                Err(H4DenyClassification::DuplicateToolCall)
+            } else if state.seen_call_ids.len() >= MAX_SEEN_CALL_IDS {
+                Err(H4DenyClassification::CallLimitExceeded)
+            } else {
+                state.seen_call_ids.insert(request.tool_call_id.clone());
+                Ok(())
+            }
+        };
+        if let Err(classification) = call_admission {
+            if classification == H4DenyClassification::DuplicateToolCall {
+                self.metrics
+                    .confirmation_replay_denials
+                    .fetch_add(1, Ordering::AcqRel);
+            }
+            return VitaWorkspaceReplaceResult::denied(request, classification);
+        }
+
+        // This first preparation supplies the immutable action facts needed
+        // by IssueReplaceGrant.  It is not the H4-B operation handle: the
+        // actual exclusive handle is opened only after the grant is imported
+        // inside the native worker below.
+        let prepared_for_issue = match self.root.prepare_target(request.relative_path.as_path()) {
+            Ok(prepared) => prepared,
+            Err(_) => {
+                return VitaWorkspaceReplaceResult::denied(
+                    request,
+                    H4DenyClassification::TargetRejected,
+                )
+            }
+        };
+        if prepared_for_issue.kind() != PreparedWorkspaceTargetKind::ExistingFile
+            || prepared_for_issue.target_identity().is_none()
+        {
+            return VitaWorkspaceReplaceResult::denied(
+                request,
+                if prepared_for_issue.kind() == PreparedWorkspaceTargetKind::Missing {
+                    H4DenyClassification::TargetMissing
+                } else {
+                    H4DenyClassification::TargetRejected
+                },
+            );
+        }
+        if self.cancelled.load(Ordering::Acquire) {
+            return VitaWorkspaceReplaceResult::denied(
+                request,
+                H4DenyClassification::TurnCancelled,
+            );
+        }
+
+        let replacement_bytes = request.replacement_content.as_bytes().len();
+        let replacement_sha256 = sha256_hex(request.replacement_content.as_bytes());
+        let authority_request = H4AuthorityRequest {
+            context: bound_context.clone(),
+            capability_id: VITA_WORKSPACE_REPLACE_CAPABILITY_ID.to_string(),
+            operation: H4AuthorityOperation::IssueReplaceGrant,
+            tool_call_id: request.tool_call_id.clone(),
+            turn_id: request.turn_id.clone(),
+            relative_path: request.relative_path.clone(),
+            expected_sha256: request.expected_sha256.clone(),
+            replacement_sha256,
+            replacement_bytes,
+            workspace_root_identity: prepared_for_issue.root().identity(),
+            target_identity: prepared_for_issue
+                .target_identity()
+                .expect("existing H4-C target has an identity"),
+            target_kind: prepared_for_issue.kind(),
+        };
+        let initial_authority = match self.evaluate_authority(authority_request.clone()).await {
+            Ok(response) => response,
+            Err(classification) => {
+                return VitaWorkspaceReplaceResult::denied(request, classification)
+            }
+        };
+        if self.cancelled.load(Ordering::Acquire) {
+            return VitaWorkspaceReplaceResult::denied(
+                request,
+                H4DenyClassification::LateAfterCancellation,
+            );
+        }
+
+        let (confirmation, evidence) =
+            match validate_issue_completion(&initial_authority, &authority_request) {
+                Ok(value) => value,
+                Err(classification) => {
+                    self.record_denial(classification);
+                    return VitaWorkspaceReplaceResult::denied(request, classification);
+                }
+            };
+        let grant = match VitaExecutableReplaceGrant::from_host_evidence(
+            confirmation,
+            evidence,
+            &authority_request,
+            &prepared_for_issue,
+        ) {
+            Ok(grant) => grant,
+            Err(_) => {
+                self.metrics
+                    .confirmation_mismatch_denials
+                    .fetch_add(1, Ordering::AcqRel);
+                return VitaWorkspaceReplaceResult::denied(
+                    request,
+                    H4DenyClassification::GrantRejected,
+                );
+            }
+        };
+        self.metrics.grants_issued.fetch_add(1, Ordering::AcqRel);
+        if initial_authority.confirmation_consumed {
+            self.metrics
+                .confirmations_consumed
+                .fetch_add(1, Ordering::AcqRel);
+        }
+
+        if self.cancelled.load(Ordering::Acquire) {
+            return VitaWorkspaceReplaceResult::governed(
+                request,
+                VitaWorkspaceReplaceExecutionOutcome::Denied {
+                    classification: H4DenyClassification::LateAfterCancellation,
+                },
+                Some(H4DenyClassification::LateAfterCancellation),
+            );
+        }
+
+        if let Some(native_setup) = native_setup {
+            native_setup();
+        }
+        if self.cancelled.load(Ordering::Acquire) {
+            return VitaWorkspaceReplaceResult::governed(
+                request,
+                VitaWorkspaceReplaceExecutionOutcome::Denied {
+                    classification: H4DenyClassification::LateAfterCancellation,
+                },
+                Some(H4DenyClassification::LateAfterCancellation),
+            );
+        }
+
+        // The preflight target was used only to bind the Host issue request.
+        // Release its metadata handle before H4-C enters the actual H4-B
+        // preparation, so the native worker owns the only operation handle.
+        drop(prepared_for_issue);
+
+        let grant_admission = {
+            let mut state = lock_unpoisoned(&self.state);
+            if state.consumed_grant_ids.insert(grant.grant_id.clone()) {
+                Ok(())
+            } else {
+                Err(H4DenyClassification::ConfirmationReplay)
+            }
+        };
+        if let Err(classification) = grant_admission {
+            self.record_denial(classification);
+            return VitaWorkspaceReplaceResult::governed(
+                request,
+                VitaWorkspaceReplaceExecutionOutcome::Denied { classification },
+                Some(classification),
+            );
+        }
+
+        let binding = H4CGrantBinding::from_grant(&grant);
+        let revalidation_input = H4CRevalidationInput::from_grant(&grant);
+        let (requests, mut receiver) = tokio::sync::mpsc::channel(1);
+        let fence = H4CCommitFence::new(requests, Arc::clone(&self.cancelled));
+        let native_request = request.clone();
+        let native_root = self.root.clone();
+        let native_cancellation = Arc::clone(&self.cancelled);
+        self.metrics
+            .native_workers_started
+            .fetch_add(1, Ordering::AcqRel);
+        let native = tokio::task::spawn_blocking(move || {
+            execute_h4c_native_replace(
+                grant,
+                native_request,
+                native_root,
+                fence,
+                native_cancellation,
+                native_fault,
+            )
+        });
+
+        let fence_decision = self
+            .service_h4c_fence(&mut receiver, revalidation_input, &binding)
+            .await;
+        let native_outcome = match native.await {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                self.metrics
+                    .native_workers_joined
+                    .fetch_add(1, Ordering::AcqRel);
+                return VitaWorkspaceReplaceResult::governed(
+                    request,
+                    VitaWorkspaceReplaceExecutionOutcome::Denied {
+                        classification: H4DenyClassification::AuthorityPanic,
+                    },
+                    Some(H4DenyClassification::AuthorityPanic),
+                );
+            }
+        };
+        self.metrics
+            .native_workers_joined
+            .fetch_add(1, Ordering::AcqRel);
+
+        self.record_h4c_native_metrics(&native_outcome);
+        let fence_classification = fence_decision
+            .as_ref()
+            .and_then(|decision| decision.classification);
+        let classification = fence_classification.or_else(|| {
+            native_outcome
+                .error_classification()
+                .filter(|_| matches!(native_outcome, WorkspaceReplaceCommitOutcome::Denied { .. }))
+        });
+        VitaWorkspaceReplaceResult::governed(
+            request,
+            VitaWorkspaceReplaceExecutionOutcome::from_native(native_outcome),
+            classification,
+        )
+    }
+
+    async fn service_h4c_fence(
+        &self,
+        receiver: &mut tokio::sync::mpsc::Receiver<H4CFinalFenceRequest>,
+        input: H4CRevalidationInput,
+        binding: &H4CGrantBinding,
+    ) -> Option<H4CFenceDecision> {
+        let fence_request = receiver.recv().await?;
+        self.metrics
+            .final_revalidations
+            .fetch_add(1, Ordering::AcqRel);
+        if self.cancelled.load(Ordering::Acquire) {
+            let decision = H4CFenceDecision {
+                fence: Err(WorkspaceReplaceFenceError::Cancelled),
+                classification: Some(H4DenyClassification::TurnCancelled),
+            };
+            let _ = fence_request
+                .decision
+                .send(Err(WorkspaceReplaceFenceError::Cancelled));
+            self.metrics
+                .final_revalidation_denials
+                .fetch_add(1, Ordering::AcqRel);
+            return Some(decision);
+        }
+
+        let authority_request = input.into_request(binding);
+        let authority = self.evaluate_authority(authority_request.clone());
+        let mut decision = tokio::select! {
+            _ = self.cancellation_notify.notified() => H4CFenceDecision {
+                fence: Err(WorkspaceReplaceFenceError::Cancelled),
+                classification: Some(H4DenyClassification::TurnCancelled),
+            },
+            response = tokio::time::timeout(H4C_NATIVE_FENCE_WAIT, authority) => match response {
+                Err(_) => H4CFenceDecision {
+                    fence: Err(WorkspaceReplaceFenceError::Error),
+                    classification: Some(H4DenyClassification::AuthorityError),
+                },
+                Ok(Ok(response)) => match validate_h4c_revalidation(
+                    &response,
+                    &authority_request,
+                    binding,
+                ) {
+                    Ok(()) => H4CFenceDecision {
+                        fence: Ok(()),
+                        classification: None,
+                    },
+                    Err(classification) => H4CFenceDecision {
+                        fence: Err(WorkspaceReplaceFenceError::Denied),
+                        classification: Some(classification),
+                    },
+                },
+                Ok(Err(classification)) => H4CFenceDecision {
+                    fence: Err(WorkspaceReplaceFenceError::Error),
+                    classification: Some(classification),
+                },
+            },
+        };
+        if self.cancelled.load(Ordering::Acquire) {
+            decision = H4CFenceDecision {
+                fence: Err(WorkspaceReplaceFenceError::Cancelled),
+                classification: Some(H4DenyClassification::TurnCancelled),
+            };
+        }
+        if decision.fence.is_err() {
+            self.metrics
+                .final_revalidation_denials
+                .fetch_add(1, Ordering::AcqRel);
+        }
+        let _ = fence_request.decision.send(decision.fence);
+        Some(decision)
+    }
+
+    async fn handle_call_governed(&self, call: ToolCall<'_>) -> VitaWorkspaceReplaceResult {
+        match VitaWorkspaceReplaceRequest::from_codex_call(&call, self.context.as_ref()) {
+            Ok(request) => self.execute_governed_request(request).await,
+            Err(error) => VitaWorkspaceReplaceResult::denied(
+                invalid_request_for_call(&call, self.context.clone()),
+                match error {
+                    H4RequestBuildError::UnmappedTool => H4DenyClassification::UnmappedTool,
+                    _ => H4DenyClassification::InvalidRequest,
+                },
+            ),
+        }
+    }
+
+    fn record_h4c_native_metrics(&self, outcome: &WorkspaceReplaceCommitOutcome) {
+        let evidence = match outcome {
+            WorkspaceReplaceCommitOutcome::Denied { evidence, .. }
+            | WorkspaceReplaceCommitOutcome::Conflict { evidence }
+            | WorkspaceReplaceCommitOutcome::Committed { evidence }
+            | WorkspaceReplaceCommitOutcome::CommitUnknown { evidence, .. } => evidence,
+        };
+        lock_unpoisoned(&self.native_evidence).push(evidence.clone());
+        if evidence.mutation_attempted {
+            self.metrics
+                .filesystem_mutation_attempts
+                .fetch_add(1, Ordering::AcqRel);
+        }
+        self.metrics
+            .exclusive_operation_handles
+            .fetch_add(evidence.operation_handle_open_count, Ordering::AcqRel);
+        match outcome {
+            WorkspaceReplaceCommitOutcome::Conflict { .. } => {
+                self.metrics
+                    .content_conflicts
+                    .fetch_add(1, Ordering::AcqRel);
+            }
+            WorkspaceReplaceCommitOutcome::Committed { .. } => {
+                self.metrics
+                    .filesystem_mutations_committed
+                    .fetch_add(1, Ordering::AcqRel);
+                self.metrics
+                    .filesystem_mutations
+                    .fetch_add(1, Ordering::AcqRel);
+                self.metrics
+                    .authorized_write_count
+                    .fetch_add(1, Ordering::AcqRel);
+            }
+            WorkspaceReplaceCommitOutcome::CommitUnknown { .. } => {
+                self.metrics
+                    .filesystem_commit_unknown
+                    .fetch_add(1, Ordering::AcqRel);
+            }
+            WorkspaceReplaceCommitOutcome::Denied { .. } => {}
+        }
+    }
+}
+
+#[cfg(test)]
+fn execute_h4c_native_replace(
+    grant: VitaExecutableReplaceGrant,
+    request: VitaWorkspaceReplaceRequest,
+    root: super::TrustedWorkspaceRoot,
+    mut fence: H4CCommitFence,
+    cancellation: Arc<AtomicBool>,
+    native_fault: Option<H4CNativeFault>,
+) -> WorkspaceReplaceCommitOutcome {
+    let prepared = match root.prepare_target(request.relative_path.as_path()) {
+        Ok(prepared) => prepared,
+        Err(_) => {
+            return WorkspaceReplaceCommitOutcome::Denied {
+                error: WorkspaceReplaceError::InvalidPreparedTarget,
+                evidence: WorkspaceReplaceEvidence::default(),
+            }
+        }
+    };
+    if prepared.kind() == PreparedWorkspaceTargetKind::Missing {
+        return WorkspaceReplaceCommitOutcome::Denied {
+            error: WorkspaceReplaceError::TargetMissing,
+            evidence: WorkspaceReplaceEvidence::default(),
+        };
+    }
+    if validate_h4c_native_binding(&grant, &request, &prepared).is_err() {
+        return WorkspaceReplaceCommitOutcome::Denied {
+            error: WorkspaceReplaceError::InvalidPreparedTarget,
+            evidence: WorkspaceReplaceEvidence::default(),
+        };
+    }
+    let expected_sha256 = grant.expected_sha256.clone();
+    #[cfg(windows)]
+    if let Some(native_fault) = native_fault {
+        return match native_fault {
+            H4CNativeFault::AfterFirstWrite => prepared
+                .replace_existing_file_utf8_bounded_with_test_fault(
+                    &expected_sha256,
+                    &request.replacement_content,
+                    &mut fence,
+                    cancellation.as_ref(),
+                    super::workspace_capability::WorkspaceReplaceTestFault::AfterFirstWrite,
+                ),
+        };
+    }
+    #[cfg(not(windows))]
+    let _ = native_fault;
+    prepared.replace_existing_file_utf8_bounded_with_cancellation(
+        &expected_sha256,
+        &request.replacement_content,
+        &mut fence,
+        cancellation.as_ref(),
+    )
+}
+
+#[cfg(test)]
+fn validate_h4c_native_binding(
+    grant: &VitaExecutableReplaceGrant,
+    request: &VitaWorkspaceReplaceRequest,
+    prepared: &PreparedWorkspaceTarget,
+) -> Result<(), H4DenyClassification> {
+    if grant.operation != H4ReplaceOperation::ReplaceExistingUtf8File
+        || grant.capability_id != VITA_WORKSPACE_REPLACE_CAPABILITY_ID
+        || grant.relative_path != request.relative_path
+        || grant.expected_sha256 != request.expected_sha256
+        || grant.replacement_sha256 != sha256_hex(request.replacement_content.as_bytes())
+        || grant.replacement_bytes != request.replacement_content.as_bytes().len()
+        || grant.workspace_root_identity != prepared.root().identity()
+        || grant.target_identity
+            != prepared
+                .target_identity()
+                .ok_or(H4DenyClassification::AuthorityEvidenceMismatch)?
+        || grant.target_kind != prepared.kind()
+        || prepared.kind() != PreparedWorkspaceTargetKind::ExistingFile
+    {
+        return Err(H4DenyClassification::AuthorityEvidenceMismatch);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn validate_h4c_revalidation(
+    response: &H4HostAuthorityResponse,
+    request: &H4AuthorityRequest,
+    binding: &H4CGrantBinding,
+) -> Result<(), H4DenyClassification> {
+    let revision = validate_canonical_decision(&response.canonical, request)?;
+    let H4AuthorityOperation::Revalidate {
+        grant_id,
+        authorization_revision,
+    } = &request.operation
+    else {
+        return Err(H4DenyClassification::AuthorityEvidenceMismatch);
+    };
+    if revision != *authorization_revision
+        || binding.authorization_revision != *authorization_revision
+        || binding.grant_id != *grant_id
+    {
+        return Err(H4DenyClassification::StaleRevision);
+    }
+    let evidence = response
+        .grant
+        .as_ref()
+        .ok_or(H4DenyClassification::RevalidationDenied)?;
+    validate_grant_evidence(evidence, request, revision, &binding.confirmation_id).map(|_| ())
+}
+
+#[cfg(test)]
+impl VitaWorkspaceReplaceExecutionOutcome {
+    fn from_native(outcome: WorkspaceReplaceCommitOutcome) -> Self {
+        match outcome {
+            WorkspaceReplaceCommitOutcome::Denied { error, evidence: _ } => Self::Denied {
+                classification: native_error_classification(error),
+            },
+            WorkspaceReplaceCommitOutcome::Conflict { evidence } => Self::Conflict { evidence },
+            WorkspaceReplaceCommitOutcome::Committed { evidence } => Self::Committed { evidence },
+            WorkspaceReplaceCommitOutcome::CommitUnknown { error, evidence } => {
+                Self::CommitUnknown { error, evidence }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+impl WorkspaceReplaceCommitOutcome {
+    fn error_classification(&self) -> Option<H4DenyClassification> {
+        match self {
+            Self::Denied { error, .. } | Self::CommitUnknown { error, .. } => {
+                Some(native_error_classification(*error))
+            }
+            Self::Conflict { .. } | Self::Committed { .. } => None,
+        }
+    }
+}
+
+#[cfg(test)]
+fn native_error_classification(error: WorkspaceReplaceError) -> H4DenyClassification {
+    match error {
+        WorkspaceReplaceError::TargetMissing => H4DenyClassification::TargetMissing,
+        WorkspaceReplaceError::CommitFenceDenied
+        | WorkspaceReplaceError::CommitFenceStale
+        | WorkspaceReplaceError::CommitFenceCancelled
+        | WorkspaceReplaceError::CommitFenceError
+        | WorkspaceReplaceError::CommitFencePanic => H4DenyClassification::RevalidationDenied,
+        WorkspaceReplaceError::HardLinkAmbiguous
+        | WorkspaceReplaceError::ReparseTarget
+        | WorkspaceReplaceError::TargetBusy
+        | WorkspaceReplaceError::TargetIdentityChanged
+        | WorkspaceReplaceError::ParentIdentityChanged
+        | WorkspaceReplaceError::RootIdentityChanged
+        | WorkspaceReplaceError::TargetOutsideRoot
+        | WorkspaceReplaceError::CurrentFileTooLarge
+        | WorkspaceReplaceError::CurrentContentNotUtf8
+        | WorkspaceReplaceError::InvalidPreparedTarget
+        | WorkspaceReplaceError::InvalidExpectedHash
+        | WorkspaceReplaceError::ReplacementTooLarge
+        | WorkspaceReplaceError::OperationHandleIo
+        | WorkspaceReplaceError::CancellationBeforeMutation
+        | WorkspaceReplaceError::FaultInjected
+        | WorkspaceReplaceError::WriteFailed
+        | WorkspaceReplaceError::ShortWrite
+        | WorkspaceReplaceError::ZeroProgressWrite
+        | WorkspaceReplaceError::SetEndOfFileFailed
+        | WorkspaceReplaceError::FlushFailed
+        | WorkspaceReplaceError::PostWriteVerificationFailed
+        | WorkspaceReplaceError::UnavailableOnThisPlatform
+        | WorkspaceReplaceError::ReparseParent => H4DenyClassification::TargetRejected,
     }
 }
 
@@ -1276,6 +2147,91 @@ impl<'call> ToolExecutor<ToolCall<'call>> for VitaWorkspaceReplaceTool {
     }
 }
 
+/// Test/integration-only H4-C contributor.  It is intentionally separate from
+/// the H4-A contributor so the authorization-only canary cannot accidentally
+/// acquire a mutation path.
+#[cfg(test)]
+pub(crate) struct VitaWorkspaceReplaceGovernedToolContributor {
+    broker: Arc<VitaWorkspaceReplaceBroker>,
+}
+
+#[cfg(test)]
+impl VitaWorkspaceReplaceGovernedToolContributor {
+    pub(crate) fn new(broker: Arc<VitaWorkspaceReplaceBroker>) -> Self {
+        Self { broker }
+    }
+}
+
+#[cfg(test)]
+impl ToolContributor for VitaWorkspaceReplaceGovernedToolContributor {
+    fn tools(
+        &self,
+        _session_store: &codex_extension_api::ExtensionData,
+        _thread_store: &codex_extension_api::ExtensionData,
+    ) -> Vec<Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>>> {
+        vec![Arc::new(VitaWorkspaceReplaceGovernedTool {
+            broker: Arc::clone(&self.broker),
+        })]
+    }
+}
+
+#[cfg(test)]
+struct VitaWorkspaceReplaceGovernedTool {
+    broker: Arc<VitaWorkspaceReplaceBroker>,
+}
+
+#[cfg(test)]
+impl<'call> ToolExecutor<ToolCall<'call>> for VitaWorkspaceReplaceGovernedTool {
+    fn tool_name(&self) -> ToolName {
+        ToolName::plain(VITA_WORKSPACE_REPLACE_TOOL_NAME)
+    }
+
+    fn spec(&self) -> ToolSpec {
+        let parameters = parse_tool_input_schema(&json!({
+            "type": "object",
+            "properties": {
+                "relative_path": {"type": "string"},
+                "expected_sha256": {
+                    "type": "string",
+                    "pattern": "^[a-f0-9]{64}$"
+                },
+                "replacement_content": {"type": "string"}
+            },
+            "required": ["relative_path", "expected_sha256", "replacement_content"],
+            "additionalProperties": false
+        }))
+        .expect("D29-H4-C replace tool schema is static and valid");
+        ToolSpec::Function(ResponsesApiTool {
+            name: VITA_WORKSPACE_REPLACE_TOOL_NAME.to_string(),
+            description:
+                "Replace one existing bounded UTF-8 workspace file after H4 authority and same-handle checks."
+                    .to_string(),
+            strict: true,
+            defer_loading: None,
+            parameters,
+            output_schema: None,
+        })
+    }
+
+    fn supports_parallel_tool_calls(&self) -> bool {
+        false
+    }
+
+    fn handle<'a>(&'a self, call: ToolCall<'call>) -> ToolExecutorFuture<'a>
+    where
+        'call: 'a,
+    {
+        let broker = Arc::clone(&self.broker);
+        Box::pin(async move {
+            let result = broker.handle_call_governed(call).await;
+            Ok(Box::new(JsonToolOutput::with_success(
+                result.model_value(),
+                Some(false),
+            )) as Box<dyn ToolOutput>)
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1414,6 +2370,7 @@ mod tests {
         trusted_confirmations_provisioned: AtomicUsize,
         request_derived_confirmations: AtomicUsize,
         events: Mutex<Vec<H4AuthorityEvent>>,
+        requests: Mutex<Vec<H4AuthorityRequest>>,
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1451,6 +2408,7 @@ mod tests {
                 trusted_confirmations_provisioned: AtomicUsize::new(0),
                 request_derived_confirmations: AtomicUsize::new(0),
                 events: Mutex::new(Vec::new()),
+                requests: Mutex::new(Vec::new()),
             })
         }
 
@@ -1633,6 +2591,7 @@ mod tests {
     impl VitaH4AuthorityPort for TestHostAuthority {
         fn evaluate(&self, request: H4AuthorityRequest) -> VitaH4AuthorityFuture {
             self.calls.fetch_add(1, Ordering::AcqRel);
+            lock_unpoisoned(&self.requests).push(request.clone());
             let response = match request.operation {
                 H4AuthorityOperation::IssueReplaceGrant => {
                     lock_unpoisoned(&self.events).push(H4AuthorityEvent::IssueEvaluated);
@@ -2230,6 +3189,10 @@ mod tests {
         let h4_source =
             fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/d29h4.rs"))
                 .expect("read H4-A source");
+        let h4_a_source = h4_source
+            .split("// D29-H4-C IMPLEMENTATION START")
+            .next()
+            .expect("H4-A source boundary marker is present");
         for forbidden in [
             concat!("Set", "EndOfFile"),
             concat!("FlushFile", "Buffers"),
@@ -2241,7 +3204,7 @@ mod tests {
             concat!("remove_", "file"),
         ] {
             assert!(
-                !h4_source.contains(forbidden),
+                !h4_a_source.contains(forbidden),
                 "H4-A authority path contains forbidden mutation primitive: {forbidden}"
             );
         }
@@ -2341,6 +3304,11 @@ mod tests {
             target_identity: String,
             target_kind: String,
             authorization_revision: i64,
+        },
+        DisableAuthorizationForTest {
+            life_id: String,
+            capability_id: String,
+            expected_revision: i64,
         },
         Shutdown {},
     }
@@ -2562,6 +3530,30 @@ mod tests {
             *lock_unpoisoned(&self.io) = None;
             valid_response && exited
         }
+
+        fn disable_authorization_for_test(&self, expected_revision: i64) -> Result<(), String> {
+            let response =
+                self.roundtrip_blocking(&H4HostWireRequest::DisableAuthorizationForTest {
+                    life_id: LIFE_ID.to_string(),
+                    capability_id: VITA_WORKSPACE_REPLACE_CAPABILITY_ID.to_string(),
+                    expected_revision,
+                })?;
+            let response: H4HostResponse = serde_json::from_slice(&response)
+                .map_err(|_| "H4 Host disable response malformed".to_string())?;
+            if response.operation != "disable_authorization_for_test"
+                || response.status != "ok"
+                || response.canonical.is_some()
+                || response.confirmation.is_some()
+                || response.action_grant.is_some()
+                || response.confirmation_consumed
+                || response.denial.is_some()
+                || response.authorization_revision != Some(expected_revision + 1)
+                || response.error_code.is_some()
+            {
+                return Err("H4 Host disable response invalid".to_string());
+            }
+            Ok(())
+        }
     }
 
     impl Drop for PersistentH4HostProcess {
@@ -2670,6 +3662,11 @@ mod tests {
 
         fn shutdown(&self) -> bool {
             self.process.shutdown()
+        }
+
+        fn disable_authorization_for_test(&self, expected_revision: i64) -> Result<(), String> {
+            self.process
+                .disable_authorization_for_test(expected_revision)
         }
     }
 
@@ -3102,6 +4099,12 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum H4FixtureMode {
+        AuthorizationOnly,
+        GovernedReplace,
+    }
+
     #[derive(Clone, Debug, Default)]
     struct H4FixtureObservation {
         request_count: usize,
@@ -3109,6 +4112,7 @@ mod tests {
         first_request_has_h4_tool: bool,
         second_request_received_h3_hash: bool,
         third_request_received_authorized_h4_result: bool,
+        third_request_received_committed_h4_result: bool,
         third_request_excluded_authority_facts: bool,
         error: Option<String>,
     }
@@ -3217,8 +4221,16 @@ mod tests {
 
     impl H4ResponsesFixture {
         fn start() -> Self {
-            let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind H4-A loopback fixture");
-            let address = listener.local_addr().expect("H4-A fixture address");
+            Self::start_with_mode(H4FixtureMode::AuthorizationOnly)
+        }
+
+        fn start_h4c() -> Self {
+            Self::start_with_mode(H4FixtureMode::GovernedReplace)
+        }
+
+        fn start_with_mode(mode: H4FixtureMode) -> Self {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind H4 loopback fixture");
+            let address = listener.local_addr().expect("H4 fixture address");
             let stop = Arc::new(AtomicBool::new(false));
             let observation = Arc::new(Mutex::new(H4FixtureObservation::default()));
             let gate = H4CanaryGate::new();
@@ -3244,6 +4256,7 @@ mod tests {
                         peer,
                         response_index,
                         &gate_for_thread,
+                        mode,
                     );
                     let mut observed = lock_unpoisoned(&observation_for_thread);
                     observed.request_count += 1;
@@ -3262,6 +4275,8 @@ mod tests {
                             2 => {
                                 observed.third_request_received_authorized_h4_result =
                                     request_has_authorized_h4_result(body);
+                                observed.third_request_received_committed_h4_result =
+                                    request_has_committed_h4_result(body);
                                 observed.third_request_excluded_authority_facts =
                                     request_excludes_h4_authority_facts(body);
                             }
@@ -3387,6 +4402,20 @@ mod tests {
             && output.get("side_effect_count").and_then(Value::as_u64) == Some(0)
     }
 
+    fn request_has_committed_h4_result(body: &[u8]) -> bool {
+        let Some(output) = function_call_output(body, H4_CANARY_REPLACE_CALL_ID) else {
+            return false;
+        };
+        output.get("status").and_then(Value::as_str) == Some("committed")
+            && output.get("commit_outcome").and_then(Value::as_str) == Some("committed")
+            && output.get("mutation_performed").and_then(Value::as_bool) == Some(true)
+            && output.get("side_effect_count").and_then(Value::as_u64) == Some(1)
+            && output.get("before_sha256").and_then(Value::as_str)
+                == Some(sha256_hex(H4_CANARY_FILE_CONTENT.as_bytes()).as_str())
+            && output.get("after_sha256").and_then(Value::as_str)
+                == Some(sha256_hex(H4_CANARY_REPLACEMENT_CONTENT.as_bytes()).as_str())
+    }
+
     fn request_excludes_h4_authority_facts(body: &[u8]) -> bool {
         let Some(output) = function_call_output(body, H4_CANARY_REPLACE_CALL_ID) else {
             return false;
@@ -3413,6 +4442,7 @@ mod tests {
         peer: SocketAddr,
         response_index: usize,
         gate: &H4CanaryGate,
+        mode: H4FixtureMode,
     ) -> Result<Vec<u8>, String> {
         if !peer.ip().is_loopback() {
             return Err("H4-A fixture received a non-loopback peer".to_string());
@@ -3422,11 +4452,19 @@ mod tests {
             gate.capture_initial_turn_id(&body)?;
             gate.wait_until_released()?;
         }
-        let events = match response_index {
-            0 => h4_canary_first_response_events(),
-            1 => h4_canary_second_response_events(),
-            2 => h4_canary_completion_response_events(),
-            _ => return Err("H4-A fixture received too many requests".to_string()),
+        let events = match mode {
+            H4FixtureMode::AuthorizationOnly => match response_index {
+                0 => h4_canary_first_response_events(),
+                1 => h4_canary_second_response_events(),
+                2 => h4_canary_completion_response_events(),
+                _ => return Err("H4-A fixture received too many requests".to_string()),
+            },
+            H4FixtureMode::GovernedReplace => match response_index {
+                0 => h4c_canary_first_response_events(),
+                1 => h4c_canary_second_response_events(),
+                2 => h4c_canary_completion_response_events(),
+                _ => return Err("H4-C fixture received too many requests".to_string()),
+            },
         };
         write_h4_sse_response(stream, events)?;
         Ok(body)
@@ -3496,6 +4534,18 @@ mod tests {
                 "response": {"id": "resp-d29h4-a-3", "object": "response", "status": "completed", "model": H4_CANARY_MODEL}
             }),
         ]
+    }
+
+    fn h4c_canary_first_response_events() -> Vec<Value> {
+        h4_canary_first_response_events()
+    }
+
+    fn h4c_canary_second_response_events() -> Vec<Value> {
+        h4_canary_second_response_events()
+    }
+
+    fn h4c_canary_completion_response_events() -> Vec<Value> {
+        h4_canary_completion_response_events()
     }
 
     fn write_h4_sse_response(stream: &mut TcpStream, events: Vec<Value>) -> Result<(), String> {
@@ -3688,6 +4738,34 @@ mod tests {
         ),
         String,
     > {
+        start_h4_runtime_with_mode(H4FixtureMode::AuthorizationOnly).await
+    }
+
+    async fn start_h4c_runtime() -> Result<
+        (
+            H4Runtime,
+            Arc<crate::d29h3::VitaWorkspaceReadBroker>,
+            Arc<VitaWorkspaceReplaceBroker>,
+            Arc<ProcessIsolatedH4Authority>,
+            H4CodexStateCanary,
+        ),
+        String,
+    > {
+        start_h4_runtime_with_mode(H4FixtureMode::GovernedReplace).await
+    }
+
+    async fn start_h4_runtime_with_mode(
+        mode: H4FixtureMode,
+    ) -> Result<
+        (
+            H4Runtime,
+            Arc<crate::d29h3::VitaWorkspaceReadBroker>,
+            Arc<VitaWorkspaceReplaceBroker>,
+            Arc<ProcessIsolatedH4Authority>,
+            H4CodexStateCanary,
+        ),
+        String,
+    > {
         let before = h4_codex_state_canary();
         let app_data = tempdir().map_err(|_| "create H4-A app data failed".to_string())?;
         let workspace = tempdir().map_err(|_| "create H4-A workspace failed".to_string())?;
@@ -3699,7 +4777,10 @@ mod tests {
             workspace.path().to_path_buf(),
         )
         .map_err(|error| format!("create H4-A profile: {error}"))?;
-        let fixture = H4ResponsesFixture::start();
+        let fixture = match mode {
+            H4FixtureMode::AuthorizationOnly => H4ResponsesFixture::start(),
+            H4FixtureMode::GovernedReplace => H4ResponsesFixture::start_h4c(),
+        };
         let provider = crate::ProviderProfile::new_for_test_localhost(
             H4_CANARY_PROVIDER_ID,
             "D29-H4-A loopback Responses fixture",
@@ -3749,9 +4830,14 @@ mod tests {
         extensions.tool_contributor(Arc::new(
             crate::d29h3::VitaWorkspaceReadToolContributor::new(Arc::clone(&h3_broker)),
         ));
-        extensions.tool_contributor(Arc::new(VitaWorkspaceReplaceToolContributor::new(
-            Arc::clone(&h4_broker),
-        )));
+        match mode {
+            H4FixtureMode::AuthorizationOnly => extensions.tool_contributor(Arc::new(
+                VitaWorkspaceReplaceToolContributor::new(Arc::clone(&h4_broker)),
+            )),
+            H4FixtureMode::GovernedReplace => extensions.tool_contributor(Arc::new(
+                VitaWorkspaceReplaceGovernedToolContributor::new(Arc::clone(&h4_broker)),
+            )),
+        }
         let extensions = Arc::new(extensions.build());
         let auth_manager = codex_core::test_support::auth_manager_from_auth_with_home(
             codex_core_api::CodexAuth::from_api_key("d29h4-a-in-memory-kernel-auth"),
@@ -4030,5 +5116,1180 @@ mod tests {
         assert_eq!(metrics.external_network_requests.load(Ordering::Acquire), 0);
         let _ = Duration::from_millis(1);
         let _ = thread::current();
+    }
+
+    // D29-H4-C TESTS CONTINUE
+    // Everything below this marker is the explicit test/integration execution
+    // path.  The H4-A source-boundary test intentionally scans only the
+    // authority-only portion above it.
+
+    struct H4CGatedAuthority {
+        inner: Arc<TestHostAuthority>,
+        revalidation_started: Arc<tokio::sync::Notify>,
+        release_revalidation: Arc<tokio::sync::Notify>,
+        panic_on_revalidation: bool,
+    }
+
+    impl H4CGatedAuthority {
+        fn new(inner: Arc<TestHostAuthority>) -> Arc<Self> {
+            Self::with_panic(inner, false)
+        }
+
+        fn with_panic(inner: Arc<TestHostAuthority>, panic_on_revalidation: bool) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                revalidation_started: Arc::new(tokio::sync::Notify::new()),
+                release_revalidation: Arc::new(tokio::sync::Notify::new()),
+                panic_on_revalidation,
+            })
+        }
+
+        fn release(&self) {
+            self.release_revalidation.notify_one();
+        }
+    }
+
+    impl VitaH4AuthorityPort for H4CGatedAuthority {
+        fn evaluate(&self, request: H4AuthorityRequest) -> VitaH4AuthorityFuture {
+            if matches!(request.operation, H4AuthorityOperation::Revalidate { .. }) {
+                let started = Arc::clone(&self.revalidation_started);
+                let release = Arc::clone(&self.release_revalidation);
+                let inner = Arc::clone(&self.inner);
+                let panic_on_revalidation = self.panic_on_revalidation;
+                Box::pin(async move {
+                    started.notify_one();
+                    release.notified().await;
+                    if panic_on_revalidation {
+                        panic!("synthetic H4-C final authority panic");
+                    }
+                    inner.evaluate(request).await
+                })
+            } else {
+                self.inner.evaluate(request)
+            }
+        }
+    }
+
+    struct H4CLateAllowAuthority {
+        inner: Arc<TestHostAuthority>,
+        revalidation_started: Arc<tokio::sync::Notify>,
+        release_revalidation: Arc<tokio::sync::Notify>,
+        late_completed: Arc<tokio::sync::Notify>,
+    }
+
+    impl H4CLateAllowAuthority {
+        fn new(inner: Arc<TestHostAuthority>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                revalidation_started: Arc::new(tokio::sync::Notify::new()),
+                release_revalidation: Arc::new(tokio::sync::Notify::new()),
+                late_completed: Arc::new(tokio::sync::Notify::new()),
+            })
+        }
+
+        fn release(&self) {
+            self.release_revalidation.notify_one();
+        }
+    }
+
+    impl VitaH4AuthorityPort for H4CLateAllowAuthority {
+        fn evaluate(&self, request: H4AuthorityRequest) -> VitaH4AuthorityFuture {
+            if matches!(request.operation, H4AuthorityOperation::Revalidate { .. }) {
+                let started = Arc::clone(&self.revalidation_started);
+                let release = Arc::clone(&self.release_revalidation);
+                let inner = Arc::clone(&self.inner);
+                let completed = Arc::clone(&self.late_completed);
+                let (sender, receiver) = tokio::sync::oneshot::channel();
+                tokio::spawn(async move {
+                    release.notified().await;
+                    let response = inner.evaluate(request).await;
+                    let _ = sender.send(response);
+                    completed.notify_one();
+                });
+                Box::pin(async move {
+                    started.notify_one();
+                    receiver
+                        .await
+                        .map_err(|_| VitaH4AuthorityError::Unavailable)?
+                })
+            } else {
+                self.inner.evaluate(request)
+            }
+        }
+    }
+
+    struct H4CRevokingAuthority {
+        inner: Arc<TestHostAuthority>,
+    }
+
+    impl VitaH4AuthorityPort for H4CRevokingAuthority {
+        fn evaluate(&self, request: H4AuthorityRequest) -> VitaH4AuthorityFuture {
+            if matches!(request.operation, H4AuthorityOperation::Revalidate { .. }) {
+                self.inner.disabled.store(true, Ordering::Release);
+                self.inner
+                    .revision
+                    .store((REVISION + 1) as usize, Ordering::Release);
+            }
+            self.inner.evaluate(request)
+        }
+    }
+
+    struct H4CProcessRevokingAuthority {
+        inner: Arc<ProcessIsolatedH4Authority>,
+        revoked: AtomicBool,
+    }
+
+    impl VitaH4AuthorityPort for H4CProcessRevokingAuthority {
+        fn evaluate(&self, request: H4AuthorityRequest) -> VitaH4AuthorityFuture {
+            let inner = Arc::clone(&self.inner);
+            if matches!(request.operation, H4AuthorityOperation::Revalidate { .. })
+                && !self.revoked.swap(true, Ordering::AcqRel)
+            {
+                Box::pin(async move {
+                    let inner_for_disable = Arc::clone(&inner);
+                    tokio::task::spawn_blocking(move || {
+                        inner_for_disable.disable_authorization_for_test(REVISION)
+                    })
+                    .await
+                    .map_err(|_| VitaH4AuthorityError::Unavailable)?
+                    .map_err(|_| VitaH4AuthorityError::Unavailable)?;
+                    inner.evaluate(request).await
+                })
+            } else {
+                inner.evaluate(request)
+            }
+        }
+    }
+
+    fn h4c_fixture(
+        call_id: &str,
+    ) -> (
+        Fixture,
+        Arc<TestHostAuthority>,
+        Arc<VitaWorkspaceReplaceBroker>,
+        VitaWorkspaceReplaceRequest,
+    ) {
+        let fixture = Fixture::new();
+        let authority = TestHostAuthority::new(fixture.root.identity());
+        let request = fixture.request(call_id);
+        let authority_request =
+            fixture.authority_request_for(&request, H4AuthorityOperation::IssueReplaceGrant);
+        authority.provision_trusted_confirmation(&authority_request);
+        let broker = fixture.broker(Arc::clone(&authority) as Arc<dyn VitaH4AuthorityPort>);
+        (fixture, authority, broker, request)
+    }
+
+    fn h4c_target_path(fixture: &Fixture) -> PathBuf {
+        fixture.root.final_path().join("replace-me.txt")
+    }
+
+    fn h4c_assert_unmodified(fixture: &Fixture) {
+        assert_eq!(
+            fs::read(h4c_target_path(fixture)).expect("H4-C target remains readable"),
+            FILE_CONTENT.as_bytes()
+        );
+    }
+
+    fn h4c_assert_no_authority_facts(value: &Value) {
+        for field in [
+            "authorization_revision",
+            "confirmation_id",
+            "grant_id",
+            "workspace_root_identity",
+            "target_identity",
+            "source",
+            "replacement_content",
+        ] {
+            assert!(
+                !value
+                    .as_object()
+                    .is_some_and(|object| object.contains_key(field)),
+                "model output exposed authority field {field}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn governed_execution_does_not_revalidate_before_native_fence() {
+        let (fixture, authority, _unused_broker, request) = h4c_fixture("h4c-no-early-revalidate");
+        let gated = H4CGatedAuthority::new(Arc::clone(&authority));
+        let broker = fixture.broker(Arc::clone(&gated) as Arc<dyn VitaH4AuthorityPort>);
+        let execution = {
+            let broker = Arc::clone(&broker);
+            tokio::spawn(async move { broker.execute_governed_request(request).await })
+        };
+        gated.revalidation_started.notified().await;
+        let requests = lock_unpoisoned(&authority.requests).clone();
+        assert_eq!(requests.len(), 1, "Host saw revalidation before fence");
+        assert!(matches!(
+            requests[0].operation,
+            H4AuthorityOperation::IssueReplaceGrant
+        ));
+        assert_eq!(broker.snapshot().final_revalidations, 1);
+        gated.release();
+        let result = execution.await.expect("H4-C execution task joined");
+        assert!(matches!(
+            result.execution,
+            Some(VitaWorkspaceReplaceExecutionOutcome::Committed { .. })
+        ));
+        assert_eq!(broker.snapshot().native_workers_started, 1);
+        assert_eq!(broker.snapshot().native_workers_joined, 1);
+        assert_eq!(lock_unpoisoned(&authority.requests).len(), 2);
+        drop(fixture);
+    }
+
+    #[tokio::test]
+    async fn native_fence_requests_exact_host_revalidation() {
+        let (fixture, authority, broker, request) = h4c_fixture("h4c-exact-revalidation");
+        let expected = fixture.authority_request_for(
+            &request,
+            H4AuthorityOperation::Revalidate {
+                grant_id: "placeholder".to_string(),
+                authorization_revision: REVISION,
+            },
+        );
+        let result = broker.execute_governed_request(request).await;
+        assert!(matches!(
+            result.execution,
+            Some(VitaWorkspaceReplaceExecutionOutcome::Committed { .. })
+        ));
+        let requests = lock_unpoisoned(&authority.requests).clone();
+        assert_eq!(requests.len(), 2);
+        let final_request = &requests[1];
+        let expected_grant_id = authority
+            .grants
+            .lock()
+            .unwrap()
+            .keys()
+            .next()
+            .cloned()
+            .expect("H4-C Host issued grant");
+        match &final_request.operation {
+            H4AuthorityOperation::Revalidate {
+                grant_id,
+                authorization_revision,
+            } => {
+                assert_eq!(grant_id, &expected_grant_id);
+                assert_eq!(*authorization_revision, REVISION);
+            }
+            other => panic!("expected final revalidation, got {other:?}"),
+        }
+        assert_eq!(final_request.context, expected.context);
+        assert_eq!(final_request.capability_id, expected.capability_id);
+        assert_eq!(final_request.tool_call_id, expected.tool_call_id);
+        assert_eq!(final_request.turn_id, expected.turn_id);
+        assert_eq!(final_request.relative_path, expected.relative_path);
+        assert_eq!(final_request.expected_sha256, expected.expected_sha256);
+        assert_eq!(
+            final_request.replacement_sha256,
+            expected.replacement_sha256
+        );
+        assert_eq!(final_request.replacement_bytes, expected.replacement_bytes);
+        assert_eq!(
+            final_request.workspace_root_identity,
+            expected.workspace_root_identity
+        );
+        assert_eq!(final_request.target_identity, expected.target_identity);
+        assert_eq!(final_request.target_kind, expected.target_kind);
+        assert_eq!(
+            fs::read(h4c_target_path(&fixture)).unwrap(),
+            REPLACEMENT_CONTENT.as_bytes()
+        );
+        assert_eq!(broker.snapshot().final_revalidations, 1);
+    }
+
+    #[tokio::test]
+    async fn final_host_revalidation_pass_allows_one_commit() {
+        let (fixture, authority, broker, request) = h4c_fixture("h4c-one-commit");
+        let result = broker.execute_governed_request(request).await;
+        assert!(matches!(
+            result.execution,
+            Some(VitaWorkspaceReplaceExecutionOutcome::Committed { .. })
+        ));
+        assert_eq!(
+            fs::read(h4c_target_path(&fixture)).unwrap(),
+            REPLACEMENT_CONTENT.as_bytes()
+        );
+        let snapshot = broker.snapshot();
+        assert_eq!(snapshot.attempted_requests, 1);
+        assert_eq!(snapshot.canonical_evaluations, 2);
+        assert_eq!(snapshot.grants_issued, 1);
+        assert_eq!(snapshot.confirmations_consumed, 1);
+        assert_eq!(snapshot.native_workers_started, 1);
+        assert_eq!(snapshot.native_workers_joined, 1);
+        assert_eq!(snapshot.exclusive_operation_handles, 1);
+        assert_eq!(snapshot.final_revalidations, 1);
+        assert_eq!(snapshot.final_revalidation_denials, 0);
+        assert_eq!(snapshot.filesystem_mutation_attempts, 1);
+        assert_eq!(snapshot.filesystem_mutations_committed, 1);
+        assert_eq!(snapshot.filesystem_commit_unknown, 0);
+        assert_eq!(snapshot.automatic_mutation_retries, 0);
+        assert_eq!(snapshot.process_spawns, 0);
+        assert_eq!(snapshot.external_network_requests, 0);
+        assert_eq!(
+            authority
+                .provenance_snapshot()
+                .request_derived_confirmations,
+            0
+        );
+    }
+
+    #[test]
+    fn rev2_to_rev3_at_native_fence_mutates_zero() {
+        thread::Builder::new()
+            .name("d29h4-c-process-revocation".to_string())
+            .stack_size(H4_CANARY_TEST_STACK_SIZE)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("H4-C process revocation runtime should build");
+                runtime.block_on(async {
+                    let fixture = Fixture::new();
+                    let authority = ProcessIsolatedH4Authority::new(fixture.root.identity())
+                        .expect("H4-C process authority should start");
+                    let request = fixture.request("h4c-process-rev2-rev3");
+                    let issue = fixture
+                        .authority_request_for(&request, H4AuthorityOperation::IssueReplaceGrant);
+                    authority
+                        .provision_confirmation(&issue)
+                        .expect("H4-C process confirmation should provision");
+                    let revoked = Arc::new(H4CProcessRevokingAuthority {
+                        inner: Arc::clone(&authority),
+                        revoked: AtomicBool::new(false),
+                    });
+                    let broker =
+                        fixture.broker(Arc::clone(&revoked) as Arc<dyn VitaH4AuthorityPort>);
+                    let result = broker.execute_governed_request(request).await;
+                    assert_eq!(
+                        result.classification,
+                        Some(H4DenyClassification::RootDisabled)
+                    );
+                    h4c_assert_unmodified(&fixture);
+                    let snapshot = broker.snapshot();
+                    assert_eq!(snapshot.final_revalidations, 1);
+                    assert_eq!(snapshot.filesystem_mutation_attempts, 0);
+                    assert_eq!(snapshot.native_workers_started, 1);
+                    assert_eq!(snapshot.native_workers_joined, 1);
+                    let observations = authority.snapshot();
+                    assert_eq!(observations.len(), 2);
+                    assert_eq!(
+                        observations[0]
+                            .canonical
+                            .as_ref()
+                            .expect("process issue canonical")
+                            .authorization_revision,
+                        Some(REVISION)
+                    );
+                    assert_eq!(
+                        observations[1]
+                            .canonical
+                            .as_ref()
+                            .expect("process revalidation canonical")
+                            .outcome,
+                        "RootDisabled"
+                    );
+                    assert_eq!(
+                        observations[1]
+                            .canonical
+                            .as_ref()
+                            .expect("process revalidation canonical revision")
+                            .authorization_revision,
+                        Some(REVISION + 1)
+                    );
+                    assert!(authority.shutdown());
+                });
+            })
+            .expect("H4-C process revocation test should start")
+            .join()
+            .expect("H4-C process revocation test should finish");
+    }
+
+    #[tokio::test]
+    async fn in_memory_rev2_to_rev3_at_native_fence_mutates_zero() {
+        let (fixture, authority, _unused_broker, request) = h4c_fixture("h4c-rev2-rev3");
+        let revoked = Arc::new(H4CRevokingAuthority {
+            inner: Arc::clone(&authority),
+        });
+        let broker = fixture.broker(Arc::clone(&revoked) as Arc<dyn VitaH4AuthorityPort>);
+        let result = broker.execute_governed_request(request).await;
+        assert_eq!(
+            result.classification,
+            Some(H4DenyClassification::RootDisabled)
+        );
+        assert!(matches!(
+            result.execution,
+            Some(VitaWorkspaceReplaceExecutionOutcome::Denied { .. })
+        ));
+        h4c_assert_unmodified(&fixture);
+        let snapshot = broker.snapshot();
+        assert_eq!(snapshot.final_revalidations, 1);
+        assert_eq!(snapshot.final_revalidation_denials, 1);
+        assert_eq!(snapshot.filesystem_mutation_attempts, 0);
+        assert_eq!(snapshot.native_workers_started, 1);
+        assert_eq!(snapshot.native_workers_joined, 1);
+        assert_eq!(
+            authority.revision.load(Ordering::Acquire),
+            (REVISION + 1) as usize
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_confirmation_never_starts_native_worker() {
+        let fixture = Fixture::new();
+        let authority = TestHostAuthority::new(fixture.root.identity());
+        let request = fixture.request("h4c-missing-confirmation");
+        let broker = fixture.broker(Arc::clone(&authority) as Arc<dyn VitaH4AuthorityPort>);
+        let result = broker.execute_governed_request(request).await;
+        assert_eq!(
+            result.classification,
+            Some(H4DenyClassification::ConfirmationMissing)
+        );
+        let snapshot = broker.snapshot();
+        assert_eq!(snapshot.native_workers_started, 0);
+        assert_eq!(snapshot.native_workers_joined, 0);
+        assert_eq!(snapshot.final_revalidations, 0);
+        assert_eq!(snapshot.filesystem_mutations_committed, 0);
+        h4c_assert_unmodified(&fixture);
+    }
+
+    #[tokio::test]
+    async fn wrong_workspace_root_never_starts_native_worker() {
+        let fixture = Fixture::new();
+        let other = Fixture::new();
+        let authority = TestHostAuthority::new(other.root.identity());
+        let request = fixture.request("h4c-wrong-root");
+        let authority_request =
+            fixture.authority_request_for(&request, H4AuthorityOperation::IssueReplaceGrant);
+        authority.provision_trusted_confirmation(&authority_request);
+        let broker = fixture.broker(Arc::clone(&authority) as Arc<dyn VitaH4AuthorityPort>);
+        let result = broker.execute_governed_request(request).await;
+        assert_eq!(
+            result.classification,
+            Some(H4DenyClassification::WorkspaceScopeDenied)
+        );
+        assert_eq!(broker.snapshot().native_workers_started, 0);
+        assert_eq!(broker.snapshot().final_revalidations, 0);
+        h4c_assert_unmodified(&fixture);
+    }
+
+    #[tokio::test]
+    async fn stale_content_after_grant_conflicts_without_mutation() {
+        let (fixture, authority, broker, request) = h4c_fixture("h4c-stale-content");
+        let path = h4c_target_path(&fixture);
+        let setup: H4CNativeSetup = Arc::new(move || {
+            fs::write(&path, b"changed after grant").expect("change content after grant");
+        });
+        let result = broker
+            .execute_governed_request_with_setup(request, None, Some(setup))
+            .await;
+        assert!(matches!(
+            result.execution,
+            Some(VitaWorkspaceReplaceExecutionOutcome::Conflict { .. })
+        ));
+        assert_eq!(result.classification, None);
+        assert_eq!(broker.snapshot().final_revalidations, 0);
+        assert_eq!(broker.snapshot().filesystem_mutation_attempts, 0);
+        assert_eq!(authority.requests.lock().unwrap().len(), 1);
+        assert_eq!(
+            fs::read(h4c_target_path(&fixture)).unwrap(),
+            b"changed after grant"
+        );
+    }
+
+    #[tokio::test]
+    async fn target_identity_change_after_grant_mutates_zero() {
+        let (fixture, _authority, broker, request) = h4c_fixture("h4c-target-identity");
+        let target = h4c_target_path(&fixture);
+        let moved = fixture.root.final_path().join("replace-me-old.txt");
+        let replacement = target.clone();
+        let target_for_setup = target.clone();
+        let moved_for_setup = moved.clone();
+        let replacement_for_setup = replacement.clone();
+        let setup: H4CNativeSetup = Arc::new(move || {
+            fs::rename(&target_for_setup, &moved_for_setup).expect("rename target after grant");
+            fs::write(&replacement_for_setup, b"new namespace object")
+                .expect("create new target object");
+        });
+        let result = broker
+            .execute_governed_request_with_setup(request, None, Some(setup))
+            .await;
+        assert!(matches!(
+            result.execution,
+            Some(VitaWorkspaceReplaceExecutionOutcome::Denied { .. })
+        ));
+        assert_eq!(broker.snapshot().filesystem_mutation_attempts, 0);
+        assert_eq!(broker.snapshot().final_revalidations, 0);
+        assert_eq!(fs::read(&moved).unwrap(), FILE_CONTENT.as_bytes());
+        assert_eq!(fs::read(&replacement).unwrap(), b"new namespace object");
+    }
+
+    #[cfg(windows)]
+    struct H4CBusyHandle(usize);
+
+    #[cfg(windows)]
+    impl Drop for H4CBusyHandle {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = windows_sys::Win32::Foundation::CloseHandle(
+                    self.0 as windows_sys::Win32::Foundation::HANDLE,
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn h4c_open_busy_target(path: &Path) -> H4CBusyHandle {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_WRITE_DATA, OPEN_EXISTING,
+        };
+        let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        wide.push(0);
+        let handle: HANDLE = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES,
+                0,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(!handle.is_null() && handle != INVALID_HANDLE_VALUE);
+        H4CBusyHandle(handle as usize)
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn hard_link_after_grant_mutates_zero() {
+        let (fixture, _authority, broker, request) = h4c_fixture("h4c-hard-link");
+        let target = h4c_target_path(&fixture);
+        let alias = fixture.root.final_path().join("replace-me-alias.txt");
+        let target_for_setup = target.clone();
+        let alias_for_setup = alias.clone();
+        let setup: H4CNativeSetup = Arc::new(move || {
+            fs::hard_link(&target_for_setup, &alias_for_setup)
+                .expect("create hard link after grant");
+        });
+        let result = broker
+            .execute_governed_request_with_setup(request, None, Some(setup))
+            .await;
+        assert!(matches!(
+            result.execution,
+            Some(VitaWorkspaceReplaceExecutionOutcome::Denied { .. })
+        ));
+        assert_eq!(broker.snapshot().filesystem_mutation_attempts, 0);
+        assert_eq!(broker.snapshot().final_revalidations, 0);
+        h4c_assert_unmodified(&fixture);
+        assert_eq!(fs::read(alias).unwrap(), FILE_CONTENT.as_bytes());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn busy_target_mutates_zero() {
+        let (fixture, _authority, broker, request) = h4c_fixture("h4c-busy");
+        let busy = Arc::new(Mutex::new(None::<H4CBusyHandle>));
+        let busy_for_setup = Arc::clone(&busy);
+        let path = h4c_target_path(&fixture);
+        let setup: H4CNativeSetup = Arc::new(move || {
+            *busy_for_setup.lock().unwrap() = Some(h4c_open_busy_target(&path));
+        });
+        let result = broker
+            .execute_governed_request_with_setup(request, None, Some(setup))
+            .await;
+        assert!(matches!(
+            result.execution,
+            Some(VitaWorkspaceReplaceExecutionOutcome::Denied { .. })
+        ));
+        assert_eq!(broker.snapshot().filesystem_mutation_attempts, 0);
+        assert_eq!(broker.snapshot().final_revalidations, 0);
+        drop(busy);
+        h4c_assert_unmodified(&fixture);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn reparse_target_mutates_zero() {
+        use std::os::windows::fs::symlink_file;
+        let (fixture, _authority, broker, request) = h4c_fixture("h4c-reparse");
+        let target = h4c_target_path(&fixture);
+        let moved = fixture.root.final_path().join("replace-me-reparse-old.txt");
+        let outside = tempdir().expect("H4-C reparse outside root");
+        let outside_file = outside.path().join("outside.txt");
+        fs::write(&outside_file, b"outside").expect("outside file");
+        let link = target.clone();
+        let target_for_setup = target.clone();
+        let moved_for_setup = moved.clone();
+        let outside_for_setup = outside_file.clone();
+        let link_for_setup = link.clone();
+        let setup: H4CNativeSetup = Arc::new(move || {
+            fs::rename(&target_for_setup, &moved_for_setup).expect("rename target before reparse");
+            symlink_file(&outside_for_setup, &link_for_setup).expect("create reparse target");
+        });
+        let result = broker
+            .execute_governed_request_with_setup(request, None, Some(setup))
+            .await;
+        assert!(matches!(
+            result.execution,
+            Some(VitaWorkspaceReplaceExecutionOutcome::Denied { .. })
+        ));
+        assert_eq!(broker.snapshot().filesystem_mutation_attempts, 0);
+        assert_eq!(fs::read(&outside_file).unwrap(), b"outside");
+        assert_eq!(fs::read(&moved).unwrap(), FILE_CONTENT.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn missing_target_is_not_created() {
+        let (fixture, _authority, broker, request) = h4c_fixture("h4c-missing-target");
+        let target = h4c_target_path(&fixture);
+        let moved = fixture.root.final_path().join("replace-me-missing-old.txt");
+        let target_for_setup = target.clone();
+        let moved_for_setup = moved.clone();
+        let setup: H4CNativeSetup = Arc::new(move || {
+            fs::rename(&target_for_setup, &moved_for_setup)
+                .expect("remove target from namespace after grant");
+        });
+        let result = broker
+            .execute_governed_request_with_setup(request, None, Some(setup))
+            .await;
+        assert!(matches!(
+            result.execution,
+            Some(VitaWorkspaceReplaceExecutionOutcome::Denied { .. })
+        ));
+        assert_eq!(broker.snapshot().filesystem_mutation_attempts, 0);
+        assert!(!target.exists(), "H4-C recreated a missing target");
+        assert_eq!(fs::read(moved).unwrap(), FILE_CONTENT.as_bytes());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn oversized_target_after_grant_mutates_zero() {
+        let (fixture, _authority, broker, request) = h4c_fixture("h4c-oversized-target");
+        let path = h4c_target_path(&fixture);
+        let setup: H4CNativeSetup = Arc::new(move || {
+            fs::write(
+                &path,
+                vec![
+                    b'x';
+                    super::super::workspace_capability::WORKSPACE_REPLACE_HARD_MAX_BYTES + 1
+                ],
+            )
+            .expect("write oversized target after grant");
+        });
+        let result = broker
+            .execute_governed_request_with_setup(request, None, Some(setup))
+            .await;
+        assert!(matches!(
+            result.execution,
+            Some(VitaWorkspaceReplaceExecutionOutcome::Denied { .. })
+        ));
+        assert_eq!(broker.snapshot().filesystem_mutation_attempts, 0);
+        assert_eq!(broker.snapshot().final_revalidations, 0);
+        assert_eq!(
+            fs::metadata(h4c_target_path(&fixture)).unwrap().len() as usize,
+            super::super::workspace_capability::WORKSPACE_REPLACE_HARD_MAX_BYTES + 1
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn invalid_utf8_target_after_grant_mutates_zero() {
+        let (fixture, _authority, broker, request) = h4c_fixture("h4c-invalid-utf8-target");
+        let path = h4c_target_path(&fixture);
+        let setup: H4CNativeSetup = Arc::new(move || {
+            fs::write(&path, [0xff, 0xfe, 0xfd]).expect("write invalid UTF-8 target after grant");
+        });
+        let result = broker
+            .execute_governed_request_with_setup(request, None, Some(setup))
+            .await;
+        assert!(matches!(
+            result.execution,
+            Some(VitaWorkspaceReplaceExecutionOutcome::Denied { .. })
+        ));
+        assert_eq!(broker.snapshot().filesystem_mutation_attempts, 0);
+        assert_eq!(broker.snapshot().final_revalidations, 0);
+        assert_eq!(
+            fs::read(h4c_target_path(&fixture)).unwrap(),
+            [0xff, 0xfe, 0xfd]
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_tool_call_commits_at_most_once() {
+        let (fixture, authority, broker, request) = h4c_fixture("h4c-duplicate");
+        let first = broker.execute_governed_request(request.clone()).await;
+        let second = broker.execute_governed_request(request).await;
+        assert!(matches!(
+            first.execution,
+            Some(VitaWorkspaceReplaceExecutionOutcome::Committed { .. })
+        ));
+        assert_eq!(
+            second.classification,
+            Some(H4DenyClassification::DuplicateToolCall)
+        );
+        let snapshot = broker.snapshot();
+        assert_eq!(snapshot.native_workers_started, 1);
+        assert_eq!(snapshot.native_workers_joined, 1);
+        assert_eq!(snapshot.filesystem_mutations_committed, 1);
+        assert_eq!(snapshot.final_revalidations, 1);
+        assert_eq!(authority.requests.lock().unwrap().len(), 2);
+        assert_eq!(
+            fs::read(h4c_target_path(&fixture)).unwrap(),
+            REPLACEMENT_CONTENT.as_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn confirmation_replay_never_reprovisions() {
+        let (_fixture, authority, broker, request) = h4c_fixture("h4c-confirmation-replay");
+        let _ = broker.execute_governed_request(request.clone()).await;
+        let provenance_before = authority.provenance_snapshot();
+        let second = broker.execute_governed_request(request).await;
+        assert_eq!(
+            second.classification,
+            Some(H4DenyClassification::DuplicateToolCall)
+        );
+        let provenance_after = authority.provenance_snapshot();
+        assert_eq!(
+            provenance_after.trusted_confirmations_provisioned,
+            provenance_before.trusted_confirmations_provisioned
+        );
+        assert_eq!(provenance_after.request_derived_confirmations, 0);
+        assert_eq!(broker.snapshot().grants_issued, 1);
+        assert_eq!(broker.snapshot().filesystem_mutations_committed, 1);
+    }
+
+    #[tokio::test]
+    async fn grant_is_consumed_once() {
+        let (fixture, authority, broker, request) = h4c_fixture("h4c-grant-once");
+        let first = broker.execute_governed_request(request.clone()).await;
+        assert!(matches!(
+            first.execution,
+            Some(VitaWorkspaceReplaceExecutionOutcome::Committed { .. })
+        ));
+        let replay = broker.execute_governed_request(request).await;
+        assert_eq!(
+            replay.classification,
+            Some(H4DenyClassification::DuplicateToolCall)
+        );
+        assert_eq!(authority.grants.lock().unwrap().len(), 1);
+        assert_eq!(broker.snapshot().filesystem_mutations_committed, 1);
+        assert_eq!(broker.snapshot().native_workers_started, 1);
+        assert_eq!(
+            fs::read(h4c_target_path(&fixture)).unwrap(),
+            REPLACEMENT_CONTENT.as_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_fence_mutates_zero() {
+        let (fixture, _authority, broker, request) = h4c_fixture("h4c-cancel-before-fence");
+        let broker_for_setup = Arc::clone(&broker);
+        let setup: H4CNativeSetup = Arc::new(move || broker_for_setup.cancel());
+        let result = broker
+            .execute_governed_request_with_setup(request, None, Some(setup))
+            .await;
+        assert_eq!(
+            result.classification,
+            Some(H4DenyClassification::LateAfterCancellation)
+        );
+        assert!(matches!(
+            result.execution,
+            Some(VitaWorkspaceReplaceExecutionOutcome::Denied { .. })
+        ));
+        let snapshot = broker.snapshot();
+        assert_eq!(snapshot.native_workers_started, 0);
+        assert_eq!(snapshot.native_workers_joined, 0);
+        assert_eq!(snapshot.final_revalidations, 0);
+        h4c_assert_unmodified(&fixture);
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_final_revalidation_mutates_zero() {
+        let (fixture, authority, _unused_broker, request) = h4c_fixture("h4c-cancel-during-fence");
+        let gated = H4CGatedAuthority::new(Arc::clone(&authority));
+        let broker = fixture.broker(Arc::clone(&gated) as Arc<dyn VitaH4AuthorityPort>);
+        let task = {
+            let broker = Arc::clone(&broker);
+            tokio::spawn(async move { broker.execute_governed_request(request).await })
+        };
+        gated.revalidation_started.notified().await;
+        broker.cancel();
+        let result = task.await.expect("H4-C cancellation task joined");
+        assert_eq!(
+            result.classification,
+            Some(H4DenyClassification::TurnCancelled)
+        );
+        h4c_assert_unmodified(&fixture);
+        let snapshot = broker.snapshot();
+        assert_eq!(snapshot.final_revalidations, 1);
+        assert_eq!(snapshot.filesystem_mutation_attempts, 0);
+        assert_eq!(snapshot.native_workers_started, 1);
+        assert_eq!(snapshot.native_workers_joined, 1);
+        gated.release();
+    }
+
+    #[tokio::test]
+    async fn late_authority_allow_cannot_mutate() {
+        let (fixture, authority, _unused_broker, request) = h4c_fixture("h4c-late-allow");
+        let late = H4CLateAllowAuthority::new(Arc::clone(&authority));
+        let broker = fixture.broker(Arc::clone(&late) as Arc<dyn VitaH4AuthorityPort>);
+        let task = {
+            let broker = Arc::clone(&broker);
+            tokio::spawn(async move { broker.execute_governed_request(request).await })
+        };
+        late.revalidation_started.notified().await;
+        broker.cancel();
+        let result = task.await.expect("H4-C late-allow task joined");
+        assert_eq!(
+            result.classification,
+            Some(H4DenyClassification::TurnCancelled)
+        );
+        late.release();
+        tokio::time::timeout(Duration::from_secs(1), late.late_completed.notified())
+            .await
+            .expect("late authority allow should arrive");
+        h4c_assert_unmodified(&fixture);
+        assert_eq!(broker.snapshot().native_workers_started, 1);
+        assert_eq!(broker.snapshot().native_workers_joined, 1);
+        assert_eq!(broker.snapshot().filesystem_mutations_committed, 0);
+        assert_eq!(authority.requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn final_authority_panic_mutates_zero() {
+        let (fixture, authority, _unused_broker, request) = h4c_fixture("h4c-authority-panic");
+        let gated = H4CGatedAuthority::with_panic(Arc::clone(&authority), true);
+        let broker = fixture.broker(Arc::clone(&gated) as Arc<dyn VitaH4AuthorityPort>);
+        let task = {
+            let broker = Arc::clone(&broker);
+            tokio::spawn(async move { broker.execute_governed_request(request).await })
+        };
+        gated.revalidation_started.notified().await;
+        gated.release();
+        let result = task.await.expect("H4-C panic task joined");
+        assert_eq!(
+            result.classification,
+            Some(H4DenyClassification::AuthorityPanic)
+        );
+        h4c_assert_unmodified(&fixture);
+        let snapshot = broker.snapshot();
+        assert_eq!(snapshot.final_revalidations, 1);
+        assert_eq!(snapshot.final_revalidation_denials, 1);
+        assert_eq!(snapshot.native_workers_started, 1);
+        assert_eq!(snapshot.native_workers_joined, 1);
+        assert_eq!(snapshot.filesystem_mutations_committed, 0);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn commit_unknown_maps_truthfully() {
+        let (_fixture, _authority, broker, request) = h4c_fixture("h4c-commit-unknown");
+        let result = broker
+            .execute_governed_request_with_fault(request, Some(H4CNativeFault::AfterFirstWrite))
+            .await;
+        assert!(matches!(
+            result.execution,
+            Some(VitaWorkspaceReplaceExecutionOutcome::CommitUnknown { .. })
+        ));
+        let value = result.model_value();
+        assert_eq!(value["status"], "commit_outcome_unknown");
+        assert_eq!(value["commit_outcome"], "unknown");
+        assert_eq!(value["mutation_started"], true);
+        assert_eq!(value["automatic_retry"], false);
+        assert_eq!(value["side_effect_state"], "may_have_mutated");
+        assert_eq!(value["side_effect_count"], 1);
+        let snapshot = broker.snapshot();
+        assert_eq!(snapshot.filesystem_commit_unknown, 1);
+        assert_eq!(snapshot.automatic_mutation_retries, 0);
+        assert_eq!(snapshot.native_workers_started, 1);
+        assert_eq!(snapshot.native_workers_joined, 1);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn commit_unknown_is_never_automatically_retried() {
+        let (_fixture, authority, broker, request) = h4c_fixture("h4c-no-unknown-retry");
+        let result = broker
+            .execute_governed_request_with_fault(
+                request.clone(),
+                Some(H4CNativeFault::AfterFirstWrite),
+            )
+            .await;
+        assert!(matches!(
+            result.execution,
+            Some(VitaWorkspaceReplaceExecutionOutcome::CommitUnknown { .. })
+        ));
+        assert_eq!(broker.snapshot().native_workers_started, 1);
+        assert_eq!(broker.snapshot().native_workers_joined, 1);
+        assert_eq!(broker.snapshot().grants_issued, 1);
+        assert_eq!(authority.requests.lock().unwrap().len(), 2);
+        assert_eq!(broker.snapshot().automatic_mutation_retries, 0);
+        let replay = broker.execute_governed_request(request).await;
+        assert_eq!(
+            replay.classification,
+            Some(H4DenyClassification::DuplicateToolCall)
+        );
+        assert_eq!(broker.snapshot().native_workers_started, 1);
+    }
+
+    #[tokio::test]
+    async fn native_worker_is_joined_on_success() {
+        let (_fixture, _authority, broker, request) = h4c_fixture("h4c-joined-success");
+        let result = broker.execute_governed_request(request).await;
+        assert!(matches!(
+            result.execution,
+            Some(VitaWorkspaceReplaceExecutionOutcome::Committed { .. })
+        ));
+        let snapshot = broker.snapshot();
+        assert_eq!(snapshot.native_workers_started, 1);
+        assert_eq!(snapshot.native_workers_joined, 1);
+    }
+
+    #[tokio::test]
+    async fn native_worker_is_joined_on_denial() {
+        let (fixture, authority, _broker, request) = h4c_fixture("h4c-joined-denial");
+        let revoked = Arc::new(H4CRevokingAuthority {
+            inner: Arc::clone(&authority),
+        });
+        let broker = fixture.broker(Arc::clone(&revoked) as Arc<dyn VitaH4AuthorityPort>);
+        let result = broker.execute_governed_request(request).await;
+        assert!(matches!(
+            result.execution,
+            Some(VitaWorkspaceReplaceExecutionOutcome::Denied { .. })
+        ));
+        let snapshot = broker.snapshot();
+        assert_eq!(snapshot.native_workers_started, 1);
+        assert_eq!(snapshot.native_workers_joined, 1);
+        h4c_assert_unmodified(&fixture);
+    }
+
+    #[tokio::test]
+    async fn model_output_excludes_authority_facts() {
+        let (fixture, _authority, broker, request) = h4c_fixture("h4c-model-output");
+        let result = broker.execute_governed_request(request).await;
+        let value = result.model_value();
+        assert_eq!(value["status"], "committed");
+        assert_eq!(value["mutation_performed"], true);
+        h4c_assert_no_authority_facts(&value);
+        let denied = VitaWorkspaceReplaceResult::denied_after_grant(
+            VitaWorkspaceReplaceRequest::synthetic(
+                "h4c-model-denied",
+                Some(fixture.context.clone()),
+                "replace-me.txt",
+                &sha256_hex(FILE_CONTENT.as_bytes()),
+                REPLACEMENT_CONTENT,
+            ),
+            H4DenyClassification::RootDisabled,
+        );
+        h4c_assert_no_authority_facts(&denied.model_value());
+    }
+
+    #[test]
+    fn h4c_fault_surface_is_test_only_and_no_new_schema_exists() {
+        let source = fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/workspace_capability.rs"),
+        )
+        .expect("read H4-B workspace primitive");
+        assert!(source.contains("WorkspaceReplaceTestFault"));
+        let migrations = fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .expect("Vita manifest has repository parent")
+                .join("src-tauri/src/storage/migrations.rs"),
+        )
+        .unwrap_or_default();
+        assert!(!migrations.contains("Migration031"));
+    }
+
+    #[test]
+    fn real_codex_h4c_canary_commits_one_governed_existing_file_replace() {
+        thread::Builder::new()
+            .name("d29h4-c-real-codex-tool".to_string())
+            .stack_size(H4_CANARY_TEST_STACK_SIZE)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("H4-C test runtime should build");
+                runtime.block_on(real_codex_h4c_canary_body());
+            })
+            .expect("H4-C test thread should start")
+            .join()
+            .expect("H4-C test thread should finish");
+    }
+
+    async fn real_codex_h4c_canary_body() {
+        let (runtime, h3_broker, h4_broker, authority, before) = start_h4c_runtime()
+            .await
+            .expect("H4-C runtime should start");
+        let file_path = runtime.workspace.path().join("replace-me.txt");
+        let turn_id = start_h4_turn(runtime.thread.as_ref().unwrap())
+            .await
+            .expect("H4-C turn should start");
+        let observed_turn_id = runtime
+            .fixture
+            .as_ref()
+            .expect("H4-C Responses fixture should remain available")
+            .wait_for_initial_turn_id()
+            .await
+            .expect("H4-C fixture should expose the active turn id");
+        assert_eq!(observed_turn_id, turn_id);
+        let context = VitaExecutionContext::try_new(LIFE_ID, TASK_ID)
+            .expect("H4-C canary context should remain valid");
+        let authority_request = h4_canary_authority_request(&h4_broker, &context, turn_id);
+        authority
+            .provision_confirmation(&authority_request)
+            .expect("H4-C canary trusted confirmation should pre-provision");
+        runtime
+            .fixture
+            .as_ref()
+            .expect("H4-C Responses fixture should remain available")
+            .release_initial_request();
+        let turn = wait_h4_turn(runtime.thread.as_ref().unwrap()).await;
+        let file_after = fs::read(&file_path).expect("H4-C canary target remains readable");
+        let (cleanup, fixture_observation) = runtime.shutdown().await;
+        let host_shutdown = authority.shutdown();
+        let turn = turn.unwrap_or_else(|error| {
+            panic!(
+                "H4-C turn should complete: {error}; fixture={fixture_observation:?}; cleanup={cleanup:?}"
+            )
+        });
+
+        assert_eq!(before, h4_codex_state_canary(), "user Codex state changed");
+        assert_eq!(turn.1, None);
+        assert_eq!(turn.0.as_deref(), Some(H4_CANARY_REPLY));
+        assert!(turn.2 > 0);
+        assert_eq!(file_after, H4_CANARY_REPLACEMENT_CONTENT.as_bytes());
+        assert_eq!(cleanup.initial_shutdown, H4ShutdownStatus::Success);
+        assert_eq!(cleanup.final_shutdown, H4ShutdownStatus::Success);
+        assert_eq!(cleanup.manager_thread_count, 0);
+        assert!(cleanup.fixture_listener_joined);
+        assert!(host_shutdown);
+
+        assert_eq!(fixture_observation.request_count, 3);
+        assert!(fixture_observation.first_request_has_h3_tool);
+        assert!(fixture_observation.first_request_has_h4_tool);
+        assert!(fixture_observation.second_request_received_h3_hash);
+        assert!(fixture_observation.third_request_received_committed_h4_result);
+        assert!(!fixture_observation.third_request_received_authorized_h4_result);
+        assert!(fixture_observation.third_request_excluded_authority_facts);
+        assert!(fixture_observation.error.is_none());
+
+        let h3_snapshot = h3_broker.snapshot();
+        assert_eq!(h3_snapshot.attempted_requests, 1);
+        assert_eq!(h3_snapshot.authorized_file_reads, 1);
+        assert_eq!(h3_snapshot.file_bytes_read, H4_CANARY_FILE_CONTENT.len());
+        assert_eq!(h3_snapshot.filesystem_mutations, 0);
+        assert_eq!(h3_snapshot.process_spawns, 0);
+        assert_eq!(h3_snapshot.external_network_requests, 0);
+
+        let h4_snapshot = h4_broker.snapshot();
+        assert_eq!(h4_snapshot.attempted_requests, 1);
+        assert_eq!(h4_snapshot.canonical_evaluations, 2);
+        assert_eq!(h4_snapshot.confirmations_consumed, 1);
+        assert_eq!(h4_snapshot.grants_issued, 1);
+        assert_eq!(h4_snapshot.native_workers_started, 1);
+        assert_eq!(h4_snapshot.native_workers_joined, 1);
+        assert_eq!(h4_snapshot.exclusive_operation_handles, 1);
+        assert_eq!(h4_snapshot.final_revalidations, 1);
+        assert_eq!(h4_snapshot.final_revalidation_denials, 0);
+        assert_eq!(h4_snapshot.filesystem_mutation_attempts, 1);
+        assert_eq!(h4_snapshot.filesystem_mutations_committed, 1);
+        assert_eq!(h4_snapshot.filesystem_commit_unknown, 0);
+        assert_eq!(h4_snapshot.automatic_mutation_retries, 0);
+        assert_eq!(h4_snapshot.authorized_write_count, 1);
+        assert_eq!(h4_snapshot.filesystem_mutations, 1);
+        assert_eq!(h4_snapshot.process_spawns, 0);
+        assert_eq!(h4_snapshot.external_network_requests, 0);
+        assert_eq!(h4_snapshot.max_active_authority, 1);
+
+        let observations = authority.snapshot();
+        assert_eq!(observations.len(), 2);
+        let provenance = authority.provenance_snapshot();
+        assert_eq!(provenance.trusted_confirmations_provisioned, 1);
+        assert_eq!(provenance.request_derived_confirmations, 0);
+        assert_eq!(
+            provenance.events,
+            vec![
+                H4AuthorityEvent::TrustedConfirmationProvisioned,
+                H4AuthorityEvent::IssueEvaluated,
+                H4AuthorityEvent::RevalidationEvaluated,
+            ]
+        );
+        for observation in &observations {
+            let canonical = observation
+                .canonical
+                .as_ref()
+                .expect("H4-C Host canonical result");
+            assert_eq!(canonical.canonical_evaluations, 1);
+            assert_eq!(canonical.production_registry_size, 0);
+            assert_eq!(canonical.test_registry_size, 1);
+            assert_eq!(canonical.authorization_row_reads, 1);
+            assert!(canonical.host_scope_authority_present);
+            assert!(canonical.requested_root_matched_authorized_root);
+            assert_eq!(canonical.outcome, "ScopeRequired");
+            assert_eq!(canonical.decision_code, "CAPABILITY_SCOPE_NOT_AVAILABLE");
+            assert_eq!(canonical.risk_class, H4_DESCRIPTOR_RISK_CLASS);
+            assert_eq!(canonical.scope_requirement, H4_DESCRIPTOR_SCOPE_REQUIREMENT);
+            assert_eq!(canonical.approval_floor, H4_DESCRIPTOR_APPROVAL_FLOOR);
+            assert_eq!(canonical.authorization_revision, Some(REVISION));
+        }
+        let evidence = h4_broker.native_evidence_snapshot();
+        assert_eq!(evidence.len(), 1);
+        let evidence = &evidence[0];
+        assert_eq!(evidence.operation_handle_open_count, 1);
+        assert_eq!(evidence.fence_calls, 1);
+        assert_eq!(
+            evidence.before_sha256.as_deref(),
+            Some(sha256_hex(H4_CANARY_FILE_CONTENT.as_bytes(),).as_str())
+        );
+        assert_eq!(
+            evidence.after_sha256.as_deref(),
+            Some(sha256_hex(H4_CANARY_REPLACEMENT_CONTENT.as_bytes(),).as_str())
+        );
+        assert_eq!(evidence.modifying_syscalls, 3);
+        assert_eq!(evidence.committed_mutations, 1);
+        assert!(!evidence.commit_unknown);
+        assert!(evidence.events.first() == Some(&WorkspaceReplaceEvidenceEvent::InitialHashCheck));
+        assert!(evidence
+            .events
+            .contains(&WorkspaceReplaceEvidenceEvent::CommitFence));
+        assert!(evidence
+            .events
+            .contains(&WorkspaceReplaceEvidenceEvent::PostFenceRootCheck));
+        assert!(evidence
+            .events
+            .contains(&WorkspaceReplaceEvidenceEvent::PostFenceTargetCheck));
+        assert!(evidence
+            .events
+            .contains(&WorkspaceReplaceEvidenceEvent::FirstModifyingSyscall));
+        let event_index = |event: WorkspaceReplaceEvidenceEvent| {
+            evidence
+                .events
+                .iter()
+                .position(|observed| *observed == event)
+                .expect("H4-C evidence event is present")
+        };
+        let initial_hash = event_index(WorkspaceReplaceEvidenceEvent::InitialHashCheck);
+        let fence = event_index(WorkspaceReplaceEvidenceEvent::CommitFence);
+        let post_root = event_index(WorkspaceReplaceEvidenceEvent::PostFenceRootCheck);
+        let post_parent = event_index(WorkspaceReplaceEvidenceEvent::PostFenceParentCheck);
+        let post_target = event_index(WorkspaceReplaceEvidenceEvent::PostFenceTargetCheck);
+        let post_link = event_index(WorkspaceReplaceEvidenceEvent::PostFenceLinkCheck);
+        let post_hash = event_index(WorkspaceReplaceEvidenceEvent::PostFenceHashCheck);
+        let post_cancel = event_index(WorkspaceReplaceEvidenceEvent::PostFenceCancellationCheck);
+        let first_mutation = event_index(WorkspaceReplaceEvidenceEvent::FirstModifyingSyscall);
+        assert!(initial_hash < fence);
+        assert!(fence < post_root);
+        assert!(post_root < post_parent);
+        assert!(post_parent < post_target);
+        assert!(post_target < post_link);
+        assert!(post_link < post_hash);
+        assert!(post_hash < post_cancel);
+        assert!(post_cancel < first_mutation);
     }
 }

@@ -454,6 +454,12 @@ pub(crate) enum WorkspaceReplaceCommitOutcome {
     },
 }
 
+#[cfg(all(test, windows))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WorkspaceReplaceTestFault {
+    AfterFirstWrite,
+}
+
 /// A process-lifetime, OS-backed capability to one trusted workspace root.
 #[derive(Clone)]
 pub struct TrustedWorkspaceRoot {
@@ -733,6 +739,31 @@ impl PreparedWorkspaceTarget {
             fence,
             cancellation,
             faults,
+        )
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn replace_existing_file_utf8_bounded_with_test_fault(
+        self,
+        expected_sha256: &str,
+        replacement_content: &str,
+        fence: &mut dyn WorkspaceReplaceCommitFence,
+        cancellation: &dyn WorkspaceReplaceCancellation,
+        fault: WorkspaceReplaceTestFault,
+    ) -> WorkspaceReplaceCommitOutcome {
+        let point = match fault {
+            WorkspaceReplaceTestFault::AfterFirstWrite => {
+                platform::WorkspaceReplaceFaultPoint::AfterFirstWrite
+            }
+        };
+        let mut faults = platform::WorkspaceReplaceFaultPlan::once(point);
+        platform::replace_existing_file_utf8_bounded_with_faults(
+            self,
+            expected_sha256,
+            replacement_content,
+            fence,
+            cancellation,
+            &mut faults,
         )
     }
 }

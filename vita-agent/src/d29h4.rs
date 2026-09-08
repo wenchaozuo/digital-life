@@ -299,7 +299,7 @@ enum H4AuthorityOperation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct H4AuthorityRequest {
+pub(crate) struct H4AuthorityRequest {
     context: VitaExecutionContext,
     capability_id: String,
     operation: H4AuthorityOperation,
@@ -331,7 +331,7 @@ pub(crate) trait VitaH4AuthorityPort: Send + Sync {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum H4DenyClassification {
+pub(crate) enum H4DenyClassification {
     MissingContext,
     WrongLifeBinding,
     WrongTaskBinding,
@@ -360,7 +360,7 @@ enum H4DenyClassification {
 }
 
 impl H4DenyClassification {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::MissingContext => "missing_execution_context",
             Self::WrongLifeBinding => "wrong_life_binding",
@@ -633,6 +633,11 @@ impl VitaWorkspaceReplaceBroker {
         self.cancellation_notify.notify_one();
     }
 
+    #[cfg(test)]
+    pub(crate) fn cancellation_token(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancelled)
+    }
+
     pub(crate) fn snapshot(&self) -> VitaWorkspaceReplaceSnapshot {
         VitaWorkspaceReplaceSnapshot {
             attempted_requests: self.metrics.attempted_requests.load(Ordering::Acquire),
@@ -800,6 +805,132 @@ impl VitaWorkspaceReplaceBroker {
             root: self.root.clone(),
             authority: Arc::clone(&self.authority),
         })
+    }
+
+    /// Build the exact H4 issue intent from a real Codex ToolCall without
+    /// evaluating Host or provisioning confirmation.  H5-C's trusted test
+    /// harness uses this only after the provider fixture has exposed the
+    /// active turn and call identifiers.
+    #[cfg(test)]
+    pub(crate) fn h5_authority_request_for_codex_call(
+        &self,
+        call: &ToolCall<'_>,
+    ) -> Result<H4AuthorityRequest, H4DenyClassification> {
+        let request = VitaWorkspaceReplaceRequest::from_codex_call(call, self.context.as_ref())
+            .map_err(|error| match error {
+                H4RequestBuildError::UnmappedTool => H4DenyClassification::UnmappedTool,
+                _ => H4DenyClassification::InvalidRequest,
+            })?;
+        self.h5_authority_request_for_parsed_request(&request)
+    }
+
+    /// Test harness form of the same intent builder.  The harness supplies
+    /// only fields observed from the local fixture's real ToolCall; this does
+    /// not evaluate Host and cannot provision a confirmation.
+    #[cfg(test)]
+    pub(crate) fn h5_authority_request_for_test_intent(
+        &self,
+        tool_call_id: &str,
+        turn_id: &str,
+        relative_path: &str,
+        expected_sha256: &str,
+        replacement_content: &str,
+    ) -> Result<H4AuthorityRequest, H4DenyClassification> {
+        if relative_path.chars().count() > MAX_PATH_CHARS
+            || tool_call_id.chars().count() > MAX_CALL_ID_CHARS
+            || turn_id.chars().count() > MAX_TURN_ID_CHARS
+        {
+            return Err(H4DenyClassification::InvalidRequest);
+        }
+        let relative_path =
+            super::WorkspaceRelativePath::parse(std::path::Path::new(relative_path))
+                .map_err(|_| H4DenyClassification::InvalidRequest)?;
+        let request = VitaWorkspaceReplaceRequest {
+            tool_call_id: tool_call_id.to_string(),
+            turn_id: turn_id.to_string(),
+            context: self.context.clone(),
+            relative_path,
+            expected_sha256: expected_sha256.to_string(),
+            replacement_content: replacement_content.to_string(),
+        };
+        self.h5_authority_request_for_parsed_request(&request)
+    }
+
+    #[cfg(test)]
+    fn h5_authority_request_for_parsed_request(
+        &self,
+        request: &VitaWorkspaceReplaceRequest,
+    ) -> Result<H4AuthorityRequest, H4DenyClassification> {
+        let bound_context = self
+            .context
+            .as_ref()
+            .ok_or(H4DenyClassification::MissingContext)?;
+        let request_context = request
+            .context
+            .as_ref()
+            .ok_or(H4DenyClassification::MissingContext)?;
+        if request_context.life_id() != bound_context.life_id() {
+            return Err(H4DenyClassification::WrongLifeBinding);
+        }
+        if request_context.task_id() != bound_context.task_id() {
+            return Err(H4DenyClassification::WrongTaskBinding);
+        }
+        if !is_sha256_hex(&request.expected_sha256)
+            || request.replacement_content.as_bytes().len() > H4_MAX_REPLACEMENT_BYTES
+        {
+            return Err(H4DenyClassification::InvalidRequest);
+        }
+        let prepared = self
+            .root
+            .prepare_target(request.relative_path.as_path())
+            .map_err(|_| H4DenyClassification::TargetRejected)?;
+        if prepared.kind() != PreparedWorkspaceTargetKind::ExistingFile
+            || prepared.target_identity().is_none()
+        {
+            return Err(if prepared.kind() == PreparedWorkspaceTargetKind::Missing {
+                H4DenyClassification::TargetMissing
+            } else {
+                H4DenyClassification::TargetRejected
+            });
+        }
+        let authority_request = H4AuthorityRequest {
+            context: bound_context.clone(),
+            capability_id: VITA_WORKSPACE_REPLACE_CAPABILITY_ID.to_string(),
+            operation: H4AuthorityOperation::IssueReplaceGrant,
+            tool_call_id: request.tool_call_id.clone(),
+            turn_id: request.turn_id.clone(),
+            relative_path: request.relative_path.clone(),
+            expected_sha256: request.expected_sha256.clone(),
+            replacement_sha256: sha256_hex(request.replacement_content.as_bytes()),
+            replacement_bytes: request.replacement_content.as_bytes().len(),
+            workspace_root_identity: prepared.root().identity(),
+            target_identity: prepared
+                .target_identity()
+                .expect("existing H5 authorization target has an identity"),
+            target_kind: prepared.kind(),
+        };
+        drop(prepared);
+        Ok(authority_request)
+    }
+
+    /// Parse and authorize one real Codex call through the certified H4
+    /// parser/authority boundary, returning only the H4 grant and the
+    /// already-bound replacement content needed by canonical H5.
+    #[cfg(test)]
+    pub(crate) async fn issue_h5_authorized_replace_action_from_codex_call(
+        &self,
+        call: &ToolCall<'_>,
+    ) -> Result<(H4AuthorizedReplaceGrant, String), H4DenyClassification> {
+        let request = VitaWorkspaceReplaceRequest::from_codex_call(call, self.context.as_ref())
+            .map_err(|error| match error {
+                H4RequestBuildError::UnmappedTool => H4DenyClassification::UnmappedTool,
+                _ => H4DenyClassification::InvalidRequest,
+            })?;
+        let replacement_content = request.replacement_content.clone();
+        let grant = self
+            .issue_h5_authorized_replace_action(H4ReplaceAuthorizationInput::from_request(&request))
+            .await?;
+        Ok((grant, replacement_content))
     }
 
     async fn execute_request(
@@ -2714,7 +2845,7 @@ impl<'call> ToolExecutor<ToolCall<'call>> for VitaWorkspaceReplaceGovernedTool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::fs;
@@ -2878,7 +3009,7 @@ mod tests {
         Turn,
     }
 
-    struct TestHostAuthority {
+    pub(crate) struct TestHostAuthority {
         root: super::super::WorkspaceRootIdentity,
         confirmations: Mutex<HashMap<String, HostExplicitActionConfirmationEvidence>>,
         grants: Mutex<HashMap<String, H4HostReplaceGrantEvidence>>,
@@ -2901,14 +3032,14 @@ mod tests {
     }
 
     #[derive(Clone, Debug, Default, Eq, PartialEq)]
-    struct H4AuthorityProvenanceEvidence {
-        trusted_confirmations_provisioned: usize,
-        request_derived_confirmations: usize,
-        events: Vec<H4AuthorityEvent>,
+    pub(crate) struct H4AuthorityProvenanceEvidence {
+        pub(crate) trusted_confirmations_provisioned: usize,
+        pub(crate) request_derived_confirmations: usize,
+        pub(crate) events: Vec<H4AuthorityEvent>,
     }
 
     impl TestHostAuthority {
-        fn new(root: super::super::WorkspaceRootIdentity) -> Arc<Self> {
+        pub(crate) fn new(root: super::super::WorkspaceRootIdentity) -> Arc<Self> {
             Self::with_mutation(root, ConfirmationMutation::None)
         }
 
@@ -2932,7 +3063,7 @@ mod tests {
             })
         }
 
-        fn provision_trusted_confirmation(&self, request: &H4AuthorityRequest) {
+        pub(crate) fn provision_trusted_confirmation(&self, request: &H4AuthorityRequest) {
             assert!(matches!(
                 &request.operation,
                 H4AuthorityOperation::IssueReplaceGrant
@@ -2991,7 +3122,7 @@ mod tests {
             lock_unpoisoned(&self.events).push(H4AuthorityEvent::TrustedConfirmationProvisioned);
         }
 
-        fn provenance_snapshot(&self) -> H4AuthorityProvenanceEvidence {
+        pub(crate) fn provenance_snapshot(&self) -> H4AuthorityProvenanceEvidence {
             H4AuthorityProvenanceEvidence {
                 trusted_confirmations_provisioned: self
                     .trusted_confirmations_provisioned
@@ -5292,7 +5423,7 @@ mod tests {
         Ok(executable)
     }
 
-    struct ProcessIsolatedH4Authority {
+    pub(crate) struct ProcessIsolatedH4Authority {
         process: Arc<PersistentH4HostProcess>,
         observations: Arc<Mutex<Vec<H4HostResponse>>>,
         trusted_confirmations_provisioned: AtomicUsize,
@@ -5301,7 +5432,7 @@ mod tests {
     }
 
     impl ProcessIsolatedH4Authority {
-        fn new(
+        pub(crate) fn new(
             allowed_workspace_root_identity: super::super::WorkspaceRootIdentity,
         ) -> Result<Arc<Self>, String> {
             let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -5321,11 +5452,15 @@ mod tests {
             }))
         }
 
-        fn snapshot(&self) -> Vec<H4HostResponse> {
+        pub(crate) fn snapshot(&self) -> Vec<H4HostResponse> {
             lock_unpoisoned(&self.observations).clone()
         }
 
-        fn provenance_snapshot(&self) -> H4AuthorityProvenanceEvidence {
+        pub(crate) fn observation_count(&self) -> usize {
+            lock_unpoisoned(&self.observations).len()
+        }
+
+        pub(crate) fn provenance_snapshot(&self) -> H4AuthorityProvenanceEvidence {
             H4AuthorityProvenanceEvidence {
                 trusted_confirmations_provisioned: self
                     .trusted_confirmations_provisioned
@@ -5340,7 +5475,10 @@ mod tests {
         /// Test/integration-only trusted confirmation seam.  The caller must
         /// establish the exact action intent before invoking this method; the
         /// normal authority evaluation path never provisions confirmations.
-        fn provision_confirmation(&self, request: &H4AuthorityRequest) -> Result<(), String> {
+        pub(crate) fn provision_confirmation(
+            &self,
+            request: &H4AuthorityRequest,
+        ) -> Result<(), String> {
             if !matches!(&request.operation, H4AuthorityOperation::IssueReplaceGrant) {
                 return Err(
                     "H4 confirmation provisioning requires an IssueReplaceGrant intent".to_string(),
@@ -5353,7 +5491,7 @@ mod tests {
             Ok(())
         }
 
-        fn shutdown(&self) -> bool {
+        pub(crate) fn shutdown(&self) -> bool {
             self.process.shutdown()
         }
 

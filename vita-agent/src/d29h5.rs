@@ -13,7 +13,15 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
-use crate::d29h4::H4AuthorizedReplaceGrant;
+use codex_extension_api::{
+    parse_tool_input_schema, JsonToolOutput, ResponsesApiTool, ToolCall, ToolContributor,
+    ToolExecutor, ToolExecutorFuture, ToolName, ToolOutput, ToolSpec,
+};
+use serde_json::{json, Value};
+
+use crate::d29h4::{
+    H4AuthorizedReplaceGrant, VitaWorkspaceReplaceBroker, VITA_WORKSPACE_REPLACE_TOOL_NAME,
+};
 use crate::recovery_journal::{
     mutation_target_key_for_prepared_target, RecoveryJournalContext, RecoveryJournalError,
     RecoveryJournalIdentity, RecoveryJournalStore, RecoveryJournalV1,
@@ -225,6 +233,39 @@ struct H5ExecutionOptions {
     started_marker_fault: Option<RecoveryMarkerPersistenceTestFault>,
     panic_after_native_commit_before_marker: bool,
     panic_after_commit_marker: bool,
+    abort_after_prepared: bool,
+    abort_after_started_before_mutation: bool,
+    abort_after_native_commit_before_marker: bool,
+    abort_after_commit_marker: bool,
+}
+
+#[cfg(test)]
+impl H5ExecutionOptions {
+    fn from_test_environment() -> Self {
+        match std::env::var("D29_H5C_CRASH_POINT").ok().as_deref() {
+            Some("prepared") => Self {
+                abort_after_prepared: true,
+                ..Self::default()
+            },
+            Some("started") => Self {
+                abort_after_started_before_mutation: true,
+                ..Self::default()
+            },
+            Some("first-mutation") => Self {
+                native_fault: Some(WorkspaceReplaceTestFault::AbortAfterFirstMutation),
+                ..Self::default()
+            },
+            Some("before-marker") => Self {
+                abort_after_native_commit_before_marker: true,
+                ..Self::default()
+            },
+            Some("after-marker") => Self {
+                abort_after_commit_marker: true,
+                ..Self::default()
+            },
+            _ => Self::default(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -347,6 +388,7 @@ struct H5StartedFence<'a> {
     host_fence: &'a mut dyn WorkspaceReplaceCommitFence,
     started_persistence: StartedPersistenceState,
     started_marker_fault: Option<RecoveryMarkerPersistenceTestFault>,
+    abort_after_started_before_mutation: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -371,6 +413,9 @@ impl WorkspaceReplaceCommitFence for H5StartedFence<'_> {
         match persisted {
             Ok(_) => {
                 self.started_persistence = StartedPersistenceState::VerifiedDurable;
+                if self.abort_after_started_before_mutation {
+                    std::process::abort();
+                }
                 Ok(())
             }
             Err(_) => {
@@ -1010,10 +1055,163 @@ pub(crate) async fn execute_governed_h5_replace(
         replacement_content,
         store,
         cancellation,
-        H5ExecutionOptions::default(),
+        H5ExecutionOptions::from_test_environment(),
         None,
     )
     .await
+}
+
+/// Test/integration-only bridge for the real pinned Codex kernel.  It keeps
+/// the model-facing tool identity from H4, imports only an H4 executable
+/// grant, and then enters the one canonical H5 replace function.
+#[cfg(test)]
+pub(crate) struct VitaWorkspaceReplaceH5ToolContributor {
+    broker: Arc<VitaWorkspaceReplaceBroker>,
+    store: RecoveryJournalStore,
+}
+
+#[cfg(test)]
+impl VitaWorkspaceReplaceH5ToolContributor {
+    pub(crate) fn new(
+        broker: Arc<VitaWorkspaceReplaceBroker>,
+        store: RecoveryJournalStore,
+    ) -> Self {
+        Self { broker, store }
+    }
+}
+
+#[cfg(test)]
+impl ToolContributor for VitaWorkspaceReplaceH5ToolContributor {
+    fn tools(
+        &self,
+        _session_store: &codex_extension_api::ExtensionData,
+        _thread_store: &codex_extension_api::ExtensionData,
+    ) -> Vec<Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>>> {
+        vec![Arc::new(VitaWorkspaceReplaceH5Tool {
+            broker: Arc::clone(&self.broker),
+            store: self.store.clone(),
+        })]
+    }
+}
+
+#[cfg(test)]
+struct VitaWorkspaceReplaceH5Tool {
+    broker: Arc<VitaWorkspaceReplaceBroker>,
+    store: RecoveryJournalStore,
+}
+
+#[cfg(test)]
+impl<'call> ToolExecutor<ToolCall<'call>> for VitaWorkspaceReplaceH5Tool {
+    fn tool_name(&self) -> ToolName {
+        ToolName::plain(VITA_WORKSPACE_REPLACE_TOOL_NAME)
+    }
+
+    fn spec(&self) -> ToolSpec {
+        let parameters = parse_tool_input_schema(&json!({
+            "type": "object",
+            "properties": {
+                "relative_path": {"type": "string"},
+                "expected_sha256": {
+                    "type": "string",
+                    "pattern": "^[a-f0-9]{64}$"
+                },
+                "replacement_content": {"type": "string"}
+            },
+            "required": ["relative_path", "expected_sha256", "replacement_content"],
+            "additionalProperties": false
+        }))
+        .expect("D29-H5-C replace tool schema is static and valid");
+        ToolSpec::Function(ResponsesApiTool {
+            name: VITA_WORKSPACE_REPLACE_TOOL_NAME.to_string(),
+            description:
+                "Replace one existing bounded UTF-8 workspace file through governed H4 and H5 recovery semantics."
+                    .to_string(),
+            strict: true,
+            defer_loading: None,
+            parameters,
+            output_schema: None,
+        })
+    }
+
+    fn supports_parallel_tool_calls(&self) -> bool {
+        false
+    }
+
+    fn handle<'a>(&'a self, call: ToolCall<'call>) -> ToolExecutorFuture<'a>
+    where
+        'call: 'a,
+    {
+        let broker = Arc::clone(&self.broker);
+        let store = self.store.clone();
+        Box::pin(async move {
+            let (grant, replacement_content) = match broker
+                .issue_h5_authorized_replace_action_from_codex_call(&call)
+                .await
+            {
+                Ok(value) => value,
+                Err(classification) => {
+                    return Ok(Box::new(JsonToolOutput::with_success(
+                        h5_denied_model_value(classification.as_str()),
+                        Some(false),
+                    )) as Box<dyn ToolOutput>);
+                }
+            };
+            let result = execute_governed_h5_replace(
+                H5AuthorizedReplaceAction::from_h4_grant(grant),
+                replacement_content,
+                store,
+                broker.cancellation_token(),
+            )
+            .await;
+            let value = match result {
+                Ok(result) => h5_model_value(result.transaction_outcome),
+                Err(_) => h5_denied_model_value("denied"),
+            };
+            Ok(Box::new(JsonToolOutput::with_success(value, Some(false))) as Box<dyn ToolOutput>)
+        })
+    }
+}
+
+#[cfg(test)]
+fn h5_denied_model_value(reason: &str) -> Value {
+    json!({
+        "status": "denied",
+        "reason": reason,
+        "mutation_performed": false,
+        "side_effect_count": 0
+    })
+}
+
+#[cfg(test)]
+fn h5_model_value(outcome: H5ReplaceTransactionOutcome) -> Value {
+    match outcome {
+        H5ReplaceTransactionOutcome::Committed => json!({
+            "status": "committed",
+            "commit_outcome": "committed",
+            "mutation_performed": true,
+            "side_effect_count": 1
+        }),
+        H5ReplaceTransactionOutcome::Denied { .. } => h5_denied_model_value("denied"),
+        H5ReplaceTransactionOutcome::Conflict { .. } => json!({
+            "status": "conflict",
+            "commit_outcome": "conflict",
+            "mutation_performed": false,
+            "side_effect_count": 0
+        }),
+        H5ReplaceTransactionOutcome::CommitUnknown { .. } => json!({
+            "status": "commit_outcome_unknown",
+            "commit_outcome": "unknown",
+            "mutation_performed": true,
+            "side_effect_count": 1
+        }),
+        H5ReplaceTransactionOutcome::LifecycleUnknown {
+            workspace_mutation_started,
+        } => json!({
+            "status": if workspace_mutation_started { "recovery_required" } else { "denied" },
+            "mutation_performed": workspace_mutation_started,
+            "side_effect_count": if workspace_mutation_started { 1 } else { 0 }
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -1249,6 +1447,7 @@ fn execute_h5b_replace_after_host_pass_internal(
         host_fence: fence,
         started_persistence: StartedPersistenceState::NotAttempted,
         started_marker_fault,
+        abort_after_started_before_mutation: false,
     };
     #[cfg(windows)]
     let outcome = match native_fault {
@@ -1390,12 +1589,16 @@ fn execute_h5b_replace_after_host_pass_with_tracker_uncaught(
         .map_err(RecoveryJournalError::Profile)?;
     let journal = store.create_prepared_for_expected_preimage(&target, context, expected_sha256)?;
     *captured_journal = Some(journal.clone());
+    if options.abort_after_prepared {
+        std::process::abort();
+    }
     let mut started_fence = H5StartedFence {
         store,
         journal: &journal,
         host_fence: fence,
         started_persistence: StartedPersistenceState::NotAttempted,
         started_marker_fault: options.started_marker_fault,
+        abort_after_started_before_mutation: options.abort_after_started_before_mutation,
     };
     #[cfg(windows)]
     let outcome = match options.native_fault {
@@ -1454,6 +1657,9 @@ fn execute_h5b_replace_after_host_pass_with_tracker_uncaught(
                     if options.panic_after_native_commit_before_marker {
                         panic!("test-only panic after native commit before H5 marker");
                     }
+                    if options.abort_after_native_commit_before_marker {
+                        std::process::abort();
+                    }
                     let commit_marker = if options.force_commit_marker_failure {
                         Err(RecoveryJournalError::InjectedFault("commit marker"))
                     } else {
@@ -1462,6 +1668,9 @@ fn execute_h5b_replace_after_host_pass_with_tracker_uncaught(
                     if commit_marker.is_ok() {
                         if options.panic_after_commit_marker {
                             panic!("test-only panic after durable H5 commit marker");
+                        }
+                        if options.abort_after_commit_marker {
+                            std::process::abort();
                         }
                         H5ReplaceTransactionOutcome::Committed
                     } else {
@@ -1576,7 +1785,7 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 #[cfg(all(test, windows))]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde::{Deserialize, Serialize};
     use std::fs;
@@ -2031,7 +2240,7 @@ mod tests {
         Ok(body)
     }
 
-    struct ProcessIsolatedH5RecoveryAuthority {
+    pub(crate) struct ProcessIsolatedH5RecoveryAuthority {
         process: Arc<ProcessIsolatedH5HostProcess>,
         life_id: String,
         trusted_confirmations_provisioned: AtomicUsize,
@@ -2041,7 +2250,7 @@ mod tests {
     }
 
     impl ProcessIsolatedH5RecoveryAuthority {
-        fn new(
+        pub(crate) fn new(
             allowed_workspace_root_identity: WorkspaceRootIdentity,
             life_id: &str,
             task_id: &str,
@@ -2066,7 +2275,7 @@ mod tests {
             }))
         }
 
-        fn provision_trusted_confirmation(
+        pub(crate) fn provision_trusted_confirmation(
             &self,
             request: &RecoveryActionRequest,
         ) -> Result<(), String> {
@@ -2108,7 +2317,7 @@ mod tests {
             self.sqlite_disable_count.load(Ordering::Acquire)
         }
 
-        fn provenance(&self) -> (usize, usize) {
+        pub(crate) fn provenance(&self) -> (usize, usize) {
             (
                 self.trusted_confirmations_provisioned
                     .load(Ordering::Acquire),
@@ -2149,7 +2358,7 @@ mod tests {
             Ok(revision)
         }
 
-        fn shutdown(&self) -> bool {
+        pub(crate) fn shutdown(&self) -> bool {
             self.process.shutdown()
         }
     }

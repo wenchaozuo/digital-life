@@ -54,6 +54,14 @@ const MARKER_PAYLOAD_BYTES: usize =
 
 static NEXT_TRANSACTION_ID: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryTransactionBlockReason {
+    RecoveryRequired,
+    AmbiguousTarget,
+    PoisonedTarget,
+    ConcurrentAdmission,
+}
+
 /// Errors are intentionally typed so malformed or incomplete evidence never
 /// gets silently treated as a prepared journal.
 #[derive(Debug)]
@@ -72,6 +80,7 @@ pub enum RecoveryJournalError {
     TargetNotExisting,
     TargetRead,
     PreimageConflict,
+    TransactionBlocked(RecoveryTransactionBlockReason),
     Corrupt(&'static str),
     UnsupportedVersion(u16),
     Oversized {
@@ -112,6 +121,12 @@ impl Display for RecoveryJournalError {
             }
             Self::PreimageConflict => formatter
                 .write_str("recovery journal preimage does not match the H4 expected SHA-256"),
+            Self::TransactionBlocked(reason) => {
+                write!(
+                    formatter,
+                    "recovery journal target admission blocked: {reason:?}"
+                )
+            }
             Self::Corrupt(reason) => write!(formatter, "recovery journal is corrupt: {reason}"),
             Self::UnsupportedVersion(version) => {
                 write!(
@@ -1166,6 +1181,11 @@ pub enum RecoveryTransactionScanItem {
         target: RecoveryJournalTargetKey,
         transactions: Vec<RecoveryTransactionId>,
     },
+    PoisonedTarget {
+        target: RecoveryJournalTargetKey,
+        transactions: Vec<RecoveryTransactionId>,
+        reason: &'static str,
+    },
     CorruptArtifact {
         file_name: String,
         reason: &'static str,
@@ -1175,6 +1195,14 @@ pub enum RecoveryTransactionScanItem {
         transaction_id: RecoveryTransactionId,
         marker_state: RecoveryMarkerState,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryTargetLifecycle {
+    Clear,
+    RecoveryRequired,
+    Ambiguous,
+    Poisoned,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1205,6 +1233,81 @@ impl RecoveryTransactionScan {
         self.items
             .iter()
             .any(|item| matches!(item, RecoveryTransactionScanItem::AmbiguousTarget { .. }))
+    }
+
+    pub fn target_lifecycle(&self, target: &RecoveryJournalTargetKey) -> RecoveryTargetLifecycle {
+        self.target_lifecycle_excluding(target, None)
+    }
+
+    pub(crate) fn target_lifecycle_for_journal(
+        &self,
+        journal: &RecoveryJournalV1,
+    ) -> RecoveryTargetLifecycle {
+        self.target_lifecycle(&target_key(journal))
+    }
+
+    pub(crate) fn target_lifecycle_excluding(
+        &self,
+        target: &RecoveryJournalTargetKey,
+        excluded_transaction: Option<&RecoveryTransactionId>,
+    ) -> RecoveryTargetLifecycle {
+        if self.items.iter().any(|item| {
+            matches!(
+                item,
+                RecoveryTransactionScanItem::PoisonedTarget {
+                    target: item_target,
+                    transactions,
+                    ..
+                } if item_target == target
+                    && transactions.iter().any(|transaction_id| {
+                        Some(transaction_id) != excluded_transaction
+                    })
+            )
+        }) {
+            return RecoveryTargetLifecycle::Poisoned;
+        }
+
+        if self.items.iter().any(|item| {
+            matches!(
+                item,
+                RecoveryTransactionScanItem::AmbiguousTarget {
+                    target: item_target,
+                    transactions,
+                } if item_target == target
+                    && transactions.iter().any(|transaction_id| {
+                        Some(transaction_id) != excluded_transaction
+                    })
+            )
+        }) {
+            return RecoveryTargetLifecycle::Ambiguous;
+        }
+
+        let recovery_required = self
+            .valid_transactions()
+            .filter(|snapshot| {
+                target_key(snapshot.journal()) == *target
+                    && snapshot.state() == RecoveryTransactionState::RecoveryRequired
+                    && Some(snapshot.journal().transaction_id()) != excluded_transaction
+            })
+            .count();
+        match recovery_required {
+            0 => RecoveryTargetLifecycle::Clear,
+            1 => RecoveryTargetLifecycle::RecoveryRequired,
+            _ => RecoveryTargetLifecycle::Ambiguous,
+        }
+    }
+
+    pub fn poisoned_targets(
+        &self,
+    ) -> impl Iterator<Item = (&RecoveryJournalTargetKey, &[RecoveryTransactionId])> {
+        self.items.iter().filter_map(|item| match item {
+            RecoveryTransactionScanItem::PoisonedTarget {
+                target,
+                transactions,
+                ..
+            } => Some((target, transactions.as_slice())),
+            _ => None,
+        })
     }
 }
 
@@ -1673,50 +1776,87 @@ impl RecoveryJournalStore {
             }
         }
 
-        let mut by_target: HashMap<RecoveryJournalTargetKey, Vec<RecoveryJournalV1>> =
+        let mut poisoned_targets: HashMap<RecoveryJournalTargetKey, Vec<RecoveryTransactionId>> =
             HashMap::new();
-        for journal in journals.values() {
-            by_target
-                .entry(target_key(journal))
-                .or_default()
-                .push(journal.clone());
-        }
+        let mut snapshots_by_target: HashMap<
+            RecoveryJournalTargetKey,
+            Vec<RecoveryTransactionSnapshot>,
+        > = HashMap::new();
 
-        for (target, mut target_journals) in by_target {
-            target_journals.sort_by(|left, right| {
-                left.transaction_id()
-                    .as_str()
-                    .cmp(right.transaction_id().as_str())
-            });
-            if target_journals.len() > 1 {
-                let transactions = target_journals
-                    .iter()
-                    .map(|journal| journal.transaction_id().clone())
-                    .collect();
-                items.push(RecoveryTransactionScanItem::AmbiguousTarget {
-                    target,
-                    transactions,
-                });
-                continue;
-            }
-            let journal = target_journals
-                .pop()
-                .expect("target group contains one journal");
-            let transaction_id = journal.transaction_id().clone();
-            if poisoned_transactions.contains(&transaction_id) {
+        // Build every transaction lifecycle before applying any target-level
+        // ambiguity rule.  Immutable Prepared records are historical evidence;
+        // only an unresolved Started lifecycle participates in active-target
+        // ambiguity.
+        for (transaction_id, journal) in &journals {
+            if poisoned_transactions.contains(transaction_id) {
                 items.push(RecoveryTransactionScanItem::CorruptArtifact {
-                    file_name: journal_file_name(&transaction_id),
+                    file_name: journal_file_name(transaction_id),
                     reason: "transaction has corrupt lifecycle evidence",
                 });
+                poisoned_targets
+                    .entry(target_key(journal))
+                    .or_default()
+                    .push(transaction_id.clone());
                 continue;
             }
-            let transaction_markers = markers.remove(&transaction_id).unwrap_or_default();
-            match build_transaction_snapshot(journal, transaction_markers) {
-                Ok(snapshot) => items.push(RecoveryTransactionScanItem::Valid(snapshot)),
-                Err(reason) => items.push(RecoveryTransactionScanItem::CorruptArtifact {
-                    file_name: journal_file_name(&transaction_id),
-                    reason,
-                }),
+            let transaction_markers = markers.remove(transaction_id).unwrap_or_default();
+            match build_transaction_snapshot(journal.clone(), transaction_markers) {
+                Ok(snapshot) => {
+                    snapshots_by_target
+                        .entry(target_key(snapshot.journal()))
+                        .or_default()
+                        .push(snapshot);
+                }
+                Err(reason) => {
+                    items.push(RecoveryTransactionScanItem::CorruptArtifact {
+                        file_name: journal_file_name(transaction_id),
+                        reason,
+                    });
+                    poisoned_targets
+                        .entry(target_key(journal))
+                        .or_default()
+                        .push(transaction_id.clone());
+                }
+            }
+        }
+
+        for (target, mut transactions) in poisoned_targets {
+            transactions.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+            items.push(RecoveryTransactionScanItem::PoisonedTarget {
+                target,
+                transactions,
+                reason: "known target has poisoned lifecycle evidence",
+            });
+        }
+
+        for (target, mut snapshots) in snapshots_by_target {
+            snapshots.sort_by(|left, right| {
+                left.journal()
+                    .transaction_id()
+                    .as_str()
+                    .cmp(right.journal().transaction_id().as_str())
+            });
+            let active_transactions = snapshots
+                .iter()
+                .filter(|snapshot| snapshot.state() == RecoveryTransactionState::RecoveryRequired)
+                .map(|snapshot| snapshot.journal().transaction_id().clone())
+                .collect::<Vec<_>>();
+            if active_transactions.len() > 1 {
+                items.push(RecoveryTransactionScanItem::AmbiguousTarget {
+                    target,
+                    transactions: active_transactions,
+                });
+                for snapshot in snapshots {
+                    if snapshot.state() != RecoveryTransactionState::RecoveryRequired {
+                        items.push(RecoveryTransactionScanItem::Valid(snapshot));
+                    }
+                }
+            } else {
+                items.extend(
+                    snapshots
+                        .into_iter()
+                        .map(RecoveryTransactionScanItem::Valid),
+                );
             }
         }
 
@@ -1748,14 +1888,33 @@ impl RecoveryJournalStore {
         marker_state: RecoveryMarkerState,
         fault: Option<RecoveryMarkerPersistenceTestFault>,
     ) -> Result<RecoveryMarkerV1, RecoveryJournalError> {
-        let snapshot = self
-            .scan_transactions()?
+        let scan = self.scan_transactions()?;
+        let snapshot = scan
             .valid_transactions()
             .find(|candidate| candidate.journal.transaction_id() == journal.transaction_id())
             .cloned()
             .ok_or(RecoveryJournalError::TargetBindingMismatch(
                 "transaction is not one unambiguous valid H5-B candidate",
             ))?;
+        let target = target_key(journal);
+        let other_target_lifecycle =
+            scan.target_lifecycle_excluding(&target, Some(journal.transaction_id()));
+        if other_target_lifecycle != RecoveryTargetLifecycle::Clear {
+            return Err(RecoveryJournalError::TransactionBlocked(
+                match other_target_lifecycle {
+                    RecoveryTargetLifecycle::RecoveryRequired => {
+                        RecoveryTransactionBlockReason::RecoveryRequired
+                    }
+                    RecoveryTargetLifecycle::Ambiguous => {
+                        RecoveryTransactionBlockReason::AmbiguousTarget
+                    }
+                    RecoveryTargetLifecycle::Poisoned => {
+                        RecoveryTransactionBlockReason::PoisonedTarget
+                    }
+                    RecoveryTargetLifecycle::Clear => unreachable!("clear lifecycle was checked"),
+                },
+            ));
+        }
         let allowed = matches!(
             (snapshot.state, marker_state),
             (
@@ -2544,6 +2703,24 @@ fn target_key(journal: &RecoveryJournalV1) -> RecoveryJournalTargetKey {
     }
 }
 
+pub(crate) fn target_key_for_prepared_target(
+    target: &PreparedWorkspaceTarget,
+) -> Result<RecoveryJournalTargetKey, RecoveryJournalError> {
+    if target.kind() != PreparedWorkspaceTargetKind::ExistingFile {
+        return Err(RecoveryJournalError::TargetNotExisting);
+    }
+    let target_identity = target
+        .target_identity()
+        .ok_or(RecoveryJournalError::TargetNotExisting)?;
+    Ok(RecoveryJournalTargetKey {
+        workspace_root_identity: RecoveryJournalIdentity::from_workspace_identity(
+            target.root().identity(),
+        )?,
+        relative_path: canonical_relative_path(target.relative_path())?,
+        target_identity: RecoveryJournalIdentity::from_workspace_identity(target_identity)?,
+    })
+}
+
 fn current_unix_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3203,6 +3380,457 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn committed_terminal_history_does_not_create_false_ambiguity() {
+        let fixture = Fixture::new();
+        let first = fixture
+            .store
+            .create_prepared_with_transaction_id_for_test(
+                &fixture.target(),
+                fixture.context(b"after-committed\n"),
+                "tx-terminal-first",
+            )
+            .unwrap();
+        fixture.store.persist_started(&first).unwrap();
+        fixture.store.persist_committed(&first).unwrap();
+        let second = fixture
+            .store
+            .create_prepared_with_transaction_id_for_test(
+                &fixture.target(),
+                fixture.context(b"after-new\n"),
+                "tx-terminal-second",
+            )
+            .unwrap();
+
+        let scan = fixture.store.scan_transactions().unwrap();
+        assert!(!scan.has_ambiguous_target());
+        assert_eq!(scan.actionable_recovery_transactions().count(), 0);
+        assert_eq!(
+            scan.valid_transactions()
+                .find(|snapshot| snapshot.journal().transaction_id() == second.transaction_id())
+                .unwrap()
+                .state(),
+            RecoveryTransactionState::PreparedOnly
+        );
+    }
+
+    #[test]
+    fn recovered_terminal_history_does_not_create_false_ambiguity() {
+        let fixture = Fixture::new();
+        let first = fixture
+            .store
+            .create_prepared_with_transaction_id_for_test(
+                &fixture.target(),
+                fixture.context(b"after-recovered\n"),
+                "tx-recovered-first",
+            )
+            .unwrap();
+        fixture.store.persist_started(&first).unwrap();
+        fixture.store.persist_recovered(&first).unwrap();
+        fixture
+            .store
+            .create_prepared_with_transaction_id_for_test(
+                &fixture.target(),
+                fixture.context(b"after-new\n"),
+                "tx-recovered-second",
+            )
+            .unwrap();
+
+        let scan = fixture.store.scan_transactions().unwrap();
+        assert!(!scan.has_ambiguous_target());
+        assert_eq!(scan.actionable_recovery_transactions().count(), 0);
+        assert_eq!(
+            scan.valid_transactions()
+                .filter(|snapshot| snapshot.state() == RecoveryTransactionState::RecoveredTerminal)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn prepared_only_history_does_not_create_false_ambiguity() {
+        let fixture = Fixture::new();
+        fixture
+            .store
+            .create_prepared_with_transaction_id_for_test(
+                &fixture.target(),
+                fixture.context(b"after-history\n"),
+                "tx-prepared-history",
+            )
+            .unwrap();
+        fixture
+            .store
+            .create_prepared_with_transaction_id_for_test(
+                &fixture.target(),
+                fixture.context(b"after-new\n"),
+                "tx-prepared-new",
+            )
+            .unwrap();
+
+        let scan = fixture.store.scan_transactions().unwrap();
+        assert!(!scan.has_ambiguous_target());
+        assert_eq!(scan.actionable_recovery_transactions().count(), 0);
+        assert_eq!(
+            scan.valid_transactions()
+                .filter(|snapshot| snapshot.state() == RecoveryTransactionState::PreparedOnly)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn prepared_only_plus_recovery_required_keeps_one_actionable_recovery() {
+        let fixture = Fixture::new();
+        fixture
+            .store
+            .create_prepared_with_transaction_id_for_test(
+                &fixture.target(),
+                fixture.context(b"after-history\n"),
+                "tx-prepared-before-active",
+            )
+            .unwrap();
+        let active = fixture
+            .store
+            .create_prepared_with_transaction_id_for_test(
+                &fixture.target(),
+                fixture.context(b"after-active\n"),
+                "tx-active-after-prepared",
+            )
+            .unwrap();
+        fixture.store.persist_started(&active).unwrap();
+
+        let scan = fixture.store.scan_transactions().unwrap();
+        assert!(!scan.has_ambiguous_target());
+        assert_eq!(scan.actionable_recovery_transactions().count(), 1);
+        assert_eq!(
+            scan.valid_transactions()
+                .find(|snapshot| snapshot.journal().transaction_id() == active.transaction_id())
+                .unwrap()
+                .state(),
+            RecoveryTransactionState::RecoveryRequired
+        );
+    }
+
+    #[test]
+    fn committed_terminal_then_second_same_target_transaction_succeeds() {
+        let fixture = Fixture::new();
+        let first = fixture
+            .store
+            .create_prepared_with_transaction_id_for_test(
+                &fixture.target(),
+                fixture.context(b"after-committed-first\n"),
+                "tx-committed-first",
+            )
+            .unwrap();
+        fixture.store.persist_started(&first).unwrap();
+        fixture.store.persist_committed(&first).unwrap();
+
+        let second = fixture
+            .store
+            .create_prepared_with_transaction_id_for_test(
+                &fixture.target(),
+                fixture.context(b"after-committed-second\n"),
+                "tx-committed-second",
+            )
+            .unwrap();
+        fixture.store.persist_started(&second).unwrap();
+
+        let scan = fixture.store.scan_transactions().unwrap();
+        assert!(!scan.has_ambiguous_target());
+        assert_eq!(scan.actionable_recovery_transactions().count(), 1);
+        assert_eq!(
+            scan.valid_transactions()
+                .find(|snapshot| snapshot.journal().transaction_id() == first.transaction_id())
+                .unwrap()
+                .state(),
+            RecoveryTransactionState::CommittedTerminal
+        );
+        assert_eq!(
+            scan.valid_transactions()
+                .find(|snapshot| snapshot.journal().transaction_id() == second.transaction_id())
+                .unwrap()
+                .state(),
+            RecoveryTransactionState::RecoveryRequired
+        );
+    }
+
+    #[test]
+    fn recovered_terminal_then_second_same_target_transaction_succeeds() {
+        let fixture = Fixture::new();
+        let first = fixture
+            .store
+            .create_prepared_with_transaction_id_for_test(
+                &fixture.target(),
+                fixture.context(b"after-recovered-first\n"),
+                "tx-recovered-first",
+            )
+            .unwrap();
+        fixture.store.persist_started(&first).unwrap();
+        fixture.store.persist_recovered(&first).unwrap();
+
+        let second = fixture
+            .store
+            .create_prepared_with_transaction_id_for_test(
+                &fixture.target(),
+                fixture.context(b"after-recovered-second\n"),
+                "tx-recovered-second",
+            )
+            .unwrap();
+        fixture.store.persist_started(&second).unwrap();
+
+        let scan = fixture.store.scan_transactions().unwrap();
+        assert!(!scan.has_ambiguous_target());
+        assert_eq!(scan.actionable_recovery_transactions().count(), 1);
+        assert_eq!(
+            scan.valid_transactions()
+                .find(|snapshot| snapshot.journal().transaction_id() == first.transaction_id())
+                .unwrap()
+                .state(),
+            RecoveryTransactionState::RecoveredTerminal
+        );
+        assert_eq!(
+            scan.valid_transactions()
+                .find(|snapshot| snapshot.journal().transaction_id() == second.transaction_id())
+                .unwrap()
+                .state(),
+            RecoveryTransactionState::RecoveryRequired
+        );
+    }
+
+    #[test]
+    fn prepared_only_history_then_new_same_target_transaction_succeeds() {
+        let fixture = Fixture::new();
+        let first = fixture
+            .store
+            .create_prepared_with_transaction_id_for_test(
+                &fixture.target(),
+                fixture.context(b"after-prepared-first\n"),
+                "tx-prepared-first",
+            )
+            .unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .scan_transactions()
+                .unwrap()
+                .valid_transactions()
+                .find(|snapshot| snapshot.journal().transaction_id() == first.transaction_id())
+                .unwrap()
+                .state(),
+            RecoveryTransactionState::PreparedOnly
+        );
+
+        let second = fixture
+            .store
+            .create_prepared_with_transaction_id_for_test(
+                &fixture.target(),
+                fixture.context(b"after-prepared-second\n"),
+                "tx-prepared-second",
+            )
+            .unwrap();
+        fixture.store.persist_started(&second).unwrap();
+
+        let scan = fixture.store.scan_transactions().unwrap();
+        assert!(!scan.has_ambiguous_target());
+        assert_eq!(scan.actionable_recovery_transactions().count(), 1);
+    }
+
+    #[test]
+    fn two_terminal_histories_then_new_same_target_transaction_succeeds() {
+        let fixture = Fixture::new();
+        let committed = fixture
+            .store
+            .create_prepared_with_transaction_id_for_test(
+                &fixture.target(),
+                fixture.context(b"after-terminal-committed\n"),
+                "tx-terminal-committed",
+            )
+            .unwrap();
+        fixture.store.persist_started(&committed).unwrap();
+        fixture.store.persist_committed(&committed).unwrap();
+
+        let recovered = fixture
+            .store
+            .create_prepared_with_transaction_id_for_test(
+                &fixture.target(),
+                fixture.context(b"after-terminal-recovered\n"),
+                "tx-terminal-recovered",
+            )
+            .unwrap();
+        fixture.store.persist_started(&recovered).unwrap();
+        fixture.store.persist_recovered(&recovered).unwrap();
+
+        let next = fixture
+            .store
+            .create_prepared_with_transaction_id_for_test(
+                &fixture.target(),
+                fixture.context(b"after-terminal-next\n"),
+                "tx-terminal-next",
+            )
+            .unwrap();
+        fixture.store.persist_started(&next).unwrap();
+
+        let scan = fixture.store.scan_transactions().unwrap();
+        assert!(!scan.has_ambiguous_target());
+        assert_eq!(scan.actionable_recovery_transactions().count(), 1);
+        assert_eq!(
+            scan.valid_transactions()
+                .find(|snapshot| snapshot.journal().transaction_id() == next.transaction_id())
+                .unwrap()
+                .state(),
+            RecoveryTransactionState::RecoveryRequired
+        );
+    }
+
+    #[test]
+    fn committed_plus_recovery_required_keeps_one_actionable_recovery() {
+        let fixture = Fixture::new();
+        let terminal = fixture
+            .store
+            .create_prepared_with_transaction_id_for_test(
+                &fixture.target(),
+                fixture.context(b"after-terminal\n"),
+                "tx-terminal-before-active",
+            )
+            .unwrap();
+        fixture.store.persist_started(&terminal).unwrap();
+        fixture.store.persist_committed(&terminal).unwrap();
+        let active = fixture
+            .store
+            .create_prepared_with_transaction_id_for_test(
+                &fixture.target(),
+                fixture.context(b"after-active\n"),
+                "tx-active-after-terminal",
+            )
+            .unwrap();
+        fixture.store.persist_started(&active).unwrap();
+
+        let scan = fixture.store.scan_transactions().unwrap();
+        assert!(!scan.has_ambiguous_target());
+        assert_eq!(scan.actionable_recovery_transactions().count(), 1);
+        assert_eq!(
+            scan.valid_transactions()
+                .filter(|snapshot| snapshot.state() == RecoveryTransactionState::CommittedTerminal)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn recovered_plus_recovery_required_keeps_one_actionable_recovery() {
+        let fixture = Fixture::new();
+        let terminal = fixture
+            .store
+            .create_prepared_with_transaction_id_for_test(
+                &fixture.target(),
+                fixture.context(b"after-terminal\n"),
+                "tx-recovered-before-active",
+            )
+            .unwrap();
+        fixture.store.persist_started(&terminal).unwrap();
+        fixture.store.persist_recovered(&terminal).unwrap();
+        let active = fixture
+            .store
+            .create_prepared_with_transaction_id_for_test(
+                &fixture.target(),
+                fixture.context(b"after-active\n"),
+                "tx-active-after-recovered",
+            )
+            .unwrap();
+        fixture.store.persist_started(&active).unwrap();
+
+        let scan = fixture.store.scan_transactions().unwrap();
+        assert!(!scan.has_ambiguous_target());
+        assert_eq!(scan.actionable_recovery_transactions().count(), 1);
+        assert_eq!(
+            scan.valid_transactions()
+                .filter(|snapshot| snapshot.state() == RecoveryTransactionState::RecoveredTerminal)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn two_recovery_required_same_target_is_ambiguous_actionable_zero() {
+        let fixture = Fixture::new();
+        let first = fixture
+            .store
+            .create_prepared_with_transaction_id_for_test(
+                &fixture.target(),
+                fixture.context(b"after-first\n"),
+                "tx-active-first",
+            )
+            .unwrap();
+        fixture.store.persist_started(&first).unwrap();
+        let second = fixture
+            .store
+            .create_prepared_with_transaction_id_for_test(
+                &fixture.target(),
+                fixture.context(b"after-second\n"),
+                "tx-active-second",
+            )
+            .unwrap();
+        create_marker_for_scan(
+            &fixture,
+            second.transaction_id().clone(),
+            second.integrity_hash_bytes(),
+            RecoveryMarkerState::Started,
+        );
+
+        let scan = fixture.store.scan_transactions().unwrap();
+        assert!(scan.has_ambiguous_target());
+        assert_eq!(scan.actionable_recovery_transactions().count(), 0);
+        assert!(scan.items().iter().any(|item| matches!(
+            item,
+            RecoveryTransactionScanItem::AmbiguousTarget { transactions, .. }
+                if transactions.len() == 2
+        )));
+    }
+
+    #[test]
+    fn poisoned_known_target_blocks_exact_target_only() {
+        let fixture = Fixture::new();
+        let target_a = fixture.target();
+        let target_b = fixture.create_target("target-b.txt", b"before-b\n");
+        let poisoned = fixture
+            .store
+            .create_prepared_with_transaction_id_for_test(
+                &target_a,
+                fixture.context(b"after-poisoned\n"),
+                "tx-poisoned-target",
+            )
+            .unwrap();
+        create_marker_for_scan(
+            &fixture,
+            poisoned.transaction_id().clone(),
+            [0x44; 32],
+            RecoveryMarkerState::Started,
+        );
+        let valid = fixture
+            .store
+            .create_prepared_with_transaction_id_for_test(
+                &target_b,
+                fixture.context(b"after-valid\n"),
+                "tx-valid-target",
+            )
+            .unwrap();
+        fixture.store.persist_started(&valid).unwrap();
+
+        let scan = fixture.store.scan_transactions().unwrap();
+        let target_a_key = target_key_for_prepared_target(&target_a).unwrap();
+        let target_b_key = target_key_for_prepared_target(&target_b).unwrap();
+        assert_eq!(
+            scan.target_lifecycle(&target_a_key),
+            RecoveryTargetLifecycle::Poisoned
+        );
+        assert_eq!(
+            scan.target_lifecycle(&target_b_key),
+            RecoveryTargetLifecycle::RecoveryRequired
+        );
+        assert_eq!(scan.actionable_recovery_transactions().count(), 1);
+        assert_eq!(scan.poisoned_targets().count(), 1);
     }
 
     #[test]

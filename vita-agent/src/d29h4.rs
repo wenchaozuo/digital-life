@@ -701,6 +701,107 @@ impl VitaWorkspaceReplaceBroker {
         lock_unpoisoned(&self.native_evidence).clone()
     }
 
+    #[cfg(test)]
+    pub(crate) async fn issue_h5_authorized_replace_action(
+        &self,
+        input: H4ReplaceAuthorizationInput,
+    ) -> Result<H4AuthorizedReplaceGrant, H4DenyClassification> {
+        let request = input.into_request();
+        self.metrics
+            .attempted_requests
+            .fetch_add(1, Ordering::AcqRel);
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(H4DenyClassification::TurnCancelled);
+        }
+        let bound_context = self
+            .context
+            .as_ref()
+            .ok_or(H4DenyClassification::MissingContext)?;
+        let request_context = request
+            .context
+            .as_ref()
+            .ok_or(H4DenyClassification::MissingContext)?;
+        if request_context.life_id() != bound_context.life_id() {
+            return Err(H4DenyClassification::WrongLifeBinding);
+        }
+        if request_context.task_id() != bound_context.task_id() {
+            return Err(H4DenyClassification::WrongTaskBinding);
+        }
+
+        {
+            let mut state = lock_unpoisoned(&self.state);
+            if state.seen_call_ids.contains(&request.tool_call_id) {
+                return Err(H4DenyClassification::DuplicateToolCall);
+            }
+            if state.seen_call_ids.len() >= MAX_SEEN_CALL_IDS {
+                return Err(H4DenyClassification::CallLimitExceeded);
+            }
+            state.seen_call_ids.insert(request.tool_call_id.clone());
+        }
+
+        if !is_sha256_hex(&request.expected_sha256) {
+            return Err(H4DenyClassification::InvalidRequest);
+        }
+        if request.replacement_content.as_bytes().len() > H4_MAX_REPLACEMENT_BYTES {
+            return Err(H4DenyClassification::InvalidRequest);
+        }
+        let prepared = self
+            .root
+            .prepare_target(request.relative_path.as_path())
+            .map_err(|_| H4DenyClassification::TargetRejected)?;
+        if prepared.kind() != PreparedWorkspaceTargetKind::ExistingFile
+            || prepared.target_identity().is_none()
+        {
+            return Err(if prepared.kind() == PreparedWorkspaceTargetKind::Missing {
+                H4DenyClassification::TargetMissing
+            } else {
+                H4DenyClassification::TargetRejected
+            });
+        }
+        let authority_request = H4AuthorityRequest {
+            context: bound_context.clone(),
+            capability_id: VITA_WORKSPACE_REPLACE_CAPABILITY_ID.to_string(),
+            operation: H4AuthorityOperation::IssueReplaceGrant,
+            tool_call_id: request.tool_call_id.clone(),
+            turn_id: request.turn_id.clone(),
+            relative_path: request.relative_path.clone(),
+            expected_sha256: request.expected_sha256.clone(),
+            replacement_sha256: sha256_hex(request.replacement_content.as_bytes()),
+            replacement_bytes: request.replacement_content.as_bytes().len(),
+            workspace_root_identity: prepared.root().identity(),
+            target_identity: prepared
+                .target_identity()
+                .expect("existing H5 authorization target has an identity"),
+            target_kind: prepared.kind(),
+        };
+        let response = self
+            .evaluate_authority(authority_request.clone())
+            .await
+            .map_err(|classification| classification)?;
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(H4DenyClassification::LateAfterCancellation);
+        }
+        let (confirmation, evidence) = validate_issue_completion(&response, &authority_request)?;
+        let grant = VitaExecutableReplaceGrant::from_host_evidence(
+            confirmation,
+            evidence,
+            &authority_request,
+            &prepared,
+        )?;
+        self.metrics.grants_issued.fetch_add(1, Ordering::AcqRel);
+        if response.confirmation_consumed {
+            self.metrics
+                .confirmations_consumed
+                .fetch_add(1, Ordering::AcqRel);
+        }
+        drop(prepared);
+        Ok(H4AuthorizedReplaceGrant {
+            grant,
+            root: self.root.clone(),
+            authority: Arc::clone(&self.authority),
+        })
+    }
+
     async fn execute_request(
         &self,
         request: VitaWorkspaceReplaceRequest,
@@ -1722,6 +1823,61 @@ fn validate_h4c_revalidation(
 }
 
 #[cfg(test)]
+pub(crate) struct H4GrantFinalFence {
+    authority: Arc<dyn VitaH4AuthorityPort>,
+    grant: VitaExecutableReplaceGrant,
+    runtime: tokio::runtime::Handle,
+    cancellation: Arc<AtomicBool>,
+    sent: bool,
+}
+
+#[cfg(test)]
+impl super::workspace_capability::WorkspaceReplaceCommitFence for H4GrantFinalFence {
+    fn check(&mut self) -> Result<(), WorkspaceReplaceFenceError> {
+        if self.sent {
+            return Err(WorkspaceReplaceFenceError::Error);
+        }
+        self.sent = true;
+        if self.cancellation.load(Ordering::Acquire) {
+            return Err(WorkspaceReplaceFenceError::Cancelled);
+        }
+
+        let binding = H4CGrantBinding::from_grant(&self.grant);
+        let request = H4CRevalidationInput::from_grant(&self.grant).into_request(&binding);
+        let future = match catch_unwind(AssertUnwindSafe(|| {
+            self.authority.evaluate(request.clone())
+        })) {
+            Ok(future) => future,
+            Err(_) => return Err(WorkspaceReplaceFenceError::Error),
+        };
+        let response = match catch_unwind(AssertUnwindSafe(|| {
+            self.runtime.block_on(CatchUnwindFuture::new(future))
+        })) {
+            Ok(Ok(Ok(response))) => response,
+            Ok(Ok(Err(_))) | Ok(Err(())) | Err(_) => return Err(WorkspaceReplaceFenceError::Error),
+        };
+        if self.cancellation.load(Ordering::Acquire) {
+            return Err(WorkspaceReplaceFenceError::Cancelled);
+        }
+        validate_h4c_revalidation(&response, &request, &binding).map_err(|classification| {
+            match classification {
+                H4DenyClassification::StaleRevision
+                | H4DenyClassification::RevalidationDenied
+                | H4DenyClassification::RootDisabled
+                | H4DenyClassification::WorkspaceScopeDenied
+                | H4DenyClassification::ConfirmationExpired
+                | H4DenyClassification::ConfirmationReplay => WorkspaceReplaceFenceError::Stale,
+                H4DenyClassification::TurnCancelled
+                | H4DenyClassification::LateAfterCancellation => {
+                    WorkspaceReplaceFenceError::Cancelled
+                }
+                _ => WorkspaceReplaceFenceError::Denied,
+            }
+        })
+    }
+}
+
+#[cfg(test)]
 impl VitaWorkspaceReplaceExecutionOutcome {
     fn from_native(outcome: WorkspaceReplaceCommitOutcome) -> Self {
         match outcome {
@@ -2108,6 +2264,158 @@ impl VitaExecutableReplaceGrant {
     }
 }
 
+#[cfg(test)]
+pub(crate) struct H4ReplaceAuthorizationInput {
+    context: VitaExecutionContext,
+    relative_path: super::WorkspaceRelativePath,
+    expected_sha256: String,
+    replacement_content: String,
+    tool_call_id: String,
+    turn_id: String,
+}
+
+#[cfg(test)]
+impl H4ReplaceAuthorizationInput {
+    pub(crate) fn new(
+        context: VitaExecutionContext,
+        relative_path: super::WorkspaceRelativePath,
+        expected_sha256: impl Into<String>,
+        replacement_content: impl Into<String>,
+        tool_call_id: impl Into<String>,
+        turn_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            context,
+            relative_path,
+            expected_sha256: expected_sha256.into(),
+            replacement_content: replacement_content.into(),
+            tool_call_id: tool_call_id.into(),
+            turn_id: turn_id.into(),
+        }
+    }
+
+    fn from_request(request: &VitaWorkspaceReplaceRequest) -> Self {
+        Self {
+            context: request
+                .context
+                .clone()
+                .expect("H4 test authorization input requires context"),
+            relative_path: request.relative_path.clone(),
+            expected_sha256: request.expected_sha256.clone(),
+            replacement_content: request.replacement_content.clone(),
+            tool_call_id: request.tool_call_id.clone(),
+            turn_id: request.turn_id.clone(),
+        }
+    }
+
+    fn into_request(self) -> VitaWorkspaceReplaceRequest {
+        VitaWorkspaceReplaceRequest {
+            tool_call_id: self.tool_call_id,
+            turn_id: self.turn_id,
+            context: Some(self.context),
+            relative_path: self.relative_path,
+            expected_sha256: self.expected_sha256,
+            replacement_content: self.replacement_content,
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct H4AuthorizedReplaceGrant {
+    grant: VitaExecutableReplaceGrant,
+    root: super::TrustedWorkspaceRoot,
+    authority: Arc<dyn VitaH4AuthorityPort>,
+}
+
+#[cfg(test)]
+impl H4AuthorizedReplaceGrant {
+    pub(crate) fn root(&self) -> &super::TrustedWorkspaceRoot {
+        &self.root
+    }
+
+    pub(crate) fn prepare_bound_target(&self) -> Result<PreparedWorkspaceTarget, ()> {
+        self.root.verify_named_path_current().map_err(|_| ())?;
+        let prepared = self
+            .root
+            .prepare_target(self.grant.relative_path.as_path())
+            .map_err(|_| ())?;
+        if self.grant.operation != H4ReplaceOperation::ReplaceExistingUtf8File
+            || self.grant.capability_id != VITA_WORKSPACE_REPLACE_CAPABILITY_ID
+            || self.grant.scope != VitaRequestedScope::Workspace
+            || !self.grant.single_use
+            || prepared.kind() != PreparedWorkspaceTargetKind::ExistingFile
+            || prepared.root().identity() != self.grant.workspace_root_identity
+            || prepared.target_identity() != Some(self.grant.target_identity)
+            || prepared.kind() != self.grant.target_kind
+        {
+            return Err(());
+        }
+        Ok(prepared)
+    }
+
+    pub(crate) fn life_id(&self) -> &str {
+        &self.grant.life_id
+    }
+
+    pub(crate) fn task_id(&self) -> &str {
+        &self.grant.task_id
+    }
+
+    pub(crate) fn capability_id(&self) -> &str {
+        &self.grant.capability_id
+    }
+
+    pub(crate) fn authorization_revision(&self) -> i64 {
+        self.grant.authorization_revision
+    }
+
+    pub(crate) fn relative_path(&self) -> &super::WorkspaceRelativePath {
+        &self.grant.relative_path
+    }
+
+    pub(crate) fn target_identity(&self) -> super::WorkspaceRootIdentity {
+        self.grant.target_identity
+    }
+
+    pub(crate) fn target_kind(&self) -> PreparedWorkspaceTargetKind {
+        self.grant.target_kind
+    }
+
+    pub(crate) fn expected_sha256(&self) -> &str {
+        &self.grant.expected_sha256
+    }
+
+    pub(crate) fn replacement_sha256(&self) -> &str {
+        &self.grant.replacement_sha256
+    }
+
+    pub(crate) fn replacement_bytes(&self) -> usize {
+        self.grant.replacement_bytes
+    }
+
+    pub(crate) fn tool_call_id(&self) -> &str {
+        &self.grant.tool_call_id
+    }
+
+    pub(crate) fn turn_id(&self) -> &str {
+        &self.grant.turn_id
+    }
+
+    pub(crate) fn into_final_fence(
+        self,
+        runtime: tokio::runtime::Handle,
+        cancellation: Arc<AtomicBool>,
+    ) -> H4GrantFinalFence {
+        H4GrantFinalFence {
+            authority: self.authority,
+            grant: self.grant,
+            runtime,
+            cancellation,
+            sent: false,
+        }
+    }
+}
+
 struct ActiveAuthorityGuard {
     metrics: Arc<H4BrokerMetrics>,
 }
@@ -2440,6 +2748,39 @@ mod tests {
         ) -> Arc<VitaWorkspaceReplaceBroker> {
             VitaWorkspaceReplaceBroker::new(self.context.clone(), self.root.clone(), authority)
         }
+    }
+
+    fn h5_store_for_fixture(
+        fixture: &Fixture,
+    ) -> (TempDir, crate::recovery_journal::RecoveryJournalStore) {
+        let app_data = tempdir().expect("H5-B app-data root");
+        let profile = crate::VitaAgentRuntimeProfile::from_explicit_app_data_root(
+            app_data.path().to_path_buf(),
+            fixture._root_dir.path().to_path_buf(),
+        )
+        .expect("H5-B profile");
+        profile
+            .ensure_private_runtime_layout()
+            .expect("H5-B private layout");
+        let store = crate::recovery_journal::RecoveryJournalStore::from_runtime_profile(&profile)
+            .expect("H5-B recovery store");
+        (app_data, store)
+    }
+
+    fn h5_context(
+        fixture: &Fixture,
+        replacement: &str,
+    ) -> crate::recovery_journal::RecoveryJournalContext {
+        crate::recovery_journal::RecoveryJournalContext::new(
+            fixture.context.life_id(),
+            fixture.context.task_id(),
+            VITA_WORKSPACE_REPLACE_CAPABILITY_ID,
+            &sha256_hex(replacement.as_bytes()),
+            replacement.as_bytes().len(),
+            "h5-admission-tool",
+            "h5-admission-turn",
+        )
+        .expect("H5-B context")
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2821,6 +3162,344 @@ mod tests {
                 H4AuthorityEvent::IssueEvaluated,
                 H4AuthorityEvent::RevalidationEvaluated,
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn h5_governed_replace_consumes_exact_h4_grant_and_commits() {
+        let fixture = Fixture::new();
+        let request = fixture.request("h5-governed-positive");
+        let authority = TestHostAuthority::new(fixture.root.identity());
+        let authority_request =
+            fixture.authority_request_for(&request, H4AuthorityOperation::IssueReplaceGrant);
+        authority.provision_trusted_confirmation(&authority_request);
+        let broker = fixture.broker(Arc::clone(&authority) as Arc<dyn VitaH4AuthorityPort>);
+        let grant = broker
+            .issue_h5_authorized_replace_action(H4ReplaceAuthorizationInput::from_request(&request))
+            .await
+            .expect("H4 executable grant");
+        let action = crate::d29h5::H5AuthorizedReplaceAction::from_h4_grant(grant);
+        let (_app_data, store) = h5_store_for_fixture(&fixture);
+
+        let result = crate::d29h5::execute_governed_h5_replace(
+            action,
+            request.replacement_content.clone(),
+            store.clone(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("governed H5 replace");
+
+        assert_eq!(
+            result.transaction_outcome,
+            crate::d29h5::H5ReplaceTransactionOutcome::Committed
+        );
+        assert_eq!(
+            fs::read(fixture._root_dir.path().join("replace-me.txt")).unwrap(),
+            REPLACEMENT_CONTENT.as_bytes()
+        );
+        let scan = store.scan_transactions().unwrap();
+        assert_eq!(
+            scan.valid_transactions().next().unwrap().state(),
+            crate::recovery_journal::RecoveryTransactionState::CommittedTerminal
+        );
+        assert_eq!(broker.snapshot().confirmations_consumed, 1);
+        assert_eq!(broker.snapshot().grants_issued, 1);
+        assert_eq!(authority.requests.lock().unwrap().len(), 2);
+        assert_eq!(
+            authority.provenance_snapshot().events,
+            vec![
+                H4AuthorityEvent::TrustedConfirmationProvisioned,
+                H4AuthorityEvent::IssueEvaluated,
+                H4AuthorityEvent::RevalidationEvaluated,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn h5_final_fence_revocation_leaves_prepared_only() {
+        let fixture = Fixture::new();
+        let request = fixture.request("h5-final-fence-revoked");
+        let authority = TestHostAuthority::new(fixture.root.identity());
+        let authority_request =
+            fixture.authority_request_for(&request, H4AuthorityOperation::IssueReplaceGrant);
+        authority.provision_trusted_confirmation(&authority_request);
+        let broker = fixture.broker(Arc::clone(&authority) as Arc<dyn VitaH4AuthorityPort>);
+        let grant = broker
+            .issue_h5_authorized_replace_action(H4ReplaceAuthorizationInput::from_request(&request))
+            .await
+            .expect("H4 executable grant");
+        authority.disabled.store(true, Ordering::Release);
+        authority
+            .revision
+            .store((REVISION + 1) as usize, Ordering::Release);
+        let action = crate::d29h5::H5AuthorizedReplaceAction::from_h4_grant(grant);
+        let (_app_data, store) = h5_store_for_fixture(&fixture);
+
+        let result = crate::d29h5::execute_governed_h5_replace(
+            action,
+            request.replacement_content.clone(),
+            store.clone(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("revoked H5 replace returns a transaction result");
+
+        assert_eq!(
+            result.transaction_outcome,
+            crate::d29h5::H5ReplaceTransactionOutcome::Denied {
+                recovery: crate::d29h5::H5RecoveryDisposition::None,
+            }
+        );
+        assert_eq!(
+            fs::read(fixture._root_dir.path().join("replace-me.txt")).unwrap(),
+            FILE_CONTENT.as_bytes()
+        );
+        let scan = store.scan_transactions().unwrap();
+        assert_eq!(scan.actionable_recovery_transactions().count(), 0);
+        assert_eq!(
+            scan.valid_transactions().next().unwrap().state(),
+            crate::recovery_journal::RecoveryTransactionState::PreparedOnly
+        );
+        assert_eq!(authority.requests.lock().unwrap().len(), 2);
+        assert_eq!(
+            authority.provenance_snapshot().events.last().copied(),
+            Some(H4AuthorityEvent::RevalidationEvaluated)
+        );
+    }
+
+    #[tokio::test]
+    async fn h5_replacement_binding_mismatch_creates_no_journal() {
+        let fixture = Fixture::new();
+        let request = fixture.request("h5-replacement-mismatch");
+        let authority = TestHostAuthority::new(fixture.root.identity());
+        let authority_request =
+            fixture.authority_request_for(&request, H4AuthorityOperation::IssueReplaceGrant);
+        authority.provision_trusted_confirmation(&authority_request);
+        let broker = fixture.broker(Arc::clone(&authority) as Arc<dyn VitaH4AuthorityPort>);
+        let grant = broker
+            .issue_h5_authorized_replace_action(H4ReplaceAuthorizationInput::from_request(&request))
+            .await
+            .expect("H4 executable grant");
+        let action = crate::d29h5::H5AuthorizedReplaceAction::from_h4_grant(grant);
+        let (_app_data, store) = h5_store_for_fixture(&fixture);
+
+        let error = crate::d29h5::execute_governed_h5_replace(
+            action,
+            "different replacement".to_string(),
+            store.clone(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect_err("replacement binding mismatch must deny before journal create");
+        assert!(matches!(
+            error,
+            crate::recovery_journal::RecoveryJournalError::TargetBindingMismatch(_)
+        ));
+        assert_eq!(
+            store
+                .scan_transactions()
+                .unwrap()
+                .valid_transactions()
+                .count(),
+            0
+        );
+        assert_eq!(
+            fs::read(fixture._root_dir.path().join("replace-me.txt")).unwrap(),
+            FILE_CONTENT.as_bytes()
+        );
+        assert_eq!(authority.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn h5_recovery_required_blocks_before_new_journal() {
+        let fixture = Fixture::new();
+        let request = fixture.request("h5-recovery-required-admission");
+        let authority = TestHostAuthority::new(fixture.root.identity());
+        let authority_request =
+            fixture.authority_request_for(&request, H4AuthorityOperation::IssueReplaceGrant);
+        authority.provision_trusted_confirmation(&authority_request);
+        let broker = fixture.broker(Arc::clone(&authority) as Arc<dyn VitaH4AuthorityPort>);
+        let grant = broker
+            .issue_h5_authorized_replace_action(H4ReplaceAuthorizationInput::from_request(&request))
+            .await
+            .expect("H4 executable grant");
+        let action = crate::d29h5::H5AuthorizedReplaceAction::from_h4_grant(grant);
+        let (_app_data, store) = h5_store_for_fixture(&fixture);
+        let existing = store
+            .create_prepared_for_expected_preimage(
+                &fixture
+                    .root
+                    .prepare_target(fixture.relative_path.as_path())
+                    .unwrap(),
+                h5_context(&fixture, REPLACEMENT_CONTENT),
+                &sha256_hex(FILE_CONTENT.as_bytes()),
+            )
+            .unwrap();
+        store.persist_started(&existing).unwrap();
+
+        let error = crate::d29h5::execute_governed_h5_replace(
+            action,
+            request.replacement_content.clone(),
+            store.clone(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect_err("RecoveryRequired must block before journal create");
+        assert!(matches!(
+            error,
+            crate::recovery_journal::RecoveryJournalError::TransactionBlocked(
+                crate::recovery_journal::RecoveryTransactionBlockReason::RecoveryRequired
+            )
+        ));
+        assert_eq!(
+            store
+                .scan_transactions()
+                .unwrap()
+                .valid_transactions()
+                .count(),
+            1
+        );
+        assert_eq!(
+            fs::read(fixture._root_dir.path().join("replace-me.txt")).unwrap(),
+            FILE_CONTENT.as_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn h5_ambiguous_recovery_blocks_before_new_journal() {
+        let fixture = Fixture::new();
+        let request = fixture.request("h5-ambiguous-admission");
+        let authority = TestHostAuthority::new(fixture.root.identity());
+        let authority_request =
+            fixture.authority_request_for(&request, H4AuthorityOperation::IssueReplaceGrant);
+        authority.provision_trusted_confirmation(&authority_request);
+        let broker = fixture.broker(Arc::clone(&authority) as Arc<dyn VitaH4AuthorityPort>);
+        let grant = broker
+            .issue_h5_authorized_replace_action(H4ReplaceAuthorizationInput::from_request(&request))
+            .await
+            .expect("H4 executable grant");
+        let action = crate::d29h5::H5AuthorizedReplaceAction::from_h4_grant(grant);
+        let (_app_data, store) = h5_store_for_fixture(&fixture);
+        let target = fixture
+            .root
+            .prepare_target(fixture.relative_path.as_path())
+            .unwrap();
+        let first = store
+            .create_prepared_with_transaction_id_for_test(
+                &target,
+                h5_context(&fixture, REPLACEMENT_CONTENT),
+                "h5-ambiguous-first",
+            )
+            .unwrap();
+        store.persist_started(&first).unwrap();
+        let second = store
+            .create_prepared_with_transaction_id_for_test(
+                &target,
+                h5_context(&fixture, REPLACEMENT_CONTENT),
+                "h5-ambiguous-second",
+            )
+            .unwrap();
+        let marker = crate::recovery_journal::RecoveryMarkerV1::new(
+            second.transaction_id().clone(),
+            second.integrity_hash_bytes(),
+            crate::recovery_journal::RecoveryMarkerState::Started,
+        );
+        fs::write(
+            store
+                .recovery_root()
+                .join(format!("{}.started", marker.transaction_id().as_str())),
+            marker.to_bytes().unwrap(),
+        )
+        .unwrap();
+
+        let error = crate::d29h5::execute_governed_h5_replace(
+            action,
+            request.replacement_content.clone(),
+            store.clone(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect_err("ambiguous recovery must block before journal create");
+        assert!(matches!(
+            error,
+            crate::recovery_journal::RecoveryJournalError::TransactionBlocked(
+                crate::recovery_journal::RecoveryTransactionBlockReason::AmbiguousTarget
+            )
+        ));
+        let scan = store.scan_transactions().unwrap();
+        assert!(scan.has_ambiguous_target());
+        assert_eq!(scan.actionable_recovery_transactions().count(), 0);
+        assert_eq!(
+            fs::read(fixture._root_dir.path().join("replace-me.txt")).unwrap(),
+            FILE_CONTENT.as_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn h5_poisoned_known_target_blocks_before_new_journal() {
+        let fixture = Fixture::new();
+        let request = fixture.request("h5-poisoned-admission");
+        let authority = TestHostAuthority::new(fixture.root.identity());
+        let authority_request =
+            fixture.authority_request_for(&request, H4AuthorityOperation::IssueReplaceGrant);
+        authority.provision_trusted_confirmation(&authority_request);
+        let broker = fixture.broker(Arc::clone(&authority) as Arc<dyn VitaH4AuthorityPort>);
+        let grant = broker
+            .issue_h5_authorized_replace_action(H4ReplaceAuthorizationInput::from_request(&request))
+            .await
+            .expect("H4 executable grant");
+        let action = crate::d29h5::H5AuthorizedReplaceAction::from_h4_grant(grant);
+        let (_app_data, store) = h5_store_for_fixture(&fixture);
+        let existing = store
+            .create_prepared_for_expected_preimage(
+                &fixture
+                    .root
+                    .prepare_target(fixture.relative_path.as_path())
+                    .unwrap(),
+                h5_context(&fixture, REPLACEMENT_CONTENT),
+                &sha256_hex(FILE_CONTENT.as_bytes()),
+            )
+            .unwrap();
+        let poisoned_marker = crate::recovery_journal::RecoveryMarkerV1::new(
+            existing.transaction_id().clone(),
+            [0x44; 32],
+            crate::recovery_journal::RecoveryMarkerState::Started,
+        );
+        fs::write(
+            store.recovery_root().join(format!(
+                "{}.started",
+                poisoned_marker.transaction_id().as_str()
+            )),
+            poisoned_marker.to_bytes().unwrap(),
+        )
+        .unwrap();
+
+        let error = crate::d29h5::execute_governed_h5_replace(
+            action,
+            request.replacement_content.clone(),
+            store.clone(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect_err("poisoned target must block before journal create");
+        assert!(matches!(
+            error,
+            crate::recovery_journal::RecoveryJournalError::TransactionBlocked(
+                crate::recovery_journal::RecoveryTransactionBlockReason::PoisonedTarget
+            )
+        ));
+        assert_eq!(
+            store
+                .scan_transactions()
+                .unwrap()
+                .valid_transactions()
+                .count(),
+            0
+        );
+        assert_eq!(
+            fs::read(fixture._root_dir.path().join("replace-me.txt")).unwrap(),
+            FILE_CONTENT.as_bytes()
         );
     }
 

@@ -10,13 +10,16 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::d29h4::H4AuthorizedReplaceGrant;
 use crate::recovery_journal::{
-    RecoveryJournalError, RecoveryJournalIdentity, RecoveryJournalStore, RecoveryJournalV1,
+    target_key_for_prepared_target, RecoveryJournalContext, RecoveryJournalError,
+    RecoveryJournalIdentity, RecoveryJournalStore, RecoveryJournalTargetKey, RecoveryJournalV1,
     RecoveryMarkerPersistenceTestFault, RecoveryMarkerState, RecoveryMarkerV1,
-    RecoveryTransactionId, RecoveryTransactionScan, RecoveryTransactionScanItem,
-    RecoveryTransactionSnapshot, RecoveryTransactionState, RECOVERY_JOURNAL_MAX_PREIMAGE_BYTES,
+    RecoveryTargetLifecycle, RecoveryTransactionBlockReason, RecoveryTransactionId,
+    RecoveryTransactionScan, RecoveryTransactionScanItem, RecoveryTransactionSnapshot,
+    RecoveryTransactionState, RECOVERY_JOURNAL_MAX_PREIMAGE_BYTES,
 };
 use crate::workspace_capability::{
     PreparedWorkspaceTargetKind, WorkspaceReadError, WorkspaceRecoveryCommitOutcome,
@@ -164,6 +167,46 @@ pub(crate) struct H5ReplaceExecutionResult {
     // Native H4 evidence is retained only as private diagnostics.  H5 callers
     // consume `transaction_outcome`, never a split native/marker verdict.
     native_diagnostics: WorkspaceReplaceCommitOutcome,
+}
+
+/// A non-Clone runtime bridge produced only from a validated H4 executable
+/// replace grant.  Recovery journal bytes deliberately never contain this
+/// object or any of its authority material.
+pub(crate) struct H5AuthorizedReplaceAction {
+    h4_grant: H4AuthorizedReplaceGrant,
+}
+
+impl H5AuthorizedReplaceAction {
+    pub(crate) fn from_h4_grant(h4_grant: H4AuthorizedReplaceGrant) -> Self {
+        Self { h4_grant }
+    }
+}
+
+static H5_TARGET_ADMISSIONS: OnceLock<Mutex<HashMap<RecoveryJournalTargetKey, ()>>> =
+    OnceLock::new();
+
+struct H5TargetAdmissionGuard {
+    target: RecoveryJournalTargetKey,
+}
+
+impl H5TargetAdmissionGuard {
+    fn try_acquire(target: RecoveryJournalTargetKey) -> Option<Self> {
+        let admissions = H5_TARGET_ADMISSIONS.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut admissions = lock_unpoisoned(admissions);
+        if admissions.contains_key(&target) {
+            return None;
+        }
+        admissions.insert(target.clone(), ());
+        Some(Self { target })
+    }
+}
+
+impl Drop for H5TargetAdmissionGuard {
+    fn drop(&mut self) {
+        if let Some(admissions) = H5_TARGET_ADMISSIONS.get() {
+            lock_unpoisoned(admissions).remove(&self.target);
+        }
+    }
 }
 
 struct H5StartedFence<'a> {
@@ -783,25 +826,124 @@ fn reconcile_started_persistence_failure(
         .valid_transactions()
         .find(|snapshot| snapshot.journal().transaction_id() == journal.transaction_id())
         .map(RecoveryTransactionSnapshot::state);
+    let target_lifecycle = scan.target_lifecycle_for_journal(journal);
 
-    match state {
-        Some(RecoveryTransactionState::PreparedOnly) => H5ReplaceTransactionOutcome::Denied {
-            recovery: H5RecoveryDisposition::None,
-        },
-        Some(RecoveryTransactionState::RecoveryRequired) => H5ReplaceTransactionOutcome::Denied {
+    match (state, target_lifecycle) {
+        (Some(RecoveryTransactionState::PreparedOnly), RecoveryTargetLifecycle::Clear) => {
+            H5ReplaceTransactionOutcome::Denied {
+                recovery: H5RecoveryDisposition::None,
+            }
+        }
+        (
+            Some(
+                RecoveryTransactionState::PreparedOnly | RecoveryTransactionState::RecoveryRequired,
+            ),
+            RecoveryTargetLifecycle::RecoveryRequired,
+        ) => H5ReplaceTransactionOutcome::Denied {
             recovery: H5RecoveryDisposition::Required,
         },
-        Some(
-            RecoveryTransactionState::CommittedTerminal
-            | RecoveryTransactionState::RecoveredTerminal,
+        (_, RecoveryTargetLifecycle::Poisoned | RecoveryTargetLifecycle::Ambiguous)
+        | (
+            Some(
+                RecoveryTransactionState::CommittedTerminal
+                | RecoveryTransactionState::RecoveredTerminal,
+            ),
+            _,
         )
-        | None => H5ReplaceTransactionOutcome::LifecycleUnknown {
+        | (Some(RecoveryTransactionState::RecoveryRequired), RecoveryTargetLifecycle::Clear) => {
+            H5ReplaceTransactionOutcome::LifecycleUnknown {
+                workspace_mutation_started: false,
+            }
+        }
+        _ => H5ReplaceTransactionOutcome::LifecycleUnknown {
             workspace_mutation_started: false,
         },
     }
 }
 
-pub(crate) fn execute_h5b_replace_after_host_pass(
+/// Canonical governed H5 entrypoint.  The caller supplies only the non-authority
+/// replacement content; every target, context, expected hash, replacement
+/// binding, and final Host fence comes from the single-use H4 action.
+pub(crate) async fn execute_governed_h5_replace(
+    authorized_action: H5AuthorizedReplaceAction,
+    replacement_content: String,
+    store: RecoveryJournalStore,
+    cancellation: Arc<AtomicBool>,
+) -> Result<H5ReplaceExecutionResult, RecoveryJournalError> {
+    let H5AuthorizedReplaceAction { h4_grant } = authorized_action;
+    let root = h4_grant.root().clone();
+    let target = h4_grant
+        .prepare_bound_target()
+        .map_err(|_| RecoveryJournalError::TargetBindingMismatch("H4 target binding rejected"))?;
+    let target_key = target_key_for_prepared_target(&target)?;
+    let _admission_guard = H5TargetAdmissionGuard::try_acquire(target_key.clone()).ok_or(
+        RecoveryJournalError::TransactionBlocked(
+            RecoveryTransactionBlockReason::ConcurrentAdmission,
+        ),
+    )?;
+    let scan = store.scan_transactions()?;
+    match scan.target_lifecycle(&target_key) {
+        RecoveryTargetLifecycle::Clear => {}
+        RecoveryTargetLifecycle::RecoveryRequired => {
+            return Err(RecoveryJournalError::TransactionBlocked(
+                RecoveryTransactionBlockReason::RecoveryRequired,
+            ))
+        }
+        RecoveryTargetLifecycle::Ambiguous => {
+            return Err(RecoveryJournalError::TransactionBlocked(
+                RecoveryTransactionBlockReason::AmbiguousTarget,
+            ))
+        }
+        RecoveryTargetLifecycle::Poisoned => {
+            return Err(RecoveryJournalError::TransactionBlocked(
+                RecoveryTransactionBlockReason::PoisonedTarget,
+            ))
+        }
+    }
+
+    let expected_sha256 = h4_grant.expected_sha256().to_string();
+    if sha256_hex(replacement_content.as_bytes()) != h4_grant.replacement_sha256()
+        || replacement_content.as_bytes().len() != h4_grant.replacement_bytes()
+    {
+        return Err(RecoveryJournalError::TargetBindingMismatch(
+            "replacement content does not match the H4 executable grant",
+        ));
+    }
+    let context = RecoveryJournalContext::new(
+        h4_grant.life_id(),
+        h4_grant.task_id(),
+        h4_grant.capability_id(),
+        h4_grant.replacement_sha256(),
+        h4_grant.replacement_bytes(),
+        h4_grant.tool_call_id(),
+        h4_grant.turn_id(),
+    )?;
+    let runtime = tokio::runtime::Handle::current();
+    let mut final_fence = h4_grant.into_final_fence(runtime, Arc::clone(&cancellation));
+    let result = tokio::task::spawn_blocking(move || {
+        execute_h5b_replace_after_host_pass_internal(
+            &store,
+            &root,
+            target,
+            context,
+            &expected_sha256,
+            &replacement_content,
+            cancellation.as_ref(),
+            &mut final_fence,
+            false,
+            None,
+            None,
+        )
+    })
+    .await
+    .map_err(|_| RecoveryJournalError::TargetBindingMismatch("H5 native worker did not return"))?;
+    result
+}
+
+// Legacy direct wrapper retained only for focused native/journal tests.  It is
+// not the governed H5 entrypoint and is never reachable from production code.
+#[cfg(test)]
+fn execute_h5b_replace_after_host_pass(
     store: &RecoveryJournalStore,
     root: &TrustedWorkspaceRoot,
     target: PreparedWorkspaceTarget,
@@ -1094,6 +1236,23 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    #[test]
+    fn same_target_admission_guard_denies_second_holder_without_waiting() {
+        let fixture = Fixture::new();
+        let target = target_key_for_prepared_target(&fixture.target()).unwrap();
+        let first = H5TargetAdmissionGuard::try_acquire(target.clone())
+            .expect("first same-target admission");
+        assert!(
+            H5TargetAdmissionGuard::try_acquire(target.clone()).is_none(),
+            "a second canonical admission must fail closed without waiting"
+        );
+        drop(first);
+        assert!(
+            H5TargetAdmissionGuard::try_acquire(target).is_some(),
+            "the exact target becomes available after the first operation exits"
+        );
     }
 
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -3612,7 +3771,7 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_prepared_target_has_no_h5_recovery_candidate() {
+    fn prepared_only_history_does_not_create_h5_recovery_block() {
         let fixture = Fixture::new();
         fixture
             .store
@@ -3631,8 +3790,8 @@ mod tests {
             )
             .unwrap();
         let scan = fixture.store.scan_transactions().unwrap();
-        assert!(scan.has_ambiguous_target());
-        assert_eq!(scan.valid_transactions().count(), 0);
+        assert!(!scan.has_ambiguous_target());
+        assert_eq!(scan.valid_transactions().count(), 2);
         assert_eq!(scan.actionable_recovery_transactions().count(), 0);
     }
 

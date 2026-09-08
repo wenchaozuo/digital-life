@@ -562,10 +562,12 @@ pub(crate) enum WorkspaceRecoveryCommitOutcome {
     },
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WorkspaceReplaceTestFault {
     AfterFirstWrite,
+    AfterCommitFenceBeforePostFenceChecks,
+    PostFenceHashMismatch,
     PanicBeforeFirstMutation,
     PanicAfterFirstMutation,
     AbortAfterFirstMutation,
@@ -1173,21 +1175,36 @@ impl PreparedWorkspaceTarget {
         tracker: &mut WorkspaceReplaceMutationTracker,
         fault: WorkspaceReplaceTestFault,
     ) -> WorkspaceReplaceCommitOutcome {
-        let point = match fault {
+        let mut faults = match fault {
             WorkspaceReplaceTestFault::AfterFirstWrite => {
-                platform::WorkspaceReplaceFaultPoint::AfterFirstWrite
+                platform::WorkspaceReplaceFaultPlan::once(
+                    platform::WorkspaceReplaceFaultPoint::AfterFirstWrite,
+                )
+            }
+            WorkspaceReplaceTestFault::AfterCommitFenceBeforePostFenceChecks => {
+                platform::WorkspaceReplaceFaultPlan::once(
+                    platform::WorkspaceReplaceFaultPoint::AfterCommitFenceBeforePostFenceChecks,
+                )
+            }
+            WorkspaceReplaceTestFault::PostFenceHashMismatch => {
+                platform::WorkspaceReplaceFaultPlan::post_fence_hash_mismatch()
             }
             WorkspaceReplaceTestFault::PanicBeforeFirstMutation => {
-                platform::WorkspaceReplaceFaultPoint::PanicBeforeFirstMutation
+                platform::WorkspaceReplaceFaultPlan::once(
+                    platform::WorkspaceReplaceFaultPoint::PanicBeforeFirstMutation,
+                )
             }
             WorkspaceReplaceTestFault::PanicAfterFirstMutation => {
-                platform::WorkspaceReplaceFaultPoint::PanicAfterFirstMutation
+                platform::WorkspaceReplaceFaultPlan::once(
+                    platform::WorkspaceReplaceFaultPoint::PanicAfterFirstMutation,
+                )
             }
             WorkspaceReplaceTestFault::AbortAfterFirstMutation => {
-                platform::WorkspaceReplaceFaultPoint::AbortAfterFirstMutation
+                platform::WorkspaceReplaceFaultPlan::once(
+                    platform::WorkspaceReplaceFaultPoint::AbortAfterFirstMutation,
+                )
             }
         };
-        let mut faults = platform::WorkspaceReplaceFaultPlan::once(point);
         platform::replace_existing_file_utf8_bounded_with_faults(
             self,
             expected_sha256,

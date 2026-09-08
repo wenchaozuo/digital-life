@@ -140,12 +140,21 @@ pub(crate) struct RecoveryExecutionResult {
     pub marker_persisted: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum H5ReplaceTransactionOutcome {
+    Denied { recovery_required: bool },
+    Conflict { recovery_required: bool },
+    Committed,
+    CommitUnknown { recovery_required: bool },
+}
+
 #[derive(Debug)]
 pub(crate) struct H5ReplaceExecutionResult {
     pub journal: RecoveryJournalV1,
-    pub native_outcome: WorkspaceReplaceCommitOutcome,
-    pub commit_marker_persisted: bool,
-    pub commit_unknown: bool,
+    pub(crate) transaction_outcome: H5ReplaceTransactionOutcome,
+    // Native H4 evidence is retained only as private diagnostics.  H5 callers
+    // consume `transaction_outcome`, never a split native/marker verdict.
+    native_diagnostics: WorkspaceReplaceCommitOutcome,
 }
 
 struct H5StartedFence<'a> {
@@ -256,7 +265,7 @@ impl TestRecoveryAuthority {
             .fetch_add(1, Ordering::AcqRel);
     }
 
-    pub(crate) fn disable_same_sqlite_authorization(&self) -> i64 {
+    pub(crate) fn disable_test_authorization(&self) -> i64 {
         self.enabled.store(false, Ordering::Release);
         self.revision.fetch_add(1, Ordering::AcqRel) + 1
     }
@@ -749,6 +758,33 @@ pub(crate) fn execute_h5b_replace_after_host_pass(
         cancellation,
         fence,
         false,
+        None,
+    )
+}
+
+#[cfg(all(test, windows))]
+fn execute_h5b_replace_after_host_pass_with_test_fault(
+    store: &RecoveryJournalStore,
+    root: &TrustedWorkspaceRoot,
+    target: PreparedWorkspaceTarget,
+    context: crate::recovery_journal::RecoveryJournalContext,
+    expected_sha256: &str,
+    replacement: &str,
+    cancellation: &dyn WorkspaceReplaceCancellation,
+    fence: &mut dyn WorkspaceReplaceCommitFence,
+    fault: WorkspaceReplaceTestFault,
+) -> Result<H5ReplaceExecutionResult, RecoveryJournalError> {
+    execute_h5b_replace_after_host_pass_internal(
+        store,
+        root,
+        target,
+        context,
+        expected_sha256,
+        replacement,
+        cancellation,
+        fence,
+        false,
+        Some(fault),
     )
 }
 
@@ -762,6 +798,7 @@ fn execute_h5b_replace_after_host_pass_internal(
     cancellation: &dyn WorkspaceReplaceCancellation,
     fence: &mut dyn WorkspaceReplaceCommitFence,
     force_commit_marker_failure: bool,
+    native_fault: Option<WorkspaceReplaceTestFault>,
 ) -> Result<H5ReplaceExecutionResult, RecoveryJournalError> {
     if context.capability_id() != H5_ORIGINAL_REPLACE_CAPABILITY_ID
         || context.replacement_sha256() != sha256_hex(replacement.as_bytes())
@@ -780,30 +817,64 @@ fn execute_h5b_replace_after_host_pass_internal(
         host_fence: fence,
         started_persisted: false,
     };
-    let outcome = target.replace_existing_file_utf8_bounded_with_cancellation(
-        expected_sha256,
-        replacement,
-        &mut started_fence,
-        cancellation,
-    );
-    let mut commit_marker_persisted = false;
-    let mut commit_unknown = false;
-    if matches!(outcome, WorkspaceReplaceCommitOutcome::Committed { .. }) {
-        let commit_marker = if force_commit_marker_failure {
-            Err(RecoveryJournalError::InjectedFault("commit marker"))
-        } else {
-            store.persist_committed(&journal)
-        };
-        match commit_marker {
-            Ok(_) => commit_marker_persisted = true,
-            Err(_) => commit_unknown = true,
+    #[cfg(windows)]
+    let outcome = match native_fault {
+        Some(fault) => target.replace_existing_file_utf8_bounded_with_test_fault(
+            expected_sha256,
+            replacement,
+            &mut started_fence,
+            cancellation,
+            fault,
+        ),
+        None => target.replace_existing_file_utf8_bounded_with_cancellation(
+            expected_sha256,
+            replacement,
+            &mut started_fence,
+            cancellation,
+        ),
+    };
+    #[cfg(not(windows))]
+    let outcome = {
+        let _ = native_fault;
+        target.replace_existing_file_utf8_bounded_with_cancellation(
+            expected_sha256,
+            replacement,
+            &mut started_fence,
+            cancellation,
+        )
+    };
+    let started_persisted = started_fence.started_persisted;
+    let transaction_outcome = match &outcome {
+        WorkspaceReplaceCommitOutcome::Denied { .. } => H5ReplaceTransactionOutcome::Denied {
+            recovery_required: started_persisted,
+        },
+        WorkspaceReplaceCommitOutcome::Conflict { .. } => H5ReplaceTransactionOutcome::Conflict {
+            recovery_required: started_persisted,
+        },
+        WorkspaceReplaceCommitOutcome::CommitUnknown { .. } => {
+            H5ReplaceTransactionOutcome::CommitUnknown {
+                recovery_required: true,
+            }
         }
-    }
+        WorkspaceReplaceCommitOutcome::Committed { .. } => {
+            let commit_marker = if force_commit_marker_failure {
+                Err(RecoveryJournalError::InjectedFault("commit marker"))
+            } else {
+                store.persist_committed(&journal)
+            };
+            if commit_marker.is_ok() {
+                H5ReplaceTransactionOutcome::Committed
+            } else {
+                H5ReplaceTransactionOutcome::CommitUnknown {
+                    recovery_required: true,
+                }
+            }
+        }
+    };
     Ok(H5ReplaceExecutionResult {
         journal,
-        native_outcome: outcome,
-        commit_marker_persisted,
-        commit_unknown,
+        transaction_outcome,
+        native_diagnostics: outcome,
     })
 }
 
@@ -825,13 +896,20 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+    use serde::{Deserialize, Serialize};
     use std::fs;
+    use std::io::{Read, Write};
     use std::path::{Path, PathBuf};
-    use std::process::Command;
+    use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+    use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
     use tempfile::{tempdir, TempDir};
 
     const BEFORE: &[u8] = b"H5-B before\n";
     const REPLACEMENT: &str = "H5-B replacement\n";
+    const H5_HOST_MAX_FRAME_BYTES: usize = 64 * 1024;
+    const H5_HOST_IPC_TIMEOUT: Duration = Duration::from_secs(10);
 
     struct Fixture {
         _app_data: TempDir,
@@ -911,6 +989,770 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct H5WireBinding {
+        action_id: String,
+        life_id: String,
+        task_id: String,
+        capability_id: String,
+        authorization_revision: i64,
+        workspace_root_identity: String,
+        relative_path: String,
+        target_identity: String,
+        transaction_id: String,
+        journal_integrity_hash: String,
+        current_sha256: String,
+        current_bytes: u64,
+        restore_sha256: String,
+        restore_bytes: u64,
+        original_replacement_sha256: String,
+    }
+
+    #[derive(Clone, Debug, Serialize)]
+    #[serde(tag = "operation", rename_all = "snake_case")]
+    enum H5HostWireRequest {
+        Initialize {
+            protocol_version: u8,
+            life_id: String,
+            task_id: String,
+            capability_id: String,
+            allowed_workspace_root_identity: String,
+        },
+        ProvisionRecoveryConfirmation {
+            confirmation_id: String,
+            #[serde(flatten)]
+            binding: H5WireBinding,
+        },
+        IssueRecoveryGrant {
+            #[serde(flatten)]
+            binding: H5WireBinding,
+        },
+        RevalidateRecoveryGrant {
+            grant_id: String,
+            #[serde(flatten)]
+            binding: H5WireBinding,
+        },
+        DisableAuthorizationForTest {
+            life_id: String,
+            capability_id: String,
+            expected_revision: i64,
+        },
+        Shutdown {},
+    }
+
+    #[derive(Clone, Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct H5ConfirmationWire {
+        confirmation_id: String,
+        binding: H5WireBinding,
+        issued_at_unix_ms: u64,
+        expires_at_unix_ms: u64,
+    }
+
+    #[derive(Clone, Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct H5GrantWire {
+        grant_id: String,
+        confirmation_id: String,
+        binding: H5WireBinding,
+        issued_at_unix_ms: u64,
+        expires_at_unix_ms: u64,
+        single_use: bool,
+        used: bool,
+    }
+
+    #[derive(Clone, Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct H5HostResponse {
+        operation: String,
+        status: String,
+        authorization_revision: Option<i64>,
+        production_registry_size: Option<usize>,
+        test_registry_size: Option<usize>,
+        same_sqlite_row: Option<bool>,
+        trusted_confirmation: Option<bool>,
+        request_derived_confirmation: Option<bool>,
+        confirmation: Option<H5ConfirmationWire>,
+        confirmation_consumed: Option<bool>,
+        recovery_grant: Option<H5GrantWire>,
+        denial: Option<String>,
+        modifying_syscalls: Option<usize>,
+        error: Option<String>,
+    }
+
+    enum H5HostCommand {
+        Request {
+            body: Vec<u8>,
+            response: SyncSender<Result<Vec<u8>, String>>,
+        },
+        Shutdown {
+            body: Vec<u8>,
+            response: SyncSender<Result<Vec<u8>, String>>,
+        },
+    }
+
+    struct ProcessIsolatedH5HostProcess {
+        commands: std::sync::Mutex<Option<SyncSender<H5HostCommand>>>,
+        child: std::sync::Mutex<Child>,
+        worker: std::sync::Mutex<Option<JoinHandle<()>>>,
+        terminated: AtomicBool,
+    }
+
+    impl ProcessIsolatedH5HostProcess {
+        fn start(
+            repo_root: &Path,
+            life_id: String,
+            task_id: String,
+            allowed_workspace_root_identity: String,
+        ) -> Result<Arc<Self>, String> {
+            let executable = h5_host_fixture_executable(repo_root)?;
+            let mut child = Command::new(executable)
+                .current_dir(repo_root)
+                .env("CARGO_TERM_COLOR", "never")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|error| format!("spawn persistent H5 Host fixture: {error}"))?;
+            let stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| "persistent H5 Host fixture stdin unavailable".to_string())?;
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| "persistent H5 Host fixture stdout unavailable".to_string())?;
+            let (sender, receiver) = sync_channel(1);
+            let process = Arc::new(Self {
+                commands: std::sync::Mutex::new(Some(sender)),
+                child: std::sync::Mutex::new(child),
+                worker: std::sync::Mutex::new(None),
+                terminated: AtomicBool::new(false),
+            });
+            let worker = thread::spawn(move || h5_host_worker(receiver, stdin, stdout));
+            *lock_unpoisoned(&process.worker) = Some(worker);
+
+            let response = process.roundtrip(&H5HostWireRequest::Initialize {
+                protocol_version: 1,
+                life_id,
+                task_id,
+                capability_id: H5_RECOVER_REPLACE_CAPABILITY_ID.to_string(),
+                allowed_workspace_root_identity,
+            });
+            let response = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    process.abort();
+                    return Err(error);
+                }
+            };
+            let response: H5HostResponse = match serde_json::from_slice(&response) {
+                Ok(response) => response,
+                Err(_) => {
+                    process.abort();
+                    return Err("persistent H5 Host initialize response malformed".to_string());
+                }
+            };
+            if response.operation != "initialize"
+                || response.status != "ok"
+                || response.authorization_revision != Some(2)
+                || response.production_registry_size != Some(0)
+                || response.test_registry_size != Some(1)
+                || response.same_sqlite_row != Some(true)
+                || response.trusted_confirmation.is_some()
+                || response.request_derived_confirmation.is_some()
+                || response.confirmation.is_some()
+                || response.confirmation_consumed.is_some()
+                || response.recovery_grant.is_some()
+                || response.denial.is_some()
+                || response.modifying_syscalls.is_some()
+                || response.error.is_some()
+            {
+                process.abort();
+                return Err("persistent H5 Host initialize response invalid".to_string());
+            }
+            Ok(process)
+        }
+
+        fn roundtrip(&self, request: &H5HostWireRequest) -> Result<Vec<u8>, String> {
+            self.send_command(request, false)
+        }
+
+        fn shutdown(&self) -> bool {
+            let response = self.send_command(&H5HostWireRequest::Shutdown {}, true);
+            let valid_response = response
+                .ok()
+                .and_then(|body| serde_json::from_slice::<H5HostResponse>(&body).ok())
+                .is_some_and(|response| {
+                    response.operation == "shutdown"
+                        && response.status == "ok"
+                        && response.authorization_revision.is_none()
+                        && response.production_registry_size.is_none()
+                        && response.test_registry_size.is_none()
+                        && response.same_sqlite_row.is_none()
+                        && response.trusted_confirmation.is_none()
+                        && response.request_derived_confirmation.is_none()
+                        && response.confirmation.is_none()
+                        && response.confirmation_consumed.is_none()
+                        && response.recovery_grant.is_none()
+                        && response.denial.is_none()
+                        && response.modifying_syscalls.is_none()
+                        && response.error.is_none()
+                });
+            self.close_worker(false);
+            valid_response
+        }
+
+        fn abort(&self) {
+            self.close_worker(true);
+        }
+
+        fn send_command(
+            &self,
+            request: &H5HostWireRequest,
+            shutdown: bool,
+        ) -> Result<Vec<u8>, String> {
+            if self.terminated.load(Ordering::Acquire) {
+                return Err("persistent H5 Host process is closed".to_string());
+            }
+            let body = serde_json::to_vec(request)
+                .map_err(|_| "H5 Host request serialization failed".to_string())?;
+            if body.is_empty() || body.len() > H5_HOST_MAX_FRAME_BYTES {
+                return Err("H5 Host request exceeded bounded frame size".to_string());
+            }
+            let (response_sender, response_receiver) = sync_channel(1);
+            let command = if shutdown {
+                H5HostCommand::Shutdown {
+                    body,
+                    response: response_sender,
+                }
+            } else {
+                H5HostCommand::Request {
+                    body,
+                    response: response_sender,
+                }
+            };
+            let sender = lock_unpoisoned(&self.commands)
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| "persistent H5 Host command channel is closed".to_string())?;
+            match sender.try_send(command) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    self.abort();
+                    return Err("persistent H5 Host command channel is busy".to_string());
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    self.abort();
+                    return Err("persistent H5 Host command channel is disconnected".to_string());
+                }
+            }
+            match response_receiver.recv_timeout(H5_HOST_IPC_TIMEOUT) {
+                Ok(Ok(body)) => Ok(body),
+                Ok(Err(error)) => {
+                    self.abort();
+                    Err(error)
+                }
+                Err(_) => {
+                    self.abort();
+                    Err("persistent H5 Host response timed out".to_string())
+                }
+            }
+        }
+
+        fn close_worker(&self, kill: bool) {
+            if self.terminated.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            lock_unpoisoned(&self.commands).take();
+            if kill {
+                let mut child = lock_unpoisoned(&self.child);
+                if child.try_wait().ok().flatten().is_none() {
+                    let _ = child.kill();
+                }
+            }
+            if let Some(worker) = lock_unpoisoned(&self.worker).take() {
+                let _ = worker.join();
+            }
+            let mut child = lock_unpoisoned(&self.child);
+            if child.try_wait().ok().flatten().is_none() {
+                let _ = child.kill();
+            }
+            let _ = child.wait();
+        }
+    }
+
+    impl Drop for ProcessIsolatedH5HostProcess {
+        fn drop(&mut self) {
+            self.close_worker(true);
+        }
+    }
+
+    fn h5_host_worker(
+        receiver: Receiver<H5HostCommand>,
+        mut stdin: ChildStdin,
+        mut stdout: ChildStdout,
+    ) {
+        while let Ok(command) = receiver.recv() {
+            let (body, response, shutdown) = match command {
+                H5HostCommand::Request { body, response } => (body, response, false),
+                H5HostCommand::Shutdown { body, response } => (body, response, true),
+            };
+            let result =
+                write_h5_frame(&mut stdin, &body).and_then(|()| read_h5_frame(&mut stdout));
+            let _ = response.send(result);
+            if shutdown {
+                break;
+            }
+        }
+    }
+
+    fn write_h5_frame(stdin: &mut ChildStdin, body: &[u8]) -> Result<(), String> {
+        stdin
+            .write_all(&(body.len() as u32).to_be_bytes())
+            .and_then(|()| stdin.write_all(body))
+            .and_then(|()| stdin.flush())
+            .map_err(|_| "H5 Host request frame write failed".to_string())
+    }
+
+    fn read_h5_frame(stdout: &mut ChildStdout) -> Result<Vec<u8>, String> {
+        let mut length = [0_u8; 4];
+        stdout
+            .read_exact(&mut length)
+            .map_err(|_| "H5 Host response frame length read failed".to_string())?;
+        let length = u32::from_be_bytes(length) as usize;
+        if length == 0 || length > H5_HOST_MAX_FRAME_BYTES {
+            return Err("H5 Host response frame exceeded its bound".to_string());
+        }
+        let mut body = vec![0_u8; length];
+        stdout
+            .read_exact(&mut body)
+            .map_err(|_| "H5 Host response frame body read failed".to_string())?;
+        Ok(body)
+    }
+
+    struct ProcessIsolatedH5RecoveryAuthority {
+        process: Arc<ProcessIsolatedH5HostProcess>,
+        life_id: String,
+        trusted_confirmations_provisioned: AtomicUsize,
+        request_derived_confirmations: AtomicUsize,
+        disable_at_next_revalidation: AtomicBool,
+        sqlite_disable_count: AtomicUsize,
+    }
+
+    impl ProcessIsolatedH5RecoveryAuthority {
+        fn new(
+            allowed_workspace_root_identity: WorkspaceRootIdentity,
+            life_id: &str,
+            task_id: &str,
+        ) -> Result<Arc<Self>, String> {
+            let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .ok_or_else(|| "D29-H5 manifest has no repository parent".to_string())?
+                .to_path_buf();
+            let process = ProcessIsolatedH5HostProcess::start(
+                &repo_root,
+                life_id.to_string(),
+                task_id.to_string(),
+                workspace_identity_wire(allowed_workspace_root_identity),
+            )?;
+            Ok(Arc::new(Self {
+                process,
+                life_id: life_id.to_string(),
+                trusted_confirmations_provisioned: AtomicUsize::new(0),
+                request_derived_confirmations: AtomicUsize::new(0),
+                disable_at_next_revalidation: AtomicBool::new(false),
+                sqlite_disable_count: AtomicUsize::new(0),
+            }))
+        }
+
+        fn provision_trusted_confirmation(
+            &self,
+            request: &RecoveryActionRequest,
+        ) -> Result<(), String> {
+            let response =
+                self.process
+                    .roundtrip(&H5HostWireRequest::ProvisionRecoveryConfirmation {
+                        confirmation_id: format!("d29h5-confirmation-{}", request.action_id()),
+                        binding: h5_wire_binding(request),
+                    })?;
+            let response: H5HostResponse = parse_h5_response(response, "confirmation")?;
+            if response.operation != "provision_recovery_confirmation"
+                || response.status != "ok"
+                || response.trusted_confirmation != Some(true)
+                || response.request_derived_confirmation != Some(false)
+                || response.authorization_revision.is_some()
+                || response.production_registry_size.is_some()
+                || response.test_registry_size.is_some()
+                || response.same_sqlite_row.is_some()
+                || response.confirmation.is_some()
+                || response.confirmation_consumed.is_some()
+                || response.recovery_grant.is_some()
+                || response.denial.is_some()
+                || response.modifying_syscalls.is_some()
+                || response.error.is_some()
+            {
+                return Err("H5 Host confirmation response shape invalid".to_string());
+            }
+            self.trusted_confirmations_provisioned
+                .fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+
+        fn arm_disable_at_next_revalidation(&self) {
+            self.disable_at_next_revalidation
+                .store(true, Ordering::Release);
+        }
+
+        fn sqlite_disable_count(&self) -> usize {
+            self.sqlite_disable_count.load(Ordering::Acquire)
+        }
+
+        fn provenance(&self) -> (usize, usize) {
+            (
+                self.trusted_confirmations_provisioned
+                    .load(Ordering::Acquire),
+                self.request_derived_confirmations.load(Ordering::Acquire),
+            )
+        }
+
+        fn disable_authorization_for_test(&self, expected_revision: i64) -> Result<i64, String> {
+            let response =
+                self.process
+                    .roundtrip(&H5HostWireRequest::DisableAuthorizationForTest {
+                        life_id: self.life_id.clone(),
+                        capability_id: H5_RECOVER_REPLACE_CAPABILITY_ID.to_string(),
+                        expected_revision,
+                    })?;
+            let response: H5HostResponse = parse_h5_response(response, "disable")?;
+            let revision = response.authorization_revision.ok_or_else(|| {
+                "H5 Host disable response omitted authorization revision".to_string()
+            })?;
+            if response.operation != "disable_authorization_for_test"
+                || response.status != "ok"
+                || revision != expected_revision + 1
+                || response.same_sqlite_row != Some(true)
+                || response.production_registry_size.is_some()
+                || response.test_registry_size.is_some()
+                || response.trusted_confirmation.is_some()
+                || response.request_derived_confirmation.is_some()
+                || response.confirmation.is_some()
+                || response.confirmation_consumed.is_some()
+                || response.recovery_grant.is_some()
+                || response.denial.is_some()
+                || response.modifying_syscalls.is_some()
+                || response.error.is_some()
+            {
+                return Err("H5 Host disable response shape invalid".to_string());
+            }
+            self.sqlite_disable_count.fetch_add(1, Ordering::AcqRel);
+            Ok(revision)
+        }
+
+        fn shutdown(&self) -> bool {
+            self.process.shutdown()
+        }
+    }
+
+    impl RecoveryAuthorityPort for ProcessIsolatedH5RecoveryAuthority {
+        fn issue_recovery_grant(
+            &self,
+            request: &RecoveryActionRequest,
+        ) -> Result<RecoveryGrantEvidence, RecoveryDenyReason> {
+            let response = self
+                .process
+                .roundtrip(&H5HostWireRequest::IssueRecoveryGrant {
+                    binding: h5_wire_binding(request),
+                })
+                .map_err(|_| RecoveryDenyReason::NativeFailure)?;
+            let response: H5HostResponse = match parse_h5_response(response, "issue") {
+                Ok(response) => response,
+                Err(_) => {
+                    self.process.abort();
+                    return Err(RecoveryDenyReason::NativeFailure);
+                }
+            };
+            if response.status == "denied" {
+                return Err(
+                    parse_h5_denied_response(&response, "issue_recovery_grant", false)
+                        .map_err(|_| RecoveryDenyReason::NativeFailure)?,
+                );
+            }
+            if response.operation != "issue_recovery_grant"
+                || response.status != "ok"
+                || response.authorization_revision != Some(request.authorization_revision())
+                || response.production_registry_size != Some(0)
+                || response.test_registry_size != Some(1)
+                || response.confirmation_consumed != Some(true)
+                || response.denial.is_some()
+                || response.modifying_syscalls.is_some()
+                || response.error.is_some()
+                || response.trusted_confirmation.is_some()
+                || response.request_derived_confirmation.is_some()
+            {
+                self.process.abort();
+                return Err(RecoveryDenyReason::NativeFailure);
+            }
+            let confirmation = match response.confirmation {
+                Some(confirmation) => confirmation,
+                None => {
+                    self.process.abort();
+                    return Err(RecoveryDenyReason::NativeFailure);
+                }
+            };
+            let wire_grant = match response.recovery_grant {
+                Some(grant) => grant,
+                None => {
+                    self.process.abort();
+                    return Err(RecoveryDenyReason::NativeFailure);
+                }
+            };
+            if confirmation.binding != h5_wire_binding(request)
+                || confirmation.confirmation_id != wire_grant.confirmation_id
+                || !valid_h5_id(&confirmation.confirmation_id)
+                || confirmation.expires_at_unix_ms <= confirmation.issued_at_unix_ms
+            {
+                self.process.abort();
+                return Err(RecoveryDenyReason::NativeFailure);
+            }
+            parse_h5_grant(wire_grant, request, false, &confirmation.confirmation_id).map_err(
+                |_| {
+                    self.process.abort();
+                    RecoveryDenyReason::NativeFailure
+                },
+            )
+        }
+
+        fn revalidate_recovery_grant(
+            &self,
+            grant: &RecoveryGrantEvidence,
+            request: &RecoveryActionRequest,
+        ) -> Result<(), RecoveryDenyReason> {
+            if self
+                .disable_at_next_revalidation
+                .swap(false, Ordering::AcqRel)
+            {
+                self.disable_authorization_for_test(grant.action.authorization_revision())
+                    .map_err(|_| RecoveryDenyReason::NativeFailure)?;
+            }
+            let response = self
+                .process
+                .roundtrip(&H5HostWireRequest::RevalidateRecoveryGrant {
+                    grant_id: grant.grant_id.clone(),
+                    binding: h5_wire_binding(request),
+                })
+                .map_err(|_| RecoveryDenyReason::NativeFailure)?;
+            let response: H5HostResponse = match parse_h5_response(response, "revalidate") {
+                Ok(response) => response,
+                Err(_) => {
+                    self.process.abort();
+                    return Err(RecoveryDenyReason::NativeFailure);
+                }
+            };
+            if response.status == "denied" {
+                return Err(
+                    parse_h5_denied_response(&response, "revalidate_recovery_grant", true)
+                        .map_err(|_| RecoveryDenyReason::NativeFailure)?,
+                );
+            }
+            if response.operation != "revalidate_recovery_grant"
+                || response.status != "ok"
+                || response.authorization_revision != Some(request.authorization_revision())
+                || response.confirmation.is_some()
+                || response.confirmation_consumed.is_some()
+                || response.denial.is_some()
+                || response.production_registry_size.is_some()
+                || response.test_registry_size.is_some()
+                || response.trusted_confirmation.is_some()
+                || response.request_derived_confirmation.is_some()
+                || response.modifying_syscalls.is_some()
+                || response.error.is_some()
+            {
+                self.process.abort();
+                return Err(RecoveryDenyReason::NativeFailure);
+            }
+            let wire_grant = match response.recovery_grant {
+                Some(grant) => grant,
+                None => {
+                    self.process.abort();
+                    return Err(RecoveryDenyReason::NativeFailure);
+                }
+            };
+            let parsed = parse_h5_grant(wire_grant, request, true, &grant.confirmation_id)
+                .map_err(|_| {
+                    self.process.abort();
+                    RecoveryDenyReason::NativeFailure
+                })?;
+            if parsed.grant_id != grant.grant_id
+                || parsed.confirmation_id != grant.confirmation_id
+                || parsed.action != grant.action
+                || parsed.issued_at_unix_ms != grant.issued_at_unix_ms
+                || parsed.expires_at_unix_ms != grant.expires_at_unix_ms
+                || parsed.single_use != grant.single_use
+            {
+                self.process.abort();
+                return Err(RecoveryDenyReason::NativeFailure);
+            }
+            Ok(())
+        }
+    }
+
+    fn h5_host_fixture_executable(repo_root: &Path) -> Result<PathBuf, String> {
+        let executable = repo_root
+            .join("src-tauri")
+            .join("target")
+            .join("debug")
+            .join(if cfg!(windows) {
+                "d29h5-authority-fixture.exe"
+            } else {
+                "d29h5-authority-fixture"
+            });
+        if executable.is_file() {
+            return Ok(executable);
+        }
+        let status = Command::new("cargo")
+            .current_dir(repo_root)
+            .args(["build", "--quiet", "--locked", "--manifest-path"])
+            .arg(repo_root.join("src-tauri").join("Cargo.toml"))
+            .args([
+                "--bin",
+                "d29h5-authority-fixture",
+                "--features",
+                "d29-h5-host-fixture",
+            ])
+            .env("CARGO_BUILD_JOBS", "1")
+            .env("CARGO_INCREMENTAL", "0")
+            .env("CARGO_TERM_COLOR", "never")
+            .status()
+            .map_err(|error| format!("build persistent H5 Host fixture: {error}"))?;
+        if !status.success() || !executable.is_file() {
+            return Err("persistent H5 Host fixture executable was not produced".to_string());
+        }
+        Ok(executable)
+    }
+
+    fn parse_h5_response(body: Vec<u8>, _operation: &str) -> Result<H5HostResponse, String> {
+        serde_json::from_slice(&body).map_err(|_| "H5 Host response JSON malformed".to_string())
+    }
+
+    fn parse_h5_grant(
+        grant: H5GrantWire,
+        request: &RecoveryActionRequest,
+        expected_used: bool,
+        expected_confirmation_id: &str,
+    ) -> Result<RecoveryGrantEvidence, String> {
+        if !valid_h5_id(&grant.grant_id)
+            || grant.confirmation_id != expected_confirmation_id
+            || grant.binding != h5_wire_binding(request)
+            || grant.issued_at_unix_ms >= grant.expires_at_unix_ms
+            || !grant.single_use
+            || grant.used != expected_used
+        {
+            return Err("H5 Host recovery grant binding was invalid".to_string());
+        }
+        Ok(RecoveryGrantEvidence {
+            grant_id: grant.grant_id,
+            confirmation_id: grant.confirmation_id,
+            action: request.clone(),
+            issued_at_unix_ms: grant.issued_at_unix_ms,
+            expires_at_unix_ms: grant.expires_at_unix_ms,
+            single_use: grant.single_use,
+            used: grant.used,
+        })
+    }
+
+    fn parse_h5_denied_response(
+        response: &H5HostResponse,
+        operation: &str,
+        require_zero_modifying_syscalls: bool,
+    ) -> Result<RecoveryDenyReason, String> {
+        if response.operation != operation
+            || response.status != "denied"
+            || response.recovery_grant.is_some()
+            || response.confirmation.is_some()
+            || response.confirmation_consumed.is_some()
+            || response.trusted_confirmation.is_some()
+            || response.request_derived_confirmation.is_some()
+            || response.production_registry_size.is_some()
+            || response.test_registry_size.is_some()
+            || response.same_sqlite_row.is_some()
+            || response.authorization_revision.is_some()
+            || response.denial.is_none()
+            || (require_zero_modifying_syscalls && response.modifying_syscalls != Some(0))
+        {
+            return Err("H5 Host denial response shape invalid".to_string());
+        }
+        Ok(match response.denial.as_deref().unwrap() {
+            "authorization_disabled_or_scope_denied" | "root_disabled_or_scope_denied" => {
+                RecoveryDenyReason::AuthorizationDisabled
+            }
+            "stale_revision" => RecoveryDenyReason::StaleRevision,
+            "confirmation_missing" => RecoveryDenyReason::ConfirmationMissing,
+            "confirmation_mismatch" => RecoveryDenyReason::ConfirmationMismatch,
+            "confirmation_expired" => RecoveryDenyReason::ConfirmationExpired,
+            "recovery_grant_replay_or_missing" | "recovery_grant_revalidation_denied" => {
+                RecoveryDenyReason::RecoveryGrantReplay
+            }
+            _ => RecoveryDenyReason::RecoveryBlocked,
+        })
+    }
+
+    fn h5_wire_binding(request: &RecoveryActionRequest) -> H5WireBinding {
+        H5WireBinding {
+            action_id: request.action_id.clone(),
+            life_id: request.life_id.clone(),
+            task_id: request.task_id.clone(),
+            capability_id: request.capability_id.clone(),
+            authorization_revision: request.authorization_revision,
+            workspace_root_identity: journal_identity_wire(request.workspace_root_identity),
+            relative_path: request
+                .relative_path
+                .as_path()
+                .to_string_lossy()
+                .into_owned(),
+            target_identity: journal_identity_wire(request.target_identity),
+            transaction_id: request.transaction_id.as_str().to_string(),
+            journal_integrity_hash: request.journal_integrity_hash.clone(),
+            current_sha256: request.current_sha256.clone(),
+            current_bytes: request.current_bytes as u64,
+            restore_sha256: request.restore_sha256.clone(),
+            restore_bytes: request.restore_bytes as u64,
+            original_replacement_sha256: request.original_replacement_sha256.clone(),
+        }
+    }
+
+    fn valid_h5_id(value: &str) -> bool {
+        !value.is_empty()
+            && value.len() <= H5_MAX_ID_CHARS
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"_-.\\".contains(&byte))
+    }
+
+    fn workspace_identity_wire(identity: WorkspaceRootIdentity) -> String {
+        let volume = identity.volume_serial_number().unwrap_or_default();
+        let file_id = identity
+            .file_id()
+            .map(|bytes| {
+                bytes
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            })
+            .unwrap_or_else(|| "none".to_string());
+        format!("v{volume:x}f{file_id}")
+    }
+
+    fn journal_identity_wire(identity: RecoveryJournalIdentity) -> String {
+        let file_id = identity
+            .file_id()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        format!("v{:x}f{file_id}", identity.volume_serial_number())
+    }
+
     fn allow_fence() -> impl WorkspaceReplaceCommitFence {
         || Ok(())
     }
@@ -932,7 +1774,7 @@ mod tests {
             grant: &RecoveryGrantEvidence,
             request: &RecoveryActionRequest,
         ) -> Result<(), RecoveryDenyReason> {
-            self.inner.disable_same_sqlite_authorization();
+            self.inner.disable_test_authorization();
             self.inner.revalidate_recovery_grant(grant, request)
         }
     }
@@ -1234,7 +2076,7 @@ mod tests {
     }
 
     #[test]
-    fn started_marker_is_persisted_after_host_fence_and_before_h4_post_fence() {
+    fn h5_committed_requires_durable_commit_marker() {
         let fixture = Fixture::new();
         let store_for_fence = fixture.store.clone();
         let mut fence = move || {
@@ -1257,12 +2099,14 @@ mod tests {
             &mut fence,
         )
         .unwrap();
+        assert_eq!(
+            result.transaction_outcome,
+            H5ReplaceTransactionOutcome::Committed
+        );
         assert!(matches!(
-            result.native_outcome,
+            result.native_diagnostics,
             WorkspaceReplaceCommitOutcome::Committed { .. }
         ));
-        assert!(result.commit_marker_persisted);
-        assert!(!result.commit_unknown);
         assert_eq!(
             fixture
                 .store
@@ -1295,14 +2139,19 @@ mod tests {
             &cancellation,
             &mut fence,
             true,
+            None,
         )
         .unwrap();
+        assert_eq!(
+            result.transaction_outcome,
+            H5ReplaceTransactionOutcome::CommitUnknown {
+                recovery_required: true
+            }
+        );
         assert!(matches!(
-            result.native_outcome,
+            result.native_diagnostics,
             WorkspaceReplaceCommitOutcome::Committed { .. }
         ));
-        assert!(!result.commit_marker_persisted);
-        assert!(result.commit_unknown);
         assert_eq!(
             fixture
                 .store
@@ -1321,14 +2170,141 @@ mod tests {
     }
 
     #[test]
-    fn disabled_same_sqlite_authorization_denies_after_grant_before_restore() {
+    fn native_commit_unknown_maps_to_h5_commit_unknown_without_retry() {
+        let fixture = Fixture::new();
+        let cancellation = AtomicBool::new(false);
+        let mut fence = allow_fence();
+        let result = execute_h5b_replace_after_host_pass_with_test_fault(
+            &fixture.store,
+            &fixture.root,
+            fixture.target(),
+            fixture.context(),
+            &sha256_hex(BEFORE),
+            REPLACEMENT,
+            &cancellation,
+            &mut fence,
+            WorkspaceReplaceTestFault::AfterFirstWrite,
+        )
+        .unwrap();
+        assert_eq!(
+            result.transaction_outcome,
+            H5ReplaceTransactionOutcome::CommitUnknown {
+                recovery_required: true
+            }
+        );
+        assert!(matches!(
+            &result.native_diagnostics,
+            WorkspaceReplaceCommitOutcome::CommitUnknown { .. }
+        ));
+        if let WorkspaceReplaceCommitOutcome::CommitUnknown { evidence, .. } =
+            &result.native_diagnostics
+        {
+            assert_eq!(evidence.automatic_retries, 0);
+        } else {
+            panic!("expected native CommitUnknown diagnostics");
+        }
+        assert_eq!(
+            fixture
+                .store
+                .scan_transactions()
+                .unwrap()
+                .valid_transactions()
+                .next()
+                .unwrap()
+                .state(),
+            RecoveryTransactionState::RecoveryRequired
+        );
+    }
+
+    #[test]
+    fn started_then_native_denied_reports_recovery_required() {
+        let fixture = Fixture::new();
+        let cancellation = AtomicBool::new(false);
+        let mut fence = allow_fence();
+        let result = execute_h5b_replace_after_host_pass_with_test_fault(
+            &fixture.store,
+            &fixture.root,
+            fixture.target(),
+            fixture.context(),
+            &sha256_hex(BEFORE),
+            REPLACEMENT,
+            &cancellation,
+            &mut fence,
+            WorkspaceReplaceTestFault::AfterCommitFenceBeforePostFenceChecks,
+        )
+        .unwrap();
+        assert_eq!(
+            result.transaction_outcome,
+            H5ReplaceTransactionOutcome::Denied {
+                recovery_required: true
+            }
+        );
+        assert_eq!(
+            fixture
+                .store
+                .scan_transactions()
+                .unwrap()
+                .valid_transactions()
+                .next()
+                .unwrap()
+                .state(),
+            RecoveryTransactionState::RecoveryRequired
+        );
+        assert_eq!(
+            fs::read(fixture.workspace_dir.path().join("target.txt")).unwrap(),
+            BEFORE
+        );
+    }
+
+    #[test]
+    fn started_then_native_conflict_reports_recovery_required() {
+        let fixture = Fixture::new();
+        let cancellation = AtomicBool::new(false);
+        let mut fence = allow_fence();
+        let result = execute_h5b_replace_after_host_pass_with_test_fault(
+            &fixture.store,
+            &fixture.root,
+            fixture.target(),
+            fixture.context(),
+            &sha256_hex(BEFORE),
+            REPLACEMENT,
+            &cancellation,
+            &mut fence,
+            WorkspaceReplaceTestFault::PostFenceHashMismatch,
+        )
+        .unwrap();
+        assert_eq!(
+            result.transaction_outcome,
+            H5ReplaceTransactionOutcome::Conflict {
+                recovery_required: true
+            }
+        );
+        assert_eq!(
+            fixture
+                .store
+                .scan_transactions()
+                .unwrap()
+                .valid_transactions()
+                .next()
+                .unwrap()
+                .state(),
+            RecoveryTransactionState::RecoveryRequired
+        );
+        assert_eq!(
+            fs::read(fixture.workspace_dir.path().join("target.txt")).unwrap(),
+            BEFORE
+        );
+    }
+
+    #[test]
+    fn disabled_test_authority_denies_after_grant_before_restore() {
         let fixture = Fixture::new();
         let journal = fixture.prepared_started();
         fixture.write_replacement();
         let authority = TestRecoveryAuthority::new(2);
         let action = fixture.action(&journal);
         authority.provision_trusted_confirmation(&action);
-        authority.disable_same_sqlite_authorization();
+        authority.disable_test_authorization();
         let executor = H5RecoveryExecutor::new(
             fixture.store.clone(),
             fixture.root.clone(),
@@ -1340,6 +2316,134 @@ mod tests {
             RecoveryExecutionOutcome::RecoveryDenied(RecoveryDenyReason::AuthorizationDisabled)
         );
         assert_eq!(result.mutation_count, 0);
+        assert_eq!(
+            fs::read(fixture.workspace_dir.path().join("target.txt")).unwrap(),
+            REPLACEMENT.as_bytes()
+        );
+    }
+
+    #[test]
+    fn process_host_recovery_requires_independent_confirmation() {
+        let fixture = Fixture::new();
+        let journal = fixture.prepared_started();
+        fixture.write_replacement();
+        let authority = ProcessIsolatedH5RecoveryAuthority::new(
+            fixture.root.identity(),
+            journal.life_id(),
+            journal.task_id(),
+        )
+        .unwrap();
+        let action = fixture.action(&journal);
+        assert_eq!(
+            authority.issue_recovery_grant(&action),
+            Err(RecoveryDenyReason::ConfirmationMissing)
+        );
+        assert_eq!(authority.provenance(), (0, 0));
+        authority.provision_trusted_confirmation(&action).unwrap();
+        let _grant = authority.issue_recovery_grant(&action).unwrap();
+        assert_eq!(authority.provenance(), (1, 0));
+        assert!(authority.shutdown());
+    }
+
+    #[test]
+    fn process_host_successful_recovery_uses_real_sqlite_d28() {
+        let fixture = Fixture::new();
+        let journal = fixture.prepared_started();
+        fixture.write_replacement();
+        let authority = ProcessIsolatedH5RecoveryAuthority::new(
+            fixture.root.identity(),
+            journal.life_id(),
+            journal.task_id(),
+        )
+        .unwrap();
+        let action = fixture.action(&journal);
+        authority.provision_trusted_confirmation(&action).unwrap();
+        let executor = H5RecoveryExecutor::new(
+            fixture.store.clone(),
+            fixture.root.clone(),
+            Arc::clone(&authority) as Arc<dyn RecoveryAuthorityPort>,
+        );
+        let result = executor.recover(action);
+        assert_eq!(result.outcome, RecoveryExecutionOutcome::Recovered);
+        assert_eq!(result.mutation_count, 1);
+        assert_eq!(result.grant_issued, true);
+        assert_eq!(result.marker_persisted, true);
+        assert_eq!(
+            fs::read(fixture.workspace_dir.path().join("target.txt")).unwrap(),
+            BEFORE
+        );
+        assert_eq!(authority.provenance(), (1, 0));
+        assert!(authority.shutdown());
+    }
+
+    #[test]
+    fn process_host_rev2_to_rev3_at_native_recovery_fence_mutates_zero() {
+        let fixture = Fixture::new();
+        let journal = fixture.prepared_started();
+        fixture.write_replacement();
+        let authority = ProcessIsolatedH5RecoveryAuthority::new(
+            fixture.root.identity(),
+            journal.life_id(),
+            journal.task_id(),
+        )
+        .unwrap();
+        let action = fixture.action(&journal);
+        authority.provision_trusted_confirmation(&action).unwrap();
+        authority.arm_disable_at_next_revalidation();
+        let executor = H5RecoveryExecutor::new(
+            fixture.store.clone(),
+            fixture.root.clone(),
+            Arc::clone(&authority) as Arc<dyn RecoveryAuthorityPort>,
+        );
+        let result = executor.recover(action);
+        assert_eq!(
+            result.outcome,
+            RecoveryExecutionOutcome::RecoveryDenied(RecoveryDenyReason::AuthorizationDisabled)
+        );
+        assert_eq!(result.grant_issued, true);
+        assert_eq!(result.mutation_count, 0);
+        assert_eq!(authority.sqlite_disable_count(), 1);
+        assert_eq!(authority.provenance(), (1, 0));
+        assert_eq!(
+            fs::read(fixture.workspace_dir.path().join("target.txt")).unwrap(),
+            REPLACEMENT.as_bytes()
+        );
+        assert!(authority.shutdown());
+    }
+
+    #[test]
+    fn corrupt_lifecycle_never_issues_recovery_grant_or_mutates_workspace() {
+        let fixture = Fixture::new();
+        let journal = fixture.prepared_started();
+        fixture.write_replacement();
+        let action = fixture.action(&journal);
+        let committed = fixture.store.persist_committed(&journal).unwrap();
+        let mut bytes = committed.to_bytes().unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        fs::write(
+            fixture
+                .store
+                .recovery_root()
+                .join(format!("{}.committed", committed.transaction_id().as_str())),
+            bytes,
+        )
+        .unwrap();
+        let authority = TestRecoveryAuthority::new(2);
+        authority.provision_trusted_confirmation(&action);
+        let executor = H5RecoveryExecutor::new(
+            fixture.store.clone(),
+            fixture.root.clone(),
+            Arc::clone(&authority) as Arc<dyn RecoveryAuthorityPort>,
+        );
+        let result = executor.recover(action);
+        assert_eq!(
+            result.outcome,
+            RecoveryExecutionOutcome::RecoveryDenied(RecoveryDenyReason::RecoveryBlocked)
+        );
+        assert_eq!(result.grant_issued, false);
+        assert_eq!(result.mutation_count, 0);
+        assert_eq!(authority.grant_count(), 0);
         assert_eq!(
             fs::read(fixture.workspace_dir.path().join("target.txt")).unwrap(),
             REPLACEMENT.as_bytes()
@@ -1941,8 +3045,8 @@ mod tests {
                 assert_eq!(result.mutation_count, 0);
                 assert_eq!(fs::read(&current_path).unwrap(), BEFORE);
                 assert_eq!(
-                    executor
-                        .scan()
+                    store
+                        .scan_transactions()
                         .unwrap()
                         .valid_transactions()
                         .next()
@@ -1953,20 +3057,39 @@ mod tests {
             }
             3 | 4 | 6 | 7 => {
                 assert_eq!(snapshot.state(), RecoveryTransactionState::RecoveryRequired);
-                let authority = TestRecoveryAuthority::new(2);
                 let action = RecoveryActionRequest::from_snapshot(
                     &snapshot,
                     &current,
                     &format!("parent-recovery-{scenario}"),
                     2,
                 );
-                authority.provision_trusted_confirmation(&action);
-                let executor = H5RecoveryExecutor::new(
-                    store.clone(),
-                    root,
-                    Arc::clone(&authority) as Arc<dyn RecoveryAuthorityPort>,
-                );
-                let result = executor.recover(action);
+                let result = if scenario == 3 {
+                    let authority = ProcessIsolatedH5RecoveryAuthority::new(
+                        root.identity(),
+                        snapshot.journal().life_id(),
+                        snapshot.journal().task_id(),
+                    )
+                    .unwrap();
+                    authority.provision_trusted_confirmation(&action).unwrap();
+                    let executor = H5RecoveryExecutor::new(
+                        store.clone(),
+                        root.clone(),
+                        Arc::clone(&authority) as Arc<dyn RecoveryAuthorityPort>,
+                    );
+                    let result = executor.recover(action);
+                    assert_eq!(authority.provenance(), (1, 0));
+                    assert!(authority.shutdown());
+                    result
+                } else {
+                    let authority = TestRecoveryAuthority::new(2);
+                    authority.provision_trusted_confirmation(&action);
+                    let executor = H5RecoveryExecutor::new(
+                        store.clone(),
+                        root,
+                        Arc::clone(&authority) as Arc<dyn RecoveryAuthorityPort>,
+                    );
+                    executor.recover(action)
+                };
                 assert_eq!(
                     result.outcome,
                     if scenario == 7 {
@@ -1978,8 +3101,8 @@ mod tests {
                 assert_eq!(result.mutation_count, if scenario == 7 { 0 } else { 1 });
                 assert_eq!(fs::read(&current_path).unwrap(), BEFORE);
                 assert_eq!(
-                    executor
-                        .scan()
+                    store
+                        .scan_transactions()
                         .unwrap()
                         .valid_transactions()
                         .next()

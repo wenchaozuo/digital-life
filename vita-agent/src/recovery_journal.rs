@@ -12,7 +12,7 @@
 //! it is not an authorization signature and is not a defense against a
 //! malicious administrator who can rewrite the app-owned directory.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fmt::{self, Display, Formatter};
 use std::io;
@@ -1522,6 +1522,7 @@ impl RecoveryJournalStore {
 
         let mut journals: HashMap<RecoveryTransactionId, RecoveryJournalV1> = HashMap::new();
         let mut markers: HashMap<RecoveryTransactionId, Vec<RecoveryMarkerV1>> = HashMap::new();
+        let mut poisoned_transactions: HashSet<RecoveryTransactionId> = HashSet::new();
         let mut items = Vec::new();
         let mut entry_count = 0usize;
 
@@ -1608,9 +1609,10 @@ impl RecoveryJournalStore {
             let bytes = match self.namespace_authority.read_marker_file(&file_name) {
                 Ok(bytes) => bytes,
                 Err(error) => {
+                    poisoned_transactions.insert(transaction_id.clone());
                     items.push(RecoveryTransactionScanItem::CorruptArtifact {
                         file_name: display_name,
-                        reason: scan_error_reason(&error),
+                        reason: scan_marker_error_reason(&error),
                     });
                     continue;
                 }
@@ -1622,14 +1624,20 @@ impl RecoveryJournalStore {
                 {
                     markers.entry(transaction_id).or_default().push(marker);
                 }
-                Ok(_) => items.push(RecoveryTransactionScanItem::CorruptArtifact {
-                    file_name: display_name,
-                    reason: "marker filename and payload do not match",
-                }),
-                Err(error) => items.push(RecoveryTransactionScanItem::CorruptArtifact {
-                    file_name: display_name,
-                    reason: scan_error_reason(&error),
-                }),
+                Ok(_) => {
+                    poisoned_transactions.insert(transaction_id.clone());
+                    items.push(RecoveryTransactionScanItem::CorruptArtifact {
+                        file_name: display_name,
+                        reason: "marker filename and payload do not match",
+                    });
+                }
+                Err(error) => {
+                    poisoned_transactions.insert(transaction_id.clone());
+                    items.push(RecoveryTransactionScanItem::CorruptArtifact {
+                        file_name: display_name,
+                        reason: scan_marker_error_reason(&error),
+                    });
+                }
             }
         }
 
@@ -1675,6 +1683,13 @@ impl RecoveryJournalStore {
                 .pop()
                 .expect("target group contains one journal");
             let transaction_id = journal.transaction_id().clone();
+            if poisoned_transactions.contains(&transaction_id) {
+                items.push(RecoveryTransactionScanItem::CorruptArtifact {
+                    file_name: journal_file_name(&transaction_id),
+                    reason: "transaction has corrupt lifecycle evidence",
+                });
+                continue;
+            }
             let transaction_markers = markers.remove(&transaction_id).unwrap_or_default();
             match build_transaction_snapshot(journal, transaction_markers) {
                 Ok(snapshot) => items.push(RecoveryTransactionScanItem::Valid(snapshot)),
@@ -2454,6 +2469,16 @@ fn scan_error_reason(error: &RecoveryJournalError) -> &'static str {
     }
 }
 
+fn scan_marker_error_reason(error: &RecoveryJournalError) -> &'static str {
+    match error {
+        RecoveryJournalError::Oversized { .. } => "marker exceeds the hard size bound",
+        RecoveryJournalError::UnsupportedVersion(_) => "unsupported marker version",
+        RecoveryJournalError::Corrupt(reason) => reason,
+        RecoveryJournalError::Io { .. } => "marker I/O failed",
+        _ => "marker failed closed",
+    }
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RecoveryJournalTestFault {
@@ -3096,9 +3121,8 @@ mod tests {
         .expect("tampered marker fixture");
 
         let scan = fixture.store.scan_transactions().expect("strict scan");
-        assert!(scan
-            .valid_transactions()
-            .any(|snapshot| snapshot.state() == RecoveryTransactionState::PreparedOnly));
+        assert!(scan.valid_transactions().next().is_none());
+        assert!(scan.actionable_recovery_transactions().next().is_none());
         assert!(scan.items().iter().any(|item| matches!(
             item,
             RecoveryTransactionScanItem::CorruptArtifact {
@@ -3106,6 +3130,211 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn unsupported_marker_version_poison_transaction() {
+        let fixture = Fixture::new();
+        let journal = fixture
+            .store
+            .create_prepared(&fixture.target(), fixture.context(b"after\n"))
+            .expect("prepared journal");
+        let marker = RecoveryMarkerV1::new(
+            journal.transaction_id().clone(),
+            journal.integrity_hash_bytes(),
+            RecoveryMarkerState::Started,
+        );
+        let mut bytes = marker.to_bytes().expect("marker fixture bytes");
+        bytes[4..6].copy_from_slice(&2_u16.to_le_bytes());
+        fs::write(
+            fixture
+                .store
+                .recovery_root()
+                .join(format!("{}.started", journal.transaction_id().as_str())),
+            bytes,
+        )
+        .expect("unsupported marker version fixture");
+
+        let scan = fixture.store.scan_transactions().expect("strict scan");
+        assert!(scan.valid_transactions().next().is_none());
+        assert!(scan.actionable_recovery_transactions().next().is_none());
+        assert!(scan.items().iter().any(|item| matches!(
+            item,
+            RecoveryTransactionScanItem::CorruptArtifact {
+                reason: "unsupported marker version",
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn marker_payload_transaction_mismatch_poison_filename_transaction() {
+        let fixture = Fixture::new();
+        let journal_a = fixture
+            .store
+            .create_prepared(&fixture.target(), fixture.context(b"after\n"))
+            .expect("prepared journal A");
+        let transaction_b = RecoveryTransactionId::parse("h5-marker-payload-b").unwrap();
+        let marker_b = RecoveryMarkerV1::new(
+            transaction_b,
+            journal_a.integrity_hash_bytes(),
+            RecoveryMarkerState::Started,
+        );
+        fs::write(
+            fixture
+                .store
+                .recovery_root()
+                .join(format!("{}.started", journal_a.transaction_id().as_str())),
+            marker_b.to_bytes().expect("marker payload fixture bytes"),
+        )
+        .expect("mismatched marker filename fixture");
+
+        let scan = fixture.store.scan_transactions().expect("strict scan");
+        assert!(scan.valid_transactions().next().is_none());
+        assert!(scan.actionable_recovery_transactions().next().is_none());
+        assert!(scan.items().iter().any(|item| matches!(
+            item,
+            RecoveryTransactionScanItem::CorruptArtifact {
+                reason: "transaction has corrupt lifecycle evidence",
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn tampered_committed_marker_poison_transaction() {
+        let fixture = Fixture::new();
+        let journal = fixture
+            .store
+            .create_prepared(&fixture.target(), fixture.context(b"after\n"))
+            .expect("prepared journal");
+        fixture
+            .store
+            .persist_started(&journal)
+            .expect("Started marker");
+        let committed = fixture
+            .store
+            .persist_committed(&journal)
+            .expect("Committed marker");
+        let mut bytes = committed.to_bytes().expect("Committed marker bytes");
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        fs::write(
+            fixture.store.recovery_root().join(committed.file_name()),
+            bytes,
+        )
+        .expect("tampered Committed marker");
+
+        let scan = fixture.store.scan_transactions().expect("strict scan");
+        assert!(scan.valid_transactions().next().is_none());
+        assert!(scan.actionable_recovery_transactions().next().is_none());
+        assert!(scan.items().iter().any(|item| matches!(
+            item,
+            RecoveryTransactionScanItem::CorruptArtifact {
+                reason: "transaction has corrupt lifecycle evidence",
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn tampered_recovered_marker_poison_transaction() {
+        let fixture = Fixture::new();
+        let journal = fixture
+            .store
+            .create_prepared(&fixture.target(), fixture.context(b"after\n"))
+            .expect("prepared journal");
+        fixture
+            .store
+            .persist_started(&journal)
+            .expect("Started marker");
+        let recovered = fixture
+            .store
+            .persist_recovered(&journal)
+            .expect("Recovered marker");
+        let mut bytes = recovered.to_bytes().expect("Recovered marker bytes");
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        fs::write(
+            fixture.store.recovery_root().join(recovered.file_name()),
+            bytes,
+        )
+        .expect("tampered Recovered marker");
+
+        let scan = fixture.store.scan_transactions().expect("strict scan");
+        assert!(scan.valid_transactions().next().is_none());
+        assert!(scan.actionable_recovery_transactions().next().is_none());
+        assert!(scan.items().iter().any(|item| matches!(
+            item,
+            RecoveryTransactionScanItem::CorruptArtifact {
+                reason: "transaction has corrupt lifecycle evidence",
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn recognized_marker_read_failure_poison_transaction() {
+        let fixture = Fixture::new();
+        let journal = fixture
+            .store
+            .create_prepared(&fixture.target(), fixture.context(b"after\n"))
+            .expect("prepared journal");
+        let marker_name = format!("{}.started", journal.transaction_id().as_str());
+        fs::create_dir(fixture.store.recovery_root().join(&marker_name))
+            .expect("marker directory fixture");
+
+        let scan = fixture.store.scan_transactions().expect("strict scan");
+        assert!(scan.valid_transactions().next().is_none());
+        assert!(scan.actionable_recovery_transactions().next().is_none());
+        assert!(scan.items().iter().any(|item| matches!(
+            item,
+            RecoveryTransactionScanItem::CorruptArtifact { file_name, .. }
+                if file_name == &marker_name
+        )));
+    }
+
+    #[test]
+    fn unrelated_valid_transaction_survives_other_transaction_corruption() {
+        let fixture = Fixture::new();
+        let a = fixture.create_target("a.txt", b"a-before\n");
+        let b = fixture.create_target("b.txt", b"b-before\n");
+        let journal_a = fixture
+            .store
+            .create_prepared(&a, fixture.context(b"a-after\n"))
+            .expect("journal A");
+        let journal_b = fixture
+            .store
+            .create_prepared(&b, fixture.context(b"b-after\n"))
+            .expect("journal B");
+        let marker_a = RecoveryMarkerV1::new(
+            journal_a.transaction_id().clone(),
+            journal_a.integrity_hash_bytes(),
+            RecoveryMarkerState::Started,
+        );
+        let mut corrupt_a = marker_a.to_bytes().expect("marker A bytes");
+        let last = corrupt_a.len() - 1;
+        corrupt_a[last] ^= 0x01;
+        fs::write(
+            fixture.store.recovery_root().join(marker_a.file_name()),
+            corrupt_a,
+        )
+        .expect("corrupt marker A");
+        create_marker_for_scan(
+            &fixture,
+            journal_b.transaction_id().clone(),
+            journal_b.integrity_hash_bytes(),
+            RecoveryMarkerState::Started,
+        );
+
+        let scan = fixture.store.scan_transactions().expect("strict scan");
+        let valid = scan.valid_transactions().collect::<Vec<_>>();
+        assert_eq!(valid.len(), 1);
+        assert_eq!(
+            valid[0].journal().transaction_id(),
+            journal_b.transaction_id()
+        );
+        assert_eq!(scan.actionable_recovery_transactions().count(), 1);
     }
 
     #[test]

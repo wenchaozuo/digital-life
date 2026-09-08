@@ -21,6 +21,11 @@ pub fn run_d29h3_authority_fixture() -> Result<(), String> {
 pub fn run_d29h4_authority_fixture() -> Result<(), String> {
     capability::d29h4_host_fixture::run_from_stdio()
 }
+
+#[cfg(feature = "d29-h5-host-fixture")]
+pub fn run_d29h5_authority_fixture() -> Result<(), String> {
+    capability::d29h5_host_fixture::run_from_stdio()
+}
 pub mod conversation;
 pub mod embedding;
 #[cfg_attr(not(test), allow(dead_code))]

@@ -23,6 +23,8 @@ use toml::Value as TomlValue;
 
 mod d29h3;
 mod d29h4;
+#[cfg(test)]
+mod d29h5;
 mod provider_gateway;
 pub mod recovery_journal;
 mod tool_authority;

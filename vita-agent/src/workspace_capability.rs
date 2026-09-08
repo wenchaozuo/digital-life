@@ -537,12 +537,45 @@ pub(crate) enum WorkspaceReplaceCommitOutcome {
     },
 }
 
+/// Same-handle raw-byte recovery outcome used by the test/integration H5-B
+/// boundary.  It is separate from H4's UTF-8 replacement verdict so a
+/// recovery request can observe a diverged or partially-written file without
+/// attempting to decode it as text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum WorkspaceRecoveryCommitOutcome {
+    Denied {
+        error: WorkspaceReplaceError,
+        evidence: WorkspaceReplaceEvidence,
+    },
+    Conflict {
+        evidence: WorkspaceReplaceEvidence,
+    },
+    NoOp {
+        evidence: WorkspaceReplaceEvidence,
+    },
+    Recovered {
+        evidence: WorkspaceReplaceEvidence,
+    },
+    RecoveryUnknown {
+        error: WorkspaceReplaceError,
+        evidence: WorkspaceReplaceEvidence,
+    },
+}
+
 #[cfg(all(test, windows))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WorkspaceReplaceTestFault {
     AfterFirstWrite,
     PanicBeforeFirstMutation,
     PanicAfterFirstMutation,
+    AbortAfterFirstMutation,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WorkspaceRecoveryTestFault {
+    AbortBeforeFirstMutation,
+    AbortAfterFirstMutation,
 }
 
 /// A process-lifetime, OS-backed capability to one trusted workspace root.
@@ -759,8 +792,22 @@ impl AppOwnedRecoveryNamespace {
         platform::create_new_recovery_journal(self, file_name, contents)
     }
 
+    /// Creates one immutable recovery marker in the same retained namespace
+    /// as H5-A journals.  The marker name is supplied only by the
+    /// crate-internal H5-B state machine; this capability never accepts a
+    /// workspace path or follows a pathname from the model.
+    #[cfg(windows)]
+    pub(crate) fn create_new_marker(&self, file_name: &OsStr, contents: &[u8]) -> io::Result<()> {
+        platform::create_new_recovery_journal(self, file_name, contents)
+    }
+
     #[cfg(windows)]
     pub(crate) fn read_journal(&self, file_name: &OsStr, max_bytes: usize) -> io::Result<Vec<u8>> {
+        platform::read_recovery_journal(self, file_name, max_bytes)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn read_marker(&self, file_name: &OsStr, max_bytes: usize) -> io::Result<Vec<u8>> {
         platform::read_recovery_journal(self, file_name, max_bytes)
     }
 
@@ -869,6 +916,113 @@ impl PreparedWorkspaceTarget {
                 "workspace read is unavailable on this platform",
             )))
         }
+    }
+
+    /// Reads bounded raw bytes from an existing regular target through a
+    /// handle-relative operation handle.  H5-B uses this observation before
+    /// issuing a fresh recovery grant so invalid UTF-8 is still represented by
+    /// its exact byte count and SHA-256 digest.
+    pub(crate) fn read_existing_file_raw_bounded(
+        &self,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, WorkspaceReadError> {
+        #[cfg(windows)]
+        {
+            return platform::read_existing_file_raw_bounded(self, max_bytes);
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = max_bytes;
+            Err(WorkspaceReadError::Kernel(VitaAgentError::KernelInvariant(
+                "workspace raw read is unavailable on this platform",
+            )))
+        }
+    }
+
+    /// Restores an existing regular file from exact raw bytes using one
+    /// exclusive handle acquired relative to the retained H2 parent handle.
+    /// This is crate-internal H5-B infrastructure; it is not a model-facing
+    /// workspace operation and never recreates a missing target.
+    pub(crate) fn recover_existing_file_raw_bounded(
+        self,
+        expected_current_sha256: &str,
+        expected_current_bytes: usize,
+        preimage: &[u8],
+        fence: &mut dyn WorkspaceReplaceCommitFence,
+        cancellation: &dyn WorkspaceReplaceCancellation,
+    ) -> WorkspaceRecoveryCommitOutcome {
+        #[cfg(windows)]
+        {
+            return platform::recover_existing_file_raw_bounded(
+                self,
+                expected_current_sha256,
+                expected_current_bytes,
+                preimage,
+                fence,
+                cancellation,
+                None,
+                None,
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (
+                self,
+                expected_current_sha256,
+                expected_current_bytes,
+                preimage,
+                fence,
+                cancellation,
+            );
+            WorkspaceRecoveryCommitOutcome::Denied {
+                error: WorkspaceReplaceError::UnavailableOnThisPlatform,
+                evidence: WorkspaceReplaceEvidence::default(),
+            }
+        }
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn recover_existing_file_raw_bounded_with_test_fault(
+        self,
+        expected_current_sha256: &str,
+        expected_current_bytes: usize,
+        preimage: &[u8],
+        fence: &mut dyn WorkspaceReplaceCommitFence,
+        cancellation: &dyn WorkspaceReplaceCancellation,
+        fault: WorkspaceRecoveryTestFault,
+    ) -> WorkspaceRecoveryCommitOutcome {
+        platform::recover_existing_file_raw_bounded(
+            self,
+            expected_current_sha256,
+            expected_current_bytes,
+            preimage,
+            fence,
+            cancellation,
+            Some(fault),
+            None,
+        )
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn recover_existing_file_raw_bounded_with_test_setup(
+        self,
+        expected_current_sha256: &str,
+        expected_current_bytes: usize,
+        preimage: &[u8],
+        fence: &mut dyn WorkspaceReplaceCommitFence,
+        cancellation: &dyn WorkspaceReplaceCancellation,
+        setup: &dyn Fn(),
+    ) -> WorkspaceRecoveryCommitOutcome {
+        platform::recover_existing_file_raw_bounded(
+            self,
+            expected_current_sha256,
+            expected_current_bytes,
+            preimage,
+            fence,
+            cancellation,
+            None,
+            Some(setup),
+        )
     }
 
     /// Replaces one already-existing regular UTF-8 file in place.  The
@@ -1028,6 +1182,9 @@ impl PreparedWorkspaceTarget {
             }
             WorkspaceReplaceTestFault::PanicAfterFirstMutation => {
                 platform::WorkspaceReplaceFaultPoint::PanicAfterFirstMutation
+            }
+            WorkspaceReplaceTestFault::AbortAfterFirstMutation => {
+                platform::WorkspaceReplaceFaultPoint::AbortAfterFirstMutation
             }
         };
         let mut faults = platform::WorkspaceReplaceFaultPlan::once(point);
@@ -1208,6 +1365,7 @@ mod platform {
         PanicBeforeFirstMutation,
         AfterFirstWrite,
         PanicAfterFirstMutation,
+        AbortAfterFirstMutation,
         BeforeSetEndOfFile,
         AfterSetEndOfFile,
         BeforeFlush,
@@ -2212,6 +2370,455 @@ mod platform {
         read_utf8_bounded(&handle, max_bytes)
     }
 
+    pub(super) fn read_existing_file_raw_bounded(
+        prepared: &PreparedWorkspaceTarget,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, WorkspaceReadError> {
+        if max_bytes == 0 || max_bytes > WORKSPACE_REPLACE_HARD_MAX_BYTES {
+            return Err(WorkspaceReadError::TooLarge {
+                limit: WORKSPACE_REPLACE_HARD_MAX_BYTES,
+            });
+        }
+        if prepared.kind != PreparedWorkspaceTargetKind::ExistingFile {
+            return Err(WorkspaceReadError::InvalidTarget(
+                "only an existing regular file may be read",
+            ));
+        }
+        let expected_identity =
+            prepared
+                .target_identity
+                .ok_or(WorkspaceReadError::InvalidTarget(
+                    "prepared file has no stable identity",
+                ))?;
+        verify_root_name(&prepared.root).map_err(WorkspaceReadError::Kernel)?;
+        if let Err(error) = verify_replace_parent(
+            &prepared.root,
+            &prepared.parent_handle,
+            prepared.parent_identity,
+        ) {
+            return Err(WorkspaceReadError::Kernel(VitaAgentError::KernelInvariant(
+                match error {
+                    WorkspaceReplaceError::ReparseParent => "workspace parent is a reparse point",
+                    WorkspaceReplaceError::ParentIdentityChanged => {
+                        "workspace parent identity changed before raw read"
+                    }
+                    _ => "workspace parent is outside the acquired root",
+                },
+            )));
+        }
+        let leaf = prepared
+            .relative_path
+            .components()
+            .last()
+            .expect("WorkspaceRelativePath always has one component");
+        let handle = match open_read_relative(&prepared.parent_handle, leaf) {
+            Ok(handle) => handle,
+            Err(RelativeOpenError::Missing(_)) => {
+                return Err(WorkspaceReadError::InvalidTarget(
+                    "workspace target disappeared before raw read",
+                ));
+            }
+            Err(error) => {
+                return Err(WorkspaceReadError::Kernel(relative_open_error(
+                    prepared.relative_path.as_path(),
+                    error,
+                )));
+            }
+        };
+        let details = inspect_handle(&handle, false).map_err(WorkspaceReadError::Kernel)?;
+        if details.is_reparse || details.is_directory {
+            return Err(WorkspaceReadError::InvalidTarget(
+                "workspace raw target is not a regular non-reparse file",
+            ));
+        }
+        if details.identity != expected_identity {
+            return Err(WorkspaceReadError::InvalidTarget(
+                "workspace target identity changed before raw read",
+            ));
+        }
+        ensure_descendant(&prepared.root, &details.final_path)
+            .map_err(WorkspaceReadError::Kernel)?;
+        verify_root_name(&prepared.root).map_err(WorkspaceReadError::Kernel)?;
+        if !set_file_pointer(&handle, 0) {
+            return Err(WorkspaceReadError::Kernel(VitaAgentError::KernelConfig(
+                io::Error::last_os_error(),
+            )));
+        }
+        match read_raw_recovery_bounded(&handle) {
+            Ok(bytes) if bytes.len() <= max_bytes => Ok(bytes),
+            Ok(_) => Err(WorkspaceReadError::TooLarge { limit: max_bytes }),
+            Err(RecoveryReadError::TooLarge) => {
+                Err(WorkspaceReadError::TooLarge { limit: max_bytes })
+            }
+            Err(RecoveryReadError::Io) => Err(WorkspaceReadError::Kernel(
+                VitaAgentError::KernelConfig(io::Error::last_os_error()),
+            )),
+        }
+    }
+
+    /// H5-B's dedicated raw-byte recovery primitive.  It deliberately shares
+    /// H4's retained-parent and exclusive-handle helpers, but never decodes
+    /// the current target as UTF-8 and never opens a missing target with a
+    /// create disposition.
+    pub(super) fn recover_existing_file_raw_bounded(
+        prepared: PreparedWorkspaceTarget,
+        expected_current_sha256: &str,
+        expected_current_bytes: usize,
+        preimage: &[u8],
+        fence: &mut dyn WorkspaceReplaceCommitFence,
+        cancellation: &dyn WorkspaceReplaceCancellation,
+        fault: Option<WorkspaceRecoveryTestFault>,
+        test_setup: Option<&dyn Fn()>,
+    ) -> WorkspaceRecoveryCommitOutcome {
+        let PreparedWorkspaceTarget {
+            root,
+            relative_path,
+            parent_identity,
+            target_identity,
+            final_path: _,
+            kind,
+            parent_handle,
+            target_handle,
+        } = prepared;
+        drop(target_handle);
+
+        let mut evidence = WorkspaceReplaceEvidence::default();
+        if cancellation.is_cancelled() {
+            return recovery_denied(evidence, WorkspaceReplaceError::CancellationBeforeMutation);
+        }
+        if kind != PreparedWorkspaceTargetKind::ExistingFile {
+            return recovery_denied(evidence, WorkspaceReplaceError::InvalidPreparedTarget);
+        }
+        let expected_identity = match target_identity {
+            Some(identity) => identity,
+            None => return recovery_denied(evidence, WorkspaceReplaceError::InvalidPreparedTarget),
+        };
+        let expected_current_sha256 = match normalized_sha256(expected_current_sha256) {
+            Some(value) => value,
+            None => return recovery_denied(evidence, WorkspaceReplaceError::InvalidExpectedHash),
+        };
+        if expected_current_bytes > WORKSPACE_REPLACE_HARD_MAX_BYTES
+            || preimage.len() > WORKSPACE_REPLACE_HARD_MAX_BYTES
+        {
+            return recovery_denied(evidence, WorkspaceReplaceError::ReplacementTooLarge);
+        }
+
+        if verify_root_name(&root).is_err() {
+            return recovery_denied(evidence, WorkspaceReplaceError::RootIdentityChanged);
+        }
+        if let Err(error) = verify_replace_parent(&root, &parent_handle, parent_identity) {
+            return recovery_denied(evidence, error);
+        }
+
+        if let Some(setup) = test_setup {
+            setup();
+        }
+        let leaf = relative_path
+            .components()
+            .last()
+            .expect("WorkspaceRelativePath always has one component");
+        let operation_handle = match open_exclusive_relative(&parent_handle, leaf) {
+            Ok(handle) => handle,
+            Err(RelativeOpenError::Missing(_)) => {
+                return recovery_denied(evidence, WorkspaceReplaceError::TargetMissing)
+            }
+            Err(RelativeOpenError::Status(_)) => {
+                return recovery_denied(evidence, WorkspaceReplaceError::TargetBusy)
+            }
+        };
+        evidence.operation_handle_open_count = 1;
+
+        let details =
+            match verify_replace_operation_handle(&root, &operation_handle, expected_identity) {
+                Ok(details) => details,
+                Err(error) => return recovery_denied(evidence, error),
+            };
+        if details.number_of_links != 1 {
+            return recovery_denied(evidence, WorkspaceReplaceError::HardLinkAmbiguous);
+        }
+        evidence.hard_link_count_after_open = Some(details.number_of_links);
+        if verify_root_name(&root).is_err() {
+            return recovery_denied(evidence, WorkspaceReplaceError::RootIdentityChanged);
+        }
+        if let Err(error) = verify_replace_parent(&root, &parent_handle, parent_identity) {
+            return recovery_denied(evidence, error);
+        }
+
+        if !set_file_pointer(&operation_handle, 0) {
+            return recovery_denied(evidence, WorkspaceReplaceError::OperationHandleIo);
+        }
+        let current_bytes = match read_raw_recovery_bounded(&operation_handle) {
+            Ok(bytes) => bytes,
+            Err(RecoveryReadError::TooLarge) => {
+                return recovery_denied(evidence, WorkspaceReplaceError::CurrentFileTooLarge)
+            }
+            Err(RecoveryReadError::Io) => {
+                return recovery_denied(evidence, WorkspaceReplaceError::OperationHandleIo)
+            }
+        };
+        let current_hash = crate::sha256_hex(&current_bytes);
+        evidence.bytes_before = Some(current_bytes.len());
+        evidence.before_sha256 = Some(current_hash.clone());
+        evidence.precommit_sha256 = Some(current_hash.clone());
+        evidence.hard_link_count_before_fence = Some(details.number_of_links);
+        evidence
+            .events
+            .push(WorkspaceReplaceEvidenceEvent::InitialHashCheck);
+        if current_bytes.len() != expected_current_bytes || current_hash != expected_current_sha256
+        {
+            return WorkspaceRecoveryCommitOutcome::Conflict { evidence };
+        }
+
+        evidence.fence_calls = 1;
+        evidence
+            .events
+            .push(WorkspaceReplaceEvidenceEvent::CommitFence);
+        let fence_result = catch_unwind(AssertUnwindSafe(|| fence.check()));
+        match fence_result {
+            Ok(Ok(())) => {}
+            Ok(Err(WorkspaceReplaceFenceError::Denied)) => {
+                return recovery_denied(evidence, WorkspaceReplaceError::CommitFenceDenied)
+            }
+            Ok(Err(WorkspaceReplaceFenceError::Cancelled)) => {
+                return recovery_denied(evidence, WorkspaceReplaceError::CommitFenceCancelled)
+            }
+            Ok(Err(WorkspaceReplaceFenceError::Stale)) => {
+                return recovery_denied(evidence, WorkspaceReplaceError::CommitFenceStale)
+            }
+            Ok(Err(WorkspaceReplaceFenceError::Error)) => {
+                return recovery_denied(evidence, WorkspaceReplaceError::CommitFenceError)
+            }
+            Err(_) => return recovery_denied(evidence, WorkspaceReplaceError::CommitFencePanic),
+        }
+
+        if verify_root_name(&root).is_err() {
+            return recovery_denied(evidence, WorkspaceReplaceError::RootIdentityChanged);
+        }
+        evidence.post_fence_root_verified = true;
+        evidence
+            .events
+            .push(WorkspaceReplaceEvidenceEvent::PostFenceRootCheck);
+        if let Err(error) = verify_replace_parent(&root, &parent_handle, parent_identity) {
+            return recovery_denied(evidence, error);
+        }
+        evidence.post_fence_parent_verified = true;
+        evidence
+            .events
+            .push(WorkspaceReplaceEvidenceEvent::PostFenceParentCheck);
+        let post_fence_details =
+            match verify_replace_operation_handle(&root, &operation_handle, expected_identity) {
+                Ok(details) => details,
+                Err(error) => return recovery_denied(evidence, error),
+            };
+        evidence.post_fence_target_verified = true;
+        evidence
+            .events
+            .push(WorkspaceReplaceEvidenceEvent::PostFenceTargetCheck);
+        evidence.hard_link_count_after_fence = Some(post_fence_details.number_of_links);
+        evidence
+            .events
+            .push(WorkspaceReplaceEvidenceEvent::PostFenceLinkCheck);
+        if post_fence_details.number_of_links != 1 {
+            return recovery_denied(evidence, WorkspaceReplaceError::HardLinkAmbiguous);
+        }
+        if !set_file_pointer(&operation_handle, 0) {
+            return recovery_denied(evidence, WorkspaceReplaceError::OperationHandleIo);
+        }
+        let post_fence_bytes = match read_raw_recovery_bounded(&operation_handle) {
+            Ok(bytes) => bytes,
+            Err(RecoveryReadError::TooLarge) => {
+                return recovery_denied(evidence, WorkspaceReplaceError::CurrentFileTooLarge)
+            }
+            Err(RecoveryReadError::Io) => {
+                return recovery_denied(evidence, WorkspaceReplaceError::OperationHandleIo)
+            }
+        };
+        let post_fence_hash = crate::sha256_hex(&post_fence_bytes);
+        evidence.bytes_post_fence = Some(post_fence_bytes.len());
+        evidence.post_fence_sha256 = Some(post_fence_hash.clone());
+        evidence
+            .events
+            .push(WorkspaceReplaceEvidenceEvent::PostFenceHashCheck);
+        if post_fence_bytes.len() != expected_current_bytes
+            || post_fence_hash != expected_current_sha256
+        {
+            return WorkspaceRecoveryCommitOutcome::Conflict { evidence };
+        }
+        evidence.post_fence_content_verified = true;
+        evidence.post_fence_cancellation_checked = true;
+        evidence
+            .events
+            .push(WorkspaceReplaceEvidenceEvent::PostFenceCancellationCheck);
+        if cancellation.is_cancelled() {
+            return recovery_denied(evidence, WorkspaceReplaceError::CancellationBeforeMutation);
+        }
+
+        if post_fence_bytes == preimage {
+            evidence.bytes_after = Some(preimage.len());
+            evidence.after_sha256 = Some(crate::sha256_hex(preimage));
+            return WorkspaceRecoveryCommitOutcome::NoOp { evidence };
+        }
+        if !set_file_pointer(&operation_handle, 0) {
+            return recovery_denied(evidence, WorkspaceReplaceError::OperationHandleIo);
+        }
+
+        if preimage.is_empty() {
+            recovery_abort_if_requested(
+                fault,
+                WorkspaceRecoveryTestFault::AbortBeforeFirstMutation,
+            );
+            evidence.mutation_attempted = true;
+            evidence.mutation_started = true;
+            evidence.modifying_syscalls += 1;
+            evidence
+                .events
+                .push(WorkspaceReplaceEvidenceEvent::FirstModifyingSyscall);
+            if !set_end_of_file(&operation_handle) {
+                return recovery_unknown(evidence, WorkspaceReplaceError::SetEndOfFileFailed);
+            }
+            recovery_abort_if_requested(fault, WorkspaceRecoveryTestFault::AbortAfterFirstMutation);
+        } else {
+            let mut offset = 0usize;
+            let mut first_write = true;
+            while offset < preimage.len() {
+                if first_write {
+                    recovery_abort_if_requested(
+                        fault,
+                        WorkspaceRecoveryTestFault::AbortBeforeFirstMutation,
+                    );
+                    evidence
+                        .events
+                        .push(WorkspaceReplaceEvidenceEvent::FirstModifyingSyscall);
+                    first_write = false;
+                }
+                evidence.mutation_attempted = true;
+                evidence.mutation_started = true;
+                evidence.modifying_syscalls += 1;
+                evidence.write_calls += 1;
+                let request_len = (preimage.len() - offset).min(u32::MAX as usize);
+                let mut written = 0_u32;
+                let write_ok = unsafe {
+                    WriteFile(
+                        operation_handle.0,
+                        preimage[offset..].as_ptr(),
+                        request_len as u32,
+                        &mut written,
+                        std::ptr::null_mut(),
+                    ) != 0
+                };
+                if !write_ok {
+                    return recovery_unknown(evidence, WorkspaceReplaceError::WriteFailed);
+                }
+                if written == 0 || written as usize > request_len {
+                    return recovery_unknown(evidence, WorkspaceReplaceError::ZeroProgressWrite);
+                }
+                offset += written as usize;
+                if evidence.write_calls == 1 {
+                    recovery_abort_if_requested(
+                        fault,
+                        WorkspaceRecoveryTestFault::AbortAfterFirstMutation,
+                    );
+                }
+            }
+            if !set_file_pointer(&operation_handle, preimage.len() as i64) {
+                return recovery_unknown(evidence, WorkspaceReplaceError::OperationHandleIo);
+            }
+            evidence.modifying_syscalls += 1;
+            if !set_end_of_file(&operation_handle) {
+                return recovery_unknown(evidence, WorkspaceReplaceError::SetEndOfFileFailed);
+            }
+        }
+
+        evidence.modifying_syscalls += 1;
+        if unsafe { FlushFileBuffers(operation_handle.0) } == 0 {
+            return recovery_unknown(evidence, WorkspaceReplaceError::FlushFailed);
+        }
+        if !set_file_pointer(&operation_handle, 0) {
+            return recovery_unknown(evidence, WorkspaceReplaceError::OperationHandleIo);
+        }
+        let after_bytes = match read_raw_recovery_bounded(&operation_handle) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return recovery_unknown(
+                    evidence,
+                    WorkspaceReplaceError::PostWriteVerificationFailed,
+                )
+            }
+        };
+        evidence.bytes_after = Some(after_bytes.len());
+        evidence.after_sha256 = Some(crate::sha256_hex(&after_bytes));
+        if after_bytes != preimage {
+            return recovery_unknown(evidence, WorkspaceReplaceError::PostWriteVerificationFailed);
+        }
+        evidence.committed_mutations = 1;
+        WorkspaceRecoveryCommitOutcome::Recovered { evidence }
+    }
+
+    fn recovery_abort_if_requested(
+        fault: Option<WorkspaceRecoveryTestFault>,
+        requested: WorkspaceRecoveryTestFault,
+    ) {
+        #[cfg(test)]
+        if fault == Some(requested) {
+            std::process::abort();
+        }
+        #[cfg(not(test))]
+        let _ = (fault, requested);
+    }
+
+    enum RecoveryReadError {
+        TooLarge,
+        Io,
+    }
+
+    fn read_raw_recovery_bounded(handle: &OwnedHandle) -> Result<Vec<u8>, RecoveryReadError> {
+        let mut bytes = Vec::with_capacity(WORKSPACE_REPLACE_HARD_MAX_BYTES + 1);
+        let mut buffer = [0_u8; 8 * 1024];
+        loop {
+            let remaining = WORKSPACE_REPLACE_HARD_MAX_BYTES + 1 - bytes.len();
+            if remaining == 0 {
+                return Err(RecoveryReadError::TooLarge);
+            }
+            let request = remaining.min(buffer.len()) as u32;
+            let mut read = 0_u32;
+            let ok = unsafe {
+                ReadFile(
+                    handle.0,
+                    buffer.as_mut_ptr(),
+                    request,
+                    &mut read,
+                    std::ptr::null_mut(),
+                ) != 0
+            };
+            if !ok || read > request {
+                return Err(RecoveryReadError::Io);
+            }
+            if read == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..read as usize]);
+            if bytes.len() > WORKSPACE_REPLACE_HARD_MAX_BYTES {
+                return Err(RecoveryReadError::TooLarge);
+            }
+        }
+        Ok(bytes)
+    }
+
+    fn recovery_denied(
+        evidence: WorkspaceReplaceEvidence,
+        error: WorkspaceReplaceError,
+    ) -> WorkspaceRecoveryCommitOutcome {
+        WorkspaceRecoveryCommitOutcome::Denied { error, evidence }
+    }
+
+    fn recovery_unknown(
+        mut evidence: WorkspaceReplaceEvidence,
+        error: WorkspaceReplaceError,
+    ) -> WorkspaceRecoveryCommitOutcome {
+        evidence.commit_unknown = true;
+        WorkspaceRecoveryCommitOutcome::RecoveryUnknown { error, evidence }
+    }
+
     pub(super) fn replace_existing_file_utf8_bounded(
         prepared: PreparedWorkspaceTarget,
         expected_sha256: &str,
@@ -2507,6 +3114,10 @@ mod platform {
                 return replace_unknown(evidence, WorkspaceReplaceError::SetEndOfFileFailed);
             }
             faults.after_first_modifying_syscall();
+            if faults.fire(WorkspaceReplaceFaultPoint::AbortAfterFirstMutation) {
+                #[cfg(test)]
+                std::process::abort();
+            }
             if faults.fire(WorkspaceReplaceFaultPoint::PanicAfterFirstMutation) {
                 panic!("test-only native panic after first mutation");
             }
@@ -2562,6 +3173,10 @@ mod platform {
                 if first_write {
                     first_write = false;
                     faults.after_first_modifying_syscall();
+                    if faults.fire(WorkspaceReplaceFaultPoint::AbortAfterFirstMutation) {
+                        #[cfg(test)]
+                        std::process::abort();
+                    }
                     if faults.fire(WorkspaceReplaceFaultPoint::PanicAfterFirstMutation) {
                         panic!("test-only native panic after first mutation");
                     }

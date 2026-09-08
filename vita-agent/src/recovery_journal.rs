@@ -32,6 +32,8 @@ pub const RECOVERY_JOURNAL_FORMAT_VERSION: u16 = 1;
 pub const RECOVERY_JOURNAL_MAX_PREIMAGE_BYTES: usize = 64 * 1024;
 pub const RECOVERY_JOURNAL_MAX_REPLACEMENT_BYTES: usize = 64 * 1024;
 pub const RECOVERY_JOURNAL_MAX_SIZE: usize = 160 * 1024;
+pub const RECOVERY_MARKER_FORMAT_VERSION: u16 = 1;
+pub const RECOVERY_MARKER_MAX_SIZE: usize = 1024;
 
 const MAGIC: &[u8; 4] = b"DLRJ";
 const DOMAIN_SEPARATOR: &[u8] = b"DigitalLife.RecoveryJournalV1\0";
@@ -44,6 +46,11 @@ const MAX_TRANSACTION_ID_BYTES: usize = 96;
 const MAX_SCAN_ENTRIES: usize = 256;
 const MAX_FILE_NAME_CHARS: usize = 256;
 const RECOVERY_DIRECTORY_NAME: &str = "recovery";
+const MARKER_MAGIC: &[u8; 4] = b"DLRM";
+const MARKER_DOMAIN_SEPARATOR: &[u8] = b"DigitalLife.RecoveryMarkerV1\0";
+const MARKER_HEADER_BYTES: usize = 4 + 2 + 4;
+const MARKER_PAYLOAD_BYTES: usize =
+    RECOVERY_MARKER_MAX_SIZE - MARKER_HEADER_BYTES - INTEGRITY_HASH_BYTES;
 
 static NEXT_TRANSACTION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -148,7 +155,7 @@ pub struct RecoveryJournalIdentity {
 }
 
 impl RecoveryJournalIdentity {
-    fn from_workspace_identity(
+    pub(crate) fn from_workspace_identity(
         identity: WorkspaceRootIdentity,
     ) -> Result<Self, RecoveryJournalError> {
         match (identity.volume_serial_number(), identity.file_id()) {
@@ -259,6 +266,256 @@ impl RecoveryTransactionId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// The only durable lifecycle markers accepted by H5-B.  A marker is
+/// tamper-evident transaction evidence, never a permission or recovery grant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryMarkerState {
+    Started,
+    Committed,
+    Recovered,
+}
+
+impl RecoveryMarkerState {
+    fn encode(self) -> u8 {
+        match self {
+            Self::Started => 1,
+            Self::Committed => 2,
+            Self::Recovered => 3,
+        }
+    }
+
+    fn decode(value: u8) -> Result<Self, RecoveryJournalError> {
+        match value {
+            1 => Ok(Self::Started),
+            2 => Ok(Self::Committed),
+            3 => Ok(Self::Recovered),
+            _ => Err(RecoveryJournalError::Corrupt(
+                "unknown recovery marker state",
+            )),
+        }
+    }
+
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::Committed => "committed",
+            Self::Recovered => "recovered",
+        }
+    }
+}
+
+/// Strict, bounded, create-new H5-B sidecar evidence.
+///
+/// The frame binds one immutable H5-A journal by transaction id and journal
+/// integrity hash.  It intentionally carries no grant, confirmation,
+/// authorization revision, credential, raw HANDLE, or provider material.
+#[derive(Clone, Eq, PartialEq)]
+pub struct RecoveryMarkerV1 {
+    transaction_id: RecoveryTransactionId,
+    journal_integrity_hash: [u8; 32],
+    marker_state: RecoveryMarkerState,
+    created_at_unix_ms: u64,
+    marker_integrity_hash: [u8; 32],
+}
+
+impl fmt::Debug for RecoveryMarkerV1 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RecoveryMarkerV1")
+            .field("transaction_id", &self.transaction_id)
+            .field(
+                "journal_integrity_hash",
+                &hex_encode(&self.journal_integrity_hash),
+            )
+            .field("marker_state", &self.marker_state)
+            .field("created_at_unix_ms", &self.created_at_unix_ms)
+            .field(
+                "marker_integrity_hash",
+                &hex_encode(&self.marker_integrity_hash),
+            )
+            .finish()
+    }
+}
+
+impl RecoveryMarkerV1 {
+    pub(crate) fn new(
+        transaction_id: RecoveryTransactionId,
+        journal_integrity_hash: [u8; 32],
+        marker_state: RecoveryMarkerState,
+    ) -> Self {
+        let created_at_unix_ms = current_unix_millis();
+        let payload = marker_payload(
+            &transaction_id,
+            journal_integrity_hash,
+            marker_state,
+            created_at_unix_ms,
+        )
+        .expect("bounded local H5-B marker facts must encode");
+        Self {
+            transaction_id,
+            journal_integrity_hash,
+            marker_state,
+            created_at_unix_ms,
+            marker_integrity_hash: marker_integrity_hash(&payload),
+        }
+    }
+
+    pub fn transaction_id(&self) -> &RecoveryTransactionId {
+        &self.transaction_id
+    }
+
+    pub fn journal_integrity_hash(&self) -> String {
+        hex_encode(&self.journal_integrity_hash)
+    }
+
+    pub fn marker_state(&self) -> RecoveryMarkerState {
+        self.marker_state
+    }
+
+    pub fn created_at_unix_ms(&self) -> u64 {
+        self.created_at_unix_ms
+    }
+
+    pub fn marker_integrity_hash(&self) -> String {
+        hex_encode(&self.marker_integrity_hash)
+    }
+
+    fn journal_integrity_hash_bytes(&self) -> [u8; 32] {
+        self.journal_integrity_hash
+    }
+
+    fn file_name(&self) -> String {
+        marker_file_name(&self.transaction_id, self.marker_state)
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, RecoveryJournalError> {
+        let payload = marker_payload(
+            &self.transaction_id,
+            self.journal_integrity_hash,
+            self.marker_state,
+            self.created_at_unix_ms,
+        )?;
+        let expected_integrity = marker_integrity_hash(&payload);
+        if expected_integrity != self.marker_integrity_hash {
+            return Err(RecoveryJournalError::Corrupt(
+                "marker integrity does not match canonical facts",
+            ));
+        }
+        let payload_length =
+            u32::try_from(payload.len()).map_err(|_| RecoveryJournalError::Oversized {
+                limit: MARKER_PAYLOAD_BYTES,
+            })?;
+        let mut bytes =
+            Vec::with_capacity(MARKER_HEADER_BYTES + payload.len() + INTEGRITY_HASH_BYTES);
+        bytes.extend_from_slice(MARKER_MAGIC);
+        bytes.extend_from_slice(&RECOVERY_MARKER_FORMAT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&payload_length.to_le_bytes());
+        bytes.extend_from_slice(&payload);
+        bytes.extend_from_slice(&expected_integrity);
+        if bytes.len() > RECOVERY_MARKER_MAX_SIZE {
+            return Err(RecoveryJournalError::Oversized {
+                limit: RECOVERY_MARKER_MAX_SIZE,
+            });
+        }
+        Ok(bytes)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, RecoveryJournalError> {
+        if bytes.len() > RECOVERY_MARKER_MAX_SIZE {
+            return Err(RecoveryJournalError::Oversized {
+                limit: RECOVERY_MARKER_MAX_SIZE,
+            });
+        }
+        if bytes.len() < MARKER_HEADER_BYTES + INTEGRITY_HASH_BYTES {
+            return Err(RecoveryJournalError::Corrupt("truncated marker frame"));
+        }
+        if &bytes[..MARKER_MAGIC.len()] != MARKER_MAGIC {
+            return Err(RecoveryJournalError::Corrupt("invalid marker magic"));
+        }
+        let version = u16::from_le_bytes([bytes[4], bytes[5]]);
+        if version != RECOVERY_MARKER_FORMAT_VERSION {
+            return Err(RecoveryJournalError::UnsupportedVersion(version));
+        }
+        let payload_length = u32::from_le_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]) as usize;
+        if payload_length > MARKER_PAYLOAD_BYTES {
+            return Err(RecoveryJournalError::Oversized {
+                limit: MARKER_PAYLOAD_BYTES,
+            });
+        }
+        let expected_length = MARKER_HEADER_BYTES
+            .checked_add(payload_length)
+            .and_then(|length| length.checked_add(INTEGRITY_HASH_BYTES))
+            .ok_or(RecoveryJournalError::Oversized {
+                limit: RECOVERY_MARKER_MAX_SIZE,
+            })?;
+        if bytes.len() < expected_length {
+            return Err(RecoveryJournalError::Corrupt("truncated marker payload"));
+        }
+        if bytes.len() > expected_length {
+            return Err(RecoveryJournalError::Corrupt("extra trailing marker bytes"));
+        }
+        let payload = &bytes[MARKER_HEADER_BYTES..MARKER_HEADER_BYTES + payload_length];
+        let stored_integrity = &bytes[MARKER_HEADER_BYTES + payload_length..];
+        let expected_integrity = marker_integrity_hash(payload);
+        if stored_integrity != expected_integrity {
+            return Err(RecoveryJournalError::Corrupt(
+                "marker integrity hash mismatch",
+            ));
+        }
+        let mut cursor = Cursor::new(payload);
+        let transaction_text =
+            cursor.string("marker_transaction_id", MAX_TRANSACTION_ID_BYTES, true)?;
+        let transaction_id = RecoveryTransactionId::parse(&transaction_text)?;
+        let journal_integrity_hash = cursor.hash("marker_journal_integrity_hash")?;
+        let marker_state = RecoveryMarkerState::decode(cursor.u8("marker_state")?)?;
+        let created_at_unix_ms = cursor.u64("marker_created_at")?;
+        cursor.finish()?;
+        let marker_integrity_hash = array_from_slice(&expected_integrity);
+        Ok(Self {
+            transaction_id,
+            journal_integrity_hash,
+            marker_state,
+            created_at_unix_ms,
+            marker_integrity_hash,
+        })
+    }
+}
+
+fn marker_payload(
+    transaction_id: &RecoveryTransactionId,
+    journal_integrity_hash: [u8; 32],
+    marker_state: RecoveryMarkerState,
+    created_at_unix_ms: u64,
+) -> Result<Vec<u8>, RecoveryJournalError> {
+    let mut payload = Vec::new();
+    put_string(
+        &mut payload,
+        "marker_transaction_id",
+        transaction_id.as_str(),
+        MAX_TRANSACTION_ID_BYTES,
+        true,
+    )?;
+    payload.extend_from_slice(&journal_integrity_hash);
+    payload.push(marker_state.encode());
+    payload.extend_from_slice(&created_at_unix_ms.to_le_bytes());
+    if payload.len() > MARKER_PAYLOAD_BYTES {
+        return Err(RecoveryJournalError::Oversized {
+            limit: MARKER_PAYLOAD_BYTES,
+        });
+    }
+    Ok(payload)
+}
+
+fn marker_integrity_hash(payload: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(MARKER_DOMAIN_SEPARATOR);
+    hasher.update(MARKER_MAGIC);
+    hasher.update(RECOVERY_MARKER_FORMAT_VERSION.to_le_bytes());
+    hasher.update((payload.len() as u32).to_le_bytes());
+    hasher.update(payload);
+    array_from_slice(&hasher.finalize())
 }
 
 /// Trusted transaction facts supplied by the host-side integration seam.
@@ -488,6 +745,10 @@ impl RecoveryJournalV1 {
 
     pub fn integrity_hash(&self) -> String {
         hex_encode(&self.integrity_hash)
+    }
+
+    pub(crate) fn integrity_hash_bytes(&self) -> [u8; 32] {
+        self.integrity_hash
     }
 
     /// Serializes the strict canonical frame.  It contains no replacement
@@ -853,6 +1114,97 @@ impl RecoveryJournalScan {
     }
 }
 
+/// The only four legal persistent H5-B transaction states.  The state is
+/// derived from one valid immutable journal and its validated marker set; it
+/// is never selected from current workspace bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryTransactionState {
+    PreparedOnly,
+    RecoveryRequired,
+    CommittedTerminal,
+    RecoveredTerminal,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryTransactionSnapshot {
+    journal: RecoveryJournalV1,
+    started: Option<RecoveryMarkerV1>,
+    committed: Option<RecoveryMarkerV1>,
+    recovered: Option<RecoveryMarkerV1>,
+    state: RecoveryTransactionState,
+}
+
+impl RecoveryTransactionSnapshot {
+    pub fn journal(&self) -> &RecoveryJournalV1 {
+        &self.journal
+    }
+
+    pub fn started(&self) -> Option<&RecoveryMarkerV1> {
+        self.started.as_ref()
+    }
+
+    pub fn committed(&self) -> Option<&RecoveryMarkerV1> {
+        self.committed.as_ref()
+    }
+
+    pub fn recovered(&self) -> Option<&RecoveryMarkerV1> {
+        self.recovered.as_ref()
+    }
+
+    pub fn state(&self) -> RecoveryTransactionState {
+        self.state
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RecoveryTransactionScanItem {
+    Valid(RecoveryTransactionSnapshot),
+    AmbiguousTarget {
+        target: RecoveryJournalTargetKey,
+        transactions: Vec<RecoveryTransactionId>,
+    },
+    CorruptArtifact {
+        file_name: String,
+        reason: &'static str,
+    },
+    OrphanedRecoveryMarker {
+        file_name: String,
+        transaction_id: RecoveryTransactionId,
+        marker_state: RecoveryMarkerState,
+    },
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RecoveryTransactionScan {
+    items: Vec<RecoveryTransactionScanItem>,
+}
+
+impl RecoveryTransactionScan {
+    pub fn items(&self) -> &[RecoveryTransactionScanItem] {
+        &self.items
+    }
+
+    pub fn valid_transactions(&self) -> impl Iterator<Item = &RecoveryTransactionSnapshot> {
+        self.items.iter().filter_map(|item| match item {
+            RecoveryTransactionScanItem::Valid(snapshot) => Some(snapshot),
+            _ => None,
+        })
+    }
+
+    pub fn actionable_recovery_transactions(
+        &self,
+    ) -> impl Iterator<Item = &RecoveryTransactionSnapshot> {
+        self.valid_transactions()
+            .filter(|snapshot| snapshot.state == RecoveryTransactionState::RecoveryRequired)
+    }
+
+    pub fn has_ambiguous_target(&self) -> bool {
+        self.items
+            .iter()
+            .any(|item| matches!(item, RecoveryTransactionScanItem::AmbiguousTarget { .. }))
+    }
+}
+
 /// Current-state reconciliation is deliberately read-only and contains no
 /// recovery action.  `AlreadyReplacement` is evidence only; it does not mark
 /// a journal finalized, and no reconciliation result is recovery
@@ -933,6 +1285,32 @@ impl RecoveryJournalRootAuthority {
         }
     }
 
+    fn create_new_marker(
+        &self,
+        marker: &RecoveryMarkerV1,
+        bytes: &[u8],
+    ) -> Result<(), RecoveryJournalError> {
+        let name = marker.file_name();
+        #[cfg(windows)]
+        {
+            return self
+                .namespace
+                .create_new_marker(OsStr::new(&name), bytes)
+                .map_err(|error| {
+                    if error.kind() == io::ErrorKind::AlreadyExists {
+                        RecoveryJournalError::DuplicateTransactionId
+                    } else {
+                        io_error("create-new recovery marker", error)
+                    }
+                });
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (marker, bytes);
+            Err(RecoveryJournalError::UnsupportedPlatform)
+        }
+    }
+
     fn read_file(&self, file_name: &OsStr) -> Result<Vec<u8>, RecoveryJournalError> {
         #[cfg(windows)]
         {
@@ -940,6 +1318,21 @@ impl RecoveryJournalRootAuthority {
                 .namespace
                 .read_journal(file_name, RECOVERY_JOURNAL_MAX_SIZE)
                 .map_err(|error| io_error("open/read journal", error));
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = file_name;
+            Err(RecoveryJournalError::UnsupportedPlatform)
+        }
+    }
+
+    fn read_marker_file(&self, file_name: &OsStr) -> Result<Vec<u8>, RecoveryJournalError> {
+        #[cfg(windows)]
+        {
+            return self
+                .namespace
+                .read_marker(file_name, RECOVERY_MARKER_MAX_SIZE)
+                .map_err(|error| io_error("open/read recovery marker", error));
         }
         #[cfg(not(windows))]
         {
@@ -1117,6 +1510,263 @@ impl RecoveryJournalStore {
         Ok(finalize_scan_items(items))
     }
 
+    /// Scans the immutable H5-A journal set and H5-B sidecars as one strict
+    /// transaction state machine.  Only `Valid` items are exposed to
+    /// operational code; corrupt, orphaned, and ambiguous artifacts remain
+    /// evidence that must be handled fail-closed.
+    pub fn scan_transactions(&self) -> Result<RecoveryTransactionScan, RecoveryJournalError> {
+        self.validate_scan_root()?;
+        self.profile
+            .verify_private_runtime_ownership()
+            .map_err(RecoveryJournalError::Profile)?;
+
+        let mut journals: HashMap<RecoveryTransactionId, RecoveryJournalV1> = HashMap::new();
+        let mut markers: HashMap<RecoveryTransactionId, Vec<RecoveryMarkerV1>> = HashMap::new();
+        let mut items = Vec::new();
+        let mut entry_count = 0usize;
+
+        for file_name in self.namespace_authority.enumerate()? {
+            entry_count += 1;
+            if entry_count > MAX_SCAN_ENTRIES {
+                return Err(RecoveryJournalError::ScanLimitExceeded);
+            }
+            let Some(display_name) = file_name
+                .to_str()
+                .map(|name| name.chars().take(MAX_FILE_NAME_CHARS).collect::<String>())
+            else {
+                continue;
+            };
+
+            if let Some(transaction_text) = display_name.strip_suffix(".dlrj") {
+                let transaction_id = match RecoveryTransactionId::parse(transaction_text) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        items.push(RecoveryTransactionScanItem::CorruptArtifact {
+                            file_name: display_name,
+                            reason: "invalid transaction filename",
+                        });
+                        continue;
+                    }
+                };
+                let bytes = match self.namespace_authority.read_file(&file_name) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        items.push(RecoveryTransactionScanItem::CorruptArtifact {
+                            file_name: display_name,
+                            reason: scan_error_reason(&error),
+                        });
+                        continue;
+                    }
+                };
+                match RecoveryJournalV1::from_bytes(&bytes) {
+                    Ok(journal)
+                        if journal.transaction_id() == &transaction_id
+                            && journal.record_state() == RecoveryJournalRecordState::Prepared =>
+                    {
+                        if journals.insert(transaction_id, journal).is_some() {
+                            items.push(RecoveryTransactionScanItem::CorruptArtifact {
+                                file_name: display_name,
+                                reason: "duplicate journal transaction record",
+                            });
+                        }
+                    }
+                    Ok(journal) if journal.transaction_id() != &transaction_id => {
+                        items.push(RecoveryTransactionScanItem::CorruptArtifact {
+                            file_name: display_name,
+                            reason: "filename and payload transaction ids differ",
+                        });
+                    }
+                    Ok(_) => {
+                        items.push(RecoveryTransactionScanItem::CorruptArtifact {
+                            file_name: display_name,
+                            reason: "journal is not an immutable Prepared record",
+                        });
+                    }
+                    Err(error) => {
+                        items.push(RecoveryTransactionScanItem::CorruptArtifact {
+                            file_name: display_name,
+                            reason: scan_error_reason(&error),
+                        });
+                    }
+                }
+                continue;
+            }
+
+            let Some(marker_parts) = parse_marker_file_name(&display_name) else {
+                continue;
+            };
+            let (transaction_id, marker_state) = match marker_parts {
+                Ok(parts) => parts,
+                Err(_) => {
+                    items.push(RecoveryTransactionScanItem::CorruptArtifact {
+                        file_name: display_name,
+                        reason: "invalid marker transaction filename",
+                    });
+                    continue;
+                }
+            };
+            let bytes = match self.namespace_authority.read_marker_file(&file_name) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    items.push(RecoveryTransactionScanItem::CorruptArtifact {
+                        file_name: display_name,
+                        reason: scan_error_reason(&error),
+                    });
+                    continue;
+                }
+            };
+            match RecoveryMarkerV1::from_bytes(&bytes) {
+                Ok(marker)
+                    if marker.transaction_id() == &transaction_id
+                        && marker.marker_state() == marker_state =>
+                {
+                    markers.entry(transaction_id).or_default().push(marker);
+                }
+                Ok(_) => items.push(RecoveryTransactionScanItem::CorruptArtifact {
+                    file_name: display_name,
+                    reason: "marker filename and payload do not match",
+                }),
+                Err(error) => items.push(RecoveryTransactionScanItem::CorruptArtifact {
+                    file_name: display_name,
+                    reason: scan_error_reason(&error),
+                }),
+            }
+        }
+
+        for (transaction_id, transaction_markers) in &markers {
+            if !journals.contains_key(transaction_id) {
+                for marker in transaction_markers {
+                    items.push(RecoveryTransactionScanItem::OrphanedRecoveryMarker {
+                        file_name: marker.file_name(),
+                        transaction_id: transaction_id.clone(),
+                        marker_state: marker.marker_state(),
+                    });
+                }
+            }
+        }
+
+        let mut by_target: HashMap<RecoveryJournalTargetKey, Vec<RecoveryJournalV1>> =
+            HashMap::new();
+        for journal in journals.values() {
+            by_target
+                .entry(target_key(journal))
+                .or_default()
+                .push(journal.clone());
+        }
+
+        for (target, mut target_journals) in by_target {
+            target_journals.sort_by(|left, right| {
+                left.transaction_id()
+                    .as_str()
+                    .cmp(right.transaction_id().as_str())
+            });
+            if target_journals.len() > 1 {
+                let transactions = target_journals
+                    .iter()
+                    .map(|journal| journal.transaction_id().clone())
+                    .collect();
+                items.push(RecoveryTransactionScanItem::AmbiguousTarget {
+                    target,
+                    transactions,
+                });
+                continue;
+            }
+            let journal = target_journals
+                .pop()
+                .expect("target group contains one journal");
+            let transaction_id = journal.transaction_id().clone();
+            let transaction_markers = markers.remove(&transaction_id).unwrap_or_default();
+            match build_transaction_snapshot(journal, transaction_markers) {
+                Ok(snapshot) => items.push(RecoveryTransactionScanItem::Valid(snapshot)),
+                Err(reason) => items.push(RecoveryTransactionScanItem::CorruptArtifact {
+                    file_name: journal_file_name(&transaction_id),
+                    reason,
+                }),
+            }
+        }
+
+        Ok(RecoveryTransactionScan { items })
+    }
+
+    /// Persists exactly one legal next marker using create-new semantics and
+    /// verifies it through the retained recovery namespace before returning.
+    pub(crate) fn persist_marker(
+        &self,
+        journal: &RecoveryJournalV1,
+        marker_state: RecoveryMarkerState,
+    ) -> Result<RecoveryMarkerV1, RecoveryJournalError> {
+        let snapshot = self
+            .scan_transactions()?
+            .valid_transactions()
+            .find(|candidate| candidate.journal.transaction_id() == journal.transaction_id())
+            .cloned()
+            .ok_or(RecoveryJournalError::TargetBindingMismatch(
+                "transaction is not one unambiguous valid H5-B candidate",
+            ))?;
+        let allowed = matches!(
+            (snapshot.state, marker_state),
+            (
+                RecoveryTransactionState::PreparedOnly,
+                RecoveryMarkerState::Started
+            ) | (
+                RecoveryTransactionState::RecoveryRequired,
+                RecoveryMarkerState::Committed,
+            ) | (
+                RecoveryTransactionState::RecoveryRequired,
+                RecoveryMarkerState::Recovered,
+            )
+        );
+        if !allowed {
+            return Err(RecoveryJournalError::TargetBindingMismatch(
+                "recovery marker is not the legal next transaction state",
+            ));
+        }
+        if snapshot.journal != *journal {
+            return Err(RecoveryJournalError::TargetBindingMismatch(
+                "marker journal binding does not match the retained Prepared record",
+            ));
+        }
+        let marker = RecoveryMarkerV1::new(
+            journal.transaction_id().clone(),
+            journal.integrity_hash_bytes(),
+            marker_state,
+        );
+        let bytes = marker.to_bytes()?;
+        self.namespace_authority
+            .create_new_marker(&marker, &bytes)?;
+        let reopened = RecoveryMarkerV1::from_bytes(
+            &self
+                .namespace_authority
+                .read_marker_file(OsStr::new(&marker.file_name()))?,
+        )
+        .map_err(|_| RecoveryJournalError::ReopenVerificationFailed)?;
+        if reopened != marker {
+            return Err(RecoveryJournalError::ReopenVerificationFailed);
+        }
+        Ok(reopened)
+    }
+
+    pub(crate) fn persist_started(
+        &self,
+        journal: &RecoveryJournalV1,
+    ) -> Result<RecoveryMarkerV1, RecoveryJournalError> {
+        self.persist_marker(journal, RecoveryMarkerState::Started)
+    }
+
+    pub(crate) fn persist_committed(
+        &self,
+        journal: &RecoveryJournalV1,
+    ) -> Result<RecoveryMarkerV1, RecoveryJournalError> {
+        self.persist_marker(journal, RecoveryMarkerState::Committed)
+    }
+
+    pub(crate) fn persist_recovered(
+        &self,
+        journal: &RecoveryJournalV1,
+    ) -> Result<RecoveryMarkerV1, RecoveryJournalError> {
+        self.persist_marker(journal, RecoveryMarkerState::Recovered)
+    }
+
     /// Reconciles the fixed workspace target against one prepared record
     /// without writing either the workspace or the journal directory.
     pub fn reconcile_prepared(
@@ -1259,7 +1909,7 @@ impl RecoveryJournalStore {
     }
 
     #[cfg(test)]
-    fn create_prepared_with_transaction_id_for_test(
+    pub(crate) fn create_prepared_with_transaction_id_for_test(
         &self,
         target: &PreparedWorkspaceTarget,
         context: RecoveryJournalContext,
@@ -1339,6 +1989,81 @@ impl RecoveryJournalStore {
 
 fn journal_file_name(transaction_id: &RecoveryTransactionId) -> String {
     format!("{}.dlrj", transaction_id.as_str())
+}
+
+fn marker_file_name(
+    transaction_id: &RecoveryTransactionId,
+    marker_state: RecoveryMarkerState,
+) -> String {
+    format!("{}.{}", transaction_id.as_str(), marker_state.suffix())
+}
+
+fn parse_marker_file_name(
+    value: &str,
+) -> Option<Result<(RecoveryTransactionId, RecoveryMarkerState), RecoveryJournalError>> {
+    for (suffix, marker_state) in [
+        (".started", RecoveryMarkerState::Started),
+        (".committed", RecoveryMarkerState::Committed),
+        (".recovered", RecoveryMarkerState::Recovered),
+    ] {
+        if let Some(transaction_text) = value.strip_suffix(suffix) {
+            return Some(
+                RecoveryTransactionId::parse(transaction_text)
+                    .map(|transaction_id| (transaction_id, marker_state)),
+            );
+        }
+    }
+    None
+}
+
+fn build_transaction_snapshot(
+    journal: RecoveryJournalV1,
+    markers: Vec<RecoveryMarkerV1>,
+) -> Result<RecoveryTransactionSnapshot, &'static str> {
+    let mut started = None;
+    let mut committed = None;
+    let mut recovered = None;
+    for marker in markers {
+        if marker.transaction_id() != journal.transaction_id()
+            || marker.journal_integrity_hash_bytes() != journal.integrity_hash_bytes()
+        {
+            return Err("marker does not bind the immutable journal");
+        }
+        match marker.marker_state() {
+            RecoveryMarkerState::Started => {
+                if started.replace(marker).is_some() {
+                    return Err("duplicate Started marker records");
+                }
+            }
+            RecoveryMarkerState::Committed => {
+                if committed.replace(marker).is_some() {
+                    return Err("duplicate Committed marker records");
+                }
+            }
+            RecoveryMarkerState::Recovered => {
+                if recovered.replace(marker).is_some() {
+                    return Err("duplicate Recovered marker records");
+                }
+            }
+        }
+    }
+    let state = match (started.is_some(), committed.is_some(), recovered.is_some()) {
+        (false, false, false) => RecoveryTransactionState::PreparedOnly,
+        (true, false, false) => RecoveryTransactionState::RecoveryRequired,
+        (true, true, false) => RecoveryTransactionState::CommittedTerminal,
+        (true, false, true) => RecoveryTransactionState::RecoveredTerminal,
+        (false, true, false) => return Err("Committed marker has no Started marker"),
+        (false, false, true) => return Err("Recovered marker has no Started marker"),
+        (true, true, true) => return Err("Committed and Recovered markers coexist"),
+        (false, true, true) => return Err("terminal markers have no Started marker"),
+    };
+    Ok(RecoveryTransactionSnapshot {
+        journal,
+        started,
+        committed,
+        recovered,
+        state,
+    })
 }
 
 fn finalize_scan_items(items: Vec<RecoveryJournalScanItem>) -> RecoveryJournalScan {
@@ -2233,6 +2958,193 @@ mod tests {
             .expect("retained root enumeration");
         assert!(names.iter().any(|candidate| candidate == &name));
         assert!(!replacement._outside.path().join(&name).exists());
+    }
+
+    fn create_marker_for_scan(
+        fixture: &Fixture,
+        transaction_id: RecoveryTransactionId,
+        journal_integrity_hash: [u8; 32],
+        marker_state: RecoveryMarkerState,
+    ) -> RecoveryMarkerV1 {
+        let marker = RecoveryMarkerV1::new(transaction_id, journal_integrity_hash, marker_state);
+        let bytes = marker.to_bytes().expect("marker fixture bytes");
+        fixture
+            .store
+            .namespace_authority
+            .create_new_marker(&marker, &bytes)
+            .expect("marker fixture create-new");
+        marker
+    }
+
+    #[test]
+    fn transaction_scanner_rejects_illegal_marker_combinations() {
+        let fixture = Fixture::new();
+        let journal = fixture
+            .store
+            .create_prepared(&fixture.target(), fixture.context(b"after\n"))
+            .expect("prepared journal");
+        create_marker_for_scan(
+            &fixture,
+            journal.transaction_id().clone(),
+            journal.integrity_hash_bytes(),
+            RecoveryMarkerState::Committed,
+        );
+        let scan = fixture.store.scan_transactions().expect("strict scan");
+        assert!(scan.valid_transactions().next().is_none());
+        assert!(scan.items().iter().any(|item| matches!(
+            item,
+            RecoveryTransactionScanItem::CorruptArtifact {
+                reason: "Committed marker has no Started marker",
+                ..
+            }
+        )));
+
+        let fixture = Fixture::new();
+        let journal = fixture
+            .store
+            .create_prepared(&fixture.target(), fixture.context(b"after\n"))
+            .expect("prepared journal");
+        create_marker_for_scan(
+            &fixture,
+            journal.transaction_id().clone(),
+            journal.integrity_hash_bytes(),
+            RecoveryMarkerState::Started,
+        );
+        create_marker_for_scan(
+            &fixture,
+            journal.transaction_id().clone(),
+            journal.integrity_hash_bytes(),
+            RecoveryMarkerState::Committed,
+        );
+        create_marker_for_scan(
+            &fixture,
+            journal.transaction_id().clone(),
+            journal.integrity_hash_bytes(),
+            RecoveryMarkerState::Recovered,
+        );
+        let scan = fixture.store.scan_transactions().expect("strict scan");
+        assert!(scan.valid_transactions().next().is_none());
+        assert!(scan.items().iter().any(|item| matches!(
+            item,
+            RecoveryTransactionScanItem::CorruptArtifact {
+                reason: "Committed and Recovered markers coexist",
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn transaction_scanner_rejects_orphan_and_mismatched_markers() {
+        let fixture = Fixture::new();
+        create_marker_for_scan(
+            &fixture,
+            RecoveryTransactionId::parse("tx-orphan").unwrap(),
+            [0x11; 32],
+            RecoveryMarkerState::Started,
+        );
+        let scan = fixture.store.scan_transactions().expect("strict scan");
+        assert!(scan.items().iter().any(|item| matches!(
+            item,
+            RecoveryTransactionScanItem::OrphanedRecoveryMarker {
+                transaction_id,
+                marker_state: RecoveryMarkerState::Started,
+                ..
+            } if transaction_id.as_str() == "tx-orphan"
+        )));
+
+        let fixture = Fixture::new();
+        let journal = fixture
+            .store
+            .create_prepared(&fixture.target(), fixture.context(b"after\n"))
+            .expect("prepared journal");
+        create_marker_for_scan(
+            &fixture,
+            journal.transaction_id().clone(),
+            [0x22; 32],
+            RecoveryMarkerState::Started,
+        );
+        let scan = fixture.store.scan_transactions().expect("strict scan");
+        assert!(scan.valid_transactions().next().is_none());
+        assert!(scan.items().iter().any(|item| matches!(
+            item,
+            RecoveryTransactionScanItem::CorruptArtifact {
+                reason: "marker does not bind the immutable journal",
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn transaction_scanner_rejects_tampered_marker_bytes() {
+        let fixture = Fixture::new();
+        let journal = fixture
+            .store
+            .create_prepared(&fixture.target(), fixture.context(b"after\n"))
+            .expect("prepared journal");
+        let marker = RecoveryMarkerV1::new(
+            journal.transaction_id().clone(),
+            journal.integrity_hash_bytes(),
+            RecoveryMarkerState::Started,
+        );
+        let mut bytes = marker.to_bytes().expect("marker fixture bytes");
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        fs::write(
+            fixture.store.recovery_root().join(marker.file_name()),
+            bytes,
+        )
+        .expect("tampered marker fixture");
+
+        let scan = fixture.store.scan_transactions().expect("strict scan");
+        assert!(scan
+            .valid_transactions()
+            .any(|snapshot| snapshot.state() == RecoveryTransactionState::PreparedOnly));
+        assert!(scan.items().iter().any(|item| matches!(
+            item,
+            RecoveryTransactionScanItem::CorruptArtifact {
+                reason: "marker integrity hash mismatch",
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn marker_create_and_reopen_stay_in_retained_recovery_namespace() {
+        let fixture = Fixture::new();
+        let journal = fixture
+            .store
+            .create_prepared(&fixture.target(), fixture.context(b"after\n"))
+            .expect("prepared journal");
+        let replacement = replace_recovery_root_with_junction(&fixture);
+        fixture
+            .store
+            .persist_started(&journal)
+            .expect("retained Started marker");
+        fixture
+            .store
+            .persist_committed(&journal)
+            .expect("retained Committed marker");
+        let started_name = format!("{}.started", journal.transaction_id().as_str());
+        let committed_name = format!("{}.committed", journal.transaction_id().as_str());
+        assert!(replacement.moved.join(&started_name).is_file());
+        assert!(replacement.moved.join(&committed_name).is_file());
+        assert!(!replacement._outside.path().join(&started_name).exists());
+        assert!(!replacement._outside.path().join(&committed_name).exists());
+
+        let fixture = Fixture::new();
+        let journal = fixture
+            .store
+            .create_prepared(&fixture.target(), fixture.context(b"after\n"))
+            .expect("prepared journal");
+        fixture.store.persist_started(&journal).unwrap();
+        let replacement = replace_recovery_root_with_junction(&fixture);
+        fixture
+            .store
+            .persist_recovered(&journal)
+            .expect("retained Recovered marker");
+        let recovered_name = format!("{}.recovered", journal.transaction_id().as_str());
+        assert!(replacement.moved.join(&recovered_name).is_file());
+        assert!(!replacement._outside.path().join(&recovered_name).exists());
     }
 
     #[test]

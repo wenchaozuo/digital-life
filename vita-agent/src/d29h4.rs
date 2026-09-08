@@ -1823,12 +1823,29 @@ fn validate_h4c_revalidation(
 }
 
 #[cfg(test)]
+pub(crate) struct H4FinalFenceRequest {
+    decision: std::sync::mpsc::SyncSender<Result<(), WorkspaceReplaceFenceError>>,
+}
+
+#[cfg(test)]
 pub(crate) struct H4GrantFinalFence {
-    authority: Arc<dyn VitaH4AuthorityPort>,
-    grant: VitaExecutableReplaceGrant,
-    runtime: tokio::runtime::Handle,
+    requests: tokio::sync::mpsc::Sender<H4FinalFenceRequest>,
     cancellation: Arc<AtomicBool>,
     sent: bool,
+}
+
+#[cfg(test)]
+impl H4GrantFinalFence {
+    fn new(
+        requests: tokio::sync::mpsc::Sender<H4FinalFenceRequest>,
+        cancellation: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            requests,
+            cancellation,
+            sent: false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1841,39 +1858,82 @@ impl super::workspace_capability::WorkspaceReplaceCommitFence for H4GrantFinalFe
         if self.cancellation.load(Ordering::Acquire) {
             return Err(WorkspaceReplaceFenceError::Cancelled);
         }
-
-        let binding = H4CGrantBinding::from_grant(&self.grant);
-        let request = H4CRevalidationInput::from_grant(&self.grant).into_request(&binding);
-        let future = match catch_unwind(AssertUnwindSafe(|| {
-            self.authority.evaluate(request.clone())
-        })) {
-            Ok(future) => future,
-            Err(_) => return Err(WorkspaceReplaceFenceError::Error),
-        };
-        let response = match catch_unwind(AssertUnwindSafe(|| {
-            self.runtime.block_on(CatchUnwindFuture::new(future))
-        })) {
-            Ok(Ok(Ok(response))) => response,
-            Ok(Ok(Err(_))) | Ok(Err(())) | Err(_) => return Err(WorkspaceReplaceFenceError::Error),
-        };
+        let (decision, result) = std::sync::mpsc::sync_channel(1);
+        self.requests
+            .blocking_send(H4FinalFenceRequest { decision })
+            .map_err(|_| WorkspaceReplaceFenceError::Error)?;
+        let result = result
+            .recv_timeout(H4C_NATIVE_FENCE_WAIT)
+            .map_err(|_| WorkspaceReplaceFenceError::Error)?;
         if self.cancellation.load(Ordering::Acquire) {
             return Err(WorkspaceReplaceFenceError::Cancelled);
         }
-        validate_h4c_revalidation(&response, &request, &binding).map_err(|classification| {
-            match classification {
-                H4DenyClassification::StaleRevision
-                | H4DenyClassification::RevalidationDenied
-                | H4DenyClassification::RootDisabled
-                | H4DenyClassification::WorkspaceScopeDenied
-                | H4DenyClassification::ConfirmationExpired
-                | H4DenyClassification::ConfirmationReplay => WorkspaceReplaceFenceError::Stale,
-                H4DenyClassification::TurnCancelled
-                | H4DenyClassification::LateAfterCancellation => {
-                    WorkspaceReplaceFenceError::Cancelled
+        result
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct H4GrantFinalFenceService {
+    authority: Arc<dyn VitaH4AuthorityPort>,
+    grant: VitaExecutableReplaceGrant,
+    cancellation: Arc<AtomicBool>,
+}
+
+#[cfg(test)]
+impl H4GrantFinalFenceService {
+    pub(crate) async fn service(
+        &self,
+        receiver: &mut tokio::sync::mpsc::Receiver<H4FinalFenceRequest>,
+    ) -> Option<Result<(), WorkspaceReplaceFenceError>> {
+        let fence_request = receiver.recv().await?;
+        if self.cancellation.load(Ordering::Acquire) {
+            let decision = Err(WorkspaceReplaceFenceError::Cancelled);
+            let _ = fence_request.decision.send(decision);
+            return Some(decision);
+        }
+
+        let binding = H4CGrantBinding::from_grant(&self.grant);
+        let authority_request =
+            H4CRevalidationInput::from_grant(&self.grant).into_request(&binding);
+        let decision = match catch_unwind(AssertUnwindSafe(|| {
+            self.authority.evaluate(authority_request.clone())
+        })) {
+            Err(_) => Err(WorkspaceReplaceFenceError::Error),
+            Ok(future) => {
+                match tokio::time::timeout(H4C_NATIVE_FENCE_WAIT, CatchUnwindFuture::new(future))
+                    .await
+                {
+                    Err(_) | Ok(Err(())) | Ok(Ok(Err(_))) => Err(WorkspaceReplaceFenceError::Error),
+                    Ok(Ok(Ok(response))) => {
+                        validate_h4c_revalidation(&response, &authority_request, &binding)
+                            .map_err(h4_final_fence_error)
+                    }
                 }
-                _ => WorkspaceReplaceFenceError::Denied,
             }
-        })
+        };
+        let decision = if self.cancellation.load(Ordering::Acquire) {
+            Err(WorkspaceReplaceFenceError::Cancelled)
+        } else {
+            decision
+        };
+        let _ = fence_request.decision.send(decision);
+        Some(decision)
+    }
+}
+
+#[cfg(test)]
+fn h4_final_fence_error(classification: H4DenyClassification) -> WorkspaceReplaceFenceError {
+    match classification {
+        H4DenyClassification::StaleRevision
+        | H4DenyClassification::RevalidationDenied
+        | H4DenyClassification::RootDisabled
+        | H4DenyClassification::WorkspaceScopeDenied
+        | H4DenyClassification::ConfirmationExpired
+        | H4DenyClassification::ConfirmationReplay => WorkspaceReplaceFenceError::Stale,
+        H4DenyClassification::TurnCancelled | H4DenyClassification::LateAfterCancellation => {
+            WorkspaceReplaceFenceError::Cancelled
+        }
+        _ => WorkspaceReplaceFenceError::Denied,
     }
 }
 
@@ -2401,18 +2461,18 @@ impl H4AuthorizedReplaceGrant {
         &self.grant.turn_id
     }
 
-    pub(crate) fn into_final_fence(
+    pub(crate) fn into_bounded_final_fence(
         self,
-        runtime: tokio::runtime::Handle,
+        requests: tokio::sync::mpsc::Sender<H4FinalFenceRequest>,
         cancellation: Arc<AtomicBool>,
-    ) -> H4GrantFinalFence {
-        H4GrantFinalFence {
+    ) -> (H4GrantFinalFence, H4GrantFinalFenceService) {
+        let fence = H4GrantFinalFence::new(requests, Arc::clone(&cancellation));
+        let service = H4GrantFinalFenceService {
             authority: self.authority,
             grant: self.grant,
-            runtime,
             cancellation,
-            sent: false,
-        }
+        };
+        (fence, service)
     }
 }
 
@@ -2726,6 +2786,10 @@ mod tests {
             request: &VitaWorkspaceReplaceRequest,
             operation: H4AuthorityOperation,
         ) -> H4AuthorityRequest {
+            let prepared = self
+                .root
+                .prepare_target(request.relative_path.as_path())
+                .expect("H4 request target should prepare");
             H4AuthorityRequest {
                 context: self.context.clone(),
                 capability_id: VITA_WORKSPACE_REPLACE_CAPABILITY_ID.to_string(),
@@ -2736,9 +2800,11 @@ mod tests {
                 expected_sha256: request.expected_sha256.clone(),
                 replacement_sha256: sha256_hex(request.replacement_content.as_bytes()),
                 replacement_bytes: request.replacement_content.as_bytes().len(),
-                workspace_root_identity: self.root.identity(),
-                target_identity: self.target_identity,
-                target_kind: PreparedWorkspaceTargetKind::ExistingFile,
+                workspace_root_identity: prepared.root().identity(),
+                target_identity: prepared
+                    .target_identity()
+                    .expect("H4 request target should have identity"),
+                target_kind: prepared.kind(),
             }
         }
 
@@ -3269,6 +3335,620 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn h5_process_host_sqlite_positive_commit() {
+        let fixture = Fixture::new();
+        let authority = ProcessIsolatedH4Authority::new(fixture.root.identity())
+            .expect("persistent H4 Host authority should start");
+        let request = fixture.request("h5-process-host-sqlite-positive");
+        let issue =
+            fixture.authority_request_for(&request, H4AuthorityOperation::IssueReplaceGrant);
+        authority
+            .provision_confirmation(&issue)
+            .expect("persistent H4 Host confirmation should provision");
+        let broker = fixture.broker(Arc::clone(&authority) as Arc<dyn VitaH4AuthorityPort>);
+        let grant = broker
+            .issue_h5_authorized_replace_action(H4ReplaceAuthorizationInput::from_request(&request))
+            .await
+            .expect("persistent H4 Host executable grant");
+        let action = crate::d29h5::H5AuthorizedReplaceAction::from_h4_grant(grant);
+        let (_app_data, store) = h5_store_for_fixture(&fixture);
+        let result = crate::d29h5::execute_governed_h5_replace(
+            action,
+            request.replacement_content.clone(),
+            store.clone(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("persistent H4 Host governed H5 replace");
+
+        assert_eq!(
+            result.transaction_outcome,
+            crate::d29h5::H5ReplaceTransactionOutcome::Committed
+        );
+        assert_eq!(
+            fs::read(fixture._root_dir.path().join("replace-me.txt")).unwrap(),
+            REPLACEMENT_CONTENT.as_bytes()
+        );
+        assert_eq!(
+            store
+                .scan_transactions()
+                .unwrap()
+                .valid_transactions()
+                .next()
+                .unwrap()
+                .state(),
+            crate::recovery_journal::RecoveryTransactionState::CommittedTerminal
+        );
+        let observations = authority.snapshot();
+        assert_eq!(observations.len(), 2);
+        assert!(observations.iter().all(|observation| {
+            observation
+                .canonical
+                .as_ref()
+                .is_some_and(|canonical| canonical.authorization_revision == Some(REVISION))
+        }));
+        assert!(authority.shutdown());
+    }
+
+    #[tokio::test]
+    async fn h5_process_host_sqlite_rev2_to_rev3_final_fence_mutates_zero() {
+        let fixture = Fixture::new();
+        let authority = ProcessIsolatedH4Authority::new(fixture.root.identity())
+            .expect("persistent H4 Host authority should start");
+        let request = fixture.request("h5-process-host-sqlite-revocation");
+        let issue =
+            fixture.authority_request_for(&request, H4AuthorityOperation::IssueReplaceGrant);
+        authority
+            .provision_confirmation(&issue)
+            .expect("persistent H4 Host confirmation should provision");
+        let revoking = Arc::new(H4CProcessRevokingAuthority {
+            inner: Arc::clone(&authority),
+            revoked: AtomicBool::new(false),
+        });
+        let broker = fixture.broker(Arc::clone(&revoking) as Arc<dyn VitaH4AuthorityPort>);
+        let grant = broker
+            .issue_h5_authorized_replace_action(H4ReplaceAuthorizationInput::from_request(&request))
+            .await
+            .expect("persistent H4 Host executable grant");
+        let action = crate::d29h5::H5AuthorizedReplaceAction::from_h4_grant(grant);
+        let (_app_data, store) = h5_store_for_fixture(&fixture);
+        let result = crate::d29h5::execute_governed_h5_replace(
+            action,
+            request.replacement_content.clone(),
+            store.clone(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("revoked final fence should return a truthful H5 result");
+
+        assert_eq!(
+            result.transaction_outcome,
+            crate::d29h5::H5ReplaceTransactionOutcome::Denied {
+                recovery: crate::d29h5::H5RecoveryDisposition::None,
+            }
+        );
+        assert_eq!(
+            fs::read(fixture._root_dir.path().join("replace-me.txt")).unwrap(),
+            FILE_CONTENT.as_bytes()
+        );
+        assert!(matches!(
+            result.native_diagnostics_for_test(),
+            crate::workspace_capability::WorkspaceReplaceCommitOutcome::Denied { evidence, .. }
+                if !evidence.mutation_attempted
+        ));
+        assert_eq!(
+            store
+                .scan_transactions()
+                .unwrap()
+                .valid_transactions()
+                .next()
+                .unwrap()
+                .state(),
+            crate::recovery_journal::RecoveryTransactionState::PreparedOnly
+        );
+        assert_eq!(
+            authority
+                .snapshot()
+                .last()
+                .and_then(|observation| observation.canonical.as_ref())
+                .map(|canonical| canonical.authorization_revision),
+            Some(Some(REVISION + 1))
+        );
+        assert!(authority.shutdown());
+    }
+
+    #[tokio::test]
+    async fn h5_final_fence_is_bounded_without_runtime_block_on() {
+        let fixture = Fixture::new();
+        let inner = TestHostAuthority::new(fixture.root.identity());
+        let authority = H4CGatedAuthority::new(Arc::clone(&inner));
+        let request = fixture.request("h5-bounded-final-fence");
+        let issue =
+            fixture.authority_request_for(&request, H4AuthorityOperation::IssueReplaceGrant);
+        inner.provision_trusted_confirmation(&issue);
+        let broker = fixture.broker(Arc::clone(&authority) as Arc<dyn VitaH4AuthorityPort>);
+        let grant = broker
+            .issue_h5_authorized_replace_action(H4ReplaceAuthorizationInput::from_request(&request))
+            .await
+            .expect("gated H4 executable grant");
+        let action = crate::d29h5::H5AuthorizedReplaceAction::from_h4_grant(grant);
+        let (_app_data, store) = h5_store_for_fixture(&fixture);
+        let lifecycle = crate::d29h5::H5WorkerLifecycle::new();
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(8),
+            crate::d29h5::execute_governed_h5_replace_with_test_options(
+                action,
+                request.replacement_content.clone(),
+                store.clone(),
+                Arc::new(AtomicBool::new(false)),
+                None,
+                false,
+                false,
+                Some(Arc::clone(&lifecycle)),
+            ),
+        )
+        .await
+        .expect("H5 final fence must be independently bounded")
+        .expect("bounded H5 result");
+        assert!(started.elapsed() < Duration::from_secs(8));
+        assert_eq!(
+            result.transaction_outcome,
+            crate::d29h5::H5ReplaceTransactionOutcome::Denied {
+                recovery: crate::d29h5::H5RecoveryDisposition::None,
+            }
+        );
+        assert_eq!(lifecycle.started_count(), 1);
+        assert_eq!(lifecycle.finished_count(), 1);
+        assert_eq!(
+            fs::read(fixture._root_dir.path().join("replace-me.txt")).unwrap(),
+            FILE_CONTENT.as_bytes()
+        );
+        assert_eq!(
+            store
+                .scan_transactions()
+                .unwrap()
+                .valid_transactions()
+                .next()
+                .unwrap()
+                .state(),
+            crate::recovery_journal::RecoveryTransactionState::PreparedOnly
+        );
+    }
+
+    #[tokio::test]
+    async fn h5_late_authority_allow_mutates_zero() {
+        let fixture = Fixture::new();
+        let inner = TestHostAuthority::new(fixture.root.identity());
+        let authority = H4CLateAllowAuthority::new(Arc::clone(&inner));
+        let request = fixture.request("h5-late-authority-allow");
+        let issue =
+            fixture.authority_request_for(&request, H4AuthorityOperation::IssueReplaceGrant);
+        inner.provision_trusted_confirmation(&issue);
+        let broker = fixture.broker(Arc::clone(&authority) as Arc<dyn VitaH4AuthorityPort>);
+        let grant = broker
+            .issue_h5_authorized_replace_action(H4ReplaceAuthorizationInput::from_request(&request))
+            .await
+            .expect("late-allow H4 executable grant");
+        let action = crate::d29h5::H5AuthorizedReplaceAction::from_h4_grant(grant);
+        let (_app_data, store) = h5_store_for_fixture(&fixture);
+        let lifecycle = crate::d29h5::H5WorkerLifecycle::new();
+        let execution = tokio::spawn(crate::d29h5::execute_governed_h5_replace_with_test_options(
+            action,
+            request.replacement_content.clone(),
+            store.clone(),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            false,
+            false,
+            Some(Arc::clone(&lifecycle)),
+        ));
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            authority.revalidation_started.notified(),
+        )
+        .await
+        .expect("late authority should receive the final-fence request");
+        let result = tokio::time::timeout(Duration::from_secs(8), execution)
+            .await
+            .expect("native final-fence timeout")
+            .expect("H5 execution task should join")
+            .expect("late authority result");
+        authority.release();
+        tokio::time::timeout(Duration::from_secs(2), authority.late_completed.notified())
+            .await
+            .expect("late authority should complete after native timeout");
+        assert_eq!(lifecycle.finished_count(), 1);
+        assert_eq!(
+            result.transaction_outcome,
+            crate::d29h5::H5ReplaceTransactionOutcome::Denied {
+                recovery: crate::d29h5::H5RecoveryDisposition::None,
+            }
+        );
+        assert_eq!(
+            fs::read(fixture._root_dir.path().join("replace-me.txt")).unwrap(),
+            FILE_CONTENT.as_bytes()
+        );
+        assert_eq!(
+            store
+                .scan_transactions()
+                .unwrap()
+                .valid_transactions()
+                .next()
+                .unwrap()
+                .state(),
+            crate::recovery_journal::RecoveryTransactionState::PreparedOnly
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn canonical_h5_panic_before_first_mutation_is_truthful() {
+        let fixture = Fixture::new();
+        let authority = TestHostAuthority::new(fixture.root.identity());
+        let request = fixture.request("h5-canonical-panic-before");
+        let issue =
+            fixture.authority_request_for(&request, H4AuthorityOperation::IssueReplaceGrant);
+        authority.provision_trusted_confirmation(&issue);
+        let broker = fixture.broker(Arc::clone(&authority) as Arc<dyn VitaH4AuthorityPort>);
+        let grant = broker
+            .issue_h5_authorized_replace_action(H4ReplaceAuthorizationInput::from_request(&request))
+            .await
+            .expect("canonical panic-before grant");
+        let action = crate::d29h5::H5AuthorizedReplaceAction::from_h4_grant(grant);
+        let (_app_data, store) = h5_store_for_fixture(&fixture);
+        let result = crate::d29h5::execute_governed_h5_replace_with_test_options(
+            action,
+            request.replacement_content.clone(),
+            store.clone(),
+            Arc::new(AtomicBool::new(false)),
+            Some(crate::workspace_capability::WorkspaceReplaceTestFault::PanicBeforeFirstMutation),
+            false,
+            false,
+            None,
+        )
+        .await
+        .expect("canonical panic-before result");
+        assert_eq!(
+            result.transaction_outcome,
+            crate::d29h5::H5ReplaceTransactionOutcome::Denied {
+                recovery: crate::d29h5::H5RecoveryDisposition::Required,
+            }
+        );
+        assert!(matches!(
+            result.native_diagnostics_for_test(),
+            crate::workspace_capability::WorkspaceReplaceCommitOutcome::Denied {
+                error: WorkspaceReplaceError::NativePanicBeforeMutation,
+                evidence,
+            } if !evidence.mutation_started
+        ));
+        assert_eq!(
+            fs::read(fixture._root_dir.path().join("replace-me.txt")).unwrap(),
+            FILE_CONTENT.as_bytes()
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn canonical_h5_panic_after_first_mutation_is_commit_unknown() {
+        let fixture = Fixture::new();
+        let authority = TestHostAuthority::new(fixture.root.identity());
+        let request = fixture.request("h5-canonical-panic-after");
+        let issue =
+            fixture.authority_request_for(&request, H4AuthorityOperation::IssueReplaceGrant);
+        authority.provision_trusted_confirmation(&issue);
+        let broker = fixture.broker(Arc::clone(&authority) as Arc<dyn VitaH4AuthorityPort>);
+        let grant = broker
+            .issue_h5_authorized_replace_action(H4ReplaceAuthorizationInput::from_request(&request))
+            .await
+            .expect("canonical panic-after grant");
+        let action = crate::d29h5::H5AuthorizedReplaceAction::from_h4_grant(grant);
+        let (_app_data, store) = h5_store_for_fixture(&fixture);
+        let result = crate::d29h5::execute_governed_h5_replace_with_test_options(
+            action,
+            request.replacement_content.clone(),
+            store.clone(),
+            Arc::new(AtomicBool::new(false)),
+            Some(crate::workspace_capability::WorkspaceReplaceTestFault::PanicAfterFirstMutation),
+            false,
+            false,
+            None,
+        )
+        .await
+        .expect("canonical panic-after result");
+        assert_eq!(
+            result.transaction_outcome,
+            crate::d29h5::H5ReplaceTransactionOutcome::CommitUnknown {
+                recovery_required: true,
+            }
+        );
+        assert!(matches!(
+            result.native_diagnostics_for_test(),
+            crate::workspace_capability::WorkspaceReplaceCommitOutcome::CommitUnknown {
+                error: WorkspaceReplaceError::NativePanicAfterMutation,
+                evidence,
+            } if evidence.mutation_started
+        ));
+        assert_eq!(
+            store
+                .scan_transactions()
+                .unwrap()
+                .valid_transactions()
+                .next()
+                .unwrap()
+                .state(),
+            crate::recovery_journal::RecoveryTransactionState::RecoveryRequired
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn canonical_h5_panic_after_native_commit_before_commit_marker_is_commit_unknown() {
+        let fixture = Fixture::new();
+        let authority = TestHostAuthority::new(fixture.root.identity());
+        let request = fixture.request("h5-canonical-panic-before-marker");
+        let issue =
+            fixture.authority_request_for(&request, H4AuthorityOperation::IssueReplaceGrant);
+        authority.provision_trusted_confirmation(&issue);
+        let broker = fixture.broker(Arc::clone(&authority) as Arc<dyn VitaH4AuthorityPort>);
+        let grant = broker
+            .issue_h5_authorized_replace_action(H4ReplaceAuthorizationInput::from_request(&request))
+            .await
+            .expect("canonical panic-before-marker grant");
+        let action = crate::d29h5::H5AuthorizedReplaceAction::from_h4_grant(grant);
+        let (_app_data, store) = h5_store_for_fixture(&fixture);
+        let result = crate::d29h5::execute_governed_h5_replace_with_test_options(
+            action,
+            request.replacement_content.clone(),
+            store.clone(),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            true,
+            false,
+            None,
+        )
+        .await
+        .expect("canonical panic-before-marker result");
+        assert_eq!(
+            result.transaction_outcome,
+            crate::d29h5::H5ReplaceTransactionOutcome::CommitUnknown {
+                recovery_required: true,
+            }
+        );
+        assert_eq!(
+            store
+                .scan_transactions()
+                .unwrap()
+                .valid_transactions()
+                .next()
+                .unwrap()
+                .state(),
+            crate::recovery_journal::RecoveryTransactionState::RecoveryRequired
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn canonical_h5_panic_after_commit_marker_remains_committed() {
+        let fixture = Fixture::new();
+        let authority = TestHostAuthority::new(fixture.root.identity());
+        let request = fixture.request("h5-canonical-panic-after-marker");
+        let issue =
+            fixture.authority_request_for(&request, H4AuthorityOperation::IssueReplaceGrant);
+        authority.provision_trusted_confirmation(&issue);
+        let broker = fixture.broker(Arc::clone(&authority) as Arc<dyn VitaH4AuthorityPort>);
+        let grant = broker
+            .issue_h5_authorized_replace_action(H4ReplaceAuthorizationInput::from_request(&request))
+            .await
+            .expect("canonical panic-after-marker grant");
+        let action = crate::d29h5::H5AuthorizedReplaceAction::from_h4_grant(grant);
+        let (_app_data, store) = h5_store_for_fixture(&fixture);
+        let result = crate::d29h5::execute_governed_h5_replace_with_test_options(
+            action,
+            request.replacement_content.clone(),
+            store.clone(),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            false,
+            true,
+            None,
+        )
+        .await
+        .expect("canonical panic-after-marker result");
+        assert_eq!(
+            result.transaction_outcome,
+            crate::d29h5::H5ReplaceTransactionOutcome::Committed
+        );
+        assert_eq!(
+            store
+                .scan_transactions()
+                .unwrap()
+                .valid_transactions()
+                .next()
+                .unwrap()
+                .state(),
+            crate::recovery_journal::RecoveryTransactionState::CommittedTerminal
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn canonical_h5_outer_abort_keeps_admission_until_worker_exit() {
+        let fixture = Fixture::new();
+        let inner = TestHostAuthority::new(fixture.root.identity());
+        let authority = H4CGatedAuthority::new(Arc::clone(&inner));
+        let broker = fixture.broker(Arc::clone(&authority) as Arc<dyn VitaH4AuthorityPort>);
+        let request_a = fixture.request("h5-outer-abort-a");
+        let issue_a =
+            fixture.authority_request_for(&request_a, H4AuthorityOperation::IssueReplaceGrant);
+        inner.provision_trusted_confirmation(&issue_a);
+        let grant_a = broker
+            .issue_h5_authorized_replace_action(H4ReplaceAuthorizationInput::from_request(
+                &request_a,
+            ))
+            .await
+            .expect("outer-abort A grant");
+        let action_a = crate::d29h5::H5AuthorizedReplaceAction::from_h4_grant(grant_a);
+        let (_app_data, store) = h5_store_for_fixture(&fixture);
+        let lifecycle = crate::d29h5::H5WorkerLifecycle::new();
+        lifecycle.hold_worker_exit();
+        let execution_a =
+            tokio::spawn(crate::d29h5::execute_governed_h5_replace_with_test_options(
+                action_a,
+                request_a.replacement_content.clone(),
+                store.clone(),
+                Arc::new(AtomicBool::new(false)),
+                None,
+                false,
+                false,
+                Some(Arc::clone(&lifecycle)),
+            ));
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            authority.revalidation_started.notified(),
+        )
+        .await
+        .expect("outer-abort A should reach final authority");
+        execution_a.abort();
+        let _ = execution_a.await;
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            lifecycle.wait_until_waiting_to_exit(),
+        )
+        .await
+        .expect("aborted A worker should remain alive at the controlled exit gate");
+
+        let request_b = fixture.request("h5-outer-abort-b");
+        let issue_b =
+            fixture.authority_request_for(&request_b, H4AuthorityOperation::IssueReplaceGrant);
+        inner.provision_trusted_confirmation(&issue_b);
+        let grant_b = broker
+            .issue_h5_authorized_replace_action(H4ReplaceAuthorizationInput::from_request(
+                &request_b,
+            ))
+            .await
+            .expect("outer-abort B grant");
+        let action_b = crate::d29h5::H5AuthorizedReplaceAction::from_h4_grant(grant_b);
+        let blocked = crate::d29h5::execute_governed_h5_replace_with_test_options(
+            action_b,
+            request_b.replacement_content.clone(),
+            store.clone(),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            false,
+            false,
+            None,
+        )
+        .await
+        .expect_err("same target must remain admitted while A worker is alive");
+        assert!(matches!(
+            blocked,
+            crate::recovery_journal::RecoveryJournalError::TransactionBlocked(
+                crate::recovery_journal::RecoveryTransactionBlockReason::ConcurrentAdmission
+            )
+        ));
+        assert_eq!(
+            store
+                .scan_transactions()
+                .unwrap()
+                .valid_transactions()
+                .count(),
+            1
+        );
+        assert_eq!(
+            store
+                .scan_transactions()
+                .unwrap()
+                .valid_transactions()
+                .next()
+                .unwrap()
+                .state(),
+            crate::recovery_journal::RecoveryTransactionState::PreparedOnly
+        );
+
+        lifecycle.release_worker_exit();
+        tokio::time::timeout(Duration::from_secs(2), lifecycle.wait_until_finished())
+            .await
+            .expect("aborted A worker should exit after cancellation");
+
+        let request_c = fixture.request("h5-outer-abort-c");
+        let issue_c =
+            fixture.authority_request_for(&request_c, H4AuthorityOperation::IssueReplaceGrant);
+        inner.provision_trusted_confirmation(&issue_c);
+        let grant_c = broker
+            .issue_h5_authorized_replace_action(H4ReplaceAuthorizationInput::from_request(
+                &request_c,
+            ))
+            .await
+            .expect("outer-abort C grant");
+        let action_c = crate::d29h5::H5AuthorizedReplaceAction::from_h4_grant(grant_c);
+        authority.release();
+        let committed = crate::d29h5::execute_governed_h5_replace(
+            action_c,
+            request_c.replacement_content.clone(),
+            store,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("admission should be released after A worker exits");
+        assert_eq!(
+            committed.transaction_outcome,
+            crate::d29h5::H5ReplaceTransactionOutcome::Committed
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn canonical_h5_outer_abort_worker_exits_boundedly() {
+        let fixture = Fixture::new();
+        let inner = TestHostAuthority::new(fixture.root.identity());
+        let authority = H4CGatedAuthority::new(Arc::clone(&inner));
+        let request = fixture.request("h5-outer-abort-bounded");
+        let issue =
+            fixture.authority_request_for(&request, H4AuthorityOperation::IssueReplaceGrant);
+        inner.provision_trusted_confirmation(&issue);
+        let broker = fixture.broker(Arc::clone(&authority) as Arc<dyn VitaH4AuthorityPort>);
+        let grant = broker
+            .issue_h5_authorized_replace_action(H4ReplaceAuthorizationInput::from_request(&request))
+            .await
+            .expect("bounded outer-abort grant");
+        let action = crate::d29h5::H5AuthorizedReplaceAction::from_h4_grant(grant);
+        let (_app_data, store) = h5_store_for_fixture(&fixture);
+        let lifecycle = crate::d29h5::H5WorkerLifecycle::new();
+        lifecycle.hold_worker_exit();
+        let task = tokio::spawn(crate::d29h5::execute_governed_h5_replace_with_test_options(
+            action,
+            request.replacement_content,
+            store,
+            Arc::new(AtomicBool::new(false)),
+            None,
+            false,
+            false,
+            Some(Arc::clone(&lifecycle)),
+        ));
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            authority.revalidation_started.notified(),
+        )
+        .await
+        .expect("bounded outer-abort request should reach final authority");
+        task.abort();
+        let _ = task.await;
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            lifecycle.wait_until_waiting_to_exit(),
+        )
+        .await
+        .expect("worker should reach the bounded exit observation");
+        lifecycle.release_worker_exit();
+        tokio::time::timeout(Duration::from_secs(2), lifecycle.wait_until_finished())
+            .await
+            .expect("worker should exit after outer cancellation");
+        assert_eq!(lifecycle.started_count(), 1);
+        assert_eq!(lifecycle.finished_count(), 1);
+    }
+
+    #[tokio::test]
     async fn h5_replacement_binding_mismatch_creates_no_journal() {
         let fixture = Fixture::new();
         let request = fixture.request("h5-replacement-mismatch");
@@ -3362,6 +4042,205 @@ mod tests {
         );
         assert_eq!(
             fs::read(fixture._root_dir.path().join("replace-me.txt")).unwrap(),
+            FILE_CONTENT.as_bytes()
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn case_alias_pending_recovery_blocks_new_replace() {
+        let fixture = Fixture::new();
+        let (_app_data, store) = h5_store_for_fixture(&fixture);
+        let existing = store
+            .create_prepared_for_expected_preimage(
+                &fixture
+                    .root
+                    .prepare_target(Path::new("replace-me.txt"))
+                    .unwrap(),
+                h5_context(&fixture, REPLACEMENT_CONTENT),
+                &sha256_hex(FILE_CONTENT.as_bytes()),
+            )
+            .unwrap();
+        store.persist_started(&existing).unwrap();
+
+        let request = VitaWorkspaceReplaceRequest::synthetic(
+            "h5-case-alias",
+            Some(fixture.context.clone()),
+            "REPLACE-ME.TXT",
+            &sha256_hex(FILE_CONTENT.as_bytes()),
+            REPLACEMENT_CONTENT,
+        );
+        let authority = TestHostAuthority::new(fixture.root.identity());
+        let issue =
+            fixture.authority_request_for(&request, H4AuthorityOperation::IssueReplaceGrant);
+        authority.provision_trusted_confirmation(&issue);
+        let broker = fixture.broker(Arc::clone(&authority) as Arc<dyn VitaH4AuthorityPort>);
+        let grant = broker
+            .issue_h5_authorized_replace_action(H4ReplaceAuthorizationInput::from_request(&request))
+            .await
+            .expect("case-alias H4 executable grant");
+        let action = crate::d29h5::H5AuthorizedReplaceAction::from_h4_grant(grant);
+        let error = crate::d29h5::execute_governed_h5_replace(
+            action,
+            request.replacement_content.clone(),
+            store.clone(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect_err("case alias must be blocked by pending recovery");
+        assert!(matches!(
+            error,
+            crate::recovery_journal::RecoveryJournalError::TransactionBlocked(
+                crate::recovery_journal::RecoveryTransactionBlockReason::RecoveryRequired
+            )
+        ));
+        assert_eq!(
+            store
+                .scan_transactions()
+                .unwrap()
+                .valid_transactions()
+                .count(),
+            1
+        );
+        assert_eq!(
+            fs::read(fixture._root_dir.path().join("replace-me.txt")).unwrap(),
+            FILE_CONTENT.as_bytes()
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn rename_alias_pending_recovery_blocks_new_replace() {
+        let fixture = Fixture::new();
+        let (_app_data, store) = h5_store_for_fixture(&fixture);
+        let existing = store
+            .create_prepared_for_expected_preimage(
+                &fixture
+                    .root
+                    .prepare_target(Path::new("replace-me.txt"))
+                    .unwrap(),
+                h5_context(&fixture, REPLACEMENT_CONTENT),
+                &sha256_hex(FILE_CONTENT.as_bytes()),
+            )
+            .unwrap();
+        store.persist_started(&existing).unwrap();
+        fs::rename(
+            fixture._root_dir.path().join("replace-me.txt"),
+            fixture._root_dir.path().join("renamed-target.txt"),
+        )
+        .unwrap();
+
+        let request = VitaWorkspaceReplaceRequest::synthetic(
+            "h5-rename-alias",
+            Some(fixture.context.clone()),
+            "renamed-target.txt",
+            &sha256_hex(FILE_CONTENT.as_bytes()),
+            REPLACEMENT_CONTENT,
+        );
+        let authority = TestHostAuthority::new(fixture.root.identity());
+        let issue =
+            fixture.authority_request_for(&request, H4AuthorityOperation::IssueReplaceGrant);
+        authority.provision_trusted_confirmation(&issue);
+        let broker = fixture.broker(Arc::clone(&authority) as Arc<dyn VitaH4AuthorityPort>);
+        let grant = broker
+            .issue_h5_authorized_replace_action(H4ReplaceAuthorizationInput::from_request(&request))
+            .await
+            .expect("rename-alias H4 executable grant");
+        let action = crate::d29h5::H5AuthorizedReplaceAction::from_h4_grant(grant);
+        let error = crate::d29h5::execute_governed_h5_replace(
+            action,
+            request.replacement_content.clone(),
+            store.clone(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect_err("rename alias must be blocked by pending recovery");
+        assert!(matches!(
+            error,
+            crate::recovery_journal::RecoveryJournalError::TransactionBlocked(
+                crate::recovery_journal::RecoveryTransactionBlockReason::RecoveryRequired
+            )
+        ));
+        assert_eq!(
+            store
+                .scan_transactions()
+                .unwrap()
+                .valid_transactions()
+                .count(),
+            1
+        );
+        assert_eq!(
+            fs::read(fixture._root_dir.path().join("renamed-target.txt")).unwrap(),
+            FILE_CONTENT.as_bytes()
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn hardlink_alias_pending_recovery_blocks_new_replace() {
+        let fixture = Fixture::new();
+        fs::hard_link(
+            fixture._root_dir.path().join("replace-me.txt"),
+            fixture._root_dir.path().join("hardlink-target.txt"),
+        )
+        .unwrap();
+        let (_app_data, store) = h5_store_for_fixture(&fixture);
+        let existing = store
+            .create_prepared_for_expected_preimage(
+                &fixture
+                    .root
+                    .prepare_target(Path::new("replace-me.txt"))
+                    .unwrap(),
+                h5_context(&fixture, REPLACEMENT_CONTENT),
+                &sha256_hex(FILE_CONTENT.as_bytes()),
+            )
+            .unwrap();
+        store.persist_started(&existing).unwrap();
+        let request = VitaWorkspaceReplaceRequest::synthetic(
+            "h5-hardlink-alias",
+            Some(fixture.context.clone()),
+            "hardlink-target.txt",
+            &sha256_hex(FILE_CONTENT.as_bytes()),
+            REPLACEMENT_CONTENT,
+        );
+        let authority = TestHostAuthority::new(fixture.root.identity());
+        let issue =
+            fixture.authority_request_for(&request, H4AuthorityOperation::IssueReplaceGrant);
+        authority.provision_trusted_confirmation(&issue);
+        let broker = fixture.broker(Arc::clone(&authority) as Arc<dyn VitaH4AuthorityPort>);
+        let grant = broker
+            .issue_h5_authorized_replace_action(H4ReplaceAuthorizationInput::from_request(&request))
+            .await
+            .expect("hardlink-alias H4 executable grant");
+        let action = crate::d29h5::H5AuthorizedReplaceAction::from_h4_grant(grant);
+        let error = crate::d29h5::execute_governed_h5_replace(
+            action,
+            request.replacement_content.clone(),
+            store.clone(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect_err("hardlink alias must be blocked by pending recovery");
+        assert!(matches!(
+            error,
+            crate::recovery_journal::RecoveryJournalError::TransactionBlocked(
+                crate::recovery_journal::RecoveryTransactionBlockReason::RecoveryRequired
+            )
+        ));
+        assert_eq!(
+            store
+                .scan_transactions()
+                .unwrap()
+                .valid_transactions()
+                .count(),
+            1
+        );
+        assert_eq!(
+            fs::read(fixture._root_dir.path().join("replace-me.txt")).unwrap(),
+            FILE_CONTENT.as_bytes()
+        );
+        assert_eq!(
+            fs::read(fixture._root_dir.path().join("hardlink-target.txt")).unwrap(),
             FILE_CONTENT.as_bytes()
         );
     }

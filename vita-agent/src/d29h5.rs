@@ -9,17 +9,18 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use crate::d29h4::H4AuthorizedReplaceGrant;
 use crate::recovery_journal::{
-    target_key_for_prepared_target, RecoveryJournalContext, RecoveryJournalError,
-    RecoveryJournalIdentity, RecoveryJournalStore, RecoveryJournalTargetKey, RecoveryJournalV1,
+    mutation_target_key_for_prepared_target, RecoveryJournalContext, RecoveryJournalError,
+    RecoveryJournalIdentity, RecoveryJournalStore, RecoveryJournalV1,
     RecoveryMarkerPersistenceTestFault, RecoveryMarkerState, RecoveryMarkerV1,
-    RecoveryTargetLifecycle, RecoveryTransactionBlockReason, RecoveryTransactionId,
-    RecoveryTransactionScan, RecoveryTransactionScanItem, RecoveryTransactionSnapshot,
-    RecoveryTransactionState, RECOVERY_JOURNAL_MAX_PREIMAGE_BYTES,
+    RecoveryMutationTargetKey, RecoveryTargetLifecycle, RecoveryTransactionBlockReason,
+    RecoveryTransactionId, RecoveryTransactionScan, RecoveryTransactionScanItem,
+    RecoveryTransactionSnapshot, RecoveryTransactionState, RECOVERY_JOURNAL_MAX_PREIMAGE_BYTES,
 };
 use crate::workspace_capability::{
     PreparedWorkspaceTargetKind, WorkspaceReadError, WorkspaceRecoveryCommitOutcome,
@@ -169,6 +170,13 @@ pub(crate) struct H5ReplaceExecutionResult {
     native_diagnostics: WorkspaceReplaceCommitOutcome,
 }
 
+#[cfg(test)]
+impl H5ReplaceExecutionResult {
+    pub(crate) fn native_diagnostics_for_test(&self) -> &WorkspaceReplaceCommitOutcome {
+        &self.native_diagnostics
+    }
+}
+
 /// A non-Clone runtime bridge produced only from a validated H4 executable
 /// replace grant.  Recovery journal bytes deliberately never contain this
 /// object or any of its authority material.
@@ -182,15 +190,15 @@ impl H5AuthorizedReplaceAction {
     }
 }
 
-static H5_TARGET_ADMISSIONS: OnceLock<Mutex<HashMap<RecoveryJournalTargetKey, ()>>> =
+static H5_TARGET_ADMISSIONS: OnceLock<Mutex<HashMap<RecoveryMutationTargetKey, ()>>> =
     OnceLock::new();
 
 struct H5TargetAdmissionGuard {
-    target: RecoveryJournalTargetKey,
+    target: RecoveryMutationTargetKey,
 }
 
 impl H5TargetAdmissionGuard {
-    fn try_acquire(target: RecoveryJournalTargetKey) -> Option<Self> {
+    fn try_acquire(target: RecoveryMutationTargetKey) -> Option<Self> {
         let admissions = H5_TARGET_ADMISSIONS.get_or_init(|| Mutex::new(HashMap::new()));
         let mut admissions = lock_unpoisoned(admissions);
         if admissions.contains_key(&target) {
@@ -206,6 +214,130 @@ impl Drop for H5TargetAdmissionGuard {
         if let Some(admissions) = H5_TARGET_ADMISSIONS.get() {
             lock_unpoisoned(admissions).remove(&self.target);
         }
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct H5ExecutionOptions {
+    force_commit_marker_failure: bool,
+    native_fault: Option<WorkspaceReplaceTestFault>,
+    started_marker_fault: Option<RecoveryMarkerPersistenceTestFault>,
+    panic_after_native_commit_before_marker: bool,
+    panic_after_commit_marker: bool,
+}
+
+#[cfg(test)]
+struct H5ExecutionLifetime {
+    cancellation: Arc<AtomicBool>,
+    completed: bool,
+}
+
+#[cfg(test)]
+impl H5ExecutionLifetime {
+    fn new(cancellation: Arc<AtomicBool>) -> Self {
+        Self {
+            cancellation,
+            completed: false,
+        }
+    }
+
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+#[cfg(test)]
+impl Drop for H5ExecutionLifetime {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.cancellation.store(true, Ordering::Release);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct H5WorkerLifecycle {
+    started: AtomicUsize,
+    finished: AtomicUsize,
+    waiting_to_exit: AtomicBool,
+    finished_notify: tokio::sync::Notify,
+    waiting_notify: tokio::sync::Notify,
+    exit_gate: Mutex<bool>,
+    exit_gate_changed: Condvar,
+}
+
+#[cfg(test)]
+impl H5WorkerLifecycle {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            started: AtomicUsize::new(0),
+            finished: AtomicUsize::new(0),
+            waiting_to_exit: AtomicBool::new(false),
+            finished_notify: tokio::sync::Notify::new(),
+            waiting_notify: tokio::sync::Notify::new(),
+            exit_gate: Mutex::new(false),
+            exit_gate_changed: Condvar::new(),
+        })
+    }
+
+    fn worker_started(self: &Arc<Self>) -> H5WorkerExitGuard {
+        self.started.fetch_add(1, Ordering::AcqRel);
+        H5WorkerExitGuard {
+            lifecycle: Arc::clone(self),
+        }
+    }
+
+    pub(crate) fn started_count(&self) -> usize {
+        self.started.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn finished_count(&self) -> usize {
+        self.finished.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn wait_until_finished(&self) {
+        while self.finished_count() == 0 {
+            self.finished_notify.notified().await;
+        }
+    }
+
+    pub(crate) fn hold_worker_exit(&self) {
+        *lock_unpoisoned(&self.exit_gate) = true;
+    }
+
+    pub(crate) fn release_worker_exit(&self) {
+        *lock_unpoisoned(&self.exit_gate) = false;
+        self.exit_gate_changed.notify_all();
+    }
+
+    pub(crate) async fn wait_until_waiting_to_exit(&self) {
+        while !self.waiting_to_exit.load(Ordering::Acquire) {
+            self.waiting_notify.notified().await;
+        }
+    }
+
+    fn wait_for_exit_release(&self) {
+        let mut gate = lock_unpoisoned(&self.exit_gate);
+        while *gate {
+            gate = match self.exit_gate_changed.wait(gate) {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+        }
+    }
+}
+
+#[cfg(test)]
+struct H5WorkerExitGuard {
+    lifecycle: Arc<H5WorkerLifecycle>,
+}
+
+#[cfg(test)]
+impl Drop for H5WorkerExitGuard {
+    fn drop(&mut self) {
+        self.lifecycle.finished.fetch_add(1, Ordering::AcqRel);
+        self.lifecycle.finished_notify.notify_waiters();
     }
 }
 
@@ -519,6 +651,9 @@ impl H5RecoveryExecutor {
             );
         }
         let journal = snapshot.journal();
+        if scan.target_lifecycle_for_journal(journal) != RecoveryTargetLifecycle::RecoveryRequired {
+            return RecoveryExecutionResult::denied(RecoveryDenyReason::RecoveryBlocked, false);
+        }
         if !action_binds_journal(&action, journal, self.root.identity()) {
             return RecoveryExecutionResult::denied(RecoveryDenyReason::RecoveryBlocked, false);
         }
@@ -870,13 +1005,33 @@ pub(crate) async fn execute_governed_h5_replace(
     store: RecoveryJournalStore,
     cancellation: Arc<AtomicBool>,
 ) -> Result<H5ReplaceExecutionResult, RecoveryJournalError> {
+    execute_governed_h5_replace_with_options(
+        authorized_action,
+        replacement_content,
+        store,
+        cancellation,
+        H5ExecutionOptions::default(),
+        None,
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn execute_governed_h5_replace_with_options(
+    authorized_action: H5AuthorizedReplaceAction,
+    replacement_content: String,
+    store: RecoveryJournalStore,
+    cancellation: Arc<AtomicBool>,
+    options: H5ExecutionOptions,
+    lifecycle: Option<Arc<H5WorkerLifecycle>>,
+) -> Result<H5ReplaceExecutionResult, RecoveryJournalError> {
     let H5AuthorizedReplaceAction { h4_grant } = authorized_action;
     let root = h4_grant.root().clone();
     let target = h4_grant
         .prepare_bound_target()
         .map_err(|_| RecoveryJournalError::TargetBindingMismatch("H4 target binding rejected"))?;
-    let target_key = target_key_for_prepared_target(&target)?;
-    let _admission_guard = H5TargetAdmissionGuard::try_acquire(target_key.clone()).ok_or(
+    let target_key = mutation_target_key_for_prepared_target(&target)?;
+    let admission_guard = H5TargetAdmissionGuard::try_acquire(target_key.clone()).ok_or(
         RecoveryJournalError::TransactionBlocked(
             RecoveryTransactionBlockReason::ConcurrentAdmission,
         ),
@@ -918,26 +1073,68 @@ pub(crate) async fn execute_governed_h5_replace(
         h4_grant.tool_call_id(),
         h4_grant.turn_id(),
     )?;
-    let runtime = tokio::runtime::Handle::current();
-    let mut final_fence = h4_grant.into_final_fence(runtime, Arc::clone(&cancellation));
-    let result = tokio::task::spawn_blocking(move || {
-        execute_h5b_replace_after_host_pass_internal(
+    let (requests, mut receiver) = tokio::sync::mpsc::channel(1);
+    let (mut final_fence, final_service) =
+        h4_grant.into_bounded_final_fence(requests, Arc::clone(&cancellation));
+    let mut lifetime = H5ExecutionLifetime::new(Arc::clone(&cancellation));
+    let native_cancellation = Arc::clone(&cancellation);
+    let native_lifecycle = lifecycle;
+    let native = tokio::task::spawn_blocking(move || {
+        let _admission_guard = admission_guard;
+        let _worker_exit_guard = native_lifecycle
+            .as_ref()
+            .map(H5WorkerLifecycle::worker_started);
+        let result = execute_h5b_replace_after_host_pass_with_tracker(
             &store,
             &root,
             target,
             context,
             &expected_sha256,
             &replacement_content,
-            cancellation.as_ref(),
+            native_cancellation.as_ref(),
             &mut final_fence,
-            false,
-            None,
-            None,
-        )
-    })
-    .await
-    .map_err(|_| RecoveryJournalError::TargetBindingMismatch("H5 native worker did not return"))?;
+            options,
+        );
+        if let Some(lifecycle) = native_lifecycle.as_ref() {
+            lifecycle.waiting_to_exit.store(true, Ordering::Release);
+            lifecycle.waiting_notify.notify_waiters();
+            lifecycle.wait_for_exit_release();
+        }
+        result
+    });
+    let _ = final_service.service(&mut receiver).await;
+    let result = native.await.map_err(|_| {
+        RecoveryJournalError::TargetBindingMismatch("H5 native worker did not return")
+    })?;
+    lifetime.complete();
     result
+}
+
+#[cfg(test)]
+pub(crate) async fn execute_governed_h5_replace_with_test_options(
+    authorized_action: H5AuthorizedReplaceAction,
+    replacement_content: String,
+    store: RecoveryJournalStore,
+    cancellation: Arc<AtomicBool>,
+    native_fault: Option<WorkspaceReplaceTestFault>,
+    panic_after_native_commit_before_marker: bool,
+    panic_after_commit_marker: bool,
+    lifecycle: Option<Arc<H5WorkerLifecycle>>,
+) -> Result<H5ReplaceExecutionResult, RecoveryJournalError> {
+    execute_governed_h5_replace_with_options(
+        authorized_action,
+        replacement_content,
+        store,
+        cancellation,
+        H5ExecutionOptions {
+            native_fault,
+            panic_after_native_commit_before_marker,
+            panic_after_commit_marker,
+            ..H5ExecutionOptions::default()
+        },
+        lifecycle,
+    )
+    .await
 }
 
 // Legacy direct wrapper retained only for focused native/journal tests.  It is
@@ -1127,6 +1324,242 @@ fn execute_h5b_replace_after_host_pass_internal(
     })
 }
 
+#[cfg(test)]
+fn execute_h5b_replace_after_host_pass_with_tracker(
+    store: &RecoveryJournalStore,
+    root: &TrustedWorkspaceRoot,
+    target: PreparedWorkspaceTarget,
+    context: crate::recovery_journal::RecoveryJournalContext,
+    expected_sha256: &str,
+    replacement: &str,
+    cancellation: &dyn WorkspaceReplaceCancellation,
+    fence: &mut dyn WorkspaceReplaceCommitFence,
+    options: H5ExecutionOptions,
+) -> Result<H5ReplaceExecutionResult, RecoveryJournalError> {
+    let mut tracker = crate::workspace_capability::WorkspaceReplaceMutationTracker::new();
+    let mut captured_journal = None;
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        execute_h5b_replace_after_host_pass_with_tracker_uncaught(
+            store,
+            root,
+            target,
+            context,
+            expected_sha256,
+            replacement,
+            cancellation,
+            fence,
+            options,
+            &mut tracker,
+            &mut captured_journal,
+        )
+    }));
+    match result {
+        Ok(result) => result,
+        Err(_) => {
+            let journal = captured_journal.ok_or(RecoveryJournalError::Corrupt(
+                "native panic occurred before H5 journal capture",
+            ))?;
+            Ok(h5_result_after_native_panic(store, journal, &tracker))
+        }
+    }
+}
+
+#[cfg(test)]
+fn execute_h5b_replace_after_host_pass_with_tracker_uncaught(
+    store: &RecoveryJournalStore,
+    root: &TrustedWorkspaceRoot,
+    target: PreparedWorkspaceTarget,
+    context: crate::recovery_journal::RecoveryJournalContext,
+    expected_sha256: &str,
+    replacement: &str,
+    cancellation: &dyn WorkspaceReplaceCancellation,
+    fence: &mut dyn WorkspaceReplaceCommitFence,
+    options: H5ExecutionOptions,
+    tracker: &mut crate::workspace_capability::WorkspaceReplaceMutationTracker,
+    captured_journal: &mut Option<RecoveryJournalV1>,
+) -> Result<H5ReplaceExecutionResult, RecoveryJournalError> {
+    if context.capability_id() != H5_ORIGINAL_REPLACE_CAPABILITY_ID
+        || context.replacement_sha256() != sha256_hex(replacement.as_bytes())
+        || context.replacement_bytes() != replacement.as_bytes().len()
+    {
+        return Err(RecoveryJournalError::TargetBindingMismatch(
+            "H5-B journal context does not bind the original replace operation",
+        ));
+    }
+    root.verify_named_path_current()
+        .map_err(RecoveryJournalError::Profile)?;
+    let journal = store.create_prepared_for_expected_preimage(&target, context, expected_sha256)?;
+    *captured_journal = Some(journal.clone());
+    let mut started_fence = H5StartedFence {
+        store,
+        journal: &journal,
+        host_fence: fence,
+        started_persistence: StartedPersistenceState::NotAttempted,
+        started_marker_fault: options.started_marker_fault,
+    };
+    #[cfg(windows)]
+    let outcome = match options.native_fault {
+        Some(fault) => target.replace_existing_file_utf8_bounded_with_test_fault_and_tracker(
+            expected_sha256,
+            replacement,
+            &mut started_fence,
+            cancellation,
+            tracker,
+            fault,
+        ),
+        None => target.replace_existing_file_utf8_bounded_with_cancellation_and_tracker(
+            expected_sha256,
+            replacement,
+            &mut started_fence,
+            cancellation,
+            tracker,
+        ),
+    };
+    #[cfg(not(windows))]
+    let outcome = {
+        let _ = options.native_fault;
+        target.replace_existing_file_utf8_bounded_with_cancellation_and_tracker(
+            expected_sha256,
+            replacement,
+            &mut started_fence,
+            cancellation,
+            tracker,
+        )
+    };
+    let transaction_outcome = match started_fence.started_persistence {
+        StartedPersistenceState::FailedNeedsReconciliation => {
+            reconcile_started_persistence_failure(store, &journal)
+        }
+        StartedPersistenceState::NotAttempted | StartedPersistenceState::VerifiedDurable => {
+            let recovery = match started_fence.started_persistence {
+                StartedPersistenceState::NotAttempted => H5RecoveryDisposition::None,
+                StartedPersistenceState::VerifiedDurable => H5RecoveryDisposition::Required,
+                StartedPersistenceState::FailedNeedsReconciliation => {
+                    unreachable!("handled by the outer Started reconciliation branch")
+                }
+            };
+            match &outcome {
+                WorkspaceReplaceCommitOutcome::Denied { .. } => {
+                    H5ReplaceTransactionOutcome::Denied { recovery }
+                }
+                WorkspaceReplaceCommitOutcome::Conflict { .. } => {
+                    H5ReplaceTransactionOutcome::Conflict { recovery }
+                }
+                WorkspaceReplaceCommitOutcome::CommitUnknown { .. } => {
+                    H5ReplaceTransactionOutcome::CommitUnknown {
+                        recovery_required: true,
+                    }
+                }
+                WorkspaceReplaceCommitOutcome::Committed { .. } => {
+                    if options.panic_after_native_commit_before_marker {
+                        panic!("test-only panic after native commit before H5 marker");
+                    }
+                    let commit_marker = if options.force_commit_marker_failure {
+                        Err(RecoveryJournalError::InjectedFault("commit marker"))
+                    } else {
+                        store.persist_committed(&journal)
+                    };
+                    if commit_marker.is_ok() {
+                        if options.panic_after_commit_marker {
+                            panic!("test-only panic after durable H5 commit marker");
+                        }
+                        H5ReplaceTransactionOutcome::Committed
+                    } else {
+                        H5ReplaceTransactionOutcome::CommitUnknown {
+                            recovery_required: true,
+                        }
+                    }
+                }
+            }
+        }
+    };
+    Ok(H5ReplaceExecutionResult {
+        journal,
+        transaction_outcome,
+        native_diagnostics: outcome,
+    })
+}
+
+#[cfg(test)]
+fn h5_result_after_native_panic(
+    store: &RecoveryJournalStore,
+    journal: RecoveryJournalV1,
+    tracker: &crate::workspace_capability::WorkspaceReplaceMutationTracker,
+) -> H5ReplaceExecutionResult {
+    let evidence = tracker.evidence_after_panic();
+    let mutation_started = evidence.mutation_started;
+    let native_diagnostics = match tracker.phase() {
+        crate::workspace_capability::WorkspaceReplaceMutationPhase::NotStarted => {
+            WorkspaceReplaceCommitOutcome::Denied {
+                error: WorkspaceReplaceError::NativePanicBeforeMutation,
+                evidence,
+            }
+        }
+        crate::workspace_capability::WorkspaceReplaceMutationPhase::Started => {
+            WorkspaceReplaceCommitOutcome::CommitUnknown {
+                error: WorkspaceReplaceError::NativePanicAfterMutation,
+                evidence,
+            }
+        }
+        crate::workspace_capability::WorkspaceReplaceMutationPhase::Committed => {
+            WorkspaceReplaceCommitOutcome::Committed { evidence }
+        }
+    };
+    let transaction_outcome = match store.scan_transactions() {
+        Ok(scan) => {
+            let lifecycle = scan.target_lifecycle_for_journal(&journal);
+            let state = scan
+                .valid_transactions()
+                .find(|snapshot| snapshot.journal().transaction_id() == journal.transaction_id())
+                .map(RecoveryTransactionSnapshot::state);
+            if matches!(
+                lifecycle,
+                RecoveryTargetLifecycle::Ambiguous | RecoveryTargetLifecycle::Poisoned
+            ) {
+                H5ReplaceTransactionOutcome::LifecycleUnknown {
+                    workspace_mutation_started: mutation_started,
+                }
+            } else {
+                match (tracker.phase(), state) {
+                    (_, Some(RecoveryTransactionState::CommittedTerminal)) => {
+                        H5ReplaceTransactionOutcome::Committed
+                    }
+                    (
+                        crate::workspace_capability::WorkspaceReplaceMutationPhase::NotStarted,
+                        Some(RecoveryTransactionState::PreparedOnly),
+                    ) => H5ReplaceTransactionOutcome::Denied {
+                        recovery: H5RecoveryDisposition::None,
+                    },
+                    (
+                        crate::workspace_capability::WorkspaceReplaceMutationPhase::NotStarted,
+                        Some(RecoveryTransactionState::RecoveryRequired),
+                    ) => H5ReplaceTransactionOutcome::Denied {
+                        recovery: H5RecoveryDisposition::Required,
+                    },
+                    (
+                        crate::workspace_capability::WorkspaceReplaceMutationPhase::Started
+                        | crate::workspace_capability::WorkspaceReplaceMutationPhase::Committed,
+                        Some(RecoveryTransactionState::RecoveryRequired),
+                    ) => H5ReplaceTransactionOutcome::CommitUnknown {
+                        recovery_required: true,
+                    },
+                    _ => H5ReplaceTransactionOutcome::LifecycleUnknown {
+                        workspace_mutation_started: mutation_started,
+                    },
+                }
+            }
+        }
+        Err(_) => H5ReplaceTransactionOutcome::LifecycleUnknown {
+            workspace_mutation_started: mutation_started,
+        },
+    };
+    H5ReplaceExecutionResult {
+        journal,
+        transaction_outcome,
+        native_diagnostics,
+    }
+}
+
 fn unix_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1241,7 +1674,7 @@ mod tests {
     #[test]
     fn same_target_admission_guard_denies_second_holder_without_waiting() {
         let fixture = Fixture::new();
-        let target = target_key_for_prepared_target(&fixture.target()).unwrap();
+        let target = mutation_target_key_for_prepared_target(&fixture.target()).unwrap();
         let first = H5TargetAdmissionGuard::try_acquire(target.clone())
             .expect("first same-target admission");
         assert!(
@@ -3233,6 +3666,75 @@ mod tests {
         assert!(!recovery.grant_issued);
         assert_eq!(authority.grant_count(), 0);
         assert_eq!(recovery.mutation_count, 0);
+    }
+
+    #[test]
+    fn poisoned_target_recovery_issues_zero_grants() {
+        let fixture = Fixture::new();
+        let poisoned = fixture
+            .store
+            .create_prepared_with_transaction_id_for_test(
+                &fixture.target(),
+                fixture.context(),
+                "tx-poisoned-recovery-target",
+            )
+            .unwrap();
+        let poisoned_marker = RecoveryMarkerV1::new(
+            poisoned.transaction_id().clone(),
+            [0x72; 32],
+            RecoveryMarkerState::Started,
+        );
+        fs::write(
+            fixture.store.recovery_root().join(format!(
+                "{}.started",
+                poisoned_marker.transaction_id().as_str()
+            )),
+            poisoned_marker.to_bytes().unwrap(),
+        )
+        .unwrap();
+        let valid = fixture
+            .store
+            .create_prepared_with_transaction_id_for_test(
+                &fixture.target(),
+                fixture.context(),
+                "tx-valid-recovery-target",
+            )
+            .unwrap();
+        let valid_marker = RecoveryMarkerV1::new(
+            valid.transaction_id().clone(),
+            valid.integrity_hash_bytes(),
+            RecoveryMarkerState::Started,
+        );
+        fs::write(
+            fixture.store.recovery_root().join(format!(
+                "{}.started",
+                valid_marker.transaction_id().as_str()
+            )),
+            valid_marker.to_bytes().unwrap(),
+        )
+        .unwrap();
+        let scan = fixture.store.scan_transactions().unwrap();
+        let action = fixture.action(&valid);
+        assert_eq!(scan.actionable_recovery_transactions().count(), 0);
+        let authority = TestRecoveryAuthority::new(2);
+        authority.provision_trusted_confirmation(&action);
+        let executor = H5RecoveryExecutor::new(
+            fixture.store.clone(),
+            fixture.root.clone(),
+            Arc::clone(&authority) as Arc<dyn RecoveryAuthorityPort>,
+        );
+        let result = executor.recover(action);
+        assert_eq!(
+            result.outcome,
+            RecoveryExecutionOutcome::RecoveryDenied(RecoveryDenyReason::RecoveryBlocked)
+        );
+        assert!(!result.grant_issued);
+        assert_eq!(result.mutation_count, 0);
+        assert_eq!(authority.grant_count(), 0);
+        assert_eq!(
+            fs::read(fixture.workspace_dir.path().join("target.txt")).unwrap(),
+            BEFORE
+        );
     }
 
     #[test]

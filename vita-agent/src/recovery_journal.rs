@@ -1066,6 +1066,26 @@ impl RecoveryJournalTargetKey {
     }
 }
 
+/// Operational identity for one mutable filesystem object.  Unlike the
+/// journal/evidence key above, this key deliberately excludes the spelling of
+/// the relative path so case aliases, renamed aliases, and hard-link aliases
+/// arbitrate the same underlying target.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct RecoveryMutationTargetKey {
+    workspace_root_identity: RecoveryJournalIdentity,
+    target_identity: RecoveryJournalIdentity,
+}
+
+impl RecoveryMutationTargetKey {
+    pub fn workspace_root_identity(&self) -> RecoveryJournalIdentity {
+        self.workspace_root_identity
+    }
+
+    pub fn target_identity(&self) -> RecoveryJournalIdentity {
+        self.target_identity
+    }
+}
+
 /// Read-only restart classification.  No scanner item authorizes recovery or
 /// deletes a journal/workspace file.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1178,11 +1198,11 @@ impl RecoveryTransactionSnapshot {
 pub enum RecoveryTransactionScanItem {
     Valid(RecoveryTransactionSnapshot),
     AmbiguousTarget {
-        target: RecoveryJournalTargetKey,
+        target: RecoveryMutationTargetKey,
         transactions: Vec<RecoveryTransactionId>,
     },
     PoisonedTarget {
-        target: RecoveryJournalTargetKey,
+        target: RecoveryMutationTargetKey,
         transactions: Vec<RecoveryTransactionId>,
         reason: &'static str,
     },
@@ -1225,8 +1245,11 @@ impl RecoveryTransactionScan {
     pub fn actionable_recovery_transactions(
         &self,
     ) -> impl Iterator<Item = &RecoveryTransactionSnapshot> {
-        self.valid_transactions()
-            .filter(|snapshot| snapshot.state == RecoveryTransactionState::RecoveryRequired)
+        self.valid_transactions().filter(|snapshot| {
+            snapshot.state == RecoveryTransactionState::RecoveryRequired
+                && self.target_lifecycle(&mutation_target_key(snapshot.journal()))
+                    == RecoveryTargetLifecycle::RecoveryRequired
+        })
     }
 
     pub fn has_ambiguous_target(&self) -> bool {
@@ -1235,20 +1258,21 @@ impl RecoveryTransactionScan {
             .any(|item| matches!(item, RecoveryTransactionScanItem::AmbiguousTarget { .. }))
     }
 
-    pub fn target_lifecycle(&self, target: &RecoveryJournalTargetKey) -> RecoveryTargetLifecycle {
+    pub fn target_lifecycle(&self, target: &RecoveryMutationTargetKey) -> RecoveryTargetLifecycle {
         self.target_lifecycle_excluding(target, None)
     }
 
+    #[cfg(test)]
     pub(crate) fn target_lifecycle_for_journal(
         &self,
         journal: &RecoveryJournalV1,
     ) -> RecoveryTargetLifecycle {
-        self.target_lifecycle(&target_key(journal))
+        self.target_lifecycle(&mutation_target_key(journal))
     }
 
     pub(crate) fn target_lifecycle_excluding(
         &self,
-        target: &RecoveryJournalTargetKey,
+        target: &RecoveryMutationTargetKey,
         excluded_transaction: Option<&RecoveryTransactionId>,
     ) -> RecoveryTargetLifecycle {
         if self.items.iter().any(|item| {
@@ -1285,7 +1309,7 @@ impl RecoveryTransactionScan {
         let recovery_required = self
             .valid_transactions()
             .filter(|snapshot| {
-                target_key(snapshot.journal()) == *target
+                mutation_target_key(snapshot.journal()) == *target
                     && snapshot.state() == RecoveryTransactionState::RecoveryRequired
                     && Some(snapshot.journal().transaction_id()) != excluded_transaction
             })
@@ -1299,7 +1323,7 @@ impl RecoveryTransactionScan {
 
     pub fn poisoned_targets(
         &self,
-    ) -> impl Iterator<Item = (&RecoveryJournalTargetKey, &[RecoveryTransactionId])> {
+    ) -> impl Iterator<Item = (&RecoveryMutationTargetKey, &[RecoveryTransactionId])> {
         self.items.iter().filter_map(|item| match item {
             RecoveryTransactionScanItem::PoisonedTarget {
                 target,
@@ -1776,10 +1800,10 @@ impl RecoveryJournalStore {
             }
         }
 
-        let mut poisoned_targets: HashMap<RecoveryJournalTargetKey, Vec<RecoveryTransactionId>> =
+        let mut poisoned_targets: HashMap<RecoveryMutationTargetKey, Vec<RecoveryTransactionId>> =
             HashMap::new();
         let mut snapshots_by_target: HashMap<
-            RecoveryJournalTargetKey,
+            RecoveryMutationTargetKey,
             Vec<RecoveryTransactionSnapshot>,
         > = HashMap::new();
 
@@ -1794,7 +1818,7 @@ impl RecoveryJournalStore {
                     reason: "transaction has corrupt lifecycle evidence",
                 });
                 poisoned_targets
-                    .entry(target_key(journal))
+                    .entry(mutation_target_key(journal))
                     .or_default()
                     .push(transaction_id.clone());
                 continue;
@@ -1803,7 +1827,7 @@ impl RecoveryJournalStore {
             match build_transaction_snapshot(journal.clone(), transaction_markers) {
                 Ok(snapshot) => {
                     snapshots_by_target
-                        .entry(target_key(snapshot.journal()))
+                        .entry(mutation_target_key(snapshot.journal()))
                         .or_default()
                         .push(snapshot);
                 }
@@ -1813,7 +1837,7 @@ impl RecoveryJournalStore {
                         reason,
                     });
                     poisoned_targets
-                        .entry(target_key(journal))
+                        .entry(mutation_target_key(journal))
                         .or_default()
                         .push(transaction_id.clone());
                 }
@@ -1896,7 +1920,7 @@ impl RecoveryJournalStore {
             .ok_or(RecoveryJournalError::TargetBindingMismatch(
                 "transaction is not one unambiguous valid H5-B candidate",
             ))?;
-        let target = target_key(journal);
+        let target = mutation_target_key(journal);
         let other_target_lifecycle =
             scan.target_lifecycle_excluding(&target, Some(journal.transaction_id()));
         if other_target_lifecycle != RecoveryTargetLifecycle::Clear {
@@ -2703,20 +2727,27 @@ fn target_key(journal: &RecoveryJournalV1) -> RecoveryJournalTargetKey {
     }
 }
 
-pub(crate) fn target_key_for_prepared_target(
+fn mutation_target_key(journal: &RecoveryJournalV1) -> RecoveryMutationTargetKey {
+    RecoveryMutationTargetKey {
+        workspace_root_identity: journal.workspace_root_identity,
+        target_identity: journal.target_identity,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn mutation_target_key_for_prepared_target(
     target: &PreparedWorkspaceTarget,
-) -> Result<RecoveryJournalTargetKey, RecoveryJournalError> {
+) -> Result<RecoveryMutationTargetKey, RecoveryJournalError> {
     if target.kind() != PreparedWorkspaceTargetKind::ExistingFile {
         return Err(RecoveryJournalError::TargetNotExisting);
     }
     let target_identity = target
         .target_identity()
         .ok_or(RecoveryJournalError::TargetNotExisting)?;
-    Ok(RecoveryJournalTargetKey {
+    Ok(RecoveryMutationTargetKey {
         workspace_root_identity: RecoveryJournalIdentity::from_workspace_identity(
             target.root().identity(),
         )?,
-        relative_path: canonical_relative_path(target.relative_path())?,
         target_identity: RecoveryJournalIdentity::from_workspace_identity(target_identity)?,
     })
 }
@@ -3819,8 +3850,8 @@ mod tests {
         fixture.store.persist_started(&valid).unwrap();
 
         let scan = fixture.store.scan_transactions().unwrap();
-        let target_a_key = target_key_for_prepared_target(&target_a).unwrap();
-        let target_b_key = target_key_for_prepared_target(&target_b).unwrap();
+        let target_a_key = mutation_target_key_for_prepared_target(&target_a).unwrap();
+        let target_b_key = mutation_target_key_for_prepared_target(&target_b).unwrap();
         assert_eq!(
             scan.target_lifecycle(&target_a_key),
             RecoveryTargetLifecycle::Poisoned
@@ -3830,6 +3861,181 @@ mod tests {
             RecoveryTargetLifecycle::RecoveryRequired
         );
         assert_eq!(scan.actionable_recovery_transactions().count(), 1);
+        assert_eq!(scan.poisoned_targets().count(), 1);
+    }
+
+    #[test]
+    fn case_alias_pending_recovery_has_one_mutation_target_identity() {
+        let fixture = Fixture::new();
+        let original = fixture.target_named("target.txt");
+        let alias = fixture.target_named("TARGET.TXT");
+        let original_key = mutation_target_key_for_prepared_target(&original).unwrap();
+        let alias_key = mutation_target_key_for_prepared_target(&alias).unwrap();
+        assert_eq!(original_key, alias_key);
+        let journal = fixture
+            .store
+            .create_prepared_with_transaction_id_for_test(
+                &original,
+                fixture.context(b"case-alias-replacement\n"),
+                "tx-case-alias",
+            )
+            .unwrap();
+        fixture.store.persist_started(&journal).unwrap();
+        let scan = fixture.store.scan_transactions().unwrap();
+        assert_eq!(
+            scan.target_lifecycle(&alias_key),
+            RecoveryTargetLifecycle::RecoveryRequired
+        );
+    }
+
+    #[test]
+    fn rename_alias_pending_recovery_has_one_mutation_target_identity() {
+        let fixture = Fixture::new();
+        let original = fixture.target_named("target.txt");
+        let original_key = mutation_target_key_for_prepared_target(&original).unwrap();
+        let journal = fixture
+            .store
+            .create_prepared_with_transaction_id_for_test(
+                &original,
+                fixture.context(b"rename-alias-replacement\n"),
+                "tx-rename-alias",
+            )
+            .unwrap();
+        fixture.store.persist_started(&journal).unwrap();
+        fs::rename(
+            fixture.workspace.path().join("target.txt"),
+            fixture.workspace.path().join("renamed-target.txt"),
+        )
+        .unwrap();
+        let renamed = fixture.target_named("renamed-target.txt");
+        let renamed_key = mutation_target_key_for_prepared_target(&renamed).unwrap();
+        assert_eq!(original_key, renamed_key);
+        assert_eq!(
+            fixture
+                .store
+                .scan_transactions()
+                .unwrap()
+                .target_lifecycle(&renamed_key),
+            RecoveryTargetLifecycle::RecoveryRequired
+        );
+    }
+
+    #[test]
+    fn hardlink_alias_pending_recovery_has_one_mutation_target_identity() {
+        let fixture = Fixture::new();
+        let original = fixture.target_named("target.txt");
+        fs::hard_link(
+            fixture.workspace.path().join("target.txt"),
+            fixture.workspace.path().join("hardlink-target.txt"),
+        )
+        .unwrap();
+        let alias = fixture.target_named("hardlink-target.txt");
+        let original_key = mutation_target_key_for_prepared_target(&original).unwrap();
+        let alias_key = mutation_target_key_for_prepared_target(&alias).unwrap();
+        assert_eq!(original_key, alias_key);
+        let journal = fixture
+            .store
+            .create_prepared_with_transaction_id_for_test(
+                &original,
+                fixture.context(b"hardlink-alias-replacement\n"),
+                "tx-hardlink-alias",
+            )
+            .unwrap();
+        create_marker_for_scan(
+            &fixture,
+            journal.transaction_id().clone(),
+            journal.integrity_hash_bytes(),
+            RecoveryMarkerState::Started,
+        );
+        let scan = fixture.store.scan_transactions().unwrap();
+        assert_eq!(
+            scan.target_lifecycle(&alias_key),
+            RecoveryTargetLifecycle::RecoveryRequired
+        );
+    }
+
+    #[test]
+    fn alias_multiple_recovery_required_is_ambiguous() {
+        let fixture = Fixture::new();
+        let first_target = fixture.target_named("target.txt");
+        let second_target = fixture.target_named("TARGET.TXT");
+        let first = fixture
+            .store
+            .create_prepared_with_transaction_id_for_test(
+                &first_target,
+                fixture.context(b"alias-first\n"),
+                "tx-alias-first",
+            )
+            .unwrap();
+        fixture.store.persist_started(&first).unwrap();
+        let second = fixture
+            .store
+            .create_prepared_with_transaction_id_for_test(
+                &second_target,
+                fixture.context(b"alias-second\n"),
+                "tx-alias-second",
+            )
+            .unwrap();
+        create_marker_for_scan(
+            &fixture,
+            second.transaction_id().clone(),
+            second.integrity_hash_bytes(),
+            RecoveryMarkerState::Started,
+        );
+        let key = mutation_target_key_for_prepared_target(&first_target).unwrap();
+        let scan = fixture.store.scan_transactions().unwrap();
+        assert_eq!(
+            scan.target_lifecycle(&key),
+            RecoveryTargetLifecycle::Ambiguous
+        );
+        assert_eq!(scan.actionable_recovery_transactions().count(), 0);
+        assert!(scan.items().iter().any(|item| matches!(
+            item,
+            RecoveryTransactionScanItem::AmbiguousTarget { transactions, .. }
+                if transactions.len() == 2
+        )));
+    }
+
+    #[test]
+    fn poisoned_target_plus_valid_recovery_is_not_actionable() {
+        let fixture = Fixture::new();
+        let poisoned_target = fixture.target_named("target.txt");
+        let valid_alias = fixture.target_named("TARGET.TXT");
+        let poisoned = fixture
+            .store
+            .create_prepared_with_transaction_id_for_test(
+                &poisoned_target,
+                fixture.context(b"poisoned-alias\n"),
+                "tx-poisoned-alias",
+            )
+            .unwrap();
+        create_marker_for_scan(
+            &fixture,
+            poisoned.transaction_id().clone(),
+            [0x55; 32],
+            RecoveryMarkerState::Started,
+        );
+        let valid = fixture
+            .store
+            .create_prepared_with_transaction_id_for_test(
+                &valid_alias,
+                fixture.context(b"valid-alias\n"),
+                "tx-valid-alias",
+            )
+            .unwrap();
+        create_marker_for_scan(
+            &fixture,
+            valid.transaction_id().clone(),
+            valid.integrity_hash_bytes(),
+            RecoveryMarkerState::Started,
+        );
+        let key = mutation_target_key_for_prepared_target(&poisoned_target).unwrap();
+        let scan = fixture.store.scan_transactions().unwrap();
+        assert_eq!(
+            scan.target_lifecycle(&key),
+            RecoveryTargetLifecycle::Poisoned
+        );
+        assert_eq!(scan.actionable_recovery_transactions().count(), 0);
         assert_eq!(scan.poisoned_targets().count(), 1);
     }
 

@@ -903,7 +903,7 @@ fn execute_h5b_replace_after_host_pass_internal(
     }
     root.verify_named_path_current()
         .map_err(RecoveryJournalError::Profile)?;
-    let journal = store.create_prepared(&target, context)?;
+    let journal = store.create_prepared_for_expected_preimage(&target, context, expected_sha256)?;
     let mut started_fence = H5StartedFence {
         store,
         journal: &journal,
@@ -1884,6 +1884,12 @@ mod tests {
         .expect("Started marker fault execution")
     }
 
+    fn recovery_entry_count(fixture: &Fixture) -> usize {
+        fs::read_dir(fixture.store.recovery_root())
+            .expect("recovery namespace enumeration")
+            .count()
+    }
+
     struct RevokeAtFenceAuthority {
         inner: Arc<TestRecoveryAuthority>,
     }
@@ -2249,6 +2255,351 @@ mod tests {
             fs::read(fixture.workspace_dir.path().join("target.txt")).unwrap(),
             REPLACEMENT.as_bytes()
         );
+    }
+
+    #[test]
+    fn h5_preimage_must_equal_expected_sha() {
+        let fixture = Fixture::new();
+        let cancellation = AtomicBool::new(false);
+        let mut fence = allow_fence();
+        let expected_sha256 = sha256_hex(BEFORE).to_ascii_uppercase();
+        let result = execute_h5b_replace_after_host_pass(
+            &fixture.store,
+            &fixture.root,
+            fixture.target(),
+            fixture.context(),
+            &expected_sha256,
+            REPLACEMENT,
+            &cancellation,
+            &mut fence,
+        )
+        .unwrap();
+
+        assert_eq!(result.journal.before_sha256(), sha256_hex(BEFORE));
+        assert_eq!(
+            result.transaction_outcome,
+            H5ReplaceTransactionOutcome::Committed
+        );
+        assert!(!fixture
+            .store
+            .scan_transactions()
+            .unwrap()
+            .has_ambiguous_target());
+    }
+
+    #[test]
+    fn preimage_mismatch_creates_no_journal() {
+        let fixture = Fixture::new();
+        let cancellation = AtomicBool::new(false);
+        let mut fence = allow_fence();
+        let result = execute_h5b_replace_after_host_pass(
+            &fixture.store,
+            &fixture.root,
+            fixture.target(),
+            fixture.context(),
+            &sha256_hex(REPLACEMENT.as_bytes()),
+            REPLACEMENT,
+            &cancellation,
+            &mut fence,
+        );
+
+        assert!(matches!(
+            result,
+            Err(RecoveryJournalError::PreimageConflict)
+        ));
+        assert_eq!(recovery_entry_count(&fixture), 0);
+    }
+
+    #[test]
+    fn preimage_mismatch_creates_no_started_marker() {
+        let fixture = Fixture::new();
+        let cancellation = AtomicBool::new(false);
+        let mut fence = allow_fence();
+        let result = execute_h5b_replace_after_host_pass(
+            &fixture.store,
+            &fixture.root,
+            fixture.target(),
+            fixture.context(),
+            &sha256_hex(REPLACEMENT.as_bytes()),
+            REPLACEMENT,
+            &cancellation,
+            &mut fence,
+        );
+
+        assert!(matches!(
+            result,
+            Err(RecoveryJournalError::PreimageConflict)
+        ));
+        assert_eq!(recovery_entry_count(&fixture), 0);
+        assert!(!fixture
+            .store
+            .recovery_root()
+            .join("h5-preimage-mismatch.started")
+            .exists());
+    }
+
+    #[test]
+    fn preimage_mismatch_mutates_workspace_zero() {
+        let fixture = Fixture::new();
+        let cancellation = AtomicBool::new(false);
+        let mut fence = allow_fence();
+        let result = execute_h5b_replace_after_host_pass(
+            &fixture.store,
+            &fixture.root,
+            fixture.target(),
+            fixture.context(),
+            &sha256_hex(REPLACEMENT.as_bytes()),
+            REPLACEMENT,
+            &cancellation,
+            &mut fence,
+        );
+
+        assert!(matches!(
+            result,
+            Err(RecoveryJournalError::PreimageConflict)
+        ));
+        assert_eq!(
+            fs::read(fixture.workspace_dir.path().join("target.txt")).unwrap(),
+            BEFORE
+        );
+    }
+
+    #[test]
+    fn preimage_mismatch_does_not_create_ambiguous_pending_transaction() {
+        let fixture = Fixture::new();
+        let cancellation = AtomicBool::new(false);
+        let mut fence = allow_fence();
+        let result = execute_h5b_replace_after_host_pass(
+            &fixture.store,
+            &fixture.root,
+            fixture.target(),
+            fixture.context(),
+            &sha256_hex(REPLACEMENT.as_bytes()),
+            REPLACEMENT,
+            &cancellation,
+            &mut fence,
+        );
+
+        assert!(matches!(
+            result,
+            Err(RecoveryJournalError::PreimageConflict)
+        ));
+        let scan = fixture.store.scan_transactions().unwrap();
+        assert!(!scan.has_ambiguous_target());
+        assert_eq!(scan.valid_transactions().count(), 0);
+        assert_eq!(scan.actionable_recovery_transactions().count(), 0);
+    }
+
+    #[test]
+    fn clean_retry_after_preimage_mismatch_can_create_one_transaction() {
+        let fixture = Fixture::new();
+        let cancellation = AtomicBool::new(false);
+        let mut first_fence = allow_fence();
+        let first = execute_h5b_replace_after_host_pass(
+            &fixture.store,
+            &fixture.root,
+            fixture.target(),
+            fixture.context(),
+            &sha256_hex(REPLACEMENT.as_bytes()),
+            REPLACEMENT,
+            &cancellation,
+            &mut first_fence,
+        );
+        assert!(matches!(first, Err(RecoveryJournalError::PreimageConflict)));
+        assert_eq!(recovery_entry_count(&fixture), 0);
+
+        fs::write(
+            fixture.workspace_dir.path().join("target.txt"),
+            REPLACEMENT.as_bytes(),
+        )
+        .unwrap();
+        let mut second_fence = allow_fence();
+        let second = execute_h5b_replace_after_host_pass(
+            &fixture.store,
+            &fixture.root,
+            fixture.target(),
+            fixture.context(),
+            &sha256_hex(REPLACEMENT.as_bytes()),
+            REPLACEMENT,
+            &cancellation,
+            &mut second_fence,
+        )
+        .unwrap();
+
+        assert_eq!(
+            second.transaction_outcome,
+            H5ReplaceTransactionOutcome::Committed
+        );
+        assert_eq!(recovery_entry_count(&fixture), 3);
+        let scan = fixture.store.scan_transactions().unwrap();
+        assert!(!scan.has_ambiguous_target());
+        assert_eq!(scan.valid_transactions().count(), 1);
+        assert_eq!(
+            scan.valid_transactions()
+                .next()
+                .unwrap()
+                .journal()
+                .before_sha256(),
+            sha256_hex(REPLACEMENT.as_bytes())
+        );
+    }
+
+    #[test]
+    fn started_transaction_before_hash_equals_h4_expected() {
+        let fixture = Fixture::new();
+        let cancellation = AtomicBool::new(false);
+        let mut fence = allow_fence();
+        let expected_sha256 = sha256_hex(BEFORE).to_ascii_uppercase();
+        let result = execute_h5b_replace_after_host_pass_with_test_fault(
+            &fixture.store,
+            &fixture.root,
+            fixture.target(),
+            fixture.context(),
+            &expected_sha256,
+            REPLACEMENT,
+            &cancellation,
+            &mut fence,
+            WorkspaceReplaceTestFault::AfterCommitFenceBeforePostFenceChecks,
+        )
+        .unwrap();
+
+        assert_eq!(result.journal.before_sha256(), sha256_hex(BEFORE));
+        assert_eq!(
+            result.transaction_outcome,
+            H5ReplaceTransactionOutcome::Denied {
+                recovery: H5RecoveryDisposition::Required,
+            }
+        );
+        assert!(matches!(
+            &result.native_diagnostics,
+            WorkspaceReplaceCommitOutcome::Denied { evidence, .. }
+                if evidence.before_sha256.as_deref() == Some(sha256_hex(BEFORE).as_str())
+        ));
+    }
+
+    #[test]
+    fn commit_unknown_recovery_preimage_equals_h4_expected() {
+        let fixture = Fixture::new();
+        let cancellation = AtomicBool::new(false);
+        let mut fence = allow_fence();
+        let expected_sha256 = sha256_hex(BEFORE).to_ascii_uppercase();
+        let result = execute_h5b_replace_after_host_pass_with_test_fault(
+            &fixture.store,
+            &fixture.root,
+            fixture.target(),
+            fixture.context(),
+            &expected_sha256,
+            REPLACEMENT,
+            &cancellation,
+            &mut fence,
+            WorkspaceReplaceTestFault::AfterFirstWrite,
+        )
+        .unwrap();
+
+        assert_eq!(result.journal.before_sha256(), sha256_hex(BEFORE));
+        assert_eq!(
+            result.transaction_outcome,
+            H5ReplaceTransactionOutcome::CommitUnknown {
+                recovery_required: true,
+            }
+        );
+        assert!(matches!(
+            result.native_diagnostics,
+            WorkspaceReplaceCommitOutcome::CommitUnknown { .. }
+        ));
+        assert_eq!(
+            fixture
+                .store
+                .scan_transactions()
+                .unwrap()
+                .valid_transactions()
+                .next()
+                .unwrap()
+                .journal()
+                .before_sha256(),
+            sha256_hex(BEFORE)
+        );
+    }
+
+    #[test]
+    fn invalid_expected_sha_creates_no_journal() {
+        let fixture = Fixture::new();
+        let cancellation = AtomicBool::new(false);
+        let mut fence = allow_fence();
+        let result = execute_h5b_replace_after_host_pass(
+            &fixture.store,
+            &fixture.root,
+            fixture.target(),
+            fixture.context(),
+            "not-a-sha256",
+            REPLACEMENT,
+            &cancellation,
+            &mut fence,
+        );
+
+        assert!(matches!(
+            result,
+            Err(RecoveryJournalError::InvalidField {
+                field: "expected_sha256",
+                ..
+            })
+        ));
+        assert_eq!(recovery_entry_count(&fixture), 0);
+        assert_eq!(
+            fs::read(fixture.workspace_dir.path().join("target.txt")).unwrap(),
+            BEFORE
+        );
+    }
+
+    #[test]
+    fn r2_started_persistence_reconciliation_still_passes() {
+        for fault in [
+            RecoveryMarkerPersistenceTestFault::CreateBeforeArtifact,
+            RecoveryMarkerPersistenceTestFault::FlushAfterCreate,
+            RecoveryMarkerPersistenceTestFault::ReopenAfterCreate,
+            RecoveryMarkerPersistenceTestFault::CorruptAfterCreate,
+        ] {
+            let fixture = Fixture::new();
+            let result = run_started_marker_fault(&fixture, fault);
+            let scan = fixture.store.scan_transactions().unwrap();
+            match fault {
+                RecoveryMarkerPersistenceTestFault::CreateBeforeArtifact => {
+                    assert_eq!(
+                        result.transaction_outcome,
+                        H5ReplaceTransactionOutcome::Denied {
+                            recovery: H5RecoveryDisposition::None,
+                        }
+                    );
+                    assert_eq!(
+                        scan.valid_transactions().next().unwrap().state(),
+                        RecoveryTransactionState::PreparedOnly
+                    );
+                }
+                RecoveryMarkerPersistenceTestFault::FlushAfterCreate
+                | RecoveryMarkerPersistenceTestFault::ReopenAfterCreate => {
+                    assert_eq!(
+                        result.transaction_outcome,
+                        H5ReplaceTransactionOutcome::Denied {
+                            recovery: H5RecoveryDisposition::Required,
+                        }
+                    );
+                    assert_eq!(
+                        scan.valid_transactions().next().unwrap().state(),
+                        RecoveryTransactionState::RecoveryRequired
+                    );
+                }
+                RecoveryMarkerPersistenceTestFault::CorruptAfterCreate => {
+                    assert_eq!(
+                        result.transaction_outcome,
+                        H5ReplaceTransactionOutcome::LifecycleUnknown {
+                            workspace_mutation_started: false,
+                        }
+                    );
+                    assert_eq!(scan.valid_transactions().count(), 0);
+                    assert_eq!(scan.actionable_recovery_transactions().count(), 0);
+                }
+            }
+        }
     }
 
     #[test]
@@ -3352,12 +3703,15 @@ mod tests {
             "turn-h5-crash",
         )
         .unwrap();
+        let expected_sha256 = sha256_hex(BEFORE);
         let journal = store
-            .create_prepared(
+            .create_prepared_for_expected_preimage(
                 &root.prepare_target(Path::new("target.txt")).unwrap(),
                 context,
+                &expected_sha256,
             )
             .unwrap();
+        assert_eq!(journal.before_sha256(), expected_sha256);
         let scenario: u8 = scenario.parse().expect("H5-B crash scenario number");
         if scenario == 1 {
             std::process::abort();
@@ -3373,7 +3727,7 @@ mod tests {
             let target = root.prepare_target(Path::new("target.txt")).unwrap();
             if scenario == 3 {
                 let _ = target.replace_existing_file_utf8_bounded_with_test_fault(
-                    &sha256_hex(BEFORE),
+                    &expected_sha256,
                     REPLACEMENT,
                     &mut fence,
                     &cancellation,
@@ -3382,7 +3736,7 @@ mod tests {
                 std::process::abort();
             }
             let outcome = target.replace_existing_file_utf8_bounded_with_cancellation(
-                &sha256_hex(BEFORE),
+                &expected_sha256,
                 REPLACEMENT,
                 &mut fence,
                 &cancellation,
@@ -3470,6 +3824,7 @@ mod tests {
             .next()
             .cloned()
             .expect("one valid crash transaction");
+        assert_eq!(snapshot.journal().before_sha256(), sha256_hex(BEFORE));
         match scenario {
             1 => {
                 assert_eq!(snapshot.state(), RecoveryTransactionState::PreparedOnly);

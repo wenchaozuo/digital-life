@@ -71,6 +71,7 @@ pub enum RecoveryJournalError {
     TargetBindingMismatch(&'static str),
     TargetNotExisting,
     TargetRead,
+    PreimageConflict,
     Corrupt(&'static str),
     UnsupportedVersion(u16),
     Oversized {
@@ -109,6 +110,8 @@ impl Display for RecoveryJournalError {
             Self::TargetRead => {
                 formatter.write_str("recovery journal could not read the target preimage")
             }
+            Self::PreimageConflict => formatter
+                .write_str("recovery journal preimage does not match the H4 expected SHA-256"),
             Self::Corrupt(reason) => write!(formatter, "recovery journal is corrupt: {reason}"),
             Self::UnsupportedVersion(version) => {
                 write!(
@@ -1428,6 +1431,23 @@ impl RecoveryJournalStore {
         self.create_prepared_internal(target, context, RecoveryTransactionId::generate())
     }
 
+    /// Captures and persists a Prepared record only when the exact bounded
+    /// preimage is the same content state that H4 is authorized to replace.
+    /// The expected SHA is validated before any journal create-new operation.
+    pub(crate) fn create_prepared_for_expected_preimage(
+        &self,
+        target: &PreparedWorkspaceTarget,
+        context: RecoveryJournalContext,
+        expected_sha256: &str,
+    ) -> Result<RecoveryJournalV1, RecoveryJournalError> {
+        self.create_prepared_for_expected_preimage_internal(
+            target,
+            context,
+            RecoveryTransactionId::generate(),
+            expected_sha256,
+        )
+    }
+
     /// Performs a read-only restart scan of the fixed app-owned directory.
     /// Missing directories are treated as an empty scan; no directory or file
     /// is created, removed, retried, or modified by this method.
@@ -1894,6 +1914,31 @@ impl RecoveryJournalStore {
         context: RecoveryJournalContext,
         transaction_id: RecoveryTransactionId,
     ) -> Result<RecoveryJournalV1, RecoveryJournalError> {
+        self.create_prepared_internal_with_expected(target, context, transaction_id, None)
+    }
+
+    fn create_prepared_for_expected_preimage_internal(
+        &self,
+        target: &PreparedWorkspaceTarget,
+        context: RecoveryJournalContext,
+        transaction_id: RecoveryTransactionId,
+        expected_sha256: &str,
+    ) -> Result<RecoveryJournalV1, RecoveryJournalError> {
+        self.create_prepared_internal_with_expected(
+            target,
+            context,
+            transaction_id,
+            Some(expected_sha256),
+        )
+    }
+
+    fn create_prepared_internal_with_expected(
+        &self,
+        target: &PreparedWorkspaceTarget,
+        context: RecoveryJournalContext,
+        transaction_id: RecoveryTransactionId,
+        expected_sha256: Option<&str>,
+    ) -> Result<RecoveryJournalV1, RecoveryJournalError> {
         self.validate_target_binding(target)?;
         let before_content = target
             .read_existing_file_utf8_bounded(RECOVERY_JOURNAL_MAX_PREIMAGE_BYTES)
@@ -1902,6 +1947,12 @@ impl RecoveryJournalStore {
             return Err(RecoveryJournalError::Oversized {
                 limit: RECOVERY_JOURNAL_MAX_PREIMAGE_BYTES,
             });
+        }
+        if let Some(expected_sha256) = expected_sha256 {
+            let expected_sha256 = decode_sha256_hex("expected_sha256", expected_sha256)?;
+            if digest(before_content.as_bytes()) != expected_sha256 {
+                return Err(RecoveryJournalError::PreimageConflict);
+            }
         }
         let record =
             RecoveryJournalV1::from_preimage(transaction_id, target, context, before_content)?;

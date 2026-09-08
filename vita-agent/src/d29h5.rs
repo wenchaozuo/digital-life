@@ -14,7 +14,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::recovery_journal::{
     RecoveryJournalError, RecoveryJournalIdentity, RecoveryJournalStore, RecoveryJournalV1,
-    RecoveryMarkerState, RecoveryMarkerV1, RecoveryTransactionId, RecoveryTransactionScan,
+    RecoveryMarkerPersistenceTestFault, RecoveryMarkerState, RecoveryMarkerV1,
+    RecoveryTransactionId, RecoveryTransactionScan, RecoveryTransactionScanItem,
     RecoveryTransactionSnapshot, RecoveryTransactionState, RECOVERY_JOURNAL_MAX_PREIMAGE_BYTES,
 };
 use crate::workspace_capability::{
@@ -141,11 +142,19 @@ pub(crate) struct RecoveryExecutionResult {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum H5RecoveryDisposition {
+    None,
+    Required,
+    MetadataUnknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum H5ReplaceTransactionOutcome {
-    Denied { recovery_required: bool },
-    Conflict { recovery_required: bool },
+    Denied { recovery: H5RecoveryDisposition },
+    Conflict { recovery: H5RecoveryDisposition },
     Committed,
     CommitUnknown { recovery_required: bool },
+    LifecycleUnknown { workspace_mutation_started: bool },
 }
 
 #[derive(Debug)]
@@ -161,20 +170,39 @@ struct H5StartedFence<'a> {
     store: &'a RecoveryJournalStore,
     journal: &'a RecoveryJournalV1,
     host_fence: &'a mut dyn WorkspaceReplaceCommitFence,
-    started_persisted: bool,
+    started_persistence: StartedPersistenceState,
+    started_marker_fault: Option<RecoveryMarkerPersistenceTestFault>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartedPersistenceState {
+    NotAttempted,
+    VerifiedDurable,
+    FailedNeedsReconciliation,
 }
 
 impl WorkspaceReplaceCommitFence for H5StartedFence<'_> {
     fn check(&mut self) -> Result<(), WorkspaceReplaceFenceError> {
-        if self.started_persisted {
+        if self.started_persistence != StartedPersistenceState::NotAttempted {
             return Err(WorkspaceReplaceFenceError::Error);
         }
         self.host_fence.check()?;
-        self.store
-            .persist_started(self.journal)
-            .map_err(|_| WorkspaceReplaceFenceError::Error)?;
-        self.started_persisted = true;
-        Ok(())
+        let persisted = match self.started_marker_fault.take() {
+            Some(fault) => self
+                .store
+                .persist_started_with_test_fault(self.journal, fault),
+            None => self.store.persist_started(self.journal),
+        };
+        match persisted {
+            Ok(_) => {
+                self.started_persistence = StartedPersistenceState::VerifiedDurable;
+                Ok(())
+            }
+            Err(_) => {
+                self.started_persistence = StartedPersistenceState::FailedNeedsReconciliation;
+                Err(WorkspaceReplaceFenceError::Error)
+            }
+        }
     }
 }
 
@@ -738,6 +766,41 @@ fn recovery_error_reason(error: WorkspaceReplaceError) -> RecoveryDenyReason {
     }
 }
 
+fn reconcile_started_persistence_failure(
+    store: &RecoveryJournalStore,
+    journal: &RecoveryJournalV1,
+) -> H5ReplaceTransactionOutcome {
+    let scan = match store.scan_transactions() {
+        Ok(scan) => scan,
+        Err(_) => {
+            return H5ReplaceTransactionOutcome::LifecycleUnknown {
+                workspace_mutation_started: false,
+            }
+        }
+    };
+
+    let state = scan
+        .valid_transactions()
+        .find(|snapshot| snapshot.journal().transaction_id() == journal.transaction_id())
+        .map(RecoveryTransactionSnapshot::state);
+
+    match state {
+        Some(RecoveryTransactionState::PreparedOnly) => H5ReplaceTransactionOutcome::Denied {
+            recovery: H5RecoveryDisposition::None,
+        },
+        Some(RecoveryTransactionState::RecoveryRequired) => H5ReplaceTransactionOutcome::Denied {
+            recovery: H5RecoveryDisposition::Required,
+        },
+        Some(
+            RecoveryTransactionState::CommittedTerminal
+            | RecoveryTransactionState::RecoveredTerminal,
+        )
+        | None => H5ReplaceTransactionOutcome::LifecycleUnknown {
+            workspace_mutation_started: false,
+        },
+    }
+}
+
 pub(crate) fn execute_h5b_replace_after_host_pass(
     store: &RecoveryJournalStore,
     root: &TrustedWorkspaceRoot,
@@ -758,6 +821,7 @@ pub(crate) fn execute_h5b_replace_after_host_pass(
         cancellation,
         fence,
         false,
+        None,
         None,
     )
 }
@@ -785,6 +849,34 @@ fn execute_h5b_replace_after_host_pass_with_test_fault(
         fence,
         false,
         Some(fault),
+        None,
+    )
+}
+
+#[cfg(all(test, windows))]
+fn execute_h5b_replace_after_host_pass_with_started_marker_fault(
+    store: &RecoveryJournalStore,
+    root: &TrustedWorkspaceRoot,
+    target: PreparedWorkspaceTarget,
+    context: crate::recovery_journal::RecoveryJournalContext,
+    expected_sha256: &str,
+    replacement: &str,
+    cancellation: &dyn WorkspaceReplaceCancellation,
+    fence: &mut dyn WorkspaceReplaceCommitFence,
+    fault: RecoveryMarkerPersistenceTestFault,
+) -> Result<H5ReplaceExecutionResult, RecoveryJournalError> {
+    execute_h5b_replace_after_host_pass_internal(
+        store,
+        root,
+        target,
+        context,
+        expected_sha256,
+        replacement,
+        cancellation,
+        fence,
+        false,
+        None,
+        Some(fault),
     )
 }
 
@@ -799,6 +891,7 @@ fn execute_h5b_replace_after_host_pass_internal(
     fence: &mut dyn WorkspaceReplaceCommitFence,
     force_commit_marker_failure: bool,
     native_fault: Option<WorkspaceReplaceTestFault>,
+    started_marker_fault: Option<RecoveryMarkerPersistenceTestFault>,
 ) -> Result<H5ReplaceExecutionResult, RecoveryJournalError> {
     if context.capability_id() != H5_ORIGINAL_REPLACE_CAPABILITY_ID
         || context.replacement_sha256() != sha256_hex(replacement.as_bytes())
@@ -815,7 +908,8 @@ fn execute_h5b_replace_after_host_pass_internal(
         store,
         journal: &journal,
         host_fence: fence,
-        started_persisted: false,
+        started_persistence: StartedPersistenceState::NotAttempted,
+        started_marker_fault,
     };
     #[cfg(windows)]
     let outcome = match native_fault {
@@ -843,30 +937,43 @@ fn execute_h5b_replace_after_host_pass_internal(
             cancellation,
         )
     };
-    let started_persisted = started_fence.started_persisted;
-    let transaction_outcome = match &outcome {
-        WorkspaceReplaceCommitOutcome::Denied { .. } => H5ReplaceTransactionOutcome::Denied {
-            recovery_required: started_persisted,
-        },
-        WorkspaceReplaceCommitOutcome::Conflict { .. } => H5ReplaceTransactionOutcome::Conflict {
-            recovery_required: started_persisted,
-        },
-        WorkspaceReplaceCommitOutcome::CommitUnknown { .. } => {
-            H5ReplaceTransactionOutcome::CommitUnknown {
-                recovery_required: true,
-            }
+    let transaction_outcome = match started_fence.started_persistence {
+        StartedPersistenceState::FailedNeedsReconciliation => {
+            reconcile_started_persistence_failure(store, &journal)
         }
-        WorkspaceReplaceCommitOutcome::Committed { .. } => {
-            let commit_marker = if force_commit_marker_failure {
-                Err(RecoveryJournalError::InjectedFault("commit marker"))
-            } else {
-                store.persist_committed(&journal)
+        StartedPersistenceState::NotAttempted | StartedPersistenceState::VerifiedDurable => {
+            let recovery = match started_fence.started_persistence {
+                StartedPersistenceState::NotAttempted => H5RecoveryDisposition::None,
+                StartedPersistenceState::VerifiedDurable => H5RecoveryDisposition::Required,
+                StartedPersistenceState::FailedNeedsReconciliation => {
+                    unreachable!("handled by the outer Started reconciliation branch")
+                }
             };
-            if commit_marker.is_ok() {
-                H5ReplaceTransactionOutcome::Committed
-            } else {
-                H5ReplaceTransactionOutcome::CommitUnknown {
-                    recovery_required: true,
+            match &outcome {
+                WorkspaceReplaceCommitOutcome::Denied { .. } => {
+                    H5ReplaceTransactionOutcome::Denied { recovery }
+                }
+                WorkspaceReplaceCommitOutcome::Conflict { .. } => {
+                    H5ReplaceTransactionOutcome::Conflict { recovery }
+                }
+                WorkspaceReplaceCommitOutcome::CommitUnknown { .. } => {
+                    H5ReplaceTransactionOutcome::CommitUnknown {
+                        recovery_required: true,
+                    }
+                }
+                WorkspaceReplaceCommitOutcome::Committed { .. } => {
+                    let commit_marker = if force_commit_marker_failure {
+                        Err(RecoveryJournalError::InjectedFault("commit marker"))
+                    } else {
+                        store.persist_committed(&journal)
+                    };
+                    if commit_marker.is_ok() {
+                        H5ReplaceTransactionOutcome::Committed
+                    } else {
+                        H5ReplaceTransactionOutcome::CommitUnknown {
+                            recovery_required: true,
+                        }
+                    }
                 }
             }
         }
@@ -1757,6 +1864,26 @@ mod tests {
         || Ok(())
     }
 
+    fn run_started_marker_fault(
+        fixture: &Fixture,
+        fault: RecoveryMarkerPersistenceTestFault,
+    ) -> H5ReplaceExecutionResult {
+        let cancellation = AtomicBool::new(false);
+        let mut fence = allow_fence();
+        execute_h5b_replace_after_host_pass_with_started_marker_fault(
+            &fixture.store,
+            &fixture.root,
+            fixture.target(),
+            fixture.context(),
+            &sha256_hex(BEFORE),
+            REPLACEMENT,
+            &cancellation,
+            &mut fence,
+            fault,
+        )
+        .expect("Started marker fault execution")
+    }
+
     struct RevokeAtFenceAuthority {
         inner: Arc<TestRecoveryAuthority>,
     }
@@ -2140,6 +2267,7 @@ mod tests {
             &mut fence,
             true,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -2236,7 +2364,7 @@ mod tests {
         assert_eq!(
             result.transaction_outcome,
             H5ReplaceTransactionOutcome::Denied {
-                recovery_required: true
+                recovery: H5RecoveryDisposition::Required
             }
         );
         assert_eq!(
@@ -2276,7 +2404,7 @@ mod tests {
         assert_eq!(
             result.transaction_outcome,
             H5ReplaceTransactionOutcome::Conflict {
-                recovery_required: true
+                recovery: H5RecoveryDisposition::Required
             }
         );
         assert_eq!(
@@ -2294,6 +2422,329 @@ mod tests {
             fs::read(fixture.workspace_dir.path().join("target.txt")).unwrap(),
             BEFORE
         );
+    }
+
+    #[test]
+    fn started_create_failure_with_no_artifact_is_prepared_only() {
+        let fixture = Fixture::new();
+        let result = run_started_marker_fault(
+            &fixture,
+            RecoveryMarkerPersistenceTestFault::CreateBeforeArtifact,
+        );
+
+        assert_eq!(
+            result.transaction_outcome,
+            H5ReplaceTransactionOutcome::Denied {
+                recovery: H5RecoveryDisposition::None,
+            }
+        );
+        assert!(matches!(
+            &result.native_diagnostics,
+            WorkspaceReplaceCommitOutcome::Denied { evidence, .. }
+                if evidence.modifying_syscalls == 0
+        ));
+        let scan = fixture.store.scan_transactions().unwrap();
+        assert_eq!(scan.valid_transactions().count(), 1);
+        assert_eq!(
+            scan.valid_transactions().next().unwrap().state(),
+            RecoveryTransactionState::PreparedOnly
+        );
+        assert_eq!(
+            fs::read(fixture.workspace_dir.path().join("target.txt")).unwrap(),
+            BEFORE
+        );
+    }
+
+    #[test]
+    fn started_reopen_failure_with_valid_marker_is_not_reported_no_recovery() {
+        let fixture = Fixture::new();
+        let result = run_started_marker_fault(
+            &fixture,
+            RecoveryMarkerPersistenceTestFault::ReopenAfterCreate,
+        );
+
+        assert_eq!(
+            result.transaction_outcome,
+            H5ReplaceTransactionOutcome::Denied {
+                recovery: H5RecoveryDisposition::Required,
+            }
+        );
+        assert!(matches!(
+            &result.native_diagnostics,
+            WorkspaceReplaceCommitOutcome::Denied { evidence, .. }
+                if evidence.modifying_syscalls == 0
+        ));
+        let scan = fixture.store.scan_transactions().unwrap();
+        let snapshot = scan.valid_transactions().next().unwrap();
+        assert_eq!(snapshot.state(), RecoveryTransactionState::RecoveryRequired);
+        assert!(snapshot.started().is_some());
+        assert_eq!(
+            fs::read(fixture.workspace_dir.path().join("target.txt")).unwrap(),
+            BEFORE
+        );
+    }
+
+    #[test]
+    fn started_flush_failure_reconciles_durable_lifecycle() {
+        let fixture = Fixture::new();
+        let result = run_started_marker_fault(
+            &fixture,
+            RecoveryMarkerPersistenceTestFault::FlushAfterCreate,
+        );
+
+        assert_eq!(
+            result.transaction_outcome,
+            H5ReplaceTransactionOutcome::Denied {
+                recovery: H5RecoveryDisposition::Required,
+            }
+        );
+        let scan = fixture.store.scan_transactions().unwrap();
+        assert_eq!(
+            scan.valid_transactions().next().unwrap().state(),
+            RecoveryTransactionState::RecoveryRequired
+        );
+        assert_eq!(
+            fs::read(fixture.workspace_dir.path().join("target.txt")).unwrap(),
+            BEFORE
+        );
+    }
+
+    #[test]
+    fn corrupt_started_after_persistence_failure_is_lifecycle_unknown() {
+        let fixture = Fixture::new();
+        let result = run_started_marker_fault(
+            &fixture,
+            RecoveryMarkerPersistenceTestFault::CorruptAfterCreate,
+        );
+
+        assert_eq!(
+            result.transaction_outcome,
+            H5ReplaceTransactionOutcome::LifecycleUnknown {
+                workspace_mutation_started: false,
+            }
+        );
+        let scan = fixture.store.scan_transactions().unwrap();
+        assert_eq!(scan.valid_transactions().count(), 0);
+        assert_eq!(scan.actionable_recovery_transactions().count(), 0);
+        assert!(scan
+            .items()
+            .iter()
+            .any(|item| matches!(item, RecoveryTransactionScanItem::CorruptArtifact { .. })));
+        assert!(fixture
+            .store
+            .recovery_root()
+            .join(format!(
+                "{}.started",
+                result.journal.transaction_id().as_str()
+            ))
+            .is_file());
+        assert_eq!(
+            fs::read(fixture.workspace_dir.path().join("target.txt")).unwrap(),
+            BEFORE
+        );
+    }
+
+    #[test]
+    fn started_failure_never_allows_workspace_mutation() {
+        for fault in [
+            RecoveryMarkerPersistenceTestFault::CreateBeforeArtifact,
+            RecoveryMarkerPersistenceTestFault::FlushAfterCreate,
+            RecoveryMarkerPersistenceTestFault::ReopenAfterCreate,
+            RecoveryMarkerPersistenceTestFault::CorruptAfterCreate,
+        ] {
+            let fixture = Fixture::new();
+            let result = run_started_marker_fault(&fixture, fault);
+            assert!(matches!(
+                &result.native_diagnostics,
+                WorkspaceReplaceCommitOutcome::Denied { evidence, .. }
+                    if evidence.modifying_syscalls == 0
+                        && !evidence.mutation_started
+            ));
+            assert_eq!(
+                fs::read(fixture.workspace_dir.path().join("target.txt")).unwrap(),
+                BEFORE,
+                "Started persistence fault {fault:?} mutated the workspace"
+            );
+        }
+    }
+
+    #[test]
+    fn started_failure_never_retries_replace() {
+        let fixture = Fixture::new();
+        let fence_calls = Arc::new(AtomicUsize::new(0));
+        let fence_calls_for_fence = Arc::clone(&fence_calls);
+        let mut fence = move || {
+            fence_calls_for_fence.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        };
+        let cancellation = AtomicBool::new(false);
+        let result = execute_h5b_replace_after_host_pass_with_started_marker_fault(
+            &fixture.store,
+            &fixture.root,
+            fixture.target(),
+            fixture.context(),
+            &sha256_hex(BEFORE),
+            REPLACEMENT,
+            &cancellation,
+            &mut fence,
+            RecoveryMarkerPersistenceTestFault::ReopenAfterCreate,
+        )
+        .unwrap();
+
+        assert_eq!(fence_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            result.transaction_outcome,
+            H5ReplaceTransactionOutcome::Denied {
+                recovery: H5RecoveryDisposition::Required,
+            }
+        );
+        let scan = fixture.store.scan_transactions().unwrap();
+        assert_eq!(scan.valid_transactions().count(), 1);
+        assert_eq!(scan.actionable_recovery_transactions().count(), 1);
+        assert_eq!(
+            fs::read(fixture.workspace_dir.path().join("target.txt")).unwrap(),
+            BEFORE
+        );
+    }
+
+    #[test]
+    fn started_failure_result_matches_fresh_transaction_scan() {
+        for (fault, expected_state, expected_outcome) in [
+            (
+                RecoveryMarkerPersistenceTestFault::CreateBeforeArtifact,
+                Some(RecoveryTransactionState::PreparedOnly),
+                H5RecoveryDisposition::None,
+            ),
+            (
+                RecoveryMarkerPersistenceTestFault::FlushAfterCreate,
+                Some(RecoveryTransactionState::RecoveryRequired),
+                H5RecoveryDisposition::Required,
+            ),
+            (
+                RecoveryMarkerPersistenceTestFault::ReopenAfterCreate,
+                Some(RecoveryTransactionState::RecoveryRequired),
+                H5RecoveryDisposition::Required,
+            ),
+        ] {
+            let fixture = Fixture::new();
+            let result = run_started_marker_fault(&fixture, fault);
+            let scan = fixture.store.scan_transactions().unwrap();
+            assert_eq!(
+                scan.valid_transactions()
+                    .next()
+                    .map(|snapshot| snapshot.state()),
+                expected_state,
+                "fresh scan disagreed for Started fault {fault:?}"
+            );
+            assert_eq!(
+                result.transaction_outcome,
+                H5ReplaceTransactionOutcome::Denied {
+                    recovery: expected_outcome,
+                },
+                "H5 result disagreed with fresh scan for Started fault {fault:?}"
+            );
+        }
+
+        let fixture = Fixture::new();
+        let result = run_started_marker_fault(
+            &fixture,
+            RecoveryMarkerPersistenceTestFault::CorruptAfterCreate,
+        );
+        let scan = fixture.store.scan_transactions().unwrap();
+        assert_eq!(scan.valid_transactions().count(), 0);
+        assert_eq!(
+            result.transaction_outcome,
+            H5ReplaceTransactionOutcome::LifecycleUnknown {
+                workspace_mutation_started: false,
+            }
+        );
+    }
+
+    #[test]
+    fn lifecycle_unknown_is_not_committed() {
+        let fixture = Fixture::new();
+        let result = run_started_marker_fault(
+            &fixture,
+            RecoveryMarkerPersistenceTestFault::CorruptAfterCreate,
+        );
+
+        assert!(!matches!(
+            result.transaction_outcome,
+            H5ReplaceTransactionOutcome::Committed
+        ));
+        assert!(!fixture
+            .store
+            .recovery_root()
+            .join(format!(
+                "{}.committed",
+                result.journal.transaction_id().as_str()
+            ))
+            .exists());
+    }
+
+    #[test]
+    fn lifecycle_unknown_does_not_issue_recovery_grant() {
+        let fixture = Fixture::new();
+        let result = run_started_marker_fault(
+            &fixture,
+            RecoveryMarkerPersistenceTestFault::CorruptAfterCreate,
+        );
+        let journal = &result.journal;
+        let action = RecoveryActionRequest {
+            action_id: "lifecycle-unknown-action".to_string(),
+            life_id: journal.life_id().to_string(),
+            task_id: journal.task_id().to_string(),
+            capability_id: H5_RECOVER_REPLACE_CAPABILITY_ID.to_string(),
+            workspace_root_identity: journal.workspace_root_identity(),
+            relative_path: journal.relative_path().clone(),
+            target_identity: journal.target_identity(),
+            transaction_id: journal.transaction_id().clone(),
+            journal_integrity_hash: journal.integrity_hash(),
+            current_sha256: sha256_hex(BEFORE),
+            current_bytes: BEFORE.len(),
+            restore_sha256: journal.before_sha256(),
+            restore_bytes: journal.before_bytes(),
+            original_replacement_sha256: journal.replacement_sha256(),
+            authorization_revision: 2,
+        };
+        let authority = TestRecoveryAuthority::new(2);
+        authority.provision_trusted_confirmation(&action);
+        let executor = H5RecoveryExecutor::new(
+            fixture.store.clone(),
+            fixture.root.clone(),
+            Arc::clone(&authority) as Arc<dyn RecoveryAuthorityPort>,
+        );
+        let recovery = executor.recover(action);
+
+        assert_eq!(
+            recovery.outcome,
+            RecoveryExecutionOutcome::RecoveryDenied(RecoveryDenyReason::RecoveryBlocked)
+        );
+        assert!(!recovery.grant_issued);
+        assert_eq!(authority.grant_count(), 0);
+        assert_eq!(recovery.mutation_count, 0);
+    }
+
+    #[test]
+    fn valid_started_after_local_error_remains_recovery_required() {
+        let fixture = Fixture::new();
+        let result = run_started_marker_fault(
+            &fixture,
+            RecoveryMarkerPersistenceTestFault::ReopenAfterCreate,
+        );
+
+        assert_eq!(
+            result.transaction_outcome,
+            H5ReplaceTransactionOutcome::Denied {
+                recovery: H5RecoveryDisposition::Required,
+            }
+        );
+        assert!(!matches!(
+            result.transaction_outcome,
+            H5ReplaceTransactionOutcome::Denied {
+                recovery: H5RecoveryDisposition::None
+            }
+        ));
     }
 
     #[test]

@@ -1710,6 +1710,24 @@ impl RecoveryJournalStore {
         journal: &RecoveryJournalV1,
         marker_state: RecoveryMarkerState,
     ) -> Result<RecoveryMarkerV1, RecoveryJournalError> {
+        self.persist_marker_with_test_fault(journal, marker_state, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn persist_started_with_test_fault(
+        &self,
+        journal: &RecoveryJournalV1,
+        fault: RecoveryMarkerPersistenceTestFault,
+    ) -> Result<RecoveryMarkerV1, RecoveryJournalError> {
+        self.persist_marker_with_test_fault(journal, RecoveryMarkerState::Started, Some(fault))
+    }
+
+    fn persist_marker_with_test_fault(
+        &self,
+        journal: &RecoveryJournalV1,
+        marker_state: RecoveryMarkerState,
+        fault: Option<RecoveryMarkerPersistenceTestFault>,
+    ) -> Result<RecoveryMarkerV1, RecoveryJournalError> {
         let snapshot = self
             .scan_transactions()?
             .valid_transactions()
@@ -1747,8 +1765,36 @@ impl RecoveryJournalStore {
             marker_state,
         );
         let bytes = marker.to_bytes()?;
+
+        if fault == Some(RecoveryMarkerPersistenceTestFault::CreateBeforeArtifact) {
+            return Err(RecoveryJournalError::InjectedFault(
+                "Started marker create before artifact",
+            ));
+        }
+
+        if fault == Some(RecoveryMarkerPersistenceTestFault::CorruptAfterCreate) {
+            let corrupt_length = bytes.len().saturating_sub(1).max(1);
+            self.namespace_authority
+                .create_new_marker(&marker, &bytes[..corrupt_length])?;
+            return Err(RecoveryJournalError::InjectedFault(
+                "Started marker corrupt after create",
+            ));
+        }
+
         self.namespace_authority
             .create_new_marker(&marker, &bytes)?;
+
+        if fault == Some(RecoveryMarkerPersistenceTestFault::FlushAfterCreate) {
+            return Err(RecoveryJournalError::InjectedFault(
+                "Started marker FlushFileBuffers",
+            ));
+        }
+        if fault == Some(RecoveryMarkerPersistenceTestFault::ReopenAfterCreate) {
+            return Err(RecoveryJournalError::InjectedFault(
+                "Started marker reopen verification",
+            ));
+        }
+
         let reopened = RecoveryMarkerV1::from_bytes(
             &self
                 .namespace_authority
@@ -2487,6 +2533,15 @@ enum RecoveryJournalTestFault {
     Truncate,
     BadIntegrity,
     Reopen,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum RecoveryMarkerPersistenceTestFault {
+    CreateBeforeArtifact,
+    FlushAfterCreate,
+    ReopenAfterCreate,
+    CorruptAfterCreate,
 }
 
 #[cfg(all(test, windows))]

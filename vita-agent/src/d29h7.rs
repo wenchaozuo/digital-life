@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::ffi::{c_void, OsStr, OsString};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
@@ -24,7 +24,7 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
@@ -58,11 +58,11 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::Pipes::{CreatePipe, PeekNamedPipe};
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess, GetCurrentThread,
-    GetExitCodeProcess, InitializeProcThreadAttributeList, ResumeThread, TerminateProcess,
-    TerminateThread, UpdateProcThreadAttribute, WaitForSingleObject, CREATE_NO_WINDOW,
-    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
-    PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess, GetExitCodeProcess,
+    InitializeProcThreadAttributeList, ResumeThread, TerminateProcess, UpdateProcThreadAttribute,
+    WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
+    EXTENDED_STARTUPINFO_PRESENT, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW,
 };
 use windows_sys::Win32::System::WindowsProgramming::DRIVE_REMOTE;
 use windows_sys::Win32::System::IO::{CancelIoEx, IO_STATUS_BLOCK};
@@ -275,11 +275,11 @@ impl H7PreparedNamespace {
             .expect("H7 namespace leaf");
         for (index, component) in normal_components.iter().enumerate() {
             let is_leaf = index + 1 == normal_components.len();
-            let handle = Arc::new(open_namespace_relative(
-                &parent,
-                component,
-                if is_leaf { directory } else { true },
-            )?);
+            let handle = Arc::new(if is_leaf && !directory {
+                open_namespace_relative_executable_leaf(&parent, component)?
+            } else {
+                open_namespace_relative_directory(&parent, component)?
+            });
             let identity = namespace_identity(handle.raw())?;
             if identity.reparse || identity.directory != (if is_leaf { directory } else { true }) {
                 return Err("H7 namespace component was reparse or wrong kind".to_string());
@@ -301,11 +301,11 @@ impl H7PreparedNamespace {
     }
 
     fn rebind_leaf(&self) -> Result<Arc<H7Handle>, String> {
-        let handle = Arc::new(open_namespace_relative(
-            &self.parent,
-            &self.leaf_name,
-            self.identity.directory,
-        )?);
+        let handle = Arc::new(if self.identity.directory {
+            open_namespace_relative_directory(&self.parent, &self.leaf_name)?
+        } else {
+            open_namespace_relative_executable_leaf(&self.parent, &self.leaf_name)?
+        });
         let identity = namespace_identity(handle.raw())?;
         if identity != self.identity || identity.reparse {
             return Err("H7 namespace leaf identity changed".to_string());
@@ -451,10 +451,25 @@ fn open_namespace_drive_anchor(path: &Path) -> Result<H7Handle, String> {
     Ok(handle)
 }
 
-fn open_namespace_relative(
+fn open_namespace_relative_directory(
+    parent: &Arc<H7Handle>,
+    component: &OsStr,
+) -> Result<H7Handle, String> {
+    open_namespace_relative_with_share(parent, component, true, FILE_SHARE_READ | FILE_SHARE_WRITE)
+}
+
+fn open_namespace_relative_executable_leaf(
+    parent: &Arc<H7Handle>,
+    component: &OsStr,
+) -> Result<H7Handle, String> {
+    open_namespace_relative_with_share(parent, component, false, FILE_SHARE_READ)
+}
+
+fn open_namespace_relative_with_share(
     parent: &Arc<H7Handle>,
     component: &OsStr,
     directory: bool,
+    share_access: u32,
 ) -> Result<H7Handle, String> {
     let mut name = component.encode_wide().collect::<Vec<_>>();
     let byte_length = name
@@ -497,7 +512,7 @@ fn open_namespace_relative(
             &mut status_block,
             std::ptr::null(),
             0,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            share_access,
             FILE_OPEN,
             create_options,
             std::ptr::null(),
@@ -944,6 +959,7 @@ enum H7NativeLaunchFault {
     PanicBeforeCreateProcess,
     PanicAfterCreateProcess,
     ForceAssignmentFailure,
+    ForceThreadHandleFailure,
 }
 
 #[derive(Default)]
@@ -952,6 +968,7 @@ struct H7SupervisorMetrics {
     job_assigned: AtomicUsize,
     thread_resumed: AtomicUsize,
     process_exited: AtomicUsize,
+    process_exit_verified: AtomicUsize,
     jobs_terminated: AtomicUsize,
     job_termination_failures: AtomicUsize,
     direct_termination_attempted: AtomicUsize,
@@ -959,8 +976,39 @@ struct H7SupervisorMetrics {
     automatic_retries: AtomicUsize,
     process_tree_remaining: AtomicUsize,
     process_tree_observations: AtomicUsize,
+    reader_threads_remaining: AtomicUsize,
+    native_workers_active: AtomicUsize,
+    native_workers_started: AtomicUsize,
+    native_workers_finished: AtomicUsize,
     active_processes_peak: AtomicUsize,
     created_notify: Notify,
+    native_worker_finished_notify: Notify,
+}
+
+struct H7NativeWorkerGuard {
+    metrics: Arc<H7SupervisorMetrics>,
+}
+
+impl H7NativeWorkerGuard {
+    fn new(metrics: Arc<H7SupervisorMetrics>) -> Self {
+        metrics
+            .native_workers_started
+            .fetch_add(1, Ordering::AcqRel);
+        metrics.native_workers_active.fetch_add(1, Ordering::AcqRel);
+        Self { metrics }
+    }
+}
+
+impl Drop for H7NativeWorkerGuard {
+    fn drop(&mut self) {
+        self.metrics
+            .native_workers_active
+            .fetch_sub(1, Ordering::AcqRel);
+        self.metrics
+            .native_workers_finished
+            .fetch_add(1, Ordering::AcqRel);
+        self.metrics.native_worker_finished_notify.notify_waiters();
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -998,6 +1046,8 @@ struct H7ReaderState {
     overflow: AtomicBool,
     cancelled: AtomicBool,
     finished: AtomicBool,
+    cancellation_wait: Mutex<()>,
+    cancellation_notify: Condvar,
 }
 
 impl H7ReaderState {
@@ -1007,7 +1057,22 @@ impl H7ReaderState {
             overflow: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
             finished: AtomicBool::new(false),
+            cancellation_wait: Mutex::new(()),
+            cancellation_notify: Condvar::new(),
         })
+    }
+
+    fn wait_for_cancellation(&self) {
+        let mut guard = self
+            .cancellation_wait
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !self.cancelled.load(Ordering::Acquire) {
+            guard = self
+                .cancellation_notify
+                .wait(guard)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
     }
 }
 
@@ -1015,12 +1080,12 @@ struct H7BoundedReader {
     raw_handle: HANDLE,
     state: Arc<H7ReaderState>,
     thread: Option<JoinHandle<()>>,
-    thread_handle: Option<H7Handle>,
 }
 
 impl H7BoundedReader {
     fn cancel_io(&self) {
         self.state.cancelled.store(true, Ordering::Release);
+        self.state.cancellation_notify.notify_all();
         if !self.raw_handle.is_null() {
             unsafe {
                 let _ = CancelIoEx(self.raw_handle, std::ptr::null_mut());
@@ -1044,27 +1109,20 @@ impl H7BoundedReader {
         }
         if !self.state.finished.load(Ordering::Acquire) {
             self.cancel_io();
-            let cancel_deadline = Instant::now() + timeout;
-            while !self.state.finished.load(Ordering::Acquire) && Instant::now() < cancel_deadline {
-                thread::yield_now();
-            }
         }
-        if !self.state.finished.load(Ordering::Acquire) {
-            if let Some(thread_handle) = self.thread_handle.as_ref() {
-                let _ = unsafe { TerminateThread(thread_handle.raw(), 1) };
-                if unsafe { WaitForSingleObject(thread_handle.raw(), 1_000) } == WAIT_OBJECT_0 {
-                    self.state.finished.store(true, Ordering::Release);
-                    self.close_raw_handle();
-                }
-            }
-        }
-        if !self.state.finished.load(Ordering::Acquire) {
-            return false;
-        }
-        self.thread
+        // The reader owns no kernel handle of its own and never gets forcefully
+        // terminated.  Cancellation makes its only blocking operation
+        // interruptible; joining here is therefore the bounded, cooperative
+        // completion point.  Closing the pipe happens only after the join so
+        // CancelIoEx and the reader cannot race a HANDLE close/reuse.
+        let joined = self
+            .thread
             .take()
-            .and_then(|thread| thread.join().ok())
-            .is_some()
+            .map(|thread| thread.join().is_ok())
+            .unwrap_or(true);
+        let finished = self.state.finished.load(Ordering::Acquire);
+        self.close_raw_handle();
+        joined && finished
     }
 }
 
@@ -1080,29 +1138,15 @@ fn spawn_bounded_reader(
     raw_handle: usize,
     state: Arc<H7ReaderState>,
     bound: usize,
+    stall: Option<Arc<H7ReaderStallGate>>,
 ) -> H7BoundedReader {
     let reader_state = Arc::clone(&state);
-    let (thread_handle_sender, thread_handle_receiver) = std::sync::mpsc::sync_channel(1);
     let thread = thread::spawn(move || {
         let raw_handle = raw_handle as HANDLE;
-        let mut duplicated_thread = std::ptr::null_mut();
-        let duplicated = unsafe {
-            DuplicateHandle(
-                GetCurrentProcess(),
-                GetCurrentThread(),
-                GetCurrentProcess(),
-                &mut duplicated_thread,
-                0,
-                FALSE,
-                DUPLICATE_SAME_ACCESS,
-            )
-        } != 0;
-        let thread_handle = if duplicated {
-            H7Handle::new(duplicated_thread).ok()
-        } else {
-            None
-        };
-        let _ = thread_handle_sender.send(thread_handle);
+        if let Some(stall) = stall.as_ref() {
+            stall.mark_entered();
+            reader_state.wait_for_cancellation();
+        }
         let mut buffer = [0_u8; 8192];
         loop {
             if reader_state.cancelled.load(Ordering::Acquire) {
@@ -1158,20 +1202,46 @@ fn spawn_bounded_reader(
                 reader_state.overflow.store(true, Ordering::Release);
             }
         }
-        unsafe {
-            CloseHandle(raw_handle);
-        }
         reader_state.finished.store(true, Ordering::Release);
     });
-    let thread_handle = thread_handle_receiver
-        .recv_timeout(Duration::from_secs(1))
-        .ok()
-        .flatten();
     H7BoundedReader {
         raw_handle: raw_handle as HANDLE,
         state,
         thread: Some(thread),
-        thread_handle,
+    }
+}
+
+struct H7ReaderStallGate {
+    entered: AtomicBool,
+    entered_wait: Mutex<()>,
+    entered_notify: Condvar,
+}
+
+impl H7ReaderStallGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            entered: AtomicBool::new(false),
+            entered_wait: Mutex::new(()),
+            entered_notify: Condvar::new(),
+        })
+    }
+
+    fn mark_entered(&self) {
+        self.entered.store(true, Ordering::Release);
+        self.entered_notify.notify_all();
+    }
+
+    fn wait_until_entered(&self) {
+        let mut guard = self
+            .entered_wait
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !self.entered.load(Ordering::Acquire) {
+            guard = self
+                .entered_notify
+                .wait(guard)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
     }
 }
 
@@ -1216,9 +1286,16 @@ impl H7NativeResources {
         let signaled =
             unsafe { WaitForSingleObject(self.process.raw(), milliseconds) } == WAIT_OBJECT_0;
         if signaled {
-            self.cleanup
+            if self
+                .cleanup
                 .process_exit_verified
-                .store(true, Ordering::Release);
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                self.metrics
+                    .process_exit_verified
+                    .fetch_add(1, Ordering::AcqRel);
+            }
         }
         signaled
     }
@@ -1246,6 +1323,9 @@ impl H7NativeResources {
             .process_tree_observed
             .store(true, Ordering::Release);
         self.metrics
+            .process_tree_remaining
+            .store(remaining, Ordering::Release);
+        self.metrics
             .process_tree_observations
             .fetch_add(1, Ordering::AcqRel);
         Some(remaining)
@@ -1263,36 +1343,13 @@ impl H7NativeResources {
     }
 
     fn terminate_primary_process(&mut self) -> bool {
-        if self
-            .cleanup
-            .direct_termination_attempted
-            .load(Ordering::Acquire)
-        {
-            return self
-                .cleanup
-                .direct_termination_verified
-                .load(Ordering::Acquire);
-        }
-        self.cleanup
-            .direct_termination_attempted
-            .store(true, Ordering::Release);
-        self.metrics
-            .direct_termination_attempted
-            .fetch_add(1, Ordering::AcqRel);
-        let _requested = unsafe { TerminateProcess(self.process.raw(), 1) } != 0;
-        let verified = self.observe_process_exit(1_000);
+        let verified = terminate_process_and_verify_exit(
+            self.process.raw(),
+            &self.phase,
+            &self.metrics,
+            &self.cleanup,
+        );
         if verified {
-            self.cleanup
-                .direct_termination_verified
-                .store(true, Ordering::Release);
-            self.metrics
-                .direct_termination_verified
-                .fetch_add(1, Ordering::AcqRel);
-            if !phase_at_least(&self.phase, H7LaunchPhase::Exited) {
-                self.phase
-                    .store(H7LaunchPhase::Exited as u8, Ordering::Release);
-                self.metrics.process_exited.fetch_add(1, Ordering::AcqRel);
-            }
             let _ = self.observe_process_tree_until_quiescent(Duration::from_millis(100));
         }
         verified
@@ -1356,6 +1413,44 @@ impl H7NativeResources {
             self.terminate_primary_process()
         }
     }
+}
+
+fn terminate_process_and_verify_exit(
+    process: HANDLE,
+    phase: &AtomicU8,
+    metrics: &H7SupervisorMetrics,
+    cleanup: &H7CleanupEvidence,
+) -> bool {
+    if cleanup
+        .direct_termination_attempted
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return cleanup.direct_termination_verified.load(Ordering::Acquire);
+    }
+    metrics
+        .direct_termination_attempted
+        .fetch_add(1, Ordering::AcqRel);
+    let _requested = unsafe { TerminateProcess(process, 1) } != 0;
+    let observed_exit = unsafe { WaitForSingleObject(process, 1_000) } == WAIT_OBJECT_0;
+    if !observed_exit {
+        return false;
+    }
+    cleanup.process_exit_verified.store(true, Ordering::Release);
+    if cleanup
+        .direct_termination_verified
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        metrics
+            .direct_termination_verified
+            .fetch_add(1, Ordering::AcqRel);
+    }
+    if !phase_at_least(phase, H7LaunchPhase::Exited) {
+        phase.store(H7LaunchPhase::Exited as u8, Ordering::Release);
+        metrics.process_exited.fetch_add(1, Ordering::AcqRel);
+    }
+    true
 }
 
 impl Drop for H7NativeResources {
@@ -1565,6 +1660,7 @@ struct H7NativeOptions {
     fault: H7NativeLaunchFault,
     unlisted_inheritable_handle: Option<usize>,
     post_host_mutation: H7PostHostMutation,
+    pre_create_process_gate: Option<Arc<H7PostHostFenceGate>>,
 }
 
 fn supervise_native(action: &PreparedProcessAction, options: H7NativeOptions) -> H7NativeResult {
@@ -1689,6 +1785,15 @@ fn supervise_native_inner(
     startup.StartupInfo.hStdError = stderr_write.raw();
     startup.lpAttributeList = attributes.pointer().cast();
     let mut process_information: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    if let Some(gate) = options.pre_create_process_gate.as_ref() {
+        gate.wait_if_armed_blocking();
+    }
+    // This is the final cancellation load.  Keep it immediately adjacent to
+    // CreateProcessW: no hash, IPC, allocation, wait, or other meaningful
+    // work may occur between the load and the syscall.
+    if options.cancellation.load(Ordering::Acquire) {
+        return launch_failed(false, false, None).with_kind(H7NativeOutcomeKind::Denied);
+    }
     let created = unsafe {
         CreateProcessW(
             application_name.as_ptr(),
@@ -1725,17 +1830,19 @@ fn supervise_native_inner(
             return launch_failed(true, false, None);
         }
     };
-    let thread = match H7Handle::new(process_information.hThread) {
+    let thread = match if options.fault == H7NativeLaunchFault::ForceThreadHandleFailure {
+        Err("D29-H7 injected process-thread handle failure".to_string())
+    } else {
+        H7Handle::new(process_information.hThread)
+    } {
         Ok(handle) => handle,
         Err(_) => {
-            let _ = unsafe { TerminateProcess(process.raw(), 1) };
-            let _ = unsafe { WaitForSingleObject(process.raw(), 1_000) };
-            cleanup
-                .direct_termination_attempted
-                .store(true, Ordering::Release);
-            cleanup
-                .direct_termination_verified
-                .store(true, Ordering::Release);
+            let _ = terminate_process_and_verify_exit(
+                process.raw(),
+                &phase,
+                &options.metrics,
+                &cleanup,
+            );
             return launch_failed(true, false, Some(&cleanup));
         }
     };
@@ -1787,15 +1894,21 @@ fn supervise_native_inner(
     let stderr_state = H7ReaderState::new();
     cleanup.stdout_reader_joined.store(false, Ordering::Release);
     cleanup.stderr_reader_joined.store(false, Ordering::Release);
+    options
+        .metrics
+        .reader_threads_remaining
+        .fetch_add(2, Ordering::AcqRel);
     let mut stdout_reader = spawn_bounded_reader(
         stdout_read.into_raw() as usize,
         Arc::clone(&stdout_state),
         action.stdout_bound,
+        None,
     );
     let mut stderr_reader = spawn_bounded_reader(
         stderr_read.into_raw() as usize,
         Arc::clone(&stderr_state),
         action.stderr_bound,
+        None,
     );
     let deadline = Instant::now() + action.timeout;
     let mut timed_out = false;
@@ -1831,7 +1944,15 @@ fn supervise_native_inner(
         let _ = resources.terminate_for_cleanup();
     }
     let stdout_reader_joined = stdout_reader.join_bounded(H7_CLEANUP_TIMEOUT);
+    options
+        .metrics
+        .reader_threads_remaining
+        .fetch_sub(1, Ordering::AcqRel);
     let stderr_reader_joined = stderr_reader.join_bounded(H7_CLEANUP_TIMEOUT);
+    options
+        .metrics
+        .reader_threads_remaining
+        .fetch_sub(1, Ordering::AcqRel);
     cleanup
         .stdout_reader_joined
         .store(stdout_reader_joined, Ordering::Release);
@@ -2793,8 +2914,13 @@ impl H7PendingConfirmationBridge {
         self.cancelled_notify.notify_waiters();
     }
 
-    async fn await_confirmation(&self, action: Arc<PreparedProcessAction>) -> Result<i64, String> {
-        if self.cancelled.load(Ordering::Acquire) {
+    async fn await_confirmation(
+        &self,
+        action: Arc<PreparedProcessAction>,
+        cancellation: &AtomicBool,
+        cancellation_notify: &Notify,
+    ) -> Result<i64, String> {
+        if cancellation.load(Ordering::Acquire) || self.cancelled.load(Ordering::Acquire) {
             return Err("D29-H7 process action was cancelled before confirmation".to_string());
         }
         let (response, receiver) = tokio::sync::oneshot::channel();
@@ -2804,6 +2930,7 @@ impl H7PendingConfirmationBridge {
         tokio::pin!(send);
         tokio::select! {
             result = &mut send => result.map_err(|_| "D29-H7 confirmation bridge closed".to_string())?,
+            _ = cancellation_notify.notified() => return Err("D29-H7 process action cancelled".to_string()),
             _ = self.cancelled_notify.notified() => return Err("D29-H7 process action cancelled".to_string()),
             _ = tokio::time::sleep(H7_CONFIRMATION_TIMEOUT) => return Err("D29-H7 confirmation timed out".to_string()),
         }
@@ -2812,6 +2939,7 @@ impl H7PendingConfirmationBridge {
                 result.map_err(|_| "D29-H7 confirmation timed out".to_string())?
                     .map_err(|_| "D29-H7 confirmation response closed".to_string())
             }
+            _ = cancellation_notify.notified() => Err("D29-H7 process action cancelled".to_string()),
             _ = self.cancelled_notify.notified() => Err("D29-H7 process action cancelled".to_string()),
         }
     }
@@ -2994,12 +3122,73 @@ impl H7ToolResult {
     }
 }
 
+struct H7ActiveCancellation {
+    token: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+}
+
+struct H7ActionCancellationGuard {
+    token: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+    active: Arc<Mutex<Option<H7ActiveCancellation>>>,
+    armed: bool,
+}
+
+impl H7ActionCancellationGuard {
+    fn new(
+        active: Arc<Mutex<Option<H7ActiveCancellation>>>,
+        token: Arc<AtomicBool>,
+        notify: Arc<Notify>,
+    ) -> Self {
+        *active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(H7ActiveCancellation {
+            token: Arc::clone(&token),
+            notify: Arc::clone(&notify),
+        });
+        Self {
+            token,
+            notify,
+            active,
+            armed: true,
+        }
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+        self.clear_active();
+    }
+
+    fn clear_active(&self) {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if active
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(&current.token, &self.token))
+        {
+            *active = None;
+        }
+    }
+}
+
+impl Drop for H7ActionCancellationGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.token.store(true, Ordering::Release);
+            self.notify.notify_waiters();
+            self.clear_active();
+        }
+    }
+}
+
 struct H7ProcessBroker {
     context: VitaExecutionContext,
     catalog: Arc<H7ExecutableCatalog>,
     authority: Arc<H7Authority>,
     bridge: Arc<H7PendingConfirmationBridge>,
-    cancellation: Arc<AtomicBool>,
+    active_cancellation: Arc<Mutex<Option<H7ActiveCancellation>>>,
     metrics: Arc<H7SupervisorMetrics>,
     final_fence_gate: Option<Arc<H7FinalFenceGate>>,
     post_host_gate: Option<Arc<H7PostHostFenceGate>>,
@@ -3020,7 +3209,7 @@ impl H7ProcessBroker {
             catalog,
             authority,
             bridge,
-            cancellation: Arc::new(AtomicBool::new(false)),
+            active_cancellation: Arc::new(Mutex::new(None)),
             metrics: Arc::new(H7SupervisorMetrics::default()),
             final_fence_gate: None,
             post_host_gate: None,
@@ -3059,7 +3248,15 @@ impl H7ProcessBroker {
     }
 
     fn cancel(&self) {
-        self.cancellation.store(true, Ordering::Release);
+        if let Some(active) = self
+            .active_cancellation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            active.token.store(true, Ordering::Release);
+            active.notify.notify_waiters();
+        }
         self.bridge.cancel();
     }
 
@@ -3068,12 +3265,46 @@ impl H7ProcessBroker {
     }
 
     async fn execute(self: &Arc<Self>, action: Arc<PreparedProcessAction>) -> H7ToolResult {
-        let authorization_revision = match self.bridge.await_confirmation(Arc::clone(&action)).await
+        self.execute_tool_action(action).await
+    }
+
+    async fn execute_tool_action(
+        self: &Arc<Self>,
+        action: Arc<PreparedProcessAction>,
+    ) -> H7ToolResult {
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let cancellation_notify = Arc::new(Notify::new());
+        let guard = H7ActionCancellationGuard::new(
+            Arc::clone(&self.active_cancellation),
+            Arc::clone(&cancellation),
+            Arc::clone(&cancellation_notify),
+        );
+        let result = self
+            .execute_with_cancellation(action, cancellation, cancellation_notify)
+            .await;
+        guard.disarm();
+        result
+    }
+
+    async fn execute_with_cancellation(
+        self: &Arc<Self>,
+        action: Arc<PreparedProcessAction>,
+        cancellation: Arc<AtomicBool>,
+        cancellation_notify: Arc<Notify>,
+    ) -> H7ToolResult {
+        let authorization_revision = match self
+            .bridge
+            .await_confirmation(
+                Arc::clone(&action),
+                cancellation.as_ref(),
+                cancellation_notify.as_ref(),
+            )
+            .await
         {
             Ok(revision) => revision,
             Err(_) => return H7ToolResult::denied(),
         };
-        if self.cancellation.load(Ordering::Acquire) {
+        if cancellation.load(Ordering::Acquire) {
             return H7ToolResult::denied();
         }
         let authority = Arc::clone(&self.authority);
@@ -3101,12 +3332,14 @@ impl H7ProcessBroker {
         }
         let authority = Arc::clone(&self.authority);
         let action_for_launch = Arc::clone(&action);
-        let cancellation = Arc::clone(&self.cancellation);
+        let cancellation = Arc::clone(&cancellation);
         let metrics = Arc::clone(&self.metrics);
         let fault = self.native_fault;
-        let post_host_gate = self.post_host_gate.clone();
+        let pre_create_process_gate = self.post_host_gate.clone();
         let post_host_mutation = self.post_host_mutation;
+        let worker_metrics = Arc::clone(&metrics);
         match tokio::task::spawn_blocking(move || {
+            let _worker = H7NativeWorkerGuard::new(worker_metrics);
             if cancellation.load(Ordering::Acquire) {
                 return H7ToolResult::denied();
             }
@@ -3117,9 +3350,6 @@ impl H7ProcessBroker {
             {
                 return H7ToolResult::denied();
             }
-            if let Some(gate) = post_host_gate {
-                gate.wait_if_armed_blocking();
-            }
             H7ToolResult::from_native(supervise_native_prepared(
                 &action_for_launch,
                 H7NativeOptions {
@@ -3128,6 +3358,7 @@ impl H7ProcessBroker {
                     fault,
                     unlisted_inheritable_handle,
                     post_host_mutation,
+                    pre_create_process_gate,
                 },
                 preparation,
                 Some(grant),
@@ -3178,6 +3409,26 @@ struct VitaProcessTool {
     tool_call_count: Arc<AtomicUsize>,
 }
 
+impl VitaProcessTool {
+    async fn execute_prepared_action(&self, action: Arc<PreparedProcessAction>) -> H7ToolResult {
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let cancellation_notify = Arc::new(Notify::new());
+        let guard = H7ActionCancellationGuard::new(
+            Arc::clone(&self.broker.active_cancellation),
+            Arc::clone(&cancellation),
+            Arc::clone(&cancellation_notify),
+        );
+        let result = self
+            .broker
+            .execute_with_cancellation(action, cancellation, cancellation_notify)
+            .await;
+        // This disarm is reached only after the action and its blocking worker
+        // have completed; dropping the ToolExecutorFuture earlier runs Drop.
+        guard.disarm();
+        result
+    }
+}
+
 impl<'call> ToolExecutor<ToolCall<'call>> for VitaProcessTool {
     fn tool_name(&self) -> ToolName {
         ToolName::plain(VITA_PROCESS_RUN_TOOL_NAME)
@@ -3205,6 +3456,7 @@ impl<'call> ToolExecutor<ToolCall<'call>> for VitaProcessTool {
     {
         self.tool_call_count.fetch_add(1, Ordering::AcqRel);
         let broker = Arc::clone(&self.broker);
+        let tool = self;
         Box::pin(async move {
             let result = match H7ProcessRequest::from_codex_call(&call).and_then(|request| {
                 broker
@@ -3212,7 +3464,7 @@ impl<'call> ToolExecutor<ToolCall<'call>> for VitaProcessTool {
                     .prepare_action(broker.context.clone(), request)
                     .map_err(|_| H7RequestError::InvalidRequest)
             }) {
-                Ok(action) => broker.execute(action).await,
+                Ok(action) => tool.execute_prepared_action(action).await,
                 Err(_) => H7ToolResult::denied(),
             };
             Ok(
@@ -3454,6 +3706,26 @@ mod tests {
         task.await.expect("D29-H7 cancelled broker task")
     }
 
+    async fn wait_h7_native_workers_quiet(metrics: Arc<H7SupervisorMetrics>) {
+        let deadline = Instant::now() + H7_CLEANUP_TIMEOUT;
+        while metrics.native_workers_active.load(Ordering::Acquire) != 0 {
+            let notified = metrics.native_worker_finished_notify.notified();
+            if metrics.native_workers_active.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "D29-H7 native worker did not exit");
+            tokio::time::timeout(remaining, notified)
+                .await
+                .expect("D29-H7 native worker exit wait");
+        }
+        assert_eq!(metrics.native_workers_active.load(Ordering::Acquire), 0);
+        assert_eq!(
+            metrics.native_workers_started.load(Ordering::Acquire),
+            metrics.native_workers_finished.load(Ordering::Acquire)
+        );
+    }
+
     fn assert_h7_zero_process_result(result: &H7ToolResult) {
         assert!(!result.process_created);
         assert_eq!(result.side_effect_count, 0);
@@ -3501,7 +3773,15 @@ mod tests {
             fault,
             unlisted_inheritable_handle: None,
             post_host_mutation: H7PostHostMutation::None,
+            pre_create_process_gate: None,
         }
+    }
+
+    fn h7_prepared_tool(broker: Arc<H7ProcessBroker>) -> Arc<VitaProcessTool> {
+        Arc::new(VitaProcessTool {
+            broker,
+            tool_call_count: Arc::new(AtomicUsize::new(0)),
+        })
     }
 
     fn parse_stdout(result: &H7ToolResult) -> Value {
@@ -3514,6 +3794,23 @@ mod tests {
         assert_eq!(result.side_effect_count, 1);
         assert!(!result.timed_out);
         assert!(!result.cancelled);
+    }
+
+    fn h7_attempt_same_length_overwrite(path: &Path, original: &[u8]) -> Result<(), String> {
+        let mut writer = OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(|error| error.to_string())?;
+        let attempt = writer
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| writer.write_all(&vec![b'X'; original.len()]))
+            .and_then(|_| writer.flush());
+        if attempt.is_ok() {
+            let _ = writer.seek(SeekFrom::Start(0));
+            let _ = writer.write_all(original);
+            let _ = writer.flush();
+        }
+        attempt.map_err(|error| error.to_string())
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4090,6 +4387,41 @@ mod tests {
     }
 
     #[test]
+    fn h7_post_create_cleanup_only_marks_verified_after_observed_exit() {
+        let _lock = lock_h7_tests();
+        let metrics = H7SupervisorMetrics::default();
+        let cleanup = super::H7CleanupEvidence::default();
+        let phase = AtomicU8::new(H7LaunchPhase::CreatedSuspended as u8);
+        assert!(!terminate_process_and_verify_exit(
+            std::ptr::null_mut(),
+            &phase,
+            &metrics,
+            &cleanup,
+        ));
+        assert!(cleanup.direct_termination_attempted.load(Ordering::Acquire));
+        assert!(!cleanup.direct_termination_verified.load(Ordering::Acquire));
+        assert!(!cleanup.process_exit_verified.load(Ordering::Acquire));
+        assert_eq!(
+            metrics.direct_termination_verified.load(Ordering::Acquire),
+            0
+        );
+
+        let harness = H7DirectHarness::new();
+        let result = supervise_native(
+            &harness.action(&["sleep", "2000"]),
+            native_options(
+                Arc::new(H7SupervisorMetrics::default()),
+                H7NativeLaunchFault::ForceThreadHandleFailure,
+            ),
+        );
+        assert!(result.process_created);
+        assert!(result.direct_termination_attempted);
+        assert!(result.direct_termination_verified);
+        assert!(result.process_exit_verified);
+        assert!(harness.authority.shutdown());
+    }
+
+    #[test]
     fn h7_panic_after_createprocess_really_leaves_zero_processes() {
         let _lock = lock_h7_tests();
         let harness = H7DirectHarness::new();
@@ -4243,6 +4575,116 @@ mod tests {
     }
 
     #[test]
+    fn h7_executable_same_length_write_after_preparation_is_blocked() {
+        let _lock = lock_h7_tests();
+        let harness = H7DirectHarness::new();
+        let action = harness.action(&["echo-argv", "immutable-before-launch"]);
+        let image_path = harness.catalog.entry.image_path.clone();
+        let original = fs::read(&image_path).expect("D29-H7 executable image bytes");
+        let overwrite = h7_attempt_same_length_overwrite(&image_path, &original);
+        assert!(
+            overwrite.is_err(),
+            "D29-H7 executable writer unexpectedly opened"
+        );
+        assert_eq!(fs::read(&image_path).unwrap(), original);
+        drop(action);
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_executable_same_length_write_after_host_pass_cannot_change_launched_image() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7DirectHarness::new();
+        let gate = H7PostHostFenceGate::new();
+        gate.arm();
+        let broker = harness.broker_with_post_host_gate(Arc::clone(&gate));
+        let action = harness.action(&["echo-argv", "immutable-after-host"]);
+        let image_path = harness.catalog.entry.image_path.clone();
+        let original = fs::read(&image_path).expect("D29-H7 executable image bytes");
+        let mut receiver = harness.receiver.take().unwrap();
+        let task = tokio::spawn({
+            let broker = Arc::clone(&broker);
+            async move { broker.execute(action).await }
+        });
+        let pending = receiver
+            .recv()
+            .await
+            .expect("D29-H7 post-Host executable mutation confirmation");
+        let revision = harness
+            .authority
+            .provision_confirmation(&pending.action)
+            .expect("D29-H7 post-Host executable mutation confirmation");
+        pending.response.send(revision).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), gate.wait_until_entered())
+            .await
+            .expect("D29-H7 final Host fence gate entry");
+        assert_eq!(
+            harness
+                .authority
+                .metrics
+                .final_revalidations
+                .load(Ordering::Acquire),
+            1
+        );
+        let overwrite = h7_attempt_same_length_overwrite(&image_path, &original);
+        assert!(
+            overwrite.is_err(),
+            "D29-H7 post-Host executable writer opened"
+        );
+        assert_eq!(fs::read(&image_path).unwrap(), original);
+        gate.release();
+        let result = task.await.unwrap();
+        assert_completed(&result);
+        assert_eq!(
+            parse_stdout(&result)["args"],
+            json!(["immutable-after-host"])
+        );
+        assert!(harness.authority.shutdown());
+    }
+
+    fn h7_stalled_reader_cancels_and_joins_boundedly() {
+        let (stdin_read, stdin_write, stdout_read, stdout_write, stderr_read, stderr_write) =
+            create_stdio_pipes().expect("D29-H7 stalled-reader pipes");
+        drop((stdin_read, stdin_write, stderr_read, stderr_write));
+        let state = H7ReaderState::new();
+        let stall = H7ReaderStallGate::new();
+        let mut reader = spawn_bounded_reader(
+            stdout_read.into_raw() as usize,
+            Arc::clone(&state),
+            1_024,
+            Some(Arc::clone(&stall)),
+        );
+        stall.wait_until_entered();
+        let started = Instant::now();
+        let joined = reader.join_bounded(Duration::from_millis(50));
+        let elapsed = started.elapsed();
+        drop(stdout_write);
+        assert!(joined);
+        assert!(state.cancelled.load(Ordering::Acquire));
+        assert!(state.finished.load(Ordering::Acquire));
+        assert!(elapsed < H7_CLEANUP_TIMEOUT);
+    }
+
+    #[test]
+    fn h7_reader_cleanup_never_uses_thread_termination() {
+        let source = include_str!("d29h7.rs");
+        let forbidden = ["Terminate", "Thread"].concat();
+        assert!(!source.contains(&forbidden));
+    }
+
+    #[test]
+    fn h7_stalled_stdout_reader_cancels_and_joins_boundedly() {
+        let _lock = lock_h7_tests();
+        h7_stalled_reader_cancels_and_joins_boundedly();
+    }
+
+    #[test]
+    fn h7_stalled_stderr_reader_cancels_and_joins_boundedly() {
+        let _lock = lock_h7_tests();
+        h7_stalled_reader_cancels_and_joins_boundedly();
+    }
+
+    #[test]
     fn h7_executable_intermediate_reparse_retarget_cannot_launch() {
         let _lock = lock_h7_tests();
         let root = tempdir().expect("D29-H7 namespace root");
@@ -4352,6 +4794,101 @@ mod tests {
                 .load(Ordering::Acquire),
             1
         );
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_outer_future_abort_after_host_pass_before_createprocess_creates_zero_processes() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7DirectHarness::new();
+        let gate = H7PostHostFenceGate::new();
+        gate.arm();
+        let broker = harness.broker_with_post_host_gate(Arc::clone(&gate));
+        let metrics = broker.metrics();
+        let tool = h7_prepared_tool(Arc::clone(&broker));
+        let action = harness.action(&["echo-argv", "outer-abort-before-create"]);
+        let mut receiver = harness.receiver.take().unwrap();
+        let task = tokio::spawn({
+            let tool = Arc::clone(&tool);
+            async move { tool.execute_prepared_action(action).await }
+        });
+        let pending = receiver
+            .recv()
+            .await
+            .expect("D29-H7 outer-abort pre-create confirmation");
+        let revision = harness
+            .authority
+            .provision_confirmation(&pending.action)
+            .expect("D29-H7 outer-abort pre-create confirmation");
+        pending.response.send(revision).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), gate.wait_until_entered())
+            .await
+            .expect("D29-H7 outer-abort pre-create gate entry");
+        assert_eq!(
+            harness
+                .authority
+                .metrics
+                .final_revalidations
+                .load(Ordering::Acquire),
+            1
+        );
+        task.abort();
+        assert!(task.await.is_err());
+        gate.release();
+        wait_h7_native_workers_quiet(Arc::clone(&metrics)).await;
+        assert_eq!(metrics.process_created.load(Ordering::Acquire), 0);
+        assert_eq!(metrics.automatic_retries.load(Ordering::Acquire), 0);
+        assert_eq!(metrics.reader_threads_remaining.load(Ordering::Acquire), 0);
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_outer_future_abort_after_createprocess_terminates_job() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7DirectHarness::new();
+        let broker = Arc::clone(&harness.broker);
+        let metrics = broker.metrics();
+        let tool = h7_prepared_tool(Arc::clone(&broker));
+        let action = harness.action(&["sleep", "2000"]);
+        let mut receiver = harness.receiver.take().unwrap();
+        let created = metrics.created_notify.notified();
+        let task = tokio::spawn({
+            let tool = Arc::clone(&tool);
+            async move { tool.execute_prepared_action(action).await }
+        });
+        let pending = receiver
+            .recv()
+            .await
+            .expect("D29-H7 outer-abort post-create confirmation");
+        let revision = harness
+            .authority
+            .provision_confirmation(&pending.action)
+            .expect("D29-H7 outer-abort post-create confirmation");
+        pending.response.send(revision).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), created)
+            .await
+            .expect("D29-H7 outer-abort process creation");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while metrics.job_assigned.load(Ordering::Acquire) == 0
+            || metrics.thread_resumed.load(Ordering::Acquire) == 0
+        {
+            assert!(
+                Instant::now() < deadline,
+                "D29-H7 outer-abort launch did not resume"
+            );
+            tokio::task::yield_now().await;
+        }
+        task.abort();
+        assert!(task.await.is_err());
+        wait_h7_native_workers_quiet(Arc::clone(&metrics)).await;
+        assert_eq!(metrics.process_created.load(Ordering::Acquire), 1);
+        assert_eq!(metrics.job_assigned.load(Ordering::Acquire), 1);
+        assert_eq!(metrics.thread_resumed.load(Ordering::Acquire), 1);
+        assert_eq!(metrics.jobs_terminated.load(Ordering::Acquire), 1);
+        assert_eq!(metrics.process_exit_verified.load(Ordering::Acquire), 1);
+        assert_eq!(metrics.process_tree_remaining.load(Ordering::Acquire), 0);
+        assert_eq!(metrics.reader_threads_remaining.load(Ordering::Acquire), 0);
+        assert_eq!(metrics.automatic_retries.load(Ordering::Acquire), 0);
         assert!(harness.authority.shutdown());
     }
 

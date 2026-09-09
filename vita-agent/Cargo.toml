@@ -41,6 +41,7 @@ zeroize = "=1.9.0"
 # audited API surface so this security contract cannot drift silently.
 windows-sys = { version = "=0.61.2", features = [
     "Win32_Foundation",
+    "Win32_Security_Cryptography",
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",

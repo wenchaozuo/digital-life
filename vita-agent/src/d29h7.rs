@@ -24,7 +24,7 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
@@ -35,15 +35,20 @@ use windows_sys::Wdk::Storage::FileSystem::{
     FILE_SYNCHRONOUS_IO_NONALERT,
 };
 use windows_sys::Win32::Foundation::{
-    CloseHandle, DuplicateHandle, GetLastError, SetHandleInformation, DUPLICATE_SAME_ACCESS, FALSE,
-    HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE,
-    UNICODE_STRING, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, DuplicateHandle, GetHandleInformation, GetLastError, SetHandleInformation,
+    DUPLICATE_SAME_ACCESS, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_OPERATION_ABORTED,
+    ERROR_PIPE_CONNECTED, FALSE, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+    OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE, UNICODE_STRING, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
+use windows_sys::Win32::Security::Cryptography::{
+    BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
 };
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, GetDriveTypeW, GetFileInformationByHandle, ReadFile, BY_HANDLE_FILE_INFORMATION,
-    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OVERLAPPED,
+    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ, OPEN_EXISTING, PIPE_ACCESS_INBOUND,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_WRITE, FILE_TRAVERSE, SYNCHRONIZE,
@@ -56,16 +61,21 @@ use windows_sys::Win32::System::JobObjects::{
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
-use windows_sys::Win32::System::Pipes::{CreatePipe, PeekNamedPipe};
+use windows_sys::Win32::System::Pipes::{
+    ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
+    PIPE_TYPE_BYTE, PIPE_WAIT,
+};
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess, GetExitCodeProcess,
-    InitializeProcThreadAttributeList, ResumeThread, TerminateProcess, UpdateProcThreadAttribute,
-    WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
-    EXTENDED_STARTUPINFO_PRESENT, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    CreateEventW, CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess,
+    GetExitCodeProcess, InitializeProcThreadAttributeList, ResetEvent, ResumeThread,
+    TerminateProcess, UpdateProcThreadAttribute, WaitForMultipleObjects, WaitForSingleObject,
+    CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
+    PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, STARTF_USESTDHANDLES, STARTUPINFOEXW,
 };
 use windows_sys::Win32::System::WindowsProgramming::DRIVE_REMOTE;
-use windows_sys::Win32::System::IO::{CancelIoEx, IO_STATUS_BLOCK};
+use windows_sys::Win32::System::IO::{
+    CancelIoEx, GetOverlappedResult, IO_STATUS_BLOCK, OVERLAPPED,
+};
 
 use crate::{sha256_hex, VitaExecutionContext};
 
@@ -981,6 +991,8 @@ struct H7SupervisorMetrics {
     native_workers_started: AtomicUsize,
     native_workers_finished: AtomicUsize,
     active_processes_peak: AtomicUsize,
+    pending_output_reads: AtomicUsize,
+    output_handles_active: AtomicUsize,
     created_notify: Notify,
     native_worker_finished_notify: Notify,
 }
@@ -1039,210 +1051,369 @@ struct H7NativeResult {
     process_exit_verified: bool,
     stdout_reader_joined: bool,
     stderr_reader_joined: bool,
+    pending_stdout_reads: usize,
+    pending_stderr_reads: usize,
+    stdout_retained_bytes: usize,
+    stderr_retained_bytes: usize,
+    output_handles_closed: bool,
 }
 
-struct H7ReaderState {
-    bytes: Mutex<Vec<u8>>,
-    overflow: AtomicBool,
-    cancelled: AtomicBool,
-    finished: AtomicBool,
-    cancellation_wait: Mutex<()>,
-    cancellation_notify: Condvar,
-}
+const H7_OUTPUT_SCRATCH_BYTES: usize = 8 * 1024;
 
-impl H7ReaderState {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            bytes: Mutex::new(Vec::new()),
-            overflow: AtomicBool::new(false),
-            cancelled: AtomicBool::new(false),
-            finished: AtomicBool::new(false),
-            cancellation_wait: Mutex::new(()),
-            cancellation_notify: Condvar::new(),
-        })
-    }
-
-    fn wait_for_cancellation(&self) {
-        let mut guard = self
-            .cancellation_wait
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while !self.cancelled.load(Ordering::Acquire) {
-            guard = self
-                .cancellation_notify
-                .wait(guard)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-        }
-    }
-}
-
-struct H7BoundedReader {
-    raw_handle: HANDLE,
-    state: Arc<H7ReaderState>,
-    thread: Option<JoinHandle<()>>,
-}
-
-impl H7BoundedReader {
-    fn cancel_io(&self) {
-        self.state.cancelled.store(true, Ordering::Release);
-        self.state.cancellation_notify.notify_all();
-        if !self.raw_handle.is_null() {
-            unsafe {
-                let _ = CancelIoEx(self.raw_handle, std::ptr::null_mut());
-            }
-        }
-    }
-
-    fn close_raw_handle(&mut self) {
-        if !self.raw_handle.is_null() {
-            unsafe {
-                CloseHandle(self.raw_handle);
-            }
-            self.raw_handle = std::ptr::null_mut();
-        }
-    }
-
-    fn join_bounded(&mut self, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
-        while !self.state.finished.load(Ordering::Acquire) && Instant::now() < deadline {
-            thread::yield_now();
-        }
-        if !self.state.finished.load(Ordering::Acquire) {
-            self.cancel_io();
-        }
-        // The reader owns no kernel handle of its own and never gets forcefully
-        // terminated.  Cancellation makes its only blocking operation
-        // interruptible; joining here is therefore the bounded, cooperative
-        // completion point.  Closing the pipe happens only after the join so
-        // CancelIoEx and the reader cannot race a HANDLE close/reuse.
-        let joined = self
-            .thread
-            .take()
-            .map(|thread| thread.join().is_ok())
-            .unwrap_or(true);
-        let finished = self.state.finished.load(Ordering::Acquire);
-        self.close_raw_handle();
-        joined && finished
-    }
-}
-
-impl Drop for H7BoundedReader {
-    fn drop(&mut self) {
-        if self.thread.is_some() {
-            let _ = self.join_bounded(H7_CLEANUP_TIMEOUT);
-        }
-    }
-}
-
-fn spawn_bounded_reader(
-    raw_handle: usize,
-    state: Arc<H7ReaderState>,
+struct H7OverlappedOutputCapture {
+    read: H7Handle,
+    child_write: H7Handle,
+    event: H7Handle,
+    overlapped: OVERLAPPED,
+    scratch: [u8; H7_OUTPUT_SCRATCH_BYTES],
+    bytes: Vec<u8>,
     bound: usize,
-    stall: Option<Arc<H7ReaderStallGate>>,
-) -> H7BoundedReader {
-    let reader_state = Arc::clone(&state);
-    let thread = thread::spawn(move || {
-        let raw_handle = raw_handle as HANDLE;
-        if let Some(stall) = stall.as_ref() {
-            stall.mark_entered();
-            reader_state.wait_for_cancellation();
-        }
-        let mut buffer = [0_u8; 8192];
-        loop {
-            if reader_state.cancelled.load(Ordering::Acquire) {
-                break;
-            }
-            let mut available = 0_u32;
-            let peeked = unsafe {
-                PeekNamedPipe(
-                    raw_handle,
-                    std::ptr::null_mut(),
-                    0,
-                    std::ptr::null_mut(),
-                    &mut available,
-                    std::ptr::null_mut(),
-                )
-            } != 0;
-            if !peeked {
-                break;
-            }
-            if available == 0 {
-                thread::yield_now();
-                continue;
-            }
-            let mut read = 0_u32;
-            let current_size = reader_state
-                .bytes
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .len();
-            if current_size >= bound {
-                reader_state.overflow.store(true, Ordering::Release);
-            }
-            let ok = unsafe {
-                ReadFile(
-                    raw_handle,
-                    buffer.as_mut_ptr().cast(),
-                    available.min(buffer.len() as u32),
-                    &mut read,
-                    std::ptr::null_mut(),
-                )
-            };
-            if ok == 0 || read == 0 {
-                break;
-            }
-            let mut bytes = reader_state
-                .bytes
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let remaining = bound.saturating_sub(bytes.len());
-            let take = remaining.min(read as usize);
-            bytes.extend_from_slice(&buffer[..take]);
-            if take < read as usize {
-                reader_state.overflow.store(true, Ordering::Release);
-            }
-        }
-        reader_state.finished.store(true, Ordering::Release);
-    });
-    H7BoundedReader {
-        raw_handle: raw_handle as HANDLE,
-        state,
-        thread: Some(thread),
-    }
+    pending: bool,
+    complete: bool,
+    cancelled: bool,
+    overflow: bool,
+    error: Option<u32>,
 }
 
-struct H7ReaderStallGate {
-    entered: AtomicBool,
-    entered_wait: Mutex<()>,
-    entered_notify: Condvar,
-}
+unsafe impl Send for H7OverlappedOutputCapture {}
 
-impl H7ReaderStallGate {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            entered: AtomicBool::new(false),
-            entered_wait: Mutex::new(()),
-            entered_notify: Condvar::new(),
+impl H7OverlappedOutputCapture {
+    fn new(bound: usize, stream: &str) -> Result<Self, String> {
+        let pipe_name = h7_output_pipe_name(stream)?;
+        let read = unsafe {
+            CreateNamedPipeW(
+                pipe_name.as_ptr(),
+                PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                1,
+                H7_OUTPUT_SCRATCH_BYTES as u32,
+                H7_OUTPUT_SCRATCH_BYTES as u32,
+                1_000,
+                std::ptr::null(),
+            )
+        };
+        let read = H7Handle::new(read)?;
+        if unsafe { SetHandleInformation(read.raw(), HANDLE_FLAG_INHERIT, 0) } == 0 {
+            return Err(format!(
+                "H7 overlapped {} read handle inheritance restriction failed: {}",
+                stream,
+                unsafe { GetLastError() }
+            ));
+        }
+
+        let connect_event =
+            H7Handle::new(unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) })?;
+        let mut connect_overlapped = OVERLAPPED {
+            hEvent: connect_event.raw(),
+            ..Default::default()
+        };
+        let connected = unsafe { ConnectNamedPipe(read.raw(), &mut connect_overlapped) } != 0;
+        let connect_pending = if connected {
+            false
+        } else {
+            match unsafe { GetLastError() } {
+                ERROR_PIPE_CONNECTED => false,
+                ERROR_IO_PENDING => true,
+                error => {
+                    return Err(format!(
+                        "H7 overlapped {} named-pipe connect failed: {}",
+                        stream, error
+                    ));
+                }
+            }
+        };
+
+        let child_write = H7Handle::new(unsafe {
+            CreateFileW(
+                pipe_name.as_ptr(),
+                FILE_GENERIC_WRITE,
+                FILE_SHARE_READ,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            )
+        })?;
+        if unsafe {
+            SetHandleInformation(child_write.raw(), HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)
+        } == 0
+        {
+            return Err(format!(
+                "H7 overlapped {} child handle inheritance setup failed: {}",
+                stream,
+                unsafe { GetLastError() }
+            ));
+        }
+        if connect_pending {
+            if unsafe { WaitForSingleObject(connect_event.raw(), 2_000) } != WAIT_OBJECT_0 {
+                unsafe {
+                    let _ = CancelIoEx(read.raw(), &connect_overlapped);
+                }
+                return Err(format!(
+                    "H7 overlapped {} named-pipe connect timed out",
+                    stream
+                ));
+            }
+            let mut transferred = 0_u32;
+            if unsafe {
+                GetOverlappedResult(read.raw(), &connect_overlapped, &mut transferred, FALSE)
+            } == 0
+            {
+                return Err(format!(
+                    "H7 overlapped {} named-pipe connect completion failed: {}",
+                    stream,
+                    unsafe { GetLastError() }
+                ));
+            }
+        }
+
+        let event =
+            H7Handle::new(unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) })?;
+        if unsafe { SetHandleInformation(event.raw(), HANDLE_FLAG_INHERIT, 0) } == 0 {
+            return Err(format!(
+                "H7 overlapped {} completion event inheritance restriction failed: {}",
+                stream,
+                unsafe { GetLastError() }
+            ));
+        }
+        let overlapped = OVERLAPPED {
+            hEvent: event.raw(),
+            ..Default::default()
+        };
+        Ok(Self {
+            read,
+            child_write,
+            event,
+            overlapped,
+            scratch: [0_u8; H7_OUTPUT_SCRATCH_BYTES],
+            bytes: Vec::with_capacity(bound.min(H7_OUTPUT_SCRATCH_BYTES)),
+            bound,
+            pending: false,
+            complete: false,
+            cancelled: false,
+            overflow: false,
+            error: None,
         })
     }
 
-    fn mark_entered(&self) {
-        self.entered.store(true, Ordering::Release);
-        self.entered_notify.notify_all();
+    fn child_handle(&self) -> HANDLE {
+        self.child_write.raw()
     }
 
-    fn wait_until_entered(&self) {
-        let mut guard = self
-            .entered_wait
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while !self.entered.load(Ordering::Acquire) {
-            guard = self
-                .entered_notify
-                .wait(guard)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+    fn close_child_endpoint(&mut self) {
+        let child_write = std::mem::replace(&mut self.child_write, H7Handle(std::ptr::null_mut()));
+        drop(child_write);
+    }
+
+    fn event_handle(&self) -> HANDLE {
+        self.event.raw()
+    }
+
+    fn pending(&self) -> bool {
+        self.pending
+    }
+
+    fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    fn overflowed(&self) -> bool {
+        self.overflow
+    }
+
+    fn failed(&self) -> bool {
+        self.error.is_some()
+    }
+
+    fn retained_len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn arm_read(&mut self) {
+        if self.pending || self.complete {
+            return;
+        }
+        let remaining = self.bound.saturating_sub(self.bytes.len());
+        let requested = remaining
+            .saturating_add(1)
+            .min(H7_OUTPUT_SCRATCH_BYTES)
+            .max(1);
+        unsafe {
+            let _ = ResetEvent(self.event.raw());
+        }
+        self.overlapped = OVERLAPPED {
+            hEvent: self.event.raw(),
+            ..Default::default()
+        };
+        self.pending = true;
+        let started = unsafe {
+            ReadFile(
+                self.read.raw(),
+                self.scratch.as_mut_ptr().cast(),
+                requested as u32,
+                std::ptr::null_mut(),
+                &mut self.overlapped,
+            )
+        } != 0;
+        if started {
+            let _ = self.complete_pending();
+            return;
+        }
+        let error = unsafe { GetLastError() };
+        if error != ERROR_IO_PENDING {
+            self.pending = false;
+            self.complete = true;
+            self.cancelled = error == ERROR_OPERATION_ABORTED;
+            if error != ERROR_BROKEN_PIPE && error != ERROR_OPERATION_ABORTED {
+                self.error = Some(error);
+            }
         }
     }
+
+    fn complete_pending(&mut self) -> bool {
+        if !self.pending {
+            return self.complete;
+        }
+        let mut transferred = 0_u32;
+        let completed = unsafe {
+            GetOverlappedResult(self.read.raw(), &self.overlapped, &mut transferred, FALSE)
+        } != 0;
+        if !completed {
+            let error = unsafe { GetLastError() };
+            if error == ERROR_IO_PENDING {
+                return false;
+            }
+            self.pending = false;
+            self.complete = true;
+            self.cancelled = error == ERROR_OPERATION_ABORTED;
+            if error != ERROR_BROKEN_PIPE && error != ERROR_OPERATION_ABORTED {
+                self.error = Some(error);
+            }
+            unsafe {
+                let _ = ResetEvent(self.event.raw());
+            }
+            return true;
+        }
+        self.pending = false;
+        unsafe {
+            let _ = ResetEvent(self.event.raw());
+        }
+        if transferred == 0 {
+            self.complete = true;
+            return true;
+        }
+        let remaining = self.bound.saturating_sub(self.bytes.len());
+        let take = remaining.min(transferred as usize);
+        self.bytes.extend_from_slice(&self.scratch[..take]);
+        if take < transferred as usize {
+            self.overflow = true;
+            self.complete = true;
+        }
+        true
+    }
+
+    fn cancel_pending(&mut self) {
+        if self.pending {
+            unsafe {
+                let _ = CancelIoEx(self.read.raw(), &self.overlapped);
+            }
+        }
+    }
+
+    fn drain_until_terminal(&mut self, deadline: Instant) -> bool {
+        while self.pending {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let wait_ms = remaining.as_millis().min(u32::MAX as u128) as u32;
+            if unsafe { WaitForSingleObject(self.event.raw(), wait_ms) } != WAIT_OBJECT_0 {
+                return false;
+            }
+            let _ = self.complete_pending();
+        }
+        true
+    }
+}
+
+impl Drop for H7OverlappedOutputCapture {
+    fn drop(&mut self) {
+        if self.pending {
+            self.cancel_pending();
+            let _ = self.drain_until_terminal(Instant::now() + H7_CLEANUP_TIMEOUT);
+        }
+    }
+}
+
+fn update_h7_pending_output_metric(
+    metrics: &H7SupervisorMetrics,
+    stdout: &H7OverlappedOutputCapture,
+    stderr: &H7OverlappedOutputCapture,
+) {
+    metrics.pending_output_reads.store(
+        usize::from(stdout.pending()) + usize::from(stderr.pending()),
+        Ordering::Release,
+    );
+}
+
+fn cancel_and_drain_h7_output(
+    metrics: &H7SupervisorMetrics,
+    stdout: &mut H7OverlappedOutputCapture,
+    stderr: &mut H7OverlappedOutputCapture,
+) -> bool {
+    stdout.cancel_pending();
+    stderr.cancel_pending();
+    let deadline = Instant::now() + H7_CLEANUP_TIMEOUT;
+    let stdout_done = stdout.drain_until_terminal(deadline);
+    let stderr_done = stderr.drain_until_terminal(deadline);
+    update_h7_pending_output_metric(metrics, stdout, stderr);
+    stdout_done && stderr_done
+}
+
+struct H7OutputHandleGuard {
+    metrics: Arc<H7SupervisorMetrics>,
+    count: usize,
+}
+
+impl H7OutputHandleGuard {
+    fn new(metrics: Arc<H7SupervisorMetrics>, count: usize) -> Self {
+        metrics
+            .output_handles_active
+            .fetch_add(count, Ordering::AcqRel);
+        Self { metrics, count }
+    }
+}
+
+impl Drop for H7OutputHandleGuard {
+    fn drop(&mut self) {
+        self.metrics
+            .output_handles_active
+            .fetch_sub(self.count, Ordering::AcqRel);
+    }
+}
+
+fn h7_output_pipe_name(stream: &str) -> Result<Vec<u16>, String> {
+    let mut nonce = [0_u8; 16];
+    let status = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            nonce.as_mut_ptr(),
+            nonce.len() as u32,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status != 0 {
+        return Err(format!(
+            "H7 {} output pipe nonce generation failed: {}",
+            stream, status
+        ));
+    }
+    let nonce = nonce
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let name = format!(r"\\.\pipe\vita-h7-{stream}-{nonce}");
+    Ok(wide_null(OsStr::new(&name)))
 }
 
 #[derive(Default)]
@@ -1474,10 +1645,8 @@ struct H7LaunchPreparation {
     job: H7Handle,
     stdin_read: H7Handle,
     stdin_write: H7Handle,
-    stdout_read: H7Handle,
-    stdout_write: H7Handle,
-    stderr_read: H7Handle,
-    stderr_write: H7Handle,
+    stdout_capture: H7OverlappedOutputCapture,
+    stderr_capture: H7OverlappedOutputCapture,
     attributes: H7ProcThreadAttributes,
     application_name: Vec<u16>,
     command_line: Vec<u16>,
@@ -1518,13 +1687,14 @@ impl H7LaunchPreparation {
             return Err("H7 working-directory binding was not host-owned".to_string());
         }
         let job = create_job_object()?;
-        let (stdin_read, stdin_write, stdout_read, stdout_write, stderr_read, stderr_write) =
-            create_stdio_pipes()?;
+        let (stdin_read, stdin_write) = create_stdin_pipe()?;
+        let stdout_capture = H7OverlappedOutputCapture::new(action.stdout_bound, "stdout")?;
+        let stderr_capture = H7OverlappedOutputCapture::new(action.stderr_bound, "stderr")?;
         let mut attributes = H7ProcThreadAttributes::new(1)?;
         attributes.set_handle_list(vec![
             stdin_read.raw(),
-            stdout_write.raw(),
-            stderr_write.raw(),
+            stdout_capture.child_handle(),
+            stderr_capture.child_handle(),
         ])?;
         if let Some(raw) = unlisted_inheritable_handle {
             unsafe {
@@ -1547,10 +1717,8 @@ impl H7LaunchPreparation {
             job,
             stdin_read,
             stdin_write,
-            stdout_read,
-            stdout_write,
-            stderr_read,
-            stderr_write,
+            stdout_capture,
+            stderr_capture,
             attributes,
             application_name,
             command_line: argv_to_command_line(&action.argv),
@@ -1722,6 +1890,12 @@ fn supervise_native_prepared(
             process_exit_verified: cleanup.process_exit_verified.load(Ordering::Acquire),
             stdout_reader_joined: cleanup.stdout_reader_joined.load(Ordering::Acquire),
             stderr_reader_joined: cleanup.stderr_reader_joined.load(Ordering::Acquire),
+            pending_stdout_reads: 0,
+            pending_stderr_reads: 0,
+            stdout_retained_bytes: 0,
+            stderr_retained_bytes: 0,
+            output_handles_closed: cleanup.stdout_reader_joined.load(Ordering::Acquire)
+                && cleanup.stderr_reader_joined.load(Ordering::Acquire),
         },
     }
 }
@@ -1761,10 +1935,8 @@ fn supervise_native_inner(
         job,
         stdin_read,
         stdin_write,
-        stdout_read,
-        stdout_write,
-        stderr_read,
-        stderr_write,
+        mut stdout_capture,
+        mut stderr_capture,
         mut attributes,
         application_name,
         mut command_line,
@@ -1781,8 +1953,8 @@ fn supervise_native_inner(
     startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
     startup.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
     startup.StartupInfo.hStdInput = stdin_read.raw();
-    startup.StartupInfo.hStdOutput = stdout_write.raw();
-    startup.StartupInfo.hStdError = stderr_write.raw();
+    startup.StartupInfo.hStdOutput = stdout_capture.child_handle();
+    startup.StartupInfo.hStdError = stderr_capture.child_handle();
     startup.lpAttributeList = attributes.pointer().cast();
     let mut process_information: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     if let Some(gate) = options.pre_create_process_gate.as_ref() {
@@ -1822,8 +1994,8 @@ fn supervise_native_inner(
     options.metrics.created_notify.notify_waiters();
     drop(stdin_read);
     drop(stdin_write);
-    drop(stdout_write);
-    drop(stderr_write);
+    stdout_capture.close_child_endpoint();
+    stderr_capture.close_child_endpoint();
     let process = match H7Handle::new(process_information.hProcess) {
         Ok(handle) => handle,
         Err(_) => {
@@ -1890,77 +2062,130 @@ fn supervise_native_inner(
         .fetch_add(1, Ordering::AcqRel);
     cleanup.user_code_started.store(true, Ordering::Release);
     phase.store(H7LaunchPhase::Resumed as u8, Ordering::Release);
-    let stdout_state = H7ReaderState::new();
-    let stderr_state = H7ReaderState::new();
-    cleanup.stdout_reader_joined.store(false, Ordering::Release);
-    cleanup.stderr_reader_joined.store(false, Ordering::Release);
-    options
-        .metrics
-        .reader_threads_remaining
-        .fetch_add(2, Ordering::AcqRel);
-    let mut stdout_reader = spawn_bounded_reader(
-        stdout_read.into_raw() as usize,
-        Arc::clone(&stdout_state),
-        action.stdout_bound,
-        None,
-    );
-    let mut stderr_reader = spawn_bounded_reader(
-        stderr_read.into_raw() as usize,
-        Arc::clone(&stderr_state),
-        action.stderr_bound,
-        None,
-    );
+    let _output_handle_guard = H7OutputHandleGuard::new(Arc::clone(&options.metrics), 4);
+    let mut stdout_capture = stdout_capture;
+    let mut stderr_capture = stderr_capture;
     let deadline = Instant::now() + action.timeout;
+    let cleanup_deadline = Instant::now() + H7_CLEANUP_TIMEOUT;
     let mut timed_out = false;
     let mut cancelled = false;
+    let mut output_failure = false;
+    let mut output_cleanup_bounded = true;
+    let mut process_signaled = false;
+
     loop {
         if options.cancellation.load(Ordering::Acquire) {
             cancelled = true;
             let _ = resources.terminate_assigned_job();
+            output_cleanup_bounded = cancel_and_drain_h7_output(
+                &options.metrics,
+                &mut stdout_capture,
+                &mut stderr_capture,
+            );
             break;
         }
-        if stdout_state.overflow.load(Ordering::Acquire)
-            || stderr_state.overflow.load(Ordering::Acquire)
-        {
+        stdout_capture.arm_read();
+        stderr_capture.arm_read();
+        update_h7_pending_output_metric(&options.metrics, &stdout_capture, &stderr_capture);
+        if stdout_capture.overflowed() || stderr_capture.overflowed() {
             let _ = resources.terminate_assigned_job();
+            output_cleanup_bounded = cancel_and_drain_h7_output(
+                &options.metrics,
+                &mut stdout_capture,
+                &mut stderr_capture,
+            );
             break;
         }
-        let wait = unsafe { WaitForSingleObject(resources.process.raw(), 20) };
+        if stdout_capture.failed() || stderr_capture.failed() {
+            output_failure = true;
+            let _ = resources.terminate_assigned_job();
+            output_cleanup_bounded = cancel_and_drain_h7_output(
+                &options.metrics,
+                &mut stdout_capture,
+                &mut stderr_capture,
+            );
+            break;
+        }
+        if process_signaled && stdout_capture.is_complete() && stderr_capture.is_complete() {
+            break;
+        }
+
+        let wait_deadline = if process_signaled {
+            cleanup_deadline
+        } else {
+            deadline
+        };
+        let remaining = wait_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            if process_signaled {
+                output_failure = true;
+            } else {
+                timed_out = true;
+            }
+            let _ = resources.terminate_assigned_job();
+            output_cleanup_bounded = cancel_and_drain_h7_output(
+                &options.metrics,
+                &mut stdout_capture,
+                &mut stderr_capture,
+            );
+            break;
+        }
+        let wait_ms = remaining.as_millis().min(20).max(1) as u32;
+        let handles = [
+            resources.process.raw(),
+            stdout_capture.event_handle(),
+            stderr_capture.event_handle(),
+        ];
+        let wait = unsafe {
+            WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), FALSE, wait_ms)
+        };
         if wait == WAIT_OBJECT_0 {
-            phase.store(H7LaunchPhase::Exited as u8, Ordering::Release);
-            options
-                .metrics
-                .process_exited
-                .fetch_add(1, Ordering::AcqRel);
-            break;
-        }
-        if wait != WAIT_TIMEOUT || Instant::now() >= deadline {
-            timed_out = true;
+            if !process_signaled {
+                process_signaled = true;
+                phase.store(H7LaunchPhase::Exited as u8, Ordering::Release);
+                options
+                    .metrics
+                    .process_exited
+                    .fetch_add(1, Ordering::AcqRel);
+            }
+        } else if wait == WAIT_OBJECT_0 + 1 {
+            let _ = stdout_capture.complete_pending();
+            update_h7_pending_output_metric(&options.metrics, &stdout_capture, &stderr_capture);
+        } else if wait == WAIT_OBJECT_0 + 2 {
+            let _ = stderr_capture.complete_pending();
+            update_h7_pending_output_metric(&options.metrics, &stdout_capture, &stderr_capture);
+        } else if wait != WAIT_TIMEOUT {
+            output_failure = true;
             let _ = resources.terminate_assigned_job();
+            output_cleanup_bounded = cancel_and_drain_h7_output(
+                &options.metrics,
+                &mut stdout_capture,
+                &mut stderr_capture,
+            );
             break;
         }
     }
     if !phase_at_least(&phase, H7LaunchPhase::Exited) && !resources.job_terminated {
         let _ = resources.terminate_for_cleanup();
     }
-    let stdout_reader_joined = stdout_reader.join_bounded(H7_CLEANUP_TIMEOUT);
-    options
-        .metrics
-        .reader_threads_remaining
-        .fetch_sub(1, Ordering::AcqRel);
-    let stderr_reader_joined = stderr_reader.join_bounded(H7_CLEANUP_TIMEOUT);
-    options
-        .metrics
-        .reader_threads_remaining
-        .fetch_sub(1, Ordering::AcqRel);
+    if stdout_capture.pending() || stderr_capture.pending() {
+        output_cleanup_bounded =
+            cancel_and_drain_h7_output(&options.metrics, &mut stdout_capture, &mut stderr_capture)
+                && output_cleanup_bounded;
+    }
+    update_h7_pending_output_metric(&options.metrics, &stdout_capture, &stderr_capture);
+    // Compatibility fields retained from the R2 result shape.  R3 has no
+    // reader threads to join; a stream is cleanup-complete once it has no
+    // outstanding overlapped read, including the pre-arm cancellation race.
+    let stdout_reader_joined = !stdout_capture.pending();
+    let stderr_reader_joined = !stderr_capture.pending();
     cleanup
         .stdout_reader_joined
         .store(stdout_reader_joined, Ordering::Release);
     cleanup
         .stderr_reader_joined
         .store(stderr_reader_joined, Ordering::Release);
-    let output_limited = stdout_state.overflow.load(Ordering::Acquire)
-        || stderr_state.overflow.load(Ordering::Acquire);
+    let output_limited = stdout_capture.overflowed() || stderr_capture.overflowed();
     if output_limited && !phase_at_least(&phase, H7LaunchPhase::Exited) && !resources.job_terminated
     {
         let _ = resources.terminate_for_cleanup();
@@ -1988,18 +2213,27 @@ fn supervise_native_inner(
     } else {
         usize::MAX
     };
-    let stdout = stdout_state
-        .bytes
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
-    let stderr = stderr_state
-        .bytes
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
+    let pending_stdout_reads = usize::from(stdout_capture.pending());
+    let pending_stderr_reads = usize::from(stderr_capture.pending());
+    let stdout_retained_bytes = stdout_capture.retained_len();
+    let stderr_retained_bytes = stderr_capture.retained_len();
+    let stdout = std::mem::take(&mut stdout_capture.bytes);
+    let stderr = std::mem::take(&mut stderr_capture.bytes);
+    drop(stdout_capture);
+    drop(stderr_capture);
+    options
+        .metrics
+        .pending_output_reads
+        .store(0, Ordering::Release);
+    let output_handles_closed = options
+        .metrics
+        .output_handles_active
+        .load(Ordering::Acquire)
+        == 4;
+    drop(_output_handle_guard);
     let termination_unproven =
-        (output_limited || cancelled || timed_out) && !resources.job_terminated;
+        (output_limited || cancelled || timed_out || output_failure || !output_cleanup_bounded)
+            && !resources.job_terminated;
     let kind = if termination_unproven {
         H7NativeOutcomeKind::StartedOutcomeUnknown
     } else if output_limited {
@@ -2029,6 +2263,11 @@ fn supervise_native_inner(
         process_exit_verified,
         stdout_reader_joined,
         stderr_reader_joined,
+        pending_stdout_reads,
+        pending_stderr_reads,
+        stdout_retained_bytes,
+        stderr_retained_bytes,
+        output_handles_closed,
     }
 }
 
@@ -2094,6 +2333,11 @@ fn launch_failed(
         process_exit_verified,
         stdout_reader_joined,
         stderr_reader_joined,
+        pending_stdout_reads: 0,
+        pending_stderr_reads: 0,
+        stdout_retained_bytes: 0,
+        stderr_retained_bytes: 0,
+        output_handles_closed: stdout_reader_joined && stderr_reader_joined,
     }
 }
 
@@ -2123,47 +2367,31 @@ fn create_job_object() -> Result<H7Handle, String> {
     Ok(job)
 }
 
-fn create_stdio_pipes(
-) -> Result<(H7Handle, H7Handle, H7Handle, H7Handle, H7Handle, H7Handle), String> {
-    fn one_pipe() -> Result<(H7Handle, H7Handle), String> {
-        let mut read = std::ptr::null_mut();
-        let mut write = std::ptr::null_mut();
-        if unsafe {
-            CreatePipe(
-                &mut read,
-                &mut write,
-                std::ptr::null::<SECURITY_ATTRIBUTES>(),
-                0,
-            )
-        } == 0
-        {
-            return Err("H7 stdio pipe creation failed".to_string());
-        }
-        Ok((H7Handle::new(read)?, H7Handle::new(write)?))
+fn create_stdin_pipe() -> Result<(H7Handle, H7Handle), String> {
+    let mut read = std::ptr::null_mut();
+    let mut write = std::ptr::null_mut();
+    if unsafe {
+        windows_sys::Win32::System::Pipes::CreatePipe(
+            &mut read,
+            &mut write,
+            std::ptr::null::<SECURITY_ATTRIBUTES>(),
+            0,
+        )
+    } == 0
+    {
+        return Err("H7 stdin pipe creation failed".to_string());
     }
-    let (stdin_read, stdin_write) = one_pipe()?;
-    let (stdout_read, stdout_write) = one_pipe()?;
-    let (stderr_read, stderr_write) = one_pipe()?;
-    for handle in [&stdin_write, &stdout_read, &stderr_read] {
-        if unsafe { SetHandleInformation(handle.raw(), HANDLE_FLAG_INHERIT, 0) } == 0 {
-            return Err("H7 parent stdio handle inheritance restriction failed".to_string());
-        }
+    let stdin_read = H7Handle::new(read)?;
+    let stdin_write = H7Handle::new(write)?;
+    if unsafe { SetHandleInformation(stdin_write.raw(), HANDLE_FLAG_INHERIT, 0) } == 0 {
+        return Err("H7 parent stdin handle inheritance restriction failed".to_string());
     }
-    for handle in [&stdin_read, &stdout_write, &stderr_write] {
-        if unsafe { SetHandleInformation(handle.raw(), HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) }
-            == 0
-        {
-            return Err("H7 child stdio handle inheritance setup failed".to_string());
-        }
+    if unsafe { SetHandleInformation(stdin_read.raw(), HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) }
+        == 0
+    {
+        return Err("H7 child stdin handle inheritance setup failed".to_string());
     }
-    Ok((
-        stdin_read,
-        stdin_write,
-        stdout_read,
-        stdout_write,
-        stderr_read,
-        stderr_write,
-    ))
+    Ok((stdin_read, stdin_write))
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -3054,6 +3282,11 @@ struct H7ToolResult {
     process_exit_verified: bool,
     stdout_reader_joined: bool,
     stderr_reader_joined: bool,
+    pending_stdout_reads: usize,
+    pending_stderr_reads: usize,
+    stdout_retained_bytes: usize,
+    stderr_retained_bytes: usize,
+    output_handles_closed: bool,
 }
 
 impl H7ToolResult {
@@ -3075,6 +3308,11 @@ impl H7ToolResult {
             process_exit_verified: false,
             stdout_reader_joined: true,
             stderr_reader_joined: true,
+            pending_stdout_reads: 0,
+            pending_stderr_reads: 0,
+            stdout_retained_bytes: 0,
+            stderr_retained_bytes: 0,
+            output_handles_closed: true,
         }
     }
 
@@ -3105,6 +3343,11 @@ impl H7ToolResult {
             process_exit_verified: native.process_exit_verified,
             stdout_reader_joined: native.stdout_reader_joined,
             stderr_reader_joined: native.stderr_reader_joined,
+            pending_stdout_reads: native.pending_stdout_reads,
+            pending_stderr_reads: native.pending_stderr_reads,
+            stdout_retained_bytes: native.stdout_retained_bytes,
+            stderr_retained_bytes: native.stderr_retained_bytes,
+            output_handles_closed: native.output_handles_closed,
         }
     }
 
@@ -3644,6 +3887,20 @@ mod tests {
             .send(revision)
             .expect("D29-H7 confirmation response");
         task.await.expect("D29-H7 broker task")
+    }
+
+    async fn run_h7_approved_fixture(args: &[&str]) -> H7ToolResult {
+        let mut harness = H7DirectHarness::new();
+        let mut receiver = harness.receiver.take().unwrap();
+        let result = run_approved(
+            Arc::clone(&harness.broker),
+            Arc::clone(&harness.authority),
+            &mut receiver,
+            harness.action(args),
+        )
+        .await;
+        assert!(harness.authority.shutdown());
+        result
     }
 
     async fn run_with_final_host_fault(fault: H7HostResponseFault) -> H7ToolResult {
@@ -4569,8 +4826,9 @@ mod tests {
         )
         .await;
         assert_eq!(result.status, "started_and_cancelled");
-        assert!(result.stdout_reader_joined);
-        assert!(result.stderr_reader_joined);
+        assert_eq!(result.pending_stdout_reads, 0);
+        assert_eq!(result.pending_stderr_reads, 0);
+        assert!(result.output_handles_closed);
         assert!(harness.authority.shutdown());
     }
 
@@ -4642,27 +4900,166 @@ mod tests {
         assert!(harness.authority.shutdown());
     }
 
-    fn h7_stalled_reader_cancels_and_joins_boundedly() {
-        let (stdin_read, stdin_write, stdout_read, stdout_write, stderr_read, stderr_write) =
-            create_stdio_pipes().expect("D29-H7 stalled-reader pipes");
-        drop((stdin_read, stdin_write, stderr_read, stderr_write));
-        let state = H7ReaderState::new();
-        let stall = H7ReaderStallGate::new();
-        let mut reader = spawn_bounded_reader(
-            stdout_read.into_raw() as usize,
-            Arc::clone(&state),
-            1_024,
-            Some(Arc::clone(&stall)),
+    fn assert_h7_output_cleanup(result: &H7ToolResult) {
+        assert!(result.stdout_reader_joined);
+        assert!(result.stderr_reader_joined);
+        assert_eq!(result.pending_stdout_reads, 0);
+        assert_eq!(result.pending_stderr_reads, 0);
+        assert!(result.stdout_retained_bytes <= H7_STDOUT_BOUND);
+        assert!(result.stderr_retained_bytes <= H7_STDERR_BOUND);
+        assert!(result.output_handles_closed);
+    }
+
+    #[test]
+    fn h7_output_capture_uses_overlapped_io() {
+        let source = include_str!("d29h7.rs");
+        assert!(source.contains("CreateNamedPipeW"));
+        assert!(source.contains("FILE_FLAG_OVERLAPPED"));
+        assert!(source.contains("GetOverlappedResult"));
+        assert!(source.contains("ReadFile("));
+        let forbidden_peek = ["Peek", "NamedPipe"].concat();
+        let forbidden_reader = ["H7", "BoundedReader"].concat();
+        let forbidden_spawn = ["spawn", "_bounded_reader"].concat();
+        assert!(!source.contains(&forbidden_peek));
+        assert!(!source.contains(&forbidden_reader));
+        assert!(!source.contains(&forbidden_spawn));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_output_capture_has_zero_reader_threads() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7DirectHarness::new();
+        let metrics = harness.broker.metrics();
+        let mut receiver = harness.receiver.take().unwrap();
+        let result = run_approved(
+            Arc::clone(&harness.broker),
+            Arc::clone(&harness.authority),
+            &mut receiver,
+            harness.action(&["echo-argv", "no-output-reader-thread"]),
+        )
+        .await;
+        assert_h7_output_cleanup(&result);
+        assert_eq!(metrics.reader_threads_remaining.load(Ordering::Acquire), 0);
+        assert_eq!(metrics.pending_output_reads.load(Ordering::Acquire), 0);
+        assert_eq!(metrics.output_handles_active.load(Ordering::Acquire), 0);
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_stdout_exact_tail_is_preserved_on_fast_exit() {
+        let _lock = lock_h7_tests();
+        let result = run_h7_approved_fixture(&["fast-exit-both"]).await;
+        assert_eq!(result.status, "started_and_exited");
+        assert_eq!(result.stdout, "D29-H7 stdout exact tail\n");
+        assert_h7_output_cleanup(&result);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_stderr_exact_tail_is_preserved_on_fast_exit() {
+        let _lock = lock_h7_tests();
+        let result = run_h7_approved_fixture(&["fast-exit-both"]).await;
+        assert_eq!(result.status, "started_and_exited");
+        assert_eq!(result.stderr, "D29-H7 stderr exact tail\n");
+        assert_h7_output_cleanup(&result);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_stdout_overflow_terminates_job_with_pending_reads_zero() {
+        let _lock = lock_h7_tests();
+        let result = run_h7_approved_fixture(&["flood-stdout"]).await;
+        assert_eq!(result.status, "started_and_output_limited");
+        assert!(result.process_created);
+        assert!(result.job_terminated);
+        assert_eq!(result.process_tree_remaining, 0);
+        assert_h7_output_cleanup(&result);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_stderr_overflow_terminates_job_with_pending_reads_zero() {
+        let _lock = lock_h7_tests();
+        let result = run_h7_approved_fixture(&["flood-stderr"]).await;
+        assert_eq!(result.status, "started_and_output_limited");
+        assert!(result.process_created);
+        assert!(result.job_terminated);
+        assert_eq!(result.process_tree_remaining, 0);
+        assert_h7_output_cleanup(&result);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_timeout_cancels_all_pending_output_io() {
+        let _lock = lock_h7_tests();
+        let result = run_h7_approved_fixture(&["sleep", "2000"]).await;
+        assert_eq!(result.status, "started_and_timed_out");
+        assert!(result.process_created);
+        assert!(result.job_terminated);
+        assert!(result.process_exit_verified);
+        assert_eq!(result.process_tree_remaining, 0);
+        assert_h7_output_cleanup(&result);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_turn_cancel_cancels_all_pending_output_io() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7DirectHarness::new();
+        let mut receiver = harness.receiver.take().unwrap();
+        let result = run_cancelled(
+            Arc::clone(&harness.broker),
+            Arc::clone(&harness.authority),
+            &mut receiver,
+            harness.action(&["sleep", "2000"]),
+        )
+        .await;
+        assert_eq!(result.status, "started_and_cancelled");
+        assert!(result.job_terminated);
+        assert_h7_output_cleanup(&result);
+        assert!(harness.authority.shutdown());
+    }
+
+    #[test]
+    fn h7_output_completion_cancel_race_is_terminal_once() {
+        let _lock = lock_h7_tests();
+        let mut capture =
+            H7OverlappedOutputCapture::new(1_024, "completion-race").expect("H7 output capture");
+        capture.arm_read();
+        capture.cancel_pending();
+        assert!(capture.drain_until_terminal(Instant::now() + H7_CLEANUP_TIMEOUT));
+        assert!(!capture.pending());
+        assert!(capture.complete_pending());
+        assert!(capture.complete_pending());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_output_overflow_exit_race_is_output_limited() {
+        let _lock = lock_h7_tests();
+        let result = run_h7_approved_fixture(&["flood-stdout"]).await;
+        assert_eq!(result.status, "started_and_output_limited");
+        assert!(result.stdout_retained_bytes <= H7_STDOUT_BOUND);
+        assert_h7_output_cleanup(&result);
+    }
+
+    #[test]
+    fn h7_output_capture_handles_are_not_inherited() {
+        let _lock = lock_h7_tests();
+        let capture =
+            H7OverlappedOutputCapture::new(1_024, "inheritance").expect("H7 output capture");
+        let mut read_flags = 0_u32;
+        let mut event_flags = 0_u32;
+        let mut child_flags = 0_u32;
+        assert_ne!(
+            unsafe { GetHandleInformation(capture.read.raw(), &mut read_flags) },
+            0
         );
-        stall.wait_until_entered();
-        let started = Instant::now();
-        let joined = reader.join_bounded(Duration::from_millis(50));
-        let elapsed = started.elapsed();
-        drop(stdout_write);
-        assert!(joined);
-        assert!(state.cancelled.load(Ordering::Acquire));
-        assert!(state.finished.load(Ordering::Acquire));
-        assert!(elapsed < H7_CLEANUP_TIMEOUT);
+        assert_ne!(
+            unsafe { GetHandleInformation(capture.event.raw(), &mut event_flags) },
+            0
+        );
+        assert_ne!(
+            unsafe { GetHandleInformation(capture.child_handle(), &mut child_flags) },
+            0
+        );
+        assert_eq!(read_flags & HANDLE_FLAG_INHERIT, 0);
+        assert_eq!(event_flags & HANDLE_FLAG_INHERIT, 0);
+        assert_ne!(child_flags & HANDLE_FLAG_INHERIT, 0);
     }
 
     #[test]
@@ -4670,18 +5067,6 @@ mod tests {
         let source = include_str!("d29h7.rs");
         let forbidden = ["Terminate", "Thread"].concat();
         assert!(!source.contains(&forbidden));
-    }
-
-    #[test]
-    fn h7_stalled_stdout_reader_cancels_and_joins_boundedly() {
-        let _lock = lock_h7_tests();
-        h7_stalled_reader_cancels_and_joins_boundedly();
-    }
-
-    #[test]
-    fn h7_stalled_stderr_reader_cancels_and_joins_boundedly() {
-        let _lock = lock_h7_tests();
-        h7_stalled_reader_cancels_and_joins_boundedly();
     }
 
     #[test]
@@ -4887,6 +5272,48 @@ mod tests {
         assert_eq!(metrics.jobs_terminated.load(Ordering::Acquire), 1);
         assert_eq!(metrics.process_exit_verified.load(Ordering::Acquire), 1);
         assert_eq!(metrics.process_tree_remaining.load(Ordering::Acquire), 0);
+        assert_eq!(metrics.reader_threads_remaining.load(Ordering::Acquire), 0);
+        assert_eq!(metrics.pending_output_reads.load(Ordering::Acquire), 0);
+        assert_eq!(metrics.output_handles_active.load(Ordering::Acquire), 0);
+        assert_eq!(metrics.automatic_retries.load(Ordering::Acquire), 0);
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_outer_future_abort_cancels_all_pending_output_io() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7DirectHarness::new();
+        let broker = Arc::clone(&harness.broker);
+        let metrics = broker.metrics();
+        let tool = h7_prepared_tool(Arc::clone(&broker));
+        let action = harness.action(&["sleep", "2000"]);
+        let mut receiver = harness.receiver.take().unwrap();
+        let created = metrics.created_notify.notified();
+        let task = tokio::spawn({
+            let tool = Arc::clone(&tool);
+            async move { tool.execute_prepared_action(action).await }
+        });
+        let pending = receiver
+            .recv()
+            .await
+            .expect("D29-H7 output-cancel confirmation");
+        let revision = harness
+            .authority
+            .provision_confirmation(&pending.action)
+            .expect("D29-H7 output-cancel confirmation");
+        pending.response.send(revision).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), created)
+            .await
+            .expect("D29-H7 output-cancel process creation");
+        task.abort();
+        assert!(task.await.is_err());
+        wait_h7_native_workers_quiet(Arc::clone(&metrics)).await;
+        assert_eq!(metrics.process_created.load(Ordering::Acquire), 1);
+        assert_eq!(metrics.jobs_terminated.load(Ordering::Acquire), 1);
+        assert_eq!(metrics.process_exit_verified.load(Ordering::Acquire), 1);
+        assert_eq!(metrics.process_tree_remaining.load(Ordering::Acquire), 0);
+        assert_eq!(metrics.pending_output_reads.load(Ordering::Acquire), 0);
+        assert_eq!(metrics.output_handles_active.load(Ordering::Acquire), 0);
         assert_eq!(metrics.reader_threads_remaining.load(Ordering::Acquire), 0);
         assert_eq!(metrics.automatic_retries.load(Ordering::Acquire), 0);
         assert!(harness.authority.shutdown());

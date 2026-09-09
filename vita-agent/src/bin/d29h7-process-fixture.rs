@@ -82,6 +82,20 @@ fn run() -> Result<(), String> {
                 .map_err(|_| "stderr flush failed".to_string())?;
             std::thread::sleep(Duration::from_millis(1_000));
         }
+        "fast-exit-both" => {
+            io::stdout()
+                .write_all(b"D29-H7 stdout exact tail\n")
+                .map_err(|_| "stdout fast-exit write failed".to_string())?;
+            io::stderr()
+                .write_all(b"D29-H7 stderr exact tail\n")
+                .map_err(|_| "stderr fast-exit write failed".to_string())?;
+            io::stdout()
+                .flush()
+                .map_err(|_| "stdout fast-exit flush failed".to_string())?;
+            io::stderr()
+                .flush()
+                .map_err(|_| "stderr fast-exit flush failed".to_string())?;
+        }
         "attempt-child" => {
             let child = std::env::current_exe()
                 .map_err(|_| "fixture executable path unavailable".to_string())?;

@@ -96,6 +96,26 @@ fn run() -> Result<(), String> {
                 .flush()
                 .map_err(|_| "stderr fast-exit flush failed".to_string())?;
         }
+        "large-fast-exit-both" => {
+            let stdout = (0..(24 * 1024))
+                .map(|index| b'A' + (index % 26) as u8)
+                .collect::<Vec<_>>();
+            let stderr = (0..(24 * 1024))
+                .map(|index| b'a' + (index % 26) as u8)
+                .collect::<Vec<_>>();
+            io::stdout()
+                .write_all(&stdout)
+                .map_err(|_| "stdout large fast-exit write failed".to_string())?;
+            io::stderr()
+                .write_all(&stderr)
+                .map_err(|_| "stderr large fast-exit write failed".to_string())?;
+            io::stdout()
+                .flush()
+                .map_err(|_| "stdout large fast-exit flush failed".to_string())?;
+            io::stderr()
+                .flush()
+                .map_err(|_| "stderr large fast-exit flush failed".to_string())?;
+        }
         "attempt-child" => {
             let child = std::env::current_exe()
                 .map_err(|_| "fixture executable path unavailable".to_string())?;

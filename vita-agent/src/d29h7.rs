@@ -36,9 +36,10 @@ use windows_sys::Wdk::Storage::FileSystem::{
 };
 use windows_sys::Win32::Foundation::{
     CloseHandle, DuplicateHandle, GetHandleInformation, GetLastError, SetHandleInformation,
-    DUPLICATE_SAME_ACCESS, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_OPERATION_ABORTED,
-    ERROR_PIPE_CONNECTED, FALSE, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
-    OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE, UNICODE_STRING, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    DUPLICATE_SAME_ACCESS, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_NOT_FOUND,
+    ERROR_OPERATION_ABORTED, ERROR_PIPE_CONNECTED, FALSE, HANDLE, HANDLE_FLAG_INHERIT,
+    INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE, TRUE, UNICODE_STRING,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Cryptography::{
     BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
@@ -70,7 +71,8 @@ use windows_sys::Win32::System::Threading::{
     GetExitCodeProcess, InitializeProcThreadAttributeList, ResetEvent, ResumeThread,
     TerminateProcess, UpdateProcThreadAttribute, WaitForMultipleObjects, WaitForSingleObject,
     CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
-    PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    INFINITE, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, STARTF_USESTDHANDLES,
+    STARTUPINFOEXW,
 };
 use windows_sys::Win32::System::WindowsProgramming::DRIVE_REMOTE;
 use windows_sys::Win32::System::IO::{
@@ -1055,30 +1057,285 @@ struct H7NativeResult {
     pending_stderr_reads: usize,
     stdout_retained_bytes: usize,
     stderr_retained_bytes: usize,
-    output_handles_closed: bool,
 }
 
 const H7_OUTPUT_SCRATCH_BYTES: usize = 8 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum H7OverlappedState {
+    Idle,
+    Pending,
+    CancelRequested,
+    TerminalCompleted,
+    TerminalCancelled,
+    TerminalEof,
+    TerminalError(u32),
+}
+
+impl H7OverlappedState {
+    fn is_pending(self) -> bool {
+        matches!(self, Self::Pending | Self::CancelRequested)
+    }
+
+    fn is_terminal(self) -> bool {
+        !self.is_pending() && !matches!(self, Self::Idle)
+    }
+}
+
+#[derive(Default)]
+struct H7TerminalityGate {
+    cancel_requested: AtomicBool,
+    allow_terminal: AtomicBool,
+}
+
+#[derive(Default)]
+struct H7TerminalityProbe {
+    drop_started: AtomicBool,
+    drop_finished: AtomicBool,
+    terminal_observed: AtomicBool,
+}
+
+#[derive(Default)]
+struct H7ConnectTerminalityProbe {
+    terminal_observed: AtomicBool,
+    dropped: AtomicBool,
+}
+
+struct H7ConnectOperation {
+    overlapped: Box<OVERLAPPED>,
+    state: H7OverlappedState,
+}
+
+struct H7OverlappedConnect {
+    read: HANDLE,
+    event: H7Handle,
+    operation: H7ConnectOperation,
+    probe: Option<Arc<H7ConnectTerminalityProbe>>,
+}
+
+impl H7OverlappedConnect {
+    fn new(read: HANDLE) -> Result<Self, String> {
+        let event =
+            H7Handle::new(unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) })?;
+        if unsafe { SetHandleInformation(event.raw(), HANDLE_FLAG_INHERIT, 0) } == 0 {
+            return Err(format!(
+                "H7 overlapped connect event inheritance restriction failed: {}",
+                unsafe { GetLastError() }
+            ));
+        }
+        Ok(Self {
+            read,
+            event,
+            operation: H7ConnectOperation {
+                overlapped: Box::new(OVERLAPPED::default()),
+                state: H7OverlappedState::Idle,
+            },
+            probe: None,
+        })
+    }
+
+    fn start(&mut self) -> Result<(), u32> {
+        self.operation.overlapped = Box::new(OVERLAPPED {
+            hEvent: self.event.raw(),
+            ..Default::default()
+        });
+        let connected =
+            unsafe { ConnectNamedPipe(self.read, self.operation.overlapped.as_mut()) } != 0;
+        if connected {
+            self.mark_terminal(H7OverlappedState::TerminalCompleted);
+            return Ok(());
+        }
+        match unsafe { GetLastError() } {
+            ERROR_PIPE_CONNECTED => {
+                self.mark_terminal(H7OverlappedState::TerminalCompleted);
+                Ok(())
+            }
+            ERROR_IO_PENDING => {
+                self.operation.state = H7OverlappedState::Pending;
+                Ok(())
+            }
+            error => {
+                self.mark_terminal(H7OverlappedState::TerminalError(error));
+                Err(error)
+            }
+        }
+    }
+
+    fn pending(&self) -> bool {
+        self.operation.state.is_pending()
+    }
+
+    fn error(&self) -> Option<u32> {
+        match self.operation.state {
+            H7OverlappedState::TerminalError(error) => Some(error),
+            _ => None,
+        }
+    }
+
+    fn mark_terminal(&mut self, state: H7OverlappedState) {
+        self.operation.state = state;
+        if let Some(probe) = self.probe.as_ref() {
+            probe.terminal_observed.store(true, Ordering::Release);
+        }
+    }
+
+    fn request_cancel(&mut self) {
+        if self.operation.state != H7OverlappedState::Pending {
+            return;
+        }
+        self.operation.state = H7OverlappedState::CancelRequested;
+        if unsafe { CancelIoEx(self.read, self.operation.overlapped.as_ref()) } == 0 {
+            let error = unsafe { GetLastError() };
+            if error != ERROR_NOT_FOUND {
+                // Cancellation remains only a request.  The event and
+                // GetOverlappedResult still prove terminality for every
+                // error, including ERROR_NOT_FOUND.
+            }
+        }
+    }
+
+    fn observe_terminal(&mut self) -> bool {
+        if !self.pending() {
+            return self.operation.state.is_terminal();
+        }
+        let mut transferred = 0_u32;
+        let completed = unsafe {
+            GetOverlappedResult(
+                self.read,
+                self.operation.overlapped.as_ref(),
+                &mut transferred,
+                FALSE,
+            )
+        } != 0;
+        if completed {
+            self.mark_terminal(H7OverlappedState::TerminalCompleted);
+            return true;
+        }
+        let error = unsafe { GetLastError() };
+        if error == ERROR_IO_PENDING {
+            unsafe {
+                let _ = ResetEvent(self.event.raw());
+            }
+            return false;
+        }
+        let state = if error == ERROR_OPERATION_ABORTED {
+            H7OverlappedState::TerminalCancelled
+        } else {
+            H7OverlappedState::TerminalError(error)
+        };
+        self.mark_terminal(state);
+        true
+    }
+
+    fn wait_for_terminal_until(&mut self, deadline: Instant) -> bool {
+        while self.pending() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                self.request_cancel();
+                self.wait_for_terminal_unbounded();
+                return false;
+            }
+            let wait_ms = remaining.as_millis().min(u32::MAX as u128) as u32;
+            match unsafe { WaitForSingleObject(self.event.raw(), wait_ms) } {
+                WAIT_OBJECT_0 => {
+                    let _ = self.observe_terminal();
+                }
+                WAIT_TIMEOUT => {
+                    self.request_cancel();
+                    self.wait_for_terminal_unbounded();
+                    return false;
+                }
+                _ => {
+                    self.request_cancel();
+                    self.wait_for_terminal_unbounded();
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn wait_for_terminal_unbounded(&mut self) {
+        while self.pending() {
+            let wait = unsafe { WaitForSingleObject(self.event.raw(), INFINITE) };
+            if wait == WAIT_OBJECT_0 {
+                if !self.observe_terminal() {
+                    thread::yield_now();
+                }
+                continue;
+            }
+            let mut transferred = 0_u32;
+            let completed = unsafe {
+                GetOverlappedResult(
+                    self.read,
+                    self.operation.overlapped.as_ref(),
+                    &mut transferred,
+                    TRUE,
+                )
+            } != 0;
+            if completed {
+                self.mark_terminal(H7OverlappedState::TerminalCompleted);
+                continue;
+            }
+            let error = unsafe { GetLastError() };
+            if error == ERROR_IO_PENDING {
+                thread::yield_now();
+                continue;
+            }
+            let state = if error == ERROR_OPERATION_ABORTED {
+                H7OverlappedState::TerminalCancelled
+            } else {
+                H7OverlappedState::TerminalError(error)
+            };
+            self.mark_terminal(state);
+        }
+    }
+}
+
+impl Drop for H7OverlappedConnect {
+    fn drop(&mut self) {
+        if self.pending() {
+            self.request_cancel();
+            self.wait_for_terminal_unbounded();
+        }
+        if let Some(probe) = self.probe.as_ref() {
+            probe.dropped.store(true, Ordering::Release);
+        }
+    }
+}
+
+struct H7OutputReadOperation {
+    overlapped: OVERLAPPED,
+    scratch: [u8; H7_OUTPUT_SCRATCH_BYTES],
+    state: H7OverlappedState,
+}
 
 struct H7OverlappedOutputCapture {
     read: H7Handle,
     child_write: H7Handle,
     event: H7Handle,
-    overlapped: OVERLAPPED,
-    scratch: [u8; H7_OUTPUT_SCRATCH_BYTES],
+    operation: Box<H7OutputReadOperation>,
     bytes: Vec<u8>,
     bound: usize,
-    pending: bool,
-    complete: bool,
-    cancelled: bool,
+    stream_complete: bool,
     overflow: bool,
-    error: Option<u32>,
+    terminality_gate: Option<Arc<H7TerminalityGate>>,
+    terminality_probe: Option<Arc<H7TerminalityProbe>>,
 }
 
 unsafe impl Send for H7OverlappedOutputCapture {}
 
 impl H7OverlappedOutputCapture {
     fn new(bound: usize, stream: &str) -> Result<Self, String> {
+        Self::new_inner(bound, stream, false, None)
+    }
+
+    fn new_inner(
+        bound: usize,
+        stream: &str,
+        force_connect_error: bool,
+        connect_probe: Option<Arc<H7ConnectTerminalityProbe>>,
+    ) -> Result<Self, String> {
         let pipe_name = h7_output_pipe_name(stream)?;
         let read = unsafe {
             CreateNamedPipeW(
@@ -1101,27 +1358,14 @@ impl H7OverlappedOutputCapture {
             ));
         }
 
-        let connect_event =
-            H7Handle::new(unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) })?;
-        let mut connect_overlapped = OVERLAPPED {
-            hEvent: connect_event.raw(),
-            ..Default::default()
-        };
-        let connected = unsafe { ConnectNamedPipe(read.raw(), &mut connect_overlapped) } != 0;
-        let connect_pending = if connected {
-            false
-        } else {
-            match unsafe { GetLastError() } {
-                ERROR_PIPE_CONNECTED => false,
-                ERROR_IO_PENDING => true,
-                error => {
-                    return Err(format!(
-                        "H7 overlapped {} named-pipe connect failed: {}",
-                        stream, error
-                    ));
-                }
-            }
-        };
+        let mut connect = H7OverlappedConnect::new(read.raw())?;
+        connect.probe = connect_probe;
+        connect.start().map_err(|error| {
+            format!(
+                "H7 overlapped {} named-pipe connect failed: {}",
+                stream, error
+            )
+        })?;
 
         let child_write = H7Handle::new(unsafe {
             CreateFileW(
@@ -1144,28 +1388,29 @@ impl H7OverlappedOutputCapture {
                 unsafe { GetLastError() }
             ));
         }
-        if connect_pending {
-            if unsafe { WaitForSingleObject(connect_event.raw(), 2_000) } != WAIT_OBJECT_0 {
-                unsafe {
-                    let _ = CancelIoEx(read.raw(), &connect_overlapped);
-                }
-                return Err(format!(
-                    "H7 overlapped {} named-pipe connect timed out",
-                    stream
-                ));
-            }
-            let mut transferred = 0_u32;
-            if unsafe {
-                GetOverlappedResult(read.raw(), &connect_overlapped, &mut transferred, FALSE)
-            } == 0
-            {
-                return Err(format!(
-                    "H7 overlapped {} named-pipe connect completion failed: {}",
-                    stream,
-                    unsafe { GetLastError() }
-                ));
-            }
+        if force_connect_error {
+            connect.request_cancel();
+            connect.wait_for_terminal_unbounded();
+            return Err(format!(
+                "D29-H7 injected named-pipe connect constructor failure for {}",
+                stream
+            ));
         }
+        if connect.pending()
+            && !connect.wait_for_terminal_until(Instant::now() + Duration::from_secs(2))
+        {
+            return Err(format!(
+                "H7 overlapped {} named-pipe connect timed out",
+                stream
+            ));
+        }
+        if let Some(error) = connect.error() {
+            return Err(format!(
+                "H7 overlapped {} named-pipe connect completion failed: {}",
+                stream, error
+            ));
+        }
+        drop(connect);
 
         let event =
             H7Handle::new(unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) })?;
@@ -1184,16 +1429,38 @@ impl H7OverlappedOutputCapture {
             read,
             child_write,
             event,
-            overlapped,
-            scratch: [0_u8; H7_OUTPUT_SCRATCH_BYTES],
+            operation: Box::new(H7OutputReadOperation {
+                overlapped,
+                scratch: [0_u8; H7_OUTPUT_SCRATCH_BYTES],
+                state: H7OverlappedState::Idle,
+            }),
             bytes: Vec::with_capacity(bound.min(H7_OUTPUT_SCRATCH_BYTES)),
             bound,
-            pending: false,
-            complete: false,
-            cancelled: false,
+            stream_complete: false,
             overflow: false,
-            error: None,
+            terminality_gate: None,
+            terminality_probe: None,
         })
+    }
+
+    #[cfg(test)]
+    fn new_for_connect_terminality_test(
+        bound: usize,
+        stream: &str,
+        probe: Arc<H7ConnectTerminalityProbe>,
+    ) -> Result<Self, String> {
+        Self::new_inner(bound, stream, true, Some(probe))
+    }
+
+    #[cfg(test)]
+    fn with_terminality_test_hooks(
+        mut self,
+        gate: Arc<H7TerminalityGate>,
+        probe: Arc<H7TerminalityProbe>,
+    ) -> Self {
+        self.terminality_gate = Some(gate);
+        self.terminality_probe = Some(probe);
+        self
     }
 
     fn child_handle(&self) -> HANDLE {
@@ -1210,11 +1477,11 @@ impl H7OverlappedOutputCapture {
     }
 
     fn pending(&self) -> bool {
-        self.pending
+        self.operation.state.is_pending()
     }
 
     fn is_complete(&self) -> bool {
-        self.complete
+        self.stream_complete
     }
 
     fn overflowed(&self) -> bool {
@@ -1222,7 +1489,7 @@ impl H7OverlappedOutputCapture {
     }
 
     fn failed(&self) -> bool {
-        self.error.is_some()
+        matches!(self.operation.state, H7OverlappedState::TerminalError(_))
     }
 
     fn retained_len(&self) -> usize {
@@ -1230,9 +1497,12 @@ impl H7OverlappedOutputCapture {
     }
 
     fn arm_read(&mut self) {
-        if self.pending || self.complete {
+        if self.pending() || self.stream_complete {
             return;
         }
+        debug_assert!(
+            self.operation.state == H7OverlappedState::Idle || self.operation.state.is_terminal()
+        );
         let remaining = self.bound.saturating_sub(self.bytes.len());
         let requested = remaining
             .saturating_add(1)
@@ -1241,18 +1511,18 @@ impl H7OverlappedOutputCapture {
         unsafe {
             let _ = ResetEvent(self.event.raw());
         }
-        self.overlapped = OVERLAPPED {
+        self.operation.overlapped = OVERLAPPED {
             hEvent: self.event.raw(),
             ..Default::default()
         };
-        self.pending = true;
+        self.operation.state = H7OverlappedState::Pending;
         let started = unsafe {
             ReadFile(
                 self.read.raw(),
-                self.scratch.as_mut_ptr().cast(),
+                self.operation.scratch.as_mut_ptr().cast(),
                 requested as u32,
                 std::ptr::null_mut(),
-                &mut self.overlapped,
+                &mut self.operation.overlapped,
             )
         } != 0;
         if started {
@@ -1261,67 +1531,110 @@ impl H7OverlappedOutputCapture {
         }
         let error = unsafe { GetLastError() };
         if error != ERROR_IO_PENDING {
-            self.pending = false;
-            self.complete = true;
-            self.cancelled = error == ERROR_OPERATION_ABORTED;
-            if error != ERROR_BROKEN_PIPE && error != ERROR_OPERATION_ABORTED {
-                self.error = Some(error);
-            }
+            self.mark_read_terminal(error, 0);
         }
     }
 
     fn complete_pending(&mut self) -> bool {
-        if !self.pending {
-            return self.complete;
+        if !self.pending() {
+            return self.operation.state.is_terminal();
+        }
+        if let Some(gate) = self.terminality_gate.as_ref() {
+            if gate.cancel_requested.load(Ordering::Acquire)
+                && !gate.allow_terminal.load(Ordering::Acquire)
+            {
+                thread::yield_now();
+                return false;
+            }
         }
         let mut transferred = 0_u32;
         let completed = unsafe {
-            GetOverlappedResult(self.read.raw(), &self.overlapped, &mut transferred, FALSE)
+            GetOverlappedResult(
+                self.read.raw(),
+                &self.operation.overlapped,
+                &mut transferred,
+                FALSE,
+            )
         } != 0;
         if !completed {
             let error = unsafe { GetLastError() };
             if error == ERROR_IO_PENDING {
+                unsafe {
+                    let _ = ResetEvent(self.event.raw());
+                }
                 return false;
             }
-            self.pending = false;
-            self.complete = true;
-            self.cancelled = error == ERROR_OPERATION_ABORTED;
-            if error != ERROR_BROKEN_PIPE && error != ERROR_OPERATION_ABORTED {
-                self.error = Some(error);
-            }
-            unsafe {
-                let _ = ResetEvent(self.event.raw());
-            }
+            self.mark_read_terminal(error, 0);
             return true;
         }
-        self.pending = false;
+        self.operation.state = H7OverlappedState::TerminalCompleted;
         unsafe {
             let _ = ResetEvent(self.event.raw());
         }
         if transferred == 0 {
-            self.complete = true;
+            self.operation.state = H7OverlappedState::TerminalEof;
+            self.stream_complete = true;
+            self.mark_read_terminal_observed();
             return true;
         }
         let remaining = self.bound.saturating_sub(self.bytes.len());
         let take = remaining.min(transferred as usize);
-        self.bytes.extend_from_slice(&self.scratch[..take]);
+        self.bytes
+            .extend_from_slice(&self.operation.scratch[..take]);
         if take < transferred as usize {
             self.overflow = true;
-            self.complete = true;
+            self.stream_complete = true;
         }
+        self.mark_read_terminal_observed();
         true
     }
 
-    fn cancel_pending(&mut self) {
-        if self.pending {
+    fn mark_read_terminal_observed(&self) {
+        if let Some(probe) = self.terminality_probe.as_ref() {
+            probe.terminal_observed.store(true, Ordering::Release);
+        }
+    }
+
+    fn mark_read_terminal(&mut self, error: u32, transferred: u32) {
+        self.operation.state = if error == ERROR_BROKEN_PIPE {
+            self.stream_complete = true;
+            H7OverlappedState::TerminalEof
+        } else if error == ERROR_OPERATION_ABORTED {
+            H7OverlappedState::TerminalCancelled
+        } else {
+            H7OverlappedState::TerminalError(error)
+        };
+        if transferred == 0 {
             unsafe {
-                let _ = CancelIoEx(self.read.raw(), &self.overlapped);
+                let _ = ResetEvent(self.event.raw());
+            }
+        }
+        self.mark_read_terminal_observed();
+    }
+
+    fn request_cancel(&mut self) {
+        if self.operation.state != H7OverlappedState::Pending {
+            return;
+        }
+        self.operation.state = H7OverlappedState::CancelRequested;
+        if let Some(gate) = self.terminality_gate.as_ref() {
+            gate.cancel_requested.store(true, Ordering::Release);
+        }
+        if unsafe { CancelIoEx(self.read.raw(), &self.operation.overlapped) } == 0 {
+            let error = unsafe { GetLastError() };
+            if error != ERROR_NOT_FOUND {
+                // ERROR_NOT_FOUND and every other failure still require the
+                // event plus GetOverlappedResult terminality proof.
             }
         }
     }
 
+    fn cancel_pending(&mut self) {
+        self.request_cancel();
+    }
+
     fn drain_until_terminal(&mut self, deadline: Instant) -> bool {
-        while self.pending {
+        while self.pending() {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return false;
@@ -1334,13 +1647,69 @@ impl H7OverlappedOutputCapture {
         }
         true
     }
+
+    fn wait_for_terminal_unbounded(&mut self) {
+        while self.pending() {
+            let wait = unsafe { WaitForSingleObject(self.event.raw(), INFINITE) };
+            if wait == WAIT_OBJECT_0 {
+                if !self.complete_pending() {
+                    thread::yield_now();
+                }
+                continue;
+            }
+            let mut transferred = 0_u32;
+            let completed = unsafe {
+                GetOverlappedResult(
+                    self.read.raw(),
+                    &self.operation.overlapped,
+                    &mut transferred,
+                    TRUE,
+                )
+            } != 0;
+            if completed {
+                self.operation.state = H7OverlappedState::TerminalCompleted;
+                if transferred == 0 {
+                    self.operation.state = H7OverlappedState::TerminalEof;
+                    self.stream_complete = true;
+                } else {
+                    let remaining = self.bound.saturating_sub(self.bytes.len());
+                    let take = remaining.min(transferred as usize);
+                    self.bytes
+                        .extend_from_slice(&self.operation.scratch[..take]);
+                    if take < transferred as usize {
+                        self.overflow = true;
+                        self.stream_complete = true;
+                    }
+                }
+                self.mark_read_terminal_observed();
+                continue;
+            }
+            let error = unsafe { GetLastError() };
+            if error == ERROR_IO_PENDING {
+                thread::yield_now();
+                continue;
+            }
+            self.mark_read_terminal(error, 0);
+        }
+    }
+
+    fn terminalize(&mut self) {
+        if self.pending() {
+            self.request_cancel();
+            self.wait_for_terminal_unbounded();
+        }
+        debug_assert!(!self.pending());
+    }
 }
 
 impl Drop for H7OverlappedOutputCapture {
     fn drop(&mut self) {
-        if self.pending {
-            self.cancel_pending();
-            let _ = self.drain_until_terminal(Instant::now() + H7_CLEANUP_TIMEOUT);
+        if let Some(probe) = self.terminality_probe.as_ref() {
+            probe.drop_started.store(true, Ordering::Release);
+        }
+        self.terminalize();
+        if let Some(probe) = self.terminality_probe.as_ref() {
+            probe.drop_finished.store(true, Ordering::Release);
         }
     }
 }
@@ -1354,6 +1723,20 @@ fn update_h7_pending_output_metric(
         usize::from(stdout.pending()) + usize::from(stderr.pending()),
         Ordering::Release,
     );
+}
+
+fn service_h7_ready_output_events(
+    stdout: &mut H7OverlappedOutputCapture,
+    stderr: &mut H7OverlappedOutputCapture,
+) {
+    if stdout.pending() && unsafe { WaitForSingleObject(stdout.event_handle(), 0) } == WAIT_OBJECT_0
+    {
+        let _ = stdout.complete_pending();
+    }
+    if stderr.pending() && unsafe { WaitForSingleObject(stderr.event_handle(), 0) } == WAIT_OBJECT_0
+    {
+        let _ = stderr.complete_pending();
+    }
 }
 
 fn cancel_and_drain_h7_output(
@@ -1894,8 +2277,6 @@ fn supervise_native_prepared(
             pending_stderr_reads: 0,
             stdout_retained_bytes: 0,
             stderr_retained_bytes: 0,
-            output_handles_closed: cleanup.stdout_reader_joined.load(Ordering::Acquire)
-                && cleanup.stderr_reader_joined.load(Ordering::Acquire),
         },
     }
 }
@@ -2066,7 +2447,7 @@ fn supervise_native_inner(
     let mut stdout_capture = stdout_capture;
     let mut stderr_capture = stderr_capture;
     let deadline = Instant::now() + action.timeout;
-    let cleanup_deadline = Instant::now() + H7_CLEANUP_TIMEOUT;
+    let mut output_drain_deadline = None;
     let mut timed_out = false;
     let mut cancelled = false;
     let mut output_failure = false;
@@ -2076,7 +2457,9 @@ fn supervise_native_inner(
     loop {
         if options.cancellation.load(Ordering::Acquire) {
             cancelled = true;
-            let _ = resources.terminate_assigned_job();
+            if !process_signaled {
+                let _ = resources.terminate_assigned_job();
+            }
             output_cleanup_bounded = cancel_and_drain_h7_output(
                 &options.metrics,
                 &mut stdout_capture,
@@ -2086,9 +2469,12 @@ fn supervise_native_inner(
         }
         stdout_capture.arm_read();
         stderr_capture.arm_read();
+        service_h7_ready_output_events(&mut stdout_capture, &mut stderr_capture);
         update_h7_pending_output_metric(&options.metrics, &stdout_capture, &stderr_capture);
         if stdout_capture.overflowed() || stderr_capture.overflowed() {
-            let _ = resources.terminate_assigned_job();
+            if !process_signaled {
+                let _ = resources.terminate_assigned_job();
+            }
             output_cleanup_bounded = cancel_and_drain_h7_output(
                 &options.metrics,
                 &mut stdout_capture,
@@ -2098,7 +2484,9 @@ fn supervise_native_inner(
         }
         if stdout_capture.failed() || stderr_capture.failed() {
             output_failure = true;
-            let _ = resources.terminate_assigned_job();
+            if !process_signaled {
+                let _ = resources.terminate_assigned_job();
+            }
             output_cleanup_bounded = cancel_and_drain_h7_output(
                 &options.metrics,
                 &mut stdout_capture,
@@ -2111,7 +2499,7 @@ fn supervise_native_inner(
         }
 
         let wait_deadline = if process_signaled {
-            cleanup_deadline
+            output_drain_deadline.expect("D29-H7 output drain deadline")
         } else {
             deadline
         };
@@ -2119,51 +2507,79 @@ fn supervise_native_inner(
         if remaining.is_zero() {
             if process_signaled {
                 output_failure = true;
+                output_cleanup_bounded = cancel_and_drain_h7_output(
+                    &options.metrics,
+                    &mut stdout_capture,
+                    &mut stderr_capture,
+                );
             } else {
                 timed_out = true;
+                let _ = resources.terminate_assigned_job();
+                output_cleanup_bounded = cancel_and_drain_h7_output(
+                    &options.metrics,
+                    &mut stdout_capture,
+                    &mut stderr_capture,
+                );
             }
-            let _ = resources.terminate_assigned_job();
-            output_cleanup_bounded = cancel_and_drain_h7_output(
-                &options.metrics,
-                &mut stdout_capture,
-                &mut stderr_capture,
-            );
             break;
         }
         let wait_ms = remaining.as_millis().min(20).max(1) as u32;
-        let handles = [
-            resources.process.raw(),
-            stdout_capture.event_handle(),
-            stderr_capture.event_handle(),
-        ];
-        let wait = unsafe {
-            WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), FALSE, wait_ms)
-        };
-        if wait == WAIT_OBJECT_0 {
-            if !process_signaled {
+        if process_signaled {
+            let handles = [stdout_capture.event_handle(), stderr_capture.event_handle()];
+            let wait = unsafe {
+                WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), FALSE, wait_ms)
+            };
+            if wait == WAIT_OBJECT_0 {
+                let _ = stdout_capture.complete_pending();
+            } else if wait == WAIT_OBJECT_0 + 1 {
+                let _ = stderr_capture.complete_pending();
+            } else if wait != WAIT_TIMEOUT {
+                output_failure = true;
+                output_cleanup_bounded = cancel_and_drain_h7_output(
+                    &options.metrics,
+                    &mut stdout_capture,
+                    &mut stderr_capture,
+                );
+                break;
+            }
+        } else {
+            let handles = [
+                resources.process.raw(),
+                stdout_capture.event_handle(),
+                stderr_capture.event_handle(),
+            ];
+            let wait = unsafe {
+                WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), FALSE, wait_ms)
+            };
+            if wait == WAIT_OBJECT_0 {
                 process_signaled = true;
+                output_drain_deadline = Some(Instant::now() + H7_CLEANUP_TIMEOUT);
                 phase.store(H7LaunchPhase::Exited as u8, Ordering::Release);
                 options
                     .metrics
                     .process_exited
                     .fetch_add(1, Ordering::AcqRel);
+                // The process HANDLE is removed from all subsequent waits.
+                // Consume both already-signaled output events before entering
+                // the output-only drain phase.
+                service_h7_ready_output_events(&mut stdout_capture, &mut stderr_capture);
+                update_h7_pending_output_metric(&options.metrics, &stdout_capture, &stderr_capture);
+            } else if wait == WAIT_OBJECT_0 + 1 {
+                let _ = stdout_capture.complete_pending();
+            } else if wait == WAIT_OBJECT_0 + 2 {
+                let _ = stderr_capture.complete_pending();
+            } else if wait != WAIT_TIMEOUT {
+                output_failure = true;
+                let _ = resources.terminate_assigned_job();
+                output_cleanup_bounded = cancel_and_drain_h7_output(
+                    &options.metrics,
+                    &mut stdout_capture,
+                    &mut stderr_capture,
+                );
+                break;
             }
-        } else if wait == WAIT_OBJECT_0 + 1 {
-            let _ = stdout_capture.complete_pending();
-            update_h7_pending_output_metric(&options.metrics, &stdout_capture, &stderr_capture);
-        } else if wait == WAIT_OBJECT_0 + 2 {
-            let _ = stderr_capture.complete_pending();
-            update_h7_pending_output_metric(&options.metrics, &stdout_capture, &stderr_capture);
-        } else if wait != WAIT_TIMEOUT {
-            output_failure = true;
-            let _ = resources.terminate_assigned_job();
-            output_cleanup_bounded = cancel_and_drain_h7_output(
-                &options.metrics,
-                &mut stdout_capture,
-                &mut stderr_capture,
-            );
-            break;
         }
+        update_h7_pending_output_metric(&options.metrics, &stdout_capture, &stderr_capture);
     }
     if !phase_at_least(&phase, H7LaunchPhase::Exited) && !resources.job_terminated {
         let _ = resources.terminate_for_cleanup();
@@ -2173,6 +2589,12 @@ fn supervise_native_inner(
             cancel_and_drain_h7_output(&options.metrics, &mut stdout_capture, &mut stderr_capture)
                 && output_cleanup_bounded;
     }
+    // A bounded drain is only an observation deadline.  Ownership cannot be
+    // released while the kernel may still reference an OVERLAPPED operation;
+    // terminalize both operations before reading final evidence or dropping
+    // their buffers, even if the bounded phase had to report unknown.
+    stdout_capture.terminalize();
+    stderr_capture.terminalize();
     update_h7_pending_output_metric(&options.metrics, &stdout_capture, &stderr_capture);
     // Compatibility fields retained from the R2 result shape.  R3 has no
     // reader threads to join; a stream is cleanup-complete once it has no
@@ -2221,19 +2643,11 @@ fn supervise_native_inner(
     let stderr = std::mem::take(&mut stderr_capture.bytes);
     drop(stdout_capture);
     drop(stderr_capture);
-    options
-        .metrics
-        .pending_output_reads
-        .store(0, Ordering::Release);
-    let output_handles_closed = options
-        .metrics
-        .output_handles_active
-        .load(Ordering::Acquire)
-        == 4;
     drop(_output_handle_guard);
-    let termination_unproven =
-        (output_limited || cancelled || timed_out || output_failure || !output_cleanup_bounded)
-            && !resources.job_terminated;
+    let termination_unproven = ((cancelled || timed_out || (output_limited && !process_signaled))
+        && !resources.job_terminated)
+        || output_failure
+        || !output_cleanup_bounded;
     let kind = if termination_unproven {
         H7NativeOutcomeKind::StartedOutcomeUnknown
     } else if output_limited {
@@ -2267,7 +2681,6 @@ fn supervise_native_inner(
         pending_stderr_reads,
         stdout_retained_bytes,
         stderr_retained_bytes,
-        output_handles_closed,
     }
 }
 
@@ -2337,7 +2750,6 @@ fn launch_failed(
         pending_stderr_reads: 0,
         stdout_retained_bytes: 0,
         stderr_retained_bytes: 0,
-        output_handles_closed: stdout_reader_joined && stderr_reader_joined,
     }
 }
 
@@ -3286,7 +3698,6 @@ struct H7ToolResult {
     pending_stderr_reads: usize,
     stdout_retained_bytes: usize,
     stderr_retained_bytes: usize,
-    output_handles_closed: bool,
 }
 
 impl H7ToolResult {
@@ -3312,7 +3723,6 @@ impl H7ToolResult {
             pending_stderr_reads: 0,
             stdout_retained_bytes: 0,
             stderr_retained_bytes: 0,
-            output_handles_closed: true,
         }
     }
 
@@ -3347,7 +3757,6 @@ impl H7ToolResult {
             pending_stderr_reads: native.pending_stderr_reads,
             stdout_retained_bytes: native.stdout_retained_bytes,
             stderr_retained_bytes: native.stderr_retained_bytes,
-            output_handles_closed: native.output_handles_closed,
         }
     }
 
@@ -4817,6 +5226,7 @@ mod tests {
     async fn h7_reader_threads_join_boundedly_after_cancel() {
         let _lock = lock_h7_tests();
         let mut harness = H7DirectHarness::new();
+        let metrics = harness.broker.metrics();
         let mut receiver = harness.receiver.take().unwrap();
         let result = run_cancelled(
             Arc::clone(&harness.broker),
@@ -4828,7 +5238,7 @@ mod tests {
         assert_eq!(result.status, "started_and_cancelled");
         assert_eq!(result.pending_stdout_reads, 0);
         assert_eq!(result.pending_stderr_reads, 0);
-        assert!(result.output_handles_closed);
+        assert_eq!(metrics.output_handles_active.load(Ordering::Acquire), 0);
         assert!(harness.authority.shutdown());
     }
 
@@ -4907,7 +5317,15 @@ mod tests {
         assert_eq!(result.pending_stderr_reads, 0);
         assert!(result.stdout_retained_bytes <= H7_STDOUT_BOUND);
         assert!(result.stderr_retained_bytes <= H7_STDERR_BOUND);
-        assert!(result.output_handles_closed);
+    }
+
+    fn h7_large_fast_exit_bytes(start: u8) -> String {
+        String::from_utf8(
+            (0..(24 * 1024))
+                .map(|index| start + (index % 26) as u8)
+                .collect(),
+        )
+        .expect("D29-H7 large fast-exit bytes are ASCII")
     }
 
     #[test]
@@ -4964,6 +5382,40 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn h7_large_fast_exit_stdout_is_exact() {
+        let _lock = lock_h7_tests();
+        let result = run_h7_approved_fixture(&["large-fast-exit-both"]).await;
+        assert_eq!(result.status, "started_and_exited");
+        assert_eq!(result.stdout, h7_large_fast_exit_bytes(b'A'));
+        assert!(!result.timed_out);
+        assert!(!result.cancelled);
+        assert_h7_output_cleanup(&result);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_large_fast_exit_stderr_is_exact() {
+        let _lock = lock_h7_tests();
+        let result = run_h7_approved_fixture(&["large-fast-exit-both"]).await;
+        assert_eq!(result.status, "started_and_exited");
+        assert_eq!(result.stderr, h7_large_fast_exit_bytes(b'a'));
+        assert!(!result.timed_out);
+        assert!(!result.cancelled);
+        assert_h7_output_cleanup(&result);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_post_exit_output_events_are_not_starved_by_process_handle() {
+        let _lock = lock_h7_tests();
+        let result = run_h7_approved_fixture(&["large-fast-exit-both"]).await;
+        assert_eq!(result.status, "started_and_exited");
+        assert_eq!(result.stdout, h7_large_fast_exit_bytes(b'A'));
+        assert_eq!(result.stderr, h7_large_fast_exit_bytes(b'a'));
+        assert_eq!(result.pending_stdout_reads, 0);
+        assert_eq!(result.pending_stderr_reads, 0);
+        assert_h7_output_cleanup(&result);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn h7_stdout_overflow_terminates_job_with_pending_reads_zero() {
         let _lock = lock_h7_tests();
         let result = run_h7_approved_fixture(&["flood-stdout"]).await;
@@ -5015,6 +5467,108 @@ mod tests {
         assert!(harness.authority.shutdown());
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_timeout_stdout_pending_read_reaches_terminal() {
+        let _lock = lock_h7_tests();
+        let result = run_h7_approved_fixture(&["sleep", "2000"]).await;
+        assert_eq!(result.status, "started_and_timed_out");
+        assert_eq!(result.pending_stdout_reads, 0);
+        assert_eq!(result.pending_stderr_reads, 0);
+        assert_h7_output_cleanup(&result);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_timeout_stderr_pending_read_reaches_terminal() {
+        let _lock = lock_h7_tests();
+        let result = run_h7_approved_fixture(&["sleep", "2000"]).await;
+        assert_eq!(result.status, "started_and_timed_out");
+        assert_eq!(result.pending_stdout_reads, 0);
+        assert_eq!(result.pending_stderr_reads, 0);
+        assert_h7_output_cleanup(&result);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_cancel_stdout_pending_read_reaches_terminal() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7DirectHarness::new();
+        let mut receiver = harness.receiver.take().unwrap();
+        let result = run_cancelled(
+            Arc::clone(&harness.broker),
+            Arc::clone(&harness.authority),
+            &mut receiver,
+            harness.action(&["sleep", "2000"]),
+        )
+        .await;
+        assert_eq!(result.status, "started_and_cancelled");
+        assert_eq!(result.pending_stdout_reads, 0);
+        assert_eq!(result.pending_stderr_reads, 0);
+        assert_h7_output_cleanup(&result);
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_cancel_stderr_pending_read_reaches_terminal() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7DirectHarness::new();
+        let mut receiver = harness.receiver.take().unwrap();
+        let result = run_cancelled(
+            Arc::clone(&harness.broker),
+            Arc::clone(&harness.authority),
+            &mut receiver,
+            harness.action(&["sleep", "2000"]),
+        )
+        .await;
+        assert_eq!(result.status, "started_and_cancelled");
+        assert_eq!(result.pending_stdout_reads, 0);
+        assert_eq!(result.pending_stderr_reads, 0);
+        assert_h7_output_cleanup(&result);
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_outer_abort_pending_reads_reach_terminal() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7DirectHarness::new();
+        let broker = Arc::clone(&harness.broker);
+        let metrics = broker.metrics();
+        let tool = h7_prepared_tool(Arc::clone(&broker));
+        let action = harness.action(&["sleep", "2000"]);
+        let mut receiver = harness.receiver.take().unwrap();
+        let created = metrics.created_notify.notified();
+        let task = tokio::spawn({
+            let tool = Arc::clone(&tool);
+            async move { tool.execute_prepared_action(action).await }
+        });
+        let pending = receiver
+            .recv()
+            .await
+            .expect("D29-H7 terminality outer-abort confirmation");
+        let revision = harness
+            .authority
+            .provision_confirmation(&pending.action)
+            .expect("D29-H7 terminality outer-abort confirmation");
+        pending.response.send(revision).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), created)
+            .await
+            .expect("D29-H7 terminality outer-abort process creation");
+        task.abort();
+        assert!(task.await.is_err());
+        wait_h7_native_workers_quiet(Arc::clone(&metrics)).await;
+        assert_eq!(metrics.pending_output_reads.load(Ordering::Acquire), 0);
+        assert_eq!(metrics.output_handles_active.load(Ordering::Acquire), 0);
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_overflow_pending_reads_reach_terminal() {
+        let _lock = lock_h7_tests();
+        let result = run_h7_approved_fixture(&["flood-stdout"]).await;
+        assert_eq!(result.status, "started_and_output_limited");
+        assert_eq!(result.pending_stdout_reads, 0);
+        assert_eq!(result.pending_stderr_reads, 0);
+        assert_h7_output_cleanup(&result);
+    }
+
     #[test]
     fn h7_output_completion_cancel_race_is_terminal_once() {
         let _lock = lock_h7_tests();
@@ -5028,6 +5582,60 @@ mod tests {
         assert!(capture.complete_pending());
     }
 
+    #[test]
+    fn h7_cancelled_output_state_is_not_freed_before_terminal_completion() {
+        let _lock = lock_h7_tests();
+        let gate = Arc::new(H7TerminalityGate::default());
+        let probe = Arc::new(H7TerminalityProbe::default());
+        let mut capture = H7OverlappedOutputCapture::new(1_024, "delayed-cancel")
+            .expect("H7 delayed-cancel output capture")
+            .with_terminality_test_hooks(Arc::clone(&gate), Arc::clone(&probe));
+        capture.arm_read();
+        assert!(capture.pending());
+        capture.cancel_pending();
+        assert!(gate.cancel_requested.load(Ordering::Acquire));
+        let drop_task = thread::spawn(move || drop(capture));
+        let started_deadline = Instant::now() + Duration::from_secs(1);
+        while !probe.drop_started.load(Ordering::Acquire) {
+            assert!(Instant::now() < started_deadline);
+            thread::yield_now();
+        }
+        assert!(!probe.drop_finished.load(Ordering::Acquire));
+        assert!(!probe.terminal_observed.load(Ordering::Acquire));
+        gate.allow_terminal.store(true, Ordering::Release);
+        drop_task.join().expect("D29-H7 delayed-cancel drop");
+        assert!(probe.terminal_observed.load(Ordering::Acquire));
+        assert!(probe.drop_finished.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn h7_connect_overlapped_is_terminal_before_constructor_error_returns() {
+        let _lock = lock_h7_tests();
+        let probe = Arc::new(H7ConnectTerminalityProbe::default());
+        let result = H7OverlappedOutputCapture::new_for_connect_terminality_test(
+            1_024,
+            "connect-terminality",
+            Arc::clone(&probe),
+        );
+        assert!(result.is_err());
+        assert!(probe.terminal_observed.load(Ordering::Acquire));
+        assert!(probe.dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn h7_named_pipe_connect_cancel_reaches_terminal_before_state_drop() {
+        let _lock = lock_h7_tests();
+        let probe = Arc::new(H7ConnectTerminalityProbe::default());
+        let result = H7OverlappedOutputCapture::new_for_connect_terminality_test(
+            1_024,
+            "connect-cancel-terminality",
+            Arc::clone(&probe),
+        );
+        assert!(result.is_err());
+        assert!(probe.terminal_observed.load(Ordering::Acquire));
+        assert!(probe.dropped.load(Ordering::Acquire));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn h7_output_overflow_exit_race_is_output_limited() {
         let _lock = lock_h7_tests();
@@ -5035,6 +5643,25 @@ mod tests {
         assert_eq!(result.status, "started_and_output_limited");
         assert!(result.stdout_retained_bytes <= H7_STDOUT_BOUND);
         assert_h7_output_cleanup(&result);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_output_handle_evidence_is_truthful() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7DirectHarness::new();
+        let metrics = harness.broker.metrics();
+        let mut receiver = harness.receiver.take().unwrap();
+        let result = run_approved(
+            Arc::clone(&harness.broker),
+            Arc::clone(&harness.authority),
+            &mut receiver,
+            harness.action(&["echo-argv", "handle-evidence"]),
+        )
+        .await;
+        assert_h7_output_cleanup(&result);
+        assert_eq!(metrics.output_handles_active.load(Ordering::Acquire), 0);
+        assert_eq!(metrics.pending_output_reads.load(Ordering::Acquire), 0);
+        assert!(harness.authority.shutdown());
     }
 
     #[test]

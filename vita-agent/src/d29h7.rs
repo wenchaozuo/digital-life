@@ -36,10 +36,10 @@ use windows_sys::Wdk::Storage::FileSystem::{
 };
 use windows_sys::Win32::Foundation::{
     CloseHandle, DuplicateHandle, GetHandleInformation, GetLastError, SetHandleInformation,
-    DUPLICATE_SAME_ACCESS, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_NOT_FOUND,
-    ERROR_OPERATION_ABORTED, ERROR_PIPE_CONNECTED, FALSE, HANDLE, HANDLE_FLAG_INHERIT,
-    INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE, UNICODE_STRING, WAIT_OBJECT_0,
-    WAIT_TIMEOUT,
+    DUPLICATE_SAME_ACCESS, ERROR_BROKEN_PIPE, ERROR_IO_INCOMPLETE, ERROR_IO_PENDING,
+    ERROR_NOT_FOUND, ERROR_OPERATION_ABORTED, ERROR_PIPE_CONNECTED, FALSE, HANDLE,
+    HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE,
+    UNICODE_STRING, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Cryptography::{
     BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
@@ -1084,6 +1084,37 @@ impl H7OverlappedState {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum H7OverlappedPoll {
+    Pending,
+    TerminalSuccess { transferred: u32 },
+    TerminalCancelled,
+    TerminalEof,
+    Indeterminate(u32),
+}
+
+// ERROR_IO_PENDING is the successful return-side status for initiating an
+// asynchronous ReadFile/ConnectNamedPipe operation.  Once the operation has
+// been initiated, GetOverlappedResult(FALSE) uses ERROR_IO_INCOMPLETE to say
+// that the kernel still owns the OVERLAPPED.  Keep this interpretation in one
+// helper so no completion path can accidentally reuse the initiation status.
+fn poll_h7_overlapped(handle: HANDLE, operation: &OVERLAPPED, pipe_read: bool) -> H7OverlappedPoll {
+    let mut transferred = 0_u32;
+    if unsafe { GetOverlappedResult(handle, operation, &mut transferred, FALSE) } != 0 {
+        return H7OverlappedPoll::TerminalSuccess { transferred };
+    }
+    classify_h7_overlapped_error(unsafe { GetLastError() }, pipe_read)
+}
+
+fn classify_h7_overlapped_error(error: u32, pipe_read: bool) -> H7OverlappedPoll {
+    match error {
+        ERROR_IO_INCOMPLETE => H7OverlappedPoll::Pending,
+        ERROR_OPERATION_ABORTED => H7OverlappedPoll::TerminalCancelled,
+        ERROR_BROKEN_PIPE if pipe_read => H7OverlappedPoll::TerminalEof,
+        error => H7OverlappedPoll::Indeterminate(error),
+    }
+}
+
 #[derive(Default)]
 struct H7TerminalityGate {
     cancel_requested: AtomicBool,
@@ -1241,44 +1272,36 @@ impl H7OverlappedConnect {
         if !self.pending() {
             return self.owner().state.is_terminal();
         }
-        {
+        let poll = {
             let owner = self.owner();
-            if let Some(gate) = owner.terminality_gate.as_ref() {
-                if gate.cancel_requested.load(Ordering::Acquire)
-                    && !gate.allow_terminal.load(Ordering::Acquire)
-                {
-                    return false;
-                }
-            }
-        }
-        let owner = self.owner_mut();
-        let mut transferred = 0_u32;
-        let completed = unsafe {
-            GetOverlappedResult(
-                owner.read.raw(),
-                owner.operation.as_ref(),
-                &mut transferred,
-                FALSE,
-            )
-        } != 0;
-        if completed {
-            owner.state = H7OverlappedState::TerminalCompleted;
-            if let Some(probe) = owner.probe.as_ref() {
-                probe.terminal_observed.store(true, Ordering::Release);
-            }
-            return true;
-        }
-        let error = unsafe { GetLastError() };
-        if error == ERROR_IO_PENDING {
+            poll_h7_overlapped(owner.read.raw(), owner.operation.as_ref(), false)
+        };
+        if matches!(
+            poll,
+            H7OverlappedPoll::Pending | H7OverlappedPoll::Indeterminate(_)
+        ) {
             unsafe {
-                let _ = ResetEvent(owner.event.raw());
+                let _ = ResetEvent(self.owner().event.raw());
             }
             return false;
         }
-        owner.state = if error == ERROR_OPERATION_ABORTED {
-            H7OverlappedState::TerminalCancelled
-        } else {
-            H7OverlappedState::TerminalError(error)
+        if let Some(gate) = self.owner().terminality_gate.as_ref() {
+            if gate.cancel_requested.load(Ordering::Acquire)
+                && !gate.allow_terminal.load(Ordering::Acquire)
+            {
+                return false;
+            }
+        }
+        let owner = self.owner_mut();
+        owner.state = match poll {
+            H7OverlappedPoll::TerminalSuccess { .. } => H7OverlappedState::TerminalCompleted,
+            H7OverlappedPoll::TerminalCancelled => H7OverlappedState::TerminalCancelled,
+            H7OverlappedPoll::TerminalEof => {
+                unreachable!("H7 connect poll cannot report EOF")
+            }
+            H7OverlappedPoll::Pending | H7OverlappedPoll::Indeterminate(_) => {
+                unreachable!("H7 connect terminal poll was filtered above")
+            }
         };
         if let Some(probe) = owner.probe.as_ref() {
             probe.terminal_observed.store(true, Ordering::Release);
@@ -1381,9 +1404,15 @@ impl H7OutputIoOwner {
         }
     }
 
-    fn observe_terminal_nonblocking(&mut self) -> bool {
-        if !self.pending() {
-            return self.operation.state.is_terminal();
+    fn observe_terminal_poll(&mut self, poll: H7OverlappedPoll) -> bool {
+        if matches!(
+            poll,
+            H7OverlappedPoll::Pending | H7OverlappedPoll::Indeterminate(_)
+        ) {
+            unsafe {
+                let _ = ResetEvent(self.event.raw());
+            }
+            return false;
         }
         if let Some(gate) = self.terminality_gate.as_ref() {
             if gate.cancel_requested.load(Ordering::Acquire)
@@ -1392,37 +1421,28 @@ impl H7OutputIoOwner {
                 return false;
             }
         }
-        let _ = unsafe { WaitForSingleObject(self.event.raw(), 0) };
-        let mut transferred = 0_u32;
-        let completed = unsafe {
-            GetOverlappedResult(
-                self.read.raw(),
-                &self.operation.overlapped,
-                &mut transferred,
-                FALSE,
-            )
-        } != 0;
-        if completed {
-            self.operation.state = H7OverlappedState::TerminalCompleted;
-            unsafe {
-                let _ = ResetEvent(self.event.raw());
+        self.operation.state = match poll {
+            H7OverlappedPoll::TerminalSuccess { .. } => H7OverlappedState::TerminalCompleted,
+            H7OverlappedPoll::TerminalCancelled => H7OverlappedState::TerminalCancelled,
+            H7OverlappedPoll::TerminalEof => H7OverlappedState::TerminalEof,
+            H7OverlappedPoll::Pending | H7OverlappedPoll::Indeterminate(_) => {
+                unreachable!("H7 output terminal poll was filtered above")
             }
-            self.mark_terminal_observed();
-            return true;
-        }
-        let error = unsafe { GetLastError() };
-        if error == ERROR_IO_PENDING {
-            return false;
-        }
-        self.operation.state = if error == ERROR_BROKEN_PIPE {
-            H7OverlappedState::TerminalEof
-        } else if error == ERROR_OPERATION_ABORTED {
-            H7OverlappedState::TerminalCancelled
-        } else {
-            H7OverlappedState::TerminalError(error)
         };
+        unsafe {
+            let _ = ResetEvent(self.event.raw());
+        }
         self.mark_terminal_observed();
         true
+    }
+
+    fn observe_terminal_nonblocking(&mut self) -> bool {
+        if !self.pending() {
+            return self.operation.state.is_terminal();
+        }
+        let _ = unsafe { WaitForSingleObject(self.event.raw(), 0) };
+        let poll = poll_h7_overlapped(self.read.raw(), &self.operation.overlapped, true);
+        self.observe_terminal_poll(poll)
     }
 
     fn mark_terminal_observed(&self) {
@@ -1751,6 +1771,19 @@ impl H7OverlappedOutputCapture {
                 .as_ref()
                 .is_some_and(|owner| owner.operation.state.is_terminal());
         }
+        let poll = {
+            let owner = self.owner();
+            poll_h7_overlapped(owner.read.raw(), &owner.operation.overlapped, true)
+        };
+        if matches!(
+            poll,
+            H7OverlappedPoll::Pending | H7OverlappedPoll::Indeterminate(_)
+        ) {
+            unsafe {
+                let _ = ResetEvent(self.owner().event.raw());
+            }
+            return false;
+        }
         if let Some(gate) = self
             .owner
             .as_ref()
@@ -1764,57 +1797,45 @@ impl H7OverlappedOutputCapture {
             }
         }
         let remaining = self.bound.saturating_sub(self.bytes.len());
-        let mut transferred = 0_u32;
-        let mut terminal_error = None;
         let mut completed_bytes = Vec::new();
+        let mut transferred = 0_u32;
         {
             let owner = self.owner_mut();
-            let completed = unsafe {
-                GetOverlappedResult(
-                    owner.read.raw(),
-                    &owner.operation.overlapped,
-                    &mut transferred,
-                    FALSE,
-                )
-            } != 0;
-            if !completed {
-                let error = unsafe { GetLastError() };
-                if error == ERROR_IO_PENDING {
-                    unsafe {
-                        let _ = ResetEvent(owner.event.raw());
+            match poll {
+                H7OverlappedPoll::TerminalSuccess { transferred: bytes } => {
+                    transferred = bytes;
+                    owner.operation.state = if bytes == 0 {
+                        H7OverlappedState::TerminalEof
+                    } else {
+                        H7OverlappedState::TerminalCompleted
+                    };
+                    if bytes != 0 {
+                        let take = remaining.min(bytes as usize);
+                        completed_bytes.extend_from_slice(&owner.operation.scratch[..take]);
                     }
-                    return false;
                 }
-                owner.operation.state = if error == ERROR_BROKEN_PIPE {
-                    H7OverlappedState::TerminalEof
-                } else if error == ERROR_OPERATION_ABORTED {
-                    H7OverlappedState::TerminalCancelled
-                } else {
-                    H7OverlappedState::TerminalError(error)
-                };
-                terminal_error = Some(error);
-            } else {
-                owner.operation.state = H7OverlappedState::TerminalCompleted;
-                unsafe {
-                    let _ = ResetEvent(owner.event.raw());
+                H7OverlappedPoll::TerminalCancelled => {
+                    owner.operation.state = H7OverlappedState::TerminalCancelled;
                 }
-                if transferred == 0 {
+                H7OverlappedPoll::TerminalEof => {
                     owner.operation.state = H7OverlappedState::TerminalEof;
-                } else {
-                    let take = remaining.min(transferred as usize);
-                    completed_bytes.extend_from_slice(&owner.operation.scratch[..take]);
+                }
+                H7OverlappedPoll::Pending | H7OverlappedPoll::Indeterminate(_) => {
+                    unreachable!("H7 output completion poll was filtered above")
                 }
             }
+            unsafe {
+                let _ = ResetEvent(owner.event.raw());
+            }
         }
-        if let Some(error) = terminal_error {
-            if error == ERROR_BROKEN_PIPE {
+        if matches!(
+            poll,
+            H7OverlappedPoll::TerminalCancelled | H7OverlappedPoll::TerminalEof
+        ) || transferred == 0
+        {
+            if matches!(poll, H7OverlappedPoll::TerminalEof) || transferred == 0 {
                 self.stream_complete = true;
             }
-            self.mark_read_terminal_observed();
-            return true;
-        }
-        if transferred == 0 {
-            self.stream_complete = true;
             self.mark_read_terminal_observed();
             return true;
         }
@@ -1950,6 +1971,16 @@ impl H7QuarantineEntry {
                 if !owner.state.is_pending() {
                     return owner.state.is_terminal();
                 }
+                let poll = poll_h7_overlapped(owner.read.raw(), owner.operation.as_ref(), false);
+                if matches!(
+                    poll,
+                    H7OverlappedPoll::Pending | H7OverlappedPoll::Indeterminate(_)
+                ) {
+                    unsafe {
+                        let _ = ResetEvent(owner.event.raw());
+                    }
+                    return false;
+                }
                 if let Some(gate) = owner.terminality_gate.as_ref() {
                     if gate.cancel_requested.load(Ordering::Acquire)
                         && !gate.allow_terminal.load(Ordering::Acquire)
@@ -1958,37 +1989,25 @@ impl H7QuarantineEntry {
                     }
                 }
                 let _ = unsafe { WaitForSingleObject(owner.event.raw(), 0) };
-                let mut transferred = 0_u32;
-                let completed = unsafe {
-                    GetOverlappedResult(
-                        owner.read.raw(),
-                        owner.operation.as_ref(),
-                        &mut transferred,
-                        FALSE,
-                    )
-                } != 0;
-                if completed {
-                    owner.state = H7OverlappedState::TerminalCompleted;
-                    if let Some(probe) = owner.probe.as_ref() {
-                        probe.terminal_observed.store(true, Ordering::Release);
+                owner.state = match poll {
+                    H7OverlappedPoll::TerminalSuccess { .. } => {
+                        H7OverlappedState::TerminalCompleted
                     }
-                    true
-                } else {
-                    let error = unsafe { GetLastError() };
-                    if error == ERROR_IO_PENDING {
-                        false
-                    } else {
-                        owner.state = if error == ERROR_OPERATION_ABORTED {
-                            H7OverlappedState::TerminalCancelled
-                        } else {
-                            H7OverlappedState::TerminalError(error)
-                        };
-                        if let Some(probe) = owner.probe.as_ref() {
-                            probe.terminal_observed.store(true, Ordering::Release);
-                        }
-                        true
+                    H7OverlappedPoll::TerminalCancelled => H7OverlappedState::TerminalCancelled,
+                    H7OverlappedPoll::TerminalEof => {
+                        unreachable!("H7 connect poll cannot report EOF")
                     }
+                    H7OverlappedPoll::Pending | H7OverlappedPoll::Indeterminate(_) => {
+                        unreachable!("H7 connect completion poll was filtered above")
+                    }
+                };
+                unsafe {
+                    let _ = ResetEvent(owner.event.raw());
                 }
+                if let Some(probe) = owner.probe.as_ref() {
+                    probe.terminal_observed.store(true, Ordering::Release);
+                }
+                true
             }
             Self::Output(owner) => owner.observe_terminal_nonblocking(),
         }
@@ -4224,6 +4243,16 @@ impl H7ProcessAdmission {
     }
 }
 
+static H7_PROCESS_ADMISSION: OnceLock<Arc<H7ProcessAdmission>> = OnceLock::new();
+
+fn h7_process_admission() -> Arc<H7ProcessAdmission> {
+    Arc::clone(H7_PROCESS_ADMISSION.get_or_init(|| {
+        Arc::new(H7ProcessAdmission {
+            active: AtomicBool::new(false),
+        })
+    }))
+}
+
 struct H7ActionCancellationGuard {
     token: Arc<AtomicBool>,
     notify: Arc<Notify>,
@@ -4308,9 +4337,7 @@ impl H7ProcessBroker {
             catalog,
             authority,
             bridge,
-            admission: Arc::new(H7ProcessAdmission {
-                active: AtomicBool::new(false),
-            }),
+            admission: h7_process_admission(),
             active_cancellation: Arc::new(Mutex::new(None)),
             metrics: Arc::new(H7SupervisorMetrics::default()),
             final_fence_gate: None,
@@ -4893,6 +4920,215 @@ mod tests {
             metrics.native_workers_started.load(Ordering::Acquire),
             metrics.native_workers_finished.load(Ordering::Acquire)
         );
+    }
+
+    fn cleanup_h7_test_output_capture(
+        mut capture: H7OverlappedOutputCapture,
+        quarantine_before: usize,
+    ) {
+        capture.cancel_pending();
+        if !capture.drain_until_terminal(Instant::now() + H7_CLEANUP_TIMEOUT) {
+            assert!(capture.quarantine_if_pending());
+        }
+        drop(capture);
+        reap_h7_quarantine_until(quarantine_before, Instant::now() + Duration::from_secs(1));
+        assert_eq!(h7_pending_io_quarantine().count(), quarantine_before);
+    }
+
+    fn h7_pending_connect_for_test(stream: &str) -> H7OverlappedConnect {
+        let pipe_name = h7_output_pipe_name(stream).expect("D29-H7 pending connect pipe name");
+        let read = H7Handle::new(unsafe {
+            CreateNamedPipeW(
+                pipe_name.as_ptr(),
+                PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                1,
+                H7_OUTPUT_SCRATCH_BYTES as u32,
+                H7_OUTPUT_SCRATCH_BYTES as u32,
+                1_000,
+                std::ptr::null(),
+            )
+        })
+        .expect("D29-H7 pending connect server handle");
+        assert_ne!(
+            unsafe { SetHandleInformation(read.raw(), HANDLE_FLAG_INHERIT, 0) },
+            0,
+            "D29-H7 pending connect server inheritance"
+        );
+        let mut connect = H7OverlappedConnect::new(read).expect("D29-H7 pending connect owner");
+        connect.start().expect("D29-H7 pending ConnectNamedPipe");
+        assert!(connect.pending(), "D29-H7 ConnectNamedPipe must be pending");
+        connect
+    }
+
+    fn cleanup_h7_test_connect(mut connect: H7OverlappedConnect, quarantine_before: usize) {
+        connect.request_cancel();
+        if !connect.wait_for_terminal_until(Instant::now() + H7_CLEANUP_TIMEOUT) {
+            connect.quarantine();
+        } else {
+            drop(connect);
+        }
+        reap_h7_quarantine_until(quarantine_before, Instant::now() + Duration::from_secs(1));
+        assert_eq!(h7_pending_io_quarantine().count(), quarantine_before);
+    }
+
+    async fn assert_h7_cross_broker_second_action_is_denied() {
+        let mut broker_a_harness = H7DirectHarness::new();
+        let mut broker_b_harness = H7DirectHarness::new();
+        let gate = H7FinalFenceGate::new();
+        gate.arm();
+        let broker_a = broker_a_harness.broker_with_final_fence(Arc::clone(&gate));
+        assert!(Arc::ptr_eq(
+            &broker_a.admission,
+            &broker_b_harness.broker.admission
+        ));
+        let mut receiver_a = broker_a_harness.receiver.take().unwrap();
+        let mut receiver_b = broker_b_harness.receiver.take().unwrap();
+        let first_task = tokio::spawn({
+            let broker = Arc::clone(&broker_a);
+            let action = broker_a_harness.action(&["echo-argv", "cross-broker-first"]);
+            async move { broker.execute(action).await }
+        });
+        let pending = receiver_a
+            .recv()
+            .await
+            .expect("D29-H7 cross-broker first confirmation");
+        let revision = broker_a_harness
+            .authority
+            .provision_confirmation(&pending.action)
+            .expect("D29-H7 cross-broker first confirmation");
+        pending.response.send(revision).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), gate.wait_until_entered())
+            .await
+            .expect("D29-H7 cross-broker final fence entry");
+
+        let second = broker_b_harness
+            .broker
+            .execute(broker_b_harness.action(&["echo-argv", "cross-broker-second"]))
+            .await;
+        assert_eq!(second.status, "denied");
+        assert_h7_zero_process_result(&second);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), receiver_b.recv())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            broker_b_harness
+                .authority
+                .metrics
+                .trusted_confirmations
+                .load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(
+            broker_b_harness
+                .authority
+                .metrics
+                .grants_issued
+                .load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(
+            broker_b_harness
+                .broker
+                .metrics()
+                .process_created
+                .load(Ordering::Acquire),
+            0
+        );
+
+        gate.release();
+        let first = first_task.await.expect("D29-H7 cross-broker first task");
+        assert_completed(&first);
+        assert_eq!(
+            broker_a.metrics().process_created.load(Ordering::Acquire),
+            1
+        );
+        assert!(broker_a_harness.authority.shutdown());
+        assert!(broker_b_harness.authority.shutdown());
+    }
+
+    async fn assert_h7_cross_broker_quarantine_is_safe() {
+        let mut broker_a_harness = H7DirectHarness::new();
+        let mut broker_b_harness = H7DirectHarness::new();
+        let gate = Arc::new(H7TerminalityGate::default());
+        let broker_a = broker_a_harness
+            .broker_with_output_terminality_gate(Arc::clone(&gate), Duration::from_millis(50));
+        let metrics = broker_a.metrics();
+        let quarantine = h7_pending_io_quarantine();
+        let before = quarantine.count();
+        let mut receiver_a = broker_a_harness.receiver.take().unwrap();
+        let mut receiver_b = broker_b_harness.receiver.take().unwrap();
+        let task = tokio::spawn({
+            let broker = Arc::clone(&broker_a);
+            let action = broker_a_harness.action(&["sleep", "2000"]);
+            async move { broker.execute(action).await }
+        });
+        let pending = receiver_a
+            .recv()
+            .await
+            .expect("D29-H7 cross-broker quarantine confirmation");
+        let revision = broker_a_harness
+            .authority
+            .provision_confirmation(&pending.action)
+            .expect("D29-H7 cross-broker quarantine confirmation");
+        pending.response.send(revision).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), metrics.created_notify.notified())
+            .await
+            .expect("D29-H7 cross-broker quarantine process creation");
+        wait_h7_pending_output_reads(&metrics).await;
+        broker_a.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("D29-H7 cross-broker quarantine worker exit")
+            .expect("D29-H7 cross-broker quarantine worker join");
+        assert_eq!(result.status, "started_outcome_unknown");
+        assert!(!broker_a.admission.active.load(Ordering::Acquire));
+        assert!(quarantine.count() > before);
+        assert!(quarantine.count() <= before + H7_MAX_QUARANTINED_OUTPUT);
+
+        let second = broker_b_harness
+            .broker
+            .execute(broker_b_harness.action(&["echo-argv", "cross-broker-quarantine-second"]))
+            .await;
+        assert_eq!(second.status, "denied");
+        assert_h7_zero_process_result(&second);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), receiver_b.recv())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            broker_b_harness
+                .authority
+                .metrics
+                .trusted_confirmations
+                .load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(
+            broker_b_harness
+                .authority
+                .metrics
+                .grants_issued
+                .load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(
+            broker_b_harness
+                .broker
+                .metrics()
+                .process_created
+                .load(Ordering::Acquire),
+            0
+        );
+
+        gate.allow_terminal.store(true, Ordering::Release);
+        reap_h7_quarantine_until(before, Instant::now() + Duration::from_secs(1));
+        assert_eq!(quarantine.count(), before);
+        assert!(broker_a_harness.authority.shutdown());
+        assert!(broker_b_harness.authority.shutdown());
     }
 
     fn assert_h7_zero_process_result(result: &H7ToolResult) {
@@ -6380,6 +6616,250 @@ mod tests {
         );
         assert_eq!(h7_pending_io_quarantine().count(), before);
         assert!(harness.authority.shutdown());
+    }
+
+    #[test]
+    fn h7_getoverlappedresult_io_incomplete_remains_pending() {
+        let _lock = lock_h7_tests();
+        let before = h7_pending_io_quarantine().count();
+        let mut capture =
+            H7OverlappedOutputCapture::new(1_024, "io-incomplete-pending").expect("H7 output");
+        capture.arm_read();
+        let poll = {
+            let owner = capture.owner();
+            poll_h7_overlapped(owner.read.raw(), &owner.operation.overlapped, true)
+        };
+        assert_eq!(poll, H7OverlappedPoll::Pending);
+        assert!(capture.pending());
+        cleanup_h7_test_output_capture(capture, before);
+    }
+
+    #[test]
+    fn h7_connect_io_incomplete_is_not_terminal() {
+        let _lock = lock_h7_tests();
+        let before = h7_pending_io_quarantine().count();
+        let mut connect = h7_pending_connect_for_test("connect-io-incomplete");
+        let poll = poll_h7_overlapped(
+            connect.owner().read.raw(),
+            connect.owner().operation.as_ref(),
+            false,
+        );
+        assert_eq!(poll, H7OverlappedPoll::Pending);
+        assert!(!connect.observe_terminal());
+        assert!(connect.pending());
+        cleanup_h7_test_connect(connect, before);
+    }
+
+    #[test]
+    fn h7_output_io_incomplete_is_not_terminal() {
+        let _lock = lock_h7_tests();
+        let before = h7_pending_io_quarantine().count();
+        let mut capture =
+            H7OverlappedOutputCapture::new(1_024, "output-io-incomplete").expect("H7 output");
+        capture.arm_read();
+        assert!(capture.pending());
+        assert!(!capture.complete_pending());
+        assert!(capture.pending());
+        cleanup_h7_test_output_capture(capture, before);
+    }
+
+    #[test]
+    fn h7_quarantine_reap_io_incomplete_retains_owner() {
+        let _lock = lock_h7_tests();
+        for stream in ["stdout-io-incomplete", "stderr-io-incomplete"] {
+            let quarantine = h7_pending_io_quarantine();
+            let before = quarantine.count();
+            let gate = Arc::new(H7TerminalityGate::default());
+            let probe = Arc::new(H7TerminalityProbe::default());
+            let mut capture = H7OverlappedOutputCapture::new(1_024, stream)
+                .expect("D29-H7 incomplete quarantine output")
+                .with_terminality_test_hooks(Arc::clone(&gate), Arc::clone(&probe));
+            capture.arm_read();
+            let poll = {
+                let owner = capture.owner();
+                poll_h7_overlapped(owner.read.raw(), &owner.operation.overlapped, true)
+            };
+            assert_eq!(poll, H7OverlappedPoll::Pending);
+            capture.cancel_pending();
+            assert!(capture.quarantine_if_pending());
+            drop(capture);
+            assert_eq!(quarantine.count(), before + 1);
+            h7_reap_pending_io_nonblocking();
+            assert_eq!(quarantine.count(), before + 1);
+            assert!(!probe.drop_finished.load(Ordering::Acquire));
+            gate.allow_terminal.store(true, Ordering::Release);
+            reap_h7_quarantine_until(before, Instant::now() + Duration::from_secs(1));
+            assert!(probe.terminal_observed.load(Ordering::Acquire));
+            assert!(probe.drop_finished.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
+    fn h7_quarantine_reap_terminal_cancel_releases_owner() {
+        let _lock = lock_h7_tests();
+        let quarantine = h7_pending_io_quarantine();
+        let before = quarantine.count();
+        let gate = Arc::new(H7TerminalityGate::default());
+        let probe = Arc::new(H7TerminalityProbe::default());
+        let mut capture = H7OverlappedOutputCapture::new(1_024, "terminal-cancel-release")
+            .expect("D29-H7 terminal cancellation output")
+            .with_terminality_test_hooks(Arc::clone(&gate), Arc::clone(&probe));
+        capture.arm_read();
+        capture.cancel_pending();
+        assert!(capture.quarantine_if_pending());
+        drop(capture);
+        assert_eq!(quarantine.count(), before + 1);
+        gate.allow_terminal.store(true, Ordering::Release);
+        reap_h7_quarantine_until(before, Instant::now() + Duration::from_secs(1));
+        assert!(probe.terminal_observed.load(Ordering::Acquire));
+        assert!(probe.drop_finished.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn h7_unknown_completion_status_does_not_free_pending_owner() {
+        let _lock = lock_h7_tests();
+        let probe = Arc::new(H7TerminalityProbe::default());
+        let event =
+            H7Handle::new(unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) })
+                .expect("D29-H7 unknown completion event");
+        let event_raw = event.raw();
+        let mut owner = H7OutputIoOwner {
+            read: H7Handle(INVALID_HANDLE_VALUE),
+            child_write: H7Handle(std::ptr::null_mut()),
+            event,
+            operation: Box::new(H7OutputReadOperation {
+                overlapped: OVERLAPPED {
+                    hEvent: event_raw,
+                    ..Default::default()
+                },
+                scratch: [0_u8; H7_OUTPUT_SCRATCH_BYTES],
+                state: H7OverlappedState::Pending,
+            }),
+            terminality_gate: None,
+            terminality_probe: Some(Arc::clone(&probe)),
+        };
+        assert!(!owner.observe_terminal_poll(classify_h7_overlapped_error(0xdead_beef, true,)));
+        assert!(owner.pending());
+        assert!(!probe.terminal_observed.load(Ordering::Acquire));
+        assert!(!probe.drop_finished.load(Ordering::Acquire));
+        assert_eq!(
+            classify_h7_overlapped_error(0xdead_beef, true),
+            H7OverlappedPoll::Indeterminate(0xdead_beef)
+        );
+        owner.operation.state = H7OverlappedState::TerminalCancelled;
+        owner.mark_released();
+        assert!(probe.drop_finished.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn h7_process_admission_is_shared_across_brokers() {
+        let _lock = lock_h7_tests();
+        let broker_a_harness = H7DirectHarness::new();
+        let broker_b_harness = H7DirectHarness::new();
+        assert!(Arc::ptr_eq(
+            &broker_a_harness.broker.admission,
+            &broker_b_harness.broker.admission
+        ));
+        assert!(broker_a_harness.authority.shutdown());
+        assert!(broker_b_harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_cross_broker_second_action_confirmation_zero() {
+        let _lock = lock_h7_tests();
+        assert_h7_cross_broker_second_action_is_denied().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_cross_broker_second_action_createprocess_zero() {
+        let _lock = lock_h7_tests();
+        assert_h7_cross_broker_second_action_is_denied().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_cross_broker_quarantine_blocks_new_action() {
+        let _lock = lock_h7_tests();
+        assert_h7_cross_broker_quarantine_is_safe().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_cross_broker_quarantine_never_overflows() {
+        let _lock = lock_h7_tests();
+        assert_h7_cross_broker_quarantine_is_safe().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_outer_abort_keeps_global_admission_until_worker_exit() {
+        let _lock = lock_h7_tests();
+        let mut broker_a_harness = H7DirectHarness::new();
+        let mut broker_b_harness = H7DirectHarness::new();
+        let gate = Arc::new(H7TerminalityGate::default());
+        let broker_a = broker_a_harness
+            .broker_with_output_terminality_gate(Arc::clone(&gate), Duration::from_millis(250));
+        let metrics = broker_a.metrics();
+        let tool = h7_prepared_tool(Arc::clone(&broker_a));
+        let quarantine = h7_pending_io_quarantine();
+        let before = quarantine.count();
+        let mut receiver_a = broker_a_harness.receiver.take().unwrap();
+        let mut receiver_b = broker_b_harness.receiver.take().unwrap();
+        let task = tokio::spawn({
+            let tool = Arc::clone(&tool);
+            let action = broker_a_harness.action(&["sleep", "2000"]);
+            async move { tool.execute_prepared_action(action).await }
+        });
+        let pending = receiver_a
+            .recv()
+            .await
+            .expect("D29-H7 global outer-abort confirmation");
+        let revision = broker_a_harness
+            .authority
+            .provision_confirmation(&pending.action)
+            .expect("D29-H7 global outer-abort confirmation");
+        pending.response.send(revision).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), metrics.created_notify.notified())
+            .await
+            .expect("D29-H7 global outer-abort process creation");
+        wait_h7_pending_output_reads(&metrics).await;
+        task.abort();
+        assert!(task.await.is_err());
+        let worker_deadline = Instant::now() + Duration::from_secs(1);
+        while metrics.native_workers_active.load(Ordering::Acquire) == 0 {
+            assert!(Instant::now() < worker_deadline);
+            tokio::task::yield_now().await;
+        }
+        assert!(broker_a.admission.active.load(Ordering::Acquire));
+        assert!(Arc::ptr_eq(
+            &broker_a.admission,
+            &broker_b_harness.broker.admission
+        ));
+
+        let second = broker_b_harness
+            .broker
+            .execute(broker_b_harness.action(&["echo-argv", "global-outer-abort-second"]))
+            .await;
+        assert_eq!(second.status, "denied");
+        assert_h7_zero_process_result(&second);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), receiver_b.recv())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            broker_b_harness
+                .broker
+                .metrics()
+                .process_created
+                .load(Ordering::Acquire),
+            0
+        );
+
+        gate.allow_terminal.store(true, Ordering::Release);
+        wait_h7_native_workers_quiet(Arc::clone(&metrics)).await;
+        reap_h7_quarantine_until(before, Instant::now() + Duration::from_secs(1));
+        assert!(!broker_a.admission.active.load(Ordering::Acquire));
+        assert_eq!(quarantine.count(), before);
+        assert!(broker_a_harness.authority.shutdown());
+        assert!(broker_b_harness.authority.shutdown());
     }
 
     #[tokio::test(flavor = "current_thread")]

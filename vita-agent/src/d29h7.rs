@@ -15,44 +15,57 @@ use codex_extension_api::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::ffi::{c_void, OsStr};
+use std::ffi::{c_void, OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf, Prefix};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 
+use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+use windows_sys::Wdk::Storage::FileSystem::{
+    NtCreateFile, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
+    FILE_SYNCHRONOUS_IO_NONALERT,
+};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, SetHandleInformation, FALSE, HANDLE, HANDLE_FLAG_INHERIT,
-    INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, DuplicateHandle, GetLastError, SetHandleInformation, DUPLICATE_SAME_ACCESS, FALSE,
+    HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE,
+    UNICODE_STRING, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, GetDriveTypeW, GetFileInformationByHandle, ReadFile, BY_HANDLE_FILE_INFORMATION,
-    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_WRITE, FILE_TRAVERSE, SYNCHRONIZE,
 };
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, TerminateJobObject, JOBOBJECT_BASIC_LIMIT_INFORMATION,
+    AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
+    JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
+    QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_BASIC_LIMIT_INFORMATION,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
-use windows_sys::Win32::System::Pipes::CreatePipe;
+use windows_sys::Win32::System::Pipes::{CreatePipe, PeekNamedPipe};
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
-    InitializeProcThreadAttributeList, ResumeThread, UpdateProcThreadAttribute,
-    WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
-    EXTENDED_STARTUPINFO_PRESENT, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess, GetCurrentThread,
+    GetExitCodeProcess, InitializeProcThreadAttributeList, ResumeThread, TerminateProcess,
+    TerminateThread, UpdateProcThreadAttribute, WaitForSingleObject, CREATE_NO_WINDOW,
+    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
+    PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, STARTF_USESTDHANDLES, STARTUPINFOEXW,
 };
 use windows_sys::Win32::System::WindowsProgramming::DRIVE_REMOTE;
+use windows_sys::Win32::System::IO::{CancelIoEx, IO_STATUS_BLOCK};
 
 use crate::{sha256_hex, VitaExecutionContext};
 
@@ -156,6 +169,14 @@ fn bounded_id(value: &str) -> Option<String> {
         .then(|| value.to_string())
 }
 
+fn h7_unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            duration.as_millis().min(u64::MAX as u128) as u64
+        })
+}
+
 fn h7_process_schema_contract() -> Value {
     json!({
         "type": "object",
@@ -188,48 +209,167 @@ impl H7ImageIdentity {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct H7NamespaceIdentity {
+    volume_serial: u32,
+    file_index: u64,
+    directory: bool,
+    reparse: bool,
+}
+
+impl H7NamespaceIdentity {
+    fn wire(self) -> String {
+        format!(
+            "{}-{:08x}-{:016x}",
+            if self.directory { "directory" } else { "file" },
+            self.volume_serial,
+            self.file_index
+        )
+    }
+}
+
+struct H7PreparedNamespace {
+    path: PathBuf,
+    parent: Arc<H7Handle>,
+    leaf: Arc<H7Handle>,
+    leaf_name: OsString,
+    identity: H7NamespaceIdentity,
+    chain: Vec<Arc<H7Handle>>,
+}
+
+impl H7PreparedNamespace {
+    fn prepare(path: &Path, directory: bool) -> Result<Self, String> {
+        if !path.is_absolute() || path.to_string_lossy().starts_with("\\\\") {
+            return Err("H7 namespace path was not an absolute local path".to_string());
+        }
+        let mut normal_components = Vec::new();
+        for component in path.components() {
+            match component {
+                Component::Prefix(prefix) if matches!(prefix.kind(), Prefix::Disk(_)) => {}
+                Component::RootDir => {}
+                Component::Normal(value) => normal_components.push(value.to_os_string()),
+                _ => return Err("H7 namespace path contained an unsafe component".to_string()),
+            }
+        }
+        let drive_letter = match path.components().next() {
+            Some(Component::Prefix(prefix)) => match prefix.kind() {
+                Prefix::Disk(letter) => letter,
+                _ => return Err("H7 namespace path had no local drive anchor".to_string()),
+            },
+            _ => return Err("H7 namespace path had no explicit local drive anchor".to_string()),
+        };
+        if normal_components.is_empty() {
+            return Err("H7 namespace path had no leaf component".to_string());
+        }
+        let drive_root = PathBuf::from(format!("{}:\\", drive_letter as char));
+        let drive_type = unsafe { GetDriveTypeW(wide_null(drive_root.as_os_str()).as_ptr()) };
+        if drive_type == DRIVE_REMOTE {
+            return Err("H7 namespace path was on a remote drive".to_string());
+        }
+        let root = open_namespace_drive_anchor(&drive_root)?;
+        let mut chain = vec![Arc::new(root)];
+        let mut parent = Arc::clone(chain.last().expect("H7 drive anchor"));
+        let leaf_name = normal_components
+            .last()
+            .cloned()
+            .expect("H7 namespace leaf");
+        for (index, component) in normal_components.iter().enumerate() {
+            let is_leaf = index + 1 == normal_components.len();
+            let handle = Arc::new(open_namespace_relative(
+                &parent,
+                component,
+                if is_leaf { directory } else { true },
+            )?);
+            let identity = namespace_identity(handle.raw())?;
+            if identity.reparse || identity.directory != (if is_leaf { directory } else { true }) {
+                return Err("H7 namespace component was reparse or wrong kind".to_string());
+            }
+            if is_leaf {
+                return Ok(Self {
+                    path: path.to_path_buf(),
+                    parent,
+                    leaf: handle,
+                    leaf_name,
+                    identity,
+                    chain,
+                });
+            }
+            chain.push(Arc::clone(&handle));
+            parent = handle;
+        }
+        Err("H7 namespace leaf acquisition failed".to_string())
+    }
+
+    fn rebind_leaf(&self) -> Result<Arc<H7Handle>, String> {
+        let handle = Arc::new(open_namespace_relative(
+            &self.parent,
+            &self.leaf_name,
+            self.identity.directory,
+        )?);
+        let identity = namespace_identity(handle.raw())?;
+        if identity != self.identity || identity.reparse {
+            return Err("H7 namespace leaf identity changed".to_string());
+        }
+        Ok(handle)
+    }
+
+    fn identity(&self) -> H7NamespaceIdentity {
+        self.identity
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+struct PreparedExecutableNamespace(H7PreparedNamespace);
+
+impl PreparedExecutableNamespace {
+    fn prepare(path: &Path) -> Result<Self, String> {
+        Ok(Self(H7PreparedNamespace::prepare(path, false)?))
+    }
+
+    fn rebind_leaf(&self) -> Result<Arc<H7Handle>, String> {
+        self.0.rebind_leaf()
+    }
+
+    fn identity(&self) -> H7NamespaceIdentity {
+        self.0.identity()
+    }
+}
+
+struct PreparedWorkingDirectory(H7PreparedNamespace);
+
+impl PreparedWorkingDirectory {
+    fn prepare(path: &Path) -> Result<Self, String> {
+        Ok(Self(H7PreparedNamespace::prepare(path, true)?))
+    }
+
+    fn rebind_leaf(&self) -> Result<Arc<H7Handle>, String> {
+        self.0.rebind_leaf()
+    }
+
+    fn identity(&self) -> H7NamespaceIdentity {
+        self.0.identity()
+    }
+
+    fn path(&self) -> &Path {
+        self.0.path()
+    }
+}
+
 struct PreparedExecutableImage {
     file: File,
     path: PathBuf,
+    namespace: Arc<PreparedExecutableNamespace>,
     identity: H7ImageIdentity,
     sha256: String,
 }
 
 impl PreparedExecutableImage {
     fn prepare(path: &Path) -> Result<Self, String> {
-        if !path.is_absolute() {
-            return Err("H7 executable path was not absolute".to_string());
-        }
-        if path.to_string_lossy().starts_with("\\\\") {
-            return Err("H7 executable path was a UNC/remote path".to_string());
-        }
-        let root = PathBuf::from(format!(
-            "{}\\",
-            path.to_string_lossy().chars().take(2).collect::<String>()
-        ));
-        let root_wide = wide_null(root.as_os_str());
-        let drive_type = unsafe { GetDriveTypeW(root_wide.as_ptr()) };
-        if drive_type == DRIVE_REMOTE {
-            return Err("H7 executable path was on a remote drive".to_string());
-        }
-        let path_wide = wide_null(path.as_os_str());
-        let handle = unsafe {
-            CreateFileW(
-                path_wide.as_ptr(),
-                FILE_GENERIC_READ,
-                FILE_SHARE_READ,
-                std::ptr::null::<SECURITY_ATTRIBUTES>(),
-                OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
-                std::ptr::null_mut(),
-            )
-        };
-        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-            return Err(format!("H7 executable image open failed: {}", unsafe {
-                GetLastError()
-            }));
-        }
-        let file = unsafe { File::from_raw_handle(handle as RawHandle) };
+        let namespace = Arc::new(PreparedExecutableNamespace::prepare(path)?);
+        let file = duplicate_file_handle(namespace.0.leaf.raw())?;
         let identity = file_identity(&file)?;
         if identity.file_size == 0 {
             return Err("H7 executable image was empty".to_string());
@@ -238,6 +378,7 @@ impl PreparedExecutableImage {
         Ok(Self {
             file,
             path: path.to_path_buf(),
+            namespace,
             identity,
             sha256,
         })
@@ -246,11 +387,152 @@ impl PreparedExecutableImage {
     fn reverify(&mut self, expected: H7ImageIdentity, expected_sha256: &str) -> Result<(), String> {
         let identity = file_identity(&self.file)?;
         let sha256 = hash_file(&self.file)?;
-        if identity != expected || sha256 != expected_sha256 {
+        if identity != expected
+            || sha256 != expected_sha256
+            || self.namespace.rebind_leaf().is_err()
+        {
             return Err("H7 retained executable image evidence changed".to_string());
         }
         Ok(())
     }
+
+    fn reverify_identity(
+        &self,
+        expected: H7ImageIdentity,
+        expected_namespace: H7NamespaceIdentity,
+    ) -> Result<Arc<H7Handle>, String> {
+        let identity = file_identity(&self.file)?;
+        if identity != expected || self.namespace.identity() != expected_namespace {
+            return Err("H7 retained executable identity changed".to_string());
+        }
+        self.namespace.rebind_leaf()
+    }
+}
+
+fn duplicate_file_handle(handle: HANDLE) -> Result<File, String> {
+    let mut duplicate = std::ptr::null_mut();
+    let ok = unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            handle,
+            GetCurrentProcess(),
+            &mut duplicate,
+            0,
+            FALSE,
+            DUPLICATE_SAME_ACCESS,
+        )
+    };
+    if ok == 0 || duplicate.is_null() || duplicate == INVALID_HANDLE_VALUE {
+        return Err(format!(
+            "H7 executable handle duplication failed: {}",
+            unsafe { GetLastError() }
+        ));
+    }
+    Ok(unsafe { File::from_raw_handle(duplicate as RawHandle) })
+}
+
+fn open_namespace_drive_anchor(path: &Path) -> Result<H7Handle, String> {
+    let handle = unsafe {
+        CreateFileW(
+            wide_null(path.as_os_str()).as_ptr(),
+            FILE_READ_ATTRIBUTES | FILE_TRAVERSE | SYNCHRONIZE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null::<SECURITY_ATTRIBUTES>(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    let handle = H7Handle::new(handle)?;
+    let identity = namespace_identity(handle.raw())?;
+    if !identity.directory || identity.reparse {
+        return Err("H7 local drive anchor was not a non-reparse directory".to_string());
+    }
+    Ok(handle)
+}
+
+fn open_namespace_relative(
+    parent: &Arc<H7Handle>,
+    component: &OsStr,
+    directory: bool,
+) -> Result<H7Handle, String> {
+    let mut name = component.encode_wide().collect::<Vec<_>>();
+    let byte_length = name
+        .len()
+        .checked_mul(2)
+        .ok_or_else(|| "H7 namespace component was too long".to_string())?;
+    if byte_length > u16::MAX as usize {
+        return Err("H7 namespace component was too long".to_string());
+    }
+    let unicode_name = UNICODE_STRING {
+        Length: byte_length as u16,
+        MaximumLength: byte_length as u16,
+        Buffer: name.as_mut_ptr(),
+    };
+    let object_attributes = OBJECT_ATTRIBUTES {
+        Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: parent.raw(),
+        ObjectName: &unicode_name,
+        Attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+        SecurityDescriptor: std::ptr::null(),
+        SecurityQualityOfService: std::ptr::null(),
+    };
+    let desired_access = if directory {
+        FILE_READ_ATTRIBUTES | FILE_TRAVERSE | SYNCHRONIZE
+    } else {
+        FILE_GENERIC_READ | SYNCHRONIZE
+    };
+    let create_options = if directory {
+        FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT
+    } else {
+        FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT
+    };
+    let mut status_block = IO_STATUS_BLOCK::default();
+    let mut raw = std::ptr::null_mut();
+    let status = unsafe {
+        NtCreateFile(
+            &mut raw,
+            desired_access,
+            &object_attributes,
+            &mut status_block,
+            std::ptr::null(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            FILE_OPEN,
+            create_options,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if status < 0 || raw.is_null() || raw == INVALID_HANDLE_VALUE {
+        if !raw.is_null() && raw != INVALID_HANDLE_VALUE {
+            unsafe {
+                CloseHandle(raw);
+            }
+        }
+        return Err(format!(
+            "H7 handle-relative namespace open failed: {status}"
+        ));
+    }
+    let handle = H7Handle::new(raw)?;
+    let _ = namespace_identity(handle.raw())?;
+    Ok(handle)
+}
+
+fn namespace_identity(handle: HANDLE) -> Result<H7NamespaceIdentity, String> {
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    if unsafe { GetFileInformationByHandle(handle, &mut information) } == 0 {
+        return Err(format!("H7 namespace identity read failed: {}", unsafe {
+            GetLastError()
+        }));
+    }
+    Ok(H7NamespaceIdentity {
+        volume_serial: information.dwVolumeSerialNumber,
+        file_index: (u64::from(information.nFileIndexHigh) << 32)
+            | u64::from(information.nFileIndexLow),
+        directory: information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0,
+        reparse: information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0,
+    })
 }
 
 fn file_identity(file: &File) -> Result<H7ImageIdentity, String> {
@@ -305,8 +587,9 @@ struct H7CatalogEntry {
     program_id: String,
     image_path: PathBuf,
     expected_image_identity: H7ImageIdentity,
+    expected_image_namespace: H7NamespaceIdentity,
     expected_image_sha256: String,
-    working_directory: PathBuf,
+    working_directory: Arc<PreparedWorkingDirectory>,
     working_directory_identity: String,
     environment: BTreeMap<String, String>,
     environment_policy_hash: String,
@@ -324,17 +607,12 @@ impl H7ExecutableCatalog {
         if !image_path.is_absolute() || !working_directory.is_absolute() {
             return Err("H7 catalog paths must be absolute".to_string());
         }
-        let working_directory = fs::canonicalize(&working_directory)
-            .map_err(|_| "H7 fixed working directory could not be resolved".to_string())?;
-        if !fs::metadata(&working_directory)
-            .map_err(|_| "H7 fixed working directory could not be read".to_string())?
-            .is_dir()
-        {
-            return Err("H7 fixed working directory was not a directory".to_string());
-        }
+        let working_directory = Arc::new(PreparedWorkingDirectory::prepare(&working_directory)?);
         let mut image = PreparedExecutableImage::prepare(&image_path)?;
         let expected_image_identity = image.identity;
+        let expected_image_namespace = image.namespace.identity();
         let expected_image_sha256 = image.sha256.clone();
+        let expected_working_directory_identity = working_directory.0.identity();
         let environment = BTreeMap::from([(
             H7_ENV_ALLOWLIST_KEY.to_string(),
             H7_ENV_ALLOWLIST_VALUE.to_string(),
@@ -348,10 +626,9 @@ impl H7ExecutableCatalog {
                 program_id: H7_PROGRAM_ID.to_string(),
                 image_path,
                 expected_image_identity,
+                expected_image_namespace,
                 expected_image_sha256,
-                working_directory_identity: sha256_hex(
-                    working_directory.to_string_lossy().as_bytes(),
-                ),
+                working_directory_identity: expected_working_directory_identity.wire(),
                 working_directory,
                 environment,
                 environment_policy_hash,
@@ -372,6 +649,7 @@ impl H7ExecutableCatalog {
         }
         let image = PreparedExecutableImage::prepare(&self.entry.image_path)?;
         if image.identity != self.entry.expected_image_identity
+            || image.namespace.identity() != self.entry.expected_image_namespace
             || image.sha256 != self.entry.expected_image_sha256
         {
             return Err("H7 executable image did not match the immutable catalog".to_string());
@@ -389,6 +667,7 @@ impl H7ExecutableCatalog {
             turn_id: request.turn_id,
             program_id: request.program,
             image: Mutex::new(image),
+            executable_namespace_identity: self.entry.expected_image_namespace,
             argv,
             argv_hash,
             argv_count: request.args.len(),
@@ -409,10 +688,11 @@ struct PreparedProcessAction {
     turn_id: String,
     program_id: String,
     image: Mutex<PreparedExecutableImage>,
+    executable_namespace_identity: H7NamespaceIdentity,
     argv: Vec<String>,
     argv_hash: String,
     argv_count: usize,
-    working_directory: PathBuf,
+    working_directory: Arc<PreparedWorkingDirectory>,
     working_directory_identity: String,
     environment: BTreeMap<String, String>,
     environment_policy_hash: String,
@@ -564,6 +844,12 @@ impl Drop for H7Handle {
     }
 }
 
+// A H7 handle is an owned process-local kernel reference.  It is moved, never
+// cloned, across the bounded blocking launch fence; Arc is used only for the
+// retained namespace chain and closes the handle exactly once.
+unsafe impl Send for H7Handle {}
+unsafe impl Sync for H7Handle {}
+
 struct H7ProcThreadAttributes {
     buffer: Vec<u8>,
     handles: Vec<HANDLE>,
@@ -667,8 +953,12 @@ struct H7SupervisorMetrics {
     thread_resumed: AtomicUsize,
     process_exited: AtomicUsize,
     jobs_terminated: AtomicUsize,
+    job_termination_failures: AtomicUsize,
+    direct_termination_attempted: AtomicUsize,
+    direct_termination_verified: AtomicUsize,
     automatic_retries: AtomicUsize,
     process_tree_remaining: AtomicUsize,
+    process_tree_observations: AtomicUsize,
     active_processes_peak: AtomicUsize,
     created_notify: Notify,
 }
@@ -693,13 +983,21 @@ struct H7NativeResult {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     job_terminated: bool,
+    process_tree_observed: bool,
     process_tree_remaining: usize,
     automatic_retry: bool,
+    direct_termination_attempted: bool,
+    direct_termination_verified: bool,
+    process_exit_verified: bool,
+    stdout_reader_joined: bool,
+    stderr_reader_joined: bool,
 }
 
 struct H7ReaderState {
     bytes: Mutex<Vec<u8>>,
     overflow: AtomicBool,
+    cancelled: AtomicBool,
+    finished: AtomicBool,
 }
 
 impl H7ReaderState {
@@ -707,7 +1005,74 @@ impl H7ReaderState {
         Arc::new(Self {
             bytes: Mutex::new(Vec::new()),
             overflow: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
         })
+    }
+}
+
+struct H7BoundedReader {
+    raw_handle: HANDLE,
+    state: Arc<H7ReaderState>,
+    thread: Option<JoinHandle<()>>,
+    thread_handle: Option<H7Handle>,
+}
+
+impl H7BoundedReader {
+    fn cancel_io(&self) {
+        self.state.cancelled.store(true, Ordering::Release);
+        if !self.raw_handle.is_null() {
+            unsafe {
+                let _ = CancelIoEx(self.raw_handle, std::ptr::null_mut());
+            }
+        }
+    }
+
+    fn close_raw_handle(&mut self) {
+        if !self.raw_handle.is_null() {
+            unsafe {
+                CloseHandle(self.raw_handle);
+            }
+            self.raw_handle = std::ptr::null_mut();
+        }
+    }
+
+    fn join_bounded(&mut self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while !self.state.finished.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        if !self.state.finished.load(Ordering::Acquire) {
+            self.cancel_io();
+            let cancel_deadline = Instant::now() + timeout;
+            while !self.state.finished.load(Ordering::Acquire) && Instant::now() < cancel_deadline {
+                thread::yield_now();
+            }
+        }
+        if !self.state.finished.load(Ordering::Acquire) {
+            if let Some(thread_handle) = self.thread_handle.as_ref() {
+                let _ = unsafe { TerminateThread(thread_handle.raw(), 1) };
+                if unsafe { WaitForSingleObject(thread_handle.raw(), 1_000) } == WAIT_OBJECT_0 {
+                    self.state.finished.store(true, Ordering::Release);
+                    self.close_raw_handle();
+                }
+            }
+        }
+        if !self.state.finished.load(Ordering::Acquire) {
+            return false;
+        }
+        self.thread
+            .take()
+            .and_then(|thread| thread.join().ok())
+            .is_some()
+    }
+}
+
+impl Drop for H7BoundedReader {
+    fn drop(&mut self) {
+        if self.thread.is_some() {
+            let _ = self.join_bounded(H7_CLEANUP_TIMEOUT);
+        }
     }
 }
 
@@ -715,17 +1080,66 @@ fn spawn_bounded_reader(
     raw_handle: usize,
     state: Arc<H7ReaderState>,
     bound: usize,
-) -> JoinHandle<()> {
-    thread::spawn(move || {
+) -> H7BoundedReader {
+    let reader_state = Arc::clone(&state);
+    let (thread_handle_sender, thread_handle_receiver) = std::sync::mpsc::sync_channel(1);
+    let thread = thread::spawn(move || {
         let raw_handle = raw_handle as HANDLE;
+        let mut duplicated_thread = std::ptr::null_mut();
+        let duplicated = unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                GetCurrentThread(),
+                GetCurrentProcess(),
+                &mut duplicated_thread,
+                0,
+                FALSE,
+                DUPLICATE_SAME_ACCESS,
+            )
+        } != 0;
+        let thread_handle = if duplicated {
+            H7Handle::new(duplicated_thread).ok()
+        } else {
+            None
+        };
+        let _ = thread_handle_sender.send(thread_handle);
         let mut buffer = [0_u8; 8192];
         loop {
+            if reader_state.cancelled.load(Ordering::Acquire) {
+                break;
+            }
+            let mut available = 0_u32;
+            let peeked = unsafe {
+                PeekNamedPipe(
+                    raw_handle,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut available,
+                    std::ptr::null_mut(),
+                )
+            } != 0;
+            if !peeked {
+                break;
+            }
+            if available == 0 {
+                thread::yield_now();
+                continue;
+            }
             let mut read = 0_u32;
+            let current_size = reader_state
+                .bytes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len();
+            if current_size >= bound {
+                reader_state.overflow.store(true, Ordering::Release);
+            }
             let ok = unsafe {
                 ReadFile(
                     raw_handle,
                     buffer.as_mut_ptr().cast(),
-                    buffer.len() as u32,
+                    available.min(buffer.len() as u32),
                     &mut read,
                     std::ptr::null_mut(),
                 )
@@ -733,7 +1147,7 @@ fn spawn_bounded_reader(
             if ok == 0 || read == 0 {
                 break;
             }
-            let mut bytes = state
+            let mut bytes = reader_state
                 .bytes
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -741,14 +1155,39 @@ fn spawn_bounded_reader(
             let take = remaining.min(read as usize);
             bytes.extend_from_slice(&buffer[..take]);
             if take < read as usize {
-                state.overflow.store(true, Ordering::Release);
-                break;
+                reader_state.overflow.store(true, Ordering::Release);
             }
         }
         unsafe {
             CloseHandle(raw_handle);
         }
-    })
+        reader_state.finished.store(true, Ordering::Release);
+    });
+    let thread_handle = thread_handle_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .ok()
+        .flatten();
+    H7BoundedReader {
+        raw_handle: raw_handle as HANDLE,
+        state,
+        thread: Some(thread),
+        thread_handle,
+    }
+}
+
+#[derive(Default)]
+struct H7CleanupEvidence {
+    direct_termination_attempted: AtomicBool,
+    direct_termination_verified: AtomicBool,
+    job_termination_attempted: AtomicBool,
+    job_termination_succeeded: AtomicBool,
+    job_termination_proven: AtomicBool,
+    process_exit_verified: AtomicBool,
+    process_tree_observed: AtomicBool,
+    process_tree_remaining: AtomicUsize,
+    stdout_reader_joined: AtomicBool,
+    stderr_reader_joined: AtomicBool,
+    user_code_started: AtomicBool,
 }
 
 struct H7NativeResources {
@@ -757,23 +1196,164 @@ struct H7NativeResources {
     thread: H7Handle,
     phase: Arc<AtomicU8>,
     metrics: Arc<H7SupervisorMetrics>,
+    cleanup: Arc<H7CleanupEvidence>,
+    job_assigned: bool,
     job_terminated: bool,
 }
 
 impl H7NativeResources {
-    fn terminate_job(&mut self) {
-        if !self.job_terminated {
-            unsafe {
-                let _ = TerminateJobObject(self.job.raw(), 1);
+    fn close_process_handle(&mut self) {
+        let process = std::mem::replace(&mut self.process, H7Handle(std::ptr::null_mut()));
+        drop(process);
+    }
+
+    fn close_thread_handle(&mut self) {
+        let thread = std::mem::replace(&mut self.thread, H7Handle(std::ptr::null_mut()));
+        drop(thread);
+    }
+
+    fn observe_process_exit(&self, milliseconds: u32) -> bool {
+        let signaled =
+            unsafe { WaitForSingleObject(self.process.raw(), milliseconds) } == WAIT_OBJECT_0;
+        if signaled {
+            self.cleanup
+                .process_exit_verified
+                .store(true, Ordering::Release);
+        }
+        signaled
+    }
+
+    fn observe_process_tree(&self) -> Option<usize> {
+        let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        let mut returned_length = 0_u32;
+        let ok = unsafe {
+            QueryInformationJobObject(
+                self.job.raw(),
+                JobObjectBasicAccountingInformation,
+                (&mut accounting as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                &mut returned_length,
+            )
+        } != 0;
+        if !ok {
+            return None;
+        }
+        let remaining = accounting.ActiveProcesses as usize;
+        self.cleanup
+            .process_tree_remaining
+            .store(remaining, Ordering::Release);
+        self.cleanup
+            .process_tree_observed
+            .store(true, Ordering::Release);
+        self.metrics
+            .process_tree_observations
+            .fetch_add(1, Ordering::AcqRel);
+        Some(remaining)
+    }
+
+    fn observe_process_tree_until_quiescent(&self, timeout: Duration) -> Option<usize> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = self.observe_process_tree()?;
+            if remaining == 0 || Instant::now() >= deadline {
+                return Some(remaining);
             }
-            self.job_terminated = true;
-            self.metrics.jobs_terminated.fetch_add(1, Ordering::AcqRel);
+            thread::yield_now();
         }
     }
 
-    fn wait_bounded(&self, milliseconds: u32) {
-        unsafe {
-            let _ = WaitForSingleObject(self.process.raw(), milliseconds);
+    fn terminate_primary_process(&mut self) -> bool {
+        if self
+            .cleanup
+            .direct_termination_attempted
+            .load(Ordering::Acquire)
+        {
+            return self
+                .cleanup
+                .direct_termination_verified
+                .load(Ordering::Acquire);
+        }
+        self.cleanup
+            .direct_termination_attempted
+            .store(true, Ordering::Release);
+        self.metrics
+            .direct_termination_attempted
+            .fetch_add(1, Ordering::AcqRel);
+        let _requested = unsafe { TerminateProcess(self.process.raw(), 1) } != 0;
+        let verified = self.observe_process_exit(1_000);
+        if verified {
+            self.cleanup
+                .direct_termination_verified
+                .store(true, Ordering::Release);
+            self.metrics
+                .direct_termination_verified
+                .fetch_add(1, Ordering::AcqRel);
+            if !phase_at_least(&self.phase, H7LaunchPhase::Exited) {
+                self.phase
+                    .store(H7LaunchPhase::Exited as u8, Ordering::Release);
+                self.metrics.process_exited.fetch_add(1, Ordering::AcqRel);
+            }
+            let _ = self.observe_process_tree_until_quiescent(Duration::from_millis(100));
+        }
+        verified
+    }
+
+    fn terminate_assigned_job(&mut self) -> bool {
+        if !self.job_assigned || self.job_terminated {
+            return self.job_terminated;
+        }
+        let job_call_succeeded = if self
+            .cleanup
+            .job_termination_attempted
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let succeeded = unsafe { TerminateJobObject(self.job.raw(), 1) } != 0;
+            if succeeded {
+                self.cleanup
+                    .job_termination_succeeded
+                    .store(true, Ordering::Release);
+                self.metrics.jobs_terminated.fetch_add(1, Ordering::AcqRel);
+            } else {
+                self.metrics
+                    .job_termination_failures
+                    .fetch_add(1, Ordering::AcqRel);
+            }
+            succeeded
+        } else {
+            self.cleanup
+                .job_termination_succeeded
+                .load(Ordering::Acquire)
+        };
+        let mut process_closed = self.observe_process_exit(1_000);
+        let mut tree_closed =
+            self.observe_process_tree_until_quiescent(H7_CLEANUP_TIMEOUT) == Some(0);
+        if (!process_closed || !tree_closed) && !self.job_terminated {
+            // A failed or unproven Job operation gets a bounded primary-process
+            // fallback.  Its proof remains separate from job_termination_succeeded.
+            let _ = self.terminate_primary_process();
+            process_closed = self.observe_process_exit(1_000);
+            tree_closed = self.observe_process_tree_until_quiescent(H7_CLEANUP_TIMEOUT) == Some(0);
+        }
+        if process_closed && !phase_at_least(&self.phase, H7LaunchPhase::Exited) {
+            self.phase
+                .store(H7LaunchPhase::Exited as u8, Ordering::Release);
+            self.metrics.process_exited.fetch_add(1, Ordering::AcqRel);
+        }
+        self.job_terminated = job_call_succeeded && process_closed && tree_closed;
+        if self.job_terminated {
+            self.cleanup
+                .job_termination_proven
+                .store(true, Ordering::Release);
+        }
+        self.job_terminated
+    }
+
+    fn terminate_for_cleanup(&mut self) -> bool {
+        if self.job_assigned {
+            self.terminate_assigned_job()
+        } else {
+            self.terminate_primary_process()
         }
     }
 }
@@ -781,9 +1361,200 @@ impl H7NativeResources {
 impl Drop for H7NativeResources {
     fn drop(&mut self) {
         if !phase_at_least(&self.phase, H7LaunchPhase::Exited) {
-            self.terminate_job();
-            self.wait_bounded(1_000);
+            let _ = self.terminate_for_cleanup();
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum H7PostHostMutation {
+    None,
+    ArgvHash,
+    CwdIdentity,
+    EnvironmentHash,
+    ExecutableIdentity,
+}
+
+struct H7LaunchPreparation {
+    job: H7Handle,
+    stdin_read: H7Handle,
+    stdin_write: H7Handle,
+    stdout_read: H7Handle,
+    stdout_write: H7Handle,
+    stderr_read: H7Handle,
+    stderr_write: H7Handle,
+    attributes: H7ProcThreadAttributes,
+    application_name: Vec<u16>,
+    command_line: Vec<u16>,
+    current_directory: Vec<u16>,
+    environment: Vec<u16>,
+    executable_probe: Arc<H7Handle>,
+    working_directory_probe: Arc<H7Handle>,
+    binding: H7ProcessBinding,
+    expected_image_identity: H7ImageIdentity,
+    expected_image_namespace: H7NamespaceIdentity,
+    expected_working_directory: H7NamespaceIdentity,
+}
+
+// The preparation owns unique native handles and is transferred once to the
+// bounded blocking launch closure.  No handle is shared through this value.
+unsafe impl Send for H7LaunchPreparation {}
+
+impl H7LaunchPreparation {
+    fn prepare(
+        action: &PreparedProcessAction,
+        unlisted_inheritable_handle: Option<usize>,
+    ) -> Result<Self, String> {
+        let (expected_image_identity, expected_image_namespace, executable_probe) = {
+            let mut image = action
+                .image
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let expected_identity = image.identity;
+            let expected_sha256 = image.sha256.clone();
+            image.reverify(expected_identity, &expected_sha256)?;
+            let namespace = image.namespace.identity();
+            let probe = image.namespace.rebind_leaf()?;
+            (expected_identity, namespace, probe)
+        };
+        let expected_working_directory = action.working_directory.0.identity();
+        let working_directory_probe = action.working_directory.rebind_leaf()?;
+        if expected_working_directory.wire() != action.working_directory_identity {
+            return Err("H7 working-directory binding was not host-owned".to_string());
+        }
+        let job = create_job_object()?;
+        let (stdin_read, stdin_write, stdout_read, stdout_write, stderr_read, stderr_write) =
+            create_stdio_pipes()?;
+        let mut attributes = H7ProcThreadAttributes::new(1)?;
+        attributes.set_handle_list(vec![
+            stdin_read.raw(),
+            stdout_write.raw(),
+            stderr_write.raw(),
+        ])?;
+        if let Some(raw) = unlisted_inheritable_handle {
+            unsafe {
+                if SetHandleInformation(raw as HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)
+                    == 0
+                {
+                    return Err("H7 unlisted handle inheritance seam failed".to_string());
+                }
+            }
+        }
+        let application_name = {
+            let image = action
+                .image
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            wide_null(image.path.as_os_str())
+        };
+        let binding = action.binding();
+        Ok(Self {
+            job,
+            stdin_read,
+            stdin_write,
+            stdout_read,
+            stdout_write,
+            stderr_read,
+            stderr_write,
+            attributes,
+            application_name,
+            command_line: argv_to_command_line(&action.argv),
+            current_directory: wide_null(action.working_directory.path().as_os_str()),
+            environment: environment_block(&action.environment),
+            executable_probe,
+            working_directory_probe,
+            binding,
+            expected_image_identity,
+            expected_image_namespace,
+            expected_working_directory,
+        })
+    }
+
+    fn final_local_fence(
+        &mut self,
+        action: &PreparedProcessAction,
+        grant: &H7ProcessGrant,
+        cancellation: &AtomicBool,
+        mutation: H7PostHostMutation,
+    ) -> Result<(), String> {
+        if cancellation.load(Ordering::Acquire) {
+            return Err("H7 cancellation won the final launch fence".to_string());
+        }
+        let mut expected_binding = self.binding.clone();
+        match mutation {
+            H7PostHostMutation::None => {}
+            H7PostHostMutation::ArgvHash => expected_binding.argv_hash = "0".repeat(64),
+            H7PostHostMutation::CwdIdentity => {
+                expected_binding.working_directory_identity = "0".repeat(64)
+            }
+            H7PostHostMutation::EnvironmentHash => {
+                expected_binding.environment_policy_hash = "0".repeat(64)
+            }
+            H7PostHostMutation::ExecutableIdentity => {
+                expected_binding.executable_identity = "0".repeat(64)
+            }
+        }
+        let current_binding = action.binding();
+        if current_binding != expected_binding
+            || grant.binding != current_binding
+            || grant.authorization_revision <= 0
+            || !grant.used
+        {
+            return Err("H7 local final binding fence rejected the ProcessGrant".to_string());
+        }
+        self.final_native_fence(action, cancellation, mutation)
+    }
+
+    fn final_native_fence(
+        &mut self,
+        action: &PreparedProcessAction,
+        cancellation: &AtomicBool,
+        mutation: H7PostHostMutation,
+    ) -> Result<(), String> {
+        if cancellation.load(Ordering::Acquire) {
+            return Err("H7 cancellation won the final launch fence".to_string());
+        }
+        let (image_identity, image_namespace_identity, probe) = {
+            let image = action
+                .image
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let probe = image.namespace.rebind_leaf()?;
+            let duplicate = duplicate_file_handle(probe.raw())?;
+            (
+                file_identity(&duplicate)?,
+                image.namespace.identity(),
+                probe,
+            )
+        };
+        let working_directory_identity = namespace_identity(self.working_directory_probe.raw())?;
+        let cwd_probe = action.working_directory.rebind_leaf()?;
+        let cwd_identity = namespace_identity(cwd_probe.raw())?;
+        if image_identity != self.expected_image_identity
+            || image_namespace_identity != self.expected_image_namespace
+            || working_directory_identity != self.expected_working_directory
+            || cwd_identity != self.expected_working_directory
+        {
+            return Err("H7 final executable or cwd identity fence failed".to_string());
+        }
+        self.executable_probe = probe;
+        self.working_directory_probe = cwd_probe;
+        if action.argv_count != self.binding.argv_count
+            || action.argv_hash != self.binding.argv_hash
+            || action.environment_policy_hash != self.binding.environment_policy_hash
+            || action.stdout_bound != self.binding.stdout_bound
+            || action.stderr_bound != self.binding.stderr_bound
+            || action.timeout.as_millis() as u64 != self.binding.timeout_ms
+        {
+            return Err("H7 final argv/environment/bounds fence failed".to_string());
+        }
+        if cancellation.load(Ordering::Acquire) {
+            return Err("H7 cancellation won the final launch fence".to_string());
+        }
+        if mutation != H7PostHostMutation::None {
+            return Err("H7 post-Host local binding mutation was detected".to_string());
+        }
+        Ok(())
     }
 }
 
@@ -793,12 +1564,35 @@ struct H7NativeOptions {
     metrics: Arc<H7SupervisorMetrics>,
     fault: H7NativeLaunchFault,
     unlisted_inheritable_handle: Option<usize>,
+    post_host_mutation: H7PostHostMutation,
 }
 
 fn supervise_native(action: &PreparedProcessAction, options: H7NativeOptions) -> H7NativeResult {
+    let preparation =
+        match H7LaunchPreparation::prepare(action, options.unlisted_inheritable_handle) {
+            Ok(preparation) => preparation,
+            Err(_) => return launch_failed(false, false, None),
+        };
+    supervise_native_prepared(action, options, preparation, None)
+}
+
+fn supervise_native_prepared(
+    action: &PreparedProcessAction,
+    options: H7NativeOptions,
+    preparation: H7LaunchPreparation,
+    grant: Option<H7ProcessGrant>,
+) -> H7NativeResult {
     let phase = Arc::new(AtomicU8::new(H7LaunchPhase::NotStarted as u8));
+    let cleanup = Arc::new(H7CleanupEvidence::default());
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        supervise_native_inner(action, &options, Arc::clone(&phase))
+        supervise_native_inner(
+            action,
+            &options,
+            Arc::clone(&phase),
+            Arc::clone(&cleanup),
+            preparation,
+            grant.as_ref(),
+        )
     }));
     match result {
         Ok(result) => result,
@@ -809,13 +1603,29 @@ fn supervise_native(action: &PreparedProcessAction, options: H7NativeOptions) ->
                 H7NativeOutcomeKind::Denied
             },
             process_created: phase_at_least(&phase, H7LaunchPhase::CreatedSuspended),
-            user_code_started: phase_at_least(&phase, H7LaunchPhase::Resumed),
+            user_code_started: cleanup.user_code_started.load(Ordering::Acquire),
             exit_code: None,
             stdout: Vec::new(),
             stderr: Vec::new(),
-            job_terminated: phase_at_least(&phase, H7LaunchPhase::CreatedSuspended),
-            process_tree_remaining: 0,
+            job_terminated: cleanup.job_termination_proven.load(Ordering::Acquire),
+            process_tree_remaining: if cleanup.process_tree_observed.load(Ordering::Acquire) {
+                cleanup.process_tree_remaining.load(Ordering::Acquire)
+            } else if phase_at_least(&phase, H7LaunchPhase::CreatedSuspended) {
+                usize::MAX
+            } else {
+                0
+            },
+            process_tree_observed: cleanup.process_tree_observed.load(Ordering::Acquire),
             automatic_retry: false,
+            direct_termination_attempted: cleanup
+                .direct_termination_attempted
+                .load(Ordering::Acquire),
+            direct_termination_verified: cleanup
+                .direct_termination_verified
+                .load(Ordering::Acquire),
+            process_exit_verified: cleanup.process_exit_verified.load(Ordering::Acquire),
+            stdout_reader_joined: cleanup.stdout_reader_joined.load(Ordering::Acquire),
+            stderr_reader_joined: cleanup.stderr_reader_joined.load(Ordering::Acquire),
         },
     }
 }
@@ -824,73 +1634,53 @@ fn supervise_native_inner(
     action: &PreparedProcessAction,
     options: &H7NativeOptions,
     phase: Arc<AtomicU8>,
+    cleanup: Arc<H7CleanupEvidence>,
+    mut preparation: H7LaunchPreparation,
+    grant: Option<&H7ProcessGrant>,
 ) -> H7NativeResult {
     if options.cancellation.load(Ordering::Acquire) {
-        return H7NativeResult {
-            kind: H7NativeOutcomeKind::Denied,
-            process_created: false,
-            user_code_started: false,
-            exit_code: None,
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-            job_terminated: false,
-            process_tree_remaining: 0,
-            automatic_retry: false,
-        };
+        return launch_failed(false, false, None).with_kind(H7NativeOutcomeKind::Denied);
     }
     if options.fault == H7NativeLaunchFault::PanicBeforeCreateProcess {
         panic!("D29-H7 injected panic before CreateProcessW");
     }
-    {
-        let mut image = action
-            .image
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let expected_identity = image.identity;
-        let expected_sha256 = image.sha256.clone();
-        image
-            .reverify(expected_identity, &expected_sha256)
-            .expect("H7 retained image revalidation must pass");
-    }
-    let job = match create_job_object() {
-        Ok(job) => job,
-        Err(_) => return launch_failed(false, false),
+    let final_fence = if let Some(grant) = grant {
+        preparation.final_local_fence(
+            action,
+            grant,
+            options.cancellation.as_ref(),
+            options.post_host_mutation,
+        )
+    } else {
+        preparation.final_native_fence(
+            action,
+            options.cancellation.as_ref(),
+            H7PostHostMutation::None,
+        )
     };
-    let (stdin_read, stdin_write, stdout_read, stdout_write, stderr_read, stderr_write) =
-        match create_stdio_pipes() {
-            Ok(pipes) => pipes,
-            Err(_) => return launch_failed(false, false),
-        };
-    let mut attributes = match H7ProcThreadAttributes::new(1) {
-        Ok(attributes) => attributes,
-        Err(_) => return launch_failed(false, false),
-    };
-    if attributes
-        .set_handle_list(vec![
-            stdin_read.raw(),
-            stdout_write.raw(),
-            stderr_write.raw(),
-        ])
-        .is_err()
-    {
-        return launch_failed(false, false);
+    if final_fence.is_err() {
+        return launch_failed(false, false, None).with_kind(H7NativeOutcomeKind::Denied);
     }
-    if let Some(raw) = options.unlisted_inheritable_handle {
-        unsafe {
-            let _ = SetHandleInformation(raw as HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
-        }
-    }
-    let image_path = {
-        let image = action
-            .image
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        image.path.clone()
-    };
-    let application_name = wide_null(image_path.as_os_str());
-    let mut command_line = argv_to_command_line(&action.argv);
-    let current_directory = wide_null(action.working_directory.as_os_str());
-    let environment = environment_block(&action.environment);
+    let H7LaunchPreparation {
+        job,
+        stdin_read,
+        stdin_write,
+        stdout_read,
+        stdout_write,
+        stderr_read,
+        stderr_write,
+        mut attributes,
+        application_name,
+        mut command_line,
+        current_directory,
+        environment,
+        executable_probe: _executable_probe,
+        working_directory_probe: _working_directory_probe,
+        binding: _binding,
+        expected_image_identity: _expected_image_identity,
+        expected_image_namespace: _expected_image_namespace,
+        expected_working_directory: _expected_working_directory,
+    } = preparation;
     let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
     startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
     startup.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
@@ -917,7 +1707,7 @@ fn supervise_native_inner(
         )
     };
     if created == 0 {
-        return launch_failed(false, false);
+        return launch_failed(false, false, None);
     }
     phase.store(H7LaunchPhase::CreatedSuspended as u8, Ordering::Release);
     options
@@ -931,11 +1721,23 @@ fn supervise_native_inner(
     drop(stderr_write);
     let process = match H7Handle::new(process_information.hProcess) {
         Ok(handle) => handle,
-        Err(_) => return launch_failed(true, false),
+        Err(_) => {
+            return launch_failed(true, false, None);
+        }
     };
     let thread = match H7Handle::new(process_information.hThread) {
         Ok(handle) => handle,
-        Err(_) => return launch_failed(true, false),
+        Err(_) => {
+            let _ = unsafe { TerminateProcess(process.raw(), 1) };
+            let _ = unsafe { WaitForSingleObject(process.raw(), 1_000) };
+            cleanup
+                .direct_termination_attempted
+                .store(true, Ordering::Release);
+            cleanup
+                .direct_termination_verified
+                .store(true, Ordering::Release);
+            return launch_failed(true, false, Some(&cleanup));
+        }
     };
     let mut resources = H7NativeResources {
         job,
@@ -943,17 +1745,20 @@ fn supervise_native_inner(
         thread,
         phase: Arc::clone(&phase),
         metrics: Arc::clone(&options.metrics),
+        cleanup: Arc::clone(&cleanup),
+        job_assigned: false,
         job_terminated: false,
     };
+    cleanup.stdout_reader_joined.store(true, Ordering::Release);
+    cleanup.stderr_reader_joined.store(true, Ordering::Release);
     if options.fault == H7NativeLaunchFault::PanicAfterCreateProcess {
         panic!("D29-H7 injected panic after CreateProcessW");
     }
     let assignment_ok = options.fault != H7NativeLaunchFault::ForceAssignmentFailure
         && unsafe { AssignProcessToJobObject(resources.job.raw(), resources.process.raw()) != 0 };
     if !assignment_ok {
-        resources.terminate_job();
-        resources.wait_bounded(1_000);
-        return launch_failed(true, false);
+        let _ = resources.terminate_for_cleanup();
+        return launch_failed(true, false, Some(&cleanup));
     }
     let mut in_job = FALSE;
     let verified = unsafe {
@@ -961,31 +1766,33 @@ fn supervise_native_inner(
             && in_job != FALSE
     };
     if !verified {
-        resources.terminate_job();
-        resources.wait_bounded(1_000);
-        return launch_failed(true, false);
+        let _ = resources.terminate_for_cleanup();
+        return launch_failed(true, false, Some(&cleanup));
     }
+    resources.job_assigned = true;
     options.metrics.job_assigned.fetch_add(1, Ordering::AcqRel);
     phase.store(H7LaunchPhase::AssignedJob as u8, Ordering::Release);
     let resumed = unsafe { ResumeThread(resources.thread.raw()) } != u32::MAX;
     if !resumed {
-        resources.terminate_job();
-        resources.wait_bounded(1_000);
-        return launch_failed(true, false);
+        let _ = resources.terminate_for_cleanup();
+        return launch_failed(true, false, Some(&cleanup));
     }
     options
         .metrics
         .thread_resumed
         .fetch_add(1, Ordering::AcqRel);
+    cleanup.user_code_started.store(true, Ordering::Release);
     phase.store(H7LaunchPhase::Resumed as u8, Ordering::Release);
     let stdout_state = H7ReaderState::new();
     let stderr_state = H7ReaderState::new();
-    let stdout_reader = spawn_bounded_reader(
+    cleanup.stdout_reader_joined.store(false, Ordering::Release);
+    cleanup.stderr_reader_joined.store(false, Ordering::Release);
+    let mut stdout_reader = spawn_bounded_reader(
         stdout_read.into_raw() as usize,
         Arc::clone(&stdout_state),
         action.stdout_bound,
     );
-    let stderr_reader = spawn_bounded_reader(
+    let mut stderr_reader = spawn_bounded_reader(
         stderr_read.into_raw() as usize,
         Arc::clone(&stderr_state),
         action.stderr_bound,
@@ -996,13 +1803,13 @@ fn supervise_native_inner(
     loop {
         if options.cancellation.load(Ordering::Acquire) {
             cancelled = true;
-            resources.terminate_job();
+            let _ = resources.terminate_assigned_job();
             break;
         }
         if stdout_state.overflow.load(Ordering::Acquire)
             || stderr_state.overflow.load(Ordering::Acquire)
         {
-            resources.terminate_job();
+            let _ = resources.terminate_assigned_job();
             break;
         }
         let wait = unsafe { WaitForSingleObject(resources.process.raw(), 20) };
@@ -1016,27 +1823,49 @@ fn supervise_native_inner(
         }
         if wait != WAIT_TIMEOUT || Instant::now() >= deadline {
             timed_out = true;
-            resources.terminate_job();
+            let _ = resources.terminate_assigned_job();
             break;
         }
     }
-    if resources.job_terminated {
-        resources.wait_bounded(1_000);
-        let _ = unsafe { WaitForSingleObject(resources.process.raw(), 1_000) };
+    if !phase_at_least(&phase, H7LaunchPhase::Exited) && !resources.job_terminated {
+        let _ = resources.terminate_for_cleanup();
     }
-    let _ = stdout_reader.join();
-    let _ = stderr_reader.join();
+    let stdout_reader_joined = stdout_reader.join_bounded(H7_CLEANUP_TIMEOUT);
+    let stderr_reader_joined = stderr_reader.join_bounded(H7_CLEANUP_TIMEOUT);
+    cleanup
+        .stdout_reader_joined
+        .store(stdout_reader_joined, Ordering::Release);
+    cleanup
+        .stderr_reader_joined
+        .store(stderr_reader_joined, Ordering::Release);
     let output_limited = stdout_state.overflow.load(Ordering::Acquire)
         || stderr_state.overflow.load(Ordering::Acquire);
-    if output_limited && !resources.job_terminated {
-        resources.terminate_job();
-        resources.wait_bounded(1_000);
+    if output_limited && !phase_at_least(&phase, H7LaunchPhase::Exited) && !resources.job_terminated
+    {
+        let _ = resources.terminate_for_cleanup();
     }
-    let exit_code = if phase_at_least(&phase, H7LaunchPhase::Exited) || resources.job_terminated {
+    let mut process_exit_verified = cleanup.process_exit_verified.load(Ordering::Acquire);
+    if phase_at_least(&phase, H7LaunchPhase::Exited) && !process_exit_verified {
+        let _ = resources.observe_process_exit(0);
+        process_exit_verified = cleanup.process_exit_verified.load(Ordering::Acquire);
+    }
+    let exit_code = if process_exit_verified {
         let mut code = 0_u32;
         (unsafe { GetExitCodeProcess(resources.process.raw(), &mut code) } != 0).then_some(code)
     } else {
         None
+    };
+    if process_exit_verified {
+        resources.close_process_handle();
+        resources.close_thread_handle();
+    }
+    if !cleanup.process_tree_observed.load(Ordering::Acquire) {
+        let _ = resources.observe_process_tree_until_quiescent(Duration::from_millis(100));
+    }
+    let process_tree_remaining = if cleanup.process_tree_observed.load(Ordering::Acquire) {
+        cleanup.process_tree_remaining.load(Ordering::Acquire)
+    } else {
+        usize::MAX
     };
     let stdout = stdout_state
         .bytes
@@ -1048,7 +1877,11 @@ fn supervise_native_inner(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
-    let kind = if output_limited {
+    let termination_unproven =
+        (output_limited || cancelled || timed_out) && !resources.job_terminated;
+    let kind = if termination_unproven {
+        H7NativeOutcomeKind::StartedOutcomeUnknown
+    } else if output_limited {
         H7NativeOutcomeKind::StartedAndOutputLimited
     } else if cancelled {
         H7NativeOutcomeKind::StartedAndCancelled
@@ -1067,12 +1900,63 @@ fn supervise_native_inner(
         stdout,
         stderr,
         job_terminated: resources.job_terminated,
-        process_tree_remaining: 0,
+        process_tree_observed: cleanup.process_tree_observed.load(Ordering::Acquire),
+        process_tree_remaining,
         automatic_retry: false,
+        direct_termination_attempted: cleanup.direct_termination_attempted.load(Ordering::Acquire),
+        direct_termination_verified: cleanup.direct_termination_verified.load(Ordering::Acquire),
+        process_exit_verified,
+        stdout_reader_joined,
+        stderr_reader_joined,
     }
 }
 
-fn launch_failed(process_created: bool, user_code_started: bool) -> H7NativeResult {
+trait H7NativeResultExt {
+    fn with_kind(self, kind: H7NativeOutcomeKind) -> Self;
+}
+
+impl H7NativeResultExt for H7NativeResult {
+    fn with_kind(mut self, kind: H7NativeOutcomeKind) -> Self {
+        self.kind = kind;
+        self
+    }
+}
+
+fn launch_failed(
+    process_created: bool,
+    user_code_started: bool,
+    cleanup: Option<&H7CleanupEvidence>,
+) -> H7NativeResult {
+    let (
+        job_terminated,
+        process_tree_observed,
+        process_tree_remaining,
+        direct_termination_attempted,
+        direct_termination_verified,
+        process_exit_verified,
+        stdout_reader_joined,
+        stderr_reader_joined,
+    ) = cleanup.map_or(
+        (false, false, 0, false, false, false, true, true),
+        |cleanup| {
+            (
+                cleanup.job_termination_proven.load(Ordering::Acquire),
+                cleanup.process_tree_observed.load(Ordering::Acquire),
+                if cleanup.process_tree_observed.load(Ordering::Acquire) {
+                    cleanup.process_tree_remaining.load(Ordering::Acquire)
+                } else if process_created {
+                    usize::MAX
+                } else {
+                    0
+                },
+                cleanup.direct_termination_attempted.load(Ordering::Acquire),
+                cleanup.direct_termination_verified.load(Ordering::Acquire),
+                cleanup.process_exit_verified.load(Ordering::Acquire),
+                cleanup.stdout_reader_joined.load(Ordering::Acquire),
+                cleanup.stderr_reader_joined.load(Ordering::Acquire),
+            )
+        },
+    );
     H7NativeResult {
         kind: H7NativeOutcomeKind::LaunchFailed,
         process_created,
@@ -1080,9 +1964,15 @@ fn launch_failed(process_created: bool, user_code_started: bool) -> H7NativeResu
         exit_code: None,
         stdout: Vec::new(),
         stderr: Vec::new(),
-        job_terminated: process_created,
-        process_tree_remaining: 0,
+        job_terminated,
+        process_tree_observed,
+        process_tree_remaining,
         automatic_retry: false,
+        direct_termination_attempted,
+        direct_termination_verified,
+        process_exit_verified,
+        stdout_reader_joined,
+        stderr_reader_joined,
     }
 }
 
@@ -1466,7 +2356,23 @@ fn h7_process_fixture_executable(repo_root: &Path) -> Result<PathBuf, String> {
         .join("target")
         .join("debug")
         .join("d29h7-process-fixture.exe");
-    if executable.is_file() {
+    let source = repo_root
+        .join("vita-agent")
+        .join("src")
+        .join("bin")
+        .join("d29h7-process-fixture.rs");
+    let executable_is_fresh = executable
+        .metadata()
+        .and_then(|binary| binary.modified())
+        .and_then(|binary_time| {
+            source.metadata().and_then(|source| {
+                source
+                    .modified()
+                    .map(|source_time| (binary_time, source_time))
+            })
+        })
+        .is_ok_and(|(binary_time, source_time)| binary_time >= source_time);
+    if executable.is_file() && executable_is_fresh {
         return Ok(executable);
     }
     let status = Command::new("cargo")
@@ -1490,6 +2396,9 @@ struct H7ProcessGrant {
     confirmation_id: String,
     binding: H7ProcessBinding,
     authorization_revision: i64,
+    issued_at_unix_ms: u64,
+    expires_at_unix_ms: u64,
+    single_use: bool,
     used: bool,
 }
 
@@ -1502,9 +2411,96 @@ struct H7AuthorityMetrics {
     canonical_evaluations: AtomicUsize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum H7HostResponseFault {
+    IssueWrongBinding,
+    IssueWrongRevision,
+    IssueWrongConfirmation,
+    IssueSingleUseFalse,
+    FinalWrongBinding,
+    FinalWrongRevision,
+    FinalWrongConfirmation,
+    FinalSingleUseFalse,
+    FinalUsedFalse,
+    FinalContradictory,
+    FinalExtraConfirmation,
+    FinalMalformed,
+    FinalTruncated,
+}
+
+impl H7HostResponseFault {
+    fn is_final(self) -> bool {
+        matches!(
+            self,
+            Self::FinalWrongBinding
+                | Self::FinalWrongRevision
+                | Self::FinalWrongConfirmation
+                | Self::FinalSingleUseFalse
+                | Self::FinalUsedFalse
+                | Self::FinalContradictory
+                | Self::FinalExtraConfirmation
+                | Self::FinalMalformed
+                | Self::FinalTruncated
+        )
+    }
+}
+
+fn apply_h7_host_response_fault(response: &mut H7HostResponse, fault: H7HostResponseFault) {
+    match fault {
+        H7HostResponseFault::IssueWrongBinding | H7HostResponseFault::FinalWrongBinding => {
+            if let Some(grant) = response.process_grant.as_mut() {
+                grant.binding.program_id = "wrong-program".to_string();
+            }
+        }
+        H7HostResponseFault::IssueWrongRevision | H7HostResponseFault::FinalWrongRevision => {
+            response.authorization_revision =
+                response.authorization_revision.map(|value| value + 1);
+            if let Some(grant) = response.process_grant.as_mut() {
+                grant.authorization_revision += 1;
+            }
+        }
+        H7HostResponseFault::IssueWrongConfirmation => {
+            if let Some(grant) = response.process_grant.as_mut() {
+                grant.confirmation_id.clear();
+            }
+        }
+        H7HostResponseFault::FinalWrongConfirmation => {
+            if let Some(grant) = response.process_grant.as_mut() {
+                grant.confirmation_id = "wrong-confirmation".to_string();
+            }
+        }
+        H7HostResponseFault::IssueSingleUseFalse | H7HostResponseFault::FinalSingleUseFalse => {
+            if let Some(grant) = response.process_grant.as_mut() {
+                grant.single_use = false;
+            }
+        }
+        H7HostResponseFault::FinalUsedFalse => {
+            if let Some(grant) = response.process_grant.as_mut() {
+                grant.used = false;
+            }
+        }
+        H7HostResponseFault::FinalContradictory => {
+            response.confirmation_consumed = true;
+        }
+        H7HostResponseFault::FinalExtraConfirmation => {
+            if let Some(grant) = response.process_grant.as_ref() {
+                response.confirmation = Some(H7ConfirmationWire {
+                    confirmation_id: grant.confirmation_id.clone(),
+                    binding: grant.binding.clone(),
+                    authorization_revision: grant.authorization_revision,
+                    issued_at_unix_ms: grant.issued_at_unix_ms,
+                    expires_at_unix_ms: grant.expires_at_unix_ms,
+                });
+            }
+        }
+        H7HostResponseFault::FinalMalformed | H7HostResponseFault::FinalTruncated => {}
+    }
+}
+
 struct H7Authority {
     process: Arc<H7PersistentHostProcess>,
     metrics: Arc<H7AuthorityMetrics>,
+    response_fault: Mutex<Option<H7HostResponseFault>>,
 }
 
 impl H7Authority {
@@ -1516,7 +2512,27 @@ impl H7Authority {
         Ok(Arc::new(Self {
             process: H7PersistentHostProcess::start(&repo_root)?,
             metrics: Arc::new(H7AuthorityMetrics::default()),
+            response_fault: Mutex::new(None),
         }))
+    }
+
+    fn inject_response_fault(&self, fault: H7HostResponseFault) {
+        *self
+            .response_fault
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(fault);
+    }
+
+    fn take_response_fault(&self, final_response: bool) -> Option<H7HostResponseFault> {
+        let mut fault = self
+            .response_fault
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if fault.is_some_and(|value| value.is_final() == final_response) {
+            fault.take()
+        } else {
+            None
+        }
     }
 
     fn provenance(&self) -> (usize, usize) {
@@ -1566,13 +2582,18 @@ impl H7Authority {
                 binding: H7ProcessBinding::from_action(action),
                 authorization_revision,
             })?;
-        let response: H7HostResponse = serde_json::from_slice(&response)
+        let mut response: H7HostResponse = serde_json::from_slice(&response)
             .map_err(|_| "D29-H7 ProcessGrant response malformed".to_string())?;
+        if let Some(fault) = self.take_response_fault(false) {
+            apply_h7_host_response_fault(&mut response, fault);
+        }
         if response.operation != "issue_process_grant"
             || response.status != "ok"
             || response.canonical.is_none()
+            || response.confirmation.is_some()
             || response.process_grant.is_none()
             || !response.confirmation_consumed
+            || response.authorization_revision != Some(authorization_revision)
             || response.denial.is_some()
             || response.error_code.is_some()
         {
@@ -1590,6 +2611,9 @@ impl H7Authority {
             confirmation_id: grant.confirmation_id,
             binding: grant.binding,
             authorization_revision: grant.authorization_revision,
+            issued_at_unix_ms: grant.issued_at_unix_ms,
+            expires_at_unix_ms: grant.expires_at_unix_ms,
+            single_use: grant.single_use,
             used: grant.used,
         })
     }
@@ -1611,12 +2635,26 @@ impl H7Authority {
                 binding: H7ProcessBinding::from_action(action),
                 authorization_revision: grant.authorization_revision,
             })?;
-        let response: H7HostResponse = serde_json::from_slice(&response)
+        let final_fault = self.take_response_fault(true);
+        let response = match final_fault {
+            Some(H7HostResponseFault::FinalMalformed) => b"not-json".to_vec(),
+            Some(H7HostResponseFault::FinalTruncated) => {
+                response[..response.len().saturating_sub(1)].to_vec()
+            }
+            _ => response,
+        };
+        let mut response: H7HostResponse = serde_json::from_slice(&response)
             .map_err(|_| "D29-H7 final Host response malformed".to_string())?;
+        if let Some(fault) = final_fault {
+            apply_h7_host_response_fault(&mut response, fault);
+        }
         if response.operation != "revalidate_process_grant"
             || response.status != "ok"
             || response.canonical.is_none()
+            || response.confirmation.is_some()
             || response.process_grant.is_none()
+            || response.confirmation_consumed
+            || response.authorization_revision != Some(grant.authorization_revision)
             || response.denial.is_some()
             || response.error_code.is_some()
         {
@@ -1627,7 +2665,16 @@ impl H7Authority {
         let canonical = response.canonical.as_ref().expect("checked canonical");
         validate_h7_canonical(canonical, action, grant.authorization_revision)?;
         let returned = response.process_grant.expect("checked final grant");
-        if returned.grant_id != grant.grant_id || !returned.used {
+        if returned.grant_id != grant.grant_id
+            || returned.confirmation_id != grant.confirmation_id
+            || returned.binding != grant.binding
+            || returned.authorization_revision != grant.authorization_revision
+            || returned.issued_at_unix_ms != grant.issued_at_unix_ms
+            || returned.expires_at_unix_ms != grant.expires_at_unix_ms
+            || !returned.single_use
+            || !returned.used
+            || returned.expires_at_unix_ms <= h7_unix_millis()
+        {
             return Err("D29-H7 final Host grant evidence was invalid".to_string());
         }
         grant.used = true;
@@ -1697,7 +2744,13 @@ fn validate_h7_grant_binding(
     action: &PreparedProcessAction,
     revision: i64,
 ) -> Result<(), String> {
-    if grant.binding != H7ProcessBinding::from_action(action)
+    let now = h7_unix_millis();
+    if bounded_id(&grant.grant_id).is_none()
+        || bounded_id(&grant.confirmation_id).is_none()
+        || grant.issued_at_unix_ms > grant.expires_at_unix_ms
+        || grant.issued_at_unix_ms > now
+        || grant.expires_at_unix_ms <= now
+        || grant.binding != H7ProcessBinding::from_action(action)
         || grant.authorization_revision != revision
         || !grant.single_use
         || grant.used
@@ -1772,6 +2825,50 @@ struct H7FinalFenceGate {
     release_notify: Notify,
 }
 
+struct H7PostHostFenceGate {
+    armed: AtomicBool,
+    entered: AtomicBool,
+    released: AtomicBool,
+    entered_notify: Notify,
+}
+
+impl H7PostHostFenceGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            armed: AtomicBool::new(false),
+            entered: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+            entered_notify: Notify::new(),
+        })
+    }
+
+    fn arm(&self) {
+        self.armed.store(true, Ordering::Release);
+    }
+
+    async fn wait_until_entered(&self) {
+        if self.entered.load(Ordering::Acquire) {
+            return;
+        }
+        self.entered_notify.notified().await;
+    }
+
+    fn release(&self) {
+        self.released.store(true, Ordering::Release);
+    }
+
+    fn wait_if_armed_blocking(&self) {
+        if !self.armed.load(Ordering::Acquire) {
+            return;
+        }
+        self.entered.store(true, Ordering::Release);
+        self.entered_notify.notify_waiters();
+        while !self.released.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+    }
+}
+
 impl H7FinalFenceGate {
     fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -1821,6 +2918,14 @@ struct H7ToolResult {
     stderr: String,
     timed_out: bool,
     cancelled: bool,
+    job_terminated: bool,
+    process_tree_observed: bool,
+    process_tree_remaining: usize,
+    direct_termination_attempted: bool,
+    direct_termination_verified: bool,
+    process_exit_verified: bool,
+    stdout_reader_joined: bool,
+    stderr_reader_joined: bool,
 }
 
 impl H7ToolResult {
@@ -1834,6 +2939,14 @@ impl H7ToolResult {
             stderr: String::new(),
             timed_out: false,
             cancelled: false,
+            job_terminated: false,
+            process_tree_observed: false,
+            process_tree_remaining: 0,
+            direct_termination_attempted: false,
+            direct_termination_verified: false,
+            process_exit_verified: false,
+            stdout_reader_joined: true,
+            stderr_reader_joined: true,
         }
     }
 
@@ -1856,6 +2969,14 @@ impl H7ToolResult {
             stderr: String::from_utf8_lossy(&native.stderr).into_owned(),
             timed_out: native.kind == H7NativeOutcomeKind::StartedAndTimedOut,
             cancelled: native.kind == H7NativeOutcomeKind::StartedAndCancelled,
+            job_terminated: native.job_terminated,
+            process_tree_observed: native.process_tree_observed,
+            process_tree_remaining: native.process_tree_remaining,
+            direct_termination_attempted: native.direct_termination_attempted,
+            direct_termination_verified: native.direct_termination_verified,
+            process_exit_verified: native.process_exit_verified,
+            stdout_reader_joined: native.stdout_reader_joined,
+            stderr_reader_joined: native.stderr_reader_joined,
         }
     }
 
@@ -1881,8 +3002,10 @@ struct H7ProcessBroker {
     cancellation: Arc<AtomicBool>,
     metrics: Arc<H7SupervisorMetrics>,
     final_fence_gate: Option<Arc<H7FinalFenceGate>>,
+    post_host_gate: Option<Arc<H7PostHostFenceGate>>,
     native_fault: H7NativeLaunchFault,
     unlisted_inheritable_handle: Option<usize>,
+    post_host_mutation: H7PostHostMutation,
 }
 
 impl H7ProcessBroker {
@@ -1900,8 +3023,10 @@ impl H7ProcessBroker {
             cancellation: Arc::new(AtomicBool::new(false)),
             metrics: Arc::new(H7SupervisorMetrics::default()),
             final_fence_gate: None,
+            post_host_gate: None,
             native_fault: H7NativeLaunchFault::None,
             unlisted_inheritable_handle: None,
+            post_host_mutation: H7PostHostMutation::None,
         })
     }
 
@@ -1916,6 +3041,20 @@ impl H7ProcessBroker {
         Arc::get_mut(&mut self)
             .expect("H7 native fault must be installed before sharing broker")
             .native_fault = fault;
+        self
+    }
+
+    fn with_post_host_gate(mut self: Arc<Self>, gate: Arc<H7PostHostFenceGate>) -> Arc<Self> {
+        Arc::get_mut(&mut self)
+            .expect("H7 post-Host gate must be installed before sharing broker")
+            .post_host_gate = Some(gate);
+        self
+    }
+
+    fn with_post_host_mutation(mut self: Arc<Self>, mutation: H7PostHostMutation) -> Arc<Self> {
+        Arc::get_mut(&mut self)
+            .expect("H7 post-Host mutation must be installed before sharing broker")
+            .post_host_mutation = mutation;
         self
     }
 
@@ -1947,6 +3086,16 @@ impl H7ProcessBroker {
             Ok(Ok(grant)) => grant,
             _ => return H7ToolResult::denied(),
         };
+        let preparation_action = Arc::clone(&action);
+        let unlisted_inheritable_handle = self.unlisted_inheritable_handle;
+        let preparation = match tokio::task::spawn_blocking(move || {
+            H7LaunchPreparation::prepare(&preparation_action, unlisted_inheritable_handle)
+        })
+        .await
+        {
+            Ok(Ok(preparation)) => preparation,
+            _ => return H7ToolResult::denied(),
+        };
         if let Some(gate) = &self.final_fence_gate {
             gate.wait_if_armed().await;
         }
@@ -1955,7 +3104,8 @@ impl H7ProcessBroker {
         let cancellation = Arc::clone(&self.cancellation);
         let metrics = Arc::clone(&self.metrics);
         let fault = self.native_fault;
-        let unlisted_inheritable_handle = self.unlisted_inheritable_handle;
+        let post_host_gate = self.post_host_gate.clone();
+        let post_host_mutation = self.post_host_mutation;
         match tokio::task::spawn_blocking(move || {
             if cancellation.load(Ordering::Acquire) {
                 return H7ToolResult::denied();
@@ -1967,14 +3117,20 @@ impl H7ProcessBroker {
             {
                 return H7ToolResult::denied();
             }
-            H7ToolResult::from_native(supervise_native(
+            if let Some(gate) = post_host_gate {
+                gate.wait_if_armed_blocking();
+            }
+            H7ToolResult::from_native(supervise_native_prepared(
                 &action_for_launch,
                 H7NativeOptions {
                     cancellation,
                     metrics,
                     fault,
                     unlisted_inheritable_handle,
+                    post_host_mutation,
                 },
+                preparation,
+                Some(grant),
             ))
         })
         .await
@@ -2095,6 +3251,35 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    struct H7EnvironmentGuard {
+        previous: Vec<(String, Option<OsString>)>,
+    }
+
+    impl H7EnvironmentGuard {
+        fn install(entries: &[(&str, &str)]) -> Self {
+            let previous = entries
+                .iter()
+                .map(|(key, value)| {
+                    let previous = std::env::var_os(key);
+                    std::env::set_var(key, value);
+                    ((*key).to_string(), previous)
+                })
+                .collect();
+            Self { previous }
+        }
+    }
+
+    impl Drop for H7EnvironmentGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.previous {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
     struct H7DirectHarness {
         _working_directory: TempDir,
         catalog: Arc<H7ExecutableCatalog>,
@@ -2157,6 +3342,32 @@ mod tests {
             )
             .with_final_fence_gate(gate)
         }
+
+        fn broker_with_post_host_gate(
+            &self,
+            gate: Arc<H7PostHostFenceGate>,
+        ) -> Arc<H7ProcessBroker> {
+            H7ProcessBroker::new(
+                self.broker.context.clone(),
+                Arc::clone(&self.catalog),
+                Arc::clone(&self.authority),
+                Arc::clone(&self.bridge),
+            )
+            .with_post_host_gate(gate)
+        }
+
+        fn broker_with_post_host_mutation(
+            &self,
+            mutation: H7PostHostMutation,
+        ) -> Arc<H7ProcessBroker> {
+            H7ProcessBroker::new(
+                self.broker.context.clone(),
+                Arc::clone(&self.catalog),
+                Arc::clone(&self.authority),
+                Arc::clone(&self.bridge),
+            )
+            .with_post_host_mutation(mutation)
+        }
     }
 
     async fn run_approved(
@@ -2183,6 +3394,103 @@ mod tests {
         task.await.expect("D29-H7 broker task")
     }
 
+    async fn run_with_final_host_fault(fault: H7HostResponseFault) -> H7ToolResult {
+        let mut harness = H7DirectHarness::new();
+        harness.authority.inject_response_fault(fault);
+        let mut receiver = harness.receiver.take().unwrap();
+        let result = run_approved(
+            Arc::clone(&harness.broker),
+            Arc::clone(&harness.authority),
+            &mut receiver,
+            harness.action(&["echo-argv", "final-fault"]),
+        )
+        .await;
+        assert!(harness.authority.shutdown());
+        result
+    }
+
+    async fn run_with_post_host_mutation(mutation: H7PostHostMutation) -> H7ToolResult {
+        let mut harness = H7DirectHarness::new();
+        let broker = harness.broker_with_post_host_mutation(mutation);
+        let mut receiver = harness.receiver.take().unwrap();
+        let result = run_approved(
+            broker,
+            Arc::clone(&harness.authority),
+            &mut receiver,
+            harness.action(&["echo-argv", "post-host-fault"]),
+        )
+        .await;
+        assert!(harness.authority.shutdown());
+        result
+    }
+
+    async fn run_cancelled(
+        broker: Arc<H7ProcessBroker>,
+        authority: Arc<H7Authority>,
+        receiver: &mut tokio::sync::mpsc::Receiver<H7PendingProcessAction>,
+        action: Arc<PreparedProcessAction>,
+    ) -> H7ToolResult {
+        let metrics = broker.metrics();
+        let created = metrics.created_notify.notified();
+        let task = tokio::spawn({
+            let broker = Arc::clone(&broker);
+            async move { broker.execute(action).await }
+        });
+        let pending = tokio::time::timeout(H7_TURN_TIMEOUT, receiver.recv())
+            .await
+            .expect("D29-H7 cancellation confirmation wait")
+            .expect("D29-H7 cancellation confirmation");
+        let revision = authority
+            .provision_confirmation(&pending.action)
+            .expect("D29-H7 cancellation confirmation");
+        pending
+            .response
+            .send(revision)
+            .expect("D29-H7 cancellation response");
+        tokio::time::timeout(Duration::from_secs(2), created)
+            .await
+            .expect("D29-H7 cancellation process creation");
+        broker.cancel();
+        task.await.expect("D29-H7 cancelled broker task")
+    }
+
+    fn assert_h7_zero_process_result(result: &H7ToolResult) {
+        assert!(!result.process_created);
+        assert_eq!(result.side_effect_count, 0);
+    }
+
+    #[test]
+    fn h7_issue_host_grant_binding_faults_are_denied() {
+        let _lock = lock_h7_tests();
+        for fault in [
+            H7HostResponseFault::IssueWrongBinding,
+            H7HostResponseFault::IssueWrongRevision,
+            H7HostResponseFault::IssueWrongConfirmation,
+            H7HostResponseFault::IssueSingleUseFalse,
+        ] {
+            let harness = H7DirectHarness::new();
+            let action = harness.action(&["echo-argv", "issue-fault"]);
+            let revision = harness
+                .authority
+                .provision_confirmation(&action)
+                .expect("D29-H7 issue-fault confirmation");
+            harness.authority.inject_response_fault(fault);
+            assert!(harness
+                .authority
+                .issue_process_grant(&action, revision)
+                .is_err());
+            assert!(harness.authority.shutdown());
+        }
+    }
+
+    #[test]
+    fn h7_host_response_parser_rejects_malformed_and_truncated() {
+        let malformed = br#"{"operation":"revalidate_process_grant""#;
+        let truncated = br#"{"operation":"revalidate_process_grant","status":"ok"}"#;
+        assert!(serde_json::from_slice::<H7HostResponse>(malformed).is_err());
+        assert!(serde_json::from_slice::<H7HostResponse>(truncated).is_err());
+    }
+
     fn native_options(
         metrics: Arc<H7SupervisorMetrics>,
         fault: H7NativeLaunchFault,
@@ -2192,6 +3500,7 @@ mod tests {
             metrics,
             fault,
             unlisted_inheritable_handle: None,
+            post_host_mutation: H7PostHostMutation::None,
         }
     }
 
@@ -2287,6 +3596,13 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn h7_environment_is_explicit_not_ambient() {
         let _lock = lock_h7_tests();
+        let _ambient = H7EnvironmentGuard::install(&[
+            ("D29H7_AMBIENT_SENTINEL", "ambient-sentinel"),
+            ("OPENAI_API_KEY", "fake-openai-key"),
+            ("HTTP_PROXY", "http://ambient.invalid"),
+            ("HTTPS_PROXY", "https://ambient.invalid"),
+            ("CODEX_HOME", "C:\\ambient-codex-home"),
+        ]);
         let mut harness = H7DirectHarness::new();
         let mut receiver = harness.receiver.take().unwrap();
         let result = run_approved(
@@ -2309,8 +3625,17 @@ mod tests {
         }));
         assert!(!environment.iter().any(|pair| {
             pair.as_array().is_some_and(|pair| {
-                pair.first().and_then(Value::as_str) == Some("PATH")
-                    || pair.first().and_then(Value::as_str) == Some("D29H7_AMBIENT_SENTINEL")
+                matches!(
+                    pair.first().and_then(Value::as_str),
+                    Some(
+                        "PATH"
+                            | "D29H7_AMBIENT_SENTINEL"
+                            | "OPENAI_API_KEY"
+                            | "HTTP_PROXY"
+                            | "HTTPS_PROXY"
+                            | "CODEX_HOME"
+                    )
+                )
             })
         }));
         assert!(harness.authority.shutdown());
@@ -2537,6 +3862,12 @@ mod tests {
         assert!(result.process_created);
         assert!(result.timed_out);
         assert_eq!(result.side_effect_count, 1);
+        assert!(result.job_terminated);
+        assert!(result.process_exit_verified);
+        assert!(result.process_tree_observed);
+        assert_eq!(result.process_tree_remaining, 0);
+        assert!(result.stdout_reader_joined);
+        assert!(result.stderr_reader_joined);
         assert!(
             harness
                 .broker
@@ -2577,6 +3908,12 @@ mod tests {
         assert_eq!(result.status, "started_and_cancelled");
         assert!(result.process_created);
         assert!(result.cancelled);
+        assert!(result.job_terminated);
+        assert!(result.process_exit_verified);
+        assert!(result.process_tree_observed);
+        assert_eq!(result.process_tree_remaining, 0);
+        assert!(result.stdout_reader_joined);
+        assert!(result.stderr_reader_joined);
         assert!(
             harness
                 .broker
@@ -2603,6 +3940,12 @@ mod tests {
         assert_eq!(result.status, "started_and_output_limited");
         assert!(result.process_created);
         assert_eq!(result.side_effect_count, 1);
+        assert!(result.job_terminated);
+        assert!(result.process_exit_verified);
+        assert!(result.process_tree_observed);
+        assert_eq!(result.process_tree_remaining, 0);
+        assert!(result.stdout_reader_joined);
+        assert!(result.stderr_reader_joined);
         assert!(
             harness
                 .broker
@@ -2629,6 +3972,12 @@ mod tests {
         assert_eq!(result.status, "started_and_output_limited");
         assert!(result.process_created);
         assert_eq!(result.side_effect_count, 1);
+        assert!(result.job_terminated);
+        assert!(result.process_exit_verified);
+        assert!(result.process_tree_observed);
+        assert_eq!(result.process_tree_remaining, 0);
+        assert!(result.stdout_reader_joined);
+        assert!(result.stderr_reader_joined);
         assert!(
             harness
                 .broker
@@ -2690,10 +4039,424 @@ mod tests {
         assert_eq!(result.kind, H7NativeOutcomeKind::StartedOutcomeUnknown);
         assert!(result.process_created);
         assert!(!result.user_code_started);
-        assert!(result.job_terminated);
+        assert!(!result.job_terminated);
+        assert!(result.direct_termination_attempted);
+        assert!(result.direct_termination_verified);
+        assert!(result.process_exit_verified);
+        assert!(result.process_tree_observed);
+        assert_eq!(result.process_tree_remaining, 0);
+        assert!(result.stdout_reader_joined);
+        assert!(result.stderr_reader_joined);
         assert_eq!(metrics.process_created.load(Ordering::Acquire), 1);
         assert_eq!(metrics.process_tree_remaining.load(Ordering::Acquire), 0);
         assert!(harness.authority.shutdown());
+    }
+
+    #[test]
+    fn h7_assignment_failure_terminates_unassigned_suspended_process() {
+        let _lock = lock_h7_tests();
+        let harness = H7DirectHarness::new();
+        let metrics = Arc::new(H7SupervisorMetrics::default());
+        let result = supervise_native(
+            &harness.action(&["echo-argv", "assignment-failure"]),
+            native_options(
+                Arc::clone(&metrics),
+                H7NativeLaunchFault::ForceAssignmentFailure,
+            ),
+        );
+        assert_eq!(result.kind, H7NativeOutcomeKind::LaunchFailed);
+        assert!(result.process_created);
+        assert!(!result.user_code_started);
+        assert!(!result.job_terminated);
+        assert!(result.direct_termination_attempted);
+        assert!(result.direct_termination_verified);
+        assert!(result.process_exit_verified);
+        assert!(result.process_tree_observed);
+        assert_eq!(result.process_tree_remaining, 0);
+        assert!(result.stdout_reader_joined);
+        assert!(result.stderr_reader_joined);
+        assert_eq!(metrics.process_created.load(Ordering::Acquire), 1);
+        assert_eq!(metrics.job_assigned.load(Ordering::Acquire), 0);
+        assert_eq!(metrics.thread_resumed.load(Ordering::Acquire), 0);
+        assert_eq!(
+            metrics.direct_termination_attempted.load(Ordering::Acquire),
+            1
+        );
+        assert_eq!(
+            metrics.direct_termination_verified.load(Ordering::Acquire),
+            1
+        );
+        assert!(harness.authority.shutdown());
+    }
+
+    #[test]
+    fn h7_panic_after_createprocess_really_leaves_zero_processes() {
+        let _lock = lock_h7_tests();
+        let harness = H7DirectHarness::new();
+        let result = supervise_native(
+            &harness.action(&["sleep", "2000"]),
+            native_options(
+                Arc::new(H7SupervisorMetrics::default()),
+                H7NativeLaunchFault::PanicAfterCreateProcess,
+            ),
+        );
+        assert_eq!(result.kind, H7NativeOutcomeKind::StartedOutcomeUnknown);
+        assert!(result.process_created);
+        assert!(!result.user_code_started);
+        assert!(result.direct_termination_attempted);
+        assert!(result.direct_termination_verified);
+        assert!(result.process_exit_verified);
+        assert!(result.process_tree_observed);
+        assert_eq!(result.process_tree_remaining, 0);
+        assert!(result.stdout_reader_joined);
+        assert!(result.stderr_reader_joined);
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_timeout_job_termination_is_verified() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7DirectHarness::new();
+        let mut receiver = harness.receiver.take().unwrap();
+        let result = run_approved(
+            Arc::clone(&harness.broker),
+            Arc::clone(&harness.authority),
+            &mut receiver,
+            harness.action(&["sleep", "2000"]),
+        )
+        .await;
+        assert_eq!(result.status, "started_and_timed_out");
+        assert!(result.job_terminated);
+        assert!(result.process_exit_verified);
+        assert!(result.process_tree_observed);
+        assert_eq!(result.process_tree_remaining, 0);
+        assert!(result.stdout_reader_joined);
+        assert!(result.stderr_reader_joined);
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_cancel_job_termination_is_verified() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7DirectHarness::new();
+        let mut receiver = harness.receiver.take().unwrap();
+        let result = run_cancelled(
+            Arc::clone(&harness.broker),
+            Arc::clone(&harness.authority),
+            &mut receiver,
+            harness.action(&["sleep", "2000"]),
+        )
+        .await;
+        assert_eq!(result.status, "started_and_cancelled");
+        assert!(result.job_terminated);
+        assert!(result.process_exit_verified);
+        assert!(result.process_tree_observed);
+        assert_eq!(result.process_tree_remaining, 0);
+        assert!(result.stdout_reader_joined);
+        assert!(result.stderr_reader_joined);
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_output_limit_job_termination_is_verified() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7DirectHarness::new();
+        let mut receiver = harness.receiver.take().unwrap();
+        let result = run_approved(
+            Arc::clone(&harness.broker),
+            Arc::clone(&harness.authority),
+            &mut receiver,
+            harness.action(&["flood-stdout"]),
+        )
+        .await;
+        assert_eq!(result.status, "started_and_output_limited");
+        assert!(result.job_terminated);
+        assert!(result.process_exit_verified);
+        assert!(result.process_tree_observed);
+        assert_eq!(result.process_tree_remaining, 0);
+        assert!(result.stdout_reader_joined);
+        assert!(result.stderr_reader_joined);
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_process_tree_remaining_is_os_observed_not_constant() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7DirectHarness::new();
+        let mut receiver = harness.receiver.take().unwrap();
+        let result = run_approved(
+            Arc::clone(&harness.broker),
+            Arc::clone(&harness.authority),
+            &mut receiver,
+            harness.action(&["echo-argv", "tree-observation"]),
+        )
+        .await;
+        assert_eq!(result.status, "started_and_exited");
+        assert!(result.process_exit_verified);
+        assert!(result.process_tree_observed);
+        assert_eq!(result.process_tree_remaining, 0);
+        assert!(
+            harness
+                .broker
+                .metrics()
+                .process_tree_observations
+                .load(Ordering::Acquire)
+                >= 1
+        );
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_reader_threads_join_boundedly_after_timeout() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7DirectHarness::new();
+        let mut receiver = harness.receiver.take().unwrap();
+        let result = run_approved(
+            Arc::clone(&harness.broker),
+            Arc::clone(&harness.authority),
+            &mut receiver,
+            harness.action(&["sleep", "2000"]),
+        )
+        .await;
+        assert_eq!(result.status, "started_and_timed_out");
+        assert!(result.stdout_reader_joined);
+        assert!(result.stderr_reader_joined);
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_reader_threads_join_boundedly_after_cancel() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7DirectHarness::new();
+        let mut receiver = harness.receiver.take().unwrap();
+        let result = run_cancelled(
+            Arc::clone(&harness.broker),
+            Arc::clone(&harness.authority),
+            &mut receiver,
+            harness.action(&["sleep", "2000"]),
+        )
+        .await;
+        assert_eq!(result.status, "started_and_cancelled");
+        assert!(result.stdout_reader_joined);
+        assert!(result.stderr_reader_joined);
+        assert!(harness.authority.shutdown());
+    }
+
+    #[test]
+    fn h7_executable_intermediate_reparse_retarget_cannot_launch() {
+        let _lock = lock_h7_tests();
+        let root = tempdir().expect("D29-H7 namespace root");
+        let nested = root.path().join("nested");
+        fs::create_dir(&nested).expect("D29-H7 nested directory");
+        let image = nested.join("fixture.exe");
+        File::create(&image)
+            .expect("D29-H7 namespace fixture")
+            .write_all(b"MZ-D29-H7")
+            .expect("D29-H7 namespace fixture write");
+        let namespace =
+            PreparedExecutableNamespace::prepare(&image).expect("D29-H7 executable namespace");
+        let replacement = root.path().join("nested-replacement");
+        assert!(
+            fs::rename(&nested, &replacement).is_err(),
+            "D29-H7 retained namespace handles must block intermediate retarget"
+        );
+        assert!(namespace.rebind_leaf().is_ok());
+
+        let target = root.path().join("reparse-target");
+        fs::create_dir(&target).expect("D29-H7 reparse target");
+        let target_image = target.join("fixture.exe");
+        File::create(&target_image)
+            .expect("D29-H7 reparse fixture")
+            .write_all(b"MZ-D29-H7")
+            .expect("D29-H7 reparse fixture write");
+        let link = root.path().join("reparse-link");
+        if std::os::windows::fs::symlink_dir(&target, &link).is_ok() {
+            assert!(
+                PreparedExecutableNamespace::prepare(&link.join("fixture.exe")).is_err(),
+                "D29-H7 intermediate reparse must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn h7_cwd_retarget_cannot_launch() {
+        let _lock = lock_h7_tests();
+        let root = tempdir().expect("D29-H7 cwd root");
+        let cwd = root.path().join("cwd");
+        fs::create_dir(&cwd).expect("D29-H7 cwd directory");
+        let prepared = PreparedWorkingDirectory::prepare(&cwd).expect("D29-H7 cwd namespace");
+        let replacement = root.path().join("cwd-replacement");
+        assert!(
+            fs::rename(&cwd, &replacement).is_err(),
+            "D29-H7 retained cwd handle must block retarget"
+        );
+        assert_eq!(
+            namespace_identity(prepared.rebind_leaf().unwrap().raw()).unwrap(),
+            prepared.identity()
+        );
+    }
+
+    #[test]
+    fn h7_cwd_binding_uses_real_directory_identity() {
+        let _lock = lock_h7_tests();
+        let root = tempdir().expect("D29-H7 cwd identity root");
+        let prepared =
+            PreparedWorkingDirectory::prepare(root.path()).expect("D29-H7 cwd identity namespace");
+        let identity = prepared.identity();
+        assert!(identity.directory);
+        assert!(!identity.reparse);
+        assert_ne!(
+            identity.wire(),
+            sha256_hex(root.path().to_string_lossy().as_bytes())
+        );
+        let rebound = prepared.rebind_leaf().expect("D29-H7 cwd identity rebind");
+        assert_eq!(namespace_identity(rebound.raw()).unwrap(), identity);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_cancel_after_host_pass_before_createprocess_creates_zero_processes() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7DirectHarness::new();
+        let gate = H7PostHostFenceGate::new();
+        gate.arm();
+        let broker = harness.broker_with_post_host_gate(Arc::clone(&gate));
+        let action = harness.action(&["echo-argv", "post-host-cancel"]);
+        let mut receiver = harness.receiver.take().unwrap();
+        let task = tokio::spawn({
+            let broker = Arc::clone(&broker);
+            async move { broker.execute(action).await }
+        });
+        let pending = receiver
+            .recv()
+            .await
+            .expect("D29-H7 post-Host cancellation confirmation");
+        let revision = harness
+            .authority
+            .provision_confirmation(&pending.action)
+            .expect("D29-H7 post-Host cancellation confirmation");
+        pending.response.send(revision).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), gate.wait_until_entered())
+            .await
+            .expect("D29-H7 post-Host gate entry");
+        broker.cancel();
+        gate.release();
+        let result = task.await.unwrap();
+        assert_eq!(result.status, "denied");
+        assert_h7_zero_process_result(&result);
+        assert_eq!(broker.metrics().process_created.load(Ordering::Acquire), 0);
+        assert_eq!(
+            harness
+                .authority
+                .metrics
+                .final_revalidations
+                .load(Ordering::Acquire),
+            1
+        );
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_post_host_argv_binding_mismatch_creates_zero_processes() {
+        let _lock = lock_h7_tests();
+        let result = run_with_post_host_mutation(H7PostHostMutation::ArgvHash).await;
+        assert_eq!(result.status, "denied");
+        assert_h7_zero_process_result(&result);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_post_host_executable_binding_mismatch_creates_zero_processes() {
+        let _lock = lock_h7_tests();
+        let result = run_with_post_host_mutation(H7PostHostMutation::ExecutableIdentity).await;
+        assert_eq!(result.status, "denied");
+        assert_h7_zero_process_result(&result);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_post_host_cwd_binding_mismatch_creates_zero_processes() {
+        let _lock = lock_h7_tests();
+        let result = run_with_post_host_mutation(H7PostHostMutation::CwdIdentity).await;
+        assert_eq!(result.status, "denied");
+        assert_h7_zero_process_result(&result);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_post_host_environment_binding_mismatch_creates_zero_processes() {
+        let _lock = lock_h7_tests();
+        let result = run_with_post_host_mutation(H7PostHostMutation::EnvironmentHash).await;
+        assert_eq!(result.status, "denied");
+        assert_h7_zero_process_result(&result);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_final_host_wrong_binding_creates_zero_processes() {
+        let _lock = lock_h7_tests();
+        let result = run_with_final_host_fault(H7HostResponseFault::FinalWrongBinding).await;
+        assert_eq!(result.status, "denied");
+        assert_h7_zero_process_result(&result);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_final_host_wrong_revision_creates_zero_processes() {
+        let _lock = lock_h7_tests();
+        let result = run_with_final_host_fault(H7HostResponseFault::FinalWrongRevision).await;
+        assert_eq!(result.status, "denied");
+        assert_h7_zero_process_result(&result);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_final_host_wrong_confirmation_creates_zero_processes() {
+        let _lock = lock_h7_tests();
+        let result = run_with_final_host_fault(H7HostResponseFault::FinalWrongConfirmation).await;
+        assert_eq!(result.status, "denied");
+        assert_h7_zero_process_result(&result);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_final_host_single_use_false_creates_zero_processes() {
+        let _lock = lock_h7_tests();
+        let result = run_with_final_host_fault(H7HostResponseFault::FinalSingleUseFalse).await;
+        assert_eq!(result.status, "denied");
+        assert_h7_zero_process_result(&result);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_final_host_used_false_creates_zero_processes() {
+        let _lock = lock_h7_tests();
+        let result = run_with_final_host_fault(H7HostResponseFault::FinalUsedFalse).await;
+        assert_eq!(result.status, "denied");
+        assert_h7_zero_process_result(&result);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_final_host_contradictory_response_creates_zero_processes() {
+        let _lock = lock_h7_tests();
+        let result = run_with_final_host_fault(H7HostResponseFault::FinalContradictory).await;
+        assert_eq!(result.status, "denied");
+        assert_h7_zero_process_result(&result);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_final_host_extra_confirmation_creates_zero_processes() {
+        let _lock = lock_h7_tests();
+        let result = run_with_final_host_fault(H7HostResponseFault::FinalExtraConfirmation).await;
+        assert_eq!(result.status, "denied");
+        assert_h7_zero_process_result(&result);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_final_host_malformed_response_creates_zero_processes() {
+        let _lock = lock_h7_tests();
+        let result = run_with_final_host_fault(H7HostResponseFault::FinalMalformed).await;
+        assert_eq!(result.status, "denied");
+        assert_h7_zero_process_result(&result);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_final_host_truncated_response_creates_zero_processes() {
+        let _lock = lock_h7_tests();
+        let result = run_with_final_host_fault(H7HostResponseFault::FinalTruncated).await;
+        assert_eq!(result.status, "denied");
+        assert_h7_zero_process_result(&result);
     }
 
     #[derive(Clone, Debug, Default)]

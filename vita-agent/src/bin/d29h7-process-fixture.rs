@@ -70,6 +70,7 @@ fn run() -> Result<(), String> {
             io::stdout()
                 .flush()
                 .map_err(|_| "stdout flush failed".to_string())?;
+            std::thread::sleep(Duration::from_millis(1_000));
         }
         "flood-stderr" => {
             let bytes = vec![b'E'; 128 * 1024];
@@ -79,6 +80,7 @@ fn run() -> Result<(), String> {
             io::stderr()
                 .flush()
                 .map_err(|_| "stderr flush failed".to_string())?;
+            std::thread::sleep(Duration::from_millis(1_000));
         }
         "attempt-child" => {
             let child = std::env::current_exe()

@@ -280,7 +280,7 @@ enum H4AuthorityResponseStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct H4HostAuthorityResponse {
+pub(crate) struct H4HostAuthorityResponse {
     status: H4AuthorityResponseStatus,
     canonical: H4CanonicalDecision,
     confirmation: Option<HostExplicitActionConfirmationEvidence>,
@@ -312,6 +312,13 @@ pub(crate) struct H4AuthorityRequest {
     workspace_root_identity: super::WorkspaceRootIdentity,
     target_identity: super::WorkspaceRootIdentity,
     target_kind: PreparedWorkspaceTargetKind,
+}
+
+#[cfg(all(test, windows))]
+impl H4AuthorityRequest {
+    pub(crate) fn is_revalidation(&self) -> bool {
+        matches!(&self.operation, H4AuthorityOperation::Revalidate { .. })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -911,6 +918,90 @@ impl VitaWorkspaceReplaceBroker {
         };
         drop(prepared);
         Ok(authority_request)
+    }
+
+    /// Build the exact existing-replace intent from H6's opaque, compiler-
+    /// derived proof.  This adapter is test/integration-only: H6 cannot mint
+    /// a second capability and cannot supply a generic replace request.
+    #[cfg(all(test, windows))]
+    pub(crate) fn h6_authority_request_for_compiled_patch(
+        &self,
+        patch: &crate::d29h6::H6CompiledPatch,
+    ) -> Result<H4AuthorityRequest, H4DenyClassification> {
+        let bound_context = self
+            .context
+            .as_ref()
+            .ok_or(H4DenyClassification::MissingContext)?;
+        if patch.context().life_id() != bound_context.life_id() {
+            return Err(H4DenyClassification::WrongLifeBinding);
+        }
+        if patch.context().task_id() != bound_context.task_id() {
+            return Err(H4DenyClassification::WrongTaskBinding);
+        }
+        if !is_sha256_hex(patch.expected_sha256())
+            || patch.replacement_bytes().len() != patch.derived_replacement_bytes()
+            || sha256_hex(patch.replacement_bytes()) != patch.replacement_sha256()
+            || patch.derived_replacement_bytes() > H4_MAX_REPLACEMENT_BYTES
+        {
+            return Err(H4DenyClassification::InvalidRequest);
+        }
+        let prepared = self
+            .root
+            .prepare_target(patch.relative_path().as_path())
+            .map_err(|_| H4DenyClassification::TargetRejected)?;
+        if prepared.kind() != PreparedWorkspaceTargetKind::ExistingFile
+            || prepared.target_identity() != Some(patch.target_identity())
+            || prepared.root().identity() != patch.workspace_root_identity()
+            || prepared.kind() != patch.target_kind()
+        {
+            return Err(if prepared.kind() == PreparedWorkspaceTargetKind::Missing {
+                H4DenyClassification::TargetMissing
+            } else {
+                H4DenyClassification::TargetRejected
+            });
+        }
+        let authority_request = H4AuthorityRequest {
+            context: bound_context.clone(),
+            capability_id: VITA_WORKSPACE_REPLACE_CAPABILITY_ID.to_string(),
+            operation: H4AuthorityOperation::IssueReplaceGrant,
+            tool_call_id: patch.tool_call_id().to_string(),
+            turn_id: patch.turn_id().to_string(),
+            relative_path: patch.relative_path().clone(),
+            expected_sha256: patch.expected_sha256().to_string(),
+            replacement_sha256: patch.replacement_sha256().to_string(),
+            replacement_bytes: patch.derived_replacement_bytes(),
+            workspace_root_identity: prepared.root().identity(),
+            target_identity: prepared
+                .target_identity()
+                .expect("existing H6 target has an identity"),
+            target_kind: prepared.kind(),
+        };
+        drop(prepared);
+        Ok(authority_request)
+    }
+
+    /// Consume exactly one H6 compiler proof and enter the existing H4 grant
+    /// path.  The returned replacement is only the compiler-derived payload
+    /// needed by canonical H5; it is not caller-supplied authority material.
+    #[cfg(all(test, windows))]
+    pub(crate) async fn issue_h5_authorized_replace_action_from_h6_patch(
+        &self,
+        patch: crate::d29h6::H6CompiledPatch,
+    ) -> Result<(H4AuthorizedReplaceGrant, String), H4DenyClassification> {
+        self.h6_authority_request_for_compiled_patch(&patch)?;
+        let parts = patch.into_h4_parts();
+        let replacement_content = String::from_utf8(parts.replacement_bytes)
+            .map_err(|_| H4DenyClassification::InvalidRequest)?;
+        let input = H4ReplaceAuthorizationInput::new(
+            parts.context,
+            parts.relative_path,
+            parts.expected_sha256,
+            replacement_content.clone(),
+            parts.tool_call_id,
+            parts.turn_id,
+        );
+        let grant = self.issue_h5_authorized_replace_action(input).await?;
+        Ok((grant, replacement_content))
     }
 
     /// Parse and authorize one real Codex call through the certified H4
@@ -5495,7 +5586,10 @@ pub(crate) mod tests {
             self.process.shutdown()
         }
 
-        fn disable_authorization_for_test(&self, expected_revision: i64) -> Result<(), String> {
+        pub(crate) fn disable_authorization_for_test(
+            &self,
+            expected_revision: i64,
+        ) -> Result<(), String> {
             self.process
                 .disable_authorization_for_test(expected_revision)
         }

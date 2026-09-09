@@ -27,6 +27,8 @@ mod d29h4;
 mod d29h5;
 #[cfg(all(test, windows))]
 mod d29h5c;
+#[cfg(all(test, windows))]
+mod d29h6;
 mod provider_gateway;
 pub mod recovery_journal;
 mod tool_authority;

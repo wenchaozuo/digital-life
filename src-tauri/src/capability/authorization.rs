@@ -74,7 +74,8 @@ impl UserExplicitCapabilityAuthorizationEvidence {
         test,
         feature = "d29-h3-host-fixture",
         feature = "d29-h4-host-fixture",
-        feature = "d29-h5-host-fixture"
+        feature = "d29-h5-host-fixture",
+        feature = "d29-h7-host-fixture"
     ))]
     pub(crate) fn for_test(event_id: impl Into<String>) -> Self {
         Self {
@@ -115,7 +116,8 @@ impl LifeCapabilityAuthorizationUpdateRequest {
         test,
         feature = "d29-h3-host-fixture",
         feature = "d29-h4-host-fixture",
-        feature = "d29-h5-host-fixture"
+        feature = "d29-h5-host-fixture",
+        feature = "d29-h7-host-fixture"
     ))]
     pub(crate) fn for_test(
         event_id: impl Into<String>,

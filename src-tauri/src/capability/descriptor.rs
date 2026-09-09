@@ -153,7 +153,8 @@ impl CapabilityDescriptor {
         test,
         feature = "d29-h3-host-fixture",
         feature = "d29-h4-host-fixture",
-        feature = "d29-h5-host-fixture"
+        feature = "d29-h5-host-fixture",
+        feature = "d29-h7-host-fixture"
     ))]
     pub(crate) fn synthetic(
         capability_id: CapabilityId,
@@ -225,7 +226,8 @@ impl CapabilityRegistry {
         test,
         feature = "d29-h3-host-fixture",
         feature = "d29-h4-host-fixture",
-        feature = "d29-h5-host-fixture"
+        feature = "d29-h5-host-fixture",
+        feature = "d29-h7-host-fixture"
     ))]
     pub(crate) fn synthetic(
         descriptors: impl IntoIterator<Item = CapabilityDescriptor>,
@@ -242,7 +244,8 @@ impl CapabilityRegistry {
         feature = "d29-h1-host-fixture",
         feature = "d29-h3-host-fixture",
         feature = "d29-h4-host-fixture",
-        feature = "d29-h5-host-fixture"
+        feature = "d29-h5-host-fixture",
+        feature = "d29-h7-host-fixture"
     ))]
     pub(crate) fn len(&self) -> usize {
         self.descriptors.len()

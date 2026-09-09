@@ -12,6 +12,10 @@ path = "src/lib.rs"
 name = "vita-agent"
 path = "src/bin/vita-agent.rs"
 
+[[bin]]
+name = "d29h7-process-fixture"
+path = "src/bin/d29h7-process-fixture.rs"
+
 [dependencies]
 # D29-C2 pins the source-kernel and protocol to the certified upstream commit.
 # The app-server executable/crate is intentionally not embedded here.
@@ -40,6 +44,9 @@ windows-sys = { version = "=0.61.2", features = [
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
     "Win32_System_WindowsProgramming",
     "Wdk_Foundation",
     "Wdk_Storage_FileSystem",

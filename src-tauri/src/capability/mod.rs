@@ -20,4 +20,7 @@ pub(crate) mod d29h4_host_fixture;
 #[cfg(feature = "d29-h5-host-fixture")]
 pub(crate) mod d29h5_host_fixture;
 
+#[cfg(feature = "d29-h7-host-fixture")]
+pub(crate) mod d29h7_host_fixture;
+
 pub(crate) use descriptor::CapabilityRegistry;

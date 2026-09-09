@@ -24,7 +24,7 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
@@ -38,8 +38,8 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, DuplicateHandle, GetHandleInformation, GetLastError, SetHandleInformation,
     DUPLICATE_SAME_ACCESS, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_NOT_FOUND,
     ERROR_OPERATION_ABORTED, ERROR_PIPE_CONNECTED, FALSE, HANDLE, HANDLE_FLAG_INHERIT,
-    INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE, TRUE, UNICODE_STRING,
-    WAIT_OBJECT_0, WAIT_TIMEOUT,
+    INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE, UNICODE_STRING, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Cryptography::{
     BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
@@ -71,8 +71,7 @@ use windows_sys::Win32::System::Threading::{
     GetExitCodeProcess, InitializeProcThreadAttributeList, ResetEvent, ResumeThread,
     TerminateProcess, UpdateProcThreadAttribute, WaitForMultipleObjects, WaitForSingleObject,
     CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
-    INFINITE, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, STARTF_USESTDHANDLES,
-    STARTUPINFOEXW,
+    PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, STARTF_USESTDHANDLES, STARTUPINFOEXW,
 };
 use windows_sys::Win32::System::WindowsProgramming::DRIVE_REMOTE;
 use windows_sys::Win32::System::IO::{
@@ -95,6 +94,9 @@ const H7_HOST_IPC_TIMEOUT: Duration = Duration::from_secs(2);
 const H7_HOST_MAX_FRAME_BYTES: usize = 64 * 1024;
 const H7_TURN_TIMEOUT: Duration = Duration::from_secs(30);
 const H7_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+const H7_MAX_QUARANTINED_OUTPUT: usize = 2;
+const H7_MAX_QUARANTINED_CONNECT: usize = 1;
+const H7_MAX_QUARANTINED_IO: usize = H7_MAX_QUARANTINED_OUTPUT + H7_MAX_QUARANTINED_CONNECT;
 const H7_HTTP_TIMEOUT: Duration = Duration::from_secs(3);
 const H7_HTTP_MAX_BODY: usize = 2 * 1024 * 1024;
 const H7_TEST_STACK_SIZE: usize = 32 * 1024 * 1024;
@@ -1086,6 +1088,7 @@ impl H7OverlappedState {
 struct H7TerminalityGate {
     cancel_requested: AtomicBool,
     allow_terminal: AtomicBool,
+    cleanup_timeout_ms: AtomicUsize,
 }
 
 #[derive(Default)]
@@ -1101,20 +1104,23 @@ struct H7ConnectTerminalityProbe {
     dropped: AtomicBool,
 }
 
-struct H7ConnectOperation {
-    overlapped: Box<OVERLAPPED>,
-    state: H7OverlappedState,
-}
-
-struct H7OverlappedConnect {
-    read: HANDLE,
+struct H7ConnectOperationOwner {
+    read: H7Handle,
     event: H7Handle,
-    operation: H7ConnectOperation,
+    operation: Box<OVERLAPPED>,
+    state: H7OverlappedState,
+    terminality_gate: Option<Arc<H7TerminalityGate>>,
     probe: Option<Arc<H7ConnectTerminalityProbe>>,
 }
 
+unsafe impl Send for H7ConnectOperationOwner {}
+
+struct H7OverlappedConnect {
+    owner: Option<H7ConnectOperationOwner>,
+}
+
 impl H7OverlappedConnect {
-    fn new(read: HANDLE) -> Result<Self, String> {
+    fn new(read: H7Handle) -> Result<Self, String> {
         let event =
             H7Handle::new(unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) })?;
         if unsafe { SetHandleInformation(event.raw(), HANDLE_FLAG_INHERIT, 0) } == 0 {
@@ -1124,23 +1130,45 @@ impl H7OverlappedConnect {
             ));
         }
         Ok(Self {
-            read,
-            event,
-            operation: H7ConnectOperation {
-                overlapped: Box::new(OVERLAPPED::default()),
+            owner: Some(H7ConnectOperationOwner {
+                read,
+                event,
+                operation: Box::new(OVERLAPPED::default()),
                 state: H7OverlappedState::Idle,
-            },
-            probe: None,
+                terminality_gate: None,
+                probe: None,
+            }),
         })
     }
 
+    #[cfg(test)]
+    fn with_terminality_test_hooks(
+        mut self,
+        gate: Arc<H7TerminalityGate>,
+        probe: Arc<H7ConnectTerminalityProbe>,
+    ) -> Self {
+        let owner = self.owner.as_mut().expect("H7 connect owner");
+        owner.terminality_gate = Some(gate);
+        owner.probe = Some(probe);
+        self
+    }
+
+    fn owner(&self) -> &H7ConnectOperationOwner {
+        self.owner.as_ref().expect("H7 connect owner exists")
+    }
+
+    fn owner_mut(&mut self) -> &mut H7ConnectOperationOwner {
+        self.owner.as_mut().expect("H7 connect owner exists")
+    }
+
     fn start(&mut self) -> Result<(), u32> {
-        self.operation.overlapped = Box::new(OVERLAPPED {
-            hEvent: self.event.raw(),
+        let owner = self.owner_mut();
+        owner.operation = Box::new(OVERLAPPED {
+            hEvent: owner.event.raw(),
             ..Default::default()
         });
         let connected =
-            unsafe { ConnectNamedPipe(self.read, self.operation.overlapped.as_mut()) } != 0;
+            unsafe { ConnectNamedPipe(owner.read.raw(), owner.operation.as_mut()) } != 0;
         if connected {
             self.mark_terminal(H7OverlappedState::TerminalCompleted);
             return Ok(());
@@ -1151,7 +1179,7 @@ impl H7OverlappedConnect {
                 Ok(())
             }
             ERROR_IO_PENDING => {
-                self.operation.state = H7OverlappedState::Pending;
+                self.owner_mut().state = H7OverlappedState::Pending;
                 Ok(())
             }
             error => {
@@ -1162,68 +1190,99 @@ impl H7OverlappedConnect {
     }
 
     fn pending(&self) -> bool {
-        self.operation.state.is_pending()
+        self.owner().state.is_pending()
     }
 
     fn error(&self) -> Option<u32> {
-        match self.operation.state {
+        match self.owner().state {
             H7OverlappedState::TerminalError(error) => Some(error),
             _ => None,
         }
     }
 
+    fn cleanup_timeout(&self) -> Duration {
+        self.owner()
+            .terminality_gate
+            .as_ref()
+            .and_then(|gate| {
+                let millis = gate.cleanup_timeout_ms.load(Ordering::Acquire);
+                (millis != 0).then_some(Duration::from_millis(millis as u64))
+            })
+            .unwrap_or(H7_CLEANUP_TIMEOUT)
+    }
+
     fn mark_terminal(&mut self, state: H7OverlappedState) {
-        self.operation.state = state;
-        if let Some(probe) = self.probe.as_ref() {
+        let owner = self.owner_mut();
+        owner.state = state;
+        if let Some(probe) = owner.probe.as_ref() {
             probe.terminal_observed.store(true, Ordering::Release);
         }
     }
 
     fn request_cancel(&mut self) {
-        if self.operation.state != H7OverlappedState::Pending {
+        if self.owner().state != H7OverlappedState::Pending {
             return;
         }
-        self.operation.state = H7OverlappedState::CancelRequested;
-        if unsafe { CancelIoEx(self.read, self.operation.overlapped.as_ref()) } == 0 {
+        let owner = self.owner_mut();
+        owner.state = H7OverlappedState::CancelRequested;
+        if let Some(gate) = owner.terminality_gate.as_ref() {
+            gate.cancel_requested.store(true, Ordering::Release);
+        }
+        if unsafe { CancelIoEx(owner.read.raw(), owner.operation.as_ref()) } == 0 {
             let error = unsafe { GetLastError() };
             if error != ERROR_NOT_FOUND {
-                // Cancellation remains only a request.  The event and
-                // GetOverlappedResult still prove terminality for every
-                // error, including ERROR_NOT_FOUND.
+                // Cancellation is only a request. The event plus an actual
+                // GetOverlappedResult(FALSE) terminal result remain required.
             }
         }
     }
 
     fn observe_terminal(&mut self) -> bool {
         if !self.pending() {
-            return self.operation.state.is_terminal();
+            return self.owner().state.is_terminal();
         }
+        {
+            let owner = self.owner();
+            if let Some(gate) = owner.terminality_gate.as_ref() {
+                if gate.cancel_requested.load(Ordering::Acquire)
+                    && !gate.allow_terminal.load(Ordering::Acquire)
+                {
+                    return false;
+                }
+            }
+        }
+        let owner = self.owner_mut();
         let mut transferred = 0_u32;
         let completed = unsafe {
             GetOverlappedResult(
-                self.read,
-                self.operation.overlapped.as_ref(),
+                owner.read.raw(),
+                owner.operation.as_ref(),
                 &mut transferred,
                 FALSE,
             )
         } != 0;
         if completed {
-            self.mark_terminal(H7OverlappedState::TerminalCompleted);
+            owner.state = H7OverlappedState::TerminalCompleted;
+            if let Some(probe) = owner.probe.as_ref() {
+                probe.terminal_observed.store(true, Ordering::Release);
+            }
             return true;
         }
         let error = unsafe { GetLastError() };
         if error == ERROR_IO_PENDING {
             unsafe {
-                let _ = ResetEvent(self.event.raw());
+                let _ = ResetEvent(owner.event.raw());
             }
             return false;
         }
-        let state = if error == ERROR_OPERATION_ABORTED {
+        owner.state = if error == ERROR_OPERATION_ABORTED {
             H7OverlappedState::TerminalCancelled
         } else {
             H7OverlappedState::TerminalError(error)
         };
-        self.mark_terminal(state);
+        if let Some(probe) = owner.probe.as_ref() {
+            probe.terminal_observed.store(true, Ordering::Release);
+        }
         true
     }
 
@@ -1232,74 +1291,64 @@ impl H7OverlappedConnect {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 self.request_cancel();
-                self.wait_for_terminal_unbounded();
-                return false;
+                let _ = self.observe_terminal();
+                return !self.pending();
             }
             let wait_ms = remaining.as_millis().min(u32::MAX as u128) as u32;
-            match unsafe { WaitForSingleObject(self.event.raw(), wait_ms) } {
+            match unsafe { WaitForSingleObject(self.owner().event.raw(), wait_ms) } {
                 WAIT_OBJECT_0 => {
                     let _ = self.observe_terminal();
                 }
                 WAIT_TIMEOUT => {
                     self.request_cancel();
-                    self.wait_for_terminal_unbounded();
-                    return false;
+                    let _ = self.observe_terminal();
+                    return !self.pending();
                 }
                 _ => {
                     self.request_cancel();
-                    self.wait_for_terminal_unbounded();
-                    return false;
+                    let _ = self.observe_terminal();
+                    return !self.pending();
                 }
             }
         }
         true
     }
 
-    fn wait_for_terminal_unbounded(&mut self) {
-        while self.pending() {
-            let wait = unsafe { WaitForSingleObject(self.event.raw(), INFINITE) };
-            if wait == WAIT_OBJECT_0 {
-                if !self.observe_terminal() {
-                    thread::yield_now();
-                }
-                continue;
-            }
-            let mut transferred = 0_u32;
-            let completed = unsafe {
-                GetOverlappedResult(
-                    self.read,
-                    self.operation.overlapped.as_ref(),
-                    &mut transferred,
-                    TRUE,
-                )
-            } != 0;
-            if completed {
-                self.mark_terminal(H7OverlappedState::TerminalCompleted);
-                continue;
-            }
-            let error = unsafe { GetLastError() };
-            if error == ERROR_IO_PENDING {
-                thread::yield_now();
-                continue;
-            }
-            let state = if error == ERROR_OPERATION_ABORTED {
-                H7OverlappedState::TerminalCancelled
-            } else {
-                H7OverlappedState::TerminalError(error)
-            };
-            self.mark_terminal(state);
+    fn take_read(mut self) -> Result<H7Handle, Self> {
+        if self.pending() {
+            return Err(self);
+        }
+        let owner = self.owner.take().expect("H7 connect owner exists");
+        owner.mark_released();
+        let H7ConnectOperationOwner {
+            read,
+            event,
+            operation,
+            terminality_gate: _,
+            probe: _,
+            state: _,
+        } = owner;
+        drop(event);
+        drop(operation);
+        Ok(read)
+    }
+
+    fn quarantine(self) {
+        let mut this = self;
+        if let Some(owner) = this.owner.take() {
+            h7_quarantine_insert(H7QuarantineEntry::Connect(owner));
         }
     }
 }
 
 impl Drop for H7OverlappedConnect {
     fn drop(&mut self) {
-        if self.pending() {
-            self.request_cancel();
-            self.wait_for_terminal_unbounded();
-        }
-        if let Some(probe) = self.probe.as_ref() {
-            probe.dropped.store(true, Ordering::Release);
+        if let Some(owner) = self.owner.take() {
+            if owner.state.is_pending() {
+                h7_quarantine_insert(H7QuarantineEntry::Connect(owner));
+            } else {
+                owner.mark_released();
+            }
         }
     }
 }
@@ -1310,24 +1359,92 @@ struct H7OutputReadOperation {
     state: H7OverlappedState,
 }
 
-struct H7OverlappedOutputCapture {
+struct H7OutputIoOwner {
     read: H7Handle,
     child_write: H7Handle,
     event: H7Handle,
     operation: Box<H7OutputReadOperation>,
+    terminality_gate: Option<Arc<H7TerminalityGate>>,
+    terminality_probe: Option<Arc<H7TerminalityProbe>>,
+}
+
+unsafe impl Send for H7OutputIoOwner {}
+
+impl H7OutputIoOwner {
+    fn pending(&self) -> bool {
+        self.operation.state.is_pending()
+    }
+
+    fn mark_released(&self) {
+        if let Some(probe) = self.terminality_probe.as_ref() {
+            probe.drop_finished.store(true, Ordering::Release);
+        }
+    }
+
+    fn observe_terminal_nonblocking(&mut self) -> bool {
+        if !self.pending() {
+            return self.operation.state.is_terminal();
+        }
+        if let Some(gate) = self.terminality_gate.as_ref() {
+            if gate.cancel_requested.load(Ordering::Acquire)
+                && !gate.allow_terminal.load(Ordering::Acquire)
+            {
+                return false;
+            }
+        }
+        let _ = unsafe { WaitForSingleObject(self.event.raw(), 0) };
+        let mut transferred = 0_u32;
+        let completed = unsafe {
+            GetOverlappedResult(
+                self.read.raw(),
+                &self.operation.overlapped,
+                &mut transferred,
+                FALSE,
+            )
+        } != 0;
+        if completed {
+            self.operation.state = H7OverlappedState::TerminalCompleted;
+            unsafe {
+                let _ = ResetEvent(self.event.raw());
+            }
+            self.mark_terminal_observed();
+            return true;
+        }
+        let error = unsafe { GetLastError() };
+        if error == ERROR_IO_PENDING {
+            return false;
+        }
+        self.operation.state = if error == ERROR_BROKEN_PIPE {
+            H7OverlappedState::TerminalEof
+        } else if error == ERROR_OPERATION_ABORTED {
+            H7OverlappedState::TerminalCancelled
+        } else {
+            H7OverlappedState::TerminalError(error)
+        };
+        self.mark_terminal_observed();
+        true
+    }
+
+    fn mark_terminal_observed(&self) {
+        if let Some(probe) = self.terminality_probe.as_ref() {
+            probe.terminal_observed.store(true, Ordering::Release);
+        }
+    }
+}
+
+struct H7OverlappedOutputCapture {
+    owner: Option<H7OutputIoOwner>,
     bytes: Vec<u8>,
     bound: usize,
     stream_complete: bool,
     overflow: bool,
-    terminality_gate: Option<Arc<H7TerminalityGate>>,
-    terminality_probe: Option<Arc<H7TerminalityProbe>>,
 }
 
 unsafe impl Send for H7OverlappedOutputCapture {}
 
 impl H7OverlappedOutputCapture {
     fn new(bound: usize, stream: &str) -> Result<Self, String> {
-        Self::new_inner(bound, stream, false, None)
+        Self::new_inner(bound, stream, false, None, None)
     }
 
     fn new_inner(
@@ -1335,6 +1452,7 @@ impl H7OverlappedOutputCapture {
         stream: &str,
         force_connect_error: bool,
         connect_probe: Option<Arc<H7ConnectTerminalityProbe>>,
+        connect_gate: Option<Arc<H7TerminalityGate>>,
     ) -> Result<Self, String> {
         let pipe_name = h7_output_pipe_name(stream)?;
         let read = unsafe {
@@ -1358,14 +1476,28 @@ impl H7OverlappedOutputCapture {
             ));
         }
 
-        let mut connect = H7OverlappedConnect::new(read.raw())?;
-        connect.probe = connect_probe;
+        let mut connect = H7OverlappedConnect::new(read)?;
+        if let Some(probe) = connect_probe {
+            connect.owner_mut().probe = Some(probe);
+        }
+        if let Some(gate) = connect_gate {
+            connect.owner_mut().terminality_gate = Some(gate);
+        }
         connect.start().map_err(|error| {
             format!(
                 "H7 overlapped {} named-pipe connect failed: {}",
                 stream, error
             )
         })?;
+
+        if force_connect_error && connect.owner().terminality_gate.is_some() {
+            connect.request_cancel();
+            let _ = connect.wait_for_terminal_until(Instant::now() + connect.cleanup_timeout());
+            return Err(format!(
+                "D29-H7 injected pending named-pipe connect constructor failure for {}",
+                stream
+            ));
+        }
 
         let child_write = H7Handle::new(unsafe {
             CreateFileW(
@@ -1390,7 +1522,7 @@ impl H7OverlappedOutputCapture {
         }
         if force_connect_error {
             connect.request_cancel();
-            connect.wait_for_terminal_unbounded();
+            let _ = connect.wait_for_terminal_until(Instant::now() + connect.cleanup_timeout());
             return Err(format!(
                 "D29-H7 injected named-pipe connect constructor failure for {}",
                 stream
@@ -1399,6 +1531,7 @@ impl H7OverlappedOutputCapture {
         if connect.pending()
             && !connect.wait_for_terminal_until(Instant::now() + Duration::from_secs(2))
         {
+            connect.quarantine();
             return Err(format!(
                 "H7 overlapped {} named-pipe connect timed out",
                 stream
@@ -1410,7 +1543,16 @@ impl H7OverlappedOutputCapture {
                 stream, error
             ));
         }
-        drop(connect);
+        let read = match connect.take_read() {
+            Ok(read) => read,
+            Err(connect) => {
+                connect.quarantine();
+                return Err(format!(
+                    "H7 overlapped {} named-pipe connect remained pending",
+                    stream
+                ));
+            }
+        };
 
         let event =
             H7Handle::new(unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) })?;
@@ -1426,20 +1568,22 @@ impl H7OverlappedOutputCapture {
             ..Default::default()
         };
         Ok(Self {
-            read,
-            child_write,
-            event,
-            operation: Box::new(H7OutputReadOperation {
-                overlapped,
-                scratch: [0_u8; H7_OUTPUT_SCRATCH_BYTES],
-                state: H7OverlappedState::Idle,
+            owner: Some(H7OutputIoOwner {
+                read,
+                child_write,
+                event,
+                operation: Box::new(H7OutputReadOperation {
+                    overlapped,
+                    scratch: [0_u8; H7_OUTPUT_SCRATCH_BYTES],
+                    state: H7OverlappedState::Idle,
+                }),
+                terminality_gate: None,
+                terminality_probe: None,
             }),
             bytes: Vec::with_capacity(bound.min(H7_OUTPUT_SCRATCH_BYTES)),
             bound,
             stream_complete: false,
             overflow: false,
-            terminality_gate: None,
-            terminality_probe: None,
         })
     }
 
@@ -1449,7 +1593,17 @@ impl H7OverlappedOutputCapture {
         stream: &str,
         probe: Arc<H7ConnectTerminalityProbe>,
     ) -> Result<Self, String> {
-        Self::new_inner(bound, stream, true, Some(probe))
+        Self::new_inner(bound, stream, true, Some(probe), None)
+    }
+
+    #[cfg(test)]
+    fn new_for_connect_quarantine_test(
+        bound: usize,
+        stream: &str,
+        gate: Arc<H7TerminalityGate>,
+        probe: Arc<H7ConnectTerminalityProbe>,
+    ) -> Result<Self, String> {
+        Self::new_inner(bound, stream, true, Some(probe), Some(gate))
     }
 
     #[cfg(test)]
@@ -1458,26 +1612,78 @@ impl H7OverlappedOutputCapture {
         gate: Arc<H7TerminalityGate>,
         probe: Arc<H7TerminalityProbe>,
     ) -> Self {
-        self.terminality_gate = Some(gate);
-        self.terminality_probe = Some(probe);
+        self = self.with_terminality_gate(gate);
+        self.owner_mut().terminality_probe = Some(probe);
         self
     }
 
+    fn with_terminality_gate(mut self, gate: Arc<H7TerminalityGate>) -> Self {
+        self.owner_mut().terminality_gate = Some(gate);
+        self
+    }
+
+    fn cleanup_timeout(&self) -> Duration {
+        self.owner
+            .as_ref()
+            .and_then(|owner| owner.terminality_gate.as_ref())
+            .and_then(|gate| {
+                let millis = gate.cleanup_timeout_ms.load(Ordering::Acquire);
+                (millis != 0).then_some(Duration::from_millis(millis as u64))
+            })
+            .unwrap_or(H7_CLEANUP_TIMEOUT)
+    }
+
+    #[cfg(test)]
+    fn with_cleanup_timeout(self, timeout: Duration) -> Self {
+        if let Some(gate) = self
+            .owner
+            .as_ref()
+            .and_then(|owner| owner.terminality_gate.as_ref())
+        {
+            gate.cleanup_timeout_ms.store(
+                timeout.as_millis().max(1).min(usize::MAX as u128) as usize,
+                Ordering::Release,
+            );
+        }
+        self
+    }
+
+    #[cfg(test)]
+    fn with_terminality_test_hooks_and_cleanup_timeout(
+        self,
+        gate: Arc<H7TerminalityGate>,
+        timeout: Duration,
+    ) -> Self {
+        self.with_terminality_gate(gate)
+            .with_cleanup_timeout(timeout)
+    }
+
+    fn owner(&self) -> &H7OutputIoOwner {
+        self.owner.as_ref().expect("H7 output owner exists")
+    }
+
+    fn owner_mut(&mut self) -> &mut H7OutputIoOwner {
+        self.owner.as_mut().expect("H7 output owner exists")
+    }
+
     fn child_handle(&self) -> HANDLE {
-        self.child_write.raw()
+        self.owner().child_write.raw()
     }
 
     fn close_child_endpoint(&mut self) {
-        let child_write = std::mem::replace(&mut self.child_write, H7Handle(std::ptr::null_mut()));
+        let child_write = std::mem::replace(
+            &mut self.owner_mut().child_write,
+            H7Handle(std::ptr::null_mut()),
+        );
         drop(child_write);
     }
 
     fn event_handle(&self) -> HANDLE {
-        self.event.raw()
+        self.owner().event.raw()
     }
 
     fn pending(&self) -> bool {
-        self.operation.state.is_pending()
+        self.owner.as_ref().is_some_and(H7OutputIoOwner::pending)
     }
 
     fn is_complete(&self) -> bool {
@@ -1489,7 +1695,9 @@ impl H7OverlappedOutputCapture {
     }
 
     fn failed(&self) -> bool {
-        matches!(self.operation.state, H7OverlappedState::TerminalError(_))
+        self.owner.as_ref().is_some_and(|owner| {
+            matches!(owner.operation.state, H7OverlappedState::TerminalError(_))
+        })
     }
 
     fn retained_len(&self) -> usize {
@@ -1500,29 +1708,30 @@ impl H7OverlappedOutputCapture {
         if self.pending() || self.stream_complete {
             return;
         }
-        debug_assert!(
-            self.operation.state == H7OverlappedState::Idle || self.operation.state.is_terminal()
-        );
         let remaining = self.bound.saturating_sub(self.bytes.len());
         let requested = remaining
             .saturating_add(1)
             .min(H7_OUTPUT_SCRATCH_BYTES)
             .max(1);
+        let owner = self.owner_mut();
+        debug_assert!(
+            owner.operation.state == H7OverlappedState::Idle || owner.operation.state.is_terminal()
+        );
         unsafe {
-            let _ = ResetEvent(self.event.raw());
+            let _ = ResetEvent(owner.event.raw());
         }
-        self.operation.overlapped = OVERLAPPED {
-            hEvent: self.event.raw(),
+        owner.operation.overlapped = OVERLAPPED {
+            hEvent: owner.event.raw(),
             ..Default::default()
         };
-        self.operation.state = H7OverlappedState::Pending;
+        owner.operation.state = H7OverlappedState::Pending;
         let started = unsafe {
             ReadFile(
-                self.read.raw(),
-                self.operation.scratch.as_mut_ptr().cast(),
+                owner.read.raw(),
+                owner.operation.scratch.as_mut_ptr().cast(),
                 requested as u32,
                 std::ptr::null_mut(),
-                &mut self.operation.overlapped,
+                &mut owner.operation.overlapped,
             )
         } != 0;
         if started {
@@ -1537,9 +1746,16 @@ impl H7OverlappedOutputCapture {
 
     fn complete_pending(&mut self) -> bool {
         if !self.pending() {
-            return self.operation.state.is_terminal();
+            return self
+                .owner
+                .as_ref()
+                .is_some_and(|owner| owner.operation.state.is_terminal());
         }
-        if let Some(gate) = self.terminality_gate.as_ref() {
+        if let Some(gate) = self
+            .owner
+            .as_ref()
+            .and_then(|owner| owner.terminality_gate.as_ref())
+        {
             if gate.cancel_requested.load(Ordering::Acquire)
                 && !gate.allow_terminal.load(Ordering::Acquire)
             {
@@ -1547,40 +1763,63 @@ impl H7OverlappedOutputCapture {
                 return false;
             }
         }
+        let remaining = self.bound.saturating_sub(self.bytes.len());
         let mut transferred = 0_u32;
-        let completed = unsafe {
-            GetOverlappedResult(
-                self.read.raw(),
-                &self.operation.overlapped,
-                &mut transferred,
-                FALSE,
-            )
-        } != 0;
-        if !completed {
-            let error = unsafe { GetLastError() };
-            if error == ERROR_IO_PENDING {
-                unsafe {
-                    let _ = ResetEvent(self.event.raw());
+        let mut terminal_error = None;
+        let mut completed_bytes = Vec::new();
+        {
+            let owner = self.owner_mut();
+            let completed = unsafe {
+                GetOverlappedResult(
+                    owner.read.raw(),
+                    &owner.operation.overlapped,
+                    &mut transferred,
+                    FALSE,
+                )
+            } != 0;
+            if !completed {
+                let error = unsafe { GetLastError() };
+                if error == ERROR_IO_PENDING {
+                    unsafe {
+                        let _ = ResetEvent(owner.event.raw());
+                    }
+                    return false;
                 }
-                return false;
+                owner.operation.state = if error == ERROR_BROKEN_PIPE {
+                    H7OverlappedState::TerminalEof
+                } else if error == ERROR_OPERATION_ABORTED {
+                    H7OverlappedState::TerminalCancelled
+                } else {
+                    H7OverlappedState::TerminalError(error)
+                };
+                terminal_error = Some(error);
+            } else {
+                owner.operation.state = H7OverlappedState::TerminalCompleted;
+                unsafe {
+                    let _ = ResetEvent(owner.event.raw());
+                }
+                if transferred == 0 {
+                    owner.operation.state = H7OverlappedState::TerminalEof;
+                } else {
+                    let take = remaining.min(transferred as usize);
+                    completed_bytes.extend_from_slice(&owner.operation.scratch[..take]);
+                }
             }
-            self.mark_read_terminal(error, 0);
+        }
+        if let Some(error) = terminal_error {
+            if error == ERROR_BROKEN_PIPE {
+                self.stream_complete = true;
+            }
+            self.mark_read_terminal_observed();
             return true;
         }
-        self.operation.state = H7OverlappedState::TerminalCompleted;
-        unsafe {
-            let _ = ResetEvent(self.event.raw());
-        }
         if transferred == 0 {
-            self.operation.state = H7OverlappedState::TerminalEof;
             self.stream_complete = true;
             self.mark_read_terminal_observed();
             return true;
         }
-        let remaining = self.bound.saturating_sub(self.bytes.len());
-        let take = remaining.min(transferred as usize);
-        self.bytes
-            .extend_from_slice(&self.operation.scratch[..take]);
+        let take = completed_bytes.len();
+        self.bytes.extend_from_slice(&completed_bytes);
         if take < transferred as usize {
             self.overflow = true;
             self.stream_complete = true;
@@ -1590,37 +1829,53 @@ impl H7OverlappedOutputCapture {
     }
 
     fn mark_read_terminal_observed(&self) {
-        if let Some(probe) = self.terminality_probe.as_ref() {
+        if let Some(probe) = self
+            .owner
+            .as_ref()
+            .and_then(|owner| owner.terminality_probe.as_ref())
+        {
             probe.terminal_observed.store(true, Ordering::Release);
         }
     }
 
     fn mark_read_terminal(&mut self, error: u32, transferred: u32) {
-        self.operation.state = if error == ERROR_BROKEN_PIPE {
-            self.stream_complete = true;
+        let end_of_stream = error == ERROR_BROKEN_PIPE;
+        let state = if end_of_stream {
             H7OverlappedState::TerminalEof
         } else if error == ERROR_OPERATION_ABORTED {
             H7OverlappedState::TerminalCancelled
         } else {
             H7OverlappedState::TerminalError(error)
         };
-        if transferred == 0 {
-            unsafe {
-                let _ = ResetEvent(self.event.raw());
+        {
+            let owner = self.owner_mut();
+            owner.operation.state = state;
+            if transferred == 0 {
+                unsafe {
+                    let _ = ResetEvent(owner.event.raw());
+                }
             }
+        }
+        if end_of_stream {
+            self.stream_complete = true;
         }
         self.mark_read_terminal_observed();
     }
 
     fn request_cancel(&mut self) {
-        if self.operation.state != H7OverlappedState::Pending {
+        if !self
+            .owner
+            .as_ref()
+            .is_some_and(|owner| owner.operation.state == H7OverlappedState::Pending)
+        {
             return;
         }
-        self.operation.state = H7OverlappedState::CancelRequested;
-        if let Some(gate) = self.terminality_gate.as_ref() {
+        let owner = self.owner_mut();
+        owner.operation.state = H7OverlappedState::CancelRequested;
+        if let Some(gate) = owner.terminality_gate.as_ref() {
             gate.cancel_requested.store(true, Ordering::Release);
         }
-        if unsafe { CancelIoEx(self.read.raw(), &self.operation.overlapped) } == 0 {
+        if unsafe { CancelIoEx(owner.read.raw(), &owner.operation.overlapped) } == 0 {
             let error = unsafe { GetLastError() };
             if error != ERROR_NOT_FOUND {
                 // ERROR_NOT_FOUND and every other failure still require the
@@ -1640,7 +1895,7 @@ impl H7OverlappedOutputCapture {
                 return false;
             }
             let wait_ms = remaining.as_millis().min(u32::MAX as u128) as u32;
-            if unsafe { WaitForSingleObject(self.event.raw(), wait_ms) } != WAIT_OBJECT_0 {
+            if unsafe { WaitForSingleObject(self.event_handle(), wait_ms) } != WAIT_OBJECT_0 {
                 return false;
             }
             let _ = self.complete_pending();
@@ -1648,70 +1903,211 @@ impl H7OverlappedOutputCapture {
         true
     }
 
-    fn wait_for_terminal_unbounded(&mut self) {
-        while self.pending() {
-            let wait = unsafe { WaitForSingleObject(self.event.raw(), INFINITE) };
-            if wait == WAIT_OBJECT_0 {
-                if !self.complete_pending() {
-                    thread::yield_now();
-                }
-                continue;
-            }
-            let mut transferred = 0_u32;
-            let completed = unsafe {
-                GetOverlappedResult(
-                    self.read.raw(),
-                    &self.operation.overlapped,
-                    &mut transferred,
-                    TRUE,
-                )
-            } != 0;
-            if completed {
-                self.operation.state = H7OverlappedState::TerminalCompleted;
-                if transferred == 0 {
-                    self.operation.state = H7OverlappedState::TerminalEof;
-                    self.stream_complete = true;
-                } else {
-                    let remaining = self.bound.saturating_sub(self.bytes.len());
-                    let take = remaining.min(transferred as usize);
-                    self.bytes
-                        .extend_from_slice(&self.operation.scratch[..take]);
-                    if take < transferred as usize {
-                        self.overflow = true;
-                        self.stream_complete = true;
-                    }
-                }
-                self.mark_read_terminal_observed();
-                continue;
-            }
-            let error = unsafe { GetLastError() };
-            if error == ERROR_IO_PENDING {
-                thread::yield_now();
-                continue;
-            }
-            self.mark_read_terminal(error, 0);
+    fn quarantine_if_pending(&mut self) -> bool {
+        if !self.pending() {
+            return false;
         }
-    }
-
-    fn terminalize(&mut self) {
-        if self.pending() {
-            self.request_cancel();
-            self.wait_for_terminal_unbounded();
-        }
-        debug_assert!(!self.pending());
+        let owner = self.owner.take().expect("H7 output owner exists");
+        h7_quarantine_insert(H7QuarantineEntry::Output(owner));
+        true
     }
 }
 
 impl Drop for H7OverlappedOutputCapture {
     fn drop(&mut self) {
-        if let Some(probe) = self.terminality_probe.as_ref() {
-            probe.drop_started.store(true, Ordering::Release);
-        }
-        self.terminalize();
-        if let Some(probe) = self.terminality_probe.as_ref() {
-            probe.drop_finished.store(true, Ordering::Release);
+        if let Some(owner) = self.owner.take() {
+            if owner.pending() {
+                if let Some(probe) = owner.terminality_probe.as_ref() {
+                    probe.drop_started.store(true, Ordering::Release);
+                }
+                h7_quarantine_insert(H7QuarantineEntry::Output(owner));
+            } else {
+                owner.mark_released();
+            }
         }
     }
+}
+
+enum H7QuarantineEntry {
+    Connect(H7ConnectOperationOwner),
+    Output(H7OutputIoOwner),
+}
+
+unsafe impl Send for H7QuarantineEntry {}
+
+impl H7QuarantineEntry {
+    fn is_output(&self) -> bool {
+        matches!(self, Self::Output(_))
+    }
+
+    fn is_connect(&self) -> bool {
+        matches!(self, Self::Connect(_))
+    }
+
+    fn observe_terminal_nonblocking(&mut self) -> bool {
+        match self {
+            Self::Connect(owner) => {
+                if !owner.state.is_pending() {
+                    return owner.state.is_terminal();
+                }
+                if let Some(gate) = owner.terminality_gate.as_ref() {
+                    if gate.cancel_requested.load(Ordering::Acquire)
+                        && !gate.allow_terminal.load(Ordering::Acquire)
+                    {
+                        return false;
+                    }
+                }
+                let _ = unsafe { WaitForSingleObject(owner.event.raw(), 0) };
+                let mut transferred = 0_u32;
+                let completed = unsafe {
+                    GetOverlappedResult(
+                        owner.read.raw(),
+                        owner.operation.as_ref(),
+                        &mut transferred,
+                        FALSE,
+                    )
+                } != 0;
+                if completed {
+                    owner.state = H7OverlappedState::TerminalCompleted;
+                    if let Some(probe) = owner.probe.as_ref() {
+                        probe.terminal_observed.store(true, Ordering::Release);
+                    }
+                    true
+                } else {
+                    let error = unsafe { GetLastError() };
+                    if error == ERROR_IO_PENDING {
+                        false
+                    } else {
+                        owner.state = if error == ERROR_OPERATION_ABORTED {
+                            H7OverlappedState::TerminalCancelled
+                        } else {
+                            H7OverlappedState::TerminalError(error)
+                        };
+                        if let Some(probe) = owner.probe.as_ref() {
+                            probe.terminal_observed.store(true, Ordering::Release);
+                        }
+                        true
+                    }
+                }
+            }
+            Self::Output(owner) => owner.observe_terminal_nonblocking(),
+        }
+    }
+
+    fn mark_released(&self) {
+        match self {
+            Self::Connect(owner) => owner.mark_released(),
+            Self::Output(owner) => owner.mark_released(),
+        }
+    }
+}
+
+impl H7ConnectOperationOwner {
+    fn mark_released(&self) {
+        if let Some(probe) = self.probe.as_ref() {
+            probe.dropped.store(true, Ordering::Release);
+        }
+    }
+}
+
+struct H7PendingIoQuarantine {
+    entries: Mutex<[Option<H7QuarantineEntry>; H7_MAX_QUARANTINED_IO]>,
+}
+
+unsafe impl Sync for H7PendingIoQuarantine {}
+
+impl Default for H7PendingIoQuarantine {
+    fn default() -> Self {
+        Self {
+            entries: Mutex::new(std::array::from_fn(|_| None)),
+        }
+    }
+}
+
+impl H7PendingIoQuarantine {
+    fn try_insert(&self, entry: H7QuarantineEntry) -> Result<(), H7QuarantineEntry> {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let output_count = entries
+            .iter()
+            .flatten()
+            .filter(|entry| entry.is_output())
+            .count();
+        let connect_count = entries
+            .iter()
+            .flatten()
+            .filter(|entry| entry.is_connect())
+            .count();
+        let allowed = match &entry {
+            H7QuarantineEntry::Output(_) => output_count < H7_MAX_QUARANTINED_OUTPUT,
+            H7QuarantineEntry::Connect(_) => connect_count < H7_MAX_QUARANTINED_CONNECT,
+        };
+        if !allowed {
+            return Err(entry);
+        }
+        let slot = entries
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .expect("H7 quarantine capacity accounting");
+        *slot = Some(entry);
+        Ok(())
+    }
+
+    fn reap_nonblocking(&self) -> usize {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut released = 0;
+        for slot in entries.iter_mut() {
+            let terminal = slot
+                .as_mut()
+                .is_some_and(H7QuarantineEntry::observe_terminal_nonblocking);
+            if terminal {
+                if let Some(entry) = slot.take() {
+                    entry.mark_released();
+                    released += 1;
+                }
+            }
+        }
+        released
+    }
+
+    fn count(&self) -> usize {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|entry| entry.is_some())
+            .count()
+    }
+}
+
+static H7_PENDING_IO_QUARANTINE: OnceLock<Arc<H7PendingIoQuarantine>> = OnceLock::new();
+
+fn h7_pending_io_quarantine() -> Arc<H7PendingIoQuarantine> {
+    Arc::clone(H7_PENDING_IO_QUARANTINE.get_or_init(|| Arc::new(H7PendingIoQuarantine::default())))
+}
+
+fn h7_quarantine_insert(entry: H7QuarantineEntry) {
+    let quarantine = h7_pending_io_quarantine();
+    match quarantine.try_insert(entry) {
+        Ok(()) => {}
+        Err(_entry) => {
+            // The single-active admission invariant makes this unreachable:
+            // at most one connect and two output operations can be pending.
+            // The process must not continue with an owner that has no fixed
+            // slot; abort before Rust can drop the kernel-referenced owner.
+            std::process::abort();
+        }
+    }
+}
+
+fn h7_reap_pending_io_nonblocking() -> usize {
+    h7_pending_io_quarantine().reap_nonblocking();
+    h7_pending_io_quarantine().count()
 }
 
 fn update_h7_pending_output_metric(
@@ -1746,7 +2142,7 @@ fn cancel_and_drain_h7_output(
 ) -> bool {
     stdout.cancel_pending();
     stderr.cancel_pending();
-    let deadline = Instant::now() + H7_CLEANUP_TIMEOUT;
+    let deadline = Instant::now() + stdout.cleanup_timeout().min(stderr.cleanup_timeout());
     let stdout_done = stdout.drain_until_terminal(deadline);
     let stderr_done = stderr.drain_until_terminal(deadline);
     update_h7_pending_output_metric(metrics, stdout, stderr);
@@ -2051,6 +2447,7 @@ impl H7LaunchPreparation {
     fn prepare(
         action: &PreparedProcessAction,
         unlisted_inheritable_handle: Option<usize>,
+        output_terminality_gate: Option<Arc<H7TerminalityGate>>,
     ) -> Result<Self, String> {
         let (expected_image_identity, expected_image_namespace, executable_probe) = {
             let mut image = action
@@ -2072,7 +2469,15 @@ impl H7LaunchPreparation {
         let job = create_job_object()?;
         let (stdin_read, stdin_write) = create_stdin_pipe()?;
         let stdout_capture = H7OverlappedOutputCapture::new(action.stdout_bound, "stdout")?;
+        let stdout_capture = match output_terminality_gate.as_ref() {
+            Some(gate) => stdout_capture.with_terminality_gate(Arc::clone(gate)),
+            None => stdout_capture,
+        };
         let stderr_capture = H7OverlappedOutputCapture::new(action.stderr_bound, "stderr")?;
+        let stderr_capture = match output_terminality_gate {
+            Some(gate) => stderr_capture.with_terminality_gate(gate),
+            None => stderr_capture,
+        };
         let mut attributes = H7ProcThreadAttributes::new(1)?;
         attributes.set_handle_list(vec![
             stdin_read.raw(),
@@ -2212,14 +2617,18 @@ struct H7NativeOptions {
     unlisted_inheritable_handle: Option<usize>,
     post_host_mutation: H7PostHostMutation,
     pre_create_process_gate: Option<Arc<H7PostHostFenceGate>>,
+    output_terminality_gate: Option<Arc<H7TerminalityGate>>,
 }
 
 fn supervise_native(action: &PreparedProcessAction, options: H7NativeOptions) -> H7NativeResult {
-    let preparation =
-        match H7LaunchPreparation::prepare(action, options.unlisted_inheritable_handle) {
-            Ok(preparation) => preparation,
-            Err(_) => return launch_failed(false, false, None),
-        };
+    let preparation = match H7LaunchPreparation::prepare(
+        action,
+        options.unlisted_inheritable_handle,
+        options.output_terminality_gate.clone(),
+    ) {
+        Ok(preparation) => preparation,
+        Err(_) => return launch_failed(false, false, None),
+    };
     supervise_native_prepared(action, options, preparation, None)
 }
 
@@ -2589,18 +2998,19 @@ fn supervise_native_inner(
             cancel_and_drain_h7_output(&options.metrics, &mut stdout_capture, &mut stderr_capture)
                 && output_cleanup_bounded;
     }
-    // A bounded drain is only an observation deadline.  Ownership cannot be
-    // released while the kernel may still reference an OVERLAPPED operation;
-    // terminalize both operations before reading final evidence or dropping
-    // their buffers, even if the bounded phase had to report unknown.
-    stdout_capture.terminalize();
-    stderr_capture.terminalize();
+    // A bounded drain is only an observation deadline. If the kernel has not
+    // reported terminality by then, transfer the exact operation owner to the
+    // process-lifetime quarantine. The active worker never frees a
+    // kernel-referenced OVERLAPPED, buffer, event, or pipe handle.
+    let stdout_quarantined = stdout_capture.quarantine_if_pending();
+    let stderr_quarantined = stderr_capture.quarantine_if_pending();
+    output_cleanup_bounded &= !stdout_quarantined && !stderr_quarantined;
     update_h7_pending_output_metric(&options.metrics, &stdout_capture, &stderr_capture);
     // Compatibility fields retained from the R2 result shape.  R3 has no
     // reader threads to join; a stream is cleanup-complete once it has no
     // outstanding overlapped read, including the pre-arm cancellation race.
-    let stdout_reader_joined = !stdout_capture.pending();
-    let stderr_reader_joined = !stderr_capture.pending();
+    let stdout_reader_joined = !stdout_quarantined && !stdout_capture.pending();
+    let stderr_reader_joined = !stderr_quarantined && !stderr_capture.pending();
     cleanup
         .stdout_reader_joined
         .store(stdout_reader_joined, Ordering::Release);
@@ -3779,6 +4189,41 @@ struct H7ActiveCancellation {
     notify: Arc<Notify>,
 }
 
+struct H7ProcessAdmission {
+    active: AtomicBool,
+}
+
+struct H7ProcessAdmissionLeaseState {
+    admission: Arc<H7ProcessAdmission>,
+}
+
+#[derive(Clone)]
+struct H7ProcessAdmissionLease {
+    state: Arc<H7ProcessAdmissionLeaseState>,
+}
+
+impl Drop for H7ProcessAdmissionLeaseState {
+    fn drop(&mut self) {
+        self.admission.active.store(false, Ordering::Release);
+    }
+}
+
+impl H7ProcessAdmission {
+    fn try_acquire(self: &Arc<Self>) -> Option<H7ProcessAdmissionLease> {
+        if h7_reap_pending_io_nonblocking() != 0 {
+            return None;
+        }
+        self.active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        Some(H7ProcessAdmissionLease {
+            state: Arc::new(H7ProcessAdmissionLeaseState {
+                admission: Arc::clone(self),
+            }),
+        })
+    }
+}
+
 struct H7ActionCancellationGuard {
     token: Arc<AtomicBool>,
     notify: Arc<Notify>,
@@ -3840,6 +4285,7 @@ struct H7ProcessBroker {
     catalog: Arc<H7ExecutableCatalog>,
     authority: Arc<H7Authority>,
     bridge: Arc<H7PendingConfirmationBridge>,
+    admission: Arc<H7ProcessAdmission>,
     active_cancellation: Arc<Mutex<Option<H7ActiveCancellation>>>,
     metrics: Arc<H7SupervisorMetrics>,
     final_fence_gate: Option<Arc<H7FinalFenceGate>>,
@@ -3847,6 +4293,7 @@ struct H7ProcessBroker {
     native_fault: H7NativeLaunchFault,
     unlisted_inheritable_handle: Option<usize>,
     post_host_mutation: H7PostHostMutation,
+    output_terminality_gate: Option<Arc<H7TerminalityGate>>,
 }
 
 impl H7ProcessBroker {
@@ -3861,6 +4308,9 @@ impl H7ProcessBroker {
             catalog,
             authority,
             bridge,
+            admission: Arc::new(H7ProcessAdmission {
+                active: AtomicBool::new(false),
+            }),
             active_cancellation: Arc::new(Mutex::new(None)),
             metrics: Arc::new(H7SupervisorMetrics::default()),
             final_fence_gate: None,
@@ -3868,6 +4318,7 @@ impl H7ProcessBroker {
             native_fault: H7NativeLaunchFault::None,
             unlisted_inheritable_handle: None,
             post_host_mutation: H7PostHostMutation::None,
+            output_terminality_gate: None,
         })
     }
 
@@ -3899,6 +4350,22 @@ impl H7ProcessBroker {
         self
     }
 
+    #[cfg(test)]
+    fn with_output_terminality_gate(
+        mut self: Arc<Self>,
+        gate: Arc<H7TerminalityGate>,
+        cleanup_timeout: Duration,
+    ) -> Arc<Self> {
+        gate.cleanup_timeout_ms.store(
+            cleanup_timeout.as_millis().max(1).min(usize::MAX as u128) as usize,
+            Ordering::Release,
+        );
+        Arc::get_mut(&mut self)
+            .expect("H7 output terminality gate must be installed before sharing broker")
+            .output_terminality_gate = Some(gate);
+        self
+    }
+
     fn cancel(&self) {
         if let Some(active) = self
             .active_cancellation
@@ -3924,6 +4391,10 @@ impl H7ProcessBroker {
         self: &Arc<Self>,
         action: Arc<PreparedProcessAction>,
     ) -> H7ToolResult {
+        let admission = match self.admission.try_acquire() {
+            Some(admission) => admission,
+            None => return H7ToolResult::denied(),
+        };
         let cancellation = Arc::new(AtomicBool::new(false));
         let cancellation_notify = Arc::new(Notify::new());
         let guard = H7ActionCancellationGuard::new(
@@ -3932,7 +4403,7 @@ impl H7ProcessBroker {
             Arc::clone(&cancellation_notify),
         );
         let result = self
-            .execute_with_cancellation(action, cancellation, cancellation_notify)
+            .execute_with_cancellation(action, cancellation, cancellation_notify, admission)
             .await;
         guard.disarm();
         result
@@ -3943,6 +4414,7 @@ impl H7ProcessBroker {
         action: Arc<PreparedProcessAction>,
         cancellation: Arc<AtomicBool>,
         cancellation_notify: Arc<Notify>,
+        admission: H7ProcessAdmissionLease,
     ) -> H7ToolResult {
         let authorization_revision = match self
             .bridge
@@ -3961,7 +4433,9 @@ impl H7ProcessBroker {
         }
         let authority = Arc::clone(&self.authority);
         let action_for_grant = Arc::clone(&action);
+        let grant_admission = admission.clone();
         let grant = match tokio::task::spawn_blocking(move || {
+            let _admission = grant_admission;
             authority.issue_process_grant(&action_for_grant, authorization_revision)
         })
         .await
@@ -3971,8 +4445,15 @@ impl H7ProcessBroker {
         };
         let preparation_action = Arc::clone(&action);
         let unlisted_inheritable_handle = self.unlisted_inheritable_handle;
+        let output_terminality_gate = self.output_terminality_gate.clone();
+        let preparation_admission = admission.clone();
         let preparation = match tokio::task::spawn_blocking(move || {
-            H7LaunchPreparation::prepare(&preparation_action, unlisted_inheritable_handle)
+            let _admission = preparation_admission;
+            H7LaunchPreparation::prepare(
+                &preparation_action,
+                unlisted_inheritable_handle,
+                output_terminality_gate,
+            )
         })
         .await
         {
@@ -3989,8 +4470,11 @@ impl H7ProcessBroker {
         let fault = self.native_fault;
         let pre_create_process_gate = self.post_host_gate.clone();
         let post_host_mutation = self.post_host_mutation;
+        let output_terminality_gate = self.output_terminality_gate.clone();
         let worker_metrics = Arc::clone(&metrics);
+        let worker_admission = admission.clone();
         match tokio::task::spawn_blocking(move || {
+            let _admission = worker_admission;
             let _worker = H7NativeWorkerGuard::new(worker_metrics);
             if cancellation.load(Ordering::Acquire) {
                 return H7ToolResult::denied();
@@ -4011,6 +4495,7 @@ impl H7ProcessBroker {
                     unlisted_inheritable_handle,
                     post_host_mutation,
                     pre_create_process_gate,
+                    output_terminality_gate,
                 },
                 preparation,
                 Some(grant),
@@ -4063,6 +4548,10 @@ struct VitaProcessTool {
 
 impl VitaProcessTool {
     async fn execute_prepared_action(&self, action: Arc<PreparedProcessAction>) -> H7ToolResult {
+        let admission = match self.broker.admission.try_acquire() {
+            Some(admission) => admission,
+            None => return H7ToolResult::denied(),
+        };
         let cancellation = Arc::new(AtomicBool::new(false));
         let cancellation_notify = Arc::new(Notify::new());
         let guard = H7ActionCancellationGuard::new(
@@ -4072,7 +4561,7 @@ impl VitaProcessTool {
         );
         let result = self
             .broker
-            .execute_with_cancellation(action, cancellation, cancellation_notify)
+            .execute_with_cancellation(action, cancellation, cancellation_notify, admission)
             .await;
         // This disarm is reached only after the action and its blocking worker
         // have completed; dropping the ToolExecutorFuture earlier runs Drop.
@@ -4272,6 +4761,20 @@ mod tests {
             )
             .with_post_host_mutation(mutation)
         }
+
+        fn broker_with_output_terminality_gate(
+            &self,
+            gate: Arc<H7TerminalityGate>,
+            cleanup_timeout: Duration,
+        ) -> Arc<H7ProcessBroker> {
+            H7ProcessBroker::new(
+                self.broker.context.clone(),
+                Arc::clone(&self.catalog),
+                Arc::clone(&self.authority),
+                Arc::clone(&self.bridge),
+            )
+            .with_output_terminality_gate(gate, cleanup_timeout)
+        }
     }
 
     async fn run_approved(
@@ -4440,6 +4943,7 @@ mod tests {
             unlisted_inheritable_handle: None,
             post_host_mutation: H7PostHostMutation::None,
             pre_create_process_gate: None,
+            output_terminality_gate: None,
         }
     }
 
@@ -5319,6 +5823,44 @@ mod tests {
         assert!(result.stderr_retained_bytes <= H7_STDERR_BOUND);
     }
 
+    fn reap_h7_quarantine_until(target: usize, deadline: Instant) {
+        let quarantine = h7_pending_io_quarantine();
+        while quarantine.count() > target {
+            h7_reap_pending_io_nonblocking();
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+    }
+
+    fn install_h7_pending_output_quarantine(
+        stream: &str,
+    ) -> (Arc<H7TerminalityGate>, Arc<H7TerminalityProbe>, usize) {
+        let quarantine = h7_pending_io_quarantine();
+        let before = quarantine.count();
+        let gate = Arc::new(H7TerminalityGate::default());
+        let probe = Arc::new(H7TerminalityProbe::default());
+        let mut capture = H7OverlappedOutputCapture::new(1_024, stream)
+            .expect("D29-H7 pending output quarantine capture")
+            .with_terminality_test_hooks(Arc::clone(&gate), Arc::clone(&probe));
+        capture.arm_read();
+        capture.cancel_pending();
+        assert!(capture.quarantine_if_pending());
+        drop(capture);
+        assert_eq!(quarantine.count(), before + 1);
+        (gate, probe, before)
+    }
+
+    async fn wait_h7_pending_output_reads(metrics: &H7SupervisorMetrics) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while metrics.pending_output_reads.load(Ordering::Acquire) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "D29-H7 output read did not become pending"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
     fn h7_large_fast_exit_bytes(start: u8) -> String {
         String::from_utf8(
             (0..(24 * 1024))
@@ -5341,6 +5883,17 @@ mod tests {
         assert!(!source.contains(&forbidden_peek));
         assert!(!source.contains(&forbidden_reader));
         assert!(!source.contains(&forbidden_spawn));
+    }
+
+    #[test]
+    fn h7_no_infinite_output_or_connect_waits() {
+        let source = include_str!("d29h7.rs");
+        let infinite = ["IN", "FINITE"].concat();
+        let unbounded = ["wait_for_terminal_", "unbounded"].concat();
+        let blocking_result = ["GetOverlappedResult", "(", "...", ", TRUE", ")"].concat();
+        assert!(!source.contains(&infinite));
+        assert!(!source.contains(&unbounded));
+        assert!(!source.contains(&blocking_result));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5594,6 +6147,8 @@ mod tests {
         assert!(capture.pending());
         capture.cancel_pending();
         assert!(gate.cancel_requested.load(Ordering::Acquire));
+        let quarantine = h7_pending_io_quarantine();
+        let before = quarantine.count();
         let drop_task = thread::spawn(move || drop(capture));
         let started_deadline = Instant::now() + Duration::from_secs(1);
         while !probe.drop_started.load(Ordering::Acquire) {
@@ -5602,10 +6157,429 @@ mod tests {
         }
         assert!(!probe.drop_finished.load(Ordering::Acquire));
         assert!(!probe.terminal_observed.load(Ordering::Acquire));
+        let quarantine_deadline = Instant::now() + Duration::from_secs(1);
+        while quarantine.count() <= before {
+            assert!(Instant::now() < quarantine_deadline);
+            thread::yield_now();
+        }
         gate.allow_terminal.store(true, Ordering::Release);
         drop_task.join().expect("D29-H7 delayed-cancel drop");
+        let reap_deadline = Instant::now() + Duration::from_secs(1);
+        while quarantine.count() > before {
+            h7_reap_pending_io_nonblocking();
+            assert!(Instant::now() < reap_deadline);
+            thread::yield_now();
+        }
         assert!(probe.terminal_observed.load(Ordering::Acquire));
         assert!(probe.drop_finished.load(Ordering::Acquire));
+        assert_eq!(quarantine.count(), before);
+    }
+
+    #[test]
+    fn h7_pending_output_after_cleanup_deadline_is_quarantined_not_dropped() {
+        let _lock = lock_h7_tests();
+        let quarantine = h7_pending_io_quarantine();
+        let before = quarantine.count();
+        let gate = Arc::new(H7TerminalityGate::default());
+        let probe = Arc::new(H7TerminalityProbe::default());
+        let mut capture = H7OverlappedOutputCapture::new(1_024, "quarantine-output")
+            .expect("D29-H7 quarantine output capture")
+            .with_terminality_test_hooks_and_cleanup_timeout(
+                Arc::clone(&gate),
+                Duration::from_millis(25),
+            )
+            .with_terminality_test_hooks(Arc::clone(&gate), Arc::clone(&probe));
+        capture.arm_read();
+        capture.cancel_pending();
+        assert!(!capture.drain_until_terminal(Instant::now()));
+        assert!(capture.quarantine_if_pending());
+        drop(capture);
+        assert_eq!(quarantine.count(), before + 1);
+        assert!(!probe.terminal_observed.load(Ordering::Acquire));
+        assert!(!probe.drop_finished.load(Ordering::Acquire));
+        gate.allow_terminal.store(true, Ordering::Release);
+        reap_h7_quarantine_until(before, Instant::now() + Duration::from_secs(1));
+        assert!(probe.terminal_observed.load(Ordering::Acquire));
+        assert!(probe.drop_finished.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn h7_quarantine_reap_releases_only_after_terminal_completion() {
+        let _lock = lock_h7_tests();
+        let quarantine = h7_pending_io_quarantine();
+        let before = quarantine.count();
+        let gate = Arc::new(H7TerminalityGate::default());
+        let probe = Arc::new(H7TerminalityProbe::default());
+        let mut capture = H7OverlappedOutputCapture::new(1_024, "quarantine-reap")
+            .expect("D29-H7 quarantine reap capture")
+            .with_terminality_test_hooks(Arc::clone(&gate), Arc::clone(&probe));
+        capture.arm_read();
+        capture.cancel_pending();
+        assert!(capture.quarantine_if_pending());
+        drop(capture);
+        assert_eq!(h7_reap_pending_io_nonblocking(), before + 1);
+        assert_eq!(quarantine.count(), before + 1);
+        assert!(!probe.drop_finished.load(Ordering::Acquire));
+        gate.allow_terminal.store(true, Ordering::Release);
+        reap_h7_quarantine_until(before, Instant::now() + Duration::from_secs(1));
+        assert!(probe.terminal_observed.load(Ordering::Acquire));
+        assert!(probe.drop_finished.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn h7_pending_connect_after_deadline_is_quarantined_not_dropped() {
+        let _lock = lock_h7_tests();
+        let quarantine = h7_pending_io_quarantine();
+        let before = quarantine.count();
+        let gate = Arc::new(H7TerminalityGate::default());
+        let probe = Arc::new(H7ConnectTerminalityProbe::default());
+        let result = H7OverlappedOutputCapture::new_for_connect_quarantine_test(
+            1_024,
+            "connect-quarantine",
+            Arc::clone(&gate),
+            Arc::clone(&probe),
+        );
+        assert!(result.is_err());
+        assert!(gate.cancel_requested.load(Ordering::Acquire));
+        assert_eq!(quarantine.count(), before + 1);
+        assert!(!probe.terminal_observed.load(Ordering::Acquire));
+        assert!(!probe.dropped.load(Ordering::Acquire));
+        gate.allow_terminal.store(true, Ordering::Release);
+        reap_h7_quarantine_until(before, Instant::now() + Duration::from_secs(1));
+        assert!(probe.terminal_observed.load(Ordering::Acquire));
+        assert!(probe.dropped.load(Ordering::Acquire));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_native_worker_exits_boundedly_when_output_terminality_is_held() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7DirectHarness::new();
+        let gate = Arc::new(H7TerminalityGate::default());
+        let broker = harness
+            .broker_with_output_terminality_gate(Arc::clone(&gate), Duration::from_millis(50));
+        let metrics = broker.metrics();
+        let quarantine = h7_pending_io_quarantine();
+        let before = quarantine.count();
+        let mut receiver = harness.receiver.take().unwrap();
+        let task = tokio::spawn({
+            let broker = Arc::clone(&broker);
+            let action = harness.action(&["sleep", "2000"]);
+            async move { broker.execute(action).await }
+        });
+        let pending = receiver
+            .recv()
+            .await
+            .expect("D29-H7 bounded terminality confirmation");
+        let revision = harness
+            .authority
+            .provision_confirmation(&pending.action)
+            .expect("D29-H7 bounded terminality confirmation");
+        pending.response.send(revision).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), metrics.created_notify.notified())
+            .await
+            .expect("D29-H7 bounded terminality process creation");
+        wait_h7_pending_output_reads(&metrics).await;
+        let worker_deadline = Instant::now() + Duration::from_secs(2);
+        broker.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("D29-H7 native worker bounded exit")
+            .expect("D29-H7 native worker join");
+        assert_eq!(result.status, "started_outcome_unknown");
+        assert!(result.process_created);
+        assert_eq!(result.pending_stdout_reads, 0);
+        assert_eq!(result.pending_stderr_reads, 0);
+        assert_eq!(metrics.pending_output_reads.load(Ordering::Acquire), 0);
+        assert_eq!(metrics.output_handles_active.load(Ordering::Acquire), 0);
+        assert_eq!(metrics.native_workers_active.load(Ordering::Acquire), 0);
+        assert!(Instant::now() < worker_deadline);
+        assert!(gate.cancel_requested.load(Ordering::Acquire));
+        assert!(quarantine.count() > before);
+        assert!(quarantine.count() <= before + H7_MAX_QUARANTINED_OUTPUT);
+        gate.allow_terminal.store(true, Ordering::Release);
+        reap_h7_quarantine_until(before, Instant::now() + Duration::from_secs(1));
+        assert_eq!(quarantine.count(), before);
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_quarantine_blocks_new_action_before_confirmation() {
+        let _lock = lock_h7_tests();
+        let (gate, probe, before) =
+            install_h7_pending_output_quarantine("blocks-before-confirmation");
+        let mut harness = H7DirectHarness::new();
+        let mut receiver = harness.receiver.take().unwrap();
+        let result = harness
+            .broker
+            .execute(harness.action(&["echo-argv", "blocked-by-quarantine"]))
+            .await;
+        assert_eq!(result.status, "denied");
+        assert_h7_zero_process_result(&result);
+        assert_eq!(
+            harness
+                .authority
+                .metrics
+                .trusted_confirmations
+                .load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(
+            harness
+                .authority
+                .metrics
+                .grants_issued
+                .load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(
+            harness
+                .broker
+                .metrics()
+                .process_created
+                .load(Ordering::Acquire),
+            0
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), receiver.recv())
+                .await
+                .is_err()
+        );
+        gate.allow_terminal.store(true, Ordering::Release);
+        reap_h7_quarantine_until(before, Instant::now() + Duration::from_secs(1));
+        assert!(probe.terminal_observed.load(Ordering::Acquire));
+        assert!(probe.drop_finished.load(Ordering::Acquire));
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_after_quarantine_reap_fresh_action_can_run() {
+        let _lock = lock_h7_tests();
+        let (gate, probe, before) = install_h7_pending_output_quarantine("reap-then-run");
+        gate.allow_terminal.store(true, Ordering::Release);
+        reap_h7_quarantine_until(before, Instant::now() + Duration::from_secs(1));
+        assert!(probe.terminal_observed.load(Ordering::Acquire));
+        assert!(probe.drop_finished.load(Ordering::Acquire));
+
+        let mut harness = H7DirectHarness::new();
+        let mut receiver = harness.receiver.take().unwrap();
+        let result = run_approved(
+            Arc::clone(&harness.broker),
+            Arc::clone(&harness.authority),
+            &mut receiver,
+            harness.action(&["echo-argv", "after-quarantine-reap"]),
+        )
+        .await;
+        assert_completed(&result);
+        assert_eq!(
+            harness
+                .broker
+                .metrics()
+                .process_created
+                .load(Ordering::Acquire),
+            1
+        );
+        assert_eq!(h7_pending_io_quarantine().count(), before);
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_single_active_admission_rejects_concurrent_second_action() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7DirectHarness::new();
+        let gate = H7FinalFenceGate::new();
+        gate.arm();
+        let broker = harness.broker_with_final_fence(Arc::clone(&gate));
+        let mut receiver = harness.receiver.take().unwrap();
+        let task = tokio::spawn({
+            let broker = Arc::clone(&broker);
+            let action = harness.action(&["echo-argv", "first-active-action"]);
+            async move { broker.execute(action).await }
+        });
+        let pending = receiver
+            .recv()
+            .await
+            .expect("D29-H7 single-active first confirmation");
+        let revision = harness
+            .authority
+            .provision_confirmation(&pending.action)
+            .expect("D29-H7 single-active first confirmation");
+        pending.response.send(revision).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), gate.wait_until_entered())
+            .await
+            .expect("D29-H7 single-active final fence entry");
+        let confirmations_before = harness
+            .authority
+            .metrics
+            .trusted_confirmations
+            .load(Ordering::Acquire);
+        let grants_before = harness
+            .authority
+            .metrics
+            .grants_issued
+            .load(Ordering::Acquire);
+        let second = broker
+            .execute(harness.action(&["echo-argv", "second-active-action"]))
+            .await;
+        assert_eq!(second.status, "denied");
+        assert_h7_zero_process_result(&second);
+        assert_eq!(
+            harness
+                .authority
+                .metrics
+                .trusted_confirmations
+                .load(Ordering::Acquire),
+            confirmations_before
+        );
+        assert_eq!(
+            harness
+                .authority
+                .metrics
+                .grants_issued
+                .load(Ordering::Acquire),
+            grants_before
+        );
+        assert_eq!(broker.metrics().process_created.load(Ordering::Acquire), 0);
+        gate.release();
+        let first = task.await.unwrap();
+        assert_completed(&first);
+        assert_eq!(broker.metrics().process_created.load(Ordering::Acquire), 1);
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_outer_abort_keeps_admission_until_worker_exit() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7DirectHarness::new();
+        let gate = Arc::new(H7TerminalityGate::default());
+        let broker = harness
+            .broker_with_output_terminality_gate(Arc::clone(&gate), Duration::from_millis(250));
+        let metrics = broker.metrics();
+        let tool = h7_prepared_tool(Arc::clone(&broker));
+        let quarantine = h7_pending_io_quarantine();
+        let before = quarantine.count();
+        let mut receiver = harness.receiver.take().unwrap();
+        let task = tokio::spawn({
+            let tool = Arc::clone(&tool);
+            let action = harness.action(&["sleep", "2000"]);
+            async move { tool.execute_prepared_action(action).await }
+        });
+        let pending = receiver
+            .recv()
+            .await
+            .expect("D29-H7 outer-abort admission confirmation");
+        let revision = harness
+            .authority
+            .provision_confirmation(&pending.action)
+            .expect("D29-H7 outer-abort admission confirmation");
+        pending.response.send(revision).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), metrics.created_notify.notified())
+            .await
+            .expect("D29-H7 outer-abort admission process creation");
+        wait_h7_pending_output_reads(&metrics).await;
+        task.abort();
+        assert!(task.await.is_err());
+        let worker_deadline = Instant::now() + Duration::from_secs(1);
+        while metrics.native_workers_active.load(Ordering::Acquire) == 0 {
+            assert!(Instant::now() < worker_deadline);
+            tokio::task::yield_now().await;
+        }
+        assert!(broker.admission.active.load(Ordering::Acquire));
+        let confirmations_before = harness
+            .authority
+            .metrics
+            .trusted_confirmations
+            .load(Ordering::Acquire);
+        let second = broker
+            .execute(harness.action(&["echo-argv", "outer-abort-second-action"]))
+            .await;
+        assert_eq!(second.status, "denied");
+        assert_h7_zero_process_result(&second);
+        assert_eq!(
+            harness
+                .authority
+                .metrics
+                .trusted_confirmations
+                .load(Ordering::Acquire),
+            confirmations_before
+        );
+        assert_eq!(metrics.process_created.load(Ordering::Acquire), 1);
+        gate.allow_terminal.store(true, Ordering::Release);
+        wait_h7_native_workers_quiet(Arc::clone(&metrics)).await;
+        reap_h7_quarantine_until(before, Instant::now() + Duration::from_secs(1));
+        assert!(!broker.admission.active.load(Ordering::Acquire));
+        let third = run_approved(
+            Arc::clone(&broker),
+            Arc::clone(&harness.authority),
+            &mut receiver,
+            harness.action(&["echo-argv", "outer-abort-reusable-action"]),
+        )
+        .await;
+        assert_completed(&third);
+        assert_eq!(metrics.process_created.load(Ordering::Acquire), 2);
+        assert_eq!(h7_pending_io_quarantine().count(), before);
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_quarantined_io_blocks_action_even_after_admission_released() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7DirectHarness::new();
+        let gate = Arc::new(H7TerminalityGate::default());
+        let broker = harness
+            .broker_with_output_terminality_gate(Arc::clone(&gate), Duration::from_millis(50));
+        let metrics = broker.metrics();
+        let quarantine = h7_pending_io_quarantine();
+        let before = quarantine.count();
+        let mut receiver = harness.receiver.take().unwrap();
+        let task = tokio::spawn({
+            let broker = Arc::clone(&broker);
+            let action = harness.action(&["sleep", "2000"]);
+            async move { broker.execute(action).await }
+        });
+        let pending = receiver
+            .recv()
+            .await
+            .expect("D29-H7 quarantined-I/O confirmation");
+        let revision = harness
+            .authority
+            .provision_confirmation(&pending.action)
+            .expect("D29-H7 quarantined-I/O confirmation");
+        pending.response.send(revision).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), metrics.created_notify.notified())
+            .await
+            .expect("D29-H7 quarantined-I/O process creation");
+        wait_h7_pending_output_reads(&metrics).await;
+        broker.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("D29-H7 quarantined-I/O worker exit")
+            .expect("D29-H7 quarantined-I/O worker join");
+        assert_eq!(result.status, "started_outcome_unknown");
+        assert!(!broker.admission.active.load(Ordering::Acquire));
+        assert!(quarantine.count() > before);
+        let confirmations_before = harness
+            .authority
+            .metrics
+            .trusted_confirmations
+            .load(Ordering::Acquire);
+        let second = broker
+            .execute(harness.action(&["echo-argv", "quarantine-poisoned-action"]))
+            .await;
+        assert_eq!(second.status, "denied");
+        assert_h7_zero_process_result(&second);
+        assert_eq!(
+            harness
+                .authority
+                .metrics
+                .trusted_confirmations
+                .load(Ordering::Acquire),
+            confirmations_before
+        );
+        assert_eq!(metrics.process_created.load(Ordering::Acquire), 1);
+        gate.allow_terminal.store(true, Ordering::Release);
+        reap_h7_quarantine_until(before, Instant::now() + Duration::from_secs(1));
+        assert_eq!(quarantine.count(), before);
+        assert!(harness.authority.shutdown());
     }
 
     #[test]
@@ -5673,11 +6647,11 @@ mod tests {
         let mut event_flags = 0_u32;
         let mut child_flags = 0_u32;
         assert_ne!(
-            unsafe { GetHandleInformation(capture.read.raw(), &mut read_flags) },
+            unsafe { GetHandleInformation(capture.owner().read.raw(), &mut read_flags) },
             0
         );
         assert_ne!(
-            unsafe { GetHandleInformation(capture.event.raw(), &mut event_flags) },
+            unsafe { GetHandleInformation(capture.owner().event.raw(), &mut event_flags) },
             0
         );
         assert_ne!(

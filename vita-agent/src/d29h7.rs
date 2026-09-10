@@ -20,6 +20,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::fs::MetadataExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -27,6 +28,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tempfile::TempDir;
 use tokio::sync::Notify;
 
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
@@ -83,8 +85,11 @@ use crate::{sha256_hex, TrustedWorkspaceRoot, VitaExecutionContext, WorkspaceRoo
 pub(crate) const VITA_PROCESS_RUN_TOOL_NAME: &str = "vita_run_process";
 const H7_CAPABILITY_ID: &str = "vita.process.run";
 const H7B_CAPABILITY_ID: &str = "vita.process.workspace.run";
+const H7C_CAPABILITY_ID: &str = "vita.process.workspace.git_status";
 const H7_PROGRAM_ID: &str = "d29h7_fixture";
 const H7B_TOOL_NAME: &str = "vita_workspace_process_probe";
+const H7C_TOOL_NAME: &str = "vita_workspace_git_status";
+const H7C_PROFILE_ID: &str = "d29h7c.git.status.v1";
 const H7_MAX_ARGS: usize = 16;
 const H7_MAX_ARG_BYTES: usize = 1024;
 const H7_STDOUT_BOUND: usize = 65_536;
@@ -774,6 +779,7 @@ impl H7ExecutableCatalog {
             stderr_bound: self.entry.stderr_bound,
             workspace_root,
             workspace_root_identity,
+            profile_id: None,
         }))
     }
 }
@@ -798,6 +804,7 @@ struct PreparedProcessAction {
     stderr_bound: usize,
     workspace_root: Option<TrustedWorkspaceRoot>,
     workspace_root_identity: Option<WorkspaceRootIdentity>,
+    profile_id: Option<String>,
 }
 
 impl PreparedProcessAction {
@@ -823,12 +830,17 @@ impl PreparedProcessAction {
             tool_call_id: self.tool_call_id.clone(),
             turn_id: self.turn_id.clone(),
             workspace_root_identity: self.workspace_root_identity.map(h7_workspace_identity_wire),
+            profile_id: self.profile_id.clone(),
         }
     }
 }
 
 fn verify_workspace_root_binding(action: &PreparedProcessAction) -> Result<(), String> {
-    if action.capability_id != H7B_CAPABILITY_ID {
+    let workspace_capability = matches!(
+        action.capability_id.as_str(),
+        H7B_CAPABILITY_ID | H7C_CAPABILITY_ID
+    );
+    if !workspace_capability {
         if action.workspace_root.is_some() || action.workspace_root_identity.is_some() {
             return Err(
                 "H7 workspace root evidence appeared on a non-workspace action".to_string(),
@@ -928,6 +940,8 @@ struct H7ProcessBinding {
     turn_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     workspace_root_identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    profile_id: Option<String>,
 }
 
 impl H7ProcessBinding {
@@ -3344,6 +3358,8 @@ enum H7HostRequest {
         capability_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         workspace_root_identity: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        profile_id: Option<String>,
     },
     EvaluateWorkspaceScope {
         binding: H7ProcessBinding,
@@ -3445,6 +3461,7 @@ impl H7PersistentHostProcess {
         repo_root: &Path,
         capability_id: &str,
         workspace_root_identity: Option<String>,
+        profile_id: Option<String>,
     ) -> Result<Arc<Self>, String> {
         let executable = h7_authority_fixture_executable(repo_root)?;
         let mut child = Command::new(executable)
@@ -3474,6 +3491,7 @@ impl H7PersistentHostProcess {
             task_id: H7_TASK_ID.to_string(),
             capability_id: capability_id.to_string(),
             workspace_root_identity,
+            profile_id,
         });
         let response = match response {
             Ok(response) => response,
@@ -3824,11 +3842,12 @@ struct H7Authority {
     response_fault: Mutex<Option<H7HostResponseFault>>,
     capability_id: String,
     workspace_root_identity: Option<String>,
+    profile_id: Option<String>,
 }
 
 impl H7Authority {
     fn new() -> Result<Arc<Self>, String> {
-        Self::new_with_binding(H7_CAPABILITY_ID, None)
+        Self::new_with_binding(H7_CAPABILITY_ID, None, None)
     }
 
     fn new_workspace(workspace_root: &TrustedWorkspaceRoot) -> Result<Arc<Self>, String> {
@@ -3838,12 +3857,25 @@ impl H7Authority {
         Self::new_with_binding(
             H7B_CAPABILITY_ID,
             Some(h7_workspace_identity_wire(workspace_root.identity())),
+            None,
+        )
+    }
+
+    fn new_git_workspace(workspace_root: &TrustedWorkspaceRoot) -> Result<Arc<Self>, String> {
+        workspace_root
+            .verify_named_path_current()
+            .map_err(|_| "D29-H7-C workspace root was not current at Host setup".to_string())?;
+        Self::new_with_binding(
+            H7C_CAPABILITY_ID,
+            Some(h7_workspace_identity_wire(workspace_root.identity())),
+            Some(H7C_PROFILE_ID.to_string()),
         )
     }
 
     fn new_with_binding(
         capability_id: &str,
         workspace_root_identity: Option<String>,
+        profile_id: Option<String>,
     ) -> Result<Arc<Self>, String> {
         let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -3854,11 +3886,13 @@ impl H7Authority {
                 &repo_root,
                 capability_id,
                 workspace_root_identity.clone(),
+                profile_id.clone(),
             )?,
             metrics: Arc::new(H7AuthorityMetrics::default()),
             response_fault: Mutex::new(None),
             capability_id: capability_id.to_string(),
             workspace_root_identity,
+            profile_id,
         }))
     }
 
@@ -3905,9 +3939,14 @@ impl H7Authority {
         let action_root_identity = action
             .workspace_root_identity
             .map(h7_workspace_identity_wire);
-        if action.capability_id != H7B_CAPABILITY_ID
-            || self.capability_id != H7B_CAPABILITY_ID
-            || self.workspace_root_identity.as_deref() != action_root_identity.as_deref()
+        if !matches!(
+            action.capability_id.as_str(),
+            H7B_CAPABILITY_ID | H7C_CAPABILITY_ID
+        ) || !matches!(
+            self.capability_id.as_str(),
+            H7B_CAPABILITY_ID | H7C_CAPABILITY_ID
+        ) || self.workspace_root_identity.as_deref() != action_root_identity.as_deref()
+            || self.profile_id.as_deref() != action.profile_id.as_deref()
         {
             return Err("D29-H7-B Host workspace scope binding was not exact".to_string());
         }
@@ -3949,7 +3988,10 @@ impl H7Authority {
         &self,
         action: &PreparedProcessAction,
     ) -> Result<i64, String> {
-        if action.capability_id != H7B_CAPABILITY_ID {
+        if !matches!(
+            action.capability_id.as_str(),
+            H7B_CAPABILITY_ID | H7C_CAPABILITY_ID
+        ) {
             return Err("D29-H7-B confirmation received a non-workspace action".to_string());
         }
         self.provision_confirmation(action)
@@ -4132,7 +4174,10 @@ fn validate_h7_canonical(
     revision: i64,
 ) -> Result<(), String> {
     let binding = H7ProcessBinding::from_action(action);
-    let workspace = action.capability_id == H7B_CAPABILITY_ID;
+    let workspace = matches!(
+        action.capability_id.as_str(),
+        H7B_CAPABILITY_ID | H7C_CAPABILITY_ID
+    );
     let expected_scope_requirement = if workspace {
         "WorkspaceRequired"
     } else {
@@ -5265,6 +5310,728 @@ impl<'call> ToolExecutor<ToolCall<'call>> for VitaWorkspaceProcessTool {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct H7CGitStatusArguments {
+    operation: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct H7CGitStatusRequest {
+    tool_call_id: String,
+    turn_id: String,
+}
+
+impl H7CGitStatusRequest {
+    fn from_codex_call(call: &ToolCall<'_>) -> Result<Self, H7RequestError> {
+        if call.tool_name.name != H7C_TOOL_NAME || !call.tool_name.is_default_namespace() {
+            return Err(H7RequestError::InvalidRequest);
+        }
+        let tool_call_id = bounded_id(&call.call_id).ok_or(H7RequestError::InvalidRequest)?;
+        let turn_id = bounded_id(&call.turn_id).ok_or(H7RequestError::InvalidRequest)?;
+        let arguments = call
+            .function_arguments()
+            .map_err(|_| H7RequestError::InvalidRequest)?;
+        let arguments: H7CGitStatusArguments =
+            serde_json::from_str(arguments).map_err(|_| H7RequestError::InvalidRequest)?;
+        if arguments.operation != "status" {
+            return Err(H7RequestError::InvalidRequest);
+        }
+        Ok(Self {
+            tool_call_id,
+            turn_id,
+        })
+    }
+}
+
+fn h7c_git_status_schema_contract() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "operation": {"type": "string", "enum": ["status"]}
+        },
+        "required": ["operation"],
+        "additionalProperties": false
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct H7CGitStatusEntry {
+    index: String,
+    worktree: String,
+    path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    from: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum H7CPathError {
+    Invalid,
+    Limited,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum H7CParseOutcome {
+    Complete(Vec<H7CGitStatusEntry>),
+    Limited,
+    Invalid,
+}
+
+fn h7c_relative_path(value: &[u8]) -> Result<String, H7CPathError> {
+    if value.len() > 1024 {
+        return Err(H7CPathError::Limited);
+    }
+    if value.is_empty() || value.contains(&0) {
+        return Err(H7CPathError::Invalid);
+    }
+    let value = std::str::from_utf8(value).map_err(|_| H7CPathError::Invalid)?;
+    let path = Path::new(value);
+    if path.is_absolute()
+        || value.starts_with('\\')
+        || value.starts_with('/')
+        || value.starts_with("\\\\")
+        || value.starts_with("//")
+        || value.starts_with(r"\\?\")
+        || value.starts_with(r"\\.\")
+    {
+        return Err(H7CPathError::Invalid);
+    }
+    for component in path.components() {
+        if !matches!(component, Component::Normal(_)) {
+            return Err(H7CPathError::Invalid);
+        }
+    }
+    Ok(value.to_string())
+}
+
+fn h7c_parse_porcelain_z(output: &[u8]) -> H7CParseOutcome {
+    if output.len() > H7_STDOUT_BOUND {
+        return H7CParseOutcome::Limited;
+    }
+    let mut entries = Vec::new();
+    let mut records = output.split(|byte| *byte == 0).peekable();
+    while let Some(record) = records.next() {
+        if record.is_empty() {
+            continue;
+        }
+        if record.len() < 4 || record[2] != b' ' {
+            return H7CParseOutcome::Invalid;
+        }
+        let index = record[0] as char;
+        let worktree = record[1] as char;
+        if !index.is_ascii() || !worktree.is_ascii() {
+            return H7CParseOutcome::Invalid;
+        }
+        let path = match h7c_relative_path(&record[3..]) {
+            Ok(path) => path,
+            Err(H7CPathError::Invalid) => return H7CParseOutcome::Invalid,
+            Err(H7CPathError::Limited) => return H7CParseOutcome::Limited,
+        };
+        let rename_or_copy = matches!(index, 'R' | 'C') || matches!(worktree, 'R' | 'C');
+        let from = if rename_or_copy {
+            let Some(source) = records.next() else {
+                return H7CParseOutcome::Invalid;
+            };
+            match h7c_relative_path(source) {
+                Ok(source) => Some(source),
+                Err(H7CPathError::Invalid) => return H7CParseOutcome::Invalid,
+                Err(H7CPathError::Limited) => return H7CParseOutcome::Limited,
+            }
+        } else {
+            None
+        };
+        entries.push(H7CGitStatusEntry {
+            index: index.to_string(),
+            worktree: worktree.to_string(),
+            path,
+            from,
+        });
+        if entries.len() > 256 {
+            return H7CParseOutcome::Limited;
+        }
+    }
+    H7CParseOutcome::Complete(entries)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct H7CGitStatusResult {
+    status: &'static str,
+    entries: Vec<H7CGitStatusEntry>,
+}
+
+impl H7CGitStatusResult {
+    fn denied() -> Self {
+        Self {
+            status: "denied",
+            entries: Vec::new(),
+        }
+    }
+
+    fn from_native(native: &H7NativeResult) -> Self {
+        if native.kind == H7NativeOutcomeKind::StartedAndOutputLimited {
+            return Self {
+                status: "inspection_output_limited",
+                entries: Vec::new(),
+            };
+        }
+        if native.kind != H7NativeOutcomeKind::StartedAndExited || native.exit_code != Some(0) {
+            return Self {
+                status: "inspection_failed",
+                entries: Vec::new(),
+            };
+        }
+        match h7c_parse_porcelain_z(&native.stdout) {
+            H7CParseOutcome::Complete(entries) => Self {
+                status: "completed",
+                entries,
+            },
+            H7CParseOutcome::Limited => Self {
+                status: "inspection_output_limited",
+                entries: Vec::new(),
+            },
+            H7CParseOutcome::Invalid => Self {
+                status: "inspection_failed",
+                entries: Vec::new(),
+            },
+        }
+    }
+
+    fn value(&self) -> Value {
+        serde_json::to_value(self).expect("D29-H7-C status result is serializable")
+    }
+}
+
+struct H7CGitStatusProfile {
+    profile_id: String,
+    git_path: PathBuf,
+    expected_image_identity: H7ImageIdentity,
+    expected_image_namespace: H7NamespaceIdentity,
+    expected_image_sha256: String,
+    working_directory: Arc<PreparedWorkingDirectory>,
+    working_directory_identity: String,
+    workspace_root_identity: WorkspaceRootIdentity,
+    argv: Vec<String>,
+    argv_hash: String,
+    environment: BTreeMap<String, String>,
+    environment_policy_hash: String,
+    timeout: Duration,
+    stdout_bound: usize,
+    stderr_bound: usize,
+    _git_home: TempDir,
+}
+
+impl H7CGitStatusProfile {
+    fn new(root: &TrustedWorkspaceRoot, git_path: PathBuf) -> Result<Self, String> {
+        root.verify_named_path_current()
+            .map_err(|_| "D29-H7-C workspace root was not current".to_string())?;
+        h7c_validate_git_metadata(root)?;
+        if !git_path.is_absolute() {
+            return Err("D29-H7-C Git image path was not absolute".to_string());
+        }
+        let mut image = PreparedExecutableImage::prepare(&git_path)?;
+        let expected_image_identity = image.identity;
+        let expected_image_namespace = image.namespace.identity();
+        let expected_image_sha256 = image.sha256.clone();
+        let working_directory = Arc::new(PreparedWorkingDirectory::prepare(root.requested_path())?);
+        let working_directory_identity = working_directory.0.identity().wire();
+        let git_home = tempfile::tempdir()
+            .map_err(|_| "D29-H7-C could not create the owned Git home".to_string())?;
+        let mut argv = vec![git_path.to_string_lossy().into_owned()];
+        argv.extend(
+            [
+                "--no-pager",
+                "--no-optional-locks",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.untrackedCache=false",
+                "-c",
+                "submodule.recurse=false",
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+                "--ignore-submodules=all",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+        let argv_hash = sha256_hex(
+            &serde_json::to_vec(&argv)
+                .map_err(|_| "D29-H7-C Git argv binding serialization failed".to_string())?,
+        );
+        let ceiling = root
+            .requested_path()
+            .parent()
+            .ok_or_else(|| "D29-H7-C workspace root had no ceiling directory".to_string())?;
+        let environment = BTreeMap::from([
+            ("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()),
+            ("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string()),
+            ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
+            ("GCM_INTERACTIVE".to_string(), "Never".to_string()),
+            (
+                "GIT_CEILING_DIRECTORIES".to_string(),
+                ceiling.to_string_lossy().into_owned(),
+            ),
+            (
+                "HOME".to_string(),
+                git_home.path().to_string_lossy().into_owned(),
+            ),
+        ]);
+        let environment_policy_hash = sha256_hex(&environment_policy_bytes(&environment));
+        image.reverify(expected_image_identity, &expected_image_sha256)?;
+        Ok(Self {
+            profile_id: H7C_PROFILE_ID.to_string(),
+            git_path,
+            expected_image_identity,
+            expected_image_namespace,
+            expected_image_sha256,
+            working_directory,
+            working_directory_identity,
+            workspace_root_identity: root.identity(),
+            argv,
+            argv_hash,
+            environment,
+            environment_policy_hash,
+            timeout: Duration::from_secs(2),
+            stdout_bound: H7_STDOUT_BOUND,
+            stderr_bound: H7_STDERR_BOUND,
+            _git_home: git_home,
+        })
+    }
+
+    fn prepare_action(
+        &self,
+        context: VitaExecutionContext,
+        request: H7CGitStatusRequest,
+        workspace_root: Option<TrustedWorkspaceRoot>,
+    ) -> Result<Arc<PreparedProcessAction>, String> {
+        if let Some(root) = workspace_root.as_ref() {
+            if root.identity() != self.workspace_root_identity
+                || !h7_workspace_paths_equal(self.working_directory.path(), root.final_path())
+            {
+                return Err(
+                    "D29-H7-C Host workspace root was not the fixed profile root".to_string(),
+                );
+            }
+            root.verify_named_path_current()
+                .map_err(|_| "D29-H7-C workspace root was not current".to_string())?;
+        }
+        let image = PreparedExecutableImage::prepare(&self.git_path)?;
+        if image.identity != self.expected_image_identity
+            || image.namespace.identity() != self.expected_image_namespace
+            || image.sha256 != self.expected_image_sha256
+        {
+            return Err("D29-H7-C Git image did not match the fixed profile".to_string());
+        }
+        let workspace_root_identity = workspace_root.as_ref().map(|root| root.identity());
+        Ok(Arc::new(PreparedProcessAction {
+            context,
+            tool_call_id: request.tool_call_id,
+            turn_id: request.turn_id,
+            capability_id: H7C_CAPABILITY_ID.to_string(),
+            program_id: H7C_PROFILE_ID.to_string(),
+            image: Mutex::new(image),
+            executable_namespace_identity: self.expected_image_namespace,
+            argv: self.argv.clone(),
+            argv_hash: self.argv_hash.clone(),
+            argv_count: self.argv.len(),
+            working_directory: Arc::clone(&self.working_directory),
+            working_directory_identity: self.working_directory_identity.clone(),
+            environment: self.environment.clone(),
+            environment_policy_hash: self.environment_policy_hash.clone(),
+            timeout: self.timeout,
+            stdout_bound: self.stdout_bound,
+            stderr_bound: self.stderr_bound,
+            workspace_root,
+            workspace_root_identity,
+            profile_id: Some(self.profile_id.clone()),
+        }))
+    }
+
+    fn action_is_exact(&self, action: &PreparedProcessAction) -> bool {
+        action.capability_id == H7C_CAPABILITY_ID
+            && action.program_id == H7C_PROFILE_ID
+            && action.profile_id.as_deref() == Some(self.profile_id.as_str())
+            && action.argv == self.argv
+            && action.argv_hash == self.argv_hash
+            && action.argv_count == self.argv.len()
+            && action.environment == self.environment
+            && action.environment_policy_hash == self.environment_policy_hash
+            && action.working_directory_identity == self.working_directory_identity
+            && action.workspace_root_identity == Some(self.workspace_root_identity)
+            && action.timeout == self.timeout
+            && action.stdout_bound == self.stdout_bound
+            && action.stderr_bound == self.stderr_bound
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct H7CWorkspaceSnapshot {
+    workspace_files: BTreeMap<String, String>,
+    git_files: BTreeMap<String, String>,
+}
+
+fn h7c_validate_git_metadata(root: &TrustedWorkspaceRoot) -> Result<(), String> {
+    let git_target = root
+        .prepare_target(Path::new(".git"))
+        .map_err(|_| "D29-H7-C Git metadata target could not be prepared".to_string())?;
+    if git_target.kind() != crate::PreparedWorkspaceTargetKind::ExistingDirectory {
+        return Err("D29-H7-C external or file-form Git metadata was rejected".to_string());
+    }
+    let snapshot = h7c_snapshot_workspace(root.requested_path())?;
+    if snapshot.git_files.is_empty() {
+        return Err("D29-H7-C Git metadata directory was empty".to_string());
+    }
+    for redirect in [
+        ".git/gitdir",
+        ".git/commondir",
+        ".git/objects/info/alternates",
+    ] {
+        if snapshot.git_files.contains_key(redirect) {
+            return Err("D29-H7-C external Git metadata redirect was rejected".to_string());
+        }
+    }
+    if root.requested_path().join(".git/worktrees").exists() {
+        return Err("D29-H7-C linked Git worktree metadata was rejected".to_string());
+    }
+    Ok(())
+}
+
+fn h7c_snapshot_workspace(root: &Path) -> Result<H7CWorkspaceSnapshot, String> {
+    let mut workspace_files = BTreeMap::new();
+    h7c_snapshot_directory(root, root, &mut workspace_files)?;
+    let git_files = workspace_files
+        .iter()
+        .filter(|(path, _)| path.as_str() == ".git" || path.starts_with(".git/"))
+        .map(|(path, digest)| (path.clone(), digest.clone()))
+        .collect();
+    Ok(H7CWorkspaceSnapshot {
+        workspace_files,
+        git_files,
+    })
+}
+
+fn h7c_snapshot_directory(
+    root: &Path,
+    current: &Path,
+    files: &mut BTreeMap<String, String>,
+) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(current)
+        .map_err(|_| "D29-H7-C workspace snapshot metadata failed".to_string())?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || metadata.file_type().is_symlink()
+    {
+        return Err("D29-H7-C workspace snapshot encountered a reparse point".to_string());
+    }
+    if metadata.is_dir() {
+        for entry in fs::read_dir(current)
+            .map_err(|_| "D29-H7-C workspace snapshot enumeration failed".to_string())?
+        {
+            let entry =
+                entry.map_err(|_| "D29-H7-C workspace snapshot entry failed".to_string())?;
+            h7c_snapshot_directory(root, &entry.path(), files)?;
+        }
+        return Ok(());
+    }
+    if !metadata.is_file() {
+        return Err("D29-H7-C workspace snapshot encountered a non-file".to_string());
+    }
+    let relative = current
+        .strip_prefix(root)
+        .map_err(|_| "D29-H7-C workspace snapshot escaped its root".to_string())?;
+    if relative.as_os_str().is_empty() {
+        return Ok(());
+    }
+    let relative = relative.to_string_lossy().replace('\\', "/");
+    let bytes =
+        fs::read(current).map_err(|_| "D29-H7-C workspace snapshot read failed".to_string())?;
+    files.insert(relative, format!("{}:{}", bytes.len(), sha256_hex(&bytes)));
+    Ok(())
+}
+
+fn h7c_index_lock_present(root: &Path) -> bool {
+    fs::symlink_metadata(root.join(".git/index.lock")).is_ok()
+}
+
+struct H7CGitStatusBroker {
+    context: VitaExecutionContext,
+    profile: Arc<H7CGitStatusProfile>,
+    authority: Arc<H7Authority>,
+    bridge: Arc<H7PendingConfirmationBridge>,
+    workspace_root: Option<TrustedWorkspaceRoot>,
+    admission: Arc<H7ProcessAdmission>,
+    active_cancellation: Arc<Mutex<Option<H7ActiveCancellation>>>,
+    metrics: Arc<H7SupervisorMetrics>,
+    last_native: Arc<Mutex<Option<H7NativeResult>>>,
+    final_fence_gate: Option<Arc<H7FinalFenceGate>>,
+}
+
+impl H7CGitStatusBroker {
+    fn new(
+        context: VitaExecutionContext,
+        profile: Arc<H7CGitStatusProfile>,
+        authority: Arc<H7Authority>,
+        bridge: Arc<H7PendingConfirmationBridge>,
+        workspace_root: Option<TrustedWorkspaceRoot>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            context,
+            profile,
+            authority,
+            bridge,
+            workspace_root,
+            admission: h7_process_admission(),
+            active_cancellation: Arc::new(Mutex::new(None)),
+            metrics: Arc::new(H7SupervisorMetrics::default()),
+            last_native: Arc::new(Mutex::new(None)),
+            final_fence_gate: None,
+        })
+    }
+
+    fn with_final_fence_gate(mut self: Arc<Self>, gate: Arc<H7FinalFenceGate>) -> Arc<Self> {
+        Arc::get_mut(&mut self)
+            .expect("D29-H7-C final fence gate must be installed before sharing broker")
+            .final_fence_gate = Some(gate);
+        self
+    }
+
+    fn prepare_model_action(
+        &self,
+        request: H7CGitStatusRequest,
+    ) -> Result<Arc<PreparedProcessAction>, String> {
+        let root = self
+            .workspace_root
+            .clone()
+            .ok_or_else(|| "D29-H7-C workspace scope was absent from Host context".to_string())?;
+        self.profile
+            .prepare_action(self.context.clone(), request, Some(root))
+    }
+
+    fn cancel(&self) {
+        if let Some(active) = self
+            .active_cancellation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            active.token.store(true, Ordering::Release);
+            active.notify.notify_waiters();
+        }
+        self.bridge.cancel();
+    }
+
+    fn metrics(&self) -> Arc<H7SupervisorMetrics> {
+        Arc::clone(&self.metrics)
+    }
+
+    fn last_native(&self) -> Option<H7NativeResult> {
+        self.last_native
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    async fn execute(self: &Arc<Self>, action: Arc<PreparedProcessAction>) -> H7CGitStatusResult {
+        let admission = match self.admission.try_acquire() {
+            Some(admission) => admission,
+            None => return H7CGitStatusResult::denied(),
+        };
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let cancellation_notify = Arc::new(Notify::new());
+        let guard = H7ActionCancellationGuard::new(
+            Arc::clone(&self.active_cancellation),
+            Arc::clone(&cancellation),
+            Arc::clone(&cancellation_notify),
+        );
+        let result = self
+            .execute_with_cancellation(action, cancellation, cancellation_notify, admission)
+            .await;
+        guard.disarm();
+        result
+    }
+
+    async fn execute_with_cancellation(
+        self: &Arc<Self>,
+        action: Arc<PreparedProcessAction>,
+        cancellation: Arc<AtomicBool>,
+        cancellation_notify: Arc<Notify>,
+        admission: H7ProcessAdmissionLease,
+    ) -> H7CGitStatusResult {
+        if !self.profile.action_is_exact(&action)
+            || action.workspace_root.is_none()
+            || self.authority.evaluate_workspace_scope(&action).is_err()
+        {
+            return H7CGitStatusResult::denied();
+        }
+        let authorization_revision = match self
+            .bridge
+            .await_confirmation(
+                Arc::clone(&action),
+                cancellation.as_ref(),
+                cancellation_notify.as_ref(),
+            )
+            .await
+        {
+            Ok(revision) => revision,
+            Err(_) => return H7CGitStatusResult::denied(),
+        };
+        if cancellation.load(Ordering::Acquire) {
+            return H7CGitStatusResult::denied();
+        }
+        let authority = Arc::clone(&self.authority);
+        let action_for_grant = Arc::clone(&action);
+        let grant_admission = admission.clone();
+        let grant = match tokio::task::spawn_blocking(move || {
+            let _admission = grant_admission;
+            authority.issue_process_grant(&action_for_grant, authorization_revision)
+        })
+        .await
+        {
+            Ok(Ok(grant)) => grant,
+            _ => return H7CGitStatusResult::denied(),
+        };
+        let preparation_action = Arc::clone(&action);
+        let preparation_admission = admission.clone();
+        let preparation = match tokio::task::spawn_blocking(move || {
+            let _admission = preparation_admission;
+            H7LaunchPreparation::prepare(&preparation_action, None, None)
+        })
+        .await
+        {
+            Ok(Ok(preparation)) => preparation,
+            _ => return H7CGitStatusResult::denied(),
+        };
+        if let Some(gate) = &self.final_fence_gate {
+            gate.wait_if_armed().await;
+        }
+        let authority = Arc::clone(&self.authority);
+        let action_for_launch = Arc::clone(&action);
+        let cancellation_for_launch = Arc::clone(&cancellation);
+        let metrics = Arc::clone(&self.metrics);
+        let last_native = Arc::clone(&self.last_native);
+        let worker_admission = admission.clone();
+        match tokio::task::spawn_blocking(move || {
+            let _admission = worker_admission;
+            let _worker = H7NativeWorkerGuard::new(Arc::clone(&metrics));
+            if cancellation_for_launch.load(Ordering::Acquire) {
+                return H7CGitStatusResult::denied();
+            }
+            let mut grant = grant;
+            if authority
+                .revalidate_process_grant(&action_for_launch, &mut grant)
+                .is_err()
+            {
+                return H7CGitStatusResult::denied();
+            }
+            let native = supervise_native_prepared(
+                &action_for_launch,
+                H7NativeOptions {
+                    cancellation: cancellation_for_launch,
+                    metrics,
+                    fault: H7NativeLaunchFault::None,
+                    unlisted_inheritable_handle: None,
+                    post_host_mutation: H7PostHostMutation::None,
+                    pre_create_process_gate: None,
+                    output_terminality_gate: None,
+                },
+                preparation,
+                Some(grant),
+            );
+            *last_native
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(native.clone());
+            H7CGitStatusResult::from_native(&native)
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => H7CGitStatusResult::denied(),
+        }
+    }
+}
+
+struct VitaGitStatusToolContributor {
+    broker: Arc<H7CGitStatusBroker>,
+    tool_call_count: Arc<AtomicUsize>,
+}
+
+impl VitaGitStatusToolContributor {
+    fn new(broker: Arc<H7CGitStatusBroker>) -> Self {
+        Self {
+            broker,
+            tool_call_count: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn with_tool_call_count(mut self, count: Arc<AtomicUsize>) -> Self {
+        self.tool_call_count = count;
+        self
+    }
+}
+
+impl ToolContributor for VitaGitStatusToolContributor {
+    fn tools(
+        &self,
+        _session_store: &codex_extension_api::ExtensionData,
+        _thread_store: &codex_extension_api::ExtensionData,
+    ) -> Vec<Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>>> {
+        vec![Arc::new(VitaGitStatusTool {
+            broker: Arc::clone(&self.broker),
+            tool_call_count: Arc::clone(&self.tool_call_count),
+        })]
+    }
+}
+
+struct VitaGitStatusTool {
+    broker: Arc<H7CGitStatusBroker>,
+    tool_call_count: Arc<AtomicUsize>,
+}
+
+impl<'call> ToolExecutor<ToolCall<'call>> for VitaGitStatusTool {
+    fn tool_name(&self) -> ToolName {
+        ToolName::plain(H7C_TOOL_NAME)
+    }
+
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::Function(ResponsesApiTool {
+            name: H7C_TOOL_NAME.to_string(),
+            description: "Inspect the fixed Host-owned Git workspace status.".to_string(),
+            strict: true,
+            defer_loading: None,
+            parameters: parse_tool_input_schema(&h7c_git_status_schema_contract())
+                .expect("D29-H7-C Git status schema is static and valid"),
+            output_schema: None,
+        })
+    }
+
+    fn supports_parallel_tool_calls(&self) -> bool {
+        false
+    }
+
+    fn handle<'a>(&'a self, call: ToolCall<'call>) -> ToolExecutorFuture<'a>
+    where
+        'call: 'a,
+    {
+        self.tool_call_count.fetch_add(1, Ordering::AcqRel);
+        let broker = Arc::clone(&self.broker);
+        Box::pin(async move {
+            let result = match H7CGitStatusRequest::from_codex_call(&call).and_then(|request| {
+                broker
+                    .prepare_model_action(request)
+                    .map_err(|_| H7RequestError::InvalidRequest)
+            }) {
+                Ok(action) => broker.execute(action).await,
+                Err(_) => H7CGitStatusResult::denied(),
+            };
+            Ok(
+                Box::new(JsonToolOutput::with_success(result.value(), Some(false)))
+                    as Box<dyn ToolOutput>,
+            )
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5511,6 +6278,696 @@ mod tests {
             )
             .with_final_fence_gate(gate)
         }
+    }
+
+    fn h7c_installed_git_path() -> PathBuf {
+        [
+            PathBuf::from(r"E:\Program Files\Git\mingw64\bin\git.exe"),
+            PathBuf::from(r"C:\Program Files\Git\mingw64\bin\git.exe"),
+            PathBuf::from(r"E:\Program Files\Git\cmd\git.exe"),
+            PathBuf::from(r"C:\Program Files\Git\cmd\git.exe"),
+            PathBuf::from(r"C:\Program Files\Git\bin\git.exe"),
+        ]
+        .into_iter()
+        .find(|path| path.is_file())
+        .expect("D29-H7-C installed Git image")
+    }
+
+    fn h7c_run_git(git_path: &Path, cwd: &Path, args: &[&str]) {
+        let output = Command::new(git_path)
+            .current_dir(cwd)
+            .args(args)
+            .output()
+            .expect("D29-H7-C local Git setup process");
+        assert!(
+            output.status.success(),
+            "D29-H7-C local Git setup failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn h7c_initialize_repo(workspace: &Path, git_path: &Path) {
+        fs::write(workspace.join("unchanged.txt"), b"unchanged\n")
+            .expect("D29-H7-C unchanged file");
+        fs::write(workspace.join("modified.txt"), b"before\n").expect("D29-H7-C modified file");
+        h7c_run_git(git_path, workspace, &["init", "--quiet"]);
+        h7c_run_git(git_path, workspace, &["config", "user.name", "D29-H7-C"]);
+        h7c_run_git(
+            git_path,
+            workspace,
+            &["config", "user.email", "d29h7c@example.invalid"],
+        );
+        h7c_run_git(
+            git_path,
+            workspace,
+            &["add", "--", "unchanged.txt", "modified.txt"],
+        );
+        h7c_run_git(git_path, workspace, &["commit", "--quiet", "-m", "initial"]);
+    }
+
+    fn h7c_helper_fixture_executable(repo_root: &Path) -> PathBuf {
+        let executable = repo_root
+            .join("vita-agent")
+            .join("target")
+            .join("debug")
+            .join("d29h7-git-helper-fixture.exe");
+        if executable.is_file() {
+            return executable;
+        }
+        let status = Command::new("cargo")
+            .current_dir(repo_root)
+            .args([
+                "build",
+                "--manifest-path",
+                "vita-agent/Cargo.toml",
+                "--bin",
+                "d29h7-git-helper-fixture",
+                "--features",
+                "d29-h7-test-helper",
+            ])
+            .env("CARGO_BUILD_JOBS", "1")
+            .env("CARGO_INCREMENTAL", "0")
+            .env("CARGO_TERM_COLOR", "never")
+            .status()
+            .expect("D29-H7-C helper fixture build");
+        assert!(status.success() && executable.is_file());
+        executable
+    }
+
+    struct H7CDirectHarness {
+        _workspace: TempDir,
+        root: TrustedWorkspaceRoot,
+        profile: Arc<H7CGitStatusProfile>,
+        authority: Arc<H7Authority>,
+        bridge: Arc<H7PendingConfirmationBridge>,
+        receiver: Option<tokio::sync::mpsc::Receiver<H7PendingProcessAction>>,
+        broker: Arc<H7CGitStatusBroker>,
+        git_path: PathBuf,
+    }
+
+    impl H7CDirectHarness {
+        fn new() -> Self {
+            let workspace = tempdir().expect("D29-H7-C workspace directory");
+            let git_path = h7c_installed_git_path();
+            h7c_initialize_repo(workspace.path(), &git_path);
+            let root = TrustedWorkspaceRoot::acquire(workspace.path())
+                .expect("D29-H7-C trusted workspace root");
+            let profile = Arc::new(
+                H7CGitStatusProfile::new(&root, git_path.clone())
+                    .expect("D29-H7-C fixed Git profile"),
+            );
+            let authority = H7Authority::new_git_workspace(&root).expect("D29-H7-C Host authority");
+            let (bridge, receiver) = H7PendingConfirmationBridge::new();
+            let context = VitaExecutionContext::try_new(H7_LIFE_ID, H7_TASK_ID)
+                .expect("D29-H7-C execution context");
+            let broker = H7CGitStatusBroker::new(
+                context,
+                Arc::clone(&profile),
+                Arc::clone(&authority),
+                Arc::clone(&bridge),
+                Some(root.clone()),
+            );
+            Self {
+                _workspace: workspace,
+                root,
+                profile,
+                authority,
+                bridge,
+                receiver: Some(receiver),
+                broker,
+                git_path,
+            }
+        }
+
+        fn action(&self) -> Arc<PreparedProcessAction> {
+            self.profile
+                .prepare_action(
+                    self.broker.context.clone(),
+                    H7CGitStatusRequest {
+                        tool_call_id: "call-d29h7c-test".to_string(),
+                        turn_id: "turn-d29h7c-test".to_string(),
+                    },
+                    Some(self.root.clone()),
+                )
+                .expect("D29-H7-C prepared Git status action")
+        }
+
+        fn action_without_scope(&self) -> Arc<PreparedProcessAction> {
+            self.profile
+                .prepare_action(
+                    self.broker.context.clone(),
+                    H7CGitStatusRequest {
+                        tool_call_id: "call-d29h7c-noscope".to_string(),
+                        turn_id: "turn-d29h7c-noscope".to_string(),
+                    },
+                    None,
+                )
+                .expect("D29-H7-C scope-free test action")
+        }
+
+        fn broker_with_final_fence(&self, gate: Arc<H7FinalFenceGate>) -> Arc<H7CGitStatusBroker> {
+            H7CGitStatusBroker::new(
+                self.broker.context.clone(),
+                Arc::clone(&self.profile),
+                Arc::clone(&self.authority),
+                Arc::clone(&self.bridge),
+                Some(self.root.clone()),
+            )
+            .with_final_fence_gate(gate)
+        }
+
+        fn snapshot(&self) -> H7CWorkspaceSnapshot {
+            h7c_snapshot_workspace(self.root.requested_path()).expect("D29-H7-C snapshot")
+        }
+    }
+
+    async fn run_h7c_approved(
+        broker: Arc<H7CGitStatusBroker>,
+        authority: Arc<H7Authority>,
+        receiver: &mut tokio::sync::mpsc::Receiver<H7PendingProcessAction>,
+        action: Arc<PreparedProcessAction>,
+    ) -> H7CGitStatusResult {
+        let task = tokio::spawn({
+            let broker = Arc::clone(&broker);
+            async move { broker.execute(action).await }
+        });
+        let pending = tokio::time::timeout(H7_TURN_TIMEOUT, receiver.recv())
+            .await
+            .expect("D29-H7-C confirmation request wait")
+            .expect("D29-H7-C confirmation request");
+        let revision = authority
+            .provision_workspace_confirmation(&pending.action)
+            .expect("D29-H7-C trusted confirmation");
+        pending
+            .response
+            .send(revision)
+            .expect("D29-H7-C confirmation response");
+        task.await.expect("D29-H7-C broker task")
+    }
+
+    fn h7c_append_malicious_core_config(root: &TrustedWorkspaceRoot, key: &str, sentinel: &Path) {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("D29-H7-C repository root")
+            .to_path_buf();
+        let helper = h7c_helper_fixture_executable(&repo_root);
+        let helper = helper.to_string_lossy().replace('\\', "/");
+        let sentinel = sentinel.to_string_lossy().replace('\\', "/");
+        let mut config = OpenOptions::new()
+            .append(true)
+            .open(root.requested_path().join(".git/config"))
+            .expect("D29-H7-C malicious Git config");
+        writeln!(
+            config,
+            "\n[core]\n\t{key} = \"{helper} write-sentinel {sentinel}\""
+        )
+        .expect("D29-H7-C malicious Git config write");
+    }
+
+    fn assert_h7c_denied(result: &H7CGitStatusResult, broker: &H7CGitStatusBroker) {
+        assert_eq!(result.status, "denied");
+        assert_eq!(broker.metrics().process_created.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn h7c_git_status_schema_is_fixed() {
+        let schema = h7c_git_status_schema_contract();
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["required"], json!(["operation"]));
+        assert_eq!(schema["properties"]["operation"]["type"], "string");
+        assert_eq!(schema["properties"]["operation"]["enum"], json!(["status"]));
+        assert_eq!(
+            schema["properties"]["operation"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["enum".to_string(), "type".to_string()])
+        );
+    }
+
+    #[test]
+    fn h7c_model_cannot_supply_git_args() {
+        assert!(serde_json::from_str::<H7CGitStatusArguments>(
+            r#"{"operation":"status","args":["--porcelain=v2"]}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn h7c_model_cannot_supply_executable() {
+        assert!(serde_json::from_str::<H7CGitStatusArguments>(
+            r#"{"operation":"status","executable":"cmd.exe"}"#
+        )
+        .is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7c_real_git_executable_is_exact_bound() {
+        let _lock = lock_h7_tests();
+        let harness = H7CDirectHarness::new();
+        let action = harness.action();
+        let image = action
+            .image
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(harness.git_path, harness.profile.git_path);
+        assert!(harness.git_path.is_absolute());
+        assert!(harness.git_path.is_file());
+        assert_eq!(image.identity, harness.profile.expected_image_identity);
+        assert_eq!(
+            image.namespace.identity(),
+            harness.profile.expected_image_namespace
+        );
+        assert_eq!(image.sha256, harness.profile.expected_image_sha256);
+        assert_eq!(action.profile_id.as_deref(), Some(H7C_PROFILE_ID));
+        assert!(action
+            .argv
+            .windows(2)
+            .any(|args| args == ["--no-pager".to_string(), "--no-optional-locks".to_string()]));
+        assert!(!action.environment.contains_key("PATH"));
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7c_workspace_scope_required() {
+        let _lock = lock_h7_tests();
+        let harness = H7CDirectHarness::new();
+        let revision = harness
+            .authority
+            .evaluate_workspace_scope(&harness.action())
+            .expect("D29-H7-C workspace scope");
+        assert_eq!(revision, 2);
+        assert_eq!(harness.authority.workspace_scope_provenance(), (1, 0));
+        assert_eq!(harness.authority.provenance(), (0, 0));
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7c_no_scope_createprocess_zero() {
+        let _lock = lock_h7_tests();
+        let harness = H7CDirectHarness::new();
+        let action = harness.action_without_scope();
+        let result = harness.broker.execute(action).await;
+        assert_h7c_denied(&result, &harness.broker);
+        assert_eq!(harness.authority.workspace_scope_provenance(), (0, 0));
+        assert_eq!(harness.authority.provenance(), (0, 0));
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7c_no_confirmation_createprocess_zero() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7CDirectHarness::new();
+        let action = harness.action();
+        let receiver = harness.receiver.as_mut().expect("D29-H7-C receiver");
+        let task = tokio::spawn({
+            let broker = Arc::clone(&harness.broker);
+            async move { broker.execute(action).await }
+        });
+        let pending = tokio::time::timeout(H7_TURN_TIMEOUT, receiver.recv())
+            .await
+            .expect("D29-H7-C no-confirmation wait")
+            .expect("D29-H7-C no-confirmation action");
+        drop(pending);
+        let result = task.await.expect("D29-H7-C no-confirmation task");
+        assert_h7c_denied(&result, &harness.broker);
+        assert_eq!(harness.authority.workspace_scope_provenance(), (1, 0));
+        assert_eq!(harness.authority.provenance(), (0, 0));
+        assert_eq!(
+            harness
+                .authority
+                .metrics
+                .grants_issued
+                .load(Ordering::Acquire),
+            0
+        );
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7c_wrong_workspace_createprocess_zero() {
+        let _lock = lock_h7_tests();
+        let harness = H7CDirectHarness::new();
+        let wrong_workspace = tempdir().expect("D29-H7-C wrong workspace");
+        let wrong_root = TrustedWorkspaceRoot::acquire(wrong_workspace.path())
+            .expect("D29-H7-C wrong trusted root");
+        let action = harness.profile.prepare_action(
+            harness.broker.context.clone(),
+            H7CGitStatusRequest {
+                tool_call_id: "call-d29h7c-wrong-root".to_string(),
+                turn_id: "turn-d29h7c-wrong-root".to_string(),
+            },
+            Some(wrong_root),
+        );
+        assert!(action.is_err());
+        assert_eq!(
+            harness
+                .broker
+                .metrics()
+                .process_created
+                .load(Ordering::Acquire),
+            0
+        );
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7c_root_rebind_createprocess_zero() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7CDirectHarness::new();
+        let action = harness.action();
+        let rebound_path = harness
+            ._workspace
+            .path()
+            .join("rebound-name-that-does-not-exist");
+        let rebound_root = crate::workspace_capability::root_with_requested_path_for_test(
+            &harness.root,
+            rebound_path,
+        );
+        let mut rebound_action = action;
+        let rebound_action_mut = Arc::get_mut(&mut rebound_action).expect("D29-H7-C unique action");
+        rebound_action_mut.workspace_root = Some(rebound_root.clone());
+        rebound_action_mut.workspace_root_identity = Some(rebound_root.identity());
+        let result = run_h7c_approved(
+            Arc::clone(&harness.broker),
+            Arc::clone(&harness.authority),
+            harness.receiver.as_mut().unwrap(),
+            rebound_action,
+        )
+        .await;
+        assert_h7c_denied(&result, &harness.broker);
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7c_same_sqlite_rev2_to_rev3_createprocess_zero() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7CDirectHarness::new();
+        let gate = H7FinalFenceGate::new();
+        gate.arm();
+        let broker = harness.broker_with_final_fence(Arc::clone(&gate));
+        let action = harness.action();
+        let task = tokio::spawn({
+            let broker = Arc::clone(&broker);
+            async move { broker.execute(action).await }
+        });
+        let pending = harness.receiver.as_mut().unwrap().recv().await.unwrap();
+        let revision = harness
+            .authority
+            .provision_workspace_confirmation(&pending.action)
+            .unwrap();
+        pending.response.send(revision).unwrap();
+        gate.wait_until_entered().await;
+        harness
+            .authority
+            .disable_authorization_for_test(2)
+            .expect("D29-H7-C SQLite rev2 to rev3 disable");
+        gate.release();
+        let result = task.await.unwrap();
+        assert_h7c_denied(&result, &broker);
+        assert_eq!(
+            harness
+                .authority
+                .metrics
+                .grants_issued
+                .load(Ordering::Acquire),
+            1
+        );
+        assert_eq!(
+            harness
+                .authority
+                .metrics
+                .final_revalidations
+                .load(Ordering::Acquire),
+            0
+        );
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7c_git_status_workspace_bytes_unchanged() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7CDirectHarness::new();
+        let before = harness.snapshot();
+        let action = harness.action();
+        let result = run_h7c_approved(
+            Arc::clone(&harness.broker),
+            Arc::clone(&harness.authority),
+            harness.receiver.as_mut().unwrap(),
+            action,
+        )
+        .await;
+        assert_eq!(result.status, "completed");
+        assert_eq!(before.workspace_files, harness.snapshot().workspace_files);
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7c_git_status_git_metadata_bytes_unchanged() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7CDirectHarness::new();
+        let before = harness.snapshot();
+        let action = harness.action();
+        let result = run_h7c_approved(
+            Arc::clone(&harness.broker),
+            Arc::clone(&harness.authority),
+            harness.receiver.as_mut().unwrap(),
+            action,
+        )
+        .await;
+        assert_eq!(result.status, "completed");
+        assert_eq!(before.git_files, harness.snapshot().git_files);
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7c_git_status_creates_no_index_lock() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7CDirectHarness::new();
+        assert!(!h7c_index_lock_present(harness.root.requested_path()));
+        let action = harness.action();
+        let result = run_h7c_approved(
+            Arc::clone(&harness.broker),
+            Arc::clone(&harness.authority),
+            harness.receiver.as_mut().unwrap(),
+            action,
+        )
+        .await;
+        assert_eq!(result.status, "completed");
+        assert!(!h7c_index_lock_present(harness.root.requested_path()));
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7c_git_status_spawns_no_descendant() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7CDirectHarness::new();
+        let action = harness.action();
+        let result = run_h7c_approved(
+            Arc::clone(&harness.broker),
+            Arc::clone(&harness.authority),
+            harness.receiver.as_mut().unwrap(),
+            action,
+        )
+        .await;
+        assert_eq!(result.status, "completed");
+        let native = harness
+            .broker
+            .last_native()
+            .expect("D29-H7-C native result");
+        assert!(native.process_tree_observed);
+        assert_eq!(native.process_tree_remaining, 0);
+        assert_eq!(
+            harness
+                .broker
+                .metrics()
+                .process_created
+                .load(Ordering::Acquire),
+            1
+        );
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7c_malicious_fsmonitor_helper_never_executes() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7CDirectHarness::new();
+        let sentinel = harness.root.requested_path().join("fsmonitor-sentinel.txt");
+        h7c_append_malicious_core_config(&harness.root, "fsmonitor", &sentinel);
+        let action = harness.action();
+        let result = run_h7c_approved(
+            Arc::clone(&harness.broker),
+            Arc::clone(&harness.authority),
+            harness.receiver.as_mut().unwrap(),
+            action,
+        )
+        .await;
+        assert_eq!(result.status, "completed");
+        assert!(!sentinel.exists());
+        assert_eq!(
+            harness
+                .broker
+                .metrics()
+                .process_tree_remaining
+                .load(Ordering::Acquire),
+            0
+        );
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7c_malicious_pager_never_executes() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7CDirectHarness::new();
+        let sentinel = harness.root.requested_path().join("pager-sentinel.txt");
+        h7c_append_malicious_core_config(&harness.root, "pager", &sentinel);
+        let action = harness.action();
+        let result = run_h7c_approved(
+            Arc::clone(&harness.broker),
+            Arc::clone(&harness.authority),
+            harness.receiver.as_mut().unwrap(),
+            action,
+        )
+        .await;
+        assert_eq!(result.status, "completed");
+        assert!(!sentinel.exists());
+        assert_eq!(
+            harness
+                .broker
+                .metrics()
+                .process_tree_remaining
+                .load(Ordering::Acquire),
+            0
+        );
+        assert!(harness.authority.shutdown());
+    }
+
+    #[test]
+    fn h7c_gitfile_outside_workspace_is_rejected() {
+        let _lock = lock_h7_tests();
+        let workspace = tempdir().expect("D29-H7-C gitfile workspace");
+        fs::write(
+            workspace.path().join(".git"),
+            b"gitdir: C:/outside/repository\n",
+        )
+        .expect("D29-H7-C external gitfile");
+        let root = TrustedWorkspaceRoot::acquire(workspace.path()).expect("D29-H7-C gitfile root");
+        assert!(H7CGitStatusProfile::new(&root, h7c_installed_git_path()).is_err());
+    }
+
+    #[test]
+    fn h7c_status_parser_rejects_absolute_path() {
+        assert_eq!(
+            h7c_parse_porcelain_z(b" M C:\\outside\\file.txt\0"),
+            H7CParseOutcome::Invalid
+        );
+    }
+
+    #[test]
+    fn h7c_status_parser_rejects_parent_escape() {
+        assert_eq!(
+            h7c_parse_porcelain_z(b" M ../outside.txt\0"),
+            H7CParseOutcome::Invalid
+        );
+    }
+
+    #[test]
+    fn h7c_status_parser_is_bounded() {
+        let mut output = Vec::new();
+        for index in 0..257 {
+            output.extend_from_slice(format!(" M file-{index}\0").as_bytes());
+        }
+        assert_eq!(h7c_parse_porcelain_z(&output), H7CParseOutcome::Limited);
+        let long_path = format!(" M {}\0", "x".repeat(1025));
+        assert_eq!(
+            h7c_parse_porcelain_z(long_path.as_bytes()),
+            H7CParseOutcome::Limited
+        );
+    }
+
+    #[test]
+    fn h7c_model_output_has_no_absolute_paths() {
+        let result = H7CGitStatusResult {
+            status: "completed",
+            entries: vec![H7CGitStatusEntry {
+                index: " ".to_string(),
+                worktree: "M".to_string(),
+                path: "modified.txt".to_string(),
+                from: None,
+            }],
+        };
+        let output = result.value().to_string();
+        assert!(!output.contains("C:\\"));
+        assert!(!output.contains("\\\\"));
+        assert!(!h7_output_has_authority_facts(&result.value()));
+    }
+
+    #[test]
+    fn h7c_uses_global_h7_admission() {
+        let _lock = lock_h7_tests();
+        let harness = H7CDirectHarness::new();
+        assert!(Arc::ptr_eq(
+            &harness.broker.admission,
+            &h7_process_admission()
+        ));
+        let lease = h7_process_admission()
+            .try_acquire()
+            .expect("D29-H7-C global admission");
+        drop(lease);
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7c_global_quarantine_blocks_git_before_confirmation() {
+        let _lock = lock_h7_tests();
+        let (gate, probe, before) = install_h7_pending_output_quarantine("h7c-quarantine");
+        let harness = H7CDirectHarness::new();
+        let result = harness.broker.execute(harness.action()).await;
+        assert_h7c_denied(&result, &harness.broker);
+        assert_eq!(harness.authority.workspace_scope_provenance(), (0, 0));
+        assert_eq!(harness.authority.provenance(), (0, 0));
+        gate.allow_terminal.store(true, Ordering::Release);
+        reap_h7_quarantine_until(before, Instant::now() + Duration::from_secs(1));
+        assert!(probe.terminal_observed.load(Ordering::Acquire));
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7c_outer_abort_preserves_h7_cleanup() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7CDirectHarness::new();
+        let gate = H7FinalFenceGate::new();
+        gate.arm();
+        let broker = harness.broker_with_final_fence(Arc::clone(&gate));
+        let task = tokio::spawn({
+            let broker = Arc::clone(&broker);
+            let action = harness.action();
+            async move { broker.execute(action).await }
+        });
+        let pending = harness.receiver.as_mut().unwrap().recv().await.unwrap();
+        let revision = harness
+            .authority
+            .provision_workspace_confirmation(&pending.action)
+            .unwrap();
+        pending.response.send(revision).unwrap();
+        gate.wait_until_entered().await;
+        task.abort();
+        assert!(task.await.is_err());
+        gate.release();
+        tokio::task::yield_now().await;
+        assert_eq!(broker.metrics().process_created.load(Ordering::Acquire), 0);
+        assert_eq!(
+            broker
+                .metrics()
+                .output_handles_active
+                .load(Ordering::Acquire),
+            0
+        );
+        assert!(!h7_process_admission().active.load(Ordering::Acquire));
+        assert!(harness.authority.shutdown());
     }
 
     async fn run_h7b_approved(
@@ -8848,6 +10305,7 @@ mod tests {
     enum H7FixtureKind {
         Process,
         WorkspaceProcess,
+        GitStatus,
     }
 
     struct H7ResponsesFixture {
@@ -8866,6 +10324,10 @@ mod tests {
 
         fn start_workspace() -> Self {
             Self::start_kind(H7FixtureKind::WorkspaceProcess)
+        }
+
+        fn start_git_status() -> Self {
+            Self::start_kind(H7FixtureKind::GitStatus)
         }
 
         fn start_kind(kind: H7FixtureKind) -> Self {
@@ -8911,6 +10373,7 @@ mod tests {
                                 H7FixtureKind::WorkspaceProcess => {
                                     exact_h7_workspace_process_schema(body)
                                 }
+                                H7FixtureKind::GitStatus => exact_h7c_git_status_schema(body),
                             };
                             observed.initial_turn_id = extract_h7_turn_id(body);
                         } else {
@@ -8999,6 +10462,7 @@ mod tests {
             let events = match kind {
                 H7FixtureKind::Process => h7_first_response_events(),
                 H7FixtureKind::WorkspaceProcess => h7b_first_response_events(),
+                H7FixtureKind::GitStatus => h7c_first_response_events(),
             };
             write_h7_sse_response(stream, events)?;
         } else if request_index == 1 {
@@ -9013,6 +10477,7 @@ mod tests {
         match kind {
             H7FixtureKind::Process => "call-d29h7-process",
             H7FixtureKind::WorkspaceProcess => "call-d29h7b-process",
+            H7FixtureKind::GitStatus => "call-d29h7c-git-status",
         }
     }
 
@@ -9055,6 +10520,27 @@ mod tests {
             json!({
                 "type": "response.completed",
                 "response": {"id": "resp-d29h7b-1", "object": "response", "status": "completed", "model": H7_MODEL}
+            }),
+        ]
+    }
+
+    fn h7c_first_response_events() -> Vec<Value> {
+        let arguments = serde_json::to_string(&json!({
+            "operation": "status"
+        }))
+        .expect("D29-H7-C function arguments");
+        vec![
+            json!({
+                "type": "response.created",
+                "response": {"id": "resp-d29h7c-1", "object": "response", "status": "in_progress", "model": H7_MODEL}
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "item": {"type": "function_call", "call_id": "call-d29h7c-git-status", "name": H7C_TOOL_NAME, "arguments": arguments}
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {"id": "resp-d29h7c-1", "object": "response", "status": "completed", "model": H7_MODEL}
             }),
         ]
     }
@@ -9318,6 +10804,57 @@ mod tests {
             Value::Array(values) => values.iter().any(h7_output_has_authority_facts),
             _ => false,
         }
+    }
+
+    fn exact_h7c_git_status_schema(body: &[u8]) -> bool {
+        let Some(tool) = serde_json::from_slice::<Value>(body)
+            .ok()
+            .and_then(|value| value.get("tools").cloned())
+            .and_then(|value| value.as_array().cloned())
+            .and_then(|tools| {
+                tools
+                    .into_iter()
+                    .find(|tool| tool.get("name").and_then(Value::as_str) == Some(H7C_TOOL_NAME))
+            })
+        else {
+            return false;
+        };
+        let parameters = tool.get("parameters").or_else(|| {
+            tool.get("function")
+                .and_then(|function| function.get("parameters"))
+        });
+        let Some(parameters) = parameters else {
+            return false;
+        };
+        let Some(properties) = parameters.get("properties").and_then(Value::as_object) else {
+            return false;
+        };
+        let names = properties.keys().cloned().collect::<BTreeSet<_>>();
+        let required = parameters
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<BTreeSet<_>>()
+            });
+        names == BTreeSet::from(["operation".to_string()])
+            && required == Some(names)
+            && parameters
+                .get("additionalProperties")
+                .and_then(Value::as_bool)
+                == Some(false)
+            && tool.get("strict").and_then(Value::as_bool) == Some(true)
+            && properties["operation"]["type"] == "string"
+            && properties["operation"]["enum"] == json!(["status"])
+            && properties["operation"]
+                .as_object()
+                .is_some_and(|operation| {
+                    operation.keys().cloned().collect::<BTreeSet<_>>()
+                        == BTreeSet::from(["enum".to_string(), "type".to_string()])
+                })
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -9757,6 +11294,175 @@ mod tests {
         }
     }
 
+    struct H7CGitCanaryEvidence {
+        reply: Option<String>,
+        error: Option<String>,
+        observation: H7FixtureObservation,
+        tool_call_count: usize,
+        process_created: usize,
+        job_assigned: usize,
+        thread_resumed: usize,
+        process_exited: usize,
+        final_revalidations: usize,
+        grants_issued: usize,
+        trusted_confirmations: usize,
+        trusted_workspace_scopes: usize,
+        parsed_entries: BTreeSet<(String, String, String)>,
+        expected_entries: BTreeSet<(String, String, String)>,
+        workspace_bytes_unchanged: bool,
+        git_metadata_bytes_unchanged: bool,
+        index_lock_absent: bool,
+        actual_git_image: bool,
+        native_process_tree_remaining: usize,
+        cleanup: H7CleanupEvidence,
+    }
+
+    async fn run_real_h7c_canary(
+        with_workspace_scope: bool,
+        approve: bool,
+    ) -> H7CGitCanaryEvidence {
+        let app_data = tempdir().expect("D29-H7-C app-data temp root");
+        let workspace = tempdir().expect("D29-H7-C workspace temp root");
+        let git_path = h7c_installed_git_path();
+        h7c_initialize_repo(workspace.path(), &git_path);
+        fs::write(workspace.path().join("modified.txt"), b"after\n")
+            .expect("D29-H7-C modified tracked file");
+        fs::write(workspace.path().join("untracked.txt"), b"untracked\n")
+            .expect("D29-H7-C untracked file");
+        let root = TrustedWorkspaceRoot::acquire(workspace.path())
+            .expect("D29-H7-C canary trusted workspace root");
+        let before =
+            h7c_snapshot_workspace(root.requested_path()).expect("D29-H7-C before snapshot");
+        let profile = Arc::new(
+            H7CGitStatusProfile::new(&root, git_path.clone()).expect("D29-H7-C canary profile"),
+        );
+        let fixture = H7ResponsesFixture::start_git_status();
+        let authority = H7Authority::new_git_workspace(&root).expect("D29-H7-C canary authority");
+        let (bridge, mut receiver) = H7PendingConfirmationBridge::new();
+        let context =
+            VitaExecutionContext::try_new(H7_LIFE_ID, H7_TASK_ID).expect("D29-H7-C canary context");
+        let broker = H7CGitStatusBroker::new(
+            context,
+            Arc::clone(&profile),
+            Arc::clone(&authority),
+            Arc::clone(&bridge),
+            with_workspace_scope.then(|| root.clone()),
+        );
+        let tool_call_count = Arc::new(AtomicUsize::new(0));
+        let contributor = VitaGitStatusToolContributor::new(Arc::clone(&broker))
+            .with_tool_call_count(Arc::clone(&tool_call_count));
+        let runtime = start_h7_runtime(
+            app_data.path().to_path_buf(),
+            workspace.path().to_path_buf(),
+            fixture,
+            contributor,
+            Arc::clone(&tool_call_count),
+        )
+        .await
+        .expect("D29-H7-C Codex runtime");
+        let turn_id = start_h7_turn(runtime.thread.as_ref().unwrap())
+            .await
+            .expect("D29-H7-C canary turn");
+        let observed_turn_id = runtime
+            .fixture
+            .as_ref()
+            .unwrap()
+            .wait_for_turn_id()
+            .await
+            .expect("D29-H7-C Responses fixture turn id");
+        assert_eq!(observed_turn_id, turn_id);
+        runtime.fixture.as_ref().unwrap().release();
+        if with_workspace_scope && approve {
+            let pending = tokio::time::timeout(H7_TURN_TIMEOUT, receiver.recv())
+                .await
+                .expect("D29-H7-C canary confirmation wait")
+                .expect("D29-H7-C canary confirmation");
+            let revision = authority
+                .provision_workspace_confirmation(&pending.action)
+                .expect("D29-H7-C canary trusted confirmation");
+            pending
+                .response
+                .send(revision)
+                .expect("D29-H7-C canary confirmation response");
+        } else {
+            drop(receiver);
+        }
+        let (reply, error, _) = wait_h7_turn(runtime.thread.as_ref().unwrap())
+            .await
+            .expect("D29-H7-C canary turn completion");
+        let (cleanup, observation, tool_calls) = runtime.shutdown().await;
+        let metrics = broker.metrics();
+        let provenance = authority.workspace_scope_provenance();
+        let grants_issued = authority.metrics.grants_issued.load(Ordering::Acquire);
+        let final_revalidations = authority
+            .metrics
+            .final_revalidations
+            .load(Ordering::Acquire);
+        let after = h7c_snapshot_workspace(root.requested_path()).expect("D29-H7-C after snapshot");
+        let parsed_entries = observation
+            .function_call_output
+            .as_ref()
+            .and_then(|value| value.get("entries"))
+            .and_then(Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|entry| {
+                        Some((
+                            entry.get("index")?.as_str()?.to_string(),
+                            entry.get("worktree")?.as_str()?.to_string(),
+                            entry.get("path")?.as_str()?.to_string(),
+                        ))
+                    })
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        let expected_entries = BTreeSet::from([
+            (" ".to_string(), "M".to_string(), "modified.txt".to_string()),
+            (
+                "?".to_string(),
+                "?".to_string(),
+                "untracked.txt".to_string(),
+            ),
+        ]);
+        let native_process_tree_remaining = broker
+            .last_native()
+            .map(|native| native.process_tree_remaining)
+            .unwrap_or(0);
+        let actual_git_image = profile.git_path == git_path
+            && profile
+                .git_path
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .contains("\\git\\");
+        assert!(authority.shutdown());
+        H7CGitCanaryEvidence {
+            reply,
+            error,
+            observation,
+            tool_call_count: tool_calls,
+            process_created: metrics.process_created.load(Ordering::Acquire),
+            job_assigned: metrics.job_assigned.load(Ordering::Acquire),
+            thread_resumed: metrics.thread_resumed.load(Ordering::Acquire),
+            process_exited: metrics.process_exited.load(Ordering::Acquire),
+            final_revalidations,
+            grants_issued,
+            trusted_confirmations: authority
+                .metrics
+                .trusted_confirmations
+                .load(Ordering::Acquire),
+            trusted_workspace_scopes: provenance.0,
+            parsed_entries,
+            expected_entries,
+            workspace_bytes_unchanged: before.workspace_files == after.workspace_files,
+            git_metadata_bytes_unchanged: before.git_files == after.git_files,
+            index_lock_absent: !h7c_index_lock_present(root.requested_path()),
+            actual_git_image,
+            native_process_tree_remaining,
+            cleanup,
+        }
+    }
+
     fn run_h7_test_body<F>(body: F)
     where
         F: FnOnce() + Send + 'static,
@@ -9950,6 +11656,87 @@ mod tests {
             assert!(!output.to_string().contains("workspace_root_identity"));
             assert!(!output.to_string().contains("authorization_revision"));
             assert_eq!(output["side_effect_count"], 1);
+        });
+    }
+
+    #[test]
+    fn real_codex_h7c_git_status_canary() {
+        run_h7_test_body(|| {
+            let _lock = lock_h7_tests();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("D29-H7-C real Codex runtime");
+            let evidence = runtime.block_on(run_real_h7c_canary(true, true));
+            assert_eq!(evidence.error, None);
+            assert_eq!(evidence.reply.as_deref(), Some(H7_REPLY));
+            assert_eq!(evidence.observation.request_count, 2);
+            assert!(evidence.observation.first_request_schema_exact);
+            assert_eq!(evidence.tool_call_count, 1);
+            assert_eq!(evidence.process_created, 1);
+            assert_eq!(evidence.job_assigned, 1);
+            assert_eq!(evidence.thread_resumed, 1);
+            assert_eq!(evidence.process_exited, 1);
+            assert_eq!(evidence.grants_issued, 1);
+            assert_eq!(evidence.final_revalidations, 1);
+            assert_eq!(evidence.trusted_confirmations, 1);
+            assert_eq!(evidence.trusted_workspace_scopes, 1);
+            assert_eq!(evidence.parsed_entries, evidence.expected_entries);
+            assert!(evidence.workspace_bytes_unchanged);
+            assert!(evidence.git_metadata_bytes_unchanged);
+            assert!(evidence.index_lock_absent);
+            assert!(evidence.actual_git_image);
+            assert_eq!(evidence.native_process_tree_remaining, 0);
+            assert!(!evidence.observation.output_has_authority_facts);
+            assert_eq!(evidence.cleanup.initial_shutdown, H7ShutdownStatus::Success);
+            assert_eq!(evidence.cleanup.final_shutdown, H7ShutdownStatus::Success);
+            assert_eq!(evidence.cleanup.manager_thread_count, 0);
+            assert!(evidence.cleanup.fixture_listener_joined);
+        });
+    }
+
+    #[test]
+    fn real_codex_h7c_without_scope_createprocess_zero() {
+        run_h7_test_body(|| {
+            let _lock = lock_h7_tests();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("D29-H7-C no-scope runtime");
+            let evidence = runtime.block_on(run_real_h7c_canary(false, false));
+            assert_eq!(evidence.error, None);
+            assert_eq!(evidence.reply.as_deref(), Some(H7_REPLY));
+            assert_eq!(evidence.tool_call_count, 1);
+            assert_eq!(evidence.process_created, 0);
+            assert_eq!(evidence.job_assigned, 0);
+            assert_eq!(evidence.thread_resumed, 0);
+            assert_eq!(evidence.process_exited, 0);
+            assert_eq!(evidence.grants_issued, 0);
+            assert_eq!(evidence.final_revalidations, 0);
+            assert_eq!(evidence.trusted_confirmations, 0);
+            assert_eq!(evidence.trusted_workspace_scopes, 0);
+            assert!(!evidence.observation.output_has_authority_facts);
+        });
+    }
+
+    #[test]
+    fn real_codex_h7c_output_exposes_no_authority_facts() {
+        run_h7_test_body(|| {
+            let _lock = lock_h7_tests();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("D29-H7-C output runtime");
+            let evidence = runtime.block_on(run_real_h7c_canary(true, true));
+            assert!(!evidence.observation.output_has_authority_facts);
+            let output = evidence
+                .observation
+                .function_call_output
+                .expect("D29-H7-C output");
+            assert!(!h7_output_has_authority_facts(&output));
+            assert!(!output.to_string().contains("workspace_root_identity"));
+            assert!(!output.to_string().contains("authorization_revision"));
+            assert!(output["entries"].is_array());
         });
     }
 }

@@ -33,6 +33,8 @@ const MAX_GRANTS: usize = 256;
 const GRANT_LIFETIME_MS: u64 = 30_000;
 const CAPABILITY_ID: &str = "vita.process.run";
 const WORKSPACE_CAPABILITY_ID: &str = "vita.process.workspace.run";
+const GIT_STATUS_CAPABILITY_ID: &str = "vita.process.workspace.git_status";
+const GIT_STATUS_PROFILE_ID: &str = "d29h7c.git.status.v1";
 const PROGRAM_ID: &str = "d29h7_fixture";
 
 #[derive(Debug, Deserialize)]
@@ -45,6 +47,8 @@ enum HostRequest {
         capability_id: String,
         #[serde(default)]
         workspace_root_identity: Option<String>,
+        #[serde(default)]
+        profile_id: Option<String>,
     },
     EvaluateWorkspaceScope {
         binding: ProcessBinding,
@@ -92,6 +96,8 @@ struct ProcessBinding {
     turn_id: String,
     #[serde(default)]
     workspace_root_identity: Option<String>,
+    #[serde(default)]
+    profile_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -216,6 +222,7 @@ struct HostSession {
     task_id: String,
     capability_id: CapabilityId,
     workspace_root_identity: Option<String>,
+    profile_id: Option<String>,
     confirmations: BTreeMap<String, ProcessConfirmation>,
     grants: BTreeMap<String, ProcessGrantWire>,
     next_id: u64,
@@ -228,17 +235,24 @@ impl HostSession {
         task_id: String,
         capability_id: String,
         workspace_root_identity: Option<String>,
+        profile_id: Option<String>,
     ) -> Result<(Self, HostResponse), String> {
+        let workspace = matches!(
+            capability_id.as_str(),
+            WORKSPACE_CAPABILITY_ID | GIT_STATUS_CAPABILITY_ID
+        );
+        let git_status = capability_id == GIT_STATUS_CAPABILITY_ID;
         if protocol_version != PROTOCOL_VERSION
             || !valid_id(&life_id)
             || !valid_id(&task_id)
             || !matches!(
                 capability_id.as_str(),
-                CAPABILITY_ID | WORKSPACE_CAPABILITY_ID
+                CAPABILITY_ID | WORKSPACE_CAPABILITY_ID | GIT_STATUS_CAPABILITY_ID
             )
-            || (capability_id == WORKSPACE_CAPABILITY_ID
-                && !workspace_root_identity.as_deref().is_some_and(valid_id))
-            || (capability_id == CAPABILITY_ID && workspace_root_identity.is_some())
+            || (workspace && !workspace_root_identity.as_deref().is_some_and(valid_id))
+            || (!workspace && workspace_root_identity.is_some())
+            || (git_status && profile_id.as_deref() != Some(GIT_STATUS_PROFILE_ID))
+            || (!git_status && profile_id.is_some())
         {
             return Err("D29-H7 Host initialize binding was invalid".to_string());
         }
@@ -270,14 +284,16 @@ impl HostSession {
             .map_err(|_| "D29-H7 Host could not create its life".to_string())?;
         let descriptor = CapabilityDescriptor::synthetic(
             capability_id.clone(),
-            if capability_id.as_str() == WORKSPACE_CAPABILITY_ID {
+            if capability_id.as_str() == GIT_STATUS_CAPABILITY_ID {
+                "D29-H7-C governed fixed Git status inspection"
+            } else if capability_id.as_str() == WORKSPACE_CAPABILITY_ID {
                 "D29-H7-B governed workspace no-shell process run"
             } else {
                 "D29-H7 governed no-shell process run"
             },
             RiskClass::Critical,
             ApprovalFloor::ExplicitPerAction,
-            if capability_id.as_str() == WORKSPACE_CAPABILITY_ID {
+            if workspace {
                 ScopeRequirement::WorkspaceRequired
             } else {
                 ScopeRequirement::None
@@ -324,6 +340,7 @@ impl HostSession {
             task_id,
             capability_id,
             workspace_root_identity,
+            profile_id,
             confirmations: BTreeMap::new(),
             grants: BTreeMap::new(),
             next_id: 0,
@@ -336,7 +353,10 @@ impl HostSession {
     fn handle(&mut self, request: HostRequest) -> Result<HostResponse, String> {
         match request {
             HostRequest::EvaluateWorkspaceScope { binding } => {
-                if self.capability_id.as_str() != WORKSPACE_CAPABILITY_ID {
+                if !matches!(
+                    self.capability_id.as_str(),
+                    WORKSPACE_CAPABILITY_ID | GIT_STATUS_CAPABILITY_ID
+                ) {
                     return Err(
                         "D29-H7 Host received a workspace scope request for H7-A".to_string()
                     );
@@ -360,13 +380,15 @@ impl HostSession {
             }
             HostRequest::ProvisionProcessConfirmation { binding } => {
                 let (canonical, revision) = self.canonical(&binding)?;
-                let confirmation_required =
-                    if self.capability_id.as_str() == WORKSPACE_CAPABILITY_ID {
-                        canonical.outcome == "scope_required"
-                            && canonical.requested_root_matched_authorized_root == Some(true)
-                    } else {
-                        canonical.outcome == "explicit_confirmation_required"
-                    };
+                let confirmation_required = if matches!(
+                    self.capability_id.as_str(),
+                    WORKSPACE_CAPABILITY_ID | GIT_STATUS_CAPABILITY_ID
+                ) {
+                    canonical.outcome == "scope_required"
+                        && canonical.requested_root_matched_authorized_root == Some(true)
+                } else {
+                    canonical.outcome == "explicit_confirmation_required"
+                };
                 if !confirmation_required || canonical.authorization_revision != Some(revision) {
                     return Ok(HostResponse::denied(
                         "provision_process_confirmation",
@@ -441,14 +463,23 @@ impl HostSession {
     }
 
     fn canonical(&self, binding: &ProcessBinding) -> Result<(CanonicalWire, i64), String> {
+        let workspace = matches!(
+            self.capability_id.as_str(),
+            WORKSPACE_CAPABILITY_ID | GIT_STATUS_CAPABILITY_ID
+        );
+        let expected_program = if self.capability_id.as_str() == GIT_STATUS_CAPABILITY_ID {
+            GIT_STATUS_PROFILE_ID
+        } else {
+            PROGRAM_ID
+        };
         if binding.life_id != self.life_id
             || binding.task_id != self.task_id
             || binding.capability_id != self.capability_id.as_str()
-            || binding.program_id != PROGRAM_ID
+            || binding.program_id != expected_program
+            || binding.profile_id != self.profile_id
         {
             return Err("D29-H7 Host process binding denied".to_string());
         }
-        let workspace = self.capability_id.as_str() == WORKSPACE_CAPABILITY_ID;
         let requested_root_matched_authorized_root = workspace
             && self.workspace_root_identity.as_deref()
                 == binding.workspace_root_identity.as_deref();
@@ -510,11 +541,21 @@ impl HostSession {
     }
 
     fn validate_binding(&self, binding: &ProcessBinding) -> Result<(), String> {
+        let workspace = matches!(
+            self.capability_id.as_str(),
+            WORKSPACE_CAPABILITY_ID | GIT_STATUS_CAPABILITY_ID
+        );
+        let git_status = self.capability_id.as_str() == GIT_STATUS_CAPABILITY_ID;
+        let expected_program = if git_status {
+            GIT_STATUS_PROFILE_ID
+        } else {
+            PROGRAM_ID
+        };
         if !valid_id(&binding.life_id)
             || !valid_id(&binding.task_id)
-            || binding.capability_id != CAPABILITY_ID
-                && binding.capability_id != WORKSPACE_CAPABILITY_ID
-            || binding.program_id != PROGRAM_ID
+            || binding.capability_id != self.capability_id.as_str()
+            || binding.program_id != expected_program
+            || binding.profile_id != self.profile_id
             || !valid_id(&binding.executable_identity)
             || !lower_sha256(&binding.executable_sha256)
             || !lower_sha256(&binding.argv_hash)
@@ -527,12 +568,14 @@ impl HostSession {
             || binding.timeout_ms > 5_000
             || !valid_id(&binding.tool_call_id)
             || !valid_id(&binding.turn_id)
-            || (binding.capability_id == CAPABILITY_ID && binding.workspace_root_identity.is_some())
-            || (binding.capability_id == WORKSPACE_CAPABILITY_ID
+            || (!workspace && binding.workspace_root_identity.is_some())
+            || (workspace
                 && !binding
                     .workspace_root_identity
                     .as_deref()
                     .is_some_and(valid_id))
+            || (git_status && binding.profile_id.as_deref() != Some(GIT_STATUS_PROFILE_ID))
+            || (!git_status && binding.profile_id.is_some())
         {
             return Err("D29-H7 Host process binding was invalid".to_string());
         }
@@ -645,8 +688,10 @@ impl HostSession {
             || grant.authorization_revision != authorization_revision
             || current_revision != authorization_revision
             || grant.expires_at_unix_ms <= unix_millis()
-            || (self.capability_id.as_str() == WORKSPACE_CAPABILITY_ID
-                && canonical.requested_root_matched_authorized_root != Some(true))
+            || (matches!(
+                self.capability_id.as_str(),
+                WORKSPACE_CAPABILITY_ID | GIT_STATUS_CAPABILITY_ID
+            ) && canonical.requested_root_matched_authorized_root != Some(true))
         {
             return Ok(HostResponse::denied(
                 "revalidate_process_grant",
@@ -678,6 +723,7 @@ pub(crate) fn run_from_stdio() -> Result<(), String> {
                 task_id,
                 capability_id,
                 workspace_root_identity,
+                profile_id,
             } => {
                 let (new_session, response) = HostSession::initialize(
                     protocol_version,
@@ -685,6 +731,7 @@ pub(crate) fn run_from_stdio() -> Result<(), String> {
                     task_id,
                     capability_id,
                     workspace_root_identity,
+                    profile_id,
                 )?;
                 session = Some(new_session);
                 response
@@ -776,6 +823,8 @@ mod tests {
             "life-1".to_string(),
             "task-1".to_string(),
             CAPABILITY_ID.to_string(),
+            None,
+            None,
         )
         .expect("H7 fixture initialize");
         assert_eq!(response.authorization_revision, Some(2));
@@ -790,6 +839,8 @@ mod tests {
             "life-1".to_string(),
             "task-1".to_string(),
             CAPABILITY_ID.to_string(),
+            None,
+            None,
         )
         .expect("H7 fixture initialize");
         let _ = session;

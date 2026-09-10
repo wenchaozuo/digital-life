@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[features]
+d29-h7-test-helper = []
+
 [lib]
 name = "vita_agent"
 path = "src/lib.rs"
@@ -15,6 +18,11 @@ path = "src/bin/vita-agent.rs"
 [[bin]]
 name = "d29h7-process-fixture"
 path = "src/bin/d29h7-process-fixture.rs"
+
+[[bin]]
+name = "d29h7-git-helper-fixture"
+path = "src/bin/d29h7-git-helper-fixture.rs"
+required-features = ["d29-h7-test-helper"]
 
 [dependencies]
 # D29-C2 pins the source-kernel and protocol to the certified upstream commit.

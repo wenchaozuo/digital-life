@@ -3839,6 +3839,14 @@ mod platform {
     }
 }
 
+#[cfg(all(windows, test))]
+pub(crate) fn root_with_requested_path_for_test(
+    root: &TrustedWorkspaceRoot,
+    requested_path: PathBuf,
+) -> TrustedWorkspaceRoot {
+    platform::root_with_requested_path_for_test(root, requested_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

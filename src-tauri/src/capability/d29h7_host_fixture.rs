@@ -32,6 +32,7 @@ const MAX_ID_CHARS: usize = 256;
 const MAX_GRANTS: usize = 256;
 const GRANT_LIFETIME_MS: u64 = 30_000;
 const CAPABILITY_ID: &str = "vita.process.run";
+const WORKSPACE_CAPABILITY_ID: &str = "vita.process.workspace.run";
 const PROGRAM_ID: &str = "d29h7_fixture";
 
 #[derive(Debug, Deserialize)]
@@ -42,6 +43,11 @@ enum HostRequest {
         life_id: String,
         task_id: String,
         capability_id: String,
+        #[serde(default)]
+        workspace_root_identity: Option<String>,
+    },
+    EvaluateWorkspaceScope {
+        binding: ProcessBinding,
     },
     ProvisionProcessConfirmation {
         binding: ProcessBinding,
@@ -84,6 +90,8 @@ struct ProcessBinding {
     timeout_ms: u64,
     tool_call_id: String,
     turn_id: String,
+    #[serde(default)]
+    workspace_root_identity: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -124,6 +132,10 @@ struct CanonicalWire {
     approval_floor: String,
     scope_requirement: String,
     authorization_revision: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    host_scope_authority_present: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requested_root_matched_authorized_root: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -203,6 +215,7 @@ struct HostSession {
     life_id: String,
     task_id: String,
     capability_id: CapabilityId,
+    workspace_root_identity: Option<String>,
     confirmations: BTreeMap<String, ProcessConfirmation>,
     grants: BTreeMap<String, ProcessGrantWire>,
     next_id: u64,
@@ -214,11 +227,18 @@ impl HostSession {
         life_id: String,
         task_id: String,
         capability_id: String,
+        workspace_root_identity: Option<String>,
     ) -> Result<(Self, HostResponse), String> {
         if protocol_version != PROTOCOL_VERSION
             || !valid_id(&life_id)
             || !valid_id(&task_id)
-            || capability_id != CAPABILITY_ID
+            || !matches!(
+                capability_id.as_str(),
+                CAPABILITY_ID | WORKSPACE_CAPABILITY_ID
+            )
+            || (capability_id == WORKSPACE_CAPABILITY_ID
+                && !workspace_root_identity.as_deref().is_some_and(valid_id))
+            || (capability_id == CAPABILITY_ID && workspace_root_identity.is_some())
         {
             return Err("D29-H7 Host initialize binding was invalid".to_string());
         }
@@ -250,10 +270,18 @@ impl HostSession {
             .map_err(|_| "D29-H7 Host could not create its life".to_string())?;
         let descriptor = CapabilityDescriptor::synthetic(
             capability_id.clone(),
-            "D29-H7 governed no-shell process run",
+            if capability_id.as_str() == WORKSPACE_CAPABILITY_ID {
+                "D29-H7-B governed workspace no-shell process run"
+            } else {
+                "D29-H7 governed no-shell process run"
+            },
             RiskClass::Critical,
             ApprovalFloor::ExplicitPerAction,
-            ScopeRequirement::None,
+            if capability_id.as_str() == WORKSPACE_CAPABILITY_ID {
+                ScopeRequirement::WorkspaceRequired
+            } else {
+                ScopeRequirement::None
+            },
         )
         .map_err(|_| "D29-H7 Host could not construct its descriptor".to_string())?;
         let test_registry = CapabilityRegistry::synthetic([descriptor])
@@ -295,6 +323,7 @@ impl HostSession {
             life_id,
             task_id,
             capability_id,
+            workspace_root_identity,
             confirmations: BTreeMap::new(),
             grants: BTreeMap::new(),
             next_id: 0,
@@ -306,11 +335,39 @@ impl HostSession {
 
     fn handle(&mut self, request: HostRequest) -> Result<HostResponse, String> {
         match request {
+            HostRequest::EvaluateWorkspaceScope { binding } => {
+                if self.capability_id.as_str() != WORKSPACE_CAPABILITY_ID {
+                    return Err(
+                        "D29-H7 Host received a workspace scope request for H7-A".to_string()
+                    );
+                }
+                let (canonical, _revision) = self.canonical(&binding)?;
+                let matched = canonical.requested_root_matched_authorized_root == Some(true);
+                if !matched {
+                    return Ok(HostResponse::denied(
+                        "evaluate_workspace_scope",
+                        "workspace_scope_denied",
+                        Some(canonical),
+                    ));
+                }
+                let mut response = HostResponse::ok("evaluate_workspace_scope");
+                response.canonical = Some(canonical);
+                response.authorization_revision = response
+                    .canonical
+                    .as_ref()
+                    .and_then(|canonical| canonical.authorization_revision);
+                Ok(response)
+            }
             HostRequest::ProvisionProcessConfirmation { binding } => {
                 let (canonical, revision) = self.canonical(&binding)?;
-                if canonical.outcome != "explicit_confirmation_required"
-                    || canonical.authorization_revision != Some(revision)
-                {
+                let confirmation_required =
+                    if self.capability_id.as_str() == WORKSPACE_CAPABILITY_ID {
+                        canonical.outcome == "scope_required"
+                            && canonical.requested_root_matched_authorized_root == Some(true)
+                    } else {
+                        canonical.outcome == "explicit_confirmation_required"
+                    };
+                if !confirmation_required || canonical.authorization_revision != Some(revision) {
                     return Ok(HostResponse::denied(
                         "provision_process_confirmation",
                         "confirmation_not_available",
@@ -391,15 +448,28 @@ impl HostSession {
         {
             return Err("D29-H7 Host process binding denied".to_string());
         }
+        let workspace = self.capability_id.as_str() == WORKSPACE_CAPABILITY_ID;
+        let requested_root_matched_authorized_root = workspace
+            && self.workspace_root_identity.as_deref()
+                == binding.workspace_root_identity.as_deref();
         let decision = evaluate_capability_authorization(
             self.storage.as_ref(),
             &self.test_registry,
             &self.life_id,
             &self.capability_id,
-            RequestedCapabilityScope::None,
+            if workspace {
+                RequestedCapabilityScope::Workspace
+            } else {
+                RequestedCapabilityScope::None
+            },
         )
         .map_err(|_| "D29-H7 Host D28 evaluation failed".to_string())?;
-        if decision.outcome() != CapabilityAuthorizationDecisionKind::ExplicitConfirmationRequired {
+        let expected_outcome = if workspace {
+            CapabilityAuthorizationDecisionKind::ScopeRequired
+        } else {
+            CapabilityAuthorizationDecisionKind::ExplicitConfirmationRequired
+        };
+        if decision.outcome() != expected_outcome {
             return Err("D29-H7 Host canonical authorization is disabled".to_string());
         }
         let revision = decision
@@ -413,12 +483,27 @@ impl HostSession {
                 authorization_row_reads: 1,
                 life_id: self.life_id.clone(),
                 capability_id: self.capability_id.as_str().to_string(),
-                outcome: "explicit_confirmation_required".to_string(),
-                decision_code: "CAPABILITY_CONFIRMATION_REQUIRED".to_string(),
+                outcome: if workspace {
+                    "scope_required".to_string()
+                } else {
+                    "explicit_confirmation_required".to_string()
+                },
+                decision_code: if workspace {
+                    "CAPABILITY_SCOPE_NOT_AVAILABLE".to_string()
+                } else {
+                    "CAPABILITY_CONFIRMATION_REQUIRED".to_string()
+                },
                 risk_class: "Critical".to_string(),
                 approval_floor: "ExplicitPerAction".to_string(),
-                scope_requirement: "None".to_string(),
+                scope_requirement: if workspace {
+                    "WorkspaceRequired".to_string()
+                } else {
+                    "None".to_string()
+                },
                 authorization_revision: Some(revision),
+                host_scope_authority_present: workspace.then_some(true),
+                requested_root_matched_authorized_root: workspace
+                    .then_some(requested_root_matched_authorized_root),
             },
             revision,
         ))
@@ -428,6 +513,7 @@ impl HostSession {
         if !valid_id(&binding.life_id)
             || !valid_id(&binding.task_id)
             || binding.capability_id != CAPABILITY_ID
+                && binding.capability_id != WORKSPACE_CAPABILITY_ID
             || binding.program_id != PROGRAM_ID
             || !valid_id(&binding.executable_identity)
             || !lower_sha256(&binding.executable_sha256)
@@ -441,6 +527,12 @@ impl HostSession {
             || binding.timeout_ms > 5_000
             || !valid_id(&binding.tool_call_id)
             || !valid_id(&binding.turn_id)
+            || (binding.capability_id == CAPABILITY_ID && binding.workspace_root_identity.is_some())
+            || (binding.capability_id == WORKSPACE_CAPABILITY_ID
+                && !binding
+                    .workspace_root_identity
+                    .as_deref()
+                    .is_some_and(valid_id))
         {
             return Err("D29-H7 Host process binding was invalid".to_string());
         }
@@ -467,6 +559,15 @@ impl HostSession {
             return Ok(HostResponse::denied(
                 "issue_process_grant",
                 "stale_revision",
+                Some(canonical),
+            ));
+        }
+        if self.capability_id.as_str() == WORKSPACE_CAPABILITY_ID
+            && canonical.requested_root_matched_authorized_root != Some(true)
+        {
+            return Ok(HostResponse::denied(
+                "issue_process_grant",
+                "workspace_scope_denied",
                 Some(canonical),
             ));
         }
@@ -544,6 +645,8 @@ impl HostSession {
             || grant.authorization_revision != authorization_revision
             || current_revision != authorization_revision
             || grant.expires_at_unix_ms <= unix_millis()
+            || (self.capability_id.as_str() == WORKSPACE_CAPABILITY_ID
+                && canonical.requested_root_matched_authorized_root != Some(true))
         {
             return Ok(HostResponse::denied(
                 "revalidate_process_grant",
@@ -574,9 +677,15 @@ pub(crate) fn run_from_stdio() -> Result<(), String> {
                 life_id,
                 task_id,
                 capability_id,
+                workspace_root_identity,
             } => {
-                let (new_session, response) =
-                    HostSession::initialize(protocol_version, life_id, task_id, capability_id)?;
+                let (new_session, response) = HostSession::initialize(
+                    protocol_version,
+                    life_id,
+                    task_id,
+                    capability_id,
+                    workspace_root_identity,
+                )?;
                 session = Some(new_session);
                 response
             }

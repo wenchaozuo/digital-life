@@ -78,11 +78,13 @@ use windows_sys::Win32::System::IO::{
     CancelIoEx, GetOverlappedResult, IO_STATUS_BLOCK, OVERLAPPED,
 };
 
-use crate::{sha256_hex, VitaExecutionContext};
+use crate::{sha256_hex, TrustedWorkspaceRoot, VitaExecutionContext, WorkspaceRootIdentity};
 
 pub(crate) const VITA_PROCESS_RUN_TOOL_NAME: &str = "vita_run_process";
 const H7_CAPABILITY_ID: &str = "vita.process.run";
+const H7B_CAPABILITY_ID: &str = "vita.process.workspace.run";
 const H7_PROGRAM_ID: &str = "d29h7_fixture";
+const H7B_TOOL_NAME: &str = "vita_workspace_process_probe";
 const H7_MAX_ARGS: usize = 16;
 const H7_MAX_ARG_BYTES: usize = 1024;
 const H7_STDOUT_BOUND: usize = 65_536;
@@ -189,6 +191,32 @@ fn h7_unix_millis() -> u64 {
         .map_or(0, |duration| {
             duration.as_millis().min(u64::MAX as u128) as u64
         })
+}
+
+fn h7_workspace_identity_wire(identity: WorkspaceRootIdentity) -> String {
+    let volume = identity.volume_serial_number().unwrap_or_default();
+    let file_id = identity
+        .file_id()
+        .map(|bytes| {
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        })
+        .unwrap_or_else(|| "none".to_string());
+    format!("v{volume:x}f{file_id}")
+}
+
+fn h7_workspace_path_key(path: &Path) -> String {
+    let path = path.to_string_lossy();
+    let path = path.strip_prefix("\\\\?\\").unwrap_or(&path);
+    path.replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase()
+}
+
+fn h7_workspace_paths_equal(left: &Path, right: &Path) -> bool {
+    h7_workspace_path_key(left) == h7_workspace_path_key(right)
 }
 
 fn h7_process_schema_contract() -> Value {
@@ -673,6 +701,41 @@ impl H7ExecutableCatalog {
         context: VitaExecutionContext,
         request: H7ProcessRequest,
     ) -> Result<Arc<PreparedProcessAction>, String> {
+        self.prepare_action_with_metadata(context, request, H7_CAPABILITY_ID, None)
+    }
+
+    fn prepare_workspace_action(
+        &self,
+        context: VitaExecutionContext,
+        request: H7ProcessRequest,
+        workspace_root: TrustedWorkspaceRoot,
+    ) -> Result<Arc<PreparedProcessAction>, String> {
+        if !h7_workspace_paths_equal(
+            self.entry.working_directory.path(),
+            workspace_root.final_path(),
+        ) {
+            return Err(
+                "H7-B catalog working directory was not the Host workspace root".to_string(),
+            );
+        }
+        self.prepare_action_with_metadata(context, request, H7B_CAPABILITY_ID, Some(workspace_root))
+    }
+
+    fn prepare_action_without_workspace_scope_for_test(
+        &self,
+        context: VitaExecutionContext,
+        request: H7ProcessRequest,
+    ) -> Result<Arc<PreparedProcessAction>, String> {
+        self.prepare_action_with_metadata(context, request, H7B_CAPABILITY_ID, None)
+    }
+
+    fn prepare_action_with_metadata(
+        &self,
+        context: VitaExecutionContext,
+        request: H7ProcessRequest,
+        capability_id: &str,
+        workspace_root: Option<TrustedWorkspaceRoot>,
+    ) -> Result<Arc<PreparedProcessAction>, String> {
         if request.program != self.entry.program_id {
             return Err("H7 program was not in the Host-owned catalog".to_string());
         }
@@ -690,10 +753,12 @@ impl H7ExecutableCatalog {
             &serde_json::to_vec(&request.args)
                 .map_err(|_| "H7 argv binding serialization failed".to_string())?,
         );
+        let workspace_root_identity = workspace_root.as_ref().map(|root| root.identity());
         Ok(Arc::new(PreparedProcessAction {
             context,
             tool_call_id: request.tool_call_id,
             turn_id: request.turn_id,
+            capability_id: capability_id.to_string(),
             program_id: request.program,
             image: Mutex::new(image),
             executable_namespace_identity: self.entry.expected_image_namespace,
@@ -707,6 +772,8 @@ impl H7ExecutableCatalog {
             timeout: self.entry.timeout,
             stdout_bound: self.entry.stdout_bound,
             stderr_bound: self.entry.stderr_bound,
+            workspace_root,
+            workspace_root_identity,
         }))
     }
 }
@@ -715,6 +782,7 @@ struct PreparedProcessAction {
     context: VitaExecutionContext,
     tool_call_id: String,
     turn_id: String,
+    capability_id: String,
     program_id: String,
     image: Mutex<PreparedExecutableImage>,
     executable_namespace_identity: H7NamespaceIdentity,
@@ -728,6 +796,8 @@ struct PreparedProcessAction {
     timeout: Duration,
     stdout_bound: usize,
     stderr_bound: usize,
+    workspace_root: Option<TrustedWorkspaceRoot>,
+    workspace_root_identity: Option<WorkspaceRootIdentity>,
 }
 
 impl PreparedProcessAction {
@@ -739,7 +809,7 @@ impl PreparedProcessAction {
         H7ProcessBinding {
             life_id: self.context.life_id().to_string(),
             task_id: self.context.task_id().to_string(),
-            capability_id: H7_CAPABILITY_ID.to_string(),
+            capability_id: self.capability_id.clone(),
             program_id: self.program_id.clone(),
             executable_identity: image.identity.wire(),
             executable_sha256: image.sha256.clone(),
@@ -752,8 +822,33 @@ impl PreparedProcessAction {
             timeout_ms: self.timeout.as_millis().min(u64::MAX as u128) as u64,
             tool_call_id: self.tool_call_id.clone(),
             turn_id: self.turn_id.clone(),
+            workspace_root_identity: self.workspace_root_identity.map(h7_workspace_identity_wire),
         }
     }
+}
+
+fn verify_workspace_root_binding(action: &PreparedProcessAction) -> Result<(), String> {
+    if action.capability_id != H7B_CAPABILITY_ID {
+        if action.workspace_root.is_some() || action.workspace_root_identity.is_some() {
+            return Err(
+                "H7 workspace root evidence appeared on a non-workspace action".to_string(),
+            );
+        }
+        return Ok(());
+    }
+
+    let root = action
+        .workspace_root
+        .as_ref()
+        .ok_or_else(|| "H7-B workspace scope was not Host-owned".to_string())?;
+    let root_identity = root.identity();
+    if action.workspace_root_identity != Some(root_identity)
+        || !h7_workspace_paths_equal(action.working_directory.path(), root.final_path())
+    {
+        return Err("H7-B workspace root and cwd binding did not match".to_string());
+    }
+    root.verify_named_path_current()
+        .map_err(|_| "H7-B workspace root named path changed".to_string())
 }
 
 fn wide_null(value: &OsStr) -> Vec<u16> {
@@ -831,6 +926,8 @@ struct H7ProcessBinding {
     timeout_ms: u64,
     tool_call_id: String,
     turn_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workspace_root_identity: Option<String>,
 }
 
 impl H7ProcessBinding {
@@ -2485,6 +2582,7 @@ impl H7LaunchPreparation {
         if expected_working_directory.wire() != action.working_directory_identity {
             return Err("H7 working-directory binding was not host-owned".to_string());
         }
+        verify_workspace_root_binding(action)?;
         let job = create_job_object()?;
         let (stdin_read, stdin_write) = create_stdin_pipe()?;
         let stdout_capture = H7OverlappedOutputCapture::new(action.stdout_bound, "stdout")?;
@@ -2584,6 +2682,7 @@ impl H7LaunchPreparation {
         if cancellation.load(Ordering::Acquire) {
             return Err("H7 cancellation won the final launch fence".to_string());
         }
+        verify_workspace_root_binding(action)?;
         let (image_identity, image_namespace_identity, probe) = {
             let image = action
                 .image
@@ -3243,6 +3342,11 @@ enum H7HostRequest {
         life_id: String,
         task_id: String,
         capability_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        workspace_root_identity: Option<String>,
+    },
+    EvaluateWorkspaceScope {
+        binding: H7ProcessBinding,
     },
     ProvisionProcessConfirmation {
         binding: H7ProcessBinding,
@@ -3296,6 +3400,10 @@ struct H7CanonicalWire {
     approval_floor: String,
     scope_requirement: String,
     authorization_revision: Option<i64>,
+    #[serde(default)]
+    host_scope_authority_present: Option<bool>,
+    #[serde(default)]
+    requested_root_matched_authorized_root: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -3333,7 +3441,11 @@ struct H7PersistentHostProcess {
 }
 
 impl H7PersistentHostProcess {
-    fn start(repo_root: &Path) -> Result<Arc<Self>, String> {
+    fn start(
+        repo_root: &Path,
+        capability_id: &str,
+        workspace_root_identity: Option<String>,
+    ) -> Result<Arc<Self>, String> {
         let executable = h7_authority_fixture_executable(repo_root)?;
         let mut child = Command::new(executable)
             .current_dir(repo_root)
@@ -3360,7 +3472,8 @@ impl H7PersistentHostProcess {
             protocol_version: 1,
             life_id: H7_LIFE_ID.to_string(),
             task_id: H7_TASK_ID.to_string(),
-            capability_id: H7_CAPABILITY_ID.to_string(),
+            capability_id: capability_id.to_string(),
+            workspace_root_identity,
         });
         let response = match response {
             Ok(response) => response,
@@ -3516,7 +3629,23 @@ fn h7_authority_fixture_executable(repo_root: &Path) -> Result<PathBuf, String> 
         .join("target")
         .join("debug")
         .join("d29h7-authority-fixture.exe");
-    if executable.is_file() {
+    let source = repo_root
+        .join("src-tauri")
+        .join("src")
+        .join("capability")
+        .join("d29h7_host_fixture.rs");
+    let executable_is_fresh = executable
+        .metadata()
+        .and_then(|binary| binary.modified())
+        .and_then(|binary_time| {
+            source.metadata().and_then(|source| {
+                source
+                    .modified()
+                    .map(|source_time| (binary_time, source_time))
+            })
+        })
+        .is_ok_and(|(binary_time, source_time)| binary_time >= source_time);
+    if executable.is_file() && executable_is_fresh {
         return Ok(executable);
     }
     let status = Command::new("cargo")
@@ -3596,6 +3725,8 @@ struct H7ProcessGrant {
 struct H7AuthorityMetrics {
     trusted_confirmations: AtomicUsize,
     request_derived_confirmations: AtomicUsize,
+    trusted_workspace_scopes: AtomicUsize,
+    request_derived_workspace_scopes: AtomicUsize,
     grants_issued: AtomicUsize,
     final_revalidations: AtomicUsize,
     canonical_evaluations: AtomicUsize,
@@ -3691,18 +3822,43 @@ struct H7Authority {
     process: Arc<H7PersistentHostProcess>,
     metrics: Arc<H7AuthorityMetrics>,
     response_fault: Mutex<Option<H7HostResponseFault>>,
+    capability_id: String,
+    workspace_root_identity: Option<String>,
 }
 
 impl H7Authority {
     fn new() -> Result<Arc<Self>, String> {
+        Self::new_with_binding(H7_CAPABILITY_ID, None)
+    }
+
+    fn new_workspace(workspace_root: &TrustedWorkspaceRoot) -> Result<Arc<Self>, String> {
+        workspace_root
+            .verify_named_path_current()
+            .map_err(|_| "D29-H7-B workspace root was not current at Host setup".to_string())?;
+        Self::new_with_binding(
+            H7B_CAPABILITY_ID,
+            Some(h7_workspace_identity_wire(workspace_root.identity())),
+        )
+    }
+
+    fn new_with_binding(
+        capability_id: &str,
+        workspace_root_identity: Option<String>,
+    ) -> Result<Arc<Self>, String> {
         let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .ok_or_else(|| "D29-H7 manifest has no repository parent".to_string())?
             .to_path_buf();
         Ok(Arc::new(Self {
-            process: H7PersistentHostProcess::start(&repo_root)?,
+            process: H7PersistentHostProcess::start(
+                &repo_root,
+                capability_id,
+                workspace_root_identity.clone(),
+            )?,
             metrics: Arc::new(H7AuthorityMetrics::default()),
             response_fault: Mutex::new(None),
+            capability_id: capability_id.to_string(),
+            workspace_root_identity,
         }))
     }
 
@@ -3732,6 +3888,71 @@ impl H7Authority {
                 .request_derived_confirmations
                 .load(Ordering::Acquire),
         )
+    }
+
+    fn workspace_scope_provenance(&self) -> (usize, usize) {
+        (
+            self.metrics
+                .trusted_workspace_scopes
+                .load(Ordering::Acquire),
+            self.metrics
+                .request_derived_workspace_scopes
+                .load(Ordering::Acquire),
+        )
+    }
+
+    fn evaluate_workspace_scope(&self, action: &PreparedProcessAction) -> Result<i64, String> {
+        let action_root_identity = action
+            .workspace_root_identity
+            .map(h7_workspace_identity_wire);
+        if action.capability_id != H7B_CAPABILITY_ID
+            || self.capability_id != H7B_CAPABILITY_ID
+            || self.workspace_root_identity.as_deref() != action_root_identity.as_deref()
+        {
+            return Err("D29-H7-B Host workspace scope binding was not exact".to_string());
+        }
+        let response = self
+            .process
+            .roundtrip_bounded(&H7HostRequest::EvaluateWorkspaceScope {
+                binding: H7ProcessBinding::from_action(action),
+            })?;
+        let response: H7HostResponse = serde_json::from_slice(&response)
+            .map_err(|_| "D29-H7-B workspace scope response malformed".to_string())?;
+        if response.operation != "evaluate_workspace_scope"
+            || response.status != "ok"
+            || response.canonical.is_none()
+            || response.confirmation.is_some()
+            || response.process_grant.is_some()
+            || response.confirmation_consumed
+            || response.denial.is_some()
+            || response.error_code.is_some()
+        {
+            return Err(response
+                .denial
+                .unwrap_or_else(|| "D29-H7-B workspace scope response invalid".to_string()));
+        }
+        let canonical = response.canonical.as_ref().expect("checked canonical");
+        validate_h7_canonical(
+            canonical,
+            action,
+            response.authorization_revision.unwrap_or(0),
+        )?;
+        self.metrics
+            .trusted_workspace_scopes
+            .fetch_add(1, Ordering::AcqRel);
+        response
+            .authorization_revision
+            .ok_or_else(|| "D29-H7-B workspace scope omitted authorization revision".to_string())
+    }
+
+    fn provision_workspace_confirmation(
+        &self,
+        action: &PreparedProcessAction,
+    ) -> Result<i64, String> {
+        if action.capability_id != H7B_CAPABILITY_ID {
+            return Err("D29-H7-B confirmation received a non-workspace action".to_string());
+        }
+        self.provision_confirmation(action)
     }
 
     fn provision_confirmation(&self, action: &PreparedProcessAction) -> Result<i64, String> {
@@ -3879,7 +4100,7 @@ impl H7Authority {
             self.process
                 .roundtrip_bounded(&H7HostRequest::DisableAuthorizationForTest {
                     life_id: H7_LIFE_ID.to_string(),
-                    capability_id: H7_CAPABILITY_ID.to_string(),
+                    capability_id: self.capability_id.clone(),
                     expected_revision,
                 })?;
         let response: H7HostResponse = serde_json::from_slice(&response)
@@ -3911,20 +4132,48 @@ fn validate_h7_canonical(
     revision: i64,
 ) -> Result<(), String> {
     let binding = H7ProcessBinding::from_action(action);
+    let workspace = action.capability_id == H7B_CAPABILITY_ID;
+    let expected_scope_requirement = if workspace {
+        "WorkspaceRequired"
+    } else {
+        "None"
+    };
+    let expected_outcome = if workspace {
+        "scope_required"
+    } else {
+        "explicit_confirmation_required"
+    };
+    let expected_decision_code = if workspace {
+        "CAPABILITY_SCOPE_NOT_AVAILABLE"
+    } else {
+        "CAPABILITY_CONFIRMATION_REQUIRED"
+    };
     if canonical.canonical_evaluations != 1
         || canonical.production_registry_size != 0
         || canonical.test_registry_size != 1
         || canonical.authorization_row_reads != 1
         || canonical.life_id != binding.life_id
-        || canonical.capability_id != H7_CAPABILITY_ID
-        || canonical.outcome != "explicit_confirmation_required"
-        || canonical.decision_code != "CAPABILITY_CONFIRMATION_REQUIRED"
+        || canonical.capability_id != binding.capability_id
+        || canonical.outcome != expected_outcome
+        || canonical.decision_code != expected_decision_code
         || canonical.risk_class != "Critical"
         || canonical.approval_floor != "ExplicitPerAction"
-        || canonical.scope_requirement != "None"
+        || canonical.scope_requirement != expected_scope_requirement
         || canonical.authorization_revision != Some(revision)
     {
         return Err("D29-H7 canonical D28 evidence was invalid".to_string());
+    }
+    if workspace
+        && (canonical.host_scope_authority_present != Some(true)
+            || canonical.requested_root_matched_authorized_root != Some(true))
+    {
+        return Err("D29-H7-B trusted workspace scope evidence was invalid".to_string());
+    }
+    if !workspace
+        && (canonical.host_scope_authority_present.is_some()
+            || canonical.requested_root_matched_authorized_root.is_some())
+    {
+        return Err("D29-H7 canonical unexpectedly exposed workspace scope evidence".to_string());
     }
     Ok(())
 }
@@ -4643,6 +4892,379 @@ impl<'call> ToolExecutor<ToolCall<'call>> for VitaProcessTool {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct H7BWorkspaceProcessArguments {
+    operation: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct H7BWorkspaceProcessRequest {
+    tool_call_id: String,
+    turn_id: String,
+}
+
+impl H7BWorkspaceProcessRequest {
+    fn from_codex_call(call: &ToolCall<'_>) -> Result<Self, H7RequestError> {
+        if call.tool_name.name != H7B_TOOL_NAME || !call.tool_name.is_default_namespace() {
+            return Err(H7RequestError::InvalidRequest);
+        }
+        let tool_call_id = bounded_id(&call.call_id).ok_or(H7RequestError::InvalidRequest)?;
+        let turn_id = bounded_id(&call.turn_id).ok_or(H7RequestError::InvalidRequest)?;
+        let arguments = call
+            .function_arguments()
+            .map_err(|_| H7RequestError::InvalidRequest)?;
+        let arguments: H7BWorkspaceProcessArguments =
+            serde_json::from_str(arguments).map_err(|_| H7RequestError::InvalidRequest)?;
+        if arguments.operation != "report_workspace" {
+            return Err(H7RequestError::InvalidRequest);
+        }
+        Ok(Self {
+            tool_call_id,
+            turn_id,
+        })
+    }
+}
+
+fn h7b_workspace_process_schema_contract() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "operation": {"type": "string", "enum": ["report_workspace"]}
+        },
+        "required": ["operation"],
+        "additionalProperties": false
+    })
+}
+
+struct H7BToolResult {
+    status: &'static str,
+    process_created: bool,
+    side_effect_count: usize,
+}
+
+impl H7BToolResult {
+    fn denied() -> Self {
+        Self {
+            status: "denied",
+            process_created: false,
+            side_effect_count: 0,
+        }
+    }
+
+    fn from_native(native: &H7NativeResult) -> Self {
+        let status = match native.kind {
+            H7NativeOutcomeKind::StartedAndExited => "workspace_process_completed",
+            H7NativeOutcomeKind::StartedAndTimedOut => "timed_out",
+            H7NativeOutcomeKind::StartedAndCancelled => "cancelled",
+            H7NativeOutcomeKind::StartedAndOutputLimited => "output_limited",
+            H7NativeOutcomeKind::StartedOutcomeUnknown => "outcome_unknown",
+            H7NativeOutcomeKind::LaunchFailed | H7NativeOutcomeKind::Denied => "denied",
+        };
+        Self {
+            status,
+            process_created: native.process_created,
+            side_effect_count: usize::from(native.process_created),
+        }
+    }
+
+    fn value(&self) -> Value {
+        json!({
+            "status": self.status,
+            "process_created": self.process_created,
+            "side_effect_count": self.side_effect_count,
+        })
+    }
+}
+
+struct H7BWorkspaceProcessBroker {
+    context: VitaExecutionContext,
+    catalog: Arc<H7ExecutableCatalog>,
+    authority: Arc<H7Authority>,
+    bridge: Arc<H7PendingConfirmationBridge>,
+    workspace_root: Option<TrustedWorkspaceRoot>,
+    admission: Arc<H7ProcessAdmission>,
+    active_cancellation: Arc<Mutex<Option<H7ActiveCancellation>>>,
+    metrics: Arc<H7SupervisorMetrics>,
+    last_fixture_stdout: Arc<Mutex<Option<Vec<u8>>>>,
+    final_fence_gate: Option<Arc<H7FinalFenceGate>>,
+}
+
+impl H7BWorkspaceProcessBroker {
+    fn new(
+        context: VitaExecutionContext,
+        catalog: Arc<H7ExecutableCatalog>,
+        authority: Arc<H7Authority>,
+        bridge: Arc<H7PendingConfirmationBridge>,
+        workspace_root: Option<TrustedWorkspaceRoot>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            context,
+            catalog,
+            authority,
+            bridge,
+            workspace_root,
+            admission: h7_process_admission(),
+            active_cancellation: Arc::new(Mutex::new(None)),
+            metrics: Arc::new(H7SupervisorMetrics::default()),
+            last_fixture_stdout: Arc::new(Mutex::new(None)),
+            final_fence_gate: None,
+        })
+    }
+
+    fn with_final_fence_gate(mut self: Arc<Self>, gate: Arc<H7FinalFenceGate>) -> Arc<Self> {
+        Arc::get_mut(&mut self)
+            .expect("D29-H7-B final fence gate must be installed before sharing broker")
+            .final_fence_gate = Some(gate);
+        self
+    }
+
+    fn prepare_model_action(
+        &self,
+        request: H7BWorkspaceProcessRequest,
+    ) -> Result<Arc<PreparedProcessAction>, String> {
+        let workspace_root = self
+            .workspace_root
+            .clone()
+            .ok_or_else(|| "D29-H7-B workspace scope was absent from Host context".to_string())?;
+        self.catalog.prepare_workspace_action(
+            self.context.clone(),
+            H7ProcessRequest {
+                tool_call_id: request.tool_call_id,
+                turn_id: request.turn_id,
+                program: H7_PROGRAM_ID.to_string(),
+                args: vec!["report-cwd".to_string()],
+            },
+            workspace_root,
+        )
+    }
+
+    fn cancel(&self) {
+        if let Some(active) = self
+            .active_cancellation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            active.token.store(true, Ordering::Release);
+            active.notify.notify_waiters();
+        }
+        self.bridge.cancel();
+    }
+
+    fn metrics(&self) -> Arc<H7SupervisorMetrics> {
+        Arc::clone(&self.metrics)
+    }
+
+    fn last_fixture_stdout(&self) -> Option<Vec<u8>> {
+        self.last_fixture_stdout
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    async fn execute(self: &Arc<Self>, action: Arc<PreparedProcessAction>) -> H7BToolResult {
+        let admission = match self.admission.try_acquire() {
+            Some(admission) => admission,
+            None => return H7BToolResult::denied(),
+        };
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let cancellation_notify = Arc::new(Notify::new());
+        let guard = H7ActionCancellationGuard::new(
+            Arc::clone(&self.active_cancellation),
+            Arc::clone(&cancellation),
+            Arc::clone(&cancellation_notify),
+        );
+        let result = self
+            .execute_with_cancellation(action, cancellation, cancellation_notify, admission)
+            .await;
+        guard.disarm();
+        result
+    }
+
+    async fn execute_with_cancellation(
+        self: &Arc<Self>,
+        action: Arc<PreparedProcessAction>,
+        cancellation: Arc<AtomicBool>,
+        cancellation_notify: Arc<Notify>,
+        admission: H7ProcessAdmissionLease,
+    ) -> H7BToolResult {
+        if action.capability_id != H7B_CAPABILITY_ID
+            || action.workspace_root.is_none()
+            || self.authority.evaluate_workspace_scope(&action).is_err()
+        {
+            return H7BToolResult::denied();
+        }
+        let authorization_revision = match self
+            .bridge
+            .await_confirmation(
+                Arc::clone(&action),
+                cancellation.as_ref(),
+                cancellation_notify.as_ref(),
+            )
+            .await
+        {
+            Ok(revision) => revision,
+            Err(_) => return H7BToolResult::denied(),
+        };
+        if cancellation.load(Ordering::Acquire) {
+            return H7BToolResult::denied();
+        }
+        let authority = Arc::clone(&self.authority);
+        let action_for_grant = Arc::clone(&action);
+        let grant_admission = admission.clone();
+        let grant = match tokio::task::spawn_blocking(move || {
+            let _admission = grant_admission;
+            authority.issue_process_grant(&action_for_grant, authorization_revision)
+        })
+        .await
+        {
+            Ok(Ok(grant)) => grant,
+            _ => return H7BToolResult::denied(),
+        };
+        let preparation_action = Arc::clone(&action);
+        let preparation_admission = admission.clone();
+        let preparation = match tokio::task::spawn_blocking(move || {
+            let _admission = preparation_admission;
+            H7LaunchPreparation::prepare(&preparation_action, None, None)
+        })
+        .await
+        {
+            Ok(Ok(preparation)) => preparation,
+            _ => return H7BToolResult::denied(),
+        };
+        if let Some(gate) = &self.final_fence_gate {
+            gate.wait_if_armed().await;
+        }
+        let authority = Arc::clone(&self.authority);
+        let action_for_launch = Arc::clone(&action);
+        let cancellation_for_launch = Arc::clone(&cancellation);
+        let metrics = Arc::clone(&self.metrics);
+        let output = Arc::clone(&self.last_fixture_stdout);
+        let worker_admission = admission.clone();
+        match tokio::task::spawn_blocking(move || {
+            let _admission = worker_admission;
+            let _worker = H7NativeWorkerGuard::new(Arc::clone(&metrics));
+            if cancellation_for_launch.load(Ordering::Acquire) {
+                return H7BToolResult::denied();
+            }
+            let mut grant = grant;
+            if authority
+                .revalidate_process_grant(&action_for_launch, &mut grant)
+                .is_err()
+            {
+                return H7BToolResult::denied();
+            }
+            let native = supervise_native_prepared(
+                &action_for_launch,
+                H7NativeOptions {
+                    cancellation: cancellation_for_launch,
+                    metrics: Arc::clone(&metrics),
+                    fault: H7NativeLaunchFault::None,
+                    unlisted_inheritable_handle: None,
+                    post_host_mutation: H7PostHostMutation::None,
+                    pre_create_process_gate: None,
+                    output_terminality_gate: None,
+                },
+                preparation,
+                Some(grant),
+            );
+            *output
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(native.stdout.clone());
+            H7BToolResult::from_native(&native)
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => H7BToolResult::denied(),
+        }
+    }
+}
+
+pub(crate) struct VitaWorkspaceProcessToolContributor {
+    broker: Arc<H7BWorkspaceProcessBroker>,
+    tool_call_count: Arc<AtomicUsize>,
+}
+
+impl VitaWorkspaceProcessToolContributor {
+    fn new(broker: Arc<H7BWorkspaceProcessBroker>) -> Self {
+        Self {
+            broker,
+            tool_call_count: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn with_tool_call_count(mut self, count: Arc<AtomicUsize>) -> Self {
+        self.tool_call_count = count;
+        self
+    }
+}
+
+impl ToolContributor for VitaWorkspaceProcessToolContributor {
+    fn tools(
+        &self,
+        _session_store: &codex_extension_api::ExtensionData,
+        _thread_store: &codex_extension_api::ExtensionData,
+    ) -> Vec<Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>>> {
+        vec![Arc::new(VitaWorkspaceProcessTool {
+            broker: Arc::clone(&self.broker),
+            tool_call_count: Arc::clone(&self.tool_call_count),
+        })]
+    }
+}
+
+struct VitaWorkspaceProcessTool {
+    broker: Arc<H7BWorkspaceProcessBroker>,
+    tool_call_count: Arc<AtomicUsize>,
+}
+
+impl<'call> ToolExecutor<ToolCall<'call>> for VitaWorkspaceProcessTool {
+    fn tool_name(&self) -> ToolName {
+        ToolName::plain(H7B_TOOL_NAME)
+    }
+
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::Function(ResponsesApiTool {
+            name: H7B_TOOL_NAME.to_string(),
+            description: "Report the workspace cwd through the Host-governed fixture process."
+                .to_string(),
+            strict: true,
+            defer_loading: None,
+            parameters: parse_tool_input_schema(&h7b_workspace_process_schema_contract())
+                .expect("D29-H7-B workspace process schema is static and valid"),
+            output_schema: None,
+        })
+    }
+
+    fn supports_parallel_tool_calls(&self) -> bool {
+        false
+    }
+
+    fn handle<'a>(&'a self, call: ToolCall<'call>) -> ToolExecutorFuture<'a>
+    where
+        'call: 'a,
+    {
+        self.tool_call_count.fetch_add(1, Ordering::AcqRel);
+        let broker = Arc::clone(&self.broker);
+        Box::pin(async move {
+            let result =
+                match H7BWorkspaceProcessRequest::from_codex_call(&call).and_then(|request| {
+                    broker
+                        .prepare_model_action(request)
+                        .map_err(|_| H7RequestError::InvalidRequest)
+                }) {
+                    Ok(action) => broker.execute(action).await,
+                    Err(_) => H7BToolResult::denied(),
+                };
+            Ok(
+                Box::new(JsonToolOutput::with_success(result.value(), Some(false)))
+                    as Box<dyn ToolOutput>,
+            )
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4802,6 +5424,613 @@ mod tests {
             )
             .with_output_terminality_gate(gate, cleanup_timeout)
         }
+    }
+
+    struct H7BDirectHarness {
+        _workspace: TempDir,
+        root: TrustedWorkspaceRoot,
+        catalog: Arc<H7ExecutableCatalog>,
+        authority: Arc<H7Authority>,
+        bridge: Arc<H7PendingConfirmationBridge>,
+        receiver: Option<tokio::sync::mpsc::Receiver<H7PendingProcessAction>>,
+        broker: Arc<H7BWorkspaceProcessBroker>,
+    }
+
+    impl H7BDirectHarness {
+        fn new() -> Self {
+            let workspace = tempdir().expect("D29-H7-B workspace directory");
+            let root = TrustedWorkspaceRoot::acquire(workspace.path())
+                .expect("D29-H7-B trusted workspace root");
+            let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .expect("D29-H7-B repository root")
+                .to_path_buf();
+            let image_path = h7_process_fixture_executable(&repo_root)
+                .expect("D29-H7-B process fixture executable");
+            let catalog = Arc::new(
+                H7ExecutableCatalog::fixture(image_path, root.requested_path().to_path_buf())
+                    .expect("D29-H7-B executable catalog"),
+            );
+            let authority = H7Authority::new_workspace(&root).expect("D29-H7-B Host authority");
+            let (bridge, receiver) = H7PendingConfirmationBridge::new();
+            let context = VitaExecutionContext::try_new(H7_LIFE_ID, H7_TASK_ID)
+                .expect("D29-H7-B execution context");
+            let broker = H7BWorkspaceProcessBroker::new(
+                context,
+                Arc::clone(&catalog),
+                Arc::clone(&authority),
+                Arc::clone(&bridge),
+                Some(root.clone()),
+            );
+            Self {
+                _workspace: workspace,
+                root,
+                catalog,
+                authority,
+                bridge,
+                receiver: Some(receiver),
+                broker,
+            }
+        }
+
+        fn action(&self) -> Arc<PreparedProcessAction> {
+            self.action_with_args(&["report-cwd"])
+        }
+
+        fn action_with_args(&self, args: &[&str]) -> Arc<PreparedProcessAction> {
+            let request = H7ProcessRequest::synthetic("call-d29h7b-test", "turn-d29h7b-test", args);
+            self.catalog
+                .prepare_workspace_action(self.broker.context.clone(), request, self.root.clone())
+                .expect("D29-H7-B prepared action")
+        }
+
+        fn action_without_scope(&self) -> Arc<PreparedProcessAction> {
+            let request = H7ProcessRequest::synthetic(
+                "call-d29h7b-noscope",
+                "turn-d29h7b-noscope",
+                &["report-cwd"],
+            );
+            self.catalog
+                .prepare_action_without_workspace_scope_for_test(
+                    self.broker.context.clone(),
+                    request,
+                )
+                .expect("D29-H7-B scope-free test action")
+        }
+
+        fn broker_with_final_fence(
+            &self,
+            gate: Arc<H7FinalFenceGate>,
+        ) -> Arc<H7BWorkspaceProcessBroker> {
+            H7BWorkspaceProcessBroker::new(
+                self.broker.context.clone(),
+                Arc::clone(&self.catalog),
+                Arc::clone(&self.authority),
+                Arc::clone(&self.bridge),
+                Some(self.root.clone()),
+            )
+            .with_final_fence_gate(gate)
+        }
+    }
+
+    async fn run_h7b_approved(
+        broker: Arc<H7BWorkspaceProcessBroker>,
+        authority: Arc<H7Authority>,
+        receiver: &mut tokio::sync::mpsc::Receiver<H7PendingProcessAction>,
+        action: Arc<PreparedProcessAction>,
+    ) -> H7BToolResult {
+        let task = tokio::spawn({
+            let broker = Arc::clone(&broker);
+            async move { broker.execute(action).await }
+        });
+        let pending = tokio::time::timeout(H7_TURN_TIMEOUT, receiver.recv())
+            .await
+            .expect("D29-H7-B confirmation request wait")
+            .expect("D29-H7-B confirmation request");
+        let revision = authority
+            .provision_workspace_confirmation(&pending.action)
+            .expect("D29-H7-B trusted confirmation");
+        pending
+            .response
+            .send(revision)
+            .expect("D29-H7-B confirmation response");
+        task.await.expect("D29-H7-B broker task")
+    }
+
+    fn assert_h7b_zero_process_result(result: &H7BToolResult) {
+        assert_eq!(result.status, "denied");
+        assert!(!result.process_created);
+        assert_eq!(result.side_effect_count, 0);
+    }
+
+    #[test]
+    fn h7b_d28_workspace_scope_required() {
+        let _lock = lock_h7_tests();
+        let harness = H7BDirectHarness::new();
+        let action = harness.action();
+        let revision = harness
+            .authority
+            .evaluate_workspace_scope(&action)
+            .expect("D29-H7-B canonical workspace scope");
+        assert_eq!(revision, 2);
+        assert_eq!(harness.authority.workspace_scope_provenance(), (1, 0));
+        assert_eq!(harness.authority.provenance(), (0, 0));
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7b_no_scope_confirmation_zero() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7BDirectHarness::new();
+        let action = harness.action_without_scope();
+        let result = harness.broker.execute(action).await;
+        assert_h7b_zero_process_result(&result);
+        assert_eq!(harness.authority.workspace_scope_provenance(), (0, 0));
+        assert_eq!(harness.authority.provenance(), (0, 0));
+        assert_eq!(
+            harness
+                .broker
+                .metrics()
+                .process_created
+                .load(Ordering::Acquire),
+            0
+        );
+        assert!(harness.receiver.take().is_some());
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7b_no_confirmation_createprocess_zero() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7BDirectHarness::new();
+        let action = harness.action();
+        let receiver = harness.receiver.as_mut().expect("D29-H7-B receiver");
+        let task = tokio::spawn({
+            let broker = Arc::clone(&harness.broker);
+            async move { broker.execute(action).await }
+        });
+        let pending = tokio::time::timeout(H7_TURN_TIMEOUT, receiver.recv())
+            .await
+            .expect("D29-H7-B no-confirmation pending wait")
+            .expect("D29-H7-B no-confirmation pending action");
+        drop(pending);
+        let result = task.await.expect("D29-H7-B no-confirmation broker task");
+        assert_h7b_zero_process_result(&result);
+        assert_eq!(harness.authority.workspace_scope_provenance(), (1, 0));
+        assert_eq!(harness.authority.provenance(), (0, 0));
+        assert_eq!(
+            harness
+                .authority
+                .metrics
+                .grants_issued
+                .load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(
+            harness
+                .broker
+                .metrics()
+                .process_created
+                .load(Ordering::Acquire),
+            0
+        );
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7b_workspace_grant_binds_exact_root() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7BDirectHarness::new();
+        let action = harness.action();
+        let binding = action.binding();
+        assert_eq!(binding.capability_id, H7B_CAPABILITY_ID);
+        assert_eq!(
+            binding.workspace_root_identity.as_deref(),
+            Some(h7_workspace_identity_wire(harness.root.identity()).as_str())
+        );
+        assert_eq!(
+            binding.working_directory_identity,
+            action.working_directory_identity
+        );
+        let result = run_h7b_approved(
+            Arc::clone(&harness.broker),
+            Arc::clone(&harness.authority),
+            harness.receiver.as_mut().unwrap(),
+            action,
+        )
+        .await;
+        assert_eq!(result.status, "workspace_process_completed");
+        assert!(result.process_created);
+        assert_eq!(harness.authority.workspace_scope_provenance(), (1, 0));
+        assert_eq!(harness.authority.provenance(), (1, 0));
+        assert_eq!(
+            harness
+                .authority
+                .metrics
+                .grants_issued
+                .load(Ordering::Acquire),
+            1
+        );
+        assert_eq!(
+            harness
+                .authority
+                .metrics
+                .final_revalidations
+                .load(Ordering::Acquire),
+            1
+        );
+        let raw = harness
+            .broker
+            .last_fixture_stdout()
+            .expect("D29-H7-B fixture cwd output");
+        let observation: Value = serde_json::from_slice(&raw).expect("D29-H7-B cwd JSON");
+        let actual = PathBuf::from(
+            observation["cwd"]
+                .as_str()
+                .expect("D29-H7-B fixture cwd field"),
+        );
+        assert_eq!(
+            fs::canonicalize(actual).unwrap(),
+            fs::canonicalize(harness.root.requested_path()).unwrap()
+        );
+        assert_eq!(
+            harness
+                .broker
+                .metrics()
+                .job_assigned
+                .load(Ordering::Acquire),
+            1
+        );
+        assert_eq!(
+            harness
+                .broker
+                .metrics()
+                .thread_resumed
+                .load(Ordering::Acquire),
+            1
+        );
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7b_wrong_workspace_root_createprocess_zero() {
+        let _lock = lock_h7_tests();
+        let harness = H7BDirectHarness::new();
+        let wrong_workspace = tempdir().expect("D29-H7-B wrong workspace");
+        let wrong_root = TrustedWorkspaceRoot::acquire(wrong_workspace.path())
+            .expect("D29-H7-B wrong trusted root");
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("D29-H7-B repository root")
+            .to_path_buf();
+        let image = h7_process_fixture_executable(&repo_root).expect("D29-H7-B fixture image");
+        let wrong_catalog =
+            H7ExecutableCatalog::fixture(image, wrong_root.requested_path().to_path_buf())
+                .expect("D29-H7-B wrong catalog");
+        let action = wrong_catalog
+            .prepare_workspace_action(
+                harness.broker.context.clone(),
+                H7ProcessRequest::synthetic(
+                    "call-d29h7b-wrong-root",
+                    "turn-d29h7b-wrong-root",
+                    &["report-cwd"],
+                ),
+                wrong_root,
+            )
+            .expect("D29-H7-B wrong-root action");
+        let result = harness.broker.execute(action).await;
+        assert_h7b_zero_process_result(&result);
+        assert_eq!(harness.authority.workspace_scope_provenance(), (0, 0));
+        assert_eq!(harness.authority.provenance(), (0, 0));
+        assert_eq!(
+            harness
+                .broker
+                .metrics()
+                .process_created
+                .load(Ordering::Acquire),
+            0
+        );
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7b_workspace_root_rebind_createprocess_zero() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7BDirectHarness::new();
+        let rebound_path = harness
+            ._workspace
+            .path()
+            .join("rebound-name-that-does-not-exist");
+        let rebound_root = crate::workspace_capability::root_with_requested_path_for_test(
+            &harness.root,
+            rebound_path,
+        );
+        let action = harness
+            .catalog
+            .prepare_workspace_action(
+                harness.broker.context.clone(),
+                H7ProcessRequest::synthetic(
+                    "call-d29h7b-root-rebind",
+                    "turn-d29h7b-root-rebind",
+                    &["report-cwd"],
+                ),
+                rebound_root,
+            )
+            .expect("D29-H7-B rebound action");
+        let result = run_h7b_approved(
+            Arc::clone(&harness.broker),
+            Arc::clone(&harness.authority),
+            harness.receiver.as_mut().unwrap(),
+            action,
+        )
+        .await;
+        assert_h7b_zero_process_result(&result);
+        assert_eq!(
+            harness
+                .authority
+                .metrics
+                .grants_issued
+                .load(Ordering::Acquire),
+            1
+        );
+        assert_eq!(
+            harness
+                .broker
+                .metrics()
+                .process_created
+                .load(Ordering::Acquire),
+            0
+        );
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7b_workspace_root_rename_cannot_redirect_process() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7BDirectHarness::new();
+        let original = harness.root.requested_path().to_path_buf();
+        let moved = harness
+            ._workspace
+            .path()
+            .parent()
+            .expect("D29-H7-B workspace parent")
+            .join("d29h7b-renamed-root");
+        let renamed = fs::rename(&original, &moved).is_ok();
+        let action = harness.action();
+        let result = run_h7b_approved(
+            Arc::clone(&harness.broker),
+            Arc::clone(&harness.authority),
+            harness.receiver.as_mut().unwrap(),
+            action,
+        )
+        .await;
+        if renamed {
+            assert_h7b_zero_process_result(&result);
+            assert!(harness.root.verify_named_path_current().is_err());
+            let _ = fs::rename(&moved, &original);
+        } else {
+            assert_eq!(result.status, "workspace_process_completed");
+            assert!(harness.root.verify_named_path_current().is_ok());
+            let raw = harness.broker.last_fixture_stdout().unwrap();
+            let observation: Value = serde_json::from_slice(&raw).unwrap();
+            assert_eq!(
+                fs::canonicalize(observation["cwd"].as_str().unwrap()).unwrap(),
+                fs::canonicalize(&original).unwrap()
+            );
+        }
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7b_same_sqlite_rev2_to_rev3_createprocess_zero() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7BDirectHarness::new();
+        let gate = H7FinalFenceGate::new();
+        gate.arm();
+        let broker = harness.broker_with_final_fence(Arc::clone(&gate));
+        let action = harness.action();
+        let task = tokio::spawn({
+            let broker = Arc::clone(&broker);
+            async move { broker.execute(action).await }
+        });
+        let pending = harness.receiver.as_mut().unwrap().recv().await.unwrap();
+        let revision = harness
+            .authority
+            .provision_workspace_confirmation(&pending.action)
+            .unwrap();
+        pending.response.send(revision).unwrap();
+        gate.wait_until_entered().await;
+        harness
+            .authority
+            .disable_authorization_for_test(2)
+            .expect("D29-H7-B SQLite rev2 to rev3 disable");
+        gate.release();
+        let result = task.await.unwrap();
+        assert_h7b_zero_process_result(&result);
+        assert_eq!(
+            harness
+                .authority
+                .metrics
+                .grants_issued
+                .load(Ordering::Acquire),
+            1
+        );
+        assert_eq!(
+            harness
+                .authority
+                .metrics
+                .final_revalidations
+                .load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(broker.metrics().process_created.load(Ordering::Acquire), 0);
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7b_fixture_cwd_equals_authorized_workspace() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7BDirectHarness::new();
+        let action = harness.action();
+        let result = run_h7b_approved(
+            Arc::clone(&harness.broker),
+            Arc::clone(&harness.authority),
+            harness.receiver.as_mut().unwrap(),
+            action,
+        )
+        .await;
+        assert_eq!(result.status, "workspace_process_completed");
+        let raw = harness.broker.last_fixture_stdout().unwrap();
+        let observation: Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(
+            fs::canonicalize(observation["cwd"].as_str().unwrap()).unwrap(),
+            fs::canonicalize(harness.root.requested_path()).unwrap()
+        );
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7b_fixture_mutates_workspace_zero() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7BDirectHarness::new();
+        let sentinel = harness.root.requested_path().join("d29h7b-sentinel.txt");
+        fs::write(&sentinel, b"unchanged").expect("D29-H7-B sentinel");
+        let before = fs::read(&sentinel).unwrap();
+        let action = harness.action();
+        let result = run_h7b_approved(
+            Arc::clone(&harness.broker),
+            Arc::clone(&harness.authority),
+            harness.receiver.as_mut().unwrap(),
+            action,
+        )
+        .await;
+        assert_eq!(result.status, "workspace_process_completed");
+        assert_eq!(fs::read(&sentinel).unwrap(), before);
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7b_model_output_hides_absolute_workspace_path() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7BDirectHarness::new();
+        let action = harness.action();
+        let result = run_h7b_approved(
+            Arc::clone(&harness.broker),
+            Arc::clone(&harness.authority),
+            harness.receiver.as_mut().unwrap(),
+            action,
+        )
+        .await;
+        let serialized = result.value().to_string();
+        assert!(!serialized.contains(harness.root.final_path().to_string_lossy().as_ref()));
+        assert!(!serialized.contains("grant_id"));
+        assert!(!serialized.contains("confirmation_id"));
+        assert!(!serialized.contains("authorization_revision"));
+        assert!(!serialized.contains("workspace_root_identity"));
+        assert!(!serialized.contains("working_directory_identity"));
+        assert!(harness.authority.shutdown());
+    }
+
+    #[test]
+    fn h7b_uses_h7a_global_admission() {
+        let _lock = lock_h7_tests();
+        let harness = H7BDirectHarness::new();
+        assert!(Arc::ptr_eq(
+            &harness.broker.admission,
+            &h7_process_admission()
+        ));
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7b_h7a_active_blocks_h7b_before_confirmation() {
+        let _lock = lock_h7_tests();
+        let mut h7a = H7DirectHarness::new();
+        let h7b = H7BDirectHarness::new();
+        let first = tokio::spawn({
+            let broker = Arc::clone(&h7a.broker);
+            let action = h7a.action(&["sleep", "500"]);
+            async move { broker.execute(action).await }
+        });
+        let pending = h7a.receiver.as_mut().unwrap().recv().await.unwrap();
+        let second = h7b.broker.execute(h7b.action()).await;
+        assert_h7b_zero_process_result(&second);
+        assert_eq!(h7b.authority.workspace_scope_provenance(), (0, 0));
+        drop(pending);
+        let first_result = first.await.unwrap();
+        assert_h7_zero_process_result(&first_result);
+        assert!(h7a.authority.shutdown());
+        assert!(h7b.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7b_active_blocks_h7a_before_confirmation() {
+        let _lock = lock_h7_tests();
+        let mut h7b = H7BDirectHarness::new();
+        let h7a = H7DirectHarness::new();
+        let first = tokio::spawn({
+            let broker = Arc::clone(&h7b.broker);
+            let action = h7b.action();
+            async move { broker.execute(action).await }
+        });
+        let pending = h7b.receiver.as_mut().unwrap().recv().await.unwrap();
+        let second = h7a
+            .broker
+            .execute(h7a.action(&["echo-argv", "blocked"]))
+            .await;
+        assert_h7_zero_process_result(&second);
+        assert_eq!(h7a.authority.provenance(), (0, 0));
+        drop(pending);
+        let first_result = first.await.unwrap();
+        assert_h7b_zero_process_result(&first_result);
+        assert!(h7a.authority.shutdown());
+        assert!(h7b.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7b_global_quarantine_blocks_workspace_process() {
+        let _lock = lock_h7_tests();
+        let (gate, probe, before) = install_h7_pending_output_quarantine("h7b-quarantine");
+        let harness = H7BDirectHarness::new();
+        let result = harness.broker.execute(harness.action()).await;
+        assert_h7b_zero_process_result(&result);
+        assert_eq!(harness.authority.workspace_scope_provenance(), (0, 0));
+        assert_eq!(harness.authority.provenance(), (0, 0));
+        gate.allow_terminal.store(true, Ordering::Release);
+        reap_h7_quarantine_until(before, Instant::now() + Duration::from_secs(1));
+        assert!(probe.terminal_observed.load(Ordering::Acquire));
+        assert!(probe.drop_finished.load(Ordering::Acquire));
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7b_outer_abort_preserves_h7a_cleanup() {
+        let _lock = lock_h7_tests();
+        let harness = H7BDirectHarness::new();
+        let metrics = harness.broker.metrics();
+        let action = harness.action_with_args(&["sleep", "2_000"]);
+        let mut receiver = harness.receiver.expect("D29-H7-B outer-abort receiver");
+        let task = tokio::spawn({
+            let broker = Arc::clone(&harness.broker);
+            async move { broker.execute(action).await }
+        });
+        let pending = receiver.recv().await.unwrap();
+        let revision = harness
+            .authority
+            .provision_workspace_confirmation(&pending.action)
+            .unwrap();
+        pending.response.send(revision).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), metrics.created_notify.notified())
+            .await
+            .expect("D29-H7-B outer-abort process creation");
+        task.abort();
+        assert!(task.await.is_err());
+        wait_h7_native_workers_quiet(metrics.clone()).await;
+        assert_eq!(metrics.jobs_terminated.load(Ordering::Acquire), 1);
+        assert_eq!(metrics.process_tree_remaining.load(Ordering::Acquire), 0);
+        assert_eq!(metrics.output_handles_active.load(Ordering::Acquire), 0);
+        assert!(!h7_process_admission().active.load(Ordering::Acquire));
+        assert!(harness.authority.shutdown());
     }
 
     async fn run_approved(
@@ -7615,16 +8844,31 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum H7FixtureKind {
+        Process,
+        WorkspaceProcess,
+    }
+
     struct H7ResponsesFixture {
         address: SocketAddr,
         stop: Arc<AtomicBool>,
         observation: Arc<Mutex<H7FixtureObservation>>,
         gate: Arc<H7Gate>,
+        kind: H7FixtureKind,
         join: Option<JoinHandle<()>>,
     }
 
     impl H7ResponsesFixture {
         fn start() -> Self {
+            Self::start_kind(H7FixtureKind::Process)
+        }
+
+        fn start_workspace() -> Self {
+            Self::start_kind(H7FixtureKind::WorkspaceProcess)
+        }
+
+        fn start_kind(kind: H7FixtureKind) -> Self {
             let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind D29-H7 fixture");
             let address = listener.local_addr().expect("D29-H7 fixture address");
             let stop = Arc::new(AtomicBool::new(false));
@@ -7654,6 +8898,7 @@ mod tests {
                         peer,
                         request_index,
                         &gate_for_thread,
+                        kind,
                     );
                     let mut observed = observation_for_thread
                         .lock()
@@ -7661,10 +8906,16 @@ mod tests {
                     observed.request_count += 1;
                     if let Ok(body) = &result {
                         if request_index == 0 {
-                            observed.first_request_schema_exact = exact_h7_process_schema(body);
+                            observed.first_request_schema_exact = match kind {
+                                H7FixtureKind::Process => exact_h7_process_schema(body),
+                                H7FixtureKind::WorkspaceProcess => {
+                                    exact_h7_workspace_process_schema(body)
+                                }
+                            };
                             observed.initial_turn_id = extract_h7_turn_id(body);
                         } else {
-                            observed.function_call_output = h7_function_call_output(body);
+                            observed.function_call_output =
+                                h7_function_call_output_for(body, h7_fixture_call_id(kind));
                             observed.output_has_authority_facts = observed
                                 .function_call_output
                                 .as_ref()
@@ -7682,6 +8933,7 @@ mod tests {
                 stop,
                 observation,
                 gate,
+                kind,
                 join: Some(join),
             }
         }
@@ -7735,6 +8987,7 @@ mod tests {
         peer: SocketAddr,
         request_index: usize,
         gate: &H7Gate,
+        kind: H7FixtureKind,
     ) -> Result<Vec<u8>, String> {
         if !peer.ip().is_loopback() {
             return Err("D29-H7 fixture received a non-loopback peer".to_string());
@@ -7743,13 +8996,24 @@ mod tests {
         if request_index == 0 {
             gate.capture_turn_id(&body)?;
             gate.wait_until_released()?;
-            write_h7_sse_response(stream, h7_first_response_events())?;
+            let events = match kind {
+                H7FixtureKind::Process => h7_first_response_events(),
+                H7FixtureKind::WorkspaceProcess => h7b_first_response_events(),
+            };
+            write_h7_sse_response(stream, events)?;
         } else if request_index == 1 {
             write_h7_sse_response(stream, h7_completion_response_events())?;
         } else {
             return Err("D29-H7 fixture received too many requests".to_string());
         }
         Ok(body)
+    }
+
+    fn h7_fixture_call_id(kind: H7FixtureKind) -> &'static str {
+        match kind {
+            H7FixtureKind::Process => "call-d29h7-process",
+            H7FixtureKind::WorkspaceProcess => "call-d29h7b-process",
+        }
     }
 
     fn h7_first_response_events() -> Vec<Value> {
@@ -7770,6 +9034,27 @@ mod tests {
             json!({
                 "type": "response.completed",
                 "response": {"id": "resp-d29h7-1", "object": "response", "status": "completed", "model": H7_MODEL}
+            }),
+        ]
+    }
+
+    fn h7b_first_response_events() -> Vec<Value> {
+        let arguments = serde_json::to_string(&json!({
+            "operation": "report_workspace"
+        }))
+        .expect("D29-H7-B function arguments");
+        vec![
+            json!({
+                "type": "response.created",
+                "response": {"id": "resp-d29h7b-1", "object": "response", "status": "in_progress", "model": H7_MODEL}
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "item": {"type": "function_call", "call_id": "call-d29h7b-process", "name": H7B_TOOL_NAME, "arguments": arguments}
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {"id": "resp-d29h7b-1", "object": "response", "status": "completed", "model": H7_MODEL}
             }),
         ]
     }
@@ -7887,6 +9172,10 @@ mod tests {
     }
 
     fn h7_function_call_output(body: &[u8]) -> Option<Value> {
+        h7_function_call_output_for(body, "call-d29h7-process")
+    }
+
+    fn h7_function_call_output_for(body: &[u8], call_id: &str) -> Option<Value> {
         serde_json::from_slice::<Value>(body)
             .ok()
             .and_then(|value| value.get("input").cloned())
@@ -7894,8 +9183,7 @@ mod tests {
             .and_then(|items| {
                 items.into_iter().find_map(|item| {
                     (item.get("type").and_then(Value::as_str) == Some("function_call_output")
-                        && item.get("call_id").and_then(Value::as_str)
-                            == Some("call-d29h7-process"))
+                        && item.get("call_id").and_then(Value::as_str) == Some(call_id))
                     .then(|| item.get("output").and_then(Value::as_str))
                     .flatten()
                     .and_then(|output| serde_json::from_str::<Value>(output).ok())
@@ -7959,6 +9247,57 @@ mod tests {
                 })
     }
 
+    fn exact_h7_workspace_process_schema(body: &[u8]) -> bool {
+        let Some(tool) = serde_json::from_slice::<Value>(body)
+            .ok()
+            .and_then(|value| value.get("tools").cloned())
+            .and_then(|value| value.as_array().cloned())
+            .and_then(|tools| {
+                tools
+                    .into_iter()
+                    .find(|tool| tool.get("name").and_then(Value::as_str) == Some(H7B_TOOL_NAME))
+            })
+        else {
+            return false;
+        };
+        let parameters = tool.get("parameters").or_else(|| {
+            tool.get("function")
+                .and_then(|function| function.get("parameters"))
+        });
+        let Some(parameters) = parameters else {
+            return false;
+        };
+        let Some(properties) = parameters.get("properties").and_then(Value::as_object) else {
+            return false;
+        };
+        let names = properties.keys().cloned().collect::<BTreeSet<_>>();
+        let required = parameters
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<BTreeSet<_>>()
+            });
+        names == BTreeSet::from(["operation".to_string()])
+            && required == Some(names)
+            && parameters
+                .get("additionalProperties")
+                .and_then(Value::as_bool)
+                == Some(false)
+            && tool.get("strict").and_then(Value::as_bool) == Some(true)
+            && properties["operation"]["type"] == "string"
+            && properties["operation"]["enum"] == json!(["report_workspace"])
+            && properties["operation"]
+                .as_object()
+                .is_some_and(|operation| {
+                    operation.keys().cloned().collect::<BTreeSet<_>>()
+                        == BTreeSet::from(["enum".to_string(), "type".to_string()])
+                })
+    }
+
     fn h7_output_has_authority_facts(value: &Value) -> bool {
         const FORBIDDEN: &[&str] = &[
             "grant_id",
@@ -7970,6 +9309,7 @@ mod tests {
             "executable_sha256",
             "environment_policy_hash",
             "working_directory_identity",
+            "workspace_root_identity",
         ];
         match value {
             Value::Object(object) => object.iter().any(|(key, value)| {
@@ -8061,13 +9401,16 @@ mod tests {
         }
     }
 
-    async fn start_h7_runtime(
+    async fn start_h7_runtime<C>(
         app_data_root: PathBuf,
         workspace_root: PathBuf,
         fixture: H7ResponsesFixture,
-        contributor: VitaProcessToolContributor,
+        contributor: C,
         tool_call_count: Arc<AtomicUsize>,
-    ) -> Result<H7Runtime, String> {
+    ) -> Result<H7Runtime, String>
+    where
+        C: ToolContributor + Send + Sync + 'static,
+    {
         let profile =
             VitaAgentRuntimeProfile::from_explicit_app_data_root(app_data_root, workspace_root)
                 .map_err(|error| format!("create D29-H7 profile: {error}"))?;
@@ -8196,6 +9539,9 @@ mod tests {
         grants_issued: usize,
         trusted_confirmations: usize,
         request_derived_confirmations: usize,
+        trusted_workspace_scopes: usize,
+        request_derived_workspace_scopes: usize,
+        workspace_cwd_matches: bool,
         cleanup: H7CleanupEvidence,
     }
 
@@ -8286,6 +9632,127 @@ mod tests {
             grants_issued,
             trusted_confirmations: provenance.0,
             request_derived_confirmations: provenance.1,
+            trusted_workspace_scopes: 0,
+            request_derived_workspace_scopes: 0,
+            workspace_cwd_matches: false,
+            cleanup,
+        }
+    }
+
+    fn h7_fixture_cwd_matches(raw: Option<&[u8]>, workspace_root: &Path) -> bool {
+        raw.and_then(|raw| serde_json::from_slice::<Value>(raw).ok())
+            .and_then(|value| value.get("cwd").cloned())
+            .and_then(|value| value.as_str().map(PathBuf::from))
+            .is_some_and(|cwd| h7_workspace_paths_equal(&cwd, workspace_root))
+    }
+
+    async fn run_real_h7b_canary(with_workspace_scope: bool, approve: bool) -> H7CanaryEvidence {
+        let app_data = tempdir().expect("D29-H7-B app-data temp root");
+        let workspace = tempdir().expect("D29-H7-B workspace temp root");
+        let root = TrustedWorkspaceRoot::acquire(workspace.path())
+            .expect("D29-H7-B canary trusted workspace root");
+        let fixture = H7ResponsesFixture::start_workspace();
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("D29-H7-B repository root")
+            .to_path_buf();
+        let image =
+            h7_process_fixture_executable(&repo_root).expect("D29-H7-B canary process image");
+        let catalog = Arc::new(
+            H7ExecutableCatalog::fixture(image, root.requested_path().to_path_buf())
+                .expect("D29-H7-B canary catalog"),
+        );
+        let authority = H7Authority::new_workspace(&root).expect("D29-H7-B canary authority");
+        let (bridge, mut receiver) = H7PendingConfirmationBridge::new();
+        let context =
+            VitaExecutionContext::try_new(H7_LIFE_ID, H7_TASK_ID).expect("D29-H7-B canary context");
+        let broker = H7BWorkspaceProcessBroker::new(
+            context,
+            Arc::clone(&catalog),
+            Arc::clone(&authority),
+            Arc::clone(&bridge),
+            with_workspace_scope.then(|| root.clone()),
+        );
+        let tool_call_count = Arc::new(AtomicUsize::new(0));
+        let contributor = VitaWorkspaceProcessToolContributor::new(Arc::clone(&broker))
+            .with_tool_call_count(Arc::clone(&tool_call_count));
+        let runtime = start_h7_runtime(
+            app_data.path().to_path_buf(),
+            workspace.path().to_path_buf(),
+            fixture,
+            contributor,
+            Arc::clone(&tool_call_count),
+        )
+        .await
+        .expect("D29-H7-B Codex runtime");
+        let turn_id = start_h7_turn(runtime.thread.as_ref().unwrap())
+            .await
+            .expect("D29-H7-B canary turn");
+        let observed_turn_id = runtime
+            .fixture
+            .as_ref()
+            .unwrap()
+            .wait_for_turn_id()
+            .await
+            .expect("D29-H7-B Responses fixture turn id");
+        assert_eq!(observed_turn_id, turn_id);
+        runtime.fixture.as_ref().unwrap().release();
+        if with_workspace_scope && approve {
+            let pending = tokio::time::timeout(H7_TURN_TIMEOUT, receiver.recv())
+                .await
+                .expect("D29-H7-B canary confirmation wait")
+                .expect("D29-H7-B canary confirmation");
+            let revision = authority
+                .provision_workspace_confirmation(&pending.action)
+                .expect("D29-H7-B canary trusted confirmation");
+            pending
+                .response
+                .send(revision)
+                .expect("D29-H7-B canary confirmation response");
+        } else {
+            if !with_workspace_scope {
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(250), receiver.recv())
+                        .await
+                        .is_err(),
+                    "D29-H7-B without Host workspace scope must not request confirmation"
+                );
+            }
+            drop(receiver);
+        }
+        let (reply, error, _) = wait_h7_turn(runtime.thread.as_ref().unwrap())
+            .await
+            .expect("D29-H7-B canary turn completion");
+        let (cleanup, observation, tool_calls) = runtime.shutdown().await;
+        let metrics = broker.metrics();
+        let provenance = authority.provenance();
+        let workspace_scope_provenance = authority.workspace_scope_provenance();
+        let grants_issued = authority.metrics.grants_issued.load(Ordering::Acquire);
+        let final_revalidations = authority
+            .metrics
+            .final_revalidations
+            .load(Ordering::Acquire);
+        let workspace_cwd_matches = h7_fixture_cwd_matches(
+            broker.last_fixture_stdout().as_deref(),
+            root.requested_path(),
+        );
+        assert!(authority.shutdown());
+        H7CanaryEvidence {
+            reply,
+            error,
+            observation,
+            tool_call_count: tool_calls,
+            process_created: metrics.process_created.load(Ordering::Acquire),
+            job_assigned: metrics.job_assigned.load(Ordering::Acquire),
+            thread_resumed: metrics.thread_resumed.load(Ordering::Acquire),
+            process_exited: metrics.process_exited.load(Ordering::Acquire),
+            final_revalidations,
+            grants_issued,
+            trusted_confirmations: provenance.0,
+            request_derived_confirmations: provenance.1,
+            trusted_workspace_scopes: workspace_scope_provenance.0,
+            request_derived_workspace_scopes: workspace_scope_provenance.1,
+            workspace_cwd_matches,
             cleanup,
         }
     }
@@ -8383,6 +9850,105 @@ mod tests {
                 .function_call_output
                 .expect("D29-H7 output");
             assert!(!h7_output_has_authority_facts(&output));
+            assert_eq!(output["side_effect_count"], 1);
+        });
+    }
+
+    #[test]
+    fn real_codex_h7b_workspace_process_canary() {
+        run_h7_test_body(|| {
+            let _lock = lock_h7_tests();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("D29-H7-B real Codex runtime");
+            let evidence = runtime.block_on(run_real_h7b_canary(true, true));
+            assert_eq!(evidence.error, None);
+            assert_eq!(evidence.reply.as_deref(), Some(H7_REPLY));
+            assert_eq!(evidence.observation.request_count, 2);
+            assert!(
+                evidence.observation.first_request_schema_exact,
+                "D29-H7-B observed first request: {:?}",
+                evidence.observation
+            );
+            assert_eq!(evidence.tool_call_count, 1);
+            assert_eq!(evidence.process_created, 1);
+            assert_eq!(evidence.job_assigned, 1);
+            assert_eq!(evidence.thread_resumed, 1);
+            assert_eq!(evidence.process_exited, 1);
+            assert_eq!(evidence.trusted_workspace_scopes, 1);
+            assert_eq!(evidence.request_derived_workspace_scopes, 0);
+            assert_eq!(evidence.grants_issued, 1);
+            assert_eq!(evidence.final_revalidations, 1);
+            assert_eq!(evidence.trusted_confirmations, 1);
+            assert_eq!(evidence.request_derived_confirmations, 0);
+            assert!(evidence.workspace_cwd_matches);
+            assert!(!evidence.observation.output_has_authority_facts);
+            assert_eq!(evidence.cleanup.initial_shutdown, H7ShutdownStatus::Success);
+            assert_eq!(evidence.cleanup.final_shutdown, H7ShutdownStatus::Success);
+            assert_eq!(evidence.cleanup.manager_thread_count, 0);
+            assert!(evidence.cleanup.fixture_listener_joined);
+            let output = evidence
+                .observation
+                .function_call_output
+                .expect("D29-H7-B function output");
+            assert_eq!(output["status"], "workspace_process_completed");
+            assert_eq!(output["process_created"], true);
+            assert_eq!(output["side_effect_count"], 1);
+        });
+    }
+
+    #[test]
+    fn real_codex_h7b_without_scope_createprocess_zero() {
+        run_h7_test_body(|| {
+            let _lock = lock_h7_tests();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("D29-H7-B no-scope runtime");
+            let evidence = runtime.block_on(run_real_h7b_canary(false, false));
+            assert_eq!(evidence.error, None);
+            assert_eq!(evidence.reply.as_deref(), Some(H7_REPLY));
+            assert_eq!(evidence.tool_call_count, 1);
+            assert_eq!(evidence.process_created, 0);
+            assert_eq!(evidence.job_assigned, 0);
+            assert_eq!(evidence.thread_resumed, 0);
+            assert_eq!(evidence.process_exited, 0);
+            assert_eq!(evidence.trusted_workspace_scopes, 0);
+            assert_eq!(evidence.request_derived_workspace_scopes, 0);
+            assert_eq!(evidence.grants_issued, 0);
+            assert_eq!(evidence.final_revalidations, 0);
+            assert_eq!(evidence.trusted_confirmations, 0);
+            assert_eq!(evidence.request_derived_confirmations, 0);
+            assert!(!evidence.workspace_cwd_matches);
+            assert!(!evidence.observation.output_has_authority_facts);
+            let output = evidence
+                .observation
+                .function_call_output
+                .expect("D29-H7-B no-scope function output");
+            assert_eq!(output["status"], "denied");
+            assert_eq!(output["process_created"], false);
+            assert_eq!(output["side_effect_count"], 0);
+        });
+    }
+
+    #[test]
+    fn real_codex_h7b_output_exposes_no_authority_facts() {
+        run_h7_test_body(|| {
+            let _lock = lock_h7_tests();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("D29-H7-B output runtime");
+            let evidence = runtime.block_on(run_real_h7b_canary(true, true));
+            assert!(!evidence.observation.output_has_authority_facts);
+            let output = evidence
+                .observation
+                .function_call_output
+                .expect("D29-H7-B output");
+            assert!(!h7_output_has_authority_facts(&output));
+            assert!(!output.to_string().contains("workspace_root_identity"));
+            assert!(!output.to_string().contains("authorization_revision"));
             assert_eq!(output["side_effect_count"], 1);
         });
     }

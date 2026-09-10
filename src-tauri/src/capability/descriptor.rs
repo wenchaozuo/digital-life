@@ -2,6 +2,9 @@ use std::{collections::BTreeMap, fmt};
 
 pub(crate) const MAX_CAPABILITY_ID_LENGTH: usize = 128;
 const MAX_DISPLAY_NAME_LENGTH: usize = 256;
+pub(crate) const PRODUCTION_GIT_STATUS_CAPABILITY_ID: &str = "vita.process.workspace.git_status";
+pub(crate) const PRODUCTION_GIT_STATUS_PROFILE_ID: &str = "d29h7c.git.status.v1";
+pub(crate) const PRODUCTION_GIT_STATUS_TOOL_NAME: &str = "vita_workspace_git_status";
 
 /// A capability identity is an opaque, exact, lower-case ASCII identifier.
 /// No normalization, aliasing, or case folding is performed.
@@ -103,6 +106,9 @@ pub(crate) struct CapabilityDescriptor {
     risk_class: RiskClass,
     approval_floor: ApprovalFloor,
     scope_requirement: ScopeRequirement,
+    execution_profile: Option<String>,
+    tool_name: Option<String>,
+    read_only: bool,
 }
 
 impl CapabilityDescriptor {
@@ -126,7 +132,21 @@ impl CapabilityDescriptor {
             risk_class,
             approval_floor,
             scope_requirement,
+            execution_profile: None,
+            tool_name: None,
+            read_only: false,
         })
+    }
+
+    fn with_execution_route(
+        mut self,
+        profile_id: impl Into<String>,
+        tool_name: impl Into<String>,
+    ) -> Self {
+        self.execution_profile = Some(profile_id.into());
+        self.tool_name = Some(tool_name.into());
+        self.read_only = true;
+        self
     }
 
     pub(crate) fn capability_id(&self) -> &CapabilityId {
@@ -147,6 +167,18 @@ impl CapabilityDescriptor {
 
     pub(crate) fn scope_requirement(&self) -> ScopeRequirement {
         self.scope_requirement
+    }
+
+    pub(crate) fn execution_profile(&self) -> Option<&str> {
+        self.execution_profile.as_deref()
+    }
+
+    pub(crate) fn tool_name(&self) -> Option<&str> {
+        self.tool_name.as_deref()
+    }
+
+    pub(crate) fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     #[cfg(any(
@@ -215,11 +247,25 @@ impl CapabilityRegistry {
         })
     }
 
-    /// The production catalog is intentionally empty until a later stage
-    /// defines an approved capability set.  Dangerous wildcard placeholders
-    /// are not registered here.
+    /// The production catalog is a closed, trusted static set.  H7-D opens
+    /// exactly one read-only capability; no generic process, shell, write, or
+    /// network descriptor is registered here.
     pub(crate) fn production() -> Result<Self, CapabilityRegistryError> {
-        Self::from_trusted_descriptors([])
+        let capability_id = CapabilityId::try_from(PRODUCTION_GIT_STATUS_CAPABILITY_ID)
+            .expect("the production Git status capability ID is a valid static identifier");
+        let descriptor = CapabilityDescriptor::new(
+            capability_id,
+            "Governed read-only workspace Git status",
+            RiskClass::Critical,
+            ApprovalFloor::ExplicitPerAction,
+            ScopeRequirement::WorkspaceRequired,
+        )
+        .expect("the production Git status descriptor is valid")
+        .with_execution_route(
+            PRODUCTION_GIT_STATUS_PROFILE_ID,
+            PRODUCTION_GIT_STATUS_TOOL_NAME,
+        );
+        Self::from_trusted_descriptors([descriptor])
     }
 
     #[cfg(any(
@@ -314,7 +360,41 @@ mod tests {
             CapabilityRegistryError::DuplicateCapabilityId(_)
         ));
         let registry = CapabilityRegistry::production().unwrap();
-        assert_eq!(registry.len(), 0);
+        assert_eq!(registry.len(), 1);
+        let git_status = CapabilityId::try_from(PRODUCTION_GIT_STATUS_CAPABILITY_ID).unwrap();
+        let descriptor = registry.descriptor(&git_status).unwrap();
+        assert_eq!(descriptor.risk_class(), RiskClass::Critical);
+        assert_eq!(
+            descriptor.approval_floor(),
+            ApprovalFloor::ExplicitPerAction
+        );
+        assert_eq!(
+            descriptor.scope_requirement(),
+            ScopeRequirement::WorkspaceRequired
+        );
+        assert_eq!(
+            descriptor.execution_profile(),
+            Some(PRODUCTION_GIT_STATUS_PROFILE_ID)
+        );
+        assert_eq!(
+            descriptor.tool_name(),
+            Some(PRODUCTION_GIT_STATUS_TOOL_NAME)
+        );
+        assert!(descriptor.is_read_only());
+        for excluded in [
+            "vita.process.run",
+            "vita.process.workspace.run",
+            "vita.shell",
+            "vita.git",
+            "vita.write",
+            "vita.network",
+        ] {
+            let id = CapabilityId::try_from(excluded).unwrap();
+            assert!(
+                registry.descriptor(&id).is_none(),
+                "{excluded} must stay closed"
+            );
+        }
     }
 
     #[test]

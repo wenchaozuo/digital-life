@@ -29,7 +29,7 @@ mod d29h5;
 mod d29h5c;
 #[cfg(all(test, windows))]
 mod d29h6;
-#[cfg(all(test, windows))]
+#[cfg(windows)]
 mod d29h7;
 mod provider_gateway;
 pub mod recovery_journal;
@@ -50,6 +50,14 @@ pub use tool_authority::{
 pub use workspace_capability::{
     PreparedWorkspaceTarget, PreparedWorkspaceTargetKind, TrustedWorkspaceRoot,
     WorkspaceRelativePath, WorkspaceRootIdentity,
+};
+
+#[cfg(windows)]
+pub use d29h7::{
+    H7ProcessBinding, H7ProcessGrant, VitaGitStatusAuthority, VitaGitStatusConfirmationBridge,
+    VitaGitStatusPendingConfirmation, VitaGitStatusProduction, VitaGitStatusToolContributor,
+    VITA_WORKSPACE_GIT_STATUS_CAPABILITY_ID, VITA_WORKSPACE_GIT_STATUS_PROFILE_ID,
+    VITA_WORKSPACE_GIT_STATUS_TOOL_NAME,
 };
 
 pub const VITA_AGENT_RUNTIME_ID: &str = "vita-agent";

@@ -2252,7 +2252,7 @@ mod h3r1_tests {
         }
         let canonical = response.canonical.as_ref().unwrap();
         if canonical.canonical_evaluations != 1
-            || canonical.production_registry_size != 0
+            || canonical.production_registry_size != 1
             || canonical.test_registry_size != 1
             || canonical.authorization_row_reads != 1
             || !canonical.host_scope_authority_present
@@ -3254,7 +3254,7 @@ mod h3r1_tests {
             assert_eq!(canonical.canonical_evaluations, 1);
             assert!(canonical.host_scope_authority_present);
             assert!(canonical.requested_root_matched_authorized_root);
-            assert_eq!(canonical.production_registry_size, 0);
+            assert_eq!(canonical.production_registry_size, 1);
             assert_eq!(canonical.test_registry_size, 1);
             assert_eq!(canonical.authorization_row_reads, 1);
             assert_eq!(canonical.outcome, "ScopeRequired");

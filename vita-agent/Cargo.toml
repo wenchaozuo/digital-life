@@ -42,6 +42,8 @@ toml = "0.9.5"
 reqwest = { version = "=0.12.28", default-features = false, features = ["blocking", "rustls-tls-native-roots"] }
 url = "=2.5.8"
 zeroize = "=1.9.0"
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "sync", "time"] }
 
 [target.'cfg(windows)'.dependencies]
 # H2's Windows-only authority uses kernel directory handles, final-handle
@@ -63,7 +65,6 @@ windows-sys = { version = "=0.61.2", features = [
 
 [dev-dependencies]
 codex-core-api = { git = "https://github.com/openai/codex.git", rev = "316795b3cf2a45e90d121d9f46499d4658b2645c" }
-tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 # These are the same upstream compatibility patches used by the pinned Codex

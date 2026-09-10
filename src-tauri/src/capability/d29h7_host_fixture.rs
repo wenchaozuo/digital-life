@@ -485,9 +485,14 @@ impl HostSession {
         let requested_root_matched_authorized_root = workspace
             && self.workspace_root_identity.as_deref()
                 == binding.workspace_root_identity.as_deref();
+        let registry = if self.capability_id.as_str() == GIT_STATUS_CAPABILITY_ID {
+            &self.production_registry
+        } else {
+            &self.test_registry
+        };
         let decision = evaluate_capability_authorization(
             self.storage.as_ref(),
-            &self.test_registry,
+            registry,
             &self.life_id,
             &self.capability_id,
             if workspace {
@@ -613,8 +618,10 @@ impl HostSession {
                 Some(canonical),
             ));
         }
-        if self.capability_id.as_str() == WORKSPACE_CAPABILITY_ID
-            && canonical.requested_root_matched_authorized_root != Some(true)
+        if matches!(
+            self.capability_id.as_str(),
+            WORKSPACE_CAPABILITY_ID | GIT_STATUS_CAPABILITY_ID
+        ) && canonical.requested_root_matched_authorized_root != Some(true)
         {
             return Ok(HostResponse::denied(
                 "issue_process_grant",
@@ -836,7 +843,13 @@ mod tests {
         )
         .expect("H7 fixture initialize");
         assert_eq!(response.authorization_revision, Some(2));
-        assert_eq!(session.production_registry.len(), 0);
+        assert_eq!(session.production_registry.len(), 1);
+        let descriptor = session
+            .production_registry
+            .descriptor(&CapabilityId::try_from(GIT_STATUS_CAPABILITY_ID).unwrap())
+            .expect("production Git status descriptor");
+        assert_eq!(descriptor.execution_profile(), Some(GIT_STATUS_PROFILE_ID));
+        assert_eq!(descriptor.tool_name(), Some("vita_workspace_git_status"));
         assert_eq!(session.test_registry.len(), 1);
     }
 

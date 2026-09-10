@@ -4663,7 +4663,7 @@ mod tests {
     }
 
     #[test]
-    fn production_registry_remains_zero() {
+    fn production_registry_contains_only_read_only_h7c() {
         let source = fs::read_to_string(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .parent()
@@ -4671,7 +4671,8 @@ mod tests {
                 .join("src-tauri/src/capability/descriptor.rs"),
         )
         .unwrap();
-        assert!(source.contains("Self::from_trusted_descriptors([])"));
+        assert!(source.contains("PRODUCTION_GIT_STATUS_CAPABILITY_ID"));
+        assert!(!source.contains("vita.workspace.recover_replace"));
     }
 
     #[test]

@@ -466,7 +466,7 @@ impl VitaToolAuthorityPort for ProcessIsolatedCanonicalAuthority {
             });
             let response = invoke_host_fixture(&repo_root, &wire_request)?;
             if response.canonical_evaluations != 1
-                || response.production_registry_size != 0
+                || response.production_registry_size != 1
                 || response.authorization_row_reads != 0
                 || response.result != "UnknownCapability"
                 || response.life_id != context.life_id()
@@ -837,7 +837,7 @@ async fn d29h1_real_codex_tool_request_body() {
     assert_eq!(host_observations.len(), 1);
     let host = &host_observations[0];
     assert_eq!(host.canonical_evaluations, 1);
-    assert_eq!(host.production_registry_size, 0);
+    assert_eq!(host.production_registry_size, 1);
     assert_eq!(host.authorization_row_reads, 0);
     assert_eq!(host.result, "UnknownCapability");
     assert_eq!(host.life_id, "life-d29h1");

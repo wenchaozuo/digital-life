@@ -1,8 +1,8 @@
 //! D29-H5-B process-crash recovery and restart-authority closure.
 //!
 //! This module is compiled only for the test/integration boundary.  The
-//! production capability registry remains empty until a later stage wires a
-//! reviewed host caller.  The durable pieces used here are nevertheless
+//! production registry is limited to the read-only H7-C route; no H5
+//! mutation capability is registered.  The durable pieces used here are nevertheless
 //! production-shaped: H5-A journals stay immutable, H5-B markers are
 //! create-new sidecars, and recovery always requires a fresh Host decision.
 
@@ -2065,7 +2065,7 @@ pub(crate) mod tests {
             if response.operation != "initialize"
                 || response.status != "ok"
                 || response.authorization_revision != Some(2)
-                || response.production_registry_size != Some(0)
+                || response.production_registry_size != Some(1)
                 || response.test_registry_size != Some(1)
                 || response.same_sqlite_row != Some(true)
                 || response.trusted_confirmation.is_some()
@@ -2390,7 +2390,7 @@ pub(crate) mod tests {
             if response.operation != "issue_recovery_grant"
                 || response.status != "ok"
                 || response.authorization_revision != Some(request.authorization_revision())
-                || response.production_registry_size != Some(0)
+                || response.production_registry_size != Some(1)
                 || response.test_registry_size != Some(1)
                 || response.confirmation_consumed != Some(true)
                 || response.denial.is_some()
@@ -4836,7 +4836,8 @@ pub(crate) mod tests {
                 .join("src-tauri/src/capability/descriptor.rs"),
         )
         .unwrap();
-        assert!(source.contains("Self::from_trusted_descriptors([])"));
+        assert!(source.contains("PRODUCTION_GIT_STATUS_CAPABILITY_ID"));
+        assert!(!source.contains("vita.workspace.recover_replace"));
         assert_eq!(H5_DESCRIPTOR_RISK_CLASS, "High");
         assert_eq!(H5_DESCRIPTOR_APPROVAL_FLOOR, "ExplicitPerAction");
         assert_eq!(H5_DESCRIPTOR_SCOPE_REQUIREMENT, "WorkspaceRequired");

@@ -1,10 +1,8 @@
-//! D29-H7-A governed no-shell process supervisor.
+//! D29-H7 governed process supervision and the production Git-status adapter.
 //!
-//! The module is deliberately test/integration-only. The only model-visible
-//! process is a Host-catalogued fixture. It compiles a strict logical request,
-//! obtains a non-serializable ProcessGrant through the independent D28 Host
-//! fixture, and launches the retained executable image directly with the
-//! Windows process API.
+//! The native supervisor and fixed H7-C profile are production-capable, but
+//! executable authority is always injected by the Digital Life Host. The
+//! fixture Host and its auto-confirmation helpers remain test-only below.
 
 #![allow(dead_code, private_interfaces)]
 
@@ -16,17 +14,24 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::ffi::{c_void, OsStr, OsString};
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(test)]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
+#[cfg(test)]
+use std::io::Write;
+use std::io::{Read, Seek, SeekFrom};
 use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::MetadataExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
 use std::path::{Component, Path, PathBuf, Prefix};
+#[cfg(test)]
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::thread::{self, JoinHandle};
+use std::thread;
+#[cfg(test)]
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 use tokio::sync::Notify;
@@ -36,13 +41,15 @@ use windows_sys::Wdk::Storage::FileSystem::{
     NtCreateFile, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
     FILE_SYNCHRONOUS_IO_NONALERT,
 };
+#[cfg(test)]
+use windows_sys::Win32::Foundation::GetHandleInformation;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, DuplicateHandle, GetHandleInformation, GetLastError, SetHandleInformation,
-    DUPLICATE_SAME_ACCESS, ERROR_BROKEN_PIPE, ERROR_IO_INCOMPLETE, ERROR_IO_PENDING,
-    ERROR_NOT_FOUND, ERROR_OPERATION_ABORTED, ERROR_PIPE_CONNECTED, FALSE, HANDLE,
-    HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, NTSTATUS, OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE,
-    STATUS_NO_SUCH_FILE, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
-    UNICODE_STRING, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, DuplicateHandle, GetLastError, SetHandleInformation, DUPLICATE_SAME_ACCESS,
+    ERROR_BROKEN_PIPE, ERROR_IO_INCOMPLETE, ERROR_IO_PENDING, ERROR_NOT_FOUND,
+    ERROR_OPERATION_ABORTED, ERROR_PIPE_CONNECTED, FALSE, HANDLE, HANDLE_FLAG_INHERIT,
+    INVALID_HANDLE_VALUE, NTSTATUS, OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE, STATUS_NO_SUCH_FILE,
+    STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND, UNICODE_STRING, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Cryptography::{
     BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
@@ -87,11 +94,14 @@ use crate::{sha256_hex, TrustedWorkspaceRoot, VitaExecutionContext, WorkspaceRoo
 pub(crate) const VITA_PROCESS_RUN_TOOL_NAME: &str = "vita_run_process";
 const H7_CAPABILITY_ID: &str = "vita.process.run";
 const H7B_CAPABILITY_ID: &str = "vita.process.workspace.run";
-const H7C_CAPABILITY_ID: &str = "vita.process.workspace.git_status";
+pub const VITA_WORKSPACE_GIT_STATUS_CAPABILITY_ID: &str = "vita.process.workspace.git_status";
 const H7_PROGRAM_ID: &str = "d29h7_fixture";
 const H7B_TOOL_NAME: &str = "vita_workspace_process_probe";
-const H7C_TOOL_NAME: &str = "vita_workspace_git_status";
-const H7C_PROFILE_ID: &str = "d29h7c.git.status.v1";
+pub const VITA_WORKSPACE_GIT_STATUS_TOOL_NAME: &str = "vita_workspace_git_status";
+pub const VITA_WORKSPACE_GIT_STATUS_PROFILE_ID: &str = "d29h7c.git.status.v1";
+const H7C_CAPABILITY_ID: &str = VITA_WORKSPACE_GIT_STATUS_CAPABILITY_ID;
+const H7C_TOOL_NAME: &str = VITA_WORKSPACE_GIT_STATUS_TOOL_NAME;
+const H7C_PROFILE_ID: &str = VITA_WORKSPACE_GIT_STATUS_PROFILE_ID;
 const H7_MAX_ARGS: usize = 16;
 const H7_MAX_ARG_BYTES: usize = 1024;
 const H7_STDOUT_BOUND: usize = 65_536;
@@ -998,7 +1008,7 @@ fn argv_to_command_line(argv: &[String]) -> Vec<u16> {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-struct H7ProcessBinding {
+pub struct H7ProcessBinding {
     life_id: String,
     task_id: String,
     capability_id: String,
@@ -1025,6 +1035,80 @@ struct H7ProcessBinding {
 impl H7ProcessBinding {
     fn from_action(action: &PreparedProcessAction) -> Self {
         action.binding()
+    }
+
+    /// Returns the capability identity bound by the Host.  The model never
+    /// constructs this binding; it is supplied only to a Host authority port.
+    pub fn capability_id(&self) -> &str {
+        &self.capability_id
+    }
+
+    pub fn program_id(&self) -> &str {
+        &self.program_id
+    }
+
+    pub fn executable_identity(&self) -> &str {
+        &self.executable_identity
+    }
+
+    pub fn executable_sha256(&self) -> &str {
+        &self.executable_sha256
+    }
+
+    pub fn argv_hash(&self) -> &str {
+        &self.argv_hash
+    }
+
+    pub fn argv_count(&self) -> usize {
+        self.argv_count
+    }
+
+    pub fn working_directory_identity(&self) -> &str {
+        &self.working_directory_identity
+    }
+
+    pub fn environment_policy_hash(&self) -> &str {
+        &self.environment_policy_hash
+    }
+
+    pub fn stdout_bound(&self) -> usize {
+        self.stdout_bound
+    }
+
+    pub fn stderr_bound(&self) -> usize {
+        self.stderr_bound
+    }
+
+    pub fn timeout_ms(&self) -> u64 {
+        self.timeout_ms
+    }
+
+    pub fn profile_id(&self) -> Option<&str> {
+        self.profile_id.as_deref()
+    }
+
+    pub fn workspace_root_identity(&self) -> Option<&str> {
+        self.workspace_root_identity.as_deref()
+    }
+
+    pub fn git_metadata_fence_hash(&self) -> Option<&str> {
+        self.git_metadata_fence_hash.as_deref()
+    }
+
+    pub fn life_id(&self) -> &str {
+        &self.life_id
+    }
+
+    pub fn task_id(&self) -> &str {
+        &self.task_id
+    }
+
+    pub fn tool_call_id(&self) -> &str {
+        &self.tool_call_id
+    }
+
+    pub fn turn_id(&self) -> &str {
+        &self.turn_id
     }
 }
 
@@ -3436,6 +3520,7 @@ fn create_stdin_pipe() -> Result<(H7Handle, H7Handle), String> {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
+#[cfg(test)]
 enum H7HostRequest {
     Initialize {
         protocol_version: u8,
@@ -3475,6 +3560,7 @@ enum H7HostRequest {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg(test)]
 struct H7HostResponse {
     operation: String,
     status: String,
@@ -3489,6 +3575,7 @@ struct H7HostResponse {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg(test)]
 struct H7CanonicalWire {
     canonical_evaluations: usize,
     production_registry_size: usize,
@@ -3510,6 +3597,7 @@ struct H7CanonicalWire {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg(test)]
 struct H7ConfirmationWire {
     confirmation_id: String,
     binding: H7ProcessBinding,
@@ -3520,6 +3608,7 @@ struct H7ConfirmationWire {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg(test)]
 struct H7GrantWire {
     grant_id: String,
     confirmation_id: String,
@@ -3531,17 +3620,20 @@ struct H7GrantWire {
     used: bool,
 }
 
+#[cfg(test)]
 struct H7HostProcessIo {
     stdin: ChildStdin,
     stdout: ChildStdout,
 }
 
+#[cfg(test)]
 struct H7PersistentHostProcess {
     io: Mutex<Option<H7HostProcessIo>>,
     child: Arc<Mutex<Child>>,
     in_flight: AtomicBool,
 }
 
+#[cfg(test)]
 impl H7PersistentHostProcess {
     fn start(
         repo_root: &Path,
@@ -3721,12 +3813,14 @@ impl H7PersistentHostProcess {
     }
 }
 
+#[cfg(test)]
 impl Drop for H7PersistentHostProcess {
     fn drop(&mut self) {
         self.abort();
     }
 }
 
+#[cfg(test)]
 fn h7_authority_fixture_executable(repo_root: &Path) -> Result<PathBuf, String> {
     let executable = repo_root
         .join("src-tauri")
@@ -3773,6 +3867,7 @@ fn h7_authority_fixture_executable(repo_root: &Path) -> Result<PathBuf, String> 
     Ok(executable)
 }
 
+#[cfg(test)]
 fn h7_process_fixture_executable(repo_root: &Path) -> Result<PathBuf, String> {
     let executable = repo_root
         .join("vita-agent")
@@ -3814,7 +3909,7 @@ fn h7_process_fixture_executable(repo_root: &Path) -> Result<PathBuf, String> {
     Ok(executable)
 }
 
-struct H7ProcessGrant {
+pub struct H7ProcessGrant {
     grant_id: String,
     confirmation_id: String,
     binding: H7ProcessBinding,
@@ -3825,6 +3920,134 @@ struct H7ProcessGrant {
     used: bool,
 }
 
+impl H7ProcessGrant {
+    /// Imports the bounded, non-serializable evidence returned by the Host.
+    /// This constructor is intentionally explicit so a model payload cannot
+    /// be mistaken for an executable grant.
+    pub fn from_host_evidence(
+        grant_id: String,
+        confirmation_id: String,
+        binding: H7ProcessBinding,
+        authorization_revision: i64,
+        issued_at_unix_ms: u64,
+        expires_at_unix_ms: u64,
+        single_use: bool,
+        used: bool,
+    ) -> Self {
+        Self {
+            grant_id,
+            confirmation_id,
+            binding,
+            authorization_revision,
+            issued_at_unix_ms,
+            expires_at_unix_ms,
+            single_use,
+            used,
+        }
+    }
+
+    pub fn grant_id(&self) -> &str {
+        &self.grant_id
+    }
+
+    pub fn authorization_revision(&self) -> i64 {
+        self.authorization_revision
+    }
+
+    pub fn binding(&self) -> &H7ProcessBinding {
+        &self.binding
+    }
+
+    pub fn confirmation_id(&self) -> &str {
+        &self.confirmation_id
+    }
+
+    pub fn expires_at_unix_ms(&self) -> u64 {
+        self.expires_at_unix_ms
+    }
+
+    pub fn single_use(&self) -> bool {
+        self.single_use
+    }
+
+    pub fn is_used(&self) -> bool {
+        self.used
+    }
+
+    /// Marks a Host-confirmed grant consumed after the Host has performed its
+    /// final revision/binding check.  Vita still performs the same check just
+    /// before `CreateProcessW`.
+    pub fn mark_used_by_host(&mut self) {
+        self.used = true;
+    }
+}
+
+/// Host authority required by the production H7-C adapter.  Implementations
+/// must resolve every decision from the current Digital Life authority state;
+/// the Vita side never accepts model-supplied revisions, grants, paths, or
+/// executable details.
+pub trait VitaGitStatusAuthority: Send + Sync {
+    fn evaluate_workspace_scope(&self, binding: &H7ProcessBinding) -> Result<i64, String>;
+
+    fn issue_process_grant(
+        &self,
+        binding: &H7ProcessBinding,
+        authorization_revision: i64,
+    ) -> Result<H7ProcessGrant, String>;
+
+    fn revalidate_process_grant(
+        &self,
+        binding: &H7ProcessBinding,
+        grant: &mut H7ProcessGrant,
+    ) -> Result<(), String>;
+}
+
+trait H7AuthorityPort: Send + Sync {
+    fn evaluate_workspace_scope(&self, action: &PreparedProcessAction) -> Result<i64, String>;
+    fn issue_process_grant(
+        &self,
+        action: &PreparedProcessAction,
+        authorization_revision: i64,
+    ) -> Result<H7ProcessGrant, String>;
+    fn revalidate_process_grant(
+        &self,
+        action: &PreparedProcessAction,
+        grant: &mut H7ProcessGrant,
+    ) -> Result<(), String>;
+}
+
+struct VitaGitStatusAuthorityAdapter {
+    authority: Arc<dyn VitaGitStatusAuthority>,
+}
+
+impl H7AuthorityPort for VitaGitStatusAuthorityAdapter {
+    fn evaluate_workspace_scope(&self, action: &PreparedProcessAction) -> Result<i64, String> {
+        self.authority
+            .evaluate_workspace_scope(&H7ProcessBinding::from_action(action))
+    }
+
+    fn issue_process_grant(
+        &self,
+        action: &PreparedProcessAction,
+        authorization_revision: i64,
+    ) -> Result<H7ProcessGrant, String> {
+        self.authority.issue_process_grant(
+            &H7ProcessBinding::from_action(action),
+            authorization_revision,
+        )
+    }
+
+    fn revalidate_process_grant(
+        &self,
+        action: &PreparedProcessAction,
+        grant: &mut H7ProcessGrant,
+    ) -> Result<(), String> {
+        self.authority
+            .revalidate_process_grant(&H7ProcessBinding::from_action(action), grant)
+    }
+}
+
+#[cfg(test)]
 #[derive(Default)]
 struct H7AuthorityMetrics {
     trusted_confirmations: AtomicUsize,
@@ -3836,6 +4059,7 @@ struct H7AuthorityMetrics {
     canonical_evaluations: AtomicUsize,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum H7HostResponseFault {
     IssueWrongBinding,
@@ -3853,6 +4077,7 @@ enum H7HostResponseFault {
     FinalTruncated,
 }
 
+#[cfg(test)]
 impl H7HostResponseFault {
     fn is_final(self) -> bool {
         matches!(
@@ -3870,6 +4095,7 @@ impl H7HostResponseFault {
     }
 }
 
+#[cfg(test)]
 fn apply_h7_host_response_fault(response: &mut H7HostResponse, fault: H7HostResponseFault) {
     match fault {
         H7HostResponseFault::IssueWrongBinding | H7HostResponseFault::FinalWrongBinding => {
@@ -3922,6 +4148,7 @@ fn apply_h7_host_response_fault(response: &mut H7HostResponse, fault: H7HostResp
     }
 }
 
+#[cfg(test)]
 struct H7Authority {
     process: Arc<H7PersistentHostProcess>,
     metrics: Arc<H7AuthorityMetrics>,
@@ -3931,6 +4158,7 @@ struct H7Authority {
     profile_id: Option<String>,
 }
 
+#[cfg(test)]
 impl H7Authority {
     fn new() -> Result<Arc<Self>, String> {
         Self::new_with_binding(H7_CAPABILITY_ID, None, None)
@@ -4254,6 +4482,30 @@ impl H7Authority {
     }
 }
 
+#[cfg(test)]
+impl H7AuthorityPort for H7Authority {
+    fn evaluate_workspace_scope(&self, action: &PreparedProcessAction) -> Result<i64, String> {
+        H7Authority::evaluate_workspace_scope(self, action)
+    }
+
+    fn issue_process_grant(
+        &self,
+        action: &PreparedProcessAction,
+        authorization_revision: i64,
+    ) -> Result<H7ProcessGrant, String> {
+        H7Authority::issue_process_grant(self, action, authorization_revision)
+    }
+
+    fn revalidate_process_grant(
+        &self,
+        action: &PreparedProcessAction,
+        grant: &mut H7ProcessGrant,
+    ) -> Result<(), String> {
+        H7Authority::revalidate_process_grant(self, action, grant)
+    }
+}
+
+#[cfg(test)]
 fn validate_h7_canonical(
     canonical: &H7CanonicalWire,
     action: &PreparedProcessAction,
@@ -4280,7 +4532,7 @@ fn validate_h7_canonical(
         "CAPABILITY_CONFIRMATION_REQUIRED"
     };
     if canonical.canonical_evaluations != 1
-        || canonical.production_registry_size != 0
+        || canonical.production_registry_size != 1
         || canonical.test_registry_size != 1
         || canonical.authorization_row_reads != 1
         || canonical.life_id != binding.life_id
@@ -4309,6 +4561,7 @@ fn validate_h7_canonical(
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_h7_grant_binding(
     grant: &H7GrantWire,
     action: &PreparedProcessAction,
@@ -4330,20 +4583,30 @@ fn validate_h7_grant_binding(
     Ok(())
 }
 
-struct H7PendingProcessAction {
+pub struct H7PendingProcessAction {
     action: Arc<PreparedProcessAction>,
     response: tokio::sync::oneshot::Sender<i64>,
 }
 
 #[derive(Clone)]
-struct H7PendingConfirmationBridge {
+pub struct H7PendingConfirmationBridge {
     sender: tokio::sync::mpsc::Sender<H7PendingProcessAction>,
     cancelled: Arc<AtomicBool>,
     cancelled_notify: Arc<Notify>,
+    timeout: Duration,
 }
 
 impl H7PendingConfirmationBridge {
-    fn new() -> (
+    pub fn new() -> (
+        Arc<Self>,
+        tokio::sync::mpsc::Receiver<H7PendingProcessAction>,
+    ) {
+        Self::new_with_timeout(H7_CONFIRMATION_TIMEOUT)
+    }
+
+    fn new_with_timeout(
+        timeout: Duration,
+    ) -> (
         Arc<Self>,
         tokio::sync::mpsc::Receiver<H7PendingProcessAction>,
     ) {
@@ -4353,6 +4616,7 @@ impl H7PendingConfirmationBridge {
                 sender,
                 cancelled: Arc::new(AtomicBool::new(false)),
                 cancelled_notify: Arc::new(Notify::new()),
+                timeout,
             }),
             receiver,
         )
@@ -4361,6 +4625,12 @@ impl H7PendingConfirmationBridge {
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
         self.cancelled_notify.notify_waiters();
+    }
+
+    /// Cancels the currently pending production action.  Cancellation is
+    /// monotonic for that action and cannot be revived by a late response.
+    pub fn cancel_pending(&self) {
+        self.cancel();
     }
 
     async fn await_confirmation(
@@ -4381,16 +4651,33 @@ impl H7PendingConfirmationBridge {
             result = &mut send => result.map_err(|_| "D29-H7 confirmation bridge closed".to_string())?,
             _ = cancellation_notify.notified() => return Err("D29-H7 process action cancelled".to_string()),
             _ = self.cancelled_notify.notified() => return Err("D29-H7 process action cancelled".to_string()),
-            _ = tokio::time::sleep(H7_CONFIRMATION_TIMEOUT) => return Err("D29-H7 confirmation timed out".to_string()),
+            _ = tokio::time::sleep(self.timeout) => return Err("D29-H7 confirmation timed out".to_string()),
         }
         tokio::select! {
-            result = tokio::time::timeout(H7_CONFIRMATION_TIMEOUT, receiver) => {
+            result = tokio::time::timeout(self.timeout, receiver) => {
                 result.map_err(|_| "D29-H7 confirmation timed out".to_string())?
                     .map_err(|_| "D29-H7 confirmation response closed".to_string())
             }
             _ = cancellation_notify.notified() => Err("D29-H7 process action cancelled".to_string()),
             _ = self.cancelled_notify.notified() => Err("D29-H7 process action cancelled".to_string()),
         }
+    }
+}
+
+/// Public names used by the Digital Life Host integration.  The underlying
+/// bridge remains process-local and carries no serializable authority data.
+pub type VitaGitStatusConfirmationBridge = H7PendingConfirmationBridge;
+pub type VitaGitStatusPendingConfirmation = H7PendingProcessAction;
+
+impl H7PendingProcessAction {
+    pub fn binding(&self) -> H7ProcessBinding {
+        self.action.binding()
+    }
+
+    pub fn confirm(self, authorization_revision: i64) -> Result<(), String> {
+        self.response
+            .send(authorization_revision)
+            .map_err(|_| "D29-H7-C confirmation waiter is no longer active".to_string())
     }
 }
 
@@ -4692,7 +4979,7 @@ impl Drop for H7ActionCancellationGuard {
 struct H7ProcessBroker {
     context: VitaExecutionContext,
     catalog: Arc<H7ExecutableCatalog>,
-    authority: Arc<H7Authority>,
+    authority: Arc<dyn H7AuthorityPort>,
     bridge: Arc<H7PendingConfirmationBridge>,
     admission: Arc<H7ProcessAdmission>,
     active_cancellation: Arc<Mutex<Option<H7ActiveCancellation>>>,
@@ -4709,7 +4996,7 @@ impl H7ProcessBroker {
     fn new(
         context: VitaExecutionContext,
         catalog: Arc<H7ExecutableCatalog>,
-        authority: Arc<H7Authority>,
+        authority: Arc<dyn H7AuthorityPort>,
         bridge: Arc<H7PendingConfirmationBridge>,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -4916,11 +5203,13 @@ impl H7ProcessBroker {
     }
 }
 
+#[cfg(test)]
 pub(crate) struct VitaProcessToolContributor {
     broker: Arc<H7ProcessBroker>,
     tool_call_count: Arc<AtomicUsize>,
 }
 
+#[cfg(test)]
 impl VitaProcessToolContributor {
     fn new(broker: Arc<H7ProcessBroker>) -> Self {
         Self {
@@ -4935,6 +5224,7 @@ impl VitaProcessToolContributor {
     }
 }
 
+#[cfg(test)]
 impl ToolContributor for VitaProcessToolContributor {
     fn tools(
         &self,
@@ -4948,11 +5238,13 @@ impl ToolContributor for VitaProcessToolContributor {
     }
 }
 
+#[cfg(test)]
 struct VitaProcessTool {
     broker: Arc<H7ProcessBroker>,
     tool_call_count: Arc<AtomicUsize>,
 }
 
+#[cfg(test)]
 impl VitaProcessTool {
     async fn execute_prepared_action(&self, action: Arc<PreparedProcessAction>) -> H7ToolResult {
         let admission = match self.broker.admission.try_acquire() {
@@ -4977,6 +5269,7 @@ impl VitaProcessTool {
     }
 }
 
+#[cfg(test)]
 impl<'call> ToolExecutor<ToolCall<'call>> for VitaProcessTool {
     fn tool_name(&self) -> ToolName {
         ToolName::plain(VITA_PROCESS_RUN_TOOL_NAME)
@@ -5111,7 +5404,7 @@ impl H7BToolResult {
 struct H7BWorkspaceProcessBroker {
     context: VitaExecutionContext,
     catalog: Arc<H7ExecutableCatalog>,
-    authority: Arc<H7Authority>,
+    authority: Arc<dyn H7AuthorityPort>,
     bridge: Arc<H7PendingConfirmationBridge>,
     workspace_root: Option<TrustedWorkspaceRoot>,
     admission: Arc<H7ProcessAdmission>,
@@ -5125,7 +5418,7 @@ impl H7BWorkspaceProcessBroker {
     fn new(
         context: VitaExecutionContext,
         catalog: Arc<H7ExecutableCatalog>,
-        authority: Arc<H7Authority>,
+        authority: Arc<dyn H7AuthorityPort>,
         bridge: Arc<H7PendingConfirmationBridge>,
         workspace_root: Option<TrustedWorkspaceRoot>,
     ) -> Arc<Self> {
@@ -5313,11 +5606,13 @@ impl H7BWorkspaceProcessBroker {
     }
 }
 
+#[cfg(test)]
 pub(crate) struct VitaWorkspaceProcessToolContributor {
     broker: Arc<H7BWorkspaceProcessBroker>,
     tool_call_count: Arc<AtomicUsize>,
 }
 
+#[cfg(test)]
 impl VitaWorkspaceProcessToolContributor {
     fn new(broker: Arc<H7BWorkspaceProcessBroker>) -> Self {
         Self {
@@ -5332,6 +5627,7 @@ impl VitaWorkspaceProcessToolContributor {
     }
 }
 
+#[cfg(test)]
 impl ToolContributor for VitaWorkspaceProcessToolContributor {
     fn tools(
         &self,
@@ -5345,11 +5641,13 @@ impl ToolContributor for VitaWorkspaceProcessToolContributor {
     }
 }
 
+#[cfg(test)]
 struct VitaWorkspaceProcessTool {
     broker: Arc<H7BWorkspaceProcessBroker>,
     tool_call_count: Arc<AtomicUsize>,
 }
 
+#[cfg(test)]
 impl<'call> ToolExecutor<ToolCall<'call>> for VitaWorkspaceProcessTool {
     fn tool_name(&self) -> ToolName {
         ToolName::plain(H7B_TOOL_NAME)
@@ -6111,7 +6409,7 @@ fn h7c_index_lock_present(root: &Path) -> bool {
 struct H7CGitStatusBroker {
     context: VitaExecutionContext,
     profile: Arc<H7CGitStatusProfile>,
-    authority: Arc<H7Authority>,
+    authority: Arc<dyn H7AuthorityPort>,
     bridge: Arc<H7PendingConfirmationBridge>,
     workspace_root: Option<TrustedWorkspaceRoot>,
     admission: Arc<H7ProcessAdmission>,
@@ -6125,7 +6423,7 @@ impl H7CGitStatusBroker {
     fn new(
         context: VitaExecutionContext,
         profile: Arc<H7CGitStatusProfile>,
-        authority: Arc<H7Authority>,
+        authority: Arc<dyn H7AuthorityPort>,
         bridge: Arc<H7PendingConfirmationBridge>,
         workspace_root: Option<TrustedWorkspaceRoot>,
     ) -> Arc<Self> {
@@ -6309,13 +6607,69 @@ impl H7CGitStatusBroker {
     }
 }
 
-struct VitaGitStatusToolContributor {
+/// Production H7-C integration.  The Host supplies the already trusted
+/// workspace root, absolute Git image, and authority port; no model argument
+/// can influence any of those values.
+pub struct VitaGitStatusProduction {
+    broker: Arc<H7CGitStatusBroker>,
+    confirmation: Arc<H7PendingConfirmationBridge>,
+    receiver: Mutex<Option<tokio::sync::mpsc::Receiver<H7PendingProcessAction>>>,
+}
+
+impl VitaGitStatusProduction {
+    pub fn new(
+        context: VitaExecutionContext,
+        workspace_root: TrustedWorkspaceRoot,
+        git_path: PathBuf,
+        authority: Arc<dyn VitaGitStatusAuthority>,
+    ) -> Result<Self, String> {
+        let profile = Arc::new(H7CGitStatusProfile::new(&workspace_root, git_path)?);
+        let (confirmation, receiver) =
+            H7PendingConfirmationBridge::new_with_timeout(Duration::from_secs(30));
+        let authority = Arc::new(VitaGitStatusAuthorityAdapter { authority });
+        let broker = H7CGitStatusBroker::new(
+            context,
+            profile,
+            authority,
+            Arc::clone(&confirmation),
+            Some(workspace_root),
+        );
+        Ok(Self {
+            broker,
+            confirmation,
+            receiver: Mutex::new(Some(receiver)),
+        })
+    }
+
+    pub fn contributor(&self) -> VitaGitStatusToolContributor {
+        VitaGitStatusToolContributor::new(Arc::clone(&self.broker))
+    }
+
+    pub fn confirmation_bridge(&self) -> Arc<VitaGitStatusConfirmationBridge> {
+        Arc::clone(&self.confirmation)
+    }
+
+    pub fn take_confirmation_receiver(
+        &self,
+    ) -> Option<tokio::sync::mpsc::Receiver<VitaGitStatusPendingConfirmation>> {
+        self.receiver
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    pub fn cancel(&self) {
+        self.broker.cancel();
+    }
+}
+
+pub struct VitaGitStatusToolContributor {
     broker: Arc<H7CGitStatusBroker>,
     tool_call_count: Arc<AtomicUsize>,
 }
 
 impl VitaGitStatusToolContributor {
-    fn new(broker: Arc<H7CGitStatusBroker>) -> Self {
+    pub(crate) fn new(broker: Arc<H7CGitStatusBroker>) -> Self {
         Self {
             broker,
             tool_call_count: Arc::new(AtomicUsize::new(0)),
@@ -6494,7 +6848,7 @@ mod tests {
             let broker = H7ProcessBroker::new(
                 context,
                 Arc::clone(&catalog),
-                Arc::clone(&authority),
+                authority.clone(),
                 Arc::clone(&bridge),
             );
             Self {
@@ -6518,7 +6872,7 @@ mod tests {
             H7ProcessBroker::new(
                 self.broker.context.clone(),
                 Arc::clone(&self.catalog),
-                Arc::clone(&self.authority),
+                self.authority.clone(),
                 Arc::clone(&self.bridge),
             )
             .with_final_fence_gate(gate)
@@ -6531,7 +6885,7 @@ mod tests {
             H7ProcessBroker::new(
                 self.broker.context.clone(),
                 Arc::clone(&self.catalog),
-                Arc::clone(&self.authority),
+                self.authority.clone(),
                 Arc::clone(&self.bridge),
             )
             .with_post_host_gate(gate)
@@ -6544,7 +6898,7 @@ mod tests {
             H7ProcessBroker::new(
                 self.broker.context.clone(),
                 Arc::clone(&self.catalog),
-                Arc::clone(&self.authority),
+                self.authority.clone(),
                 Arc::clone(&self.bridge),
             )
             .with_post_host_mutation(mutation)
@@ -6558,7 +6912,7 @@ mod tests {
             H7ProcessBroker::new(
                 self.broker.context.clone(),
                 Arc::clone(&self.catalog),
-                Arc::clone(&self.authority),
+                self.authority.clone(),
                 Arc::clone(&self.bridge),
             )
             .with_output_terminality_gate(gate, cleanup_timeout)
@@ -6597,7 +6951,7 @@ mod tests {
             let broker = H7BWorkspaceProcessBroker::new(
                 context,
                 Arc::clone(&catalog),
-                Arc::clone(&authority),
+                authority.clone(),
                 Arc::clone(&bridge),
                 Some(root.clone()),
             );
@@ -6644,7 +6998,7 @@ mod tests {
             H7BWorkspaceProcessBroker::new(
                 self.broker.context.clone(),
                 Arc::clone(&self.catalog),
-                Arc::clone(&self.authority),
+                self.authority.clone(),
                 Arc::clone(&self.bridge),
                 Some(self.root.clone()),
             )
@@ -6772,7 +7126,7 @@ mod tests {
             let broker = H7CGitStatusBroker::new(
                 context,
                 Arc::clone(&profile),
-                Arc::clone(&authority),
+                authority.clone(),
                 Arc::clone(&bridge),
                 Some(root.clone()),
             );
@@ -6818,7 +7172,7 @@ mod tests {
             H7CGitStatusBroker::new(
                 self.broker.context.clone(),
                 Arc::clone(&self.profile),
-                Arc::clone(&self.authority),
+                self.authority.clone(),
                 Arc::clone(&self.bridge),
                 Some(self.root.clone()),
             )
@@ -6923,6 +7277,29 @@ mod tests {
             r#"{"operation":"status","executable":"cmd.exe"}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn h7c_production_schema_has_no_authority_or_process_inputs() {
+        for field in [
+            "authorization_revision",
+            "grant_id",
+            "workspace_root_identity",
+            "scope",
+            "program",
+            "args",
+            "repo",
+            "cwd",
+            "git_path",
+            "env",
+            "PATH",
+        ] {
+            let payload = serde_json::json!({"operation":"status", field: "model-value"});
+            assert!(
+                serde_json::from_value::<H7CGitStatusArguments>(payload).is_err(),
+                "model field {field} must remain outside the H7-C schema"
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -7054,7 +7431,7 @@ mod tests {
         rebound_action_mut.workspace_root_identity = Some(rebound_root.identity());
         let result = run_h7c_approved(
             Arc::clone(&harness.broker),
-            Arc::clone(&harness.authority),
+            harness.authority.clone(),
             harness.receiver.as_mut().unwrap(),
             rebound_action,
         )
@@ -7116,7 +7493,7 @@ mod tests {
         let action = harness.action();
         let result = run_h7c_approved(
             Arc::clone(&harness.broker),
-            Arc::clone(&harness.authority),
+            harness.authority.clone(),
             harness.receiver.as_mut().unwrap(),
             action,
         )
@@ -7134,7 +7511,7 @@ mod tests {
         let action = harness.action();
         let result = run_h7c_approved(
             Arc::clone(&harness.broker),
-            Arc::clone(&harness.authority),
+            harness.authority.clone(),
             harness.receiver.as_mut().unwrap(),
             action,
         )
@@ -7152,7 +7529,7 @@ mod tests {
         let action = harness.action();
         let result = run_h7c_approved(
             Arc::clone(&harness.broker),
-            Arc::clone(&harness.authority),
+            harness.authority.clone(),
             harness.receiver.as_mut().unwrap(),
             action,
         )
@@ -7169,7 +7546,7 @@ mod tests {
         let action = harness.action();
         let result = run_h7c_approved(
             Arc::clone(&harness.broker),
-            Arc::clone(&harness.authority),
+            harness.authority.clone(),
             harness.receiver.as_mut().unwrap(),
             action,
         )
@@ -7199,7 +7576,7 @@ mod tests {
         let action = harness.action();
         let result = run_h7c_approved(
             Arc::clone(&harness.broker),
-            Arc::clone(&harness.authority),
+            harness.authority.clone(),
             harness.receiver.as_mut().unwrap(),
             action,
         )
@@ -7224,7 +7601,7 @@ mod tests {
         let action = harness.action();
         let result = run_h7c_approved(
             Arc::clone(&harness.broker),
-            Arc::clone(&harness.authority),
+            harness.authority.clone(),
             harness.receiver.as_mut().unwrap(),
             action,
         )
@@ -7451,7 +7828,7 @@ mod tests {
         let broker = H7CGitStatusBroker::new(
             harness.broker.context.clone(),
             Arc::clone(&profile),
-            Arc::clone(&harness.authority),
+            harness.authority.clone(),
             Arc::clone(&harness.bridge),
             Some(root.clone()),
         );
@@ -7467,7 +7844,7 @@ mod tests {
             .expect("D29-H7-C large workspace action");
         let result = run_h7c_approved(
             Arc::clone(&broker),
-            Arc::clone(&harness.authority),
+            harness.authority.clone(),
             harness.receiver.as_mut().unwrap(),
             action,
         )
@@ -7493,7 +7870,7 @@ mod tests {
         let action = harness.action();
         let result = run_h7c_approved(
             Arc::clone(&harness.broker),
-            Arc::clone(&harness.authority),
+            harness.authority.clone(),
             harness.receiver.as_mut().unwrap(),
             action,
         )
@@ -7907,7 +8284,7 @@ mod tests {
         );
         let result = run_h7b_approved(
             Arc::clone(&harness.broker),
-            Arc::clone(&harness.authority),
+            harness.authority.clone(),
             harness.receiver.as_mut().unwrap(),
             action,
         )
@@ -8032,7 +8409,7 @@ mod tests {
             .expect("D29-H7-B rebound action");
         let result = run_h7b_approved(
             Arc::clone(&harness.broker),
-            Arc::clone(&harness.authority),
+            harness.authority.clone(),
             harness.receiver.as_mut().unwrap(),
             action,
         )
@@ -8072,7 +8449,7 @@ mod tests {
         let action = harness.action();
         let result = run_h7b_approved(
             Arc::clone(&harness.broker),
-            Arc::clone(&harness.authority),
+            harness.authority.clone(),
             harness.receiver.as_mut().unwrap(),
             action,
         )
@@ -8147,7 +8524,7 @@ mod tests {
         let action = harness.action();
         let result = run_h7b_approved(
             Arc::clone(&harness.broker),
-            Arc::clone(&harness.authority),
+            harness.authority.clone(),
             harness.receiver.as_mut().unwrap(),
             action,
         )
@@ -8172,7 +8549,7 @@ mod tests {
         let action = harness.action();
         let result = run_h7b_approved(
             Arc::clone(&harness.broker),
-            Arc::clone(&harness.authority),
+            harness.authority.clone(),
             harness.receiver.as_mut().unwrap(),
             action,
         )
@@ -8189,7 +8566,7 @@ mod tests {
         let action = harness.action();
         let result = run_h7b_approved(
             Arc::clone(&harness.broker),
-            Arc::clone(&harness.authority),
+            harness.authority.clone(),
             harness.receiver.as_mut().unwrap(),
             action,
         )
@@ -8335,7 +8712,7 @@ mod tests {
         let mut receiver = harness.receiver.take().unwrap();
         let result = run_approved(
             Arc::clone(&harness.broker),
-            Arc::clone(&harness.authority),
+            harness.authority.clone(),
             &mut receiver,
             harness.action(args),
         )
@@ -8350,7 +8727,7 @@ mod tests {
         let mut receiver = harness.receiver.take().unwrap();
         let result = run_approved(
             Arc::clone(&harness.broker),
-            Arc::clone(&harness.authority),
+            harness.authority.clone(),
             &mut receiver,
             harness.action(&["echo-argv", "final-fault"]),
         )
@@ -8365,7 +8742,7 @@ mod tests {
         let mut receiver = harness.receiver.take().unwrap();
         let result = run_approved(
             broker,
-            Arc::clone(&harness.authority),
+            harness.authority.clone(),
             &mut receiver,
             harness.action(&["echo-argv", "post-host-fault"]),
         )
@@ -8741,7 +9118,7 @@ mod tests {
         ];
         let result = run_approved(
             Arc::clone(&harness.broker),
-            Arc::clone(&harness.authority),
+            harness.authority.clone(),
             &mut receiver,
             harness.action(&args),
         )
@@ -8788,7 +9165,7 @@ mod tests {
         ];
         let result = run_approved(
             Arc::clone(&harness.broker),
-            Arc::clone(&harness.authority),
+            harness.authority.clone(),
             &mut receiver,
             harness.action(&args),
         )
@@ -8812,7 +9189,7 @@ mod tests {
         let mut receiver = harness.receiver.take().unwrap();
         let result = run_approved(
             Arc::clone(&harness.broker),
-            Arc::clone(&harness.authority),
+            harness.authority.clone(),
             &mut receiver,
             harness.action(&["report-env"]),
         )
@@ -8854,7 +9231,7 @@ mod tests {
         let mut receiver = harness.receiver.take().unwrap();
         let result = run_approved(
             Arc::clone(&harness.broker),
-            Arc::clone(&harness.authority),
+            harness.authority.clone(),
             &mut receiver,
             harness.action(&["report-cwd"]),
         )
@@ -9058,7 +9435,7 @@ mod tests {
         let mut receiver = harness.receiver.take().unwrap();
         let result = run_approved(
             Arc::clone(&harness.broker),
-            Arc::clone(&harness.authority),
+            harness.authority.clone(),
             &mut receiver,
             harness.action(&["sleep", "2000"]),
         )
@@ -9137,7 +9514,7 @@ mod tests {
         let mut receiver = harness.receiver.take().unwrap();
         let result = run_approved(
             Arc::clone(&harness.broker),
-            Arc::clone(&harness.authority),
+            harness.authority.clone(),
             &mut receiver,
             harness.action(&["flood-stdout"]),
         )
@@ -9169,7 +9546,7 @@ mod tests {
         let mut receiver = harness.receiver.take().unwrap();
         let result = run_approved(
             Arc::clone(&harness.broker),
-            Arc::clone(&harness.authority),
+            harness.authority.clone(),
             &mut receiver,
             harness.action(&["flood-stderr"]),
         )
@@ -9201,7 +9578,7 @@ mod tests {
         let mut receiver = harness.receiver.take().unwrap();
         let result = run_approved(
             Arc::clone(&harness.broker),
-            Arc::clone(&harness.authority),
+            harness.authority.clone(),
             &mut receiver,
             harness.action(&["attempt-child"]),
         )
@@ -9360,7 +9737,7 @@ mod tests {
         let mut receiver = harness.receiver.take().unwrap();
         let result = run_approved(
             Arc::clone(&harness.broker),
-            Arc::clone(&harness.authority),
+            harness.authority.clone(),
             &mut receiver,
             harness.action(&["sleep", "2000"]),
         )
@@ -9382,7 +9759,7 @@ mod tests {
         let mut receiver = harness.receiver.take().unwrap();
         let result = run_cancelled(
             Arc::clone(&harness.broker),
-            Arc::clone(&harness.authority),
+            harness.authority.clone(),
             &mut receiver,
             harness.action(&["sleep", "2000"]),
         )
@@ -9404,7 +9781,7 @@ mod tests {
         let mut receiver = harness.receiver.take().unwrap();
         let result = run_approved(
             Arc::clone(&harness.broker),
-            Arc::clone(&harness.authority),
+            harness.authority.clone(),
             &mut receiver,
             harness.action(&["flood-stdout"]),
         )
@@ -9426,7 +9803,7 @@ mod tests {
         let mut receiver = harness.receiver.take().unwrap();
         let result = run_approved(
             Arc::clone(&harness.broker),
-            Arc::clone(&harness.authority),
+            harness.authority.clone(),
             &mut receiver,
             harness.action(&["echo-argv", "tree-observation"]),
         )
@@ -9453,7 +9830,7 @@ mod tests {
         let mut receiver = harness.receiver.take().unwrap();
         let result = run_approved(
             Arc::clone(&harness.broker),
-            Arc::clone(&harness.authority),
+            harness.authority.clone(),
             &mut receiver,
             harness.action(&["sleep", "2000"]),
         )
@@ -9472,7 +9849,7 @@ mod tests {
         let mut receiver = harness.receiver.take().unwrap();
         let result = run_cancelled(
             Arc::clone(&harness.broker),
-            Arc::clone(&harness.authority),
+            harness.authority.clone(),
             &mut receiver,
             harness.action(&["sleep", "2000"]),
         )
@@ -9642,7 +10019,7 @@ mod tests {
         let mut receiver = harness.receiver.take().unwrap();
         let result = run_approved(
             Arc::clone(&harness.broker),
-            Arc::clone(&harness.authority),
+            harness.authority.clone(),
             &mut receiver,
             harness.action(&["echo-argv", "no-output-reader-thread"]),
         )
@@ -9747,7 +10124,7 @@ mod tests {
         let mut receiver = harness.receiver.take().unwrap();
         let result = run_cancelled(
             Arc::clone(&harness.broker),
-            Arc::clone(&harness.authority),
+            harness.authority.clone(),
             &mut receiver,
             harness.action(&["sleep", "2000"]),
         )
@@ -9785,7 +10162,7 @@ mod tests {
         let mut receiver = harness.receiver.take().unwrap();
         let result = run_cancelled(
             Arc::clone(&harness.broker),
-            Arc::clone(&harness.authority),
+            harness.authority.clone(),
             &mut receiver,
             harness.action(&["sleep", "2000"]),
         )
@@ -9804,7 +10181,7 @@ mod tests {
         let mut receiver = harness.receiver.take().unwrap();
         let result = run_cancelled(
             Arc::clone(&harness.broker),
-            Arc::clone(&harness.authority),
+            harness.authority.clone(),
             &mut receiver,
             harness.action(&["sleep", "2000"]),
         )
@@ -10102,7 +10479,7 @@ mod tests {
         let mut receiver = harness.receiver.take().unwrap();
         let result = run_approved(
             Arc::clone(&harness.broker),
-            Arc::clone(&harness.authority),
+            harness.authority.clone(),
             &mut receiver,
             harness.action(&["echo-argv", "after-quarantine-reap"]),
         )
@@ -10491,7 +10868,7 @@ mod tests {
         assert!(!broker.admission.active.load(Ordering::Acquire));
         let third = run_approved(
             Arc::clone(&broker),
-            Arc::clone(&harness.authority),
+            harness.authority.clone(),
             &mut receiver,
             harness.action(&["echo-argv", "outer-abort-reusable-action"]),
         )
@@ -10609,7 +10986,7 @@ mod tests {
         let mut receiver = harness.receiver.take().unwrap();
         let result = run_approved(
             Arc::clone(&harness.broker),
-            Arc::clone(&harness.authority),
+            harness.authority.clone(),
             &mut receiver,
             harness.action(&["echo-argv", "handle-evidence"]),
         )
@@ -11918,7 +12295,7 @@ mod tests {
         let broker = H7ProcessBroker::new(
             context,
             Arc::clone(&catalog),
-            Arc::clone(&authority),
+            authority.clone(),
             Arc::clone(&bridge),
         );
         let tool_call_count = Arc::new(AtomicUsize::new(0));
@@ -12022,7 +12399,7 @@ mod tests {
         let broker = H7BWorkspaceProcessBroker::new(
             context,
             Arc::clone(&catalog),
-            Arc::clone(&authority),
+            authority.clone(),
             Arc::clone(&bridge),
             with_workspace_scope.then(|| root.clone()),
         );
@@ -12160,7 +12537,7 @@ mod tests {
         let broker = H7CGitStatusBroker::new(
             context,
             Arc::clone(&profile),
-            Arc::clone(&authority),
+            authority.clone(),
             Arc::clone(&bridge),
             with_workspace_scope.then(|| root.clone()),
         );

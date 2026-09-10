@@ -2774,7 +2774,8 @@ fn unix_millis() -> u64 {
 }
 
 /// Test/integration-only contributor.  The normal Vita entrypoint never
-/// installs H4-A and the production capability registry remains empty.
+/// installs H4-A; the production registry contains only the read-only H7-C
+/// route and no H4 mutation capability.
 pub(crate) struct VitaWorkspaceReplaceToolContributor {
     broker: Arc<VitaWorkspaceReplaceBroker>,
 }
@@ -5152,7 +5153,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn production_registry_remains_empty() {
+    fn production_registry_contains_only_the_h7c_route() {
         let descriptor_source = fs::read_to_string(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .parent()
@@ -5160,7 +5161,8 @@ pub(crate) mod tests {
                 .join("src-tauri/src/capability/descriptor.rs"),
         )
         .expect("read D28 descriptor registry");
-        assert!(descriptor_source.contains("Self::from_trusted_descriptors([])"));
+        assert!(descriptor_source.contains("PRODUCTION_GIT_STATUS_CAPABILITY_ID"));
+        assert!(descriptor_source.contains("PRODUCTION_GIT_STATUS_PROFILE_ID"));
     }
 
     #[derive(Clone, Debug, Serialize)]
@@ -5790,7 +5792,7 @@ pub(crate) mod tests {
         }
         let canonical = response.canonical.as_ref().unwrap();
         if canonical.canonical_evaluations != 1
-            || canonical.production_registry_size != 0
+            || canonical.production_registry_size != 1
             || canonical.test_registry_size != 1
             || canonical.authorization_row_reads != 1
             || !canonical.host_scope_authority_present
@@ -7047,7 +7049,7 @@ pub(crate) mod tests {
                 .as_ref()
                 .expect("H4-A Host canonical result");
             assert_eq!(canonical.canonical_evaluations, 1);
-            assert_eq!(canonical.production_registry_size, 0);
+            assert_eq!(canonical.production_registry_size, 1);
             assert_eq!(canonical.test_registry_size, 1);
             assert_eq!(canonical.authorization_row_reads, 1);
             assert!(canonical.host_scope_authority_present);
@@ -8494,7 +8496,7 @@ pub(crate) mod tests {
                 .as_ref()
                 .expect("H4-C Host canonical result");
             assert_eq!(canonical.canonical_evaluations, 1);
-            assert_eq!(canonical.production_registry_size, 0);
+            assert_eq!(canonical.production_registry_size, 1);
             assert_eq!(canonical.test_registry_size, 1);
             assert_eq!(canonical.authorization_row_reads, 1);
             assert!(canonical.host_scope_authority_present);

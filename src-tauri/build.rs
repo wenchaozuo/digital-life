@@ -1,4 +1,23 @@
+use std::{env, path::PathBuf};
+
 fn main() {
+    let sidecar = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap())
+        .join("../vita-agent/target/release/vita-agent.exe");
+    if !sidecar.is_file() {
+        if env::var("PROFILE").as_deref() == Ok("release") {
+            panic!(
+                "Vita sidecar release image is missing at {}; run `npm run build:vita-sidecar` first",
+                sidecar.display()
+            );
+        }
+        // `cargo check` and debug library tests must remain runnable before a
+        // release bundle is staged.  The release build above is still a hard
+        // gate, and the packaged resource mapping remains explicit in the
+        // Tauri config.
+        if env::var_os("TAURI_CONFIG").is_none() {
+            env::set_var("TAURI_CONFIG", r#"{"bundle":{"resources":[]}}"#);
+        }
+    }
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
             "chat_with_governed_context",

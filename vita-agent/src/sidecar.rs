@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Stdin, Stdout};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -27,7 +27,7 @@ use crate::{
     VITA_WORKSPACE_GIT_STATUS_TOOL_NAME,
 };
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(35);
+const AUTHORITY_REQUEST_TIMEOUT: Duration = Duration::from_secs(35);
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_request_id(prefix: &str) -> String {
@@ -134,7 +134,7 @@ impl SidecarRouter {
         let send_result = self.send(&message);
         let response = if send_result.is_ok() {
             receiver
-                .recv_timeout(REQUEST_TIMEOUT)
+                .recv_timeout(AUTHORITY_REQUEST_TIMEOUT)
                 .map_err(|_| "Vita Host authority response timed out".to_string())
         } else {
             Err(send_result.unwrap_err())
@@ -156,12 +156,12 @@ impl SidecarRouter {
             .commands
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match receiver.recv_timeout(REQUEST_TIMEOUT) {
-            Ok(message) => Ok(Some(message)),
-            Err(RecvTimeoutError::Timeout) => Err("Vita Host command timed out".to_string()),
-            Err(RecvTimeoutError::Disconnected) => Ok(None),
-        }
+        receive_command_from(&receiver)
     }
+}
+
+fn receive_command_from(receiver: &Receiver<HostMessage>) -> Result<Option<HostMessage>, String> {
+    Ok(receiver.recv().ok())
 }
 
 fn host_request_id(message: &HostMessage) -> &str {
@@ -559,4 +559,40 @@ fn unix_millis() -> u64 {
         .map_or(0, |duration| {
             duration.as_millis().min(u64::MAX as u128) as u64
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idle_command_receiver_blocks_until_command_without_timeout() {
+        let (sender, receiver) = mpsc::sync_channel(0);
+        let message = HostMessage::Shutdown(protocol::Shutdown {
+            request_id: "shutdown".to_string(),
+            session_id: "session".to_string(),
+        });
+        assert!(matches!(
+            sender.try_send(message.clone()),
+            Err(mpsc::TrySendError::Full(_))
+        ));
+        let worker = std::thread::spawn(move || receive_command_from(&receiver));
+        sender
+            .send(message)
+            .expect("command send");
+        assert!(matches!(
+            worker.join().expect("command receiver worker"),
+            Ok(Some(HostMessage::Shutdown(_)))
+        ));
+    }
+
+    #[test]
+    fn command_receiver_reports_pipe_disconnect() {
+        let (sender, receiver) = mpsc::sync_channel::<HostMessage>(1);
+        drop(sender);
+        assert_eq!(
+            receive_command_from(&receiver).expect("disconnect result"),
+            None
+        );
+    }
 }

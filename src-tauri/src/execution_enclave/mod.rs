@@ -1076,6 +1076,9 @@ impl VitaSidecarProcess {
     ) -> Result<Self, CodexRuntimeError> {
         let executable =
             fs::canonicalize(executable).map_err(|_| CodexRuntimeError::SpawnFailed)?;
+        if is_inside_repository(&executable) {
+            return Err(CodexRuntimeError::UntrustedExecutable);
+        }
         let resource_dir = executable
             .parent()
             .ok_or(CodexRuntimeError::UntrustedExecutable)?;

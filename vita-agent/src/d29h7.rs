@@ -5777,11 +5777,14 @@ impl H7CGitMetadataFence {
         let expected_config_bytes = h7c_read_file_handle_bounded(&config_handle)?;
         h7c_validate_local_git_config(&expected_config_bytes)?;
 
-        let snapshot = h7c_snapshot_workspace(&workspace_root)?;
-        h7c_validate_git_snapshot(&workspace_root, &snapshot)?;
+        // The runtime fence deliberately covers only Git metadata.  A whole-workspace
+        // walk belongs to the test-only mutation oracle below and must not make a
+        // normal large working tree ineligible for this fixed read-only profile.
+        let git_files = h7c_snapshot_git_metadata(&workspace_root)?;
+        h7c_validate_git_snapshot(&workspace_root, &git_files)?;
         let expected_config_sha256 = sha256_hex(&expected_config_bytes);
         let fence_material = serde_json::to_vec(&(
-            &snapshot.git_files,
+            &git_files,
             expected_config_identity.wire(),
             &expected_config_sha256,
         ))
@@ -5795,7 +5798,7 @@ impl H7CGitMetadataFence {
             expected_config_identity,
             expected_config_bytes,
             expected_config_sha256,
-            expected_git_files: snapshot.git_files,
+            expected_git_files: git_files,
             fence_hash,
         }))
     }
@@ -5820,9 +5823,9 @@ impl H7CGitMetadataFence {
         }
         h7c_validate_local_git_config(&config_bytes)?;
 
-        let snapshot = h7c_snapshot_workspace(&self.workspace_root)?;
-        h7c_validate_git_snapshot(&self.workspace_root, &snapshot)?;
-        if snapshot.git_files != self.expected_git_files {
+        let git_files = h7c_snapshot_git_metadata(&self.workspace_root)?;
+        h7c_validate_git_snapshot(&self.workspace_root, &git_files)?;
+        if git_files != self.expected_git_files {
             return Err("D29-H7-C Git metadata snapshot changed".to_string());
         }
         Ok(())
@@ -5909,6 +5912,8 @@ fn h7c_validate_local_git_config(bytes: &[u8]) -> Result<(), String> {
         if dotted_key == "core.worktree"
             || dotted_key == "include.path"
             || dotted_key.starts_with("includeif.")
+            || dotted_key == "extensions.worktreeconfig"
+            || dotted_key == "core.excludesfile"
         {
             return Err("D29-H7-C external Git config indirection was rejected".to_string());
         }
@@ -5916,8 +5921,11 @@ fn h7c_validate_local_git_config(bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn h7c_validate_git_snapshot(root: &Path, snapshot: &H7CWorkspaceSnapshot) -> Result<(), String> {
-    if snapshot.git_files.is_empty() {
+fn h7c_validate_git_snapshot(
+    root: &Path,
+    git_files: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    if git_files.is_empty() {
         return Err("D29-H7-C Git metadata directory was empty".to_string());
     }
     for redirect in [
@@ -5925,12 +5933,11 @@ fn h7c_validate_git_snapshot(root: &Path, snapshot: &H7CWorkspaceSnapshot) -> Re
         ".git/commondir",
         ".git/objects/info/alternates",
     ] {
-        if snapshot.git_files.contains_key(redirect) {
+        if git_files.contains_key(redirect) {
             return Err("D29-H7-C external Git metadata redirect was rejected".to_string());
         }
     }
-    if snapshot
-        .git_files
+    if git_files
         .keys()
         .any(|path| path.starts_with(".git/worktrees/"))
         || fs::symlink_metadata(root.join(".git/worktrees"))
@@ -5940,6 +5947,13 @@ fn h7c_validate_git_snapshot(root: &Path, snapshot: &H7CWorkspaceSnapshot) -> Re
         return Err("D29-H7-C linked Git worktree metadata was rejected".to_string());
     }
     Ok(())
+}
+
+fn h7c_snapshot_git_metadata(root: &Path) -> Result<BTreeMap<String, String>, String> {
+    let mut git_files = BTreeMap::new();
+    let mut total_bytes = 0usize;
+    h7c_snapshot_directory(root, &root.join(".git"), &mut git_files, &mut total_bytes)?;
+    Ok(git_files)
 }
 
 fn h7c_validate_git_metadata(
@@ -7182,6 +7196,116 @@ mod tests {
         h7c_profile_rejects_extra_config(&format!(
             "\n[includeIf \"gitdir:*\"]\n\tpath = {outside_config}\n"
         ));
+    }
+
+    #[test]
+    fn h7c_local_config_rejects_r2_external_authority_keys() {
+        assert!(h7c_validate_local_git_config(b"[extensions]\n\tworktreeConfig = true\n").is_err());
+        assert!(
+            h7c_validate_local_git_config(b"[core]\n\texcludesFile = C:/outside/ignore\n").is_err()
+        );
+    }
+
+    #[test]
+    fn h7c_worktree_config_outside_scope_is_rejected_before_process_creation() {
+        let _lock = lock_h7_tests();
+        let workspace = tempdir().expect("D29-H7-C worktree-config workspace");
+        let outside = tempdir().expect("D29-H7-C external worktree directory");
+        let git_path = h7c_installed_git_path();
+        h7c_initialize_repo(workspace.path(), &git_path);
+        h7c_append_raw_config(
+            workspace.path(),
+            "\n[extensions]\n\tworktreeConfig = true\n",
+        );
+        fs::write(
+            workspace.path().join(".git/config.worktree"),
+            format!("[core]\n\tworktree = {}\n", outside.path().display()),
+        )
+        .expect("D29-H7-C external worktree config");
+        let root = TrustedWorkspaceRoot::acquire(workspace.path())
+            .expect("D29-H7-C worktree-config trusted root");
+        assert!(H7CGitStatusProfile::new(&root, git_path).is_err());
+    }
+
+    #[test]
+    fn h7c_worktree_config_include_outside_scope_is_rejected_before_process_creation() {
+        let _lock = lock_h7_tests();
+        let workspace = tempdir().expect("D29-H7-C worktree-config workspace");
+        let outside = tempdir().expect("D29-H7-C external include directory");
+        let git_path = h7c_installed_git_path();
+        h7c_initialize_repo(workspace.path(), &git_path);
+        h7c_append_raw_config(
+            workspace.path(),
+            "\n[extensions]\n\tworktreeConfig = true\n",
+        );
+        fs::write(
+            workspace.path().join(".git/config.worktree"),
+            format!(
+                "[include]\n\tpath = {}/outside-config\n",
+                outside.path().display()
+            ),
+        )
+        .expect("D29-H7-C external include worktree config");
+        let root = TrustedWorkspaceRoot::acquire(workspace.path())
+            .expect("D29-H7-C worktree-config trusted root");
+        assert!(H7CGitStatusProfile::new(&root, git_path).is_err());
+    }
+
+    #[test]
+    fn h7c_core_excludes_file_outside_scope_is_rejected() {
+        let _lock = lock_h7_tests();
+        let outside = tempdir().expect("D29-H7-C external excludes directory");
+        let excludes = outside.path().join("ignore");
+        fs::write(&excludes, b"would-change-untracked-classification.txt\n")
+            .expect("D29-H7-C real external excludes file");
+        let excludes = excludes.to_string_lossy().replace('\\', "/");
+        h7c_profile_rejects_extra_config(&format!("\n[core]\n\texcludesFile = {excludes}\n"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7c_large_workspace_is_not_part_of_metadata_fence() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7CDirectHarness::new();
+        fs::write(
+            harness
+                .root
+                .requested_path()
+                .join("ordinary-large-file.bin"),
+            vec![0_u8; H7C_MAX_SNAPSHOT_BYTES + 1],
+        )
+        .expect("D29-H7-C large ordinary workspace file");
+        let root = TrustedWorkspaceRoot::acquire(harness.root.requested_path())
+            .expect("D29-H7-C large trusted workspace root");
+        let profile = Arc::new(
+            H7CGitStatusProfile::new(&root, harness.git_path.clone())
+                .expect("D29-H7-C large workspace profile"),
+        );
+        let broker = H7CGitStatusBroker::new(
+            harness.broker.context.clone(),
+            Arc::clone(&profile),
+            Arc::clone(&harness.authority),
+            Arc::clone(&harness.bridge),
+            Some(root.clone()),
+        );
+        let action = profile
+            .prepare_action(
+                harness.broker.context.clone(),
+                H7CGitStatusRequest {
+                    tool_call_id: "call-d29h7c-large-workspace".to_string(),
+                    turn_id: "turn-d29h7c-large-workspace".to_string(),
+                },
+                Some(root),
+            )
+            .expect("D29-H7-C large workspace action");
+        let result = run_h7c_approved(
+            Arc::clone(&broker),
+            Arc::clone(&harness.authority),
+            harness.receiver.as_mut().unwrap(),
+            action,
+        )
+        .await;
+        assert_eq!(result.status, "completed");
+        assert!(harness.authority.shutdown());
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -503,6 +503,31 @@ impl StorageService {
         upgrade_coordinator::open_coordinated_storage_connection(database_path)
     }
 
+    /// Opens a second process-local authority view over the already-selected
+    /// SQLite file without changing the active location or running a
+    /// migration.  The Vita sidecar host loop uses this view from its
+    /// background IPC thread; the normal Tauri command surface keeps owning
+    /// the primary StorageService value.
+    pub(crate) fn open_authority_view(&self) -> Result<Self, StorageError> {
+        let state = self.state()?;
+        let connection = Self::open_connection(&state.database_path)?;
+        Ok(Self {
+            state: Mutex::new(StorageState {
+                connection,
+                active_root: state.active_root.clone(),
+                database_path: state.database_path.clone(),
+            }),
+            location: self.location.clone(),
+            core_activation_restart_required: AtomicBool::new(false),
+            #[cfg(test)]
+            candidate_confirmation_panic_failpoint: Mutex::new(None),
+            #[cfg(test)]
+            candidate_confirmation_d4_calls: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            candidate_confirmation_recovery_reads: AtomicU64::new(0),
+        })
+    }
+
     fn state(&self) -> Result<MutexGuard<'_, StorageState>, StorageError> {
         self.state.lock().map_err(StorageError::database)
     }

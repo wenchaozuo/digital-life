@@ -63,6 +63,7 @@ pub(crate) mod relationship;
 pub mod secrets;
 mod storage;
 pub mod vector_store;
+mod vita_sidecar;
 
 use tauri::{Manager, WebviewWindowBuilder, WindowEvent};
 
@@ -96,9 +97,18 @@ pub fn run() {
         .setup(|app| {
             let storage = storage::StorageService::initialize(app.handle())
                 .map_err(|error| std::io::Error::other(error.message))?;
+            let sidecar_authority_storage = Arc::new(
+                storage
+                    .open_authority_view()
+                    .map_err(|error| std::io::Error::other(error.message))?,
+            );
             app.manage(storage);
             let capability_registry = capability::CapabilityRegistry::production()
                 .map_err(|error| std::io::Error::other(error.to_string()))?;
+            app.manage(vita_sidecar::VitaSidecarCoordinator::new(
+                sidecar_authority_storage,
+                capability_registry.clone(),
+            ));
             app.manage(capability_registry);
             app.manage(secrets::WindowsCredentialSecretStore::new());
             app.manage(perception::screen_policy::ScreenPerceptionSessionGate::new());
@@ -210,6 +220,12 @@ pub fn run() {
             open_settings_window,
             open_chat_window,
             close_settings_window,
+            vita_sidecar::start_vita_sidecar,
+            vita_sidecar::get_vita_sidecar_status,
+            vita_sidecar::confirm_vita_sidecar,
+            vita_sidecar::deny_vita_sidecar,
+            vita_sidecar::cancel_vita_sidecar,
+            vita_sidecar::stop_vita_sidecar,
             storage::initialize_storage,
             storage::get_storage_location,
             storage::validate_storage_location,

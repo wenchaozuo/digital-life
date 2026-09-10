@@ -2157,6 +2157,7 @@ dependencies = [
  "arrow-schema",
  "base64 0.22.1",
  "bytes",
+ "digital-life-vita-agent-protocol",
  "futures",
  "getrandom 0.3.4",
  "http-body-util",
@@ -2184,6 +2185,14 @@ dependencies = [
  "windows-future",
  "windows-sys 0.61.2",
  "zeroize",
+]
+
+[[package]]
+name = "digital-life-vita-agent-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

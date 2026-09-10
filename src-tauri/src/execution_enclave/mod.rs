@@ -861,6 +861,130 @@ fn create_contained_process(
     Ok((child, stdin, stdout, stderr))
 }
 
+/// A process-isolated Vita sidecar handle set.  This intentionally reuses the
+/// same creation-time Job Object and explicit inherited-handle list as the
+/// private Codex foundation, while keeping the Vita wire protocol outside the
+/// Codex JSON-lines client.
+#[cfg(windows)]
+#[derive(Debug)]
+pub(crate) struct VitaSidecarProcess {
+    child: Option<CodexProcessChild>,
+    stdin: Option<fs::File>,
+    stdout: Option<fs::File>,
+    stderr: Option<fs::File>,
+    containment: Option<CodexProcessContainment>,
+    _isolation_root: PathBuf,
+}
+
+#[cfg(windows)]
+impl VitaSidecarProcess {
+    pub(crate) fn spawn(
+        executable: &Path,
+        arguments: &[OsString],
+        isolation_root: &Path,
+    ) -> Result<Self, CodexRuntimeError> {
+        let executable =
+            fs::canonicalize(executable).map_err(|_| CodexRuntimeError::SpawnFailed)?;
+        let isolation_root = fs::canonicalize(isolation_root)
+            .map_err(|_| CodexRuntimeError::InvalidIsolationRoot)?;
+        if !executable.is_absolute()
+            || !executable.is_file()
+            || is_inside_repository(&executable)
+            || !isolation_root.is_absolute()
+            || !isolation_root.is_dir()
+            || is_forbidden_location(&isolation_root)
+        {
+            return Err(
+                if !executable.is_file() || is_inside_repository(&executable) {
+                    CodexRuntimeError::UntrustedExecutable
+                } else {
+                    CodexRuntimeError::InvalidIsolationRoot
+                },
+            );
+        }
+
+        let containment = CodexProcessContainment::create()?;
+        let (child, stdin, stdout, stderr) = create_contained_process(
+            &executable,
+            arguments,
+            &isolation_root,
+            &containment,
+            CodexUpstreamPin::pinned(),
+        )?;
+        Ok(Self {
+            child: Some(child),
+            stdin: Some(stdin),
+            stdout: Some(stdout),
+            stderr: Some(stderr),
+            containment: Some(containment),
+            _isolation_root: isolation_root,
+        })
+    }
+
+    pub(crate) fn take_stdin(&mut self) -> Option<fs::File> {
+        self.stdin.take()
+    }
+
+    pub(crate) fn take_stdout(&mut self) -> Option<fs::File> {
+        self.stdout.take()
+    }
+
+    pub(crate) fn take_stderr(&mut self) -> Option<fs::File> {
+        self.stderr.take()
+    }
+
+    pub(crate) fn shutdown(&mut self) -> Result<(), CodexRuntimeError> {
+        self.stdin.take();
+        self.stdout.take();
+        self.stderr.take();
+        let Some(mut child) = self.child.take() else {
+            self.containment.take();
+            return Ok(());
+        };
+
+        let deadline = Instant::now() + SHUTDOWN_GRACE;
+        let mut exited = false;
+        while Instant::now() < deadline {
+            match child.try_wait_control() {
+                ChildControlObservation::Exited(_) => {
+                    exited = true;
+                    break;
+                }
+                ChildControlObservation::Running => thread::sleep(Duration::from_millis(5)),
+                ChildControlObservation::Failed => break,
+            }
+        }
+        if !exited {
+            match bounded_kill_reap_with_delay(
+                &mut child,
+                KILL_REAP_ATTEMPTS,
+                KILL_REAP_RETRY_DELAY,
+            ) {
+                ReapDecision::Reaped(_) => {}
+                ReapDecision::RetainOwnership => {
+                    self.child = Some(child);
+                    return Err(CodexRuntimeError::ShutdownFailed);
+                }
+            }
+        }
+        self.containment.take();
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for VitaSidecarProcess {
+    fn drop(&mut self) {
+        if self.shutdown().is_err() {
+            // Closing the Job Object is the final containment fence.  Keep the
+            // bounded Drop path non-panicking even if the child is already
+            // wedged in kernel wait state.
+            self.containment.take();
+            self.child.take();
+        }
+    }
+}
+
 #[derive(Debug)]
 struct CodexLaunchSpec {
     executable: PathBuf,

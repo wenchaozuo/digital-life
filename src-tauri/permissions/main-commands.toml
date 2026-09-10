@@ -4,6 +4,12 @@ description = "Commands required by the main digital-life window."
 commands.allow = [
     "open_settings_window",
     "open_chat_window",
+    "start_vita_sidecar",
+    "get_vita_sidecar_status",
+    "confirm_vita_sidecar",
+    "deny_vita_sidecar",
+    "cancel_vita_sidecar",
+    "stop_vita_sidecar",
     "initialize_storage",
     "save_life_identity",
     "get_current_life_identity",

@@ -91,12 +91,10 @@ mod windows {
     use crate::execution_enclave::{CodexRuntimeError, VitaSidecarProcess};
     use protocol::{
         AuthorityEvaluate, AuthorityScopeReply, ConfirmationDecision, ConfirmationReply,
-        ConfirmationRequired, GrantIssued, GrantRevalidated, Handshake, HostMessage,
-        InitializeSession, IssueGrant, ProcessBinding, ProcessGrant, RevalidateGrant, VitaMessage,
+        ConfirmationRequired, GrantIssued, GrantRevalidated, HostMessage, InitializeSession,
+        IssueGrant, ProcessBinding, ProcessGrant, RevalidateGrant, VitaMessage,
         CODEX_PROTOCOL_SCHEMA_HASH, CODEX_UPSTREAM_COMMIT, PROTOCOL_VERSION, RUNTIME_ID,
     };
-    use serde::de::DeserializeOwned;
-    use sha2::{Digest, Sha256};
     use std::collections::{HashMap, HashSet};
     use std::ffi::OsString;
     use std::fs::{self, File};
@@ -114,11 +112,12 @@ mod windows {
     // production capability lane.
     const PROGRAM_ID: &str = PRODUCTION_GIT_STATUS_PROFILE_ID;
     const GRANT_LIFETIME_MS: u64 = 30_000;
+    const HOST_CONFIRMATION_TTL_MS: u64 = 30_000;
     const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
     const READY_TIMEOUT: Duration = Duration::from_secs(20);
     const MAX_PENDING: usize = 1;
     const MAX_GRANTS: usize = 64;
-    const MAX_SIDECAR_IMAGE_BYTES: u64 = 256 * 1024 * 1024;
+    const SIDECAR_RESOURCE_NAME: &str = "vita-agent.exe";
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
     #[derive(Default)]
@@ -287,6 +286,7 @@ mod windows {
             if !workspace.is_dir() {
                 return Err("Vita workspace path is not a directory".to_string());
             }
+            let sidecar_workspace = normalize_sidecar_local_path(&workspace)?;
             let app_data_root = app
                 .path()
                 .app_data_dir()
@@ -296,19 +296,25 @@ mod windows {
             let app_data_root = fs::canonicalize(&app_data_root)
                 .map_err(|_| "Vita app data root could not be canonicalized".to_string())?;
             validate_private_app_data_root(&app_data_root)?;
+            let sidecar_app_data_root = normalize_sidecar_local_path(&app_data_root)?;
 
             let sidecar_binding = app_owned_sidecar_path(app)?;
             let sidecar = sidecar_binding.path.clone();
-            let sidecar_image_sha256 = sha256_file(&sidecar)?;
+            // The image authority retains the resource directory and image
+            // handles through the final pre-CreateProcessW fence.  The path
+            // below is only the app-owned resource lookup, not the authority.
+            let image = VitaSidecarProcess::prepare_image(&sidecar, &sidecar_binding.resource_dir)
+                .map_err(map_process_error)?;
             let process_root = app_data_root.join("vita-sidecar-process");
             fs::create_dir_all(&process_root)
                 .map_err(|_| "Vita sidecar process root could not be created".to_string())?;
             let process_root = fs::canonicalize(&process_root)
                 .map_err(|_| "Vita sidecar process root could not be canonicalized".to_string())?;
             let git_path = resolve_git_path()?;
+            let sidecar_git_path = normalize_sidecar_local_path(&git_path)?;
 
-            let mut process = VitaSidecarProcess::spawn(
-                &sidecar,
+            let mut process = VitaSidecarProcess::spawn_prepared(
+                image,
                 &[OsString::from("--serve-ipc")],
                 &process_root,
             )
@@ -326,19 +332,21 @@ mod windows {
             // can never block the sidecar's stdout protocol channel.
             spawn_stderr_drain(_stderr);
 
-            let (handshake, reader) = receive_with_timeout::<Handshake>(
+            let (message, reader) = receive_vita_message_with_timeout(
                 BufReader::new(stdout),
                 HANDSHAKE_TIMEOUT,
                 "Vita sidecar handshake",
             )?;
+            let handshake = match message {
+                VitaMessage::Handshake(handshake) => handshake,
+                _ => return Err("Vita sidecar first frame was not Handshake".to_string()),
+            };
             validate_handshake(&handshake)?;
             let current_binding = app_owned_sidecar_path(app)?;
             if current_binding.path != sidecar
-                || current_binding.namespace != sidecar_binding.namespace
-                || current_binding.image != sidecar_binding.image
-                || sha256_file(&sidecar)? != sidecar_image_sha256
+                || current_binding.resource_dir != sidecar_binding.resource_dir
             {
-                return Err("Vita sidecar image changed during launch".to_string());
+                return Err("Vita sidecar resource namespace changed during launch".to_string());
             }
 
             let session_id = secure_id("vita-session")?;
@@ -349,17 +357,18 @@ mod windows {
                 session_id: session_id.clone(),
                 life_id: request.life_id.clone(),
                 task_id: request.task_id.clone(),
-                app_data_root: app_data_root.to_string_lossy().into_owned(),
-                workspace_path: workspace.to_string_lossy().into_owned(),
-                git_path: git_path.to_string_lossy().into_owned(),
+                app_data_root: sidecar_app_data_root.to_string_lossy().into_owned(),
+                workspace_path: sidecar_workspace.to_string_lossy().into_owned(),
+                git_path: sidecar_git_path.to_string_lossy().into_owned(),
             });
             protocol::write_frame(&mut writer, &init).map_err(|error| error.to_string())?;
 
-            let (ready, reader) = receive_with_timeout::<protocol::Ready>(
-                reader,
-                READY_TIMEOUT,
-                "Vita sidecar ready",
-            )?;
+            let (message, reader) =
+                receive_vita_message_with_timeout(reader, READY_TIMEOUT, "Vita sidecar ready")?;
+            let ready = match message {
+                VitaMessage::Ready(ready) => ready,
+                _ => return Err("Vita sidecar post-initialize frame was not Ready".to_string()),
+            };
             validate_ready(&ready, &session_id, &request)?;
             let session = Arc::new(HostSessionState {
                 session_id: session_id.clone(),
@@ -404,6 +413,7 @@ mod windows {
                     pending: None,
                 });
             };
+            expire_pending(&running.session);
             Ok(VitaSidecarStatusResponse {
                 running: !running.session.closed.load(Ordering::Acquire),
                 session_id: Some(running.session.session_id.clone()),
@@ -432,6 +442,7 @@ mod windows {
                 .running
                 .as_ref()
                 .ok_or_else(|| "Vita sidecar is not running".to_string())?;
+            expire_pending(&running.session);
             let pending = {
                 let pending_guard = running
                     .session
@@ -444,19 +455,6 @@ mod windows {
                     .cloned()
             }
             .ok_or_else(|| "Vita pending confirmation was not found".to_string())?;
-
-            if pending.expires_at_unix_ms <= unix_millis() {
-                let _ = running
-                    .session
-                    .send(&HostMessage::ConfirmationReply(ConfirmationReply {
-                        request_id: pending.request_id.clone(),
-                        session_id: running.session.session_id.clone(),
-                        decision: ConfirmationDecision::Deny,
-                        authorization_revision: None,
-                    }));
-                remove_pending(&running.session, &pending.request_id);
-                return Err("Vita pending confirmation expired".to_string());
-            }
 
             let mut revision = None;
             if decision == ConfirmationDecision::Confirm {
@@ -517,6 +515,7 @@ mod windows {
                 .running
                 .as_ref()
                 .ok_or_else(|| "Vita sidecar is not running".to_string())?;
+            expire_pending(&running.session);
             if let Some(pending) = running
                 .session
                 .pending
@@ -661,12 +660,23 @@ mod windows {
             || request.life_id != session.life_id
             || request.task_id != session.task_id
             || request.capability_id != PRODUCTION_GIT_STATUS_CAPABILITY_ID
-            || request.expires_at_unix_ms <= unix_millis()
             || request.binding.validate().is_err()
         {
             return Err("Vita confirmation binding was not exact".to_string());
         }
         validate_binding(session, &request.binding)?;
+        let now = unix_millis();
+        let Some(expires_at_unix_ms) =
+            effective_confirmation_expiry(now, request.expires_at_unix_ms)
+        else {
+            session.send(&HostMessage::ConfirmationReply(ConfirmationReply {
+                request_id: request.request_id,
+                session_id: session.session_id.clone(),
+                decision: ConfirmationDecision::Deny,
+                authorization_revision: None,
+            }))?;
+            return Ok(());
+        };
         let mut pending = session
             .pending
             .lock()
@@ -684,7 +694,7 @@ mod windows {
                 task_id: request.task_id,
                 capability_id: request.capability_id,
                 workspace_summary: request.workspace_summary,
-                expires_at_unix_ms: request.expires_at_unix_ms,
+                expires_at_unix_ms,
                 binding: request.binding,
             },
         );
@@ -700,6 +710,7 @@ mod windows {
         if request.session_id != session.session_id {
             return Err("Vita grant request session was not exact".to_string());
         }
+        expire_pending(session);
         let allowed = validate_binding(session, &request.binding).and_then(|_| {
             let revision =
                 current_workspace_revision(storage, registry, session, &request.binding)?;
@@ -866,6 +877,38 @@ mod windows {
         }
     }
 
+    fn expire_pending(session: &HostSessionState) {
+        let now = unix_millis();
+        let expired = if let Ok(mut pending) = session.pending.lock() {
+            let mut expired = Vec::new();
+            pending.retain(|_, value| {
+                if value.expires_at_unix_ms <= now {
+                    expired.push(value.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            expired
+        } else {
+            Vec::new()
+        };
+        for pending in expired {
+            let _ = session.send(&HostMessage::ConfirmationReply(ConfirmationReply {
+                request_id: pending.request_id,
+                session_id: session.session_id.clone(),
+                decision: ConfirmationDecision::Deny,
+                authorization_revision: None,
+            }));
+        }
+    }
+
+    fn effective_confirmation_expiry(now: u64, vita_expiry: u64) -> Option<u64> {
+        let host_deadline = now.saturating_add(HOST_CONFIRMATION_TTL_MS);
+        let effective = vita_expiry.min(host_deadline);
+        (effective > now).then_some(effective)
+    }
+
     fn binding_key(binding: &ProcessBinding) -> String {
         format!("{}:{}", binding.tool_call_id, binding.turn_id)
     }
@@ -884,7 +927,7 @@ mod windows {
         }
     }
 
-    fn validate_handshake(handshake: &Handshake) -> Result<(), String> {
+    fn validate_handshake(handshake: &protocol::Handshake) -> Result<(), String> {
         if handshake.protocol_version != PROTOCOL_VERSION
             || handshake.runtime != RUNTIME_ID
             || handshake.codex_commit != CODEX_UPSTREAM_COMMIT
@@ -913,14 +956,11 @@ mod windows {
         Ok(())
     }
 
-    fn receive_with_timeout<T>(
+    fn receive_vita_message_with_timeout(
         mut reader: BufReader<File>,
         timeout: Duration,
         label: &'static str,
-    ) -> Result<(T, BufReader<File>), String>
-    where
-        T: DeserializeOwned + Send + 'static,
-    {
+    ) -> Result<(VitaMessage, BufReader<File>), String> {
         let (sender, receiver) = mpsc::sync_channel(1);
         thread::Builder::new()
             .name(format!("vita-sidecar-{label}"))
@@ -928,7 +968,9 @@ mod windows {
                 let result = protocol::read_frame(&mut reader)
                     .map_err(|error| error.to_string())?
                     .ok_or_else(|| format!("{label} channel closed"))
-                    .and_then(|body| protocol::decode_frame::<T>(&body).map_err(|e| e.to_string()));
+                    .and_then(|body| {
+                        protocol::decode_frame::<VitaMessage>(&body).map_err(|e| e.to_string())
+                    });
                 let _ = sender.send(result.map(|value| (value, reader)));
                 Ok::<(), String>(())
             })
@@ -942,18 +984,9 @@ mod windows {
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
-    struct FileIdentity {
-        volume_serial: u32,
-        file_index: u64,
-        file_size: u64,
-        reparse: bool,
-    }
-
-    #[derive(Clone, Debug, Eq, PartialEq)]
     struct SidecarPathBinding {
         path: PathBuf,
-        namespace: FileIdentity,
-        image: FileIdentity,
+        resource_dir: PathBuf,
     }
 
     fn app_owned_sidecar_path(app: &AppHandle) -> Result<SidecarPathBinding, String> {
@@ -963,69 +996,16 @@ mod windows {
             .map_err(|error| format!("Vita resource directory unavailable: {error}"))?;
         let resource_dir = fs::canonicalize(&resource_dir)
             .map_err(|_| "Vita resource directory could not be canonicalized".to_string())?;
-        let candidate = fs::canonicalize(resource_dir.join("vita-agent.exe"))
+        let candidate = fs::canonicalize(resource_dir.join(SIDECAR_RESOURCE_NAME))
             .map_err(|_| "Vita sidecar image is not installed".to_string())?;
-        if !candidate.is_file() || !candidate.starts_with(&resource_dir) {
+        if !candidate.is_file() || candidate.parent() != Some(resource_dir.as_path()) {
             return Err(
                 "Vita sidecar image is outside the app-owned resource directory".to_string(),
             );
         }
         Ok(SidecarPathBinding {
-            path: candidate.clone(),
-            namespace: file_identity(&resource_dir, false)?,
-            image: file_identity(&candidate, true)?,
-        })
-    }
-
-    fn file_identity(path: &Path, expect_file: bool) -> Result<FileIdentity, String> {
-        use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-        use windows_sys::Win32::Storage::FileSystem::{
-            CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
-            FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-            FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-            FILE_SHARE_WRITE, OPEN_EXISTING,
-        };
-
-        let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
-        if wide.iter().any(|unit| *unit == 0) {
-            return Err("Vita image identity path was malformed".to_string());
-        }
-        wide.push(0);
-        let handle = unsafe {
-            CreateFileW(
-                wide.as_ptr(),
-                FILE_READ_ATTRIBUTES,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                std::ptr::null(),
-                OPEN_EXISTING,
-                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-                std::ptr::null_mut(),
-            )
-        };
-        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-            return Err("Vita image identity handle could not be opened".to_string());
-        }
-        let mut information = BY_HANDLE_FILE_INFORMATION::default();
-        let read = unsafe { GetFileInformationByHandle(handle, &mut information) != 0 };
-        unsafe {
-            let _ = CloseHandle(handle);
-        }
-        if !read {
-            return Err("Vita image identity could not be read".to_string());
-        }
-        let directory = information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
-        let reparse = information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0;
-        if reparse || (expect_file && directory) || (!expect_file && !directory) {
-            return Err("Vita image identity was not a trusted non-reparse object".to_string());
-        }
-        Ok(FileIdentity {
-            volume_serial: information.dwVolumeSerialNumber,
-            file_index: (u64::from(information.nFileIndexHigh) << 32)
-                | u64::from(information.nFileIndexLow),
-            file_size: (u64::from(information.nFileSizeHigh) << 32)
-                | u64::from(information.nFileSizeLow),
-            reparse,
+            path: candidate,
+            resource_dir,
         })
     }
 
@@ -1061,25 +1041,20 @@ mod windows {
         Ok(())
     }
 
-    fn sha256_file(path: &Path) -> Result<String, String> {
-        let mut file =
-            File::open(path).map_err(|_| "Vita image could not be opened".to_string())?;
-        let mut digest = Sha256::new();
-        let mut buffer = [0_u8; 64 * 1024];
-        let mut total = 0_u64;
-        loop {
-            let read = std::io::Read::read(&mut file, &mut buffer)
-                .map_err(|_| "Vita image hash read failed".to_string())?;
-            if read == 0 {
-                break;
-            }
-            total = total.saturating_add(read as u64);
-            if total > MAX_SIDECAR_IMAGE_BYTES {
-                return Err("Vita sidecar image exceeded its hash bound".to_string());
-            }
-            digest.update(&buffer[..read]);
+    fn normalize_sidecar_local_path(path: &Path) -> Result<PathBuf, String> {
+        let value = path.to_string_lossy().replace('/', "\\");
+        let value = value.strip_prefix(r"\\?\").unwrap_or(&value);
+        if value.starts_with(r"\\")
+            || value.starts_with(r"\Device\")
+            || value.starts_with(r"\GlobalRoot\")
+        {
+            return Err("Vita sidecar path was not a local drive path".to_string());
         }
-        Ok(format!("{:x}", digest.finalize()))
+        let normalized = PathBuf::from(value);
+        if !normalized.is_absolute() {
+            return Err("Vita sidecar path was not absolute".to_string());
+        }
+        Ok(normalized)
     }
 
     fn spawn_stderr_drain(mut stderr: File) {
@@ -1222,6 +1197,179 @@ mod windows {
                 git_metadata_fence_hash: "3".repeat(64),
             };
             assert_eq!(binding_key(&binding), "call:turn");
+        }
+
+        #[test]
+        fn host_confirmation_ttl_is_an_upper_bound() {
+            assert_eq!(effective_confirmation_expiry(1_000, 90_000), Some(31_000));
+            assert_eq!(effective_confirmation_expiry(1_000, 20_000), Some(20_000));
+            assert_eq!(effective_confirmation_expiry(1_000, 1_000), None);
+        }
+
+        #[test]
+        fn sidecar_paths_drop_verbatim_prefix_but_reject_unc() {
+            let normalized = normalize_sidecar_local_path(Path::new(r"\\?\E:\vita\workspace"))
+                .expect("verbatim local path");
+            assert_eq!(normalized, PathBuf::from(r"E:\vita\workspace"));
+            assert!(normalize_sidecar_local_path(Path::new(r"\\server\share\workspace")).is_err());
+        }
+
+        #[test]
+        fn startup_frames_are_tagged_and_ordered() {
+            let handshake = protocol::Handshake {
+                request_id: "handshake".to_string(),
+                protocol_version: PROTOCOL_VERSION.to_string(),
+                runtime: RUNTIME_ID.to_string(),
+                codex_commit: CODEX_UPSTREAM_COMMIT.to_string(),
+                codex_schema_hash: CODEX_PROTOCOL_SCHEMA_HASH.to_string(),
+            };
+            let frame = protocol::encode_frame(&VitaMessage::Handshake(handshake.clone()))
+                .expect("handshake frame");
+            let decoded = protocol::decode_frame::<VitaMessage>(&frame[4..]).expect("tagged frame");
+            assert!(matches!(decoded, VitaMessage::Handshake(value) if value == handshake));
+
+            let ready = protocol::Ready {
+                request_id: "ready".to_string(),
+                session_id: "session".to_string(),
+                life_id: "life".to_string(),
+                task_id: "task".to_string(),
+                workspace_identity: "workspace".to_string(),
+                capability_id: PRODUCTION_GIT_STATUS_CAPABILITY_ID.to_string(),
+                profile_id: PRODUCTION_GIT_STATUS_PROFILE_ID.to_string(),
+                tool_name: PRODUCTION_GIT_STATUS_TOOL_NAME.to_string(),
+            };
+            let frame = protocol::encode_frame(&VitaMessage::Ready(ready)).expect("ready frame");
+            let decoded = protocol::decode_frame::<VitaMessage>(&frame[4..]).expect("tagged frame");
+            assert!(matches!(decoded, VitaMessage::Ready(_)));
+        }
+
+        #[test]
+        fn bundle_resource_mapping_matches_runtime_name() {
+            let config: serde_json::Value =
+                serde_json::from_str(include_str!("../tauri.conf.json")).expect("tauri config");
+            let resources = config["bundle"]["resources"]
+                .as_object()
+                .expect("explicit resource mapping");
+            assert_eq!(
+                resources
+                    .get("../vita-agent/target/release/vita-agent.exe")
+                    .and_then(serde_json::Value::as_str),
+                Some(SIDECAR_RESOURCE_NAME)
+            );
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn production_shaped_sidecar_startup_canary_uses_tagged_frames() {
+            let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../vita-agent/target/release/vita-agent.exe");
+            if !executable.is_file() {
+                eprintln!(
+                    "skipping production-shaped sidecar canary; release image is absent: {}",
+                    executable.display()
+                );
+                return;
+            }
+            let git_path = match resolve_git_path() {
+                Ok(path) => path,
+                Err(error) => {
+                    eprintln!("skipping production-shaped sidecar canary: {error}");
+                    return;
+                }
+            };
+            let app_data = tempfile::tempdir().expect("sidecar app-data root");
+            let process_root = tempfile::tempdir().expect("sidecar process root");
+            let workspace = fs::canonicalize(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".."))
+                .expect("repository workspace");
+            let workspace_for_sidecar =
+                normalize_sidecar_local_path(&workspace).expect("sidecar workspace path");
+            let app_data_for_sidecar =
+                normalize_sidecar_local_path(app_data.path()).expect("sidecar app-data path");
+            let git_for_sidecar =
+                normalize_sidecar_local_path(&git_path).expect("sidecar Git path");
+            let sidecar_binding = VitaSidecarProcess::prepare_image(
+                &executable,
+                executable.parent().expect("release resource directory"),
+            )
+            .expect("prepared release sidecar image");
+            let mut process = VitaSidecarProcess::spawn_prepared(
+                sidecar_binding,
+                &[OsString::from("--serve-ipc")],
+                process_root.path(),
+            )
+            .expect("production-shaped sidecar process");
+            let stdout = process.take_stdout().expect("sidecar stdout");
+            let stdin = process.take_stdin().expect("sidecar stdin");
+            let mut stderr = process.take_stderr().expect("sidecar stderr");
+
+            let (message, reader) = receive_vita_message_with_timeout(
+                BufReader::new(stdout),
+                HANDSHAKE_TIMEOUT,
+                "canary handshake",
+            )
+            .expect("tagged handshake");
+            let handshake = match message {
+                VitaMessage::Handshake(value) => value,
+                other => panic!("unexpected canary first frame: {other:?}"),
+            };
+            validate_handshake(&handshake).expect("pinned canary handshake");
+
+            let session_id = "session-canary".to_string();
+            let request = VitaSidecarStartRequest {
+                life_id: "life-canary".to_string(),
+                task_id: "task-canary".to_string(),
+                workspace_path: workspace_for_sidecar.to_string_lossy().into_owned(),
+            };
+            let mut writer = BufWriter::new(stdin);
+            protocol::write_frame(
+                &mut writer,
+                &HostMessage::Initialize(InitializeSession {
+                    request_id: "initialize-canary".to_string(),
+                    protocol_version: PROTOCOL_VERSION.to_string(),
+                    session_id: session_id.clone(),
+                    life_id: request.life_id.clone(),
+                    task_id: request.task_id.clone(),
+                    app_data_root: app_data_for_sidecar.to_string_lossy().into_owned(),
+                    workspace_path: request.workspace_path.clone(),
+                    git_path: git_for_sidecar.to_string_lossy().into_owned(),
+                }),
+            )
+            .expect("canary initialize");
+            let ready_result =
+                receive_vita_message_with_timeout(reader, READY_TIMEOUT, "canary ready");
+            let (message, reader) = match ready_result {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ = process.shutdown();
+                    let mut diagnostics = String::new();
+                    let _ = std::io::Read::read_to_string(&mut stderr, &mut diagnostics);
+                    panic!("tagged ready: {error}; sidecar stderr: {diagnostics}");
+                }
+            };
+            let ready = match message {
+                VitaMessage::Ready(value) => value,
+                other => panic!("unexpected canary post-initialize frame: {other:?}"),
+            };
+            validate_ready(&ready, &session_id, &request).expect("exact canary ready identity");
+
+            protocol::write_frame(
+                &mut writer,
+                &HostMessage::Shutdown(protocol::Shutdown {
+                    request_id: "shutdown-canary".to_string(),
+                    session_id: session_id.clone(),
+                }),
+            )
+            .expect("canary shutdown");
+            let (message, _reader) =
+                receive_vita_message_with_timeout(reader, READY_TIMEOUT, "canary shutdown ack")
+                    .expect("tagged shutdown ack");
+            assert!(matches!(
+                message,
+                VitaMessage::ShutdownAck(protocol::ShutdownAck { session_id: ack_session, .. })
+                    if ack_session == session_id
+            ));
+            drop(writer);
+            process.shutdown().expect("canary process shutdown");
         }
     }
 }

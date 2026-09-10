@@ -10,7 +10,7 @@ use std::{
     collections::VecDeque,
     ffi::OsString,
     fmt, fs,
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::{Child, ExitStatus},
     sync::{
@@ -35,9 +35,15 @@ use std::{
 #[cfg(windows)]
 use windows_sys::Win32::{
     Foundation::{
-        CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+        WAIT_OBJECT_0, WAIT_TIMEOUT,
     },
     Security::SECURITY_ATTRIBUTES,
+    Storage::FileSystem::{
+        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING,
+    },
     System::JobObjects::{
         CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -576,6 +582,8 @@ impl CodexRuntimeAdapter {
             spec.isolation_root.path(),
             &containment,
             self.pin,
+            None,
+            None,
         )?;
 
         Ok(CodexAppServerProcess::new(
@@ -718,14 +726,19 @@ fn windows_wide_string(value: &OsStr) -> Result<Vec<u16>, CodexRuntimeError> {
 }
 
 #[cfg(windows)]
-fn windows_environment_block(pin: CodexUpstreamPin) -> Vec<u16> {
-    let entries = [
+fn windows_environment_block(pin: CodexUpstreamPin, private_temp_root: Option<&Path>) -> Vec<u16> {
+    let mut entries = vec![
         format!(
             "CODEX_D29_CLIENT_CONTRACT_VERSION={}",
             pin.client_contract_version()
         ),
         format!("CODEX_D29_UPSTREAM_COMMIT={}", pin.commit()),
     ];
+    if let Some(private_temp_root) = private_temp_root {
+        let private_temp_root = private_temp_root.to_string_lossy();
+        entries.push(format!("TEMP={private_temp_root}"));
+        entries.push(format!("TMP={private_temp_root}"));
+    }
     let mut block = Vec::new();
     for entry in entries {
         block.extend(OsStr::new(&entry).encode_wide());
@@ -736,12 +749,177 @@ fn windows_environment_block(pin: CodexUpstreamPin) -> Vec<u16> {
 }
 
 #[cfg(windows)]
+const MAX_VITA_SIDECAR_IMAGE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Stable identity captured from the retained Windows object used for the
+/// Vita image launch fence.  This is intentionally not a wire type.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct VitaSidecarObjectIdentity {
+    volume_serial: u32,
+    file_index: u64,
+    file_size: u64,
+    reparse: bool,
+}
+
+/// A retained, non-replaceable app-resource namespace and executable image.
+/// The handles are opened with read sharing only and remain owned until the
+/// `CreateProcessW` call has crossed its creation boundary.
+#[cfg(windows)]
+#[derive(Debug)]
+pub(crate) struct VitaSidecarImageAuthority {
+    executable: PathBuf,
+    executable_handle: fs::File,
+    resource_handle: fs::File,
+    executable_identity: VitaSidecarObjectIdentity,
+    resource_identity: VitaSidecarObjectIdentity,
+    sha256: String,
+}
+
+#[cfg(windows)]
+impl VitaSidecarImageAuthority {
+    fn prepare(executable: &Path, resource_dir: &Path) -> Result<Self, CodexRuntimeError> {
+        let resource_dir =
+            fs::canonicalize(resource_dir).map_err(|_| CodexRuntimeError::UntrustedExecutable)?;
+        let executable =
+            fs::canonicalize(executable).map_err(|_| CodexRuntimeError::UntrustedExecutable)?;
+        if !resource_dir.is_dir()
+            || executable.parent() != Some(resource_dir.as_path())
+            || !executable.is_file()
+        {
+            return Err(CodexRuntimeError::UntrustedExecutable);
+        }
+
+        let resource_handle = open_retained_resource_handle(&resource_dir, false)?;
+        let resource_identity = read_retained_identity(&resource_handle, false)?;
+        let mut executable_handle = open_retained_resource_handle(&executable, true)?;
+        let executable_identity = read_retained_identity(&executable_handle, true)?;
+        let sha256 = hash_retained_image(&mut executable_handle)?;
+
+        Ok(Self {
+            executable,
+            executable_handle,
+            resource_handle,
+            executable_identity,
+            resource_identity,
+            sha256,
+        })
+    }
+
+    pub(crate) fn executable(&self) -> &Path {
+        &self.executable
+    }
+
+    /// Revalidates the retained objects immediately before `CreateProcessW`.
+    /// Since the handles do not share write/delete, a replacement or mutation
+    /// cannot pass this fence while the authority is retained.
+    fn verify_current(&mut self) -> Result<(), CodexRuntimeError> {
+        let resource_identity = read_retained_identity(&self.resource_handle, false)?;
+        let executable_identity = read_retained_identity(&self.executable_handle, true)?;
+        let sha256 = hash_retained_image(&mut self.executable_handle)?;
+        if resource_identity != self.resource_identity
+            || executable_identity != self.executable_identity
+            || sha256 != self.sha256
+        {
+            return Err(CodexRuntimeError::UntrustedExecutable);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn open_retained_resource_handle(
+    path: &Path,
+    expect_file: bool,
+) -> Result<fs::File, CodexRuntimeError> {
+    let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    if wide.iter().any(|unit| *unit == 0) {
+        return Err(CodexRuntimeError::UntrustedExecutable);
+    }
+    wide.push(0);
+    let raw = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_GENERIC_READ,
+            FILE_SHARE_READ,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if raw.is_null() || raw == INVALID_HANDLE_VALUE {
+        return Err(CodexRuntimeError::UntrustedExecutable);
+    }
+    let handle = unsafe { fs::File::from_raw_handle(raw) };
+    let identity = read_retained_identity(&handle, expect_file)?;
+    if identity.reparse {
+        return Err(CodexRuntimeError::UntrustedExecutable);
+    }
+    Ok(handle)
+}
+
+#[cfg(windows)]
+fn read_retained_identity(
+    handle: &fs::File,
+    expect_file: bool,
+) -> Result<VitaSidecarObjectIdentity, CodexRuntimeError> {
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    let read = unsafe {
+        GetFileInformationByHandle(handle.as_raw_handle() as HANDLE, &mut information) != 0
+    };
+    if !read {
+        return Err(CodexRuntimeError::UntrustedExecutable);
+    }
+    let directory = information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+    let reparse = information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    if reparse || (expect_file && directory) || (!expect_file && !directory) {
+        return Err(CodexRuntimeError::UntrustedExecutable);
+    }
+    Ok(VitaSidecarObjectIdentity {
+        volume_serial: information.dwVolumeSerialNumber,
+        file_index: (u64::from(information.nFileIndexHigh) << 32)
+            | u64::from(information.nFileIndexLow),
+        file_size: (u64::from(information.nFileSizeHigh) << 32)
+            | u64::from(information.nFileSizeLow),
+        reparse,
+    })
+}
+
+#[cfg(windows)]
+fn hash_retained_image(file: &mut fs::File) -> Result<String, CodexRuntimeError> {
+    use sha2::{Digest, Sha256};
+
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| CodexRuntimeError::UntrustedExecutable)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut total = 0_u64;
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| CodexRuntimeError::UntrustedExecutable)?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read as u64);
+        if total > MAX_VITA_SIDECAR_IMAGE_BYTES {
+            return Err(CodexRuntimeError::UntrustedExecutable);
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+#[cfg(windows)]
 fn create_contained_process(
     executable: &Path,
     arguments: &[OsString],
     isolation_root: &Path,
     containment: &CodexProcessContainment,
     pin: CodexUpstreamPin,
+    mut image_authority: Option<&mut VitaSidecarImageAuthority>,
+    private_temp_root: Option<&Path>,
 ) -> Result<(CodexProcessChild, fs::File, fs::File, fs::File), CodexRuntimeError> {
     let (stdin_child, stdin_parent) = create_inheritable_pipe()?;
     let (stdout_parent, stdout_child) = create_inheritable_pipe()?;
@@ -817,7 +995,7 @@ fn create_contained_process(
     let executable_wide = windows_wide_string(executable.as_os_str())?;
     let mut command_line = windows_command_line(executable, arguments)?;
     let isolation_root_wide = windows_wide_string(isolation_root.as_os_str())?;
-    let environment_block = windows_environment_block(pin);
+    let environment_block = windows_environment_block(pin, private_temp_root);
 
     let mut startup = STARTUPINFOEXW::default();
     startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
@@ -826,6 +1004,12 @@ fn create_contained_process(
     startup.StartupInfo.hStdOutput = stdout_child.as_raw_handle() as HANDLE;
     startup.StartupInfo.hStdError = stderr_child.as_raw_handle() as HANDLE;
     startup.lpAttributeList = attribute_list;
+
+    if let Some(image_authority) = image_authority.as_deref_mut() {
+        // This is deliberately the last validation before the native launch
+        // call.  The retained handles remain alive through CreateProcessW.
+        image_authority.verify_current()?;
+    }
 
     let mut process_information = PROCESS_INFORMATION::default();
     let created = unsafe {
@@ -878,6 +1062,13 @@ pub(crate) struct VitaSidecarProcess {
 
 #[cfg(windows)]
 impl VitaSidecarProcess {
+    pub(crate) fn prepare_image(
+        executable: &Path,
+        resource_dir: &Path,
+    ) -> Result<VitaSidecarImageAuthority, CodexRuntimeError> {
+        VitaSidecarImageAuthority::prepare(executable, resource_dir)
+    }
+
     pub(crate) fn spawn(
         executable: &Path,
         arguments: &[OsString],
@@ -885,22 +1076,27 @@ impl VitaSidecarProcess {
     ) -> Result<Self, CodexRuntimeError> {
         let executable =
             fs::canonicalize(executable).map_err(|_| CodexRuntimeError::SpawnFailed)?;
+        let resource_dir = executable
+            .parent()
+            .ok_or(CodexRuntimeError::UntrustedExecutable)?;
+        let image = Self::prepare_image(&executable, resource_dir)?;
+        Self::spawn_prepared(image, arguments, isolation_root)
+    }
+
+    pub(crate) fn spawn_prepared(
+        mut image: VitaSidecarImageAuthority,
+        arguments: &[OsString],
+        isolation_root: &Path,
+    ) -> Result<Self, CodexRuntimeError> {
+        let executable = image.executable().to_path_buf();
         let isolation_root = fs::canonicalize(isolation_root)
             .map_err(|_| CodexRuntimeError::InvalidIsolationRoot)?;
         if !executable.is_absolute()
-            || !executable.is_file()
-            || is_inside_repository(&executable)
             || !isolation_root.is_absolute()
             || !isolation_root.is_dir()
             || is_forbidden_location(&isolation_root)
         {
-            return Err(
-                if !executable.is_file() || is_inside_repository(&executable) {
-                    CodexRuntimeError::UntrustedExecutable
-                } else {
-                    CodexRuntimeError::InvalidIsolationRoot
-                },
-            );
+            return Err(CodexRuntimeError::InvalidIsolationRoot);
         }
 
         let containment = CodexProcessContainment::create()?;
@@ -910,7 +1106,12 @@ impl VitaSidecarProcess {
             &isolation_root,
             &containment,
             CodexUpstreamPin::pinned(),
+            Some(&mut image),
+            Some(&isolation_root),
         )?;
+        // The retained image authority is intentionally released only after
+        // CreateProcessW returned successfully.
+        drop(image);
         Ok(Self {
             child: Some(child),
             stdin: Some(stdin),
@@ -5103,5 +5304,29 @@ mod tests {
         }
         assert!(root.path().join("d29-drop-observed.txt").is_file());
         assert!(directory.path().join(".d29-dedicated-root").is_file());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn vita_image_authority_rejects_write_and_rename_while_retained() {
+        let resource = tempfile::tempdir().expect("sidecar resource root");
+        let image_path = resource.path().join("vita-agent.exe");
+        let replacement_path = resource.path().join("vita-agent.replacement.exe");
+        fs::write(&image_path, b"retained-sidecar-image").expect("sidecar image");
+        let authority = VitaSidecarProcess::prepare_image(&image_path, resource.path())
+            .expect("trusted sidecar image");
+        assert!(
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&image_path)
+                .is_err(),
+            "retained image handle must deny a concurrent writer"
+        );
+        assert!(
+            fs::rename(&image_path, &replacement_path).is_err(),
+            "retained resource/image handles must deny a namespace swap"
+        );
+        drop(authority);
+        assert!(fs::rename(&image_path, &replacement_path).is_ok());
     }
 }

@@ -7585,6 +7585,7 @@ mod tests {
     async fn h7c_post_confirmation_git_metadata_toctou_createprocess_zero() {
         let _lock = lock_h7_tests();
         let mut harness = H7CDirectHarness::new();
+        let outside = tempdir().expect("D29-H7-C commondir outside directory");
         let gate = H7FinalFenceGate::new();
         gate.arm();
         let broker = harness.broker_with_final_fence(Arc::clone(&gate));
@@ -7609,14 +7610,11 @@ mod tests {
             .send(revision)
             .expect("D29-H7-C metadata TOCTOU confirmation response");
         gate.wait_until_entered().await;
-        let head = harness.root.requested_path().join(".git/HEAD");
-        let mut head_file = OpenOptions::new()
-            .append(true)
-            .open(&head)
-            .expect("D29-H7-C metadata TOCTOU HEAD");
-        head_file
-            .write_all(b"\n")
-            .expect("D29-H7-C metadata TOCTOU HEAD write");
+        fs::write(
+            harness.root.requested_path().join(".git/commondir"),
+            format!("{}\n", outside.path().display()),
+        )
+        .expect("D29-H7-C metadata TOCTOU commondir write");
         gate.release();
         let result = task.await.expect("D29-H7-C metadata TOCTOU task");
         assert_eq!(result.status, "denied");

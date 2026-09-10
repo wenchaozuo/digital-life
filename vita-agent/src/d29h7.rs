@@ -51,7 +51,8 @@ use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, GetDriveTypeW, GetFileInformationByHandle, ReadFile, BY_HANDLE_FILE_INFORMATION,
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
     FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OVERLAPPED,
-    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ, OPEN_EXISTING, PIPE_ACCESS_INBOUND,
+    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ, OPEN_EXISTING,
+    PIPE_ACCESS_INBOUND,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_WRITE, FILE_TRAVERSE, SYNCHRONIZE,
@@ -115,6 +116,9 @@ const H7_PROMPT: &str = "Run the bounded fixture process.";
 const H7_REPLY: &str = "D29-H7 process completed";
 const H7_ENV_ALLOWLIST_KEY: &str = "D29H7_FIXTURE_ALLOWLIST";
 const H7_ENV_ALLOWLIST_VALUE: &str = "fixture-v1";
+const H7C_MAX_CONFIG_BYTES: usize = 64 * 1024;
+const H7C_MAX_SNAPSHOT_FILES: usize = 4096;
+const H7C_MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -280,12 +284,26 @@ struct H7PreparedNamespace {
     parent: Arc<H7Handle>,
     leaf: Arc<H7Handle>,
     leaf_name: OsString,
+    leaf_share_access: u32,
     identity: H7NamespaceIdentity,
     chain: Vec<Arc<H7Handle>>,
 }
 
 impl H7PreparedNamespace {
     fn prepare(path: &Path, directory: bool) -> Result<Self, String> {
+        let leaf_share_access = if directory {
+            FILE_SHARE_READ | FILE_SHARE_WRITE
+        } else {
+            FILE_SHARE_READ
+        };
+        Self::prepare_with_leaf_share(path, directory, leaf_share_access)
+    }
+
+    fn prepare_with_leaf_share(
+        path: &Path,
+        directory: bool,
+        leaf_share_access: u32,
+    ) -> Result<Self, String> {
         if !path.is_absolute() || path.to_string_lossy().starts_with("\\\\") {
             return Err("H7 namespace path was not an absolute local path".to_string());
         }
@@ -323,7 +341,7 @@ impl H7PreparedNamespace {
         for (index, component) in normal_components.iter().enumerate() {
             let is_leaf = index + 1 == normal_components.len();
             let handle = Arc::new(if is_leaf && !directory {
-                open_namespace_relative_executable_leaf(&parent, component)?
+                open_namespace_relative_with_share(&parent, component, false, leaf_share_access)?
             } else {
                 open_namespace_relative_directory(&parent, component)?
             });
@@ -337,6 +355,7 @@ impl H7PreparedNamespace {
                     parent,
                     leaf: handle,
                     leaf_name,
+                    leaf_share_access,
                     identity,
                     chain,
                 });
@@ -351,7 +370,12 @@ impl H7PreparedNamespace {
         let handle = Arc::new(if self.identity.directory {
             open_namespace_relative_directory(&self.parent, &self.leaf_name)?
         } else {
-            open_namespace_relative_executable_leaf(&self.parent, &self.leaf_name)?
+            open_namespace_relative_with_share(
+                &self.parent,
+                &self.leaf_name,
+                false,
+                self.leaf_share_access,
+            )?
         });
         let identity = namespace_identity(handle.raw())?;
         if identity != self.identity || identity.reparse {
@@ -780,6 +804,8 @@ impl H7ExecutableCatalog {
             workspace_root,
             workspace_root_identity,
             profile_id: None,
+            git_metadata_fence: None,
+            git_metadata_fence_hash: None,
         }))
     }
 }
@@ -805,6 +831,8 @@ struct PreparedProcessAction {
     workspace_root: Option<TrustedWorkspaceRoot>,
     workspace_root_identity: Option<WorkspaceRootIdentity>,
     profile_id: Option<String>,
+    git_metadata_fence: Option<Arc<H7CGitMetadataFence>>,
+    git_metadata_fence_hash: Option<String>,
 }
 
 impl PreparedProcessAction {
@@ -831,6 +859,7 @@ impl PreparedProcessAction {
             turn_id: self.turn_id.clone(),
             workspace_root_identity: self.workspace_root_identity.map(h7_workspace_identity_wire),
             profile_id: self.profile_id.clone(),
+            git_metadata_fence_hash: self.git_metadata_fence_hash.clone(),
         }
     }
 }
@@ -861,6 +890,23 @@ fn verify_workspace_root_binding(action: &PreparedProcessAction) -> Result<(), S
     }
     root.verify_named_path_current()
         .map_err(|_| "H7-B workspace root named path changed".to_string())
+}
+
+fn h7c_revalidate_metadata_fence(action: &PreparedProcessAction) -> Result<(), String> {
+    if action.capability_id != H7C_CAPABILITY_ID {
+        if action.git_metadata_fence.is_some() || action.git_metadata_fence_hash.is_some() {
+            return Err("H7 Git metadata evidence appeared on a non-Git action".to_string());
+        }
+        return Ok(());
+    }
+    let fence = action
+        .git_metadata_fence
+        .as_ref()
+        .ok_or_else(|| "D29-H7-C Git metadata fence was absent".to_string())?;
+    if action.git_metadata_fence_hash.as_deref() != Some(fence.fence_hash.as_str()) {
+        return Err("D29-H7-C Git metadata fence binding changed".to_string());
+    }
+    fence.revalidate()
 }
 
 fn wide_null(value: &OsStr) -> Vec<u16> {
@@ -942,6 +988,8 @@ struct H7ProcessBinding {
     workspace_root_identity: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    git_metadata_fence_hash: Option<String>,
 }
 
 impl H7ProcessBinding {
@@ -2737,6 +2785,7 @@ impl H7LaunchPreparation {
         if mutation != H7PostHostMutation::None {
             return Err("H7 post-Host local binding mutation was detected".to_string());
         }
+        h7c_revalidate_metadata_fence(action)?;
         Ok(())
     }
 }
@@ -2881,6 +2930,13 @@ fn supervise_native_inner(
     let mut process_information: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     if let Some(gate) = options.pre_create_process_gate.as_ref() {
         gate.wait_if_armed_blocking();
+    }
+    // A Git-status action owns a retained local metadata fence.  Recheck it
+    // after any final gate and immediately before the last cancellation load
+    // and CreateProcessW call so confirmation cannot authorize changed Git
+    // metadata.
+    if h7c_revalidate_metadata_fence(action).is_err() {
+        return launch_failed(false, false, None).with_kind(H7NativeOutcomeKind::Denied);
     }
     // This is the final cancellation load.  Keep it immediately adjacent to
     // CreateProcessW: no hash, IPC, allocation, wait, or other meaningful
@@ -5517,6 +5573,8 @@ struct H7CGitStatusProfile {
     timeout: Duration,
     stdout_bound: usize,
     stderr_bound: usize,
+    git_metadata_fence: Arc<H7CGitMetadataFence>,
+    git_metadata_fence_hash: String,
     _git_home: TempDir,
 }
 
@@ -5524,7 +5582,7 @@ impl H7CGitStatusProfile {
     fn new(root: &TrustedWorkspaceRoot, git_path: PathBuf) -> Result<Self, String> {
         root.verify_named_path_current()
             .map_err(|_| "D29-H7-C workspace root was not current".to_string())?;
-        h7c_validate_git_metadata(root)?;
+        let git_metadata_fence = h7c_validate_git_metadata(root)?;
         if !git_path.is_absolute() {
             return Err("D29-H7-C Git image path was not absolute".to_string());
         }
@@ -5596,6 +5654,8 @@ impl H7CGitStatusProfile {
             timeout: Duration::from_secs(2),
             stdout_bound: H7_STDOUT_BOUND,
             stderr_bound: H7_STDERR_BOUND,
+            git_metadata_fence_hash: git_metadata_fence.fence_hash.clone(),
+            git_metadata_fence,
             _git_home: git_home,
         })
     }
@@ -5646,6 +5706,8 @@ impl H7CGitStatusProfile {
             workspace_root,
             workspace_root_identity,
             profile_id: Some(self.profile_id.clone()),
+            git_metadata_fence: Some(Arc::clone(&self.git_metadata_fence)),
+            git_metadata_fence_hash: Some(self.git_metadata_fence_hash.clone()),
         }))
     }
 
@@ -5660,6 +5722,12 @@ impl H7CGitStatusProfile {
             && action.environment_policy_hash == self.environment_policy_hash
             && action.working_directory_identity == self.working_directory_identity
             && action.workspace_root_identity == Some(self.workspace_root_identity)
+            && action
+                .git_metadata_fence
+                .as_ref()
+                .is_some_and(|fence| Arc::ptr_eq(fence, &self.git_metadata_fence))
+            && action.git_metadata_fence_hash.as_deref()
+                == Some(self.git_metadata_fence_hash.as_str())
             && action.timeout == self.timeout
             && action.stdout_bound == self.stdout_bound
             && action.stderr_bound == self.stderr_bound
@@ -5672,14 +5740,183 @@ struct H7CWorkspaceSnapshot {
     git_files: BTreeMap<String, String>,
 }
 
-fn h7c_validate_git_metadata(root: &TrustedWorkspaceRoot) -> Result<(), String> {
-    let git_target = root
-        .prepare_target(Path::new(".git"))
-        .map_err(|_| "D29-H7-C Git metadata target could not be prepared".to_string())?;
-    if git_target.kind() != crate::PreparedWorkspaceTargetKind::ExistingDirectory {
-        return Err("D29-H7-C external or file-form Git metadata was rejected".to_string());
+struct H7CGitMetadataFence {
+    workspace_root: PathBuf,
+    git_directory: Arc<H7PreparedNamespace>,
+    config_file: Arc<H7PreparedNamespace>,
+    expected_git_directory_identity: H7NamespaceIdentity,
+    expected_config_identity: H7ImageIdentity,
+    expected_config_bytes: Vec<u8>,
+    expected_config_sha256: String,
+    expected_git_files: BTreeMap<String, String>,
+    fence_hash: String,
+}
+
+impl H7CGitMetadataFence {
+    fn new(root: &TrustedWorkspaceRoot) -> Result<Arc<Self>, String> {
+        let git_target = root
+            .prepare_target(Path::new(".git"))
+            .map_err(|_| "D29-H7-C Git metadata target could not be prepared".to_string())?;
+        if git_target.kind() != crate::PreparedWorkspaceTargetKind::ExistingDirectory {
+            return Err("D29-H7-C external or file-form Git metadata was rejected".to_string());
+        }
+
+        let workspace_root = root.requested_path().to_path_buf();
+        let git_directory = Arc::new(H7PreparedNamespace::prepare(
+            &workspace_root.join(".git"),
+            true,
+        )?);
+        let expected_git_directory_identity = git_directory.identity();
+        let config_file = Arc::new(H7PreparedNamespace::prepare_with_leaf_share(
+            &workspace_root.join(".git/config"),
+            false,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        )?);
+        let config_handle = duplicate_file_handle(config_file.leaf.raw())?;
+        let expected_config_identity = file_identity(&config_handle)?;
+        let expected_config_bytes = h7c_read_file_handle_bounded(&config_handle)?;
+        h7c_validate_local_git_config(&expected_config_bytes)?;
+
+        let snapshot = h7c_snapshot_workspace(&workspace_root)?;
+        h7c_validate_git_snapshot(&workspace_root, &snapshot)?;
+        let expected_config_sha256 = sha256_hex(&expected_config_bytes);
+        let fence_material = serde_json::to_vec(&(
+            &snapshot.git_files,
+            expected_config_identity.wire(),
+            &expected_config_sha256,
+        ))
+        .map_err(|_| "D29-H7-C Git metadata fence serialization failed".to_string())?;
+        let fence_hash = sha256_hex(&fence_material);
+        Ok(Arc::new(Self {
+            workspace_root,
+            git_directory,
+            config_file,
+            expected_git_directory_identity,
+            expected_config_identity,
+            expected_config_bytes,
+            expected_config_sha256,
+            expected_git_files: snapshot.git_files,
+            fence_hash,
+        }))
     }
-    let snapshot = h7c_snapshot_workspace(root.requested_path())?;
+
+    fn revalidate(&self) -> Result<(), String> {
+        let git_directory = self.git_directory.rebind_leaf()?;
+        if namespace_identity(git_directory.raw())? != self.expected_git_directory_identity {
+            return Err("D29-H7-C Git metadata directory identity changed".to_string());
+        }
+
+        let config_probe = self.config_file.rebind_leaf()?;
+        let config_handle = duplicate_file_handle(config_probe.raw())?;
+        let config_identity = file_identity(&config_handle)?;
+        if config_identity != self.expected_config_identity {
+            return Err("D29-H7-C Git config identity changed".to_string());
+        }
+        let config_bytes = h7c_read_file_handle_bounded(&config_handle)?;
+        if config_bytes != self.expected_config_bytes
+            || sha256_hex(&config_bytes) != self.expected_config_sha256
+        {
+            return Err("D29-H7-C Git config bytes changed".to_string());
+        }
+        h7c_validate_local_git_config(&config_bytes)?;
+
+        let snapshot = h7c_snapshot_workspace(&self.workspace_root)?;
+        h7c_validate_git_snapshot(&self.workspace_root, &snapshot)?;
+        if snapshot.git_files != self.expected_git_files {
+            return Err("D29-H7-C Git metadata snapshot changed".to_string());
+        }
+        Ok(())
+    }
+}
+
+fn h7c_read_file_handle_bounded(file: &File) -> Result<Vec<u8>, String> {
+    let mut file = file
+        .try_clone()
+        .map_err(|_| "D29-H7-C Git config handle clone failed".to_string())?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| "D29-H7-C Git config handle seek failed".to_string())?;
+    let mut bytes = Vec::new();
+    let mut chunk = [0_u8; 8 * 1024];
+    loop {
+        let read = file
+            .read(&mut chunk)
+            .map_err(|_| "D29-H7-C Git config handle read failed".to_string())?;
+        if read == 0 {
+            break;
+        }
+        if bytes.len().saturating_add(read) > H7C_MAX_CONFIG_BYTES {
+            return Err("D29-H7-C Git config exceeded its hard bound".to_string());
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+    Ok(bytes)
+}
+
+fn h7c_validate_local_git_config(bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() > H7C_MAX_CONFIG_BYTES {
+        return Err("D29-H7-C Git config exceeded its hard bound".to_string());
+    }
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| "D29-H7-C Git config was not valid UTF-8".to_string())?;
+    let mut section = None;
+    for raw_line in text.lines() {
+        if raw_line.trim_end().ends_with('\\') {
+            return Err("D29-H7-C Git config continuation was rejected".to_string());
+        }
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if line.starts_with('[') {
+            if !line.ends_with(']') || line.len() < 3 {
+                return Err("D29-H7-C Git config section was malformed".to_string());
+            }
+            let name = line[1..line.len() - 1].trim();
+            if name.is_empty() || name.contains('\0') {
+                return Err("D29-H7-C Git config section was malformed".to_string());
+            }
+            let normalized = name.to_ascii_lowercase();
+            if normalized == "include"
+                || normalized.starts_with("includeif")
+                || normalized.starts_with("include.")
+                || normalized == "core.worktree"
+            {
+                return Err("D29-H7-C external Git config indirection was rejected".to_string());
+            }
+            section = Some(normalized);
+            continue;
+        }
+        let section = section
+            .as_deref()
+            .ok_or_else(|| "D29-H7-C Git config key appeared before a section".to_string())?;
+        let key_end = line
+            .find(|character: char| character == '=' || character.is_ascii_whitespace())
+            .unwrap_or(line.len());
+        let key = line[..key_end].trim();
+        if key.is_empty()
+            || !key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+        {
+            return Err("D29-H7-C Git config key was malformed".to_string());
+        }
+        let key = key.to_ascii_lowercase();
+        let dotted_key = if key.contains('.') {
+            key.clone()
+        } else {
+            format!("{section}.{key}")
+        };
+        if dotted_key == "core.worktree"
+            || dotted_key == "include.path"
+            || dotted_key.starts_with("includeif.")
+        {
+            return Err("D29-H7-C external Git config indirection was rejected".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn h7c_validate_git_snapshot(root: &Path, snapshot: &H7CWorkspaceSnapshot) -> Result<(), String> {
     if snapshot.git_files.is_empty() {
         return Err("D29-H7-C Git metadata directory was empty".to_string());
     }
@@ -5692,15 +5929,29 @@ fn h7c_validate_git_metadata(root: &TrustedWorkspaceRoot) -> Result<(), String> 
             return Err("D29-H7-C external Git metadata redirect was rejected".to_string());
         }
     }
-    if root.requested_path().join(".git/worktrees").exists() {
+    if snapshot
+        .git_files
+        .keys()
+        .any(|path| path.starts_with(".git/worktrees/"))
+        || fs::symlink_metadata(root.join(".git/worktrees"))
+            .map(|metadata| metadata.is_dir())
+            .unwrap_or(false)
+    {
         return Err("D29-H7-C linked Git worktree metadata was rejected".to_string());
     }
     Ok(())
 }
 
+fn h7c_validate_git_metadata(
+    root: &TrustedWorkspaceRoot,
+) -> Result<Arc<H7CGitMetadataFence>, String> {
+    H7CGitMetadataFence::new(root)
+}
+
 fn h7c_snapshot_workspace(root: &Path) -> Result<H7CWorkspaceSnapshot, String> {
     let mut workspace_files = BTreeMap::new();
-    h7c_snapshot_directory(root, root, &mut workspace_files)?;
+    let mut total_bytes = 0usize;
+    h7c_snapshot_directory(root, root, &mut workspace_files, &mut total_bytes)?;
     let git_files = workspace_files
         .iter()
         .filter(|(path, _)| path.as_str() == ".git" || path.starts_with(".git/"))
@@ -5716,6 +5967,7 @@ fn h7c_snapshot_directory(
     root: &Path,
     current: &Path,
     files: &mut BTreeMap<String, String>,
+    total_bytes: &mut usize,
 ) -> Result<(), String> {
     let metadata = fs::symlink_metadata(current)
         .map_err(|_| "D29-H7-C workspace snapshot metadata failed".to_string())?;
@@ -5730,7 +5982,7 @@ fn h7c_snapshot_directory(
         {
             let entry =
                 entry.map_err(|_| "D29-H7-C workspace snapshot entry failed".to_string())?;
-            h7c_snapshot_directory(root, &entry.path(), files)?;
+            h7c_snapshot_directory(root, &entry.path(), files, total_bytes)?;
         }
         return Ok(());
     }
@@ -5743,9 +5995,18 @@ fn h7c_snapshot_directory(
     if relative.as_os_str().is_empty() {
         return Ok(());
     }
+    if files.len() >= H7C_MAX_SNAPSHOT_FILES {
+        return Err("D29-H7-C workspace snapshot exceeded its file bound".to_string());
+    }
     let relative = relative.to_string_lossy().replace('\\', "/");
     let bytes =
         fs::read(current).map_err(|_| "D29-H7-C workspace snapshot read failed".to_string())?;
+    *total_bytes = total_bytes
+        .checked_add(bytes.len())
+        .ok_or_else(|| "D29-H7-C workspace snapshot size overflowed".to_string())?;
+    if *total_bytes > H7C_MAX_SNAPSHOT_BYTES {
+        return Err("D29-H7-C workspace snapshot exceeded its byte bound".to_string());
+    }
     files.insert(relative, format!("{}:{}", bytes.len(), sha256_hex(&bytes)));
     Ok(())
 }
@@ -5941,7 +6202,11 @@ impl H7CGitStatusBroker {
             *last_native
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(native.clone());
-            H7CGitStatusResult::from_native(&native)
+            if native.kind == H7NativeOutcomeKind::Denied {
+                H7CGitStatusResult::denied()
+            } else {
+                H7CGitStatusResult::from_native(&native)
+            }
         })
         .await
         {
@@ -6370,6 +6635,23 @@ mod tests {
             let workspace = tempdir().expect("D29-H7-C workspace directory");
             let git_path = h7c_installed_git_path();
             h7c_initialize_repo(workspace.path(), &git_path);
+            Self::from_initialized_workspace(workspace, git_path)
+        }
+
+        fn new_with_malicious_core_config(key: &str) -> (Self, PathBuf) {
+            let workspace = tempdir().expect("D29-H7-C malicious workspace directory");
+            let git_path = h7c_installed_git_path();
+            h7c_initialize_repo(workspace.path(), &git_path);
+            let sentinel = workspace.path().join(format!("{key}-sentinel.txt"));
+            let config = h7c_malicious_core_config_text(key, &sentinel);
+            h7c_append_raw_config(workspace.path(), &config);
+            (
+                Self::from_initialized_workspace(workspace, git_path),
+                sentinel,
+            )
+        }
+
+        fn from_initialized_workspace(workspace: TempDir, git_path: PathBuf) -> Self {
             let root = TrustedWorkspaceRoot::acquire(workspace.path())
                 .expect("D29-H7-C trusted workspace root");
             let profile = Arc::new(
@@ -6465,7 +6747,17 @@ mod tests {
         task.await.expect("D29-H7-C broker task")
     }
 
-    fn h7c_append_malicious_core_config(root: &TrustedWorkspaceRoot, key: &str, sentinel: &Path) {
+    fn h7c_append_raw_config(root: &Path, config_text: &str) {
+        let mut config = OpenOptions::new()
+            .append(true)
+            .open(root.join(".git/config"))
+            .expect("D29-H7-C Git config append");
+        config
+            .write_all(config_text.as_bytes())
+            .expect("D29-H7-C Git config append write");
+    }
+
+    fn h7c_malicious_core_config_text(key: &str, sentinel: &Path) -> String {
         let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("D29-H7-C repository root")
@@ -6473,15 +6765,17 @@ mod tests {
         let helper = h7c_helper_fixture_executable(&repo_root);
         let helper = helper.to_string_lossy().replace('\\', "/");
         let sentinel = sentinel.to_string_lossy().replace('\\', "/");
-        let mut config = OpenOptions::new()
-            .append(true)
-            .open(root.requested_path().join(".git/config"))
-            .expect("D29-H7-C malicious Git config");
-        writeln!(
-            config,
-            "\n[core]\n\t{key} = \"{helper} write-sentinel {sentinel}\""
-        )
-        .expect("D29-H7-C malicious Git config write");
+        format!("\n[core]\n\t{key} = \"{helper} write-sentinel {sentinel}\"\n")
+    }
+
+    fn h7c_profile_rejects_extra_config(config_text: &str) {
+        let workspace = tempdir().expect("D29-H7-C config workspace");
+        let git_path = h7c_installed_git_path();
+        h7c_initialize_repo(workspace.path(), &git_path);
+        h7c_append_raw_config(workspace.path(), config_text);
+        let root =
+            TrustedWorkspaceRoot::acquire(workspace.path()).expect("D29-H7-C config trusted root");
+        assert!(H7CGitStatusProfile::new(&root, git_path).is_err());
     }
 
     fn assert_h7c_denied(result: &H7CGitStatusResult, broker: &H7CGitStatusBroker) {
@@ -6794,9 +7088,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn h7c_malicious_fsmonitor_helper_never_executes() {
         let _lock = lock_h7_tests();
-        let mut harness = H7CDirectHarness::new();
-        let sentinel = harness.root.requested_path().join("fsmonitor-sentinel.txt");
-        h7c_append_malicious_core_config(&harness.root, "fsmonitor", &sentinel);
+        let (mut harness, sentinel) = H7CDirectHarness::new_with_malicious_core_config("fsmonitor");
         let action = harness.action();
         let result = run_h7c_approved(
             Arc::clone(&harness.broker),
@@ -6821,9 +7113,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn h7c_malicious_pager_never_executes() {
         let _lock = lock_h7_tests();
-        let mut harness = H7CDirectHarness::new();
-        let sentinel = harness.root.requested_path().join("pager-sentinel.txt");
-        h7c_append_malicious_core_config(&harness.root, "pager", &sentinel);
+        let (mut harness, sentinel) = H7CDirectHarness::new_with_malicious_core_config("pager");
         let action = harness.action();
         let result = run_h7c_approved(
             Arc::clone(&harness.broker),
@@ -6856,6 +7146,130 @@ mod tests {
         .expect("D29-H7-C external gitfile");
         let root = TrustedWorkspaceRoot::acquire(workspace.path()).expect("D29-H7-C gitfile root");
         assert!(H7CGitStatusProfile::new(&root, h7c_installed_git_path()).is_err());
+    }
+
+    #[test]
+    fn h7c_core_worktree_outside_scope_is_rejected() {
+        let _lock = lock_h7_tests();
+        h7c_profile_rejects_extra_config("\n[core]\n\tworktree = C:/outside/worktree\n");
+    }
+
+    #[test]
+    fn h7c_include_path_outside_scope_is_rejected() {
+        let _lock = lock_h7_tests();
+        let outside = tempdir().expect("D29-H7-C external include directory");
+        let outside_config = outside.path().join("config");
+        fs::write(
+            &outside_config,
+            b"[core]\n\tworktree = C:/outside/worktree\n",
+        )
+        .expect("D29-H7-C external include config");
+        let outside_config = outside_config.to_string_lossy().replace('\\', "/");
+        h7c_profile_rejects_extra_config(&format!("\n[include]\n\tpath = {outside_config}\n"));
+    }
+
+    #[test]
+    fn h7c_include_if_path_outside_scope_is_rejected() {
+        let _lock = lock_h7_tests();
+        let outside = tempdir().expect("D29-H7-C external include-if directory");
+        let outside_config = outside.path().join("config");
+        fs::write(
+            &outside_config,
+            b"[core]\n\tworktree = C:/outside/worktree\n",
+        )
+        .expect("D29-H7-C external include-if config");
+        let outside_config = outside_config.to_string_lossy().replace('\\', "/");
+        h7c_profile_rejects_extra_config(&format!(
+            "\n[includeIf \"gitdir:*\"]\n\tpath = {outside_config}\n"
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7c_post_confirmation_config_toctou_createprocess_zero() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7CDirectHarness::new();
+        let gate = H7FinalFenceGate::new();
+        gate.arm();
+        let broker = harness.broker_with_final_fence(Arc::clone(&gate));
+        let task = tokio::spawn({
+            let broker = Arc::clone(&broker);
+            let action = harness.action();
+            async move { broker.execute(action).await }
+        });
+        let pending = harness
+            .receiver
+            .as_mut()
+            .expect("D29-H7-C config TOCTOU receiver")
+            .recv()
+            .await
+            .expect("D29-H7-C config TOCTOU confirmation");
+        let revision = harness
+            .authority
+            .provision_workspace_confirmation(&pending.action)
+            .expect("D29-H7-C config TOCTOU confirmation provision");
+        pending
+            .response
+            .send(revision)
+            .expect("D29-H7-C config TOCTOU confirmation response");
+        gate.wait_until_entered().await;
+        h7c_append_raw_config(
+            harness.root.requested_path(),
+            "\n[core]\n\tworktree = C:/outside/worktree\n",
+        );
+        gate.release();
+        let result = task.await.expect("D29-H7-C config TOCTOU task");
+        assert_eq!(result.status, "denied");
+        let metrics = broker.metrics();
+        assert_eq!(metrics.process_created.load(Ordering::Acquire), 0);
+        assert_eq!(metrics.job_assigned.load(Ordering::Acquire), 0);
+        assert_eq!(metrics.thread_resumed.load(Ordering::Acquire), 0);
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7c_post_confirmation_git_metadata_toctou_createprocess_zero() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7CDirectHarness::new();
+        let gate = H7FinalFenceGate::new();
+        gate.arm();
+        let broker = harness.broker_with_final_fence(Arc::clone(&gate));
+        let task = tokio::spawn({
+            let broker = Arc::clone(&broker);
+            let action = harness.action();
+            async move { broker.execute(action).await }
+        });
+        let pending = harness
+            .receiver
+            .as_mut()
+            .expect("D29-H7-C metadata TOCTOU receiver")
+            .recv()
+            .await
+            .expect("D29-H7-C metadata TOCTOU confirmation");
+        let revision = harness
+            .authority
+            .provision_workspace_confirmation(&pending.action)
+            .expect("D29-H7-C metadata TOCTOU confirmation provision");
+        pending
+            .response
+            .send(revision)
+            .expect("D29-H7-C metadata TOCTOU confirmation response");
+        gate.wait_until_entered().await;
+        let head = harness.root.requested_path().join(".git/HEAD");
+        let mut head_file = OpenOptions::new()
+            .append(true)
+            .open(&head)
+            .expect("D29-H7-C metadata TOCTOU HEAD");
+        head_file
+            .write_all(b"\n")
+            .expect("D29-H7-C metadata TOCTOU HEAD write");
+        gate.release();
+        let result = task.await.expect("D29-H7-C metadata TOCTOU task");
+        assert_eq!(result.status, "denied");
+        let metrics = broker.metrics();
+        assert_eq!(metrics.process_created.load(Ordering::Acquire), 0);
+        assert_eq!(metrics.job_assigned.load(Ordering::Acquire), 0);
+        assert_eq!(metrics.thread_resumed.load(Ordering::Acquire), 0);
+        assert!(harness.authority.shutdown());
     }
 
     #[test]

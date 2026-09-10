@@ -98,6 +98,8 @@ struct ProcessBinding {
     workspace_root_identity: Option<String>,
     #[serde(default)]
     profile_id: Option<String>,
+    #[serde(default)]
+    git_metadata_fence_hash: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -576,6 +578,12 @@ impl HostSession {
                     .is_some_and(valid_id))
             || (git_status && binding.profile_id.as_deref() != Some(GIT_STATUS_PROFILE_ID))
             || (!git_status && binding.profile_id.is_some())
+            || (git_status
+                && !binding
+                    .git_metadata_fence_hash
+                    .as_deref()
+                    .is_some_and(lower_sha256))
+            || (!git_status && binding.git_metadata_fence_hash.is_some())
         {
             return Err("D29-H7 Host process binding was invalid".to_string());
         }

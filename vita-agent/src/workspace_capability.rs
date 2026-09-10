@@ -265,6 +265,23 @@ impl WorkspaceRootIdentity {
             None
         }
     }
+
+    /// Bounded identity evidence used only on the private Host↔Vita wire.
+    /// It is derived from the retained native identity, never from a path
+    /// string supplied by the model.
+    pub fn wire(&self) -> String {
+        let volume = self.volume_serial_number().unwrap_or_default();
+        let file_id = self
+            .file_id()
+            .map(|bytes| {
+                bytes
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            })
+            .unwrap_or_else(|| "none".to_string());
+        format!("v{volume:x}f{file_id}")
+    }
 }
 
 /// Classification of a prepared resource.  `Missing` is identity-only and

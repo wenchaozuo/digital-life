@@ -25,10 +25,12 @@ path = "src/bin/d29h7-git-helper-fixture.rs"
 required-features = ["d29-h7-test-helper"]
 
 [dependencies]
+digital-life-vita-agent-protocol = { path = "../vita-agent-protocol" }
 # D29-C2 pins the source-kernel and protocol to the certified upstream commit.
 # The app-server executable/crate is intentionally not embedded here.
 codex-core = { git = "https://github.com/openai/codex.git", rev = "316795b3cf2a45e90d121d9f46499d4658b2645c" }
 codex-app-server-protocol = { git = "https://github.com/openai/codex.git", rev = "316795b3cf2a45e90d121d9f46499d4658b2645c" }
+codex-core-api = { git = "https://github.com/openai/codex.git", rev = "316795b3cf2a45e90d121d9f46499d4658b2645c" }
 codex-config = { git = "https://github.com/openai/codex.git", rev = "316795b3cf2a45e90d121d9f46499d4658b2645c" }
 codex-extension-api = { git = "https://github.com/openai/codex.git", rev = "316795b3cf2a45e90d121d9f46499d4658b2645c" }
 # The pinned upstream workspace lock resolves this exact pre-1.0 release.
@@ -64,7 +66,6 @@ windows-sys = { version = "=0.61.2", features = [
 ] }
 
 [dev-dependencies]
-codex-core-api = { git = "https://github.com/openai/codex.git", rev = "316795b3cf2a45e90d121d9f46499d4658b2645c" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 # These are the same upstream compatibility patches used by the pinned Codex

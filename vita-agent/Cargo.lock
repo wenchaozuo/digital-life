@@ -4009,6 +4009,7 @@ dependencies = [
  "codex-core",
  "codex-core-api",
  "codex-extension-api",
+ "digital-life-vita-agent-protocol",
  "rama-error",
  "reqwest 0.12.28",
  "serde",
@@ -4020,6 +4021,14 @@ dependencies = [
  "url",
  "windows-sys 0.61.2",
  "zeroize",
+]
+
+[[package]]
+name = "digital-life-vita-agent-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

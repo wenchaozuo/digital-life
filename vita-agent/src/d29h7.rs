@@ -1110,6 +1110,51 @@ impl H7ProcessBinding {
     pub fn turn_id(&self) -> &str {
         &self.turn_id
     }
+
+    /// Rehydrates a binding received only from the trusted Host-side private
+    /// sidecar protocol.  The wire layer validates bounds; H7 still checks
+    /// exact capability/profile/image/fence identity before any launch.
+    pub fn from_host_wire(
+        life_id: String,
+        task_id: String,
+        capability_id: String,
+        program_id: String,
+        executable_identity: String,
+        executable_sha256: String,
+        argv_hash: String,
+        argv_count: usize,
+        working_directory_identity: String,
+        environment_policy_hash: String,
+        stdout_bound: usize,
+        stderr_bound: usize,
+        timeout_ms: u64,
+        tool_call_id: String,
+        turn_id: String,
+        workspace_root_identity: Option<String>,
+        profile_id: Option<String>,
+        git_metadata_fence_hash: Option<String>,
+    ) -> Self {
+        Self {
+            life_id,
+            task_id,
+            capability_id,
+            program_id,
+            executable_identity,
+            executable_sha256,
+            argv_hash,
+            argv_count,
+            working_directory_identity,
+            environment_policy_hash,
+            stdout_bound,
+            stderr_bound,
+            timeout_ms,
+            tool_call_id,
+            turn_id,
+            workspace_root_identity,
+            profile_id,
+            git_metadata_fence_hash,
+        }
+    }
 }
 
 struct H7Handle(HANDLE);
@@ -3964,6 +4009,10 @@ impl H7ProcessGrant {
 
     pub fn expires_at_unix_ms(&self) -> u64 {
         self.expires_at_unix_ms
+    }
+
+    pub fn issued_at_unix_ms(&self) -> u64 {
+        self.issued_at_unix_ms
     }
 
     pub fn single_use(&self) -> bool {

@@ -33,6 +33,9 @@ mod d29h6;
 mod d29h7;
 mod provider_gateway;
 pub mod recovery_journal;
+mod runtime_composition;
+#[cfg(windows)]
+mod sidecar;
 mod tool_authority;
 mod workspace_capability;
 
@@ -41,6 +44,7 @@ pub use provider_gateway::{
     ProviderModelIdentityPolicy, ProviderProfile, ProviderProtocol, ProviderRetryPolicy,
     VitaProviderState,
 };
+pub use runtime_composition::VitaAgentRuntime;
 pub use tool_authority::{
     VitaAuthorityError, VitaAuthorityEvidenceSource, VitaAuthorityFuture, VitaAuthorityOutcome,
     VitaAuthorityReason, VitaAuthorityVerdict, VitaBrokerSnapshot, VitaExecutionContext,
@@ -59,6 +63,15 @@ pub use d29h7::{
     VITA_WORKSPACE_GIT_STATUS_CAPABILITY_ID, VITA_WORKSPACE_GIT_STATUS_PROFILE_ID,
     VITA_WORKSPACE_GIT_STATUS_TOOL_NAME,
 };
+
+#[cfg(windows)]
+pub fn run_sidecar_ipc() -> Result<(), String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("Vita sidecar runtime could not start: {error}"))?;
+    runtime.block_on(sidecar::serve_ipc())
+}
 
 pub const VITA_AGENT_RUNTIME_ID: &str = "vita-agent";
 pub const VITA_UNCONFIGURED_PROVIDER_ID: &str = "vita-unconfigured";

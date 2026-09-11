@@ -66,6 +66,8 @@ fn main() {
             "close_settings_window",
             "start_vita_sidecar",
             "get_vita_sidecar_status",
+            "start_vita_turn",
+            "cancel_vita_turn",
             "confirm_vita_sidecar",
             "deny_vita_sidecar",
             "cancel_vita_sidecar",

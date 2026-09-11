@@ -44,6 +44,7 @@ const error = ref<string>();
 let pollTimer: ReturnType<typeof setInterval> | undefined;
 
 const turnActive = computed(() => status.value.activeTurnId !== null);
+const cancelling = computed(() => status.value.turnPhase === "CANCELLING");
 const pendingConfirmation = computed(() => status.value.pending);
 
 async function refreshStatus(): Promise<void> {
@@ -92,6 +93,15 @@ async function startTurn(): Promise<void> {
   busy.value = true;
   error.value = undefined;
   try {
+    await refreshStatus();
+    if (!status.value.running && ["NO_ACTIVE_PROFILE", "CREDENTIAL_MISSING", "INELIGIBLE_URL"].includes(status.value.providerReadiness)) {
+      error.value = readinessMessage(status.value.providerReadiness);
+      return;
+    }
+    if (status.value.running && status.value.providerReadiness === "SIDECAR_RESTART_REQUIRED") {
+      error.value = "The active Chat profile changed. Stop and restart Vita before starting a turn.";
+      return;
+    }
     if (!(await ensureSession())) return;
     await invoke("start_vita_turn", { request: { prompt: prompt.value } });
     prompt.value = "";
@@ -104,7 +114,7 @@ async function startTurn(): Promise<void> {
 }
 
 async function cancelTurn(): Promise<void> {
-  if (busy.value) return;
+  if (busy.value || !turnActive.value || cancelling.value) return;
   try {
     await invoke("cancel_vita_turn");
     await refreshStatus();
@@ -136,6 +146,13 @@ function boundedError(caught: unknown, fallback: string): string {
   return (value || fallback).slice(0, 256);
 }
 
+function readinessMessage(readiness: string): string {
+  if (readiness === "NO_ACTIVE_PROFILE") return "Choose an eligible active Chat profile before starting Vita.";
+  if (readiness === "CREDENTIAL_MISSING") return "Add a credential to the active Chat profile before starting Vita.";
+  if (readiness === "INELIGIBLE_URL") return "Vita requires an HTTPS public provider endpoint.";
+  return "Vita is not ready to start a turn.";
+}
+
 onMounted(() => {
   void refreshStatus();
   pollTimer = setInterval(() => void refreshStatus(), 750);
@@ -164,11 +181,14 @@ onUnmounted(() => {
     <p v-else-if="status.providerReadiness === 'CREDENTIAL_MISSING'" class="vita-error">
       Add a credential to the active Chat profile before starting Vita.
     </p>
+    <p v-else-if="status.providerReadiness === 'SIDECAR_RESTART_REQUIRED'" class="vita-error">
+      The active Chat profile changed. Stop and restart Vita to bind the new provider.
+    </p>
 
     <label class="field-label" for="vita-workspace">Workspace</label>
     <div class="vita-input-row">
-      <input id="vita-workspace" v-model="workspacePath" autocomplete="off" placeholder="Choose a workspace folder" />
-      <button type="button" @click="chooseWorkspace">Choose folder</button>
+      <input id="vita-workspace" v-model="workspacePath" :disabled="status.running" autocomplete="off" placeholder="Choose a workspace folder" />
+      <button type="button" :disabled="status.running" @click="chooseWorkspace">Choose folder</button>
     </div>
 
     <label class="field-label" for="vita-prompt">Turn prompt</label>
@@ -178,7 +198,7 @@ onUnmounted(() => {
       <button type="button" class="primary" :disabled="busy || turnActive || prompt.trim().length === 0" @click="startTurn">
         {{ busy ? "Starting…" : "Start Vita turn" }}
       </button>
-      <button type="button" :disabled="!turnActive" @click="cancelTurn">Cancel turn</button>
+      <button type="button" :disabled="!turnActive || cancelling" @click="cancelTurn">{{ cancelling ? "Cancelling…" : "Cancel turn" }}</button>
       <button type="button" :disabled="!status.running" @click="stopSession">Stop sidecar</button>
     </div>
 

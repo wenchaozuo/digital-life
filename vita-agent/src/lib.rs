@@ -712,10 +712,10 @@ impl VitaAgentRuntimeProfile {
         ]
     }
 
-    #[cfg(test)]
-    fn cli_overrides_for_gateway(
+    fn cli_overrides_for_gateway_internal(
         &self,
         provider: &provider_gateway::DerivedCodexProvider,
+        session_token: Option<&str>,
     ) -> Vec<(String, TomlValue)> {
         let mut overrides = self.cli_overrides();
         let mut vita_provider = Map::new();
@@ -735,6 +735,15 @@ impl VitaAgentRuntimeProfile {
             "requires_openai_auth".to_string(),
             TomlValue::Boolean(provider.requires_openai_auth()),
         );
+        if let Some(session_token) = session_token {
+            // This value is process-local configuration for Codex's supported
+            // provider bearer-header seam.  It is never written to the
+            // Vita-owned config files because these are CLI overrides only.
+            vita_provider.insert(
+                "experimental_bearer_token".to_string(),
+                TomlValue::String(session_token.to_string()),
+            );
+        }
         vita_provider.insert("request_max_retries".to_string(), TomlValue::Integer(0));
         vita_provider.insert("stream_max_retries".to_string(), TomlValue::Integer(0));
         vita_provider.insert(
@@ -767,6 +776,14 @@ impl VitaAgentRuntimeProfile {
             }
         }
         overrides
+    }
+
+    #[cfg(test)]
+    fn cli_overrides_for_gateway(
+        &self,
+        provider: &provider_gateway::DerivedCodexProvider,
+    ) -> Vec<(String, TomlValue)> {
+        self.cli_overrides_for_gateway_internal(provider, None)
     }
 }
 
@@ -1063,14 +1080,14 @@ impl VitaAgentEntrypoint {
         })
     }
 
-    /// Builds the same private Codex configuration boundary for the D29-F
-    /// localhost proof.  The provider is already validated and the listener
-    /// binding is owned by the caller; this helper only compiles the derived
-    /// provider into the real upstream `Config` used by `ThreadManager`.
-    #[cfg(test)]
-    pub(crate) async fn initialize_with_gateway_for_tests(
+    /// Compiles a validated Vita gateway provider into the private upstream
+    /// `Config` used by `ThreadManager`.  The optional token is an in-memory
+    /// local-listener credential; it is deliberately never written by the
+    /// config loader.
+    async fn initialize_with_gateway_internal(
         profile: VitaAgentRuntimeProfile,
         ready: &provider_gateway::GatewayReadyProvider,
+        session_token: Option<&str>,
     ) -> Result<Self, VitaAgentError> {
         let provider = ready.derived_codex_provider();
         profile.validate_private_namespace()?;
@@ -1081,7 +1098,7 @@ impl VitaAgentEntrypoint {
         let config = ConfigBuilder::default()
             .codex_home(profile.kernel_home().to_path_buf())
             .fallback_cwd(Some(profile.workspace_root().to_path_buf()))
-            .cli_overrides(profile.cli_overrides_for_gateway(provider))
+            .cli_overrides(profile.cli_overrides_for_gateway_internal(provider, session_token))
             .loader_overrides(profile.loader_overrides())
             .strict_config(true)
             .build()
@@ -1099,7 +1116,12 @@ impl VitaAgentEntrypoint {
             ));
         }
         if config.model_provider.env_key.is_some()
-            || config.model_provider.experimental_bearer_token.is_some()
+            || config
+                .model_provider
+                .experimental_bearer_token
+                .as_ref()
+                .map(|token| token.as_str())
+                != session_token
             || config.model_provider.auth.is_some()
             || config.model_provider.aws.is_some()
         {
@@ -1135,6 +1157,26 @@ impl VitaAgentEntrypoint {
                 capabilities: Some(InitializeCapabilities::default()),
             },
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn initialize_with_gateway_for_tests(
+        profile: VitaAgentRuntimeProfile,
+        ready: &provider_gateway::GatewayReadyProvider,
+    ) -> Result<Self, VitaAgentError> {
+        Self::initialize_with_gateway_internal(profile, ready, None).await
+    }
+
+    pub(crate) async fn initialize_with_authenticated_gateway(
+        profile: VitaAgentRuntimeProfile,
+        ready: &provider_gateway::GatewayReadyProvider,
+    ) -> Result<Self, VitaAgentError> {
+        let token = ready.derived_codex_provider().session_token().ok_or(
+            VitaAgentError::KernelInvariant(
+                "production Vita gateway must carry a session authentication token",
+            ),
+        )?;
+        Self::initialize_with_gateway_internal(profile, ready, Some(token.as_str())).await
     }
 
     pub fn profile(&self) -> &VitaAgentRuntimeProfile {

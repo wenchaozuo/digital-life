@@ -5,13 +5,15 @@
 //! has no dependency edge to this crate or to any Codex crate; it communicates
 //! with the sidecar through `digital-life-vita-agent-protocol` instead.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use codex_core_api::{
-    AuthCredentialsStoreMode, AuthManager, CodexAppsToolsCache, EnvironmentManager,
-    ExtensionRegistryBuilder, LoadUserInstructionsFuture, LoadedUserInstructions, SessionSource,
-    ThreadManager, UserInstructionsProvider,
+    AuthCredentialsStoreMode, AuthManager, CodexAppsToolsCache, EnvironmentManager, EventMsg,
+    ExtensionRegistryBuilder, LoadUserInstructionsFuture, LoadedUserInstructions, Op,
+    SessionSource, StartThreadOptions, ThreadManager, TurnInputRequest, UserInput,
+    UserInstructionsProvider,
 };
 use codex_extension_api::ToolContributor;
 
@@ -30,6 +32,9 @@ impl UserInstructionsProvider for NoUserInstructions {
 /// configuration is reachable from this object.
 pub struct VitaAgentRuntime {
     manager: Arc<ThreadManager>,
+    config: codex_core::config::Config,
+    active: AtomicBool,
+    active_thread: Mutex<Option<Arc<codex_core_api::CodexThread>>>,
 }
 
 impl VitaAgentRuntime {
@@ -77,13 +82,163 @@ impl VitaAgentRuntime {
             None,
             None,
         ));
-        Ok(Self { manager })
+        Ok(Self {
+            manager,
+            config: config.clone(),
+            active: AtomicBool::new(false),
+            active_thread: Mutex::new(None),
+        })
+    }
+
+    /// Runs one bounded user turn on the single sidecar-owned Codex runtime.
+    /// The caller owns the protocol lifecycle; this method deliberately
+    /// returns only the bounded terminal assistant text and never exposes a
+    /// raw Codex transcript or provider response.
+    pub async fn run_turn(&self, prompt: String) -> Result<String, VitaAgentError> {
+        if self.active.swap(true, Ordering::AcqRel) {
+            return Err(VitaAgentError::GatewayProtocol(
+                "another Vita turn is already active".to_string(),
+            ));
+        }
+
+        let result = async {
+            let new_thread = tokio::time::timeout(
+                Duration::from_secs(30),
+                self.manager
+                    .start_thread(StartThreadOptions::new(self.config.clone())),
+            )
+            .await
+            .map_err(|_| {
+                VitaAgentError::GatewayProtocol("Vita turn startup timed out".to_string())
+            })?
+            .map_err(|error| {
+                VitaAgentError::GatewayProtocol(format!("Vita turn startup failed: {error}"))
+            })?;
+            let thread = new_thread.thread;
+            if let Ok(mut active_thread) = self.active_thread.lock() {
+                *active_thread = Some(Arc::clone(&thread));
+            }
+
+            let submission = tokio::time::timeout(
+                Duration::from_secs(30),
+                thread.start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                    text: prompt,
+                    text_elements: Vec::new(),
+                }])),
+            )
+            .await
+            .map_err(|_| {
+                VitaAgentError::GatewayProtocol("Vita turn submission timed out".to_string())
+            })?
+            .map_err(|error| {
+                VitaAgentError::GatewayProtocol(format!("Vita turn submission failed: {error}"))
+            })?;
+            let _ = submission;
+
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+            let mut assistant_text = String::new();
+            loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    let _ = thread.submit(Op::Interrupt).await;
+                    return Err(VitaAgentError::GatewayProtocol(
+                        "Vita turn timed out".to_string(),
+                    ));
+                }
+                let event = tokio::time::timeout(remaining, thread.next_event())
+                    .await
+                    .map_err(|_| {
+                        VitaAgentError::GatewayProtocol("Vita turn timed out".to_string())
+                    })?
+                    .map_err(|error| {
+                        VitaAgentError::GatewayProtocol(format!(
+                            "Vita event stream failed: {error}"
+                        ))
+                    })?;
+                match event.msg {
+                    EventMsg::AgentMessage(message) => {
+                        append_bounded_text(
+                            &mut assistant_text,
+                            &message.message,
+                            vita_agent_protocol::MAX_TURN_OUTPUT_BYTES,
+                        );
+                    }
+                    EventMsg::TurnComplete(complete) => {
+                        if let Some(message) = complete.last_agent_message {
+                            assistant_text =
+                                bounded_text(&message, vita_agent_protocol::MAX_TURN_OUTPUT_BYTES);
+                        }
+                        if let Some(error) = complete.error {
+                            return Err(VitaAgentError::GatewayProtocol(
+                                error.message.chars().take(256).collect(),
+                            ));
+                        }
+                        return Ok(assistant_text);
+                    }
+                    EventMsg::TurnAborted(_) => {
+                        return Err(VitaAgentError::GatewayProtocol(
+                            "Vita turn was cancelled".to_string(),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        .await;
+
+        if let Ok(mut active_thread) = self.active_thread.lock() {
+            active_thread.take();
+        }
+        self.active.store(false, Ordering::Release);
+        result
+    }
+
+    /// Best-effort bounded interruption used by Host cancellation and sidecar
+    /// retirement.  It never starts a replacement turn.
+    pub async fn interrupt_active_turn(&self) -> bool {
+        let thread = self
+            .active_thread
+            .lock()
+            .ok()
+            .and_then(|active| active.clone());
+        let Some(thread) = thread else { return false };
+        tokio::time::timeout(Duration::from_secs(2), thread.submit(Op::Interrupt))
+            .await
+            .is_ok_and(|result| result.is_ok())
     }
 
     pub async fn shutdown(&self) {
+        let _ = self.interrupt_active_turn().await;
         let _ = self
             .manager
             .shutdown_all_threads_bounded(Duration::from_secs(2))
             .await;
     }
+}
+
+fn append_bounded_text(target: &mut String, value: &str, max_bytes: usize) {
+    if target.len() >= max_bytes {
+        return;
+    }
+    let remaining = max_bytes - target.len();
+    if value.len() <= remaining {
+        target.push_str(value);
+        return;
+    }
+    let mut end = remaining;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    target.push_str(&value[..end]);
+}
+
+fn bounded_text(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
 }

@@ -4,8 +4,10 @@
 //! pinned Codex composition. Authority decisions are RPCs to the Tauri Host;
 //! this process never reads the Host SQLite database and never mints a grant.
 
+use serde_json::Value;
 use std::collections::HashMap;
-use std::io::{BufReader, BufWriter, Stdin, Stdout};
+use std::io::{BufReader, BufWriter, Read, Stdin, Stdout, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
@@ -13,12 +15,20 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use protocol::{
-    AuthorityEvaluate, ConfirmationDecision, ConfirmationRequired, GrantIssued, Handshake,
-    HostMessage, InitializeSession, IssueGrant, ProcessBinding, ProcessGrant, RevalidateGrant,
-    VitaMessage, CODEX_PROTOCOL_SCHEMA_HASH, CODEX_UPSTREAM_COMMIT, PROTOCOL_VERSION, RUNTIME_ID,
+    AuthorityEvaluate, ConfirmationDecision, ConfirmationRequired, CredentialRequired, GrantIssued,
+    Handshake, HostMessage, InitializeSession, IssueGrant, ProcessBinding, ProcessGrant,
+    ProviderBinding, ProviderConfiguration, RevalidateGrant, StartTurn, TurnCompleted, TurnFailed,
+    TurnPhase, TurnState, VitaMessage, CODEX_PROTOCOL_SCHEMA_HASH, CODEX_UPSTREAM_COMMIT,
+    MAX_FRAME_BYTES, MAX_PROMPT_BYTES, MAX_TURN_OUTPUT_BYTES, PROTOCOL_VERSION, RUNTIME_ID,
+    TOOL_NAME,
 };
 use vita_agent_protocol as protocol;
 
+use crate::provider_gateway::{
+    CredentialResolver, GatewayReadyProvider, GatewayToolDefinition, ProviderGateway,
+    ProviderRequestIdentity, ResolvedCredential, VitaFunctionCall, VitaMessage as GatewayMessage,
+    VitaMessageRole, VitaResponsesRequest, VitaResponsesRequestOptions, VitaToolOutput,
+};
 use crate::{
     H7ProcessBinding, H7ProcessGrant, VitaAgentEntrypoint, VitaAgentRuntime,
     VitaAgentRuntimeProfile, VitaExecutionContext, VitaGitStatusAuthority,
@@ -26,6 +36,674 @@ use crate::{
     VITA_WORKSPACE_GIT_STATUS_CAPABILITY_ID, VITA_WORKSPACE_GIT_STATUS_PROFILE_ID,
     VITA_WORKSPACE_GIT_STATUS_TOOL_NAME,
 };
+
+const LOCAL_GATEWAY_HEADER_LIMIT: usize = 64 * 1024;
+const LOCAL_GATEWAY_BODY_LIMIT: usize = MAX_FRAME_BYTES;
+const LOCAL_GATEWAY_IO_TIMEOUT: Duration = Duration::from_secs(5);
+const LOCAL_GATEWAY_PATH: &str = "/v1/responses";
+const MAX_GATEWAY_TEXT_BYTES: usize = MAX_TURN_OUTPUT_BYTES;
+
+#[derive(Clone)]
+struct SidecarCredentialResolver {
+    router: SidecarRouter,
+    session_id: String,
+    provider_configuration: ProviderConfiguration,
+    ready: GatewayReadyProvider,
+    active_identity: Arc<Mutex<Option<ProviderRequestIdentity>>>,
+}
+
+impl CredentialResolver for SidecarCredentialResolver {
+    fn resolve(
+        &self,
+        _credential_ref: &crate::provider_gateway::CredentialRef,
+    ) -> Result<ResolvedCredential, crate::VitaAgentError> {
+        Err(crate::VitaAgentError::CredentialResolution(
+            "request identity is required for Vita credential resolution",
+        ))
+    }
+
+    fn resolve_for_request(
+        &self,
+        credential_ref: &crate::provider_gateway::CredentialRef,
+        request: &ProviderRequestIdentity,
+    ) -> Result<ResolvedCredential, crate::VitaAgentError> {
+        let configuration = &self.provider_configuration;
+        if configuration.credential_ref != credential_ref.reference_id()
+            || configuration.model != self.ready.profile().model()
+        {
+            return Err(crate::VitaAgentError::CredentialResolution(
+                "provider credential reference was stale",
+            ));
+        }
+        let binding = ProviderBinding::derive(&self.session_id, &request.turn_id, configuration)
+            .map_err(|_| {
+                crate::VitaAgentError::CredentialResolution("provider binding was invalid")
+            })?;
+        if binding.binding_hash != request.binding_hash {
+            return Err(crate::VitaAgentError::CredentialResolution(
+                "provider binding was stale",
+            ));
+        }
+        if !active_identity_matches(&self.active_identity, request) {
+            return Err(crate::VitaAgentError::CredentialResolution(
+                "Vita turn is no longer active",
+            ));
+        }
+        let request_id = next_request_id("vita-credential");
+        let reply = self
+            .router
+            .request(VitaMessage::CredentialRequired(CredentialRequired {
+                request_id,
+                session_id: self.session_id.clone(),
+                turn_id: request.turn_id.clone(),
+                binding: binding.clone(),
+            }))
+            .map_err(|_| {
+                crate::VitaAgentError::CredentialResolution("Host credential authority unavailable")
+            })?;
+        let HostMessage::SensitiveCredentialReply(reply) = reply else {
+            return Err(crate::VitaAgentError::CredentialResolution(
+                "Host returned an unexpected credential response",
+            ));
+        };
+        reply.validate().map_err(|_| {
+            crate::VitaAgentError::CredentialResolution("Host credential response was malformed")
+        })?;
+        if reply.session_id != self.session_id
+            || reply.turn_id != request.turn_id
+            || reply.binding_hash != binding.binding_hash
+            || reply.credential_ref != credential_ref.reference_id()
+        {
+            return Err(crate::VitaAgentError::CredentialResolution(
+                "Host credential response binding was stale",
+            ));
+        }
+        if !active_identity_matches(&self.active_identity, request) {
+            return Err(crate::VitaAgentError::CredentialResolution(
+                "Vita turn is no longer active",
+            ));
+        }
+        let credential = reply
+            .credential
+            .ok_or(crate::VitaAgentError::CredentialResolution(
+                "Host denied provider credential",
+            ))?;
+        let resolved = ResolvedCredential::new(credential.as_str().to_owned());
+        resolved.validate_header_safety()?;
+        Ok(resolved)
+    }
+}
+
+fn active_identity_matches(
+    active_identity: &Arc<Mutex<Option<ProviderRequestIdentity>>>,
+    expected: &ProviderRequestIdentity,
+) -> bool {
+    active_identity
+        .lock()
+        .ok()
+        .is_some_and(|active| active.as_ref() == Some(expected))
+}
+
+fn active_turn_id_matches(
+    active_identity: &Arc<Mutex<Option<ProviderRequestIdentity>>>,
+    turn_id: &str,
+) -> bool {
+    active_identity.lock().ok().is_some_and(|active| {
+        active
+            .as_ref()
+            .is_some_and(|identity| identity.turn_id == turn_id)
+    })
+}
+
+struct VitaGatewayServer {
+    stop: Arc<AtomicBool>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl VitaGatewayServer {
+    fn start(
+        listener: TcpListener,
+        ready: GatewayReadyProvider,
+        provider_configuration: ProviderConfiguration,
+        router: SidecarRouter,
+        session_id: String,
+        active_identity: Arc<Mutex<Option<ProviderRequestIdentity>>>,
+    ) -> Result<Self, crate::VitaAgentError> {
+        listener
+            .set_nonblocking(true)
+            .map_err(crate::VitaAgentError::GatewayTransport)?;
+        let token = ready
+            .binding()
+            .session_token()
+            .ok_or(crate::VitaAgentError::GatewayProtocol(
+                "production Vita gateway is missing session authentication".to_string(),
+            ))?
+            .as_str()
+            .to_string();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_thread = Arc::clone(&stop);
+        let provider_configuration_for_thread = provider_configuration;
+        let join = std::thread::Builder::new()
+            .name("vita-provider-gateway".to_string())
+            .spawn(move || {
+                while !stop_for_thread.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((stream, peer)) => {
+                            let _ = handle_gateway_connection(
+                                stream,
+                                peer,
+                                &token,
+                                &ready,
+                                &provider_configuration_for_thread,
+                                &router,
+                                &session_id,
+                                &active_identity,
+                            );
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+            .map_err(crate::VitaAgentError::GatewayTransport)?;
+        Ok(Self {
+            stop,
+            join: Some(join),
+        })
+    }
+
+    fn stop(mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+impl Drop for VitaGatewayServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+fn handle_gateway_connection(
+    mut stream: TcpStream,
+    peer: std::net::SocketAddr,
+    expected_token: &str,
+    ready: &GatewayReadyProvider,
+    provider_configuration: &ProviderConfiguration,
+    router: &SidecarRouter,
+    session_id: &str,
+    active_identity: &Arc<Mutex<Option<ProviderRequestIdentity>>>,
+) -> Result<(), String> {
+    if !peer.ip().is_loopback() {
+        return write_gateway_error(&mut stream, "403 Forbidden", "GATEWAY_PEER_DENIED");
+    }
+    stream
+        .set_read_timeout(Some(LOCAL_GATEWAY_IO_TIMEOUT))
+        .map_err(|error| error.to_string())?;
+    stream
+        .set_write_timeout(Some(LOCAL_GATEWAY_IO_TIMEOUT))
+        .map_err(|error| error.to_string())?;
+    let request = match read_gateway_http_request(&mut stream) {
+        Ok(request) => request,
+        Err(code) => return write_gateway_error(&mut stream, "400 Bad Request", code),
+    };
+    if let Err(code) = authorize_gateway_request(&request, expected_token) {
+        let status = if code == "GATEWAY_AUTH_DENIED" {
+            "401 Unauthorized"
+        } else {
+            "404 Not Found"
+        };
+        return write_gateway_error(&mut stream, status, code);
+    }
+    let identity = active_identity
+        .lock()
+        .map_err(|_| "active Vita turn state was poisoned".to_string())?
+        .clone()
+        .ok_or_else(|| "no active Vita turn".to_string());
+    let identity = match identity {
+        Ok(identity) => identity,
+        Err(_) => return write_gateway_error(&mut stream, "409 Conflict", "TURN_NOT_ACTIVE"),
+    };
+    let request = match parse_gateway_responses_request(&request.body, ready.profile().model()) {
+        Ok(request) => request,
+        Err(_) => return write_gateway_error(&mut stream, "400 Bad Request", "REQUEST_INVALID"),
+    };
+    let resolver = SidecarCredentialResolver {
+        router: router.clone(),
+        session_id: session_id.to_string(),
+        provider_configuration: provider_configuration.clone(),
+        ready: ready.clone(),
+        active_identity: Arc::clone(active_identity),
+    };
+    let transport = crate::provider_gateway::new_production_provider_transport()
+        .map_err(|_| "provider transport unavailable".to_string())?;
+    let gateway = ProviderGateway::new(ready.clone(), resolver, transport);
+    let result = gateway
+        .execute_responses_request_with_identity(&request, Some(&identity))
+        .map_err(|_| "provider request failed".to_string())?;
+    if !active_identity_matches(active_identity, &identity) {
+        return write_gateway_error(&mut stream, "409 Conflict", "TURN_NOT_ACTIVE");
+    }
+    write_gateway_success(&mut stream, &result)
+}
+
+struct GatewayHttpRequest {
+    method: String,
+    path: String,
+    authorization: Option<String>,
+    body: Vec<u8>,
+}
+
+fn authorize_gateway_request(
+    request: &GatewayHttpRequest,
+    expected_token: &str,
+) -> Result<(), &'static str> {
+    if request.method != "POST" || request.path != LOCAL_GATEWAY_PATH {
+        return Err("GATEWAY_ROUTE_DENIED");
+    }
+    if request.authorization.as_deref() != Some(expected_token) {
+        return Err("GATEWAY_AUTH_DENIED");
+    }
+    Ok(())
+}
+
+fn read_gateway_http_request(stream: &mut TcpStream) -> Result<GatewayHttpRequest, &'static str> {
+    let mut bytes = Vec::with_capacity(4096);
+    let mut header_end = None;
+    let mut chunk = [0_u8; 4096];
+    while bytes.len() <= LOCAL_GATEWAY_HEADER_LIMIT + LOCAL_GATEWAY_BODY_LIMIT {
+        let count = stream.read(&mut chunk).map_err(|_| "GATEWAY_IO")?;
+        if count == 0 {
+            return Err("GATEWAY_TRUNCATED");
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+        if header_end.is_none() {
+            header_end = bytes.windows(4).position(|window| window == b"\r\n\r\n");
+            if header_end.is_some_and(|offset| offset > LOCAL_GATEWAY_HEADER_LIMIT) {
+                return Err("GATEWAY_HEADERS_TOO_LARGE");
+            }
+        }
+        let Some(offset) = header_end else { continue };
+        let header_len = offset + 4;
+        let header = std::str::from_utf8(&bytes[..offset]).map_err(|_| "GATEWAY_HEADERS")?;
+        let mut lines = header.split("\r\n");
+        let request_line = lines.next().ok_or("GATEWAY_REQUEST_LINE")?;
+        let mut request_parts = request_line.split_ascii_whitespace();
+        let method = request_parts.next().ok_or("GATEWAY_REQUEST_LINE")?;
+        let path = request_parts.next().ok_or("GATEWAY_REQUEST_LINE")?;
+        let version = request_parts.next().ok_or("GATEWAY_REQUEST_LINE")?;
+        if version != "HTTP/1.1" || request_parts.next().is_some() {
+            return Err("GATEWAY_REQUEST_LINE");
+        }
+        let mut content_length = None;
+        let mut authorization = None;
+        for line in lines {
+            let Some((name, value)) = line.split_once(':') else {
+                return Err("GATEWAY_HEADERS");
+            };
+            let value = value.trim();
+            if name.eq_ignore_ascii_case("content-length") {
+                if content_length.is_some() {
+                    return Err("GATEWAY_DUPLICATE_LENGTH");
+                }
+                content_length = Some(value.parse::<usize>().map_err(|_| "GATEWAY_LENGTH")?);
+            } else if name.eq_ignore_ascii_case("authorization") {
+                if authorization.is_some() {
+                    return Err("GATEWAY_DUPLICATE_AUTH");
+                }
+                let Some(token) = value.strip_prefix("Bearer ") else {
+                    return Err("GATEWAY_AUTH");
+                };
+                authorization = Some(token.to_string());
+            } else if name.eq_ignore_ascii_case("transfer-encoding") {
+                return Err("GATEWAY_CHUNKED");
+            }
+        }
+        let content_length = content_length.ok_or("GATEWAY_LENGTH")?;
+        if content_length == 0 || content_length > LOCAL_GATEWAY_BODY_LIMIT {
+            return Err("GATEWAY_BODY_TOO_LARGE");
+        }
+        let body_end = header_len.saturating_add(content_length);
+        if body_end > bytes.len() {
+            continue;
+        }
+        let body = bytes[header_len..body_end].to_vec();
+        return Ok(GatewayHttpRequest {
+            method: method.to_string(),
+            path: path.to_string(),
+            authorization,
+            body,
+        });
+    }
+    Err("GATEWAY_BODY_TOO_LARGE")
+}
+
+fn write_gateway_error(stream: &mut TcpStream, status: &str, code: &str) -> Result<(), String> {
+    let body = serde_json::json!({"error": {"code": code}}).to_string();
+    write_gateway_http_response(stream, status, "application/json", body.as_bytes())
+}
+
+fn write_gateway_success(
+    stream: &mut TcpStream,
+    result: &crate::provider_gateway::VitaResponsesResult,
+) -> Result<(), String> {
+    let response_id = format!("resp-{}", result.id);
+    let mut events = Vec::new();
+    events.push(serde_json::json!({
+        "type": "response.created",
+        "response": {"id": response_id, "object": "response", "status": "in_progress", "model": result.model}
+    }));
+    if result.function_calls.is_empty() {
+        let text = bounded_utf8_prefix(&result.output_text, MAX_GATEWAY_TEXT_BYTES);
+        events.push(serde_json::json!({
+            "type": "response.output_item.added",
+            "item": {"type":"message","id":"msg-vita","role":"assistant","status":"in_progress","content":[]}
+        }));
+        events.push(serde_json::json!({"type":"response.content_part.added"}));
+        events.push(serde_json::json!({"type":"response.output_text.delta","delta":text}));
+        events.push(serde_json::json!({"type":"response.output_text.done","text":text}));
+        events.push(serde_json::json!({"type":"response.content_part.done"}));
+        events.push(serde_json::json!({
+            "type": "response.output_item.done",
+            "item": {"type":"message","id":"msg-vita","role":"assistant","status":"completed","content":[{"type":"output_text","text":text}]}
+        }));
+        events.push(serde_json::json!({"type":"response.completed","response":{"id":format!("resp-{}", result.id),"status":"completed","model":result.model,"usage":result.usage.as_ref().map(|usage| serde_json::json!({"input_tokens":usage.input_tokens,"output_tokens":usage.output_tokens,"total_tokens":usage.total_tokens})),"end_turn":true}}));
+    } else {
+        for call in &result.function_calls {
+            events.push(serde_json::json!({"type":"response.output_item.added","item":{"type":"function_call","id":call.id,"call_id":call.id,"name":call.name,"arguments":"","status":"in_progress"}}));
+            events.push(serde_json::json!({"type":"response.function_call_arguments.delta","item_id":call.id,"call_id":call.id,"delta":call.arguments}));
+            events.push(serde_json::json!({"type":"response.function_call_arguments.done","item_id":call.id,"call_id":call.id,"arguments":call.arguments}));
+            events.push(serde_json::json!({"type":"response.output_item.done","item":{"type":"function_call","id":call.id,"call_id":call.id,"name":call.name,"arguments":call.arguments,"status":"completed"}}));
+        }
+        events.push(serde_json::json!({"type":"response.completed","response":{"id":format!("resp-{}", result.id),"status":"completed","model":result.model,"usage":result.usage.as_ref().map(|usage| serde_json::json!({"input_tokens":usage.input_tokens,"output_tokens":usage.output_tokens,"total_tokens":usage.total_tokens})),"end_turn":false}}));
+    }
+    let mut body = String::new();
+    for event in events {
+        let kind = event
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("response.completed");
+        body.push_str("event: ");
+        body.push_str(kind);
+        body.push_str("\ndata: ");
+        body.push_str(
+            &serde_json::to_string(&event).map_err(|_| "serialize gateway event".to_string())?,
+        );
+        body.push_str("\n\n");
+    }
+    if body.len() > LOCAL_GATEWAY_BODY_LIMIT {
+        return write_gateway_error(stream, "502 Bad Gateway", "RESPONSE_TOO_LARGE");
+    }
+    write_gateway_http_response(stream, "200 OK", "text/event-stream", body.as_bytes())
+}
+
+fn write_gateway_http_response(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &[u8],
+) -> Result<(), String> {
+    let header = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",
+        body.len()
+    );
+    stream
+        .write_all(header.as_bytes())
+        .and_then(|_| stream.write_all(body))
+        .map_err(|_| "gateway response write failed".to_string())
+}
+
+fn parse_gateway_responses_request(
+    body: &[u8],
+    expected_model: &str,
+) -> Result<VitaResponsesRequest, String> {
+    if body.len() > LOCAL_GATEWAY_BODY_LIMIT {
+        return Err("request too large".to_string());
+    }
+    let value: Value =
+        serde_json::from_slice(body).map_err(|_| "invalid request json".to_string())?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "request must be an object".to_string())?;
+    let model = object
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "model missing".to_string())?;
+    if model != expected_model || object.get("stream").and_then(Value::as_bool) != Some(true) {
+        return Err("model or stream mismatch".to_string());
+    }
+    if object
+        .get("store")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err("store is disabled".to_string());
+    }
+    if object
+        .get("parallel_tool_calls")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err("parallel tool calls are disabled".to_string());
+    }
+    let mut messages = Vec::new();
+    if let Some(instructions) = object.get("instructions").and_then(Value::as_str) {
+        if !instructions.is_empty() {
+            messages.push(GatewayMessage::text(
+                VitaMessageRole::System,
+                bounded_gateway_text(instructions)?,
+            ));
+        }
+    }
+    let mut tool_calls = Vec::new();
+    let mut tool_outputs = Vec::new();
+    for item in object
+        .get("input")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "input missing".to_string())?
+    {
+        let item = item
+            .as_object()
+            .ok_or_else(|| "input item invalid".to_string())?;
+        match item.get("type").and_then(Value::as_str).unwrap_or_default() {
+            "message" => {
+                let role = match item.get("role").and_then(Value::as_str).unwrap_or_default() {
+                    "system" => VitaMessageRole::System,
+                    "developer" => VitaMessageRole::Developer,
+                    "user" => VitaMessageRole::User,
+                    "assistant" => VitaMessageRole::Assistant,
+                    _ => return Err("message role invalid".to_string()),
+                };
+                let content = item
+                    .get("content")
+                    .ok_or_else(|| "message content missing".to_string())?;
+                let mut text = String::new();
+                if let Some(content) = content.as_str() {
+                    text.push_str(content);
+                } else {
+                    for part in content
+                        .as_array()
+                        .ok_or_else(|| "message content invalid".to_string())?
+                    {
+                        let part = part
+                            .as_object()
+                            .ok_or_else(|| "message part invalid".to_string())?;
+                        if !matches!(
+                            part.get("type").and_then(Value::as_str),
+                            Some("input_text" | "output_text")
+                        ) {
+                            return Err("message content type invalid".to_string());
+                        }
+                        text.push_str(
+                            part.get("text")
+                                .and_then(Value::as_str)
+                                .ok_or_else(|| "message text missing".to_string())?,
+                        );
+                    }
+                }
+                messages.push(GatewayMessage::text(role, bounded_gateway_text(&text)?));
+            }
+            "function_call" => {
+                let id = item
+                    .get("call_id")
+                    .or_else(|| item.get("id"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "function call id missing".to_string())?;
+                let name = item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "function call name missing".to_string())?;
+                if name != TOOL_NAME {
+                    return Err("unknown tool call".to_string());
+                }
+                let arguments = item
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "function call arguments missing".to_string())?;
+                tool_calls.push(VitaFunctionCall {
+                    id: bounded_gateway_id(id)?,
+                    name: name.to_string(),
+                    arguments: bounded_gateway_text(arguments)?,
+                });
+            }
+            "function_call_output" => {
+                let call_id = item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "function output id missing".to_string())?;
+                let output = item
+                    .get("output")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| item.get("output").map(Value::to_string))
+                    .ok_or_else(|| "function output missing".to_string())?;
+                tool_outputs.push(VitaToolOutput {
+                    call_id: bounded_gateway_id(call_id)?,
+                    output: bounded_gateway_text(&output)?,
+                });
+            }
+            _ => return Err("unsupported Responses input item".to_string()),
+        }
+    }
+    let mut options = VitaResponsesRequestOptions {
+        stream: true,
+        ..Default::default()
+    };
+    let mut advertised_tool = false;
+    if let Some(tools) = object.get("tools") {
+        for tool in tools
+            .as_array()
+            .ok_or_else(|| "tools invalid".to_string())?
+        {
+            let tool = tool.as_object().ok_or_else(|| "tool invalid".to_string())?;
+            if tool.get("type").and_then(Value::as_str) != Some("function") {
+                return Err("tool type invalid".to_string());
+            }
+            let name = tool
+                .get("name")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    tool.get("function")
+                        .and_then(Value::as_object)
+                        .and_then(|function| function.get("name"))
+                        .and_then(Value::as_str)
+                })
+                .ok_or_else(|| "tool name missing".to_string())?;
+            if name != TOOL_NAME {
+                return Err("unknown advertised tool".to_string());
+            }
+            if advertised_tool {
+                return Err("duplicate advertised tool".to_string());
+            }
+            advertised_tool = true;
+            let description = tool
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let parameters = tool
+                .get("parameters")
+                .cloned()
+                .or_else(|| {
+                    tool.get("function")
+                        .and_then(Value::as_object)
+                        .and_then(|function| function.get("parameters"))
+                        .cloned()
+                })
+                .ok_or_else(|| "tool parameters missing".to_string())?;
+            options.tools.push(GatewayToolDefinition {
+                name: name.to_string(),
+                description,
+                parameters,
+            });
+        }
+    }
+    Ok(VitaResponsesRequest {
+        model: model.to_string(),
+        messages,
+        options,
+        tool_calls,
+        tool_outputs,
+    })
+}
+
+fn bounded_gateway_text(value: &str) -> Result<String, String> {
+    if value.is_empty()
+        || value.len() > MAX_PROMPT_BYTES
+        || value
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+    {
+        return Err("gateway text exceeded its bound".to_string());
+    }
+    Ok(value.to_string())
+}
+
+fn bounded_gateway_id(value: &str) -> Result<String, String> {
+    if value.is_empty()
+        || value.len() > 128
+        || value
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return Err("gateway identifier exceeded its bound".to_string());
+    }
+    Ok(value.to_string())
+}
+
+fn bounded_utf8_prefix(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
+
+fn bounded_protocol_text(value: &str, max_bytes: usize) -> String {
+    let mut output = String::new();
+    for character in value.chars() {
+        let character = if character.is_control() && !matches!(character, '\n' | '\r' | '\t') {
+            ' '
+        } else {
+            character
+        };
+        let remaining = max_bytes.saturating_sub(output.len());
+        if remaining == 0 || character.len_utf8() > remaining {
+            break;
+        }
+        output.push(character);
+    }
+    output
+}
 
 const AUTHORITY_REQUEST_TIMEOUT: Duration = Duration::from_secs(35);
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -66,7 +744,7 @@ impl SidecarRouter {
             .spawn(move || {
                 let mut reader = reader;
                 loop {
-                    let body = match protocol::read_frame(&mut reader) {
+                    let body = match protocol::read_sensitive_frame(&mut reader) {
                         Ok(Some(body)) => body,
                         Ok(None) | Err(_) => {
                             thread_inner.closed.store(true, Ordering::Release);
@@ -172,6 +850,9 @@ fn host_request_id(message: &HostMessage) -> &str {
         HostMessage::GrantIssued(message) => &message.request_id,
         HostMessage::GrantRevalidated(message) => &message.request_id,
         HostMessage::CancelAction(message) => &message.request_id,
+        HostMessage::StartTurn(message) => &message.request_id,
+        HostMessage::CancelTurn(message) => &message.request_id,
+        HostMessage::SensitiveCredentialReply(message) => &message.request_id,
         HostMessage::Shutdown(message) => &message.request_id,
     }
 }
@@ -185,6 +866,10 @@ fn vita_request_id(message: &VitaMessage) -> &str {
         VitaMessage::IssueGrant(message) => &message.request_id,
         VitaMessage::RevalidateGrant(message) => &message.request_id,
         VitaMessage::ActionCancelled(message) => &message.request_id,
+        VitaMessage::CredentialRequired(message) => &message.request_id,
+        VitaMessage::TurnState(message) => &message.request_id,
+        VitaMessage::TurnCompleted(message) => &message.request_id,
+        VitaMessage::TurnFailed(message) => &message.request_id,
         VitaMessage::ShutdownAck(message) => &message.request_id,
         VitaMessage::Fatal(message) => &message.request_id,
     }
@@ -217,6 +902,7 @@ pub async fn serve_ipc() -> Result<(), String> {
     };
     init.validate().map_err(protocol_error)?;
 
+    let router = SidecarRouter::start(reader, writer);
     let profile = VitaAgentRuntimeProfile::from_explicit_app_data_root(
         PathBuf::from(&init.app_data_root),
         PathBuf::from(&init.workspace_path),
@@ -227,12 +913,8 @@ pub async fn serve_ipc() -> Result<(), String> {
         .ok_or_else(|| "Vita workspace authority is unavailable".to_string())?
         .clone();
     let workspace_identity = workspace.identity().wire();
-    let entrypoint = VitaAgentEntrypoint::initialize(profile)
-        .await
-        .map_err(|error| format!("Vita entrypoint initialization failed: {error}"))?;
     let context = VitaExecutionContext::try_new(init.life_id.clone(), init.task_id.clone())
         .map_err(|error| format!("Vita execution identity was invalid: {error:?}"))?;
-    let router = SidecarRouter::start(reader, writer);
     let authority = Arc::new(SidecarHostAuthority {
         router: router.clone(),
         session_id: init.session_id.clone(),
@@ -247,6 +929,66 @@ pub async fn serve_ipc() -> Result<(), String> {
         .map_err(|error| format!("Vita H7-C production setup failed: {error}"))?,
     );
     let contributor = production.contributor();
+    let active_identity = Arc::new(Mutex::new(None::<ProviderRequestIdentity>));
+    let (entrypoint, mut gateway_server) = if let Some(provider_config) = init.provider.as_ref() {
+        provider_config.validate().map_err(protocol_error)?;
+        let credential = crate::CredentialRef::new(
+            provider_config.credential_ref.clone(),
+            provider_config.profile_id.clone(),
+            &provider_config.base_url,
+        )
+        .map_err(|error| format!("Vita credential binding was rejected: {error}"))?;
+        let provider = crate::ProviderProfile::new(
+            provider_config.profile_id.clone(),
+            "Digital Life active Chat provider",
+            crate::ProviderProtocol::OpenAiChatCompletions,
+            &provider_config.base_url,
+            provider_config.model.clone(),
+            Some(credential),
+            Duration::from_secs(300),
+            crate::ProviderRetryPolicy::default(),
+            crate::ProviderCapabilities {
+                tools: true,
+                developer_role: true,
+                ..crate::ProviderCapabilities::none()
+            },
+        )
+        .map_err(|error| format!("Vita production provider was rejected: {error}"))?;
+        let provider_authority =
+            crate::provider_gateway::VitaProviderAuthority::configure(provider)
+                .map_err(|error| format!("Vita provider authority was rejected: {error}"))?;
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .map_err(|error| format!("Vita local gateway could not bind: {error}"))?;
+        let port = listener
+            .local_addr()
+            .map_err(|error| format!("Vita local gateway address unavailable: {error}"))?
+            .port();
+        let binding =
+            crate::provider_gateway::VitaGatewayBinding::for_authenticated_private_listener(port)
+                .map_err(|error| format!("Vita local gateway binding failed: {error}"))?;
+        let ready = provider_authority
+            .prepare_gateway(binding)
+            .map_err(|error| format!("Vita provider gateway preparation failed: {error}"))?;
+        let gateway_server = VitaGatewayServer::start(
+            listener,
+            ready.clone(),
+            provider_config.clone(),
+            router.clone(),
+            init.session_id.clone(),
+            Arc::clone(&active_identity),
+        )
+        .map_err(|error| format!("Vita local gateway startup failed: {error}"))?;
+        let entrypoint =
+            VitaAgentEntrypoint::initialize_with_authenticated_gateway(profile, &ready)
+                .await
+                .map_err(|error| format!("Vita entrypoint initialization failed: {error}"))?;
+        (entrypoint, Some(gateway_server))
+    } else {
+        let entrypoint = VitaAgentEntrypoint::initialize(profile)
+            .await
+            .map_err(|error| format!("Vita entrypoint initialization failed: {error}"))?;
+        (entrypoint, None)
+    };
     let runtime = Arc::new(
         VitaAgentRuntime::compose(&entrypoint, contributor)
             .await
@@ -266,7 +1008,12 @@ pub async fn serve_ipc() -> Result<(), String> {
         profile_id: VITA_WORKSPACE_GIT_STATUS_PROFILE_ID.to_string(),
         tool_name: VITA_WORKSPACE_GIT_STATUS_TOOL_NAME.to_string(),
     }))?;
-    spawn_confirmation_loop(router.clone(), init.clone(), receiver);
+    spawn_confirmation_loop(
+        router.clone(),
+        init.clone(),
+        receiver,
+        Arc::clone(&active_identity),
+    );
 
     loop {
         let command = tokio::task::spawn_blocking({
@@ -278,6 +1025,9 @@ pub async fn serve_ipc() -> Result<(), String> {
         let Some(command) = command else {
             production.cancel();
             runtime.shutdown().await;
+            if let Some(gateway_server) = gateway_server.take() {
+                gateway_server.stop();
+            }
             return Err("Vita Host pipe closed".to_string());
         };
         match command {
@@ -288,9 +1038,31 @@ pub async fn serve_ipc() -> Result<(), String> {
                     session_id: init.session_id.clone(),
                 }))?;
             }
+            HostMessage::StartTurn(message) if message.session_id == init.session_id => {
+                handle_start_turn(
+                    message,
+                    &init,
+                    init.provider.as_ref(),
+                    Arc::clone(&runtime),
+                    router.clone(),
+                    Arc::clone(&active_identity),
+                );
+            }
+            HostMessage::CancelTurn(message) if message.session_id == init.session_id => {
+                handle_cancel_turn(
+                    message,
+                    &init,
+                    Arc::clone(&runtime),
+                    router.clone(),
+                    Arc::clone(&active_identity),
+                );
+            }
             HostMessage::Shutdown(message) if message.session_id == init.session_id => {
                 production.cancel();
                 runtime.shutdown().await;
+                if let Some(gateway_server) = gateway_server.take() {
+                    gateway_server.stop();
+                }
                 router.send(&VitaMessage::ShutdownAck(protocol::ShutdownAck {
                     request_id: message.request_id,
                     session_id: init.session_id.clone(),
@@ -311,14 +1083,178 @@ pub async fn serve_ipc() -> Result<(), String> {
     }
 }
 
+fn handle_start_turn(
+    message: StartTurn,
+    init: &InitializeSession,
+    provider_config: Option<&ProviderConfiguration>,
+    runtime: Arc<VitaAgentRuntime>,
+    router: SidecarRouter,
+    active_identity: Arc<Mutex<Option<ProviderRequestIdentity>>>,
+) {
+    let request_id = message.request_id.clone();
+    let turn_id = message.turn_id.clone();
+    let failed = |code: &str| {
+        let _ = router.send(&VitaMessage::TurnFailed(TurnFailed {
+            request_id: request_id.clone(),
+            session_id: init.session_id.clone(),
+            turn_id: turn_id.clone(),
+            phase: TurnPhase::Failed,
+            error_code: code.to_string(),
+            message: "Vita turn was not started".to_string(),
+        }));
+    };
+    if message.validate().is_err() {
+        failed("TURN_REQUEST_INVALID");
+        return;
+    }
+    let Some(provider_config) = provider_config else {
+        failed("NOT_CONFIGURED");
+        return;
+    };
+    let expected =
+        match ProviderBinding::derive(&init.session_id, &message.turn_id, provider_config) {
+            Ok(binding) => binding,
+            Err(_) => {
+                failed("PROVIDER_INELIGIBLE");
+                return;
+            }
+        };
+    if message.binding != expected {
+        failed("PROVIDER_BINDING_MISMATCH");
+        return;
+    }
+    let identity = ProviderRequestIdentity {
+        turn_id: message.turn_id.clone(),
+        binding_hash: message.binding.binding_hash.clone(),
+    };
+    {
+        let Ok(mut active) = active_identity.lock() else {
+            failed("TURN_STATE_UNAVAILABLE");
+            return;
+        };
+        if active.is_some() {
+            failed("BUSY");
+            return;
+        }
+        *active = Some(identity.clone());
+    }
+    let _ = router.send(&VitaMessage::TurnState(TurnState {
+        request_id: next_request_id("vita-turn-starting"),
+        session_id: init.session_id.clone(),
+        turn_id: turn_id.clone(),
+        phase: TurnPhase::Starting,
+    }));
+    let _ = router.send(&VitaMessage::TurnState(TurnState {
+        request_id: next_request_id("vita-turn-running"),
+        session_id: init.session_id.clone(),
+        turn_id: turn_id.clone(),
+        phase: TurnPhase::Running,
+    }));
+    let session_id = init.session_id.clone();
+    let model = provider_config.model.clone();
+    let prompt = message.prompt;
+    tokio::spawn(async move {
+        let result = runtime.run_turn(prompt).await;
+        let still_current = active_identity
+            .lock()
+            .ok()
+            .is_some_and(|active| active.as_ref() == Some(&identity));
+        if !still_current {
+            return;
+        }
+        if let Ok(mut active) = active_identity.lock() {
+            active.take();
+        }
+        match result {
+            Ok(assistant_text) => {
+                let text = if assistant_text.is_empty() {
+                    "(Vita completed without assistant text)".to_string()
+                } else {
+                    bounded_protocol_text(&assistant_text, MAX_TURN_OUTPUT_BYTES)
+                };
+                let _ = router.send(&VitaMessage::TurnCompleted(TurnCompleted {
+                    request_id: next_request_id("vita-turn-completed"),
+                    session_id,
+                    turn_id,
+                    model,
+                    assistant_text: text,
+                }));
+            }
+            Err(error) => {
+                let error_text = error.to_string();
+                let cancelled = error_text.to_ascii_lowercase().contains("cancel");
+                let _ = router.send(&VitaMessage::TurnFailed(TurnFailed {
+                    request_id: next_request_id("vita-turn-failed"),
+                    session_id,
+                    turn_id,
+                    phase: if cancelled {
+                        TurnPhase::Cancelled
+                    } else {
+                        TurnPhase::Failed
+                    },
+                    error_code: if cancelled {
+                        "CANCELLED"
+                    } else {
+                        "TURN_FAILED"
+                    }
+                    .to_string(),
+                    message: bounded_protocol_text(&error_text, 256),
+                }));
+            }
+        }
+    });
+}
+
+fn handle_cancel_turn(
+    message: protocol::CancelTurn,
+    init: &InitializeSession,
+    runtime: Arc<VitaAgentRuntime>,
+    router: SidecarRouter,
+    active_identity: Arc<Mutex<Option<ProviderRequestIdentity>>>,
+) {
+    if message.validate().is_err() {
+        return;
+    }
+    let matches = active_identity.lock().ok().is_some_and(|active| {
+        active
+            .as_ref()
+            .is_some_and(|identity| identity.turn_id == message.turn_id)
+    });
+    if !matches {
+        return;
+    }
+    if let Ok(mut active) = active_identity.lock() {
+        active.take();
+    }
+    let _ = router.send(&VitaMessage::TurnState(TurnState {
+        request_id: next_request_id("vita-turn-cancelled"),
+        session_id: init.session_id.clone(),
+        turn_id: message.turn_id,
+        phase: TurnPhase::Cancelled,
+    }));
+    tokio::spawn(async move {
+        let _ = runtime.interrupt_active_turn().await;
+    });
+}
+
 fn spawn_confirmation_loop(
     router: SidecarRouter,
     init: InitializeSession,
     mut receiver: tokio::sync::mpsc::Receiver<VitaGitStatusPendingConfirmation>,
+    active_identity: Arc<Mutex<Option<ProviderRequestIdentity>>>,
 ) {
     tokio::spawn(async move {
         while let Some(action) = receiver.recv().await {
             let binding = action.binding();
+            if !active_turn_id_matches(&active_identity, binding.turn_id()) {
+                continue;
+            }
+            let _ = router.send(&VitaMessage::TurnState(TurnState {
+                request_id: next_request_id("vita-turn-awaiting-confirmation"),
+                session_id: init.session_id.clone(),
+                turn_id: binding.turn_id().to_string(),
+                phase: TurnPhase::WaitingForToolConfirmation,
+            }));
             let wire_binding = binding_to_wire(&init.session_id, &binding);
             let request_id = next_request_id("vita-confirm");
             let response = tokio::task::spawn_blocking({
@@ -347,6 +1283,14 @@ fn spawn_confirmation_loop(
                 _ => 0,
             };
             let _ = action.confirm(revision);
+            if active_turn_id_matches(&active_identity, binding.turn_id()) {
+                let _ = router.send(&VitaMessage::TurnState(TurnState {
+                    request_id: next_request_id("vita-turn-resumed"),
+                    session_id: init.session_id.clone(),
+                    turn_id: binding.turn_id().to_string(),
+                    phase: TurnPhase::Running,
+                }));
+            }
         }
     });
 }
@@ -564,6 +1508,7 @@ fn unix_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn idle_command_receiver_blocks_until_command_without_timeout() {
@@ -592,5 +1537,84 @@ mod tests {
             receive_command_from(&receiver).expect("disconnect result"),
             None
         );
+    }
+
+    #[test]
+    fn local_gateway_requires_current_session_token_and_exact_route() {
+        let request = |method: &str, path: &str, authorization: Option<&str>| GatewayHttpRequest {
+            method: method.to_string(),
+            path: path.to_string(),
+            authorization: authorization.map(str::to_string),
+            body: Vec::new(),
+        };
+        assert_eq!(
+            authorize_gateway_request(&request("POST", LOCAL_GATEWAY_PATH, None), "current"),
+            Err("GATEWAY_AUTH_DENIED")
+        );
+        assert_eq!(
+            authorize_gateway_request(&request("POST", LOCAL_GATEWAY_PATH, Some("old")), "current"),
+            Err("GATEWAY_AUTH_DENIED")
+        );
+        assert_eq!(
+            authorize_gateway_request(
+                &request("GET", LOCAL_GATEWAY_PATH, Some("current")),
+                "current"
+            ),
+            Err("GATEWAY_ROUTE_DENIED")
+        );
+        assert_eq!(
+            authorize_gateway_request(&request("POST", "/v1/other", Some("current")), "current"),
+            Err("GATEWAY_ROUTE_DENIED")
+        );
+        assert!(authorize_gateway_request(
+            &request("POST", LOCAL_GATEWAY_PATH, Some("current")),
+            "current"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn responses_request_parser_keeps_multiline_text_and_only_fixed_tool() {
+        let body = serde_json::to_vec(&json!({
+            "model": "model",
+            "stream": true,
+            "instructions": "line one\nline two",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello\nworld"}]
+            }],
+            "tools": [{
+                "type": "function",
+                "name": TOOL_NAME,
+                "parameters": {"type": "object"}
+            }]
+        }))
+        .unwrap();
+        let request = parse_gateway_responses_request(&body, "model").unwrap();
+        assert_eq!(request.messages.len(), 2);
+        assert_eq!(request.options.tools.len(), 1);
+
+        let unknown = serde_json::to_vec(&json!({
+            "model": "model",
+            "stream": true,
+            "input": [{"type":"message","role":"user","content":"hello"}],
+            "tools": [{"type":"function","name":"other","parameters":{}}]
+        }))
+        .unwrap();
+        assert!(parse_gateway_responses_request(&unknown, "model").is_err());
+
+        let invalid_id = serde_json::to_vec(&json!({
+            "model": "model",
+            "stream": true,
+            "input": [{
+                "type": "function_call",
+                "call_id": "call\n1",
+                "name": TOOL_NAME,
+                "arguments": "{}"
+            }]
+        }))
+        .unwrap();
+        assert!(parse_gateway_responses_request(&invalid_id, "model").is_err());
     }
 }

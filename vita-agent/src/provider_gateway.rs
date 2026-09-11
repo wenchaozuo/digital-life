@@ -3,8 +3,9 @@
 //! Digital Life-owned provider authority and provider-neutral gateway.
 //!
 //! The module owns the provider boundary and its transport seams.  The
-//! production HTTPS transport is library-only: it is not exposed through the
-//! Tauri/frontend, Chat Completions route, or autonomy surfaces in this stage.
+//! production HTTPS transport is reachable only through the process-isolated
+//! Vita sidecar gateway; it is not exposed as a general Tauri, frontend, or
+//! autonomy HTTP surface.
 
 use std::fmt::{self, Display, Formatter};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -13,11 +14,19 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::{Host, Url};
+use vita_agent_protocol::TOOL_NAME;
 use zeroize::Zeroizing;
 
 use super::{VitaAgentError, VITA_AGENT_RUNTIME_ID, VITA_GATEWAY_PROVIDER_ID};
 
 mod production_transport;
+
+pub(crate) fn new_production_provider_transport(
+) -> Result<impl ProviderRequestTransport, VitaAgentError> {
+    production_transport::ProductionProviderTransport::new(
+        production_transport::ProductionTransportLimits::default(),
+    )
+}
 
 #[cfg(test)]
 #[path = "d29f.rs"]
@@ -499,7 +508,7 @@ enum EndpointScope {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ProviderEndpoint {
+pub(crate) struct ProviderEndpoint {
     normalized_base_url: String,
     scheme: String,
     host: String,
@@ -845,6 +854,39 @@ pub(crate) struct VitaGatewayBinding {
     base_url: String,
     port: u16,
     runtime_identity: &'static str,
+    session_token: Option<GatewaySessionToken>,
+}
+
+/// Per-sidecar authentication for the Codex-facing loopback listener.  The
+/// token is generated inside Vita, retained only in the process, and redacted
+/// from every diagnostic representation.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct GatewaySessionToken(Zeroizing<String>);
+
+impl fmt::Debug for GatewaySessionToken {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str("GatewaySessionToken([REDACTED])")
+    }
+}
+
+impl GatewaySessionToken {
+    fn generate() -> Result<Self, VitaAgentError> {
+        let mut bytes = [0_u8; 32];
+        getrandom::fill(&mut bytes).map_err(|_| {
+            VitaAgentError::GatewayProtocol(
+                "Vita gateway session authentication could not be generated".to_string(),
+            )
+        })?;
+        let token = bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        Ok(Self(Zeroizing::new(token)))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
 }
 
 impl VitaGatewayBinding {
@@ -858,6 +900,24 @@ impl VitaGatewayBinding {
             base_url: format!("http://127.0.0.1:{port}/v1"),
             port,
             runtime_identity: VITA_AGENT_RUNTIME_ID,
+            session_token: None,
+        })
+    }
+
+    /// Creates the production binding.  Unlike the test-only constructor,
+    /// this always carries a fresh per-sidecar token for the local Codex
+    /// listener.
+    pub(crate) fn for_authenticated_private_listener(port: u16) -> Result<Self, VitaAgentError> {
+        if port == 0 {
+            return Err(VitaAgentError::GatewayProtocol(
+                "owned Vita gateway listener must have a non-zero port".to_string(),
+            ));
+        }
+        Ok(Self {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            port,
+            runtime_identity: VITA_AGENT_RUNTIME_ID,
+            session_token: Some(GatewaySessionToken::generate()?),
         })
     }
 
@@ -872,6 +932,10 @@ impl VitaGatewayBinding {
     pub(crate) fn runtime_identity(&self) -> &'static str {
         self.runtime_identity
     }
+
+    pub(crate) fn session_token(&self) -> Option<&GatewaySessionToken> {
+        self.session_token.as_ref()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -881,6 +945,7 @@ pub(crate) struct DerivedCodexProvider {
     base_url: String,
     wire_api: &'static str,
     requires_openai_auth: bool,
+    session_token: Option<GatewaySessionToken>,
 }
 
 impl DerivedCodexProvider {
@@ -891,6 +956,7 @@ impl DerivedCodexProvider {
             base_url: binding.base_url.clone(),
             wire_api: "responses",
             requires_openai_auth: false,
+            session_token: binding.session_token.clone(),
         }
     }
 
@@ -912,6 +978,10 @@ impl DerivedCodexProvider {
 
     pub(crate) fn requires_openai_auth(&self) -> bool {
         self.requires_openai_auth
+    }
+
+    pub(crate) fn session_token(&self) -> Option<&GatewaySessionToken> {
+        self.session_token.as_ref()
     }
 }
 
@@ -954,9 +1024,23 @@ impl GatewayReadyProvider {
 /// Implementations must keep any resolved secret ephemeral.  The production
 /// implementation is deliberately a seam for the future Digital Life Secret
 /// Store; it does not read ambient process credentials or stock Codex state.
-trait CredentialResolver {
+pub(crate) trait CredentialResolver {
     fn resolve(&self, credential_ref: &CredentialRef)
         -> Result<ResolvedCredential, VitaAgentError>;
+
+    fn resolve_for_request(
+        &self,
+        credential_ref: &CredentialRef,
+        _request: &ProviderRequestIdentity,
+    ) -> Result<ResolvedCredential, VitaAgentError> {
+        self.resolve(credential_ref)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProviderRequestIdentity {
+    pub(crate) turn_id: String,
+    pub(crate) binding_hash: String,
 }
 
 /// A request-lifetime credential container.
@@ -987,7 +1071,7 @@ impl ResolvedCredential {
         self.0.as_str()
     }
 
-    fn validate_header_safety(&self) -> Result<(), VitaAgentError> {
+    pub(crate) fn validate_header_safety(&self) -> Result<(), VitaAgentError> {
         if self
             .as_bytes()
             .iter()
@@ -1014,7 +1098,7 @@ impl fmt::Debug for ResolvedCredential {
 /// The endpoint and request-lifetime credential are supplied by the already
 /// validated Digital Life profile and credential reference, never by ambient
 /// process configuration.  Implementations must not follow redirects.
-trait ProviderRequestTransport {
+pub(crate) trait ProviderRequestTransport {
     fn post_json(
         &self,
         endpoint: &ProviderEndpoint,
@@ -1025,7 +1109,7 @@ trait ProviderRequestTransport {
     ) -> Result<Vec<u8>, VitaAgentError>;
 }
 
-struct ProviderGateway<R, T> {
+pub(crate) struct ProviderGateway<R, T> {
     ready: GatewayReadyProvider,
     credential_resolver: R,
     transport: T,
@@ -1036,7 +1120,7 @@ where
     R: CredentialResolver,
     T: ProviderRequestTransport,
 {
-    fn new(ready: GatewayReadyProvider, credential_resolver: R, transport: T) -> Self {
+    pub(crate) fn new(ready: GatewayReadyProvider, credential_resolver: R, transport: T) -> Self {
         Self {
             ready,
             credential_resolver,
@@ -1044,9 +1128,17 @@ where
         }
     }
 
-    fn execute_responses_request(
+    pub(crate) fn execute_responses_request(
         &self,
         request: &VitaResponsesRequest,
+    ) -> Result<VitaResponsesResult, VitaAgentError> {
+        self.execute_responses_request_with_identity(request, None)
+    }
+
+    pub(crate) fn execute_responses_request_with_identity(
+        &self,
+        request: &VitaResponsesRequest,
+        identity: Option<&ProviderRequestIdentity>,
     ) -> Result<VitaResponsesResult, VitaAgentError> {
         if self.ready.state() != VitaProviderState::GatewayReady {
             return Err(VitaAgentError::GatewayNotReady);
@@ -1084,7 +1176,15 @@ where
             .profile
             .credential_ref
             .as_ref()
-            .map(|reference| self.credential_resolver.resolve(reference))
+            .map(|reference| {
+                identity.map_or_else(
+                    || self.credential_resolver.resolve(reference),
+                    |identity| {
+                        self.credential_resolver
+                            .resolve_for_request(reference, identity)
+                    },
+                )
+            })
             .transpose()?;
         if credential
             .as_ref()
@@ -1190,6 +1290,17 @@ pub(crate) struct VitaResponsesRequest {
     pub(crate) model: String,
     pub(crate) messages: Vec<VitaMessage>,
     pub(crate) options: VitaResponsesRequestOptions,
+    /// Tool calls and outputs already present in a Responses conversation.
+    /// They are kept separate from plain text messages so the gateway can
+    /// deterministically reconstruct Chat Completions assistant/tool turns.
+    pub(crate) tool_calls: Vec<VitaFunctionCall>,
+    pub(crate) tool_outputs: Vec<VitaToolOutput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VitaToolOutput {
+    pub(crate) call_id: String,
+    pub(crate) output: String,
 }
 
 impl VitaResponsesRequest {
@@ -1202,6 +1313,8 @@ impl VitaResponsesRequest {
             model: model.into(),
             messages,
             options,
+            tool_calls: Vec::new(),
+            tool_outputs: Vec::new(),
         }
     }
 }
@@ -1221,6 +1334,10 @@ struct ChatCompletionsRequest {
 struct ChatCompletionsMessage {
     role: String,
     content: String,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    tool_calls: Vec<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1272,12 +1389,30 @@ fn map_responses_request_to_chat(
         require_capability(profile.capabilities, ProviderCapability::Tools)?;
         require_gateway_capability(ProviderCapability::Tools)?;
     }
+    if request.tool_calls.len() > 1 {
+        return Err(VitaAgentError::UnsupportedGatewayCapability {
+            capability: ProviderCapability::ParallelTools,
+        });
+    }
+    let mut tool_call_ids = std::collections::HashSet::new();
+    for call in &request.tool_calls {
+        if call.name != TOOL_NAME {
+            return Err(VitaAgentError::GatewayProtocol(
+                "request contained an unadvertised Vita tool call".to_string(),
+            ));
+        }
+        if !tool_call_ids.insert(call.id.as_str()) {
+            return Err(VitaAgentError::GatewayProtocol(
+                "request contained duplicate Vita tool call ids".to_string(),
+            ));
+        }
+    }
     if request.options.parallel_tools && !request.options.tools.is_empty() {
         require_capability(profile.capabilities, ProviderCapability::ParallelTools)?;
         require_gateway_capability(ProviderCapability::ParallelTools)?;
     }
 
-    let messages = request
+    let mut messages = request
         .messages
         .iter()
         .map(|message| ChatCompletionsMessage {
@@ -1286,8 +1421,35 @@ fn map_responses_request_to_chat(
                 .as_chat_role(profile.instruction_role_policy)
                 .to_string(),
             content: message.content.clone(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
         })
-        .collect();
+        .collect::<Vec<_>>();
+    for call in &request.tool_calls {
+        messages.push(ChatCompletionsMessage {
+            role: "assistant".to_string(),
+            content: String::new(),
+            tool_calls: vec![serde_json::json!({
+                "id": call.id,
+                "type": "function",
+                "function": {"name": call.name, "arguments": call.arguments},
+            })],
+            tool_call_id: None,
+        });
+    }
+    for output in &request.tool_outputs {
+        if !tool_call_ids.contains(output.call_id.as_str()) {
+            return Err(VitaAgentError::GatewayProtocol(
+                "request contained an unpaired Vita tool output".to_string(),
+            ));
+        }
+        messages.push(ChatCompletionsMessage {
+            role: "tool".to_string(),
+            content: output.output.clone(),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(output.call_id.clone()),
+        });
+    }
     let tools = request
         .options
         .tools
@@ -1366,6 +1528,17 @@ struct ChatCompletionMessage {
     tool_calls: Vec<Value>,
 }
 
+const MAX_TOOL_CALL_ID_BYTES: usize = 128;
+const MAX_TOOL_NAME_BYTES: usize = 128;
+const MAX_TOOL_ARGUMENT_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VitaFunctionCall {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) arguments: String,
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 struct ChatUsage {
     prompt_tokens: u64,
@@ -1380,6 +1553,7 @@ pub(crate) struct VitaResponsesResult {
     pub(crate) output_text: String,
     pub(crate) finish_reason: Option<String>,
     pub(crate) usage: Option<VitaUsage>,
+    pub(crate) function_calls: Vec<VitaFunctionCall>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1403,11 +1577,7 @@ fn map_chat_response_to_responses(
             "chat completion response message role must be assistant".to_string(),
         ));
     }
-    if !choice.message.tool_calls.is_empty() {
-        return Err(VitaAgentError::UnsupportedGatewayCapability {
-            capability: ProviderCapability::Tools,
-        });
-    }
+    let function_calls = parse_chat_tool_calls(&choice.message.tool_calls)?;
     let usage = response.usage.map(|usage| VitaUsage {
         input_tokens: usage.prompt_tokens,
         output_tokens: usage.completion_tokens,
@@ -1419,7 +1589,79 @@ fn map_chat_response_to_responses(
         output_text: choice.message.content.unwrap_or_default(),
         finish_reason: choice.finish_reason,
         usage,
+        function_calls,
     })
+}
+
+fn parse_chat_tool_calls(values: &[Value]) -> Result<Vec<VitaFunctionCall>, VitaAgentError> {
+    if values.len() > 1 {
+        return Err(VitaAgentError::UnsupportedGatewayCapability {
+            capability: ProviderCapability::ParallelTools,
+        });
+    }
+    let mut calls = Vec::with_capacity(values.len());
+    let mut ids = std::collections::HashSet::new();
+    for value in values {
+        let object = value.as_object().ok_or_else(|| {
+            VitaAgentError::GatewayProtocol("provider tool call must be an object".to_string())
+        })?;
+        if object.get("type").and_then(Value::as_str) != Some("function") {
+            return Err(VitaAgentError::GatewayProtocol(
+                "provider tool call type must be function".to_string(),
+            ));
+        }
+        let id = bounded_tool_string(object.get("id"), MAX_TOOL_CALL_ID_BYTES, "tool call id")?;
+        if !ids.insert(id.clone()) {
+            return Err(VitaAgentError::GatewayProtocol(
+                "provider returned duplicate tool call id".to_string(),
+            ));
+        }
+        let function = object
+            .get("function")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                VitaAgentError::GatewayProtocol(
+                    "provider tool call function object was missing".to_string(),
+                )
+            })?;
+        let name = bounded_tool_string(
+            function.get("name"),
+            MAX_TOOL_NAME_BYTES,
+            "tool function name",
+        )?;
+        if name != TOOL_NAME {
+            return Err(VitaAgentError::GatewayProtocol(
+                "provider returned an unadvertised Vita tool call".to_string(),
+            ));
+        }
+        let arguments = bounded_tool_string(
+            function.get("arguments"),
+            MAX_TOOL_ARGUMENT_BYTES,
+            "tool function arguments",
+        )?;
+        calls.push(VitaFunctionCall {
+            id,
+            name,
+            arguments,
+        });
+    }
+    Ok(calls)
+}
+
+fn bounded_tool_string(
+    value: Option<&Value>,
+    max_bytes: usize,
+    field: &'static str,
+) -> Result<String, VitaAgentError> {
+    let value = value.and_then(Value::as_str).ok_or_else(|| {
+        VitaAgentError::GatewayProtocol(format!("provider {field} was missing or not a string"))
+    })?;
+    if value.is_empty() || value.len() > max_bytes || value.chars().any(char::is_control) {
+        return Err(VitaAgentError::GatewayProtocol(format!(
+            "provider {field} exceeded its bound"
+        )));
+    }
+    Ok(value.to_string())
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -1461,6 +1703,11 @@ pub(crate) enum VitaResponsesEvent {
         model: String,
         finish_reason: Option<String>,
         usage: Option<VitaUsage>,
+    },
+    FunctionCall {
+        id: String,
+        name: String,
+        arguments: String,
     },
 }
 
@@ -1902,6 +2149,75 @@ mod tests {
     }
 
     #[test]
+    fn chat_tool_calls_map_to_responses_function_calls_and_history_maps_back() {
+        let response = ChatCompletionsResponse {
+            id: "chatcmpl-tool".to_string(),
+            model: "mock-model".to_string(),
+            choices: vec![ChatCompletionChoice {
+                index: 0,
+                message: ChatCompletionMessage {
+                    role: "assistant".to_string(),
+                    content: None,
+                    tool_calls: vec![json!({
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "vita_workspace_git_status", "arguments": "{}"}
+                    })],
+                },
+                finish_reason: Some("tool_calls".to_string()),
+            }],
+            usage: None,
+        };
+        let result = map_chat_response_to_responses(response).unwrap();
+        assert_eq!(
+            result.function_calls,
+            vec![VitaFunctionCall {
+                id: "call-1".to_string(),
+                name: "vita_workspace_git_status".to_string(),
+                arguments: "{}".to_string(),
+            }]
+        );
+
+        let profile = profile(
+            "https://provider.example/v1",
+            None,
+            ProviderCapabilities::none(),
+        );
+        let mut request = VitaResponsesRequest::new(
+            "mock-model",
+            vec![VitaMessage::text(VitaMessageRole::User, "continue")],
+            VitaResponsesRequestOptions::default(),
+        );
+        request.tool_calls = result.function_calls;
+        request.tool_outputs = vec![VitaToolOutput {
+            call_id: "call-1".to_string(),
+            output: "status".to_string(),
+        }];
+        let mapped = map_responses_request_to_chat(&request, &profile).unwrap();
+        assert_eq!(mapped.messages[1].role, "assistant");
+        assert_eq!(mapped.messages[2].role, "tool");
+        assert_eq!(mapped.messages[2].tool_call_id.as_deref(), Some("call-1"));
+    }
+
+    #[test]
+    fn malformed_or_duplicate_chat_tool_calls_fail_closed() {
+        let malformed = vec![
+            json!({
+                "id": "call-1",
+                "type": "function",
+                "function": {"name": "vita_workspace_git_status", "arguments": "{}"}
+            }),
+            json!({
+                "id": "call-1",
+                "type": "function",
+                "function": {"name": "vita_workspace_git_status", "arguments": "{}"}
+            }),
+        ];
+        assert!(parse_chat_tool_calls(&malformed).is_err());
+        assert!(parse_chat_tool_calls(&[json!({"id":"call-1","type":"shell"})]).is_err());
+    }
+
+    #[test]
     fn bounded_stream_chunk_mapping_is_deterministic() {
         let capabilities = ProviderCapabilities {
             streaming: true,
@@ -2126,6 +2442,108 @@ mod tests {
         println!(
             "D29-E local mock bind=127.0.0.1:{mock_port} request_count=1 endpoint={expected_path} external_endpoint_calls=0"
         );
+    }
+
+    #[test]
+    fn localhost_mock_tool_round_trip_issues_two_bounded_requests() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind local tool mock");
+        let mock_port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let mut observed = Vec::new();
+            for round in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept tool request");
+                let (_, _, body) = read_http_request(&mut stream);
+                let request: ChatCompletionsRequest =
+                    serde_json::from_slice(&body).expect("chat request JSON");
+                if round == 0 {
+                    assert_eq!(request.tools.len(), 1);
+                    assert_eq!(request.tools[0].function.name, TOOL_NAME);
+                } else {
+                    assert_eq!(
+                        request
+                            .messages
+                            .iter()
+                            .map(|message| message.role.as_str())
+                            .collect::<Vec<_>>(),
+                        vec!["user", "assistant", "tool"]
+                    );
+                    assert_eq!(request.messages[2].tool_call_id.as_deref(), Some("call-1"));
+                }
+                observed.push(request);
+                let response = if round == 0 {
+                    json!({
+                        "id": "chatcmpl-tool-1",
+                        "model": "mock-model",
+                        "choices": [{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call-1","type":"function","function":{"name":TOOL_NAME,"arguments":"{}"}}]},"finish_reason":"tool_calls"}]
+                    })
+                } else {
+                    json!({
+                        "id": "chatcmpl-tool-2",
+                        "model": "mock-model",
+                        "choices": [{"index":0,"message":{"role":"assistant","content":"final tool result"},"finish_reason":"stop"}]
+                    })
+                };
+                let body = serde_json::to_vec(&response).unwrap();
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(headers.as_bytes()).unwrap();
+                stream.write_all(&body).unwrap();
+            }
+            observed
+        });
+
+        let base_url = format!("http://127.0.0.1:{mock_port}/v1");
+        let credential = CredentialRef::new("mock-ref", "provider-one", &base_url).unwrap();
+        let profile = test_local_profile(
+            &base_url,
+            Some(credential.clone()),
+            ProviderCapabilities {
+                tools: true,
+                ..ProviderCapabilities::none()
+            },
+        );
+        let authority = VitaProviderAuthority::configure(profile).unwrap();
+        let owned_listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let binding = VitaGatewayBinding::for_owned_private_listener(
+            owned_listener.local_addr().unwrap().port(),
+        )
+        .unwrap();
+        let ready = authority.prepare_gateway(binding).unwrap();
+        let options = VitaResponsesRequestOptions {
+            stream: true,
+            tools: vec![GatewayToolDefinition {
+                name: TOOL_NAME.to_string(),
+                description: Some("fixed workspace status".to_string()),
+                parameters: json!({"type":"object","properties":{}}),
+            }],
+            ..VitaResponsesRequestOptions::default()
+        };
+        let first = VitaResponsesRequest::new(
+            "mock-model",
+            vec![VitaMessage::text(VitaMessageRole::User, "inspect")],
+            options.clone(),
+        );
+        let gateway = ProviderGateway::new(
+            ready,
+            InMemoryTestCredential {
+                reference: credential,
+                value: "fake-test-credential".to_string(),
+            },
+            TcpLocalTransport,
+        );
+        let first_result = gateway.execute_responses_request(&first).unwrap();
+        assert_eq!(first_result.function_calls.len(), 1);
+        let mut second = first.clone();
+        second.tool_calls = first_result.function_calls;
+        second.tool_outputs = vec![VitaToolOutput {
+            call_id: "call-1".to_string(),
+            output: "{\"status\":\"clean\"}".to_string(),
+        }];
+        let second_result = gateway.execute_responses_request(&second).unwrap();
+        assert_eq!(second_result.output_text, "final tool result");
+        assert_eq!(server.join().unwrap().len(), 2);
     }
 
     struct InMemoryTestCredential {

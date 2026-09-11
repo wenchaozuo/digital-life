@@ -1,8 +1,8 @@
 //! Production-only provider HTTPS transport foundation.
 //!
-//! This module is intentionally below the gateway's library seam.  It is not
-//! wired into the Tauri command surface, frontend, Chat Completions listener,
-//! or autonomy/CapabilityGrant code in D29-G1.
+//! This module is intentionally below the gateway's library seam.  Production
+//! calls reach it only from the process-isolated Vita gateway, never from a
+//! general Tauri command, frontend, or autonomy/CapabilityGrant surface.
 
 use std::fmt::{self, Formatter};
 use std::io::Read;
@@ -111,12 +111,12 @@ impl ProductionTransportLimits {
 
 /// A DNS resolver kept behind a small seam so every returned address can be
 /// checked before a socket connection is attempted.
-trait DnsResolver: Clone + Send + Sync + 'static {
+pub(super) trait DnsResolver: Clone + Send + Sync + 'static {
     fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, VitaAgentError>;
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-struct SystemDnsResolver;
+pub(super) struct SystemDnsResolver;
 
 impl DnsResolver for SystemDnsResolver {
     fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, VitaAgentError> {
@@ -284,7 +284,7 @@ fn system_dns_worker() -> Result<Arc<BoundedDnsWorker<SystemDnsResolver>>, VitaA
 
 /// The HTTP executor is separated from the policy so DNS/SSRF and retry tests
 /// can run without making an external request.
-trait HttpExecutor {
+pub(super) trait HttpExecutor {
     fn post_json(
         &self,
         request: &OutboundRequest<'_>,
@@ -295,11 +295,11 @@ trait HttpExecutor {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-struct ReqwestHttpExecutor;
+pub(super) struct ReqwestHttpExecutor;
 
 /// The request view passed to an executor.  Its Debug implementation never
 /// includes request bytes or credential material.
-struct OutboundRequest<'a> {
+pub(super) struct OutboundRequest<'a> {
     url: String,
     host: &'a str,
     port: u16,
@@ -324,7 +324,7 @@ impl fmt::Debug for OutboundRequest<'_> {
 }
 
 #[derive(Clone)]
-struct ProviderHttpResponse {
+pub(super) struct ProviderHttpResponse {
     status: u16,
     header_bytes: usize,
     content_type: Option<String>,
@@ -342,13 +342,13 @@ impl fmt::Debug for ProviderHttpResponse {
 }
 
 #[derive(Debug)]
-enum HttpExecutionError {
+pub(super) enum HttpExecutionError {
     Retryable(VitaAgentError),
     Fatal(VitaAgentError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct EffectiveTimeouts {
+pub(super) struct EffectiveTimeouts {
     connect: Duration,
     tls: Duration,
     request: Duration,
@@ -371,9 +371,9 @@ impl EffectiveTimeouts {
     }
 }
 
-/// Library-only production transport.  It is not constructed by the current
-/// Tauri or Chat route code; G1 only establishes the security foundation.
-struct ProductionProviderTransport<D = SystemDnsResolver, H = ReqwestHttpExecutor> {
+/// Production transport constructed only by the process-isolated Vita
+/// gateway.  Its policy is shared with the focused provider tests below.
+pub(super) struct ProductionProviderTransport<D = SystemDnsResolver, H = ReqwestHttpExecutor> {
     dns: Arc<BoundedDnsWorker<D>>,
     http: H,
     limits: ProductionTransportLimits,
@@ -402,7 +402,7 @@ impl ProductionTransportObservation {
 impl ProductionProviderTransport<SystemDnsResolver, ReqwestHttpExecutor> {
     /// Creates a production transport with platform certificate validation and
     /// redirect handling disabled by the reqwest executor.
-    fn new(limits: ProductionTransportLimits) -> Result<Self, VitaAgentError> {
+    pub(super) fn new(limits: ProductionTransportLimits) -> Result<Self, VitaAgentError> {
         limits.validate()?;
         Ok(Self {
             dns: system_dns_worker()?,
@@ -974,7 +974,9 @@ fn min_duration(left: Duration, right: Duration) -> Duration {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
-    use std::sync::{Arc, Condvar, Mutex};
+    use std::ffi::OsString;
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
     use serde_json::json;
 
@@ -1211,6 +1213,54 @@ mod tests {
             http,
             ProductionTransportLimits::default(),
         )
+    }
+
+    struct ProxyEnvironmentGuard {
+        previous: Vec<(String, Option<OsString>)>,
+    }
+
+    impl ProxyEnvironmentGuard {
+        fn disable_ambient_proxy() -> Self {
+            let keys = [
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "ALL_PROXY",
+                "http_proxy",
+                "https_proxy",
+                "all_proxy",
+                "NO_PROXY",
+                "no_proxy",
+            ];
+            let previous = keys
+                .iter()
+                .map(|key| ((*key).to_string(), std::env::var_os(key)))
+                .collect::<Vec<_>>();
+            for key in [
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "ALL_PROXY",
+                "http_proxy",
+                "https_proxy",
+                "all_proxy",
+            ] {
+                std::env::set_var(key, "http://127.0.0.1:1");
+            }
+            for key in ["NO_PROXY", "no_proxy"] {
+                std::env::remove_var(key);
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for ProxyEnvironmentGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.previous {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
     }
 
     fn controlled_dns() -> (
@@ -2164,6 +2214,83 @@ mod tests {
         assert_eq!(limits.max_request_body_bytes, MAX_REQUEST_BODY_BYTES);
         assert_eq!(limits.max_response_body_bytes, MAX_RESPONSE_BODY_BYTES);
         assert!(ProviderEndpoint::parse_production("http://provider.example/v1").is_err());
+    }
+
+    #[test]
+    fn reqwest_executor_ignores_ambient_proxy_environment() {
+        static PROXY_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _lock = PROXY_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _environment = ProxyEnvironmentGuard::disable_ambient_proxy();
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("proxy regression target listener");
+        let port = listener
+            .local_addr()
+            .expect("proxy regression target address")
+            .port();
+        listener
+            .set_nonblocking(true)
+            .expect("proxy regression nonblocking listener");
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut request = [0_u8; 4096];
+                        let _ = stream.read(&mut request);
+                        let body = b"{}";
+                        let header = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        stream
+                            .write_all(header.as_bytes())
+                            .and_then(|_| stream.write_all(body))
+                            .expect("proxy regression response");
+                        return true;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return false;
+                        }
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => return false,
+                }
+            }
+        });
+
+        let addresses = [SocketAddr::from(([127, 0, 0, 1], port))];
+        let body = b"{}";
+        let request = OutboundRequest {
+            url: format!("http://provider.example:{port}/v1/chat/completions"),
+            host: "provider.example",
+            port,
+            path: "/v1/chat/completions".to_string(),
+            addresses: &addresses,
+            body,
+            authorization: None,
+        };
+        let response = ReqwestHttpExecutor
+            .post_json(
+                &request,
+                EffectiveTimeouts {
+                    connect: Duration::from_secs(1),
+                    tls: Duration::from_secs(1),
+                    request: Duration::from_secs(1),
+                    body: Duration::from_secs(1),
+                    total: Duration::from_secs(2),
+                },
+                Instant::now() + Duration::from_secs(2),
+                ProductionTransportLimits::default(),
+            )
+            .expect("ambient proxy must not intercept the direct request");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, body);
+        assert!(server.join().expect("proxy regression server join"));
     }
 
     #[test]

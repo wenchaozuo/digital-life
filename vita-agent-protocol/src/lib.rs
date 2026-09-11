@@ -11,8 +11,10 @@ use std::io::{self, Read, Write};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
-pub const PROTOCOL_VERSION: &str = "d29-h8.vita-sidecar.v1";
+pub const PROTOCOL_VERSION: &str = "d29-h9.vita-sidecar.v2";
 pub const RUNTIME_ID: &str = "vita-agent";
 pub const CODEX_UPSTREAM_COMMIT: &str = "316795b3cf2a45e90d121d9f46499d4658b2645c";
 pub const CODEX_PROTOCOL_SCHEMA_HASH: &str =
@@ -22,6 +24,10 @@ pub const MAX_ID_BYTES: usize = 128;
 pub const MAX_PATH_BYTES: usize = 32 * 1024;
 pub const MAX_SUMMARY_BYTES: usize = 256;
 pub const MAX_SHA256_BYTES: usize = 128;
+pub const MAX_PROMPT_BYTES: usize = 64 * 1024;
+pub const MAX_TURN_OUTPUT_BYTES: usize = 256 * 1024;
+pub const MAX_PROVIDER_BINDING_BYTES: usize = 256;
+pub const MAX_CREDENTIAL_BYTES: usize = 64 * 1024;
 
 pub const CAPABILITY_ID: &str = "vita.process.workspace.git_status";
 pub const PROFILE_ID: &str = "d29h7c.git.status.v1";
@@ -77,6 +83,24 @@ pub fn encode_frame<T: Serialize>(value: &T) -> Result<Vec<u8>, FrameError> {
     Ok(frame)
 }
 
+/// Encodes a credential-bearing frame into a zeroizing Digital Life-owned
+/// buffer.  Ordinary protocol frames intentionally retain the existing
+/// `Vec<u8>` API; this separate entry point makes it impossible for a caller
+/// to accidentally use the ordinary buffer for sensitive replies.
+pub fn encode_sensitive_frame<T: Serialize>(value: &T) -> Result<Zeroizing<Vec<u8>>, FrameError> {
+    let body = Zeroizing::new(serde_json::to_vec(value).map_err(|_| FrameError::InvalidJson)?);
+    if body.is_empty() {
+        return Err(FrameError::ZeroLength);
+    }
+    if body.len() > MAX_FRAME_BYTES || body.len() > u32::MAX as usize {
+        return Err(FrameError::TooLarge);
+    }
+    let mut frame = Zeroizing::new(Vec::with_capacity(4 + body.len()));
+    frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&body);
+    Ok(frame)
+}
+
 pub fn decode_frame<T: DeserializeOwned>(body: &[u8]) -> Result<T, FrameError> {
     if body.is_empty() {
         return Err(FrameError::ZeroLength);
@@ -92,6 +116,19 @@ pub fn decode_frame<T: DeserializeOwned>(body: &[u8]) -> Result<T, FrameError> {
 /// length byte is a clean channel close; a partial length/body is a protocol
 /// failure and must be treated as deny/retire by the caller.
 pub fn read_frame(reader: &mut impl Read) -> Result<Option<Vec<u8>>, FrameError> {
+    read_frame_owned(reader).map(|body| body.map(|body| body.to_vec()))
+}
+
+/// Reads a frame into a zeroizing owned buffer.  This is used by the mixed
+/// Host/Vita reader loops so a credential reply does not leave a plaintext
+/// JSON body in an ordinary heap allocation after dispatch.
+pub fn read_sensitive_frame(
+    reader: &mut impl Read,
+) -> Result<Option<Zeroizing<Vec<u8>>>, FrameError> {
+    read_frame_owned(reader)
+}
+
+fn read_frame_owned(reader: &mut impl Read) -> Result<Option<Zeroizing<Vec<u8>>>, FrameError> {
     let mut length_bytes = [0_u8; 4];
     match reader.read(&mut length_bytes[..1]) {
         Ok(0) => return Ok(None),
@@ -109,7 +146,7 @@ pub fn read_frame(reader: &mut impl Read) -> Result<Option<Vec<u8>>, FrameError>
     if length > MAX_FRAME_BYTES {
         return Err(FrameError::TooLarge);
     }
-    let mut body = vec![0_u8; length];
+    let mut body = Zeroizing::new(vec![0_u8; length]);
     reader
         .read_exact(&mut body)
         .map_err(|_| FrameError::TruncatedBody)?;
@@ -123,6 +160,15 @@ pub fn write_frame<T: Serialize>(writer: &mut impl Write, value: &T) -> Result<(
     writer.flush().map_err(FrameError::from)
 }
 
+pub fn write_sensitive_frame<T: Serialize>(
+    writer: &mut impl Write,
+    value: &T,
+) -> Result<(), FrameError> {
+    let frame = encode_sensitive_frame(value)?;
+    writer.write_all(&frame).map_err(FrameError::from)?;
+    writer.flush().map_err(FrameError::from)
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HostMessage {
@@ -132,6 +178,9 @@ pub enum HostMessage {
     GrantIssued(GrantIssued),
     GrantRevalidated(GrantRevalidated),
     CancelAction(CancelAction),
+    StartTurn(StartTurn),
+    CancelTurn(CancelTurn),
+    SensitiveCredentialReply(SensitiveCredentialReply),
     Shutdown(Shutdown),
 }
 
@@ -145,6 +194,10 @@ pub enum VitaMessage {
     IssueGrant(IssueGrant),
     RevalidateGrant(RevalidateGrant),
     ActionCancelled(ActionCancelled),
+    CredentialRequired(CredentialRequired),
+    TurnState(TurnState),
+    TurnCompleted(TurnCompleted),
+    TurnFailed(TurnFailed),
     ShutdownAck(ShutdownAck),
     Fatal(FatalMessage),
 }
@@ -160,6 +213,106 @@ pub struct InitializeSession {
     pub app_data_root: String,
     pub workspace_path: String,
     pub git_path: String,
+    #[serde(default)]
+    pub provider: Option<ProviderConfiguration>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderConfiguration {
+    pub profile_id: String,
+    pub purpose: String,
+    pub provider_kind: String,
+    pub base_url: String,
+    pub model: String,
+    pub credential_ref: String,
+    pub credential_destination: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderBinding {
+    pub session_id: String,
+    pub turn_id: String,
+    pub profile_id: String,
+    pub purpose: String,
+    pub provider_kind: String,
+    pub base_url: String,
+    pub model: String,
+    pub credential_ref: String,
+    pub credential_destination: String,
+    pub binding_hash: String,
+}
+
+impl ProviderBinding {
+    pub fn derive(
+        session_id: &str,
+        turn_id: &str,
+        configuration: &ProviderConfiguration,
+    ) -> Result<Self, FrameError> {
+        let mut binding = Self {
+            session_id: session_id.to_string(),
+            turn_id: turn_id.to_string(),
+            profile_id: configuration.profile_id.clone(),
+            purpose: configuration.purpose.clone(),
+            provider_kind: configuration.provider_kind.clone(),
+            base_url: configuration.base_url.clone(),
+            model: configuration.model.clone(),
+            credential_ref: configuration.credential_ref.clone(),
+            credential_destination: configuration.credential_destination.clone(),
+            binding_hash: String::new(),
+        };
+        binding.validate_without_hash()?;
+        binding.binding_hash = binding.expected_hash();
+        Ok(binding)
+    }
+
+    pub fn expected_hash(&self) -> String {
+        let canonical = [
+            self.session_id.as_str(),
+            self.turn_id.as_str(),
+            self.profile_id.as_str(),
+            self.purpose.as_str(),
+            self.provider_kind.as_str(),
+            self.base_url.as_str(),
+            self.model.as_str(),
+            self.credential_ref.as_str(),
+            self.credential_destination.as_str(),
+        ]
+        .join("\u{1f}");
+        format!("{:x}", Sha256::digest(canonical.as_bytes()))
+    }
+
+    fn validate_without_hash(&self) -> Result<(), FrameError> {
+        for value in [
+            &self.session_id,
+            &self.turn_id,
+            &self.profile_id,
+            &self.purpose,
+            &self.provider_kind,
+            &self.base_url,
+            &self.model,
+            &self.credential_ref,
+            &self.credential_destination,
+        ] {
+            valid_bounded_text(value, MAX_PROVIDER_BINDING_BYTES)?;
+        }
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<(), FrameError> {
+        self.validate_without_hash()?;
+        if self.binding_hash.len() != 64
+            || !self
+                .binding_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || self.binding_hash != self.expected_hash()
+        {
+            return Err(FrameError::InvalidField);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -339,6 +492,151 @@ pub struct ShutdownAck {
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
+pub struct StartTurn {
+    pub request_id: String,
+    pub session_id: String,
+    pub turn_id: String,
+    pub prompt: String,
+    pub binding: ProviderBinding,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CancelTurn {
+    pub request_id: String,
+    pub session_id: String,
+    pub turn_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialRequired {
+    pub request_id: String,
+    pub session_id: String,
+    pub turn_id: String,
+    pub binding: ProviderBinding,
+}
+
+/// A request-scoped credential.  The custom Debug implementation and the
+/// zeroizing owned allocation are deliberate: this type may cross only the
+/// dedicated sensitive message path and must never become ordinary
+/// diagnostics.
+pub struct SensitiveCredential(Zeroizing<String>);
+
+impl SensitiveCredential {
+    pub fn new(value: String) -> Result<Self, FrameError> {
+        if value.is_empty()
+            || value.len() > MAX_CREDENTIAL_BYTES
+            || value.chars().any(char::is_control)
+        {
+            return Err(FrameError::InvalidField);
+        }
+        Ok(Self(Zeroizing::new(value)))
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl Clone for SensitiveCredential {
+    fn clone(&self) -> Self {
+        Self(Zeroizing::new(self.0.to_string()))
+    }
+}
+
+impl PartialEq for SensitiveCredential {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.as_str() == other.0.as_str()
+    }
+}
+
+impl Eq for SensitiveCredential {}
+
+impl fmt::Debug for SensitiveCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
+impl Serialize for SensitiveCredential {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for SensitiveCredential {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(|_| serde::de::Error::custom("invalid sensitive credential"))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SensitiveCredentialReply {
+    pub request_id: String,
+    pub session_id: String,
+    pub turn_id: String,
+    pub binding_hash: String,
+    pub credential_ref: String,
+    /// `None` is a deliberate deny response.  It lets the Host reject a
+    /// stale/deleted profile without ever manufacturing placeholder secret
+    /// material for the sidecar.
+    pub credential: Option<SensitiveCredential>,
+    pub error_code: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnPhase {
+    Starting,
+    Running,
+    WaitingForToolConfirmation,
+    Completed,
+    Failed,
+    Cancelled,
+    TimedOut,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TurnState {
+    pub request_id: String,
+    pub session_id: String,
+    pub turn_id: String,
+    pub phase: TurnPhase,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TurnCompleted {
+    pub request_id: String,
+    pub session_id: String,
+    pub turn_id: String,
+    pub model: String,
+    pub assistant_text: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TurnFailed {
+    pub request_id: String,
+    pub session_id: String,
+    pub turn_id: String,
+    pub phase: TurnPhase,
+    pub error_code: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct FatalMessage {
     pub request_id: String,
     pub session_id: Option<String>,
@@ -356,7 +654,126 @@ impl InitializeSession {
         valid_id(&self.task_id)?;
         valid_path(&self.app_data_root)?;
         valid_path(&self.workspace_path)?;
-        valid_path(&self.git_path)
+        valid_path(&self.git_path)?;
+        if let Some(provider) = &self.provider {
+            provider.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl ProviderConfiguration {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        for value in [
+            &self.profile_id,
+            &self.purpose,
+            &self.provider_kind,
+            &self.base_url,
+            &self.model,
+            &self.credential_ref,
+            &self.credential_destination,
+        ] {
+            valid_bounded_text(value, MAX_PROVIDER_BINDING_BYTES)?;
+        }
+        if self.purpose != "chat" || self.provider_kind != "openai_compatible" {
+            return Err(FrameError::InvalidField);
+        }
+        Ok(())
+    }
+}
+
+impl StartTurn {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        valid_id(&self.request_id)?;
+        valid_id(&self.session_id)?;
+        valid_id(&self.turn_id)?;
+        if self.prompt.is_empty() || self.prompt.len() > MAX_PROMPT_BYTES {
+            return Err(FrameError::InvalidField);
+        }
+        if self.prompt.chars().any(disallowed_text_control) {
+            return Err(FrameError::InvalidField);
+        }
+        self.binding.validate()
+    }
+}
+
+impl CancelTurn {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        valid_id(&self.request_id)?;
+        valid_id(&self.session_id)?;
+        valid_id(&self.turn_id)
+    }
+}
+
+impl CredentialRequired {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        valid_id(&self.request_id)?;
+        valid_id(&self.session_id)?;
+        valid_id(&self.turn_id)?;
+        self.binding.validate()
+    }
+}
+
+impl SensitiveCredentialReply {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        valid_id(&self.request_id)?;
+        valid_id(&self.session_id)?;
+        valid_id(&self.turn_id)?;
+        valid_bounded_text(&self.binding_hash, 64)?;
+        valid_bounded_text(&self.credential_ref, MAX_PROVIDER_BINDING_BYTES)?;
+        if let Some(error_code) = &self.error_code {
+            valid_id(error_code)?;
+        }
+        if self.credential.is_some() == self.error_code.is_some() {
+            return Err(FrameError::InvalidField);
+        }
+        Ok(())
+    }
+}
+
+impl TurnState {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        valid_id(&self.request_id)?;
+        valid_id(&self.session_id)?;
+        valid_id(&self.turn_id)
+    }
+}
+
+impl TurnCompleted {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        valid_id(&self.request_id)?;
+        valid_id(&self.session_id)?;
+        valid_id(&self.turn_id)?;
+        valid_bounded_text(&self.model, MAX_PROVIDER_BINDING_BYTES)?;
+        if self.assistant_text.is_empty()
+            || self.assistant_text.len() > MAX_TURN_OUTPUT_BYTES
+            || self.assistant_text.chars().any(disallowed_text_control)
+        {
+            return Err(FrameError::InvalidField);
+        }
+        Ok(())
+    }
+}
+
+impl TurnFailed {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        valid_id(&self.request_id)?;
+        valid_id(&self.session_id)?;
+        valid_id(&self.turn_id)?;
+        valid_id(&self.error_code)?;
+        if !matches!(
+            self.phase,
+            TurnPhase::Failed | TurnPhase::Cancelled | TurnPhase::TimedOut
+        ) {
+            return Err(FrameError::InvalidField);
+        }
+        if self.message.is_empty()
+            || self.message.len() > MAX_SUMMARY_BYTES
+            || self.message.chars().any(disallowed_text_control)
+        {
+            return Err(FrameError::InvalidField);
+        }
+        Ok(())
     }
 }
 
@@ -419,6 +836,17 @@ fn valid_id(value: &str) -> Result<(), FrameError> {
         return Err(FrameError::InvalidField);
     }
     Ok(())
+}
+
+fn valid_bounded_text(value: &str, max_bytes: usize) -> Result<(), FrameError> {
+    if value.is_empty() || value.len() > max_bytes || value.chars().any(char::is_control) {
+        return Err(FrameError::InvalidField);
+    }
+    Ok(())
+}
+
+fn disallowed_text_control(value: char) -> bool {
+    value.is_control() && !matches!(value, '\n' | '\r' | '\t')
 }
 
 fn valid_path(value: &str) -> Result<(), FrameError> {
@@ -494,5 +922,46 @@ mod tests {
             decode_frame::<VitaMessage>(body),
             Err(FrameError::InvalidJson)
         );
+    }
+
+    #[test]
+    fn sensitive_credential_debug_and_wire_buffer_are_redacted() {
+        let credential = SensitiveCredential::new("secret-placeholder".to_string()).unwrap();
+        assert_eq!(format!("{credential:?}"), "[REDACTED]");
+        assert!(!format!("{credential:?}").contains("secret-placeholder"));
+        let reply = HostMessage::SensitiveCredentialReply(SensitiveCredentialReply {
+            request_id: "credential-request".to_string(),
+            session_id: "session".to_string(),
+            turn_id: "turn".to_string(),
+            binding_hash: "a".repeat(64),
+            credential_ref: "profile".to_string(),
+            credential: Some(credential),
+            error_code: None,
+        });
+        let frame = encode_sensitive_frame(&reply).expect("sensitive frame");
+        assert!(frame
+            .windows("secret-placeholder".len())
+            .any(|window| { window == b"secret-placeholder" }));
+        let decoded: HostMessage = decode_frame(&frame[4..]).expect("sensitive decode");
+        assert!(matches!(decoded, HostMessage::SensitiveCredentialReply(_)));
+    }
+
+    #[test]
+    fn provider_binding_hash_is_exact_and_secret_free() {
+        let configuration = ProviderConfiguration {
+            profile_id: "profile".to_string(),
+            purpose: "chat".to_string(),
+            provider_kind: "openai_compatible".to_string(),
+            base_url: "https://provider.example/v1".to_string(),
+            model: "model".to_string(),
+            credential_ref: "profile".to_string(),
+            credential_destination: "https://provider.example/v1".to_string(),
+        };
+        let binding = ProviderBinding::derive("session", "turn", &configuration).unwrap();
+        assert_eq!(binding.binding_hash, binding.expected_hash());
+        assert!(binding.validate().is_ok());
+        let mut stale = binding.clone();
+        stale.model = "other-model".to_string();
+        assert!(stale.validate().is_err());
     }
 }

@@ -16,8 +16,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use protocol::{
     ConfirmationDecision, GrantIssued, GrantRevalidated, HostMessage, InitializeSession,
-    ProcessGrant, ProviderBinding, ProviderConfiguration, StartTurn, VitaMessage,
-    CODEX_UPSTREAM_COMMIT, PROTOCOL_VERSION, RUNTIME_ID,
+    ProcessGrant, ProviderBinding, ProviderConfiguration, SensitiveCredential, StartTurn,
+    VitaMessage, CODEX_UPSTREAM_COMMIT, PROTOCOL_VERSION, RUNTIME_ID,
 };
 use vita_agent_protocol as protocol;
 
@@ -50,6 +50,10 @@ fn send<T: serde::Serialize>(writer: &mut BufWriter<impl std::io::Write>, messag
     protocol::write_frame(writer, message).expect("canary Host frame");
 }
 
+fn send_sensitive<T: serde::Serialize>(writer: &mut BufWriter<impl std::io::Write>, message: &T) {
+    protocol::write_sensitive_frame(writer, message).expect("canary sensitive Host frame");
+}
+
 fn receive(reader: &mut BufReader<impl std::io::Read>) -> VitaMessage {
     let body = protocol::read_frame(reader)
         .expect("canary Vita frame")
@@ -60,16 +64,15 @@ fn receive(reader: &mut BufReader<impl std::io::Read>) -> VitaMessage {
 fn git_fixture() -> (tempfile::TempDir, PathBuf) {
     let workspace = tempfile::tempdir().expect("canary Git workspace");
     std::fs::write(workspace.path().join("canary.txt"), "h9\n").expect("canary file");
-    let git = Command::new("where.exe")
-        .arg("git.exe")
-        .output()
-        .expect("locate Git executable");
-    assert!(git.status.success(), "Git executable is not available");
-    let git_path = String::from_utf8_lossy(&git.stdout)
-        .lines()
-        .map(PathBuf::from)
-        .find(|path| path.is_file())
-        .expect("absolute Git executable");
+    let git_path = [
+        PathBuf::from(r"E:\Program Files\Git\mingw64\bin\git.exe"),
+        PathBuf::from(r"C:\Program Files\Git\mingw64\bin\git.exe"),
+        PathBuf::from(r"E:\Program Files\Git\bin\git.exe"),
+        PathBuf::from(r"C:\Program Files\Git\bin\git.exe"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+    .expect("absolute Git executable");
     let initialized = Command::new(&git_path)
         .args(["init", "--quiet"])
         .current_dir(workspace.path())
@@ -157,6 +160,7 @@ fn process_isolated_codex_h8_h7c_second_provider_closure() {
     let mut scope_seen = false;
     let mut grant_seen = false;
     let mut revalidation_seen = false;
+    let mut credential_requests = 0_u32;
     let final_text = loop {
         match receive(&mut reader) {
             VitaMessage::TurnState(_) => {}
@@ -216,6 +220,27 @@ fn process_isolated_codex_h8_h7c_second_provider_closure() {
                     }),
                 );
             }
+            VitaMessage::CredentialRequired(request) => {
+                credential_requests += 1;
+                assert_eq!(request.session_id, SESSION_ID);
+                assert_eq!(request.turn_id, turn_id);
+                assert_eq!(request.binding.credential_ref, "h9-canary-credential");
+                send_sensitive(
+                    &mut writer,
+                    &HostMessage::SensitiveCredentialReply(protocol::SensitiveCredentialReply {
+                        request_id: request.request_id,
+                        session_id: SESSION_ID.to_string(),
+                        turn_id: request.turn_id,
+                        binding_hash: request.binding.binding_hash,
+                        credential_ref: request.binding.credential_ref,
+                        credential: Some(
+                            SensitiveCredential::new("h9-canary-fake-credential".to_string())
+                                .expect("canary fake credential"),
+                        ),
+                        error_code: None,
+                    }),
+                );
+            }
             VitaMessage::TurnCompleted(message) => {
                 break message.assistant_text;
             }
@@ -237,9 +262,14 @@ fn process_isolated_codex_h8_h7c_second_provider_closure() {
         "final ProcessGrant revalidation was observed"
     );
     assert_eq!(
+        credential_requests, 2,
+        "each provider request resolved a credential"
+    );
+    assert_eq!(
         final_text.as_str(),
         "D29-H9 process-isolated closure complete (provider_requests=2)"
     );
+    assert!(!final_text.contains("h9-canary-fake-credential"));
 
     send(
         &mut writer,

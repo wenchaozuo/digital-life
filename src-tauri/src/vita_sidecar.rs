@@ -1691,7 +1691,9 @@ mod windows {
             .map_err(|_| "Vita turn authority lock was poisoned".to_string())?;
         if !matches!(
             &*authority,
-            HostTurnAuthority::Active(active) if active.turn_id == request.host_turn_id
+            HostTurnAuthority::Active(active)
+                if active.turn_id == request.host_turn_id
+                    && request.binding.turn_id == request.host_turn_id
         ) {
             return session.send(&HostMessage::AuthorityScopeReply(AuthorityScopeReply {
                 request_id: request.request_id,
@@ -1761,7 +1763,9 @@ mod windows {
             .map_err(|_| "Vita turn authority lock was poisoned".to_string())?;
         if !matches!(
             &*authority,
-            HostTurnAuthority::Active(active) if active.turn_id == request.host_turn_id
+            HostTurnAuthority::Active(active)
+                if active.turn_id == request.host_turn_id
+                    && request.binding.turn_id == request.host_turn_id
         ) {
             session.send(&HostMessage::ConfirmationReply(ConfirmationReply {
                 request_id: request.request_id,
@@ -1816,7 +1820,9 @@ mod windows {
             .map_err(|_| "Vita turn authority lock was poisoned".to_string())?;
         if !matches!(
             &*authority,
-            HostTurnAuthority::Active(active) if active.turn_id == request.host_turn_id
+            HostTurnAuthority::Active(active)
+                if active.turn_id == request.host_turn_id
+                    && request.binding.turn_id == request.host_turn_id
         ) {
             return session.send(&HostMessage::GrantIssued(GrantIssued {
                 request_id: request.request_id,
@@ -1925,7 +1931,9 @@ mod windows {
             .map_err(|_| "Vita turn authority lock was poisoned".to_string())?;
         if !matches!(
             &*authority,
-            HostTurnAuthority::Active(active) if active.turn_id == request.host_turn_id
+            HostTurnAuthority::Active(active)
+                if active.turn_id == request.host_turn_id
+                    && request.binding.turn_id == request.host_turn_id
         ) {
             return session.send(&HostMessage::GrantRevalidated(GrantRevalidated {
                 request_id: request.request_id,
@@ -2917,7 +2925,7 @@ mod windows {
                     allowed: false,
                     error_code: Some(code),
                     ..
-                }) if code == "AUTHORITY_DENIED"
+                }) if code == "TURN_NOT_ACTIVE"
             ));
 
             handle_revalidate_grant(
@@ -2941,7 +2949,7 @@ mod windows {
                     allowed: false,
                     error_code: Some(code),
                     ..
-                }) if code == "AUTHORITY_DENIED"
+                }) if code == "TURN_NOT_ACTIVE"
             ));
 
             handle_issue_grant(
@@ -2977,6 +2985,31 @@ mod windows {
                 consume_active_grant(&mut stale_grants, &turn_b, &grant_a, &binding_a, 7,).is_err()
             );
             assert_eq!(stale_grants.len(), 1);
+
+            handle_confirmation_required(
+                &session,
+                ConfirmationRequired {
+                    request_id: "cross-confirmation-a-on-b".to_string(),
+                    session_id: session.session_id.clone(),
+                    host_turn_id: turn_b.clone(),
+                    life_id: session.life_id.clone(),
+                    task_id: session.task_id.clone(),
+                    capability_id: PRODUCTION_GIT_STATUS_CAPABILITY_ID.to_string(),
+                    workspace_summary: "workspace".to_string(),
+                    expires_at_unix_ms: unix_millis().saturating_add(5_000),
+                    binding: binding_a.clone(),
+                },
+            )
+            .expect("cross-generation confirmation is answered");
+            assert!(matches!(
+                receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("cross-generation confirmation reply"),
+                HostMessage::ConfirmationReply(ConfirmationReply {
+                    decision: ConfirmationDecision::Cancel,
+                    ..
+                })
+            ));
 
             let late_confirmation = ConfirmationRequired {
                 request_id: "late-confirmation-a".to_string(),

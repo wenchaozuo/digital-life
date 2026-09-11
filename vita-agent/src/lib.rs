@@ -1411,6 +1411,7 @@ fn table<const N: usize>(entries: [(&str, TomlValue); N]) -> TomlValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use tempfile::tempdir;
 
     fn test_profile() -> (
@@ -1670,6 +1671,47 @@ mod tests {
                 "provider must not contain {auth_key}"
             );
         }
+    }
+
+    #[test]
+    fn h9_gateway_codex_retry_overrides_are_zero() {
+        let (_app_data, _workspace, profile) = test_profile();
+        let provider = ProviderProfile::new_for_test_localhost(
+            "provider-one",
+            "Provider One",
+            ProviderProtocol::OpenAiChatCompletions,
+            "http://127.0.0.1:43123/v1",
+            "mock-model",
+            None,
+            Duration::from_secs(10),
+            ProviderRetryPolicy::default(),
+            ProviderCapabilities::none(),
+        )
+        .expect("test-local provider profile");
+        let authority = provider_gateway::VitaProviderAuthority::configure(provider).unwrap();
+        let binding = provider_gateway::VitaGatewayBinding::for_owned_private_listener(43123)
+            .expect("test gateway binding");
+        let ready = authority.prepare_gateway(binding).expect("gateway ready");
+        let overrides = profile.cli_overrides_for_gateway(ready.derived_codex_provider());
+        let providers = overrides
+            .iter()
+            .find(|(key, _)| key == "model_providers")
+            .and_then(|(_, value)| value.as_table())
+            .and_then(|providers| providers.get(VITA_GATEWAY_PROVIDER_ID))
+            .and_then(TomlValue::as_table)
+            .expect("Vita gateway provider override");
+        assert_eq!(
+            providers
+                .get("request_max_retries")
+                .and_then(TomlValue::as_integer),
+            Some(0)
+        );
+        assert_eq!(
+            providers
+                .get("stream_max_retries")
+                .and_then(TomlValue::as_integer),
+            Some(0)
+        );
     }
 
     #[tokio::test]

@@ -1862,6 +1862,13 @@ mod tests {
     }
 
     #[test]
+    fn h9_v1_retry_policy_is_explicitly_disabled() {
+        let policy = ProviderRetryPolicy::default();
+        assert_eq!(policy.max_retries, 0);
+        assert_eq!(policy.backoff, Duration::ZERO);
+    }
+
+    #[test]
     fn provider_profile_is_authoritative_and_derived_codex_provider_is_gateway_only() {
         let credential = CredentialRef::new(
             "secret-store-entry",

@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use zeroize::Zeroizing;
 
 use protocol::{
     AuthorityEvaluate, ConfirmationDecision, ConfirmationRequired, CredentialRequired, GrantIssued,
@@ -44,6 +45,172 @@ const LOCAL_GATEWAY_BODY_LIMIT: usize = MAX_FRAME_BYTES;
 const LOCAL_GATEWAY_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const LOCAL_GATEWAY_PATH: &str = "/v1/responses";
 const MAX_GATEWAY_TEXT_BYTES: usize = MAX_TURN_OUTPUT_BYTES;
+
+/// A loopback bearer credential scoped to one Host turn.  The previous
+/// session-wide token authenticated the listener but could not distinguish a
+/// late request from turn A after turn B had become active.
+#[derive(Clone, PartialEq, Eq)]
+struct TurnGatewayToken(Zeroizing<String>);
+
+impl std::fmt::Debug for TurnGatewayToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("TurnGatewayToken([REDACTED])")
+    }
+}
+
+impl TurnGatewayToken {
+    fn generate() -> Result<Self, String> {
+        let mut bytes = [0_u8; 32];
+        getrandom::fill(&mut bytes)
+            .map_err(|_| "Vita turn gateway credential could not be generated".to_string())?;
+        let value = bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        Ok(Self(Zeroizing::new(value)))
+    }
+
+    fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+#[derive(Clone)]
+struct GatewayGeneration {
+    generation: u64,
+    identity: ProviderRequestIdentity,
+    token: TurnGatewayToken,
+}
+
+struct GatewayAuthority {
+    next_generation: AtomicU64,
+    active: Mutex<Option<GatewayGeneration>>,
+}
+
+struct ActiveTurnTask {
+    identity: ProviderRequestIdentity,
+    gateway: GatewayGeneration,
+    cancelled: Arc<AtomicBool>,
+    cancel_notify: Arc<tokio::sync::Notify>,
+    join: tokio::task::JoinHandle<Result<String, crate::VitaAgentError>>,
+}
+
+#[derive(Default)]
+struct TurnOwner {
+    active: Mutex<Option<ActiveTurnTask>>,
+}
+
+impl TurnOwner {
+    fn install(&self, task: ActiveTurnTask) -> Result<(), String> {
+        let mut active = self
+            .active
+            .lock()
+            .map_err(|_| "Vita turn owner was poisoned".to_string())?;
+        if active.is_some() {
+            task.join.abort();
+            return Err("Vita turn owner is already occupied".to_string());
+        }
+        *active = Some(task);
+        Ok(())
+    }
+
+    fn take(&self, identity: &ProviderRequestIdentity) -> Option<ActiveTurnTask> {
+        self.active.lock().ok().and_then(|mut active| {
+            active
+                .as_ref()
+                .is_some_and(|task| task.identity == *identity)
+                .then(|| active.take())
+                .flatten()
+        })
+    }
+
+    fn reap_finished(&self) {
+        if let Ok(mut active) = self.active.lock() {
+            if active.as_ref().is_some_and(|task| task.join.is_finished()) {
+                active.take();
+            }
+        }
+    }
+}
+
+impl GatewayAuthority {
+    fn new() -> Self {
+        Self {
+            next_generation: AtomicU64::new(0),
+            active: Mutex::new(None),
+        }
+    }
+
+    fn activate(&self, identity: ProviderRequestIdentity) -> Result<GatewayGeneration, String> {
+        let generation = self.next_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let value = GatewayGeneration {
+            generation,
+            identity,
+            token: TurnGatewayToken::generate()?,
+        };
+        let mut active = self
+            .active
+            .lock()
+            .map_err(|_| "Vita gateway authority was poisoned".to_string())?;
+        if active.is_some() {
+            return Err("Vita gateway already has an active turn".to_string());
+        }
+        *active = Some(value.clone());
+        Ok(value)
+    }
+
+    fn deactivate(&self, identity: &ProviderRequestIdentity) -> bool {
+        let Ok(mut active) = self.active.lock() else {
+            return false;
+        };
+        let Some(current) = active.as_ref() else {
+            return false;
+        };
+        if current.identity != *identity {
+            return false;
+        }
+        active.take();
+        self.next_generation.fetch_add(1, Ordering::AcqRel);
+        true
+    }
+
+    fn deactivate_generation(&self, expected: &GatewayGeneration) -> bool {
+        let Ok(mut active) = self.active.lock() else {
+            return false;
+        };
+        let Some(current) = active.as_ref() else {
+            return false;
+        };
+        if current.generation != expected.generation
+            || current.identity != expected.identity
+            || current.token != expected.token
+        {
+            return false;
+        }
+        active.take();
+        self.next_generation.fetch_add(1, Ordering::AcqRel);
+        true
+    }
+
+    fn authorize(&self, token: &str) -> Option<GatewayGeneration> {
+        self.active.lock().ok().and_then(|active| {
+            active
+                .as_ref()
+                .filter(|generation| generation.token.as_str() == token)
+                .cloned()
+        })
+    }
+
+    fn is_current(&self, expected: &GatewayGeneration) -> bool {
+        self.active.lock().ok().is_some_and(|active| {
+            active.as_ref().is_some_and(|current| {
+                current.generation == expected.generation
+                    && current.identity == expected.identity
+                    && current.token == expected.token
+            })
+        })
+    }
+}
 
 enum SidecarGatewayTransport {
     Production,
@@ -76,7 +243,9 @@ impl crate::provider_gateway::ProviderRequestTransport for BorrowedProviderTrans
 struct ActiveIdentityTransport<'a> {
     inner: &'a dyn crate::provider_gateway::ProviderRequestTransport,
     active_identity: Arc<Mutex<Option<ProviderRequestIdentity>>>,
+    gateway_authority: Arc<GatewayAuthority>,
     expected: ProviderRequestIdentity,
+    expected_gateway: GatewayGeneration,
 }
 
 impl crate::provider_gateway::ProviderRequestTransport for ActiveIdentityTransport<'_> {
@@ -88,7 +257,9 @@ impl crate::provider_gateway::ProviderRequestTransport for ActiveIdentityTranspo
         timeout: Duration,
         retry_policy: crate::provider_gateway::ProviderRetryPolicy,
     ) -> Result<Vec<u8>, crate::VitaAgentError> {
-        if !active_identity_matches(&self.active_identity, &self.expected) {
+        if !active_identity_matches(&self.active_identity, &self.expected)
+            || !self.gateway_authority.is_current(&self.expected_gateway)
+        {
             return Err(crate::VitaAgentError::CredentialResolution(
                 "Vita turn was cancelled before provider attempt",
             ));
@@ -101,13 +272,15 @@ impl crate::provider_gateway::ProviderRequestTransport for ActiveIdentityTranspo
 #[cfg(feature = "d29-h9-test-helper")]
 struct H9CanaryTransport {
     request_count: AtomicUsize,
+    expected_workspace_path: String,
 }
 
 #[cfg(feature = "d29-h9-test-helper")]
 impl H9CanaryTransport {
-    fn new() -> Self {
+    fn new(expected_workspace_path: impl Into<String>) -> Self {
         Self {
             request_count: AtomicUsize::new(0),
+            expected_workspace_path: expected_workspace_path.into(),
         }
     }
 }
@@ -117,8 +290,8 @@ impl crate::provider_gateway::ProviderRequestTransport for H9CanaryTransport {
     fn post_json(
         &self,
         endpoint: &crate::provider_gateway::ProviderEndpoint,
-        _authorization: Option<&ResolvedCredential>,
-        _body: &[u8],
+        authorization: Option<&ResolvedCredential>,
+        body: &[u8],
         _timeout: Duration,
         _retry_policy: crate::provider_gateway::ProviderRetryPolicy,
     ) -> Result<Vec<u8>, crate::VitaAgentError> {
@@ -127,7 +300,103 @@ impl crate::provider_gateway::ProviderRequestTransport for H9CanaryTransport {
                 "H9 canary transport accepts only the test loopback endpoint".to_string(),
             ));
         }
+        if authorization.map(ResolvedCredential::as_str) != Some("h9-canary-fake-credential") {
+            return Err(crate::VitaAgentError::CredentialResolution(
+                "H9 canary provider received the wrong credential",
+            ));
+        }
         let request_number = self.request_count.fetch_add(1, Ordering::AcqRel) + 1;
+        let request: Value = serde_json::from_slice(body).map_err(|_| {
+            crate::VitaAgentError::GatewayProtocol(
+                "H9 canary provider request was not JSON".to_string(),
+            )
+        })?;
+        let messages = request
+            .get("messages")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                crate::VitaAgentError::GatewayProtocol(
+                    "H9 canary provider request omitted messages".to_string(),
+                )
+            })?;
+        match request_number {
+            1 => {
+                let tools = request
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| {
+                        crate::VitaAgentError::GatewayProtocol(
+                            "H9 canary first request omitted tools".to_string(),
+                        )
+                    })?;
+                if tools.len() != 1
+                    || tools[0]
+                        .get("function")
+                        .and_then(Value::as_object)
+                        .and_then(|function| function.get("name"))
+                        .and_then(Value::as_str)
+                        != Some(VITA_WORKSPACE_GIT_STATUS_TOOL_NAME)
+                {
+                    return Err(crate::VitaAgentError::GatewayProtocol(
+                        "H9 canary first request advertised an unexpected tool set".to_string(),
+                    ));
+                }
+            }
+            2 => {
+                let tool_output = messages
+                    .iter()
+                    .find(|message| message.get("role").and_then(Value::as_str) == Some("tool"));
+                let output = tool_output
+                    .and_then(|message| message.get("content"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        crate::VitaAgentError::GatewayProtocol(
+                            "H9 canary second request omitted the native tool output".to_string(),
+                        )
+                    })?;
+                let result: Value = serde_json::from_str(output).map_err(|_| {
+                    crate::VitaAgentError::GatewayProtocol(
+                        "H9 canary native tool output was not JSON".to_string(),
+                    )
+                })?;
+                let entries = result
+                    .get("entries")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| {
+                        crate::VitaAgentError::GatewayProtocol(
+                            "H9 canary native tool output omitted entries".to_string(),
+                        )
+                    })?;
+                let canary_seen = entries
+                    .iter()
+                    .any(|entry| entry.get("path").and_then(Value::as_str) == Some("canary.txt"));
+                let absolute_path_seen = entries.iter().any(|entry| {
+                    let Some(path) = entry.get("path").and_then(Value::as_str) else {
+                        return true;
+                    };
+                    Path::new(path).is_absolute()
+                        || path.starts_with('/')
+                        || path.starts_with('\\')
+                        || path.contains(":\\")
+                        || path.contains(":/")
+                });
+                if result.get("status").and_then(Value::as_str) != Some("completed")
+                    || !canary_seen
+                    || absolute_path_seen
+                    || output.contains(&self.expected_workspace_path)
+                {
+                    return Err(crate::VitaAgentError::GatewayProtocol(
+                        "H9 canary second request did not contain a bounded relative Git result"
+                            .to_string(),
+                    ));
+                }
+            }
+            _ => {
+                return Err(crate::VitaAgentError::GatewayProtocol(
+                    "H9 canary provider received an unexpected third request".to_string(),
+                ));
+            }
+        }
         let response = if request_number == 1 {
             serde_json::json!({
                 "id": "h9-canary-tool-call",
@@ -163,9 +432,7 @@ impl crate::provider_gateway::ProviderRequestTransport for H9CanaryTransport {
                 }]
             })
         } else {
-            return Err(crate::VitaAgentError::GatewayProtocol(
-                "H9 canary provider received an unexpected third request".to_string(),
-            ));
+            unreachable!("request count was checked above");
         };
         serde_json::to_vec(&response).map_err(|_| {
             crate::VitaAgentError::GatewayProtocol(
@@ -298,23 +565,17 @@ impl VitaGatewayServer {
         router: SidecarRouter,
         session_id: String,
         active_identity: Arc<Mutex<Option<ProviderRequestIdentity>>>,
+        gateway_authority: Arc<GatewayAuthority>,
         transport: SidecarGatewayTransport,
     ) -> Result<Self, crate::VitaAgentError> {
         listener
             .set_nonblocking(true)
             .map_err(crate::VitaAgentError::GatewayTransport)?;
-        let token = ready
-            .binding()
-            .session_token()
-            .ok_or(crate::VitaAgentError::GatewayProtocol(
-                "production Vita gateway is missing session authentication".to_string(),
-            ))?
-            .as_str()
-            .to_string();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_for_thread = Arc::clone(&stop);
         let provider_configuration_for_thread = provider_configuration;
         let transport_for_thread = transport;
+        let gateway_authority_for_thread = Arc::clone(&gateway_authority);
         let join = std::thread::Builder::new()
             .name("vita-provider-gateway".to_string())
             .spawn(move || {
@@ -324,12 +585,12 @@ impl VitaGatewayServer {
                             let _ = handle_gateway_connection(
                                 stream,
                                 peer,
-                                &token,
                                 &ready,
                                 &provider_configuration_for_thread,
                                 &router,
                                 &session_id,
                                 &active_identity,
+                                &gateway_authority_for_thread,
                                 &transport_for_thread,
                             );
                         }
@@ -367,12 +628,12 @@ impl Drop for VitaGatewayServer {
 fn handle_gateway_connection(
     mut stream: TcpStream,
     peer: std::net::SocketAddr,
-    expected_token: &str,
     ready: &GatewayReadyProvider,
     provider_configuration: &ProviderConfiguration,
     router: &SidecarRouter,
     session_id: &str,
     active_identity: &Arc<Mutex<Option<ProviderRequestIdentity>>>,
+    gateway_authority: &Arc<GatewayAuthority>,
     transport: &SidecarGatewayTransport,
 ) -> Result<(), String> {
     if !peer.ip().is_loopback() {
@@ -388,7 +649,7 @@ fn handle_gateway_connection(
         Ok(request) => request,
         Err(code) => return write_gateway_error(&mut stream, "400 Bad Request", code),
     };
-    if let Err(code) = authorize_gateway_request(&request, expected_token) {
+    if let Err(code) = authorize_gateway_request(&request) {
         let status = if code == "GATEWAY_AUTH_DENIED" {
             "401 Unauthorized"
         } else {
@@ -396,6 +657,13 @@ fn handle_gateway_connection(
         };
         return write_gateway_error(&mut stream, status, code);
     }
+    let gateway = request
+        .authorization
+        .as_deref()
+        .and_then(|token| gateway_authority.authorize(token));
+    let Some(gateway) = gateway else {
+        return write_gateway_error(&mut stream, "401 Unauthorized", "GATEWAY_AUTH_DENIED");
+    };
     let identity = active_identity
         .lock()
         .map_err(|_| "active Vita turn state was poisoned".to_string())?
@@ -405,6 +673,9 @@ fn handle_gateway_connection(
         Ok(identity) => identity,
         Err(_) => return write_gateway_error(&mut stream, "409 Conflict", "TURN_NOT_ACTIVE"),
     };
+    if identity != gateway.identity {
+        return write_gateway_error(&mut stream, "409 Conflict", "TURN_NOT_ACTIVE");
+    }
     let request = match parse_gateway_responses_request(&request.body, ready.profile().model()) {
         Ok(request) => request,
         Err(_) => {
@@ -425,7 +696,9 @@ fn handle_gateway_connection(
             let guarded = ActiveIdentityTransport {
                 inner: &transport,
                 active_identity: Arc::clone(active_identity),
+                gateway_authority: Arc::clone(gateway_authority),
                 expected: identity.clone(),
+                expected_gateway: gateway.clone(),
             };
             let gateway = ProviderGateway::new(ready.clone(), resolver, guarded);
             gateway.execute_responses_request_with_identity(&request, Some(&identity))
@@ -438,14 +711,18 @@ fn handle_gateway_connection(
             let guarded = ActiveIdentityTransport {
                 inner: &borrowed,
                 active_identity: Arc::clone(active_identity),
+                gateway_authority: Arc::clone(gateway_authority),
                 expected: identity.clone(),
+                expected_gateway: gateway.clone(),
             };
             let gateway = ProviderGateway::new(ready.clone(), resolver, guarded);
             gateway.execute_responses_request_with_identity(&request, Some(&identity))
         }
     }
     .map_err(|_| "provider request failed".to_string())?;
-    if !active_identity_matches(active_identity, &identity) {
+    if !active_identity_matches(active_identity, &identity)
+        || !gateway_authority.is_current(&gateway)
+    {
         return write_gateway_error(&mut stream, "409 Conflict", "TURN_NOT_ACTIVE");
     }
     write_gateway_success(&mut stream, &result)
@@ -458,14 +735,11 @@ struct GatewayHttpRequest {
     body: Vec<u8>,
 }
 
-fn authorize_gateway_request(
-    request: &GatewayHttpRequest,
-    expected_token: &str,
-) -> Result<(), &'static str> {
+fn authorize_gateway_request(request: &GatewayHttpRequest) -> Result<(), &'static str> {
     if request.method != "POST" || request.path != LOCAL_GATEWAY_PATH {
         return Err("GATEWAY_ROUTE_DENIED");
     }
-    if request.authorization.as_deref() != Some(expected_token) {
+    if request.authorization.is_none() {
         return Err("GATEWAY_AUTH_DENIED");
     }
     Ok(())
@@ -1071,6 +1345,8 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
     let context = VitaExecutionContext::try_new(init.life_id.clone(), init.task_id.clone())
         .map_err(|error| format!("Vita execution identity was invalid: {error:?}"))?;
     let active_identity = Arc::new(Mutex::new(None::<ProviderRequestIdentity>));
+    let gateway_authority = Arc::new(GatewayAuthority::new());
+    let turn_owner = Arc::new(TurnOwner::default());
     let authority = Arc::new(SidecarHostAuthority {
         router: router.clone(),
         session_id: init.session_id.clone(),
@@ -1095,13 +1371,19 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
         let provider = if test_canary {
             #[cfg(feature = "d29-h9-test-helper")]
             {
+                let credential = crate::CredentialRef::new(
+                    provider_config.credential_ref.clone(),
+                    provider_config.profile_id.clone(),
+                    &provider_config.base_url,
+                )
+                .map_err(|error| format!("H9 canary credential binding failed: {error}"))?;
                 crate::ProviderProfile::new_for_test_localhost(
                     provider_config.profile_id.clone(),
                     "D29-H9 deterministic local Chat provider",
                     crate::ProviderProtocol::OpenAiChatCompletions,
                     &provider_config.base_url,
                     provider_config.model.clone(),
-                    None,
+                    Some(credential),
                     Duration::from_secs(30),
                     crate::ProviderRetryPolicy::default(),
                     crate::ProviderCapabilities {
@@ -1163,10 +1445,13 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
             router.clone(),
             init.session_id.clone(),
             Arc::clone(&active_identity),
+            Arc::clone(&gateway_authority),
             if test_canary {
                 #[cfg(feature = "d29-h9-test-helper")]
                 {
-                    SidecarGatewayTransport::H9Canary(Arc::new(H9CanaryTransport::new()))
+                    SidecarGatewayTransport::H9Canary(Arc::new(H9CanaryTransport::new(
+                        &init.workspace_path,
+                    )))
                 }
                 #[cfg(not(feature = "d29-h9-test-helper"))]
                 {
@@ -1248,6 +1533,8 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
                     Arc::clone(&production),
                     router.clone(),
                     Arc::clone(&active_identity),
+                    Arc::clone(&gateway_authority),
+                    Arc::clone(&turn_owner),
                 );
             }
             HostMessage::CancelTurn(message) if message.session_id == init.session_id => {
@@ -1258,7 +1545,10 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
                     Arc::clone(&production),
                     router.clone(),
                     Arc::clone(&active_identity),
-                );
+                    Arc::clone(&gateway_authority),
+                    Arc::clone(&turn_owner),
+                )
+                .await?;
             }
             HostMessage::Shutdown(message) if message.session_id == init.session_id => {
                 production.cancel();
@@ -1294,6 +1584,8 @@ fn handle_start_turn(
     production: Arc<VitaGitStatusProduction>,
     router: SidecarRouter,
     active_identity: Arc<Mutex<Option<ProviderRequestIdentity>>>,
+    gateway_authority: Arc<GatewayAuthority>,
+    turn_owner: Arc<TurnOwner>,
 ) {
     let request_id = message.request_id.clone();
     let turn_id = message.turn_id.clone();
@@ -1331,6 +1623,7 @@ fn handle_start_turn(
         turn_id: message.turn_id.clone(),
         binding_hash: message.binding.binding_hash.clone(),
     };
+    turn_owner.reap_finished();
     {
         let Ok(mut active) = active_identity.lock() else {
             failed("TURN_STATE_UNAVAILABLE");
@@ -1342,6 +1635,16 @@ fn handle_start_turn(
         }
         *active = Some(identity.clone());
     }
+    let gateway = match gateway_authority.activate(identity.clone()) {
+        Ok(gateway) => gateway,
+        Err(_) => {
+            if let Ok(mut active) = active_identity.lock() {
+                active.take();
+            }
+            failed("TURN_GATEWAY_BUSY");
+            return;
+        }
+    };
     production.begin_turn();
     let _ = router.send(&VitaMessage::TurnState(TurnState {
         request_id: next_request_id("vita-turn-starting"),
@@ -1358,40 +1661,62 @@ fn handle_start_turn(
     let session_id = init.session_id.clone();
     let model = provider_config.model.clone();
     let prompt = message.prompt;
-    tokio::spawn(async move {
-        let result = runtime.run_turn(prompt).await;
-        let still_current = active_identity
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancel_notify = Arc::new(tokio::sync::Notify::new());
+    let gateway_for_task = gateway.clone();
+    let gateway_for_install_error = gateway.clone();
+    let gateway_token = gateway.token.clone();
+    let active_identity_for_task = Arc::clone(&active_identity);
+    let active_identity_for_error = Arc::clone(&active_identity);
+    let gateway_authority_for_task = Arc::clone(&gateway_authority);
+    let identity_for_task = identity.clone();
+    let turn_id_for_task = turn_id.clone();
+    let cancelled_for_task = Arc::clone(&cancelled);
+    let cancel_notify_for_task = Arc::clone(&cancel_notify);
+    let router_for_task = router.clone();
+    let join = tokio::spawn(async move {
+        let result = runtime
+            .run_turn(
+                prompt,
+                gateway_token.as_str(),
+                cancelled_for_task,
+                cancel_notify_for_task,
+            )
+            .await;
+        let still_current = active_identity_for_task
             .lock()
             .ok()
-            .is_some_and(|active| active.as_ref() == Some(&identity));
+            .is_some_and(|active| active.as_ref() == Some(&identity_for_task))
+            && gateway_authority_for_task.is_current(&gateway_for_task);
         if !still_current {
-            return;
+            return result;
         }
-        if let Ok(mut active) = active_identity.lock() {
+        if let Ok(mut active) = active_identity_for_task.lock() {
             active.take();
         }
-        match result {
+        gateway_authority_for_task.deactivate(&gateway_for_task.identity);
+        match &result {
             Ok(assistant_text) => {
                 let text = if assistant_text.is_empty() {
                     "(Vita completed without assistant text)".to_string()
                 } else {
-                    bounded_protocol_text(&assistant_text, MAX_TURN_OUTPUT_BYTES)
+                    bounded_protocol_text(assistant_text, MAX_TURN_OUTPUT_BYTES)
                 };
-                let _ = router.send(&VitaMessage::TurnCompleted(TurnCompleted {
+                let _ = router_for_task.send(&VitaMessage::TurnCompleted(TurnCompleted {
                     request_id: next_request_id("vita-turn-completed"),
-                    session_id,
-                    turn_id,
-                    model,
+                    session_id: session_id.clone(),
+                    turn_id: turn_id_for_task.clone(),
+                    model: model.clone(),
                     assistant_text: text,
                 }));
             }
             Err(error) => {
                 let error_text = error.to_string();
                 let cancelled = error_text.to_ascii_lowercase().contains("cancel");
-                let _ = router.send(&VitaMessage::TurnFailed(TurnFailed {
+                let _ = router_for_task.send(&VitaMessage::TurnFailed(TurnFailed {
                     request_id: next_request_id("vita-turn-failed"),
                     session_id,
-                    turn_id,
+                    turn_id: turn_id_for_task.clone(),
                     phase: if cancelled {
                         TurnPhase::Cancelled
                     } else {
@@ -1407,48 +1732,82 @@ fn handle_start_turn(
                 }));
             }
         }
+        result
     });
+    if let Err(error) = turn_owner.install(ActiveTurnTask {
+        identity: identity.clone(),
+        gateway,
+        cancelled,
+        cancel_notify,
+        join,
+    }) {
+        gateway_authority.deactivate_generation(&gateway_for_install_error);
+        if let Ok(mut active) = active_identity_for_error.lock() {
+            active.take();
+        }
+        let _ = router.send(&VitaMessage::TurnFailed(TurnFailed {
+            request_id,
+            session_id: init.session_id.clone(),
+            turn_id,
+            phase: TurnPhase::Failed,
+            error_code: "TURN_OWNER_UNAVAILABLE".to_string(),
+            message: bounded_protocol_text(&error, 256),
+        }));
+    }
 }
 
-fn handle_cancel_turn(
+async fn handle_cancel_turn(
     message: protocol::CancelTurn,
     init: &InitializeSession,
     runtime: Arc<VitaAgentRuntime>,
     production: Arc<VitaGitStatusProduction>,
     router: SidecarRouter,
     active_identity: Arc<Mutex<Option<ProviderRequestIdentity>>>,
-) {
+    gateway_authority: Arc<GatewayAuthority>,
+    turn_owner: Arc<TurnOwner>,
+) -> Result<(), String> {
     if message.validate().is_err() {
-        return;
+        return Ok(());
     }
-    let matches = active_identity.lock().ok().is_some_and(|active| {
+    let identity = active_identity.lock().ok().and_then(|active| {
         active
             .as_ref()
-            .is_some_and(|identity| identity.turn_id == message.turn_id)
+            .filter(|identity| identity.turn_id == message.turn_id)
+            .cloned()
     });
-    if !matches {
-        return;
-    }
+    let Some(identity) = identity else {
+        return Ok(());
+    };
     if let Ok(mut active) = active_identity.lock() {
         active.take();
     }
     production.cancel_turn();
+    let Some(task) = turn_owner.take(&identity) else {
+        gateway_authority.deactivate(&identity);
+        return Err("Vita turn owner disappeared before cancellation proof".to_string());
+    };
+    gateway_authority.deactivate_generation(&task.gateway);
+    task.cancelled.store(true, Ordering::Release);
+    task.cancel_notify.notify_waiters();
     let session_id = init.session_id.clone();
     let turn_id = message.turn_id;
-    tokio::spawn(async move {
-        // The acknowledgement is emitted only after the bounded Codex
-        // interrupt attempt has completed.  Clearing the identity above
-        // fences gateway credentials/tool continuations immediately; this
-        // final frame is the Host-visible proof that the old lifecycle is
-        // terminally fenced.
-        let _ = runtime.interrupt_active_turn().await;
-        let _ = router.send(&VitaMessage::TurnState(TurnState {
-            request_id: next_request_id("vita-turn-cancelled"),
-            session_id,
-            turn_id,
-            phase: TurnPhase::Cancelled,
-        }));
-    });
+    // The acknowledgement is emitted only after the bounded Codex interrupt
+    // and the actual run_turn future have both terminated.  Clearing the
+    // identity and gateway authority above fences late requests immediately;
+    // this join proves the old lifecycle cannot later mutate a new turn.
+    let _ = runtime.interrupt_active_turn().await;
+    let joined = tokio::time::timeout(Duration::from_secs(5), task.join)
+        .await
+        .map_err(|_| "Vita turn cancellation did not reach terminality".to_string())?
+        .map_err(|_| "Vita turn cancellation task failed".to_string())?;
+    let _ = joined;
+    router.send(&VitaMessage::TurnState(TurnState {
+        request_id: next_request_id("vita-turn-cancelled"),
+        session_id,
+        turn_id,
+        phase: TurnPhase::Cancelled,
+    }))?;
+    Ok(())
 }
 
 fn spawn_confirmation_loop(
@@ -1780,7 +2139,7 @@ mod tests {
     }
 
     #[test]
-    fn local_gateway_requires_current_session_token_and_exact_route() {
+    fn local_gateway_requires_bearer_header_and_exact_route() {
         let request = |method: &str, path: &str, authorization: Option<&str>| GatewayHttpRequest {
             method: method.to_string(),
             path: path.to_string(),
@@ -1788,29 +2147,52 @@ mod tests {
             body: Vec::new(),
         };
         assert_eq!(
-            authorize_gateway_request(&request("POST", LOCAL_GATEWAY_PATH, None), "current"),
+            authorize_gateway_request(&request("POST", LOCAL_GATEWAY_PATH, None)),
             Err("GATEWAY_AUTH_DENIED")
         );
         assert_eq!(
-            authorize_gateway_request(&request("POST", LOCAL_GATEWAY_PATH, Some("old")), "current"),
-            Err("GATEWAY_AUTH_DENIED")
+            authorize_gateway_request(&request("POST", LOCAL_GATEWAY_PATH, Some("old"))),
+            Ok(())
         );
         assert_eq!(
-            authorize_gateway_request(
-                &request("GET", LOCAL_GATEWAY_PATH, Some("current")),
-                "current"
-            ),
+            authorize_gateway_request(&request("GET", LOCAL_GATEWAY_PATH, Some("current"))),
             Err("GATEWAY_ROUTE_DENIED")
         );
         assert_eq!(
-            authorize_gateway_request(&request("POST", "/v1/other", Some("current")), "current"),
+            authorize_gateway_request(&request("POST", "/v1/other", Some("current"))),
             Err("GATEWAY_ROUTE_DENIED")
         );
-        assert!(authorize_gateway_request(
-            &request("POST", LOCAL_GATEWAY_PATH, Some("current")),
-            "current"
-        )
-        .is_ok());
+        assert!(
+            authorize_gateway_request(&request("POST", LOCAL_GATEWAY_PATH, Some("current")))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn gateway_generation_rejects_old_turn_token_after_new_turn_activation() {
+        let authority = GatewayAuthority::new();
+        let identity_a = ProviderRequestIdentity {
+            turn_id: "turn-a".to_string(),
+            binding_hash: "binding-a".to_string(),
+        };
+        let generation_a = authority
+            .activate(identity_a.clone())
+            .expect("turn A gateway generation");
+        assert!(authority.authorize(generation_a.token.as_str()).is_some());
+        assert!(authority.deactivate_generation(&generation_a));
+
+        let identity_b = ProviderRequestIdentity {
+            turn_id: "turn-b".to_string(),
+            binding_hash: "binding-b".to_string(),
+        };
+        let generation_b = authority
+            .activate(identity_b.clone())
+            .expect("turn B gateway generation");
+        assert!(authority.authorize(generation_a.token.as_str()).is_none());
+        assert!(!authority.is_current(&generation_a));
+        assert!(authority.is_current(&generation_b));
+        assert!(authority.authorize(generation_b.token.as_str()).is_some());
+        assert_eq!(generation_b.identity, identity_b);
     }
 
     #[test]

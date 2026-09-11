@@ -94,7 +94,13 @@ impl VitaAgentRuntime {
     /// The caller owns the protocol lifecycle; this method deliberately
     /// returns only the bounded terminal assistant text and never exposes a
     /// raw Codex transcript or provider response.
-    pub async fn run_turn(&self, prompt: String) -> Result<String, VitaAgentError> {
+    pub async fn run_turn(
+        &self,
+        prompt: String,
+        gateway_token: &str,
+        cancelled: Arc<AtomicBool>,
+        cancel_notify: Arc<tokio::sync::Notify>,
+    ) -> Result<String, VitaAgentError> {
         if self.active.swap(true, Ordering::AcqRel) {
             return Err(VitaAgentError::GatewayProtocol(
                 "another Vita turn is already active".to_string(),
@@ -102,37 +108,73 @@ impl VitaAgentRuntime {
         }
 
         let result = async {
-            let new_thread = tokio::time::timeout(
+            if gateway_token.trim().is_empty() {
+                return Err(VitaAgentError::GatewayProtocol(
+                    "Vita turn gateway credential was empty".to_string(),
+                ));
+            }
+            // The sidecar gateway accepts only the random credential minted
+            // for this exact turn.  The base configuration remains immutable;
+            // this cloned Config is passed to one StartThreadOptions instance
+            // and is never persisted or shared with a later generation.
+            let mut turn_config = self.config.clone();
+            turn_config.model_provider.experimental_bearer_token =
+                Some(gateway_token.to_string().into());
+            if cancelled.load(Ordering::Acquire) {
+                return Err(VitaAgentError::GatewayProtocol(
+                    "Vita turn was cancelled".to_string(),
+                ));
+            }
+            let start = tokio::time::timeout(
                 Duration::from_secs(30),
                 self.manager
-                    .start_thread(StartThreadOptions::new(self.config.clone())),
-            )
-            .await
-            .map_err(|_| {
-                VitaAgentError::GatewayProtocol("Vita turn startup timed out".to_string())
-            })?
-            .map_err(|error| {
-                VitaAgentError::GatewayProtocol(format!("Vita turn startup failed: {error}"))
-            })?;
+                    .start_thread(StartThreadOptions::new(turn_config)),
+            );
+            let new_thread = tokio::select! {
+                _ = cancel_notify.notified() => {
+                    return Err(VitaAgentError::GatewayProtocol(
+                        "Vita turn was cancelled".to_string(),
+                    ));
+                }
+                result = start => result
+                    .map_err(|_| {
+                        VitaAgentError::GatewayProtocol("Vita turn startup timed out".to_string())
+                    })?
+                    .map_err(|error| {
+                        VitaAgentError::GatewayProtocol(format!("Vita turn startup failed: {error}"))
+                    })?,
+            };
             let thread = new_thread.thread;
             if let Ok(mut active_thread) = self.active_thread.lock() {
                 *active_thread = Some(Arc::clone(&thread));
             }
 
-            let submission = tokio::time::timeout(
+            if cancelled.load(Ordering::Acquire) {
+                return Err(VitaAgentError::GatewayProtocol(
+                    "Vita turn was cancelled".to_string(),
+                ));
+            }
+            let submission_future = tokio::time::timeout(
                 Duration::from_secs(30),
                 thread.start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
                     text: prompt,
                     text_elements: Vec::new(),
                 }])),
-            )
-            .await
-            .map_err(|_| {
-                VitaAgentError::GatewayProtocol("Vita turn submission timed out".to_string())
-            })?
-            .map_err(|error| {
-                VitaAgentError::GatewayProtocol(format!("Vita turn submission failed: {error}"))
-            })?;
+            );
+            let submission = tokio::select! {
+                _ = cancel_notify.notified() => {
+                    return Err(VitaAgentError::GatewayProtocol(
+                        "Vita turn was cancelled".to_string(),
+                    ));
+                }
+                result = submission_future => result
+                    .map_err(|_| {
+                        VitaAgentError::GatewayProtocol("Vita turn submission timed out".to_string())
+                    })?
+                    .map_err(|error| {
+                        VitaAgentError::GatewayProtocol(format!("Vita turn submission failed: {error}"))
+                    })?,
+            };
             let _ = submission;
 
             let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
@@ -145,16 +187,23 @@ impl VitaAgentRuntime {
                         "Vita turn timed out".to_string(),
                     ));
                 }
-                let event = tokio::time::timeout(remaining, thread.next_event())
-                    .await
-                    .map_err(|_| {
-                        VitaAgentError::GatewayProtocol("Vita turn timed out".to_string())
-                    })?
-                    .map_err(|error| {
-                        VitaAgentError::GatewayProtocol(format!(
-                            "Vita event stream failed: {error}"
-                        ))
-                    })?;
+                let event_future = tokio::time::timeout(remaining, thread.next_event());
+                let event = tokio::select! {
+                    _ = cancel_notify.notified() => {
+                        return Err(VitaAgentError::GatewayProtocol(
+                            "Vita turn was cancelled".to_string(),
+                        ));
+                    }
+                    result = event_future => result
+                        .map_err(|_| {
+                            VitaAgentError::GatewayProtocol("Vita turn timed out".to_string())
+                        })?
+                        .map_err(|error| {
+                            VitaAgentError::GatewayProtocol(format!(
+                                "Vita event stream failed: {error}"
+                            ))
+                        })?,
+                };
                 match event.msg {
                     EventMsg::AgentMessage(message) => {
                         append_bounded_text(

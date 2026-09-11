@@ -55,6 +55,7 @@ pub enum VitaProviderReadiness {
     IneligibleUrl,
     Ready,
     SidecarNotRunning,
+    SidecarRestartRequired,
     TurnActive,
 }
 
@@ -234,7 +235,12 @@ mod windows {
         secrets: &WindowsCredentialSecretStore,
         running: bool,
         turn_active: bool,
+        session_provider: Option<&protocol::ProviderConfiguration>,
     ) -> Result<VitaProviderReadiness, String> {
+        let current_provider = active_chat_provider_configuration(storage, secrets)?;
+        if sidecar_provider_requires_restart(running, session_provider, current_provider.as_ref()) {
+            return Ok(VitaProviderReadiness::SidecarRestartRequired);
+        }
         let Some(active) = storage
             .get_active_profile(ModelPurpose::Chat)
             .map_err(|error| error.message)?
@@ -273,6 +279,14 @@ mod windows {
             return Ok(VitaProviderReadiness::TurnActive);
         }
         Ok(VitaProviderReadiness::Ready)
+    }
+
+    fn sidecar_provider_requires_restart(
+        running: bool,
+        session_provider: Option<&protocol::ProviderConfiguration>,
+        current_provider: Option<&protocol::ProviderConfiguration>,
+    ) -> bool {
+        running && session_provider != current_provider
     }
 
     #[derive(Default)]
@@ -315,7 +329,7 @@ mod windows {
         writer: Mutex<Option<BufWriter<File>>>,
         pending: Mutex<HashMap<String, PendingAction>>,
         approvals: Mutex<HashMap<String, ApprovedAction>>,
-        grants: Mutex<HashMap<String, ProcessGrant>>,
+        grants: Mutex<HashMap<String, HostStoredGrant>>,
         replay: Mutex<RequestReplayWindow>,
         expiry: Arc<ExpiryOwner>,
         closed: AtomicBool,
@@ -342,10 +356,20 @@ mod windows {
     }
 
     struct ApprovedAction {
+        host_turn_id: String,
         binding: ProcessBinding,
         authorization_revision: i64,
         confirmation_id: String,
         expires_at_unix_ms: u64,
+    }
+
+    /// Host-owned generation evidence.  The wire ProcessGrant intentionally
+    /// remains unchanged; this wrapper prevents a later Host turn from
+    /// replaying an unconsumed grant that was minted for an older turn.
+    #[derive(Clone)]
+    struct HostStoredGrant {
+        host_turn_id: String,
+        grant: ProcessGrant,
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -534,7 +558,12 @@ mod windows {
                 HostTurnAuthority::Cancelling(active) => Some(active.turn_id.clone()),
                 HostTurnAuthority::Idle | HostTurnAuthority::Terminal { .. } => None,
             };
+            let retired_pending = turn_id
+                .as_deref()
+                .map(|turn_id| self.clear_turn_evidence_locked(turn_id))
+                .unwrap_or_default();
             drop(authority);
+            self.cancel_pending_replies(retired_pending);
             if turn_id.is_some() {
                 if let Ok(mut phase) = self.turn_phase.lock() {
                     *phase = Some(protocol::TurnPhase::Cancelling);
@@ -582,6 +611,7 @@ mod windows {
                 turn_id: turn_id.to_string(),
                 phase,
             };
+            let retired_pending = self.clear_turn_evidence_locked(turn_id);
             // Terminal is a generation fence.  New turns are admitted only
             // after this exact acknowledgement has been observed, and late
             // frames cannot match the new generation once it starts.
@@ -592,6 +622,8 @@ mod windows {
                 *current_phase = Some(phase);
             }
             *authority = HostTurnAuthority::Idle;
+            drop(authority);
+            self.cancel_pending_replies(retired_pending);
             true
         }
 
@@ -634,10 +666,30 @@ mod windows {
                 }
                 _ => false,
             };
-            drop(authority);
             if !accepted {
                 return false;
             }
+            let terminal = matches!(
+                phase,
+                protocol::TurnPhase::Completed
+                    | protocol::TurnPhase::Failed
+                    | protocol::TurnPhase::Cancelled
+                    | protocol::TurnPhase::TimedOut
+            );
+            let retired_pending = if terminal {
+                self.clear_turn_evidence_locked(turn_id)
+            } else {
+                Vec::new()
+            };
+            if terminal {
+                if let HostTurnAuthority::Terminal { .. } = &*authority {
+                    // The terminal state is projected through `turn_phase`
+                    // below; the authority lock remains held until all
+                    // generation evidence has been retired.
+                    *authority = HostTurnAuthority::Idle;
+                }
+            }
+            drop(authority);
             if matches!(
                 phase,
                 protocol::TurnPhase::Completed
@@ -654,22 +706,7 @@ mod windows {
             if let Ok(mut current_phase) = self.turn_phase.lock() {
                 *current_phase = Some(phase);
             }
-            if matches!(
-                phase,
-                protocol::TurnPhase::Completed
-                    | protocol::TurnPhase::Failed
-                    | protocol::TurnPhase::Cancelled
-                    | protocol::TurnPhase::TimedOut
-            ) {
-                if let Ok(mut authority) = self.turn_authority.lock() {
-                    // The terminal state is observable through the projected
-                    // phase; dropping to Idle admits a fresh generation only
-                    // after this exact frame was accepted.
-                    if matches!(*authority, HostTurnAuthority::Terminal { .. }) {
-                        *authority = HostTurnAuthority::Idle;
-                    }
-                }
-            }
+            self.cancel_pending_replies(retired_pending);
             true
         }
 
@@ -723,6 +760,43 @@ mod windows {
         fn close_writer(&self) {
             if let Ok(mut writer) = self.writer.lock() {
                 writer.take();
+            }
+        }
+
+        /// Retire all authority evidence belonging to one Host turn while the
+        /// caller still owns `turn_authority`.  Keeping this under the same
+        /// mutex as Active -> Cancelling/terminal admission means a fresh turn
+        /// cannot observe the old ledger half-cleared.
+        fn clear_turn_evidence_locked(&self, turn_id: &str) -> Vec<PendingAction> {
+            let pending = if let Ok(mut pending) = self.pending.lock() {
+                let keys = pending
+                    .iter()
+                    .filter(|(_, value)| value.host_turn_id == turn_id)
+                    .map(|(key, _)| key.clone())
+                    .collect::<Vec<_>>();
+                keys.into_iter()
+                    .filter_map(|key| pending.remove(&key))
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            for value in &pending {
+                self.expiry
+                    .clear(&ExpiryTicket::for_pending(&self.session_id, value));
+            }
+            if let Ok(mut approvals) = self.approvals.lock() {
+                approvals.retain(|_, approval| approval.host_turn_id != turn_id);
+            }
+            if let Ok(mut grants) = self.grants.lock() {
+                grants.retain(|_, grant| grant.host_turn_id != turn_id);
+            }
+            pending
+        }
+
+        fn cancel_pending_replies(&self, pending: Vec<PendingAction>) {
+            for pending in pending {
+                let _ =
+                    send_confirmation_decision(self, &pending, ConfirmationDecision::Cancel, None);
             }
         }
 
@@ -1062,6 +1136,7 @@ mod windows {
                         &self.credential_store,
                         false,
                         false,
+                        None,
                     )?,
                     session_id: None,
                     pending: None,
@@ -1084,6 +1159,7 @@ mod windows {
                     &self.credential_store,
                     !running.session.closed.load(Ordering::Acquire),
                     active_turn,
+                    running.session.provider.as_ref(),
                 )?,
                 session_id: Some(running.session.session_id.clone()),
                 pending: running.session.pending_summary(),
@@ -1195,8 +1271,9 @@ mod windows {
                     .lock()
                     .map_err(|_| "Vita approval state lock was poisoned".to_string())?
                     .insert(
-                        binding_key(&pending.binding),
+                        approval_key(&pending.host_turn_id, &pending.binding),
                         ApprovedAction {
+                            host_turn_id: pending.host_turn_id.clone(),
                             binding: pending.binding.clone(),
                             authorization_revision: revision.unwrap_or_default(),
                             confirmation_id,
@@ -1209,7 +1286,7 @@ mod windows {
             {
                 if decision == ConfirmationDecision::Confirm {
                     if let Ok(mut approvals) = running.session.approvals.lock() {
-                        approvals.remove(&binding_key(&pending.binding));
+                        approvals.remove(&approval_key(&pending.host_turn_id, &pending.binding));
                     }
                 }
                 return Err(error);
@@ -1756,24 +1833,26 @@ mod windows {
             if revision != request.authorization_revision {
                 return Err("stale authorization revision".to_string());
             }
-            let mut grants = session
-                .grants
-                .lock()
-                .map_err(|_| "Vita grant state lock was poisoned".to_string())?;
-            reap_expired_grants(&mut grants);
-            if grants.len() >= MAX_GRANTS {
-                return Err("Vita grant capacity was exhausted".to_string());
+            {
+                let mut grants = session
+                    .grants
+                    .lock()
+                    .map_err(|_| "Vita grant state lock was poisoned".to_string())?;
+                reap_expired_grants(&mut grants);
+                if grants.len() >= MAX_GRANTS {
+                    return Err("Vita grant capacity was exhausted".to_string());
+                }
             }
-            drop(grants);
             let mut approvals = session
                 .approvals
                 .lock()
                 .map_err(|_| "Vita approval state lock was poisoned".to_string())?;
-            let key = binding_key(&request.binding);
+            let key = approval_key(&request.host_turn_id, &request.binding);
             let approval = approvals
                 .remove(&key)
                 .ok_or_else(|| "Vita confirmation was not approved".to_string())?;
-            if approval.binding != request.binding
+            if approval.host_turn_id != request.host_turn_id
+                || approval.binding != request.binding
                 || approval.authorization_revision != request.authorization_revision
                 || approval.expires_at_unix_ms <= unix_millis()
             {
@@ -1797,7 +1876,13 @@ mod windows {
             if grants.len() >= MAX_GRANTS {
                 return Err("Vita grant capacity was exhausted".to_string());
             }
-            grants.insert(grant.grant_id.clone(), grant.clone());
+            grants.insert(
+                grant.grant_id.clone(),
+                HostStoredGrant {
+                    host_turn_id: request.host_turn_id.clone(),
+                    grant: grant.clone(),
+                },
+            );
             Ok(grant)
         });
         let result = match allowed {
@@ -1857,7 +1942,13 @@ mod windows {
                 .grants
                 .lock()
                 .map_err(|_| "Vita grant state lock was poisoned".to_string())?;
-            consume_active_grant(&mut grants, &request.grant, &request.binding, revision)
+            consume_active_grant(
+                &mut grants,
+                &request.host_turn_id,
+                &request.grant,
+                &request.binding,
+                revision,
+            )
         });
         let result = match result {
             Ok(grant) => session.send(&HostMessage::GrantRevalidated(GrantRevalidated {
@@ -1995,13 +2086,14 @@ mod windows {
         }
     }
 
-    fn reap_expired_grants(grants: &mut HashMap<String, ProcessGrant>) {
+    fn reap_expired_grants(grants: &mut HashMap<String, HostStoredGrant>) {
         let now = unix_millis();
-        grants.retain(|_, grant| !grant.used && grant.expires_at_unix_ms > now);
+        grants.retain(|_, grant| !grant.grant.used && grant.grant.expires_at_unix_ms > now);
     }
 
     fn consume_active_grant(
-        grants: &mut HashMap<String, ProcessGrant>,
+        grants: &mut HashMap<String, HostStoredGrant>,
+        host_turn_id: &str,
         requested: &ProcessGrant,
         binding: &ProcessBinding,
         authorization_revision: i64,
@@ -2010,20 +2102,21 @@ mod windows {
             .get(&requested.grant_id)
             .cloned()
             .ok_or_else(|| "Vita grant was not found".to_string())?;
-        if stored != *requested
-            || stored.used
-            || !stored.single_use
-            || stored.binding != *binding
-            || stored.authorization_revision != authorization_revision
-            || stored.expires_at_unix_ms <= unix_millis()
+        if stored.host_turn_id != host_turn_id
+            || stored.grant != *requested
+            || stored.grant.used
+            || !stored.grant.single_use
+            || stored.grant.binding != *binding
+            || stored.grant.authorization_revision != authorization_revision
+            || stored.grant.expires_at_unix_ms <= unix_millis()
         {
             return Err("Vita grant revalidation was denied".to_string());
         }
         let mut consumed = grants
             .remove(&requested.grant_id)
             .ok_or_else(|| "Vita grant was not found".to_string())?;
-        consumed.used = true;
-        Ok(consumed)
+        consumed.grant.used = true;
+        Ok(consumed.grant)
     }
 
     fn effective_confirmation_expiry(now: u64, vita_expiry: u64) -> Option<u64> {
@@ -2034,6 +2127,10 @@ mod windows {
 
     fn binding_key(binding: &ProcessBinding) -> String {
         format!("{}:{}", binding.tool_call_id, binding.turn_id)
+    }
+
+    fn approval_key(host_turn_id: &str, binding: &ProcessBinding) -> String {
+        format!("{host_turn_id}:{}", binding_key(binding))
     }
 
     fn vita_request_id(message: &VitaMessage) -> &str {
@@ -2314,6 +2411,10 @@ mod windows {
         use super::*;
 
         fn test_binding(session_id: &str) -> ProcessBinding {
+            test_binding_for(session_id, "turn", "call")
+        }
+
+        fn test_binding_for(session_id: &str, turn_id: &str, tool_call_id: &str) -> ProcessBinding {
             ProcessBinding {
                 session_id: session_id.to_string(),
                 life_id: "life".to_string(),
@@ -2329,11 +2430,25 @@ mod windows {
                 stdout_bound: 1,
                 stderr_bound: 1,
                 timeout_ms: 1,
-                tool_call_id: "call".to_string(),
-                turn_id: "turn".to_string(),
+                tool_call_id: tool_call_id.to_string(),
+                turn_id: turn_id.to_string(),
                 workspace_root_identity: "workspace".to_string(),
                 profile_id: PRODUCTION_GIT_STATUS_PROFILE_ID.to_string(),
                 git_metadata_fence_hash: "3".repeat(64),
+            }
+        }
+
+        fn test_grant(session_id: &str, grant_id: &str, binding: ProcessBinding) -> ProcessGrant {
+            ProcessGrant {
+                session_id: session_id.to_string(),
+                grant_id: grant_id.to_string(),
+                confirmation_id: format!("confirmation-{grant_id}"),
+                binding,
+                authorization_revision: 7,
+                issued_at_unix_ms: unix_millis(),
+                expires_at_unix_ms: unix_millis().saturating_add(60_000),
+                single_use: true,
+                used: false,
             }
         }
 
@@ -2347,6 +2462,33 @@ mod windows {
                 credential_ref: "credential-chat".to_string(),
                 credential_destination: "https://api.example.test/v1".to_string(),
             }
+        }
+
+        #[test]
+        fn stale_sidecar_provider_requires_explicit_restart() {
+            let provider_a = test_provider();
+            let mut provider_b = provider_a.clone();
+            provider_b.profile_id = "profile-chat-b".to_string();
+            assert!(sidecar_provider_requires_restart(
+                true,
+                Some(&provider_a),
+                Some(&provider_b)
+            ));
+            assert!(sidecar_provider_requires_restart(
+                true,
+                None,
+                Some(&provider_a)
+            ));
+            assert!(!sidecar_provider_requires_restart(
+                true,
+                Some(&provider_a),
+                Some(&provider_a)
+            ));
+            assert!(!sidecar_provider_requires_restart(
+                false,
+                None,
+                Some(&provider_a)
+            ));
         }
 
         fn test_session() -> (Arc<HostSessionState>, mpsc::Receiver<HostMessage>) {
@@ -2641,6 +2783,28 @@ mod windows {
         }
 
         #[test]
+        fn vita_settings_command_surfaces_are_synchronized() {
+            let settings = include_str!("../permissions/settings-commands.toml");
+            let manifest = include_str!("../build.rs");
+            let invoke_handler = include_str!("lib.rs");
+            let chat = include_str!("../permissions/chat-commands.toml");
+            for command in [
+                "start_vita_sidecar",
+                "get_vita_sidecar_status",
+                "start_vita_turn",
+                "cancel_vita_turn",
+                "confirm_vita_sidecar",
+                "deny_vita_sidecar",
+                "stop_vita_sidecar",
+            ] {
+                assert!(settings.contains(&format!("\"{command}\"")));
+                assert!(manifest.contains(&format!("\"{command}\"")));
+                assert!(invoke_handler.contains(&format!("vita_sidecar::{command}")));
+                assert!(!chat.contains(&format!("\"{command}\"")));
+            }
+        }
+
+        #[test]
         fn active_confirmation_expiry_denies_without_polling_and_releases_slot() {
             let (session, receiver) = test_session();
             session
@@ -2676,6 +2840,237 @@ mod windows {
             assert_eq!(session.pending.lock().expect("pending lock").len(), 1);
             session.retire();
             assert!(session.pending.lock().expect("pending lock").is_empty());
+        }
+
+        #[test]
+        fn host_turn_generation_retires_and_rejects_late_evidence() {
+            let (session, receiver) = test_session();
+            let provider = test_provider();
+            let turn_a = "turn-generation-a".to_string();
+            let provider_binding_a =
+                protocol::ProviderBinding::derive(&session.session_id, &turn_a, &provider)
+                    .expect("provider binding A");
+            session
+                .begin_turn(turn_a.clone(), provider.clone(), provider_binding_a)
+                .expect("turn A active");
+
+            let binding_a = test_binding_for(&session.session_id, &turn_a, "call-a");
+            let grant_a = test_grant(&session.session_id, "grant-a", binding_a.clone());
+            session.approvals.lock().expect("approval lock").insert(
+                approval_key(&turn_a, &binding_a),
+                ApprovedAction {
+                    host_turn_id: turn_a.clone(),
+                    binding: binding_a.clone(),
+                    authorization_revision: 7,
+                    confirmation_id: "confirmation-a".to_string(),
+                    expires_at_unix_ms: unix_millis().saturating_add(60_000),
+                },
+            );
+            session.grants.lock().expect("grant lock").insert(
+                grant_a.grant_id.clone(),
+                HostStoredGrant {
+                    host_turn_id: turn_a.clone(),
+                    grant: grant_a.clone(),
+                },
+            );
+
+            assert_eq!(
+                session.begin_cancellation().expect("cancel A"),
+                Some(turn_a.clone())
+            );
+            assert!(session.approvals.lock().expect("approval lock").is_empty());
+            assert!(session.grants.lock().expect("grant lock").is_empty());
+            assert!(session.accept_turn_state(&turn_a, protocol::TurnPhase::Cancelled));
+
+            let turn_b = "turn-generation-b".to_string();
+            let provider_binding_b =
+                protocol::ProviderBinding::derive(&session.session_id, &turn_b, &provider)
+                    .expect("provider binding B");
+            session
+                .begin_turn(turn_b.clone(), provider, provider_binding_b)
+                .expect("turn B active");
+
+            let data_root = tempfile::tempdir().expect("authority test storage root");
+            let storage =
+                StorageService::initialize_with_roots(data_root.path().to_path_buf(), None)
+                    .expect("authority test storage");
+            let registry = CapabilityRegistry::production().expect("production registry");
+
+            handle_issue_grant(
+                &session,
+                &storage,
+                &registry,
+                IssueGrant {
+                    request_id: "old-approval-a-on-b".to_string(),
+                    session_id: session.session_id.clone(),
+                    host_turn_id: turn_b.clone(),
+                    binding: binding_a.clone(),
+                    authorization_revision: 7,
+                },
+            )
+            .expect("old approval replay is answered");
+            assert!(matches!(
+                receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("old approval replay reply"),
+                HostMessage::GrantIssued(GrantIssued {
+                    allowed: false,
+                    error_code: Some(code),
+                    ..
+                }) if code == "AUTHORITY_DENIED"
+            ));
+
+            handle_revalidate_grant(
+                &session,
+                &storage,
+                &registry,
+                RevalidateGrant {
+                    request_id: "old-grant-a-on-b".to_string(),
+                    session_id: session.session_id.clone(),
+                    host_turn_id: turn_b.clone(),
+                    binding: binding_a.clone(),
+                    grant: grant_a.clone(),
+                },
+            )
+            .expect("old grant replay is answered");
+            assert!(matches!(
+                receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("old grant replay reply"),
+                HostMessage::GrantRevalidated(GrantRevalidated {
+                    allowed: false,
+                    error_code: Some(code),
+                    ..
+                }) if code == "AUTHORITY_DENIED"
+            ));
+
+            handle_issue_grant(
+                &session,
+                &storage,
+                &registry,
+                IssueGrant {
+                    request_id: "late-issue-a".to_string(),
+                    session_id: session.session_id.clone(),
+                    host_turn_id: turn_a.clone(),
+                    binding: binding_a.clone(),
+                    authorization_revision: 7,
+                },
+            )
+            .expect("late issue is answered");
+            assert!(matches!(
+                receiver.recv_timeout(Duration::from_secs(1)).expect("late issue reply"),
+                HostMessage::GrantIssued(GrantIssued {
+                    allowed: false,
+                    error_code: Some(code),
+                    ..
+                }) if code == "TURN_NOT_ACTIVE"
+            ));
+
+            let mut stale_grants = HashMap::from([(
+                grant_a.grant_id.clone(),
+                HostStoredGrant {
+                    host_turn_id: turn_a.clone(),
+                    grant: grant_a.clone(),
+                },
+            )]);
+            assert!(
+                consume_active_grant(&mut stale_grants, &turn_b, &grant_a, &binding_a, 7,).is_err()
+            );
+            assert_eq!(stale_grants.len(), 1);
+
+            let late_confirmation = ConfirmationRequired {
+                request_id: "late-confirmation-a".to_string(),
+                session_id: session.session_id.clone(),
+                host_turn_id: turn_a.clone(),
+                life_id: session.life_id.clone(),
+                task_id: session.task_id.clone(),
+                capability_id: PRODUCTION_GIT_STATUS_CAPABILITY_ID.to_string(),
+                workspace_summary: "workspace".to_string(),
+                expires_at_unix_ms: unix_millis().saturating_add(5_000),
+                binding: binding_a.clone(),
+            };
+            handle_confirmation_required(&session, late_confirmation)
+                .expect("late confirmation is answered");
+            assert!(matches!(
+                receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("late confirmation reply"),
+                HostMessage::ConfirmationReply(ConfirmationReply {
+                    decision: ConfirmationDecision::Cancel,
+                    ..
+                })
+            ));
+
+            handle_authority_evaluate(
+                &session,
+                &storage,
+                &registry,
+                AuthorityEvaluate {
+                    request_id: "late-authority-a".to_string(),
+                    session_id: session.session_id.clone(),
+                    host_turn_id: turn_a.clone(),
+                    binding: binding_a.clone(),
+                },
+            )
+            .expect("late authority is answered");
+            assert!(matches!(
+                receiver.recv_timeout(Duration::from_secs(1)).expect("late authority reply"),
+                HostMessage::AuthorityScopeReply(AuthorityScopeReply {
+                    allowed: false,
+                    error_code: Some(code),
+                    ..
+                }) if code == "TURN_NOT_ACTIVE"
+            ));
+
+            handle_revalidate_grant(
+                &session,
+                &storage,
+                &registry,
+                RevalidateGrant {
+                    request_id: "late-revalidate-a".to_string(),
+                    session_id: session.session_id.clone(),
+                    host_turn_id: turn_a,
+                    binding: binding_a,
+                    grant: grant_a,
+                },
+            )
+            .expect("late revalidation is answered");
+            assert!(matches!(
+                receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("late revalidation reply"),
+                HostMessage::GrantRevalidated(GrantRevalidated {
+                    allowed: false,
+                    error_code: Some(code),
+                    ..
+                }) if code == "TURN_NOT_ACTIVE"
+            ));
+            assert!(session.pending.lock().expect("pending lock").is_empty());
+            assert!(session.approvals.lock().expect("approval lock").is_empty());
+            assert!(session.grants.lock().expect("grant lock").is_empty());
+            assert!(session.active_authority_matches(
+                &turn_b,
+                &protocol::ProviderBinding::derive(
+                    &session.session_id,
+                    "turn-generation-b",
+                    &test_provider(),
+                )
+                .expect("provider binding B replay check")
+            ));
+
+            let binding_b = test_binding_for(&session.session_id, "turn-generation-b", "call-b");
+            session.approvals.lock().expect("approval lock").insert(
+                approval_key("turn-generation-b", &binding_b),
+                ApprovedAction {
+                    host_turn_id: "turn-generation-b".to_string(),
+                    binding: binding_b,
+                    authorization_revision: 7,
+                    confirmation_id: "confirmation-b".to_string(),
+                    expires_at_unix_ms: unix_millis().saturating_add(60_000),
+                },
+            );
+            assert!(session.accept_turn_state("turn-generation-b", protocol::TurnPhase::Completed));
+            assert!(session.approvals.lock().expect("approval lock").is_empty());
         }
 
         #[test]
@@ -2860,8 +3255,9 @@ mod windows {
             );
             let binding = test_binding(&session.session_id);
             session.approvals.lock().expect("approval lock").insert(
-                binding_key(&binding),
+                approval_key("turn", &binding),
                 ApprovedAction {
+                    host_turn_id: "turn".to_string(),
                     binding: binding.clone(),
                     authorization_revision: 7,
                     confirmation_id: "confirmation-cleanup".to_string(),
@@ -2870,16 +3266,19 @@ mod windows {
             );
             session.grants.lock().expect("grant lock").insert(
                 "grant-cleanup".to_string(),
-                ProcessGrant {
-                    session_id: session.session_id.clone(),
-                    grant_id: "grant-cleanup".to_string(),
-                    confirmation_id: "confirmation-cleanup".to_string(),
-                    binding,
-                    authorization_revision: 7,
-                    issued_at_unix_ms: unix_millis(),
-                    expires_at_unix_ms: unix_millis().saturating_add(5_000),
-                    single_use: true,
-                    used: false,
+                HostStoredGrant {
+                    host_turn_id: "turn".to_string(),
+                    grant: ProcessGrant {
+                        session_id: session.session_id.clone(),
+                        grant_id: "grant-cleanup".to_string(),
+                        confirmation_id: "confirmation-cleanup".to_string(),
+                        binding,
+                        authorization_revision: 7,
+                        issued_at_unix_ms: unix_millis(),
+                        expires_at_unix_ms: unix_millis().saturating_add(5_000),
+                        single_use: true,
+                        used: false,
+                    },
                 },
             );
             session
@@ -2925,16 +3324,19 @@ mod windows {
             let mut grants = HashMap::new();
             grants.insert(
                 "expired".to_string(),
-                ProcessGrant {
-                    session_id: "session-ledger".to_string(),
-                    grant_id: "expired".to_string(),
-                    confirmation_id: "expired-confirmation".to_string(),
-                    binding: binding.clone(),
-                    authorization_revision: 7,
-                    issued_at_unix_ms: unix_millis().saturating_sub(10_000),
-                    expires_at_unix_ms: unix_millis().saturating_sub(1),
-                    single_use: true,
-                    used: false,
+                HostStoredGrant {
+                    host_turn_id: "session-ledger-turn".to_string(),
+                    grant: ProcessGrant {
+                        session_id: "session-ledger".to_string(),
+                        grant_id: "expired".to_string(),
+                        confirmation_id: "expired-confirmation".to_string(),
+                        binding: binding.clone(),
+                        authorization_revision: 7,
+                        issued_at_unix_ms: unix_millis().saturating_sub(10_000),
+                        expires_at_unix_ms: unix_millis().saturating_sub(1),
+                        single_use: true,
+                        used: false,
+                    },
                 },
             );
             reap_expired_grants(&mut grants);
@@ -2951,13 +3353,27 @@ mod windows {
                     single_use: true,
                     used: false,
                 };
-                grants.insert(grant.grant_id.clone(), grant.clone());
+                grants.insert(
+                    grant.grant_id.clone(),
+                    HostStoredGrant {
+                        host_turn_id: "session-ledger-turn".to_string(),
+                        grant: grant.clone(),
+                    },
+                );
                 assert!(grants.len() <= MAX_GRANTS);
-                let consumed = consume_active_grant(&mut grants, &grant, &binding, 7)
-                    .expect("single-use grant consumption");
+                let consumed =
+                    consume_active_grant(&mut grants, "session-ledger-turn", &grant, &binding, 7)
+                        .expect("single-use grant consumption");
                 assert!(consumed.used);
                 assert!(grants.is_empty());
-                assert!(consume_active_grant(&mut grants, &grant, &binding, 7).is_err());
+                assert!(consume_active_grant(
+                    &mut grants,
+                    "session-ledger-turn",
+                    &grant,
+                    &binding,
+                    7,
+                )
+                .is_err());
             }
         }
 

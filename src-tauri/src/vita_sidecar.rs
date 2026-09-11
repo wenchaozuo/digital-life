@@ -165,6 +165,29 @@ mod windows {
     const SIDECAR_RESOURCE_NAME: &str = "vita-agent.exe";
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+    /// The Host-side turn authority is the security decision point for
+    /// provider credentials.  The UI-facing `active_turn_id` and
+    /// `turn_phase` fields below are retained as a projection, but are never
+    /// consulted to authorize a credential release.  Every credential request
+    /// and the Active -> Cancelling transition takes this one mutex.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum HostTurnAuthority {
+        Idle,
+        Active(HostTurnActive),
+        Cancelling(HostTurnActive),
+        Terminal {
+            turn_id: String,
+            phase: protocol::TurnPhase,
+        },
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct HostTurnActive {
+        turn_id: String,
+        provider: protocol::ProviderConfiguration,
+        binding: protocol::ProviderBinding,
+    }
+
     fn active_chat_provider_configuration(
         storage: &StorageService,
         secrets: &WindowsCredentialSecretStore,
@@ -296,6 +319,7 @@ mod windows {
         replay: Mutex<RequestReplayWindow>,
         expiry: Arc<ExpiryOwner>,
         closed: AtomicBool,
+        turn_authority: Mutex<HostTurnAuthority>,
         active_turn_id: Mutex<Option<String>>,
         turn_phase: Mutex<Option<protocol::TurnPhase>>,
         assistant_text: Mutex<Option<String>>,
@@ -308,6 +332,7 @@ mod windows {
     struct PendingAction {
         pending_id: String,
         request_id: String,
+        host_turn_id: String,
         life_id: String,
         task_id: String,
         capability_id: String,
@@ -460,6 +485,218 @@ mod windows {
     }
 
     impl HostSessionState {
+        fn begin_turn(
+            &self,
+            turn_id: String,
+            provider: protocol::ProviderConfiguration,
+            binding: protocol::ProviderBinding,
+        ) -> Result<(), String> {
+            let mut authority = self
+                .turn_authority
+                .lock()
+                .map_err(|_| "Vita turn authority lock was poisoned".to_string())?;
+            if self.closed.load(Ordering::Acquire) {
+                return Err("Vita sidecar session was already retired".to_string());
+            }
+            if !matches!(*authority, HostTurnAuthority::Idle) {
+                return Err("Vita turn is already active or cancelling".to_string());
+            }
+            *authority = HostTurnAuthority::Active(HostTurnActive {
+                turn_id: turn_id.clone(),
+                provider,
+                binding,
+            });
+            drop(authority);
+            if let Ok(mut active) = self.active_turn_id.lock() {
+                *active = Some(turn_id);
+            }
+            if let Ok(mut phase) = self.turn_phase.lock() {
+                *phase = Some(protocol::TurnPhase::Starting);
+            }
+            Ok(())
+        }
+
+        /// Establishes the cancellation linearization point.  Once this
+        /// returns `Some`, no credential request can pass the same authority
+        /// mutex unless it already completed its decision and reply while the
+        /// mutex was held.
+        fn begin_cancellation(&self) -> Result<Option<String>, String> {
+            let mut authority = self
+                .turn_authority
+                .lock()
+                .map_err(|_| "Vita turn authority lock was poisoned".to_string())?;
+            let turn_id = match &*authority {
+                HostTurnAuthority::Active(active) => {
+                    let turn_id = active.turn_id.clone();
+                    *authority = HostTurnAuthority::Cancelling(active.clone());
+                    Some(turn_id)
+                }
+                HostTurnAuthority::Cancelling(active) => Some(active.turn_id.clone()),
+                HostTurnAuthority::Idle | HostTurnAuthority::Terminal { .. } => None,
+            };
+            drop(authority);
+            if turn_id.is_some() {
+                if let Ok(mut phase) = self.turn_phase.lock() {
+                    *phase = Some(protocol::TurnPhase::Cancelling);
+                }
+            }
+            Ok(turn_id)
+        }
+
+        #[cfg(test)]
+        fn authority_snapshot(&self) -> Option<HostTurnAuthority> {
+            self.turn_authority.lock().ok().map(|state| state.clone())
+        }
+
+        #[cfg(test)]
+        fn active_authority_matches(
+            &self,
+            turn_id: &str,
+            binding: &protocol::ProviderBinding,
+        ) -> bool {
+            self.turn_authority.lock().ok().is_some_and(|state| {
+                matches!(
+                    &*state,
+                    HostTurnAuthority::Active(active)
+                        if active.turn_id == turn_id && active.binding == *binding
+                )
+            })
+        }
+
+        fn terminalize_turn(&self, turn_id: &str, phase: protocol::TurnPhase) -> bool {
+            let Ok(mut authority) = self.turn_authority.lock() else {
+                return false;
+            };
+            let accepted = match &*authority {
+                HostTurnAuthority::Active(active) | HostTurnAuthority::Cancelling(active)
+                    if active.turn_id == turn_id =>
+                {
+                    true
+                }
+                _ => false,
+            };
+            if !accepted {
+                return false;
+            }
+            *authority = HostTurnAuthority::Terminal {
+                turn_id: turn_id.to_string(),
+                phase,
+            };
+            // Terminal is a generation fence.  New turns are admitted only
+            // after this exact acknowledgement has been observed, and late
+            // frames cannot match the new generation once it starts.
+            if let Ok(mut active) = self.active_turn_id.lock() {
+                active.take();
+            }
+            if let Ok(mut current_phase) = self.turn_phase.lock() {
+                *current_phase = Some(phase);
+            }
+            *authority = HostTurnAuthority::Idle;
+            true
+        }
+
+        fn accept_turn_state(&self, turn_id: &str, phase: protocol::TurnPhase) -> bool {
+            let Ok(mut authority) = self.turn_authority.lock() else {
+                return false;
+            };
+            let accepted = match &*authority {
+                HostTurnAuthority::Active(active) if active.turn_id == turn_id => {
+                    if matches!(
+                        phase,
+                        protocol::TurnPhase::Completed
+                            | protocol::TurnPhase::Failed
+                            | protocol::TurnPhase::Cancelled
+                            | protocol::TurnPhase::TimedOut
+                    ) {
+                        *authority = HostTurnAuthority::Terminal {
+                            turn_id: turn_id.to_string(),
+                            phase,
+                        };
+                        true
+                    } else {
+                        true
+                    }
+                }
+                // Once Host cancellation wins, only an exact terminal
+                // cancellation acknowledgement can close the generation.
+                HostTurnAuthority::Cancelling(active)
+                    if active.turn_id == turn_id
+                        && matches!(
+                            phase,
+                            protocol::TurnPhase::Cancelled | protocol::TurnPhase::TimedOut
+                        ) =>
+                {
+                    *authority = HostTurnAuthority::Terminal {
+                        turn_id: turn_id.to_string(),
+                        phase,
+                    };
+                    true
+                }
+                _ => false,
+            };
+            drop(authority);
+            if !accepted {
+                return false;
+            }
+            if matches!(
+                phase,
+                protocol::TurnPhase::Completed
+                    | protocol::TurnPhase::Failed
+                    | protocol::TurnPhase::Cancelled
+                    | protocol::TurnPhase::TimedOut
+            ) {
+                if let Ok(mut active) = self.active_turn_id.lock() {
+                    active.take();
+                }
+            } else if let Ok(mut active) = self.active_turn_id.lock() {
+                *active = Some(turn_id.to_string());
+            }
+            if let Ok(mut current_phase) = self.turn_phase.lock() {
+                *current_phase = Some(phase);
+            }
+            if matches!(
+                phase,
+                protocol::TurnPhase::Completed
+                    | protocol::TurnPhase::Failed
+                    | protocol::TurnPhase::Cancelled
+                    | protocol::TurnPhase::TimedOut
+            ) {
+                if let Ok(mut authority) = self.turn_authority.lock() {
+                    // The terminal state is observable through the projected
+                    // phase; dropping to Idle admits a fresh generation only
+                    // after this exact frame was accepted.
+                    if matches!(*authority, HostTurnAuthority::Terminal { .. }) {
+                        *authority = HostTurnAuthority::Idle;
+                    }
+                }
+            }
+            true
+        }
+
+        fn force_terminal_cancelled(&self) {
+            if let Ok(mut authority) = self.turn_authority.lock() {
+                let turn_id = match &*authority {
+                    HostTurnAuthority::Active(active) | HostTurnAuthority::Cancelling(active) => {
+                        Some(active.turn_id.clone())
+                    }
+                    HostTurnAuthority::Terminal { turn_id, .. } => Some(turn_id.clone()),
+                    HostTurnAuthority::Idle => None,
+                };
+                if let Some(turn_id) = turn_id {
+                    *authority = HostTurnAuthority::Terminal {
+                        turn_id,
+                        phase: protocol::TurnPhase::Cancelled,
+                    };
+                }
+            }
+            if let Ok(mut active) = self.active_turn_id.lock() {
+                active.take();
+            }
+            if let Ok(mut phase) = self.turn_phase.lock() {
+                *phase = Some(protocol::TurnPhase::Cancelled);
+            }
+        }
+
         fn send(&self, message: &HostMessage) -> Result<(), String> {
             #[cfg(test)]
             if let Ok(hook) = self.test_outbound.lock() {
@@ -533,12 +770,7 @@ mod windows {
                 replay.clear();
             }
             self.expiry.stop();
-            if let Ok(mut turn) = self.active_turn_id.lock() {
-                turn.take();
-            }
-            if let Ok(mut phase) = self.turn_phase.lock() {
-                *phase = Some(protocol::TurnPhase::Cancelled);
-            }
+            self.force_terminal_cancelled();
         }
     }
 
@@ -788,6 +1020,7 @@ mod windows {
                 replay: Mutex::new(RequestReplayWindow::default()),
                 expiry: Arc::new(ExpiryOwner::new()),
                 closed: AtomicBool::new(false),
+                turn_authority: Mutex::new(HostTurnAuthority::Idle),
                 active_turn_id: Mutex::new(None),
                 turn_phase: Mutex::new(None),
                 assistant_text: Mutex::new(None),
@@ -905,6 +1138,25 @@ mod windows {
             expire_pending(&running.session);
             let pending = take_pending(&running.session, &pending_id)
                 .ok_or_else(|| "Vita pending confirmation was not found".to_string())?;
+            let authority = running
+                .session
+                .turn_authority
+                .lock()
+                .map_err(|_| "Vita turn authority lock was poisoned".to_string())?;
+            let active = matches!(
+                &*authority,
+                HostTurnAuthority::Active(active)
+                    if active.turn_id == pending.host_turn_id
+            );
+            if !active {
+                let _ = send_confirmation_decision(
+                    &running.session,
+                    &pending,
+                    ConfirmationDecision::Cancel,
+                    None,
+                );
+                return Err("Vita pending confirmation belongs to a retired turn".to_string());
+            }
             if pending.expires_at_unix_ms <= unix_millis() {
                 let _ = send_confirmation_decision(
                     &running.session,
@@ -962,6 +1214,7 @@ mod windows {
                 }
                 return Err(error);
             }
+            drop(authority);
             Ok(VitaSidecarActionResponse { accepted: true })
         }
 
@@ -974,6 +1227,7 @@ mod windows {
                 .running
                 .as_ref()
                 .ok_or_else(|| "Vita sidecar is not running".to_string())?;
+            let turn_id = running.session.begin_cancellation()?;
             expire_pending(&running.session);
             if let Some(pending) = take_any_pending(&running.session) {
                 let decision = if pending.expires_at_unix_ms <= unix_millis() {
@@ -989,13 +1243,7 @@ mod windows {
                     request_id: next_id("host-cancel"),
                     session_id: running.session.session_id.clone(),
                 }))?;
-            if let Some(turn_id) = running
-                .session
-                .active_turn_id
-                .lock()
-                .map_err(|_| "Vita active turn state lock was poisoned".to_string())?
-                .clone()
-            {
+            if let Some(turn_id) = turn_id {
                 let _ = running
                     .session
                     .send(&HostMessage::CancelTurn(protocol::CancelTurn {
@@ -1027,15 +1275,6 @@ mod windows {
                 .running
                 .as_ref()
                 .ok_or_else(|| "Vita sidecar is not running".to_string())?;
-            let current = running
-                .session
-                .active_turn_id
-                .lock()
-                .map_err(|_| "Vita active turn state lock was poisoned".to_string())?;
-            if current.is_some() {
-                return Err("Vita turn is already active".to_string());
-            }
-            drop(current);
             let provider = running
                 .session
                 .provider
@@ -1053,12 +1292,9 @@ mod windows {
             let binding =
                 protocol::ProviderBinding::derive(&running.session.session_id, &turn_id, &provider)
                     .map_err(|_| "Vita provider binding could not be derived".to_string())?;
-            if let Ok(mut active) = running.session.active_turn_id.lock() {
-                *active = Some(turn_id.clone());
-            }
-            if let Ok(mut phase) = running.session.turn_phase.lock() {
-                *phase = Some(protocol::TurnPhase::Starting);
-            }
+            running
+                .session
+                .begin_turn(turn_id.clone(), provider.clone(), binding.clone())?;
             if let Ok(mut output) = running.session.assistant_text.lock() {
                 output.take();
             }
@@ -1073,9 +1309,9 @@ mod windows {
                 binding,
             });
             if let Err(error) = running.session.send(&message) {
-                if let Ok(mut active) = running.session.active_turn_id.lock() {
-                    active.take();
-                }
+                let _ = running
+                    .session
+                    .terminalize_turn(&turn_id, protocol::TurnPhase::Failed);
                 return Err(error);
             }
             Ok(VitaTurnStartResponse {
@@ -1093,13 +1329,7 @@ mod windows {
                 .running
                 .as_ref()
                 .ok_or_else(|| "Vita sidecar is not running".to_string())?;
-            let Some(turn_id) = running
-                .session
-                .active_turn_id
-                .lock()
-                .map_err(|_| "Vita active turn state lock was poisoned".to_string())?
-                .clone()
-            else {
+            let Some(turn_id) = running.session.begin_cancellation()? else {
                 return Ok(VitaSidecarActionResponse { accepted: false });
             };
             expire_pending(&running.session);
@@ -1230,34 +1460,7 @@ mod windows {
         if message.session_id != session.session_id {
             return Err("Vita turn state session was not exact".to_string());
         }
-        if let Ok(mut turn) = session.active_turn_id.lock() {
-            if turn
-                .as_deref()
-                .is_some_and(|active| active != message.turn_id.as_str())
-            {
-                // A late state from a retired turn must not mutate the next
-                // turn.  It is safe to ignore it because the sidecar already
-                // owns the authoritative cancellation/retirement state.
-                return Ok(());
-            }
-            if turn.is_none() && !matches!(message.phase, protocol::TurnPhase::Starting) {
-                return Ok(());
-            }
-            if matches!(
-                message.phase,
-                protocol::TurnPhase::Completed
-                    | protocol::TurnPhase::Failed
-                    | protocol::TurnPhase::Cancelled
-                    | protocol::TurnPhase::TimedOut
-            ) {
-                turn.take();
-            } else {
-                *turn = Some(message.turn_id);
-            }
-        }
-        if let Ok(mut phase) = session.turn_phase.lock() {
-            *phase = Some(message.phase);
-        }
+        let _ = session.accept_turn_state(&message.turn_id, message.phase);
         Ok(())
     }
 
@@ -1271,17 +1474,9 @@ mod windows {
         if message.session_id != session.session_id {
             return Err("Vita turn result session was not exact".to_string());
         }
-        if let Ok(mut turn) = session.active_turn_id.lock() {
-            if turn
-                .as_deref()
-                .is_none_or(|active| active != message.turn_id.as_str())
-            {
-                return Ok(());
-            }
-            turn.take();
-        }
-        if let Ok(mut phase) = session.turn_phase.lock() {
-            *phase = Some(protocol::TurnPhase::Completed);
+        let accepted = session.accept_turn_state(&message.turn_id, protocol::TurnPhase::Completed);
+        if !accepted {
+            return Ok(());
         }
         if let Ok(mut output) = session.assistant_text.lock() {
             *output = Some(message.assistant_text);
@@ -1302,17 +1497,9 @@ mod windows {
         if message.session_id != session.session_id {
             return Err("Vita turn failure session was not exact".to_string());
         }
-        if let Ok(mut turn) = session.active_turn_id.lock() {
-            if turn
-                .as_deref()
-                .is_none_or(|active| active != message.turn_id.as_str())
-            {
-                return Ok(());
-            }
-            turn.take();
-        }
-        if let Ok(mut phase) = session.turn_phase.lock() {
-            *phase = Some(message.phase);
+        let accepted = session.accept_turn_state(&message.turn_id, message.phase);
+        if !accepted {
+            return Ok(());
         }
         if let Ok(mut error) = session.turn_error.lock() {
             *error = Some(message.error_code);
@@ -1342,19 +1529,30 @@ mod windows {
                 },
             ))
         };
-        if session.closed.load(Ordering::Acquire)
-            || request.session_id != session.session_id
-            || session
-                .active_turn_id
-                .lock()
-                .ok()
-                .is_none_or(|turn| turn.as_deref() != Some(request.turn_id.as_str()))
-        {
+        if session.closed.load(Ordering::Acquire) || request.session_id != session.session_id {
+            return deny("TURN_NOT_ACTIVE");
+        }
+
+        // This guard is the Host credential authority fence.  Keep it held
+        // through profile/secret resolution and the sensitive reply write so
+        // `cancel_vita_turn` cannot linearize between the final check and
+        // credential release.
+        let authority = match session.turn_authority.lock() {
+            Ok(authority) => authority,
+            Err(_) => return deny("TURN_AUTHORITY_UNAVAILABLE"),
+        };
+        let HostTurnAuthority::Active(active) = &*authority else {
+            return deny("TURN_NOT_ACTIVE");
+        };
+        if active.turn_id != request.turn_id || active.binding != request.binding {
             return deny("TURN_NOT_ACTIVE");
         }
         let Some(configuration) = active_chat_provider_configuration(storage, secrets)? else {
             return deny("CREDENTIAL_MISSING");
         };
+        if configuration != active.provider {
+            return deny("PROVIDER_PROFILE_CHANGED");
+        }
         let expected = protocol::ProviderBinding::derive(
             &session.session_id,
             &request.turn_id,
@@ -1362,6 +1560,14 @@ mod windows {
         )
         .map_err(|_| "provider binding could not be derived".to_string())?;
         if expected != request.binding {
+            return deny("PROVIDER_BINDING_MISMATCH");
+        }
+        if request.binding.credential_ref != configuration.credential_ref
+            || request.binding.purpose != "chat"
+            || request.binding.provider_kind != "openai_compatible"
+            || request.binding.base_url != configuration.base_url
+            || request.binding.model != configuration.model
+        {
             return deny("PROVIDER_BINDING_MISMATCH");
         }
         let identifier = SecretIdentifier::new(
@@ -1375,7 +1581,7 @@ mod windows {
         };
         let credential = protocol::SensitiveCredential::new(secret.expose_secret().to_owned())
             .map_err(|_| "credential value was invalid".to_string())?;
-        session.send(&HostMessage::SensitiveCredentialReply(
+        let result = session.send(&HostMessage::SensitiveCredentialReply(
             protocol::SensitiveCredentialReply {
                 request_id: request.request_id,
                 session_id: session.session_id.clone(),
@@ -1385,7 +1591,9 @@ mod windows {
                 credential: Some(credential),
                 error_code: None,
             },
-        ))
+        ));
+        drop(authority);
+        result
     }
 
     fn handle_authority_evaluate(
@@ -1394,27 +1602,51 @@ mod windows {
         registry: &CapabilityRegistry,
         request: AuthorityEvaluate,
     ) -> Result<(), String> {
+        request
+            .validate()
+            .map_err(|_| "Vita authority request was malformed".to_string())?;
         if request.session_id != session.session_id {
             return Err("Vita authority request session was not exact".to_string());
+        }
+        let authority = session
+            .turn_authority
+            .lock()
+            .map_err(|_| "Vita turn authority lock was poisoned".to_string())?;
+        if !matches!(
+            &*authority,
+            HostTurnAuthority::Active(active) if active.turn_id == request.host_turn_id
+        ) {
+            return session.send(&HostMessage::AuthorityScopeReply(AuthorityScopeReply {
+                request_id: request.request_id,
+                session_id: session.session_id.clone(),
+                allowed: false,
+                authorization_revision: None,
+                error_code: Some("TURN_NOT_ACTIVE".to_string()),
+            }));
         }
         let (allowed, revision, error_code) =
             match current_workspace_revision(storage, registry, session, &request.binding) {
                 Ok(revision) => (true, Some(revision), None),
                 Err(error) => (false, None, Some(error_code(&error))),
             };
-        session.send(&HostMessage::AuthorityScopeReply(AuthorityScopeReply {
+        let result = session.send(&HostMessage::AuthorityScopeReply(AuthorityScopeReply {
             request_id: request.request_id,
             session_id: session.session_id.clone(),
             allowed,
             authorization_revision: revision,
             error_code,
-        }))
+        }));
+        drop(authority);
+        result
     }
 
     fn handle_confirmation_required(
         session: &Arc<HostSessionState>,
         request: ConfirmationRequired,
     ) -> Result<(), String> {
+        request
+            .validate()
+            .map_err(|_| "Vita confirmation request was malformed".to_string())?;
         if session.closed.load(Ordering::Acquire) {
             return Err("Vita sidecar session was already retired".to_string());
         }
@@ -1442,10 +1674,31 @@ mod windows {
         // The active timer is authoritative; this opportunistic pass only
         // closes a just-expired slot before applying MAX_PENDING.
         expire_pending(session);
+        // Serialize H8 admission with Host cancellation.  A confirmation
+        // request that arrives after Active -> Cancelling is denied without
+        // entering the pending ledger, so a stale H7 action cannot be
+        // resurrected by a new UI decision.
+        let authority = session
+            .turn_authority
+            .lock()
+            .map_err(|_| "Vita turn authority lock was poisoned".to_string())?;
+        if !matches!(
+            &*authority,
+            HostTurnAuthority::Active(active) if active.turn_id == request.host_turn_id
+        ) {
+            session.send(&HostMessage::ConfirmationReply(ConfirmationReply {
+                request_id: request.request_id,
+                session_id: session.session_id.clone(),
+                decision: ConfirmationDecision::Cancel,
+                authorization_revision: None,
+            }))?;
+            return Ok(());
+        }
         let pending_id = format!("pending:{}", secure_id("vita")?);
         let pending_action = PendingAction {
             pending_id: pending_id.clone(),
             request_id: request.request_id,
+            host_turn_id: request.host_turn_id,
             life_id: request.life_id,
             task_id: request.task_id,
             capability_id: request.capability_id,
@@ -1463,6 +1716,7 @@ mod windows {
         let ticket = ExpiryTicket::for_pending(&session.session_id, &pending_action);
         pending.insert(pending_id, pending_action);
         drop(pending);
+        drop(authority);
         session.expiry.schedule(ticket);
         Ok(())
     }
@@ -1473,8 +1727,27 @@ mod windows {
         registry: &CapabilityRegistry,
         request: IssueGrant,
     ) -> Result<(), String> {
+        request
+            .validate()
+            .map_err(|_| "Vita grant request was malformed".to_string())?;
         if request.session_id != session.session_id {
             return Err("Vita grant request session was not exact".to_string());
+        }
+        let authority = session
+            .turn_authority
+            .lock()
+            .map_err(|_| "Vita turn authority lock was poisoned".to_string())?;
+        if !matches!(
+            &*authority,
+            HostTurnAuthority::Active(active) if active.turn_id == request.host_turn_id
+        ) {
+            return session.send(&HostMessage::GrantIssued(GrantIssued {
+                request_id: request.request_id,
+                session_id: session.session_id.clone(),
+                allowed: false,
+                grant: None,
+                error_code: Some("TURN_NOT_ACTIVE".to_string()),
+            }));
         }
         expire_pending(session);
         let allowed = validate_binding(session, &request.binding).and_then(|_| {
@@ -1527,7 +1800,7 @@ mod windows {
             grants.insert(grant.grant_id.clone(), grant.clone());
             Ok(grant)
         });
-        match allowed {
+        let result = match allowed {
             Ok(grant) => session.send(&HostMessage::GrantIssued(GrantIssued {
                 request_id: request.request_id,
                 session_id: session.session_id.clone(),
@@ -1542,7 +1815,9 @@ mod windows {
                 grant: None,
                 error_code: Some(error_code(&error)),
             })),
-        }
+        };
+        drop(authority);
+        result
     }
 
     fn handle_revalidate_grant(
@@ -1551,10 +1826,29 @@ mod windows {
         registry: &CapabilityRegistry,
         request: RevalidateGrant,
     ) -> Result<(), String> {
+        request
+            .validate()
+            .map_err(|_| "Vita revalidation request was malformed".to_string())?;
         if request.session_id != session.session_id
             || request.grant.session_id != session.session_id
         {
             return Err("Vita revalidation request session was not exact".to_string());
+        }
+        let authority = session
+            .turn_authority
+            .lock()
+            .map_err(|_| "Vita turn authority lock was poisoned".to_string())?;
+        if !matches!(
+            &*authority,
+            HostTurnAuthority::Active(active) if active.turn_id == request.host_turn_id
+        ) {
+            return session.send(&HostMessage::GrantRevalidated(GrantRevalidated {
+                request_id: request.request_id,
+                session_id: session.session_id.clone(),
+                allowed: false,
+                grant: None,
+                error_code: Some("TURN_NOT_ACTIVE".to_string()),
+            }));
         }
         let result = validate_binding(session, &request.binding).and_then(|_| {
             let revision =
@@ -1565,7 +1859,7 @@ mod windows {
                 .map_err(|_| "Vita grant state lock was poisoned".to_string())?;
             consume_active_grant(&mut grants, &request.grant, &request.binding, revision)
         });
-        match result {
+        let result = match result {
             Ok(grant) => session.send(&HostMessage::GrantRevalidated(GrantRevalidated {
                 request_id: request.request_id,
                 session_id: session.session_id.clone(),
@@ -1580,7 +1874,9 @@ mod windows {
                 grant: None,
                 error_code: Some(error_code(&error)),
             })),
-        }
+        };
+        drop(authority);
+        result
     }
 
     fn current_workspace_revision(
@@ -2041,6 +2337,18 @@ mod windows {
             }
         }
 
+        fn test_provider() -> protocol::ProviderConfiguration {
+            protocol::ProviderConfiguration {
+                profile_id: "profile-chat".to_string(),
+                purpose: "chat".to_string(),
+                provider_kind: "openai_compatible".to_string(),
+                base_url: "https://api.example.test/v1".to_string(),
+                model: "model-test".to_string(),
+                credential_ref: "credential-chat".to_string(),
+                credential_destination: "https://api.example.test/v1".to_string(),
+            }
+        }
+
         fn test_session() -> (Arc<HostSessionState>, mpsc::Receiver<HostMessage>) {
             let (sender, receiver) = mpsc::channel();
             let session = Arc::new(HostSessionState {
@@ -2056,6 +2364,7 @@ mod windows {
                 replay: Mutex::new(RequestReplayWindow::default()),
                 expiry: Arc::new(ExpiryOwner::new()),
                 closed: AtomicBool::new(false),
+                turn_authority: Mutex::new(HostTurnAuthority::Idle),
                 active_turn_id: Mutex::new(None),
                 turn_phase: Mutex::new(None),
                 assistant_text: Mutex::new(None),
@@ -2074,6 +2383,7 @@ mod windows {
             let pending = PendingAction {
                 pending_id: pending_id.to_string(),
                 request_id: request_id.to_string(),
+                host_turn_id: "turn".to_string(),
                 life_id: session.life_id.clone(),
                 task_id: session.task_id.clone(),
                 capability_id: PRODUCTION_GIT_STATUS_CAPABILITY_ID.to_string(),
@@ -2088,6 +2398,161 @@ mod windows {
                 .expect("pending lock")
                 .insert(pending_id.to_string(), pending);
             session.expiry.schedule(ticket);
+        }
+
+        #[test]
+        fn host_turn_authority_cancel_wins_before_credential_decision() {
+            let (session, _receiver) = test_session();
+            let provider = test_provider();
+            let turn_id = "turn-authority-race".to_string();
+            let binding =
+                protocol::ProviderBinding::derive(&session.session_id, &turn_id, &provider)
+                    .expect("test provider binding");
+            session
+                .begin_turn(turn_id.clone(), provider, binding.clone())
+                .expect("active turn");
+
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let cancelled = {
+                let session = Arc::clone(&session);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    session.begin_cancellation().expect("cancel decision")
+                })
+            };
+            barrier.wait();
+            let cancelled_turn = cancelled
+                .join()
+                .expect("cancel race worker")
+                .expect("cancellation won");
+            assert_eq!(cancelled_turn, turn_id);
+            assert!(!session.active_authority_matches(&turn_id, &binding));
+            assert!(matches!(
+                session.authority_snapshot(),
+                Some(HostTurnAuthority::Cancelling(_))
+            ));
+            assert!(session
+                .begin_turn(
+                    "turn-blocked-while-cancelling".to_string(),
+                    test_provider(),
+                    protocol::ProviderBinding::derive(
+                        &session.session_id,
+                        "turn-blocked-while-cancelling",
+                        &test_provider(),
+                    )
+                    .expect("blocked binding"),
+                )
+                .is_err());
+
+            // A late credential request is denied by the same fence and
+            // cannot be made current by the old projected active_turn_id.
+            assert!(!session.active_authority_matches(&turn_id, &binding));
+            assert!(session.accept_turn_state(&turn_id, protocol::TurnPhase::Cancelled));
+            assert!(session
+                .begin_turn(
+                    "turn-after-cancel".to_string(),
+                    test_provider(),
+                    protocol::ProviderBinding::derive(
+                        &session.session_id,
+                        "turn-after-cancel",
+                        &test_provider(),
+                    )
+                    .expect("new binding"),
+                )
+                .is_ok());
+        }
+
+        #[test]
+        fn host_turn_authority_credential_decision_can_precede_cancel() {
+            let (session, _receiver) = test_session();
+            let provider = test_provider();
+            let turn_id = "turn-credential-first".to_string();
+            let binding =
+                protocol::ProviderBinding::derive(&session.session_id, &turn_id, &provider)
+                    .expect("test provider binding");
+            session
+                .begin_turn(turn_id.clone(), provider, binding.clone())
+                .expect("active turn");
+
+            let locked = Arc::new(std::sync::Barrier::new(3));
+            let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+            let credential = {
+                let session = Arc::clone(&session);
+                let locked = Arc::clone(&locked);
+                let release = Arc::clone(&release);
+                thread::spawn(move || {
+                    let authority = session.turn_authority.lock().expect("authority lock");
+                    assert!(matches!(*authority, HostTurnAuthority::Active(_)));
+                    locked.wait();
+                    let (released, wake) = &*release;
+                    let mut released = released.lock().expect("release lock");
+                    while !*released {
+                        released = wake.wait(released).expect("release wait");
+                    }
+                    // Holding the authority mutex models the credential
+                    // decision/reply write: cancellation cannot win before it
+                    // is released.
+                    true
+                })
+            };
+            let cancel = {
+                let session = Arc::clone(&session);
+                let locked = Arc::clone(&locked);
+                thread::spawn(move || {
+                    locked.wait();
+                    session.begin_cancellation().expect("cancel decision")
+                })
+            };
+            locked.wait();
+            {
+                let (released, wake) = &*release;
+                *released.lock().expect("release lock") = true;
+                wake.notify_one();
+            }
+            assert!(credential.join().expect("credential worker"));
+            assert_eq!(cancel.join().expect("cancel worker"), Some(turn_id));
+        }
+
+        #[test]
+        fn late_confirmation_is_cancelled_after_host_turn_fence() {
+            let (session, receiver) = test_session();
+            let provider = test_provider();
+            let host_turn_id = "turn-h8-late".to_string();
+            let provider_binding =
+                protocol::ProviderBinding::derive(&session.session_id, &host_turn_id, &provider)
+                    .expect("provider binding");
+            session
+                .begin_turn(host_turn_id.clone(), provider, provider_binding)
+                .expect("active turn");
+            session
+                .begin_cancellation()
+                .expect("cancellation decision")
+                .expect("turn was active");
+
+            let request = ConfirmationRequired {
+                request_id: "late-confirmation".to_string(),
+                session_id: session.session_id.clone(),
+                host_turn_id,
+                life_id: session.life_id.clone(),
+                task_id: session.task_id.clone(),
+                capability_id: PRODUCTION_GIT_STATUS_CAPABILITY_ID.to_string(),
+                workspace_summary: "workspace".to_string(),
+                expires_at_unix_ms: unix_millis().saturating_add(5_000),
+                binding: test_binding(&session.session_id),
+            };
+            handle_confirmation_required(&session, request).expect("late request is denied");
+            assert!(session.pending.lock().expect("pending lock").is_empty());
+            assert!(matches!(
+                receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("cancellation reply"),
+                HostMessage::ConfirmationReply(ConfirmationReply {
+                    decision: ConfirmationDecision::Cancel,
+                    ..
+                })
+            ));
+            session.retire();
         }
 
         #[test]

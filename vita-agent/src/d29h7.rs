@@ -27,7 +27,7 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
 use std::path::{Component, Path, PathBuf, Prefix};
 #[cfg(test)]
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 #[cfg(test)]
@@ -4635,6 +4635,8 @@ fn validate_h7_grant_binding(
 pub struct H7PendingProcessAction {
     action: Arc<PreparedProcessAction>,
     response: tokio::sync::oneshot::Sender<i64>,
+    generation: u64,
+    generation_state: Arc<AtomicU64>,
 }
 
 #[derive(Clone)]
@@ -4642,6 +4644,7 @@ pub struct H7PendingConfirmationBridge {
     sender: tokio::sync::mpsc::Sender<H7PendingProcessAction>,
     cancelled: Arc<AtomicBool>,
     cancelled_notify: Arc<Notify>,
+    generation: Arc<AtomicU64>,
     timeout: Duration,
 }
 
@@ -4665,6 +4668,7 @@ impl H7PendingConfirmationBridge {
                 sender,
                 cancelled: Arc::new(AtomicBool::new(false)),
                 cancelled_notify: Arc::new(Notify::new()),
+                generation: Arc::new(AtomicU64::new(0)),
                 timeout,
             }),
             receiver,
@@ -4673,6 +4677,16 @@ impl H7PendingConfirmationBridge {
 
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        self.cancelled_notify.notify_waiters();
+    }
+
+    fn begin_turn(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn cancel_turn(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
         self.cancelled_notify.notify_waiters();
     }
 
@@ -4688,13 +4702,20 @@ impl H7PendingConfirmationBridge {
         cancellation: &AtomicBool,
         cancellation_notify: &Notify,
     ) -> Result<i64, String> {
+        let generation = self.generation.load(Ordering::Acquire);
         if cancellation.load(Ordering::Acquire) || self.cancelled.load(Ordering::Acquire) {
             return Err("D29-H7 process action was cancelled before confirmation".to_string());
         }
+        if self.generation.load(Ordering::Acquire) != generation {
+            return Err("D29-H7 process action belongs to a retired turn".to_string());
+        }
         let (response, receiver) = tokio::sync::oneshot::channel();
-        let send = self
-            .sender
-            .send(H7PendingProcessAction { action, response });
+        let send = self.sender.send(H7PendingProcessAction {
+            action,
+            response,
+            generation,
+            generation_state: Arc::clone(&self.generation),
+        });
         tokio::pin!(send);
         tokio::select! {
             result = &mut send => result.map_err(|_| "D29-H7 confirmation bridge closed".to_string())?,
@@ -4727,6 +4748,10 @@ impl H7PendingProcessAction {
         self.response
             .send(authorization_revision)
             .map_err(|_| "D29-H7-C confirmation waiter is no longer active".to_string())
+    }
+
+    pub fn is_current(&self) -> bool {
+        self.generation_state.load(Ordering::Acquire) == self.generation
     }
 }
 
@@ -6522,6 +6547,23 @@ impl H7CGitStatusBroker {
         self.bridge.cancel();
     }
 
+    fn begin_turn(&self) {
+        self.bridge.begin_turn();
+    }
+
+    fn cancel_turn(&self) {
+        if let Some(active) = self
+            .active_cancellation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            active.token.store(true, Ordering::Release);
+            active.notify.notify_waiters();
+        }
+        self.bridge.cancel_turn();
+    }
+
     fn metrics(&self) -> Arc<H7SupervisorMetrics> {
         Arc::clone(&self.metrics)
     }
@@ -6709,6 +6751,14 @@ impl VitaGitStatusProduction {
 
     pub fn cancel(&self) {
         self.broker.cancel();
+    }
+
+    pub fn begin_turn(&self) {
+        self.broker.begin_turn();
+    }
+
+    pub fn cancel_turn(&self) {
+        self.broker.cancel_turn();
     }
 }
 

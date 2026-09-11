@@ -381,6 +381,10 @@ pub struct ProcessGrant {
 pub struct AuthorityEvaluate {
     pub request_id: String,
     pub session_id: String,
+    /// Host turn generation owning this governed action.  The process-local
+    /// H7 binding has its own Codex turn id; this field prevents a late H7
+    /// authority message from being accepted by a newer Host turn.
+    pub host_turn_id: String,
     pub binding: ProcessBinding,
 }
 
@@ -399,6 +403,7 @@ pub struct AuthorityScopeReply {
 pub struct ConfirmationRequired {
     pub request_id: String,
     pub session_id: String,
+    pub host_turn_id: String,
     pub life_id: String,
     pub task_id: String,
     pub capability_id: String,
@@ -429,6 +434,7 @@ pub struct ConfirmationReply {
 pub struct IssueGrant {
     pub request_id: String,
     pub session_id: String,
+    pub host_turn_id: String,
     pub binding: ProcessBinding,
     pub authorization_revision: i64,
 }
@@ -448,6 +454,7 @@ pub struct GrantIssued {
 pub struct RevalidateGrant {
     pub request_id: String,
     pub session_id: String,
+    pub host_turn_id: String,
     pub binding: ProcessBinding,
     pub grant: ProcessGrant,
 }
@@ -598,6 +605,11 @@ pub struct SensitiveCredentialReply {
 pub enum TurnPhase {
     Starting,
     Running,
+    /// Host has won the cancellation authority race and is waiting for the
+    /// sidecar's bounded interruption acknowledgement.  This is deliberately
+    /// distinct from `Cancelled`: a cancellation request is not terminal
+    /// until the sidecar has fenced its Codex/provider/tool lifecycle.
+    Cancelling,
     WaitingForToolConfirmation,
     Completed,
     Failed,
@@ -711,6 +723,53 @@ impl CredentialRequired {
         valid_id(&self.session_id)?;
         valid_id(&self.turn_id)?;
         self.binding.validate()
+    }
+}
+
+impl AuthorityEvaluate {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        valid_id(&self.request_id)?;
+        valid_id(&self.session_id)?;
+        valid_id(&self.host_turn_id)?;
+        self.binding.validate()
+    }
+}
+
+impl ConfirmationRequired {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        valid_id(&self.request_id)?;
+        valid_id(&self.session_id)?;
+        valid_id(&self.host_turn_id)?;
+        valid_id(&self.life_id)?;
+        valid_id(&self.task_id)?;
+        valid_id(&self.capability_id)?;
+        valid_bounded_text(&self.workspace_summary, MAX_SUMMARY_BYTES)?;
+        if self.expires_at_unix_ms == 0 {
+            return Err(FrameError::InvalidField);
+        }
+        self.binding.validate()
+    }
+}
+
+impl IssueGrant {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        valid_id(&self.request_id)?;
+        valid_id(&self.session_id)?;
+        valid_id(&self.host_turn_id)?;
+        if self.authorization_revision <= 0 {
+            return Err(FrameError::InvalidField);
+        }
+        self.binding.validate()
+    }
+}
+
+impl RevalidateGrant {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        valid_id(&self.request_id)?;
+        valid_id(&self.session_id)?;
+        valid_id(&self.host_turn_id)?;
+        self.binding.validate()?;
+        self.grant.validate()
     }
 }
 

@@ -786,6 +786,7 @@ impl VitaSidecarImageAuthority {
         if !resource_dir.is_dir()
             || executable.parent() != Some(resource_dir.as_path())
             || !executable.is_file()
+            || is_inside_repository(&executable)
         {
             return Err(CodexRuntimeError::UntrustedExecutable);
         }
@@ -5331,5 +5332,30 @@ mod tests {
         );
         drop(authority);
         assert!(fs::rename(&image_path, &replacement_path).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn vita_image_authority_rejects_repository_contained_image_before_process_creation() {
+        let repository_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let resource = tempfile::tempdir_in(repository_root).expect("repository fixture root");
+        let image_path = resource.path().join("vita-agent.exe");
+        fs::write(&image_path, b"repository-contained-vita-agent-like-image")
+            .expect("repository image");
+        let process_root = tempfile::tempdir().expect("sidecar process root");
+
+        assert_eq!(
+            VitaSidecarProcess::prepare_image(&image_path, resource.path()).unwrap_err(),
+            CodexRuntimeError::UntrustedExecutable
+        );
+        assert_eq!(
+            VitaSidecarProcess::spawn(
+                &image_path,
+                &[OsString::from("--serve-ipc")],
+                process_root.path(),
+            )
+            .unwrap_err(),
+            CodexRuntimeError::UntrustedExecutable
+        );
     }
 }

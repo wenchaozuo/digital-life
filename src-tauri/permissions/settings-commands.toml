@@ -22,6 +22,8 @@ commands.allow = [
     "confirm_vita_sidecar",
     "deny_vita_sidecar",
     "stop_vita_sidecar",
+    "get_capability_authorization_snapshot",
+    "set_capability_authorization_enabled",
     "save_api_credential",
     "has_api_credential",
     "delete_api_credential",

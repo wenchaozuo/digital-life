@@ -72,6 +72,8 @@ fn main() {
             "deny_vita_sidecar",
             "cancel_vita_sidecar",
             "stop_vita_sidecar",
+            "get_capability_authorization_snapshot",
+            "set_capability_authorization_enabled",
             "initialize_storage",
             "get_storage_location",
             "validate_storage_location",

@@ -228,6 +228,8 @@ pub fn run() {
             vita_sidecar::deny_vita_sidecar,
             vita_sidecar::cancel_vita_sidecar,
             vita_sidecar::stop_vita_sidecar,
+            capability::activation::get_capability_authorization_snapshot,
+            capability::activation::set_capability_authorization_enabled,
             storage::initialize_storage,
             storage::get_storage_location,
             storage::validate_storage_location,

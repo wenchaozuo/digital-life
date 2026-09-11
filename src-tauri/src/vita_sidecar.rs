@@ -187,6 +187,9 @@ mod windows {
         turn_id: String,
         provider: protocol::ProviderConfiguration,
         binding: protocol::ProviderBinding,
+        /// Codex owns this H7 turn namespace.  It is learned only from the
+        /// first valid AuthorityEvaluate for this Host generation.
+        h7_codex_turn_id: Option<String>,
     }
 
     fn active_chat_provider_configuration(
@@ -529,6 +532,7 @@ mod windows {
                 turn_id: turn_id.clone(),
                 provider,
                 binding,
+                h7_codex_turn_id: None,
             });
             drop(authority);
             if let Ok(mut active) = self.active_turn_id.lock() {
@@ -1685,27 +1689,41 @@ mod windows {
         if request.session_id != session.session_id {
             return Err("Vita authority request session was not exact".to_string());
         }
-        let authority = session
+        let mut authority = session
             .turn_authority
             .lock()
             .map_err(|_| "Vita turn authority lock was poisoned".to_string())?;
-        if !matches!(
-            &*authority,
-            HostTurnAuthority::Active(active)
-                if active.turn_id == request.host_turn_id
-                    && request.binding.turn_id == request.host_turn_id
-        ) {
+        let active = match &mut *authority {
+            HostTurnAuthority::Active(active) if active.turn_id == request.host_turn_id => active,
+            _ => {
+                return session.send(&HostMessage::AuthorityScopeReply(AuthorityScopeReply {
+                    request_id: request.request_id,
+                    session_id: session.session_id.clone(),
+                    allowed: false,
+                    authorization_revision: None,
+                    error_code: Some("TURN_NOT_ACTIVE".to_string()),
+                }));
+            }
+        };
+        if active
+            .h7_codex_turn_id
+            .as_deref()
+            .is_some_and(|codex_turn_id| codex_turn_id != request.binding.turn_id)
+        {
             return session.send(&HostMessage::AuthorityScopeReply(AuthorityScopeReply {
                 request_id: request.request_id,
                 session_id: session.session_id.clone(),
                 allowed: false,
                 authorization_revision: None,
-                error_code: Some("TURN_NOT_ACTIVE".to_string()),
+                error_code: Some("CODEX_TURN_MISMATCH".to_string()),
             }));
         }
         let (allowed, revision, error_code) =
             match current_workspace_revision(storage, registry, session, &request.binding) {
-                Ok(revision) => (true, Some(revision), None),
+                Ok(revision) => {
+                    active.h7_codex_turn_id = Some(request.binding.turn_id.clone());
+                    (true, Some(revision), None)
+                }
                 Err(error) => (false, None, Some(error_code(&error))),
             };
         let result = session.send(&HostMessage::AuthorityScopeReply(AuthorityScopeReply {
@@ -1764,8 +1782,7 @@ mod windows {
         if !matches!(
             &*authority,
             HostTurnAuthority::Active(active)
-                if active.turn_id == request.host_turn_id
-                    && request.binding.turn_id == request.host_turn_id
+                if active_h7_binding_matches(active, &request.host_turn_id, &request.binding)
         ) {
             session.send(&HostMessage::ConfirmationReply(ConfirmationReply {
                 request_id: request.request_id,
@@ -1821,8 +1838,7 @@ mod windows {
         if !matches!(
             &*authority,
             HostTurnAuthority::Active(active)
-                if active.turn_id == request.host_turn_id
-                    && request.binding.turn_id == request.host_turn_id
+                if active_h7_binding_matches(active, &request.host_turn_id, &request.binding)
         ) {
             return session.send(&HostMessage::GrantIssued(GrantIssued {
                 request_id: request.request_id,
@@ -1932,8 +1948,7 @@ mod windows {
         if !matches!(
             &*authority,
             HostTurnAuthority::Active(active)
-                if active.turn_id == request.host_turn_id
-                    && request.binding.turn_id == request.host_turn_id
+                if active_h7_binding_matches(active, &request.host_turn_id, &request.binding)
         ) {
             return session.send(&HostMessage::GrantRevalidated(GrantRevalidated {
                 request_id: request.request_id,
@@ -2026,6 +2041,18 @@ mod windows {
             return Err("Vita process binding was not exact".to_string());
         }
         Ok(())
+    }
+
+    fn active_h7_binding_matches(
+        active: &HostTurnActive,
+        host_turn_id: &str,
+        binding: &ProcessBinding,
+    ) -> bool {
+        active.turn_id == host_turn_id
+            && active
+                .h7_codex_turn_id
+                .as_deref()
+                .is_some_and(|codex_turn_id| codex_turn_id == binding.turn_id)
     }
 
     fn take_pending(session: &HostSessionState, pending_id: &str) -> Option<PendingAction> {
@@ -2417,6 +2444,12 @@ mod windows {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::capability::authorization::{
+            CapabilityAuthorizationCreateOutcome, CapabilityAuthorizationRepository,
+            CapabilityAuthorizationUpdateOutcome, LifeCapabilityAuthorizationCreateRequest,
+            LifeCapabilityAuthorizationUpdateRequest,
+        };
+        use crate::storage::{LifeIdentityRecord, PersonaTemplateRecord};
 
         fn test_binding(session_id: &str) -> ProcessBinding {
             test_binding_for(session_id, "turn", "call")
@@ -2470,6 +2503,60 @@ mod windows {
                 credential_ref: "credential-chat".to_string(),
                 credential_destination: "https://api.example.test/v1".to_string(),
             }
+        }
+
+        fn authority_fixture(
+            session: &HostSessionState,
+        ) -> (tempfile::TempDir, StorageService, CapabilityRegistry, i64) {
+            let root = tempfile::tempdir().expect("authority fixture root");
+            let storage = StorageService::initialize_with_roots(root.path().to_path_buf(), None)
+                .expect("authority fixture storage");
+            storage
+                .save_persona(PersonaTemplateRecord {
+                    id: "d29h9-r3-persona".to_string(),
+                    name: "D29-H9-R3 fixture persona".to_string(),
+                    version: 1,
+                    persona_json: "{}".to_string(),
+                })
+                .expect("authority fixture persona");
+            storage
+                .save_life(LifeIdentityRecord {
+                    id: session.life_id.clone(),
+                    name: "D29-H9-R3 fixture life".to_string(),
+                    created_at: "2026-09-11T00:00:00.000Z".to_string(),
+                    version: 1,
+                    body_id: "d29h9-r3-body".to_string(),
+                    persona_id: "d29h9-r3-persona".to_string(),
+                    persona_version: 1,
+                })
+                .expect("authority fixture life");
+            let capability_id =
+                CapabilityId::try_from(PRODUCTION_GIT_STATUS_CAPABILITY_ID).expect("capability");
+            assert!(matches!(
+                storage
+                    .create_capability_authorization(LifeCapabilityAuthorizationCreateRequest {
+                        life_id: session.life_id.clone(),
+                        capability_id: capability_id.clone(),
+                    })
+                    .expect("authority fixture authorization root"),
+                CapabilityAuthorizationCreateOutcome::Applied(_)
+            ));
+            assert!(matches!(
+                storage
+                    .update_capability_authorization(
+                        LifeCapabilityAuthorizationUpdateRequest::for_test(
+                            "d29h9-r3-enable",
+                            &session.life_id,
+                            capability_id,
+                            true,
+                            1,
+                        )
+                    )
+                    .expect("authority fixture authorization enable"),
+                CapabilityAuthorizationUpdateOutcome::Applied { .. }
+            ));
+            let registry = CapabilityRegistry::production().expect("production registry");
+            (root, storage, registry, 2)
         }
 
         #[test]
@@ -2854,6 +2941,8 @@ mod windows {
         fn host_turn_generation_retires_and_rejects_late_evidence() {
             let (session, receiver) = test_session();
             let provider = test_provider();
+            let (_data_root, storage, registry, authorization_revision) =
+                authority_fixture(&session);
             let turn_a = "turn-generation-a".to_string();
             let provider_binding_a =
                 protocol::ProviderBinding::derive(&session.session_id, &turn_a, &provider)
@@ -2862,14 +2951,39 @@ mod windows {
                 .begin_turn(turn_a.clone(), provider.clone(), provider_binding_a)
                 .expect("turn A active");
 
-            let binding_a = test_binding_for(&session.session_id, &turn_a, "call-a");
-            let grant_a = test_grant(&session.session_id, "grant-a", binding_a.clone());
+            let codex_turn_a = "codex-turn-generation-a".to_string();
+            let binding_a = test_binding_for(&session.session_id, &codex_turn_a, "call-a");
+            handle_authority_evaluate(
+                &session,
+                &storage,
+                &registry,
+                AuthorityEvaluate {
+                    request_id: "authority-a".to_string(),
+                    session_id: session.session_id.clone(),
+                    host_turn_id: turn_a.clone(),
+                    binding: binding_a.clone(),
+                },
+            )
+            .expect("turn A authority is evaluated");
+            assert!(matches!(
+                receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("turn A authority reply"),
+                HostMessage::AuthorityScopeReply(AuthorityScopeReply {
+                    allowed: true,
+                    authorization_revision: Some(revision),
+                    error_code: None,
+                    ..
+                }) if revision == authorization_revision
+            ));
+            let mut grant_a = test_grant(&session.session_id, "grant-a", binding_a.clone());
+            grant_a.authorization_revision = authorization_revision;
             session.approvals.lock().expect("approval lock").insert(
                 approval_key(&turn_a, &binding_a),
                 ApprovedAction {
                     host_turn_id: turn_a.clone(),
                     binding: binding_a.clone(),
-                    authorization_revision: 7,
+                    authorization_revision,
                     confirmation_id: "confirmation-a".to_string(),
                     expires_at_unix_ms: unix_millis().saturating_add(60_000),
                 },
@@ -2898,11 +3012,8 @@ mod windows {
                 .begin_turn(turn_b.clone(), provider, provider_binding_b)
                 .expect("turn B active");
 
-            let data_root = tempfile::tempdir().expect("authority test storage root");
-            let storage =
-                StorageService::initialize_with_roots(data_root.path().to_path_buf(), None)
-                    .expect("authority test storage");
-            let registry = CapabilityRegistry::production().expect("production registry");
+            let codex_turn_b = "codex-turn-generation-b".to_string();
+            let binding_b = test_binding_for(&session.session_id, &codex_turn_b, "call-b");
 
             handle_issue_grant(
                 &session,
@@ -2913,7 +3024,7 @@ mod windows {
                     session_id: session.session_id.clone(),
                     host_turn_id: turn_b.clone(),
                     binding: binding_a.clone(),
-                    authorization_revision: 7,
+                    authorization_revision,
                 },
             )
             .expect("old approval replay is answered");
@@ -2952,6 +3063,30 @@ mod windows {
                 }) if code == "TURN_NOT_ACTIVE"
             ));
 
+            handle_authority_evaluate(
+                &session,
+                &storage,
+                &registry,
+                AuthorityEvaluate {
+                    request_id: "authority-b".to_string(),
+                    session_id: session.session_id.clone(),
+                    host_turn_id: turn_b.clone(),
+                    binding: binding_b.clone(),
+                },
+            )
+            .expect("turn B authority is evaluated");
+            assert!(matches!(
+                receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("turn B authority reply"),
+                HostMessage::AuthorityScopeReply(AuthorityScopeReply {
+                    allowed: true,
+                    authorization_revision: Some(revision),
+                    error_code: None,
+                    ..
+                }) if revision == authorization_revision
+            ));
+
             handle_issue_grant(
                 &session,
                 &storage,
@@ -2961,7 +3096,7 @@ mod windows {
                     session_id: session.session_id.clone(),
                     host_turn_id: turn_a.clone(),
                     binding: binding_a.clone(),
-                    authorization_revision: 7,
+                    authorization_revision,
                 },
             )
             .expect("late issue is answered");
@@ -2981,9 +3116,14 @@ mod windows {
                     grant: grant_a.clone(),
                 },
             )]);
-            assert!(
-                consume_active_grant(&mut stale_grants, &turn_b, &grant_a, &binding_a, 7,).is_err()
-            );
+            assert!(consume_active_grant(
+                &mut stale_grants,
+                &turn_b,
+                &grant_a,
+                &binding_a,
+                authorization_revision,
+            )
+            .is_err());
             assert_eq!(stale_grants.len(), 1);
 
             handle_confirmation_required(
@@ -3091,19 +3231,354 @@ mod windows {
                 .expect("provider binding B replay check")
             ));
 
-            let binding_b = test_binding_for(&session.session_id, "turn-generation-b", "call-b");
             session.approvals.lock().expect("approval lock").insert(
-                approval_key("turn-generation-b", &binding_b),
+                approval_key(&turn_b, &binding_b),
                 ApprovedAction {
-                    host_turn_id: "turn-generation-b".to_string(),
+                    host_turn_id: turn_b.clone(),
                     binding: binding_b,
-                    authorization_revision: 7,
+                    authorization_revision: authorization_revision,
                     confirmation_id: "confirmation-b".to_string(),
                     expires_at_unix_ms: unix_millis().saturating_add(60_000),
                 },
             );
             assert!(session.accept_turn_state("turn-generation-b", protocol::TurnPhase::Completed));
             assert!(session.approvals.lock().expect("approval lock").is_empty());
+        }
+
+        #[test]
+        fn authority_binds_distinct_host_and_codex_turns_for_full_h7_chain() {
+            let (session, receiver) = test_session();
+            let provider = test_provider();
+            let (_data_root, storage, registry, authorization_revision) =
+                authority_fixture(&session);
+            let host_turn_id = "host-turn-A".to_string();
+            let provider_binding =
+                protocol::ProviderBinding::derive(&session.session_id, &host_turn_id, &provider)
+                    .expect("provider binding");
+            session
+                .begin_turn(host_turn_id.clone(), provider, provider_binding)
+                .expect("active Host turn");
+            let codex_turn_id = "0199-codex-turn-A".to_string();
+            let binding = test_binding_for(&session.session_id, &codex_turn_id, "call-distinct");
+
+            handle_authority_evaluate(
+                &session,
+                &storage,
+                &registry,
+                AuthorityEvaluate {
+                    request_id: "distinct-authority-1".to_string(),
+                    session_id: session.session_id.clone(),
+                    host_turn_id: host_turn_id.clone(),
+                    binding: binding.clone(),
+                },
+            )
+            .expect("distinct authority evaluation");
+            assert!(matches!(
+                receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("distinct authority reply"),
+                HostMessage::AuthorityScopeReply(AuthorityScopeReply {
+                    allowed: true,
+                    authorization_revision: Some(revision),
+                    error_code: None,
+                    ..
+                }) if revision == authorization_revision
+            ));
+            assert!(matches!(
+                session.authority_snapshot(),
+                Some(HostTurnAuthority::Active(active))
+                    if active.turn_id == host_turn_id
+                        && active.h7_codex_turn_id.as_deref() == Some(codex_turn_id.as_str())
+            ));
+
+            // Re-evaluation with the same Codex/H7 turn is idempotently
+            // accepted and does not create a second mapping.
+            handle_authority_evaluate(
+                &session,
+                &storage,
+                &registry,
+                AuthorityEvaluate {
+                    request_id: "distinct-authority-2".to_string(),
+                    session_id: session.session_id.clone(),
+                    host_turn_id: host_turn_id.clone(),
+                    binding: binding.clone(),
+                },
+            )
+            .expect("same Codex turn authority re-evaluation");
+            assert!(matches!(
+                receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("same Codex turn authority reply"),
+                HostMessage::AuthorityScopeReply(AuthorityScopeReply {
+                    allowed: true,
+                    authorization_revision: Some(revision),
+                    error_code: None,
+                    ..
+                }) if revision == authorization_revision
+            ));
+
+            handle_confirmation_required(
+                &session,
+                ConfirmationRequired {
+                    request_id: "distinct-confirmation".to_string(),
+                    session_id: session.session_id.clone(),
+                    host_turn_id: host_turn_id.clone(),
+                    life_id: session.life_id.clone(),
+                    task_id: session.task_id.clone(),
+                    capability_id: PRODUCTION_GIT_STATUS_CAPABILITY_ID.to_string(),
+                    workspace_summary: "workspace".to_string(),
+                    expires_at_unix_ms: unix_millis().saturating_add(5_000),
+                    binding: binding.clone(),
+                },
+            )
+            .expect("distinct confirmation admission");
+            let pending_id = session
+                .pending_summary()
+                .expect("distinct pending confirmation")
+                .pending_id;
+            let pending = take_pending(&session, &pending_id).expect("pending action");
+            send_confirmation_decision(
+                &session,
+                &pending,
+                ConfirmationDecision::Confirm,
+                Some(authorization_revision),
+            )
+            .expect("user confirmation reply");
+            assert!(matches!(
+                receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("user confirmation response"),
+                HostMessage::ConfirmationReply(ConfirmationReply {
+                    decision: ConfirmationDecision::Confirm,
+                    authorization_revision: Some(revision),
+                    ..
+                }) if revision == authorization_revision
+            ));
+            session.approvals.lock().expect("approval lock").insert(
+                approval_key(&host_turn_id, &binding),
+                ApprovedAction {
+                    host_turn_id: host_turn_id.clone(),
+                    binding: binding.clone(),
+                    authorization_revision,
+                    confirmation_id: "distinct-confirmation-id".to_string(),
+                    expires_at_unix_ms: unix_millis().saturating_add(5_000),
+                },
+            );
+
+            handle_issue_grant(
+                &session,
+                &storage,
+                &registry,
+                IssueGrant {
+                    request_id: "distinct-issue".to_string(),
+                    session_id: session.session_id.clone(),
+                    host_turn_id: host_turn_id.clone(),
+                    binding: binding.clone(),
+                    authorization_revision,
+                },
+            )
+            .expect("distinct grant issue");
+            let grant = match receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("distinct grant issue reply")
+            {
+                HostMessage::GrantIssued(GrantIssued {
+                    allowed: true,
+                    grant: Some(grant),
+                    error_code: None,
+                    ..
+                }) => grant,
+                other => panic!("unexpected distinct grant issue reply: {other:?}"),
+            };
+            assert_eq!(grant.binding, binding);
+
+            handle_revalidate_grant(
+                &session,
+                &storage,
+                &registry,
+                RevalidateGrant {
+                    request_id: "distinct-revalidate".to_string(),
+                    session_id: session.session_id.clone(),
+                    host_turn_id: host_turn_id.clone(),
+                    binding: binding.clone(),
+                    grant,
+                },
+            )
+            .expect("distinct grant revalidation");
+            assert!(matches!(
+                receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("distinct grant revalidation reply"),
+                HostMessage::GrantRevalidated(GrantRevalidated {
+                    allowed: true,
+                    grant: Some(_),
+                    error_code: None,
+                    ..
+                })
+            ));
+            assert!(session.pending.lock().expect("pending lock").is_empty());
+            assert!(session.approvals.lock().expect("approval lock").is_empty());
+            assert!(session.grants.lock().expect("grant lock").is_empty());
+            assert!(session.accept_turn_state(&host_turn_id, protocol::TurnPhase::Completed));
+            assert!(matches!(
+                session.authority_snapshot(),
+                Some(HostTurnAuthority::Idle)
+            ));
+        }
+
+        #[test]
+        fn authority_rejects_same_host_turn_with_wrong_codex_turn_everywhere() {
+            let (session, receiver) = test_session();
+            let provider = test_provider();
+            let (_data_root, storage, registry, authorization_revision) =
+                authority_fixture(&session);
+            let host_turn_id = "host-turn-wrong-codex".to_string();
+            let provider_binding =
+                protocol::ProviderBinding::derive(&session.session_id, &host_turn_id, &provider)
+                    .expect("provider binding");
+            session
+                .begin_turn(host_turn_id.clone(), provider, provider_binding)
+                .expect("active Host turn");
+            let codex_turn_one = "0199-codex-turn-one".to_string();
+            let codex_turn_two = "0199-codex-turn-two".to_string();
+            let binding_one = test_binding_for(&session.session_id, &codex_turn_one, "call-one");
+            let binding_two = test_binding_for(&session.session_id, &codex_turn_two, "call-two");
+
+            handle_authority_evaluate(
+                &session,
+                &storage,
+                &registry,
+                AuthorityEvaluate {
+                    request_id: "wrong-codex-bind-one".to_string(),
+                    session_id: session.session_id.clone(),
+                    host_turn_id: host_turn_id.clone(),
+                    binding: binding_one.clone(),
+                },
+            )
+            .expect("initial Codex turn authority evaluation");
+            assert!(matches!(
+                receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("initial authority reply"),
+                HostMessage::AuthorityScopeReply(AuthorityScopeReply {
+                    allowed: true,
+                    authorization_revision: Some(revision),
+                    error_code: None,
+                    ..
+                }) if revision == authorization_revision
+            ));
+
+            handle_authority_evaluate(
+                &session,
+                &storage,
+                &registry,
+                AuthorityEvaluate {
+                    request_id: "wrong-codex-bind-two".to_string(),
+                    session_id: session.session_id.clone(),
+                    host_turn_id: host_turn_id.clone(),
+                    binding: binding_two.clone(),
+                },
+            )
+            .expect("wrong Codex turn authority evaluation");
+            assert!(matches!(
+                receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("wrong authority reply"),
+                HostMessage::AuthorityScopeReply(AuthorityScopeReply {
+                    allowed: false,
+                    authorization_revision: None,
+                    error_code: Some(code),
+                    ..
+                }) if code == "CODEX_TURN_MISMATCH"
+            ));
+
+            handle_confirmation_required(
+                &session,
+                ConfirmationRequired {
+                    request_id: "wrong-codex-confirmation".to_string(),
+                    session_id: session.session_id.clone(),
+                    host_turn_id: host_turn_id.clone(),
+                    life_id: session.life_id.clone(),
+                    task_id: session.task_id.clone(),
+                    capability_id: PRODUCTION_GIT_STATUS_CAPABILITY_ID.to_string(),
+                    workspace_summary: "workspace".to_string(),
+                    expires_at_unix_ms: unix_millis().saturating_add(5_000),
+                    binding: binding_two.clone(),
+                },
+            )
+            .expect("wrong Codex confirmation is denied");
+            assert!(matches!(
+                receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("wrong confirmation reply"),
+                HostMessage::ConfirmationReply(ConfirmationReply {
+                    decision: ConfirmationDecision::Cancel,
+                    authorization_revision: None,
+                    ..
+                })
+            ));
+            assert!(session.pending.lock().expect("pending lock").is_empty());
+
+            handle_issue_grant(
+                &session,
+                &storage,
+                &registry,
+                IssueGrant {
+                    request_id: "wrong-codex-issue".to_string(),
+                    session_id: session.session_id.clone(),
+                    host_turn_id: host_turn_id.clone(),
+                    binding: binding_two.clone(),
+                    authorization_revision,
+                },
+            )
+            .expect("wrong Codex grant issue is denied");
+            assert!(matches!(
+                receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("wrong grant issue reply"),
+                HostMessage::GrantIssued(GrantIssued {
+                    allowed: false,
+                    error_code: Some(code),
+                    ..
+                }) if code == "TURN_NOT_ACTIVE"
+            ));
+
+            let wrong_grant = test_grant(
+                &session.session_id,
+                "wrong-codex-grant",
+                binding_two.clone(),
+            );
+            handle_revalidate_grant(
+                &session,
+                &storage,
+                &registry,
+                RevalidateGrant {
+                    request_id: "wrong-codex-revalidate".to_string(),
+                    session_id: session.session_id.clone(),
+                    host_turn_id: host_turn_id.clone(),
+                    binding: binding_two,
+                    grant: wrong_grant,
+                },
+            )
+            .expect("wrong Codex grant revalidation is denied");
+            assert!(matches!(
+                receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("wrong grant revalidation reply"),
+                HostMessage::GrantRevalidated(GrantRevalidated {
+                    allowed: false,
+                    error_code: Some(code),
+                    ..
+                }) if code == "TURN_NOT_ACTIVE"
+            ));
+            assert!(session.pending.lock().expect("pending lock").is_empty());
+            assert!(session.approvals.lock().expect("approval lock").is_empty());
+            assert!(session.grants.lock().expect("grant lock").is_empty());
+            assert!(matches!(
+                session.authority_snapshot(),
+                Some(HostTurnAuthority::Active(active))
+                    if active.h7_codex_turn_id.as_deref() == Some(codex_turn_one.as_str())
+            ));
         }
 
         #[test]

@@ -97,6 +97,26 @@ fn grant(binding: protocol::ProcessBinding, used: bool) -> ProcessGrant {
     }
 }
 
+fn record_codex_turn_id(
+    slot: &mut Option<String>,
+    host_turn_id: &str,
+    binding: &protocol::ProcessBinding,
+) {
+    assert!(!binding.turn_id.is_empty(), "Codex/H7 turn id is present");
+    assert_ne!(
+        binding.turn_id, host_turn_id,
+        "Host and Codex/H7 turn namespaces remain distinct"
+    );
+    if let Some(expected) = slot.as_ref() {
+        assert_eq!(
+            expected, &binding.turn_id,
+            "all H7 authority messages use one Codex/H7 turn id"
+        );
+    } else {
+        *slot = Some(binding.turn_id.clone());
+    }
+}
+
 #[test]
 fn process_isolated_codex_h8_h7c_second_provider_closure() {
     let (workspace, git_path) = git_fixture();
@@ -160,6 +180,7 @@ fn process_isolated_codex_h8_h7c_second_provider_closure() {
     let mut scope_seen = false;
     let mut grant_seen = false;
     let mut revalidation_seen = false;
+    let mut codex_turn_id = None;
     let mut credential_requests = 0_u32;
     let final_text = loop {
         match receive(&mut reader) {
@@ -168,6 +189,7 @@ fn process_isolated_codex_h8_h7c_second_provider_closure() {
                 confirmation_seen = true;
                 assert_eq!(request.capability_id, "vita.process.workspace.git_status");
                 assert_eq!(request.host_turn_id, turn_id);
+                record_codex_turn_id(&mut codex_turn_id, turn_id, &request.binding);
                 send(
                     &mut writer,
                     &HostMessage::ConfirmationReply(protocol::ConfirmationReply {
@@ -181,6 +203,7 @@ fn process_isolated_codex_h8_h7c_second_provider_closure() {
             VitaMessage::AuthorityEvaluate(request) => {
                 scope_seen = true;
                 assert_eq!(request.host_turn_id, turn_id);
+                record_codex_turn_id(&mut codex_turn_id, turn_id, &request.binding);
                 send(
                     &mut writer,
                     &HostMessage::AuthorityScopeReply(protocol::AuthorityScopeReply {
@@ -195,6 +218,7 @@ fn process_isolated_codex_h8_h7c_second_provider_closure() {
             VitaMessage::IssueGrant(request) => {
                 grant_seen = true;
                 assert_eq!(request.host_turn_id, turn_id);
+                record_codex_turn_id(&mut codex_turn_id, turn_id, &request.binding);
                 send(
                     &mut writer,
                     &HostMessage::GrantIssued(GrantIssued {
@@ -209,6 +233,7 @@ fn process_isolated_codex_h8_h7c_second_provider_closure() {
             VitaMessage::RevalidateGrant(request) => {
                 revalidation_seen = true;
                 assert_eq!(request.host_turn_id, turn_id);
+                record_codex_turn_id(&mut codex_turn_id, turn_id, &request.binding);
                 send(
                     &mut writer,
                     &HostMessage::GrantRevalidated(GrantRevalidated {
@@ -261,6 +286,8 @@ fn process_isolated_codex_h8_h7c_second_provider_closure() {
         revalidation_seen,
         "final ProcessGrant revalidation was observed"
     );
+    let codex_turn_id = codex_turn_id.expect("at least one H7 authority message was observed");
+    println!("D29-H9-R3 canary Host turn id={turn_id}; Codex/H7 turn id={codex_turn_id}");
     assert_eq!(
         credential_requests, 2,
         "each provider request resolved a credential"

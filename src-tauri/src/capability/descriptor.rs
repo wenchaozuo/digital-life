@@ -285,6 +285,16 @@ impl CapabilityRegistry {
         self.descriptors.get(capability_id)
     }
 
+    /// Deterministic, read-only enumeration of the trusted catalog.
+    ///
+    /// The backing map is ordered by `CapabilityId`, so callers get a stable
+    /// ordering without supplying one.  This is the only way the D30-A control
+    /// plane learns which capabilities exist; it never accepts a catalog from
+    /// the frontend, and the descriptor metadata it returns is authoritative.
+    pub(crate) fn entries(&self) -> impl Iterator<Item = &CapabilityDescriptor> {
+        self.descriptors.values()
+    }
+
     #[cfg(any(
         test,
         feature = "d29-h1-host-fixture",

@@ -85,6 +85,35 @@ impl UserExplicitCapabilityAuthorizationEvidence {
             evidence_version: UserExplicitEvidenceVersion,
         }
     }
+
+    /// D30-A production constructor for the explicit-user authorization root.
+    ///
+    /// This is the only non-test way to mint this evidence.  It takes exactly
+    /// one opaque, Host-minted event identity and hard-codes the fixed
+    /// provenance triple, so no caller can influence `actor_kind`,
+    /// `provenance_kind`, or `evidence_version`:
+    ///
+    /// ```text
+    /// actor_kind      = user_explicit
+    /// provenance_kind = user_authorization_root
+    /// evidence_version = 1
+    /// ```
+    ///
+    /// Reachability: this crate's `capability` module is `pub(crate)` and the
+    /// Vita/Codex runtime is a separate crate *and* a separate process with no
+    /// dependency edge to the Host crate, so model, persona, and autonomy
+    /// paths cannot name this function at all.  Inside the Host the only
+    /// caller is the Settings capability activation control plane
+    /// (`capability::activation`), which is itself gated on the Settings
+    /// window label.
+    pub(crate) fn mint_host_user_authorization_root(event_id: String) -> Self {
+        Self {
+            event_id,
+            actor_kind: UserExplicitActorKind,
+            provenance_kind: UserAuthorizationRootProvenanceKind,
+            evidence_version: UserExplicitEvidenceVersion,
+        }
+    }
 }
 
 impl LifeCapabilityAuthorizationUpdateRequest {
@@ -133,6 +162,36 @@ impl LifeCapabilityAuthorizationUpdateRequest {
             expected_revision,
             user_explicit_evidence: UserExplicitCapabilityAuthorizationEvidence::for_test(event_id),
         }
+    }
+
+    /// D30-A production constructor for one explicit user authorization-root
+    /// transition.
+    ///
+    /// The four caller-controlled values are exactly the ones the Settings
+    /// control plane is allowed to influence: the Host-minted event identity,
+    /// the Host-derived current life, the trusted-registry capability, and the
+    /// desired boolean state with the revision the UI last observed.  Evidence
+    /// provenance, revision arithmetic, and the resulting immutable audit row
+    /// are all decided by D28, never by the caller.
+    pub(crate) fn from_host_user_authorization_root(
+        event_id: String,
+        life_id: String,
+        capability_id: CapabilityId,
+        enabled: bool,
+        expected_revision: i64,
+    ) -> Result<Self, CapabilityAuthorizationError> {
+        let request = Self {
+            life_id,
+            capability_id,
+            enabled,
+            expected_revision,
+            user_explicit_evidence:
+                UserExplicitCapabilityAuthorizationEvidence::mint_host_user_authorization_root(
+                    event_id,
+                ),
+        };
+        validate_update_request(&request)?;
+        Ok(request)
     }
 }
 

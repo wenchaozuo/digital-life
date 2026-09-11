@@ -4,7 +4,12 @@
 //! user-authorization contract, and a non-executable grant candidate.  It has
 //! no command, process, filesystem, network, browser, provider, or agent
 //! execution surface.
+//!
+//! D30-A adds `activation`: the Settings-only user control surface over the
+//! durable D28 root.  It is a control plane for the existing authority, never
+//! a second permission system, and it introduces no new side-effect class.
 
+pub(crate) mod activation;
 pub(crate) mod authorization;
 pub(crate) mod descriptor;
 

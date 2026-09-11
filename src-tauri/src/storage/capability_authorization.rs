@@ -436,6 +436,54 @@ impl CapabilityAuthorizationRepository for StorageService {
     }
 }
 
+/// Hard upper bound for one D30-A audit page.  The Settings surface asks for a
+/// smaller window; this cap means no caller, present or future, can turn the
+/// audit view into an unbounded scan of the event table.
+pub(super) const MAX_AUTHORIZATION_EVENT_PAGE: usize = 50;
+
+impl StorageService {
+    /// Bounded, read-only audit projection of the immutable D28 authorization
+    /// transitions for one life/capability pair.
+    ///
+    /// Ordering is deterministic: newest revision first, which for this table
+    /// is the same as newest transition first because `new_revision` is
+    /// unique per `(life_id, capability_id)` and advances by exactly one.
+    /// This is a read-only query only; it never writes, never repairs, and
+    /// never mints authority.
+    pub(crate) fn list_capability_authorization_events(
+        &self,
+        life_id: &str,
+        capability_id: &CapabilityId,
+        limit: usize,
+    ) -> Result<Vec<LifeCapabilityAuthorizationEvent>, CapabilityAuthorizationError> {
+        validate_lookup_identity("life identity", life_id)?;
+        let limit = limit.clamp(1, MAX_AUTHORIZATION_EVENT_PAGE) as i64;
+        let state = self
+            .state()
+            .map_err(|_| CapabilityAuthorizationError::database())?;
+        let mut statement = state
+            .connection
+            .prepare(&format!(
+                "SELECT {EVENT_COLUMNS}
+                 FROM life_capability_authorization_event
+                 WHERE life_id = ?1 AND capability_id = ?2
+                 ORDER BY new_revision DESC
+                 LIMIT ?3"
+            ))
+            .map_err(|_| CapabilityAuthorizationError::database())?;
+        let rows = statement
+            .query_map(params![life_id, capability_id.as_str(), limit], read_event)
+            .map_err(|_| CapabilityAuthorizationError::database())?;
+        let mut events = Vec::new();
+        for row in rows {
+            let event = row.map_err(|_| CapabilityAuthorizationError::database())?;
+            validate_event_state(&event)?;
+            events.push(event);
+        }
+        Ok(events)
+    }
+}
+
 /// Exact normalized validation of the Schema-30 D28 objects. Validation is
 /// read-only and never repairs malformed database state.
 pub(super) fn validate_schema_objects(connection: &Connection) -> Result<(), StorageError> {
@@ -820,6 +868,55 @@ mod tests {
             )
             .unwrap();
         assert_eq!(event_count, 1);
+    }
+
+    #[test]
+    fn audit_event_page_is_clamped_newest_first_and_read_only() {
+        let fixture = Fixture::new();
+        fixture.create();
+        // rev1 disabled -> rev2 enabled -> rev3 disabled
+        fixture.update("d30a-page-enable", true, 1).unwrap();
+        fixture.update("d30a-page-disable", false, 2).unwrap();
+
+        // Newest revision first, deterministically.
+        let page = fixture
+            .storage
+            .list_capability_authorization_events("d28-life", &fixture.capability_id(), 20)
+            .unwrap();
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].new_revision(), 3);
+        assert_eq!(page[0].old_revision(), 2);
+        assert_eq!(page[0].new_enabled(), false);
+        assert_eq!(page[1].new_revision(), 2);
+        assert_eq!(page[1].old_enabled(), false);
+
+        // A zero limit is clamped up rather than returning an empty page.
+        let clamped = fixture
+            .storage
+            .list_capability_authorization_events("d28-life", &fixture.capability_id(), 0)
+            .unwrap();
+        assert_eq!(clamped.len(), 1);
+        assert_eq!(clamped[0].new_revision(), 3);
+
+        // An oversized limit is clamped down by the hard page bound and never
+        // errors; with two events present it simply returns both.
+        let oversized = fixture
+            .storage
+            .list_capability_authorization_events("d28-life", &fixture.capability_id(), usize::MAX)
+            .unwrap();
+        assert_eq!(oversized.len(), 2);
+        assert!(oversized.len() <= MAX_AUTHORIZATION_EVENT_PAGE);
+
+        // The query is read-only: the durable row and audit history are intact.
+        assert_eq!(
+            fixture
+                .storage
+                .find_capability_authorization("d28-life", &fixture.capability_id())
+                .unwrap()
+                .unwrap()
+                .revision,
+            3
+        );
     }
 
     #[test]

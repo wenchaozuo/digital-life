@@ -8,6 +8,7 @@ import MemoryCenterView from "./memory/MemoryCenterView.vue";
 import BodySettingsView from "./body/BodySettingsView.vue";
 import Live2DCoreSettingsView from "./core/Live2DCoreSettingsView.vue";
 import ScreenPerceptionSettingsView from "./perception/ScreenPerceptionSettingsView.vue";
+import CapabilitySettingsView from "./capability/CapabilitySettingsView.vue";
 import {
   storageService,
   type StorageLocationInfo,
@@ -41,7 +42,8 @@ type SettingsSection =
   | "memory"
   | "body"
   | "core"
-  | "perception";
+  | "perception"
+  | "capabilities";
 interface SettingsViewHandle {
   clearSensitiveInputs(): void;
   requestLeave(): boolean;
@@ -186,6 +188,9 @@ function requestActiveViewLeave(): boolean {
   if (activeSection.value === "perception") {
     return true;
   }
+  if (activeSection.value === "capabilities") {
+    return true;
+  }
   return modelProfilesView.value?.requestLeave() ?? true;
 }
 
@@ -245,6 +250,7 @@ onMounted(async () => {
         <button type="button" :class="{ selected: activeSection === 'body' }" :disabled="phase === 'migrating'" @click="switchSection('body')">Body</button>
         <button type="button" :class="{ selected: activeSection === 'core' }" :disabled="phase === 'migrating'" @click="switchSection('core')">Live2D Core</button>
         <button type="button" :class="{ selected: activeSection === 'perception' }" :disabled="phase === 'migrating'" @click="switchSection('perception')">Screen privacy</button>
+        <button type="button" :class="{ selected: activeSection === 'capabilities' }" :disabled="phase === 'migrating'" @click="switchSection('capabilities')">Agent permissions</button>
       </nav>
 
       <section v-if="activeSection === 'storage'" class="settings-section" aria-label="Storage location settings">
@@ -334,6 +340,8 @@ onMounted(async () => {
       <Live2DCoreSettingsView v-else-if="activeSection === 'core'" />
 
       <ScreenPerceptionSettingsView v-else-if="activeSection === 'perception'" />
+
+      <CapabilitySettingsView v-else-if="activeSection === 'capabilities'" />
 
       <ModelProfilesView
         v-else

@@ -9,8 +9,15 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
+use vita_agent_protocol as protocol;
 
-use crate::{capability::CapabilityRegistry, storage::StorageService};
+#[cfg(windows)]
+use crate::secrets::{SecretIdentifier, SecretStore, WindowsCredentialSecretStore};
+use crate::{
+    capability::CapabilityRegistry,
+    model::profile::{credential_purpose, ModelProfileRepository, ModelProviderKind, ModelPurpose},
+    storage::StorageService,
+};
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -25,6 +32,30 @@ pub struct VitaSidecarStartRequest {
 pub struct VitaSidecarStartResponse {
     pub session_id: String,
     pub ready: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VitaTurnStartRequest {
+    pub prompt: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VitaTurnStartResponse {
+    pub turn_id: String,
+    pub accepted: bool,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum VitaProviderReadiness {
+    NoActiveProfile,
+    CredentialMissing,
+    IneligibleUrl,
+    Ready,
+    SidecarNotRunning,
+    TurnActive,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -42,8 +73,13 @@ pub struct VitaSidecarPendingSummary {
 #[serde(rename_all = "camelCase")]
 pub struct VitaSidecarStatusResponse {
     pub running: bool,
+    pub provider_readiness: VitaProviderReadiness,
     pub session_id: Option<String>,
     pub pending: Option<VitaSidecarPendingSummary>,
+    pub active_turn_id: Option<String>,
+    pub turn_phase: Option<protocol::TurnPhase>,
+    pub assistant_text: Option<String>,
+    pub turn_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -55,6 +91,8 @@ pub struct VitaSidecarActionResponse {
 pub struct VitaSidecarCoordinator {
     authority_storage: Arc<StorageService>,
     registry: CapabilityRegistry,
+    #[cfg(windows)]
+    credential_store: WindowsCredentialSecretStore,
     #[cfg(windows)]
     inner: Mutex<WindowsCoordinatorState>,
     #[cfg(not(windows))]
@@ -69,6 +107,8 @@ impl VitaSidecarCoordinator {
         Self {
             authority_storage,
             registry,
+            #[cfg(windows)]
+            credential_store: WindowsCredentialSecretStore::new(),
             #[cfg(windows)]
             inner: Mutex::new(WindowsCoordinatorState::default()),
             #[cfg(not(windows))]
@@ -125,6 +165,93 @@ mod windows {
     const SIDECAR_RESOURCE_NAME: &str = "vita-agent.exe";
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+    fn active_chat_provider_configuration(
+        storage: &StorageService,
+        secrets: &WindowsCredentialSecretStore,
+    ) -> Result<Option<protocol::ProviderConfiguration>, String> {
+        let Some(active) = storage
+            .get_active_profile(ModelPurpose::Chat)
+            .map_err(|error| error.message)?
+        else {
+            return Ok(None);
+        };
+        let Some(profile) = storage
+            .get_profile(&active.profile_id)
+            .map_err(|error| error.message)?
+        else {
+            return Ok(None);
+        };
+        if profile.purpose != ModelPurpose::Chat
+            || profile.provider_kind != ModelProviderKind::OpenaiCompatible
+        {
+            return Ok(None);
+        }
+        let credential_ref =
+            SecretIdentifier::new(credential_purpose(ModelPurpose::Chat), profile.id.clone())
+                .map_err(|_| "Vita Chat credential identifier was invalid".to_string())?;
+        if !secrets
+            .has_secret(&credential_ref)
+            .map_err(|_| "Vita Chat credential availability could not be checked".to_string())?
+        {
+            return Ok(None);
+        }
+        Ok(Some(protocol::ProviderConfiguration {
+            profile_id: profile.id.clone(),
+            purpose: profile.purpose.as_str().to_string(),
+            provider_kind: profile.provider_kind.as_str().to_string(),
+            base_url: profile.base_url.clone(),
+            model: profile.model_name.clone(),
+            credential_ref: profile.id.clone(),
+            credential_destination: profile.base_url,
+        }))
+    }
+
+    fn provider_readiness(
+        storage: &StorageService,
+        secrets: &WindowsCredentialSecretStore,
+        running: bool,
+        turn_active: bool,
+    ) -> Result<VitaProviderReadiness, String> {
+        let Some(active) = storage
+            .get_active_profile(ModelPurpose::Chat)
+            .map_err(|error| error.message)?
+        else {
+            return Ok(VitaProviderReadiness::NoActiveProfile);
+        };
+        let Some(profile) = storage
+            .get_profile(&active.profile_id)
+            .map_err(|error| error.message)?
+        else {
+            return Ok(VitaProviderReadiness::NoActiveProfile);
+        };
+        if profile.purpose != ModelPurpose::Chat
+            || profile.provider_kind != ModelProviderKind::OpenaiCompatible
+        {
+            return Ok(VitaProviderReadiness::NoActiveProfile);
+        }
+        let identifier =
+            SecretIdentifier::new(credential_purpose(ModelPurpose::Chat), profile.id.clone())
+                .map_err(|_| "Vita Chat credential identifier was invalid".to_string())?;
+        if !secrets
+            .has_secret(&identifier)
+            .map_err(|_| "Vita Chat credential availability could not be checked".to_string())?
+        {
+            return Ok(VitaProviderReadiness::CredentialMissing);
+        }
+        let url = reqwest::Url::parse(&profile.base_url)
+            .map_err(|_| "Vita Chat provider URL was invalid".to_string())?;
+        if url.scheme() != "https" {
+            return Ok(VitaProviderReadiness::IneligibleUrl);
+        }
+        if !running {
+            return Ok(VitaProviderReadiness::SidecarNotRunning);
+        }
+        if turn_active {
+            return Ok(VitaProviderReadiness::TurnActive);
+        }
+        Ok(VitaProviderReadiness::Ready)
+    }
+
     #[derive(Default)]
     pub(super) struct WindowsCoordinatorState {
         running: Option<RunningSidecar>,
@@ -161,6 +288,7 @@ mod windows {
         life_id: String,
         task_id: String,
         workspace_identity: String,
+        provider: Option<protocol::ProviderConfiguration>,
         writer: Mutex<Option<BufWriter<File>>>,
         pending: Mutex<HashMap<String, PendingAction>>,
         approvals: Mutex<HashMap<String, ApprovedAction>>,
@@ -168,6 +296,10 @@ mod windows {
         replay: Mutex<RequestReplayWindow>,
         expiry: Arc<ExpiryOwner>,
         closed: AtomicBool,
+        active_turn_id: Mutex<Option<String>>,
+        turn_phase: Mutex<Option<protocol::TurnPhase>>,
+        assistant_text: Mutex<Option<String>>,
+        turn_error: Mutex<Option<String>>,
         #[cfg(test)]
         test_outbound: Mutex<Option<mpsc::Sender<HostMessage>>>,
     }
@@ -344,7 +476,11 @@ mod windows {
             let writer = guard
                 .as_mut()
                 .ok_or_else(|| "Vita Host sidecar writer is closed".to_string())?;
-            protocol::write_frame(writer, message).map_err(|error| error.to_string())
+            if matches!(message, HostMessage::SensitiveCredentialReply(_)) {
+                protocol::write_sensitive_frame(writer, message).map_err(|error| error.to_string())
+            } else {
+                protocol::write_frame(writer, message).map_err(|error| error.to_string())
+            }
         }
 
         fn close_writer(&self) {
@@ -397,6 +533,12 @@ mod windows {
                 replay.clear();
             }
             self.expiry.stop();
+            if let Ok(mut turn) = self.active_turn_id.lock() {
+                turn.take();
+            }
+            if let Ok(mut phase) = self.turn_phase.lock() {
+                *phase = Some(protocol::TurnPhase::Cancelled);
+            }
         }
     }
 
@@ -541,6 +683,8 @@ mod windows {
             app: &AppHandle,
             request: VitaSidecarStartRequest,
         ) -> Result<(RunningSidecar, VitaSidecarStartResponse), String> {
+            let secrets = app.state::<WindowsCredentialSecretStore>().inner().clone();
+            let provider = active_chat_provider_configuration(&self.authority_storage, &secrets)?;
             let workspace = fs::canonicalize(&request.workspace_path)
                 .map_err(|_| "Vita workspace path could not be canonicalized".to_string())?;
             if !workspace.is_dir() {
@@ -620,6 +764,7 @@ mod windows {
                 app_data_root: sidecar_app_data_root.to_string_lossy().into_owned(),
                 workspace_path: sidecar_workspace.to_string_lossy().into_owned(),
                 git_path: sidecar_git_path.to_string_lossy().into_owned(),
+                provider: provider.clone(),
             });
             protocol::write_frame(&mut writer, &init).map_err(|error| error.to_string())?;
 
@@ -635,6 +780,7 @@ mod windows {
                 life_id: request.life_id.clone(),
                 task_id: request.task_id.clone(),
                 workspace_identity: ready.workspace_identity,
+                provider,
                 writer: Mutex::new(Some(writer)),
                 pending: Mutex::new(HashMap::new()),
                 approvals: Mutex::new(HashMap::new()),
@@ -642,6 +788,10 @@ mod windows {
                 replay: Mutex::new(RequestReplayWindow::default()),
                 expiry: Arc::new(ExpiryOwner::new()),
                 closed: AtomicBool::new(false),
+                active_turn_id: Mutex::new(None),
+                turn_phase: Mutex::new(None),
+                assistant_text: Mutex::new(None),
+                turn_error: Mutex::new(None),
                 #[cfg(test)]
                 test_outbound: Mutex::new(None),
             });
@@ -651,7 +801,7 @@ mod windows {
             session.expiry.start(Arc::downgrade(&session))?;
             let reader_handle = thread::Builder::new()
                 .name("vita-sidecar-host-reader".to_string())
-                .spawn(move || reader_loop(reader, reader_session, storage, registry))
+                .spawn(move || reader_loop(reader, reader_session, storage, registry, secrets))
                 .map_err(|_| "Vita sidecar Host reader could not start".to_string())?;
             Ok((
                 RunningSidecar {
@@ -674,14 +824,60 @@ mod windows {
             let Some(running) = guard.running.as_ref() else {
                 return Ok(VitaSidecarStatusResponse {
                     running: false,
+                    provider_readiness: provider_readiness(
+                        &self.authority_storage,
+                        &self.credential_store,
+                        false,
+                        false,
+                    )?,
                     session_id: None,
                     pending: None,
+                    active_turn_id: None,
+                    turn_phase: None,
+                    assistant_text: None,
+                    turn_error: None,
                 });
             };
+            let active_turn = running
+                .session
+                .active_turn_id
+                .lock()
+                .ok()
+                .is_some_and(|turn| turn.is_some());
             Ok(VitaSidecarStatusResponse {
                 running: !running.session.closed.load(Ordering::Acquire),
+                provider_readiness: provider_readiness(
+                    &self.authority_storage,
+                    &self.credential_store,
+                    !running.session.closed.load(Ordering::Acquire),
+                    active_turn,
+                )?,
                 session_id: Some(running.session.session_id.clone()),
                 pending: running.session.pending_summary(),
+                active_turn_id: running
+                    .session
+                    .active_turn_id
+                    .lock()
+                    .ok()
+                    .and_then(|turn| turn.clone()),
+                turn_phase: running
+                    .session
+                    .turn_phase
+                    .lock()
+                    .ok()
+                    .and_then(|phase| *phase),
+                assistant_text: running
+                    .session
+                    .assistant_text
+                    .lock()
+                    .ok()
+                    .and_then(|text| text.clone()),
+                turn_error: running
+                    .session
+                    .turn_error
+                    .lock()
+                    .ok()
+                    .and_then(|error| error.clone()),
             })
         }
 
@@ -793,6 +989,145 @@ mod windows {
                     request_id: next_id("host-cancel"),
                     session_id: running.session.session_id.clone(),
                 }))?;
+            if let Some(turn_id) = running
+                .session
+                .active_turn_id
+                .lock()
+                .map_err(|_| "Vita active turn state lock was poisoned".to_string())?
+                .clone()
+            {
+                let _ = running
+                    .session
+                    .send(&HostMessage::CancelTurn(protocol::CancelTurn {
+                        request_id: next_id("host-cancel-turn"),
+                        session_id: running.session.session_id.clone(),
+                        turn_id,
+                    }));
+            }
+            Ok(VitaSidecarActionResponse { accepted: true })
+        }
+
+        fn start_turn(
+            &self,
+            request: VitaTurnStartRequest,
+        ) -> Result<VitaTurnStartResponse, String> {
+            if request.prompt.is_empty()
+                || request.prompt.len() > protocol::MAX_PROMPT_BYTES
+                || request.prompt.chars().any(|character| {
+                    character.is_control() && !matches!(character, '\n' | '\r' | '\t')
+                })
+            {
+                return Err("Vita turn prompt was empty, oversized, or malformed".to_string());
+            }
+            let guard = self
+                .inner
+                .lock()
+                .map_err(|_| "Vita sidecar coordinator lock was poisoned".to_string())?;
+            let running = guard
+                .running
+                .as_ref()
+                .ok_or_else(|| "Vita sidecar is not running".to_string())?;
+            let current = running
+                .session
+                .active_turn_id
+                .lock()
+                .map_err(|_| "Vita active turn state lock was poisoned".to_string())?;
+            if current.is_some() {
+                return Err("Vita turn is already active".to_string());
+            }
+            drop(current);
+            let provider = running
+                .session
+                .provider
+                .clone()
+                .ok_or_else(|| "Vita Chat provider is not configured".to_string())?;
+            let current_provider = active_chat_provider_configuration(
+                &self.authority_storage,
+                &self.credential_store,
+            )?
+            .ok_or_else(|| "Vita Chat provider is not ready".to_string())?;
+            if current_provider != provider {
+                return Err("Vita active Chat provider changed; restart the sidecar".to_string());
+            }
+            let turn_id = secure_id("vita-turn")?;
+            let binding =
+                protocol::ProviderBinding::derive(&running.session.session_id, &turn_id, &provider)
+                    .map_err(|_| "Vita provider binding could not be derived".to_string())?;
+            if let Ok(mut active) = running.session.active_turn_id.lock() {
+                *active = Some(turn_id.clone());
+            }
+            if let Ok(mut phase) = running.session.turn_phase.lock() {
+                *phase = Some(protocol::TurnPhase::Starting);
+            }
+            if let Ok(mut output) = running.session.assistant_text.lock() {
+                output.take();
+            }
+            if let Ok(mut error) = running.session.turn_error.lock() {
+                error.take();
+            }
+            let message = HostMessage::StartTurn(protocol::StartTurn {
+                request_id: next_id("host-start-turn"),
+                session_id: running.session.session_id.clone(),
+                turn_id: turn_id.clone(),
+                prompt: request.prompt,
+                binding,
+            });
+            if let Err(error) = running.session.send(&message) {
+                if let Ok(mut active) = running.session.active_turn_id.lock() {
+                    active.take();
+                }
+                return Err(error);
+            }
+            Ok(VitaTurnStartResponse {
+                turn_id,
+                accepted: true,
+            })
+        }
+
+        fn cancel_turn(&self) -> Result<VitaSidecarActionResponse, String> {
+            let guard = self
+                .inner
+                .lock()
+                .map_err(|_| "Vita sidecar coordinator lock was poisoned".to_string())?;
+            let running = guard
+                .running
+                .as_ref()
+                .ok_or_else(|| "Vita sidecar is not running".to_string())?;
+            let Some(turn_id) = running
+                .session
+                .active_turn_id
+                .lock()
+                .map_err(|_| "Vita active turn state lock was poisoned".to_string())?
+                .clone()
+            else {
+                return Ok(VitaSidecarActionResponse { accepted: false });
+            };
+            expire_pending(&running.session);
+            if let Some(pending) = take_any_pending(&running.session) {
+                let decision = if pending.expires_at_unix_ms <= unix_millis() {
+                    ConfirmationDecision::Deny
+                } else {
+                    ConfirmationDecision::Cancel
+                };
+                let _ = send_confirmation_decision(&running.session, &pending, decision, None);
+            }
+            // Cancel the governed H7 action and any pending H8 confirmation
+            // before interrupting the Codex turn.  A turn-only interrupt is
+            // not sufficient to retire a tool broker that is waiting on the
+            // Host confirmation bridge.
+            let _ = running
+                .session
+                .send(&HostMessage::CancelAction(protocol::CancelAction {
+                    request_id: next_id("host-cancel-action"),
+                    session_id: running.session.session_id.clone(),
+                }));
+            running
+                .session
+                .send(&HostMessage::CancelTurn(protocol::CancelTurn {
+                    request_id: next_id("host-cancel-turn"),
+                    session_id: running.session.session_id.clone(),
+                    turn_id,
+                }))?;
             Ok(VitaSidecarActionResponse { accepted: true })
         }
 
@@ -825,9 +1160,10 @@ mod windows {
         session: Arc<HostSessionState>,
         storage: Arc<StorageService>,
         registry: CapabilityRegistry,
+        secrets: WindowsCredentialSecretStore,
     ) {
         loop {
-            let body = match protocol::read_frame(&mut reader) {
+            let body = match protocol::read_sensitive_frame(&mut reader) {
                 Ok(Some(body)) => body,
                 Ok(None) | Err(_) => break,
             };
@@ -855,6 +1191,12 @@ mod windows {
                 VitaMessage::RevalidateGrant(request) => {
                     handle_revalidate_grant(&session, &storage, &registry, request)
                 }
+                VitaMessage::CredentialRequired(request) => {
+                    handle_credential_required(&session, &storage, &secrets, request)
+                }
+                VitaMessage::TurnState(message) => handle_turn_state(&session, message),
+                VitaMessage::TurnCompleted(message) => handle_turn_completed(&session, message),
+                VitaMessage::TurnFailed(message) => handle_turn_failed(&session, message),
                 VitaMessage::ActionCancelled(message)
                     if message.session_id == session.session_id =>
                 {
@@ -876,6 +1218,174 @@ mod windows {
         }
         session.retire();
         session.close_writer();
+    }
+
+    fn handle_turn_state(
+        session: &Arc<HostSessionState>,
+        message: protocol::TurnState,
+    ) -> Result<(), String> {
+        message
+            .validate()
+            .map_err(|_| "Vita turn state was malformed".to_string())?;
+        if message.session_id != session.session_id {
+            return Err("Vita turn state session was not exact".to_string());
+        }
+        if let Ok(mut turn) = session.active_turn_id.lock() {
+            if turn
+                .as_deref()
+                .is_some_and(|active| active != message.turn_id.as_str())
+            {
+                // A late state from a retired turn must not mutate the next
+                // turn.  It is safe to ignore it because the sidecar already
+                // owns the authoritative cancellation/retirement state.
+                return Ok(());
+            }
+            if turn.is_none() && !matches!(message.phase, protocol::TurnPhase::Starting) {
+                return Ok(());
+            }
+            if matches!(
+                message.phase,
+                protocol::TurnPhase::Completed
+                    | protocol::TurnPhase::Failed
+                    | protocol::TurnPhase::Cancelled
+                    | protocol::TurnPhase::TimedOut
+            ) {
+                turn.take();
+            } else {
+                *turn = Some(message.turn_id);
+            }
+        }
+        if let Ok(mut phase) = session.turn_phase.lock() {
+            *phase = Some(message.phase);
+        }
+        Ok(())
+    }
+
+    fn handle_turn_completed(
+        session: &Arc<HostSessionState>,
+        message: protocol::TurnCompleted,
+    ) -> Result<(), String> {
+        message
+            .validate()
+            .map_err(|_| "Vita turn result was malformed".to_string())?;
+        if message.session_id != session.session_id {
+            return Err("Vita turn result session was not exact".to_string());
+        }
+        if let Ok(mut turn) = session.active_turn_id.lock() {
+            if turn
+                .as_deref()
+                .is_none_or(|active| active != message.turn_id.as_str())
+            {
+                return Ok(());
+            }
+            turn.take();
+        }
+        if let Ok(mut phase) = session.turn_phase.lock() {
+            *phase = Some(protocol::TurnPhase::Completed);
+        }
+        if let Ok(mut output) = session.assistant_text.lock() {
+            *output = Some(message.assistant_text);
+        }
+        if let Ok(mut error) = session.turn_error.lock() {
+            error.take();
+        }
+        Ok(())
+    }
+
+    fn handle_turn_failed(
+        session: &Arc<HostSessionState>,
+        message: protocol::TurnFailed,
+    ) -> Result<(), String> {
+        message
+            .validate()
+            .map_err(|_| "Vita turn failure was malformed".to_string())?;
+        if message.session_id != session.session_id {
+            return Err("Vita turn failure session was not exact".to_string());
+        }
+        if let Ok(mut turn) = session.active_turn_id.lock() {
+            if turn
+                .as_deref()
+                .is_none_or(|active| active != message.turn_id.as_str())
+            {
+                return Ok(());
+            }
+            turn.take();
+        }
+        if let Ok(mut phase) = session.turn_phase.lock() {
+            *phase = Some(message.phase);
+        }
+        if let Ok(mut error) = session.turn_error.lock() {
+            *error = Some(message.error_code);
+        }
+        Ok(())
+    }
+
+    fn handle_credential_required(
+        session: &Arc<HostSessionState>,
+        storage: &StorageService,
+        secrets: &WindowsCredentialSecretStore,
+        request: protocol::CredentialRequired,
+    ) -> Result<(), String> {
+        request
+            .validate()
+            .map_err(|_| "Vita credential request was malformed".to_string())?;
+        let deny = |code: &str| {
+            session.send(&HostMessage::SensitiveCredentialReply(
+                protocol::SensitiveCredentialReply {
+                    request_id: request.request_id.clone(),
+                    session_id: session.session_id.clone(),
+                    turn_id: request.turn_id.clone(),
+                    binding_hash: request.binding.binding_hash.clone(),
+                    credential_ref: request.binding.credential_ref.clone(),
+                    credential: None,
+                    error_code: Some(code.to_string()),
+                },
+            ))
+        };
+        if session.closed.load(Ordering::Acquire)
+            || request.session_id != session.session_id
+            || session
+                .active_turn_id
+                .lock()
+                .ok()
+                .is_none_or(|turn| turn.as_deref() != Some(request.turn_id.as_str()))
+        {
+            return deny("TURN_NOT_ACTIVE");
+        }
+        let Some(configuration) = active_chat_provider_configuration(storage, secrets)? else {
+            return deny("CREDENTIAL_MISSING");
+        };
+        let expected = protocol::ProviderBinding::derive(
+            &session.session_id,
+            &request.turn_id,
+            &configuration,
+        )
+        .map_err(|_| "provider binding could not be derived".to_string())?;
+        if expected != request.binding {
+            return deny("PROVIDER_BINDING_MISMATCH");
+        }
+        let identifier = SecretIdentifier::new(
+            credential_purpose(ModelPurpose::Chat),
+            configuration.credential_ref.clone(),
+        )
+        .map_err(|_| "credential identifier was invalid".to_string())?;
+        let secret = match secrets.get_secret(&identifier) {
+            Ok(secret) => secret,
+            Err(_) => return deny("CREDENTIAL_MISSING"),
+        };
+        let credential = protocol::SensitiveCredential::new(secret.expose_secret().to_owned())
+            .map_err(|_| "credential value was invalid".to_string())?;
+        session.send(&HostMessage::SensitiveCredentialReply(
+            protocol::SensitiveCredentialReply {
+                request_id: request.request_id,
+                session_id: session.session_id.clone(),
+                turn_id: request.turn_id,
+                binding_hash: request.binding.binding_hash,
+                credential_ref: request.binding.credential_ref,
+                credential: Some(credential),
+                error_code: None,
+            },
+        ))
     }
 
     fn handle_authority_evaluate(
@@ -1239,6 +1749,10 @@ mod windows {
             VitaMessage::IssueGrant(message) => &message.request_id,
             VitaMessage::RevalidateGrant(message) => &message.request_id,
             VitaMessage::ActionCancelled(message) => &message.request_id,
+            VitaMessage::CredentialRequired(message) => &message.request_id,
+            VitaMessage::TurnState(message) => &message.request_id,
+            VitaMessage::TurnCompleted(message) => &message.request_id,
+            VitaMessage::TurnFailed(message) => &message.request_id,
             VitaMessage::ShutdownAck(message) => &message.request_id,
             VitaMessage::Fatal(message) => &message.request_id,
         }
@@ -1480,6 +1994,19 @@ mod windows {
         coordinator.cancel()
     }
 
+    pub fn start_vita_turn(
+        coordinator: State<'_, VitaSidecarCoordinator>,
+        request: VitaTurnStartRequest,
+    ) -> Result<VitaTurnStartResponse, String> {
+        coordinator.start_turn(request)
+    }
+
+    pub fn cancel_vita_turn(
+        coordinator: State<'_, VitaSidecarCoordinator>,
+    ) -> Result<VitaSidecarActionResponse, String> {
+        coordinator.cancel_turn()
+    }
+
     pub fn stop_vita_sidecar(
         coordinator: State<'_, VitaSidecarCoordinator>,
     ) -> Result<VitaSidecarActionResponse, String> {
@@ -1521,6 +2048,7 @@ mod windows {
                 life_id: "life".to_string(),
                 task_id: "task".to_string(),
                 workspace_identity: "workspace".to_string(),
+                provider: None,
                 writer: Mutex::new(None),
                 pending: Mutex::new(HashMap::new()),
                 approvals: Mutex::new(HashMap::new()),
@@ -1528,6 +2056,10 @@ mod windows {
                 replay: Mutex::new(RequestReplayWindow::default()),
                 expiry: Arc::new(ExpiryOwner::new()),
                 closed: AtomicBool::new(false),
+                active_turn_id: Mutex::new(None),
+                turn_phase: Mutex::new(None),
+                assistant_text: Mutex::new(None),
+                turn_error: Mutex::new(None),
                 test_outbound: Mutex::new(Some(sender)),
             });
             (session, receiver)
@@ -2039,6 +2571,7 @@ mod windows {
                     app_data_root: app_data_for_sidecar.to_string_lossy().into_owned(),
                     workspace_path: request.workspace_path.clone(),
                     git_path: git_for_sidecar.to_string_lossy().into_owned(),
+                    provider: None,
                 }),
             )
             .expect("canary initialize");
@@ -2101,8 +2634,13 @@ mod non_windows {
     ) -> Result<VitaSidecarStatusResponse, String> {
         Ok(VitaSidecarStatusResponse {
             running: false,
+            provider_readiness: VitaProviderReadiness::SidecarNotRunning,
             session_id: None,
             pending: None,
+            active_turn_id: None,
+            turn_phase: None,
+            assistant_text: None,
+            turn_error: None,
         })
     }
 
@@ -2121,6 +2659,19 @@ mod non_windows {
     }
 
     pub(super) fn cancel_vita_sidecar(
+        _coordinator: State<'_, VitaSidecarCoordinator>,
+    ) -> Result<VitaSidecarActionResponse, String> {
+        Err("Vita sidecar production boundary is Windows-only".to_string())
+    }
+
+    pub(super) fn start_vita_turn(
+        _coordinator: State<'_, VitaSidecarCoordinator>,
+        _request: VitaTurnStartRequest,
+    ) -> Result<VitaTurnStartResponse, String> {
+        Err("Vita sidecar production boundary is Windows-only".to_string())
+    }
+
+    pub(super) fn cancel_vita_turn(
         _coordinator: State<'_, VitaSidecarCoordinator>,
     ) -> Result<VitaSidecarActionResponse, String> {
         Err("Vita sidecar production boundary is Windows-only".to_string())
@@ -2161,6 +2712,35 @@ pub(crate) fn get_vita_sidecar_status(
     #[cfg(not(windows))]
     {
         non_windows::get_vita_sidecar_status(coordinator)
+    }
+}
+
+#[tauri::command]
+pub(crate) fn start_vita_turn(
+    coordinator: State<'_, VitaSidecarCoordinator>,
+    request: VitaTurnStartRequest,
+) -> Result<VitaTurnStartResponse, String> {
+    #[cfg(windows)]
+    {
+        windows::start_vita_turn(coordinator, request)
+    }
+    #[cfg(not(windows))]
+    {
+        non_windows::start_vita_turn(coordinator, request)
+    }
+}
+
+#[tauri::command]
+pub(crate) fn cancel_vita_turn(
+    coordinator: State<'_, VitaSidecarCoordinator>,
+) -> Result<VitaSidecarActionResponse, String> {
+    #[cfg(windows)]
+    {
+        windows::cancel_vita_turn(coordinator)
+    }
+    #[cfg(not(windows))]
+    {
+        non_windows::cancel_vita_turn(coordinator)
     }
 }
 

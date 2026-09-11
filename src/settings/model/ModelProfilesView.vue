@@ -5,6 +5,7 @@ import ModelProfileCard from "./ModelProfileCard.vue";
 import ModelProfileForm from "./ModelProfileForm.vue";
 import MemoryVectorIndexPanel from "./MemoryVectorIndexPanel.vue";
 import MemoryVectorSyncPanel from "./MemoryVectorSyncPanel.vue";
+import VitaTurnPanel from "./VitaTurnPanel.vue";
 import type { MemoryVectorIndexStatus } from "./memoryVectorIndexService.ts";
 import type { MemoryVectorSyncWorkerStatus, MemoryVectorSyncSettings } from "./memoryVectorSyncService.ts";
 import {
@@ -246,6 +247,8 @@ defineExpose({ clearSensitiveInputs, requestLeave });
         @edit="openEdit"
       />
     </div>
+
+    <VitaTurnPanel v-if="purpose === 'chat'" />
 
     <div v-if="purpose === 'embedding'" class="index-section">
       <MemoryVectorIndexPanel

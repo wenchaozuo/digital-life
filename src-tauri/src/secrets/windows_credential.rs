@@ -17,6 +17,7 @@ use super::{
 const PRODUCTION_NAMESPACE: &str = "com.digitallife.app/credential/v1";
 const TARGET_FORMAT_VERSION: &[u8] = b"digital-life-secret-target-v1";
 
+#[derive(Clone)]
 pub struct WindowsCredentialSecretStore {
     namespace: &'static str,
 }

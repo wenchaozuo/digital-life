@@ -221,6 +221,8 @@ pub fn run() {
             open_chat_window,
             close_settings_window,
             vita_sidecar::start_vita_sidecar,
+            vita_sidecar::start_vita_turn,
+            vita_sidecar::cancel_vita_turn,
             vita_sidecar::get_vita_sidecar_status,
             vita_sidecar::confirm_vita_sidecar,
             vita_sidecar::deny_vita_sidecar,

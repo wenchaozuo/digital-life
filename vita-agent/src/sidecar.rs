@@ -577,9 +577,7 @@ mod tests {
             Err(mpsc::TrySendError::Full(_))
         ));
         let worker = std::thread::spawn(move || receive_command_from(&receiver));
-        sender
-            .send(message)
-            .expect("command send");
+        sender.send(message).expect("command send");
         assert!(matches!(
             worker.join().expect("command receiver worker"),
             Ok(Some(HostMessage::Shutdown(_)))

@@ -95,13 +95,14 @@ mod windows {
         IssueGrant, ProcessBinding, ProcessGrant, RevalidateGrant, VitaMessage,
         CODEX_PROTOCOL_SCHEMA_HASH, CODEX_UPSTREAM_COMMIT, PROTOCOL_VERSION, RUNTIME_ID,
     };
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{HashMap, HashSet, VecDeque};
     use std::ffi::OsString;
     use std::fs::{self, File};
     use std::io::{BufReader, BufWriter};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::sync::{Condvar, Weak};
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tauri::{AppHandle, Manager, State};
@@ -116,7 +117,11 @@ mod windows {
     const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
     const READY_TIMEOUT: Duration = Duration::from_secs(20);
     const MAX_PENDING: usize = 1;
+    // Active grants are bounded, but successful single-use grants are removed
+    // immediately after final revalidation, so this is not a session lifetime
+    // limit.
     const MAX_GRANTS: usize = 64;
+    const REQUEST_REPLAY_WINDOW: usize = 128;
     const SIDECAR_RESOURCE_NAME: &str = "vita-agent.exe";
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -142,6 +147,7 @@ mod windows {
                     request_id: next_id("host-shutdown"),
                     session_id: self.session.session_id.clone(),
                 }));
+            self.session.retire();
             self.session.close_writer();
             let _ = self.process.shutdown();
             if let Some(reader) = self.reader.take() {
@@ -159,7 +165,11 @@ mod windows {
         pending: Mutex<HashMap<String, PendingAction>>,
         approvals: Mutex<HashMap<String, ApprovedAction>>,
         grants: Mutex<HashMap<String, ProcessGrant>>,
+        replay: Mutex<RequestReplayWindow>,
+        expiry: Arc<ExpiryOwner>,
         closed: AtomicBool,
+        #[cfg(test)]
+        test_outbound: Mutex<Option<mpsc::Sender<HostMessage>>>,
     }
 
     #[derive(Clone)]
@@ -181,8 +191,152 @@ mod windows {
         expires_at_unix_ms: u64,
     }
 
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct ExpiryTicket {
+        session_id: String,
+        pending_id: String,
+        request_id: String,
+        binding: ProcessBinding,
+        expires_at_unix_ms: u64,
+    }
+
+    impl ExpiryTicket {
+        fn for_pending(session_id: &str, pending: &PendingAction) -> Self {
+            Self {
+                session_id: session_id.to_string(),
+                pending_id: pending.pending_id.clone(),
+                request_id: pending.request_id.clone(),
+                binding: pending.binding.clone(),
+                expires_at_unix_ms: pending.expires_at_unix_ms,
+            }
+        }
+    }
+
+    struct ExpiryState {
+        ticket: Option<ExpiryTicket>,
+        stopped: bool,
+    }
+
+    struct ExpiryOwner {
+        control: Arc<(Mutex<ExpiryState>, Condvar)>,
+        worker: Mutex<Option<JoinHandle<()>>>,
+    }
+
+    impl ExpiryOwner {
+        fn new() -> Self {
+            Self {
+                control: Arc::new((
+                    Mutex::new(ExpiryState {
+                        ticket: None,
+                        stopped: false,
+                    }),
+                    Condvar::new(),
+                )),
+                worker: Mutex::new(None),
+            }
+        }
+
+        fn start(&self, session: Weak<HostSessionState>) -> Result<(), String> {
+            let control = Arc::clone(&self.control);
+            let worker = thread::Builder::new()
+                .name("vita-sidecar-confirmation-expiry".to_string())
+                .spawn(move || expiry_loop(control, session))
+                .map_err(|_| "Vita confirmation expiry worker could not start".to_string())?;
+            let mut slot = self
+                .worker
+                .lock()
+                .map_err(|_| "Vita expiry worker lock was poisoned".to_string())?;
+            if slot.is_some() {
+                return Err("Vita confirmation expiry worker was already started".to_string());
+            }
+            *slot = Some(worker);
+            Ok(())
+        }
+
+        fn schedule(&self, ticket: ExpiryTicket) {
+            let (state, wake) = &*self.control;
+            if let Ok(mut state) = state.lock() {
+                if !state.stopped {
+                    state.ticket = Some(ticket);
+                    wake.notify_one();
+                }
+            }
+        }
+
+        fn clear(&self, ticket: &ExpiryTicket) {
+            let (state, wake) = &*self.control;
+            if let Ok(mut state) = state.lock() {
+                if state.ticket.as_ref() == Some(ticket) {
+                    state.ticket = None;
+                    wake.notify_one();
+                }
+            }
+        }
+
+        fn stop(&self) {
+            let worker = {
+                let (state, wake) = &*self.control;
+                if let Ok(mut state) = state.lock() {
+                    state.stopped = true;
+                    state.ticket = None;
+                    wake.notify_all();
+                }
+                self.worker.lock().ok().and_then(|mut slot| slot.take())
+            };
+            if let Some(worker) = worker {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    impl Drop for ExpiryOwner {
+        fn drop(&mut self) {
+            self.stop();
+        }
+    }
+
+    #[derive(Default)]
+    struct RequestReplayWindow {
+        order: VecDeque<String>,
+        seen: HashSet<String>,
+    }
+
+    impl RequestReplayWindow {
+        fn accept(&mut self, request_id: &str) -> bool {
+            if self.seen.contains(request_id) {
+                return false;
+            }
+            self.seen.insert(request_id.to_string());
+            self.order.push_back(request_id.to_string());
+            while self.order.len() > REQUEST_REPLAY_WINDOW {
+                if let Some(retired) = self.order.pop_front() {
+                    self.seen.remove(&retired);
+                }
+            }
+            true
+        }
+
+        fn clear(&mut self) {
+            self.order.clear();
+            self.seen.clear();
+        }
+
+        #[cfg(test)]
+        fn len(&self) -> usize {
+            self.order.len()
+        }
+    }
+
     impl HostSessionState {
         fn send(&self, message: &HostMessage) -> Result<(), String> {
+            #[cfg(test)]
+            if let Ok(hook) = self.test_outbound.lock() {
+                if let Some(sender) = hook.as_ref() {
+                    return sender
+                        .send(message.clone())
+                        .map_err(|_| "Vita test outbound channel was closed".to_string());
+                }
+            }
             let mut guard = self
                 .writer
                 .lock()
@@ -210,10 +364,116 @@ mod windows {
                 expires_at_unix_ms: pending.expires_at_unix_ms,
             })
         }
+
+        fn accept_request_id(&self, request_id: &str) -> bool {
+            self.replay
+                .lock()
+                .map(|mut replay| replay.accept(request_id))
+                .unwrap_or(false)
+        }
+
+        fn retire(&self) {
+            self.closed.store(true, Ordering::Release);
+            let pending = if let Ok(mut pending) = self.pending.lock() {
+                pending.drain().map(|(_, value)| value).collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            for pending in pending {
+                let _ = self.send(&HostMessage::ConfirmationReply(ConfirmationReply {
+                    request_id: pending.request_id,
+                    session_id: self.session_id.clone(),
+                    decision: ConfirmationDecision::Deny,
+                    authorization_revision: None,
+                }));
+            }
+            if let Ok(mut approvals) = self.approvals.lock() {
+                approvals.clear();
+            }
+            if let Ok(mut grants) = self.grants.lock() {
+                grants.clear();
+            }
+            if let Ok(mut replay) = self.replay.lock() {
+                replay.clear();
+            }
+            self.expiry.stop();
+        }
     }
 
     fn pending_key(pending: &PendingAction) -> String {
         pending.pending_id.clone()
+    }
+
+    fn expiry_loop(control: Arc<(Mutex<ExpiryState>, Condvar)>, session: Weak<HostSessionState>) {
+        loop {
+            let ticket = {
+                let (state_lock, wake) = &*control;
+                let mut state = match state_lock.lock() {
+                    Ok(state) => state,
+                    Err(_) => return,
+                };
+                loop {
+                    if state.stopped {
+                        return;
+                    }
+                    let Some(ticket) = state.ticket.clone() else {
+                        state = match wake.wait(state) {
+                            Ok(state) => state,
+                            Err(_) => return,
+                        };
+                        continue;
+                    };
+                    let now = unix_millis();
+                    if ticket.expires_at_unix_ms > now {
+                        let wait_for =
+                            Duration::from_millis(ticket.expires_at_unix_ms.saturating_sub(now));
+                        state = match wake.wait_timeout(state, wait_for) {
+                            Ok((state, _)) => state,
+                            Err(_) => return,
+                        };
+                        continue;
+                    }
+                    // Retire this ticket before dropping the control lock.  A
+                    // newer pending action can install a new ticket while the
+                    // exact old ticket is being retired.
+                    state.ticket = None;
+                    break ticket;
+                }
+            };
+            let Some(session) = session.upgrade() else {
+                return;
+            };
+            session.expire_pending_ticket(&ticket);
+        }
+    }
+
+    impl HostSessionState {
+        fn expire_pending_ticket(&self, ticket: &ExpiryTicket) {
+            if self.closed.load(Ordering::Acquire) || ticket.session_id != self.session_id {
+                return;
+            }
+            let expired = if let Ok(mut pending) = self.pending.lock() {
+                let key = pending.iter().find_map(|(key, value)| {
+                    (value.pending_id == ticket.pending_id
+                        && value.request_id == ticket.request_id
+                        && value.binding == ticket.binding
+                        && value.expires_at_unix_ms == ticket.expires_at_unix_ms
+                        && value.expires_at_unix_ms <= unix_millis())
+                    .then_some(key.clone())
+                });
+                key.and_then(|key| pending.remove(&key))
+            } else {
+                None
+            };
+            if let Some(pending) = expired {
+                let _ = self.send(&HostMessage::ConfirmationReply(ConfirmationReply {
+                    request_id: pending.request_id,
+                    session_id: self.session_id.clone(),
+                    decision: ConfirmationDecision::Deny,
+                    authorization_revision: None,
+                }));
+            }
+        }
     }
 
     impl VitaSidecarCoordinator {
@@ -379,11 +639,16 @@ mod windows {
                 pending: Mutex::new(HashMap::new()),
                 approvals: Mutex::new(HashMap::new()),
                 grants: Mutex::new(HashMap::new()),
+                replay: Mutex::new(RequestReplayWindow::default()),
+                expiry: Arc::new(ExpiryOwner::new()),
                 closed: AtomicBool::new(false),
+                #[cfg(test)]
+                test_outbound: Mutex::new(None),
             });
             let reader_session = Arc::clone(&session);
             let storage = Arc::clone(&self.authority_storage);
             let registry = self.registry.clone();
+            session.expiry.start(Arc::downgrade(&session))?;
             let reader_handle = thread::Builder::new()
                 .name("vita-sidecar-host-reader".to_string())
                 .spawn(move || reader_loop(reader, reader_session, storage, registry))
@@ -413,7 +678,6 @@ mod windows {
                     pending: None,
                 });
             };
-            expire_pending(&running.session);
             Ok(VitaSidecarStatusResponse {
                 running: !running.session.closed.load(Ordering::Acquire),
                 session_id: Some(running.session.session_id.clone()),
@@ -443,18 +707,17 @@ mod windows {
                 .as_ref()
                 .ok_or_else(|| "Vita sidecar is not running".to_string())?;
             expire_pending(&running.session);
-            let pending = {
-                let pending_guard = running
-                    .session
-                    .pending
-                    .lock()
-                    .map_err(|_| "Vita pending state lock was poisoned".to_string())?;
-                pending_guard
-                    .values()
-                    .find(|pending| pending_key(pending) == pending_id)
-                    .cloned()
+            let pending = take_pending(&running.session, &pending_id)
+                .ok_or_else(|| "Vita pending confirmation was not found".to_string())?;
+            if pending.expires_at_unix_ms <= unix_millis() {
+                let _ = send_confirmation_decision(
+                    &running.session,
+                    &pending,
+                    ConfirmationDecision::Deny,
+                    None,
+                );
+                return Err("Vita pending confirmation expired".to_string());
             }
-            .ok_or_else(|| "Vita pending confirmation was not found".to_string())?;
 
             let mut revision = None;
             if decision == ConfirmationDecision::Confirm {
@@ -474,7 +737,6 @@ mod windows {
                                 authorization_revision: None,
                             },
                         ));
-                        remove_pending(&running.session, &pending.request_id);
                         return Err(error);
                     }
                 };
@@ -494,15 +756,16 @@ mod windows {
                         },
                     );
             }
-            running
-                .session
-                .send(&HostMessage::ConfirmationReply(ConfirmationReply {
-                    request_id: pending.request_id.clone(),
-                    session_id: running.session.session_id.clone(),
-                    decision,
-                    authorization_revision: revision,
-                }))?;
-            remove_pending(&running.session, &pending.request_id);
+            if let Err(error) =
+                send_confirmation_decision(&running.session, &pending, decision, revision)
+            {
+                if decision == ConfirmationDecision::Confirm {
+                    if let Ok(mut approvals) = running.session.approvals.lock() {
+                        approvals.remove(&binding_key(&pending.binding));
+                    }
+                }
+                return Err(error);
+            }
             Ok(VitaSidecarActionResponse { accepted: true })
         }
 
@@ -516,24 +779,13 @@ mod windows {
                 .as_ref()
                 .ok_or_else(|| "Vita sidecar is not running".to_string())?;
             expire_pending(&running.session);
-            if let Some(pending) = running
-                .session
-                .pending
-                .lock()
-                .map_err(|_| "Vita pending state lock was poisoned")?
-                .values()
-                .next()
-                .cloned()
-            {
-                let _ = running
-                    .session
-                    .send(&HostMessage::ConfirmationReply(ConfirmationReply {
-                        request_id: pending.request_id.clone(),
-                        session_id: running.session.session_id.clone(),
-                        decision: ConfirmationDecision::Cancel,
-                        authorization_revision: None,
-                    }));
-                remove_pending(&running.session, &pending.request_id);
+            if let Some(pending) = take_any_pending(&running.session) {
+                let decision = if pending.expires_at_unix_ms <= unix_millis() {
+                    ConfirmationDecision::Deny
+                } else {
+                    ConfirmationDecision::Cancel
+                };
+                let _ = send_confirmation_decision(&running.session, &pending, decision, None);
             }
             running
                 .session
@@ -574,8 +826,6 @@ mod windows {
         storage: Arc<StorageService>,
         registry: CapabilityRegistry,
     ) {
-        const MAX_SEEN_REQUEST_IDS: usize = 128;
-        let mut seen_request_ids = HashSet::new();
         loop {
             let body = match protocol::read_frame(&mut reader) {
                 Ok(Some(body)) => body,
@@ -588,8 +838,7 @@ mod windows {
             let request_id = vita_request_id(&message);
             if request_id.is_empty()
                 || request_id.len() > protocol::MAX_ID_BYTES
-                || !seen_request_ids.insert(request_id.to_string())
-                || seen_request_ids.len() > MAX_SEEN_REQUEST_IDS
+                || !session.accept_request_id(request_id)
             {
                 break;
             }
@@ -625,7 +874,7 @@ mod windows {
                 break;
             }
         }
-        session.closed.store(true, Ordering::Release);
+        session.retire();
         session.close_writer();
     }
 
@@ -656,6 +905,9 @@ mod windows {
         session: &Arc<HostSessionState>,
         request: ConfirmationRequired,
     ) -> Result<(), String> {
+        if session.closed.load(Ordering::Acquire) {
+            return Err("Vita sidecar session was already retired".to_string());
+        }
         if request.session_id != session.session_id
             || request.life_id != session.life_id
             || request.task_id != session.task_id
@@ -677,6 +929,20 @@ mod windows {
             }))?;
             return Ok(());
         };
+        // The active timer is authoritative; this opportunistic pass only
+        // closes a just-expired slot before applying MAX_PENDING.
+        expire_pending(session);
+        let pending_id = format!("pending:{}", secure_id("vita")?);
+        let pending_action = PendingAction {
+            pending_id: pending_id.clone(),
+            request_id: request.request_id,
+            life_id: request.life_id,
+            task_id: request.task_id,
+            capability_id: request.capability_id,
+            workspace_summary: request.workspace_summary,
+            expires_at_unix_ms,
+            binding: request.binding,
+        };
         let mut pending = session
             .pending
             .lock()
@@ -684,20 +950,10 @@ mod windows {
         if pending.len() >= MAX_PENDING {
             return Err("Vita pending confirmation capacity was exhausted".to_string());
         }
-        let pending_id = format!("pending:{}", secure_id("vita")?);
-        pending.insert(
-            pending_id.clone(),
-            PendingAction {
-                pending_id,
-                request_id: request.request_id,
-                life_id: request.life_id,
-                task_id: request.task_id,
-                capability_id: request.capability_id,
-                workspace_summary: request.workspace_summary,
-                expires_at_unix_ms,
-                binding: request.binding,
-            },
-        );
+        let ticket = ExpiryTicket::for_pending(&session.session_id, &pending_action);
+        pending.insert(pending_id, pending_action);
+        drop(pending);
+        session.expiry.schedule(ticket);
         Ok(())
     }
 
@@ -717,6 +973,15 @@ mod windows {
             if revision != request.authorization_revision {
                 return Err("stale authorization revision".to_string());
             }
+            let mut grants = session
+                .grants
+                .lock()
+                .map_err(|_| "Vita grant state lock was poisoned".to_string())?;
+            reap_expired_grants(&mut grants);
+            if grants.len() >= MAX_GRANTS {
+                return Err("Vita grant capacity was exhausted".to_string());
+            }
+            drop(grants);
             let mut approvals = session
                 .approvals
                 .lock()
@@ -788,20 +1053,7 @@ mod windows {
                 .grants
                 .lock()
                 .map_err(|_| "Vita grant state lock was poisoned".to_string())?;
-            let stored = grants
-                .get_mut(&request.grant.grant_id)
-                .ok_or_else(|| "Vita grant was not found".to_string())?;
-            if stored != &request.grant
-                || stored.used
-                || !stored.single_use
-                || stored.binding != request.binding
-                || stored.authorization_revision != revision
-                || stored.expires_at_unix_ms <= unix_millis()
-            {
-                return Err("Vita grant revalidation was denied".to_string());
-            }
-            stored.used = true;
-            Ok(stored.clone())
+            consume_active_grant(&mut grants, &request.grant, &request.binding, revision)
         });
         match result {
             Ok(grant) => session.send(&HostMessage::GrantRevalidated(GrantRevalidated {
@@ -871,10 +1123,46 @@ mod windows {
         Ok(())
     }
 
-    fn remove_pending(session: &HostSessionState, request_id: &str) {
-        if let Ok(mut pending) = session.pending.lock() {
-            pending.retain(|_, value| value.request_id != request_id);
+    fn take_pending(session: &HostSessionState, pending_id: &str) -> Option<PendingAction> {
+        let removed = session.pending.lock().ok().and_then(|mut pending| {
+            pending
+                .iter()
+                .find_map(|(key, value)| (pending_key(value) == pending_id).then_some(key.clone()))
+                .and_then(|key| pending.remove(&key))
+        });
+        if let Some(ref pending) = removed {
+            session
+                .expiry
+                .clear(&ExpiryTicket::for_pending(&session.session_id, pending));
         }
+        removed
+    }
+
+    fn take_any_pending(session: &HostSessionState) -> Option<PendingAction> {
+        let removed = session.pending.lock().ok().and_then(|mut pending| {
+            let key = pending.keys().next().cloned()?;
+            pending.remove(&key)
+        });
+        if let Some(ref pending) = removed {
+            session
+                .expiry
+                .clear(&ExpiryTicket::for_pending(&session.session_id, pending));
+        }
+        removed
+    }
+
+    fn send_confirmation_decision(
+        session: &HostSessionState,
+        pending: &PendingAction,
+        decision: ConfirmationDecision,
+        authorization_revision: Option<i64>,
+    ) -> Result<(), String> {
+        session.send(&HostMessage::ConfirmationReply(ConfirmationReply {
+            request_id: pending.request_id.clone(),
+            session_id: session.session_id.clone(),
+            decision,
+            authorization_revision,
+        }))
     }
 
     fn expire_pending(session: &HostSessionState) {
@@ -894,13 +1182,42 @@ mod windows {
             Vec::new()
         };
         for pending in expired {
-            let _ = session.send(&HostMessage::ConfirmationReply(ConfirmationReply {
-                request_id: pending.request_id,
-                session_id: session.session_id.clone(),
-                decision: ConfirmationDecision::Deny,
-                authorization_revision: None,
-            }));
+            session
+                .expiry
+                .clear(&ExpiryTicket::for_pending(&session.session_id, &pending));
+            let _ = send_confirmation_decision(session, &pending, ConfirmationDecision::Deny, None);
         }
+    }
+
+    fn reap_expired_grants(grants: &mut HashMap<String, ProcessGrant>) {
+        let now = unix_millis();
+        grants.retain(|_, grant| !grant.used && grant.expires_at_unix_ms > now);
+    }
+
+    fn consume_active_grant(
+        grants: &mut HashMap<String, ProcessGrant>,
+        requested: &ProcessGrant,
+        binding: &ProcessBinding,
+        authorization_revision: i64,
+    ) -> Result<ProcessGrant, String> {
+        let stored = grants
+            .get(&requested.grant_id)
+            .cloned()
+            .ok_or_else(|| "Vita grant was not found".to_string())?;
+        if stored != *requested
+            || stored.used
+            || !stored.single_use
+            || stored.binding != *binding
+            || stored.authorization_revision != authorization_revision
+            || stored.expires_at_unix_ms <= unix_millis()
+        {
+            return Err("Vita grant revalidation was denied".to_string());
+        }
+        let mut consumed = grants
+            .remove(&requested.grant_id)
+            .ok_or_else(|| "Vita grant was not found".to_string())?;
+        consumed.used = true;
+        Ok(consumed)
     }
 
     fn effective_confirmation_expiry(now: u64, vita_expiry: u64) -> Option<u64> {
@@ -1173,6 +1490,74 @@ mod windows {
     mod tests {
         use super::*;
 
+        fn test_binding(session_id: &str) -> ProcessBinding {
+            ProcessBinding {
+                session_id: session_id.to_string(),
+                life_id: "life".to_string(),
+                task_id: "task".to_string(),
+                capability_id: PRODUCTION_GIT_STATUS_CAPABILITY_ID.to_string(),
+                program_id: PROGRAM_ID.to_string(),
+                executable_identity: "v1f1".to_string(),
+                executable_sha256: "0".repeat(64),
+                argv_hash: "1".repeat(64),
+                argv_count: 1,
+                working_directory_identity: "v1f2".to_string(),
+                environment_policy_hash: "2".repeat(64),
+                stdout_bound: 1,
+                stderr_bound: 1,
+                timeout_ms: 1,
+                tool_call_id: "call".to_string(),
+                turn_id: "turn".to_string(),
+                workspace_root_identity: "workspace".to_string(),
+                profile_id: PRODUCTION_GIT_STATUS_PROFILE_ID.to_string(),
+                git_metadata_fence_hash: "3".repeat(64),
+            }
+        }
+
+        fn test_session() -> (Arc<HostSessionState>, mpsc::Receiver<HostMessage>) {
+            let (sender, receiver) = mpsc::channel();
+            let session = Arc::new(HostSessionState {
+                session_id: "session-test".to_string(),
+                life_id: "life".to_string(),
+                task_id: "task".to_string(),
+                workspace_identity: "workspace".to_string(),
+                writer: Mutex::new(None),
+                pending: Mutex::new(HashMap::new()),
+                approvals: Mutex::new(HashMap::new()),
+                grants: Mutex::new(HashMap::new()),
+                replay: Mutex::new(RequestReplayWindow::default()),
+                expiry: Arc::new(ExpiryOwner::new()),
+                closed: AtomicBool::new(false),
+                test_outbound: Mutex::new(Some(sender)),
+            });
+            (session, receiver)
+        }
+
+        fn install_test_pending(
+            session: &Arc<HostSessionState>,
+            pending_id: &str,
+            request_id: &str,
+            expires_at_unix_ms: u64,
+        ) {
+            let pending = PendingAction {
+                pending_id: pending_id.to_string(),
+                request_id: request_id.to_string(),
+                life_id: session.life_id.clone(),
+                task_id: session.task_id.clone(),
+                capability_id: PRODUCTION_GIT_STATUS_CAPABILITY_ID.to_string(),
+                workspace_summary: "workspace".to_string(),
+                expires_at_unix_ms,
+                binding: test_binding(&session.session_id),
+            };
+            let ticket = ExpiryTicket::for_pending(&session.session_id, &pending);
+            session
+                .pending
+                .lock()
+                .expect("pending lock")
+                .insert(pending_id.to_string(), pending);
+            session.expiry.schedule(ticket);
+        }
+
         #[test]
         fn binding_key_is_not_a_frontend_grant_or_revision() {
             let binding = ProcessBinding {
@@ -1258,6 +1643,327 @@ mod windows {
             );
         }
 
+        #[test]
+        fn active_confirmation_expiry_denies_without_polling_and_releases_slot() {
+            let (session, receiver) = test_session();
+            session
+                .expiry
+                .start(Arc::downgrade(&session))
+                .expect("expiry worker");
+            install_test_pending(
+                &session,
+                "pending-old",
+                "request-old",
+                unix_millis().saturating_add(40),
+            );
+
+            let message = receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("automatic expiry denial");
+            assert!(matches!(
+                message,
+                HostMessage::ConfirmationReply(ConfirmationReply {
+                    request_id,
+                    decision: ConfirmationDecision::Deny,
+                    ..
+                }) if request_id == "request-old"
+            ));
+            assert!(session.pending.lock().expect("pending lock").is_empty());
+
+            install_test_pending(
+                &session,
+                "pending-new",
+                "request-new",
+                unix_millis().saturating_add(5_000),
+            );
+            assert_eq!(session.pending.lock().expect("pending lock").len(), 1);
+            session.retire();
+            assert!(session.pending.lock().expect("pending lock").is_empty());
+        }
+
+        #[test]
+        fn confirmation_race_has_exactly_one_terminal_winner() {
+            let (session, receiver) = test_session();
+            install_test_pending(
+                &session,
+                "pending-race",
+                "request-race",
+                unix_millis().saturating_add(5_000),
+            );
+            let barrier = Arc::new(std::sync::Barrier::new(3));
+            let first = {
+                let session = Arc::clone(&session);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    take_pending(&session, "pending-race")
+                })
+            };
+            let second = {
+                let session = Arc::clone(&session);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    take_pending(&session, "pending-race")
+                })
+            };
+            barrier.wait();
+            let first = first.join().expect("first race worker");
+            let second = second.join().expect("second race worker");
+            assert!(first.is_some() ^ second.is_some());
+            let winner = first.or(second).expect("one terminal winner");
+            send_confirmation_decision(&session, &winner, ConfirmationDecision::Confirm, Some(0))
+                .expect("winner reply");
+            assert!(matches!(
+                receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("one reply"),
+                HostMessage::ConfirmationReply(ConfirmationReply {
+                    decision: ConfirmationDecision::Confirm,
+                    ..
+                })
+            ));
+            assert!(receiver.recv_timeout(Duration::from_millis(50)).is_err());
+            session.retire();
+        }
+
+        #[test]
+        fn deny_and_cancel_races_also_have_one_terminal_winner() {
+            for decision in [ConfirmationDecision::Deny, ConfirmationDecision::Cancel] {
+                let (session, receiver) = test_session();
+                install_test_pending(
+                    &session,
+                    "pending-terminal-race",
+                    "request-terminal-race",
+                    unix_millis().saturating_add(5_000),
+                );
+                let barrier = Arc::new(std::sync::Barrier::new(3));
+                let first = {
+                    let session = Arc::clone(&session);
+                    let barrier = Arc::clone(&barrier);
+                    thread::spawn(move || {
+                        barrier.wait();
+                        take_pending(&session, "pending-terminal-race")
+                    })
+                };
+                let second = {
+                    let session = Arc::clone(&session);
+                    let barrier = Arc::clone(&barrier);
+                    thread::spawn(move || {
+                        barrier.wait();
+                        take_pending(&session, "pending-terminal-race")
+                    })
+                };
+                barrier.wait();
+                let winner = first
+                    .join()
+                    .expect("first terminal worker")
+                    .or(second.join().expect("second terminal worker"))
+                    .expect("one terminal winner");
+                send_confirmation_decision(&session, &winner, decision, None)
+                    .expect("terminal reply");
+                assert!(matches!(
+                    receiver
+                        .recv_timeout(Duration::from_secs(1))
+                        .expect("one terminal reply"),
+                    HostMessage::ConfirmationReply(ConfirmationReply {
+                        decision: actual,
+                        ..
+                    }) if actual == decision
+                ));
+                assert!(receiver.recv_timeout(Duration::from_millis(50)).is_err());
+                session.retire();
+            }
+        }
+
+        #[test]
+        fn late_confirmation_after_expiry_is_rejected() {
+            let (session, receiver) = test_session();
+            session
+                .expiry
+                .start(Arc::downgrade(&session))
+                .expect("expiry worker");
+            install_test_pending(
+                &session,
+                "pending-late",
+                "request-late",
+                unix_millis().saturating_add(30),
+            );
+            assert!(matches!(
+                receiver
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("expiry reply"),
+                HostMessage::ConfirmationReply(ConfirmationReply {
+                    decision: ConfirmationDecision::Deny,
+                    ..
+                })
+            ));
+            assert!(take_pending(&session, "pending-late").is_none());
+            assert!(receiver.recv_timeout(Duration::from_millis(50)).is_err());
+            session.retire();
+        }
+
+        #[test]
+        fn stopped_expiry_owner_cannot_touch_a_fresh_session() {
+            let (old_session, old_receiver) = test_session();
+            old_session
+                .expiry
+                .start(Arc::downgrade(&old_session))
+                .expect("old expiry worker");
+            install_test_pending(
+                &old_session,
+                "pending-old-session",
+                "request-old-session",
+                unix_millis().saturating_add(40),
+            );
+            old_session.retire();
+            assert!(matches!(
+                old_receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("shutdown denial"),
+                HostMessage::ConfirmationReply(ConfirmationReply {
+                    decision: ConfirmationDecision::Deny,
+                    ..
+                })
+            ));
+            assert!(old_receiver
+                .recv_timeout(Duration::from_millis(100))
+                .is_err());
+
+            let (new_session, new_receiver) = test_session();
+            new_session
+                .expiry
+                .start(Arc::downgrade(&new_session))
+                .expect("new expiry worker");
+            install_test_pending(
+                &new_session,
+                "pending-new-session",
+                "request-new-session",
+                unix_millis().saturating_add(5_000),
+            );
+            assert_eq!(new_session.pending.lock().expect("pending lock").len(), 1);
+            assert!(new_receiver
+                .recv_timeout(Duration::from_millis(100))
+                .is_err());
+            new_session.retire();
+        }
+
+        #[test]
+        fn session_retire_clears_all_authority_state_and_joins_expiry_owner() {
+            let (session, receiver) = test_session();
+            session
+                .expiry
+                .start(Arc::downgrade(&session))
+                .expect("expiry worker");
+            install_test_pending(
+                &session,
+                "pending-cleanup",
+                "request-cleanup",
+                unix_millis().saturating_add(5_000),
+            );
+            let binding = test_binding(&session.session_id);
+            session.approvals.lock().expect("approval lock").insert(
+                binding_key(&binding),
+                ApprovedAction {
+                    binding: binding.clone(),
+                    authorization_revision: 7,
+                    confirmation_id: "confirmation-cleanup".to_string(),
+                    expires_at_unix_ms: unix_millis().saturating_add(5_000),
+                },
+            );
+            session.grants.lock().expect("grant lock").insert(
+                "grant-cleanup".to_string(),
+                ProcessGrant {
+                    session_id: session.session_id.clone(),
+                    grant_id: "grant-cleanup".to_string(),
+                    confirmation_id: "confirmation-cleanup".to_string(),
+                    binding,
+                    authorization_revision: 7,
+                    issued_at_unix_ms: unix_millis(),
+                    expires_at_unix_ms: unix_millis().saturating_add(5_000),
+                    single_use: true,
+                    used: false,
+                },
+            );
+            session
+                .replay
+                .lock()
+                .expect("replay lock")
+                .accept("request-cleanup");
+
+            session.retire();
+            assert!(session.closed.load(Ordering::Acquire));
+            assert!(session.pending.lock().expect("pending lock").is_empty());
+            assert!(session.approvals.lock().expect("approval lock").is_empty());
+            assert!(session.grants.lock().expect("grant lock").is_empty());
+            assert_eq!(session.replay.lock().expect("replay lock").len(), 0);
+            assert!(session
+                .expiry
+                .worker
+                .lock()
+                .expect("expiry worker lock")
+                .is_none());
+            assert!(matches!(
+                receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("cleanup denial"),
+                HostMessage::ConfirmationReply(ConfirmationReply {
+                    decision: ConfirmationDecision::Deny,
+                    ..
+                })
+            ));
+        }
+
+        #[test]
+        fn long_session_replay_window_and_grant_ledger_stay_bounded() {
+            let mut replay = RequestReplayWindow::default();
+            for index in 0..300 {
+                assert!(replay.accept(&format!("request-{index}")));
+            }
+            assert_eq!(replay.len(), REQUEST_REPLAY_WINDOW);
+            assert!(!replay.accept("request-299"));
+            assert!(replay.accept("request-0"));
+
+            let binding = test_binding("session-ledger");
+            let mut grants = HashMap::new();
+            grants.insert(
+                "expired".to_string(),
+                ProcessGrant {
+                    session_id: "session-ledger".to_string(),
+                    grant_id: "expired".to_string(),
+                    confirmation_id: "expired-confirmation".to_string(),
+                    binding: binding.clone(),
+                    authorization_revision: 7,
+                    issued_at_unix_ms: unix_millis().saturating_sub(10_000),
+                    expires_at_unix_ms: unix_millis().saturating_sub(1),
+                    single_use: true,
+                    used: false,
+                },
+            );
+            reap_expired_grants(&mut grants);
+            assert!(grants.is_empty());
+            for index in 0..160 {
+                let grant = ProcessGrant {
+                    session_id: "session-ledger".to_string(),
+                    grant_id: format!("grant-{index}"),
+                    confirmation_id: format!("confirmation-{index}"),
+                    binding: binding.clone(),
+                    authorization_revision: 7,
+                    issued_at_unix_ms: unix_millis(),
+                    expires_at_unix_ms: unix_millis().saturating_add(60_000),
+                    single_use: true,
+                    used: false,
+                };
+                grants.insert(grant.grant_id.clone(), grant.clone());
+                assert!(grants.len() <= MAX_GRANTS);
+                let consumed = consume_active_grant(&mut grants, &grant, &binding, 7)
+                    .expect("single-use grant consumption");
+                assert!(consumed.used);
+                assert!(grants.is_empty());
+                assert!(consume_active_grant(&mut grants, &grant, &binding, 7).is_err());
+            }
+        }
+
         #[cfg(windows)]
         #[test]
         fn production_shaped_sidecar_startup_canary_uses_tagged_frames() {
@@ -1287,11 +1993,12 @@ mod windows {
                 normalize_sidecar_local_path(app_data.path()).expect("sidecar app-data path");
             let git_for_sidecar =
                 normalize_sidecar_local_path(&git_path).expect("sidecar Git path");
-            let sidecar_binding = VitaSidecarProcess::prepare_image(
-                &executable,
-                executable.parent().expect("release resource directory"),
-            )
-            .expect("prepared release sidecar image");
+            let canary_resource = tempfile::tempdir().expect("sidecar canary resource root");
+            let canary_executable = canary_resource.path().join(SIDECAR_RESOURCE_NAME);
+            fs::copy(&executable, &canary_executable).expect("copy canary sidecar image");
+            let sidecar_binding =
+                VitaSidecarProcess::prepare_image(&canary_executable, canary_resource.path())
+                    .expect("prepared release sidecar image");
             let mut process = VitaSidecarProcess::spawn_prepared(
                 sidecar_binding,
                 &[OsString::from("--serve-ipc")],

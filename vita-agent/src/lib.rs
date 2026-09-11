@@ -66,11 +66,34 @@ pub use d29h7::{
 
 #[cfg(windows)]
 pub fn run_sidecar_ipc() -> Result<(), String> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| format!("Vita sidecar runtime could not start: {error}"))?;
-    runtime.block_on(sidecar::serve_ipc())
+    run_sidecar_ipc_with_mode(false)
+}
+
+#[cfg(all(windows, feature = "d29-h9-test-helper"))]
+pub fn run_sidecar_ipc_test_canary() -> Result<(), String> {
+    run_sidecar_ipc_with_mode(true)
+}
+
+#[cfg(windows)]
+fn run_sidecar_ipc_with_mode(test_canary: bool) -> Result<(), String> {
+    // The pinned Codex turn machinery has a deliberately deep synchronous
+    // setup path.  Keep the process-isolated sidecar runtime bounded while
+    // giving that one private runtime thread an explicit stack budget instead
+    // of relying on the platform main-thread default.
+    let worker = std::thread::Builder::new()
+        .name("vita-sidecar-runtime".to_string())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| format!("Vita sidecar runtime could not start: {error}"))?;
+            runtime.block_on(sidecar::serve_ipc(test_canary))
+        })
+        .map_err(|error| format!("Vita sidecar runtime thread could not start: {error}"))?;
+    worker
+        .join()
+        .map_err(|_| "Vita sidecar runtime thread panicked".to_string())?
 }
 
 pub const VITA_AGENT_RUNTIME_ID: &str = "vita-agent";

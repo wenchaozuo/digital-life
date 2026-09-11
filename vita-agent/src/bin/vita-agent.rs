@@ -33,6 +33,15 @@ fn main() {
         }
     }
 
+    #[cfg(all(windows, feature = "d29-h9-test-helper"))]
+    if probe.as_deref() == Some(OsStr::new("--serve-ipc-test-canary")) && no_extra_arguments {
+        if let Err(error) = vita_agent::run_sidecar_ipc_test_canary() {
+            eprintln!("Vita H9 test canary sidecar terminated: {error}");
+            exit(1);
+        }
+        return;
+    }
+
     eprintln!("usage: vita-agent --probe | --serve-ipc");
     exit(2);
 }

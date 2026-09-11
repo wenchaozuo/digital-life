@@ -6,6 +6,7 @@ publish = false
 
 [features]
 d29-h7-test-helper = []
+d29-h9-test-helper = []
 
 [lib]
 name = "vita_agent"

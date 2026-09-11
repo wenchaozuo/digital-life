@@ -338,7 +338,7 @@ impl ProviderProfile {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "d29-h9-test-helper"))]
     pub(crate) fn new_for_test_localhost(
         provider_id: impl Into<String>,
         display_name: impl Into<String>,
@@ -545,7 +545,7 @@ impl ProviderEndpoint {
         Ok(Self::from_normalized(normalized, EndpointScope::Production))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "d29-h9-test-helper"))]
     fn parse_test_localhost(raw: &str) -> Result<Self, VitaAgentError> {
         let normalized = normalize_url(raw)?;
         if normalized.scheme != "http"
@@ -592,7 +592,7 @@ impl ProviderEndpoint {
         }
     }
 
-    fn is_test_localhost(&self) -> bool {
+    pub(crate) fn is_test_localhost(&self) -> bool {
         self.scope == EndpointScope::TestLocalhost
     }
 }
@@ -1776,6 +1776,8 @@ mod tests {
     use serde_json::json;
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier, Condvar, Mutex};
     use std::thread;
 
     fn profile(
@@ -2544,6 +2546,222 @@ mod tests {
         let second_result = gateway.execute_responses_request(&second).unwrap();
         assert_eq!(second_result.output_text, "final tool result");
         assert_eq!(server.join().unwrap().len(), 2);
+    }
+
+    struct CountingTransport {
+        attempts: Arc<AtomicUsize>,
+        response: Vec<u8>,
+    }
+
+    impl ProviderRequestTransport for CountingTransport {
+        fn post_json(
+            &self,
+            endpoint: &ProviderEndpoint,
+            _authorization: Option<&ResolvedCredential>,
+            _body: &[u8],
+            _timeout: Duration,
+            _retry_policy: ProviderRetryPolicy,
+        ) -> Result<Vec<u8>, VitaAgentError> {
+            if !endpoint.is_test_localhost() {
+                return Err(VitaAgentError::GatewayProtocol(
+                    "cancellation canary transport received a non-local endpoint".to_string(),
+                ));
+            }
+            self.attempts.fetch_add(1, Ordering::AcqRel);
+            Ok(self.response.clone())
+        }
+    }
+
+    struct CancellableCredentialResolver {
+        cancelled: Arc<AtomicBool>,
+        entered: Option<Arc<Barrier>>,
+        release: Option<Arc<(Mutex<bool>, Condvar)>>,
+    }
+
+    impl CredentialResolver for CancellableCredentialResolver {
+        fn resolve(
+            &self,
+            _credential_ref: &CredentialRef,
+        ) -> Result<ResolvedCredential, VitaAgentError> {
+            self.resolve_for_request(
+                _credential_ref,
+                &ProviderRequestIdentity {
+                    turn_id: "cancellation-canary-turn".to_string(),
+                    binding_hash: "cancellation-canary-binding".to_string(),
+                },
+            )
+        }
+
+        fn resolve_for_request(
+            &self,
+            _credential_ref: &CredentialRef,
+            _request: &ProviderRequestIdentity,
+        ) -> Result<ResolvedCredential, VitaAgentError> {
+            if let Some(entered) = &self.entered {
+                entered.wait();
+            }
+            if let Some(release) = &self.release {
+                let (released, wake) = &**release;
+                let mut released = released.lock().expect("credential gate lock");
+                while !*released {
+                    released = wake.wait(released).expect("credential gate wait");
+                }
+            }
+            if self.cancelled.load(Ordering::Acquire) {
+                return Err(VitaAgentError::CredentialResolution(
+                    "cancellation authority retired the provider request",
+                ));
+            }
+            Ok(ResolvedCredential::new("cancellation-canary-secret"))
+        }
+    }
+
+    fn cancellation_canary_ready() -> GatewayReadyProvider {
+        let base_url = "http://127.0.0.1:9/v1";
+        let credential = CredentialRef::new("cancellation-canary", "provider-one", base_url)
+            .expect("cancellation canary credential binding");
+        let profile = test_local_profile(
+            base_url,
+            Some(credential),
+            ProviderCapabilities {
+                streaming: true,
+                ..ProviderCapabilities::none()
+            },
+        );
+        let authority = VitaProviderAuthority::configure(profile).expect("canary authority");
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("canary gateway listener");
+        let binding = VitaGatewayBinding::for_owned_private_listener(
+            listener
+                .local_addr()
+                .expect("canary listener address")
+                .port(),
+        )
+        .expect("canary gateway binding");
+        authority
+            .prepare_gateway(binding)
+            .expect("canary gateway ready")
+    }
+
+    fn cancellation_canary_request() -> VitaResponsesRequest {
+        VitaResponsesRequest::new(
+            "mock-model",
+            vec![VitaMessage::text(
+                VitaMessageRole::User,
+                "cancellation canary",
+            )],
+            VitaResponsesRequestOptions {
+                stream: true,
+                ..VitaResponsesRequestOptions::default()
+            },
+        )
+    }
+
+    fn cancellation_canary_response() -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "id": "cancellation-canary-response",
+            "model": "mock-model",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "canary"},
+                "finish_reason": "stop"
+            }]
+        }))
+        .expect("cancellation canary response")
+    }
+
+    #[test]
+    fn provider_attempt_fence_cancellation_canaries_keep_attempts_bounded() {
+        let identity = ProviderRequestIdentity {
+            turn_id: "cancellation-canary-turn".to_string(),
+            binding_hash: "cancellation-canary-binding".to_string(),
+        };
+
+        // Cancellation before credential release means no transport attempt.
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let gateway = ProviderGateway::new(
+            cancellation_canary_ready(),
+            CancellableCredentialResolver {
+                cancelled: Arc::new(AtomicBool::new(true)),
+                entered: None,
+                release: None,
+            },
+            CountingTransport {
+                attempts: Arc::clone(&attempts),
+                response: cancellation_canary_response(),
+            },
+        );
+        assert!(gateway
+            .execute_responses_request_with_identity(
+                &cancellation_canary_request(),
+                Some(&identity)
+            )
+            .is_err());
+        assert_eq!(attempts.load(Ordering::Acquire), 0);
+
+        // Cancellation while credential resolution is blocked still prevents
+        // the first provider attempt without relying on a timing sleep.
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let gateway = ProviderGateway::new(
+            cancellation_canary_ready(),
+            CancellableCredentialResolver {
+                cancelled: Arc::clone(&cancelled),
+                entered: Some(Arc::clone(&entered)),
+                release: Some(Arc::clone(&release)),
+            },
+            CountingTransport {
+                attempts: Arc::clone(&attempts),
+                response: cancellation_canary_response(),
+            },
+        );
+        let request = cancellation_canary_request();
+        let worker_identity = identity.clone();
+        let worker = thread::spawn(move || {
+            gateway.execute_responses_request_with_identity(&request, Some(&worker_identity))
+        });
+        entered.wait();
+        cancelled.store(true, Ordering::Release);
+        {
+            let (released, wake) = &*release;
+            *released.lock().expect("credential gate lock") = true;
+            wake.notify_one();
+        }
+        assert!(worker.join().expect("blocked credential worker").is_err());
+        assert_eq!(attempts.load(Ordering::Acquire), 0);
+
+        // A first response may already be complete, but after cancellation
+        // the second request is denied before transport and cannot retry.
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let gateway = ProviderGateway::new(
+            cancellation_canary_ready(),
+            CancellableCredentialResolver {
+                cancelled: Arc::clone(&cancelled),
+                entered: None,
+                release: None,
+            },
+            CountingTransport {
+                attempts: Arc::clone(&attempts),
+                response: cancellation_canary_response(),
+            },
+        );
+        assert!(gateway
+            .execute_responses_request_with_identity(
+                &cancellation_canary_request(),
+                Some(&identity)
+            )
+            .is_ok());
+        assert_eq!(attempts.load(Ordering::Acquire), 1);
+        cancelled.store(true, Ordering::Release);
+        assert!(gateway
+            .execute_responses_request_with_identity(
+                &cancellation_canary_request(),
+                Some(&identity)
+            )
+            .is_err());
+        assert_eq!(attempts.load(Ordering::Acquire), 1);
     }
 
     struct InMemoryTestCredential {

@@ -105,6 +105,8 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
 
 pub const DATABASE_FILE_NAME: &str = "digital-life.sqlite3";
+pub(crate) const CAPABILITY_AUTHORITY_RESTART_REQUIRED: &str =
+    "CAPABILITY_AUTHORITY_RESTART_REQUIRED";
 static UNIQUE_SUFFIX_COUNTER: AtomicU64 = AtomicU64::new(0);
 const MIGRATIONS: &[(i64, &str, &str)] = &[
     (1, "001_initial", include_str!("migrations/001_initial.sql")),
@@ -197,6 +199,14 @@ impl StorageError {
         Self::new(
             capability_authorization_gate::CapabilityAuthorizationGateError::CODE,
             "The capability authorization gate is currently unavailable.",
+            true,
+        )
+    }
+
+    pub(crate) fn capability_authority_restart_required() -> Self {
+        Self::new(
+            CAPABILITY_AUTHORITY_RESTART_REQUIRED,
+            "The capability authority belongs to a previous storage generation; restart the application before using it again.",
             true,
         )
     }
@@ -462,6 +472,11 @@ pub struct StorageService {
     /// and D31 release decisions therefore have one explicit cross-process
     /// boundary without relying on an undocumented static lock.
     capability_authorization_gate: Arc<capability_authorization_gate::CapabilityAuthorizationGate>,
+    /// Shared generation fence for every primary/authority-view handle opened
+    /// before a successful storage migration.  A migration changes the
+    /// authoritative database identity; the old process must fail closed until
+    /// a fresh StorageService is initialized for the new generation.
+    capability_authority_restart_required: Arc<AtomicBool>,
     /// Process-local fence preventing a newly installed Core from becoming
     /// executable until the next application process owns the service.
     core_activation_restart_required: AtomicBool,
@@ -471,6 +486,21 @@ pub struct StorageService {
     candidate_confirmation_d4_calls: Mutex<Vec<(String, String)>>,
     #[cfg(test)]
     candidate_confirmation_recovery_reads: AtomicU64,
+}
+
+/// Capability authority access that proves the caller currently owns the
+/// process-local and database-identity-bound gate.  The actual repository
+/// operations are attached in `capability_authorization.rs`; callers cannot
+/// obtain this value without passing the shared generation fence first.
+pub(crate) struct CapabilityAuthorizationScope<'a> {
+    storage: &'a StorageService,
+    _guard: capability_authorization_gate::CapabilityAuthorizationGateGuard<'a>,
+}
+
+impl<'a> CapabilityAuthorizationScope<'a> {
+    pub(crate) fn storage(&self) -> &'a StorageService {
+        self.storage
+    }
 }
 
 impl StorageService {
@@ -507,6 +537,7 @@ impl StorageService {
             }),
             location,
             capability_authorization_gate,
+            capability_authority_restart_required: Arc::new(AtomicBool::new(false)),
             core_activation_restart_required: AtomicBool::new(false),
             #[cfg(test)]
             candidate_confirmation_panic_failpoint: Mutex::new(None),
@@ -540,6 +571,9 @@ impl StorageService {
             }),
             location: self.location.clone(),
             capability_authorization_gate: Arc::clone(&self.capability_authorization_gate),
+            capability_authority_restart_required: Arc::clone(
+                &self.capability_authority_restart_required,
+            ),
             core_activation_restart_required: AtomicBool::new(false),
             #[cfg(test)]
             candidate_confirmation_panic_failpoint: Mutex::new(None),
@@ -568,6 +602,37 @@ impl StorageService {
         self.capability_authorization_gate
             .lock()
             .map_err(|_| StorageError::capability_authorization_gate_unavailable())
+    }
+
+    /// Fail closed when this handle belongs to the storage generation that a
+    /// successful location migration retired.  This check is intentionally
+    /// separate from `get_current_life`: ordinary UI state can still explain
+    /// the restart requirement, while every capability authority crossing is
+    /// denied before it reaches SQLite.
+    pub(crate) fn ensure_capability_authority_current(&self) -> Result<(), StorageError> {
+        if self
+            .capability_authority_restart_required
+            .load(Ordering::Acquire)
+        {
+            Err(StorageError::capability_authority_restart_required())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// A capability-authority scope owns the composite gate for the complete
+    /// D30 admission sequence.  Its methods are implemented by the storage
+    /// capability repository and can only be reached while this guard is
+    /// alive, preventing an accidental nested gate acquisition.
+    pub(crate) fn capability_authorization_scope(
+        &self,
+    ) -> Result<CapabilityAuthorizationScope<'_>, StorageError> {
+        let guard = self.lock_capability_authorization_linearizer()?;
+        self.ensure_capability_authority_current()?;
+        Ok(CapabilityAuthorizationScope {
+            storage: self,
+            _guard: guard,
+        })
     }
 
     #[cfg(test)]
@@ -796,6 +861,13 @@ impl StorageService {
     }
 
     pub fn migrate_location(&self, candidate: &str) -> StorageMigrationResult {
+        let _authority_linearizer = match self.lock_capability_authorization_linearizer() {
+            Ok(guard) => guard,
+            Err(error) => return migration_failure("acquire_authority_gate", "", candidate, error),
+        };
+        if let Err(error) = self.ensure_capability_authority_current() {
+            return migration_failure("authority_restart_required", "", candidate, error);
+        }
         let mut state = match self.state() {
             Ok(state) => state,
             Err(error) => return migration_failure("acquire_lock", "", candidate, error),
@@ -956,12 +1028,14 @@ impl StorageService {
         state.connection = target_connection;
         state.active_root = target_root;
         state.database_path = final_database;
+        self.capability_authority_restart_required
+            .store(true, Ordering::Release);
 
         StorageMigrationResult {
             success: true,
             old_directory,
             new_directory,
-            restart_required: false,
+            restart_required: true,
             original_database_retained: true,
             failed_stage: None,
             error_code: None,
@@ -1037,6 +1111,14 @@ impl StorageService {
     }
 
     pub fn save_life(&self, life: LifeIdentityRecord) -> Result<(), StorageError> {
+        let _authority_linearizer = self.capability_authorization_scope()?;
+        self.save_life_under_capability_authority(life)
+    }
+
+    fn save_life_under_capability_authority(
+        &self,
+        life: LifeIdentityRecord,
+    ) -> Result<(), StorageError> {
         let mut state = self.state()?;
         let transaction = state
             .connection
@@ -2022,6 +2104,124 @@ mod tests {
             .join("default")
             .join(location::LOCATION_CONFIG_FILE_NAME)
             .exists());
+    }
+
+    #[test]
+    fn migration_fences_preopened_authority_views_until_fresh_service() {
+        use crate::capability::authorization::{
+            evaluate_capability_authorization, CapabilityAuthorizationErrorCode,
+            CapabilityAuthorizationRepository, LifeCapabilityAuthorizationCreateRequest,
+            LifeCapabilityAuthorizationUpdateRequest, RequestedCapabilityScope,
+        };
+        use crate::capability::descriptor::{CapabilityId, CapabilityRegistry};
+
+        let root = TestRoot::new("migration-authority-generation-fence");
+        let service = seeded_service(&root.0);
+        let authority_view = service.open_authority_view().unwrap();
+        let capability_id = CapabilityId::try_from("vita.process.workspace.git_status").unwrap();
+        service
+            .create_capability_authorization(LifeCapabilityAuthorizationCreateRequest {
+                life_id: "life-1".to_string(),
+                capability_id: capability_id.clone(),
+            })
+            .unwrap();
+        service
+            .update_capability_authorization(LifeCapabilityAuthorizationUpdateRequest::for_test(
+                "migration-enable",
+                "life-1",
+                capability_id.clone(),
+                true,
+                1,
+            ))
+            .unwrap();
+
+        let target = root.0.join("custom");
+        let result = service.migrate_location(target.to_str().unwrap());
+        assert!(result.success, "{result:?}");
+        assert!(result.restart_required);
+        assert_eq!(
+            service
+                .ensure_capability_authority_current()
+                .unwrap_err()
+                .code,
+            "CAPABILITY_AUTHORITY_RESTART_REQUIRED"
+        );
+
+        let stale = authority_view
+            .find_capability_authorization("life-1", &capability_id)
+            .unwrap_err();
+        assert_eq!(
+            stale.code,
+            CapabilityAuthorizationErrorCode::AuthorityRestartRequired
+        );
+        let registry = CapabilityRegistry::production().unwrap();
+        let stale_evaluation = evaluate_capability_authorization(
+            &authority_view,
+            &registry,
+            "life-1",
+            &capability_id,
+            RequestedCapabilityScope::Workspace,
+        )
+        .unwrap_err();
+        assert_eq!(
+            stale_evaluation.code,
+            crate::capability::authorization::CapabilityEvaluationErrorCode::AuthorityRestartRequired
+        );
+        let stale_life = service
+            .save_life(LifeIdentityRecord {
+                id: "life-2".to_string(),
+                name: "stale life".to_string(),
+                created_at: "2026-09-12T00:00:00.000Z".to_string(),
+                version: 1,
+                body_id: "body-2".to_string(),
+                persona_id: "persona-1".to_string(),
+                persona_version: 1,
+            })
+            .unwrap_err();
+        assert_eq!(stale_life.code, "CAPABILITY_AUTHORITY_RESTART_REQUIRED");
+        let stale_revoke = service
+            .update_capability_authorization(LifeCapabilityAuthorizationUpdateRequest::for_test(
+                "migration-disable-stale",
+                "life-1",
+                capability_id.clone(),
+                false,
+                2,
+            ))
+            .unwrap_err();
+        assert_eq!(
+            stale_revoke.code,
+            CapabilityAuthorizationErrorCode::AuthorityRestartRequired
+        );
+
+        let fresh = StorageService::initialize_with_roots(
+            root.0.join("default"),
+            Some(root.0.join("project")),
+        )
+        .unwrap();
+        assert!(fresh.ensure_capability_authority_current().is_ok());
+        #[cfg(windows)]
+        assert_ne!(
+            service.capability_authorization_gate_name_for_test(),
+            fresh.capability_authorization_gate_name_for_test()
+        );
+        assert_eq!(fresh.get_current_life().unwrap().unwrap().id, "life-1");
+        assert!(fresh
+            .find_capability_authorization("life-1", &capability_id)
+            .unwrap()
+            .is_some());
+        let fresh_revoke = fresh
+            .update_capability_authorization(LifeCapabilityAuthorizationUpdateRequest::for_test(
+                "migration-disable-fresh",
+                "life-1",
+                capability_id,
+                false,
+                2,
+            ))
+            .unwrap();
+        assert!(matches!(
+            fresh_revoke,
+            crate::capability::authorization::CapabilityAuthorizationUpdateOutcome::Applied { .. }
+        ));
     }
 
     #[test]
@@ -3584,5 +3784,9 @@ mod tests {
         assert!(!config_path.exists());
         assert!(original_database.exists());
         assert_eq!(service.get_current_life().unwrap().unwrap().id, "life-1");
+        assert!(
+            service.ensure_capability_authority_current().is_ok(),
+            "a clean migration rollback must not leave a false restart fence"
+        );
     }
 }

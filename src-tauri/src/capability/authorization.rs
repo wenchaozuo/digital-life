@@ -333,6 +333,7 @@ pub(crate) enum CapabilityAuthorizationErrorCode {
     EventConflict,
     RevisionConflict,
     InvalidTransition,
+    AuthorityRestartRequired,
     DatabaseUnavailable,
 }
 
@@ -353,6 +354,7 @@ impl CapabilityAuthorizationError {
                 CapabilityAuthorizationErrorCode::LifeNotFound
                     | CapabilityAuthorizationErrorCode::AuthorizationNotFound
                     | CapabilityAuthorizationErrorCode::RevisionConflict
+                    | CapabilityAuthorizationErrorCode::AuthorityRestartRequired
                     | CapabilityAuthorizationErrorCode::DatabaseUnavailable
             ),
         }
@@ -401,6 +403,13 @@ impl CapabilityAuthorizationError {
         Self::new(
             CapabilityAuthorizationErrorCode::InvalidTransition,
             "The capability authorization update must change the current boolean state.",
+        )
+    }
+
+    pub(crate) fn authority_restart_required() -> Self {
+        Self::new(
+            CapabilityAuthorizationErrorCode::AuthorityRestartRequired,
+            "The capability authority belongs to a previous storage generation; restart the application before using it again.",
         )
     }
 
@@ -620,6 +629,7 @@ pub(crate) enum CapabilityEvaluationErrorCode {
     InvalidArgument,
     UnknownCapability,
     AuthorizationUnavailable,
+    AuthorityRestartRequired,
     NotEligible,
 }
 
@@ -665,10 +675,20 @@ pub(crate) fn evaluate_capability_authorization(
 
     let authorization = repository
         .find_capability_authorization(life_id, capability_id)
-        .map_err(|_| {
+        .map_err(|error| {
+            let code = if error.code == CapabilityAuthorizationErrorCode::AuthorityRestartRequired
+            {
+                CapabilityEvaluationErrorCode::AuthorityRestartRequired
+            } else {
+                CapabilityEvaluationErrorCode::AuthorizationUnavailable
+            };
             CapabilityEvaluationError::new(
-                CapabilityEvaluationErrorCode::AuthorizationUnavailable,
-                "The current capability authorization could not be read.",
+                code,
+                if code == CapabilityEvaluationErrorCode::AuthorityRestartRequired {
+                    "The capability authority belongs to a previous storage generation; restart the application before using it again."
+                } else {
+                    "The current capability authorization could not be read."
+                },
             )
         })?;
 

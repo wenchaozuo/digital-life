@@ -6,7 +6,10 @@
 
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 
-use super::{StorageError, StorageService};
+use super::{
+    CapabilityAuthorizationScope, StorageError, StorageService,
+    CAPABILITY_AUTHORITY_RESTART_REQUIRED,
+};
 use crate::capability::authorization::{
     validate_authorization_state, validate_create_request, validate_event_state,
     validate_update_request, CapabilityAuthorizationCreateOutcome, CapabilityAuthorizationError,
@@ -353,14 +356,27 @@ fn update_authorization_in_transaction(
     })
 }
 
-impl CapabilityAuthorizationRepository for StorageService {
-    fn create_capability_authorization(
+fn map_storage_authority_error(error: StorageError) -> CapabilityAuthorizationError {
+    if error.code == CAPABILITY_AUTHORITY_RESTART_REQUIRED {
+        CapabilityAuthorizationError::authority_restart_required()
+    } else {
+        CapabilityAuthorizationError::database()
+    }
+}
+
+impl StorageService {
+    /// Repository primitives used only by `CapabilityAuthorizationScope`.
+    /// The scope owns the composite gate, so these functions never acquire it
+    /// recursively.
+    pub(super) fn create_capability_authorization_under_gate(
         &self,
         request: LifeCapabilityAuthorizationCreateRequest,
     ) -> Result<CapabilityAuthorizationCreateOutcome, CapabilityAuthorizationError> {
+        self.ensure_capability_authority_current()
+            .map_err(map_storage_authority_error)?;
         let mut state = self
             .state()
-            .map_err(|_| CapabilityAuthorizationError::database())?;
+            .map_err(|error| map_storage_authority_error(error))?;
         let transaction = state
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -372,15 +388,15 @@ impl CapabilityAuthorizationRepository for StorageService {
         Ok(outcome)
     }
 
-    fn find_capability_authorization(
+    pub(super) fn find_capability_authorization_under_gate(
         &self,
         life_id: &str,
         capability_id: &CapabilityId,
     ) -> Result<Option<LifeCapabilityAuthorization>, CapabilityAuthorizationError> {
+        self.ensure_capability_authority_current()
+            .map_err(map_storage_authority_error)?;
         validate_lookup_identity("life identity", life_id)?;
-        let state = self
-            .state()
-            .map_err(|_| CapabilityAuthorizationError::database())?;
+        let state = self.state().map_err(map_storage_authority_error)?;
         let authorization = load_authorization(&state.connection, life_id, capability_id)?;
         if let Some(authorization) = &authorization {
             validate_authorization_state(authorization)?;
@@ -388,20 +404,13 @@ impl CapabilityAuthorizationRepository for StorageService {
         Ok(authorization)
     }
 
-    fn update_capability_authorization(
+    pub(super) fn update_capability_authorization_under_gate(
         &self,
         request: LifeCapabilityAuthorizationUpdateRequest,
     ) -> Result<CapabilityAuthorizationUpdateOutcome, CapabilityAuthorizationError> {
-        // D30 enable/disable transitions share the explicit Host-owned
-        // linearization boundary with D31 workspace-read release.  The guard
-        // is shared by the primary StorageService and its authority view; it
-        // is held through the SQLite IMMEDIATE CAS commit.
-        let _linearizer = self
-            .lock_capability_authorization_linearizer()
-            .map_err(|_| CapabilityAuthorizationError::database())?;
-        let mut state = self
-            .state()
-            .map_err(|_| CapabilityAuthorizationError::database())?;
+        self.ensure_capability_authority_current()
+            .map_err(map_storage_authority_error)?;
+        let mut state = self.state().map_err(map_storage_authority_error)?;
         let transaction = state
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -413,16 +422,16 @@ impl CapabilityAuthorizationRepository for StorageService {
         Ok(outcome)
     }
 
-    fn find_capability_authorization_event(
+    pub(super) fn find_capability_authorization_event_under_gate(
         &self,
         life_id: &str,
         event_id: &str,
     ) -> Result<Option<LifeCapabilityAuthorizationEvent>, CapabilityAuthorizationError> {
+        self.ensure_capability_authority_current()
+            .map_err(map_storage_authority_error)?;
         validate_lookup_identity("life identity", life_id)?;
         validate_lookup_identity("authorization event identity", event_id)?;
-        let state = self
-            .state()
-            .map_err(|_| CapabilityAuthorizationError::database())?;
+        let state = self.state().map_err(map_storage_authority_error)?;
         let event = state
             .connection
             .query_row(
@@ -440,6 +449,114 @@ impl CapabilityAuthorizationRepository for StorageService {
             validate_event_state(event)?;
         }
         Ok(event)
+    }
+
+    pub(super) fn list_capability_authorization_events_under_gate(
+        &self,
+        life_id: &str,
+        capability_id: &CapabilityId,
+        limit: usize,
+    ) -> Result<Vec<LifeCapabilityAuthorizationEvent>, CapabilityAuthorizationError> {
+        self.ensure_capability_authority_current()
+            .map_err(map_storage_authority_error)?;
+        validate_lookup_identity("life identity", life_id)?;
+        let limit = limit.clamp(1, MAX_AUTHORIZATION_EVENT_PAGE) as i64;
+        let state = self.state().map_err(map_storage_authority_error)?;
+        let mut statement = state
+            .connection
+            .prepare(&format!(
+                "SELECT {EVENT_COLUMNS}
+                 FROM life_capability_authorization_event
+                 WHERE life_id = ?1 AND capability_id = ?2
+                 ORDER BY new_revision DESC
+                 LIMIT ?3"
+            ))
+            .map_err(|_| CapabilityAuthorizationError::database())?;
+        let rows = statement
+            .query_map(params![life_id, capability_id.as_str(), limit], read_event)
+            .map_err(|_| CapabilityAuthorizationError::database())?;
+        let mut events = Vec::new();
+        for row in rows {
+            let event = row.map_err(|_| CapabilityAuthorizationError::database())?;
+            validate_event_state(&event)?;
+            events.push(event);
+        }
+        Ok(events)
+    }
+}
+
+impl<'a> CapabilityAuthorizationScope<'a> {
+    pub(crate) fn create_capability_authorization(
+        &self,
+        request: LifeCapabilityAuthorizationCreateRequest,
+    ) -> Result<CapabilityAuthorizationCreateOutcome, CapabilityAuthorizationError> {
+        self.storage()
+            .create_capability_authorization_under_gate(request)
+    }
+
+    pub(crate) fn find_capability_authorization(
+        &self,
+        life_id: &str,
+        capability_id: &CapabilityId,
+    ) -> Result<Option<LifeCapabilityAuthorization>, CapabilityAuthorizationError> {
+        self.storage()
+            .find_capability_authorization_under_gate(life_id, capability_id)
+    }
+
+    pub(crate) fn update_capability_authorization(
+        &self,
+        request: LifeCapabilityAuthorizationUpdateRequest,
+    ) -> Result<CapabilityAuthorizationUpdateOutcome, CapabilityAuthorizationError> {
+        self.storage()
+            .update_capability_authorization_under_gate(request)
+    }
+
+    pub(crate) fn list_capability_authorization_events(
+        &self,
+        life_id: &str,
+        capability_id: &CapabilityId,
+        limit: usize,
+    ) -> Result<Vec<LifeCapabilityAuthorizationEvent>, CapabilityAuthorizationError> {
+        self.storage()
+            .list_capability_authorization_events_under_gate(life_id, capability_id, limit)
+    }
+}
+
+impl CapabilityAuthorizationRepository for StorageService {
+    fn create_capability_authorization(
+        &self,
+        request: LifeCapabilityAuthorizationCreateRequest,
+    ) -> Result<CapabilityAuthorizationCreateOutcome, CapabilityAuthorizationError> {
+        let scope = self
+            .capability_authorization_scope()
+            .map_err(map_storage_authority_error)?;
+        scope.create_capability_authorization(request)
+    }
+
+    fn find_capability_authorization(
+        &self,
+        life_id: &str,
+        capability_id: &CapabilityId,
+    ) -> Result<Option<LifeCapabilityAuthorization>, CapabilityAuthorizationError> {
+        self.find_capability_authorization_under_gate(life_id, capability_id)
+    }
+
+    fn update_capability_authorization(
+        &self,
+        request: LifeCapabilityAuthorizationUpdateRequest,
+    ) -> Result<CapabilityAuthorizationUpdateOutcome, CapabilityAuthorizationError> {
+        let scope = self
+            .capability_authorization_scope()
+            .map_err(map_storage_authority_error)?;
+        scope.update_capability_authorization(request)
+    }
+
+    fn find_capability_authorization_event(
+        &self,
+        life_id: &str,
+        event_id: &str,
+    ) -> Result<Option<LifeCapabilityAuthorizationEvent>, CapabilityAuthorizationError> {
+        self.find_capability_authorization_event_under_gate(life_id, event_id)
     }
 }
 
@@ -463,31 +580,7 @@ impl StorageService {
         capability_id: &CapabilityId,
         limit: usize,
     ) -> Result<Vec<LifeCapabilityAuthorizationEvent>, CapabilityAuthorizationError> {
-        validate_lookup_identity("life identity", life_id)?;
-        let limit = limit.clamp(1, MAX_AUTHORIZATION_EVENT_PAGE) as i64;
-        let state = self
-            .state()
-            .map_err(|_| CapabilityAuthorizationError::database())?;
-        let mut statement = state
-            .connection
-            .prepare(&format!(
-                "SELECT {EVENT_COLUMNS}
-                 FROM life_capability_authorization_event
-                 WHERE life_id = ?1 AND capability_id = ?2
-                 ORDER BY new_revision DESC
-                 LIMIT ?3"
-            ))
-            .map_err(|_| CapabilityAuthorizationError::database())?;
-        let rows = statement
-            .query_map(params![life_id, capability_id.as_str(), limit], read_event)
-            .map_err(|_| CapabilityAuthorizationError::database())?;
-        let mut events = Vec::new();
-        for row in rows {
-            let event = row.map_err(|_| CapabilityAuthorizationError::database())?;
-            validate_event_state(&event)?;
-            events.push(event);
-        }
-        Ok(events)
+        self.list_capability_authorization_events_under_gate(life_id, capability_id, limit)
     }
 }
 

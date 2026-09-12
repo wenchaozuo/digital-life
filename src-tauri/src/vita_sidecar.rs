@@ -16,7 +16,7 @@ use crate::secrets::{SecretIdentifier, SecretStore, WindowsCredentialSecretStore
 use crate::{
     capability::CapabilityRegistry,
     model::profile::{credential_purpose, ModelProfileRepository, ModelProviderKind, ModelPurpose},
-    storage::{StorageError, StorageService},
+    storage::{StorageError, StorageService, CAPABILITY_AUTHORITY_RESTART_REQUIRED},
 };
 
 fn capability_authorization_gate_error(error: StorageError) -> String {
@@ -165,7 +165,8 @@ mod windows {
     use super::*;
     use crate::capability::authorization::{
         evaluate_capability_authorization, CapabilityAuthorizationDecisionKind,
-        CapabilityAuthorizationRepository, RequestedCapabilityScope,
+        CapabilityAuthorizationErrorCode, CapabilityAuthorizationRepository,
+        CapabilityEvaluationErrorCode, RequestedCapabilityScope,
     };
     use crate::capability::descriptor::{
         CapabilityId, ScopeRequirement, PRODUCTION_GIT_STATUS_CAPABILITY_ID,
@@ -372,7 +373,13 @@ mod windows {
                     any_missing = true;
                     continue;
                 }
-                Err(_) => {
+                Err(error) => {
+                    if matches!(
+                        error.code,
+                        CapabilityAuthorizationErrorCode::AuthorityRestartRequired
+                    ) {
+                        return Err(CAPABILITY_AUTHORITY_RESTART_REQUIRED.to_string());
+                    }
                     any_unavailable = true;
                     continue;
                 }
@@ -391,7 +398,16 @@ mod windows {
                 {
                     any_disabled = true;
                 }
-                Ok(_) | Err(_) => any_unavailable = true,
+                Ok(_) => any_unavailable = true,
+                Err(error)
+                    if matches!(
+                        error.code,
+                        CapabilityEvaluationErrorCode::AuthorityRestartRequired
+                    ) =>
+                {
+                    return Err(CAPABILITY_AUTHORITY_RESTART_REQUIRED.to_string())
+                }
+                Err(_) => any_unavailable = true,
             }
         }
         if any_disabled {
@@ -445,7 +461,16 @@ mod windows {
             &capability_id,
             requested_scope_for(descriptor.scope_requirement()),
         )
-        .map_err(|_| "CAPABILITY_AUTHORIZATION_UNAVAILABLE".to_string())?;
+        .map_err(|error| {
+            if matches!(
+                error.code,
+                CapabilityEvaluationErrorCode::AuthorityRestartRequired
+            ) {
+                CAPABILITY_AUTHORITY_RESTART_REQUIRED.to_string()
+            } else {
+                "CAPABILITY_AUTHORIZATION_UNAVAILABLE".to_string()
+            }
+        })?;
         if decision.outcome() == CapabilityAuthorizationDecisionKind::RootDisabled {
             return Err("CAPABILITY_ROOT_DISABLED".to_string());
         }
@@ -708,6 +733,11 @@ mod windows {
         let capability_id = descriptor.capability_id();
         let state = match storage.find_capability_authorization(life_id, capability_id) {
             Ok(None) => (VitaCapabilityReadiness::AuthorizationMissing, None),
+            Err(error)
+                if matches!(
+                    error.code,
+                    crate::capability::authorization::CapabilityAuthorizationErrorCode::AuthorityRestartRequired
+                ) => (VitaCapabilityReadiness::LifeRestartRequired, None),
             Err(_) => (VitaCapabilityReadiness::AuthorizationUnavailable, None),
             Ok(Some(row)) => match evaluate_capability_authorization(
                 storage,
@@ -725,7 +755,13 @@ mod windows {
                 {
                     (VitaCapabilityReadiness::RootDisabled, Some(row.revision))
                 }
-                Ok(_) | Err(_) => (VitaCapabilityReadiness::AuthorizationUnavailable, None),
+                Ok(_) => (VitaCapabilityReadiness::AuthorizationUnavailable, None),
+                Err(error)
+                    if matches!(
+                        error.code,
+                        CapabilityEvaluationErrorCode::AuthorityRestartRequired
+                    ) => (VitaCapabilityReadiness::LifeRestartRequired, None),
+                Err(_) => (VitaCapabilityReadiness::AuthorizationUnavailable, None),
             },
         };
         VitaCapabilityState {
@@ -747,6 +783,13 @@ mod windows {
         Vec<VitaCapabilityState>,
         Option<String>,
     ) {
+        if storage.ensure_capability_authority_current().is_err() {
+            return (
+                VitaCapabilityReadiness::LifeRestartRequired,
+                Vec::new(),
+                None,
+            );
+        }
         let current = match storage.get_current_life() {
             Ok(Some(life)) => life,
             Ok(None) | Err(_) => {
@@ -771,6 +814,11 @@ mod windows {
             .map(|descriptor| capability_state(storage, registry, life_id, descriptor))
             .collect::<Vec<_>>();
         let aggregate = if states
+            .iter()
+            .any(|state| state.readiness == VitaCapabilityReadiness::LifeRestartRequired)
+        {
+            VitaCapabilityReadiness::LifeRestartRequired
+        } else if states
             .iter()
             .any(|state| state.readiness == VitaCapabilityReadiness::RootEnabled)
         {
@@ -2049,8 +2097,20 @@ mod windows {
             if session.closed.load(Ordering::Acquire) {
                 return Err("Vita sidecar is not running".to_string());
             }
-            session.ensure_turn_idle()?;
+            // StartTurn admission is one authority transaction: the shared
+            // capability gate is acquired before the fresh current-Life read,
+            // remains held through the D30 preflight and Host turn-authority
+            // begin point, and is released before provider inspection or any
+            // sidecar/network IPC.
+            let authority_linearizer = self
+                .authority_storage
+                .lock_capability_authorization_linearizer()
+                .map_err(capability_authorization_gate_error)?;
+            self.authority_storage
+                .ensure_capability_authority_current()
+                .map_err(|error| error.code.clone())?;
             require_current_session_life(&self.authority_storage, session)?;
+            session.ensure_turn_idle()?;
             // Root admission deliberately precedes provider/credential
             // inspection.  A disabled D30 root must not release credentials,
             // contact a provider, create a turn generation, or emit a
@@ -2060,11 +2120,6 @@ mod windows {
                 .provider
                 .clone()
                 .ok_or_else(|| "Vita Chat provider is not configured".to_string())?;
-            let current_provider = current_chat_provider_configuration(self)?
-                .ok_or_else(|| "Vita Chat provider is not ready".to_string())?;
-            if current_provider != provider {
-                return Err("Vita active Chat provider changed; restart the sidecar".to_string());
-            }
             // The preflight above is advisory only.  The D29 AuthorityEvaluate,
             // confirmation, grant, and final revalidation paths below still
             // perform their own fresh D28 reads; do not carry this decision or
@@ -2074,6 +2129,21 @@ mod windows {
                 protocol::ProviderBinding::derive(&session.session_id, &turn_id, &provider)
                     .map_err(|_| "Vita provider binding could not be derived".to_string())?;
             session.begin_turn(turn_id.clone(), provider.clone(), binding.clone())?;
+            drop(authority_linearizer);
+            // Provider/credential inspection is intentionally outside the
+            // authority gate.  A provider change after the Host generation is
+            // admitted retires that generation before any IPC is emitted.
+            let current_provider = match current_chat_provider_configuration(self)? {
+                Some(provider) => provider,
+                None => {
+                    let _ = session.terminalize_turn(&turn_id, protocol::TurnPhase::Failed);
+                    return Err("Vita Chat provider is not ready".to_string());
+                }
+            };
+            if current_provider != provider {
+                let _ = session.terminalize_turn(&turn_id, protocol::TurnPhase::Failed);
+                return Err("Vita active Chat provider changed; restart the sidecar".to_string());
+            }
             if let Ok(mut output) = session.assistant_text.lock() {
                 output.take();
             }
@@ -3185,7 +3255,8 @@ mod windows {
             ApprovalFloor, CapabilityDescriptor, RiskClass, ScopeRequirement,
         };
         use crate::storage::{LifeIdentityRecord, PersonaTemplateRecord};
-        use std::sync::Barrier;
+        use std::sync::{mpsc, Arc, Barrier};
+        use std::thread;
 
         fn test_binding(session_id: &str) -> ProcessBinding {
             test_binding_for(session_id, "turn", "call")
@@ -3391,6 +3462,20 @@ mod windows {
             let active_root = storage.active_root_for_test();
             StorageService::initialize_with_roots(active_root, None)
                 .expect("independent storage service")
+        }
+
+        fn switch_current_life_for_test(storage: &StorageService) {
+            storage
+                .save_life(LifeIdentityRecord {
+                    id: "d31-life-b".to_string(),
+                    name: "D31 second life".to_string(),
+                    created_at: "2026-09-13T00:00:00.000Z".to_string(),
+                    version: 1,
+                    body_id: "d31-b-body".to_string(),
+                    persona_id: "d31-a-persona".to_string(),
+                    persona_version: 1,
+                })
+                .expect("switch current Life");
         }
 
         fn assert_independent_storage_gate_identities(
@@ -3788,6 +3873,111 @@ mod windows {
                 session.begin_cancellation().expect("cancel after release"),
                 Some("d31-release-host-turn".to_string())
             );
+            assert_eq!(
+                session
+                    .workspace_read_grants
+                    .lock()
+                    .expect("workspace read grant lock")
+                    .get(&request.grant.grant_id)
+                    .map(|state| state.phase),
+                Some(WorkspaceReadGrantPhase::Released)
+            );
+            session.retire();
+            drop(root);
+        }
+
+        #[test]
+        fn d31_life_switch_before_preread_denies_and_preserves_issued_grant() {
+            let provider = test_provider();
+            let (session, _receiver) = test_session_with_provider(provider.clone());
+            let (root, storage, registry) =
+                synthetic_multi_capability_fixture(&session, None, Some(true));
+            let (binding, issued) = workspace_read_issued_grant(
+                &session,
+                &storage,
+                &registry,
+                &provider,
+                "d31-life-switch-before-preread",
+            );
+            switch_current_life_for_test(&storage);
+            let result = revalidate_workspace_read_grant(
+                &storage,
+                &registry,
+                &session,
+                &protocol::WorkspaceReadRevalidateGrant {
+                    request_id: "d31-life-switch-before-preread-request".to_string(),
+                    session_id: session.session_id.clone(),
+                    host_turn_id: "d31-life-switch-before-preread".to_string(),
+                    binding,
+                    grant: issued.clone(),
+                },
+            );
+            assert_eq!(result.unwrap_err(), LIFE_RESTART_REQUIRED);
+            assert_eq!(
+                session
+                    .workspace_read_grants
+                    .lock()
+                    .expect("workspace read grant lock")
+                    .get(&issued.grant_id)
+                    .map(|state| (state.phase, state.grant.used)),
+                Some((WorkspaceReadGrantPhase::Issued, false))
+            );
+            session.retire();
+            drop(root);
+        }
+
+        #[test]
+        fn d31_life_switch_after_preread_denies_release_and_preserves_revalidated() {
+            let provider = test_provider();
+            let content = b"D31 life switch bytes";
+            let (session, _receiver) = test_session_with_provider(provider.clone());
+            let (root, storage, registry) =
+                synthetic_multi_capability_fixture(&session, None, Some(true));
+            let request = workspace_read_release_request(
+                &session,
+                &storage,
+                &registry,
+                &provider,
+                "d31-life-switch-before-release",
+                content,
+            );
+            switch_current_life_for_test(&storage);
+            assert_eq!(
+                authorize_workspace_read_release(&storage, &registry, &session, &request, content)
+                    .unwrap_err(),
+                LIFE_RESTART_REQUIRED
+            );
+            assert_eq!(
+                session
+                    .workspace_read_grants
+                    .lock()
+                    .expect("workspace read grant lock")
+                    .get(&request.grant.grant_id)
+                    .map(|state| (state.phase, state.grant.used)),
+                Some((WorkspaceReadGrantPhase::Revalidated, true))
+            );
+            session.retire();
+            drop(root);
+        }
+
+        #[test]
+        fn d31_release_first_then_life_switch_preserves_released_decision() {
+            let provider = test_provider();
+            let content = b"D31 released before life switch";
+            let (session, _receiver) = test_session_with_provider(provider.clone());
+            let (root, storage, registry) =
+                synthetic_multi_capability_fixture(&session, None, Some(true));
+            let request = workspace_read_release_request(
+                &session,
+                &storage,
+                &registry,
+                &provider,
+                "d31-release-before-life-switch",
+                content,
+            );
+            authorize_workspace_read_release(&storage, &registry, &session, &request, content)
+                .expect("release commits before Life switch");
+            switch_current_life_for_test(&storage);
             assert_eq!(
                 session
                     .workspace_read_grants
@@ -4603,6 +4793,138 @@ mod windows {
                 .expect("active turn lock")
                 .is_none());
             assert!(receiver.try_recv().is_err());
+            drop(coordinator);
+            drop(root);
+        }
+
+        #[test]
+        fn d30_start_turn_barrier_switch_first_emits_zero_frames() {
+            let provider = test_provider();
+            let (session, receiver) = test_session_with_provider(provider.clone());
+            let (root, storage, registry, _enabled_revision) = authority_fixture(&session);
+            let coordinator = Arc::new(VitaSidecarCoordinator::new(Arc::new(storage), registry));
+            *coordinator
+                .test_provider_override
+                .lock()
+                .expect("provider override lock") = Some(provider);
+            coordinator.install_test_session(Arc::clone(&session));
+
+            let start = Arc::new(Barrier::new(2));
+            let (switch_done_tx, switch_done_rx) = mpsc::channel();
+            let switch_storage = Arc::clone(&coordinator.authority_storage);
+            let switch_start = Arc::clone(&start);
+            let switch_thread = thread::spawn(move || {
+                switch_start.wait();
+                switch_storage
+                    .save_life(LifeIdentityRecord {
+                        id: "life-b".to_string(),
+                        name: "D30-C second life".to_string(),
+                        created_at: "2026-09-12T00:00:00.000Z".to_string(),
+                        version: 1,
+                        body_id: "d29h9-r3-body".to_string(),
+                        persona_id: "d29h9-r3-persona".to_string(),
+                        persona_version: 1,
+                    })
+                    .expect("switch current Life first");
+                switch_done_tx.send(()).expect("switch completion");
+            });
+            let admission_coordinator = Arc::clone(&coordinator);
+            let admission_start = Arc::clone(&start);
+            let admission_thread = thread::spawn(move || {
+                admission_start.wait();
+                switch_done_rx.recv().expect("switch-first barrier");
+                admission_coordinator.start_turn(VitaTurnStartRequest {
+                    prompt: "must bind to current Life".to_string(),
+                })
+            });
+
+            switch_thread.join().expect("switch thread");
+            assert_eq!(
+                admission_thread
+                    .join()
+                    .expect("admission thread")
+                    .unwrap_err(),
+                LIFE_RESTART_REQUIRED
+            );
+            assert!(matches!(
+                session.authority_snapshot(),
+                Some(HostTurnAuthority::Idle)
+            ));
+            assert!(receiver.try_recv().is_err());
+            drop(coordinator);
+            drop(root);
+        }
+
+        #[test]
+        fn d30_start_turn_barrier_admission_first_remains_bound_to_life_a() {
+            let provider = test_provider();
+            let (session, receiver) = test_session_with_provider(provider.clone());
+            let (root, storage, registry, _enabled_revision) = authority_fixture(&session);
+            let coordinator = Arc::new(VitaSidecarCoordinator::new(Arc::new(storage), registry));
+            *coordinator
+                .test_provider_override
+                .lock()
+                .expect("provider override lock") = Some(provider);
+            coordinator.install_test_session(Arc::clone(&session));
+
+            let start = Arc::new(Barrier::new(2));
+            let (admission_done_tx, admission_done_rx) = mpsc::channel();
+            let admission_coordinator = Arc::clone(&coordinator);
+            let admission_start = Arc::clone(&start);
+            let admission_thread = thread::spawn(move || {
+                admission_start.wait();
+                let result = admission_coordinator.start_turn(VitaTurnStartRequest {
+                    prompt: "bind Life A".to_string(),
+                });
+                admission_done_tx
+                    .send(result.is_ok())
+                    .expect("admission completion");
+                result
+            });
+            let switch_storage = Arc::clone(&coordinator.authority_storage);
+            let switch_start = Arc::clone(&start);
+            let switch_thread = thread::spawn(move || {
+                switch_start.wait();
+                assert!(
+                    admission_done_rx.recv().expect("admission-first barrier"),
+                    "Life A admission must commit first"
+                );
+                switch_storage
+                    .save_life(LifeIdentityRecord {
+                        id: "life-b".to_string(),
+                        name: "D30-C second life".to_string(),
+                        created_at: "2026-09-12T00:00:00.000Z".to_string(),
+                        version: 1,
+                        body_id: "d29h9-r3-body".to_string(),
+                        persona_id: "d29h9-r3-persona".to_string(),
+                        persona_version: 1,
+                    })
+                    .expect("switch current Life after admission");
+            });
+
+            let admitted = admission_thread
+                .join()
+                .expect("admission thread")
+                .expect("Life A admission");
+            switch_thread.join().expect("switch thread");
+            assert!(admitted.accepted);
+            assert!(matches!(
+                receiver.recv_timeout(Duration::from_secs(1)),
+                Ok(HostMessage::StartTurn(protocol::StartTurn { .. }))
+            ));
+            // The active turn remains bound to Life A; a later admission after
+            // the switch is rejected by the current-Life fence, not
+            // transplanted to Life B.
+            assert_eq!(
+                coordinator
+                    .start_turn(VitaTurnStartRequest {
+                        prompt: "must not transplant".to_string(),
+                    })
+                    .unwrap_err(),
+                LIFE_RESTART_REQUIRED
+            );
+            assert!(receiver.recv_timeout(Duration::from_millis(50)).is_err());
+            session.retire();
             drop(coordinator);
             drop(root);
         }

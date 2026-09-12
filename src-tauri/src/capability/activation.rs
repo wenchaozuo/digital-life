@@ -29,16 +29,18 @@ use tauri::{State, WebviewWindow};
 
 use super::authorization::{
     CapabilityAuthorizationCreateOutcome, CapabilityAuthorizationError,
-    CapabilityAuthorizationErrorCode, CapabilityAuthorizationRepository,
-    CapabilityAuthorizationUpdateOutcome, LifeCapabilityAuthorization,
-    LifeCapabilityAuthorizationCreateRequest, LifeCapabilityAuthorizationEvent,
-    LifeCapabilityAuthorizationUpdateRequest,
+    CapabilityAuthorizationErrorCode, CapabilityAuthorizationUpdateOutcome,
+    LifeCapabilityAuthorization, LifeCapabilityAuthorizationCreateRequest,
+    LifeCapabilityAuthorizationEvent, LifeCapabilityAuthorizationUpdateRequest,
 };
 use super::descriptor::{
     ApprovalFloor, CapabilityDescriptor, CapabilityId, CapabilityRegistry, RiskClass,
     ScopeRequirement,
 };
-use crate::storage::{LifeIdentityRecord, StorageService};
+use crate::storage::{
+    CapabilityAuthorizationScope, LifeIdentityRecord, StorageService,
+    CAPABILITY_AUTHORITY_RESTART_REQUIRED,
+};
 
 /// The only window label permitted to read or transition the user
 /// authorization root. The label is assigned by the Tauri capability
@@ -209,6 +211,13 @@ impl CapabilityActivationCommandError {
         )
     }
 
+    fn authority_restart_required() -> Self {
+        Self::new(
+            "CAPABILITY_AUTHORITY_RESTART_REQUIRED",
+            "The capability authority belongs to a previous storage generation; restart the application before managing capabilities.",
+        )
+    }
+
     /// The trusted catalog cannot be represented by the bounded Settings view.
     fn catalog_too_large() -> Self {
         Self::new(
@@ -359,20 +368,20 @@ fn validated_catalog<'a>(
 /// never overwrites an existing row. A created row that is not exactly
 /// `disabled`/`revision 1` is treated as a storage failure.
 fn ensure_disabled_rows(
-    storage: &StorageService,
+    authority: &CapabilityAuthorizationScope<'_>,
     catalog: &[&CapabilityDescriptor],
     life_id: &str,
 ) -> Result<(), CapabilityActivationCommandError> {
     for &descriptor in catalog {
         let capability_id = descriptor.capability_id().clone();
-        let existing = storage.find_capability_authorization(life_id, &capability_id);
+        let existing = authority.find_capability_authorization(life_id, &capability_id);
         match existing {
             // Existing rows are never modified by provisioning.
             Ok(Some(_)) => continue,
             Ok(None) => {}
             Err(_) => return Err(CapabilityActivationCommandError::storage_unavailable()),
         }
-        let outcome = storage
+        let outcome = authority
             .create_capability_authorization(LifeCapabilityAuthorizationCreateRequest {
                 life_id: life_id.to_string(),
                 capability_id,
@@ -409,8 +418,13 @@ fn map_update_error(error: CapabilityAuthorizationError) -> CapabilityActivation
         }
         CapabilityAuthorizationErrorCode::AuthorizationConflict
         | CapabilityAuthorizationErrorCode::EventConflict
+        | CapabilityAuthorizationErrorCode::AuthorityRestartRequired
         | CapabilityAuthorizationErrorCode::DatabaseUnavailable => {
-            CapabilityActivationCommandError::storage_unavailable()
+            if error.code == CapabilityAuthorizationErrorCode::AuthorityRestartRequired {
+                CapabilityActivationCommandError::authority_restart_required()
+            } else {
+                CapabilityActivationCommandError::storage_unavailable()
+            }
         }
     }
 }
@@ -421,30 +435,37 @@ fn build_snapshot(
     storage: &StorageService,
     registry: &CapabilityRegistry,
 ) -> Result<CapabilityAuthorizationSnapshot, CapabilityActivationCommandError> {
-    let life = current_life(storage)?;
+    let authority = storage.capability_authorization_scope().map_err(|error| {
+        if error.code == CAPABILITY_AUTHORITY_RESTART_REQUIRED {
+            CapabilityActivationCommandError::authority_restart_required()
+        } else {
+            CapabilityActivationCommandError::storage_unavailable()
+        }
+    })?;
+    let life = current_life(authority.storage())?;
     let catalog = validated_catalog(registry)?;
-    build_snapshot_for_life(storage, &catalog, &life)
+    build_snapshot_for_life(&authority, &catalog, &life)
 }
 
 fn build_snapshot_for_life(
-    storage: &StorageService,
+    authority: &CapabilityAuthorizationScope<'_>,
     catalog: &[&CapabilityDescriptor],
     life: &LifeIdentityRecord,
 ) -> Result<CapabilityAuthorizationSnapshot, CapabilityActivationCommandError> {
     let life_id = &life.id;
-    ensure_disabled_rows(storage, catalog, life_id)?;
+    ensure_disabled_rows(authority, catalog, life_id)?;
 
     let mut capabilities = Vec::new();
     for &descriptor in catalog {
         let capability_id = descriptor.capability_id().clone();
-        let row = storage
+        let row = authority
             .find_capability_authorization(life_id, &capability_id)
             .map_err(|_| CapabilityActivationCommandError::storage_unavailable())?
             .ok_or_else(CapabilityActivationCommandError::not_provisioned)?;
         if row.life_id.as_str() != life_id || row.capability_id != capability_id {
             return Err(CapabilityActivationCommandError::storage_unavailable());
         }
-        let events = storage
+        let events = authority
             .list_capability_authorization_events(
                 life_id,
                 &capability_id,
@@ -475,13 +496,20 @@ fn apply_transition(
     expected_revision: i64,
     observed_life_id: &str,
 ) -> Result<CapabilityAuthorizationUpdateResult, CapabilityActivationCommandError> {
+    let authority = storage.capability_authorization_scope().map_err(|error| {
+        if error.code == CAPABILITY_AUTHORITY_RESTART_REQUIRED {
+            CapabilityActivationCommandError::authority_restart_required()
+        } else {
+            CapabilityActivationCommandError::storage_unavailable()
+        }
+    })?;
     // The equality check is deliberately before catalog validation,
     // provisioning, event-id minting, and every D28 mutation. The observed
     // Life never selects the target; it only rejects stale Settings intent.
-    let life = current_life_for_observed_intent(storage, observed_life_id)?;
+    let life = current_life_for_observed_intent(authority.storage(), observed_life_id)?;
     let catalog = validated_catalog(registry)?;
     apply_transition_for_life(
-        storage,
+        &authority,
         registry,
         &catalog,
         &life,
@@ -515,7 +543,7 @@ pub(crate) fn apply_transition_for_test(
 }
 
 fn apply_transition_for_life(
-    storage: &StorageService,
+    authority: &CapabilityAuthorizationScope<'_>,
     registry: &CapabilityRegistry,
     catalog: &[&CapabilityDescriptor],
     life: &LifeIdentityRecord,
@@ -527,7 +555,7 @@ fn apply_transition_for_life(
     let capability_id = trusted_capability(registry, capability_id)?;
     // Provision first so a freshly installed catalog still has a durable row to
     // compare-and-swap against. This never enables anything.
-    ensure_disabled_rows(storage, catalog, life_id)?;
+    ensure_disabled_rows(authority, catalog, life_id)?;
 
     let request = LifeCapabilityAuthorizationUpdateRequest::from_host_user_authorization_root(
         mint_host_event_id()?,
@@ -538,7 +566,7 @@ fn apply_transition_for_life(
     )
     .map_err(|_| CapabilityActivationCommandError::invalid_request())?;
 
-    let (event, current, transition) = match storage.update_capability_authorization(request) {
+    let (event, current, transition) = match authority.update_capability_authorization(request) {
         Ok(CapabilityAuthorizationUpdateOutcome::Applied {
             event,
             authorization,
@@ -549,7 +577,7 @@ fn apply_transition_for_life(
         Err(error) => return Err(map_update_error(error)),
     };
 
-    let events = storage
+    let events = authority
         .list_capability_authorization_events(
             life_id,
             &capability_id,
@@ -612,10 +640,14 @@ pub(crate) fn set_capability_authorization_enabled(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{mpsc, Arc, Barrier};
+    use std::thread;
+
     use super::*;
     use crate::capability::authorization::{
         evaluate_capability_authorization, CapabilityAuthorizationDecisionCode,
-        CapabilityAuthorizationDecisionKind, RequestedCapabilityScope,
+        CapabilityAuthorizationDecisionKind, CapabilityAuthorizationRepository,
+        RequestedCapabilityScope,
     };
     use crate::storage::{LifeIdentityRecord, PersonaTemplateRecord};
 
@@ -814,6 +846,189 @@ mod tests {
         assert_eq!(enabled_b.revision, 2);
         assert!(enabled_b.enabled);
         assert_eq!(fixture.event_count_for(SECOND_LIFE_ID), 1);
+    }
+
+    #[test]
+    fn d30_transition_first_commits_before_a_later_life_switch() {
+        let fixture = Fixture::new();
+        build_snapshot(&fixture.storage, &fixture.registry).expect("Life A snapshot");
+
+        // The complete transition owns the composite gate through the SQLite
+        // CAS commit.  A later save_life therefore cannot interleave between
+        // the observed-Life read and the D28 write.
+        let transition = apply_transition(
+            &fixture.storage,
+            &fixture.registry,
+            PRODUCTION_CAPABILITY_ID,
+            true,
+            1,
+            LIFE_ID,
+        )
+        .expect("Life A transition commits first");
+        assert_eq!(transition.revision, 2);
+        fixture
+            .storage
+            .save_life(Fixture::life_record(SECOND_LIFE_ID, "D30-A life B"))
+            .expect("switch current Life after transition");
+
+        let row_a = fixture.row_for(LIFE_ID).expect("Life A row");
+        assert!(row_a.enabled);
+        assert_eq!(row_a.revision, 2);
+        assert_eq!(
+            fixture.storage.get_current_life().unwrap().unwrap().id,
+            SECOND_LIFE_ID
+        );
+        assert!(fixture.row_for(SECOND_LIFE_ID).is_none());
+    }
+
+    #[test]
+    fn d30_switch_first_denies_before_provisioning_or_transition() {
+        let fixture = Fixture::new();
+        build_snapshot(&fixture.storage, &fixture.registry).expect("Life A snapshot");
+        fixture
+            .storage
+            .save_life(Fixture::life_record(SECOND_LIFE_ID, "D30-A life B"))
+            .expect("switch current Life first");
+
+        let error = apply_transition(
+            &fixture.storage,
+            &fixture.registry,
+            PRODUCTION_CAPABILITY_ID,
+            true,
+            1,
+            LIFE_ID,
+        )
+        .expect_err("the stale Life A transition must be denied");
+        assert_eq!(error.code, "CAPABILITY_ACTIVATION_LIFE_CHANGED");
+        let row_a = fixture.row_for(LIFE_ID).expect("Life A row");
+        assert!(!row_a.enabled);
+        assert_eq!(row_a.revision, 1);
+        assert!(fixture.row_for(SECOND_LIFE_ID).is_none());
+        assert_eq!(fixture.event_count_for(LIFE_ID), 0);
+    }
+
+    #[test]
+    fn d30_barrier_switch_first_is_denied_without_mutation() {
+        let fixture = Fixture::new();
+        build_snapshot(&fixture.storage, &fixture.registry).expect("Life A snapshot");
+        let storage = Arc::new(fixture.storage);
+        let registry = Arc::new(fixture.registry);
+        let start = Arc::new(Barrier::new(2));
+        let (switch_done_tx, switch_done_rx) = mpsc::channel();
+        let switch_storage = Arc::clone(&storage);
+        let switch_start = Arc::clone(&start);
+        let switch_thread = thread::spawn(move || {
+            switch_start.wait();
+            switch_storage
+                .save_life(Fixture::life_record(SECOND_LIFE_ID, "D30-A life B"))
+                .expect("switch current Life first");
+            switch_done_tx.send(()).expect("switch completion");
+        });
+        let transition_storage = Arc::clone(&storage);
+        let transition_registry = Arc::clone(&registry);
+        let transition_start = Arc::clone(&start);
+        let transition_thread = thread::spawn(move || {
+            transition_start.wait();
+            switch_done_rx.recv().expect("switch-first barrier");
+            apply_transition(
+                &transition_storage,
+                &transition_registry,
+                PRODUCTION_CAPABILITY_ID,
+                true,
+                1,
+                LIFE_ID,
+            )
+        });
+
+        switch_thread.join().expect("switch thread");
+        let error = transition_thread
+            .join()
+            .expect("transition thread")
+            .expect_err("switch-first transition must be denied");
+        assert_eq!(error.code, "CAPABILITY_ACTIVATION_LIFE_CHANGED");
+        let row_a = storage
+            .find_capability_authorization(
+                LIFE_ID,
+                &CapabilityId::try_from(PRODUCTION_CAPABILITY_ID).unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(!row_a.enabled);
+        assert_eq!(row_a.revision, 1);
+        assert!(storage
+            .find_capability_authorization(
+                SECOND_LIFE_ID,
+                &CapabilityId::try_from(PRODUCTION_CAPABILITY_ID).unwrap(),
+            )
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn d30_barrier_transition_first_commits_before_switch() {
+        let fixture = Fixture::new();
+        build_snapshot(&fixture.storage, &fixture.registry).expect("Life A snapshot");
+        let storage = Arc::new(fixture.storage);
+        let registry = Arc::new(fixture.registry);
+        let start = Arc::new(Barrier::new(2));
+        let (transition_done_tx, transition_done_rx) = mpsc::channel();
+        let transition_storage = Arc::clone(&storage);
+        let transition_registry = Arc::clone(&registry);
+        let transition_start = Arc::clone(&start);
+        let transition_thread = thread::spawn(move || {
+            transition_start.wait();
+            let result = apply_transition(
+                &transition_storage,
+                &transition_registry,
+                PRODUCTION_CAPABILITY_ID,
+                true,
+                1,
+                LIFE_ID,
+            );
+            transition_done_tx
+                .send(result.is_ok())
+                .expect("transition completion");
+            result
+        });
+        let switch_storage = Arc::clone(&storage);
+        let switch_start = Arc::clone(&start);
+        let switch_thread = thread::spawn(move || {
+            switch_start.wait();
+            assert!(
+                transition_done_rx.recv().expect("transition-first barrier"),
+                "transition must commit before Life switch"
+            );
+            switch_storage
+                .save_life(Fixture::life_record(SECOND_LIFE_ID, "D30-A life B"))
+                .expect("switch current Life after transition");
+        });
+
+        let transition = transition_thread
+            .join()
+            .expect("transition thread")
+            .expect("transition-first commit");
+        switch_thread.join().expect("switch thread");
+        assert_eq!(transition.revision, 2);
+        let row_a = storage
+            .find_capability_authorization(
+                LIFE_ID,
+                &CapabilityId::try_from(PRODUCTION_CAPABILITY_ID).unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(row_a.enabled);
+        assert_eq!(row_a.revision, 2);
+        assert_eq!(
+            storage.get_current_life().unwrap().unwrap().id,
+            SECOND_LIFE_ID
+        );
+        assert!(storage
+            .find_capability_authorization(
+                SECOND_LIFE_ID,
+                &CapabilityId::try_from(PRODUCTION_CAPABILITY_ID).unwrap(),
+            )
+            .unwrap()
+            .is_none());
     }
 
     #[test]

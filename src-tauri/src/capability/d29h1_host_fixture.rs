@@ -169,6 +169,7 @@ fn canonical_error_name(code: CapabilityEvaluationErrorCode) -> &'static str {
         CapabilityEvaluationErrorCode::InvalidArgument => "InvalidArgument",
         CapabilityEvaluationErrorCode::UnknownCapability => "UnknownCapability",
         CapabilityEvaluationErrorCode::AuthorizationUnavailable => "AuthorizationUnavailable",
+        CapabilityEvaluationErrorCode::AuthorityRestartRequired => "AuthorityRestartRequired",
         CapabilityEvaluationErrorCode::NotEligible => "NotEligible",
     }
 }

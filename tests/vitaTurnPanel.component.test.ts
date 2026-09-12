@@ -17,6 +17,9 @@ function status(overrides: Record<string, unknown> = {}) {
   return {
     running: false,
     providerReadiness: "SIDECAR_NOT_RUNNING",
+    capabilityReadiness: "ROOT_ENABLED",
+    sessionLifeId: null,
+    currentLifeId: null,
     sessionId: null,
     pending: null,
     activeTurnId: null,
@@ -67,6 +70,54 @@ describe("VitaTurnPanel", () => {
     expect(invokeMock).not.toHaveBeenCalledWith("start_vita_sidecar", expect.anything());
     expect(wrapper.text()).toContain("Add a credential");
     expect(currentLifeMock).not.toHaveBeenCalled();
+    wrapper.unmount();
+  });
+
+  it("renders a disabled capability root and blocks Start Turn without auto-enable", async () => {
+    invokeMock.mockResolvedValue(status({ capabilityReadiness: "ROOT_DISABLED" }));
+    const wrapper = mount(VitaTurnPanel);
+    await wrapper.find("textarea").setValue("inspect status");
+    await flushPromises();
+
+    expect(wrapper.get("[data-testid='vita-capability-readiness']").text()).toContain("Disabled");
+    expect(wrapper.text()).toContain("Enable the governed Git status capability in Agent permissions.");
+    const start = wrapper.findAll("button").find(button => button.text() === "Start Vita turn");
+    expect(start?.attributes("disabled")).toBeDefined();
+    expect(wrapper.findAll("button").some(button => /Enable|Disable/.test(button.text()))).toBe(false);
+    expect(invokeMock).not.toHaveBeenCalledWith("start_vita_sidecar", expect.anything());
+    wrapper.unmount();
+  });
+
+  it("keeps provider readiness independent from an enabled capability root", async () => {
+    invokeMock.mockResolvedValue(
+      status({ capabilityReadiness: "ROOT_ENABLED", providerReadiness: "CREDENTIAL_MISSING" }),
+    );
+    const wrapper = mount(VitaTurnPanel);
+    await flushPromises();
+
+    expect(wrapper.get("[data-testid='vita-capability-readiness']").text()).toContain("Enabled");
+    expect(wrapper.text()).toContain("Add a credential to the active Chat profile before starting Vita.");
+    wrapper.unmount();
+  });
+
+  it("requires an explicit sidecar restart when the current Life changes", async () => {
+    invokeMock.mockResolvedValue(
+      status({
+        running: true,
+        providerReadiness: "READY",
+        capabilityReadiness: "LIFE_RESTART_REQUIRED",
+        sessionLifeId: "life-a",
+        currentLifeId: "life-b",
+      }),
+    );
+    const wrapper = mount(VitaTurnPanel);
+    await wrapper.find("textarea").setValue("inspect status");
+    await flushPromises();
+
+    expect(wrapper.get("[data-testid='vita-capability-readiness']").text()).toContain("Restart required");
+    expect(wrapper.text()).toContain("Current Life changed. Stop and restart Vita to bind the current Life.");
+    const start = wrapper.findAll("button").find(button => button.text() === "Start Vita turn");
+    expect(start?.attributes("disabled")).toBeDefined();
     wrapper.unmount();
   });
 });

@@ -22,6 +22,8 @@ use crate::{
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct VitaSidecarStartRequest {
+    /// The Life ID observed by the caller.  This is an optimistic stale-intent
+    /// fence only; the Host reads and owns the current Life at command entry.
     pub life_id: String,
     pub task_id: String,
     pub workspace_path: String,
@@ -59,6 +61,19 @@ pub enum VitaProviderReadiness {
     TurnActive,
 }
 
+/// Display-safe readiness for the one production governed capability exposed
+/// by the Vita panel.  This is intentionally separate from provider readiness:
+/// a healthy provider does not imply that the D30 authorization root is on.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum VitaCapabilityReadiness {
+    RootEnabled,
+    RootDisabled,
+    AuthorizationMissing,
+    AuthorizationUnavailable,
+    LifeRestartRequired,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VitaSidecarPendingSummary {
@@ -75,6 +90,9 @@ pub struct VitaSidecarPendingSummary {
 pub struct VitaSidecarStatusResponse {
     pub running: bool,
     pub provider_readiness: VitaProviderReadiness,
+    pub capability_readiness: VitaCapabilityReadiness,
+    pub session_life_id: Option<String>,
+    pub current_life_id: Option<String>,
     pub session_id: Option<String>,
     pub pending: Option<VitaSidecarPendingSummary>,
     pub active_turn_id: Option<String>,
@@ -123,7 +141,7 @@ mod windows {
     use super::*;
     use crate::capability::authorization::{
         evaluate_capability_authorization, CapabilityAuthorizationDecisionKind,
-        RequestedCapabilityScope,
+        CapabilityAuthorizationRepository, RequestedCapabilityScope,
     };
     use crate::capability::descriptor::{
         CapabilityId, PRODUCTION_GIT_STATUS_CAPABILITY_ID, PRODUCTION_GIT_STATUS_PROFILE_ID,
@@ -164,6 +182,9 @@ mod windows {
     const MAX_GRANTS: usize = 64;
     const REQUEST_REPLAY_WINDOW: usize = 128;
     const SIDECAR_RESOURCE_NAME: &str = "vita-agent.exe";
+    const RUNTIME_LIFE_CHANGED: &str = "CAPABILITY_RUNTIME_LIFE_CHANGED";
+    const LIFE_RESTART_REQUIRED: &str = "SIDECAR_LIFE_RESTART_REQUIRED";
+    const LIFE_UNAVAILABLE: &str = "CAPABILITY_RUNTIME_LIFE_UNAVAILABLE";
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
     /// The Host-side turn authority is the security decision point for
@@ -231,6 +252,137 @@ mod windows {
             credential_ref: profile.id.clone(),
             credential_destination: profile.base_url,
         }))
+    }
+
+    fn observed_current_life(
+        storage: &StorageService,
+        observed_life_id: &str,
+    ) -> Result<crate::storage::LifeIdentityRecord, String> {
+        let current = storage
+            .get_current_life()
+            .map_err(|_| LIFE_UNAVAILABLE.to_string())?
+            .ok_or_else(|| LIFE_UNAVAILABLE.to_string())?;
+        if current.id != observed_life_id {
+            return Err(RUNTIME_LIFE_CHANGED.to_string());
+        }
+        Ok(current)
+    }
+
+    fn current_life_id(storage: &StorageService) -> Result<String, String> {
+        storage
+            .get_current_life()
+            .map_err(|_| LIFE_UNAVAILABLE.to_string())?
+            .map(|life| life.id)
+            .ok_or_else(|| LIFE_UNAVAILABLE.to_string())
+    }
+
+    fn require_current_session_life(
+        storage: &StorageService,
+        session: &HostSessionState,
+    ) -> Result<(), String> {
+        let current_life_id = current_life_id(storage)?;
+        if current_life_id != session.life_id {
+            return Err(LIFE_RESTART_REQUIRED.to_string());
+        }
+        Ok(())
+    }
+
+    /// Read the exact D30 row and evaluator result immediately before a Host
+    /// turn is admitted.  This is advisory admission only: no revision,
+    /// confirmation, workspace scope, or ProcessGrant is created or cached.
+    fn preflight_capability_root(
+        storage: &StorageService,
+        registry: &CapabilityRegistry,
+        session: &HostSessionState,
+    ) -> Result<(), String> {
+        let capability_id = CapabilityId::try_from(PRODUCTION_GIT_STATUS_CAPABILITY_ID)
+            .map_err(|_| "CAPABILITY_AUTHORIZATION_UNAVAILABLE".to_string())?;
+        match storage.find_capability_authorization(&session.life_id, &capability_id) {
+            Ok(Some(_)) => {}
+            Ok(None) => return Err("CAPABILITY_AUTHORIZATION_REQUIRED".to_string()),
+            Err(_) => return Err("CAPABILITY_AUTHORIZATION_UNAVAILABLE".to_string()),
+        }
+        let decision = evaluate_capability_authorization(
+            storage,
+            registry,
+            &session.life_id,
+            &capability_id,
+            RequestedCapabilityScope::Workspace,
+        )
+        .map_err(|_| "CAPABILITY_AUTHORIZATION_UNAVAILABLE".to_string())?;
+        if decision.outcome() == CapabilityAuthorizationDecisionKind::ScopeRequired
+            && decision.authorization_revision().is_some()
+        {
+            return Ok(());
+        }
+        if decision.outcome() == CapabilityAuthorizationDecisionKind::RootDisabled {
+            return Err("CAPABILITY_ROOT_DISABLED".to_string());
+        }
+        Err("CAPABILITY_AUTHORIZATION_UNAVAILABLE".to_string())
+    }
+
+    /// Project only display-safe capability state.  The current Life is read
+    /// fresh for every status call, and a running session never borrows the
+    /// authorization row of a different current Life.
+    fn capability_readiness(
+        storage: &StorageService,
+        registry: &CapabilityRegistry,
+        session_life_id: Option<&str>,
+    ) -> (VitaCapabilityReadiness, Option<String>) {
+        let current = match storage.get_current_life() {
+            Ok(Some(life)) => life,
+            Ok(None) | Err(_) => return (VitaCapabilityReadiness::AuthorizationUnavailable, None),
+        };
+        let current_life_id = current.id.clone();
+        let life_id = session_life_id.unwrap_or(current.id.as_str());
+        if session_life_id.is_some_and(|session_life_id| session_life_id != current.id) {
+            return (
+                VitaCapabilityReadiness::LifeRestartRequired,
+                Some(current_life_id),
+            );
+        }
+        let capability_id = match CapabilityId::try_from(PRODUCTION_GIT_STATUS_CAPABILITY_ID) {
+            Ok(capability_id) => capability_id,
+            Err(_) => {
+                return (
+                    VitaCapabilityReadiness::AuthorizationUnavailable,
+                    Some(current_life_id),
+                )
+            }
+        };
+        match storage.find_capability_authorization(life_id, &capability_id) {
+            Ok(None) => (
+                VitaCapabilityReadiness::AuthorizationMissing,
+                Some(current_life_id),
+            ),
+            Err(_) => (
+                VitaCapabilityReadiness::AuthorizationUnavailable,
+                Some(current_life_id),
+            ),
+            Ok(Some(_)) => match evaluate_capability_authorization(
+                storage,
+                registry,
+                life_id,
+                &capability_id,
+                RequestedCapabilityScope::Workspace,
+            ) {
+                Ok(decision)
+                    if decision.outcome() == CapabilityAuthorizationDecisionKind::ScopeRequired
+                        && decision.authorization_revision().is_some() =>
+                {
+                    (VitaCapabilityReadiness::RootEnabled, Some(current_life_id))
+                }
+                Ok(decision)
+                    if decision.outcome() == CapabilityAuthorizationDecisionKind::RootDisabled =>
+                {
+                    (VitaCapabilityReadiness::RootDisabled, Some(current_life_id))
+                }
+                Ok(_) | Err(_) => (
+                    VitaCapabilityReadiness::AuthorizationUnavailable,
+                    Some(current_life_id),
+                ),
+            },
+        }
     }
 
     fn provider_readiness(
@@ -512,6 +664,18 @@ mod windows {
     }
 
     impl HostSessionState {
+        fn ensure_turn_idle(&self) -> Result<(), String> {
+            let authority = self
+                .turn_authority
+                .lock()
+                .map_err(|_| "Vita turn authority lock was poisoned".to_string())?;
+            if matches!(*authority, HostTurnAuthority::Idle) {
+                Ok(())
+            } else {
+                Err("Vita turn is already active or cancelling".to_string())
+            }
+        }
+
         fn begin_turn(
             &self,
             turn_id: String,
@@ -936,14 +1100,11 @@ mod windows {
         ) -> Result<VitaSidecarStartResponse, String> {
             validate_id(&request.life_id)?;
             validate_id(&request.task_id)?;
-            let life = self
-                .authority_storage
-                .get_life(&request.life_id)
-                .map_err(|error| error.message)?
-                .ok_or_else(|| "Vita life identity was not found".to_string())?;
-            if life.id != request.life_id {
-                return Err("Vita life identity binding was not exact".to_string());
-            }
+            // `request.life_id` is only the caller's observed-current-Life
+            // fence.  The Host reads the current Life once and carries this
+            // immutable record through image preparation and initialization;
+            // the caller never selects the runtime authorization target.
+            let life = observed_current_life(&self.authority_storage, &request.life_id)?;
 
             {
                 let mut guard = self
@@ -974,7 +1135,7 @@ mod windows {
                 guard.starting = true;
             }
 
-            let result = self.start_inner(app, request);
+            let result = self.start_inner(app, request, life);
             let mut guard = self
                 .inner
                 .lock()
@@ -992,6 +1153,7 @@ mod windows {
             &self,
             app: &AppHandle,
             request: VitaSidecarStartRequest,
+            life: crate::storage::LifeIdentityRecord,
         ) -> Result<(RunningSidecar, VitaSidecarStartResponse), String> {
             let secrets = app.state::<WindowsCredentialSecretStore>().inner().clone();
             let provider = active_chat_provider_configuration(&self.authority_storage, &secrets)?;
@@ -1069,7 +1231,7 @@ mod windows {
                 request_id: next_id("host-initialize"),
                 protocol_version: PROTOCOL_VERSION.to_string(),
                 session_id: session_id.clone(),
-                life_id: request.life_id.clone(),
+                life_id: life.id.clone(),
                 task_id: request.task_id.clone(),
                 app_data_root: sidecar_app_data_root.to_string_lossy().into_owned(),
                 workspace_path: sidecar_workspace.to_string_lossy().into_owned(),
@@ -1084,10 +1246,10 @@ mod windows {
                 VitaMessage::Ready(ready) => ready,
                 _ => return Err("Vita sidecar post-initialize frame was not Ready".to_string()),
             };
-            validate_ready(&ready, &session_id, &request)?;
+            validate_ready(&ready, &session_id, &request, &life.id)?;
             let session = Arc::new(HostSessionState {
                 session_id: session_id.clone(),
-                life_id: request.life_id.clone(),
+                life_id: life.id.clone(),
                 task_id: request.task_id.clone(),
                 workspace_identity: ready.workspace_identity,
                 provider,
@@ -1133,6 +1295,8 @@ mod windows {
                 .lock()
                 .map_err(|_| "Vita sidecar coordinator lock was poisoned".to_string())?;
             let Some(running) = guard.running.as_ref() else {
+                let (capability_readiness, current_life_id) =
+                    capability_readiness(&self.authority_storage, &self.registry, None);
                 return Ok(VitaSidecarStatusResponse {
                     running: false,
                     provider_readiness: provider_readiness(
@@ -1142,6 +1306,9 @@ mod windows {
                         false,
                         None,
                     )?,
+                    capability_readiness,
+                    session_life_id: None,
+                    current_life_id,
                     session_id: None,
                     pending: None,
                     active_turn_id: None,
@@ -1156,15 +1323,24 @@ mod windows {
                 .lock()
                 .ok()
                 .is_some_and(|turn| turn.is_some());
+            let (capability_readiness, current_life_id) = capability_readiness(
+                &self.authority_storage,
+                &self.registry,
+                Some(&running.session.life_id),
+            );
+            let running_now = !running.session.closed.load(Ordering::Acquire);
             Ok(VitaSidecarStatusResponse {
-                running: !running.session.closed.load(Ordering::Acquire),
+                running: running_now,
                 provider_readiness: provider_readiness(
                     &self.authority_storage,
                     &self.credential_store,
-                    !running.session.closed.load(Ordering::Acquire),
+                    running_now,
                     active_turn,
                     running.session.provider.as_ref(),
                 )?,
+                capability_readiness,
+                session_life_id: Some(running.session.life_id.clone()),
+                current_life_id,
                 session_id: Some(running.session.session_id.clone()),
                 pending: running.session.pending_summary(),
                 active_turn_id: running
@@ -1356,6 +1532,16 @@ mod windows {
                 .running
                 .as_ref()
                 .ok_or_else(|| "Vita sidecar is not running".to_string())?;
+            if running.session.closed.load(Ordering::Acquire) {
+                return Err("Vita sidecar is not running".to_string());
+            }
+            running.session.ensure_turn_idle()?;
+            require_current_session_life(&self.authority_storage, &running.session)?;
+            // Root admission deliberately precedes provider/credential
+            // inspection.  A disabled D30 root must not release credentials,
+            // contact a provider, create a turn generation, or emit a
+            // HostMessage::StartTurn frame.
+            preflight_capability_root(&self.authority_storage, &self.registry, &running.session)?;
             let provider = running
                 .session
                 .provider
@@ -1369,6 +1555,10 @@ mod windows {
             if current_provider != provider {
                 return Err("Vita active Chat provider changed; restart the sidecar".to_string());
             }
+            // The preflight above is advisory only.  The D29 AuthorityEvaluate,
+            // confirmation, grant, and final revalidation paths below still
+            // perform their own fresh D28 reads; do not carry this decision or
+            // its revision into executable authority.
             let turn_id = secure_id("vita-turn")?;
             let binding =
                 protocol::ProviderBinding::derive(&running.session.session_id, &turn_id, &provider)
@@ -2201,9 +2391,10 @@ mod windows {
         ready: &protocol::Ready,
         session_id: &str,
         request: &VitaSidecarStartRequest,
+        host_life_id: &str,
     ) -> Result<(), String> {
         if ready.session_id != session_id
-            || ready.life_id != request.life_id
+            || ready.life_id != host_life_id
             || ready.task_id != request.task_id
             || ready.capability_id != PRODUCTION_GIT_STATUS_CAPABILITY_ID
             || ready.profile_id != PRODUCTION_GIT_STATUS_PROFILE_ID
@@ -2348,7 +2539,9 @@ mod windows {
     }
 
     fn error_code(error: &str) -> String {
-        if error.contains("revision") {
+        if error.starts_with("CAPABILITY_") {
+            error.to_string()
+        } else if error.contains("revision") {
             "STALE_AUTHORIZATION_REVISION".to_string()
         } else if error.contains("binding") {
             "BINDING_MISMATCH".to_string()
@@ -2444,10 +2637,10 @@ mod windows {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::capability::activation::apply_transition_for_test;
         use crate::capability::authorization::{
             CapabilityAuthorizationCreateOutcome, CapabilityAuthorizationRepository,
-            CapabilityAuthorizationUpdateOutcome, LifeCapabilityAuthorizationCreateRequest,
-            LifeCapabilityAuthorizationUpdateRequest,
+            LifeCapabilityAuthorizationCreateRequest,
         };
         use crate::storage::{LifeIdentityRecord, PersonaTemplateRecord};
 
@@ -2541,22 +2734,19 @@ mod windows {
                     .expect("authority fixture authorization root"),
                 CapabilityAuthorizationCreateOutcome::Applied(_)
             ));
-            assert!(matches!(
-                storage
-                    .update_capability_authorization(
-                        LifeCapabilityAuthorizationUpdateRequest::for_test(
-                            "d29h9-r3-enable",
-                            &session.life_id,
-                            capability_id,
-                            true,
-                            1,
-                        )
-                    )
-                    .expect("authority fixture authorization enable"),
-                CapabilityAuthorizationUpdateOutcome::Applied { .. }
-            ));
             let registry = CapabilityRegistry::production().expect("production registry");
-            (root, storage, registry, 2)
+            let transition = apply_transition_for_test(
+                &storage,
+                &registry,
+                PRODUCTION_GIT_STATUS_CAPABILITY_ID,
+                true,
+                1,
+                &session.life_id,
+            )
+            .expect("authority fixture authorization enable");
+            assert_eq!(transition.previous_revision, 1);
+            assert_eq!(transition.revision, 2);
+            (root, storage, registry, transition.revision)
         }
 
         #[test]
@@ -2586,11 +2776,260 @@ mod windows {
             ));
         }
 
+        #[test]
+        fn sidecar_start_uses_host_current_life_fence_before_process_work() {
+            let (session, receiver) = test_session();
+            let (_root, storage, _registry, _revision) = authority_fixture(&session);
+            storage
+                .save_life(LifeIdentityRecord {
+                    id: "life-b".to_string(),
+                    name: "D30-B second life".to_string(),
+                    created_at: "2026-09-12T00:00:00.000Z".to_string(),
+                    version: 1,
+                    body_id: "d29h9-r3-body".to_string(),
+                    persona_id: "d29h9-r3-persona".to_string(),
+                    persona_version: 1,
+                })
+                .expect("switch current Life");
+
+            assert_eq!(
+                observed_current_life(&storage, &session.life_id).unwrap_err(),
+                RUNTIME_LIFE_CHANGED
+            );
+            // The fence is checked before start_inner, so no Host session,
+            // workspace authority, or native process can exist to observe.
+            assert!(receiver.try_recv().is_err());
+        }
+
+        #[test]
+        fn running_session_rejects_new_turn_after_current_life_changes() {
+            let (session, _receiver) = test_session();
+            let (_root, storage, _registry, _revision) = authority_fixture(&session);
+            storage
+                .save_life(LifeIdentityRecord {
+                    id: "life-b".to_string(),
+                    name: "D30-B second life".to_string(),
+                    created_at: "2026-09-12T00:00:00.000Z".to_string(),
+                    version: 1,
+                    body_id: "d29h9-r3-body".to_string(),
+                    persona_id: "d29h9-r3-persona".to_string(),
+                    persona_version: 1,
+                })
+                .expect("switch current Life");
+
+            assert_eq!(
+                require_current_session_life(&storage, &session).unwrap_err(),
+                LIFE_RESTART_REQUIRED
+            );
+            assert!(matches!(
+                session.authority_snapshot(),
+                Some(HostTurnAuthority::Idle)
+            ));
+            assert!(session
+                .active_turn_id
+                .lock()
+                .expect("active turn lock")
+                .is_none());
+        }
+
+        #[test]
+        fn runtime_preflight_uses_d30_transition_and_fails_closed() {
+            let (session, receiver) = test_session();
+            let (_root, storage, registry, enabled_revision) = authority_fixture(&session);
+
+            assert_eq!(
+                preflight_capability_root(&storage, &registry, &session),
+                Ok(())
+            );
+            let disabled = apply_transition_for_test(
+                &storage,
+                &registry,
+                PRODUCTION_GIT_STATUS_CAPABILITY_ID,
+                false,
+                enabled_revision,
+                &session.life_id,
+            )
+            .expect("D30 production disable");
+            assert_eq!(disabled.previous_revision, enabled_revision);
+            assert_eq!(disabled.revision, enabled_revision + 1);
+            assert_eq!(
+                preflight_capability_root(&storage, &registry, &session).unwrap_err(),
+                "CAPABILITY_ROOT_DISABLED"
+            );
+
+            let (missing_session, _missing_receiver) = test_session_for_life("life-missing");
+            assert_eq!(
+                preflight_capability_root(&storage, &registry, &missing_session).unwrap_err(),
+                "CAPABILITY_AUTHORIZATION_REQUIRED"
+            );
+            // A denied preflight does not create a Host turn generation or a
+            // StartTurn frame, which is the zero-provider disabled canary.
+            assert!(matches!(
+                session.authority_snapshot(),
+                Some(HostTurnAuthority::Idle)
+            ));
+            assert!(receiver.try_recv().is_err());
+        }
+
+        #[test]
+        fn d30_disable_is_seen_by_final_grant_revalidation() {
+            let (session, receiver) = test_session();
+            let (_root, storage, registry, enabled_revision) = authority_fixture(&session);
+            let provider = test_provider();
+            let host_turn_id = "d30-revoke-host-turn".to_string();
+            let provider_binding =
+                protocol::ProviderBinding::derive(&session.session_id, &host_turn_id, &provider)
+                    .expect("provider binding");
+            session
+                .begin_turn(host_turn_id.clone(), provider, provider_binding)
+                .expect("active Host turn");
+            let binding = test_binding_for(&session.session_id, "d30-revoke-codex", "call-revoke");
+            handle_authority_evaluate(
+                &session,
+                &storage,
+                &registry,
+                AuthorityEvaluate {
+                    request_id: "d30-revoke-authority".to_string(),
+                    session_id: session.session_id.clone(),
+                    host_turn_id: host_turn_id.clone(),
+                    binding: binding.clone(),
+                },
+            )
+            .expect("authority evaluation");
+            assert!(matches!(
+                receiver.recv_timeout(Duration::from_secs(1)).expect("authority reply"),
+                HostMessage::AuthorityScopeReply(AuthorityScopeReply {
+                    allowed: true,
+                    authorization_revision: Some(revision),
+                    ..
+                }) if revision == enabled_revision
+            ));
+            let mut grant = test_grant(&session.session_id, "d30-revoke-grant", binding.clone());
+            grant.authorization_revision = enabled_revision;
+            session.grants.lock().expect("grant lock").insert(
+                grant.grant_id.clone(),
+                HostStoredGrant {
+                    host_turn_id: host_turn_id.clone(),
+                    grant: grant.clone(),
+                },
+            );
+
+            let disabled = apply_transition_for_test(
+                &storage,
+                &registry,
+                PRODUCTION_GIT_STATUS_CAPABILITY_ID,
+                false,
+                enabled_revision,
+                &session.life_id,
+            )
+            .expect("D30 production disable");
+            assert_eq!(disabled.revision, enabled_revision + 1);
+            handle_revalidate_grant(
+                &session,
+                &storage,
+                &registry,
+                RevalidateGrant {
+                    request_id: "d30-revoke-revalidate".to_string(),
+                    session_id: session.session_id.clone(),
+                    host_turn_id,
+                    binding,
+                    grant,
+                },
+            )
+            .expect("revoked grant is answered");
+            assert!(matches!(
+                receiver.recv_timeout(Duration::from_secs(1)).expect("revalidation reply"),
+                HostMessage::GrantRevalidated(GrantRevalidated {
+                    allowed: false,
+                    error_code: Some(code),
+                    ..
+                }) if code == "CAPABILITY_ROOT_DISABLED"
+            ));
+            assert_eq!(session.grants.lock().expect("grant lock").len(), 1);
+        }
+
+        #[test]
+        fn d30_disable_rechecks_pending_confirmation_before_approval() {
+            let (session, receiver) = test_session();
+            let (_root, storage, registry, enabled_revision) = authority_fixture(&session);
+            let provider = test_provider();
+            let host_turn_id = "d30-pending-host-turn".to_string();
+            let provider_binding =
+                protocol::ProviderBinding::derive(&session.session_id, &host_turn_id, &provider)
+                    .expect("provider binding");
+            session
+                .begin_turn(host_turn_id.clone(), provider, provider_binding)
+                .expect("active Host turn");
+            let binding =
+                test_binding_for(&session.session_id, "d30-pending-codex", "call-pending");
+            handle_authority_evaluate(
+                &session,
+                &storage,
+                &registry,
+                AuthorityEvaluate {
+                    request_id: "d30-pending-authority".to_string(),
+                    session_id: session.session_id.clone(),
+                    host_turn_id: host_turn_id.clone(),
+                    binding: binding.clone(),
+                },
+            )
+            .expect("authority evaluation");
+            let _ = receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("authority reply");
+            handle_confirmation_required(
+                &session,
+                ConfirmationRequired {
+                    request_id: "d30-pending-confirmation".to_string(),
+                    session_id: session.session_id.clone(),
+                    host_turn_id,
+                    life_id: session.life_id.clone(),
+                    task_id: session.task_id.clone(),
+                    capability_id: PRODUCTION_GIT_STATUS_CAPABILITY_ID.to_string(),
+                    workspace_summary: "workspace".to_string(),
+                    expires_at_unix_ms: unix_millis().saturating_add(5_000),
+                    binding,
+                },
+            )
+            .expect("pending confirmation");
+            let pending_id = session
+                .pending_summary()
+                .expect("pending summary")
+                .pending_id;
+            let pending = take_pending(&session, &pending_id).expect("pending action");
+
+            let disabled = apply_transition_for_test(
+                &storage,
+                &registry,
+                PRODUCTION_GIT_STATUS_CAPABILITY_ID,
+                false,
+                enabled_revision,
+                &session.life_id,
+            )
+            .expect("D30 production disable");
+            assert_eq!(disabled.revision, enabled_revision + 1);
+            // `decide_pending` uses this same fresh read before minting an
+            // approval; a stale preflight cannot authorize the confirmation.
+            assert_eq!(
+                current_workspace_revision(&storage, &registry, &session, &pending.binding)
+                    .unwrap_err(),
+                "CAPABILITY_ROOT_DISABLED"
+            );
+            assert!(session.approvals.lock().expect("approval lock").is_empty());
+            assert!(receiver.try_recv().is_err());
+        }
+
         fn test_session() -> (Arc<HostSessionState>, mpsc::Receiver<HostMessage>) {
+            test_session_for_life("life")
+        }
+
+        fn test_session_for_life(
+            life_id: &str,
+        ) -> (Arc<HostSessionState>, mpsc::Receiver<HostMessage>) {
             let (sender, receiver) = mpsc::channel();
             let session = Arc::new(HostSessionState {
                 session_id: "session-test".to_string(),
-                life_id: "life".to_string(),
+                life_id: life_id.to_string(),
                 task_id: "task".to_string(),
                 workspace_identity: "workspace".to_string(),
                 provider: None,
@@ -3979,7 +4418,8 @@ mod windows {
                 VitaMessage::Ready(value) => value,
                 other => panic!("unexpected canary post-initialize frame: {other:?}"),
             };
-            validate_ready(&ready, &session_id, &request).expect("exact canary ready identity");
+            validate_ready(&ready, &session_id, &request, &request.life_id)
+                .expect("exact canary ready identity");
 
             protocol::write_frame(
                 &mut writer,
@@ -4024,6 +4464,9 @@ mod non_windows {
         Ok(VitaSidecarStatusResponse {
             running: false,
             provider_readiness: VitaProviderReadiness::SidecarNotRunning,
+            capability_readiness: VitaCapabilityReadiness::AuthorizationUnavailable,
+            session_life_id: None,
+            current_life_id: None,
             session_id: None,
             pending: None,
             active_turn_id: None,

@@ -19,6 +19,9 @@ interface VitaPendingSummary {
 interface VitaStatus {
   running: boolean;
   providerReadiness: string;
+  capabilityReadiness: string;
+  sessionLifeId: string | null;
+  currentLifeId: string | null;
   sessionId: string | null;
   pending: VitaPendingSummary | null;
   activeTurnId: string | null;
@@ -32,6 +35,9 @@ const prompt = ref("");
 const status = ref<VitaStatus>({
   running: false,
   providerReadiness: "SIDECAR_NOT_RUNNING",
+  capabilityReadiness: "AUTHORIZATION_UNAVAILABLE",
+  sessionLifeId: null,
+  currentLifeId: null,
   sessionId: null,
   pending: null,
   activeTurnId: null,
@@ -46,6 +52,12 @@ let pollTimer: ReturnType<typeof setInterval> | undefined;
 const turnActive = computed(() => status.value.activeTurnId !== null);
 const cancelling = computed(() => status.value.turnPhase === "CANCELLING");
 const pendingConfirmation = computed(() => status.value.pending);
+const capabilityBlocksTurn = computed(() => [
+  "ROOT_DISABLED",
+  "AUTHORIZATION_MISSING",
+  "AUTHORIZATION_UNAVAILABLE",
+  "LIFE_RESTART_REQUIRED",
+].includes(status.value.capabilityReadiness));
 
 async function refreshStatus(): Promise<void> {
   try {
@@ -94,6 +106,10 @@ async function startTurn(): Promise<void> {
   error.value = undefined;
   try {
     await refreshStatus();
+    if (capabilityBlocksTurn.value) {
+      error.value = capabilityMessage(status.value.capabilityReadiness);
+      return;
+    }
     if (!status.value.running && ["NO_ACTIVE_PROFILE", "CREDENTIAL_MISSING", "INELIGIBLE_URL"].includes(status.value.providerReadiness)) {
       error.value = readinessMessage(status.value.providerReadiness);
       return;
@@ -107,7 +123,13 @@ async function startTurn(): Promise<void> {
     prompt.value = "";
     await refreshStatus();
   } catch (caught) {
-    error.value = boundedError(caught, "Vita turn could not start.");
+    const value = boundedError(caught, "Vita turn could not start.");
+    const lifeChanged = value === "CAPABILITY_RUNTIME_LIFE_CHANGED" || value === "SIDECAR_LIFE_RESTART_REQUIRED";
+    const capabilityError = capabilityErrorMessage(value);
+    error.value = capabilityError ?? value;
+    if (lifeChanged) {
+      await refreshStatus();
+    }
   } finally {
     busy.value = false;
   }
@@ -153,6 +175,31 @@ function readinessMessage(readiness: string): string {
   return "Vita is not ready to start a turn.";
 }
 
+function capabilityMessage(readiness: string): string {
+  if (readiness === "ROOT_DISABLED") return "Enable the governed Git status capability in Agent permissions.";
+  if (readiness === "AUTHORIZATION_MISSING") return "Open Agent permissions to provision the governed Git status capability.";
+  if (readiness === "LIFE_RESTART_REQUIRED") return "Current Life changed. Stop and restart Vita to bind the current Life.";
+  return "The governed Git status capability is unavailable. Review Agent permissions before starting Vita.";
+}
+
+function capabilityErrorMessage(value: string): string | undefined {
+  if (value === "CAPABILITY_RUNTIME_LIFE_CHANGED" || value === "SIDECAR_LIFE_RESTART_REQUIRED") {
+    return capabilityMessage("LIFE_RESTART_REQUIRED");
+  }
+  if (value === "CAPABILITY_ROOT_DISABLED") return capabilityMessage("ROOT_DISABLED");
+  if (value === "CAPABILITY_AUTHORIZATION_REQUIRED") return capabilityMessage("AUTHORIZATION_MISSING");
+  if (value === "CAPABILITY_AUTHORIZATION_UNAVAILABLE") return capabilityMessage("AUTHORIZATION_UNAVAILABLE");
+  return undefined;
+}
+
+function capabilityLabel(readiness: string): string {
+  if (readiness === "ROOT_ENABLED") return "Enabled";
+  if (readiness === "ROOT_DISABLED") return "Disabled";
+  if (readiness === "LIFE_RESTART_REQUIRED") return "Restart required";
+  if (readiness === "AUTHORIZATION_MISSING") return "Authorization missing";
+  return "Unavailable";
+}
+
 onMounted(() => {
   void refreshStatus();
   pollTimer = setInterval(() => void refreshStatus(), 750);
@@ -175,6 +222,16 @@ onUnmounted(() => {
       </span>
     </header>
 
+    <p class="vita-capability" data-testid="vita-capability-readiness">
+      Capability root: {{ capabilityLabel(status.capabilityReadiness) }}
+    </p>
+    <p v-if="status.capabilityReadiness === 'ROOT_DISABLED' || status.capabilityReadiness === 'AUTHORIZATION_MISSING'" class="vita-error">
+      {{ capabilityMessage(status.capabilityReadiness) }}
+    </p>
+    <p v-else-if="status.capabilityReadiness === 'LIFE_RESTART_REQUIRED'" class="vita-error">
+      {{ capabilityMessage(status.capabilityReadiness) }}
+    </p>
+
     <p v-if="status.providerReadiness === 'INELIGIBLE_URL'" class="vita-error">
       Vita production mode requires an HTTPS public provider endpoint; this profile can still be used elsewhere.
     </p>
@@ -195,7 +252,7 @@ onUnmounted(() => {
     <textarea id="vita-prompt" v-model="prompt" rows="3" maxlength="65536" placeholder="Ask Vita to inspect the governed workspace status" />
 
     <div class="vita-actions">
-      <button type="button" class="primary" :disabled="busy || turnActive || prompt.trim().length === 0" @click="startTurn">
+      <button type="button" class="primary" :disabled="busy || turnActive || capabilityBlocksTurn || prompt.trim().length === 0" @click="startTurn">
         {{ busy ? "Starting…" : "Start Vita turn" }}
       </button>
       <button type="button" :disabled="!turnActive || cancelling" @click="cancelTurn">{{ cancelling ? "Cancelling…" : "Cancel turn" }}</button>

@@ -491,6 +491,29 @@ fn apply_transition(
     )
 }
 
+/// Narrow composition seam for Host integration tests.  Production callers
+/// must use the Settings-window command below; keeping this helper behind
+/// `cfg(test)` lets Vita tests exercise the exact D30 transition path without
+/// widening the runtime authorization API.
+#[cfg(test)]
+pub(crate) fn apply_transition_for_test(
+    storage: &StorageService,
+    registry: &CapabilityRegistry,
+    capability_id: &str,
+    enabled: bool,
+    expected_revision: i64,
+    observed_life_id: &str,
+) -> Result<CapabilityAuthorizationUpdateResult, CapabilityActivationCommandError> {
+    apply_transition(
+        storage,
+        registry,
+        capability_id,
+        enabled,
+        expected_revision,
+        observed_life_id,
+    )
+}
+
 fn apply_transition_for_life(
     storage: &StorageService,
     registry: &CapabilityRegistry,

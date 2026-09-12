@@ -74,6 +74,17 @@ pub enum VitaCapabilityReadiness {
     LifeRestartRequired,
 }
 
+/// Display-only projection of one trusted registry entry.  This is never an
+/// authority token: every tool lane independently performs its own fresh
+/// Host-side evaluation before it can obtain a grant.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct VitaCapabilityState {
+    pub capability_id: String,
+    pub readiness: VitaCapabilityReadiness,
+    pub revision: Option<i64>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VitaSidecarPendingSummary {
@@ -91,6 +102,7 @@ pub struct VitaSidecarStatusResponse {
     pub running: bool,
     pub provider_readiness: VitaProviderReadiness,
     pub capability_readiness: VitaCapabilityReadiness,
+    pub capability_states: Vec<VitaCapabilityState>,
     pub session_life_id: Option<String>,
     pub current_life_id: Option<String>,
     pub session_id: Option<String>,
@@ -148,16 +160,18 @@ mod windows {
         CapabilityAuthorizationRepository, RequestedCapabilityScope,
     };
     use crate::capability::descriptor::{
-        CapabilityId, PRODUCTION_GIT_STATUS_CAPABILITY_ID, PRODUCTION_GIT_STATUS_PROFILE_ID,
-        PRODUCTION_GIT_STATUS_TOOL_NAME,
+        CapabilityId, ScopeRequirement, PRODUCTION_GIT_STATUS_CAPABILITY_ID,
+        PRODUCTION_GIT_STATUS_PROFILE_ID, PRODUCTION_GIT_STATUS_TOOL_NAME,
     };
     use crate::execution_enclave::{CodexRuntimeError, VitaSidecarProcess};
     use protocol::{
         AuthorityEvaluate, AuthorityScopeReply, ConfirmationDecision, ConfirmationReply,
         ConfirmationRequired, GrantIssued, GrantRevalidated, HostMessage, InitializeSession,
         IssueGrant, ProcessBinding, ProcessGrant, RevalidateGrant, VitaMessage,
-        CODEX_PROTOCOL_SCHEMA_HASH, CODEX_UPSTREAM_COMMIT, PROTOCOL_VERSION, RUNTIME_ID,
+        WorkspaceReadReleaseCheck, CODEX_PROTOCOL_SCHEMA_HASH, CODEX_UPSTREAM_COMMIT,
+        PROTOCOL_VERSION, RUNTIME_ID,
     };
+    use sha2::{Digest, Sha256};
     use std::collections::{HashMap, HashSet, VecDeque};
     use std::ffi::OsString;
     use std::fs::{self, File};
@@ -306,102 +320,245 @@ mod windows {
         Ok(())
     }
 
-    /// Read the exact D30 row and evaluator result immediately before a Host
-    /// turn is admitted.  This is advisory admission only: no revision,
-    /// confirmation, workspace scope, or ProcessGrant is created or cached.
-    fn preflight_capability_root(
+    fn requested_scope_for(requirement: ScopeRequirement) -> RequestedCapabilityScope {
+        match requirement {
+            ScopeRequirement::None => RequestedCapabilityScope::None,
+            ScopeRequirement::WorkspaceRequired => RequestedCapabilityScope::Workspace,
+            ScopeRequirement::NetworkDestinationRequired => {
+                RequestedCapabilityScope::NetworkDestination
+            }
+            ScopeRequirement::ExternalResourceRequired => {
+                RequestedCapabilityScope::ExternalResource
+            }
+        }
+    }
+
+    fn root_is_usable(
+        decision: &crate::capability::authorization::CapabilityAuthorizationDecision,
+    ) -> bool {
+        decision.authorization_revision().is_some()
+            && matches!(
+                decision.outcome(),
+                CapabilityAuthorizationDecisionKind::ScopeRequired
+                    | CapabilityAuthorizationDecisionKind::ExplicitConfirmationRequired
+                    | CapabilityAuthorizationDecisionKind::Eligible
+            )
+    }
+
+    /// Freshly read every trusted registry root immediately before Host turn
+    /// admission.  This is only an admission summary: it neither caches an
+    /// authorization revision nor creates scope, confirmation, or grant
+    /// authority for any individual tool.
+    fn preflight_capability_roots(
         storage: &StorageService,
         registry: &CapabilityRegistry,
         session: &HostSessionState,
     ) -> Result<(), String> {
-        let capability_id = CapabilityId::try_from(PRODUCTION_GIT_STATUS_CAPABILITY_ID)
-            .map_err(|_| "CAPABILITY_AUTHORIZATION_UNAVAILABLE".to_string())?;
-        match storage.find_capability_authorization(&session.life_id, &capability_id) {
-            Ok(Some(_)) => {}
-            Ok(None) => return Err("CAPABILITY_AUTHORIZATION_REQUIRED".to_string()),
-            Err(_) => return Err("CAPABILITY_AUTHORIZATION_UNAVAILABLE".to_string()),
+        let mut any_disabled = false;
+        let mut any_missing = false;
+        let mut any_unavailable = false;
+        for descriptor in registry.entries() {
+            let capability_id = descriptor.capability_id();
+            match storage.find_capability_authorization(&session.life_id, capability_id) {
+                Ok(None) => {
+                    any_missing = true;
+                    continue;
+                }
+                Err(_) => {
+                    any_unavailable = true;
+                    continue;
+                }
+                Ok(Some(_)) => {}
+            }
+            match evaluate_capability_authorization(
+                storage,
+                registry,
+                &session.life_id,
+                capability_id,
+                requested_scope_for(descriptor.scope_requirement()),
+            ) {
+                Ok(decision) if root_is_usable(&decision) => return Ok(()),
+                Ok(decision)
+                    if decision.outcome() == CapabilityAuthorizationDecisionKind::RootDisabled =>
+                {
+                    any_disabled = true;
+                }
+                Ok(_) | Err(_) => any_unavailable = true,
+            }
         }
+        if any_disabled {
+            Err("CAPABILITY_ROOT_DISABLED".to_string())
+        } else if any_missing {
+            Err("CAPABILITY_AUTHORIZATION_REQUIRED".to_string())
+        } else if any_unavailable {
+            Err("CAPABILITY_AUTHORIZATION_UNAVAILABLE".to_string())
+        } else {
+            Err("CAPABILITY_AUTHORIZATION_UNAVAILABLE".to_string())
+        }
+    }
+
+    /// D31-A's post-read confidentiality contract.  This is deliberately
+    /// independent from turn admission and any future local read primitive:
+    /// a buffer is not eligible for Codex tool output until this fresh Host
+    /// check succeeds.  D31-A does not route or expose a production read tool
+    /// yet; the function establishes the exact fence D31-B must call.
+    fn authorize_workspace_read_release(
+        storage: &StorageService,
+        registry: &CapabilityRegistry,
+        session: &HostSessionState,
+        request: &WorkspaceReadReleaseCheck,
+        confidential_bytes: &[u8],
+    ) -> Result<(), String> {
+        request
+            .validate()
+            .map_err(|_| "WORKSPACE_READ_RELEASE_EVIDENCE_INVALID".to_string())?;
+        if request.session_id != session.session_id
+            || request.binding.session_id != session.session_id
+            || request.binding.life_id != session.life_id
+            || request.binding.task_id != session.task_id
+        {
+            return Err("WORKSPACE_READ_BINDING_MISMATCH".to_string());
+        }
+        require_current_session_life(storage, session)?;
+        if request.grant.expires_at_unix_ms <= unix_millis() {
+            return Err("WORKSPACE_READ_GRANT_EXPIRED".to_string());
+        }
+        if request.grant.used {
+            return Err("WORKSPACE_READ_GRANT_USED".to_string());
+        }
+        if u64::try_from(confidential_bytes.len()).ok() != Some(request.bytes_read)
+            || format!("{:x}", Sha256::digest(confidential_bytes)) != request.content_sha256
+        {
+            return Err("WORKSPACE_READ_CONTENT_EVIDENCE_MISMATCH".to_string());
+        }
+        let authority = session
+            .turn_authority
+            .lock()
+            .map_err(|_| "Vita turn authority lock was poisoned".to_string())?;
+        let active = matches!(
+            &*authority,
+            HostTurnAuthority::Active(active)
+                if active.turn_id == request.host_turn_id
+                    && active.binding.binding_hash == request.binding.provider_binding_hash
+        );
+        if !active {
+            return Err("WORKSPACE_READ_DISCLOSURE_TURN_NOT_ACTIVE".to_string());
+        }
+        let capability_id = CapabilityId::try_from(request.binding.capability_id.as_str())
+            .map_err(|_| "CAPABILITY_AUTHORIZATION_UNAVAILABLE".to_string())?;
+        let descriptor = registry
+            .descriptor(&capability_id)
+            .ok_or_else(|| "CAPABILITY_AUTHORIZATION_REQUIRED".to_string())?;
         let decision = evaluate_capability_authorization(
             storage,
             registry,
             &session.life_id,
             &capability_id,
-            RequestedCapabilityScope::Workspace,
+            requested_scope_for(descriptor.scope_requirement()),
         )
         .map_err(|_| "CAPABILITY_AUTHORIZATION_UNAVAILABLE".to_string())?;
-        if decision.outcome() == CapabilityAuthorizationDecisionKind::ScopeRequired
-            && decision.authorization_revision().is_some()
-        {
-            return Ok(());
-        }
         if decision.outcome() == CapabilityAuthorizationDecisionKind::RootDisabled {
             return Err("CAPABILITY_ROOT_DISABLED".to_string());
         }
-        Err("CAPABILITY_AUTHORIZATION_UNAVAILABLE".to_string())
+        if !root_is_usable(&decision) {
+            return Err("CAPABILITY_AUTHORIZATION_UNAVAILABLE".to_string());
+        }
+        if decision.authorization_revision() != Some(request.grant.authorization_revision) {
+            return Err("CAPABILITY_AUTHORIZATION_REVISION_MISMATCH".to_string());
+        }
+        Ok(())
     }
 
-    /// Project only display-safe capability state.  The current Life is read
-    /// fresh for every status call, and a running session never borrows the
+    fn capability_state(
+        storage: &StorageService,
+        registry: &CapabilityRegistry,
+        life_id: &str,
+        descriptor: &crate::capability::descriptor::CapabilityDescriptor,
+    ) -> VitaCapabilityState {
+        let capability_id = descriptor.capability_id();
+        let state = match storage.find_capability_authorization(life_id, capability_id) {
+            Ok(None) => (VitaCapabilityReadiness::AuthorizationMissing, None),
+            Err(_) => (VitaCapabilityReadiness::AuthorizationUnavailable, None),
+            Ok(Some(row)) => match evaluate_capability_authorization(
+                storage,
+                registry,
+                life_id,
+                capability_id,
+                requested_scope_for(descriptor.scope_requirement()),
+            ) {
+                Ok(decision) if root_is_usable(&decision) => (
+                    VitaCapabilityReadiness::RootEnabled,
+                    decision.authorization_revision(),
+                ),
+                Ok(decision)
+                    if decision.outcome() == CapabilityAuthorizationDecisionKind::RootDisabled =>
+                {
+                    (VitaCapabilityReadiness::RootDisabled, Some(row.revision))
+                }
+                Ok(_) | Err(_) => (VitaCapabilityReadiness::AuthorizationUnavailable, None),
+            },
+        };
+        VitaCapabilityState {
+            capability_id: capability_id.as_str().to_string(),
+            readiness: state.0,
+            revision: state.1,
+        }
+    }
+
+    /// Project display-safe trusted registry state.  The current Life is read
+    /// fresh for every status call, and a running session never borrows an
     /// authorization row of a different current Life.
     fn capability_readiness(
         storage: &StorageService,
         registry: &CapabilityRegistry,
         session_life_id: Option<&str>,
-    ) -> (VitaCapabilityReadiness, Option<String>) {
+    ) -> (
+        VitaCapabilityReadiness,
+        Vec<VitaCapabilityState>,
+        Option<String>,
+    ) {
         let current = match storage.get_current_life() {
             Ok(Some(life)) => life,
-            Ok(None) | Err(_) => return (VitaCapabilityReadiness::AuthorizationUnavailable, None),
+            Ok(None) | Err(_) => {
+                return (
+                    VitaCapabilityReadiness::AuthorizationUnavailable,
+                    Vec::new(),
+                    None,
+                )
+            }
         };
         let current_life_id = current.id.clone();
         let life_id = session_life_id.unwrap_or(current.id.as_str());
         if session_life_id.is_some_and(|session_life_id| session_life_id != current.id) {
             return (
                 VitaCapabilityReadiness::LifeRestartRequired,
+                Vec::new(),
                 Some(current_life_id),
             );
         }
-        let capability_id = match CapabilityId::try_from(PRODUCTION_GIT_STATUS_CAPABILITY_ID) {
-            Ok(capability_id) => capability_id,
-            Err(_) => {
-                return (
-                    VitaCapabilityReadiness::AuthorizationUnavailable,
-                    Some(current_life_id),
-                )
-            }
+        let states = registry
+            .entries()
+            .map(|descriptor| capability_state(storage, registry, life_id, descriptor))
+            .collect::<Vec<_>>();
+        let aggregate = if states
+            .iter()
+            .any(|state| state.readiness == VitaCapabilityReadiness::RootEnabled)
+        {
+            VitaCapabilityReadiness::RootEnabled
+        } else if states
+            .iter()
+            .any(|state| state.readiness == VitaCapabilityReadiness::RootDisabled)
+        {
+            VitaCapabilityReadiness::RootDisabled
+        } else if states
+            .iter()
+            .any(|state| state.readiness == VitaCapabilityReadiness::AuthorizationMissing)
+        {
+            VitaCapabilityReadiness::AuthorizationMissing
+        } else {
+            VitaCapabilityReadiness::AuthorizationUnavailable
         };
-        match storage.find_capability_authorization(life_id, &capability_id) {
-            Ok(None) => (
-                VitaCapabilityReadiness::AuthorizationMissing,
-                Some(current_life_id),
-            ),
-            Err(_) => (
-                VitaCapabilityReadiness::AuthorizationUnavailable,
-                Some(current_life_id),
-            ),
-            Ok(Some(_)) => match evaluate_capability_authorization(
-                storage,
-                registry,
-                life_id,
-                &capability_id,
-                RequestedCapabilityScope::Workspace,
-            ) {
-                Ok(decision)
-                    if decision.outcome() == CapabilityAuthorizationDecisionKind::ScopeRequired
-                        && decision.authorization_revision().is_some() =>
-                {
-                    (VitaCapabilityReadiness::RootEnabled, Some(current_life_id))
-                }
-                Ok(decision)
-                    if decision.outcome() == CapabilityAuthorizationDecisionKind::RootDisabled =>
-                {
-                    (VitaCapabilityReadiness::RootDisabled, Some(current_life_id))
-                }
-                Ok(_) | Err(_) => (
-                    VitaCapabilityReadiness::AuthorizationUnavailable,
-                    Some(current_life_id),
-                ),
-            },
-        }
+        (aggregate, states, Some(current_life_id))
     }
 
     fn provider_readiness(
@@ -1323,7 +1480,7 @@ mod windows {
                 .lock()
                 .map_err(|_| "Vita sidecar coordinator lock was poisoned".to_string())?;
             let Some(running) = guard.running.as_ref() else {
-                let (capability_readiness, current_life_id) =
+                let (capability_readiness, capability_states, current_life_id) =
                     capability_readiness(&self.authority_storage, &self.registry, None);
                 return Ok(VitaSidecarStatusResponse {
                     running: false,
@@ -1335,6 +1492,7 @@ mod windows {
                         None,
                     )?,
                     capability_readiness,
+                    capability_states,
                     session_life_id: None,
                     current_life_id,
                     session_id: None,
@@ -1351,7 +1509,7 @@ mod windows {
                 .lock()
                 .ok()
                 .is_some_and(|turn| turn.is_some());
-            let (capability_readiness, current_life_id) = capability_readiness(
+            let (capability_readiness, capability_states, current_life_id) = capability_readiness(
                 &self.authority_storage,
                 &self.registry,
                 Some(&running.session.life_id),
@@ -1367,6 +1525,7 @@ mod windows {
                     running.session.provider.as_ref(),
                 )?,
                 capability_readiness,
+                capability_states,
                 session_life_id: Some(running.session.life_id.clone()),
                 current_life_id,
                 session_id: Some(running.session.session_id.clone()),
@@ -1591,7 +1750,7 @@ mod windows {
             // inspection.  A disabled D30 root must not release credentials,
             // contact a provider, create a turn generation, or emit a
             // HostMessage::StartTurn frame.
-            preflight_capability_root(&self.authority_storage, &self.registry, session)?;
+            preflight_capability_roots(&self.authority_storage, &self.registry, session)?;
             let provider = session
                 .provider
                 .clone()
@@ -1733,6 +1892,17 @@ mod windows {
                 }
                 VitaMessage::RevalidateGrant(request) => {
                     handle_revalidate_grant(&session, &storage, &registry, request)
+                }
+                // D31-A reserves and validates the typed read/disclosure
+                // protocol, but no production read tool is registered yet.
+                // A sidecar attempting this future lane against this Host is
+                // terminally denied rather than falling through to H7 state.
+                VitaMessage::WorkspaceReadAuthorityEvaluate(_)
+                | VitaMessage::WorkspaceReadConfirmationRequired(_)
+                | VitaMessage::WorkspaceReadIssueGrant(_)
+                | VitaMessage::WorkspaceReadRevalidateGrant(_)
+                | VitaMessage::WorkspaceReadReleaseCheck(_) => {
+                    Err("D31 workspace-read authority is not production-enabled".to_string())
                 }
                 VitaMessage::CredentialRequired(request) => {
                     handle_credential_required(&session, &storage, &secrets, request)
@@ -2408,6 +2578,11 @@ mod windows {
             VitaMessage::ConfirmationRequired(message) => &message.request_id,
             VitaMessage::IssueGrant(message) => &message.request_id,
             VitaMessage::RevalidateGrant(message) => &message.request_id,
+            VitaMessage::WorkspaceReadAuthorityEvaluate(message) => &message.request_id,
+            VitaMessage::WorkspaceReadConfirmationRequired(message) => &message.request_id,
+            VitaMessage::WorkspaceReadIssueGrant(message) => &message.request_id,
+            VitaMessage::WorkspaceReadRevalidateGrant(message) => &message.request_id,
+            VitaMessage::WorkspaceReadReleaseCheck(message) => &message.request_id,
             VitaMessage::ActionCancelled(message) => &message.request_id,
             VitaMessage::CredentialRequired(message) => &message.request_id,
             VitaMessage::TurnState(message) => &message.request_id,
@@ -2682,7 +2857,10 @@ mod windows {
         use crate::capability::activation::apply_transition_for_test;
         use crate::capability::authorization::{
             CapabilityAuthorizationCreateOutcome, CapabilityAuthorizationRepository,
-            LifeCapabilityAuthorizationCreateRequest,
+            LifeCapabilityAuthorizationCreateRequest, LifeCapabilityAuthorizationUpdateRequest,
+        };
+        use crate::capability::descriptor::{
+            ApprovalFloor, CapabilityDescriptor, RiskClass, ScopeRequirement,
         };
         use crate::storage::{LifeIdentityRecord, PersonaTemplateRecord};
 
@@ -2791,6 +2969,155 @@ mod windows {
             (root, storage, registry, transition.revision)
         }
 
+        fn synthetic_workspace_read_descriptor() -> CapabilityDescriptor {
+            CapabilityDescriptor::synthetic(
+                CapabilityId::try_from(protocol::WORKSPACE_READ_CAPABILITY_ID)
+                    .expect("D31 workspace read capability ID"),
+                "Synthetic D31 workspace read",
+                RiskClass::Critical,
+                ApprovalFloor::ExplicitPerAction,
+                ScopeRequirement::WorkspaceRequired,
+            )
+            .expect("synthetic D31 workspace read descriptor")
+        }
+
+        fn synthetic_multi_capability_registry() -> CapabilityRegistry {
+            let git = CapabilityDescriptor::synthetic(
+                CapabilityId::try_from(PRODUCTION_GIT_STATUS_CAPABILITY_ID)
+                    .expect("production Git capability ID"),
+                "Synthetic Git status",
+                RiskClass::Critical,
+                ApprovalFloor::ExplicitPerAction,
+                ScopeRequirement::WorkspaceRequired,
+            )
+            .expect("synthetic Git descriptor");
+            CapabilityRegistry::synthetic([git, synthetic_workspace_read_descriptor()])
+                .expect("synthetic two-capability registry")
+        }
+
+        fn synthetic_multi_capability_fixture(
+            session: &HostSessionState,
+            git_enabled: Option<bool>,
+            read_enabled: Option<bool>,
+        ) -> (tempfile::TempDir, StorageService, CapabilityRegistry) {
+            let root = tempfile::tempdir().expect("multi-capability fixture root");
+            let storage = StorageService::initialize_with_roots(root.path().to_path_buf(), None)
+                .expect("multi-capability fixture storage");
+            storage
+                .save_persona(PersonaTemplateRecord {
+                    id: "d31-a-persona".to_string(),
+                    name: "D31-A fixture persona".to_string(),
+                    version: 1,
+                    persona_json: "{}".to_string(),
+                })
+                .expect("multi-capability fixture persona");
+            storage
+                .save_life(LifeIdentityRecord {
+                    id: session.life_id.clone(),
+                    name: "D31-A fixture life".to_string(),
+                    created_at: "2026-09-13T00:00:00.000Z".to_string(),
+                    version: 1,
+                    body_id: "d31-a-body".to_string(),
+                    persona_id: "d31-a-persona".to_string(),
+                    persona_version: 1,
+                })
+                .expect("multi-capability fixture life");
+            let registry = synthetic_multi_capability_registry();
+            for (capability_id, enabled, event_id) in [
+                (
+                    PRODUCTION_GIT_STATUS_CAPABILITY_ID,
+                    git_enabled,
+                    "d31-a-synthetic-git",
+                ),
+                (
+                    protocol::WORKSPACE_READ_CAPABILITY_ID,
+                    read_enabled,
+                    "d31-a-synthetic-read",
+                ),
+            ] {
+                let Some(enabled) = enabled else { continue };
+                let capability_id =
+                    CapabilityId::try_from(capability_id).expect("synthetic capability ID");
+                assert!(matches!(
+                    storage
+                        .create_capability_authorization(LifeCapabilityAuthorizationCreateRequest {
+                            life_id: session.life_id.clone(),
+                            capability_id: capability_id.clone(),
+                        })
+                        .expect("synthetic authorization root"),
+                    CapabilityAuthorizationCreateOutcome::Applied(_)
+                ));
+                if enabled {
+                    storage
+                        .update_capability_authorization(
+                            LifeCapabilityAuthorizationUpdateRequest::for_test(
+                                event_id,
+                                session.life_id.clone(),
+                                capability_id,
+                                true,
+                                1,
+                            ),
+                        )
+                        .expect("enable synthetic root");
+                }
+            }
+            (root, storage, registry)
+        }
+
+        fn workspace_read_release_request(
+            session: &Arc<HostSessionState>,
+            provider: &protocol::ProviderConfiguration,
+            host_turn_id: &str,
+            content: &[u8],
+        ) -> protocol::WorkspaceReadReleaseCheck {
+            let provider_binding =
+                protocol::ProviderBinding::derive(&session.session_id, host_turn_id, provider)
+                    .expect("provider binding");
+            session
+                .begin_turn(
+                    host_turn_id.to_string(),
+                    provider.clone(),
+                    provider_binding.clone(),
+                )
+                .expect("active Host turn");
+            let binding = protocol::WorkspaceReadBinding {
+                session_id: session.session_id.clone(),
+                life_id: session.life_id.clone(),
+                task_id: session.task_id.clone(),
+                capability_id: protocol::WORKSPACE_READ_CAPABILITY_ID.to_string(),
+                tool_name: protocol::WORKSPACE_READ_TOOL_NAME.to_string(),
+                workspace_root_identity: "workspace-root".to_string(),
+                relative_path: "notes/today.txt".to_string(),
+                target_identity: "workspace-target".to_string(),
+                target_kind: protocol::WorkspaceReadTargetKind::File,
+                max_bytes: protocol::MAX_WORKSPACE_READ_BYTES,
+                tool_call_id: "read-call".to_string(),
+                codex_turn_id: "codex-read-turn".to_string(),
+                provider_binding_hash: provider_binding.binding_hash,
+            };
+            let content_sha256 = format!("{:x}", Sha256::digest(content));
+            let grant = protocol::WorkspaceReadGrant {
+                session_id: session.session_id.clone(),
+                grant_id: "read-grant".to_string(),
+                confirmation_id: "read-confirmation".to_string(),
+                binding: binding.clone(),
+                authorization_revision: 2,
+                issued_at_unix_ms: unix_millis(),
+                expires_at_unix_ms: unix_millis().saturating_add(5_000),
+                single_use: true,
+                used: false,
+            };
+            protocol::WorkspaceReadReleaseCheck {
+                request_id: "read-release".to_string(),
+                session_id: session.session_id.clone(),
+                host_turn_id: host_turn_id.to_string(),
+                binding,
+                grant,
+                bytes_read: content.len() as u64,
+                content_sha256,
+            }
+        }
+
         #[test]
         fn stale_sidecar_provider_requires_explicit_restart() {
             let provider_a = test_provider();
@@ -2880,7 +3207,7 @@ mod windows {
             let (_root, storage, registry, enabled_revision) = authority_fixture(&session);
 
             assert_eq!(
-                preflight_capability_root(&storage, &registry, &session),
+                preflight_capability_roots(&storage, &registry, &session),
                 Ok(())
             );
             let disabled = apply_transition_for_test(
@@ -2895,13 +3222,13 @@ mod windows {
             assert_eq!(disabled.previous_revision, enabled_revision);
             assert_eq!(disabled.revision, enabled_revision + 1);
             assert_eq!(
-                preflight_capability_root(&storage, &registry, &session).unwrap_err(),
+                preflight_capability_roots(&storage, &registry, &session).unwrap_err(),
                 "CAPABILITY_ROOT_DISABLED"
             );
 
             let (missing_session, _missing_receiver) = test_session_for_life("life-missing");
             assert_eq!(
-                preflight_capability_root(&storage, &registry, &missing_session).unwrap_err(),
+                preflight_capability_roots(&storage, &registry, &missing_session).unwrap_err(),
                 "CAPABILITY_AUTHORIZATION_REQUIRED"
             );
             // A denied preflight does not create a Host turn generation or a
@@ -2911,6 +3238,204 @@ mod windows {
                 Some(HostTurnAuthority::Idle)
             ));
             assert!(receiver.try_recv().is_err());
+        }
+
+        #[test]
+        fn d31_synthetic_multi_capability_admission_allows_any_usable_root() {
+            for (case, git_enabled, read_enabled, admitted) in [
+                ("git enabled/read disabled", Some(true), Some(false), true),
+                ("git disabled/read enabled", Some(false), Some(true), true),
+                ("both enabled", Some(true), Some(true), true),
+                ("both disabled", Some(false), Some(false), false),
+                ("git missing/read enabled", None, Some(true), true),
+                ("git enabled/read missing", Some(true), None, true),
+                ("all missing", None, None, false),
+            ] {
+                let provider = test_provider();
+                let (session, receiver) = test_session_with_provider(provider.clone());
+                let (root, storage, registry) =
+                    synthetic_multi_capability_fixture(&session, git_enabled, read_enabled);
+                let coordinator = VitaSidecarCoordinator::new(Arc::new(storage), registry);
+                *coordinator
+                    .test_provider_override
+                    .lock()
+                    .expect("provider override lock") = Some(provider);
+                coordinator.install_test_session(Arc::clone(&session));
+
+                let result = coordinator.start_turn(VitaTurnStartRequest {
+                    prompt: format!("D31 multi-capability {case}"),
+                });
+                if admitted {
+                    let response = result.expect(case);
+                    assert!(response.accepted, "{case}");
+                    assert!(matches!(
+                        receiver.recv_timeout(Duration::from_secs(1)),
+                        Ok(HostMessage::StartTurn(protocol::StartTurn { turn_id, .. }))
+                            if turn_id == response.turn_id
+                    ));
+                    assert!(receiver.recv_timeout(Duration::from_millis(25)).is_err());
+                    session.retire();
+                } else {
+                    assert!(result.is_err(), "{case} must deny");
+                    assert!(matches!(
+                        session.authority_snapshot(),
+                        Some(HostTurnAuthority::Idle)
+                    ));
+                    assert!(receiver.try_recv().is_err());
+                }
+                drop(coordinator);
+                drop(root);
+            }
+        }
+
+        #[test]
+        fn d31_status_projects_each_trusted_capability_without_authority_cache() {
+            let (session, _receiver) = test_session();
+            let (root, storage, registry) =
+                synthetic_multi_capability_fixture(&session, Some(false), Some(true));
+            let (aggregate, states, current_life_id) =
+                capability_readiness(&storage, &registry, Some(&session.life_id));
+            assert_eq!(aggregate, VitaCapabilityReadiness::RootEnabled);
+            assert_eq!(current_life_id.as_deref(), Some(session.life_id.as_str()));
+            assert_eq!(states.len(), 2);
+            assert!(states.iter().any(|state| {
+                state.capability_id == PRODUCTION_GIT_STATUS_CAPABILITY_ID
+                    && state.readiness == VitaCapabilityReadiness::RootDisabled
+                    && state.revision == Some(1)
+            }));
+            assert!(states.iter().any(|state| {
+                state.capability_id == protocol::WORKSPACE_READ_CAPABILITY_ID
+                    && state.readiness == VitaCapabilityReadiness::RootEnabled
+                    && state.revision == Some(2)
+            }));
+            drop(root);
+        }
+
+        #[test]
+        fn d31_release_contract_rechecks_buffer_binding_and_fresh_authority() {
+            let provider = test_provider();
+            let content = b"D31 confidential workspace bytes";
+            let (session, _receiver) = test_session_with_provider(provider.clone());
+            let (root, storage, registry) =
+                synthetic_multi_capability_fixture(&session, None, Some(true));
+            let request = workspace_read_release_request(
+                &session,
+                &provider,
+                "d31-release-host-turn",
+                content,
+            );
+            assert_eq!(
+                authorize_workspace_read_release(&storage, &registry, &session, &request, content),
+                Ok(())
+            );
+
+            let mut wrong_provider = request.clone();
+            wrong_provider.binding.provider_binding_hash = "c".repeat(64);
+            wrong_provider.grant.binding = wrong_provider.binding.clone();
+            assert_eq!(
+                authorize_workspace_read_release(
+                    &storage,
+                    &registry,
+                    &session,
+                    &wrong_provider,
+                    content,
+                )
+                .unwrap_err(),
+                "WORKSPACE_READ_DISCLOSURE_TURN_NOT_ACTIVE"
+            );
+
+            let mut wrong_revision = request.clone();
+            wrong_revision.grant.authorization_revision = 1;
+            assert_eq!(
+                authorize_workspace_read_release(
+                    &storage,
+                    &registry,
+                    &session,
+                    &wrong_revision,
+                    content,
+                )
+                .unwrap_err(),
+                "CAPABILITY_AUTHORIZATION_REVISION_MISMATCH"
+            );
+
+            let mut wrong_content = request.clone();
+            wrong_content.content_sha256 = "d".repeat(64);
+            assert_eq!(
+                authorize_workspace_read_release(
+                    &storage,
+                    &registry,
+                    &session,
+                    &wrong_content,
+                    content,
+                )
+                .unwrap_err(),
+                "WORKSPACE_READ_CONTENT_EVIDENCE_MISMATCH"
+            );
+
+            let mut wrong_byte_count = request.clone();
+            wrong_byte_count.bytes_read += 1;
+            assert_eq!(
+                authorize_workspace_read_release(
+                    &storage,
+                    &registry,
+                    &session,
+                    &wrong_byte_count,
+                    content,
+                )
+                .unwrap_err(),
+                "WORKSPACE_READ_CONTENT_EVIDENCE_MISMATCH"
+            );
+
+            let mut expired = request.clone();
+            expired.grant.expires_at_unix_ms = expired.grant.issued_at_unix_ms;
+            assert_eq!(
+                authorize_workspace_read_release(&storage, &registry, &session, &expired, content)
+                    .unwrap_err(),
+                "WORKSPACE_READ_GRANT_EXPIRED"
+            );
+
+            let disabled = apply_transition_for_test(
+                &storage,
+                &registry,
+                protocol::WORKSPACE_READ_CAPABILITY_ID,
+                false,
+                2,
+                &session.life_id,
+            )
+            .expect("D31 synthetic root revoke");
+            assert_eq!(disabled.revision, 3);
+            assert_eq!(
+                authorize_workspace_read_release(&storage, &registry, &session, &request, content)
+                    .unwrap_err(),
+                "CAPABILITY_ROOT_DISABLED"
+            );
+            session.retire();
+            drop(root);
+        }
+
+        #[test]
+        fn d31_release_contract_denies_after_turn_cancellation() {
+            let provider = test_provider();
+            let content = b"D31 confidential workspace bytes";
+            let (session, _receiver) = test_session_with_provider(provider.clone());
+            let (root, storage, registry) =
+                synthetic_multi_capability_fixture(&session, None, Some(true));
+            let request = workspace_read_release_request(
+                &session,
+                &provider,
+                "d31-cancelled-release-host-turn",
+                content,
+            );
+            session
+                .begin_cancellation()
+                .expect("cancel active Host turn");
+            assert_eq!(
+                authorize_workspace_read_release(&storage, &registry, &session, &request, content)
+                    .unwrap_err(),
+                "WORKSPACE_READ_DISCLOSURE_TURN_NOT_ACTIVE"
+            );
+            session.retire();
+            drop(root);
         }
 
         #[test]
@@ -3709,6 +4234,24 @@ mod windows {
             let frame = protocol::encode_frame(&VitaMessage::Ready(ready)).expect("ready frame");
             let decoded = protocol::decode_frame::<VitaMessage>(&frame[4..]).expect("tagged frame");
             assert!(matches!(decoded, VitaMessage::Ready(_)));
+        }
+
+        #[test]
+        fn d31_protocol_version_mismatch_is_rejected_before_session_start() {
+            let mut handshake = protocol::Handshake {
+                request_id: "d31-version".to_string(),
+                protocol_version: PROTOCOL_VERSION.to_string(),
+                runtime: RUNTIME_ID.to_string(),
+                codex_commit: CODEX_UPSTREAM_COMMIT.to_string(),
+                codex_schema_hash: CODEX_PROTOCOL_SCHEMA_HASH.to_string(),
+            };
+            assert!(validate_handshake(&handshake).is_ok());
+
+            handshake.protocol_version = "d30-c.vita-sidecar.v2".to_string();
+            assert_eq!(
+                validate_handshake(&handshake),
+                Err("Vita sidecar handshake identity was not pinned".to_string())
+            );
         }
 
         #[test]
@@ -4875,6 +5418,7 @@ mod non_windows {
             running: false,
             provider_readiness: VitaProviderReadiness::SidecarNotRunning,
             capability_readiness: VitaCapabilityReadiness::AuthorizationUnavailable,
+            capability_states: Vec::new(),
             session_life_id: None,
             current_life_id: None,
             session_id: None,

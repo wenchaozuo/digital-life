@@ -18,6 +18,13 @@ function status(overrides: Record<string, unknown> = {}) {
     running: false,
     providerReadiness: "SIDECAR_NOT_RUNNING",
     capabilityReadiness: "ROOT_ENABLED",
+    capabilityStates: [
+      {
+        capabilityId: "vita.process.workspace.git_status",
+        readiness: "ROOT_ENABLED",
+        revision: 2,
+      },
+    ],
     sessionLifeId: null,
     currentLifeId: null,
     sessionId: null,

@@ -14,7 +14,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-pub const PROTOCOL_VERSION: &str = "d29-h9.vita-sidecar.v2";
+/// Digital Life's private Host↔Vita wire version.  D31-A adds new workspace
+/// read authority variants, so old and new sidecars must fail closed during
+/// the initialization handshake instead of relying on serde compatibility.
+pub const PROTOCOL_VERSION: &str = "d31-a.vita-sidecar.v3";
 pub const RUNTIME_ID: &str = "vita-agent";
 pub const CODEX_UPSTREAM_COMMIT: &str = "316795b3cf2a45e90d121d9f46499d4658b2645c";
 pub const CODEX_PROTOCOL_SCHEMA_HASH: &str =
@@ -28,10 +31,18 @@ pub const MAX_PROMPT_BYTES: usize = 64 * 1024;
 pub const MAX_TURN_OUTPUT_BYTES: usize = 256 * 1024;
 pub const MAX_PROVIDER_BINDING_BYTES: usize = 256;
 pub const MAX_CREDENTIAL_BYTES: usize = 64 * 1024;
+pub const MAX_WORKSPACE_READ_BYTES: u64 = 64 * 1024;
+pub const MAX_WORKSPACE_READ_RELATIVE_PATH_BYTES: usize = 4 * 1024;
 
 pub const CAPABILITY_ID: &str = "vita.process.workspace.git_status";
 pub const PROFILE_ID: &str = "d29h7c.git.status.v1";
 pub const TOOL_NAME: &str = "vita_workspace_git_status";
+
+/// D31-A freezes this future lane's identities without registering it in the
+/// production Host catalog.  These wire constants are not a tool exposure.
+pub const WORKSPACE_READ_CAPABILITY_ID: &str = "vita.workspace.read_file";
+pub const WORKSPACE_READ_PROFILE_ID: &str = "d31.workspace.read_file.v1";
+pub const WORKSPACE_READ_TOOL_NAME: &str = "vita_workspace_read_file";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FrameError {
@@ -177,6 +188,11 @@ pub enum HostMessage {
     ConfirmationReply(ConfirmationReply),
     GrantIssued(GrantIssued),
     GrantRevalidated(GrantRevalidated),
+    WorkspaceReadAuthorityReply(WorkspaceReadAuthorityReply),
+    WorkspaceReadConfirmationReply(WorkspaceReadConfirmationReply),
+    WorkspaceReadGrantIssued(WorkspaceReadGrantIssued),
+    WorkspaceReadGrantRevalidated(WorkspaceReadGrantRevalidated),
+    WorkspaceReadReleaseChecked(WorkspaceReadReleaseChecked),
     CancelAction(CancelAction),
     StartTurn(StartTurn),
     CancelTurn(CancelTurn),
@@ -193,6 +209,11 @@ pub enum VitaMessage {
     ConfirmationRequired(ConfirmationRequired),
     IssueGrant(IssueGrant),
     RevalidateGrant(RevalidateGrant),
+    WorkspaceReadAuthorityEvaluate(WorkspaceReadAuthorityEvaluate),
+    WorkspaceReadConfirmationRequired(WorkspaceReadConfirmationRequired),
+    WorkspaceReadIssueGrant(WorkspaceReadIssueGrant),
+    WorkspaceReadRevalidateGrant(WorkspaceReadRevalidateGrant),
+    WorkspaceReadReleaseCheck(WorkspaceReadReleaseCheck),
     ActionCancelled(ActionCancelled),
     CredentialRequired(CredentialRequired),
     TurnState(TurnState),
@@ -374,6 +395,149 @@ pub struct ProcessGrant {
     pub expires_at_unix_ms: u64,
     pub single_use: bool,
     pub used: bool,
+}
+
+/// Typed evidence for a future bounded workspace-file read.  This is
+/// intentionally separate from `ProcessBinding`: it does not represent an
+/// executable image, arguments, environment, or process authority.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceReadTargetKind {
+    File,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceReadBinding {
+    pub session_id: String,
+    pub life_id: String,
+    pub task_id: String,
+    pub capability_id: String,
+    pub tool_name: String,
+    pub workspace_root_identity: String,
+    pub relative_path: String,
+    pub target_identity: String,
+    pub target_kind: WorkspaceReadTargetKind,
+    pub max_bytes: u64,
+    pub tool_call_id: String,
+    pub codex_turn_id: String,
+    pub provider_binding_hash: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceReadGrant {
+    pub session_id: String,
+    pub grant_id: String,
+    pub confirmation_id: String,
+    pub binding: WorkspaceReadBinding,
+    pub authorization_revision: i64,
+    pub issued_at_unix_ms: u64,
+    pub expires_at_unix_ms: u64,
+    pub single_use: bool,
+    pub used: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceReadAuthorityEvaluate {
+    pub request_id: String,
+    pub session_id: String,
+    pub host_turn_id: String,
+    pub binding: WorkspaceReadBinding,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceReadAuthorityReply {
+    pub request_id: String,
+    pub session_id: String,
+    pub allowed: bool,
+    pub authorization_revision: Option<i64>,
+    pub error_code: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceReadConfirmationRequired {
+    pub request_id: String,
+    pub session_id: String,
+    pub host_turn_id: String,
+    pub workspace_summary: String,
+    pub expires_at_unix_ms: u64,
+    pub binding: WorkspaceReadBinding,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceReadConfirmationReply {
+    pub request_id: String,
+    pub session_id: String,
+    pub decision: ConfirmationDecision,
+    pub authorization_revision: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceReadIssueGrant {
+    pub request_id: String,
+    pub session_id: String,
+    pub host_turn_id: String,
+    pub binding: WorkspaceReadBinding,
+    pub authorization_revision: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceReadGrantIssued {
+    pub request_id: String,
+    pub session_id: String,
+    pub allowed: bool,
+    pub grant: Option<WorkspaceReadGrant>,
+    pub error_code: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceReadRevalidateGrant {
+    pub request_id: String,
+    pub session_id: String,
+    pub host_turn_id: String,
+    pub binding: WorkspaceReadBinding,
+    pub grant: WorkspaceReadGrant,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceReadGrantRevalidated {
+    pub request_id: String,
+    pub session_id: String,
+    pub allowed: bool,
+    pub grant: Option<WorkspaceReadGrant>,
+    pub error_code: Option<String>,
+}
+
+/// The post-read disclosure fence.  A successful reply makes a confidential
+/// Vita-owned buffer eligible for tool output; it is not a read grant itself.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceReadReleaseCheck {
+    pub request_id: String,
+    pub session_id: String,
+    pub host_turn_id: String,
+    pub binding: WorkspaceReadBinding,
+    pub grant: WorkspaceReadGrant,
+    pub bytes_read: u64,
+    pub content_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceReadReleaseChecked {
+    pub request_id: String,
+    pub session_id: String,
+    pub allowed: bool,
+    pub error_code: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -773,6 +937,191 @@ impl RevalidateGrant {
     }
 }
 
+impl WorkspaceReadBinding {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        for value in [
+            &self.session_id,
+            &self.life_id,
+            &self.task_id,
+            &self.capability_id,
+            &self.tool_name,
+            &self.workspace_root_identity,
+            &self.target_identity,
+            &self.tool_call_id,
+            &self.codex_turn_id,
+        ] {
+            valid_id(value)?;
+        }
+        if self.capability_id != WORKSPACE_READ_CAPABILITY_ID
+            || self.tool_name != WORKSPACE_READ_TOOL_NAME
+            || self.max_bytes == 0
+            || self.max_bytes > MAX_WORKSPACE_READ_BYTES
+        {
+            return Err(FrameError::InvalidField);
+        }
+        valid_workspace_relative_path(&self.relative_path)?;
+        valid_sha256(&self.provider_binding_hash)
+    }
+}
+
+impl WorkspaceReadGrant {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        valid_id(&self.session_id)?;
+        valid_id(&self.grant_id)?;
+        valid_id(&self.confirmation_id)?;
+        self.binding.validate()?;
+        if self.session_id != self.binding.session_id
+            || self.authorization_revision <= 0
+            || self.issued_at_unix_ms > self.expires_at_unix_ms
+            || !self.single_use
+        {
+            return Err(FrameError::InvalidField);
+        }
+        Ok(())
+    }
+}
+
+impl WorkspaceReadAuthorityEvaluate {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        valid_id(&self.request_id)?;
+        valid_id(&self.session_id)?;
+        valid_id(&self.host_turn_id)?;
+        self.binding.validate()?;
+        if self.session_id != self.binding.session_id {
+            return Err(FrameError::InvalidField);
+        }
+        Ok(())
+    }
+}
+
+impl WorkspaceReadAuthorityReply {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        valid_authority_reply(
+            &self.request_id,
+            &self.session_id,
+            self.allowed,
+            self.authorization_revision,
+            self.error_code.as_deref(),
+        )
+    }
+}
+
+impl WorkspaceReadConfirmationRequired {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        valid_id(&self.request_id)?;
+        valid_id(&self.session_id)?;
+        valid_id(&self.host_turn_id)?;
+        valid_bounded_text(&self.workspace_summary, MAX_SUMMARY_BYTES)?;
+        if self.expires_at_unix_ms == 0 {
+            return Err(FrameError::InvalidField);
+        }
+        self.binding.validate()?;
+        if self.session_id != self.binding.session_id {
+            return Err(FrameError::InvalidField);
+        }
+        Ok(())
+    }
+}
+
+impl WorkspaceReadConfirmationReply {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        valid_confirmation_reply(
+            &self.request_id,
+            &self.session_id,
+            self.decision,
+            self.authorization_revision,
+        )
+    }
+}
+
+impl WorkspaceReadIssueGrant {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        valid_id(&self.request_id)?;
+        valid_id(&self.session_id)?;
+        valid_id(&self.host_turn_id)?;
+        self.binding.validate()?;
+        if self.session_id != self.binding.session_id || self.authorization_revision <= 0 {
+            return Err(FrameError::InvalidField);
+        }
+        Ok(())
+    }
+}
+
+impl WorkspaceReadGrantIssued {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        valid_grant_reply(
+            &self.request_id,
+            &self.session_id,
+            self.allowed,
+            self.grant.as_ref(),
+            self.error_code.as_deref(),
+        )
+    }
+}
+
+impl WorkspaceReadRevalidateGrant {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        valid_id(&self.request_id)?;
+        valid_id(&self.session_id)?;
+        valid_id(&self.host_turn_id)?;
+        self.binding.validate()?;
+        self.grant.validate()?;
+        if self.session_id != self.binding.session_id
+            || self.binding != self.grant.binding
+            || self.session_id != self.grant.session_id
+        {
+            return Err(FrameError::InvalidField);
+        }
+        Ok(())
+    }
+}
+
+impl WorkspaceReadGrantRevalidated {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        valid_grant_reply(
+            &self.request_id,
+            &self.session_id,
+            self.allowed,
+            self.grant.as_ref(),
+            self.error_code.as_deref(),
+        )
+    }
+}
+
+impl WorkspaceReadReleaseCheck {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        valid_id(&self.request_id)?;
+        valid_id(&self.session_id)?;
+        valid_id(&self.host_turn_id)?;
+        self.binding.validate()?;
+        self.grant.validate()?;
+        valid_sha256(&self.content_sha256)?;
+        if self.session_id != self.binding.session_id
+            || self.session_id != self.grant.session_id
+            || self.binding != self.grant.binding
+            || self.bytes_read > self.binding.max_bytes
+        {
+            return Err(FrameError::InvalidField);
+        }
+        Ok(())
+    }
+}
+
+impl WorkspaceReadReleaseChecked {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        valid_id(&self.request_id)?;
+        valid_id(&self.session_id)?;
+        match (self.allowed, self.error_code.as_deref()) {
+            (true, None) | (false, Some(_)) => {}
+            _ => return Err(FrameError::InvalidField),
+        }
+        if let Some(error_code) = &self.error_code {
+            valid_id(error_code)?;
+        }
+        Ok(())
+    }
+}
+
 impl SensitiveCredentialReply {
     pub fn validate(&self) -> Result<(), FrameError> {
         valid_id(&self.request_id)?;
@@ -885,12 +1234,90 @@ impl ProcessGrant {
     }
 }
 
+fn valid_authority_reply(
+    request_id: &str,
+    session_id: &str,
+    allowed: bool,
+    authorization_revision: Option<i64>,
+    error_code: Option<&str>,
+) -> Result<(), FrameError> {
+    valid_id(request_id)?;
+    valid_id(session_id)?;
+    match (allowed, authorization_revision, error_code) {
+        (true, Some(revision), None) if revision > 0 => Ok(()),
+        (false, None, Some(code)) => valid_id(code),
+        _ => Err(FrameError::InvalidField),
+    }
+}
+
+fn valid_confirmation_reply(
+    request_id: &str,
+    session_id: &str,
+    decision: ConfirmationDecision,
+    authorization_revision: Option<i64>,
+) -> Result<(), FrameError> {
+    valid_id(request_id)?;
+    valid_id(session_id)?;
+    match (decision, authorization_revision) {
+        (ConfirmationDecision::Confirm, Some(revision)) if revision > 0 => Ok(()),
+        (ConfirmationDecision::Deny | ConfirmationDecision::Cancel, None) => Ok(()),
+        _ => Err(FrameError::InvalidField),
+    }
+}
+
+fn valid_grant_reply(
+    request_id: &str,
+    session_id: &str,
+    allowed: bool,
+    grant: Option<&WorkspaceReadGrant>,
+    error_code: Option<&str>,
+) -> Result<(), FrameError> {
+    valid_id(request_id)?;
+    valid_id(session_id)?;
+    match (allowed, grant, error_code) {
+        (true, Some(grant), None) if grant.session_id == session_id => grant.validate(),
+        (false, None, Some(code)) => valid_id(code),
+        _ => Err(FrameError::InvalidField),
+    }
+}
+
 fn valid_id(value: &str) -> Result<(), FrameError> {
     if value.is_empty()
         || value.len() > MAX_ID_BYTES
         || value
             .chars()
             .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return Err(FrameError::InvalidField);
+    }
+    Ok(())
+}
+
+fn valid_workspace_relative_path(value: &str) -> Result<(), FrameError> {
+    if value.is_empty()
+        || value.len() > MAX_WORKSPACE_READ_RELATIVE_PATH_BYTES
+        || value.chars().any(char::is_control)
+        || value.starts_with('/')
+        || value.starts_with('\\')
+        || value.contains('\\')
+        || value.contains(':')
+    {
+        return Err(FrameError::InvalidField);
+    }
+    if value
+        .split('/')
+        .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
+    {
+        return Err(FrameError::InvalidField);
+    }
+    Ok(())
+}
+
+fn valid_sha256(value: &str) -> Result<(), FrameError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
     {
         return Err(FrameError::InvalidField);
     }
@@ -923,6 +1350,38 @@ fn valid_path(value: &str) -> Result<(), FrameError> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    fn read_binding() -> WorkspaceReadBinding {
+        WorkspaceReadBinding {
+            session_id: "session".to_string(),
+            life_id: "life".to_string(),
+            task_id: "task".to_string(),
+            capability_id: WORKSPACE_READ_CAPABILITY_ID.to_string(),
+            tool_name: WORKSPACE_READ_TOOL_NAME.to_string(),
+            workspace_root_identity: "root-identity".to_string(),
+            relative_path: "notes/today.txt".to_string(),
+            target_identity: "target-identity".to_string(),
+            target_kind: WorkspaceReadTargetKind::File,
+            max_bytes: 1024,
+            tool_call_id: "call-1".to_string(),
+            codex_turn_id: "codex-turn".to_string(),
+            provider_binding_hash: "a".repeat(64),
+        }
+    }
+
+    fn read_grant(binding: WorkspaceReadBinding) -> WorkspaceReadGrant {
+        WorkspaceReadGrant {
+            session_id: binding.session_id.clone(),
+            grant_id: "grant-1".to_string(),
+            confirmation_id: "confirmation-1".to_string(),
+            binding,
+            authorization_revision: 2,
+            issued_at_unix_ms: 1,
+            expires_at_unix_ms: 2,
+            single_use: true,
+            used: false,
+        }
+    }
 
     #[test]
     fn frame_round_trip_is_bounded() {
@@ -1022,5 +1481,137 @@ mod tests {
         let mut stale = binding.clone();
         stale.model = "other-model".to_string();
         assert!(stale.validate().is_err());
+    }
+
+    #[test]
+    fn workspace_read_binding_round_trips_without_process_fields() {
+        let binding = read_binding();
+        assert!(binding.validate().is_ok());
+        let grant = read_grant(binding.clone());
+        let message = VitaMessage::WorkspaceReadReleaseCheck(WorkspaceReadReleaseCheck {
+            request_id: "release-1".to_string(),
+            session_id: binding.session_id.clone(),
+            host_turn_id: "host-turn".to_string(),
+            binding,
+            grant,
+            bytes_read: 42,
+            content_sha256: "b".repeat(64),
+        });
+        let frame = encode_frame(&message).expect("read release frame");
+        let decoded: VitaMessage = decode_frame(&frame[4..]).expect("read release decode");
+        assert_eq!(decoded, message);
+        if let VitaMessage::WorkspaceReadReleaseCheck(check) = decoded {
+            assert!(check.validate().is_ok());
+        } else {
+            panic!("workspace read release variant was not preserved");
+        }
+    }
+
+    #[test]
+    fn workspace_read_binding_and_release_evidence_fail_closed() {
+        let mut malformed_path = read_binding();
+        malformed_path.relative_path = "../secret.txt".to_string();
+        assert_eq!(malformed_path.validate(), Err(FrameError::InvalidField));
+        let mut oversized = read_binding();
+        oversized.max_bytes = MAX_WORKSPACE_READ_BYTES + 1;
+        assert_eq!(oversized.validate(), Err(FrameError::InvalidField));
+        let mut malformed_provider_hash = read_binding();
+        malformed_provider_hash.provider_binding_hash = "A".repeat(64);
+        assert_eq!(
+            malformed_provider_hash.validate(),
+            Err(FrameError::InvalidField)
+        );
+
+        let binding = read_binding();
+        let mut grant = read_grant(binding.clone());
+        grant.binding.relative_path = "other.txt".to_string();
+        let mismatched = WorkspaceReadReleaseCheck {
+            request_id: "release-2".to_string(),
+            session_id: binding.session_id.clone(),
+            host_turn_id: "host-turn".to_string(),
+            binding: binding.clone(),
+            grant,
+            bytes_read: 1,
+            content_sha256: "c".repeat(64),
+        };
+        assert_eq!(mismatched.validate(), Err(FrameError::InvalidField));
+        let invalid_hash = WorkspaceReadReleaseCheck {
+            request_id: "release-3".to_string(),
+            session_id: binding.session_id.clone(),
+            host_turn_id: "host-turn".to_string(),
+            binding: binding.clone(),
+            grant: read_grant(binding.clone()),
+            bytes_read: 1,
+            content_sha256: "not-a-sha".to_string(),
+        };
+        assert_eq!(invalid_hash.validate(), Err(FrameError::InvalidField));
+    }
+
+    #[test]
+    fn workspace_read_unknown_fields_and_protocol_mismatches_are_denied() {
+        let message = VitaMessage::WorkspaceReadAuthorityEvaluate(WorkspaceReadAuthorityEvaluate {
+            request_id: "authority-1".to_string(),
+            session_id: "session".to_string(),
+            host_turn_id: "host-turn".to_string(),
+            binding: read_binding(),
+        });
+        let mut value = serde_json::to_value(message).expect("wire value");
+        value
+            .as_object_mut()
+            .expect("wire object")
+            .insert("unexpected".to_string(), serde_json::json!(true));
+        assert_eq!(
+            decode_frame::<VitaMessage>(&serde_json::to_vec(&value).expect("wire bytes")),
+            Err(FrameError::InvalidJson)
+        );
+
+        let mut init = InitializeSession {
+            request_id: "init".to_string(),
+            protocol_version: "d29-h9.vita-sidecar.v2".to_string(),
+            session_id: "session".to_string(),
+            life_id: "life".to_string(),
+            task_id: "task".to_string(),
+            app_data_root: "C:/app".to_string(),
+            workspace_path: "C:/workspace".to_string(),
+            git_path: "C:/git.exe".to_string(),
+            provider: None,
+        };
+        assert_eq!(init.validate(), Err(FrameError::InvalidField));
+        init.protocol_version = PROTOCOL_VERSION.to_string();
+        assert!(init.validate().is_ok());
+    }
+
+    #[test]
+    fn h7_authority_wire_variant_remains_process_specific() {
+        let binding = ProcessBinding {
+            session_id: "session".to_string(),
+            life_id: "life".to_string(),
+            task_id: "task".to_string(),
+            capability_id: CAPABILITY_ID.to_string(),
+            program_id: PROFILE_ID.to_string(),
+            executable_identity: "image".to_string(),
+            executable_sha256: "a".repeat(64),
+            argv_hash: "argv".to_string(),
+            argv_count: 1,
+            working_directory_identity: "cwd".to_string(),
+            environment_policy_hash: "environment".to_string(),
+            stdout_bound: 1,
+            stderr_bound: 1,
+            timeout_ms: 1,
+            tool_call_id: "call".to_string(),
+            turn_id: "codex-turn".to_string(),
+            workspace_root_identity: "root".to_string(),
+            profile_id: PROFILE_ID.to_string(),
+            git_metadata_fence_hash: "fence".to_string(),
+        };
+        let message = VitaMessage::AuthorityEvaluate(AuthorityEvaluate {
+            request_id: "authority".to_string(),
+            session_id: "session".to_string(),
+            host_turn_id: "host-turn".to_string(),
+            binding,
+        });
+        let frame = encode_frame(&message).expect("H7 frame");
+        let decoded: VitaMessage = decode_frame(&frame[4..]).expect("H7 decode");
+        assert_eq!(decoded, message);
     }
 }

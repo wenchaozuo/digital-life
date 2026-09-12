@@ -20,6 +20,11 @@ interface VitaStatus {
   running: boolean;
   providerReadiness: string;
   capabilityReadiness: string;
+  capabilityStates: Array<{
+    capabilityId: string;
+    readiness: string;
+    revision: number | null;
+  }>;
   sessionLifeId: string | null;
   currentLifeId: string | null;
   sessionId: string | null;
@@ -36,6 +41,7 @@ const status = ref<VitaStatus>({
   running: false,
   providerReadiness: "SIDECAR_NOT_RUNNING",
   capabilityReadiness: "AUTHORIZATION_UNAVAILABLE",
+  capabilityStates: [],
   sessionLifeId: null,
   currentLifeId: null,
   sessionId: null,

@@ -542,9 +542,13 @@ mod windows {
         Ok(grant)
     }
 
-    /// Future-lane Host helper.  The authority mutex remains held from the
-    /// active-turn check through the fresh D28 evaluation and the ledger
-    /// transition, so cancellation cannot interleave with revalidation.
+    /// Future-lane Host helper.  The pre-read authorization commit is
+    /// `Issued -> Revalidated`, and it uses the same Host-owned linearizer as
+    /// D30 CAS updates and disclosure release.  Lock order is
+    /// `turn_authority -> capability_authorization_linearizer
+    /// -> workspace_read_grants -> StorageService state`; the linearizer is
+    /// released as soon as the in-memory pre-read commit is complete, before
+    /// any future filesystem I/O.
     #[allow(dead_code)]
     fn revalidate_workspace_read_grant(
         storage: &StorageService,
@@ -572,9 +576,9 @@ mod windows {
         {
             return Err("WORKSPACE_READ_DISCLOSURE_TURN_NOT_ACTIVE".to_string());
         }
-        require_current_session_life(storage, session)?;
-        let current_revision =
-            current_workspace_read_revision(storage, registry, session, &request.binding)?;
+        let _authorization_linearizer = storage
+            .lock_capability_authorization_linearizer()
+            .map_err(|_| "CAPABILITY_AUTHORIZATION_UNAVAILABLE".to_string())?;
         let mut grants = session
             .workspace_read_grants
             .lock()
@@ -586,15 +590,24 @@ mod windows {
             || state.phase != WorkspaceReadGrantPhase::Issued
             || state.grant != request.grant
             || state.grant.binding != request.binding
-            || state.grant.authorization_revision != current_revision
             || state.grant.expires_at_unix_ms <= unix_millis()
             || !state.grant.single_use
         {
             return Err("WORKSPACE_READ_GRANT_REVALIDATION_DENIED".to_string());
         }
+        require_current_session_life(storage, session)?;
+        let current_revision =
+            current_workspace_read_revision(storage, registry, session, &request.binding)?;
+        if state.grant.authorization_revision != current_revision {
+            return Err("CAPABILITY_AUTHORIZATION_REVISION_MISMATCH".to_string());
+        }
         state.grant.used = true;
         state.phase = WorkspaceReadGrantPhase::Revalidated;
-        Ok(state.grant.clone())
+        let revalidated = state.grant.clone();
+        drop(grants);
+        drop(_authorization_linearizer);
+        drop(authority);
+        Ok(revalidated)
     }
 
     /// Host release decision linearization point.  The caller may write the
@@ -626,16 +639,15 @@ mod windows {
         {
             return Err("WORKSPACE_READ_DISCLOSURE_TURN_NOT_ACTIVE".to_string());
         }
-        // The turn authority is acquired first.  The shared Host-owned
-        // capability linearizer is acquired before the fresh D28 evaluation
-        // and held through the authoritative grant transition.  D30's
-        // enable/disable CAS takes the same boundary through its SQLite
-        // IMMEDIATE commit, so exactly one of revoke or release linearizes
-        // first.  No IPC write happens while either decision is pending.
+        // The turn authority is acquired first, then the shared Host-owned
+        // capability linearizer, then the exact grant ledger, and only then
+        // fresh D28 storage reads.  D30's enable/disable CAS takes the same
+        // linearizer before its SQLite IMMEDIATE commit, so exactly one of
+        // revoke or release linearizes first.  No IPC write happens while
+        // either decision is pending.
         let _authorization_linearizer = storage
             .lock_capability_authorization_linearizer()
             .map_err(|_| "CAPABILITY_AUTHORIZATION_UNAVAILABLE".to_string())?;
-        require_current_session_life(storage, session)?;
         let mut grants = session
             .workspace_read_grants
             .lock()
@@ -651,6 +663,7 @@ mod windows {
         {
             return Err("WORKSPACE_READ_GRANT_PROVENANCE_MISMATCH".to_string());
         }
+        require_current_session_life(storage, session)?;
         // D28 is read inside the release decision while the shared
         // linearizer is still held.  A revocation that commits first is
         // observed here and denies; a release that commits first is already
@@ -673,6 +686,7 @@ mod windows {
         // later IPC write is transport only and cannot authorize a replay.
         state.phase = WorkspaceReadGrantPhase::Released;
         drop(grants);
+        drop(_authorization_linearizer);
         drop(authority);
         Ok(())
     }
@@ -3390,14 +3404,13 @@ mod windows {
             }
         }
 
-        fn workspace_read_release_request(
+        fn workspace_read_issued_grant(
             session: &Arc<HostSessionState>,
             storage: &StorageService,
             registry: &CapabilityRegistry,
             provider: &protocol::ProviderConfiguration,
             host_turn_id: &str,
-            content: &[u8],
-        ) -> protocol::WorkspaceReadReleaseCheck {
+        ) -> (protocol::WorkspaceReadBinding, WorkspaceReadGrant) {
             let binding = workspace_read_binding(session, provider, host_turn_id);
             let provider_binding =
                 protocol::ProviderBinding::derive(&session.session_id, host_turn_id, provider)
@@ -3437,6 +3450,19 @@ mod windows {
                     .map(|state| state.phase),
                 Some(WorkspaceReadGrantPhase::Issued)
             );
+            (binding, issued)
+        }
+
+        fn workspace_read_release_request(
+            session: &Arc<HostSessionState>,
+            storage: &StorageService,
+            registry: &CapabilityRegistry,
+            provider: &protocol::ProviderConfiguration,
+            host_turn_id: &str,
+            content: &[u8],
+        ) -> protocol::WorkspaceReadReleaseCheck {
+            let (binding, issued) =
+                workspace_read_issued_grant(session, storage, registry, provider, host_turn_id);
             let revalidated = revalidate_workspace_read_grant(
                 storage,
                 registry,
@@ -3743,6 +3769,264 @@ mod windows {
                     .map(|state| state.phase),
                 Some(WorkspaceReadGrantPhase::Released)
             );
+            session.retire();
+            drop(root);
+        }
+
+        #[test]
+        fn d31_revoke_first_linearizes_before_pre_read_revalidation() {
+            let provider = test_provider();
+            let (session, _receiver) = test_session_with_provider(provider.clone());
+            let (root, primary_storage, registry) =
+                synthetic_multi_capability_fixture(&session, None, Some(true));
+            let authority_storage = primary_storage
+                .open_authority_view()
+                .expect("shared authority view");
+            let primary_storage = Arc::new(primary_storage);
+            let authority_storage = Arc::new(authority_storage);
+            let (binding, issued) = workspace_read_issued_grant(
+                &session,
+                &authority_storage,
+                &registry,
+                &provider,
+                "d31-preread-revoke-first-host-turn",
+            );
+            assert!(!issued.used);
+            let request = protocol::WorkspaceReadRevalidateGrant {
+                request_id: "d31-preread-revoke-first".to_string(),
+                session_id: session.session_id.clone(),
+                host_turn_id: "d31-preread-revoke-first-host-turn".to_string(),
+                binding,
+                grant: issued.clone(),
+            };
+            let start = Arc::new(Barrier::new(2));
+            let (revoke_done_tx, revoke_done_rx) = mpsc::channel();
+            let revoke_storage = Arc::clone(&primary_storage);
+            let revoke_registry = registry.clone();
+            let revoke_life_id = session.life_id.clone();
+            let revoke_start = Arc::clone(&start);
+            let revoke_thread = thread::spawn(move || {
+                revoke_start.wait();
+                let transition = apply_transition_for_test(
+                    &revoke_storage,
+                    &revoke_registry,
+                    protocol::WORKSPACE_READ_CAPABILITY_ID,
+                    false,
+                    2,
+                    &revoke_life_id,
+                )
+                .expect("revoke must commit first");
+                revoke_done_tx
+                    .send(transition.revision)
+                    .expect("revalidate thread must observe revoke commit");
+                transition.revision
+            });
+            let revalidate_storage = Arc::clone(&authority_storage);
+            let revalidate_registry = registry.clone();
+            let revalidate_session = Arc::clone(&session);
+            let revalidate_request = request.clone();
+            let revalidate_start = Arc::clone(&start);
+            let revalidate_thread = thread::spawn(move || {
+                revalidate_start.wait();
+                assert_eq!(revoke_done_rx.recv().expect("revoke-first barrier"), 3);
+                revalidate_workspace_read_grant(
+                    &revalidate_storage,
+                    &revalidate_registry,
+                    &revalidate_session,
+                    &revalidate_request,
+                )
+            });
+
+            assert_eq!(revoke_thread.join().expect("revoke thread"), 3);
+            assert_eq!(
+                revalidate_thread.join().expect("revalidate thread"),
+                Err("CAPABILITY_ROOT_DISABLED".to_string())
+            );
+            assert_eq!(
+                session
+                    .workspace_read_grants
+                    .lock()
+                    .expect("workspace read grant lock")
+                    .get(&issued.grant_id)
+                    .map(|state| (state.phase, state.grant.used)),
+                Some((WorkspaceReadGrantPhase::Issued, false))
+            );
+            let row = primary_storage
+                .find_capability_authorization(
+                    &session.life_id,
+                    &CapabilityId::try_from(protocol::WORKSPACE_READ_CAPABILITY_ID)
+                        .expect("workspace read capability"),
+                )
+                .expect("authorization row")
+                .expect("authorization row exists");
+            assert!(!row.enabled);
+            assert_eq!(row.revision, 3);
+            session.retire();
+            drop(root);
+        }
+
+        #[test]
+        fn d31_pre_read_revalidation_wins_then_later_revoke_blocks_release() {
+            let provider = test_provider();
+            let content: &'static [u8] = b"D31 pre-read authorized bytes";
+            let (session, _receiver) = test_session_with_provider(provider.clone());
+            let (root, primary_storage, registry) =
+                synthetic_multi_capability_fixture(&session, None, Some(true));
+            let authority_storage = primary_storage
+                .open_authority_view()
+                .expect("shared authority view");
+            let primary_storage = Arc::new(primary_storage);
+            let authority_storage = Arc::new(authority_storage);
+            let (binding, issued) = workspace_read_issued_grant(
+                &session,
+                &authority_storage,
+                &registry,
+                &provider,
+                "d31-preread-release-first-host-turn",
+            );
+            let request = protocol::WorkspaceReadRevalidateGrant {
+                request_id: "d31-preread-release-first".to_string(),
+                session_id: session.session_id.clone(),
+                host_turn_id: "d31-preread-release-first-host-turn".to_string(),
+                binding: binding.clone(),
+                grant: issued,
+            };
+            let start = Arc::new(Barrier::new(2));
+            let (revalidate_done_tx, revalidate_done_rx) = mpsc::channel();
+            let revalidate_storage = Arc::clone(&authority_storage);
+            let revalidate_registry = registry.clone();
+            let revalidate_session = Arc::clone(&session);
+            let revalidate_request = request.clone();
+            let revalidate_start = Arc::clone(&start);
+            let revalidate_thread = thread::spawn(move || {
+                revalidate_start.wait();
+                let result = revalidate_workspace_read_grant(
+                    &revalidate_storage,
+                    &revalidate_registry,
+                    &revalidate_session,
+                    &revalidate_request,
+                );
+                revalidate_done_tx
+                    .send(result.is_ok())
+                    .expect("revoke thread must observe revalidation commit");
+                result
+            });
+            let revoke_storage = Arc::clone(&primary_storage);
+            let revoke_registry = registry.clone();
+            let revoke_life_id = session.life_id.clone();
+            let revoke_start = Arc::clone(&start);
+            let revoke_thread = thread::spawn(move || {
+                revoke_start.wait();
+                assert!(
+                    revalidate_done_rx
+                        .recv()
+                        .expect("revalidation-first barrier"),
+                    "pre-read revalidation must commit before revoke"
+                );
+                apply_transition_for_test(
+                    &revoke_storage,
+                    &revoke_registry,
+                    protocol::WORKSPACE_READ_CAPABILITY_ID,
+                    false,
+                    2,
+                    &revoke_life_id,
+                )
+                .expect("revoke after pre-read authorization")
+                .revision
+            });
+
+            let revalidated = revalidate_thread
+                .join()
+                .expect("revalidate thread")
+                .expect("pre-read revalidation wins");
+            assert!(revalidated.used);
+            assert_eq!(revoke_thread.join().expect("revoke thread"), 3);
+            assert_eq!(
+                session
+                    .workspace_read_grants
+                    .lock()
+                    .expect("workspace read grant lock")
+                    .get(&revalidated.grant_id)
+                    .map(|state| (state.phase, state.grant.used)),
+                Some((WorkspaceReadGrantPhase::Revalidated, true))
+            );
+
+            let release_request = protocol::WorkspaceReadReleaseCheck {
+                request_id: "d31-preread-release-after-revoke".to_string(),
+                session_id: session.session_id.clone(),
+                host_turn_id: "d31-preread-release-first-host-turn".to_string(),
+                binding,
+                bytes_read: content.len() as u64,
+                content_sha256: format!("{:x}", Sha256::digest(content)),
+                grant: revalidated,
+            };
+            assert_eq!(
+                authorize_workspace_read_release(
+                    &authority_storage,
+                    &registry,
+                    &session,
+                    &release_request,
+                    content,
+                )
+                .unwrap_err(),
+                "CAPABILITY_ROOT_DISABLED"
+            );
+            assert_eq!(
+                session
+                    .workspace_read_grants
+                    .lock()
+                    .expect("workspace read grant lock")
+                    .get(&release_request.grant.grant_id)
+                    .map(|state| state.phase),
+                Some(WorkspaceReadGrantPhase::Revalidated)
+            );
+            let row = primary_storage
+                .find_capability_authorization(
+                    &session.life_id,
+                    &CapabilityId::try_from(protocol::WORKSPACE_READ_CAPABILITY_ID)
+                        .expect("workspace read capability"),
+                )
+                .expect("authorization row")
+                .expect("authorization row exists");
+            assert!(!row.enabled);
+            assert_eq!(row.revision, 3);
+            session.retire();
+            drop(root);
+        }
+
+        #[test]
+        fn d31_cancel_before_pre_read_revalidation_denies_and_retires_issued_grant() {
+            let provider = test_provider();
+            let (session, _receiver) = test_session_with_provider(provider.clone());
+            let (root, storage, registry) =
+                synthetic_multi_capability_fixture(&session, None, Some(true));
+            let (binding, issued) = workspace_read_issued_grant(
+                &session,
+                &storage,
+                &registry,
+                &provider,
+                "d31-preread-cancel-host-turn",
+            );
+            let request = protocol::WorkspaceReadRevalidateGrant {
+                request_id: "d31-preread-cancel".to_string(),
+                session_id: session.session_id.clone(),
+                host_turn_id: "d31-preread-cancel-host-turn".to_string(),
+                binding,
+                grant: issued,
+            };
+            session
+                .begin_cancellation()
+                .expect("cancel active Host turn");
+            assert_eq!(
+                revalidate_workspace_read_grant(&storage, &registry, &session, &request)
+                    .unwrap_err(),
+                "WORKSPACE_READ_DISCLOSURE_TURN_NOT_ACTIVE"
+            );
+            assert!(session
+                .workspace_read_grants
+                .lock()
+                .expect("workspace read grant lock")
+                .is_empty());
             session.retire();
             drop(root);
         }

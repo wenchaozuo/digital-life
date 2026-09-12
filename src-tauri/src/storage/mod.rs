@@ -544,8 +544,9 @@ impl StorageService {
     /// Acquire the explicit Host capability-authorization linearization
     /// boundary.  Lock order for the release authority path is
     /// `turn_authority -> capability_authorization_linearizer
-    /// -> workspace_read_grants -> storage state`; D30 transition callers acquire this guard
-    /// immediately before their SQLite IMMEDIATE CAS transaction.
+    /// -> workspace_read_grants -> storage state`; D30 transition callers
+    /// acquire this guard immediately before their SQLite IMMEDIATE CAS
+    /// transaction.
     pub(crate) fn lock_capability_authorization_linearizer(
         &self,
     ) -> Result<MutexGuard<'_, ()>, StorageError> {

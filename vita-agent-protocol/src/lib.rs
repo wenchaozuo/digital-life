@@ -1049,12 +1049,13 @@ impl WorkspaceReadIssueGrant {
 
 impl WorkspaceReadGrantIssued {
     pub fn validate(&self) -> Result<(), FrameError> {
-        valid_grant_reply(
+        valid_workspace_grant_reply(
             &self.request_id,
             &self.session_id,
             self.allowed,
             self.grant.as_ref(),
             self.error_code.as_deref(),
+            false,
         )
     }
 }
@@ -1069,6 +1070,7 @@ impl WorkspaceReadRevalidateGrant {
         if self.session_id != self.binding.session_id
             || self.binding != self.grant.binding
             || self.session_id != self.grant.session_id
+            || self.grant.used
         {
             return Err(FrameError::InvalidField);
         }
@@ -1078,12 +1080,13 @@ impl WorkspaceReadRevalidateGrant {
 
 impl WorkspaceReadGrantRevalidated {
     pub fn validate(&self) -> Result<(), FrameError> {
-        valid_grant_reply(
+        valid_workspace_grant_reply(
             &self.request_id,
             &self.session_id,
             self.allowed,
             self.grant.as_ref(),
             self.error_code.as_deref(),
+            true,
         )
     }
 }
@@ -1099,6 +1102,7 @@ impl WorkspaceReadReleaseCheck {
         if self.session_id != self.binding.session_id
             || self.session_id != self.grant.session_id
             || self.binding != self.grant.binding
+            || !self.grant.used
             || self.bytes_read > self.binding.max_bytes
         {
             return Err(FrameError::InvalidField);
@@ -1265,17 +1269,22 @@ fn valid_confirmation_reply(
     }
 }
 
-fn valid_grant_reply(
+fn valid_workspace_grant_reply(
     request_id: &str,
     session_id: &str,
     allowed: bool,
     grant: Option<&WorkspaceReadGrant>,
     error_code: Option<&str>,
+    expected_used: bool,
 ) -> Result<(), FrameError> {
     valid_id(request_id)?;
     valid_id(session_id)?;
     match (allowed, grant, error_code) {
-        (true, Some(grant), None) if grant.session_id == session_id => grant.validate(),
+        (true, Some(grant), None)
+            if grant.session_id == session_id && grant.used == expected_used =>
+        {
+            grant.validate()
+        }
         (false, None, Some(code)) => valid_id(code),
         _ => Err(FrameError::InvalidField),
     }
@@ -1487,7 +1496,8 @@ mod tests {
     fn workspace_read_binding_round_trips_without_process_fields() {
         let binding = read_binding();
         assert!(binding.validate().is_ok());
-        let grant = read_grant(binding.clone());
+        let mut grant = read_grant(binding.clone());
+        grant.used = true;
         let message = VitaMessage::WorkspaceReadReleaseCheck(WorkspaceReadReleaseCheck {
             request_id: "release-1".to_string(),
             session_id: binding.session_id.clone(),
@@ -1505,6 +1515,59 @@ mod tests {
         } else {
             panic!("workspace read release variant was not preserved");
         }
+    }
+
+    #[test]
+    fn workspace_read_grant_replies_enforce_stage_specific_used_state() {
+        let binding = read_binding();
+        let issued_grant = read_grant(binding.clone());
+        let issued = WorkspaceReadGrantIssued {
+            request_id: "issue-1".to_string(),
+            session_id: binding.session_id.clone(),
+            allowed: true,
+            grant: Some(issued_grant.clone()),
+            error_code: None,
+        };
+        assert!(issued.validate().is_ok());
+
+        let mut issued_with_used = issued.clone();
+        issued_with_used.grant.as_mut().expect("issued grant").used = true;
+        assert_eq!(issued_with_used.validate(), Err(FrameError::InvalidField));
+
+        let mut revalidated_grant = issued_grant;
+        revalidated_grant.used = true;
+        let revalidated = WorkspaceReadGrantRevalidated {
+            request_id: "revalidate-1".to_string(),
+            session_id: binding.session_id.clone(),
+            allowed: true,
+            grant: Some(revalidated_grant.clone()),
+            error_code: None,
+        };
+        assert!(revalidated.validate().is_ok());
+
+        let mut revalidated_without_use = revalidated.clone();
+        revalidated_without_use
+            .grant
+            .as_mut()
+            .expect("revalidated grant")
+            .used = false;
+        assert_eq!(
+            revalidated_without_use.validate(),
+            Err(FrameError::InvalidField)
+        );
+
+        let mut release_without_revalidation = revalidated_grant;
+        release_without_revalidation.used = false;
+        let release = WorkspaceReadReleaseCheck {
+            request_id: "release-stage-1".to_string(),
+            session_id: binding.session_id.clone(),
+            host_turn_id: "host-turn".to_string(),
+            binding,
+            grant: release_without_revalidation,
+            bytes_read: 1,
+            content_sha256: "c".repeat(64),
+        };
+        assert_eq!(release.validate(), Err(FrameError::InvalidField));
     }
 
     #[test]

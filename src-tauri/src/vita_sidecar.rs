@@ -167,9 +167,9 @@ mod windows {
     use protocol::{
         AuthorityEvaluate, AuthorityScopeReply, ConfirmationDecision, ConfirmationReply,
         ConfirmationRequired, GrantIssued, GrantRevalidated, HostMessage, InitializeSession,
-        IssueGrant, ProcessBinding, ProcessGrant, RevalidateGrant, VitaMessage,
-        WorkspaceReadReleaseCheck, CODEX_PROTOCOL_SCHEMA_HASH, CODEX_UPSTREAM_COMMIT,
-        PROTOCOL_VERSION, RUNTIME_ID,
+        IssueGrant, ProcessBinding, ProcessGrant, RevalidateGrant, VitaMessage, WorkspaceReadGrant,
+        WorkspaceReadIssueGrant, WorkspaceReadReleaseCheck, WorkspaceReadRevalidateGrant,
+        CODEX_PROTOCOL_SCHEMA_HASH, CODEX_UPSTREAM_COMMIT, PROTOCOL_VERSION, RUNTIME_ID,
     };
     use sha2::{Digest, Sha256};
     use std::collections::{HashMap, HashSet, VecDeque};
@@ -397,54 +397,35 @@ mod windows {
         }
     }
 
-    /// D31-A's post-read confidentiality contract.  This is deliberately
-    /// independent from turn admission and any future local read primitive:
-    /// a buffer is not eligible for Codex tool output until this fresh Host
-    /// check succeeds.  D31-A does not route or expose a production read tool
-    /// yet; the function establishes the exact fence D31-B must call.
-    fn authorize_workspace_read_release(
+    fn active_workspace_read_turn_matches(
+        authority: &HostTurnAuthority,
+        host_turn_id: &str,
+        binding: &protocol::WorkspaceReadBinding,
+    ) -> bool {
+        matches!(
+            authority,
+            HostTurnAuthority::Active(active)
+                if active.turn_id == host_turn_id
+                    && active.binding.binding_hash == binding.provider_binding_hash
+        )
+    }
+
+    fn current_workspace_read_revision(
         storage: &StorageService,
         registry: &CapabilityRegistry,
         session: &HostSessionState,
-        request: &WorkspaceReadReleaseCheck,
-        confidential_bytes: &[u8],
-    ) -> Result<(), String> {
-        request
+        binding: &protocol::WorkspaceReadBinding,
+    ) -> Result<i64, String> {
+        binding
             .validate()
-            .map_err(|_| "WORKSPACE_READ_RELEASE_EVIDENCE_INVALID".to_string())?;
-        if request.session_id != session.session_id
-            || request.binding.session_id != session.session_id
-            || request.binding.life_id != session.life_id
-            || request.binding.task_id != session.task_id
+            .map_err(|_| "WORKSPACE_READ_BINDING_MISMATCH".to_string())?;
+        if binding.session_id != session.session_id
+            || binding.life_id != session.life_id
+            || binding.task_id != session.task_id
         {
             return Err("WORKSPACE_READ_BINDING_MISMATCH".to_string());
         }
-        require_current_session_life(storage, session)?;
-        if request.grant.expires_at_unix_ms <= unix_millis() {
-            return Err("WORKSPACE_READ_GRANT_EXPIRED".to_string());
-        }
-        if request.grant.used {
-            return Err("WORKSPACE_READ_GRANT_USED".to_string());
-        }
-        if u64::try_from(confidential_bytes.len()).ok() != Some(request.bytes_read)
-            || format!("{:x}", Sha256::digest(confidential_bytes)) != request.content_sha256
-        {
-            return Err("WORKSPACE_READ_CONTENT_EVIDENCE_MISMATCH".to_string());
-        }
-        let authority = session
-            .turn_authority
-            .lock()
-            .map_err(|_| "Vita turn authority lock was poisoned".to_string())?;
-        let active = matches!(
-            &*authority,
-            HostTurnAuthority::Active(active)
-                if active.turn_id == request.host_turn_id
-                    && active.binding.binding_hash == request.binding.provider_binding_hash
-        );
-        if !active {
-            return Err("WORKSPACE_READ_DISCLOSURE_TURN_NOT_ACTIVE".to_string());
-        }
-        let capability_id = CapabilityId::try_from(request.binding.capability_id.as_str())
+        let capability_id = CapabilityId::try_from(binding.capability_id.as_str())
             .map_err(|_| "CAPABILITY_AUTHORIZATION_UNAVAILABLE".to_string())?;
         let descriptor = registry
             .descriptor(&capability_id)
@@ -463,9 +444,225 @@ mod windows {
         if !root_is_usable(&decision) {
             return Err("CAPABILITY_AUTHORIZATION_UNAVAILABLE".to_string());
         }
-        if decision.authorization_revision() != Some(request.grant.authorization_revision) {
+        decision
+            .authorization_revision()
+            .ok_or_else(|| "CAPABILITY_AUTHORIZATION_UNAVAILABLE".to_string())
+    }
+
+    /// Future-lane Host helper.  The production reader loop deliberately does
+    /// not call this in D31-A-R1.  A confirmation ID can enter this function
+    /// only through the Host-owned approved-action ledger.
+    #[allow(dead_code)]
+    fn issue_workspace_read_grant(
+        storage: &StorageService,
+        registry: &CapabilityRegistry,
+        session: &HostSessionState,
+        request: &WorkspaceReadIssueGrant,
+    ) -> Result<WorkspaceReadGrant, String> {
+        request
+            .validate()
+            .map_err(|_| "WORKSPACE_READ_ISSUE_INVALID".to_string())?;
+        if request.session_id != session.session_id
+            || request.binding.session_id != session.session_id
+            || request.binding.life_id != session.life_id
+            || request.binding.task_id != session.task_id
+        {
+            return Err("WORKSPACE_READ_BINDING_MISMATCH".to_string());
+        }
+        let authority = session
+            .turn_authority
+            .lock()
+            .map_err(|_| "Vita turn authority lock was poisoned".to_string())?;
+        if !active_workspace_read_turn_matches(&authority, &request.host_turn_id, &request.binding)
+        {
+            return Err("WORKSPACE_READ_DISCLOSURE_TURN_NOT_ACTIVE".to_string());
+        }
+        require_current_session_life(storage, session)?;
+        let current_revision =
+            current_workspace_read_revision(storage, registry, session, &request.binding)?;
+        if current_revision != request.authorization_revision {
             return Err("CAPABILITY_AUTHORIZATION_REVISION_MISMATCH".to_string());
         }
+
+        let approval_key = workspace_read_approval_key(&request.host_turn_id, &request.binding);
+        let mut approvals = session
+            .workspace_read_approvals
+            .lock()
+            .map_err(|_| "Vita workspace read approval state lock was poisoned".to_string())?;
+        let approval = approvals
+            .get(&approval_key)
+            .cloned()
+            .ok_or_else(|| "WORKSPACE_READ_CONFIRMATION_NOT_APPROVED".to_string())?;
+        if approval.host_turn_id != request.host_turn_id
+            || approval.binding != request.binding
+            || approval.authorization_revision != request.authorization_revision
+            || approval.expires_at_unix_ms <= unix_millis()
+        {
+            return Err("WORKSPACE_READ_CONFIRMATION_STALE".to_string());
+        }
+
+        let now = unix_millis();
+        let expires_at_unix_ms = approval
+            .expires_at_unix_ms
+            .min(now.saturating_add(GRANT_LIFETIME_MS));
+        if expires_at_unix_ms <= now {
+            return Err("WORKSPACE_READ_GRANT_EXPIRED".to_string());
+        }
+        let grant = WorkspaceReadGrant {
+            session_id: session.session_id.clone(),
+            grant_id: secure_id("vita-read-grant")?,
+            confirmation_id: approval.confirmation_id,
+            binding: request.binding.clone(),
+            authorization_revision: request.authorization_revision,
+            issued_at_unix_ms: now,
+            expires_at_unix_ms,
+            single_use: true,
+            used: false,
+        };
+        grant
+            .validate()
+            .map_err(|_| "WORKSPACE_READ_GRANT_INVALID".to_string())?;
+        let mut grants = session
+            .workspace_read_grants
+            .lock()
+            .map_err(|_| "Vita workspace read grant state lock was poisoned".to_string())?;
+        reap_expired_workspace_read_grants(&mut grants);
+        if grants.len() >= MAX_GRANTS {
+            return Err("WORKSPACE_READ_GRANT_CAPACITY_EXHAUSTED".to_string());
+        }
+        approvals.remove(&approval_key);
+        grants.insert(
+            grant.grant_id.clone(),
+            WorkspaceReadGrantState {
+                host_turn_id: request.host_turn_id.clone(),
+                grant: grant.clone(),
+                phase: WorkspaceReadGrantPhase::Issued,
+            },
+        );
+        Ok(grant)
+    }
+
+    /// Future-lane Host helper.  The authority mutex remains held from the
+    /// active-turn check through the fresh D28 evaluation and the ledger
+    /// transition, so cancellation cannot interleave with revalidation.
+    #[allow(dead_code)]
+    fn revalidate_workspace_read_grant(
+        storage: &StorageService,
+        registry: &CapabilityRegistry,
+        session: &HostSessionState,
+        request: &WorkspaceReadRevalidateGrant,
+    ) -> Result<WorkspaceReadGrant, String> {
+        request
+            .validate()
+            .map_err(|_| "WORKSPACE_READ_REVALIDATION_INVALID".to_string())?;
+        if request.grant.used {
+            return Err("WORKSPACE_READ_GRANT_ALREADY_REVALIDATED".to_string());
+        }
+        if request.session_id != session.session_id
+            || request.grant.session_id != session.session_id
+            || request.binding.session_id != session.session_id
+        {
+            return Err("WORKSPACE_READ_BINDING_MISMATCH".to_string());
+        }
+        let authority = session
+            .turn_authority
+            .lock()
+            .map_err(|_| "Vita turn authority lock was poisoned".to_string())?;
+        if !active_workspace_read_turn_matches(&authority, &request.host_turn_id, &request.binding)
+        {
+            return Err("WORKSPACE_READ_DISCLOSURE_TURN_NOT_ACTIVE".to_string());
+        }
+        require_current_session_life(storage, session)?;
+        let current_revision =
+            current_workspace_read_revision(storage, registry, session, &request.binding)?;
+        let mut grants = session
+            .workspace_read_grants
+            .lock()
+            .map_err(|_| "Vita workspace read grant state lock was poisoned".to_string())?;
+        let state = grants
+            .get_mut(&request.grant.grant_id)
+            .ok_or_else(|| "WORKSPACE_READ_GRANT_NOT_FOUND".to_string())?;
+        if state.host_turn_id != request.host_turn_id
+            || state.phase != WorkspaceReadGrantPhase::Issued
+            || state.grant != request.grant
+            || state.grant.binding != request.binding
+            || state.grant.authorization_revision != current_revision
+            || state.grant.expires_at_unix_ms <= unix_millis()
+            || !state.grant.single_use
+        {
+            return Err("WORKSPACE_READ_GRANT_REVALIDATION_DENIED".to_string());
+        }
+        state.grant.used = true;
+        state.phase = WorkspaceReadGrantPhase::Revalidated;
+        Ok(state.grant.clone())
+    }
+
+    /// Host release decision linearization point.  The caller may write the
+    /// post-read IPC response only after this function commits `Revalidated →
+    /// Released` under the same authority mutex used by cancellation.
+    fn authorize_workspace_read_release(
+        storage: &StorageService,
+        registry: &CapabilityRegistry,
+        session: &HostSessionState,
+        request: &WorkspaceReadReleaseCheck,
+        confidential_bytes: &[u8],
+    ) -> Result<(), String> {
+        request
+            .validate()
+            .map_err(|_| "WORKSPACE_READ_RELEASE_EVIDENCE_INVALID".to_string())?;
+        if request.session_id != session.session_id
+            || request.binding.session_id != session.session_id
+            || request.binding.life_id != session.life_id
+            || request.binding.task_id != session.task_id
+        {
+            return Err("WORKSPACE_READ_BINDING_MISMATCH".to_string());
+        }
+        let authority = session
+            .turn_authority
+            .lock()
+            .map_err(|_| "Vita turn authority lock was poisoned".to_string())?;
+        if !active_workspace_read_turn_matches(&authority, &request.host_turn_id, &request.binding)
+        {
+            return Err("WORKSPACE_READ_DISCLOSURE_TURN_NOT_ACTIVE".to_string());
+        }
+        require_current_session_life(storage, session)?;
+        let mut grants = session
+            .workspace_read_grants
+            .lock()
+            .map_err(|_| "Vita workspace read grant state lock was poisoned".to_string())?;
+        let state = grants
+            .get_mut(&request.grant.grant_id)
+            .ok_or_else(|| "WORKSPACE_READ_GRANT_NOT_FOUND".to_string())?;
+        if state.host_turn_id != request.host_turn_id
+            || state.phase != WorkspaceReadGrantPhase::Revalidated
+            || state.grant != request.grant
+            || state.grant.binding != request.binding
+            || !state.grant.used
+        {
+            return Err("WORKSPACE_READ_GRANT_PROVENANCE_MISMATCH".to_string());
+        }
+        // D28 is read inside the release decision.  A revocation that commits
+        // first is observed here and denies; a release that commits first is
+        // already ordered before a later revocation.
+        let current_revision =
+            current_workspace_read_revision(storage, registry, session, &request.binding)?;
+        if current_revision != state.grant.authorization_revision {
+            return Err("CAPABILITY_AUTHORIZATION_REVISION_MISMATCH".to_string());
+        }
+        if state.grant.expires_at_unix_ms <= unix_millis() {
+            return Err("WORKSPACE_READ_GRANT_EXPIRED".to_string());
+        }
+        if u64::try_from(confidential_bytes.len()).ok() != Some(request.bytes_read)
+            || request.bytes_read > request.binding.max_bytes
+            || format!("{:x}", Sha256::digest(confidential_bytes)) != request.content_sha256
+        {
+            return Err("WORKSPACE_READ_CONTENT_EVIDENCE_MISMATCH".to_string());
+        }
+        // This assignment is the authoritative disclosure decision.  The
+        // later IPC write is transport only and cannot authorize a replay.
+        state.phase = WorkspaceReadGrantPhase::Released;
+        drop(grants);
+        drop(authority);
         Ok(())
     }
 
@@ -663,6 +860,8 @@ mod windows {
         pending: Mutex<HashMap<String, PendingAction>>,
         approvals: Mutex<HashMap<String, ApprovedAction>>,
         grants: Mutex<HashMap<String, HostStoredGrant>>,
+        workspace_read_approvals: Mutex<HashMap<String, WorkspaceReadApprovedAction>>,
+        workspace_read_grants: Mutex<HashMap<String, WorkspaceReadGrantState>>,
         replay: Mutex<RequestReplayWindow>,
         expiry: Arc<ExpiryOwner>,
         closed: AtomicBool,
@@ -703,6 +902,35 @@ mod windows {
     struct HostStoredGrant {
         host_turn_id: String,
         grant: ProcessGrant,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum WorkspaceReadGrantPhase {
+        Issued,
+        Revalidated,
+        Released,
+    }
+
+    /// Host-only confirmation evidence for the future workspace-read lane.
+    /// The wire request never carries a confirmation ID; issue derives it
+    /// only from this Host-owned state.
+    #[derive(Clone)]
+    struct WorkspaceReadApprovedAction {
+        host_turn_id: String,
+        binding: protocol::WorkspaceReadBinding,
+        authorization_revision: i64,
+        confirmation_id: String,
+        expires_at_unix_ms: u64,
+    }
+
+    /// The read grant ledger is separate from the frozen H7 ProcessGrant
+    /// ledger.  `phase` is authoritative Host state; the wire `used` bit is
+    /// only the stage projection required by the protocol.
+    #[derive(Clone)]
+    struct WorkspaceReadGrantState {
+        host_turn_id: String,
+        grant: WorkspaceReadGrant,
+        phase: WorkspaceReadGrantPhase,
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1136,6 +1364,18 @@ mod windows {
             if let Ok(mut grants) = self.grants.lock() {
                 grants.retain(|_, grant| grant.host_turn_id != turn_id);
             }
+            if let Ok(mut approvals) = self.workspace_read_approvals.lock() {
+                approvals.retain(|_, approval| approval.host_turn_id != turn_id);
+            }
+            if let Ok(mut grants) = self.workspace_read_grants.lock() {
+                // A release decision is already authoritative.  Cancellation
+                // after that point cannot retroactively erase the committed
+                // disclosure state; pre-release evidence is retired here.
+                grants.retain(|_, grant| {
+                    grant.host_turn_id != turn_id
+                        || grant.phase == WorkspaceReadGrantPhase::Released
+                });
+            }
             pending
         }
 
@@ -1165,6 +1405,30 @@ mod windows {
                 .unwrap_or(false)
         }
 
+        #[cfg(test)]
+        fn install_workspace_read_approval(
+            &self,
+            host_turn_id: &str,
+            binding: protocol::WorkspaceReadBinding,
+            authorization_revision: i64,
+            confirmation_id: &str,
+            expires_at_unix_ms: u64,
+        ) {
+            self.workspace_read_approvals
+                .lock()
+                .expect("workspace read approval lock")
+                .insert(
+                    workspace_read_approval_key(host_turn_id, &binding),
+                    WorkspaceReadApprovedAction {
+                        host_turn_id: host_turn_id.to_string(),
+                        binding,
+                        authorization_revision,
+                        confirmation_id: confirmation_id.to_string(),
+                        expires_at_unix_ms,
+                    },
+                );
+        }
+
         fn retire(&self) {
             self.closed.store(true, Ordering::Release);
             let pending = if let Ok(mut pending) = self.pending.lock() {
@@ -1184,6 +1448,12 @@ mod windows {
                 approvals.clear();
             }
             if let Ok(mut grants) = self.grants.lock() {
+                grants.clear();
+            }
+            if let Ok(mut approvals) = self.workspace_read_approvals.lock() {
+                approvals.clear();
+            }
+            if let Ok(mut grants) = self.workspace_read_grants.lock() {
                 grants.clear();
             }
             if let Ok(mut replay) = self.replay.lock() {
@@ -1442,6 +1712,8 @@ mod windows {
                 pending: Mutex::new(HashMap::new()),
                 approvals: Mutex::new(HashMap::new()),
                 grants: Mutex::new(HashMap::new()),
+                workspace_read_approvals: Mutex::new(HashMap::new()),
+                workspace_read_grants: Mutex::new(HashMap::new()),
                 replay: Mutex::new(RequestReplayWindow::default()),
                 expiry: Arc::new(ExpiryOwner::new()),
                 closed: AtomicBool::new(false),
@@ -2528,6 +2800,13 @@ mod windows {
         grants.retain(|_, grant| !grant.grant.used && grant.grant.expires_at_unix_ms > now);
     }
 
+    fn reap_expired_workspace_read_grants(grants: &mut HashMap<String, WorkspaceReadGrantState>) {
+        let now = unix_millis();
+        grants.retain(|_, state| {
+            state.phase == WorkspaceReadGrantPhase::Released || state.grant.expires_at_unix_ms > now
+        });
+    }
+
     fn consume_active_grant(
         grants: &mut HashMap<String, HostStoredGrant>,
         host_turn_id: &str,
@@ -2568,6 +2847,16 @@ mod windows {
 
     fn approval_key(host_turn_id: &str, binding: &ProcessBinding) -> String {
         format!("{host_turn_id}:{}", binding_key(binding))
+    }
+
+    fn workspace_read_approval_key(
+        host_turn_id: &str,
+        binding: &protocol::WorkspaceReadBinding,
+    ) -> String {
+        format!(
+            "{host_turn_id}:{}:{}",
+            binding.tool_call_id, binding.codex_turn_id
+        )
     }
 
     fn vita_request_id(message: &VitaMessage) -> &str {
@@ -3064,23 +3353,15 @@ mod windows {
             (root, storage, registry)
         }
 
-        fn workspace_read_release_request(
+        fn workspace_read_binding(
             session: &Arc<HostSessionState>,
             provider: &protocol::ProviderConfiguration,
             host_turn_id: &str,
-            content: &[u8],
-        ) -> protocol::WorkspaceReadReleaseCheck {
+        ) -> protocol::WorkspaceReadBinding {
             let provider_binding =
                 protocol::ProviderBinding::derive(&session.session_id, host_turn_id, provider)
                     .expect("provider binding");
-            session
-                .begin_turn(
-                    host_turn_id.to_string(),
-                    provider.clone(),
-                    provider_binding.clone(),
-                )
-                .expect("active Host turn");
-            let binding = protocol::WorkspaceReadBinding {
+            protocol::WorkspaceReadBinding {
                 session_id: session.session_id.clone(),
                 life_id: session.life_id.clone(),
                 task_id: session.task_id.clone(),
@@ -3094,25 +3375,77 @@ mod windows {
                 tool_call_id: "read-call".to_string(),
                 codex_turn_id: "codex-read-turn".to_string(),
                 provider_binding_hash: provider_binding.binding_hash,
-            };
+            }
+        }
+
+        fn workspace_read_release_request(
+            session: &Arc<HostSessionState>,
+            storage: &StorageService,
+            registry: &CapabilityRegistry,
+            provider: &protocol::ProviderConfiguration,
+            host_turn_id: &str,
+            content: &[u8],
+        ) -> protocol::WorkspaceReadReleaseCheck {
+            let binding = workspace_read_binding(session, provider, host_turn_id);
+            let provider_binding =
+                protocol::ProviderBinding::derive(&session.session_id, host_turn_id, provider)
+                    .expect("provider binding");
+            session
+                .begin_turn(host_turn_id.to_string(), provider.clone(), provider_binding)
+                .expect("active Host turn");
+            let revision = current_workspace_read_revision(storage, registry, session, &binding)
+                .expect("workspace read revision");
+            session.install_workspace_read_approval(
+                host_turn_id,
+                binding.clone(),
+                revision,
+                "read-confirmation",
+                unix_millis().saturating_add(5_000),
+            );
+            let issued = issue_workspace_read_grant(
+                storage,
+                registry,
+                session,
+                &protocol::WorkspaceReadIssueGrant {
+                    request_id: "read-issue".to_string(),
+                    session_id: session.session_id.clone(),
+                    host_turn_id: host_turn_id.to_string(),
+                    binding: binding.clone(),
+                    authorization_revision: revision,
+                },
+            )
+            .expect("workspace read issue");
+            assert!(!issued.used);
+            assert_eq!(
+                session
+                    .workspace_read_grants
+                    .lock()
+                    .expect("workspace read grant lock")
+                    .get(&issued.grant_id)
+                    .map(|state| state.phase),
+                Some(WorkspaceReadGrantPhase::Issued)
+            );
+            let revalidated = revalidate_workspace_read_grant(
+                storage,
+                registry,
+                session,
+                &protocol::WorkspaceReadRevalidateGrant {
+                    request_id: "read-revalidate".to_string(),
+                    session_id: session.session_id.clone(),
+                    host_turn_id: host_turn_id.to_string(),
+                    binding: binding.clone(),
+                    grant: issued,
+                },
+            )
+            .expect("workspace read revalidate");
+            assert!(revalidated.used);
             let content_sha256 = format!("{:x}", Sha256::digest(content));
-            let grant = protocol::WorkspaceReadGrant {
-                session_id: session.session_id.clone(),
-                grant_id: "read-grant".to_string(),
-                confirmation_id: "read-confirmation".to_string(),
-                binding: binding.clone(),
-                authorization_revision: 2,
-                issued_at_unix_ms: unix_millis(),
-                expires_at_unix_ms: unix_millis().saturating_add(5_000),
-                single_use: true,
-                used: false,
-            };
             protocol::WorkspaceReadReleaseCheck {
                 request_id: "read-release".to_string(),
                 session_id: session.session_id.clone(),
                 host_turn_id: host_turn_id.to_string(),
                 binding,
-                grant,
+                grant: revalidated,
                 bytes_read: content.len() as u64,
                 content_sha256,
             }
@@ -3312,7 +3645,7 @@ mod windows {
         }
 
         #[test]
-        fn d31_release_contract_rechecks_buffer_binding_and_fresh_authority() {
+        fn d31_workspace_read_lifecycle_is_host_ledger_linearized() {
             let provider = test_provider();
             let content = b"D31 confidential workspace bytes";
             let (session, _receiver) = test_session_with_provider(provider.clone());
@@ -3320,13 +3653,102 @@ mod windows {
                 synthetic_multi_capability_fixture(&session, None, Some(true));
             let request = workspace_read_release_request(
                 &session,
+                &storage,
+                &registry,
                 &provider,
                 "d31-release-host-turn",
                 content,
             );
+            assert!(request.grant.used);
+            assert_eq!(
+                session
+                    .workspace_read_grants
+                    .lock()
+                    .expect("workspace read grant lock")
+                    .get(&request.grant.grant_id)
+                    .map(|state| state.phase),
+                Some(WorkspaceReadGrantPhase::Revalidated)
+            );
+            assert_eq!(
+                revalidate_workspace_read_grant(
+                    &storage,
+                    &registry,
+                    &session,
+                    &protocol::WorkspaceReadRevalidateGrant {
+                        request_id: "read-revalidate-replay".to_string(),
+                        session_id: session.session_id.clone(),
+                        host_turn_id: "d31-release-host-turn".to_string(),
+                        binding: request.binding.clone(),
+                        grant: request.grant.clone(),
+                    },
+                )
+                .unwrap_err(),
+                "WORKSPACE_READ_REVALIDATION_INVALID"
+            );
             assert_eq!(
                 authorize_workspace_read_release(&storage, &registry, &session, &request, content),
                 Ok(())
+            );
+            assert_eq!(
+                session
+                    .workspace_read_grants
+                    .lock()
+                    .expect("workspace read grant lock")
+                    .get(&request.grant.grant_id)
+                    .map(|state| state.phase),
+                Some(WorkspaceReadGrantPhase::Released)
+            );
+
+            let disabled_after_release = apply_transition_for_test(
+                &storage,
+                &registry,
+                protocol::WORKSPACE_READ_CAPABILITY_ID,
+                false,
+                2,
+                &session.life_id,
+            )
+            .expect("revoke after committed release");
+            assert_eq!(disabled_after_release.revision, 3);
+
+            let mut replay = request.clone();
+            replay.request_id = "read-release-replay".to_string();
+            assert_eq!(
+                authorize_workspace_read_release(&storage, &registry, &session, &replay, content)
+                    .unwrap_err(),
+                "WORKSPACE_READ_GRANT_PROVENANCE_MISMATCH"
+            );
+
+            assert_eq!(
+                session.begin_cancellation().expect("cancel after release"),
+                Some("d31-release-host-turn".to_string())
+            );
+            assert_eq!(
+                session
+                    .workspace_read_grants
+                    .lock()
+                    .expect("workspace read grant lock")
+                    .get(&request.grant.grant_id)
+                    .map(|state| state.phase),
+                Some(WorkspaceReadGrantPhase::Released)
+            );
+            session.retire();
+            drop(root);
+        }
+
+        #[test]
+        fn d31_release_contract_rechecks_provenance_and_evidence() {
+            let provider = test_provider();
+            let content = b"D31 confidential workspace bytes";
+            let (session, _receiver) = test_session_with_provider(provider.clone());
+            let (root, storage, registry) =
+                synthetic_multi_capability_fixture(&session, None, Some(true));
+            let request = workspace_read_release_request(
+                &session,
+                &storage,
+                &registry,
+                &provider,
+                "d31-provenance-host-turn",
+                content,
             );
 
             let mut wrong_provider = request.clone();
@@ -3344,7 +3766,54 @@ mod windows {
                 "WORKSPACE_READ_DISCLOSURE_TURN_NOT_ACTIVE"
             );
 
+            let mut wrong_grant_id = request.clone();
+            wrong_grant_id.request_id = "wrong-grant-id".to_string();
+            wrong_grant_id.grant.grant_id = "fabricated-read-grant".to_string();
+            assert_eq!(
+                authorize_workspace_read_release(
+                    &storage,
+                    &registry,
+                    &session,
+                    &wrong_grant_id,
+                    content,
+                )
+                .unwrap_err(),
+                "WORKSPACE_READ_GRANT_NOT_FOUND"
+            );
+
+            let mut wrong_confirmation = request.clone();
+            wrong_confirmation.request_id = "wrong-confirmation".to_string();
+            wrong_confirmation.grant.confirmation_id = "fabricated-confirmation".to_string();
+            assert_eq!(
+                authorize_workspace_read_release(
+                    &storage,
+                    &registry,
+                    &session,
+                    &wrong_confirmation,
+                    content,
+                )
+                .unwrap_err(),
+                "WORKSPACE_READ_GRANT_PROVENANCE_MISMATCH"
+            );
+
+            let mut wrong_binding = request.clone();
+            wrong_binding.request_id = "wrong-binding".to_string();
+            wrong_binding.binding.relative_path = "notes/other.txt".to_string();
+            wrong_binding.grant.binding = wrong_binding.binding.clone();
+            assert_eq!(
+                authorize_workspace_read_release(
+                    &storage,
+                    &registry,
+                    &session,
+                    &wrong_binding,
+                    content,
+                )
+                .unwrap_err(),
+                "WORKSPACE_READ_GRANT_PROVENANCE_MISMATCH"
+            );
+
             let mut wrong_revision = request.clone();
+            wrong_revision.request_id = "wrong-revision".to_string();
             wrong_revision.grant.authorization_revision = 1;
             assert_eq!(
                 authorize_workspace_read_release(
@@ -3355,7 +3824,7 @@ mod windows {
                     content,
                 )
                 .unwrap_err(),
-                "CAPABILITY_AUTHORIZATION_REVISION_MISMATCH"
+                "WORKSPACE_READ_GRANT_PROVENANCE_MISMATCH"
             );
 
             let mut wrong_content = request.clone();
@@ -3387,13 +3856,41 @@ mod windows {
             );
 
             let mut expired = request.clone();
+            {
+                let mut grants = session
+                    .workspace_read_grants
+                    .lock()
+                    .expect("workspace read grant lock");
+                let state = grants
+                    .get_mut(&request.grant.grant_id)
+                    .expect("revalidated grant");
+                state.grant.expires_at_unix_ms = state.grant.issued_at_unix_ms;
+            }
             expired.grant.expires_at_unix_ms = expired.grant.issued_at_unix_ms;
             assert_eq!(
                 authorize_workspace_read_release(&storage, &registry, &session, &expired, content)
                     .unwrap_err(),
                 "WORKSPACE_READ_GRANT_EXPIRED"
             );
+            session.retire();
+            drop(root);
+        }
 
+        #[test]
+        fn d31_release_fabricated_grant_and_revision_revocation_are_denied() {
+            let provider = test_provider();
+            let content = b"D31 confidential workspace bytes";
+            let (session, _receiver) = test_session_with_provider(provider.clone());
+            let (root, storage, registry) =
+                synthetic_multi_capability_fixture(&session, None, Some(true));
+            let request = workspace_read_release_request(
+                &session,
+                &storage,
+                &registry,
+                &provider,
+                "d31-revoke-host-turn",
+                content,
+            );
             let disabled = apply_transition_for_test(
                 &storage,
                 &registry,
@@ -3409,6 +3906,15 @@ mod windows {
                     .unwrap_err(),
                 "CAPABILITY_ROOT_DISABLED"
             );
+            assert_eq!(
+                session
+                    .workspace_read_grants
+                    .lock()
+                    .expect("workspace read grant lock")
+                    .get(&request.grant.grant_id)
+                    .map(|state| state.phase),
+                Some(WorkspaceReadGrantPhase::Revalidated)
+            );
             session.retire();
             drop(root);
         }
@@ -3422,6 +3928,8 @@ mod windows {
                 synthetic_multi_capability_fixture(&session, None, Some(true));
             let request = workspace_read_release_request(
                 &session,
+                &storage,
+                &registry,
                 &provider,
                 "d31-cancelled-release-host-turn",
                 content,
@@ -3429,6 +3937,11 @@ mod windows {
             session
                 .begin_cancellation()
                 .expect("cancel active Host turn");
+            assert!(session
+                .workspace_read_grants
+                .lock()
+                .expect("workspace read grant lock")
+                .is_empty());
             assert_eq!(
                 authorize_workspace_read_release(&storage, &registry, &session, &request, content)
                     .unwrap_err(),
@@ -3972,6 +4485,8 @@ mod windows {
                 pending: Mutex::new(HashMap::new()),
                 approvals: Mutex::new(HashMap::new()),
                 grants: Mutex::new(HashMap::new()),
+                workspace_read_approvals: Mutex::new(HashMap::new()),
+                workspace_read_grants: Mutex::new(HashMap::new()),
                 replay: Mutex::new(RequestReplayWindow::default()),
                 expiry: Arc::new(ExpiryOwner::new()),
                 closed: AtomicBool::new(false),

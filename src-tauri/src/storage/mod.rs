@@ -93,7 +93,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Mutex, MutexGuard,
+        Arc, Mutex, MutexGuard,
     },
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -446,6 +446,11 @@ pub(crate) struct OutboxSyncHealthAggregate {
 pub struct StorageService {
     state: Mutex<StorageState>,
     location: StorageLocationResolver,
+    /// Host-owned linearization domain for Life capability authorization
+    /// transitions.  The primary service and every authority view share this
+    /// process-local guard, so D30 CAS commits and D31 release decisions have
+    /// one explicit boundary without relying on an undocumented static lock.
+    capability_authorization_linearizer: Arc<Mutex<()>>,
     /// Process-local fence preventing a newly installed Core from becoming
     /// executable until the next application process owns the service.
     core_activation_restart_required: AtomicBool,
@@ -486,6 +491,7 @@ impl StorageService {
                 database_path,
             }),
             location,
+            capability_authorization_linearizer: Arc::new(Mutex::new(())),
             core_activation_restart_required: AtomicBool::new(false),
             #[cfg(test)]
             candidate_confirmation_panic_failpoint: Mutex::new(None),
@@ -518,6 +524,9 @@ impl StorageService {
                 database_path: state.database_path.clone(),
             }),
             location: self.location.clone(),
+            capability_authorization_linearizer: Arc::clone(
+                &self.capability_authorization_linearizer,
+            ),
             core_activation_restart_required: AtomicBool::new(false),
             #[cfg(test)]
             candidate_confirmation_panic_failpoint: Mutex::new(None),
@@ -530,6 +539,19 @@ impl StorageService {
 
     fn state(&self) -> Result<MutexGuard<'_, StorageState>, StorageError> {
         self.state.lock().map_err(StorageError::database)
+    }
+
+    /// Acquire the explicit Host capability-authorization linearization
+    /// boundary.  Lock order for the release authority path is
+    /// `turn_authority -> capability_authorization_linearizer
+    /// -> workspace_read_grants -> storage state`; D30 transition callers acquire this guard
+    /// immediately before their SQLite IMMEDIATE CAS transaction.
+    pub(crate) fn lock_capability_authorization_linearizer(
+        &self,
+    ) -> Result<MutexGuard<'_, ()>, StorageError> {
+        self.capability_authorization_linearizer
+            .lock()
+            .map_err(StorageError::database)
     }
 
     pub(crate) fn core_activation_requires_restart(&self) -> bool {

@@ -392,6 +392,13 @@ impl CapabilityAuthorizationRepository for StorageService {
         &self,
         request: LifeCapabilityAuthorizationUpdateRequest,
     ) -> Result<CapabilityAuthorizationUpdateOutcome, CapabilityAuthorizationError> {
+        // D30 enable/disable transitions share the explicit Host-owned
+        // linearization boundary with D31 workspace-read release.  The guard
+        // is shared by the primary StorageService and its authority view; it
+        // is held through the SQLite IMMEDIATE CAS commit.
+        let _linearizer = self
+            .lock_capability_authorization_linearizer()
+            .map_err(|_| CapabilityAuthorizationError::database())?;
         let mut state = self
             .state()
             .map_err(|_| CapabilityAuthorizationError::database())?;

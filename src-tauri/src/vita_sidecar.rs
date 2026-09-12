@@ -599,7 +599,8 @@ mod windows {
 
     /// Host release decision linearization point.  The caller may write the
     /// post-read IPC response only after this function commits `Revalidated →
-    /// Released` under the same authority mutex used by cancellation.
+    /// Released` under the turn authority and the shared capability
+    /// authorization linearizer used by D30 revocation.
     fn authorize_workspace_read_release(
         storage: &StorageService,
         registry: &CapabilityRegistry,
@@ -625,6 +626,15 @@ mod windows {
         {
             return Err("WORKSPACE_READ_DISCLOSURE_TURN_NOT_ACTIVE".to_string());
         }
+        // The turn authority is acquired first.  The shared Host-owned
+        // capability linearizer is acquired before the fresh D28 evaluation
+        // and held through the authoritative grant transition.  D30's
+        // enable/disable CAS takes the same boundary through its SQLite
+        // IMMEDIATE commit, so exactly one of revoke or release linearizes
+        // first.  No IPC write happens while either decision is pending.
+        let _authorization_linearizer = storage
+            .lock_capability_authorization_linearizer()
+            .map_err(|_| "CAPABILITY_AUTHORIZATION_UNAVAILABLE".to_string())?;
         require_current_session_life(storage, session)?;
         let mut grants = session
             .workspace_read_grants
@@ -641,9 +651,10 @@ mod windows {
         {
             return Err("WORKSPACE_READ_GRANT_PROVENANCE_MISMATCH".to_string());
         }
-        // D28 is read inside the release decision.  A revocation that commits
-        // first is observed here and denies; a release that commits first is
-        // already ordered before a later revocation.
+        // D28 is read inside the release decision while the shared
+        // linearizer is still held.  A revocation that commits first is
+        // observed here and denies; a release that commits first is already
+        // ordered before a later revocation.
         let current_revision =
             current_workspace_read_revision(storage, registry, session, &request.binding)?;
         if current_revision != state.grant.authorization_revision {
@@ -3152,6 +3163,7 @@ mod windows {
             ApprovalFloor, CapabilityDescriptor, RiskClass, ScopeRequirement,
         };
         use crate::storage::{LifeIdentityRecord, PersonaTemplateRecord};
+        use std::sync::Barrier;
 
         fn test_binding(session_id: &str) -> ProcessBinding {
             test_binding_for(session_id, "turn", "call")
@@ -3733,6 +3745,259 @@ mod windows {
             );
             session.retire();
             drop(root);
+        }
+
+        #[test]
+        fn d31_revoke_first_linearizes_before_workspace_release() {
+            let provider = test_provider();
+            let content: &'static [u8] = b"D31 revoke-first bytes";
+            let (session, _receiver) = test_session_with_provider(provider.clone());
+            let (root, primary_storage, registry) =
+                synthetic_multi_capability_fixture(&session, None, Some(true));
+            // The production sidecar uses a separate authority view.  This
+            // test deliberately revokes through the primary view and releases
+            // through the view to prove that both share one linearizer.
+            let authority_storage = primary_storage
+                .open_authority_view()
+                .expect("shared authority view");
+            let primary_storage = Arc::new(primary_storage);
+            let authority_storage = Arc::new(authority_storage);
+            let request = workspace_read_release_request(
+                &session,
+                &authority_storage,
+                &registry,
+                &provider,
+                "d31-revoke-first-host-turn",
+                content,
+            );
+            let start = Arc::new(Barrier::new(2));
+            let (revoke_done_tx, revoke_done_rx) = mpsc::channel();
+            let revoke_storage = Arc::clone(&primary_storage);
+            let revoke_registry = registry.clone();
+            let revoke_session = session.life_id.clone();
+            let revoke_start = Arc::clone(&start);
+            let revoke_thread = thread::spawn(move || {
+                revoke_start.wait();
+                let transition = apply_transition_for_test(
+                    &revoke_storage,
+                    &revoke_registry,
+                    protocol::WORKSPACE_READ_CAPABILITY_ID,
+                    false,
+                    2,
+                    &revoke_session,
+                )
+                .expect("revoke must commit first");
+                revoke_done_tx
+                    .send(transition.revision)
+                    .expect("release thread must observe revoke commit");
+                transition.revision
+            });
+            let release_storage = Arc::clone(&authority_storage);
+            let release_registry = registry.clone();
+            let release_session = Arc::clone(&session);
+            let release_request = request.clone();
+            let release_start = Arc::clone(&start);
+            let release_thread = thread::spawn(move || {
+                release_start.wait();
+                assert_eq!(revoke_done_rx.recv().expect("revoke-first barrier"), 3);
+                authorize_workspace_read_release(
+                    &release_storage,
+                    &release_registry,
+                    &release_session,
+                    &release_request,
+                    content,
+                )
+            });
+
+            assert_eq!(revoke_thread.join().expect("revoke thread"), 3);
+            assert_eq!(
+                release_thread.join().expect("release thread"),
+                Err("CAPABILITY_ROOT_DISABLED".to_string())
+            );
+            assert_eq!(
+                session
+                    .workspace_read_grants
+                    .lock()
+                    .expect("workspace read grant lock")
+                    .get(&request.grant.grant_id)
+                    .map(|state| state.phase),
+                Some(WorkspaceReadGrantPhase::Revalidated)
+            );
+            let row = primary_storage
+                .find_capability_authorization(
+                    &session.life_id,
+                    &CapabilityId::try_from(protocol::WORKSPACE_READ_CAPABILITY_ID)
+                        .expect("workspace read capability"),
+                )
+                .expect("authorization row")
+                .expect("authorization row exists");
+            assert!(!row.enabled);
+            assert_eq!(row.revision, 3);
+            session.retire();
+            drop(root);
+        }
+
+        #[test]
+        fn d31_workspace_release_first_linearizes_before_revoke() {
+            let provider = test_provider();
+            let content: &'static [u8] = b"D31 release-first bytes";
+            let (session, _receiver) = test_session_with_provider(provider.clone());
+            let (root, primary_storage, registry) =
+                synthetic_multi_capability_fixture(&session, None, Some(true));
+            let authority_storage = primary_storage
+                .open_authority_view()
+                .expect("shared authority view");
+            let primary_storage = Arc::new(primary_storage);
+            let authority_storage = Arc::new(authority_storage);
+            let request = workspace_read_release_request(
+                &session,
+                &authority_storage,
+                &registry,
+                &provider,
+                "d31-release-first-host-turn",
+                content,
+            );
+            let start = Arc::new(Barrier::new(2));
+            let (release_done_tx, release_done_rx) = mpsc::channel();
+            let release_storage = Arc::clone(&authority_storage);
+            let release_registry = registry.clone();
+            let release_session = Arc::clone(&session);
+            let release_request = request.clone();
+            let release_start = Arc::clone(&start);
+            let release_thread = thread::spawn(move || {
+                release_start.wait();
+                let result = authorize_workspace_read_release(
+                    &release_storage,
+                    &release_registry,
+                    &release_session,
+                    &release_request,
+                    content,
+                );
+                release_done_tx
+                    .send(result.is_ok())
+                    .expect("revoke thread must observe release commit");
+                result
+            });
+            let revoke_storage = Arc::clone(&primary_storage);
+            let revoke_registry = registry.clone();
+            let revoke_session = session.life_id.clone();
+            let revoke_start = Arc::clone(&start);
+            let revoke_thread = thread::spawn(move || {
+                revoke_start.wait();
+                assert!(
+                    release_done_rx.recv().expect("release-first barrier"),
+                    "release must commit before revoke"
+                );
+                apply_transition_for_test(
+                    &revoke_storage,
+                    &revoke_registry,
+                    protocol::WORKSPACE_READ_CAPABILITY_ID,
+                    false,
+                    2,
+                    &revoke_session,
+                )
+                .expect("revoke after release")
+                .revision
+            });
+
+            assert_eq!(release_thread.join().expect("release thread"), Ok(()));
+            assert_eq!(revoke_thread.join().expect("revoke thread"), 3);
+            assert_eq!(
+                session
+                    .workspace_read_grants
+                    .lock()
+                    .expect("workspace read grant lock")
+                    .get(&request.grant.grant_id)
+                    .map(|state| state.phase),
+                Some(WorkspaceReadGrantPhase::Released)
+            );
+            let row = primary_storage
+                .find_capability_authorization(
+                    &session.life_id,
+                    &CapabilityId::try_from(protocol::WORKSPACE_READ_CAPABILITY_ID)
+                        .expect("workspace read capability"),
+                )
+                .expect("authorization row")
+                .expect("authorization row exists");
+            assert!(!row.enabled);
+            assert_eq!(row.revision, 3);
+            session.retire();
+            drop(root);
+        }
+
+        #[test]
+        fn d31_cancel_first_denies_and_cannot_erase_committed_release() {
+            let provider = test_provider();
+            let content: &'static [u8] = b"D31 cancel-property bytes";
+
+            let (cancel_session, _receiver) = test_session_with_provider(provider.clone());
+            let (cancel_root, cancel_storage, cancel_registry) =
+                synthetic_multi_capability_fixture(&cancel_session, None, Some(true));
+            let cancel_request = workspace_read_release_request(
+                &cancel_session,
+                &cancel_storage,
+                &cancel_registry,
+                &provider,
+                "d31-cancel-first-host-turn",
+                content,
+            );
+            cancel_session
+                .begin_cancellation()
+                .expect("cancel active turn");
+            assert_eq!(
+                authorize_workspace_read_release(
+                    &cancel_storage,
+                    &cancel_registry,
+                    &cancel_session,
+                    &cancel_request,
+                    content,
+                )
+                .unwrap_err(),
+                "WORKSPACE_READ_DISCLOSURE_TURN_NOT_ACTIVE"
+            );
+            assert!(cancel_session
+                .workspace_read_grants
+                .lock()
+                .expect("cancel grant lock")
+                .is_empty());
+            cancel_session.retire();
+            drop(cancel_root);
+
+            let (release_session, _receiver) = test_session_with_provider(provider.clone());
+            let (release_root, release_storage, release_registry) =
+                synthetic_multi_capability_fixture(&release_session, None, Some(true));
+            let release_request = workspace_read_release_request(
+                &release_session,
+                &release_storage,
+                &release_registry,
+                &provider,
+                "d31-cancel-after-release-host-turn",
+                content,
+            );
+            assert_eq!(
+                authorize_workspace_read_release(
+                    &release_storage,
+                    &release_registry,
+                    &release_session,
+                    &release_request,
+                    content,
+                ),
+                Ok(())
+            );
+            release_session
+                .begin_cancellation()
+                .expect("cancel after release");
+            assert_eq!(
+                release_session
+                    .workspace_read_grants
+                    .lock()
+                    .expect("release grant lock")
+                    .get(&release_request.grant.grant_id)
+                    .map(|state| state.phase),
+                Some(WorkspaceReadGrantPhase::Released)
+            );
+            release_session.retire();
+            drop(release_root);
         }
 
         #[test]

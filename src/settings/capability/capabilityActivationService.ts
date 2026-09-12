@@ -4,10 +4,12 @@ import { invoke } from "@tauri-apps/api/core";
  * D30-A capability activation service.
  *
  * This module is a thin, display-only control surface over the durable D28
- * authorization root. It sends exactly three caller-controlled values on a
- * transition — the capability id, the desired state, and the revision last
- * observed — and it never sends a life id, event id, provenance, scope, risk,
- * approval floor, grant, or revision to mint. The Host derives all of those.
+ * authorization root. It sends the capability id, desired state, revision last
+ * observed, and the Host-derived Life ID echoed from the current snapshot. The
+ * observed Life ID is only a stale-intent fence; it never selects an
+ * authorization target. The service never sends an event id, provenance,
+ * scope, risk, approval floor, grant, or revision to mint. The Host derives
+ * all of those.
  */
 
 export type CapabilityRiskClass = "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
@@ -70,7 +72,9 @@ export const CAPABILITY_ACTIVATION_CODES = {
   settingsWindowRequired: "CAPABILITY_ACTIVATION_SETTINGS_WINDOW_REQUIRED",
   lifeNotAvailable: "LIFE_NOT_AVAILABLE",
   unknownCapability: "CAPABILITY_ACTIVATION_UNKNOWN_CAPABILITY",
+  lifeChanged: "CAPABILITY_ACTIVATION_LIFE_CHANGED",
   revisionConflict: "CAPABILITY_ACTIVATION_REVISION_CONFLICT",
+  catalogTooLarge: "CAPABILITY_ACTIVATION_CATALOG_TOO_LARGE",
   noTransition: "CAPABILITY_ACTIVATION_NO_TRANSITION",
   notProvisioned: "CAPABILITY_ACTIVATION_NOT_PROVISIONED",
   invalidRequest: "CAPABILITY_ACTIVATION_INVALID_REQUEST",
@@ -88,10 +92,11 @@ export const capabilityActivationService = {
     capabilityId: string,
     enabled: boolean,
     expectedRevision: number,
+    observedLifeId: string,
   ): Promise<CapabilityAuthorizationUpdateResult> {
     return invoke<CapabilityAuthorizationUpdateResult>(
       "set_capability_authorization_enabled",
-      { capabilityId, enabled, expectedRevision },
+      { capabilityId, enabled, expectedRevision, observedLifeId },
     );
   },
 };

@@ -17,30 +17,47 @@ const busy = ref(false);
 const error = ref<string>();
 const notice = ref<string>();
 /** Second-step confirmation target. Enabling is never a one-click toggle. */
-const pendingEnable = ref<CapabilityAuthorizationEntryView>();
+const pendingEnable = ref<{
+  entry: CapabilityAuthorizationEntryView;
+  observedLifeId: string;
+}>();
 const pendingEnableAcknowledged = ref(false);
+let refreshGeneration = 0;
 
 const capabilities = computed(() => snapshot.value?.capabilities ?? []);
+const pendingEnableEntry = computed(() => pendingEnable.value?.entry);
 const lifeUnavailable = computed(
   () => error.value !== undefined && error.value.includes("No current Life"),
 );
 
 async function refresh(): Promise<void> {
+  const generation = ++refreshGeneration;
+  // A refresh invalidates both the old cards and any confirmation derived from
+  // them. No failed refresh may leave an actionable stale Life on screen.
+  cancelEnable();
+  snapshot.value = undefined;
+  loading.value = true;
+  error.value = undefined;
   try {
-    snapshot.value = await capabilityActivationService.getSnapshot();
-    error.value = undefined;
+    const nextSnapshot = await capabilityActivationService.getSnapshot();
+    if (generation !== refreshGeneration) return;
+    snapshot.value = nextSnapshot;
   } catch (caught) {
+    if (generation !== refreshGeneration) return;
+    snapshot.value = undefined;
     error.value = activationErrorText(
       caught,
       "Capability permissions are unavailable.",
     );
   } finally {
-    loading.value = false;
+    if (generation === refreshGeneration) loading.value = false;
   }
 }
 
 function requestEnable(entry: CapabilityAuthorizationEntryView): void {
-  pendingEnable.value = entry;
+  const observedLifeId = snapshot.value?.lifeId;
+  if (!observedLifeId) return;
+  pendingEnable.value = { entry, observedLifeId };
   pendingEnableAcknowledged.value = false;
   notice.value = undefined;
 }
@@ -53,6 +70,7 @@ function cancelEnable(): void {
 async function applyTransition(
   entry: CapabilityAuthorizationEntryView,
   enabled: boolean,
+  observedLifeId: string,
 ): Promise<void> {
   if (busy.value) return;
   busy.value = true;
@@ -63,6 +81,7 @@ async function applyTransition(
       entry.capabilityId,
       enabled,
       entry.revision,
+      observedLifeId,
     );
     notice.value = result.enabled
       ? `Enabled ${entry.displayName}. Each use still requires your explicit confirmation.`
@@ -71,7 +90,11 @@ async function applyTransition(
     await refresh();
   } catch (caught) {
     const code = activationErrorCode(caught);
-    if (code === CAPABILITY_ACTIVATION_CODES.revisionConflict) {
+    if (code === CAPABILITY_ACTIVATION_CODES.lifeChanged) {
+      cancelEnable();
+      await refresh();
+      notice.value = "Current Life changed. Review permissions again.";
+    } else if (code === CAPABILITY_ACTIVATION_CODES.revisionConflict) {
       // Stale local state: refresh and ask the user to decide again. A
       // revision conflict is never silently converted into success and the
       // requested change is never retried automatically.
@@ -95,9 +118,15 @@ async function applyTransition(
 }
 
 async function confirmEnable(): Promise<void> {
-  const entry = pendingEnable.value;
-  if (!entry || !pendingEnableAcknowledged.value) return;
-  await applyTransition(entry, true);
+  const pending = pendingEnable.value;
+  if (!pending || !pendingEnableAcknowledged.value) return;
+  await applyTransition(pending.entry, true, pending.observedLifeId);
+}
+
+async function disableCapability(entry: CapabilityAuthorizationEntryView): Promise<void> {
+  const observedLifeId = snapshot.value?.lifeId;
+  if (!observedLifeId) return;
+  await applyTransition(entry, false, observedLifeId);
 }
 
 function lastUpdated(entry: CapabilityAuthorizationEntryView): string {
@@ -147,6 +176,10 @@ onMounted(() => {
     </p>
 
     <p v-if="notice" class="capability-notice" aria-live="polite">{{ notice }}</p>
+
+    <p v-if="snapshot" class="capability-life" aria-label="Current Life">
+      Permissions for current Life: <code>{{ snapshot.lifeId }}</code>
+    </p>
 
     <p v-if="!loading && capabilities.length === 0 && !error" class="capability-muted">
       No governed capabilities are available for this Life.
@@ -203,7 +236,7 @@ onMounted(() => {
           v-else
           type="button"
           :disabled="busy"
-          @click="applyTransition(entry, false)"
+          @click="disableCapability(entry)"
         >
           Disable capability
         </button>
@@ -234,19 +267,19 @@ onMounted(() => {
     </article>
 
     <section
-      v-if="pendingEnable"
+      v-if="pendingEnableEntry"
       class="capability-confirmation"
       aria-label="Enable capability confirmation"
     >
-      <strong>Enable {{ pendingEnable.displayName }}?</strong>
+      <strong>Enable {{ pendingEnableEntry.displayName }}?</strong>
       <p>
-        This permits Vita Agent to request this {{ pendingEnable.readOnly ? "read-only " : "" }}capability.
+        This permits Vita Agent to request this {{ pendingEnableEntry.readOnly ? "read-only " : "" }}capability.
         Each use will still require your explicit confirmation.
         You can disable it at any time.
       </p>
       <p class="capability-meta-line">
-        Risk {{ pendingEnable.riskClass }} · Approval {{ pendingEnable.approvalFloor }} · Scope
-        {{ pendingEnable.scopeRequirement }}
+        Risk {{ pendingEnableEntry.riskClass }} · Approval {{ pendingEnableEntry.approvalFloor }} · Scope
+        {{ pendingEnableEntry.scopeRequirement }}
       </p>
       <label class="capability-ack">
         <input
@@ -277,6 +310,7 @@ onMounted(() => {
 .capability-header h3, .capability-header p { margin: 0; }
 .capability-header p { color: #cbd5e1; font-size: 0.9rem; }
 .capability-explain { margin: 0; color: #cbd5e1; font-size: 0.9rem; border-left: 3px solid #22d3ee; padding-left: 0.75rem; }
+.capability-life { margin: 0; color: #e2e8f0; font-size: 0.9rem; }
 .capability-card { display: grid; gap: 0.6rem; border: 1px solid #475569; border-radius: 0.7rem; padding: 1rem; background: #111c2e; }
 .capability-card-header { display: flex; justify-content: space-between; gap: 1rem; align-items: start; }
 .capability-card-header h4, .capability-card-header p { margin: 0; }

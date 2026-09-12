@@ -131,6 +131,7 @@ describe("CapabilitySettingsView", () => {
       capabilityId: CAPABILITY_ID,
       enabled: true,
       expectedRevision: 1,
+      observedLifeId: "life-1",
     });
     // Refresh after success, and the new state is rendered.
     expect(invokeMock).toHaveBeenCalledWith("get_capability_authorization_snapshot");
@@ -163,6 +164,7 @@ describe("CapabilitySettingsView", () => {
       capabilityId: CAPABILITY_ID,
       enabled: false,
       expectedRevision: 2,
+      observedLifeId: "life-1",
     });
     expect(wrapper.get(`[data-capability-id="${CAPABILITY_ID}"]`).text()).toContain(
       "Root disabled",
@@ -284,6 +286,78 @@ describe("CapabilitySettingsView", () => {
     }
     // The current Life is never submitted from the frontend.
     expect(html).not.toContain('name="lifeId"');
+    wrapper.unmount();
+  });
+
+  it("binds a pending enable to the exact snapshot Life and never retries after LIFE_CHANGED", async () => {
+    const wrapper = await mountWith(snapshot([entry()]));
+    await wrapper.get("button.primary").trigger("click");
+    await wrapper.get('input[type="checkbox"]').setValue(true);
+
+    invokeMock.mockRejectedValueOnce({
+      code: "CAPABILITY_ACTIVATION_LIFE_CHANGED",
+      message: "The current Life changed.",
+    });
+    invokeMock.mockResolvedValueOnce(snapshot([entry({ enabled: true, revision: 2 })]));
+
+    const confirm = wrapper
+      .findAll("button")
+      .find(button => button.text() === "Enable capability")!;
+    await confirm.trigger("click");
+    await flushPromises();
+
+    const setCalls = invokeMock.mock.calls.filter(
+      call => call[0] === "set_capability_authorization_enabled",
+    );
+    expect(setCalls).toHaveLength(1);
+    expect(setCalls[0][1]).toMatchObject({
+      capabilityId: CAPABILITY_ID,
+      enabled: true,
+      expectedRevision: 1,
+      observedLifeId: "life-1",
+    });
+    expect(wrapper.text()).toContain("Current Life changed. Review permissions again.");
+    expect(wrapper.get(`[data-capability-id="${CAPABILITY_ID}"]`).text()).toContain(
+      "Root enabled",
+    );
+    expect(wrapper.find('[aria-label="Enable capability confirmation"]').exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("clears cards and confirmation when a refresh fails", async () => {
+    const wrapper = await mountWith(snapshot([entry()]));
+    await wrapper.get("button.primary").trigger("click");
+    expect(wrapper.find('[aria-label="Enable capability confirmation"]').exists()).toBe(true);
+
+    invokeMock.mockRejectedValueOnce({
+      code: "CAPABILITY_ACTIVATION_STORAGE_UNAVAILABLE",
+      message: "The capability authorization store is unavailable.",
+    });
+    const refresh = wrapper.findAll("button").find(button => button.text() === "Refresh")!;
+    await refresh.trigger("click");
+    await flushPromises();
+
+    expect(wrapper.find(`[data-capability-id="${CAPABILITY_ID}"]`).exists()).toBe(false);
+    expect(wrapper.find('[aria-label="Enable capability confirmation"]').exists()).toBe(false);
+    expect(wrapper.text()).toContain("unavailable");
+    wrapper.unmount();
+  });
+
+  it("cancels stale confirmation before installing a refreshed snapshot", async () => {
+    const wrapper = await mountWith(snapshot([entry()]));
+    await wrapper.get("button.primary").trigger("click");
+    expect(wrapper.find('[aria-label="Enable capability confirmation"]').exists()).toBe(true);
+
+    invokeMock.mockResolvedValueOnce(snapshot([entry({ enabled: true, revision: 2 })]));
+    const refresh = wrapper.findAll("button").find(button => button.text() === "Refresh")!;
+    await refresh.trigger("click");
+    await flushPromises();
+
+    expect(wrapper.find('[aria-label="Enable capability confirmation"]').exists()).toBe(false);
+    expect(wrapper.text()).toContain("Permissions for current Life:");
+    expect(wrapper.get(`[data-capability-id="${CAPABILITY_ID}"]`).text()).toContain(
+      "Root enabled",
+    );
     wrapper.unmount();
   });
 });

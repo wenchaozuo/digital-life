@@ -11,8 +11,8 @@
 //! * the trusted production catalog always comes from
 //!   `CapabilityRegistry::production()`; descriptor metadata is never accepted
 //!   from the frontend;
-//! * the current life always comes from Host storage; the frontend cannot
-//!   submit a `life_id`;
+//! * the current life always comes from Host storage; the frontend may only
+//!   echo the snapshot Life ID as a stale-intent fence, never select a target;
 //! * the event identity is minted by the Host from a cryptographic source and
 //!   can never be supplied by the caller;
 //! * the caller must be the `settings` window, in addition to the Tauri ACL;
@@ -38,7 +38,7 @@ use super::descriptor::{
     ApprovalFloor, CapabilityDescriptor, CapabilityId, CapabilityRegistry, RiskClass,
     ScopeRequirement,
 };
-use crate::storage::StorageService;
+use crate::storage::{LifeIdentityRecord, StorageService};
 
 /// The only window label permitted to read or transition the user
 /// authorization root. The label is assigned by the Tauri capability
@@ -153,6 +153,14 @@ impl CapabilityActivationCommandError {
         )
     }
 
+    /// The Settings card belongs to a Life that is no longer current.
+    fn life_changed() -> Self {
+        Self::new(
+            "CAPABILITY_ACTIVATION_LIFE_CHANGED",
+            "The current Life changed. Review permissions again before applying this change.",
+        )
+    }
+
     /// The requested capability is not in the trusted production catalog.
     fn unknown_capability() -> Self {
         Self::new(
@@ -198,6 +206,14 @@ impl CapabilityActivationCommandError {
         Self::new(
             "CAPABILITY_ACTIVATION_STORAGE_UNAVAILABLE",
             "The capability authorization store is unavailable.",
+        )
+    }
+
+    /// The trusted catalog cannot be represented by the bounded Settings view.
+    fn catalog_too_large() -> Self {
+        Self::new(
+            "CAPABILITY_ACTIVATION_CATALOG_TOO_LARGE",
+            "The trusted capability catalog is too large to manage safely.",
         )
     }
 }
@@ -282,13 +298,30 @@ fn mint_host_event_id() -> Result<String, CapabilityActivationCommandError> {
     Ok(format!("{HOST_EVENT_ID_PREFIX}-{suffix}"))
 }
 
-/// Resolves the current Life from Host storage. The frontend never supplies it.
-fn current_life_id(storage: &StorageService) -> Result<String, CapabilityActivationCommandError> {
+/// Captures the current Life from Host storage exactly once at the command
+/// boundary. The frontend never supplies the authorization target.
+fn current_life(
+    storage: &StorageService,
+) -> Result<LifeIdentityRecord, CapabilityActivationCommandError> {
     match storage.get_current_life() {
-        Ok(Some(life)) => Ok(life.id),
+        Ok(Some(life)) => Ok(life),
         Ok(None) => Err(CapabilityActivationCommandError::life_not_available()),
         Err(_) => Err(CapabilityActivationCommandError::storage_unavailable()),
     }
+}
+
+/// The observed Life is only an optimistic stale-intent fence. Once it
+/// matches, the Host-owned Life record is the immutable target for the rest of
+/// this transition; no deeper operation re-reads current Life.
+fn current_life_for_observed_intent(
+    storage: &StorageService,
+    observed_life_id: &str,
+) -> Result<LifeIdentityRecord, CapabilityActivationCommandError> {
+    let life = current_life(storage)?;
+    if life.id != observed_life_id {
+        return Err(CapabilityActivationCommandError::life_changed());
+    }
+    Ok(life)
 }
 
 /// Resolves a capability id only if the trusted production catalog contains
@@ -305,6 +338,19 @@ fn trusted_capability(
     Ok(capability_id)
 }
 
+/// Validates the complete trusted catalog before any provisioning or
+/// transition side effect. A bounded control surface must never silently hide
+/// entries after the first sixteen.
+fn validated_catalog<'a>(
+    registry: &'a CapabilityRegistry,
+) -> Result<Vec<&'a CapabilityDescriptor>, CapabilityActivationCommandError> {
+    let catalog = registry.entries().collect::<Vec<_>>();
+    if catalog.len() > MAX_CATALOG_ENTRIES {
+        return Err(CapabilityActivationCommandError::catalog_too_large());
+    }
+    Ok(catalog)
+}
+
 /// Idempotently ensures a disabled `revision 1` row exists for every trusted
 /// production capability of the current Life.
 ///
@@ -314,10 +360,10 @@ fn trusted_capability(
 /// `disabled`/`revision 1` is treated as a storage failure.
 fn ensure_disabled_rows(
     storage: &StorageService,
-    registry: &CapabilityRegistry,
+    catalog: &[&CapabilityDescriptor],
     life_id: &str,
 ) -> Result<(), CapabilityActivationCommandError> {
-    for descriptor in registry.entries().take(MAX_CATALOG_ENTRIES) {
+    for &descriptor in catalog {
         let capability_id = descriptor.capability_id().clone();
         let existing = storage.find_capability_authorization(life_id, &capability_id);
         match existing {
@@ -371,26 +417,36 @@ fn map_update_error(error: CapabilityAuthorizationError) -> CapabilityActivation
 
 // ── Control-plane operations (testable without a webview) ─────────────
 
-pub(crate) fn build_snapshot(
+fn build_snapshot(
     storage: &StorageService,
     registry: &CapabilityRegistry,
 ) -> Result<CapabilityAuthorizationSnapshot, CapabilityActivationCommandError> {
-    let life_id = current_life_id(storage)?;
-    ensure_disabled_rows(storage, registry, &life_id)?;
+    let life = current_life(storage)?;
+    let catalog = validated_catalog(registry)?;
+    build_snapshot_for_life(storage, &catalog, &life)
+}
+
+fn build_snapshot_for_life(
+    storage: &StorageService,
+    catalog: &[&CapabilityDescriptor],
+    life: &LifeIdentityRecord,
+) -> Result<CapabilityAuthorizationSnapshot, CapabilityActivationCommandError> {
+    let life_id = &life.id;
+    ensure_disabled_rows(storage, catalog, life_id)?;
 
     let mut capabilities = Vec::new();
-    for descriptor in registry.entries().take(MAX_CATALOG_ENTRIES) {
+    for &descriptor in catalog {
         let capability_id = descriptor.capability_id().clone();
         let row = storage
-            .find_capability_authorization(&life_id, &capability_id)
+            .find_capability_authorization(life_id, &capability_id)
             .map_err(|_| CapabilityActivationCommandError::storage_unavailable())?
             .ok_or_else(CapabilityActivationCommandError::not_provisioned)?;
-        if row.life_id != life_id || row.capability_id != capability_id {
+        if row.life_id.as_str() != life_id || row.capability_id != capability_id {
             return Err(CapabilityActivationCommandError::storage_unavailable());
         }
         let events = storage
             .list_capability_authorization_events(
-                &life_id,
+                life_id,
                 &capability_id,
                 MAX_RECENT_AUTHORIZATION_EVENTS,
             )
@@ -406,23 +462,49 @@ pub(crate) fn build_snapshot(
     }
 
     Ok(CapabilityAuthorizationSnapshot {
-        life_id,
+        life_id: life_id.clone(),
         capabilities,
     })
 }
 
-pub(crate) fn apply_transition(
+fn apply_transition(
     storage: &StorageService,
     registry: &CapabilityRegistry,
     capability_id: &str,
     enabled: bool,
     expected_revision: i64,
+    observed_life_id: &str,
 ) -> Result<CapabilityAuthorizationUpdateResult, CapabilityActivationCommandError> {
-    let life_id = current_life_id(storage)?;
+    // The equality check is deliberately before catalog validation,
+    // provisioning, event-id minting, and every D28 mutation. The observed
+    // Life never selects the target; it only rejects stale Settings intent.
+    let life = current_life_for_observed_intent(storage, observed_life_id)?;
+    let catalog = validated_catalog(registry)?;
+    apply_transition_for_life(
+        storage,
+        registry,
+        &catalog,
+        &life,
+        capability_id,
+        enabled,
+        expected_revision,
+    )
+}
+
+fn apply_transition_for_life(
+    storage: &StorageService,
+    registry: &CapabilityRegistry,
+    catalog: &[&CapabilityDescriptor],
+    life: &LifeIdentityRecord,
+    capability_id: &str,
+    enabled: bool,
+    expected_revision: i64,
+) -> Result<CapabilityAuthorizationUpdateResult, CapabilityActivationCommandError> {
+    let life_id = &life.id;
     let capability_id = trusted_capability(registry, capability_id)?;
     // Provision first so a freshly installed catalog still has a durable row to
     // compare-and-swap against. This never enables anything.
-    ensure_disabled_rows(storage, registry, &life_id)?;
+    ensure_disabled_rows(storage, catalog, life_id)?;
 
     let request = LifeCapabilityAuthorizationUpdateRequest::from_host_user_authorization_root(
         mint_host_event_id()?,
@@ -446,7 +528,7 @@ pub(crate) fn apply_transition(
 
     let events = storage
         .list_capability_authorization_events(
-            &life_id,
+            life_id,
             &capability_id,
             MAX_RECENT_AUTHORIZATION_EVENTS,
         )
@@ -480,9 +562,10 @@ pub(crate) fn get_capability_authorization_snapshot(
 /// Settings-only explicit user-root transition.
 ///
 /// The frontend supplies only the capability id, the desired state, and the
-/// revision it last observed. Life identity, event identity, provenance,
-/// scope, risk, approval floor, and the resulting revision are all decided by
-/// the Host and D28.
+/// revision it last observed, plus the Host-derived Life ID it observed in the
+/// snapshot. The Life ID is only a stale-intent fence: event identity,
+/// authorization target, provenance, scope, risk, approval floor, and the
+/// resulting revision are all decided by the Host and D28.
 #[tauri::command]
 pub(crate) fn set_capability_authorization_enabled(
     window: WebviewWindow,
@@ -491,6 +574,7 @@ pub(crate) fn set_capability_authorization_enabled(
     capability_id: String,
     enabled: bool,
     expected_revision: i64,
+    observed_life_id: String,
 ) -> Result<CapabilityAuthorizationUpdateResult, CapabilityActivationCommandError> {
     require_settings_window(&window)?;
     apply_transition(
@@ -499,6 +583,7 @@ pub(crate) fn set_capability_authorization_enabled(
         &capability_id,
         enabled,
         expected_revision,
+        &observed_life_id,
     )
 }
 
@@ -513,6 +598,7 @@ mod tests {
 
     const PRODUCTION_CAPABILITY_ID: &str = "vita.process.workspace.git_status";
     const LIFE_ID: &str = "d30a-life";
+    const SECOND_LIFE_ID: &str = "d30a-life-b";
 
     struct Fixture {
         _root: tempfile::TempDir,
@@ -555,6 +641,18 @@ mod tests {
             CapabilityId::try_from(PRODUCTION_CAPABILITY_ID).expect("production capability id")
         }
 
+        fn life_record(id: &str, name: &str) -> LifeIdentityRecord {
+            LifeIdentityRecord {
+                id: id.to_string(),
+                name: name.to_string(),
+                created_at: "2026-09-12T00:00:00.000Z".to_string(),
+                version: 1,
+                body_id: "d30a-body".to_string(),
+                persona_id: "d30a-persona".to_string(),
+                persona_version: 1,
+            }
+        }
+
         fn decision(&self) -> (CapabilityAuthorizationDecisionKind, Option<i64>) {
             let decision = evaluate_capability_authorization(
                 &self.storage,
@@ -568,16 +666,23 @@ mod tests {
         }
 
         fn row(&self) -> LifeCapabilityAuthorization {
+            self.row_for(LIFE_ID).expect("d30a row present")
+        }
+
+        fn row_for(&self, life_id: &str) -> Option<LifeCapabilityAuthorization> {
             self.storage
-                .find_capability_authorization(LIFE_ID, &self.capability_id())
+                .find_capability_authorization(life_id, &self.capability_id())
                 .expect("d30a row read")
-                .expect("d30a row present")
         }
 
         fn event_count(&self) -> usize {
+            self.event_count_for(LIFE_ID)
+        }
+
+        fn event_count_for(&self, life_id: &str) -> usize {
             self.storage
                 .list_capability_authorization_events(
-                    LIFE_ID,
+                    life_id,
                     &self.capability_id(),
                     MAX_RECENT_AUTHORIZATION_EVENTS,
                 )
@@ -588,10 +693,7 @@ mod tests {
         /// The durable root table has `PRIMARY KEY (life_id, capability_id)`,
         /// so existence of the keyed row is exactly "one durable row".
         fn row_exists(&self) -> bool {
-            self.storage
-                .find_capability_authorization(LIFE_ID, &self.capability_id())
-                .expect("d30a row read")
-                .is_some()
+            self.row_for(LIFE_ID).is_some()
         }
     }
 
@@ -636,6 +738,117 @@ mod tests {
     }
 
     #[test]
+    fn observed_life_fence_denies_stale_a_intent_before_provisioning_b() {
+        let fixture = Fixture::new();
+
+        // The Settings card was rendered for Life A at revision 1.
+        let snapshot_a = build_snapshot(&fixture.storage, &fixture.registry).expect("snapshot A");
+        assert_eq!(snapshot_a.life_id, LIFE_ID);
+        assert_eq!(snapshot_a.capabilities[0].revision, 1);
+
+        // Switch the Host-owned current Life to B. Both lives would otherwise
+        // naturally have revision 1, so the revision alone cannot fence this
+        // stale intent.
+        fixture
+            .storage
+            .save_life(Fixture::life_record(SECOND_LIFE_ID, "D30-A life B"))
+            .expect("switch current Life to B");
+
+        let error = apply_transition(
+            &fixture.storage,
+            &fixture.registry,
+            PRODUCTION_CAPABILITY_ID,
+            true,
+            1,
+            LIFE_ID,
+        )
+        .expect_err("a stale Life A intent must be denied");
+        assert_eq!(error.code, "CAPABILITY_ACTIVATION_LIFE_CHANGED");
+
+        // The mismatch check happens before provisioning, event-id minting, or
+        // D28 mutation: B remains absent and A remains untouched.
+        assert!(fixture.row_for(SECOND_LIFE_ID).is_none());
+        assert_eq!(fixture.event_count_for(SECOND_LIFE_ID), 0);
+        let row_a = fixture.row_for(LIFE_ID).expect("Life A row");
+        assert!(!row_a.enabled);
+        assert_eq!(row_a.revision, 1);
+        assert_eq!(fixture.event_count_for(LIFE_ID), 0);
+
+        // A fresh B snapshot creates only B's disabled rev1 row; the fresh B
+        // intent then enables B through the Host-derived current target.
+        let snapshot_b = build_snapshot(&fixture.storage, &fixture.registry).expect("snapshot B");
+        assert_eq!(snapshot_b.life_id, SECOND_LIFE_ID);
+        assert_eq!(snapshot_b.capabilities[0].revision, 1);
+        let enabled_b = apply_transition(
+            &fixture.storage,
+            &fixture.registry,
+            PRODUCTION_CAPABILITY_ID,
+            true,
+            1,
+            SECOND_LIFE_ID,
+        )
+        .expect("fresh Life B intent");
+        assert_eq!(enabled_b.revision, 2);
+        assert!(enabled_b.enabled);
+        assert_eq!(fixture.event_count_for(SECOND_LIFE_ID), 1);
+    }
+
+    #[test]
+    fn oversized_trusted_catalog_fails_closed_without_partial_provisioning() {
+        let fixture = Fixture::new();
+        let descriptors = (0..17)
+            .map(|index| {
+                CapabilityDescriptor::synthetic(
+                    CapabilityId::try_from(format!("synthetic.capability.{index:02}")).unwrap(),
+                    format!("Synthetic capability {index}"),
+                    RiskClass::Low,
+                    ApprovalFloor::RootEnabled,
+                    ScopeRequirement::None,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let registry = CapabilityRegistry::synthetic(descriptors).expect("synthetic registry");
+
+        let error = build_snapshot(&fixture.storage, &registry)
+            .expect_err("catalog overflow must fail closed");
+        assert_eq!(error.code, "CAPABILITY_ACTIVATION_CATALOG_TOO_LARGE");
+        for descriptor in registry.entries() {
+            assert!(fixture
+                .storage
+                .find_capability_authorization(LIFE_ID, descriptor.capability_id())
+                .expect("overflow row read")
+                .is_none());
+            assert!(fixture
+                .storage
+                .list_capability_authorization_events(
+                    LIFE_ID,
+                    descriptor.capability_id(),
+                    MAX_RECENT_AUTHORIZATION_EVENTS,
+                )
+                .expect("overflow event read")
+                .is_empty());
+        }
+
+        let first_id = registry
+            .entries()
+            .next()
+            .expect("synthetic descriptor")
+            .capability_id()
+            .as_str();
+        let error = apply_transition(&fixture.storage, &registry, first_id, true, 1, LIFE_ID)
+            .expect_err("transition must reject an oversized catalog");
+        assert_eq!(error.code, "CAPABILITY_ACTIVATION_CATALOG_TOO_LARGE");
+        for descriptor in registry.entries() {
+            assert!(fixture
+                .storage
+                .find_capability_authorization(LIFE_ID, descriptor.capability_id())
+                .expect("transition overflow row read")
+                .is_none());
+        }
+    }
+
+    #[test]
     fn enable_then_disable_mints_exactly_two_immutable_user_events() {
         let fixture = Fixture::new();
         build_snapshot(&fixture.storage, &fixture.registry).expect("snapshot");
@@ -647,6 +860,7 @@ mod tests {
             PRODUCTION_CAPABILITY_ID,
             true,
             1,
+            LIFE_ID,
         )
         .expect("enable");
         assert_eq!(enabled.transition, "applied");
@@ -663,6 +877,7 @@ mod tests {
             PRODUCTION_CAPABILITY_ID,
             false,
             2,
+            LIFE_ID,
         )
         .expect("disable");
         assert_eq!(disabled.transition, "applied");
@@ -701,6 +916,7 @@ mod tests {
             PRODUCTION_CAPABILITY_ID,
             true,
             1,
+            LIFE_ID,
         )
         .expect("enable");
 
@@ -710,6 +926,7 @@ mod tests {
             PRODUCTION_CAPABILITY_ID,
             false,
             1, // stale: the row is already at revision 2
+            LIFE_ID,
         )
         .expect_err("stale revision must conflict");
         assert_eq!(
@@ -734,6 +951,7 @@ mod tests {
             PRODUCTION_CAPABILITY_ID,
             true,
             1,
+            LIFE_ID,
         )
         .expect("enable");
         assert_eq!(fixture.event_count(), 1);
@@ -744,6 +962,7 @@ mod tests {
             PRODUCTION_CAPABILITY_ID,
             true, // already enabled
             2,
+            LIFE_ID,
         )
         .expect_err("a no-op transition must not be fabricated");
         assert_eq!(error.code, "CAPABILITY_ACTIVATION_NO_TRANSITION");
@@ -764,8 +983,15 @@ mod tests {
             "with space",
             "with/slash",
         ] {
-            let error = apply_transition(&fixture.storage, &fixture.registry, candidate, true, 1)
-                .expect_err("unknown capability must be denied");
+            let error = apply_transition(
+                &fixture.storage,
+                &fixture.registry,
+                candidate,
+                true,
+                1,
+                LIFE_ID,
+            )
+            .expect_err("unknown capability must be denied");
             assert_eq!(
                 error.code, "CAPABILITY_ACTIVATION_UNKNOWN_CAPABILITY",
                 "capability {candidate:?} must be denied"
@@ -797,8 +1023,15 @@ mod tests {
         let error = build_snapshot(&storage, &registry).expect_err("no life must fail closed");
         assert_eq!(error.code, "LIFE_NOT_AVAILABLE");
 
-        let error = apply_transition(&storage, &registry, PRODUCTION_CAPABILITY_ID, true, 1)
-            .expect_err("no life must fail closed");
+        let error = apply_transition(
+            &storage,
+            &registry,
+            PRODUCTION_CAPABILITY_ID,
+            true,
+            1,
+            "missing-life",
+        )
+        .expect_err("no life must fail closed");
         assert_eq!(error.code, "LIFE_NOT_AVAILABLE");
     }
 
@@ -822,6 +1055,10 @@ mod tests {
     #[test]
     fn authority_revocation_uses_one_durable_row_and_the_real_evaluator() {
         let fixture = Fixture::new();
+        let authority_view = fixture
+            .storage
+            .open_authority_view()
+            .expect("separate Host authority view");
 
         // 1. initial state: disabled revision 1 (provisioned, never enabled)
         build_snapshot(&fixture.storage, &fixture.registry).expect("snapshot");
@@ -838,6 +1075,7 @@ mod tests {
             PRODUCTION_CAPABILITY_ID,
             true,
             1,
+            LIFE_ID,
         )
         .expect("user enable");
         assert_eq!(enabled.revision, 2);
@@ -857,6 +1095,20 @@ mod tests {
             "confirmation/grant evidence is bound to the enabled revision"
         );
 
+        let authority_enabled = evaluate_capability_authorization(
+            &authority_view,
+            &fixture.registry,
+            LIFE_ID,
+            &fixture.capability_id(),
+            RequestedCapabilityScope::Workspace,
+        )
+        .expect("authority view sees rev2");
+        assert_eq!(
+            authority_enabled.outcome(),
+            CapabilityAuthorizationDecisionKind::ScopeRequired
+        );
+        assert_eq!(authority_enabled.authorization_revision(), Some(2));
+
         // 4. the same durable row is disabled by the user: revision 3
         let disabled = apply_transition(
             &fixture.storage,
@@ -864,6 +1116,7 @@ mod tests {
             PRODUCTION_CAPABILITY_ID,
             false,
             2,
+            LIFE_ID,
         )
         .expect("user disable");
         assert_eq!(disabled.revision, 3);
@@ -877,6 +1130,20 @@ mod tests {
             "the final revalidation must deny after revocation"
         );
         assert_eq!(revision, Some(3));
+
+        let authority_disabled = evaluate_capability_authorization(
+            &authority_view,
+            &fixture.registry,
+            LIFE_ID,
+            &fixture.capability_id(),
+            RequestedCapabilityScope::Workspace,
+        )
+        .expect("authority view sees rev3");
+        assert_eq!(
+            authority_disabled.outcome(),
+            CapabilityAuthorizationDecisionKind::RootDisabled
+        );
+        assert_eq!(authority_disabled.authorization_revision(), Some(3));
 
         // The denial is the same decision code the D29 Host maps to a refusal
         // before any native operation is attempted.
@@ -924,6 +1191,7 @@ mod tests {
                 PRODUCTION_CAPABILITY_ID,
                 enabled,
                 expected_revision,
+                LIFE_ID,
             )
             .expect("alternating transition");
         }

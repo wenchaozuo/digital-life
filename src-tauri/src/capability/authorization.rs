@@ -106,7 +106,7 @@ impl UserExplicitCapabilityAuthorizationEvidence {
     /// caller is the Settings capability activation control plane
     /// (`capability::activation`), which is itself gated on the Settings
     /// window label.
-    pub(crate) fn mint_host_user_authorization_root(event_id: String) -> Self {
+    fn mint_host_user_authorization_root(event_id: String) -> Self {
         Self {
             event_id,
             actor_kind: UserExplicitActorKind,
@@ -173,7 +173,7 @@ impl LifeCapabilityAuthorizationUpdateRequest {
     /// desired boolean state with the revision the UI last observed.  Evidence
     /// provenance, revision arithmetic, and the resulting immutable audit row
     /// are all decided by D28, never by the caller.
-    pub(crate) fn from_host_user_authorization_root(
+    pub(super) fn from_host_user_authorization_root(
         event_id: String,
         life_id: String,
         capability_id: CapabilityId,

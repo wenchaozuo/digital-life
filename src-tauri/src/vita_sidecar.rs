@@ -112,6 +112,8 @@ pub struct VitaSidecarCoordinator {
     registry: CapabilityRegistry,
     #[cfg(windows)]
     credential_store: WindowsCredentialSecretStore,
+    #[cfg(all(windows, test))]
+    test_provider_override: Mutex<Option<protocol::ProviderConfiguration>>,
     #[cfg(windows)]
     inner: Mutex<WindowsCoordinatorState>,
     #[cfg(not(windows))]
@@ -128,6 +130,8 @@ impl VitaSidecarCoordinator {
             registry,
             #[cfg(windows)]
             credential_store: WindowsCredentialSecretStore::new(),
+            #[cfg(all(windows, test))]
+            test_provider_override: Mutex::new(None),
             #[cfg(windows)]
             inner: Mutex::new(WindowsCoordinatorState::default()),
             #[cfg(not(windows))]
@@ -252,6 +256,21 @@ mod windows {
             credential_ref: profile.id.clone(),
             credential_destination: profile.base_url,
         }))
+    }
+
+    fn current_chat_provider_configuration(
+        coordinator: &VitaSidecarCoordinator,
+    ) -> Result<Option<protocol::ProviderConfiguration>, String> {
+        #[cfg(test)]
+        if let Ok(provider) = coordinator.test_provider_override.lock() {
+            if provider.is_some() {
+                return Ok(provider.clone());
+            }
+        }
+        active_chat_provider_configuration(
+            &coordinator.authority_storage,
+            &coordinator.credential_store,
+        )
     }
 
     fn observed_current_life(
@@ -448,6 +467,8 @@ mod windows {
     pub(super) struct WindowsCoordinatorState {
         running: Option<RunningSidecar>,
         starting: bool,
+        #[cfg(test)]
+        test_session: Option<Arc<HostSessionState>>,
     }
 
     pub(super) use self::WindowsCoordinatorState as StateType;
@@ -1093,6 +1114,13 @@ mod windows {
     }
 
     impl VitaSidecarCoordinator {
+        #[cfg(test)]
+        fn install_test_session(&self, session: Arc<HostSessionState>) {
+            if let Ok(mut guard) = self.inner.lock() {
+                guard.test_session = Some(session);
+            }
+        }
+
         fn start(
             &self,
             app: &AppHandle,
@@ -1387,15 +1415,30 @@ mod windows {
                 .inner
                 .lock()
                 .map_err(|_| "Vita sidecar coordinator lock was poisoned".to_string())?;
+            #[cfg(test)]
+            if let Some(session) = guard.test_session.as_ref() {
+                return self.decide_pending_for_session(session, pending_id, decision);
+            }
             let running = guard
                 .running
                 .as_ref()
                 .ok_or_else(|| "Vita sidecar is not running".to_string())?;
-            expire_pending(&running.session);
-            let pending = take_pending(&running.session, &pending_id)
+            self.decide_pending_for_session(&running.session, pending_id, decision)
+        }
+
+        /// The production decision path is kept separate from the outer
+        /// RunningSidecar lock so tests can inject only an already-constructed
+        /// Host session.  No confirmation logic is duplicated or bypassed.
+        fn decide_pending_for_session(
+            &self,
+            session: &Arc<HostSessionState>,
+            pending_id: String,
+            decision: ConfirmationDecision,
+        ) -> Result<VitaSidecarActionResponse, String> {
+            expire_pending(session);
+            let pending = take_pending(session, &pending_id)
                 .ok_or_else(|| "Vita pending confirmation was not found".to_string())?;
-            let authority = running
-                .session
+            let authority = session
                 .turn_authority
                 .lock()
                 .map_err(|_| "Vita turn authority lock was poisoned".to_string())?;
@@ -1406,7 +1449,7 @@ mod windows {
             );
             if !active {
                 let _ = send_confirmation_decision(
-                    &running.session,
+                    session,
                     &pending,
                     ConfirmationDecision::Cancel,
                     None,
@@ -1414,12 +1457,8 @@ mod windows {
                 return Err("Vita pending confirmation belongs to a retired turn".to_string());
             }
             if pending.expires_at_unix_ms <= unix_millis() {
-                let _ = send_confirmation_decision(
-                    &running.session,
-                    &pending,
-                    ConfirmationDecision::Deny,
-                    None,
-                );
+                let _ =
+                    send_confirmation_decision(session, &pending, ConfirmationDecision::Deny, None);
                 return Err("Vita pending confirmation expired".to_string());
             }
 
@@ -1428,25 +1467,22 @@ mod windows {
                 revision = match current_workspace_revision(
                     &self.authority_storage,
                     &self.registry,
-                    &running.session,
+                    session,
                     &pending.binding,
                 ) {
                     Ok(revision) => Some(revision),
                     Err(error) => {
-                        let _ = running.session.send(&HostMessage::ConfirmationReply(
-                            ConfirmationReply {
-                                request_id: pending.request_id.clone(),
-                                session_id: running.session.session_id.clone(),
-                                decision: ConfirmationDecision::Deny,
-                                authorization_revision: None,
-                            },
-                        ));
+                        let _ = session.send(&HostMessage::ConfirmationReply(ConfirmationReply {
+                            request_id: pending.request_id.clone(),
+                            session_id: session.session_id.clone(),
+                            decision: ConfirmationDecision::Deny,
+                            authorization_revision: None,
+                        }));
                         return Err(error);
                     }
                 };
                 let confirmation_id = secure_id("vita-confirmation")?;
-                running
-                    .session
+                session
                     .approvals
                     .lock()
                     .map_err(|_| "Vita approval state lock was poisoned".to_string())?
@@ -1461,11 +1497,9 @@ mod windows {
                         },
                     );
             }
-            if let Err(error) =
-                send_confirmation_decision(&running.session, &pending, decision, revision)
-            {
+            if let Err(error) = send_confirmation_decision(session, &pending, decision, revision) {
                 if decision == ConfirmationDecision::Confirm {
-                    if let Ok(mut approvals) = running.session.approvals.lock() {
+                    if let Ok(mut approvals) = session.approvals.lock() {
                         approvals.remove(&approval_key(&pending.host_turn_id, &pending.binding));
                     }
                 }
@@ -1516,6 +1550,30 @@ mod windows {
             &self,
             request: VitaTurnStartRequest,
         ) -> Result<VitaTurnStartResponse, String> {
+            let guard = self
+                .inner
+                .lock()
+                .map_err(|_| "Vita sidecar coordinator lock was poisoned".to_string())?;
+            #[cfg(test)]
+            if let Some(session) = guard.test_session.as_ref() {
+                return self.start_turn_for_session(session, request);
+            }
+            let running = guard
+                .running
+                .as_ref()
+                .ok_or_else(|| "Vita sidecar is not running".to_string())?;
+            self.start_turn_for_session(&running.session, request)
+        }
+
+        /// Runs the same production admission sequence against one Host
+        /// session.  The outer command keeps the coordinator lock; tests use
+        /// this narrow seam only to inject provider/session plumbing without
+        /// constructing another process graph.
+        fn start_turn_for_session(
+            &self,
+            session: &Arc<HostSessionState>,
+            request: VitaTurnStartRequest,
+        ) -> Result<VitaTurnStartResponse, String> {
             if request.prompt.is_empty()
                 || request.prompt.len() > protocol::MAX_PROMPT_BYTES
                 || request.prompt.chars().any(|character| {
@@ -1524,34 +1582,22 @@ mod windows {
             {
                 return Err("Vita turn prompt was empty, oversized, or malformed".to_string());
             }
-            let guard = self
-                .inner
-                .lock()
-                .map_err(|_| "Vita sidecar coordinator lock was poisoned".to_string())?;
-            let running = guard
-                .running
-                .as_ref()
-                .ok_or_else(|| "Vita sidecar is not running".to_string())?;
-            if running.session.closed.load(Ordering::Acquire) {
+            if session.closed.load(Ordering::Acquire) {
                 return Err("Vita sidecar is not running".to_string());
             }
-            running.session.ensure_turn_idle()?;
-            require_current_session_life(&self.authority_storage, &running.session)?;
+            session.ensure_turn_idle()?;
+            require_current_session_life(&self.authority_storage, session)?;
             // Root admission deliberately precedes provider/credential
             // inspection.  A disabled D30 root must not release credentials,
             // contact a provider, create a turn generation, or emit a
             // HostMessage::StartTurn frame.
-            preflight_capability_root(&self.authority_storage, &self.registry, &running.session)?;
-            let provider = running
-                .session
+            preflight_capability_root(&self.authority_storage, &self.registry, session)?;
+            let provider = session
                 .provider
                 .clone()
                 .ok_or_else(|| "Vita Chat provider is not configured".to_string())?;
-            let current_provider = active_chat_provider_configuration(
-                &self.authority_storage,
-                &self.credential_store,
-            )?
-            .ok_or_else(|| "Vita Chat provider is not ready".to_string())?;
+            let current_provider = current_chat_provider_configuration(self)?
+                .ok_or_else(|| "Vita Chat provider is not ready".to_string())?;
             if current_provider != provider {
                 return Err("Vita active Chat provider changed; restart the sidecar".to_string());
             }
@@ -1561,28 +1607,24 @@ mod windows {
             // its revision into executable authority.
             let turn_id = secure_id("vita-turn")?;
             let binding =
-                protocol::ProviderBinding::derive(&running.session.session_id, &turn_id, &provider)
+                protocol::ProviderBinding::derive(&session.session_id, &turn_id, &provider)
                     .map_err(|_| "Vita provider binding could not be derived".to_string())?;
-            running
-                .session
-                .begin_turn(turn_id.clone(), provider.clone(), binding.clone())?;
-            if let Ok(mut output) = running.session.assistant_text.lock() {
+            session.begin_turn(turn_id.clone(), provider.clone(), binding.clone())?;
+            if let Ok(mut output) = session.assistant_text.lock() {
                 output.take();
             }
-            if let Ok(mut error) = running.session.turn_error.lock() {
+            if let Ok(mut error) = session.turn_error.lock() {
                 error.take();
             }
             let message = HostMessage::StartTurn(protocol::StartTurn {
                 request_id: next_id("host-start-turn"),
-                session_id: running.session.session_id.clone(),
+                session_id: session.session_id.clone(),
                 turn_id: turn_id.clone(),
                 prompt: request.prompt,
                 binding,
             });
-            if let Err(error) = running.session.send(&message) {
-                let _ = running
-                    .session
-                    .terminalize_turn(&turn_id, protocol::TurnPhase::Failed);
+            if let Err(error) = session.send(&message) {
+                let _ = session.terminalize_turn(&turn_id, protocol::TurnPhase::Failed);
                 return Err(error);
             }
             Ok(VitaTurnStartResponse {
@@ -2872,6 +2914,361 @@ mod windows {
         }
 
         #[test]
+        fn d30_production_enable_admits_exactly_one_start_turn() {
+            let provider = test_provider();
+            let (session, receiver) = test_session_with_provider(provider.clone());
+            let (root, storage, registry, enabled_revision) = authority_fixture(&session);
+            assert_eq!(enabled_revision, 2);
+            let coordinator = VitaSidecarCoordinator::new(Arc::new(storage), registry);
+            *coordinator
+                .test_provider_override
+                .lock()
+                .expect("provider override lock") = Some(provider);
+            coordinator.install_test_session(Arc::clone(&session));
+
+            let response = coordinator
+                .start_turn(VitaTurnStartRequest {
+                    prompt: "inspect governed status".to_string(),
+                })
+                .expect("D30-enabled Host turn admission");
+            assert!(response.accepted);
+            let message = receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("one StartTurn frame");
+            assert!(matches!(
+                message,
+                HostMessage::StartTurn(protocol::StartTurn { turn_id, .. })
+                    if turn_id == response.turn_id
+            ));
+            assert!(receiver.recv_timeout(Duration::from_millis(50)).is_err());
+            assert!(matches!(
+                session.authority_snapshot(),
+                Some(HostTurnAuthority::Active(_))
+            ));
+            session.retire();
+            drop(coordinator);
+            drop(root);
+        }
+
+        #[test]
+        fn d30_running_session_a_rejects_current_life_b_before_process_work() {
+            let provider = test_provider();
+            let (session, receiver) = test_session_with_provider(provider.clone());
+            let (root, storage, registry, _enabled_revision) = authority_fixture(&session);
+            storage
+                .save_life(LifeIdentityRecord {
+                    id: "life-b".to_string(),
+                    name: "D30-C second life".to_string(),
+                    created_at: "2026-09-12T00:00:00.000Z".to_string(),
+                    version: 1,
+                    body_id: "d29h9-r3-body".to_string(),
+                    persona_id: "d29h9-r3-persona".to_string(),
+                    persona_version: 1,
+                })
+                .expect("switch current Life");
+
+            let coordinator = VitaSidecarCoordinator::new(Arc::new(storage), registry);
+            *coordinator
+                .test_provider_override
+                .lock()
+                .expect("provider override lock") = Some(provider);
+            coordinator.install_test_session(Arc::clone(&session));
+
+            assert_eq!(
+                coordinator
+                    .start_turn(VitaTurnStartRequest {
+                        prompt: "must bind to current Life".to_string(),
+                    })
+                    .unwrap_err(),
+                LIFE_RESTART_REQUIRED
+            );
+            assert!(matches!(
+                session.authority_snapshot(),
+                Some(HostTurnAuthority::Idle)
+            ));
+            assert!(session
+                .active_turn_id
+                .lock()
+                .expect("active turn lock")
+                .is_none());
+            assert!(receiver.try_recv().is_err());
+            drop(coordinator);
+            drop(root);
+        }
+
+        #[test]
+        fn d30_disabled_admission_emits_zero_start_turn_frames() {
+            let provider = test_provider();
+            let (session, receiver) = test_session_with_provider(provider.clone());
+            let (root, storage, registry, enabled_revision) = authority_fixture(&session);
+            let disabled = apply_transition_for_test(
+                &storage,
+                &registry,
+                PRODUCTION_GIT_STATUS_CAPABILITY_ID,
+                false,
+                enabled_revision,
+                &session.life_id,
+            )
+            .expect("D30 production disable");
+            assert_eq!(disabled.revision, 3);
+            let coordinator = VitaSidecarCoordinator::new(Arc::new(storage), registry);
+            *coordinator
+                .test_provider_override
+                .lock()
+                .expect("provider override lock") = Some(provider);
+            coordinator.install_test_session(Arc::clone(&session));
+
+            assert_eq!(
+                coordinator
+                    .start_turn(VitaTurnStartRequest {
+                        prompt: "must not start".to_string(),
+                    })
+                    .unwrap_err(),
+                "CAPABILITY_ROOT_DISABLED"
+            );
+            assert!(matches!(
+                session.authority_snapshot(),
+                Some(HostTurnAuthority::Idle)
+            ));
+            assert!(session
+                .active_turn_id
+                .lock()
+                .expect("active turn lock")
+                .is_none());
+            assert!(receiver.try_recv().is_err());
+            drop(coordinator);
+            drop(root);
+        }
+
+        #[test]
+        fn d30_disable_denies_actual_decide_pending_path() {
+            let provider = test_provider();
+            let (session, receiver) = test_session_with_provider(provider.clone());
+            let (root, storage, registry, enabled_revision) = authority_fixture(&session);
+            let host_turn_id = "d30-direct-pending-host".to_string();
+            let provider_binding =
+                protocol::ProviderBinding::derive(&session.session_id, &host_turn_id, &provider)
+                    .expect("provider binding");
+            session
+                .begin_turn(host_turn_id.clone(), provider, provider_binding)
+                .expect("active Host turn");
+            let binding = test_binding_for(
+                &session.session_id,
+                "d30-direct-pending-codex",
+                "call-direct-pending",
+            );
+            handle_authority_evaluate(
+                &session,
+                &storage,
+                &registry,
+                AuthorityEvaluate {
+                    request_id: "d30-direct-pending-authority".to_string(),
+                    session_id: session.session_id.clone(),
+                    host_turn_id: host_turn_id.clone(),
+                    binding: binding.clone(),
+                },
+            )
+            .expect("authority evaluation");
+            assert!(matches!(
+                receiver.recv_timeout(Duration::from_secs(1)).expect("authority reply"),
+                HostMessage::AuthorityScopeReply(AuthorityScopeReply {
+                    allowed: true,
+                    authorization_revision: Some(revision),
+                    ..
+                }) if revision == enabled_revision
+            ));
+            handle_confirmation_required(
+                &session,
+                ConfirmationRequired {
+                    request_id: "d30-direct-pending-confirmation".to_string(),
+                    session_id: session.session_id.clone(),
+                    host_turn_id,
+                    life_id: session.life_id.clone(),
+                    task_id: session.task_id.clone(),
+                    capability_id: PRODUCTION_GIT_STATUS_CAPABILITY_ID.to_string(),
+                    workspace_summary: "workspace".to_string(),
+                    expires_at_unix_ms: unix_millis().saturating_add(5_000),
+                    binding,
+                },
+            )
+            .expect("pending confirmation");
+            let pending_id = session
+                .pending_summary()
+                .expect("real pending entry")
+                .pending_id;
+            let disabled = apply_transition_for_test(
+                &storage,
+                &registry,
+                PRODUCTION_GIT_STATUS_CAPABILITY_ID,
+                false,
+                enabled_revision,
+                &session.life_id,
+            )
+            .expect("D30 production disable");
+            assert_eq!(disabled.revision, 3);
+
+            let coordinator = VitaSidecarCoordinator::new(Arc::new(storage), registry);
+            coordinator.install_test_session(Arc::clone(&session));
+            assert_eq!(
+                coordinator
+                    .decide_pending(pending_id, ConfirmationDecision::Confirm)
+                    .unwrap_err(),
+                "CAPABILITY_ROOT_DISABLED"
+            );
+            assert!(matches!(
+                receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("deny reply"),
+                HostMessage::ConfirmationReply(ConfirmationReply {
+                    decision: ConfirmationDecision::Deny,
+                    authorization_revision: None,
+                    ..
+                })
+            ));
+            assert!(session.pending.lock().expect("pending lock").is_empty());
+            assert!(session.approvals.lock().expect("approval lock").is_empty());
+            assert!(session.grants.lock().expect("grant lock").is_empty());
+            session.retire();
+            drop(coordinator);
+            drop(root);
+        }
+
+        #[test]
+        fn d30_real_issue_grant_then_revoke_denies_revalidation() {
+            let provider = test_provider();
+            let (session, receiver) = test_session_with_provider(provider.clone());
+            let (root, storage, registry, enabled_revision) = authority_fixture(&session);
+            let storage = Arc::new(storage);
+            let host_turn_id = "d30-real-grant-host".to_string();
+            let provider_binding =
+                protocol::ProviderBinding::derive(&session.session_id, &host_turn_id, &provider)
+                    .expect("provider binding");
+            session
+                .begin_turn(host_turn_id.clone(), provider, provider_binding)
+                .expect("active Host turn");
+            let binding = test_binding_for(
+                &session.session_id,
+                "d30-real-grant-codex",
+                "call-real-grant",
+            );
+            handle_authority_evaluate(
+                &session,
+                &storage,
+                &registry,
+                AuthorityEvaluate {
+                    request_id: "d30-real-grant-authority".to_string(),
+                    session_id: session.session_id.clone(),
+                    host_turn_id: host_turn_id.clone(),
+                    binding: binding.clone(),
+                },
+            )
+            .expect("authority evaluation");
+            assert!(matches!(
+                receiver.recv_timeout(Duration::from_secs(1)).expect("authority reply"),
+                HostMessage::AuthorityScopeReply(AuthorityScopeReply {
+                    allowed: true,
+                    authorization_revision: Some(revision),
+                    ..
+                }) if revision == enabled_revision
+            ));
+            handle_confirmation_required(
+                &session,
+                ConfirmationRequired {
+                    request_id: "d30-real-grant-confirmation".to_string(),
+                    session_id: session.session_id.clone(),
+                    host_turn_id: host_turn_id.clone(),
+                    life_id: session.life_id.clone(),
+                    task_id: session.task_id.clone(),
+                    capability_id: PRODUCTION_GIT_STATUS_CAPABILITY_ID.to_string(),
+                    workspace_summary: "workspace".to_string(),
+                    expires_at_unix_ms: unix_millis().saturating_add(5_000),
+                    binding: binding.clone(),
+                },
+            )
+            .expect("pending confirmation");
+            let pending_id = session
+                .pending_summary()
+                .expect("real pending entry")
+                .pending_id;
+            let coordinator = VitaSidecarCoordinator::new(Arc::clone(&storage), registry.clone());
+            coordinator.install_test_session(Arc::clone(&session));
+            coordinator
+                .decide_pending(pending_id, ConfirmationDecision::Confirm)
+                .expect("real production confirmation");
+            assert!(matches!(
+                receiver.recv_timeout(Duration::from_secs(1)).expect("confirmation reply"),
+                HostMessage::ConfirmationReply(ConfirmationReply {
+                    decision: ConfirmationDecision::Confirm,
+                    authorization_revision: Some(revision),
+                    ..
+                }) if revision == enabled_revision
+            ));
+            assert_eq!(session.approvals.lock().expect("approval lock").len(), 1);
+
+            handle_issue_grant(
+                &session,
+                &storage,
+                &registry,
+                IssueGrant {
+                    request_id: "d30-real-grant-issue".to_string(),
+                    session_id: session.session_id.clone(),
+                    host_turn_id: host_turn_id.clone(),
+                    binding: binding.clone(),
+                    authorization_revision: enabled_revision,
+                },
+            )
+            .expect("real Host ProcessGrant issuance");
+            let grant = match receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("grant reply")
+            {
+                HostMessage::GrantIssued(GrantIssued {
+                    allowed: true,
+                    grant: Some(grant),
+                    error_code: None,
+                    ..
+                }) => grant,
+                other => panic!("unexpected grant reply: {other:?}"),
+            };
+            assert_eq!(grant.authorization_revision, 2);
+
+            let disabled = apply_transition_for_test(
+                &storage,
+                &registry,
+                PRODUCTION_GIT_STATUS_CAPABILITY_ID,
+                false,
+                enabled_revision,
+                &session.life_id,
+            )
+            .expect("D30 production disable");
+            assert_eq!(disabled.revision, 3);
+            handle_revalidate_grant(
+                &session,
+                &storage,
+                &registry,
+                RevalidateGrant {
+                    request_id: "d30-real-grant-revalidate".to_string(),
+                    session_id: session.session_id.clone(),
+                    host_turn_id,
+                    binding,
+                    grant,
+                },
+            )
+            .expect("real final revalidation reply");
+            assert!(matches!(
+                receiver.recv_timeout(Duration::from_secs(1)).expect("revalidation reply"),
+                HostMessage::GrantRevalidated(GrantRevalidated {
+                    allowed: false,
+                    error_code: Some(code),
+                    ..
+                }) if code == "CAPABILITY_ROOT_DISABLED"
+            ));
+            session.retire();
+            drop(coordinator);
+            drop(root);
+        }
+
+        #[test]
         fn d30_disable_is_seen_by_final_grant_revalidation() {
             let (session, receiver) = test_session();
             let (_root, storage, registry, enabled_revision) = authority_fixture(&session);
@@ -3023,8 +3420,21 @@ mod windows {
             test_session_for_life("life")
         }
 
+        fn test_session_with_provider(
+            provider: protocol::ProviderConfiguration,
+        ) -> (Arc<HostSessionState>, mpsc::Receiver<HostMessage>) {
+            test_session_for_life_and_provider("life", Some(provider))
+        }
+
         fn test_session_for_life(
             life_id: &str,
+        ) -> (Arc<HostSessionState>, mpsc::Receiver<HostMessage>) {
+            test_session_for_life_and_provider(life_id, None)
+        }
+
+        fn test_session_for_life_and_provider(
+            life_id: &str,
+            provider: Option<protocol::ProviderConfiguration>,
         ) -> (Arc<HostSessionState>, mpsc::Receiver<HostMessage>) {
             let (sender, receiver) = mpsc::channel();
             let session = Arc::new(HostSessionState {
@@ -3032,7 +3442,7 @@ mod windows {
                 life_id: life_id.to_string(),
                 task_id: "task".to_string(),
                 workspace_identity: "workspace".to_string(),
-                provider: None,
+                provider,
                 writer: Mutex::new(None),
                 pending: Mutex::new(HashMap::new()),
                 approvals: Mutex::new(HashMap::new()),

@@ -5,6 +5,7 @@ mod candidate_extraction;
 mod candidate_memory;
 #[cfg_attr(not(test), allow(dead_code))]
 mod capability_authorization;
+mod capability_authorization_gate;
 mod connection;
 mod conversation;
 pub(crate) mod conversation_emotion;
@@ -188,6 +189,14 @@ impl StorageError {
         Self::new(
             "CONNECTION_OPEN_FAILED",
             "The storage database could not be opened.",
+            true,
+        )
+    }
+
+    pub(crate) fn capability_authorization_gate_unavailable() -> Self {
+        Self::new(
+            capability_authorization_gate::CapabilityAuthorizationGateError::CODE,
+            "The capability authorization gate is currently unavailable.",
             true,
         )
     }
@@ -447,10 +456,12 @@ pub struct StorageService {
     state: Mutex<StorageState>,
     location: StorageLocationResolver,
     /// Host-owned linearization domain for Life capability authorization
-    /// transitions.  The primary service and every authority view share this
-    /// process-local guard, so D30 CAS commits and D31 release decisions have
-    /// one explicit boundary without relying on an undocumented static lock.
-    capability_authorization_linearizer: Arc<Mutex<()>>,
+    /// transitions.  Authority views opened from one service share the
+    /// process-local layer, while independently initialized services for the
+    /// same database derive the same Windows Global layer.  D30 CAS commits
+    /// and D31 release decisions therefore have one explicit cross-process
+    /// boundary without relying on an undocumented static lock.
+    capability_authorization_gate: Arc<capability_authorization_gate::CapabilityAuthorizationGate>,
     /// Process-local fence preventing a newly installed Core from becoming
     /// executable until the next application process owns the service.
     core_activation_restart_required: AtomicBool,
@@ -482,6 +493,10 @@ impl StorageService {
         let active_root =
             fs::canonicalize(&active_root).map_err(|_| StorageError::connection_open_failed())?;
         let database_path = active_root.join(DATABASE_FILE_NAME);
+        let capability_authorization_gate = Arc::new(
+            capability_authorization_gate::CapabilityAuthorizationGate::new(&database_path)
+                .map_err(|_| StorageError::capability_authorization_gate_unavailable())?,
+        );
         let connection = Self::open_connection(&database_path)?;
 
         let service = Self {
@@ -491,7 +506,7 @@ impl StorageService {
                 database_path,
             }),
             location,
-            capability_authorization_linearizer: Arc::new(Mutex::new(())),
+            capability_authorization_gate,
             core_activation_restart_required: AtomicBool::new(false),
             #[cfg(test)]
             candidate_confirmation_panic_failpoint: Mutex::new(None),
@@ -524,9 +539,7 @@ impl StorageService {
                 database_path: state.database_path.clone(),
             }),
             location: self.location.clone(),
-            capability_authorization_linearizer: Arc::clone(
-                &self.capability_authorization_linearizer,
-            ),
+            capability_authorization_gate: Arc::clone(&self.capability_authorization_gate),
             core_activation_restart_required: AtomicBool::new(false),
             #[cfg(test)]
             candidate_confirmation_panic_failpoint: Mutex::new(None),
@@ -543,16 +556,36 @@ impl StorageService {
 
     /// Acquire the explicit Host capability-authorization linearization
     /// boundary.  Lock order for the release authority path is
-    /// `turn_authority -> capability_authorization_linearizer
+    /// `turn_authority -> capability_authorization_gate
     /// -> workspace_read_grants -> storage state`; D30 transition callers
-    /// acquire this guard immediately before their SQLite IMMEDIATE CAS
-    /// transaction.
+    /// acquire this composite guard immediately before their SQLite IMMEDIATE
+    /// CAS transaction.  On Windows the gate holds both the process-local
+    /// mutex and the database-identity-bound Global mutex.
     pub(crate) fn lock_capability_authorization_linearizer(
         &self,
-    ) -> Result<MutexGuard<'_, ()>, StorageError> {
-        self.capability_authorization_linearizer
+    ) -> Result<capability_authorization_gate::CapabilityAuthorizationGateGuard<'_>, StorageError>
+    {
+        self.capability_authorization_gate
             .lock()
-            .map_err(StorageError::database)
+            .map_err(|_| StorageError::capability_authorization_gate_unavailable())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capability_authorization_gate_name_for_test(&self) -> Option<String> {
+        self.capability_authorization_gate
+            .mutex_name_for_test()
+            .map(str::to_owned)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capability_authorization_process_local_identity_for_test(&self) -> usize {
+        self.capability_authorization_gate
+            .process_local_identity_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_root_for_test(&self) -> PathBuf {
+        self.state().expect("storage state").active_root.clone()
     }
 
     pub(crate) fn core_activation_requires_restart(&self) -> bool {
@@ -1923,6 +1956,52 @@ mod tests {
             })
             .unwrap();
         service
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn independently_initialized_storage_services_share_global_authority_gate() {
+        let root = TestRoot::new("capability-gate-independent-services");
+        let first = seeded_service(&root.0);
+        let active_root = first.active_root_for_test();
+        let second = StorageService::initialize_with_roots(active_root, None).unwrap();
+        let authority_view = first.open_authority_view().unwrap();
+
+        assert_eq!(
+            first.capability_authorization_process_local_identity_for_test(),
+            authority_view.capability_authorization_process_local_identity_for_test()
+        );
+        assert_eq!(
+            first.capability_authorization_gate_name_for_test(),
+            authority_view.capability_authorization_gate_name_for_test()
+        );
+
+        assert_ne!(
+            first.capability_authorization_process_local_identity_for_test(),
+            second.capability_authorization_process_local_identity_for_test()
+        );
+        assert_eq!(
+            first.capability_authorization_gate_name_for_test(),
+            second.capability_authorization_gate_name_for_test()
+        );
+
+        let first_guard = first.lock_capability_authorization_linearizer().unwrap();
+        let second = Arc::new(second);
+        let contender = Arc::clone(&second);
+        let result = thread::spawn(move || {
+            contender
+                .lock_capability_authorization_linearizer()
+                .map(|_| ())
+        })
+        .join()
+        .unwrap();
+        let error = match result {
+            Ok(_) => panic!("independent services must serialize on the global gate"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "CAPABILITY_AUTHORIZATION_GATE_UNAVAILABLE");
+        drop(first_guard);
+        assert!(second.lock_capability_authorization_linearizer().is_ok());
     }
 
     #[test]

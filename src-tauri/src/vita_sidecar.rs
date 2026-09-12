@@ -16,8 +16,16 @@ use crate::secrets::{SecretIdentifier, SecretStore, WindowsCredentialSecretStore
 use crate::{
     capability::CapabilityRegistry,
     model::profile::{credential_purpose, ModelProfileRepository, ModelProviderKind, ModelPurpose},
-    storage::StorageService,
+    storage::{StorageError, StorageService},
 };
+
+fn capability_authorization_gate_error(error: StorageError) -> String {
+    if error.code == "CAPABILITY_AUTHORIZATION_GATE_UNAVAILABLE" {
+        error.code
+    } else {
+        "CAPABILITY_AUTHORIZATION_UNAVAILABLE".to_string()
+    }
+}
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -545,7 +553,7 @@ mod windows {
     /// Future-lane Host helper.  The pre-read authorization commit is
     /// `Issued -> Revalidated`, and it uses the same Host-owned linearizer as
     /// D30 CAS updates and disclosure release.  Lock order is
-    /// `turn_authority -> capability_authorization_linearizer
+    /// `turn_authority -> capability_authorization_gate
     /// -> workspace_read_grants -> StorageService state`; the linearizer is
     /// released as soon as the in-memory pre-read commit is complete, before
     /// any future filesystem I/O.
@@ -578,7 +586,7 @@ mod windows {
         }
         let _authorization_linearizer = storage
             .lock_capability_authorization_linearizer()
-            .map_err(|_| "CAPABILITY_AUTHORIZATION_UNAVAILABLE".to_string())?;
+            .map_err(capability_authorization_gate_error)?;
         let mut grants = session
             .workspace_read_grants
             .lock()
@@ -647,7 +655,7 @@ mod windows {
         // either decision is pending.
         let _authorization_linearizer = storage
             .lock_capability_authorization_linearizer()
-            .map_err(|_| "CAPABILITY_AUTHORIZATION_UNAVAILABLE".to_string())?;
+            .map_err(capability_authorization_gate_error)?;
         let mut grants = session
             .workspace_read_grants
             .lock()
@@ -3379,6 +3387,26 @@ mod windows {
             (root, storage, registry)
         }
 
+        fn independently_initialized_storage(storage: &StorageService) -> StorageService {
+            let active_root = storage.active_root_for_test();
+            StorageService::initialize_with_roots(active_root, None)
+                .expect("independent storage service")
+        }
+
+        fn assert_independent_storage_gate_identities(
+            first: &StorageService,
+            second: &StorageService,
+        ) {
+            assert_ne!(
+                first.capability_authorization_process_local_identity_for_test(),
+                second.capability_authorization_process_local_identity_for_test()
+            );
+            assert_eq!(
+                first.capability_authorization_gate_name_for_test(),
+                second.capability_authorization_gate_name_for_test()
+            );
+        }
+
         fn workspace_read_binding(
             session: &Arc<HostSessionState>,
             provider: &protocol::ProviderConfiguration,
@@ -3779,9 +3807,8 @@ mod windows {
             let (session, _receiver) = test_session_with_provider(provider.clone());
             let (root, primary_storage, registry) =
                 synthetic_multi_capability_fixture(&session, None, Some(true));
-            let authority_storage = primary_storage
-                .open_authority_view()
-                .expect("shared authority view");
+            let authority_storage = independently_initialized_storage(&primary_storage);
+            assert_independent_storage_gate_identities(&primary_storage, &authority_storage);
             let primary_storage = Arc::new(primary_storage);
             let authority_storage = Arc::new(authority_storage);
             let (binding, issued) = workspace_read_issued_grant(
@@ -3872,9 +3899,8 @@ mod windows {
             let (session, _receiver) = test_session_with_provider(provider.clone());
             let (root, primary_storage, registry) =
                 synthetic_multi_capability_fixture(&session, None, Some(true));
-            let authority_storage = primary_storage
-                .open_authority_view()
-                .expect("shared authority view");
+            let authority_storage = independently_initialized_storage(&primary_storage);
+            assert_independent_storage_gate_identities(&primary_storage, &authority_storage);
             let primary_storage = Arc::new(primary_storage);
             let authority_storage = Arc::new(authority_storage);
             let (binding, issued) = workspace_read_issued_grant(
@@ -4038,12 +4064,11 @@ mod windows {
             let (session, _receiver) = test_session_with_provider(provider.clone());
             let (root, primary_storage, registry) =
                 synthetic_multi_capability_fixture(&session, None, Some(true));
-            // The production sidecar uses a separate authority view.  This
-            // test deliberately revokes through the primary view and releases
-            // through the view to prove that both share one linearizer.
-            let authority_storage = primary_storage
-                .open_authority_view()
-                .expect("shared authority view");
+            // Revoke through one independently initialized Host service and
+            // release through another to prove that both share the durable
+            // database-identity-bound capability gate.
+            let authority_storage = independently_initialized_storage(&primary_storage);
+            assert_independent_storage_gate_identities(&primary_storage, &authority_storage);
             let primary_storage = Arc::new(primary_storage);
             let authority_storage = Arc::new(authority_storage);
             let request = workspace_read_release_request(
@@ -4128,9 +4153,8 @@ mod windows {
             let (session, _receiver) = test_session_with_provider(provider.clone());
             let (root, primary_storage, registry) =
                 synthetic_multi_capability_fixture(&session, None, Some(true));
-            let authority_storage = primary_storage
-                .open_authority_view()
-                .expect("shared authority view");
+            let authority_storage = independently_initialized_storage(&primary_storage);
+            assert_independent_storage_gate_identities(&primary_storage, &authority_storage);
             let primary_storage = Arc::new(primary_storage);
             let authority_storage = Arc::new(authority_storage);
             let request = workspace_read_release_request(

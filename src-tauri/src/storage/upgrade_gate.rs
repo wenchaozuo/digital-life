@@ -112,8 +112,8 @@ mod windows;
 
 #[cfg(windows)]
 pub(crate) use windows::{
-    acquire_upgrade_mutex, inspect_database_resource_occupants, verify_processes_terminated,
-    WindowsUpgradeMutexGuard,
+    acquire_upgrade_mutex, database_identity_hash, inspect_database_resource_occupants,
+    verify_processes_terminated, WindowsUpgradeMutexGuard,
 };
 
 #[cfg(not(windows))]

@@ -288,6 +288,20 @@ fn deduplicate_resource_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>, Upgra
 }
 
 fn upgrade_mutex_name(database_path: &Path) -> Result<String, UpgradeGateError> {
+    let database_id = database_identity_hash(database_path)?;
+
+    let name = format!("{UPGRADE_MUTEX_PREFIX}{database_id}");
+    if name.encode_utf16().count() > MAX_UPGRADE_MUTEX_NAME_UTF16 {
+        return Err(UpgradeGateError::UpgradeMutexNameDerivationFailed);
+    }
+    Ok(name)
+}
+
+/// Returns the bounded, deidentified identity for an authoritative database
+/// path.  H1 and the D31 capability-authority gate deliberately share this
+/// exact normalization and SHA-256 derivation so equivalent database paths
+/// cannot diverge between the two Windows coordination domains.
+pub(crate) fn database_identity_hash(database_path: &Path) -> Result<String, UpgradeGateError> {
     let normalized_path = normalized_windows_path_text(database_path)?;
     let digest = Sha256::digest(normalized_path.as_bytes());
     let mut database_id = String::with_capacity(digest.len() * 2);
@@ -295,12 +309,7 @@ fn upgrade_mutex_name(database_path: &Path) -> Result<String, UpgradeGateError> 
         use std::fmt::Write;
         let _ = write!(database_id, "{byte:02x}");
     }
-
-    let name = format!("{UPGRADE_MUTEX_PREFIX}{database_id}");
-    if name.encode_utf16().count() > MAX_UPGRADE_MUTEX_NAME_UTF16 {
-        return Err(UpgradeGateError::UpgradeMutexNameDerivationFailed);
-    }
-    Ok(name)
+    Ok(database_id)
 }
 
 fn normalized_windows_path_text(database_path: &Path) -> Result<String, UpgradeGateError> {

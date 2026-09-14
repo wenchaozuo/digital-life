@@ -20,10 +20,10 @@ use crate::{
 };
 
 fn capability_authorization_gate_error(error: StorageError) -> String {
-    if error.code == "CAPABILITY_AUTHORIZATION_GATE_UNAVAILABLE" {
-        error.code
-    } else {
-        "CAPABILITY_AUTHORIZATION_UNAVAILABLE".to_string()
+    match error.code.as_str() {
+        CAPABILITY_AUTHORITY_RESTART_REQUIRED => CAPABILITY_AUTHORITY_RESTART_REQUIRED.to_string(),
+        "CAPABILITY_AUTHORIZATION_GATE_UNAVAILABLE" => error.code,
+        _ => "CAPABILITY_AUTHORIZATION_UNAVAILABLE".to_string(),
     }
 }
 
@@ -3892,6 +3892,250 @@ mod windows {
                     && state.readiness == VitaCapabilityReadiness::RootEnabled
                     && state.revision == Some(2)
             }));
+            drop(root);
+        }
+
+        #[test]
+        fn d31_r7_gate_error_mapper_preserves_restart_and_gate_classes() {
+            assert_eq!(
+                capability_authorization_gate_error(
+                    StorageError::capability_authority_restart_required()
+                ),
+                CAPABILITY_AUTHORITY_RESTART_REQUIRED
+            );
+            assert_eq!(
+                capability_authorization_gate_error(
+                    StorageError::capability_authorization_gate_unavailable()
+                ),
+                "CAPABILITY_AUTHORIZATION_GATE_UNAVAILABLE"
+            );
+            assert_eq!(
+                capability_authorization_gate_error(StorageError::connection_open_failed()),
+                "CAPABILITY_AUTHORIZATION_UNAVAILABLE"
+            );
+        }
+
+        #[test]
+        fn d31_r7_stale_generation_preserves_restart_through_h7_confirmation() {
+            let provider = test_provider();
+            let (session, receiver) = test_session();
+            let (root, primary_storage, registry, enabled_revision) = authority_fixture(&session);
+            let stale_storage = independently_initialized_storage(&primary_storage);
+            let host_turn_id = "d31-r7-h7-host-turn".to_string();
+            let provider_binding =
+                protocol::ProviderBinding::derive(&session.session_id, &host_turn_id, &provider)
+                    .expect("provider binding");
+            session
+                .begin_turn(host_turn_id.clone(), provider, provider_binding)
+                .expect("active Host turn");
+            let binding = test_binding_for(
+                &session.session_id,
+                "d31-r7-h7-codex-turn",
+                "d31-r7-h7-call",
+            );
+            handle_authority_evaluate(
+                &session,
+                &primary_storage,
+                &registry,
+                AuthorityEvaluate {
+                    request_id: "d31-r7-h7-authority".to_string(),
+                    session_id: session.session_id.clone(),
+                    host_turn_id: host_turn_id.clone(),
+                    binding: binding.clone(),
+                },
+            )
+            .expect("H7 authority evaluation");
+            assert!(matches!(
+                receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("H7 authority reply"),
+                HostMessage::AuthorityScopeReply(AuthorityScopeReply {
+                    allowed: true,
+                    authorization_revision: Some(revision),
+                    error_code: None,
+                    ..
+                }) if revision == enabled_revision
+            ));
+            handle_confirmation_required(
+                &session,
+                ConfirmationRequired {
+                    request_id: "d31-r7-h7-confirmation".to_string(),
+                    session_id: session.session_id.clone(),
+                    host_turn_id: host_turn_id.clone(),
+                    life_id: session.life_id.clone(),
+                    task_id: session.task_id.clone(),
+                    capability_id: PRODUCTION_GIT_STATUS_CAPABILITY_ID.to_string(),
+                    workspace_summary: "workspace".to_string(),
+                    expires_at_unix_ms: unix_millis().saturating_add(5_000),
+                    binding: binding.clone(),
+                },
+            )
+            .expect("H7 confirmation pending");
+            let pending_id = session
+                .pending_summary()
+                .expect("pending H7 confirmation")
+                .pending_id;
+
+            let target = root.path().join("d31-r7-h7-target");
+            let migration = primary_storage.migrate_location(target.to_str().expect("target path"));
+            assert!(migration.success, "{migration:?}");
+            assert!(migration.restart_required);
+
+            assert_eq!(
+                current_workspace_revision(&stale_storage, &registry, &session, &binding,)
+                    .unwrap_err(),
+                CAPABILITY_AUTHORITY_RESTART_REQUIRED
+            );
+            let coordinator = VitaSidecarCoordinator::new(Arc::new(stale_storage), registry);
+            coordinator.install_test_session(Arc::clone(&session));
+            assert_eq!(
+                coordinator
+                    .decide_pending(pending_id, ConfirmationDecision::Confirm)
+                    .unwrap_err(),
+                CAPABILITY_AUTHORITY_RESTART_REQUIRED
+            );
+            assert!(matches!(
+                receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("restart denial reply"),
+                HostMessage::ConfirmationReply(ConfirmationReply {
+                    decision: ConfirmationDecision::Deny,
+                    authorization_revision: None,
+                    ..
+                })
+            ));
+            assert!(session.pending.lock().expect("pending lock").is_empty());
+            assert!(session.approvals.lock().expect("approval lock").is_empty());
+            assert!(session.grants.lock().expect("grant lock").is_empty());
+            session.retire();
+            drop(coordinator);
+            drop(primary_storage);
+            drop(root);
+        }
+
+        #[test]
+        fn d31_r7_stale_generation_denies_preread_with_restart_and_preserves_issued() {
+            let provider = test_provider();
+            let (session, _receiver) = test_session_with_provider(provider.clone());
+            let (root, primary_storage, registry) =
+                synthetic_multi_capability_fixture(&session, None, Some(true));
+            let stale_storage = independently_initialized_storage(&primary_storage);
+            let host_turn_id = "d31-r7-preread-host-turn";
+            let (binding, issued) = workspace_read_issued_grant(
+                &session,
+                &stale_storage,
+                &registry,
+                &provider,
+                host_turn_id,
+            );
+            let target = root.path().join("d31-r7-preread-target");
+            let migration = primary_storage.migrate_location(target.to_str().expect("target path"));
+            assert!(migration.success, "{migration:?}");
+            assert!(migration.restart_required);
+
+            assert_eq!(
+                current_workspace_read_revision(&stale_storage, &registry, &session, &binding,)
+                    .unwrap_err(),
+                CAPABILITY_AUTHORITY_RESTART_REQUIRED
+            );
+            session.install_workspace_read_approval(
+                host_turn_id,
+                binding.clone(),
+                issued.authorization_revision,
+                "d31-r7-stale-issue-confirmation",
+                unix_millis().saturating_add(5_000),
+            );
+            assert_eq!(
+                issue_workspace_read_grant(
+                    &stale_storage,
+                    &registry,
+                    &session,
+                    &WorkspaceReadIssueGrant {
+                        request_id: "d31-r7-stale-issue".to_string(),
+                        session_id: session.session_id.clone(),
+                        host_turn_id: host_turn_id.to_string(),
+                        binding: binding.clone(),
+                        authorization_revision: issued.authorization_revision,
+                    },
+                )
+                .unwrap_err(),
+                CAPABILITY_AUTHORITY_RESTART_REQUIRED
+            );
+            assert_eq!(
+                revalidate_workspace_read_grant(
+                    &stale_storage,
+                    &registry,
+                    &session,
+                    &WorkspaceReadRevalidateGrant {
+                        request_id: "d31-r7-stale-preread".to_string(),
+                        session_id: session.session_id.clone(),
+                        host_turn_id: host_turn_id.to_string(),
+                        binding,
+                        grant: issued.clone(),
+                    },
+                )
+                .unwrap_err(),
+                CAPABILITY_AUTHORITY_RESTART_REQUIRED
+            );
+            assert_eq!(
+                session
+                    .workspace_read_grants
+                    .lock()
+                    .expect("workspace read grant lock")
+                    .get(&issued.grant_id)
+                    .map(|state| (state.phase, state.grant.used)),
+                Some((WorkspaceReadGrantPhase::Issued, false))
+            );
+            session.retire();
+            drop(stale_storage);
+            drop(primary_storage);
+            drop(root);
+        }
+
+        #[test]
+        fn d31_r7_stale_generation_denies_release_with_restart_and_preserves_revalidated() {
+            let provider = test_provider();
+            let content = b"D31-R7 stale generation release bytes";
+            let (session, _receiver) = test_session_with_provider(provider.clone());
+            let (root, primary_storage, registry) =
+                synthetic_multi_capability_fixture(&session, None, Some(true));
+            let stale_storage = independently_initialized_storage(&primary_storage);
+            let request = workspace_read_release_request(
+                &session,
+                &stale_storage,
+                &registry,
+                &provider,
+                "d31-r7-release-host-turn",
+                content,
+            );
+            let target = root.path().join("d31-r7-release-target");
+            let migration = primary_storage.migrate_location(target.to_str().expect("target path"));
+            assert!(migration.success, "{migration:?}");
+            assert!(migration.restart_required);
+
+            assert_eq!(
+                authorize_workspace_read_release(
+                    &stale_storage,
+                    &registry,
+                    &session,
+                    &request,
+                    content,
+                )
+                .unwrap_err(),
+                CAPABILITY_AUTHORITY_RESTART_REQUIRED
+            );
+            assert_eq!(
+                session
+                    .workspace_read_grants
+                    .lock()
+                    .expect("workspace read grant lock")
+                    .get(&request.grant.grant_id)
+                    .map(|state| (state.phase, state.grant.used)),
+                Some((WorkspaceReadGrantPhase::Revalidated, true))
+            );
+            session.retire();
+            drop(stale_storage);
+            drop(primary_storage);
             drop(root);
         }
 

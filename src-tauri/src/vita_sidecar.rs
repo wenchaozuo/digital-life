@@ -164,9 +164,9 @@ impl VitaSidecarCoordinator {
 mod windows {
     use super::*;
     use crate::capability::authorization::{
-        evaluate_capability_authorization, CapabilityAuthorizationDecisionKind,
-        CapabilityAuthorizationErrorCode, CapabilityAuthorizationRepository,
-        CapabilityEvaluationErrorCode, RequestedCapabilityScope,
+        evaluate_capability_authorization, evaluate_capability_authorization_in_scope,
+        CapabilityAuthorizationDecisionKind, CapabilityAuthorizationErrorCode,
+        CapabilityAuthorizationRepository, CapabilityEvaluationErrorCode, RequestedCapabilityScope,
     };
     use crate::capability::descriptor::{
         CapabilityId, ScopeRequirement, PRODUCTION_GIT_STATUS_CAPABILITY_ID,
@@ -358,8 +358,20 @@ mod windows {
     /// admission.  This is only an admission summary: it neither caches an
     /// authorization revision nor creates scope, confirmation, or grant
     /// authority for any individual tool.
+    #[allow(dead_code)]
     fn preflight_capability_roots(
         storage: &StorageService,
+        registry: &CapabilityRegistry,
+        session: &HostSessionState,
+    ) -> Result<(), String> {
+        let authority_scope = storage
+            .capability_authorization_scope()
+            .map_err(|error| error.code.clone())?;
+        preflight_capability_roots_in_scope(&authority_scope, registry, session)
+    }
+
+    fn preflight_capability_roots_in_scope(
+        authority: &crate::storage::CapabilityAuthorizationScope<'_>,
         registry: &CapabilityRegistry,
         session: &HostSessionState,
     ) -> Result<(), String> {
@@ -368,7 +380,7 @@ mod windows {
         let mut any_unavailable = false;
         for descriptor in registry.entries() {
             let capability_id = descriptor.capability_id();
-            match storage.find_capability_authorization(&session.life_id, capability_id) {
+            match authority.find_capability_authorization(&session.life_id, capability_id) {
                 Ok(None) => {
                     any_missing = true;
                     continue;
@@ -385,8 +397,8 @@ mod windows {
                 }
                 Ok(Some(_)) => {}
             }
-            match evaluate_capability_authorization(
-                storage,
+            match evaluate_capability_authorization_in_scope(
+                authority,
                 registry,
                 &session.life_id,
                 capability_id,
@@ -434,8 +446,21 @@ mod windows {
         )
     }
 
+    #[allow(dead_code)]
     fn current_workspace_read_revision(
         storage: &StorageService,
+        registry: &CapabilityRegistry,
+        session: &HostSessionState,
+        binding: &protocol::WorkspaceReadBinding,
+    ) -> Result<i64, String> {
+        let authority_scope = storage
+            .capability_authorization_scope()
+            .map_err(capability_authorization_gate_error)?;
+        current_workspace_read_revision_in_scope(&authority_scope, registry, session, binding)
+    }
+
+    fn current_workspace_read_revision_in_scope(
+        authority: &crate::storage::CapabilityAuthorizationScope<'_>,
         registry: &CapabilityRegistry,
         session: &HostSessionState,
         binding: &protocol::WorkspaceReadBinding,
@@ -454,8 +479,8 @@ mod windows {
         let descriptor = registry
             .descriptor(&capability_id)
             .ok_or_else(|| "CAPABILITY_AUTHORIZATION_REQUIRED".to_string())?;
-        let decision = evaluate_capability_authorization(
-            storage,
+        let decision = evaluate_capability_authorization_in_scope(
+            authority,
             registry,
             &session.life_id,
             &capability_id,
@@ -510,9 +535,16 @@ mod windows {
         {
             return Err("WORKSPACE_READ_DISCLOSURE_TURN_NOT_ACTIVE".to_string());
         }
+        let authority_scope = storage
+            .capability_authorization_scope()
+            .map_err(capability_authorization_gate_error)?;
         require_current_session_life(storage, session)?;
-        let current_revision =
-            current_workspace_read_revision(storage, registry, session, &request.binding)?;
+        let current_revision = current_workspace_read_revision_in_scope(
+            &authority_scope,
+            registry,
+            session,
+            &request.binding,
+        )?;
         if current_revision != request.authorization_revision {
             return Err("CAPABILITY_AUTHORIZATION_REVISION_MISMATCH".to_string());
         }
@@ -609,8 +641,8 @@ mod windows {
         {
             return Err("WORKSPACE_READ_DISCLOSURE_TURN_NOT_ACTIVE".to_string());
         }
-        let _authorization_linearizer = storage
-            .lock_capability_authorization_linearizer()
+        let authority_scope = storage
+            .capability_authorization_scope()
             .map_err(capability_authorization_gate_error)?;
         let mut grants = session
             .workspace_read_grants
@@ -629,8 +661,12 @@ mod windows {
             return Err("WORKSPACE_READ_GRANT_REVALIDATION_DENIED".to_string());
         }
         require_current_session_life(storage, session)?;
-        let current_revision =
-            current_workspace_read_revision(storage, registry, session, &request.binding)?;
+        let current_revision = current_workspace_read_revision_in_scope(
+            &authority_scope,
+            registry,
+            session,
+            &request.binding,
+        )?;
         if state.grant.authorization_revision != current_revision {
             return Err("CAPABILITY_AUTHORIZATION_REVISION_MISMATCH".to_string());
         }
@@ -638,7 +674,7 @@ mod windows {
         state.phase = WorkspaceReadGrantPhase::Revalidated;
         let revalidated = state.grant.clone();
         drop(grants);
-        drop(_authorization_linearizer);
+        drop(authority_scope);
         drop(authority);
         Ok(revalidated)
     }
@@ -647,6 +683,7 @@ mod windows {
     /// post-read IPC response only after this function commits `Revalidated →
     /// Released` under the turn authority and the shared capability
     /// authorization linearizer used by D30 revocation.
+    #[allow(dead_code)]
     fn authorize_workspace_read_release(
         storage: &StorageService,
         registry: &CapabilityRegistry,
@@ -678,8 +715,8 @@ mod windows {
         // linearizer before its SQLite IMMEDIATE commit, so exactly one of
         // revoke or release linearizes first.  No IPC write happens while
         // either decision is pending.
-        let _authorization_linearizer = storage
-            .lock_capability_authorization_linearizer()
+        let authority_scope = storage
+            .capability_authorization_scope()
             .map_err(capability_authorization_gate_error)?;
         let mut grants = session
             .workspace_read_grants
@@ -701,8 +738,12 @@ mod windows {
         // linearizer is still held.  A revocation that commits first is
         // observed here and denies; a release that commits first is already
         // ordered before a later revocation.
-        let current_revision =
-            current_workspace_read_revision(storage, registry, session, &request.binding)?;
+        let current_revision = current_workspace_read_revision_in_scope(
+            &authority_scope,
+            registry,
+            session,
+            &request.binding,
+        )?;
         if current_revision != state.grant.authorization_revision {
             return Err("CAPABILITY_AUTHORIZATION_REVISION_MISMATCH".to_string());
         }
@@ -719,7 +760,7 @@ mod windows {
         // later IPC write is transport only and cannot authorize a replay.
         state.phase = WorkspaceReadGrantPhase::Released;
         drop(grants);
-        drop(_authorization_linearizer);
+        drop(authority_scope);
         drop(authority);
         Ok(())
     }
@@ -2102,20 +2143,17 @@ mod windows {
             // remains held through the D30 preflight and Host turn-authority
             // begin point, and is released before provider inspection or any
             // sidecar/network IPC.
-            let authority_linearizer = self
+            let authority_scope = self
                 .authority_storage
-                .lock_capability_authorization_linearizer()
-                .map_err(capability_authorization_gate_error)?;
-            self.authority_storage
-                .ensure_capability_authority_current()
+                .capability_authorization_scope()
                 .map_err(|error| error.code.clone())?;
-            require_current_session_life(&self.authority_storage, session)?;
+            require_current_session_life(authority_scope.storage(), session)?;
             session.ensure_turn_idle()?;
             // Root admission deliberately precedes provider/credential
             // inspection.  A disabled D30 root must not release credentials,
             // contact a provider, create a turn generation, or emit a
             // HostMessage::StartTurn frame.
-            preflight_capability_roots(&self.authority_storage, &self.registry, session)?;
+            preflight_capability_roots_in_scope(&authority_scope, &self.registry, session)?;
             let provider = session
                 .provider
                 .clone()
@@ -2129,7 +2167,7 @@ mod windows {
                 protocol::ProviderBinding::derive(&session.session_id, &turn_id, &provider)
                     .map_err(|_| "Vita provider binding could not be derived".to_string())?;
             session.begin_turn(turn_id.clone(), provider.clone(), binding.clone())?;
-            drop(authority_linearizer);
+            drop(authority_scope);
             // Provider/credential inspection is intentionally outside the
             // authority gate.  A provider change after the Host generation is
             // admitted retires that generation before any IPC is emitted.
@@ -2495,20 +2533,27 @@ mod windows {
                 error_code: Some("CODEX_TURN_MISMATCH".to_string()),
             }));
         }
-        let (allowed, revision, error_code) =
-            match current_workspace_revision(storage, registry, session, &request.binding) {
+        let (allowed, revision, reply_error_code) = match storage.capability_authorization_scope() {
+            Ok(authority_scope) => match current_workspace_revision_in_scope(
+                &authority_scope,
+                registry,
+                session,
+                &request.binding,
+            ) {
                 Ok(revision) => {
                     active.h7_codex_turn_id = Some(request.binding.turn_id.clone());
                     (true, Some(revision), None)
                 }
                 Err(error) => (false, None, Some(error_code(&error))),
-            };
+            },
+            Err(error) => (false, None, Some(error.code)),
+        };
         let result = session.send(&HostMessage::AuthorityScopeReply(AuthorityScopeReply {
             request_id: request.request_id,
             session_id: session.session_id.clone(),
             allowed,
             authorization_revision: revision,
-            error_code,
+            error_code: reply_error_code,
         }));
         drop(authority);
         result
@@ -2626,9 +2671,25 @@ mod windows {
             }));
         }
         expire_pending(session);
+        let authority_scope = match storage.capability_authorization_scope() {
+            Ok(scope) => scope,
+            Err(error) => {
+                return session.send(&HostMessage::GrantIssued(GrantIssued {
+                    request_id: request.request_id,
+                    session_id: session.session_id.clone(),
+                    allowed: false,
+                    grant: None,
+                    error_code: Some(error.code),
+                }));
+            }
+        };
         let allowed = validate_binding(session, &request.binding).and_then(|_| {
-            let revision =
-                current_workspace_revision(storage, registry, session, &request.binding)?;
+            let revision = current_workspace_revision_in_scope(
+                &authority_scope,
+                registry,
+                session,
+                &request.binding,
+            )?;
             if revision != request.authorization_revision {
                 return Err("stale authorization revision".to_string());
             }
@@ -2735,9 +2796,25 @@ mod windows {
                 error_code: Some("TURN_NOT_ACTIVE".to_string()),
             }));
         }
+        let authority_scope = match storage.capability_authorization_scope() {
+            Ok(scope) => scope,
+            Err(error) => {
+                return session.send(&HostMessage::GrantRevalidated(GrantRevalidated {
+                    request_id: request.request_id,
+                    session_id: session.session_id.clone(),
+                    allowed: false,
+                    grant: None,
+                    error_code: Some(error.code),
+                }));
+            }
+        };
         let result = validate_binding(session, &request.binding).and_then(|_| {
-            let revision =
-                current_workspace_revision(storage, registry, session, &request.binding)?;
+            let revision = current_workspace_revision_in_scope(
+                &authority_scope,
+                registry,
+                session,
+                &request.binding,
+            )?;
             let mut grants = session
                 .grants
                 .lock()
@@ -2776,17 +2853,38 @@ mod windows {
         session: &HostSessionState,
         binding: &ProcessBinding,
     ) -> Result<i64, String> {
+        let authority_scope = storage
+            .capability_authorization_scope()
+            .map_err(capability_authorization_gate_error)?;
+        current_workspace_revision_in_scope(&authority_scope, registry, session, binding)
+    }
+
+    fn current_workspace_revision_in_scope(
+        authority: &crate::storage::CapabilityAuthorizationScope<'_>,
+        registry: &CapabilityRegistry,
+        session: &HostSessionState,
+        binding: &ProcessBinding,
+    ) -> Result<i64, String> {
         validate_binding(session, binding)?;
         let capability_id = CapabilityId::try_from(binding.capability_id.as_str())
             .map_err(|_| "invalid capability identity".to_string())?;
-        let decision = evaluate_capability_authorization(
-            storage,
+        let decision = evaluate_capability_authorization_in_scope(
+            authority,
             registry,
             &session.life_id,
             &capability_id,
             RequestedCapabilityScope::Workspace,
         )
-        .map_err(|error| error.message)?;
+        .map_err(|error| {
+            if matches!(
+                error.code,
+                CapabilityEvaluationErrorCode::AuthorityRestartRequired
+            ) {
+                CAPABILITY_AUTHORITY_RESTART_REQUIRED.to_string()
+            } else {
+                error.message
+            }
+        })?;
         if decision.outcome() != CapabilityAuthorizationDecisionKind::ScopeRequired {
             return Err(decision.decision_code().as_str().to_string());
         }
@@ -3148,7 +3246,9 @@ mod windows {
     }
 
     fn error_code(error: &str) -> String {
-        if error.starts_with("CAPABILITY_") {
+        if error == CAPABILITY_AUTHORITY_RESTART_REQUIRED {
+            CAPABILITY_AUTHORITY_RESTART_REQUIRED.to_string()
+        } else if error.starts_with("CAPABILITY_") {
             error.to_string()
         } else if error.contains("revision") {
             "STALE_AUTHORIZATION_REVISION".to_string()

@@ -37,6 +37,7 @@ mod relationship;
 mod screen_perception;
 #[cfg_attr(not(test), allow(dead_code))]
 mod screen_vision_outbound_policy;
+mod storage_generation_authority;
 mod upgrade_coordinator;
 pub(crate) mod upgrade_gate;
 mod vector_sync_outbox;
@@ -472,6 +473,11 @@ pub struct StorageService {
     /// and D31 release decisions therefore have one explicit cross-process
     /// boundary without relying on an undocumented static lock.
     capability_authorization_gate: Arc<capability_authorization_gate::CapabilityAuthorizationGate>,
+    /// Durable generation identity captured when this Host opened the
+    /// database.  The identity is backed by a marker in the data root (not by
+    /// process-local state); every authority crossing revalidates that marker
+    /// so an independently initialized Host observes retirement too.
+    capability_authority_generation_id: String,
     /// Shared generation fence for every primary/authority-view handle opened
     /// before a successful storage migration.  A migration changes the
     /// authoritative database identity; the old process must fail closed until
@@ -527,7 +533,25 @@ impl StorageService {
             capability_authorization_gate::CapabilityAuthorizationGate::new(&database_path)
                 .map_err(|_| StorageError::capability_authorization_gate_unavailable())?,
         );
+        {
+            let _authority_guard = capability_authorization_gate
+                .lock()
+                .map_err(|_| StorageError::capability_authorization_gate_unavailable())?;
+            storage_generation_authority::reject_nonactive_before_open(&active_root)?;
+        }
         let connection = Self::open_connection(&database_path)?;
+
+        // The marker is initialized while the same cross-process capability
+        // gate used by D30/D31 is held.  This closes the small window between
+        // opening SQLite and publishing a usable StorageService: a Host that
+        // starts while another process retires this generation is rejected
+        // before it can derive authority.
+        let generation_id = {
+            let _authority_guard = capability_authorization_gate
+                .lock()
+                .map_err(|_| StorageError::capability_authorization_gate_unavailable())?;
+            storage_generation_authority::open_or_create_active(&active_root, &database_path)?
+        };
 
         let service = Self {
             state: Mutex::new(StorageState {
@@ -537,6 +561,7 @@ impl StorageService {
             }),
             location,
             capability_authorization_gate,
+            capability_authority_generation_id: generation_id,
             capability_authority_restart_required: Arc::new(AtomicBool::new(false)),
             core_activation_restart_required: AtomicBool::new(false),
             #[cfg(test)]
@@ -571,6 +596,7 @@ impl StorageService {
             }),
             location: self.location.clone(),
             capability_authorization_gate: Arc::clone(&self.capability_authorization_gate),
+            capability_authority_generation_id: self.capability_authority_generation_id.clone(),
             capability_authority_restart_required: Arc::clone(
                 &self.capability_authority_restart_required,
             ),
@@ -616,7 +642,12 @@ impl StorageService {
         {
             Err(StorageError::capability_authority_restart_required())
         } else {
-            Ok(())
+            let state = self.state()?;
+            storage_generation_authority::ensure_active_generation(
+                &state.active_root,
+                &state.database_path,
+                &self.capability_authority_generation_id,
+            )
         }
     }
 
@@ -640,6 +671,11 @@ impl StorageService {
         self.capability_authorization_gate
             .mutex_name_for_test()
             .map(str::to_owned)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capability_authority_generation_id_for_test(&self) -> String {
+        self.capability_authority_generation_id.clone()
     }
 
     #[cfg(test)]
@@ -873,6 +909,7 @@ impl StorageService {
             Err(error) => return migration_failure("acquire_lock", "", candidate, error),
         };
         let old_root = state.active_root.clone();
+        let old_database_path = state.database_path.clone();
         let target_root = match self.location.validate_candidate(candidate, &old_root) {
             Ok(path) => path,
             Err(error) => {
@@ -969,15 +1006,62 @@ impl StorageService {
             return migration_failure("backup_and_verify", &old_directory, &new_directory, error);
         }
 
+        // Mark the target as pending before it is visible as a database.  A
+        // Host that races the publication can open no executable authority
+        // from a pending root, and the marker also closes the activation
+        // window between the atomic file rename and target verification.
+        let target_generation_id = match storage_generation_authority::create_pending_target(
+            &target_root,
+            &final_database,
+            &self.capability_authority_generation_id,
+        ) {
+            Ok(generation_id) => generation_id,
+            Err(error) => {
+                let _ = remove_database_artifacts(&temporary_database);
+                return migration_failure(
+                    "prepare_target_generation",
+                    &old_directory,
+                    &new_directory,
+                    error,
+                );
+            }
+        };
+
         if let Err(error) =
             migration::activate_temporary_database(&temporary_database, &final_database)
         {
             let _ = fs::remove_file(&temporary_database);
+            let _ = storage_generation_authority::remove_marker(&target_root);
             return migration_failure("activate_database", &old_directory, &new_directory, error);
         }
 
+        let target_connection =
+            match Self::open_and_verify_existing(&final_database, schema_version, &current_life_id)
+            {
+                Ok(connection) => connection,
+                Err(error) => {
+                    let _ = storage_generation_authority::remove_marker(&target_root);
+                    let _ = remove_database_artifacts(&final_database);
+                    return migration_failure(
+                        "reopen_target",
+                        &old_directory,
+                        &new_directory,
+                        error,
+                    );
+                }
+            };
+
+        // The target is fully backed up and reopened before the active-root
+        // pointer is published.  The target marker remains pending until the
+        // pointer and source retirement have both been durably staged, so a
+        // fresh Host cannot join a half-published authority generation.
         if let Err(error) = self.location.write_active_root(&target_root) {
-            let error = match remove_database_artifacts(&final_database) {
+            // The target connection owns a Windows file handle.  Release it
+            // before removing the target database on any rollback path.
+            drop(target_connection);
+            let cleanup = storage_generation_authority::remove_marker(&target_root)
+                .and_then(|_| remove_database_artifacts(&final_database));
+            let error = match cleanup {
                 Ok(()) => error,
                 Err(cleanup_error) => StorageError::new(
                     "MIGRATION_CLEANUP_FAILED",
@@ -996,34 +1080,83 @@ impl StorageService {
             );
         }
 
-        let target_connection =
-            match Self::open_and_verify_existing(&final_database, schema_version, &current_life_id)
-            {
-                Ok(connection) => connection,
-                Err(error) => {
-                    let error = match rollback_after_activation(
-                        &self.location,
-                        &config_snapshot,
-                        &final_database,
-                    ) {
-                        Ok(()) => error,
-                        Err(rollback_error) => StorageError::new(
-                            "MIGRATION_ROLLBACK_FAILED",
-                            format!(
-                                "Target reopen failed: {} Rollback also failed: {}",
-                                error.message, rollback_error.message
-                            ),
-                            false,
-                        ),
-                    };
-                    return migration_failure(
-                        "reopen_target",
-                        &old_directory,
-                        &new_directory,
-                        error,
-                    );
-                }
+        if let Err(error) = storage_generation_authority::retire_source(
+            &old_root,
+            &old_database_path,
+            &self.capability_authority_generation_id,
+        ) {
+            drop(target_connection);
+            let rollback =
+                rollback_after_activation(&self.location, &config_snapshot, &final_database)
+                    .and_then(|_| storage_generation_authority::remove_marker(&target_root));
+            let error = match rollback {
+                Ok(()) => error,
+                Err(rollback_error) => StorageError::new(
+                    "MIGRATION_ROLLBACK_FAILED",
+                    format!(
+                        "Source generation retirement failed: {} Rollback also failed: {}",
+                        error.message, rollback_error.message
+                    ),
+                    false,
+                ),
             };
+            return migration_failure(
+                "retire_source_generation",
+                &old_directory,
+                &new_directory,
+                error,
+            );
+        }
+
+        if let Err(error) = storage_generation_authority::activate_target(
+            &target_root,
+            &final_database,
+            &target_generation_id,
+        ) {
+            drop(target_connection);
+            // Keep the source retired if restoring the old configuration is
+            // not possible: an old Host must then remain fail-closed rather
+            // than continue against a root the config no longer selects.
+            let config_restore = self.location.restore_config(&config_snapshot);
+            let source_restore = if config_restore.is_ok() {
+                storage_generation_authority::restore_source_active(
+                    &old_root,
+                    &old_database_path,
+                    &self.capability_authority_generation_id,
+                )
+            } else {
+                Err(StorageError::new(
+                    "MIGRATION_ROLLBACK_FAILED",
+                    "The previous storage configuration could not be restored.",
+                    false,
+                ))
+            };
+            let cleanup = storage_generation_authority::remove_marker(&target_root)
+                .and_then(|_| remove_database_artifacts(&final_database));
+            let rollback_error = config_restore
+                .err()
+                .or_else(|| source_restore.err())
+                .or_else(|| cleanup.err());
+            let error = rollback_error.map_or_else(
+                || error.clone(),
+                |rollback_error| {
+                    StorageError::new(
+                        "MIGRATION_ROLLBACK_FAILED",
+                        format!(
+                            "Target generation activation failed: {} Rollback also failed: {}",
+                            error.message, rollback_error.message
+                        ),
+                        false,
+                    )
+                },
+            );
+            return migration_failure(
+                "activate_target_generation",
+                &old_directory,
+                &new_directory,
+                error,
+            );
+        }
 
         state.connection = target_connection;
         state.active_root = target_root;
@@ -1879,9 +2012,17 @@ pub(crate) mod test_support {
 mod tests {
     use std::{
         collections::HashSet,
-        sync::{Arc, Barrier},
+        sync::{mpsc, Arc, Barrier},
         thread,
     };
+
+    #[cfg(windows)]
+    use std::{
+        io::{BufRead, BufReader, Write},
+        process::{Child, Command, Stdio},
+    };
+
+    use crate::capability::authorization::CapabilityAuthorizationRepository;
 
     use super::*;
 
@@ -2038,6 +2179,421 @@ mod tests {
             })
             .unwrap();
         service
+    }
+
+    fn legacy_authority_state(
+        database_path: &Path,
+        capability_id: &str,
+    ) -> (String, bool, i64, i64) {
+        let connection = open_authorized_test_connection(database_path).unwrap();
+        let current_life: String = connection
+            .query_row(
+                "SELECT current_life_id FROM app_state WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let (enabled, revision): (bool, i64) = connection
+            .query_row(
+                "SELECT enabled, revision
+                 FROM life_capability_authorization
+                 WHERE life_id = 'life-1' AND capability_id = ?1",
+                [capability_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let event_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM life_capability_authorization_event
+                 WHERE life_id = 'life-1' AND capability_id = ?1",
+                [capability_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        (current_life, enabled, revision, event_count)
+    }
+
+    #[test]
+    fn migration_after_authority_commit_preserves_committed_transition() {
+        use crate::capability::authorization::{
+            CapabilityAuthorizationCreateOutcome, CapabilityAuthorizationUpdateOutcome,
+            LifeCapabilityAuthorizationCreateRequest, LifeCapabilityAuthorizationUpdateRequest,
+        };
+        use crate::capability::descriptor::CapabilityId;
+
+        let root = TestRoot::new("migration-authority-first");
+        let service = Arc::new(seeded_service(&root.0));
+        let capability_id = CapabilityId::try_from("vita.process.workspace.git_status").unwrap();
+        assert!(matches!(
+            service
+                .create_capability_authorization(LifeCapabilityAuthorizationCreateRequest {
+                    life_id: "life-1".to_string(),
+                    capability_id: capability_id.clone(),
+                })
+                .unwrap(),
+            CapabilityAuthorizationCreateOutcome::Applied(_)
+        ));
+
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let (commit_go_tx, commit_go_rx) = mpsc::channel();
+        let (committed_tx, committed_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let authority_service = Arc::clone(&service);
+        let authority_capability_id = capability_id.clone();
+        let authority_thread = thread::spawn(move || {
+            let authority = authority_service.capability_authorization_scope().unwrap();
+            acquired_tx.send(()).unwrap();
+            commit_go_rx.recv().unwrap();
+            let outcome = authority
+                .update_capability_authorization(
+                    LifeCapabilityAuthorizationUpdateRequest::for_test(
+                        "migration-authority-first-enable",
+                        "life-1",
+                        authority_capability_id,
+                        true,
+                        1,
+                    ),
+                )
+                .unwrap();
+            committed_tx.send(outcome).unwrap();
+            release_rx.recv().unwrap();
+        });
+
+        // The authority thread proves that it owns the composite gate before
+        // migration is even started. Migration cannot publish a target
+        // snapshot that omits the already committed CAS.
+        acquired_rx.recv().unwrap();
+        let migration_service = Arc::clone(&service);
+        let target = root.0.join("authority-first-target");
+        let target_for_thread = target.clone();
+        let migration_thread = thread::spawn(move || {
+            migration_service.migrate_location(target_for_thread.to_str().unwrap())
+        });
+        commit_go_tx.send(()).unwrap();
+        let outcome = committed_rx.recv().unwrap();
+        assert!(matches!(
+            outcome,
+            CapabilityAuthorizationUpdateOutcome::Applied { .. }
+        ));
+        release_tx.send(()).unwrap();
+        authority_thread.join().unwrap();
+
+        let migration = migration_thread.join().unwrap();
+        assert!(migration.success, "{migration:?}");
+        assert!(migration.restart_required);
+
+        let fresh = StorageService::initialize_with_roots(
+            root.0.join("default"),
+            Some(root.0.join("project")),
+        )
+        .unwrap();
+        let migrated = fresh
+            .find_capability_authorization("life-1", &capability_id)
+            .unwrap()
+            .unwrap();
+        assert!(migrated.enabled);
+        assert_eq!(migrated.revision, 2);
+        assert_eq!(
+            fresh
+                .list_capability_authorization_events("life-1", &capability_id, 50)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[cfg(windows)]
+    const STORAGE_GENERATION_CHILD_MODE_ENV: &str = "DIGITAL_LIFE_STORAGE_GENERATION_CHILD_MODE";
+    #[cfg(windows)]
+    const STORAGE_GENERATION_CHILD_DEFAULT_ROOT_ENV: &str =
+        "DIGITAL_LIFE_STORAGE_GENERATION_CHILD_DEFAULT_ROOT";
+    #[cfg(windows)]
+    const STORAGE_GENERATION_CHILD_PROJECT_ROOT_ENV: &str =
+        "DIGITAL_LIFE_STORAGE_GENERATION_CHILD_PROJECT_ROOT";
+    #[cfg(windows)]
+    const STORAGE_GENERATION_CHILD_CAPABILITY_ENV: &str =
+        "DIGITAL_LIFE_STORAGE_GENERATION_CHILD_CAPABILITY";
+    #[cfg(windows)]
+    const STORAGE_GENERATION_CHILD_READY: &str = "D31_R6_STORAGE_CHILD_READY";
+    #[cfg(windows)]
+    const STORAGE_GENERATION_CHILD_GATE_PREFIX: &str = "D31_R6_STORAGE_CHILD_GATE:";
+    #[cfg(windows)]
+    const STORAGE_GENERATION_CHILD_GENERATION_PREFIX: &str = "D31_R6_STORAGE_CHILD_GENERATION:";
+    #[cfg(windows)]
+    const STORAGE_GENERATION_CHILD_SAVE_PREFIX: &str = "D31_R6_STORAGE_CHILD_SAVE:";
+    #[cfg(windows)]
+    const STORAGE_GENERATION_CHILD_D30_PREFIX: &str = "D31_R6_STORAGE_CHILD_D30:";
+    #[cfg(windows)]
+    const STORAGE_GENERATION_CHILD_EVAL_PREFIX: &str = "D31_R6_STORAGE_CHILD_EVAL:";
+    #[cfg(windows)]
+    const STORAGE_GENERATION_CHILD_MUTATIONS_PREFIX: &str = "D31_R6_STORAGE_CHILD_MUTATIONS:";
+    #[cfg(windows)]
+    const STORAGE_GENERATION_CHILD_ACTIVE_ROOT_PREFIX: &str = "D31_R6_STORAGE_CHILD_ROOT:";
+    #[cfg(windows)]
+    const STORAGE_GENERATION_CHILD_DONE: &str = "D31_R6_STORAGE_CHILD_DONE";
+
+    #[cfg(windows)]
+    #[test]
+    fn storage_generation_child_process_probe() {
+        let Ok(mode) = std::env::var(STORAGE_GENERATION_CHILD_MODE_ENV) else {
+            return;
+        };
+        assert_eq!(mode, "probe");
+
+        use crate::capability::authorization::{
+            evaluate_capability_authorization, CapabilityAuthorizationErrorCode,
+            CapabilityAuthorizationRepository, CapabilityEvaluationErrorCode,
+            LifeCapabilityAuthorizationUpdateRequest, RequestedCapabilityScope,
+        };
+        use crate::capability::descriptor::{CapabilityId, CapabilityRegistry};
+
+        let default_root =
+            PathBuf::from(std::env::var_os(STORAGE_GENERATION_CHILD_DEFAULT_ROOT_ENV).unwrap());
+        let project_root =
+            PathBuf::from(std::env::var_os(STORAGE_GENERATION_CHILD_PROJECT_ROOT_ENV).unwrap());
+        let capability_id =
+            CapabilityId::try_from(std::env::var(STORAGE_GENERATION_CHILD_CAPABILITY_ENV).unwrap())
+                .unwrap();
+        let storage =
+            StorageService::initialize_with_roots(default_root, Some(project_root)).unwrap();
+        let gate_name = storage
+            .capability_authorization_gate_name_for_test()
+            .expect("Windows child gate name");
+        println!("{STORAGE_GENERATION_CHILD_READY}");
+        println!("{STORAGE_GENERATION_CHILD_GATE_PREFIX}{gate_name}");
+        println!(
+            "{STORAGE_GENERATION_CHILD_GENERATION_PREFIX}{}",
+            storage.capability_authority_generation_id_for_test()
+        );
+        std::io::stdout().flush().unwrap();
+
+        let mut command = String::new();
+        std::io::stdin().read_line(&mut command).unwrap();
+        assert_eq!(command.trim(), "ATTEMPT");
+        let baseline = storage.total_changes_for_test().unwrap();
+
+        let save_code = match storage.save_life(LifeIdentityRecord {
+            id: "life-2".to_string(),
+            name: "stale child life".to_string(),
+            created_at: "2026-09-14T00:00:00.000Z".to_string(),
+            version: 1,
+            body_id: "body-2".to_string(),
+            persona_id: "persona-1".to_string(),
+            persona_version: 1,
+        }) {
+            Ok(()) => "UNEXPECTED_OK",
+            Err(error) if error.code == CAPABILITY_AUTHORITY_RESTART_REQUIRED => {
+                CAPABILITY_AUTHORITY_RESTART_REQUIRED
+            }
+            Err(_) => "OTHER",
+        };
+        println!("{STORAGE_GENERATION_CHILD_SAVE_PREFIX}{save_code}");
+
+        let d30_code = match storage.update_capability_authorization(
+            LifeCapabilityAuthorizationUpdateRequest::for_test(
+                "stale-child-d30-transition",
+                "life-1",
+                capability_id.clone(),
+                false,
+                2,
+            ),
+        ) {
+            Ok(_) => "UNEXPECTED_OK",
+            Err(error)
+                if error.code == CapabilityAuthorizationErrorCode::AuthorityRestartRequired =>
+            {
+                "CAPABILITY_AUTHORITY_RESTART_REQUIRED"
+            }
+            Err(_) => "OTHER",
+        };
+        println!("{STORAGE_GENERATION_CHILD_D30_PREFIX}{d30_code}");
+
+        let registry = CapabilityRegistry::production().unwrap();
+        let evaluation_code = match evaluate_capability_authorization(
+            &storage,
+            &registry,
+            "life-1",
+            &capability_id,
+            RequestedCapabilityScope::Workspace,
+        ) {
+            Ok(_) => "UNEXPECTED_OK",
+            Err(error) if error.code == CapabilityEvaluationErrorCode::AuthorityRestartRequired => {
+                "CAPABILITY_AUTHORITY_RESTART_REQUIRED"
+            }
+            Err(_) => "OTHER",
+        };
+        println!("{STORAGE_GENERATION_CHILD_EVAL_PREFIX}{evaluation_code}");
+
+        let mutations = storage
+            .total_changes_for_test()
+            .unwrap()
+            .saturating_sub(baseline);
+        println!("{STORAGE_GENERATION_CHILD_MUTATIONS_PREFIX}{mutations}");
+        println!(
+            "{STORAGE_GENERATION_CHILD_ACTIVE_ROOT_PREFIX}{}",
+            storage.active_root_for_test().display()
+        );
+        println!("{STORAGE_GENERATION_CHILD_DONE}");
+        std::io::stdout().flush().unwrap();
+    }
+
+    #[cfg(windows)]
+    fn spawn_storage_generation_child(
+        default_root: &Path,
+        project_root: &Path,
+        capability_id: &str,
+    ) -> Child {
+        Command::new(std::env::current_exe().unwrap())
+            .arg("storage_generation_child_process_probe")
+            .arg("--nocapture")
+            .env(STORAGE_GENERATION_CHILD_MODE_ENV, "probe")
+            .env(STORAGE_GENERATION_CHILD_DEFAULT_ROOT_ENV, default_root)
+            .env(STORAGE_GENERATION_CHILD_PROJECT_ROOT_ENV, project_root)
+            .env(STORAGE_GENERATION_CHILD_CAPABILITY_ENV, capability_id)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    #[cfg(windows)]
+    fn read_child_prefixed<R: BufRead>(reader: &mut R, prefix: &str) -> String {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let count = reader.read_line(&mut line).unwrap();
+            assert!(count > 0, "child exited before marker {prefix}");
+            let line = line.trim_end_matches(['\r', '\n']);
+            if let Some(value) = line.strip_prefix(prefix) {
+                return value.to_string();
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn migration_fences_independently_opened_host_process() {
+        use crate::capability::authorization::{
+            evaluate_capability_authorization, LifeCapabilityAuthorizationCreateRequest,
+            LifeCapabilityAuthorizationUpdateRequest, RequestedCapabilityScope,
+        };
+        use crate::capability::descriptor::{CapabilityId, CapabilityRegistry};
+
+        let root = TestRoot::new("migration-process-isolated");
+        let service = seeded_service(&root.0);
+        let capability_id = CapabilityId::try_from("vita.process.workspace.git_status").unwrap();
+        service
+            .create_capability_authorization(LifeCapabilityAuthorizationCreateRequest {
+                life_id: "life-1".to_string(),
+                capability_id: capability_id.clone(),
+            })
+            .unwrap();
+        service
+            .update_capability_authorization(LifeCapabilityAuthorizationUpdateRequest::for_test(
+                "process-isolated-enable",
+                "life-1",
+                capability_id.clone(),
+                true,
+                1,
+            ))
+            .unwrap();
+
+        let default_root = root.0.join("default");
+        let project_root = root.0.join("project");
+        let old_root = service.active_root_for_test();
+        let old_database = old_root.join(DATABASE_FILE_NAME);
+        let old_state_before = legacy_authority_state(&old_database, capability_id.as_str());
+        let mut child =
+            spawn_storage_generation_child(&default_root, &project_root, capability_id.as_str());
+        let child_stdout = child.stdout.take().unwrap();
+        let mut child_output = BufReader::new(child_stdout);
+        assert_eq!(
+            read_child_prefixed(&mut child_output, STORAGE_GENERATION_CHILD_READY),
+            ""
+        );
+        let child_gate =
+            read_child_prefixed(&mut child_output, STORAGE_GENERATION_CHILD_GATE_PREFIX);
+        assert_eq!(
+            Some(child_gate),
+            service.capability_authorization_gate_name_for_test()
+        );
+        assert_eq!(
+            read_child_prefixed(
+                &mut child_output,
+                STORAGE_GENERATION_CHILD_GENERATION_PREFIX,
+            ),
+            service.capability_authority_generation_id_for_test()
+        );
+
+        let target = root.0.join("process-isolated-target");
+        let migration = service.migrate_location(target.to_str().unwrap());
+        assert!(migration.success, "{migration:?}");
+        assert!(migration.restart_required);
+
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"ATTEMPT\n")
+            .unwrap();
+        child.stdin.as_mut().unwrap().flush().unwrap();
+        assert_eq!(
+            read_child_prefixed(&mut child_output, STORAGE_GENERATION_CHILD_SAVE_PREFIX),
+            CAPABILITY_AUTHORITY_RESTART_REQUIRED
+        );
+        assert_eq!(
+            read_child_prefixed(&mut child_output, STORAGE_GENERATION_CHILD_D30_PREFIX),
+            CAPABILITY_AUTHORITY_RESTART_REQUIRED
+        );
+        assert_eq!(
+            read_child_prefixed(&mut child_output, STORAGE_GENERATION_CHILD_EVAL_PREFIX),
+            CAPABILITY_AUTHORITY_RESTART_REQUIRED
+        );
+        assert_eq!(
+            read_child_prefixed(&mut child_output, STORAGE_GENERATION_CHILD_MUTATIONS_PREFIX),
+            "0"
+        );
+        assert_eq!(
+            PathBuf::from(read_child_prefixed(
+                &mut child_output,
+                STORAGE_GENERATION_CHILD_ACTIVE_ROOT_PREFIX,
+            )),
+            old_root
+        );
+        assert_eq!(
+            read_child_prefixed(&mut child_output, STORAGE_GENERATION_CHILD_DONE),
+            ""
+        );
+        assert!(child.wait().unwrap().success());
+
+        assert_eq!(
+            legacy_authority_state(&old_database, capability_id.as_str()),
+            old_state_before,
+            "stale process must not mutate the retired database"
+        );
+
+        let fresh =
+            StorageService::initialize_with_roots(default_root, Some(project_root)).unwrap();
+        assert_eq!(
+            fresh.active_root_for_test(),
+            fs::canonicalize(target).unwrap()
+        );
+        assert_ne!(
+            service.capability_authorization_gate_name_for_test(),
+            fresh.capability_authorization_gate_name_for_test()
+        );
+        let fresh_registry = CapabilityRegistry::production().unwrap();
+        let fresh_decision = evaluate_capability_authorization(
+            &fresh,
+            &fresh_registry,
+            "life-1",
+            &capability_id,
+            RequestedCapabilityScope::Workspace,
+        )
+        .unwrap();
+        assert_eq!(fresh_decision.authorization_revision(), Some(2));
     }
 
     #[cfg(windows)]

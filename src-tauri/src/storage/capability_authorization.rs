@@ -368,7 +368,7 @@ impl StorageService {
     /// Repository primitives used only by `CapabilityAuthorizationScope`.
     /// The scope owns the composite gate, so these functions never acquire it
     /// recursively.
-    pub(super) fn create_capability_authorization_under_gate(
+    fn create_capability_authorization_under_gate(
         &self,
         request: LifeCapabilityAuthorizationCreateRequest,
     ) -> Result<CapabilityAuthorizationCreateOutcome, CapabilityAuthorizationError> {
@@ -388,7 +388,7 @@ impl StorageService {
         Ok(outcome)
     }
 
-    pub(super) fn find_capability_authorization_under_gate(
+    fn find_capability_authorization_under_gate(
         &self,
         life_id: &str,
         capability_id: &CapabilityId,
@@ -404,7 +404,7 @@ impl StorageService {
         Ok(authorization)
     }
 
-    pub(super) fn update_capability_authorization_under_gate(
+    fn update_capability_authorization_under_gate(
         &self,
         request: LifeCapabilityAuthorizationUpdateRequest,
     ) -> Result<CapabilityAuthorizationUpdateOutcome, CapabilityAuthorizationError> {
@@ -422,7 +422,7 @@ impl StorageService {
         Ok(outcome)
     }
 
-    pub(super) fn find_capability_authorization_event_under_gate(
+    fn find_capability_authorization_event_under_gate(
         &self,
         life_id: &str,
         event_id: &str,
@@ -451,7 +451,7 @@ impl StorageService {
         Ok(event)
     }
 
-    pub(super) fn list_capability_authorization_events_under_gate(
+    fn list_capability_authorization_events_under_gate(
         &self,
         life_id: &str,
         capability_id: &CapabilityId,
@@ -520,6 +520,15 @@ impl<'a> CapabilityAuthorizationScope<'a> {
         self.storage()
             .list_capability_authorization_events_under_gate(life_id, capability_id, limit)
     }
+
+    pub(crate) fn find_capability_authorization_event(
+        &self,
+        life_id: &str,
+        event_id: &str,
+    ) -> Result<Option<LifeCapabilityAuthorizationEvent>, CapabilityAuthorizationError> {
+        self.storage()
+            .find_capability_authorization_event_under_gate(life_id, event_id)
+    }
 }
 
 impl CapabilityAuthorizationRepository for StorageService {
@@ -538,7 +547,10 @@ impl CapabilityAuthorizationRepository for StorageService {
         life_id: &str,
         capability_id: &CapabilityId,
     ) -> Result<Option<LifeCapabilityAuthorization>, CapabilityAuthorizationError> {
-        self.find_capability_authorization_under_gate(life_id, capability_id)
+        let scope = self
+            .capability_authorization_scope()
+            .map_err(map_storage_authority_error)?;
+        scope.find_capability_authorization(life_id, capability_id)
     }
 
     fn update_capability_authorization(
@@ -556,7 +568,10 @@ impl CapabilityAuthorizationRepository for StorageService {
         life_id: &str,
         event_id: &str,
     ) -> Result<Option<LifeCapabilityAuthorizationEvent>, CapabilityAuthorizationError> {
-        self.find_capability_authorization_event_under_gate(life_id, event_id)
+        let scope = self
+            .capability_authorization_scope()
+            .map_err(map_storage_authority_error)?;
+        scope.find_capability_authorization_event(life_id, event_id)
     }
 }
 
@@ -580,7 +595,10 @@ impl StorageService {
         capability_id: &CapabilityId,
         limit: usize,
     ) -> Result<Vec<LifeCapabilityAuthorizationEvent>, CapabilityAuthorizationError> {
-        self.list_capability_authorization_events_under_gate(life_id, capability_id, limit)
+        let scope = self
+            .capability_authorization_scope()
+            .map_err(map_storage_authority_error)?;
+        scope.list_capability_authorization_events(life_id, capability_id, limit)
     }
 }
 

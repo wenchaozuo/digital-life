@@ -1,4 +1,5 @@
 use super::descriptor::{ApprovalFloor, CapabilityId, CapabilityRegistry, ScopeRequirement};
+use crate::storage::CapabilityAuthorizationScope;
 
 const MAX_ID_LENGTH: usize = 128;
 const USER_EXPLICIT_ACTOR_KIND: &str = "user_explicit";
@@ -660,6 +661,46 @@ pub(crate) fn evaluate_capability_authorization(
     capability_id: &CapabilityId,
     requested_scope: RequestedCapabilityScope,
 ) -> Result<CapabilityAuthorizationDecision, CapabilityEvaluationError> {
+    evaluate_capability_authorization_with_read(
+        |life_id, capability_id| repository.find_capability_authorization(life_id, capability_id),
+        registry,
+        life_id,
+        capability_id,
+        requested_scope,
+    )
+}
+
+/// Scope-bound evaluator used by larger Host decisions that already own the
+/// composite gate.  The scope cannot be sent across threads (it owns the
+/// process-local mutex guard), so it intentionally is not a second generic
+/// repository implementation; this explicit seam makes lock ownership
+/// visible at each nested authority read.
+pub(crate) fn evaluate_capability_authorization_in_scope(
+    authority: &CapabilityAuthorizationScope<'_>,
+    registry: &CapabilityRegistry,
+    life_id: &str,
+    capability_id: &CapabilityId,
+    requested_scope: RequestedCapabilityScope,
+) -> Result<CapabilityAuthorizationDecision, CapabilityEvaluationError> {
+    evaluate_capability_authorization_with_read(
+        |life_id, capability_id| authority.find_capability_authorization(life_id, capability_id),
+        registry,
+        life_id,
+        capability_id,
+        requested_scope,
+    )
+}
+
+fn evaluate_capability_authorization_with_read(
+    read: impl FnOnce(
+        &str,
+        &CapabilityId,
+    ) -> Result<Option<LifeCapabilityAuthorization>, CapabilityAuthorizationError>,
+    registry: &CapabilityRegistry,
+    life_id: &str,
+    capability_id: &CapabilityId,
+    requested_scope: RequestedCapabilityScope,
+) -> Result<CapabilityAuthorizationDecision, CapabilityEvaluationError> {
     validate_life_id(life_id).map_err(|error| {
         CapabilityEvaluationError::new(
             CapabilityEvaluationErrorCode::InvalidArgument,
@@ -673,9 +714,7 @@ pub(crate) fn evaluate_capability_authorization(
         )
     })?;
 
-    let authorization = repository
-        .find_capability_authorization(life_id, capability_id)
-        .map_err(|error| {
+    let authorization = read(life_id, capability_id).map_err(|error| {
             let code = if error.code == CapabilityAuthorizationErrorCode::AuthorityRestartRequired
             {
                 CapabilityEvaluationErrorCode::AuthorityRestartRequired

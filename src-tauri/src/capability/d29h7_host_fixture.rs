@@ -843,7 +843,10 @@ mod tests {
         )
         .expect("H7 fixture initialize");
         assert_eq!(response.authorization_revision, Some(2));
-        assert_eq!(session.production_registry.len(), 1);
+        // D31-B keeps the accepted H7 Git-status descriptor and adds the
+        // separate bounded workspace-read descriptor; both are production
+        // entries, while this fixture still exercises only Git status.
+        assert_eq!(session.production_registry.len(), 2);
         let descriptor = session
             .production_registry
             .descriptor(&CapabilityId::try_from(GIT_STATUS_CAPABILITY_ID).unwrap())

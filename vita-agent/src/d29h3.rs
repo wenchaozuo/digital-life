@@ -301,7 +301,6 @@ enum H3DenyClassification {
     TargetIdentityMismatch,
     Oversized,
     InvalidUtf8,
-    CancelledAfterRead,
     DisclosureRejected,
 }
 
@@ -330,7 +329,6 @@ impl H3DenyClassification {
             Self::TargetIdentityMismatch => "workspace_target_identity_mismatch",
             Self::Oversized => "workspace_file_too_large",
             Self::InvalidUtf8 => "workspace_file_not_utf8",
-            Self::CancelledAfterRead => "turn_cancelled_after_bounded_read",
             Self::DisclosureRejected => "workspace_read_disclosure_denied",
         }
     }
@@ -681,13 +679,6 @@ impl VitaWorkspaceReadBroker {
                 return VitaWorkspaceReadResult::denied_after_grant(request, classification)
             }
         };
-        if self.cancelled.load(Ordering::Acquire) {
-            self.metrics.late_denials.fetch_add(1, Ordering::AcqRel);
-            return VitaWorkspaceReadResult::denied_after_grant(
-                request,
-                H3DenyClassification::LateAfterCancellation,
-            );
-        }
         if let Err(classification) =
             validate_revalidation(&current_authority, &current_authority_request, &grant)
         {
@@ -696,16 +687,11 @@ impl VitaWorkspaceReadBroker {
             }
             return VitaWorkspaceReadResult::denied_after_grant(request, classification);
         }
-        if self.cancelled.load(Ordering::Acquire) {
-            self.metrics
-                .cancellation_denials
-                .fetch_add(1, Ordering::AcqRel);
-            return VitaWorkspaceReadResult::denied_after_grant(
-                request,
-                H3DenyClassification::TurnCancelled,
-            );
-        }
-
+        // Host `Issued -> Revalidated` is the executable-read-start commit.
+        // Once that Host decision has returned successfully, a later local
+        // cancellation flag cannot withdraw the already-committed start.  The
+        // bounded read may therefore execute; the subsequent Host release
+        // check is the only disclosure decision.
         self.metrics
             .execution_started
             .fetch_add(1, Ordering::AcqRel);
@@ -737,16 +723,10 @@ impl VitaWorkspaceReadBroker {
             }
         };
         let bytes_read = content.len();
-        if self.cancelled.load(Ordering::Acquire) {
-            return VitaWorkspaceReadResult {
-                request,
-                classification: Some(H3DenyClassification::CancelledAfterRead),
-                content: None,
-                bytes_read: 0,
-                execution_started: true,
-                grant_issued: true,
-            };
-        }
+        // A cancellation that commits after the executable-read-start point
+        // is intentionally allowed to reach this release fence.  Host
+        // cancellation then denies disclosure while keeping the confidential
+        // bytes process-local; do not short-circuit with a local AtomicBool.
         let disclosure_request = H3DisclosureRequest {
             context: bound_context.clone(),
             capability_id: grant.capability_id.clone(),
@@ -1933,6 +1913,81 @@ mod h3r1_tests {
             Some(H3DenyClassification::TurnCancelled)
         );
         assert_eq!(authority.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancel_after_pre_read_commit_before_release_allows_bounded_read_but_denies_release() {
+        struct RevalidationGateAuthority {
+            revalidation_committed: Arc<tokio::sync::Notify>,
+            allow_revalidation: Arc<tokio::sync::Notify>,
+            release_calls: Arc<AtomicUsize>,
+        }
+
+        impl VitaH3AuthorityPort for RevalidationGateAuthority {
+            fn evaluate(&self, request: H3AuthorityRequest) -> VitaH3AuthorityFuture {
+                let response = response_from_reply(&request, AuthorityReply::scope_required());
+                match request.operation {
+                    H3AuthorityOperation::IssueScopeGrant => Box::pin(async move { Ok(response) }),
+                    H3AuthorityOperation::Revalidate { .. } => {
+                        let committed = Arc::clone(&self.revalidation_committed);
+                        let allow = Arc::clone(&self.allow_revalidation);
+                        Box::pin(async move {
+                            // This notification is the Host's successful
+                            // Issued -> Revalidated commit.  The test holds
+                            // the response at this point so cancellation can
+                            // commit after executable authority but before
+                            // the Vita executor resumes.
+                            committed.notify_one();
+                            allow.notified().await;
+                            Ok(response)
+                        })
+                    }
+                }
+            }
+
+            fn release(&self, _request: H3DisclosureRequest) -> VitaH3DisclosureFuture {
+                self.release_calls.fetch_add(1, Ordering::AcqRel);
+                Box::pin(async { Err(VitaH3AuthorityError::Unavailable) })
+            }
+        }
+
+        let fixture = Fixture::new(FILE_CONTENT.as_bytes());
+        let authority = Arc::new(RevalidationGateAuthority {
+            revalidation_committed: Arc::new(tokio::sync::Notify::new()),
+            allow_revalidation: Arc::new(tokio::sync::Notify::new()),
+            release_calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let broker = VitaWorkspaceReadBroker::new(
+            fixture.context.clone(),
+            fixture.root.clone(),
+            Arc::clone(&authority) as Arc<dyn VitaH3AuthorityPort>,
+        );
+        let committed = authority.revalidation_committed.notified();
+        let task = tokio::spawn({
+            let broker = Arc::clone(&broker);
+            let request = fixture.request("call-cancel-after-pre-read-commit-before-release");
+            async move { run(&broker, request).await }
+        });
+
+        committed.await;
+        // This is the precise cancel-after-pre-read-commit-before-release
+        // ordering: Host cancellation is after the executable-read-start
+        // commit and before the physical read/release.
+        broker.cancel();
+        authority.allow_revalidation.notify_one();
+
+        let result = task.await.expect("bounded-read task");
+        assert_eq!(
+            result.classification,
+            Some(H3DenyClassification::DisclosureRejected)
+        );
+        assert!(result.content.is_none());
+        assert_eq!(result.bytes_read, 0);
+        let snapshot = broker.snapshot();
+        assert_eq!(snapshot.execution_started, 1);
+        assert_eq!(snapshot.authorized_file_reads, 0);
+        assert_eq!(snapshot.file_bytes_read, 0);
+        assert_eq!(authority.release_calls.load(Ordering::Acquire), 1);
     }
 
     #[test]

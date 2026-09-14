@@ -5531,6 +5531,173 @@ mod windows {
         }
 
         #[test]
+        fn d31_cancel_before_pre_read_commit_is_deny_only_without_a_read_start() {
+            let provider = test_provider();
+            let (session, _receiver) = test_session_with_provider(provider.clone());
+            let (root, storage, registry) =
+                synthetic_multi_capability_fixture(&session, None, Some(true));
+            let (binding, issued) = workspace_read_issued_grant(
+                &session,
+                &storage,
+                &registry,
+                &provider,
+                "d31-cancel-before-pre-read-commit",
+            );
+            let request = protocol::WorkspaceReadRevalidateGrant {
+                request_id: "d31-cancel-before-pre-read-commit-request".to_string(),
+                session_id: session.session_id.clone(),
+                host_turn_id: "d31-cancel-before-pre-read-commit".to_string(),
+                binding,
+                grant: issued,
+            };
+            let start = Arc::new(Barrier::new(2));
+            let (cancel_committed_tx, cancel_committed_rx) = mpsc::channel();
+            let cancel_session = Arc::clone(&session);
+            let cancel_start = Arc::clone(&start);
+            let cancel_thread = thread::spawn(move || {
+                cancel_start.wait();
+                let result = cancel_session
+                    .begin_cancellation()
+                    .expect("Host cancellation must linearize");
+                cancel_committed_tx
+                    .send(result)
+                    .expect("revalidation must observe cancellation commit");
+            });
+            let revalidate_storage = storage;
+            let revalidate_registry = registry;
+            let revalidate_session = Arc::clone(&session);
+            let revalidate_start = Arc::clone(&start);
+            let revalidate_thread = thread::spawn(move || {
+                revalidate_start.wait();
+                assert_eq!(
+                    cancel_committed_rx
+                        .recv()
+                        .expect("cancel-before-pre-read-commit signal"),
+                    Some("d31-cancel-before-pre-read-commit".to_string())
+                );
+                revalidate_workspace_read_grant(
+                    &revalidate_storage,
+                    &revalidate_registry,
+                    &revalidate_session,
+                    &request,
+                )
+            });
+
+            cancel_thread.join().expect("cancellation thread");
+            assert_eq!(
+                revalidate_thread.join().expect("revalidation thread"),
+                Err("WORKSPACE_READ_DISCLOSURE_TURN_NOT_ACTIVE".to_string())
+            );
+            // No Issued -> Revalidated transition means no executable read
+            // start can be imported by Vita, and cancellation retired the
+            // complete pre-read ledger.
+            assert!(session
+                .workspace_read_grants
+                .lock()
+                .expect("workspace read grant lock")
+                .is_empty());
+            session.retire();
+            drop(root);
+        }
+
+        #[test]
+        fn d31_cancel_after_pre_read_commit_before_release_denies_release() {
+            let provider = test_provider();
+            let content = b"D31 cancellation-after-pre-read-commit-before-release bytes";
+            let (session, _receiver) = test_session_with_provider(provider.clone());
+            let (root, storage, registry) =
+                synthetic_multi_capability_fixture(&session, None, Some(true));
+            let storage = Arc::new(storage);
+            let (binding, issued) = workspace_read_issued_grant(
+                &session,
+                &storage,
+                &registry,
+                &provider,
+                "d31-revalidation-first-read-start",
+            );
+            let start = Arc::new(Barrier::new(2));
+            let (commit_tx, commit_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let revalidate_storage = Arc::clone(&storage);
+            let revalidate_registry = registry.clone();
+            let revalidate_session = Arc::clone(&session);
+            let revalidate_start = Arc::clone(&start);
+            let revalidate_request = protocol::WorkspaceReadRevalidateGrant {
+                request_id: "d31-revalidation-first-read-start-request".to_string(),
+                session_id: session.session_id.clone(),
+                host_turn_id: "d31-revalidation-first-read-start".to_string(),
+                binding: binding.clone(),
+                grant: issued,
+            };
+            let revalidate_thread = thread::spawn(move || {
+                revalidate_start.wait();
+                let result = revalidate_workspace_read_grant(
+                    &revalidate_storage,
+                    &revalidate_registry,
+                    &revalidate_session,
+                    &revalidate_request,
+                );
+                let returned = result.expect("pre-read authority commit");
+                commit_tx
+                    .send(returned.clone())
+                    .expect("cancellation must observe pre-read commit");
+            });
+            let cancel_session = Arc::clone(&session);
+            let cancel_start = Arc::clone(&start);
+            let cancel_thread = thread::spawn(move || {
+                cancel_start.wait();
+                let revalidated = commit_rx
+                    .recv()
+                    .expect("cancel-after-pre-read-commit signal");
+                assert!(revalidated.used);
+                cancel_session
+                    .begin_cancellation()
+                    .expect("Host cancellation must linearize after pre-read commit");
+                release_tx
+                    .send(revalidated)
+                    .expect("main thread must receive committed grant");
+            });
+            revalidate_thread.join().expect("revalidation thread");
+            cancel_thread.join().expect("cancellation thread");
+
+            let revalidated = release_rx
+                .recv()
+                .expect("committed grant after cancellation");
+            let release_request = protocol::WorkspaceReadReleaseCheck {
+                request_id: "d31-revalidation-first-read-start-release".to_string(),
+                session_id: session.session_id.clone(),
+                host_turn_id: "d31-revalidation-first-read-start".to_string(),
+                binding,
+                grant: revalidated,
+                bytes_read: content.len() as u64,
+                content_sha256: format!("{:x}", Sha256::digest(content)),
+            };
+            // The physical bounded read is owned by Vita and is represented
+            // here only by its count/hash evidence.  In the precise
+            // cancel-after-pre-read-commit-before-release ordering,
+            // cancellation must deny Host release, so no confidential bytes
+            // can become model-visible.
+            let release_result = authorize_workspace_read_release(
+                &storage,
+                &registry,
+                &session,
+                &release_request,
+                content,
+            );
+            assert_eq!(
+                release_result.unwrap_err(),
+                "WORKSPACE_READ_DISCLOSURE_TURN_NOT_ACTIVE"
+            );
+            assert!(session
+                .workspace_read_grants
+                .lock()
+                .expect("workspace read grant lock")
+                .is_empty());
+            session.retire();
+            drop(root);
+        }
+
+        #[test]
         fn d31_revoke_first_linearizes_before_workspace_release() {
             let provider = test_provider();
             let content: &'static [u8] = b"D31 revoke-first bytes";
@@ -8090,9 +8257,37 @@ mod windows {
 
         #[test]
         fn d31_b_real_process_workspace_read_canary() {
+            run_d31_b_real_process_workspace_read_canary(false, d31_b_require_real_canary());
+        }
+
+        #[test]
+        fn d31_b_real_process_workspace_read_revocation_canary() {
+            if !d31_b_require_real_canary() {
+                eprintln!(
+                    "skipping D31-B negative process canary; set D31_B_REQUIRE_REAL_CANARY=1 for the freeze gate"
+                );
+                return;
+            }
+            run_d31_b_real_process_workspace_read_canary(true, true);
+        }
+
+        fn d31_b_require_real_canary() -> bool {
+            std::env::var("D31_B_REQUIRE_REAL_CANARY").as_deref() == Ok("1")
+        }
+
+        fn run_d31_b_real_process_workspace_read_canary(
+            revoke_before_revalidation: bool,
+            require_real_canary: bool,
+        ) {
             let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../vita-agent/target/release/vita-agent.exe");
             if !executable.is_file() {
+                if require_real_canary {
+                    panic!(
+                        "D31-B process freeze canary requires the release image: {}",
+                        executable.display()
+                    );
+                }
                 eprintln!(
                     "skipping D31-B process canary; release image is absent: {}",
                     executable.display()
@@ -8102,6 +8297,9 @@ mod windows {
             let git_path = match resolve_git_path() {
                 Ok(path) => path,
                 Err(error) => {
+                    if require_real_canary {
+                        panic!("D31-B process freeze canary requires trusted Git: {error}");
+                    }
                     eprintln!("skipping D31-B process canary: {error}");
                     return;
                 }
@@ -8146,6 +8344,11 @@ mod windows {
                     let _ = process.shutdown();
                     let mut diagnostics = String::new();
                     let _ = std::io::Read::read_to_string(&mut stderr, &mut diagnostics);
+                    if require_real_canary {
+                        panic!(
+                            "D31-B process freeze canary handshake failed: {error}; sidecar stderr: {diagnostics}"
+                        );
+                    }
                     eprintln!(
                         "skipping D31-B process canary; release image lacks the test helper: {error}; sidecar stderr: {diagnostics}"
                     );
@@ -8167,7 +8370,11 @@ mod windows {
                 purpose: "chat".to_string(),
                 provider_kind: "openai_compatible".to_string(),
                 base_url: "http://127.0.0.1:9/v1".to_string(),
-                model: "d31-b-canary-model".to_string(),
+                model: if revoke_before_revalidation {
+                    "d31-b-negative-canary-model".to_string()
+                } else {
+                    "d31-b-canary-model".to_string()
+                },
                 credential_ref: "d31-b-canary-credential".to_string(),
                 credential_destination: "http://127.0.0.1:9/v1".to_string(),
             };
@@ -8200,6 +8407,11 @@ mod windows {
                     let _ = process.shutdown();
                     let mut diagnostics = String::new();
                     let _ = std::io::Read::read_to_string(&mut stderr, &mut diagnostics);
+                    if require_real_canary {
+                        panic!(
+                            "D31-B process freeze canary ready failed: {error}; sidecar stderr: {diagnostics}"
+                        );
+                    }
                     eprintln!(
                         "skipping D31-B process canary; sidecar image has no test helper: {error}; sidecar stderr: {diagnostics}"
                     );
@@ -8311,6 +8523,12 @@ mod windows {
                 .expect("D31-B canary start turn");
 
             let mut completed = false;
+            let mut authority_evaluate_seen = false;
+            let mut confirmation_seen = false;
+            let mut grant_issue_seen = false;
+            let mut revalidation_seen = false;
+            let mut release_seen = false;
+            let mut release_bytes = 0_u64;
             for _ in 0..32 {
                 let (message, next_reader) = receive_vita_message_with_timeout(
                     reader,
@@ -8347,12 +8565,14 @@ mod windows {
                             .expect("D31-B credential reply");
                     }
                     VitaMessage::WorkspaceReadAuthorityEvaluate(request) => {
+                        authority_evaluate_seen = true;
                         handle_workspace_read_authority_evaluate(
                             &session, &storage, &registry, request,
                         )
                         .expect("D31-B authority evaluation");
                     }
                     VitaMessage::WorkspaceReadConfirmationRequired(request) => {
+                        confirmation_seen = true;
                         handle_workspace_read_confirmation_required(&session, request)
                             .expect("D31-B confirmation request");
                         let pending_id = session
@@ -8364,16 +8584,41 @@ mod windows {
                             .expect("D31-B explicit confirmation");
                     }
                     VitaMessage::WorkspaceReadIssueGrant(request) => {
+                        grant_issue_seen = true;
                         handle_workspace_read_issue_grant(&session, &storage, &registry, request)
                             .expect("D31-B grant issue");
                     }
                     VitaMessage::WorkspaceReadRevalidateGrant(request) => {
-                        handle_workspace_read_revalidate_grant(
-                            &session, &storage, &registry, request,
-                        )
-                        .expect("D31-B pre-read revalidation");
+                        revalidation_seen = true;
+                        if revoke_before_revalidation {
+                            let revoked = apply_transition_for_test(
+                                &storage,
+                                &registry,
+                                PRODUCTION_WORKSPACE_READ_CAPABILITY_ID,
+                                false,
+                                2,
+                                &life_id,
+                            )
+                            .expect("D31-B negative canary revocation");
+                            assert_eq!(revoked.revision, 3);
+                            handle_workspace_read_revalidate_grant(
+                                &session, &storage, &registry, request,
+                            )
+                            .expect("D31-B negative canary revalidation denial reply");
+                        } else {
+                            handle_workspace_read_revalidate_grant(
+                                &session, &storage, &registry, request,
+                            )
+                            .expect("D31-B pre-read revalidation");
+                        }
                     }
                     VitaMessage::WorkspaceReadReleaseCheck(request) => {
+                        release_seen = true;
+                        release_bytes = request.bytes_read;
+                        assert!(
+                            !revoke_before_revalidation,
+                            "D31-B negative canary must not reach release"
+                        );
                         assert!(request.bytes_read <= 64);
                         handle_workspace_read_release_check(&session, &storage, &registry, request)
                             .expect("D31-B disclosure release");
@@ -8398,6 +8643,23 @@ mod windows {
                 }
             }
             assert!(completed, "D31-B canary did not complete a real turn");
+            assert!(
+                authority_evaluate_seen,
+                "D31-B canary missed authority evaluation"
+            );
+            assert!(
+                confirmation_seen,
+                "D31-B canary missed explicit confirmation"
+            );
+            assert!(grant_issue_seen, "D31-B canary missed Host grant issue");
+            assert!(revalidation_seen, "D31-B canary missed Host revalidation");
+            if revoke_before_revalidation {
+                assert!(!release_seen, "D31-B negative canary reached release");
+                assert_eq!(release_bytes, 0);
+            } else {
+                assert!(release_seen, "D31-B canary missed disclosure release");
+                assert!(release_bytes > 0, "D31-B canary read no fixture bytes");
+            }
             assert_eq!(
                 fs::read(&canary_file).expect("D31-B canary file remains readable"),
                 canary_content

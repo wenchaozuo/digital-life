@@ -280,6 +280,8 @@ struct H9CanaryTransport {
     request_count: AtomicUsize,
     expected_workspace_path: String,
     read_mode: bool,
+    negative_read_mode: bool,
+    response_model: String,
 }
 
 #[cfg(feature = "d29-h9-test-helper")]
@@ -287,11 +289,18 @@ const D31_B_CANARY_CONTENT: &str = "D31-B bounded canary content\n";
 
 #[cfg(feature = "d29-h9-test-helper")]
 impl H9CanaryTransport {
-    fn new(expected_workspace_path: impl Into<String>, read_mode: bool) -> Self {
+    fn new(
+        expected_workspace_path: impl Into<String>,
+        read_mode: bool,
+        negative_read_mode: bool,
+        response_model: impl Into<String>,
+    ) -> Self {
         Self {
             request_count: AtomicUsize::new(0),
             expected_workspace_path: expected_workspace_path.into(),
             read_mode,
+            negative_read_mode,
+            response_model: response_model.into(),
         }
     }
 }
@@ -388,16 +397,30 @@ impl crate::provider_gateway::ProviderRequestTransport for H9CanaryTransport {
                     let bytes_read = result.get("bytes_read").and_then(Value::as_u64);
                     let max_bytes = result.get("max_bytes").and_then(Value::as_u64);
                     let expected_hash = crate::sha256_hex(D31_B_CANARY_CONTENT.as_bytes());
-                    result.get("status").and_then(Value::as_str) == Some("success")
-                        && relative_path == Some("canary.txt")
-                        && content == Some(D31_B_CANARY_CONTENT)
-                        && bytes_read == Some(D31_B_CANARY_CONTENT.len() as u64)
-                        && max_bytes.is_some_and(|max| max <= 64 * 1024)
-                        && result.get("content_sha256").and_then(Value::as_str)
-                            == Some(expected_hash.as_str())
-                        && result.get("execution_started").and_then(Value::as_bool) == Some(true)
-                        && result.get("grant_issued").and_then(Value::as_bool) == Some(true)
-                        && result.get("side_effect_count").and_then(Value::as_u64) == Some(0)
+                    if self.negative_read_mode {
+                        result.get("status").and_then(Value::as_str) == Some("denied")
+                            && relative_path == Some("canary.txt")
+                            && content.is_none()
+                            && bytes_read == Some(0)
+                            && max_bytes.is_some_and(|max| max <= 64 * 1024)
+                            && result.get("content_sha256").is_some_and(Value::is_null)
+                            && result.get("execution_started").and_then(Value::as_bool)
+                                == Some(false)
+                            && result.get("grant_issued").and_then(Value::as_bool) == Some(true)
+                            && result.get("side_effect_count").and_then(Value::as_u64) == Some(0)
+                    } else {
+                        result.get("status").and_then(Value::as_str) == Some("success")
+                            && relative_path == Some("canary.txt")
+                            && content == Some(D31_B_CANARY_CONTENT)
+                            && bytes_read == Some(D31_B_CANARY_CONTENT.len() as u64)
+                            && max_bytes.is_some_and(|max| max <= 64 * 1024)
+                            && result.get("content_sha256").and_then(Value::as_str)
+                                == Some(expected_hash.as_str())
+                            && result.get("execution_started").and_then(Value::as_bool)
+                                == Some(true)
+                            && result.get("grant_issued").and_then(Value::as_bool) == Some(true)
+                            && result.get("side_effect_count").and_then(Value::as_u64) == Some(0)
+                    }
                 } else {
                     let entries =
                         result
@@ -445,7 +468,7 @@ impl crate::provider_gateway::ProviderRequestTransport for H9CanaryTransport {
         let response = if request_number == 1 {
             serde_json::json!({
                 "id": "h9-canary-tool-call",
-                "model": if self.read_mode { "d31-b-canary-model" } else { "h9-canary-model" },
+                "model": self.response_model.clone(),
                 "choices": [{
                     "index": 0,
                     "message": {
@@ -474,7 +497,7 @@ impl crate::provider_gateway::ProviderRequestTransport for H9CanaryTransport {
         } else if request_number == 2 {
             serde_json::json!({
                 "id": "h9-canary-final",
-                "model": if self.read_mode { "d31-b-canary-model" } else { "h9-canary-model" },
+                "model": self.response_model.clone(),
                 "choices": [{
                     "index": 0,
                     "message": {
@@ -1532,9 +1555,12 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
             if test_canary {
                 #[cfg(feature = "d29-h9-test-helper")]
                 {
+                    let negative_read_mode = provider_config.model == "d31-b-negative-canary-model";
                     SidecarGatewayTransport::H9Canary(Arc::new(H9CanaryTransport::new(
                         &init.workspace_path,
-                        provider_config.model == "d31-b-canary-model",
+                        provider_config.model == "d31-b-canary-model" || negative_read_mode,
+                        negative_read_mode,
+                        provider_config.model.clone(),
                     )))
                 }
                 #[cfg(not(feature = "d29-h9-test-helper"))]

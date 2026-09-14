@@ -61,6 +61,10 @@ const H5_GRANT_LIFETIME_MS: u64 = 30_000;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RecoveryActionRequest {
     pub(crate) action_id: String,
+    /// Host-owned recovery generation.  This is intentionally independent of
+    /// any Codex/provider turn identity so a restart action can be authorized
+    /// before a model turn exists.
+    pub(crate) recovery_generation: String,
     pub(crate) life_id: String,
     pub(crate) task_id: String,
     pub(crate) capability_id: String,
@@ -87,6 +91,7 @@ impl RecoveryActionRequest {
         let journal = snapshot.journal();
         Self {
             action_id: action_id.to_string(),
+            recovery_generation: action_id.to_string(),
             life_id: journal.life_id().to_string(),
             task_id: journal.task_id().to_string(),
             capability_id: H5_RECOVER_REPLACE_CAPABILITY_ID.to_string(),
@@ -106,6 +111,23 @@ impl RecoveryActionRequest {
 
     pub(crate) fn action_id(&self) -> &str {
         &self.action_id
+    }
+
+    pub(crate) fn recovery_generation(&self) -> &str {
+        &self.recovery_generation
+    }
+
+    pub(crate) fn with_recovery_generation(mut self, generation: &str) -> Self {
+        self.recovery_generation = generation.to_string();
+        self
+    }
+
+    fn same_target_as(&self, other: &Self) -> bool {
+        let mut left = self.clone();
+        let mut right = other.clone();
+        left.authorization_revision = 0;
+        right.authorization_revision = 0;
+        left == right
     }
 
     pub(crate) fn transaction_id(&self) -> &RecoveryTransactionId {
@@ -794,6 +816,14 @@ impl H5RecoveryExecutor {
             Ok(grant) => grant,
             Err(reason) => return RecoveryExecutionResult::denied(reason, false),
         };
+        // The Host may learn the current D28 revision during the authority
+        // exchange.  Carry that fresh revision forward while rejecting any
+        // attempt to retarget the transaction or alter its Host-owned action
+        // generation.
+        if !action.same_target_as(&grant.action) {
+            return RecoveryExecutionResult::denied(RecoveryDenyReason::ConfirmationMismatch, true);
+        }
+        let action = grant.action.clone();
         if self.cancelled.load(Ordering::Acquire) {
             return RecoveryExecutionResult::denied(RecoveryDenyReason::Cancellation, true);
         }
@@ -4152,6 +4182,7 @@ pub(crate) mod tests {
             restore_sha256: journal.before_sha256(),
             restore_bytes: journal.before_bytes(),
             original_replacement_sha256: journal.replacement_sha256(),
+            recovery_generation: "lifecycle-unknown-generation".to_string(),
             authorization_revision: 2,
         };
         let authority = TestRecoveryAuthority::new(2);

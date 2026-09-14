@@ -1,4 +1,5 @@
 use std::ffi::OsStr;
+use std::path::PathBuf;
 use std::process::exit;
 
 use vita_agent::VITA_AGENT_RUNTIME_ID;
@@ -7,7 +8,8 @@ fn main() {
     let mut args = std::env::args_os();
     let _executable = args.next();
     let probe = args.next();
-    let no_extra_arguments = args.next().is_none();
+    let remaining = args.collect::<Vec<_>>();
+    let no_extra_arguments = remaining.is_empty();
 
     if probe.as_deref() == Some(OsStr::new("--probe")) && no_extra_arguments {
         println!(
@@ -15,6 +17,58 @@ fn main() {
             VITA_AGENT_RUNTIME_ID
         );
         return;
+    }
+
+    #[cfg(all(windows, feature = "d29-h9-test-helper"))]
+    if probe.as_deref() == Some(OsStr::new("--seed-recovery-fixture")) {
+        let mut args = remaining.into_iter();
+        let Some(app_data_root) = args.next() else {
+            eprintln!(
+                "usage: vita-agent --seed-recovery-fixture <app-data> <workspace> <life> <task>"
+            );
+            exit(2);
+        };
+        let Some(workspace_root) = args.next() else {
+            eprintln!(
+                "usage: vita-agent --seed-recovery-fixture <app-data> <workspace> <life> <task>"
+            );
+            exit(2);
+        };
+        let Some(life_id) = args.next() else {
+            eprintln!(
+                "usage: vita-agent --seed-recovery-fixture <app-data> <workspace> <life> <task>"
+            );
+            exit(2);
+        };
+        let Some(task_id) = args.next() else {
+            eprintln!(
+                "usage: vita-agent --seed-recovery-fixture <app-data> <workspace> <life> <task>"
+            );
+            exit(2);
+        };
+        if args.next().is_some() {
+            eprintln!(
+                "usage: vita-agent --seed-recovery-fixture <app-data> <workspace> <life> <task>"
+            );
+            exit(2);
+        }
+        let life_id = life_id.to_string_lossy();
+        let task_id = task_id.to_string_lossy();
+        match vita_agent::seed_recovery_fixture(
+            PathBuf::from(app_data_root),
+            PathBuf::from(workspace_root),
+            &life_id,
+            &task_id,
+        ) {
+            Ok(transaction_id) => {
+                println!("{transaction_id}");
+                return;
+            }
+            Err(error) => {
+                eprintln!("Vita recovery fixture seeding failed: {error}");
+                exit(1);
+            }
+        }
     }
 
     if probe.as_deref() == Some(OsStr::new("--serve-ipc")) && no_extra_arguments {

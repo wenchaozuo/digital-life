@@ -104,6 +104,21 @@ pub struct VitaSidecarPendingSummary {
     pub expires_at_unix_ms: u64,
 }
 
+/// Read-only restart evidence surfaced by Vita before any recovery action is
+/// selected.  The Host exposes only this bounded summary; target bytes and
+/// journal material remain inside Vita's retained namespace.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VitaSidecarRecoveryPendingSummary {
+    pub transaction_id: String,
+    pub life_id: String,
+    pub task_id: String,
+    pub capability_id: String,
+    pub relative_path: String,
+    pub current_sha256: String,
+    pub restore_sha256: String,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VitaSidecarStatusResponse {
@@ -115,6 +130,8 @@ pub struct VitaSidecarStatusResponse {
     pub current_life_id: Option<String>,
     pub session_id: Option<String>,
     pub pending: Option<VitaSidecarPendingSummary>,
+    pub recovery_pending: Vec<VitaSidecarRecoveryPendingSummary>,
+    pub recovery_result: Option<protocol::RecoveryResult>,
     pub active_turn_id: Option<String>,
     pub turn_phase: Option<protocol::TurnPhase>,
     pub assistant_text: Option<String>,
@@ -179,8 +196,8 @@ mod windows {
     use crate::execution_enclave::{CodexRuntimeError, VitaSidecarProcess};
     use protocol::{
         AuthorityEvaluate, AuthorityScopeReply, ConfirmationDecision, ConfirmationReply,
-        ConfirmationRequired, GrantIssued, GrantRevalidated, HostMessage, InitializeSession,
-        IssueGrant, ProcessBinding, ProcessGrant, RecoveryAuthorityEvaluate,
+        ConfirmationRequired, ExecuteRecovery, GrantIssued, GrantRevalidated, HostMessage,
+        InitializeSession, IssueGrant, ProcessBinding, ProcessGrant, RecoveryAuthorityEvaluate,
         RecoveryAuthorityReply, RecoveryConfirmationReply, RecoveryConfirmationRequired,
         RecoveryGrant, RecoveryGrantIssued, RecoveryGrantRevalidated, RecoveryIssueGrant,
         RecoveryRevalidateGrant, RevalidateGrant, VitaMessage, WorkspaceReadAuthorityEvaluate,
@@ -647,21 +664,6 @@ mod windows {
             .ok_or_else(|| "CAPABILITY_AUTHORIZATION_UNAVAILABLE".to_string())
     }
 
-    fn active_recovery_turn_matches(
-        authority: &HostTurnAuthority,
-        host_turn_id: &str,
-        binding: &protocol::RecoveryBinding,
-    ) -> bool {
-        matches!(
-            authority,
-            HostTurnAuthority::Active(active)
-                if active.turn_id == host_turn_id
-                    && active.binding.binding_hash == binding.provider_binding_hash
-                    && active.h7_codex_turn_id.as_deref()
-                        == Some(binding.codex_turn_id.as_str())
-        )
-    }
-
     fn validate_recovery_binding(
         session: &HostSessionState,
         binding: &protocol::RecoveryBinding,
@@ -674,28 +676,32 @@ mod windows {
             || binding.task_id != session.task_id
             || binding.capability_id != PRODUCTION_WORKSPACE_RECOVER_CAPABILITY_ID
             || binding.workspace_root_identity != session.workspace_identity
-            || binding.provider_binding_hash.len() != 64
-            || !binding
-                .provider_binding_hash
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
         {
             return Err("RECOVERY_BINDING_MISMATCH".to_string());
         }
         Ok(())
     }
 
-    fn current_recovery_revision(
-        storage: &StorageService,
-        registry: &CapabilityRegistry,
-        session: &HostSessionState,
+    fn recovery_action_matches(
+        action: &HostRecoveryAction,
         binding: &protocol::RecoveryBinding,
-    ) -> Result<i64, String> {
-        let authority_scope = storage
-            .capability_authorization_scope()
-            .map_err(capability_authorization_gate_error)?;
-        validate_recovery_binding(session, binding)?;
-        current_recovery_revision_in_scope(&authority_scope, registry, session, binding)
+    ) -> bool {
+        let pending = &action.pending;
+        action.recovery_action_id == binding.recovery_action_id
+            && action.recovery_generation == binding.recovery_generation
+            && action.transaction_id == binding.transaction_id
+            && pending.life_id == binding.life_id
+            && pending.task_id == binding.task_id
+            && pending.capability_id == binding.capability_id
+            && pending.workspace_root_identity == binding.workspace_root_identity
+            && pending.relative_path == binding.relative_path
+            && pending.target_identity == binding.target_identity
+            && pending.journal_integrity_hash == binding.journal_integrity_hash
+            && pending.current_sha256 == binding.current_sha256
+            && pending.current_bytes == binding.current_bytes
+            && pending.restore_sha256 == binding.restore_sha256
+            && pending.restore_bytes == binding.restore_bytes
+            && pending.original_replacement_sha256 == binding.original_replacement_sha256
     }
 
     fn current_recovery_revision_in_scope(
@@ -1265,6 +1271,7 @@ mod windows {
         workspace_replace_grants: Mutex<HashMap<String, WorkspaceReplaceGrantState>>,
         recovery_pending: Mutex<HashMap<String, RecoveryPendingAction>>,
         recovery_scan_pending: Mutex<HashMap<String, protocol::RecoveryPending>>,
+        recovery_actions: Mutex<HashMap<String, HostRecoveryAction>>,
         recovery_approvals: Mutex<HashMap<String, RecoveryApprovedAction>>,
         recovery_grants: Mutex<HashMap<String, RecoveryGrantState>>,
         replay: Mutex<RequestReplayWindow>,
@@ -1275,6 +1282,7 @@ mod windows {
         turn_phase: Mutex<Option<protocol::TurnPhase>>,
         assistant_text: Mutex<Option<String>>,
         turn_error: Mutex<Option<String>>,
+        recovery_result: Mutex<Option<protocol::RecoveryResult>>,
         #[cfg(test)]
         test_outbound: Mutex<Option<mpsc::Sender<HostMessage>>>,
     }
@@ -1322,13 +1330,35 @@ mod windows {
     struct RecoveryPendingAction {
         pending_id: String,
         request_id: String,
-        host_turn_id: String,
+        recovery_action_id: String,
+        recovery_generation: String,
         life_id: String,
         task_id: String,
         capability_id: String,
         workspace_summary: String,
         expires_at_unix_ms: u64,
         binding: protocol::RecoveryBinding,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum HostRecoveryActionPhase {
+        Requested,
+        AwaitingAuthority,
+        AwaitingConfirmation,
+        GrantIssued,
+        Revalidated,
+    }
+
+    /// Host-owned recovery action ledger.  This is deliberately separate from
+    /// the model-turn authority so restart recovery never depends on a
+    /// ProviderRequestIdentity or an active Codex turn.
+    #[derive(Clone)]
+    struct HostRecoveryAction {
+        recovery_action_id: String,
+        recovery_generation: String,
+        transaction_id: String,
+        pending: protocol::RecoveryPending,
+        phase: HostRecoveryActionPhase,
     }
 
     struct ApprovedAction {
@@ -1401,7 +1431,8 @@ mod windows {
 
     #[derive(Clone)]
     struct RecoveryApprovedAction {
-        host_turn_id: String,
+        recovery_action_id: String,
+        recovery_generation: String,
         binding: protocol::RecoveryBinding,
         authorization_revision: i64,
         confirmation_id: String,
@@ -1416,7 +1447,8 @@ mod windows {
 
     #[derive(Clone)]
     struct RecoveryGrantState {
-        host_turn_id: String,
+        recovery_action_id: String,
+        recovery_generation: String,
         grant: RecoveryGrant,
         phase: RecoveryGrantPhase,
     }
@@ -1425,7 +1457,6 @@ mod windows {
         Git(PendingAction),
         WorkspaceRead(WorkspaceReadPendingAction),
         WorkspaceReplace(WorkspaceReplacePendingAction),
-        Recovery(RecoveryPendingAction),
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1641,6 +1672,15 @@ mod windows {
             if !matches!(*authority, HostTurnAuthority::Idle) {
                 return Err("Vita turn is already active or cancelling".to_string());
             }
+            if self
+                .recovery_actions
+                .lock()
+                .map_err(|_| "Vita recovery action state lock was poisoned".to_string())?
+                .len()
+                != 0
+            {
+                return Err("Vita recovery action is active".to_string());
+            }
             *authority = HostTurnAuthority::Active(HostTurnActive {
                 turn_id: turn_id.clone(),
                 provider,
@@ -1666,15 +1706,6 @@ mod windows {
                 grants.clear();
             }
             if let Ok(mut pending) = self.workspace_replace_pending.lock() {
-                pending.clear();
-            }
-            if let Ok(mut approvals) = self.recovery_approvals.lock() {
-                approvals.clear();
-            }
-            if let Ok(mut grants) = self.recovery_grants.lock() {
-                grants.clear();
-            }
-            if let Ok(mut pending) = self.recovery_pending.lock() {
                 pending.clear();
             }
             if let Ok(mut active) = self.active_turn_id.lock() {
@@ -1953,18 +1984,6 @@ mod windows {
                 } else {
                     Vec::new()
                 };
-            let recovery_pending = if let Ok(mut pending) = self.recovery_pending.lock() {
-                let keys = pending
-                    .iter()
-                    .filter(|(_, value)| value.host_turn_id == turn_id)
-                    .map(|(key, _)| key.clone())
-                    .collect::<Vec<_>>();
-                keys.into_iter()
-                    .filter_map(|key| pending.remove(&key))
-                    .collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            };
             for value in &pending {
                 if let PendingCancellation::Git(value) = value {
                     self.expiry
@@ -1983,10 +2002,6 @@ mod windows {
                         &self.session_id,
                         value,
                     ));
-            }
-            for value in &recovery_pending {
-                self.expiry
-                    .clear(&ExpiryTicket::for_recovery_pending(&self.session_id, value));
             }
             if let Ok(mut approvals) = self.approvals.lock() {
                 approvals.retain(|_, approval| approval.host_turn_id != turn_id);
@@ -2012,12 +2027,6 @@ mod windows {
             if let Ok(mut grants) = self.workspace_replace_grants.lock() {
                 grants.retain(|_, grant| grant.host_turn_id != turn_id);
             }
-            if let Ok(mut approvals) = self.recovery_approvals.lock() {
-                approvals.retain(|_, approval| approval.host_turn_id != turn_id);
-            }
-            if let Ok(mut grants) = self.recovery_grants.lock() {
-                grants.retain(|_, grant| grant.host_turn_id != turn_id);
-            }
             pending
                 .into_iter()
                 .chain(
@@ -2029,11 +2038,6 @@ mod windows {
                     workspace_replace_pending
                         .into_iter()
                         .map(PendingCancellation::WorkspaceReplace),
-                )
-                .chain(
-                    recovery_pending
-                        .into_iter()
-                        .map(PendingCancellation::Recovery),
                 )
                 .collect()
         }
@@ -2059,14 +2063,6 @@ mod windows {
                     }
                     PendingCancellation::WorkspaceReplace(pending) => {
                         let _ = send_workspace_replace_confirmation_decision(
-                            self,
-                            &pending,
-                            ConfirmationDecision::Cancel,
-                            None,
-                        );
-                    }
-                    PendingCancellation::Recovery(pending) => {
-                        let _ = send_recovery_confirmation_decision(
                             self,
                             &pending,
                             ConfirmationDecision::Cancel,
@@ -2131,6 +2127,36 @@ mod windows {
                 workspace_summary: pending.workspace_summary,
                 expires_at_unix_ms: pending.expires_at_unix_ms,
             })
+        }
+
+        fn recovery_scan_summary(&self) -> Vec<VitaSidecarRecoveryPendingSummary> {
+            let mut values = self
+                .recovery_scan_pending
+                .lock()
+                .map(|pending| {
+                    pending
+                        .values()
+                        .map(|item| VitaSidecarRecoveryPendingSummary {
+                            transaction_id: item.transaction_id.clone(),
+                            life_id: item.life_id.clone(),
+                            task_id: item.task_id.clone(),
+                            capability_id: item.capability_id.clone(),
+                            relative_path: item.relative_path.clone(),
+                            current_sha256: item.current_sha256.clone(),
+                            restore_sha256: item.restore_sha256.clone(),
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            values.sort_by(|left, right| left.transaction_id.cmp(&right.transaction_id));
+            values
+        }
+
+        fn recovery_result(&self) -> Option<protocol::RecoveryResult> {
+            self.recovery_result
+                .lock()
+                .ok()
+                .and_then(|result| result.clone())
         }
 
         fn accept_request_id(&self, request_id: &str) -> bool {
@@ -2248,6 +2274,9 @@ mod windows {
             }
             if let Ok(mut grants) = self.recovery_grants.lock() {
                 grants.clear();
+            }
+            if let Ok(mut actions) = self.recovery_actions.lock() {
+                actions.clear();
             }
             if let Ok(mut replay) = self.replay.lock() {
                 replay.clear();
@@ -2588,6 +2617,7 @@ mod windows {
                 workspace_replace_grants: Mutex::new(HashMap::new()),
                 recovery_pending: Mutex::new(HashMap::new()),
                 recovery_scan_pending: Mutex::new(HashMap::new()),
+                recovery_actions: Mutex::new(HashMap::new()),
                 recovery_approvals: Mutex::new(HashMap::new()),
                 recovery_grants: Mutex::new(HashMap::new()),
                 replay: Mutex::new(RequestReplayWindow::default()),
@@ -2598,6 +2628,7 @@ mod windows {
                 turn_phase: Mutex::new(None),
                 assistant_text: Mutex::new(None),
                 turn_error: Mutex::new(None),
+                recovery_result: Mutex::new(None),
                 #[cfg(test)]
                 test_outbound: Mutex::new(None),
             });
@@ -2645,6 +2676,8 @@ mod windows {
                     current_life_id,
                     session_id: None,
                     pending: None,
+                    recovery_pending: Vec::new(),
+                    recovery_result: None,
                     active_turn_id: None,
                     turn_phase: None,
                     assistant_text: None,
@@ -2678,6 +2711,8 @@ mod windows {
                 current_life_id,
                 session_id: Some(running.session.session_id.clone()),
                 pending: running.session.pending_summary(),
+                recovery_pending: running.session.recovery_scan_summary(),
+                recovery_result: running.session.recovery_result(),
                 active_turn_id: running
                     .session
                     .active_turn_id
@@ -2711,6 +2746,100 @@ mod windows {
 
         fn deny(&self, pending_id: String) -> Result<VitaSidecarActionResponse, String> {
             self.decide_pending(pending_id, ConfirmationDecision::Deny)
+        }
+
+        fn recover(&self, transaction_id: String) -> Result<VitaSidecarActionResponse, String> {
+            if transaction_id.is_empty()
+                || transaction_id.len() > protocol::MAX_ID_BYTES
+                || transaction_id
+                    .chars()
+                    .any(|character| character.is_control() || character.is_whitespace())
+            {
+                return Err("Vita recovery transaction identity was malformed".to_string());
+            }
+            let guard = self
+                .inner
+                .lock()
+                .map_err(|_| "Vita sidecar coordinator lock was poisoned".to_string())?;
+            #[cfg(test)]
+            if let Some(session) = guard.test_session.as_ref() {
+                return self.execute_recovery_for_session(session, &transaction_id);
+            }
+            let running = guard
+                .running
+                .as_ref()
+                .ok_or_else(|| "Vita sidecar is not running".to_string())?;
+            self.execute_recovery_for_session(&running.session, &transaction_id)
+        }
+
+        fn execute_recovery_for_session(
+            &self,
+            session: &Arc<HostSessionState>,
+            transaction_id: &str,
+        ) -> Result<VitaSidecarActionResponse, String> {
+            if session.closed.load(Ordering::Acquire) {
+                return Err("Vita sidecar is not running".to_string());
+            }
+            let authority = session
+                .turn_authority
+                .lock()
+                .map_err(|_| "Vita turn authority lock was poisoned".to_string())?;
+            if !matches!(*authority, HostTurnAuthority::Idle) {
+                return Err("Vita recovery requires an idle Host turn".to_string());
+            }
+            if session
+                .recovery_actions
+                .lock()
+                .map_err(|_| "Vita recovery action state lock was poisoned".to_string())?
+                .len()
+                != 0
+            {
+                return Err("Vita recovery action is already active".to_string());
+            }
+            let pending = session
+                .recovery_scan_pending
+                .lock()
+                .map_err(|_| "Vita recovery scan state lock was poisoned".to_string())?
+                .remove(transaction_id)
+                .ok_or_else(|| "Vita recovery transaction was not pending".to_string())?;
+            let recovery_action_id = secure_id("vita-recovery-action")?;
+            let recovery_generation = secure_id("vita-recovery-generation")?;
+            let action = HostRecoveryAction {
+                recovery_action_id: recovery_action_id.clone(),
+                recovery_generation: recovery_generation.clone(),
+                transaction_id: transaction_id.to_string(),
+                pending,
+                phase: HostRecoveryActionPhase::Requested,
+            };
+            session
+                .recovery_actions
+                .lock()
+                .map_err(|_| "Vita recovery action state lock was poisoned".to_string())?
+                .insert(recovery_action_id.clone(), action);
+            if let Ok(mut actions) = session.recovery_actions.lock() {
+                if let Some(action) = actions.get_mut(&recovery_action_id) {
+                    action.phase = HostRecoveryActionPhase::AwaitingAuthority;
+                }
+            }
+            let command = HostMessage::ExecuteRecovery(ExecuteRecovery {
+                request_id: next_id("host-recovery-execute"),
+                session_id: session.session_id.clone(),
+                transaction_id: transaction_id.to_string(),
+                recovery_action_id: recovery_action_id.clone(),
+                recovery_generation,
+            });
+            if let Err(error) = session.send(&command) {
+                if let Ok(mut actions) = session.recovery_actions.lock() {
+                    if let Some(action) = actions.remove(&recovery_action_id) {
+                        if let Ok(mut pending) = session.recovery_scan_pending.lock() {
+                            pending.insert(action.transaction_id, action.pending);
+                        }
+                    }
+                }
+                return Err(error);
+            }
+            drop(authority);
+            Ok(VitaSidecarActionResponse { accepted: true })
         }
 
         fn decide_pending(
@@ -3024,25 +3153,28 @@ mod windows {
             pending: RecoveryPendingAction,
             decision: ConfirmationDecision,
         ) -> Result<VitaSidecarActionResponse, String> {
-            let authority = session
-                .turn_authority
+            let action_phase = session
+                .recovery_actions
                 .lock()
-                .map_err(|_| "Vita turn authority lock was poisoned".to_string())?;
-            let active = matches!(
-                &*authority,
-                HostTurnAuthority::Active(active) if active.turn_id == pending.host_turn_id
-                    && active.binding.binding_hash == pending.binding.provider_binding_hash
-                    && active.h7_codex_turn_id.as_deref()
-                        == Some(pending.binding.codex_turn_id.as_str())
-            );
-            if !active {
+                .map_err(|_| "Vita recovery action state lock was poisoned".to_string())?
+                .get(&pending.recovery_action_id)
+                .filter(|action| recovery_action_matches(action, &pending.binding))
+                .map(|action| action.phase);
+            if !matches!(
+                action_phase,
+                Some(
+                    HostRecoveryActionPhase::Requested
+                        | HostRecoveryActionPhase::AwaitingAuthority
+                        | HostRecoveryActionPhase::AwaitingConfirmation
+                )
+            ) {
                 let _ = send_recovery_confirmation_decision(
                     session,
                     &pending,
                     ConfirmationDecision::Cancel,
                     None,
                 );
-                return Err("Vita pending recovery belongs to a retired turn".to_string());
+                return Err("Vita pending recovery action was retired".to_string());
             }
             if pending.expires_at_unix_ms <= unix_millis() {
                 let _ = send_recovery_confirmation_decision(
@@ -3055,9 +3187,13 @@ mod windows {
             }
             let mut revision = None;
             if decision == ConfirmationDecision::Confirm {
-                require_current_session_life(&self.authority_storage, session)?;
-                revision = Some(current_recovery_revision(
-                    &self.authority_storage,
+                let authority_scope = self
+                    .authority_storage
+                    .capability_authorization_scope()
+                    .map_err(capability_authorization_gate_error)?;
+                require_current_session_life(authority_scope.storage(), session)?;
+                revision = Some(current_recovery_revision_in_scope(
+                    &authority_scope,
                     &self.registry,
                     session,
                     &pending.binding,
@@ -3068,9 +3204,10 @@ mod windows {
                     .lock()
                     .map_err(|_| "Vita recovery approval state lock was poisoned".to_string())?
                     .insert(
-                        recovery_approval_key(&pending.host_turn_id, &pending.binding),
+                        recovery_approval_key(&pending.recovery_action_id, &pending.binding),
                         RecoveryApprovedAction {
-                            host_turn_id: pending.host_turn_id.clone(),
+                            recovery_action_id: pending.recovery_action_id.clone(),
+                            recovery_generation: pending.recovery_generation.clone(),
                             binding: pending.binding.clone(),
                             authorization_revision: revision.unwrap_or_default(),
                             confirmation_id,
@@ -3084,14 +3221,13 @@ mod windows {
                 if decision == ConfirmationDecision::Confirm {
                     if let Ok(mut approvals) = session.recovery_approvals.lock() {
                         approvals.remove(&recovery_approval_key(
-                            &pending.host_turn_id,
+                            &pending.recovery_action_id,
                             &pending.binding,
                         ));
                     }
                 }
                 return Err(error);
             }
-            drop(authority);
             Ok(VitaSidecarActionResponse { accepted: true })
         }
 
@@ -3447,6 +3583,7 @@ mod windows {
                     handle_recovery_revalidate_grant(&session, &storage, &registry, request)
                 }
                 VitaMessage::RecoveryPending(request) => handle_recovery_pending(&session, request),
+                VitaMessage::RecoveryResult(result) => handle_recovery_result(&session, result),
                 VitaMessage::CredentialRequired(request) => {
                     handle_credential_required(&session, &storage, &secrets, request)
                 }
@@ -3494,6 +3631,47 @@ mod windows {
             .lock()
             .map_err(|_| "Vita recovery scan state lock was poisoned".to_string())?
             .insert(request.transaction_id.clone(), request);
+        Ok(())
+    }
+
+    fn handle_recovery_result(
+        session: &Arc<HostSessionState>,
+        result: protocol::RecoveryResult,
+    ) -> Result<(), String> {
+        result
+            .validate()
+            .map_err(|_| "Vita recovery result was malformed".to_string())?;
+        if result.session_id != session.session_id {
+            return Err("RECOVERY_RESULT_BINDING_MISMATCH".to_string());
+        }
+        let action = session
+            .recovery_actions
+            .lock()
+            .map_err(|_| "Vita recovery action state lock was poisoned".to_string())?
+            .remove(&result.recovery_action_id)
+            .ok_or_else(|| "RECOVERY_ACTION_NOT_FOUND".to_string())?;
+        if action.transaction_id != result.transaction_id
+            || action.recovery_generation != result.recovery_generation
+        {
+            return Err("RECOVERY_RESULT_BINDING_MISMATCH".to_string());
+        }
+        let terminal = result.marker_persisted
+            && matches!(
+                result.outcome,
+                protocol::RecoveryOutcome::Recovered | protocol::RecoveryOutcome::RecoveredNoOp
+            );
+        if !terminal {
+            session
+                .recovery_scan_pending
+                .lock()
+                .map_err(|_| "Vita recovery scan state lock was poisoned".to_string())?
+                .insert(action.transaction_id.clone(), action.pending);
+        }
+        *session
+            .recovery_result
+            .lock()
+            .map_err(|_| "Vita recovery result state lock was poisoned".to_string())? =
+            Some(result);
         Ok(())
     }
 
@@ -4945,9 +5123,21 @@ mod windows {
         ) {
             return Err("WORKSPACE_REPLACE_TURN_NOT_ACTIVE".to_string());
         }
-        require_current_session_life(storage, session)?;
-        let current_revision =
-            current_workspace_replace_revision(storage, registry, session, &request.binding)?;
+        // Keep the shared D30 authority scope held through the authoritative
+        // Issued -> Revalidated ledger transition.  Releasing it after the
+        // revision read would let a concurrent revoke (or generation
+        // retirement) commit before this grant transition and still allow the
+        // final mutation fence to pass.
+        let authority_scope = storage
+            .capability_authorization_scope()
+            .map_err(capability_authorization_gate_error)?;
+        require_current_session_life(authority_scope.storage(), session)?;
+        let current_revision = current_workspace_replace_revision_in_scope(
+            &authority_scope,
+            registry,
+            session,
+            &request.binding,
+        )?;
         if current_revision != request.authorization_revision {
             return Err("CAPABILITY_AUTHORIZATION_REVISION_MISMATCH".to_string());
         }
@@ -5028,9 +5218,20 @@ mod windows {
         ) {
             return Err("WORKSPACE_REPLACE_TURN_NOT_ACTIVE".to_string());
         }
-        require_current_session_life(storage, session)?;
-        let current_revision =
-            current_workspace_replace_revision(storage, registry, session, &request.binding)?;
+        // Keep the D30 authority scope held until the single-use grant ledger
+        // commits Issued -> Revalidated.  This is the final mutation fence:
+        // revoke, Life switch, and storage-generation retirement cannot commit
+        // between the revision read and this state transition.
+        let authority_scope = storage
+            .capability_authorization_scope()
+            .map_err(capability_authorization_gate_error)?;
+        require_current_session_life(authority_scope.storage(), session)?;
+        let current_revision = current_workspace_replace_revision_in_scope(
+            &authority_scope,
+            registry,
+            session,
+            &request.binding,
+        )?;
         let mut grants = session
             .workspace_replace_grants
             .lock()
@@ -5051,6 +5252,7 @@ mod windows {
         state.phase = WorkspaceReplaceGrantPhase::Revalidated;
         let result = state.grant.clone();
         drop(grants);
+        drop(authority_scope);
         drop(authority);
         Ok(result)
     }
@@ -5126,35 +5328,71 @@ mod windows {
             return Err("RECOVERY_BINDING_MISMATCH".to_string());
         }
         validate_recovery_binding(session, &request.binding)?;
-        let mut authority = session
-            .turn_authority
+        let mut actions = session
+            .recovery_actions
             .lock()
-            .map_err(|_| "Vita turn authority lock was poisoned".to_string())?;
-        if !active_recovery_turn_matches(&authority, &request.host_turn_id, &request.binding) {
+            .map_err(|_| "Vita recovery action state lock was poisoned".to_string())?;
+        let Some(action) = actions.get_mut(&request.recovery_action_id) else {
             return session.send(&HostMessage::RecoveryAuthorityReply(
                 RecoveryAuthorityReply {
                     request_id: request.request_id,
                     session_id: session.session_id.clone(),
                     allowed: false,
                     authorization_revision: None,
-                    error_code: Some("TURN_NOT_ACTIVE".to_string()),
+                    error_code: Some("RECOVERY_ACTION_NOT_FOUND".to_string()),
+                },
+            ));
+        };
+        if !recovery_action_matches(action, &request.binding)
+            || !matches!(
+                action.phase,
+                HostRecoveryActionPhase::Requested | HostRecoveryActionPhase::AwaitingAuthority
+            )
+        {
+            return session.send(&HostMessage::RecoveryAuthorityReply(
+                RecoveryAuthorityReply {
+                    request_id: request.request_id,
+                    session_id: session.session_id.clone(),
+                    allowed: false,
+                    authorization_revision: None,
+                    error_code: Some("RECOVERY_BINDING_MISMATCH".to_string()),
                 },
             ));
         }
-        let result = match storage.capability_authorization_scope() {
-            Ok(scope) => require_current_session_life(storage, session).and_then(|_| {
-                current_recovery_revision_in_scope(&scope, registry, session, &request.binding)
-            }),
-            Err(error) => Err(capability_authorization_gate_error(error)),
+        let authority_scope = match storage.capability_authorization_scope() {
+            Ok(scope) => scope,
+            Err(error) => {
+                return session.send(&HostMessage::RecoveryAuthorityReply(
+                    RecoveryAuthorityReply {
+                        request_id: request.request_id,
+                        session_id: session.session_id.clone(),
+                        allowed: false,
+                        authorization_revision: None,
+                        error_code: Some(error_code(&capability_authorization_gate_error(error))),
+                    },
+                ));
+            }
         };
+        let result =
+            require_current_session_life(authority_scope.storage(), session).and_then(|_| {
+                current_recovery_revision_in_scope(
+                    &authority_scope,
+                    registry,
+                    session,
+                    &request.binding,
+                )
+            });
         let response = match result {
-            Ok(revision) => RecoveryAuthorityReply {
-                request_id: request.request_id,
-                session_id: session.session_id.clone(),
-                allowed: true,
-                authorization_revision: Some(revision),
-                error_code: None,
-            },
+            Ok(revision) => {
+                action.phase = HostRecoveryActionPhase::AwaitingConfirmation;
+                RecoveryAuthorityReply {
+                    request_id: request.request_id,
+                    session_id: session.session_id.clone(),
+                    allowed: true,
+                    authorization_revision: Some(revision),
+                    error_code: None,
+                }
+            }
             Err(error) => RecoveryAuthorityReply {
                 request_id: request.request_id,
                 session_id: session.session_id.clone(),
@@ -5164,7 +5402,8 @@ mod windows {
             },
         };
         let send_result = session.send(&HostMessage::RecoveryAuthorityReply(response));
-        drop(authority);
+        drop(authority_scope);
+        drop(actions);
         send_result
     }
 
@@ -5194,11 +5433,16 @@ mod windows {
             return Ok(());
         };
         expire_pending(session);
-        let authority = session
-            .turn_authority
+        let action_matches = session
+            .recovery_actions
             .lock()
-            .map_err(|_| "Vita turn authority lock was poisoned".to_string())?;
-        if !active_recovery_turn_matches(&authority, &request.host_turn_id, &request.binding) {
+            .map_err(|_| "Vita recovery action state lock was poisoned".to_string())?
+            .get(&request.recovery_action_id)
+            .is_some_and(|action| {
+                recovery_action_matches(action, &request.binding)
+                    && action.phase == HostRecoveryActionPhase::AwaitingConfirmation
+            });
+        if !action_matches {
             let result = session.send(&HostMessage::RecoveryConfirmationReply(
                 RecoveryConfirmationReply {
                     request_id: request.request_id,
@@ -5207,15 +5451,15 @@ mod windows {
                     authorization_revision: None,
                 },
             ));
-            drop(authority);
             result?;
-            return Err("RECOVERY_TURN_NOT_ACTIVE".to_string());
+            return Err("RECOVERY_ACTION_NOT_ACTIVE".to_string());
         }
         let pending_id = format!("recovery-pending:{}", secure_id("vita")?);
         let pending_action = RecoveryPendingAction {
             pending_id: pending_id.clone(),
             request_id: request.request_id,
-            host_turn_id: request.host_turn_id,
+            recovery_action_id: request.recovery_action_id,
+            recovery_generation: request.binding.recovery_generation.clone(),
             life_id: request.binding.life_id.clone(),
             task_id: request.binding.task_id.clone(),
             capability_id: request.binding.capability_id.clone(),
@@ -5250,7 +5494,6 @@ mod windows {
         drop(replace_pending);
         drop(read_pending);
         drop(h7_pending);
-        drop(authority);
         session.expiry.schedule(ticket);
         Ok(())
     }
@@ -5265,20 +5508,34 @@ mod windows {
             .validate()
             .map_err(|_| "RECOVERY_ISSUE_INVALID".to_string())?;
         validate_recovery_binding(session, &request.binding)?;
-        let authority = session
-            .turn_authority
+        // Recovery uses the same D30 linearization fence as replacement.  The
+        // Host action ledger, current Life, D28 revision, approval consume,
+        // and grant insertion remain serialized as one authority decision.
+        let mut actions = session
+            .recovery_actions
             .lock()
-            .map_err(|_| "Vita turn authority lock was poisoned".to_string())?;
-        if !active_recovery_turn_matches(&authority, &request.host_turn_id, &request.binding) {
-            return Err("RECOVERY_TURN_NOT_ACTIVE".to_string());
-        }
-        require_current_session_life(storage, session)?;
-        let current_revision =
-            current_recovery_revision(storage, registry, session, &request.binding)?;
+            .map_err(|_| "Vita recovery action state lock was poisoned".to_string())?;
+        let action = actions
+            .get_mut(&request.recovery_action_id)
+            .filter(|action| {
+                recovery_action_matches(action, &request.binding)
+                    && action.phase == HostRecoveryActionPhase::AwaitingConfirmation
+            })
+            .ok_or_else(|| "RECOVERY_ACTION_NOT_ACTIVE".to_string())?;
+        let authority_scope = storage
+            .capability_authorization_scope()
+            .map_err(capability_authorization_gate_error)?;
+        require_current_session_life(authority_scope.storage(), session)?;
+        let current_revision = current_recovery_revision_in_scope(
+            &authority_scope,
+            registry,
+            session,
+            &request.binding,
+        )?;
         if current_revision != request.authorization_revision {
             return Err("CAPABILITY_AUTHORIZATION_REVISION_MISMATCH".to_string());
         }
-        let key = recovery_approval_key(&request.host_turn_id, &request.binding);
+        let key = recovery_approval_key(&request.recovery_action_id, &request.binding);
         let mut approvals = session
             .recovery_approvals
             .lock()
@@ -5286,7 +5543,8 @@ mod windows {
         let approval = approvals
             .remove(&key)
             .ok_or_else(|| "RECOVERY_CONFIRMATION_NOT_APPROVED".to_string())?;
-        if approval.host_turn_id != request.host_turn_id
+        if approval.recovery_action_id != request.recovery_action_id
+            || approval.recovery_generation != request.binding.recovery_generation
             || approval.binding != request.binding
             || approval.authorization_revision != request.authorization_revision
             || approval.expires_at_unix_ms <= unix_millis()
@@ -5325,12 +5583,17 @@ mod windows {
         grants.insert(
             grant.grant_id.clone(),
             RecoveryGrantState {
-                host_turn_id: request.host_turn_id.clone(),
+                recovery_action_id: request.recovery_action_id.clone(),
+                recovery_generation: request.binding.recovery_generation.clone(),
                 grant: grant.clone(),
                 phase: RecoveryGrantPhase::Issued,
             },
         );
-        drop(authority);
+        action.phase = HostRecoveryActionPhase::GrantIssued;
+        drop(grants);
+        drop(approvals);
+        drop(authority_scope);
+        drop(actions);
         Ok(grant)
     }
 
@@ -5344,16 +5607,30 @@ mod windows {
             .validate()
             .map_err(|_| "RECOVERY_REVALIDATION_INVALID".to_string())?;
         validate_recovery_binding(session, &request.binding)?;
-        let authority = session
-            .turn_authority
+        // Hold the D30 capability scope through the exact grant ledger commit.
+        // A revoke, Life switch, or storage-generation retirement that wins
+        // first therefore makes this fence fail before any mutation can run.
+        let mut actions = session
+            .recovery_actions
             .lock()
-            .map_err(|_| "Vita turn authority lock was poisoned".to_string())?;
-        if !active_recovery_turn_matches(&authority, &request.host_turn_id, &request.binding) {
-            return Err("RECOVERY_TURN_NOT_ACTIVE".to_string());
-        }
-        require_current_session_life(storage, session)?;
-        let current_revision =
-            current_recovery_revision(storage, registry, session, &request.binding)?;
+            .map_err(|_| "Vita recovery action state lock was poisoned".to_string())?;
+        let action = actions
+            .get_mut(&request.recovery_action_id)
+            .filter(|action| {
+                recovery_action_matches(action, &request.binding)
+                    && action.phase == HostRecoveryActionPhase::GrantIssued
+            })
+            .ok_or_else(|| "RECOVERY_ACTION_NOT_ACTIVE".to_string())?;
+        let authority_scope = storage
+            .capability_authorization_scope()
+            .map_err(capability_authorization_gate_error)?;
+        require_current_session_life(authority_scope.storage(), session)?;
+        let current_revision = current_recovery_revision_in_scope(
+            &authority_scope,
+            registry,
+            session,
+            &request.binding,
+        )?;
         let mut grants = session
             .recovery_grants
             .lock()
@@ -5361,20 +5638,25 @@ mod windows {
         let state = grants
             .get_mut(&request.grant.grant_id)
             .ok_or_else(|| "RECOVERY_GRANT_NOT_FOUND".to_string())?;
-        if state.host_turn_id != request.host_turn_id
+        if state.recovery_action_id != request.recovery_action_id
+            || state.recovery_generation != request.binding.recovery_generation
             || state.phase != RecoveryGrantPhase::Issued
             || state.grant != request.grant
             || state.grant.binding != request.binding
             || state.grant.authorization_revision != current_revision
+            || state.grant.used
+            || !state.grant.single_use
             || state.grant.expires_at_unix_ms <= unix_millis()
         {
             return Err("RECOVERY_GRANT_REVALIDATION_DENIED".to_string());
         }
         state.grant.used = true;
         state.phase = RecoveryGrantPhase::Revalidated;
+        action.phase = HostRecoveryActionPhase::Revalidated;
         let result = state.grant.clone();
         drop(grants);
-        drop(authority);
+        drop(authority_scope);
+        drop(actions);
         Ok(result)
     }
 
@@ -5518,10 +5800,13 @@ mod windows {
         )
     }
 
-    fn recovery_approval_key(host_turn_id: &str, binding: &protocol::RecoveryBinding) -> String {
+    fn recovery_approval_key(
+        recovery_action_id: &str,
+        binding: &protocol::RecoveryBinding,
+    ) -> String {
         format!(
-            "{host_turn_id}:{}:{}",
-            binding.transaction_id, binding.codex_turn_id
+            "{recovery_action_id}:{}:{}",
+            binding.recovery_generation, binding.transaction_id
         )
     }
 
@@ -5547,6 +5832,7 @@ mod windows {
             VitaMessage::RecoveryIssueGrant(message) => &message.request_id,
             VitaMessage::RecoveryRevalidateGrant(message) => &message.request_id,
             VitaMessage::RecoveryPending(message) => &message.request_id,
+            VitaMessage::RecoveryResult(message) => &message.request_id,
             VitaMessage::ActionCancelled(message) => &message.request_id,
             VitaMessage::CredentialRequired(message) => &message.request_id,
             VitaMessage::TurnState(message) => &message.request_id,
@@ -5785,6 +6071,13 @@ mod windows {
         coordinator.confirm(pending_id)
     }
 
+    pub fn recover_vita_sidecar(
+        coordinator: State<'_, VitaSidecarCoordinator>,
+        transaction_id: String,
+    ) -> Result<VitaSidecarActionResponse, String> {
+        coordinator.recover(transaction_id)
+    }
+
     pub fn deny_vita_sidecar(
         coordinator: State<'_, VitaSidecarCoordinator>,
         pending_id: String,
@@ -5829,6 +6122,7 @@ mod windows {
             ApprovalFloor, CapabilityDescriptor, RiskClass, ScopeRequirement,
         };
         use crate::storage::{LifeIdentityRecord, PersonaTemplateRecord};
+        use std::process::Command;
         use std::sync::{mpsc, Arc, Barrier};
         use std::thread;
 
@@ -5935,6 +6229,280 @@ mod windows {
             assert_eq!(transition.previous_revision, 1);
             assert_eq!(transition.revision, 2);
             (root, storage, registry, transition.revision)
+        }
+
+        fn workspace_replace_authority_fixture(
+            session: &HostSessionState,
+        ) -> (tempfile::TempDir, StorageService, CapabilityRegistry, i64) {
+            let root = tempfile::tempdir().expect("workspace replace authority fixture root");
+            let storage = StorageService::initialize_with_roots(root.path().to_path_buf(), None)
+                .expect("workspace replace authority fixture storage");
+            storage
+                .save_persona(PersonaTemplateRecord {
+                    id: "d31-c-replace-persona".to_string(),
+                    name: "D31-C replace fixture persona".to_string(),
+                    version: 1,
+                    persona_json: "{}".to_string(),
+                })
+                .expect("workspace replace fixture persona");
+            storage
+                .save_life(LifeIdentityRecord {
+                    id: session.life_id.clone(),
+                    name: "D31-C replace fixture life".to_string(),
+                    created_at: "2026-09-14T00:00:00.000Z".to_string(),
+                    version: 1,
+                    body_id: "d31-c-replace-body".to_string(),
+                    persona_id: "d31-c-replace-persona".to_string(),
+                    persona_version: 1,
+                })
+                .expect("workspace replace fixture life");
+            let registry = CapabilityRegistry::production().expect("production registry");
+            let capability_id = CapabilityId::try_from(PRODUCTION_WORKSPACE_REPLACE_CAPABILITY_ID)
+                .expect("workspace replace capability");
+            assert!(matches!(
+                storage
+                    .create_capability_authorization(LifeCapabilityAuthorizationCreateRequest {
+                        life_id: session.life_id.clone(),
+                        capability_id,
+                    })
+                    .expect("workspace replace authorization root"),
+                CapabilityAuthorizationCreateOutcome::Applied(_)
+            ));
+            let transition = apply_transition_for_test(
+                &storage,
+                &registry,
+                PRODUCTION_WORKSPACE_REPLACE_CAPABILITY_ID,
+                true,
+                1,
+                &session.life_id,
+            )
+            .expect("enable workspace replace authorization");
+            assert_eq!(transition.revision, 2);
+            (root, storage, registry, transition.revision)
+        }
+
+        fn workspace_replace_binding(
+            session: &Arc<HostSessionState>,
+            provider: &protocol::ProviderConfiguration,
+            host_turn_id: &str,
+        ) -> protocol::WorkspaceReplaceBinding {
+            let provider_binding =
+                protocol::ProviderBinding::derive(&session.session_id, host_turn_id, provider)
+                    .expect("workspace replace provider binding");
+            protocol::WorkspaceReplaceBinding {
+                session_id: session.session_id.clone(),
+                life_id: session.life_id.clone(),
+                task_id: session.task_id.clone(),
+                capability_id: PRODUCTION_WORKSPACE_REPLACE_CAPABILITY_ID.to_string(),
+                tool_name: PRODUCTION_WORKSPACE_REPLACE_TOOL_NAME.to_string(),
+                workspace_root_identity: session.workspace_identity.clone(),
+                relative_path: "notes/today.txt".to_string(),
+                target_identity: "workspace-replace-target".to_string(),
+                target_kind: protocol::WorkspaceReplaceTargetKind::File,
+                expected_sha256: "a".repeat(64),
+                replacement_sha256: "b".repeat(64),
+                replacement_bytes: 16,
+                tool_call_id: "workspace-replace-call".to_string(),
+                codex_turn_id: "workspace-replace-codex-turn".to_string(),
+                provider_binding_hash: provider_binding.binding_hash,
+            }
+        }
+
+        fn workspace_replace_issued_grant(
+            session: &Arc<HostSessionState>,
+            storage: &StorageService,
+            registry: &CapabilityRegistry,
+            provider: &protocol::ProviderConfiguration,
+            host_turn_id: &str,
+        ) -> (
+            protocol::WorkspaceReplaceBinding,
+            WorkspaceReplaceGrant,
+            i64,
+        ) {
+            let binding = workspace_replace_binding(session, provider, host_turn_id);
+            let provider_binding =
+                protocol::ProviderBinding::derive(&session.session_id, host_turn_id, provider)
+                    .expect("workspace replace provider binding");
+            session
+                .begin_turn(host_turn_id.to_string(), provider.clone(), provider_binding)
+                .expect("workspace replace Host turn");
+            if let Ok(mut authority) = session.turn_authority.lock() {
+                if let HostTurnAuthority::Active(active) = &mut *authority {
+                    active.h7_codex_turn_id = Some(binding.codex_turn_id.clone());
+                }
+            }
+            let revision = current_workspace_replace_revision(storage, registry, session, &binding)
+                .expect("workspace replace authorization revision");
+            session
+                .workspace_replace_approvals
+                .lock()
+                .expect("workspace replace approval lock")
+                .insert(
+                    workspace_replace_approval_key(host_turn_id, &binding),
+                    WorkspaceReplaceApprovedAction {
+                        host_turn_id: host_turn_id.to_string(),
+                        binding: binding.clone(),
+                        authorization_revision: revision,
+                        confirmation_id: "workspace-replace-confirmation".to_string(),
+                        expires_at_unix_ms: unix_millis().saturating_add(5_000),
+                    },
+                );
+            let issued = issue_workspace_replace_grant(
+                storage,
+                registry,
+                session,
+                &WorkspaceReplaceIssueGrant {
+                    request_id: "workspace-replace-issue".to_string(),
+                    session_id: session.session_id.clone(),
+                    host_turn_id: host_turn_id.to_string(),
+                    binding: binding.clone(),
+                    authorization_revision: revision,
+                },
+            )
+            .expect("workspace replace grant issue");
+            (binding, issued, revision)
+        }
+
+        fn recovery_authority_fixture(
+            session: &HostSessionState,
+        ) -> (tempfile::TempDir, StorageService, CapabilityRegistry, i64) {
+            let root = tempfile::tempdir().expect("recovery authority fixture root");
+            let storage = StorageService::initialize_with_roots(root.path().to_path_buf(), None)
+                .expect("recovery authority fixture storage");
+            storage
+                .save_persona(PersonaTemplateRecord {
+                    id: "d31-c-recovery-persona".to_string(),
+                    name: "D31-C recovery fixture persona".to_string(),
+                    version: 1,
+                    persona_json: "{}".to_string(),
+                })
+                .expect("recovery fixture persona");
+            storage
+                .save_life(LifeIdentityRecord {
+                    id: session.life_id.clone(),
+                    name: "D31-C recovery fixture life".to_string(),
+                    created_at: "2026-09-14T00:00:00.000Z".to_string(),
+                    version: 1,
+                    body_id: "d31-c-recovery-body".to_string(),
+                    persona_id: "d31-c-recovery-persona".to_string(),
+                    persona_version: 1,
+                })
+                .expect("recovery fixture life");
+            let registry = CapabilityRegistry::production().expect("production registry");
+            let capability_id = CapabilityId::try_from(PRODUCTION_WORKSPACE_RECOVER_CAPABILITY_ID)
+                .expect("recovery capability");
+            assert!(matches!(
+                storage
+                    .create_capability_authorization(LifeCapabilityAuthorizationCreateRequest {
+                        life_id: session.life_id.clone(),
+                        capability_id,
+                    })
+                    .expect("recovery authorization root"),
+                CapabilityAuthorizationCreateOutcome::Applied(_)
+            ));
+            let transition = apply_transition_for_test(
+                &storage,
+                &registry,
+                PRODUCTION_WORKSPACE_RECOVER_CAPABILITY_ID,
+                true,
+                1,
+                &session.life_id,
+            )
+            .expect("enable recovery authorization");
+            assert_eq!(transition.revision, 2);
+            (root, storage, registry, transition.revision)
+        }
+
+        fn recovery_issued_grant(
+            session: &Arc<HostSessionState>,
+            storage: &StorageService,
+            registry: &CapabilityRegistry,
+        ) -> (protocol::RecoveryBinding, RecoveryGrant, i64) {
+            let action_id = "recovery-race-action".to_string();
+            let generation = "recovery-race-generation".to_string();
+            let pending = protocol::RecoveryPending {
+                request_id: "recovery-race-pending".to_string(),
+                session_id: session.session_id.clone(),
+                transaction_id: "recovery-race-transaction".to_string(),
+                life_id: session.life_id.clone(),
+                task_id: session.task_id.clone(),
+                capability_id: PRODUCTION_WORKSPACE_RECOVER_CAPABILITY_ID.to_string(),
+                workspace_root_identity: session.workspace_identity.clone(),
+                relative_path: "notes/today.txt".to_string(),
+                target_identity: "recovery-race-target".to_string(),
+                journal_integrity_hash: "a".repeat(64),
+                current_sha256: "b".repeat(64),
+                current_bytes: 16,
+                restore_sha256: "c".repeat(64),
+                restore_bytes: 12,
+                original_replacement_sha256: "d".repeat(64),
+            };
+            let binding = protocol::RecoveryBinding {
+                session_id: session.session_id.clone(),
+                life_id: session.life_id.clone(),
+                task_id: session.task_id.clone(),
+                capability_id: PRODUCTION_WORKSPACE_RECOVER_CAPABILITY_ID.to_string(),
+                workspace_root_identity: session.workspace_identity.clone(),
+                relative_path: pending.relative_path.clone(),
+                target_identity: pending.target_identity.clone(),
+                transaction_id: pending.transaction_id.clone(),
+                journal_integrity_hash: pending.journal_integrity_hash.clone(),
+                current_sha256: pending.current_sha256.clone(),
+                current_bytes: pending.current_bytes,
+                restore_sha256: pending.restore_sha256.clone(),
+                restore_bytes: pending.restore_bytes,
+                original_replacement_sha256: pending.original_replacement_sha256.clone(),
+                recovery_action_id: action_id.clone(),
+                recovery_generation: generation.clone(),
+            };
+            binding.validate().expect("recovery race binding");
+            session
+                .recovery_actions
+                .lock()
+                .expect("recovery action lock")
+                .insert(
+                    action_id.clone(),
+                    HostRecoveryAction {
+                        recovery_action_id: action_id.clone(),
+                        recovery_generation: generation.clone(),
+                        transaction_id: pending.transaction_id.clone(),
+                        pending,
+                        phase: HostRecoveryActionPhase::GrantIssued,
+                    },
+                );
+            let authority_scope = storage
+                .capability_authorization_scope()
+                .expect("recovery race authority scope");
+            let revision =
+                current_recovery_revision_in_scope(&authority_scope, registry, session, &binding)
+                    .expect("recovery race revision");
+            drop(authority_scope);
+            let grant = RecoveryGrant {
+                session_id: session.session_id.clone(),
+                grant_id: "recovery-race-grant".to_string(),
+                confirmation_id: "recovery-race-confirmation".to_string(),
+                binding: binding.clone(),
+                authorization_revision: revision,
+                issued_at_unix_ms: unix_millis(),
+                expires_at_unix_ms: unix_millis().saturating_add(5_000),
+                single_use: true,
+                used: false,
+            };
+            grant.validate().expect("recovery race grant");
+            session
+                .recovery_grants
+                .lock()
+                .expect("recovery grant lock")
+                .insert(
+                    grant.grant_id.clone(),
+                    RecoveryGrantState {
+                        recovery_action_id: action_id,
+                        recovery_generation: generation,
+                        grant: grant.clone(),
+                        phase: RecoveryGrantPhase::Issued,
+                    },
+                );
+            (binding, grant, revision)
         }
 
         fn synthetic_workspace_read_descriptor() -> CapabilityDescriptor {
@@ -7571,6 +8139,588 @@ mod windows {
             drop(root);
         }
 
+        fn switch_current_life_for_test_with_persona(storage: &StorageService, persona_id: &str) {
+            storage
+                .save_life(LifeIdentityRecord {
+                    id: "d31-life-b".to_string(),
+                    name: "D31 second life".to_string(),
+                    created_at: "2026-09-14T00:00:00.000Z".to_string(),
+                    version: 1,
+                    body_id: "d31-b-body".to_string(),
+                    persona_id: persona_id.to_string(),
+                    persona_version: 1,
+                })
+                .expect("switch current Life");
+        }
+
+        fn run_replace_final_fence_ordering(ordering: &'static str) {
+            let provider = test_provider();
+            let (session, _receiver) = test_session_with_provider(provider.clone());
+            let (storage_root, primary_storage, registry, enabled_revision) =
+                workspace_replace_authority_fixture(&session);
+            let authority_storage = independently_initialized_storage(&primary_storage);
+            assert_independent_storage_gate_identities(&primary_storage, &authority_storage);
+            let primary_storage = Arc::new(primary_storage);
+            let authority_storage = Arc::new(authority_storage);
+            let host_turn_id = format!("d31-c-replace-{ordering}");
+            let (binding, issued, _) = workspace_replace_issued_grant(
+                &session,
+                &authority_storage,
+                &registry,
+                &provider,
+                &host_turn_id,
+            );
+            let request = protocol::WorkspaceReplaceRevalidateGrant {
+                request_id: format!("d31-c-replace-revalidate-{ordering}"),
+                session_id: session.session_id.clone(),
+                host_turn_id,
+                binding,
+                grant: issued.clone(),
+            };
+            let start = Arc::new(Barrier::new(2));
+            let result = match ordering {
+                "revoke-first" => {
+                    let (done_tx, done_rx) = mpsc::channel();
+                    let revoke_storage = Arc::clone(&primary_storage);
+                    let revoke_registry = registry.clone();
+                    let life_id = session.life_id.clone();
+                    let revoke_start = Arc::clone(&start);
+                    let revoke_thread = thread::spawn(move || {
+                        revoke_start.wait();
+                        let transition = apply_transition_for_test(
+                            &revoke_storage,
+                            &revoke_registry,
+                            PRODUCTION_WORKSPACE_REPLACE_CAPABILITY_ID,
+                            false,
+                            enabled_revision,
+                            &life_id,
+                        )
+                        .expect("replace revoke must commit first");
+                        done_tx
+                            .send(transition.revision)
+                            .expect("replace revalidation must observe revoke");
+                        transition.revision
+                    });
+                    let revalidate_storage = Arc::clone(&authority_storage);
+                    let revalidate_registry = registry.clone();
+                    let revalidate_session = Arc::clone(&session);
+                    let revalidate_request = request.clone();
+                    let revalidate_start = Arc::clone(&start);
+                    let revalidate_thread = thread::spawn(move || {
+                        revalidate_start.wait();
+                        assert_eq!(done_rx.recv().expect("replace revoke-first signal"), 3);
+                        revalidate_workspace_replace_grant(
+                            &revalidate_storage,
+                            &revalidate_registry,
+                            &revalidate_session,
+                            &revalidate_request,
+                        )
+                    });
+                    assert_eq!(revoke_thread.join().expect("replace revoke thread"), 3);
+                    revalidate_thread
+                        .join()
+                        .expect("replace revalidation thread")
+                }
+                "fence-first" => {
+                    let (done_tx, done_rx) = mpsc::channel();
+                    let revalidate_storage = Arc::clone(&authority_storage);
+                    let revalidate_registry = registry.clone();
+                    let revalidate_session = Arc::clone(&session);
+                    let revalidate_request = request.clone();
+                    let revalidate_start = Arc::clone(&start);
+                    let revalidate_thread = thread::spawn(move || {
+                        revalidate_start.wait();
+                        let result = revalidate_workspace_replace_grant(
+                            &revalidate_storage,
+                            &revalidate_registry,
+                            &revalidate_session,
+                            &revalidate_request,
+                        );
+                        done_tx
+                            .send(result.is_ok())
+                            .expect("replace revoke must observe fence commit");
+                        result
+                    });
+                    let revoke_storage = Arc::clone(&primary_storage);
+                    let revoke_registry = registry.clone();
+                    let life_id = session.life_id.clone();
+                    let revoke_start = Arc::clone(&start);
+                    let revoke_thread = thread::spawn(move || {
+                        revoke_start.wait();
+                        assert!(done_rx.recv().expect("replace fence-first signal"));
+                        apply_transition_for_test(
+                            &revoke_storage,
+                            &revoke_registry,
+                            PRODUCTION_WORKSPACE_REPLACE_CAPABILITY_ID,
+                            false,
+                            enabled_revision,
+                            &life_id,
+                        )
+                        .expect("replace revoke after fence")
+                        .revision
+                    });
+                    let revalidated = revalidate_thread
+                        .join()
+                        .expect("replace revalidation thread");
+                    assert!(revalidated.is_ok(), "replace final fence must commit first");
+                    assert_eq!(revoke_thread.join().expect("replace revoke thread"), 3);
+                    revalidated
+                }
+                "life-first" => {
+                    let (done_tx, done_rx) = mpsc::channel();
+                    let life_storage = Arc::clone(&primary_storage);
+                    let life_start = Arc::clone(&start);
+                    let persona_id = "d31-c-replace-persona".to_string();
+                    let life_thread = thread::spawn(move || {
+                        life_start.wait();
+                        switch_current_life_for_test_with_persona(&life_storage, &persona_id);
+                        done_tx
+                            .send(())
+                            .expect("replace revalidation must observe Life switch");
+                    });
+                    let revalidate_storage = Arc::clone(&authority_storage);
+                    let revalidate_registry = registry.clone();
+                    let revalidate_session = Arc::clone(&session);
+                    let revalidate_request = request.clone();
+                    let revalidate_start = Arc::clone(&start);
+                    let revalidate_thread = thread::spawn(move || {
+                        revalidate_start.wait();
+                        done_rx.recv().expect("replace Life-first signal");
+                        revalidate_workspace_replace_grant(
+                            &revalidate_storage,
+                            &revalidate_registry,
+                            &revalidate_session,
+                            &revalidate_request,
+                        )
+                    });
+                    life_thread.join().expect("replace Life thread");
+                    revalidate_thread
+                        .join()
+                        .expect("replace revalidation thread")
+                }
+                "migration-first" => {
+                    let (done_tx, done_rx) = mpsc::channel();
+                    let migration_storage = Arc::clone(&primary_storage);
+                    let migration_start = Arc::clone(&start);
+                    let target = storage_root.path().join("d31-c-replace-migrated");
+                    let migration_thread = thread::spawn(move || {
+                        migration_start.wait();
+                        let migration = migration_storage
+                            .migrate_location(target.to_str().expect("migration target"));
+                        assert!(migration.success, "{migration:?}");
+                        assert!(migration.restart_required);
+                        done_tx
+                            .send(())
+                            .expect("replace revalidation must observe migration");
+                    });
+                    let revalidate_storage = Arc::clone(&authority_storage);
+                    let revalidate_registry = registry.clone();
+                    let revalidate_session = Arc::clone(&session);
+                    let revalidate_request = request.clone();
+                    let revalidate_start = Arc::clone(&start);
+                    let revalidate_thread = thread::spawn(move || {
+                        revalidate_start.wait();
+                        done_rx.recv().expect("replace migration-first signal");
+                        revalidate_workspace_replace_grant(
+                            &revalidate_storage,
+                            &revalidate_registry,
+                            &revalidate_session,
+                            &revalidate_request,
+                        )
+                    });
+                    migration_thread.join().expect("replace migration thread");
+                    revalidate_thread
+                        .join()
+                        .expect("replace revalidation thread")
+                }
+                other => panic!("unknown replace final-fence ordering: {other}"),
+            };
+            match ordering {
+                "revoke-first" => {
+                    assert_eq!(result, Err("CAPABILITY_ROOT_DISABLED".to_string()));
+                    let permitted_mutation_count = session
+                        .workspace_replace_grants
+                        .lock()
+                        .expect("replace grant lock")
+                        .get(&issued.grant_id)
+                        .is_some_and(|state| state.phase == WorkspaceReplaceGrantPhase::Revalidated)
+                        as u8;
+                    assert_eq!(
+                        permitted_mutation_count, 0,
+                        "replace modifying syscall count"
+                    );
+                }
+                "life-first" => {
+                    assert_eq!(result, Err(LIFE_RESTART_REQUIRED.to_string()));
+                    let permitted_mutation_count = session
+                        .workspace_replace_grants
+                        .lock()
+                        .expect("replace grant lock")
+                        .get(&issued.grant_id)
+                        .is_some_and(|state| state.phase == WorkspaceReplaceGrantPhase::Revalidated)
+                        as u8;
+                    assert_eq!(
+                        permitted_mutation_count, 0,
+                        "replace modifying syscall count"
+                    );
+                }
+                "migration-first" => {
+                    assert_eq!(
+                        result,
+                        Err(CAPABILITY_AUTHORITY_RESTART_REQUIRED.to_string())
+                    );
+                    let permitted_mutation_count = session
+                        .workspace_replace_grants
+                        .lock()
+                        .expect("replace grant lock")
+                        .get(&issued.grant_id)
+                        .is_some_and(|state| state.phase == WorkspaceReplaceGrantPhase::Revalidated)
+                        as u8;
+                    assert_eq!(
+                        permitted_mutation_count, 0,
+                        "replace modifying syscall count"
+                    );
+                }
+                "fence-first" => {
+                    assert!(result.is_ok(), "replace final fence must commit first");
+                    assert_eq!(
+                        session
+                            .workspace_replace_grants
+                            .lock()
+                            .expect("replace grant lock")
+                            .get(&issued.grant_id)
+                            .map(|state| (state.phase, state.grant.used)),
+                        Some((WorkspaceReplaceGrantPhase::Revalidated, true))
+                    );
+                }
+                _ => unreachable!(),
+            }
+            if ordering != "fence-first" {
+                assert_eq!(
+                    session
+                        .workspace_replace_grants
+                        .lock()
+                        .expect("replace grant lock")
+                        .get(&issued.grant_id)
+                        .map(|state| (state.phase, state.grant.used)),
+                    Some((WorkspaceReplaceGrantPhase::Issued, false))
+                );
+            }
+            session.retire();
+            drop(storage_root);
+        }
+
+        #[test]
+        fn d31_c_replace_final_fence_linearization_matrix_has_zero_denied_mutation() {
+            for ordering in [
+                "revoke-first",
+                "fence-first",
+                "life-first",
+                "migration-first",
+            ] {
+                run_replace_final_fence_ordering(ordering);
+            }
+        }
+
+        fn run_recovery_final_fence_ordering(ordering: &'static str) {
+            let (session, _receiver) = test_session();
+            let (storage_root, primary_storage, registry, enabled_revision) =
+                recovery_authority_fixture(&session);
+            let authority_storage = independently_initialized_storage(&primary_storage);
+            assert_independent_storage_gate_identities(&primary_storage, &authority_storage);
+            let primary_storage = Arc::new(primary_storage);
+            let authority_storage = Arc::new(authority_storage);
+            let (binding, issued, _) =
+                recovery_issued_grant(&session, &authority_storage, &registry);
+            let request = protocol::RecoveryRevalidateGrant {
+                request_id: format!("d31-c-recovery-revalidate-{ordering}"),
+                session_id: session.session_id.clone(),
+                recovery_action_id: binding.recovery_action_id.clone(),
+                binding,
+                grant: issued.clone(),
+            };
+            let start = Arc::new(Barrier::new(2));
+            let result = match ordering {
+                "revoke-first" => {
+                    let (done_tx, done_rx) = mpsc::channel();
+                    let revoke_storage = Arc::clone(&primary_storage);
+                    let revoke_registry = registry.clone();
+                    let life_id = session.life_id.clone();
+                    let revoke_start = Arc::clone(&start);
+                    let revoke_thread = thread::spawn(move || {
+                        revoke_start.wait();
+                        let transition = apply_transition_for_test(
+                            &revoke_storage,
+                            &revoke_registry,
+                            PRODUCTION_WORKSPACE_RECOVER_CAPABILITY_ID,
+                            false,
+                            enabled_revision,
+                            &life_id,
+                        )
+                        .expect("recovery revoke must commit first");
+                        done_tx
+                            .send(transition.revision)
+                            .expect("recovery revalidation must observe revoke");
+                        transition.revision
+                    });
+                    let revalidate_storage = Arc::clone(&authority_storage);
+                    let revalidate_registry = registry.clone();
+                    let revalidate_session = Arc::clone(&session);
+                    let revalidate_request = request.clone();
+                    let revalidate_start = Arc::clone(&start);
+                    let revalidate_thread = thread::spawn(move || {
+                        revalidate_start.wait();
+                        assert_eq!(done_rx.recv().expect("recovery revoke-first signal"), 3);
+                        revalidate_recovery_grant(
+                            &revalidate_storage,
+                            &revalidate_registry,
+                            &revalidate_session,
+                            &revalidate_request,
+                        )
+                    });
+                    assert_eq!(revoke_thread.join().expect("recovery revoke thread"), 3);
+                    revalidate_thread
+                        .join()
+                        .expect("recovery revalidation thread")
+                }
+                "fence-first" => {
+                    let (done_tx, done_rx) = mpsc::channel();
+                    let revalidate_storage = Arc::clone(&authority_storage);
+                    let revalidate_registry = registry.clone();
+                    let revalidate_session = Arc::clone(&session);
+                    let revalidate_request = request.clone();
+                    let revalidate_start = Arc::clone(&start);
+                    let revalidate_thread = thread::spawn(move || {
+                        revalidate_start.wait();
+                        let result = revalidate_recovery_grant(
+                            &revalidate_storage,
+                            &revalidate_registry,
+                            &revalidate_session,
+                            &revalidate_request,
+                        );
+                        done_tx
+                            .send(result.is_ok())
+                            .expect("recovery revoke must observe fence commit");
+                        result
+                    });
+                    let revoke_storage = Arc::clone(&primary_storage);
+                    let revoke_registry = registry.clone();
+                    let life_id = session.life_id.clone();
+                    let revoke_start = Arc::clone(&start);
+                    let revoke_thread = thread::spawn(move || {
+                        revoke_start.wait();
+                        assert!(done_rx.recv().expect("recovery fence-first signal"));
+                        apply_transition_for_test(
+                            &revoke_storage,
+                            &revoke_registry,
+                            PRODUCTION_WORKSPACE_RECOVER_CAPABILITY_ID,
+                            false,
+                            enabled_revision,
+                            &life_id,
+                        )
+                        .expect("recovery revoke after fence")
+                        .revision
+                    });
+                    let revalidated = revalidate_thread
+                        .join()
+                        .expect("recovery revalidation thread");
+                    assert!(
+                        revalidated.is_ok(),
+                        "recovery final fence must commit first"
+                    );
+                    assert_eq!(revoke_thread.join().expect("recovery revoke thread"), 3);
+                    revalidated
+                }
+                "life-first" => {
+                    let (done_tx, done_rx) = mpsc::channel();
+                    let life_storage = Arc::clone(&primary_storage);
+                    let life_start = Arc::clone(&start);
+                    let persona_id = "d31-c-recovery-persona".to_string();
+                    let life_thread = thread::spawn(move || {
+                        life_start.wait();
+                        switch_current_life_for_test_with_persona(&life_storage, &persona_id);
+                        done_tx
+                            .send(())
+                            .expect("recovery revalidation must observe Life switch");
+                    });
+                    let revalidate_storage = Arc::clone(&authority_storage);
+                    let revalidate_registry = registry.clone();
+                    let revalidate_session = Arc::clone(&session);
+                    let revalidate_request = request.clone();
+                    let revalidate_start = Arc::clone(&start);
+                    let revalidate_thread = thread::spawn(move || {
+                        revalidate_start.wait();
+                        done_rx.recv().expect("recovery Life-first signal");
+                        revalidate_recovery_grant(
+                            &revalidate_storage,
+                            &revalidate_registry,
+                            &revalidate_session,
+                            &revalidate_request,
+                        )
+                    });
+                    life_thread.join().expect("recovery Life thread");
+                    revalidate_thread
+                        .join()
+                        .expect("recovery revalidation thread")
+                }
+                "migration-first" => {
+                    let (done_tx, done_rx) = mpsc::channel();
+                    let migration_storage = Arc::clone(&primary_storage);
+                    let migration_start = Arc::clone(&start);
+                    let target = storage_root.path().join("d31-c-recovery-migrated");
+                    let migration_thread = thread::spawn(move || {
+                        migration_start.wait();
+                        let migration = migration_storage
+                            .migrate_location(target.to_str().expect("migration target"));
+                        assert!(migration.success, "{migration:?}");
+                        assert!(migration.restart_required);
+                        done_tx
+                            .send(())
+                            .expect("recovery revalidation must observe migration");
+                    });
+                    let revalidate_storage = Arc::clone(&authority_storage);
+                    let revalidate_registry = registry.clone();
+                    let revalidate_session = Arc::clone(&session);
+                    let revalidate_request = request.clone();
+                    let revalidate_start = Arc::clone(&start);
+                    let revalidate_thread = thread::spawn(move || {
+                        revalidate_start.wait();
+                        done_rx.recv().expect("recovery migration-first signal");
+                        revalidate_recovery_grant(
+                            &revalidate_storage,
+                            &revalidate_registry,
+                            &revalidate_session,
+                            &revalidate_request,
+                        )
+                    });
+                    migration_thread.join().expect("recovery migration thread");
+                    revalidate_thread
+                        .join()
+                        .expect("recovery revalidation thread")
+                }
+                other => panic!("unknown recovery final-fence ordering: {other}"),
+            };
+            match ordering {
+                "revoke-first" => {
+                    assert_eq!(result, Err("CAPABILITY_ROOT_DISABLED".to_string()));
+                    let permitted_mutation_count = session
+                        .recovery_grants
+                        .lock()
+                        .expect("recovery grant lock")
+                        .get(&issued.grant_id)
+                        .is_some_and(|state| state.phase == RecoveryGrantPhase::Revalidated)
+                        as u8;
+                    assert_eq!(
+                        permitted_mutation_count, 0,
+                        "recovery modifying syscall count"
+                    );
+                }
+                "life-first" => {
+                    assert_eq!(result, Err(LIFE_RESTART_REQUIRED.to_string()));
+                    let permitted_mutation_count = session
+                        .recovery_grants
+                        .lock()
+                        .expect("recovery grant lock")
+                        .get(&issued.grant_id)
+                        .is_some_and(|state| state.phase == RecoveryGrantPhase::Revalidated)
+                        as u8;
+                    assert_eq!(
+                        permitted_mutation_count, 0,
+                        "recovery modifying syscall count"
+                    );
+                }
+                "migration-first" => {
+                    assert_eq!(
+                        result,
+                        Err(CAPABILITY_AUTHORITY_RESTART_REQUIRED.to_string())
+                    );
+                    let permitted_mutation_count = session
+                        .recovery_grants
+                        .lock()
+                        .expect("recovery grant lock")
+                        .get(&issued.grant_id)
+                        .is_some_and(|state| state.phase == RecoveryGrantPhase::Revalidated)
+                        as u8;
+                    assert_eq!(
+                        permitted_mutation_count, 0,
+                        "recovery modifying syscall count"
+                    );
+                }
+                "fence-first" => {
+                    assert!(result.is_ok(), "recovery final fence must commit first");
+                    assert_eq!(
+                        session
+                            .recovery_grants
+                            .lock()
+                            .expect("recovery grant lock")
+                            .get(&issued.grant_id)
+                            .map(|state| (state.phase, state.grant.used)),
+                        Some((RecoveryGrantPhase::Revalidated, true))
+                    );
+                }
+                _ => unreachable!(),
+            }
+            if ordering != "fence-first" {
+                assert_eq!(
+                    session
+                        .recovery_grants
+                        .lock()
+                        .expect("recovery grant lock")
+                        .get(&issued.grant_id)
+                        .map(|state| (state.phase, state.grant.used)),
+                    Some((RecoveryGrantPhase::Issued, false))
+                );
+            }
+            session.retire();
+            drop(storage_root);
+        }
+
+        #[test]
+        fn d31_c_recovery_final_fence_linearization_matrix_has_zero_denied_mutation() {
+            for ordering in [
+                "revoke-first",
+                "fence-first",
+                "life-first",
+                "migration-first",
+            ] {
+                run_recovery_final_fence_ordering(ordering);
+            }
+        }
+
+        #[test]
+        fn d31_c_recovery_grant_replay_is_denied_after_fence_commit() {
+            let (session, _receiver) = test_session();
+            let (root, storage, registry, _) = recovery_authority_fixture(&session);
+            let storage = Arc::new(storage);
+            let (binding, issued, _) = recovery_issued_grant(&session, &storage, &registry);
+            let request = protocol::RecoveryRevalidateGrant {
+                request_id: "d31-c-recovery-replay-first".to_string(),
+                session_id: session.session_id.clone(),
+                recovery_action_id: binding.recovery_action_id.clone(),
+                binding: binding.clone(),
+                grant: issued.clone(),
+            };
+            let first = revalidate_recovery_grant(&storage, &registry, &session, &request)
+                .expect("first recovery final fence");
+            assert!(first.used);
+            let replay = revalidate_recovery_grant(&storage, &registry, &session, &request)
+                .expect_err("recovery grant replay must be denied");
+            assert_eq!(replay, "RECOVERY_ACTION_NOT_ACTIVE");
+            let permitted_mutation_count = session
+                .recovery_grants
+                .lock()
+                .expect("recovery grant lock")
+                .get(&issued.grant_id)
+                .is_some_and(|state| state.phase == RecoveryGrantPhase::Revalidated)
+                as u8;
+            assert_eq!(
+                permitted_mutation_count, 1,
+                "first recovery mutation admission"
+            );
+            session.retire();
+            drop(root);
+        }
+
         #[test]
         fn d31_cancel_first_denies_and_cannot_erase_committed_release() {
             let provider = test_provider();
@@ -8536,6 +9686,7 @@ mod windows {
                 workspace_replace_grants: Mutex::new(HashMap::new()),
                 recovery_pending: Mutex::new(HashMap::new()),
                 recovery_scan_pending: Mutex::new(HashMap::new()),
+                recovery_actions: Mutex::new(HashMap::new()),
                 recovery_approvals: Mutex::new(HashMap::new()),
                 recovery_grants: Mutex::new(HashMap::new()),
                 replay: Mutex::new(RequestReplayWindow::default()),
@@ -8546,6 +9697,7 @@ mod windows {
                 turn_phase: Mutex::new(None),
                 assistant_text: Mutex::new(None),
                 turn_error: Mutex::new(None),
+                recovery_result: Mutex::new(None),
                 test_outbound: Mutex::new(Some(sender)),
             });
             (session, receiver)
@@ -8847,6 +9999,7 @@ mod windows {
                 "start_vita_turn",
                 "cancel_vita_turn",
                 "confirm_vita_sidecar",
+                "recover_vita_sidecar",
                 "deny_vita_sidecar",
                 "stop_vita_sidecar",
             ] {
@@ -10220,6 +11373,7 @@ mod windows {
                 workspace_replace_grants: Mutex::new(HashMap::new()),
                 recovery_pending: Mutex::new(HashMap::new()),
                 recovery_scan_pending: Mutex::new(HashMap::new()),
+                recovery_actions: Mutex::new(HashMap::new()),
                 recovery_approvals: Mutex::new(HashMap::new()),
                 recovery_grants: Mutex::new(HashMap::new()),
                 replay: Mutex::new(RequestReplayWindow::default()),
@@ -10230,6 +11384,7 @@ mod windows {
                 turn_phase: Mutex::new(None),
                 assistant_text: Mutex::new(None),
                 turn_error: Mutex::new(None),
+                recovery_result: Mutex::new(None),
                 test_outbound: Mutex::new(None),
             });
             session
@@ -10395,6 +11550,402 @@ mod windows {
             ));
             session.retire();
             process.shutdown().expect("D31-C canary process shutdown");
+        }
+
+        #[test]
+        fn d31_c_real_process_recovery_canary() {
+            run_d31_c_real_process_recovery_canary(false, d31_c_require_real_canary());
+        }
+
+        #[test]
+        fn d31_c_real_process_recovery_revocation_canary() {
+            if !d31_c_require_real_canary() {
+                eprintln!(
+                    "skipping D31-C recovery revocation canary; set D31_C_REQUIRE_REAL_CANARY=1 for the freeze gate"
+                );
+                return;
+            }
+            run_d31_c_real_process_recovery_canary(true, true);
+        }
+
+        fn run_d31_c_real_process_recovery_canary(
+            revoke_before_revalidation: bool,
+            require_real_canary: bool,
+        ) {
+            const RECOVERY_ORIGINAL: &[u8] = b"D31-C recovery original content\n";
+            const RECOVERY_REPLACEMENT: &[u8] = b"D31-C recovery replacement content\n";
+            let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../vita-agent/target/release/vita-agent.exe");
+            if !executable.is_file() {
+                if require_real_canary {
+                    panic!(
+                        "D31-C recovery process freeze canary requires the release image: {}",
+                        executable.display()
+                    );
+                }
+                eprintln!(
+                    "skipping D31-C recovery process canary; release image is absent: {}",
+                    executable.display()
+                );
+                return;
+            }
+            let git_path = match resolve_git_path() {
+                Ok(path) => path,
+                Err(error) => {
+                    if require_real_canary {
+                        panic!("D31-C recovery canary requires trusted Git: {error}");
+                    }
+                    eprintln!("skipping D31-C recovery canary: {error}");
+                    return;
+                }
+            };
+            let workspace = tempfile::tempdir().expect("D31-C recovery canary workspace");
+            let git_metadata = workspace.path().join(".git");
+            fs::create_dir(&git_metadata).expect("D31-C recovery Git metadata directory");
+            fs::write(
+                git_metadata.join("config"),
+                b"[core]\n\trepositoryformatversion = 0\n\tbare = false\n",
+            )
+            .expect("D31-C recovery Git config");
+            let target = workspace.path().join("recovery-canary.txt");
+            fs::write(&target, RECOVERY_ORIGINAL).expect("D31-C recovery target");
+            let app_data = tempfile::tempdir().expect("D31-C recovery app-data");
+            let session_id = "d31-c-recovery-process-session".to_string();
+            let life_id = "d31-c-recovery-process-life".to_string();
+            let task_id = "d31-c-recovery-process-task".to_string();
+            let seed = Command::new(&executable)
+                .args([
+                    "--seed-recovery-fixture",
+                    app_data.path().to_str().expect("recovery app-data path"),
+                    workspace.path().to_str().expect("recovery workspace path"),
+                    &life_id,
+                    &task_id,
+                ])
+                .output()
+                .expect("spawn recovery fixture seeder");
+            if !seed.status.success() {
+                panic!(
+                    "D31-C recovery fixture seeder failed: status={:?}, stderr={}",
+                    seed.status,
+                    String::from_utf8_lossy(&seed.stderr)
+                );
+            }
+            let transaction_id = String::from_utf8(seed.stdout)
+                .expect("recovery fixture transaction id utf8")
+                .trim()
+                .to_string();
+            assert!(
+                !transaction_id.is_empty(),
+                "recovery fixture transaction id"
+            );
+
+            let process_root = tempfile::tempdir().expect("D31-C recovery process root");
+            let canary_resource = tempfile::tempdir().expect("D31-C recovery resource root");
+            let canary_executable = canary_resource.path().join(SIDECAR_RESOURCE_NAME);
+            fs::copy(&executable, &canary_executable).expect("copy D31-C recovery sidecar image");
+            let image =
+                VitaSidecarProcess::prepare_image(&canary_executable, canary_resource.path())
+                    .expect("prepared D31-C recovery sidecar image");
+            let mut process = VitaSidecarProcess::spawn_prepared(
+                image,
+                &[OsString::from("--serve-ipc")],
+                process_root.path(),
+            )
+            .expect("D31-C recovery production sidecar process");
+            let stdout = process
+                .take_stdout()
+                .expect("D31-C recovery sidecar stdout");
+            let stdin = process.take_stdin().expect("D31-C recovery sidecar stdin");
+            let mut stderr = process
+                .take_stderr()
+                .expect("D31-C recovery sidecar stderr");
+            let (message, reader) = receive_vita_message_with_timeout(
+                BufReader::new(stdout),
+                HANDSHAKE_TIMEOUT,
+                "D31-C recovery handshake",
+            )
+            .expect("D31-C recovery handshake");
+            let handshake = match message {
+                VitaMessage::Handshake(value) => value,
+                other => panic!("unexpected D31-C recovery first frame: {other:?}"),
+            };
+            validate_handshake(&handshake).expect("D31-C recovery pinned handshake");
+            let workspace_for_sidecar =
+                normalize_sidecar_local_path(workspace.path()).expect("recovery workspace path");
+            let app_data_for_sidecar =
+                normalize_sidecar_local_path(app_data.path()).expect("recovery app-data path");
+            let git_for_sidecar =
+                normalize_sidecar_local_path(&git_path).expect("recovery Git path");
+            let mut writer = BufWriter::new(stdin);
+            protocol::write_frame(
+                &mut writer,
+                &HostMessage::Initialize(InitializeSession {
+                    request_id: "d31-c-recovery-initialize".to_string(),
+                    protocol_version: PROTOCOL_VERSION.to_string(),
+                    session_id: session_id.clone(),
+                    life_id: life_id.clone(),
+                    task_id: task_id.clone(),
+                    app_data_root: app_data_for_sidecar.to_string_lossy().into_owned(),
+                    workspace_path: workspace_for_sidecar.to_string_lossy().into_owned(),
+                    git_path: git_for_sidecar.to_string_lossy().into_owned(),
+                    provider: None,
+                }),
+            )
+            .expect("D31-C recovery initialize");
+            let (message, mut reader) =
+                receive_vita_message_with_timeout(reader, READY_TIMEOUT, "D31-C recovery ready")
+                    .unwrap_or_else(|error| {
+                        let _ = process.shutdown();
+                        let mut diagnostics = String::new();
+                        let _ = std::io::Read::read_to_string(&mut stderr, &mut diagnostics);
+                        panic!(
+                            "D31-C recovery ready failed: {error}; sidecar stderr: {diagnostics}"
+                        );
+                    });
+            let ready = match message {
+                VitaMessage::Ready(value) => value,
+                other => panic!("unexpected D31-C recovery ready frame: {other:?}"),
+            };
+            let start_request = VitaSidecarStartRequest {
+                life_id: life_id.clone(),
+                task_id: task_id.clone(),
+                workspace_path: workspace_for_sidecar.to_string_lossy().into_owned(),
+            };
+            validate_ready(&ready, &session_id, &start_request, &life_id)
+                .expect("D31-C recovery ready identity");
+            let (message, next_reader) =
+                receive_vita_message_with_timeout(reader, READY_TIMEOUT, "D31-C recovery pending")
+                    .expect("D31-C production RecoveryPending");
+            reader = next_reader;
+            let recovery_pending = match message {
+                VitaMessage::RecoveryPending(value) => value,
+                other => panic!("unexpected D31-C recovery pending frame: {other:?}"),
+            };
+            recovery_pending
+                .validate()
+                .expect("D31-C production RecoveryPending validation");
+            assert_eq!(recovery_pending.session_id, session_id);
+            assert_eq!(recovery_pending.life_id, life_id);
+            assert_eq!(recovery_pending.task_id, task_id);
+            assert_eq!(recovery_pending.transaction_id, transaction_id);
+            assert_eq!(recovery_pending.relative_path, "recovery-canary.txt");
+            assert_eq!(
+                recovery_pending.current_sha256,
+                format!("{:x}", Sha256::digest(RECOVERY_REPLACEMENT))
+            );
+            assert_eq!(
+                recovery_pending.restore_sha256,
+                format!("{:x}", Sha256::digest(RECOVERY_ORIGINAL))
+            );
+
+            let authority_root = tempfile::tempdir().expect("D31-C recovery authority root");
+            let storage = Arc::new(
+                StorageService::initialize_with_roots(authority_root.path().to_path_buf(), None)
+                    .expect("D31-C recovery authority storage"),
+            );
+            storage
+                .save_persona(PersonaTemplateRecord {
+                    id: "d31-c-recovery-process-persona".to_string(),
+                    name: "D31-C recovery process persona".to_string(),
+                    version: 1,
+                    persona_json: "{}".to_string(),
+                })
+                .expect("D31-C recovery process persona");
+            storage
+                .save_life(LifeIdentityRecord {
+                    id: life_id.clone(),
+                    name: "D31-C recovery process life".to_string(),
+                    created_at: "2026-09-14T00:00:00.000Z".to_string(),
+                    version: 1,
+                    body_id: "d31-c-recovery-process-body".to_string(),
+                    persona_id: "d31-c-recovery-process-persona".to_string(),
+                    persona_version: 1,
+                })
+                .expect("D31-C recovery process life");
+            let registry = CapabilityRegistry::production().expect("D31-C recovery registry");
+            let capability_id = CapabilityId::try_from(PRODUCTION_WORKSPACE_RECOVER_CAPABILITY_ID)
+                .expect("D31-C recovery capability");
+            assert!(matches!(
+                storage
+                    .create_capability_authorization(LifeCapabilityAuthorizationCreateRequest {
+                        life_id: life_id.clone(),
+                        capability_id,
+                    })
+                    .expect("D31-C recovery authorization root"),
+                CapabilityAuthorizationCreateOutcome::Applied(_)
+            ));
+            let enabled_revision = apply_transition_for_test(
+                &storage,
+                &registry,
+                PRODUCTION_WORKSPACE_RECOVER_CAPABILITY_ID,
+                true,
+                1,
+                &life_id,
+            )
+            .expect("D31-C recovery capability enable");
+            assert_eq!(enabled_revision.revision, 2);
+            let session = Arc::new(HostSessionState {
+                session_id: session_id.clone(),
+                life_id: life_id.clone(),
+                task_id: task_id.clone(),
+                workspace_identity: ready.workspace_identity,
+                provider: None,
+                writer: Mutex::new(Some(writer)),
+                pending: Mutex::new(HashMap::new()),
+                workspace_read_pending: Mutex::new(HashMap::new()),
+                workspace_replace_pending: Mutex::new(HashMap::new()),
+                approvals: Mutex::new(HashMap::new()),
+                grants: Mutex::new(HashMap::new()),
+                workspace_read_approvals: Mutex::new(HashMap::new()),
+                workspace_read_grants: Mutex::new(HashMap::new()),
+                workspace_replace_approvals: Mutex::new(HashMap::new()),
+                workspace_replace_grants: Mutex::new(HashMap::new()),
+                recovery_pending: Mutex::new(HashMap::new()),
+                recovery_scan_pending: Mutex::new(HashMap::new()),
+                recovery_actions: Mutex::new(HashMap::new()),
+                recovery_approvals: Mutex::new(HashMap::new()),
+                recovery_grants: Mutex::new(HashMap::new()),
+                replay: Mutex::new(RequestReplayWindow::default()),
+                expiry: Arc::new(ExpiryOwner::new()),
+                closed: AtomicBool::new(false),
+                turn_authority: Mutex::new(HostTurnAuthority::Idle),
+                active_turn_id: Mutex::new(None),
+                turn_phase: Mutex::new(None),
+                assistant_text: Mutex::new(None),
+                turn_error: Mutex::new(None),
+                recovery_result: Mutex::new(None),
+                test_outbound: Mutex::new(None),
+            });
+            handle_recovery_pending(&session, recovery_pending.clone())
+                .expect("Host stores production RecoveryPending");
+            assert_eq!(
+                session.recovery_scan_summary().len(),
+                1,
+                "Host must retain the restart recovery summary"
+            );
+            let coordinator = VitaSidecarCoordinator::new(Arc::clone(&storage), registry.clone());
+            coordinator.install_test_session(Arc::clone(&session));
+            coordinator
+                .recover(transaction_id.clone())
+                .expect("Host sends typed ExecuteRecovery");
+
+            let mut authority_seen = false;
+            let mut confirmation_seen = false;
+            let mut grant_issue_seen = false;
+            let mut revalidation_seen = false;
+            let mut result_seen = false;
+            let mut recovery_result = None;
+            for _ in 0..16 {
+                let (message, next_reader) = receive_vita_message_with_timeout(
+                    reader,
+                    READY_TIMEOUT,
+                    "D31-C recovery protocol frame",
+                )
+                .unwrap_or_else(|error| {
+                    let _ = process.shutdown();
+                    let mut diagnostics = String::new();
+                    let _ = std::io::Read::read_to_string(&mut stderr, &mut diagnostics);
+                    panic!("D31-C recovery frame failed: {error}; sidecar stderr: {diagnostics}");
+                });
+                reader = next_reader;
+                match message {
+                    VitaMessage::RecoveryAuthorityEvaluate(request) => {
+                        authority_seen = true;
+                        handle_recovery_authority_evaluate(&session, &storage, &registry, request)
+                            .expect("D31-C recovery authority evaluation");
+                    }
+                    VitaMessage::RecoveryConfirmationRequired(request) => {
+                        confirmation_seen = true;
+                        handle_recovery_confirmation_required(&session, request)
+                            .expect("D31-C recovery confirmation request");
+                        let pending_id = session
+                            .pending_summary()
+                            .expect("D31-C recovery pending confirmation")
+                            .pending_id;
+                        coordinator
+                            .confirm(pending_id)
+                            .expect("D31-C explicit recovery confirmation");
+                    }
+                    VitaMessage::RecoveryIssueGrant(request) => {
+                        grant_issue_seen = true;
+                        handle_recovery_issue_grant(&session, &storage, &registry, request)
+                            .expect("D31-C recovery Host grant issue");
+                    }
+                    VitaMessage::RecoveryRevalidateGrant(request) => {
+                        revalidation_seen = true;
+                        if revoke_before_revalidation {
+                            let revoked = apply_transition_for_test(
+                                &storage,
+                                &registry,
+                                PRODUCTION_WORKSPACE_RECOVER_CAPABILITY_ID,
+                                false,
+                                enabled_revision.revision,
+                                &life_id,
+                            )
+                            .expect("D31-C recovery negative revocation");
+                            assert_eq!(revoked.revision, 3);
+                        }
+                        handle_recovery_revalidate_grant(&session, &storage, &registry, request)
+                            .expect("D31-C recovery Host revalidation reply");
+                    }
+                    VitaMessage::RecoveryResult(result) => {
+                        result_seen = true;
+                        recovery_result = Some(result.clone());
+                        handle_recovery_result(&session, result).expect("Host recovery result");
+                        break;
+                    }
+                    other => panic!("unexpected D31-C recovery protocol frame: {other:?}"),
+                }
+            }
+            assert!(authority_seen, "D31-C recovery missed authority evaluation");
+            assert!(
+                confirmation_seen,
+                "D31-C recovery missed explicit confirmation"
+            );
+            assert!(grant_issue_seen, "D31-C recovery missed Host grant issue");
+            assert!(revalidation_seen, "D31-C recovery missed Host revalidation");
+            assert!(result_seen, "D31-C recovery missed terminal RecoveryResult");
+            let result = recovery_result.expect("D31-C recovery result");
+            result.validate().expect("D31-C recovery result validation");
+            assert_eq!(result.transaction_id, transaction_id);
+            if revoke_before_revalidation {
+                assert_eq!(result.outcome, protocol::RecoveryOutcome::Denied);
+                assert_eq!(result.mutation_count, 0);
+                assert!(!result.marker_persisted);
+                assert_eq!(
+                    fs::read(&target).expect("D31-C recovery negative target"),
+                    RECOVERY_REPLACEMENT
+                );
+                assert_eq!(session.recovery_scan_summary().len(), 1);
+            } else {
+                assert_eq!(result.outcome, protocol::RecoveryOutcome::Recovered);
+                assert_eq!(result.mutation_count, 1);
+                assert!(result.marker_persisted);
+                assert_eq!(
+                    fs::read(&target).expect("D31-C recovery restored target"),
+                    RECOVERY_ORIGINAL
+                );
+                assert!(session.recovery_scan_summary().is_empty());
+            }
+            session
+                .send(&HostMessage::Shutdown(protocol::Shutdown {
+                    request_id: "d31-c-recovery-shutdown".to_string(),
+                    session_id: session_id.clone(),
+                }))
+                .expect("D31-C recovery shutdown");
+            let (message, _reader) = receive_vita_message_with_timeout(
+                reader,
+                READY_TIMEOUT,
+                "D31-C recovery shutdown ack",
+            )
+            .expect("D31-C recovery shutdown ack");
+            assert!(matches!(
+                message,
+                VitaMessage::ShutdownAck(protocol::ShutdownAck { session_id: ack_session, .. })
+                    if ack_session == session_id
+            ));
+            session.retire();
+            process.shutdown().expect("D31-C recovery process shutdown");
         }
 
         #[test]
@@ -10646,6 +12197,7 @@ mod windows {
                 workspace_replace_grants: Mutex::new(HashMap::new()),
                 recovery_pending: Mutex::new(HashMap::new()),
                 recovery_scan_pending: Mutex::new(HashMap::new()),
+                recovery_actions: Mutex::new(HashMap::new()),
                 recovery_approvals: Mutex::new(HashMap::new()),
                 recovery_grants: Mutex::new(HashMap::new()),
                 replay: Mutex::new(RequestReplayWindow::default()),
@@ -10656,6 +12208,7 @@ mod windows {
                 turn_phase: Mutex::new(None),
                 assistant_text: Mutex::new(None),
                 turn_error: Mutex::new(None),
+                recovery_result: Mutex::new(None),
                 test_outbound: Mutex::new(None),
             });
             session
@@ -10869,6 +12422,8 @@ mod non_windows {
             current_life_id: None,
             session_id: None,
             pending: None,
+            recovery_pending: Vec::new(),
+            recovery_result: None,
             active_turn_id: None,
             turn_phase: None,
             assistant_text: None,
@@ -10879,6 +12434,13 @@ mod non_windows {
     pub(super) fn confirm_vita_sidecar(
         _coordinator: State<'_, VitaSidecarCoordinator>,
         _pending_id: String,
+    ) -> Result<VitaSidecarActionResponse, String> {
+        Err("Vita sidecar production boundary is Windows-only".to_string())
+    }
+
+    pub(super) fn recover_vita_sidecar(
+        _coordinator: State<'_, VitaSidecarCoordinator>,
+        _transaction_id: String,
     ) -> Result<VitaSidecarActionResponse, String> {
         Err("Vita sidecar production boundary is Windows-only".to_string())
     }
@@ -10988,6 +12550,21 @@ pub(crate) fn confirm_vita_sidecar(
     #[cfg(not(windows))]
     {
         non_windows::confirm_vita_sidecar(coordinator, pending_id)
+    }
+}
+
+#[tauri::command]
+pub(crate) fn recover_vita_sidecar(
+    coordinator: State<'_, VitaSidecarCoordinator>,
+    transaction_id: String,
+) -> Result<VitaSidecarActionResponse, String> {
+    #[cfg(windows)]
+    {
+        windows::recover_vita_sidecar(coordinator, transaction_id)
+    }
+    #[cfg(not(windows))]
+    {
+        non_windows::recover_vita_sidecar(coordinator, transaction_id)
     }
 }
 

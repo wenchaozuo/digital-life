@@ -207,6 +207,7 @@ pub enum HostMessage {
     RecoveryConfirmationReply(RecoveryConfirmationReply),
     RecoveryGrantIssued(RecoveryGrantIssued),
     RecoveryGrantRevalidated(RecoveryGrantRevalidated),
+    ExecuteRecovery(ExecuteRecovery),
     CancelAction(CancelAction),
     StartTurn(StartTurn),
     CancelTurn(CancelTurn),
@@ -237,6 +238,7 @@ pub enum VitaMessage {
     RecoveryIssueGrant(RecoveryIssueGrant),
     RecoveryRevalidateGrant(RecoveryRevalidateGrant),
     RecoveryPending(RecoveryPending),
+    RecoveryResult(RecoveryResult),
     ActionCancelled(ActionCancelled),
     CredentialRequired(CredentialRequired),
     TurnState(TurnState),
@@ -704,8 +706,12 @@ pub struct RecoveryBinding {
     pub restore_sha256: String,
     pub restore_bytes: u64,
     pub original_replacement_sha256: String,
-    pub provider_binding_hash: String,
-    pub codex_turn_id: String,
+    /// Host-owned recovery action identity.  Recovery is not a Codex turn and
+    /// therefore never binds to ProviderRequestIdentity or a model turn ID.
+    pub recovery_action_id: String,
+    /// Host-owned generation prevents a late response from an older recovery
+    /// action from being accepted after the action ledger has advanced.
+    pub recovery_generation: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -727,7 +733,7 @@ pub struct RecoveryGrant {
 pub struct RecoveryAuthorityEvaluate {
     pub request_id: String,
     pub session_id: String,
-    pub host_turn_id: String,
+    pub recovery_action_id: String,
     pub binding: RecoveryBinding,
 }
 
@@ -746,7 +752,7 @@ pub struct RecoveryAuthorityReply {
 pub struct RecoveryConfirmationRequired {
     pub request_id: String,
     pub session_id: String,
-    pub host_turn_id: String,
+    pub recovery_action_id: String,
     pub workspace_summary: String,
     pub expires_at_unix_ms: u64,
     pub binding: RecoveryBinding,
@@ -766,7 +772,7 @@ pub struct RecoveryConfirmationReply {
 pub struct RecoveryIssueGrant {
     pub request_id: String,
     pub session_id: String,
-    pub host_turn_id: String,
+    pub recovery_action_id: String,
     pub binding: RecoveryBinding,
     pub authorization_revision: i64,
 }
@@ -786,7 +792,7 @@ pub struct RecoveryGrantIssued {
 pub struct RecoveryRevalidateGrant {
     pub request_id: String,
     pub session_id: String,
-    pub host_turn_id: String,
+    pub recovery_action_id: String,
     pub binding: RecoveryBinding,
     pub grant: RecoveryGrant,
 }
@@ -821,6 +827,47 @@ pub struct RecoveryPending {
     pub restore_sha256: String,
     pub restore_bytes: u64,
     pub original_replacement_sha256: String,
+}
+
+/// A Host-owned command selecting one opaque pending H5 transaction.  It
+/// carries no preimage, restore bytes, target identity, path authority, or
+/// grant material; Vita must re-scan its retained journal before constructing
+/// the recovery action.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecuteRecovery {
+    pub request_id: String,
+    pub session_id: String,
+    pub transaction_id: String,
+    pub recovery_action_id: String,
+    pub recovery_generation: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryOutcome {
+    Denied,
+    Conflict,
+    RecoveredNoOp,
+    Recovered,
+    Unknown,
+}
+
+/// Terminal result for one Host-selected recovery action.  `Recovered` with
+/// `marker_persisted=true` is the RecoveredTerminal proof; a denied or
+/// conflicting action leaves the journal available for a later explicit try.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryResult {
+    pub request_id: String,
+    pub session_id: String,
+    pub recovery_action_id: String,
+    pub recovery_generation: String,
+    pub transaction_id: String,
+    pub outcome: RecoveryOutcome,
+    pub mutation_count: u64,
+    pub marker_persisted: bool,
+    pub error_code: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -1575,7 +1622,8 @@ impl RecoveryBinding {
             &self.workspace_root_identity,
             &self.target_identity,
             &self.transaction_id,
-            &self.codex_turn_id,
+            &self.recovery_action_id,
+            &self.recovery_generation,
         ] {
             valid_id(value)?;
         }
@@ -1590,7 +1638,7 @@ impl RecoveryBinding {
         valid_sha256(&self.current_sha256)?;
         valid_sha256(&self.restore_sha256)?;
         valid_sha256(&self.original_replacement_sha256)?;
-        valid_sha256(&self.provider_binding_hash)
+        Ok(())
     }
 }
 
@@ -1615,9 +1663,11 @@ impl RecoveryAuthorityEvaluate {
     pub fn validate(&self) -> Result<(), FrameError> {
         valid_id(&self.request_id)?;
         valid_id(&self.session_id)?;
-        valid_id(&self.host_turn_id)?;
+        valid_id(&self.recovery_action_id)?;
         self.binding.validate()?;
-        if self.session_id != self.binding.session_id {
+        if self.session_id != self.binding.session_id
+            || self.recovery_action_id != self.binding.recovery_action_id
+        {
             return Err(FrameError::InvalidField);
         }
         Ok(())
@@ -1640,13 +1690,15 @@ impl RecoveryConfirmationRequired {
     pub fn validate(&self) -> Result<(), FrameError> {
         valid_id(&self.request_id)?;
         valid_id(&self.session_id)?;
-        valid_id(&self.host_turn_id)?;
+        valid_id(&self.recovery_action_id)?;
         valid_bounded_text(&self.workspace_summary, MAX_SUMMARY_BYTES)?;
         if self.expires_at_unix_ms == 0 {
             return Err(FrameError::InvalidField);
         }
         self.binding.validate()?;
-        if self.session_id != self.binding.session_id {
+        if self.session_id != self.binding.session_id
+            || self.recovery_action_id != self.binding.recovery_action_id
+        {
             return Err(FrameError::InvalidField);
         }
         Ok(())
@@ -1668,9 +1720,12 @@ impl RecoveryIssueGrant {
     pub fn validate(&self) -> Result<(), FrameError> {
         valid_id(&self.request_id)?;
         valid_id(&self.session_id)?;
-        valid_id(&self.host_turn_id)?;
+        valid_id(&self.recovery_action_id)?;
         self.binding.validate()?;
-        if self.session_id != self.binding.session_id || self.authorization_revision <= 0 {
+        if self.session_id != self.binding.session_id
+            || self.recovery_action_id != self.binding.recovery_action_id
+            || self.authorization_revision <= 0
+        {
             return Err(FrameError::InvalidField);
         }
         Ok(())
@@ -1694,10 +1749,11 @@ impl RecoveryRevalidateGrant {
     pub fn validate(&self) -> Result<(), FrameError> {
         valid_id(&self.request_id)?;
         valid_id(&self.session_id)?;
-        valid_id(&self.host_turn_id)?;
+        valid_id(&self.recovery_action_id)?;
         self.binding.validate()?;
         self.grant.validate()?;
         if self.session_id != self.binding.session_id
+            || self.recovery_action_id != self.binding.recovery_action_id
             || self.binding != self.grant.binding
             || self.session_id != self.grant.session_id
             || self.grant.used
@@ -1746,6 +1802,43 @@ impl RecoveryPending {
         valid_sha256(&self.current_sha256)?;
         valid_sha256(&self.restore_sha256)?;
         valid_sha256(&self.original_replacement_sha256)
+    }
+}
+
+impl ExecuteRecovery {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        valid_id(&self.request_id)?;
+        valid_id(&self.session_id)?;
+        valid_id(&self.transaction_id)?;
+        valid_id(&self.recovery_action_id)?;
+        valid_id(&self.recovery_generation)
+    }
+}
+
+impl RecoveryResult {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        valid_id(&self.request_id)?;
+        valid_id(&self.session_id)?;
+        valid_id(&self.recovery_action_id)?;
+        valid_id(&self.recovery_generation)?;
+        valid_id(&self.transaction_id)?;
+        if self.mutation_count > 1 {
+            return Err(FrameError::InvalidField);
+        }
+        match (
+            &self.outcome,
+            self.error_code.as_deref(),
+            self.marker_persisted,
+        ) {
+            (
+                RecoveryOutcome::Denied | RecoveryOutcome::Conflict | RecoveryOutcome::Unknown,
+                Some(code),
+                false,
+            ) if !code.is_empty() => valid_id(code),
+            (RecoveryOutcome::RecoveredNoOp, None, true) => Ok(()),
+            (RecoveryOutcome::Recovered, None, true) if self.mutation_count <= 1 => Ok(()),
+            _ => Err(FrameError::InvalidField),
+        }
     }
 }
 
@@ -2107,8 +2200,8 @@ mod tests {
             restore_sha256: "c".repeat(64),
             restore_bytes: 1024,
             original_replacement_sha256: "d".repeat(64),
-            provider_binding_hash: "e".repeat(64),
-            codex_turn_id: "codex-turn".to_string(),
+            recovery_action_id: "recovery-action".to_string(),
+            recovery_generation: "recovery-generation".to_string(),
         }
     }
 

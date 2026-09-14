@@ -99,6 +99,68 @@ pub fn run_sidecar_ipc_test_canary() -> Result<(), String> {
     run_sidecar_ipc_with_mode(true)
 }
 
+/// Creates one deterministic H5 recovery-required fixture for the production
+/// process canary.  This helper is compiled only into the explicitly-enabled
+/// test image; it seeds evidence, never grants authority, and is not reachable
+/// from the normal `--serve-ipc` entry point.
+#[cfg(all(windows, feature = "d29-h9-test-helper"))]
+pub fn seed_recovery_fixture(
+    app_data_root: impl AsRef<std::path::Path>,
+    workspace_root: impl AsRef<std::path::Path>,
+    life_id: &str,
+    task_id: &str,
+) -> Result<String, String> {
+    const RELATIVE_PATH: &str = "recovery-canary.txt";
+    const ORIGINAL: &[u8] = b"D31-C recovery original content\n";
+    const REPLACEMENT: &[u8] = b"D31-C recovery replacement content\n";
+
+    let app_data_root = app_data_root.as_ref().to_path_buf();
+    let workspace_root = workspace_root.as_ref().to_path_buf();
+    let profile =
+        VitaAgentRuntimeProfile::from_explicit_app_data_root(app_data_root, workspace_root.clone())
+            .map_err(|error| format!("recovery fixture profile was rejected: {error}"))?;
+    profile
+        .ensure_private_runtime_layout()
+        .map_err(|error| format!("recovery fixture runtime layout failed: {error}"))?;
+    let root = profile
+        .workspace_authority()
+        .ok_or_else(|| "recovery fixture workspace authority is unavailable".to_string())?
+        .clone();
+    let target = root
+        .prepare_target(std::path::Path::new(RELATIVE_PATH))
+        .map_err(|error| format!("recovery fixture target was rejected: {error}"))?;
+    if target.kind() != PreparedWorkspaceTargetKind::ExistingFile {
+        return Err("recovery fixture target must already be an existing file".to_string());
+    }
+    let current = target
+        .read_existing_file_raw_bounded(recovery_journal::RECOVERY_JOURNAL_MAX_PREIMAGE_BYTES)
+        .map_err(|error| format!("recovery fixture target read failed: {error}"))?;
+    if current != ORIGINAL {
+        return Err("recovery fixture target preimage was not exact".to_string());
+    }
+    let store = recovery_journal::RecoveryJournalStore::from_runtime_profile(&profile)
+        .map_err(|error| format!("recovery fixture journal store failed: {error}"))?;
+    let context = recovery_journal::RecoveryJournalContext::new(
+        life_id,
+        task_id,
+        "vita.workspace.replace_file",
+        &sha256_hex(REPLACEMENT),
+        REPLACEMENT.len(),
+        "d31-c-recovery-fixture-call",
+        "d31-c-recovery-fixture-turn",
+    )
+    .map_err(|error| format!("recovery fixture context was rejected: {error}"))?;
+    let journal = store
+        .create_prepared(&target, context)
+        .map_err(|error| format!("recovery fixture journal create failed: {error}"))?;
+    store
+        .persist_started(&journal)
+        .map_err(|error| format!("recovery fixture started marker failed: {error}"))?;
+    std::fs::write(workspace_root.join(RELATIVE_PATH), REPLACEMENT)
+        .map_err(|error| format!("recovery fixture replacement write failed: {error}"))?;
+    Ok(journal.transaction_id().as_str().to_string())
+}
+
 #[cfg(windows)]
 fn run_sidecar_ipc_with_mode(test_canary: bool) -> Result<(), String> {
     // The pinned Codex turn machinery has a deliberately deep synchronous

@@ -19,15 +19,17 @@ use std::time::Duration;
 use zeroize::Zeroizing;
 
 use protocol::{
-    AuthorityEvaluate, ConfirmationDecision, ConfirmationRequired, CredentialRequired, GrantIssued,
-    Handshake, HostMessage, InitializeSession, IssueGrant, ProcessBinding, ProcessGrant,
-    ProviderBinding, ProviderConfiguration, RecoveryIssueGrant, RevalidateGrant, StartTurn,
-    TurnCompleted, TurnFailed, TurnPhase, TurnState, VitaMessage, CODEX_PROTOCOL_SCHEMA_HASH,
-    CODEX_UPSTREAM_COMMIT, MAX_FRAME_BYTES, MAX_PROMPT_BYTES, MAX_TURN_OUTPUT_BYTES,
-    PROTOCOL_VERSION, RUNTIME_ID, TOOL_NAME,
+    AuthorityEvaluate, ConfirmationDecision, ConfirmationRequired, CredentialRequired,
+    ExecuteRecovery, GrantIssued, Handshake, HostMessage, InitializeSession, IssueGrant,
+    ProcessBinding, ProcessGrant, ProviderBinding, ProviderConfiguration, RecoveryIssueGrant,
+    RecoveryOutcome, RecoveryResult, RevalidateGrant, StartTurn, TurnCompleted, TurnFailed,
+    TurnPhase, TurnState, VitaMessage, CODEX_PROTOCOL_SCHEMA_HASH, CODEX_UPSTREAM_COMMIT,
+    MAX_FRAME_BYTES, MAX_PROMPT_BYTES, MAX_TURN_OUTPUT_BYTES, PROTOCOL_VERSION, RUNTIME_ID,
+    TOOL_NAME,
 };
 use vita_agent_protocol as protocol;
 
+use crate::d29h5::RecoveryExecutionOutcome;
 use crate::provider_gateway::{
     CredentialResolver, GatewayReadyProvider, GatewayToolDefinition, ProviderGateway,
     ProviderRequestIdentity, ResolvedCredential, VitaFunctionCall, VitaMessage as GatewayMessage,
@@ -42,12 +44,12 @@ use crate::{
     H4ConfirmationEvidenceSource, H4HostAuthorityResponse, H4HostReplaceGrantEvidence,
     H4ReplaceOperation, H4ScopeRequirement, H5RecoveryExecutor, H7ProcessBinding, H7ProcessGrant,
     HostExplicitActionConfirmationEvidence, PreparedWorkspaceTargetKind, RecoveryActionRequest,
-    RecoveryAuthorityPort, RecoveryDenyReason, RecoveryGrantEvidence, VitaAgentEntrypoint,
-    VitaAgentRuntime, VitaAgentRuntimeProfile, VitaExecutionContext, VitaGitStatusAuthority,
-    VitaGitStatusPendingConfirmation, VitaGitStatusProduction, VitaGitStatusToolContributor,
-    VitaH3AuthorityError, VitaH3AuthorityFuture, VitaH3AuthorityPort, VitaH3DisclosureFuture,
-    VitaH4AuthorityError, VitaH4AuthorityFuture, VitaH4AuthorityPort, VitaWorkspaceReadBroker,
-    VitaWorkspaceReadToolContributor, VitaWorkspaceReplaceBroker,
+    RecoveryAuthorityPort, RecoveryDenyReason, RecoveryGrantEvidence, TrustedWorkspaceRoot,
+    VitaAgentEntrypoint, VitaAgentRuntime, VitaAgentRuntimeProfile, VitaExecutionContext,
+    VitaGitStatusAuthority, VitaGitStatusPendingConfirmation, VitaGitStatusProduction,
+    VitaGitStatusToolContributor, VitaH3AuthorityError, VitaH3AuthorityFuture, VitaH3AuthorityPort,
+    VitaH3DisclosureFuture, VitaH4AuthorityError, VitaH4AuthorityFuture, VitaH4AuthorityPort,
+    VitaWorkspaceReadBroker, VitaWorkspaceReadToolContributor, VitaWorkspaceReplaceBroker,
     VitaWorkspaceReplaceH5ToolContributor, H5_RECOVER_REPLACE_CAPABILITY_ID,
     VITA_WORKSPACE_GIT_STATUS_CAPABILITY_ID, VITA_WORKSPACE_GIT_STATUS_PROFILE_ID,
     VITA_WORKSPACE_GIT_STATUS_TOOL_NAME, VITA_WORKSPACE_READ_CAPABILITY_ID,
@@ -108,6 +110,11 @@ struct ActiveTurnTask {
     cancelled: Arc<AtomicBool>,
     cancel_notify: Arc<tokio::sync::Notify>,
     join: tokio::task::JoinHandle<Result<String, crate::VitaAgentError>>,
+}
+
+enum SidecarLoopEvent {
+    Command(Result<Result<Option<HostMessage>, String>, tokio::task::JoinError>),
+    Recovery(Result<Result<(), String>, tokio::task::JoinError>),
 }
 
 #[derive(Default)]
@@ -1444,6 +1451,7 @@ fn host_request_id(message: &HostMessage) -> &str {
         HostMessage::RecoveryConfirmationReply(message) => &message.request_id,
         HostMessage::RecoveryGrantIssued(message) => &message.request_id,
         HostMessage::RecoveryGrantRevalidated(message) => &message.request_id,
+        HostMessage::ExecuteRecovery(message) => &message.request_id,
         HostMessage::CancelAction(message) => &message.request_id,
         HostMessage::StartTurn(message) => &message.request_id,
         HostMessage::CancelTurn(message) => &message.request_id,
@@ -1474,6 +1482,7 @@ fn vita_request_id(message: &VitaMessage) -> &str {
         VitaMessage::RecoveryIssueGrant(message) => &message.request_id,
         VitaMessage::RecoveryRevalidateGrant(message) => &message.request_id,
         VitaMessage::RecoveryPending(message) => &message.request_id,
+        VitaMessage::RecoveryResult(message) => &message.request_id,
         VitaMessage::ActionCancelled(message) => &message.request_id,
         VitaMessage::CredentialRequired(message) => &message.request_id,
         VitaMessage::TurnState(message) => &message.request_id,
@@ -1560,7 +1569,6 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
         router.clone(),
         &init,
         workspace_identity.clone(),
-        Arc::clone(&active_identity),
     ));
     let recovery_executor = Arc::new(H5RecoveryExecutor::new(
         recovery_store.clone(),
@@ -1608,6 +1616,10 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
             })
         })
         .collect::<Vec<_>>();
+    // The recovery action path reuses the same retained workspace capability
+    // as H5, but is independently driven by a Host command and never by a
+    // Codex turn.
+    let recovery_root = workspace.clone();
     let production = Arc::new(
         VitaGitStatusProduction::new(
             context,
@@ -1772,18 +1784,44 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
         Arc::clone(&active_identity),
     );
 
+    // Keep command reception alive while an H5 recovery is running.  A
+    // recovery is Host-owned rather than a model turn, but it is still a
+    // bounded long-running operation and must observe CancelAction/Shutdown
+    // without waiting for the filesystem executor to return first.
+    let mut command_reader = tokio::task::spawn_blocking({
+        let router = router.clone();
+        move || router.receive_command()
+    });
+    let mut recovery_task: Option<tokio::task::JoinHandle<Result<(), String>>> = None;
+
     loop {
-        let command = tokio::task::spawn_blocking({
-            let router = router.clone();
-            move || router.receive_command()
-        })
-        .await
-        .map_err(|_| "Vita sidecar command reader task failed".to_string())??;
+        let event = if let Some(task) = recovery_task.as_mut() {
+            tokio::select! {
+                result = task => SidecarLoopEvent::Recovery(result),
+                result = &mut command_reader => SidecarLoopEvent::Command(result),
+            }
+        } else {
+            SidecarLoopEvent::Command((&mut command_reader).await)
+        };
+
+        let result = match event {
+            SidecarLoopEvent::Recovery(result) => {
+                recovery_task = None;
+                result.map_err(|_| "Vita sidecar recovery task failed".to_string())??;
+                continue;
+            }
+            SidecarLoopEvent::Command(result) => result,
+        };
+        let command =
+            result.map_err(|_| "Vita sidecar command reader task failed".to_string())??;
         let Some(command) = command else {
             production.cancel();
             read_broker.cancel();
             replace_broker.cancel();
             recovery_executor.cancel();
+            if let Some(task) = recovery_task.take() {
+                let _ = task.await;
+            }
             runtime.shutdown().await;
             if let Some(gateway_server) = gateway_server.take() {
                 gateway_server.stop();
@@ -1804,6 +1842,26 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
                     session_id: init.session_id.clone(),
                 }))?;
             }
+            HostMessage::ExecuteRecovery(message) if message.session_id == init.session_id => {
+                if recovery_task.is_some() {
+                    return Err("Vita sidecar recovery action is already running".to_string());
+                }
+                recovery_executor.begin_turn();
+                let task_init = init.clone();
+                let task_root = recovery_root.clone();
+                let task_executor = Arc::clone(&recovery_executor);
+                let task_router = router.clone();
+                recovery_task = Some(tokio::spawn(async move {
+                    handle_execute_recovery(
+                        message,
+                        &task_init,
+                        task_root,
+                        task_executor,
+                        task_router,
+                    )
+                    .await
+                }));
+            }
             HostMessage::StartTurn(message) if message.session_id == init.session_id => {
                 handle_start_turn(
                     message,
@@ -1815,8 +1873,6 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
                     Arc::clone(&read_authority),
                     Arc::clone(&replace_broker),
                     Arc::clone(&replace_authority),
-                    Arc::clone(&recovery_authority),
-                    Arc::clone(&recovery_executor),
                     router.clone(),
                     Arc::clone(&active_identity),
                     Arc::clone(&gateway_authority),
@@ -1831,7 +1887,6 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
                     Arc::clone(&production),
                     Arc::clone(&read_broker),
                     Arc::clone(&replace_broker),
-                    Arc::clone(&recovery_executor),
                     router.clone(),
                     Arc::clone(&active_identity),
                     Arc::clone(&gateway_authority),
@@ -1844,6 +1899,9 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
                 read_broker.cancel();
                 replace_broker.cancel();
                 recovery_executor.cancel();
+                if let Some(task) = recovery_task.take() {
+                    let _ = task.await;
+                }
                 runtime.shutdown().await;
                 if let Some(gateway_server) = gateway_server.take() {
                     gateway_server.stop();
@@ -1859,6 +1917,9 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
                 read_broker.cancel();
                 replace_broker.cancel();
                 recovery_executor.cancel();
+                if let Some(task) = recovery_task.take() {
+                    let _ = task.await;
+                }
                 runtime.shutdown().await;
                 let _ = router.send(&VitaMessage::Fatal(protocol::FatalMessage {
                     request_id: next_request_id("vita-fatal"),
@@ -1868,7 +1929,145 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
                 return Err("Vita sidecar received an unexpected Host message".to_string());
             }
         }
+
+        command_reader = tokio::task::spawn_blocking({
+            let router = router.clone();
+            move || router.receive_command()
+        });
     }
+}
+
+fn recovery_result_for(
+    command: &ExecuteRecovery,
+    result: crate::d29h5::RecoveryExecutionResult,
+) -> RecoveryResult {
+    let (outcome, error_code) = match result.outcome {
+        RecoveryExecutionOutcome::RecoveryDenied(reason) => {
+            let code = match reason {
+                RecoveryDenyReason::ConfirmationMissing => "RECOVERY_CONFIRMATION_MISSING",
+                RecoveryDenyReason::ConfirmationMismatch => "RECOVERY_CONFIRMATION_MISMATCH",
+                RecoveryDenyReason::ConfirmationExpired => "RECOVERY_CONFIRMATION_EXPIRED",
+                RecoveryDenyReason::AuthorizationDisabled => "CAPABILITY_ROOT_DISABLED",
+                RecoveryDenyReason::StaleRevision => "CAPABILITY_AUTHORIZATION_REVISION_MISMATCH",
+                RecoveryDenyReason::RecoveryGrantReplay => "RECOVERY_GRANT_REPLAY",
+                RecoveryDenyReason::RecoveryStateInvalid => "RECOVERY_STATE_INVALID",
+                RecoveryDenyReason::RecoveryBlocked => "RECOVERY_BLOCKED",
+                RecoveryDenyReason::TargetMissing => "RECOVERY_TARGET_MISSING",
+                RecoveryDenyReason::TargetIdentityChanged => "RECOVERY_TARGET_IDENTITY_CHANGED",
+                RecoveryDenyReason::TargetBusy => "RECOVERY_TARGET_BUSY",
+                RecoveryDenyReason::HardLinkAmbiguous => "RECOVERY_HARDLINK_AMBIGUOUS",
+                RecoveryDenyReason::Cancellation => "RECOVERY_CANCELLED",
+                RecoveryDenyReason::NativeFailure => "RECOVERY_NATIVE_FAILURE",
+            };
+            (RecoveryOutcome::Denied, Some(code.to_string()))
+        }
+        RecoveryExecutionOutcome::RecoveryConflict => (
+            RecoveryOutcome::Conflict,
+            Some("RECOVERY_CONFLICT".to_string()),
+        ),
+        RecoveryExecutionOutcome::RecoveredNoOp => (RecoveryOutcome::RecoveredNoOp, None),
+        RecoveryExecutionOutcome::Recovered => (RecoveryOutcome::Recovered, None),
+        RecoveryExecutionOutcome::RecoveryUnknown => (
+            RecoveryOutcome::Unknown,
+            Some("RECOVERY_OUTCOME_UNKNOWN".to_string()),
+        ),
+    };
+    RecoveryResult {
+        request_id: command.request_id.clone(),
+        session_id: command.session_id.clone(),
+        recovery_action_id: command.recovery_action_id.clone(),
+        recovery_generation: command.recovery_generation.clone(),
+        transaction_id: command.transaction_id.clone(),
+        outcome,
+        mutation_count: result.mutation_count as u64,
+        marker_persisted: result.marker_persisted,
+        error_code,
+    }
+}
+
+fn denied_recovery_result(command: &ExecuteRecovery, error_code: &str) -> RecoveryResult {
+    RecoveryResult {
+        request_id: command.request_id.clone(),
+        session_id: command.session_id.clone(),
+        recovery_action_id: command.recovery_action_id.clone(),
+        recovery_generation: command.recovery_generation.clone(),
+        transaction_id: command.transaction_id.clone(),
+        outcome: RecoveryOutcome::Denied,
+        mutation_count: 0,
+        marker_persisted: false,
+        error_code: Some(error_code.to_string()),
+    }
+}
+
+fn build_recovery_action(
+    command: &ExecuteRecovery,
+    init: &InitializeSession,
+    root: &TrustedWorkspaceRoot,
+    executor: &H5RecoveryExecutor,
+) -> Result<RecoveryActionRequest, String> {
+    let scan = executor
+        .scan()
+        .map_err(|_| "RECOVERY_SCAN_FAILED".to_string())?;
+    let snapshot = scan
+        .actionable_recovery_transactions()
+        .find(|snapshot| snapshot.journal().transaction_id().as_str() == command.transaction_id)
+        .ok_or_else(|| "RECOVERY_TRANSACTION_NOT_ACTIONABLE".to_string())?;
+    let journal = snapshot.journal();
+    if journal.life_id() != init.life_id || journal.task_id() != init.task_id {
+        return Err("RECOVERY_BINDING_MISMATCH".to_string());
+    }
+    if journal.workspace_root_identity()
+        != crate::recovery_journal::RecoveryJournalIdentity::from_workspace_identity(
+            root.identity(),
+        )
+        .map_err(|_| "RECOVERY_BINDING_MISMATCH".to_string())?
+    {
+        return Err("RECOVERY_BINDING_MISMATCH".to_string());
+    }
+    root.verify_named_path_current()
+        .map_err(|_| "RECOVERY_TARGET_IDENTITY_CHANGED".to_string())?;
+    let target = root
+        .prepare_target(journal.relative_path().as_path())
+        .map_err(|_| "RECOVERY_TARGET_MISSING".to_string())?;
+    if target.kind() != PreparedWorkspaceTargetKind::ExistingFile
+        || target.target_identity().is_none()
+    {
+        return Err("RECOVERY_TARGET_IDENTITY_CHANGED".to_string());
+    }
+    let current = target
+        .read_existing_file_raw_bounded(RECOVERY_JOURNAL_MAX_PREIMAGE_BYTES)
+        .map_err(|_| "RECOVERY_TARGET_MISSING".to_string())?;
+    Ok(
+        RecoveryActionRequest::from_snapshot(snapshot, &current, &command.recovery_action_id, 0)
+            .with_recovery_generation(&command.recovery_generation),
+    )
+}
+
+async fn handle_execute_recovery(
+    command: ExecuteRecovery,
+    init: &InitializeSession,
+    root: TrustedWorkspaceRoot,
+    executor: Arc<H5RecoveryExecutor>,
+    router: SidecarRouter,
+) -> Result<(), String> {
+    command
+        .validate()
+        .map_err(|_| "RECOVERY_EXECUTE_REQUEST_INVALID".to_string())?;
+    let action = match build_recovery_action(&command, init, &root, &executor) {
+        Ok(action) => action,
+        Err(error) => {
+            let result = denied_recovery_result(&command, &error);
+            result.validate().map_err(protocol_error)?;
+            router.send(&VitaMessage::RecoveryResult(result))?;
+            return Ok(());
+        }
+    };
+    let result = tokio::task::spawn_blocking(move || executor.recover(action))
+        .await
+        .map_err(|_| "RECOVERY_EXECUTOR_TASK_FAILED".to_string())?;
+    let message = recovery_result_for(&command, result);
+    message.validate().map_err(protocol_error)?;
+    router.send(&VitaMessage::RecoveryResult(message))
 }
 
 fn handle_start_turn(
@@ -1881,8 +2080,6 @@ fn handle_start_turn(
     read_authority: Arc<SidecarWorkspaceReadAuthority>,
     replace_broker: Arc<VitaWorkspaceReplaceBroker>,
     replace_authority: Arc<SidecarWorkspaceReplaceAuthority>,
-    recovery_authority: Arc<SidecarRecoveryAuthority>,
-    recovery_executor: Arc<H5RecoveryExecutor>,
     router: SidecarRouter,
     active_identity: Arc<Mutex<Option<ProviderRequestIdentity>>>,
     gateway_authority: Arc<GatewayAuthority>,
@@ -1951,8 +2148,6 @@ fn handle_start_turn(
     read_broker.begin_turn();
     replace_authority.begin_turn();
     replace_broker.begin_turn();
-    recovery_authority.begin_turn();
-    recovery_executor.begin_turn();
     let _ = router.send(&VitaMessage::TurnState(TurnState {
         request_id: next_request_id("vita-turn-starting"),
         session_id: init.session_id.clone(),
@@ -2070,7 +2265,6 @@ async fn handle_cancel_turn(
     production: Arc<VitaGitStatusProduction>,
     read_broker: Arc<VitaWorkspaceReadBroker>,
     replace_broker: Arc<VitaWorkspaceReplaceBroker>,
-    recovery_executor: Arc<H5RecoveryExecutor>,
     router: SidecarRouter,
     active_identity: Arc<Mutex<Option<ProviderRequestIdentity>>>,
     gateway_authority: Arc<GatewayAuthority>,
@@ -2094,7 +2288,6 @@ async fn handle_cancel_turn(
     production.cancel_turn();
     read_broker.cancel_turn();
     replace_broker.cancel_turn();
-    recovery_executor.cancel();
     let Some(task) = turn_owner.take(&identity) else {
         gateway_authority.deactivate(&identity);
         return Err("Vita turn owner disappeared before cancellation proof".to_string());
@@ -3109,17 +3302,11 @@ pub(crate) struct SidecarRecoveryAuthority {
     task_id: String,
     workspace_identity: String,
     workspace_summary: String,
-    active_identity: Arc<Mutex<Option<ProviderRequestIdentity>>>,
     grants: Arc<Mutex<HashMap<String, protocol::RecoveryGrant>>>,
 }
 
 impl SidecarRecoveryAuthority {
-    fn new(
-        router: SidecarRouter,
-        init: &InitializeSession,
-        workspace_identity: String,
-        active_identity: Arc<Mutex<Option<ProviderRequestIdentity>>>,
-    ) -> Self {
+    fn new(router: SidecarRouter, init: &InitializeSession, workspace_identity: String) -> Self {
         Self {
             router,
             session_id: init.session_id.clone(),
@@ -3127,29 +3314,20 @@ impl SidecarRecoveryAuthority {
             task_id: init.task_id.clone(),
             workspace_identity,
             workspace_summary: workspace_summary(&init.workspace_path),
-            active_identity,
             grants: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
-
-    pub(crate) fn begin_turn(&self) {
-        if let Ok(mut grants) = self.grants.lock() {
-            grants.clear();
         }
     }
 
     fn binding_for(
         &self,
         request: &RecoveryActionRequest,
-    ) -> Result<(protocol::RecoveryBinding, String), RecoveryDenyReason> {
+    ) -> Result<protocol::RecoveryBinding, RecoveryDenyReason> {
         if request.life_id != self.life_id
             || request.task_id != self.task_id
             || request.capability_id != H5_RECOVER_REPLACE_CAPABILITY_ID
         {
             return Err(RecoveryDenyReason::ConfirmationMismatch);
         }
-        let active = active_identity_snapshot(&self.active_identity)
-            .ok_or(RecoveryDenyReason::Cancellation)?;
         if request.action_id.is_empty() {
             return Err(RecoveryDenyReason::RecoveryStateInvalid);
         }
@@ -3173,27 +3351,27 @@ impl SidecarRecoveryAuthority {
             restore_sha256: request.restore_sha256.clone(),
             restore_bytes: request.restore_bytes as u64,
             original_replacement_sha256: request.original_replacement_sha256.clone(),
-            provider_binding_hash: active.binding_hash,
-            codex_turn_id: active.turn_id.clone(),
+            recovery_action_id: request.action_id.clone(),
+            recovery_generation: request.recovery_generation.clone(),
         };
         binding
             .validate()
             .map_err(|_| RecoveryDenyReason::ConfirmationMismatch)?;
-        Ok((binding, active.turn_id))
+        Ok(binding)
     }
 
     fn issue(
         &self,
         request: &RecoveryActionRequest,
     ) -> Result<RecoveryGrantEvidence, RecoveryDenyReason> {
-        let (binding, host_turn_id) = self.binding_for(request)?;
+        let binding = self.binding_for(request)?;
         let authority = self
             .router
             .request(VitaMessage::RecoveryAuthorityEvaluate(
                 protocol::RecoveryAuthorityEvaluate {
                     request_id: next_request_id("vita-recovery-authority"),
                     session_id: self.session_id.clone(),
-                    host_turn_id: host_turn_id.clone(),
+                    recovery_action_id: request.action_id.clone(),
                     binding: binding.clone(),
                 },
             ))
@@ -3217,7 +3395,7 @@ impl SidecarRecoveryAuthority {
                 protocol::RecoveryConfirmationRequired {
                     request_id: next_request_id("vita-recovery-confirm"),
                     session_id: self.session_id.clone(),
-                    host_turn_id: host_turn_id.clone(),
+                    recovery_action_id: request.action_id.clone(),
                     workspace_summary: self.workspace_summary.clone(),
                     expires_at_unix_ms: unix_millis().saturating_add(30_000),
                     binding: binding.clone(),
@@ -3242,7 +3420,7 @@ impl SidecarRecoveryAuthority {
             .request(VitaMessage::RecoveryIssueGrant(RecoveryIssueGrant {
                 request_id: next_request_id("vita-recovery-issue"),
                 session_id: self.session_id.clone(),
-                host_turn_id,
+                recovery_action_id: request.action_id.clone(),
                 binding: binding.clone(),
                 authorization_revision: revision,
             }))
@@ -3267,6 +3445,8 @@ impl SidecarRecoveryAuthority {
         {
             return Err(RecoveryDenyReason::RecoveryStateInvalid);
         }
+        let mut authorized_action = request.clone();
+        authorized_action.authorization_revision = revision;
         self.grants
             .lock()
             .map_err(|_| RecoveryDenyReason::AuthorizationDisabled)?
@@ -3274,7 +3454,7 @@ impl SidecarRecoveryAuthority {
         Ok(RecoveryGrantEvidence {
             grant_id: grant.grant_id,
             confirmation_id: grant.confirmation_id,
-            action: request.clone(),
+            action: authorized_action,
             issued_at_unix_ms: grant.issued_at_unix_ms,
             expires_at_unix_ms: grant.expires_at_unix_ms,
             single_use: grant.single_use,
@@ -3296,7 +3476,7 @@ impl RecoveryAuthorityPort for SidecarRecoveryAuthority {
         grant: &RecoveryGrantEvidence,
         request: &RecoveryActionRequest,
     ) -> Result<(), RecoveryDenyReason> {
-        let (binding, host_turn_id) = self.binding_for(request)?;
+        let binding = self.binding_for(request)?;
         let wire_grant = self
             .grants
             .lock()
@@ -3313,7 +3493,7 @@ impl RecoveryAuthorityPort for SidecarRecoveryAuthority {
                 protocol::RecoveryRevalidateGrant {
                     request_id: next_request_id("vita-recovery-revalidate"),
                     session_id: self.session_id.clone(),
-                    host_turn_id,
+                    recovery_action_id: request.action_id.clone(),
                     binding,
                     grant: wire_grant,
                 },

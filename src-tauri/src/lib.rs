@@ -225,6 +225,7 @@ pub fn run() {
             vita_sidecar::cancel_vita_turn,
             vita_sidecar::get_vita_sidecar_status,
             vita_sidecar::confirm_vita_sidecar,
+            vita_sidecar::recover_vita_sidecar,
             vita_sidecar::deny_vita_sidecar,
             vita_sidecar::cancel_vita_sidecar,
             vita_sidecar::stop_vita_sidecar,

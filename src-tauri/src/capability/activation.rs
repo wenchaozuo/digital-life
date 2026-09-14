@@ -1538,6 +1538,7 @@ mod tests {
             "start_vita_turn",
             "cancel_vita_turn",
             "confirm_vita_sidecar",
+            "recover_vita_sidecar",
             "deny_vita_sidecar",
             "stop_vita_sidecar",
         ] {

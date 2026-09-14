@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::{Host, Url};
 use vita_agent_protocol::TOOL_NAME;
+
+use crate::d29h3::VITA_WORKSPACE_READ_TOOL_NAME;
 use zeroize::Zeroizing;
 
 use super::{VitaAgentError, VITA_AGENT_RUNTIME_ID, VITA_GATEWAY_PROVIDER_ID};
@@ -1218,7 +1220,13 @@ where
                     .to_string(),
             ));
         }
-        map_chat_response_to_responses(response)
+        let advertised_tool_names = request
+            .options
+            .tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<Vec<_>>();
+        map_chat_response_to_responses_with_tools(response, &advertised_tool_names)
     }
 }
 
@@ -1396,7 +1404,14 @@ fn map_responses_request_to_chat(
     }
     let mut tool_call_ids = std::collections::HashSet::new();
     for call in &request.tool_calls {
-        if call.name != TOOL_NAME {
+        if !is_vita_tool_name(&call.name)
+            || (!request.options.tools.is_empty()
+                && !request
+                    .options
+                    .tools
+                    .iter()
+                    .any(|tool| tool.name == call.name))
+        {
             return Err(VitaAgentError::GatewayProtocol(
                 "request contained an unadvertised Vita tool call".to_string(),
             ));
@@ -1566,6 +1581,13 @@ pub(crate) struct VitaUsage {
 fn map_chat_response_to_responses(
     response: ChatCompletionsResponse,
 ) -> Result<VitaResponsesResult, VitaAgentError> {
+    map_chat_response_to_responses_with_tools(response, &[TOOL_NAME.to_string()])
+}
+
+fn map_chat_response_to_responses_with_tools(
+    response: ChatCompletionsResponse,
+    advertised_tool_names: &[String],
+) -> Result<VitaResponsesResult, VitaAgentError> {
     if response.choices.len() != 1 {
         return Err(VitaAgentError::GatewayProtocol(
             "chat completion response must contain exactly one choice".to_string(),
@@ -1577,7 +1599,8 @@ fn map_chat_response_to_responses(
             "chat completion response message role must be assistant".to_string(),
         ));
     }
-    let function_calls = parse_chat_tool_calls(&choice.message.tool_calls)?;
+    let function_calls =
+        parse_chat_tool_calls_with_tools(&choice.message.tool_calls, advertised_tool_names)?;
     let usage = response.usage.map(|usage| VitaUsage {
         input_tokens: usage.prompt_tokens,
         output_tokens: usage.completion_tokens,
@@ -1594,6 +1617,13 @@ fn map_chat_response_to_responses(
 }
 
 fn parse_chat_tool_calls(values: &[Value]) -> Result<Vec<VitaFunctionCall>, VitaAgentError> {
+    parse_chat_tool_calls_with_tools(values, &[TOOL_NAME.to_string()])
+}
+
+fn parse_chat_tool_calls_with_tools(
+    values: &[Value],
+    advertised_tool_names: &[String],
+) -> Result<Vec<VitaFunctionCall>, VitaAgentError> {
     if values.len() > 1 {
         return Err(VitaAgentError::UnsupportedGatewayCapability {
             capability: ProviderCapability::ParallelTools,
@@ -1629,7 +1659,11 @@ fn parse_chat_tool_calls(values: &[Value]) -> Result<Vec<VitaFunctionCall>, Vita
             MAX_TOOL_NAME_BYTES,
             "tool function name",
         )?;
-        if name != TOOL_NAME {
+        let advertised = advertised_tool_names.is_empty()
+            || advertised_tool_names
+                .iter()
+                .any(|advertised| advertised == &name);
+        if !is_vita_tool_name(&name) || !advertised {
             return Err(VitaAgentError::GatewayProtocol(
                 "provider returned an unadvertised Vita tool call".to_string(),
             ));
@@ -1646,6 +1680,10 @@ fn parse_chat_tool_calls(values: &[Value]) -> Result<Vec<VitaFunctionCall>, Vita
         });
     }
     Ok(calls)
+}
+
+fn is_vita_tool_name(name: &str) -> bool {
+    name == TOOL_NAME || name == VITA_WORKSPACE_READ_TOOL_NAME
 }
 
 fn bounded_tool_string(

@@ -753,26 +753,47 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_provisions_only_a_disabled_revision_one_row() {
+    fn snapshot_provisions_each_trusted_capability_as_disabled_revision_one() {
         let fixture = Fixture::new();
         assert!(!fixture.row_exists());
 
         let snapshot = build_snapshot(&fixture.storage, &fixture.registry).expect("snapshot");
         assert_eq!(snapshot.life_id, LIFE_ID);
-        assert_eq!(snapshot.capabilities.len(), 1);
+        assert_eq!(snapshot.capabilities.len(), 2);
 
-        let entry = &snapshot.capabilities[0];
+        let entry = snapshot
+            .capabilities
+            .iter()
+            .find(|entry| entry.descriptor.capability_id == PRODUCTION_CAPABILITY_ID)
+            .expect("frozen Git capability snapshot entry");
         assert_eq!(entry.descriptor.capability_id, PRODUCTION_CAPABILITY_ID);
         assert!(!entry.enabled, "provisioning must never enable");
         assert_eq!(entry.revision, 1, "provisioning must create revision 1");
         assert!(entry.recent_authorization_events.is_empty());
         assert!(fixture.row_exists());
         assert_eq!(fixture.event_count(), 0);
+        for entry in &snapshot.capabilities {
+            assert!(
+                !entry.enabled,
+                "provisioning must never enable a capability"
+            );
+            assert_eq!(entry.revision, 1, "provisioning must create revision 1");
+            assert!(entry.recent_authorization_events.is_empty());
+        }
 
         // Idempotent: a second snapshot neither duplicates nor re-enables.
         let again = build_snapshot(&fixture.storage, &fixture.registry).expect("second snapshot");
-        assert!(!again.capabilities[0].enabled);
-        assert_eq!(again.capabilities[0].revision, 1);
+        let again_git = again
+            .capabilities
+            .iter()
+            .find(|entry| entry.descriptor.capability_id == PRODUCTION_CAPABILITY_ID)
+            .expect("frozen Git capability second snapshot entry");
+        assert!(!again_git.enabled);
+        assert_eq!(again_git.revision, 1);
+        assert!(again
+            .capabilities
+            .iter()
+            .all(|entry| !entry.enabled && entry.revision == 1));
         assert!(fixture.row_exists());
         assert_eq!(fixture.event_count(), 0);
     }
@@ -1583,28 +1604,37 @@ mod tests {
             );
         }
 
-        // The production catalog is unchanged: exactly one read-only
-        // capability, so D30-A changes authorization reachability only.
+        // D31-B adds exactly one explicitly approved bounded read capability
+        // beside the frozen Git-status route. D30-A still changes only
+        // authorization reachability; no generic side-effect surface is
+        // admitted.
         let registry = CapabilityRegistry::production().expect("production registry");
         let entries: Vec<&CapabilityDescriptor> = registry.entries().collect();
         assert_eq!(
             entries.len(),
-            1,
-            "D30-A must not widen the production tool surface"
+            2,
+            "D31-B opens exactly one bounded read route"
         );
-        assert!(entries[0].is_read_only());
+        let entry_ids = entries
+            .iter()
+            .map(|entry| entry.capability_id().as_str())
+            .collect::<std::collections::HashSet<_>>();
         assert_eq!(
-            entries[0].capability_id().as_str(),
-            "vita.process.workspace.git_status"
+            entry_ids,
+            std::collections::HashSet::from([
+                "vita.process.workspace.git_status",
+                "vita.workspace.read_file",
+            ])
         );
-        assert_eq!(
-            entries[0].approval_floor(),
-            ApprovalFloor::ExplicitPerAction
-        );
-        assert_eq!(
-            entries[0].scope_requirement(),
-            ScopeRequirement::WorkspaceRequired
-        );
+        for entry in entries {
+            assert!(entry.is_read_only());
+            assert_eq!(entry.risk_class(), RiskClass::Critical);
+            assert_eq!(entry.approval_floor(), ApprovalFloor::ExplicitPerAction);
+            assert_eq!(
+                entry.scope_requirement(),
+                ScopeRequirement::WorkspaceRequired
+            );
+        }
         for forbidden in [
             "vita.process.run",
             "vita.process.workspace.run",

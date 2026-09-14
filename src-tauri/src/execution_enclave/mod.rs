@@ -26,7 +26,7 @@ use std::{
 use std::{
     ffi::{c_void, OsStr},
     os::windows::{
-        ffi::OsStrExt,
+        ffi::{OsStrExt, OsStringExt},
         io::{AsRawHandle, FromRawHandle, IntoRawHandle, OwnedHandle},
         process::ExitStatusExt,
     },
@@ -49,6 +49,7 @@ use windows_sys::Win32::{
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     },
     System::Pipes::CreatePipe,
+    System::SystemInformation::GetWindowsDirectoryW,
     System::Threading::{
         CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
         InitializeProcThreadAttributeList, TerminateProcess, UpdateProcThreadAttribute,
@@ -726,6 +727,16 @@ fn windows_wide_string(value: &OsStr) -> Result<Vec<u16>, CodexRuntimeError> {
 }
 
 #[cfg(windows)]
+fn windows_system_root() -> Option<OsString> {
+    let mut buffer = [0_u16; 260];
+    let length = unsafe { GetWindowsDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
+    if length == 0 || length >= buffer.len() {
+        return None;
+    }
+    Some(OsString::from_wide(&buffer[..length]))
+}
+
+#[cfg(windows)]
 fn windows_environment_block(pin: CodexUpstreamPin, private_temp_root: Option<&Path>) -> Vec<u16> {
     let mut entries = vec![
         format!(
@@ -734,6 +745,15 @@ fn windows_environment_block(pin: CodexUpstreamPin, private_temp_root: Option<&P
         ),
         format!("CODEX_D29_UPSTREAM_COMMIT={}", pin.commit()),
     ];
+    // Winsock's provider loader requires the OS installation root when the
+    // child receives an explicit, hermetic environment block.  This value is
+    // read from the Windows API rather than inherited from the caller, so the
+    // process boundary remains deterministic and model-independent.
+    if let Some(system_root) = windows_system_root() {
+        let system_root = system_root.to_string_lossy();
+        entries.push(format!("SystemRoot={system_root}"));
+        entries.push(format!("WINDIR={system_root}"));
+    }
     if let Some(private_temp_root) = private_temp_root {
         let private_temp_root = private_temp_root.to_string_lossy();
         entries.push(format!("TEMP={private_temp_root}"));

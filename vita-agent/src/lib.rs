@@ -57,6 +57,16 @@ pub use workspace_capability::{
 };
 
 #[cfg(windows)]
+pub(crate) use d29h3::{
+    H3ApprovalFloor, H3AuthorityOperation, H3AuthorityRequest, H3CanonicalDecision,
+    H3CanonicalDecisionCode, H3CanonicalOutcome, H3DisclosureRequest, H3HostAuthorityResponse,
+    H3HostScopedGrantEvidence, H3ScopeRequirement, VitaH3AuthorityError, VitaH3AuthorityFuture,
+    VitaH3AuthorityPort, VitaH3DisclosureFuture, VitaWorkspaceReadBroker,
+    VitaWorkspaceReadToolContributor, VITA_WORKSPACE_READ_CAPABILITY_ID,
+    VITA_WORKSPACE_READ_TOOL_NAME,
+};
+
+#[cfg(windows)]
 pub use d29h7::{
     H7ProcessBinding, H7ProcessGrant, VitaGitStatusAuthority, VitaGitStatusConfirmationBridge,
     VitaGitStatusPendingConfirmation, VitaGitStatusProduction, VitaGitStatusToolContributor,

@@ -5,6 +5,9 @@ const MAX_DISPLAY_NAME_LENGTH: usize = 256;
 pub(crate) const PRODUCTION_GIT_STATUS_CAPABILITY_ID: &str = "vita.process.workspace.git_status";
 pub(crate) const PRODUCTION_GIT_STATUS_PROFILE_ID: &str = "d29h7c.git.status.v1";
 pub(crate) const PRODUCTION_GIT_STATUS_TOOL_NAME: &str = "vita_workspace_git_status";
+pub(crate) const PRODUCTION_WORKSPACE_READ_CAPABILITY_ID: &str = "vita.workspace.read_file";
+pub(crate) const PRODUCTION_WORKSPACE_READ_PROFILE_ID: &str = "d31.workspace.read_file.v1";
+pub(crate) const PRODUCTION_WORKSPACE_READ_TOOL_NAME: &str = "vita_workspace_read_file";
 
 /// A capability identity is an opaque, exact, lower-case ASCII identifier.
 /// No normalization, aliasing, or case folding is performed.
@@ -247,14 +250,15 @@ impl CapabilityRegistry {
         })
     }
 
-    /// The production catalog is a closed, trusted static set.  H7-D opens
-    /// exactly one read-only capability; no generic process, shell, write, or
+    /// The production catalog is a closed, trusted static set.  D31-B adds
+    /// exactly one bounded read-only workspace-file capability beside the
+    /// frozen H7 Git-status route; no generic process, shell, write, or
     /// network descriptor is registered here.
     pub(crate) fn production() -> Result<Self, CapabilityRegistryError> {
-        let capability_id = CapabilityId::try_from(PRODUCTION_GIT_STATUS_CAPABILITY_ID)
+        let git_capability_id = CapabilityId::try_from(PRODUCTION_GIT_STATUS_CAPABILITY_ID)
             .expect("the production Git status capability ID is a valid static identifier");
-        let descriptor = CapabilityDescriptor::new(
-            capability_id,
+        let git_descriptor = CapabilityDescriptor::new(
+            git_capability_id,
             "Governed read-only workspace Git status",
             RiskClass::Critical,
             ApprovalFloor::ExplicitPerAction,
@@ -265,7 +269,21 @@ impl CapabilityRegistry {
             PRODUCTION_GIT_STATUS_PROFILE_ID,
             PRODUCTION_GIT_STATUS_TOOL_NAME,
         );
-        Self::from_trusted_descriptors([descriptor])
+        let read_capability_id = CapabilityId::try_from(PRODUCTION_WORKSPACE_READ_CAPABILITY_ID)
+            .expect("the production workspace read capability ID is a valid static identifier");
+        let read_descriptor = CapabilityDescriptor::new(
+            read_capability_id,
+            "Governed bounded workspace file read",
+            RiskClass::Critical,
+            ApprovalFloor::ExplicitPerAction,
+            ScopeRequirement::WorkspaceRequired,
+        )
+        .expect("the production workspace read descriptor is valid")
+        .with_execution_route(
+            PRODUCTION_WORKSPACE_READ_PROFILE_ID,
+            PRODUCTION_WORKSPACE_READ_TOOL_NAME,
+        );
+        Self::from_trusted_descriptors([git_descriptor, read_descriptor])
     }
 
     #[cfg(any(
@@ -370,7 +388,7 @@ mod tests {
             CapabilityRegistryError::DuplicateCapabilityId(_)
         ));
         let registry = CapabilityRegistry::production().unwrap();
-        assert_eq!(registry.len(), 1);
+        assert_eq!(registry.len(), 2);
         let git_status = CapabilityId::try_from(PRODUCTION_GIT_STATUS_CAPABILITY_ID).unwrap();
         let descriptor = registry.descriptor(&git_status).unwrap();
         assert_eq!(descriptor.risk_class(), RiskClass::Critical);
@@ -391,6 +409,26 @@ mod tests {
             Some(PRODUCTION_GIT_STATUS_TOOL_NAME)
         );
         assert!(descriptor.is_read_only());
+        let read = CapabilityId::try_from(PRODUCTION_WORKSPACE_READ_CAPABILITY_ID).unwrap();
+        let read_descriptor = registry.descriptor(&read).unwrap();
+        assert_eq!(read_descriptor.risk_class(), RiskClass::Critical);
+        assert_eq!(
+            read_descriptor.approval_floor(),
+            ApprovalFloor::ExplicitPerAction
+        );
+        assert_eq!(
+            read_descriptor.scope_requirement(),
+            ScopeRequirement::WorkspaceRequired
+        );
+        assert_eq!(
+            read_descriptor.execution_profile(),
+            Some(PRODUCTION_WORKSPACE_READ_PROFILE_ID)
+        );
+        assert_eq!(
+            read_descriptor.tool_name(),
+            Some(PRODUCTION_WORKSPACE_READ_TOOL_NAME)
+        );
+        assert!(read_descriptor.is_read_only());
         for excluded in [
             "vita.process.run",
             "vita.process.workspace.run",

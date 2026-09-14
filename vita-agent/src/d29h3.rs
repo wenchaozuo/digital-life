@@ -1,10 +1,10 @@
 //! D29-H3's first governed bounded workspace read.
 //!
 //! The executable path in this module is deliberately crate-private and is
-//! not installed by the normal Vita entrypoint.  The model can request a
-//! relative resource, but it cannot select a capability, mint a grant, or
-//! supply authority evidence.  A bounded Host-scoped evidence response is
-//! required before the private local execution object can exist.
+//! installed only by the production Vita sidecar composition root.  The model
+//! can request a relative resource, but it cannot select a capability, mint a
+//! grant, or supply authority evidence.  A bounded Host-scoped evidence
+//! response is required before the private local execution object can exist.
 #![allow(dead_code, private_interfaces)]
 
 use std::collections::HashSet;
@@ -121,7 +121,7 @@ enum H3RequestBuildError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum H3CanonicalOutcome {
+pub(crate) enum H3CanonicalOutcome {
     Denied,
     RootDisabled,
     ExplicitConfirmationRequired,
@@ -133,7 +133,7 @@ enum H3CanonicalOutcome {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum H3CanonicalDecisionCode {
+pub(crate) enum H3CanonicalDecisionCode {
     Denied,
     RootDisabled,
     ExplicitConfirmationRequired,
@@ -160,56 +160,56 @@ impl H3CanonicalDecisionCode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum H3ScopeRequirement {
+pub(crate) enum H3ScopeRequirement {
     None,
     WorkspaceRequired,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum H3ApprovalFloor {
+pub(crate) enum H3ApprovalFloor {
     RootEnabled,
     ExplicitPerAction,
     Forbidden,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct H3CanonicalDecision {
-    life_id: String,
-    capability_id: String,
-    outcome: H3CanonicalOutcome,
-    decision_code: H3CanonicalDecisionCode,
-    scope_requirement: H3ScopeRequirement,
-    approval_floor: H3ApprovalFloor,
-    authorization_revision: Option<i64>,
+pub(crate) struct H3CanonicalDecision {
+    pub(crate) life_id: String,
+    pub(crate) capability_id: String,
+    pub(crate) outcome: H3CanonicalOutcome,
+    pub(crate) decision_code: H3CanonicalDecisionCode,
+    pub(crate) scope_requirement: H3ScopeRequirement,
+    pub(crate) approval_floor: H3ApprovalFloor,
+    pub(crate) authorization_revision: Option<i64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct H3HostScopedGrantEvidence {
-    grant_id: String,
-    life_id: String,
-    task_id: String,
-    capability_id: String,
-    authorization_revision: i64,
-    scope: VitaRequestedScope,
-    workspace_root_identity: super::WorkspaceRootIdentity,
-    relative_path: super::WorkspaceRelativePath,
-    target_identity: super::WorkspaceRootIdentity,
-    target_kind: PreparedWorkspaceTargetKind,
-    max_bytes: usize,
-    tool_call_id: String,
-    turn_id: String,
-    issued_at_unix_ms: u64,
-    expires_at_unix_ms: u64,
+pub(crate) struct H3HostScopedGrantEvidence {
+    pub(crate) grant_id: String,
+    pub(crate) life_id: String,
+    pub(crate) task_id: String,
+    pub(crate) capability_id: String,
+    pub(crate) authorization_revision: i64,
+    pub(crate) scope: VitaRequestedScope,
+    pub(crate) workspace_root_identity: super::WorkspaceRootIdentity,
+    pub(crate) relative_path: super::WorkspaceRelativePath,
+    pub(crate) target_identity: super::WorkspaceRootIdentity,
+    pub(crate) target_kind: PreparedWorkspaceTargetKind,
+    pub(crate) max_bytes: usize,
+    pub(crate) tool_call_id: String,
+    pub(crate) turn_id: String,
+    pub(crate) issued_at_unix_ms: u64,
+    pub(crate) expires_at_unix_ms: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct H3HostAuthorityResponse {
-    canonical: H3CanonicalDecision,
-    scope_grant: Option<H3HostScopedGrantEvidence>,
+pub(crate) struct H3HostAuthorityResponse {
+    pub(crate) canonical: H3CanonicalDecision,
+    pub(crate) scope_grant: Option<H3HostScopedGrantEvidence>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum H3AuthorityOperation {
+pub(crate) enum H3AuthorityOperation {
     IssueScopeGrant,
     Revalidate {
         grant_id: String,
@@ -218,17 +218,37 @@ enum H3AuthorityOperation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct H3AuthorityRequest {
-    context: VitaExecutionContext,
-    capability_id: String,
-    operation: H3AuthorityOperation,
-    tool_call_id: String,
-    turn_id: String,
-    relative_path: super::WorkspaceRelativePath,
-    max_bytes: usize,
-    workspace_root_identity: super::WorkspaceRootIdentity,
-    target_identity: super::WorkspaceRootIdentity,
-    target_kind: PreparedWorkspaceTargetKind,
+pub(crate) struct H3AuthorityRequest {
+    pub(crate) context: VitaExecutionContext,
+    pub(crate) capability_id: String,
+    pub(crate) operation: H3AuthorityOperation,
+    pub(crate) tool_call_id: String,
+    pub(crate) turn_id: String,
+    pub(crate) relative_path: super::WorkspaceRelativePath,
+    pub(crate) max_bytes: usize,
+    pub(crate) workspace_root_identity: super::WorkspaceRootIdentity,
+    pub(crate) target_identity: super::WorkspaceRootIdentity,
+    pub(crate) target_kind: PreparedWorkspaceTargetKind,
+}
+
+/// Evidence supplied to the Host disclosure-release fence after the bounded
+/// read has completed.  The content itself never enters this authority
+/// request; only its exact byte count and digest do.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct H3DisclosureRequest {
+    pub(crate) context: VitaExecutionContext,
+    pub(crate) capability_id: String,
+    pub(crate) grant_id: String,
+    pub(crate) authorization_revision: i64,
+    pub(crate) tool_call_id: String,
+    pub(crate) turn_id: String,
+    pub(crate) relative_path: super::WorkspaceRelativePath,
+    pub(crate) max_bytes: usize,
+    pub(crate) workspace_root_identity: super::WorkspaceRootIdentity,
+    pub(crate) target_identity: super::WorkspaceRootIdentity,
+    pub(crate) target_kind: PreparedWorkspaceTargetKind,
+    pub(crate) bytes_read: usize,
+    pub(crate) content_sha256: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -245,7 +265,17 @@ pub(crate) type VitaH3AuthorityFuture = Pin<
 
 pub(crate) trait VitaH3AuthorityPort: Send + Sync {
     fn evaluate(&self, request: H3AuthorityRequest) -> VitaH3AuthorityFuture;
+
+    /// The D29-H3 test authorities predate the D31 disclosure fence and keep
+    /// the default no-op behavior.  The process-isolated production adapter
+    /// overrides this method with the typed Host release RPC.
+    fn release(&self, _request: H3DisclosureRequest) -> VitaH3DisclosureFuture {
+        Box::pin(async { Ok(()) })
+    }
 }
+
+pub(crate) type VitaH3DisclosureFuture =
+    Pin<Box<dyn Future<Output = Result<(), VitaH3AuthorityError>> + Send + 'static>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum H3DenyClassification {
@@ -272,6 +302,7 @@ enum H3DenyClassification {
     Oversized,
     InvalidUtf8,
     CancelledAfterRead,
+    DisclosureRejected,
 }
 
 impl H3DenyClassification {
@@ -300,6 +331,7 @@ impl H3DenyClassification {
             Self::Oversized => "workspace_file_too_large",
             Self::InvalidUtf8 => "workspace_file_not_utf8",
             Self::CancelledAfterRead => "turn_cancelled_after_bounded_read",
+            Self::DisclosureRejected => "workspace_read_disclosure_denied",
         }
     }
 }
@@ -410,10 +442,9 @@ pub(crate) struct VitaWorkspaceReadSnapshot {
     pub max_active_authority: usize,
 }
 
-/// The H3 broker is an internal test/integration seam.  It has no production
-/// constructor call and is not attached to the normal Vita entrypoint.  A
-/// private executable object can only be imported from typed Host-scoped
-/// evidence and the matching H2 prepared target.
+/// The H3 broker is the narrow production execution seam for D31-B.  A private
+/// executable object can only be imported from typed Host-scoped evidence and
+/// the matching H2 prepared target.
 pub(crate) struct VitaWorkspaceReadBroker {
     context: Option<VitaExecutionContext>,
     root: super::TrustedWorkspaceRoot,
@@ -455,6 +486,18 @@ impl VitaWorkspaceReadBroker {
     }
 
     pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    /// Starts a fresh Codex turn without replacing the retained workspace
+    /// handle or authority adapter.  Call IDs are scoped to the current turn
+    /// so a later turn cannot replay an older tool invocation.
+    pub(crate) fn begin_turn(&self) {
+        self.cancelled.store(false, Ordering::Release);
+        lock_unpoisoned(&self.state).seen_call_ids.clear();
+    }
+
+    pub(crate) fn cancel_turn(&self) {
         self.cancelled.store(true, Ordering::Release);
     }
 
@@ -694,12 +737,6 @@ impl VitaWorkspaceReadBroker {
             }
         };
         let bytes_read = content.len();
-        self.metrics
-            .authorized_file_reads
-            .fetch_add(1, Ordering::AcqRel);
-        self.metrics
-            .file_bytes_read
-            .fetch_add(bytes_read, Ordering::AcqRel);
         if self.cancelled.load(Ordering::Acquire) {
             return VitaWorkspaceReadResult {
                 request,
@@ -710,6 +747,43 @@ impl VitaWorkspaceReadBroker {
                 grant_issued: true,
             };
         }
+        let disclosure_request = H3DisclosureRequest {
+            context: bound_context.clone(),
+            capability_id: grant.capability_id.clone(),
+            grant_id: grant.grant_id.clone(),
+            authorization_revision: grant.authorization_revision,
+            tool_call_id: request.tool_call_id.clone(),
+            turn_id: request.turn_id.clone(),
+            relative_path: request.relative_path.clone(),
+            max_bytes: request.max_bytes,
+            workspace_root_identity: prepared.root().identity(),
+            target_identity: grant.target_identity,
+            target_kind: grant.target_kind,
+            bytes_read,
+            content_sha256: super::sha256_hex(content.as_bytes()),
+        };
+        let release = match catch_unwind(AssertUnwindSafe(|| {
+            self.authority.release(disclosure_request)
+        })) {
+            Ok(future) => CatchUnwindDisclosureFuture::new(future).await,
+            Err(_) => Err(()),
+        };
+        if !matches!(release, Ok(Ok(()))) {
+            return VitaWorkspaceReadResult {
+                request,
+                classification: Some(H3DenyClassification::DisclosureRejected),
+                content: None,
+                bytes_read: 0,
+                execution_started: true,
+                grant_issued: true,
+            };
+        }
+        self.metrics
+            .authorized_file_reads
+            .fetch_add(1, Ordering::AcqRel);
+        self.metrics
+            .file_bytes_read
+            .fetch_add(bytes_read, Ordering::AcqRel);
         VitaWorkspaceReadResult {
             request,
             classification: None,
@@ -1068,6 +1142,32 @@ impl<F> CatchUnwindFuture<F> {
     }
 }
 
+struct CatchUnwindDisclosureFuture<F> {
+    future: F,
+}
+
+impl<F> CatchUnwindDisclosureFuture<F> {
+    fn new(future: F) -> Self {
+        Self { future }
+    }
+}
+
+impl<F: Future> Future for CatchUnwindDisclosureFuture<F> {
+    type Output = Result<F::Output, ()>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: the future is pinned together with this wrapper and is not
+        // moved after it is projected for polling.
+        let this = unsafe { self.get_unchecked_mut() };
+        let future = unsafe { Pin::new_unchecked(&mut this.future) };
+        match catch_unwind(AssertUnwindSafe(|| future.poll(cx))) {
+            Ok(Poll::Pending) => Poll::Pending,
+            Ok(Poll::Ready(value)) => Poll::Ready(Ok(value)),
+            Err(_) => Poll::Ready(Err(())),
+        }
+    }
+}
+
 impl<F: Future> Future for CatchUnwindFuture<F> {
     type Output = Result<F::Output, ()>;
 
@@ -1084,8 +1184,8 @@ impl<F: Future> Future for CatchUnwindFuture<F> {
     }
 }
 
-/// Test/integration-only contributor for the real Codex canary.  The normal
-/// Vita entrypoint never installs it.
+/// The production contributor for the bounded D31-B read route.  The same
+/// contributor is also used by the process-isolated canary.
 pub(crate) struct VitaWorkspaceReadToolContributor {
     broker: Arc<VitaWorkspaceReadBroker>,
 }
@@ -1351,6 +1451,21 @@ mod h3r1_tests {
         }
     }
 
+    struct ReleaseDenyAuthority {
+        inner: Arc<ScriptedAuthority>,
+    }
+
+    impl VitaH3AuthorityPort for ReleaseDenyAuthority {
+        fn evaluate(&self, request: H3AuthorityRequest) -> VitaH3AuthorityFuture {
+            let inner = Arc::clone(&self.inner);
+            Box::pin(async move { inner.evaluate(request).await })
+        }
+
+        fn release(&self, _request: H3DisclosureRequest) -> VitaH3DisclosureFuture {
+            Box::pin(async { Err(VitaH3AuthorityError::Unavailable) })
+        }
+    }
+
     fn response_from_reply(
         request: &H3AuthorityRequest,
         reply: AuthorityReply,
@@ -1546,6 +1661,31 @@ mod h3r1_tests {
         assert_eq!(snapshot.process_spawns, 0);
         assert_eq!(snapshot.external_network_requests, 0);
         assert_eq!(authority.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn disclosure_release_denial_never_returns_content() {
+        let fixture = Fixture::new(FILE_CONTENT.as_bytes());
+        let scripted = ScriptedAuthority::new([
+            Ok(AuthorityReply::scope_required()),
+            Ok(AuthorityReply::scope_required()),
+        ]);
+        let authority = Arc::new(ReleaseDenyAuthority {
+            inner: Arc::clone(&scripted),
+        });
+        let broker = fixture.broker(authority);
+        let result = run(&broker, fixture.request("call-release-denied")).await;
+        assert_eq!(
+            result.classification,
+            Some(H3DenyClassification::DisclosureRejected)
+        );
+        assert!(result.content.is_none());
+        assert_eq!(result.bytes_read, 0);
+        let snapshot = broker.snapshot();
+        assert_eq!(snapshot.execution_started, 1);
+        assert_eq!(snapshot.authorized_file_reads, 0);
+        assert_eq!(snapshot.file_bytes_read, 0);
+        assert_eq!(scripted.calls(), 2);
     }
 
     #[tokio::test]
@@ -2625,7 +2765,7 @@ mod h3r1_tests {
     }
 
     #[test]
-    fn production_surface_stays_closed_and_h3_tool_is_not_registered_in_tauri() {
+    fn production_surface_exposes_only_the_bounded_read_tool_route() {
         assert_eq!(VITA_WORKSPACE_READ_TOOL_NAME, "vita_workspace_read_file");
         assert_eq!(
             VITA_WORKSPACE_READ_CAPABILITY_ID,
@@ -2634,7 +2774,7 @@ mod h3r1_tests {
         let source =
             fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs"))
                 .expect("read Vita entrypoint");
-        assert!(!source.contains("VitaWorkspaceReadToolContributor"));
+        assert!(source.contains("VitaWorkspaceReadToolContributor"));
     }
 
     #[derive(Clone, Debug, Default)]

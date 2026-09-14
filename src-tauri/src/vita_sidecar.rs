@@ -171,13 +171,17 @@ mod windows {
     use crate::capability::descriptor::{
         CapabilityId, ScopeRequirement, PRODUCTION_GIT_STATUS_CAPABILITY_ID,
         PRODUCTION_GIT_STATUS_PROFILE_ID, PRODUCTION_GIT_STATUS_TOOL_NAME,
+        PRODUCTION_WORKSPACE_READ_CAPABILITY_ID, PRODUCTION_WORKSPACE_READ_TOOL_NAME,
     };
     use crate::execution_enclave::{CodexRuntimeError, VitaSidecarProcess};
     use protocol::{
         AuthorityEvaluate, AuthorityScopeReply, ConfirmationDecision, ConfirmationReply,
         ConfirmationRequired, GrantIssued, GrantRevalidated, HostMessage, InitializeSession,
-        IssueGrant, ProcessBinding, ProcessGrant, RevalidateGrant, VitaMessage, WorkspaceReadGrant,
-        WorkspaceReadIssueGrant, WorkspaceReadReleaseCheck, WorkspaceReadRevalidateGrant,
+        IssueGrant, ProcessBinding, ProcessGrant, RevalidateGrant, VitaMessage,
+        WorkspaceReadAuthorityEvaluate, WorkspaceReadAuthorityReply,
+        WorkspaceReadConfirmationReply, WorkspaceReadConfirmationRequired, WorkspaceReadGrant,
+        WorkspaceReadGrantIssued, WorkspaceReadGrantRevalidated, WorkspaceReadIssueGrant,
+        WorkspaceReadReleaseCheck, WorkspaceReadReleaseChecked, WorkspaceReadRevalidateGrant,
         CODEX_PROTOCOL_SCHEMA_HASH, CODEX_UPSTREAM_COMMIT, PROTOCOL_VERSION, RUNTIME_ID,
     };
     use sha2::{Digest, Sha256};
@@ -440,9 +444,11 @@ mod windows {
     ) -> bool {
         matches!(
             authority,
-            HostTurnAuthority::Active(active)
-                if active.turn_id == host_turn_id
-                    && active.binding.binding_hash == binding.provider_binding_hash
+                HostTurnAuthority::Active(active)
+                    if active.turn_id == host_turn_id
+                        && active.binding.binding_hash == binding.provider_binding_hash
+                        && active.h7_codex_turn_id.as_deref()
+                            == Some(binding.codex_turn_id.as_str())
         )
     }
 
@@ -465,15 +471,7 @@ mod windows {
         session: &HostSessionState,
         binding: &protocol::WorkspaceReadBinding,
     ) -> Result<i64, String> {
-        binding
-            .validate()
-            .map_err(|_| "WORKSPACE_READ_BINDING_MISMATCH".to_string())?;
-        if binding.session_id != session.session_id
-            || binding.life_id != session.life_id
-            || binding.task_id != session.task_id
-        {
-            return Err("WORKSPACE_READ_BINDING_MISMATCH".to_string());
-        }
+        validate_workspace_read_binding(session, binding)?;
         let capability_id = CapabilityId::try_from(binding.capability_id.as_str())
             .map_err(|_| "CAPABILITY_AUTHORIZATION_UNAVAILABLE".to_string())?;
         let descriptor = registry
@@ -507,9 +505,36 @@ mod windows {
             .ok_or_else(|| "CAPABILITY_AUTHORIZATION_UNAVAILABLE".to_string())
     }
 
-    /// Future-lane Host helper.  The production reader loop deliberately does
-    /// not call this in D31-A-R1.  A confirmation ID can enter this function
-    /// only through the Host-owned approved-action ledger.
+    fn validate_workspace_read_binding(
+        session: &HostSessionState,
+        binding: &protocol::WorkspaceReadBinding,
+    ) -> Result<(), String> {
+        binding
+            .validate()
+            .map_err(|_| "WORKSPACE_READ_BINDING_MISMATCH".to_string())?;
+        if binding.session_id != session.session_id
+            || binding.life_id != session.life_id
+            || binding.task_id != session.task_id
+            || binding.capability_id != PRODUCTION_WORKSPACE_READ_CAPABILITY_ID
+            || binding.tool_name != PRODUCTION_WORKSPACE_READ_TOOL_NAME
+            || binding.workspace_root_identity != session.workspace_identity
+            || !matches!(binding.target_kind, protocol::WorkspaceReadTargetKind::File)
+            || binding.max_bytes == 0
+            || binding.max_bytes > protocol::MAX_WORKSPACE_READ_BYTES
+            || binding.provider_binding_hash.len() != 64
+            || !binding
+                .provider_binding_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err("WORKSPACE_READ_BINDING_MISMATCH".to_string());
+        }
+        Ok(())
+    }
+
+    /// Host-owned grant issue helper for the production D31-B reader loop.  A
+    /// confirmation ID can enter this function only through the Host-owned
+    /// approved-action ledger.
     #[allow(dead_code)]
     fn issue_workspace_read_grant(
         storage: &StorageService,
@@ -520,6 +545,7 @@ mod windows {
         request
             .validate()
             .map_err(|_| "WORKSPACE_READ_ISSUE_INVALID".to_string())?;
+        validate_workspace_read_binding(session, &request.binding)?;
         if request.session_id != session.session_id
             || request.binding.session_id != session.session_id
             || request.binding.life_id != session.life_id
@@ -607,9 +633,9 @@ mod windows {
         Ok(grant)
     }
 
-    /// Future-lane Host helper.  The pre-read authorization commit is
-    /// `Issued -> Revalidated`, and it uses the same Host-owned linearizer as
-    /// D30 CAS updates and disclosure release.  Lock order is
+    /// The pre-read authorization commit is `Issued -> Revalidated`, and it
+    /// uses the same Host-owned linearizer as D30 CAS updates and disclosure
+    /// release.  Lock order is
     /// `turn_authority -> capability_authorization_gate
     /// -> workspace_read_grants -> StorageService state`; the linearizer is
     /// released as soon as the in-memory pre-read commit is complete, before
@@ -624,6 +650,7 @@ mod windows {
         request
             .validate()
             .map_err(|_| "WORKSPACE_READ_REVALIDATION_INVALID".to_string())?;
+        validate_workspace_read_binding(session, &request.binding)?;
         if request.grant.used {
             return Err("WORKSPACE_READ_GRANT_ALREADY_REVALIDATED".to_string());
         }
@@ -691,9 +718,38 @@ mod windows {
         request: &WorkspaceReadReleaseCheck,
         confidential_bytes: &[u8],
     ) -> Result<(), String> {
+        authorize_workspace_read_release_inner(
+            storage,
+            registry,
+            session,
+            request,
+            Some(confidential_bytes),
+        )
+    }
+
+    /// Production release path.  The Host receives only the bounded byte
+    /// count and digest from Vita; the confidential bytes stay in the
+    /// process-isolated sidecar and are never copied into Host memory.
+    fn authorize_workspace_read_release_evidence(
+        storage: &StorageService,
+        registry: &CapabilityRegistry,
+        session: &HostSessionState,
+        request: &WorkspaceReadReleaseCheck,
+    ) -> Result<(), String> {
+        authorize_workspace_read_release_inner(storage, registry, session, request, None)
+    }
+
+    fn authorize_workspace_read_release_inner(
+        storage: &StorageService,
+        registry: &CapabilityRegistry,
+        session: &HostSessionState,
+        request: &WorkspaceReadReleaseCheck,
+        confidential_bytes: Option<&[u8]>,
+    ) -> Result<(), String> {
         request
             .validate()
             .map_err(|_| "WORKSPACE_READ_RELEASE_EVIDENCE_INVALID".to_string())?;
+        validate_workspace_read_binding(session, &request.binding)?;
         if request.session_id != session.session_id
             || request.binding.session_id != session.session_id
             || request.binding.life_id != session.life_id
@@ -750,11 +806,15 @@ mod windows {
         if state.grant.expires_at_unix_ms <= unix_millis() {
             return Err("WORKSPACE_READ_GRANT_EXPIRED".to_string());
         }
-        if u64::try_from(confidential_bytes.len()).ok() != Some(request.bytes_read)
-            || request.bytes_read > request.binding.max_bytes
-            || format!("{:x}", Sha256::digest(confidential_bytes)) != request.content_sha256
-        {
+        if request.bytes_read > request.binding.max_bytes {
             return Err("WORKSPACE_READ_CONTENT_EVIDENCE_MISMATCH".to_string());
+        }
+        if let Some(confidential_bytes) = confidential_bytes {
+            if u64::try_from(confidential_bytes.len()).ok() != Some(request.bytes_read)
+                || format!("{:x}", Sha256::digest(confidential_bytes)) != request.content_sha256
+            {
+                return Err("WORKSPACE_READ_CONTENT_EVIDENCE_MISMATCH".to_string());
+            }
         }
         // This assignment is the authoritative disclosure decision.  The
         // later IPC write is transport only and cannot authorize a replay.
@@ -980,6 +1040,7 @@ mod windows {
         provider: Option<protocol::ProviderConfiguration>,
         writer: Mutex<Option<BufWriter<File>>>,
         pending: Mutex<HashMap<String, PendingAction>>,
+        workspace_read_pending: Mutex<HashMap<String, WorkspaceReadPendingAction>>,
         approvals: Mutex<HashMap<String, ApprovedAction>>,
         grants: Mutex<HashMap<String, HostStoredGrant>>,
         workspace_read_approvals: Mutex<HashMap<String, WorkspaceReadApprovedAction>>,
@@ -1007,6 +1068,19 @@ mod windows {
         workspace_summary: String,
         expires_at_unix_ms: u64,
         binding: ProcessBinding,
+    }
+
+    #[derive(Clone)]
+    struct WorkspaceReadPendingAction {
+        pending_id: String,
+        request_id: String,
+        host_turn_id: String,
+        life_id: String,
+        task_id: String,
+        capability_id: String,
+        workspace_summary: String,
+        expires_at_unix_ms: u64,
+        binding: protocol::WorkspaceReadBinding,
     }
 
     struct ApprovedAction {
@@ -1055,12 +1129,18 @@ mod windows {
         phase: WorkspaceReadGrantPhase,
     }
 
+    enum PendingCancellation {
+        Git(PendingAction),
+        WorkspaceRead(WorkspaceReadPendingAction),
+    }
+
     #[derive(Clone, Debug, Eq, PartialEq)]
     struct ExpiryTicket {
         session_id: String,
         pending_id: String,
         request_id: String,
-        binding: ProcessBinding,
+        binding: Option<ProcessBinding>,
+        workspace_binding: Option<protocol::WorkspaceReadBinding>,
         expires_at_unix_ms: u64,
     }
 
@@ -1070,7 +1150,19 @@ mod windows {
                 session_id: session_id.to_string(),
                 pending_id: pending.pending_id.clone(),
                 request_id: pending.request_id.clone(),
-                binding: pending.binding.clone(),
+                binding: Some(pending.binding.clone()),
+                workspace_binding: None,
+                expires_at_unix_ms: pending.expires_at_unix_ms,
+            }
+        }
+
+        fn for_workspace_pending(session_id: &str, pending: &WorkspaceReadPendingAction) -> Self {
+            Self {
+                session_id: session_id.to_string(),
+                pending_id: pending.pending_id.clone(),
+                request_id: pending.request_id.clone(),
+                binding: None,
+                workspace_binding: Some(pending.binding.clone()),
                 expires_at_unix_ms: pending.expires_at_unix_ms,
             }
         }
@@ -1227,6 +1319,17 @@ mod windows {
                 h7_codex_turn_id: None,
             });
             drop(authority);
+            // A new Host generation cannot inherit any disclosure evidence
+            // (including a previously committed Released projection) from a
+            // terminal generation.  The prior generation's release decision
+            // remains observable until that generation is retired, then this
+            // admission fence removes it before fresh tool traffic starts.
+            if let Ok(mut approvals) = self.workspace_read_approvals.lock() {
+                approvals.clear();
+            }
+            if let Ok(mut grants) = self.workspace_read_grants.lock() {
+                grants.clear();
+            }
             if let Ok(mut active) = self.active_turn_id.lock() {
                 *active = Some(turn_id);
             }
@@ -1463,8 +1566,22 @@ mod windows {
         /// caller still owns `turn_authority`.  Keeping this under the same
         /// mutex as Active -> Cancelling/terminal admission means a fresh turn
         /// cannot observe the old ledger half-cleared.
-        fn clear_turn_evidence_locked(&self, turn_id: &str) -> Vec<PendingAction> {
+        fn clear_turn_evidence_locked(&self, turn_id: &str) -> Vec<PendingCancellation> {
             let pending = if let Ok(mut pending) = self.pending.lock() {
+                let keys = pending
+                    .iter()
+                    .filter(|(_, value)| value.host_turn_id == turn_id)
+                    .map(|(key, _)| key.clone())
+                    .collect::<Vec<_>>();
+                keys.into_iter()
+                    .filter_map(|key| pending.remove(&key))
+                    .into_iter()
+                    .map(PendingCancellation::Git)
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            let workspace_pending = if let Ok(mut pending) = self.workspace_read_pending.lock() {
                 let keys = pending
                     .iter()
                     .filter(|(_, value)| value.host_turn_id == turn_id)
@@ -1477,8 +1594,16 @@ mod windows {
                 Vec::new()
             };
             for value in &pending {
-                self.expiry
-                    .clear(&ExpiryTicket::for_pending(&self.session_id, value));
+                if let PendingCancellation::Git(value) = value {
+                    self.expiry
+                        .clear(&ExpiryTicket::for_pending(&self.session_id, value));
+                }
+            }
+            for value in &workspace_pending {
+                self.expiry.clear(&ExpiryTicket::for_workspace_pending(
+                    &self.session_id,
+                    value,
+                ));
             }
             if let Ok(mut approvals) = self.approvals.lock() {
                 approvals.retain(|_, approval| approval.host_turn_id != turn_id);
@@ -1499,19 +1624,58 @@ mod windows {
                 });
             }
             pending
+                .into_iter()
+                .chain(
+                    workspace_pending
+                        .into_iter()
+                        .map(PendingCancellation::WorkspaceRead),
+                )
+                .collect()
         }
 
-        fn cancel_pending_replies(&self, pending: Vec<PendingAction>) {
+        fn cancel_pending_replies(&self, pending: Vec<PendingCancellation>) {
             for pending in pending {
-                let _ =
-                    send_confirmation_decision(self, &pending, ConfirmationDecision::Cancel, None);
+                match pending {
+                    PendingCancellation::Git(pending) => {
+                        let _ = send_confirmation_decision(
+                            self,
+                            &pending,
+                            ConfirmationDecision::Cancel,
+                            None,
+                        );
+                    }
+                    PendingCancellation::WorkspaceRead(pending) => {
+                        let _ = send_workspace_read_confirmation_decision(
+                            self,
+                            &pending,
+                            ConfirmationDecision::Cancel,
+                            None,
+                        );
+                    }
+                }
             }
         }
 
         fn pending_summary(&self) -> Option<VitaSidecarPendingSummary> {
-            let pending = self.pending.lock().ok()?.values().next()?.clone();
+            if let Some(pending) = self.pending.lock().ok()?.values().next().cloned() {
+                return Some(VitaSidecarPendingSummary {
+                    pending_id: pending_key(&pending),
+                    life_id: pending.life_id,
+                    task_id: pending.task_id,
+                    capability_id: pending.capability_id,
+                    workspace_summary: pending.workspace_summary,
+                    expires_at_unix_ms: pending.expires_at_unix_ms,
+                });
+            }
+            let pending = self
+                .workspace_read_pending
+                .lock()
+                .ok()?
+                .values()
+                .next()?
+                .clone();
             Some(VitaSidecarPendingSummary {
-                pending_id: pending_key(&pending),
+                pending_id: pending.pending_id,
                 life_id: pending.life_id,
                 task_id: pending.task_id,
                 capability_id: pending.capability_id,
@@ -1565,6 +1729,21 @@ mod windows {
                     decision: ConfirmationDecision::Deny,
                     authorization_revision: None,
                 }));
+            }
+            let workspace_pending = if let Ok(mut pending) = self.workspace_read_pending.lock() {
+                pending.drain().map(|(_, value)| value).collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            for pending in workspace_pending {
+                let _ = self.send(&HostMessage::WorkspaceReadConfirmationReply(
+                    WorkspaceReadConfirmationReply {
+                        request_id: pending.request_id,
+                        session_id: self.session_id.clone(),
+                        decision: ConfirmationDecision::Deny,
+                        authorization_revision: None,
+                    },
+                ));
             }
             if let Ok(mut approvals) = self.approvals.lock() {
                 approvals.clear();
@@ -1638,11 +1817,38 @@ mod windows {
             if self.closed.load(Ordering::Acquire) || ticket.session_id != self.session_id {
                 return;
             }
-            let expired = if let Ok(mut pending) = self.pending.lock() {
+            if let Some(expected_binding) = ticket.binding.as_ref() {
+                let expired = if let Ok(mut pending) = self.pending.lock() {
+                    let key = pending.iter().find_map(|(key, value)| {
+                        (value.pending_id == ticket.pending_id
+                            && value.request_id == ticket.request_id
+                            && value.binding == *expected_binding
+                            && value.expires_at_unix_ms == ticket.expires_at_unix_ms
+                            && value.expires_at_unix_ms <= unix_millis())
+                        .then_some(key.clone())
+                    });
+                    key.and_then(|key| pending.remove(&key))
+                } else {
+                    None
+                };
+                if let Some(pending) = expired {
+                    let _ = self.send(&HostMessage::ConfirmationReply(ConfirmationReply {
+                        request_id: pending.request_id,
+                        session_id: self.session_id.clone(),
+                        decision: ConfirmationDecision::Deny,
+                        authorization_revision: None,
+                    }));
+                }
+                return;
+            }
+            let Some(expected_binding) = ticket.workspace_binding.as_ref() else {
+                return;
+            };
+            let expired = if let Ok(mut pending) = self.workspace_read_pending.lock() {
                 let key = pending.iter().find_map(|(key, value)| {
                     (value.pending_id == ticket.pending_id
                         && value.request_id == ticket.request_id
-                        && value.binding == ticket.binding
+                        && value.binding == *expected_binding
                         && value.expires_at_unix_ms == ticket.expires_at_unix_ms
                         && value.expires_at_unix_ms <= unix_millis())
                     .then_some(key.clone())
@@ -1652,12 +1858,12 @@ mod windows {
                 None
             };
             if let Some(pending) = expired {
-                let _ = self.send(&HostMessage::ConfirmationReply(ConfirmationReply {
-                    request_id: pending.request_id,
-                    session_id: self.session_id.clone(),
-                    decision: ConfirmationDecision::Deny,
-                    authorization_revision: None,
-                }));
+                let _ = send_workspace_read_confirmation_decision(
+                    self,
+                    &pending,
+                    ConfirmationDecision::Deny,
+                    None,
+                );
             }
         }
     }
@@ -1832,6 +2038,7 @@ mod windows {
                 provider,
                 writer: Mutex::new(Some(writer)),
                 pending: Mutex::new(HashMap::new()),
+                workspace_read_pending: Mutex::new(HashMap::new()),
                 approvals: Mutex::new(HashMap::new()),
                 grants: Mutex::new(HashMap::new()),
                 workspace_read_approvals: Mutex::new(HashMap::new()),
@@ -1989,6 +2196,9 @@ mod windows {
             decision: ConfirmationDecision,
         ) -> Result<VitaSidecarActionResponse, String> {
             expire_pending(session);
+            if let Some(pending) = take_workspace_read_pending(session, &pending_id) {
+                return self.decide_workspace_read_pending_for_session(session, pending, decision);
+            }
             let pending = take_pending(session, &pending_id)
                 .ok_or_else(|| "Vita pending confirmation was not found".to_string())?;
             let authority = session
@@ -2062,6 +2272,118 @@ mod windows {
             Ok(VitaSidecarActionResponse { accepted: true })
         }
 
+        fn decide_workspace_read_pending_for_session(
+            &self,
+            session: &Arc<HostSessionState>,
+            pending: WorkspaceReadPendingAction,
+            decision: ConfirmationDecision,
+        ) -> Result<VitaSidecarActionResponse, String> {
+            let authority = session
+                .turn_authority
+                .lock()
+                .map_err(|_| "Vita turn authority lock was poisoned".to_string())?;
+            let active = matches!(
+                &*authority,
+                HostTurnAuthority::Active(active)
+                    if active_workspace_read_turn_matches(
+                        &HostTurnAuthority::Active(active.clone()),
+                        &pending.host_turn_id,
+                        &pending.binding,
+                    )
+            );
+            if !active {
+                let _ = send_workspace_read_confirmation_decision(
+                    session,
+                    &pending,
+                    ConfirmationDecision::Cancel,
+                    None,
+                );
+                return Err("Vita pending workspace read belongs to a retired turn".to_string());
+            }
+            if pending.expires_at_unix_ms <= unix_millis() {
+                let _ = send_workspace_read_confirmation_decision(
+                    session,
+                    &pending,
+                    ConfirmationDecision::Deny,
+                    None,
+                );
+                return Err("Vita pending workspace read confirmation expired".to_string());
+            }
+
+            let mut revision = None;
+            if decision == ConfirmationDecision::Confirm {
+                if let Err(error) = require_current_session_life(&self.authority_storage, session) {
+                    let _ = send_workspace_read_confirmation_decision(
+                        session,
+                        &pending,
+                        ConfirmationDecision::Deny,
+                        None,
+                    );
+                    return Err(error);
+                }
+                revision = match current_workspace_read_revision(
+                    &self.authority_storage,
+                    &self.registry,
+                    session,
+                    &pending.binding,
+                ) {
+                    Ok(revision) => Some(revision),
+                    Err(error) => {
+                        let _ = send_workspace_read_confirmation_decision(
+                            session,
+                            &pending,
+                            ConfirmationDecision::Deny,
+                            None,
+                        );
+                        return Err(error);
+                    }
+                };
+                let confirmation_id = match secure_id("vita-read-confirmation") {
+                    Ok(confirmation_id) => confirmation_id,
+                    Err(error) => {
+                        let _ = send_workspace_read_confirmation_decision(
+                            session,
+                            &pending,
+                            ConfirmationDecision::Deny,
+                            None,
+                        );
+                        return Err(error);
+                    }
+                };
+                session
+                    .workspace_read_approvals
+                    .lock()
+                    .map_err(|_| {
+                        "Vita workspace read approval state lock was poisoned".to_string()
+                    })?
+                    .insert(
+                        workspace_read_approval_key(&pending.host_turn_id, &pending.binding),
+                        WorkspaceReadApprovedAction {
+                            host_turn_id: pending.host_turn_id.clone(),
+                            binding: pending.binding.clone(),
+                            authorization_revision: revision.unwrap_or_default(),
+                            confirmation_id,
+                            expires_at_unix_ms: pending.expires_at_unix_ms,
+                        },
+                    );
+            }
+            if let Err(error) =
+                send_workspace_read_confirmation_decision(session, &pending, decision, revision)
+            {
+                if decision == ConfirmationDecision::Confirm {
+                    if let Ok(mut approvals) = session.workspace_read_approvals.lock() {
+                        approvals.remove(&workspace_read_approval_key(
+                            &pending.host_turn_id,
+                            &pending.binding,
+                        ));
+                    }
+                }
+                return Err(error);
+            }
+            drop(authority);
+            Ok(VitaSidecarActionResponse { accepted: true })
+        }
+
         fn cancel(&self) -> Result<VitaSidecarActionResponse, String> {
             let guard = self
                 .inner
@@ -2080,6 +2402,18 @@ mod windows {
                     ConfirmationDecision::Cancel
                 };
                 let _ = send_confirmation_decision(&running.session, &pending, decision, None);
+            } else if let Some(pending) = take_any_workspace_read_pending(&running.session) {
+                let decision = if pending.expires_at_unix_ms <= unix_millis() {
+                    ConfirmationDecision::Deny
+                } else {
+                    ConfirmationDecision::Cancel
+                };
+                let _ = send_workspace_read_confirmation_decision(
+                    &running.session,
+                    &pending,
+                    decision,
+                    None,
+                );
             }
             running
                 .session
@@ -2225,6 +2559,18 @@ mod windows {
                     ConfirmationDecision::Cancel
                 };
                 let _ = send_confirmation_decision(&running.session, &pending, decision, None);
+            } else if let Some(pending) = take_any_workspace_read_pending(&running.session) {
+                let decision = if pending.expires_at_unix_ms <= unix_millis() {
+                    ConfirmationDecision::Deny
+                } else {
+                    ConfirmationDecision::Cancel
+                };
+                let _ = send_workspace_read_confirmation_decision(
+                    &running.session,
+                    &pending,
+                    decision,
+                    None,
+                );
             }
             // Cancel the governed H7 action and any pending H8 confirmation
             // before interrupting the Codex turn.  A turn-only interrupt is
@@ -2306,16 +2652,20 @@ mod windows {
                 VitaMessage::RevalidateGrant(request) => {
                     handle_revalidate_grant(&session, &storage, &registry, request)
                 }
-                // D31-A reserves and validates the typed read/disclosure
-                // protocol, but no production read tool is registered yet.
-                // A sidecar attempting this future lane against this Host is
-                // terminally denied rather than falling through to H7 state.
-                VitaMessage::WorkspaceReadAuthorityEvaluate(_)
-                | VitaMessage::WorkspaceReadConfirmationRequired(_)
-                | VitaMessage::WorkspaceReadIssueGrant(_)
-                | VitaMessage::WorkspaceReadRevalidateGrant(_)
-                | VitaMessage::WorkspaceReadReleaseCheck(_) => {
-                    Err("D31 workspace-read authority is not production-enabled".to_string())
+                VitaMessage::WorkspaceReadAuthorityEvaluate(request) => {
+                    handle_workspace_read_authority_evaluate(&session, &storage, &registry, request)
+                }
+                VitaMessage::WorkspaceReadConfirmationRequired(request) => {
+                    handle_workspace_read_confirmation_required(&session, request)
+                }
+                VitaMessage::WorkspaceReadIssueGrant(request) => {
+                    handle_workspace_read_issue_grant(&session, &storage, &registry, request)
+                }
+                VitaMessage::WorkspaceReadRevalidateGrant(request) => {
+                    handle_workspace_read_revalidate_grant(&session, &storage, &registry, request)
+                }
+                VitaMessage::WorkspaceReadReleaseCheck(request) => {
+                    handle_workspace_read_release_check(&session, &storage, &registry, request)
                 }
                 VitaMessage::CredentialRequired(request) => {
                     handle_credential_required(&session, &storage, &secrets, request)
@@ -2557,6 +2907,331 @@ mod windows {
         }));
         drop(authority);
         result
+    }
+
+    fn handle_workspace_read_authority_evaluate(
+        session: &Arc<HostSessionState>,
+        storage: &StorageService,
+        registry: &CapabilityRegistry,
+        request: WorkspaceReadAuthorityEvaluate,
+    ) -> Result<(), String> {
+        request
+            .validate()
+            .map_err(|_| "Vita workspace read authority request was malformed".to_string())?;
+        if session.closed.load(Ordering::Acquire) {
+            return Err("Vita sidecar session was already retired".to_string());
+        }
+        if request.session_id != session.session_id {
+            return Err("Vita workspace read authority session was not exact".to_string());
+        }
+        validate_workspace_read_binding(session, &request.binding)?;
+        let mut authority = session
+            .turn_authority
+            .lock()
+            .map_err(|_| "Vita turn authority lock was poisoned".to_string())?;
+        let active = match &mut *authority {
+            HostTurnAuthority::Active(active) if active.turn_id == request.host_turn_id => active,
+            _ => {
+                let result = session.send(&HostMessage::WorkspaceReadAuthorityReply(
+                    WorkspaceReadAuthorityReply {
+                        request_id: request.request_id,
+                        session_id: session.session_id.clone(),
+                        allowed: false,
+                        authorization_revision: None,
+                        error_code: Some("TURN_NOT_ACTIVE".to_string()),
+                    },
+                ));
+                drop(authority);
+                result?;
+                return Err("WORKSPACE_READ_DISCLOSURE_TURN_NOT_ACTIVE".to_string());
+            }
+        };
+        if active.binding.binding_hash != request.binding.provider_binding_hash {
+            let result = session.send(&HostMessage::WorkspaceReadAuthorityReply(
+                WorkspaceReadAuthorityReply {
+                    request_id: request.request_id,
+                    session_id: session.session_id.clone(),
+                    allowed: false,
+                    authorization_revision: None,
+                    error_code: Some("PROVIDER_BINDING_MISMATCH".to_string()),
+                },
+            ));
+            drop(authority);
+            result?;
+            return Err("WORKSPACE_READ_BINDING_MISMATCH".to_string());
+        }
+        if active
+            .h7_codex_turn_id
+            .as_deref()
+            .is_some_and(|codex_turn_id| codex_turn_id != request.binding.codex_turn_id)
+        {
+            let result = session.send(&HostMessage::WorkspaceReadAuthorityReply(
+                WorkspaceReadAuthorityReply {
+                    request_id: request.request_id,
+                    session_id: session.session_id.clone(),
+                    allowed: false,
+                    authorization_revision: None,
+                    error_code: Some("CODEX_TURN_MISMATCH".to_string()),
+                },
+            ));
+            drop(authority);
+            result?;
+            return Err("CODEX_TURN_MISMATCH".to_string());
+        }
+        let (allowed, revision, reply_error_code) = match storage.capability_authorization_scope() {
+            Ok(authority_scope) => {
+                match require_current_session_life(storage, session).and_then(|_| {
+                    current_workspace_read_revision_in_scope(
+                        &authority_scope,
+                        registry,
+                        session,
+                        &request.binding,
+                    )
+                }) {
+                    Ok(revision) => {
+                        // This is the first Codex-side read message for the Host
+                        // generation.  Retain it as part of the same generation
+                        // fence used by H7 so a later independent Codex turn can
+                        // never reuse this Host authority.
+                        active.h7_codex_turn_id = Some(request.binding.codex_turn_id.clone());
+                        (true, Some(revision), None)
+                    }
+                    Err(error) => (false, None, Some(error_code(&error))),
+                }
+            }
+            Err(error) => (
+                false,
+                None,
+                Some(error_code(&capability_authorization_gate_error(error))),
+            ),
+        };
+        let result = session.send(&HostMessage::WorkspaceReadAuthorityReply(
+            WorkspaceReadAuthorityReply {
+                request_id: request.request_id,
+                session_id: session.session_id.clone(),
+                allowed,
+                authorization_revision: revision,
+                error_code: reply_error_code,
+            },
+        ));
+        drop(authority);
+        result
+    }
+
+    fn handle_workspace_read_confirmation_required(
+        session: &Arc<HostSessionState>,
+        request: WorkspaceReadConfirmationRequired,
+    ) -> Result<(), String> {
+        request
+            .validate()
+            .map_err(|_| "Vita workspace read confirmation request was malformed".to_string())?;
+        if session.closed.load(Ordering::Acquire) {
+            return Err("Vita sidecar session was already retired".to_string());
+        }
+        if request.session_id != session.session_id {
+            return Err("Vita workspace read confirmation session was not exact".to_string());
+        }
+        validate_workspace_read_binding(session, &request.binding)?;
+        let now = unix_millis();
+        let Some(expires_at_unix_ms) =
+            effective_confirmation_expiry(now, request.expires_at_unix_ms)
+        else {
+            session.send(&HostMessage::WorkspaceReadConfirmationReply(
+                WorkspaceReadConfirmationReply {
+                    request_id: request.request_id,
+                    session_id: session.session_id.clone(),
+                    decision: ConfirmationDecision::Deny,
+                    authorization_revision: None,
+                },
+            ))?;
+            return Ok(());
+        };
+        expire_pending(session);
+        let authority = session
+            .turn_authority
+            .lock()
+            .map_err(|_| "Vita turn authority lock was poisoned".to_string())?;
+        let active = matches!(
+            &*authority,
+            HostTurnAuthority::Active(active)
+                if active.turn_id == request.host_turn_id
+                    && active.binding.binding_hash == request.binding.provider_binding_hash
+                    && active.h7_codex_turn_id.as_deref()
+                        == Some(request.binding.codex_turn_id.as_str())
+        );
+        if !active {
+            session.send(&HostMessage::WorkspaceReadConfirmationReply(
+                WorkspaceReadConfirmationReply {
+                    request_id: request.request_id,
+                    session_id: session.session_id.clone(),
+                    decision: ConfirmationDecision::Cancel,
+                    authorization_revision: None,
+                },
+            ))?;
+            drop(authority);
+            return Err("WORKSPACE_READ_DISCLOSURE_TURN_NOT_ACTIVE".to_string());
+        }
+        let pending_id = format!("read-pending:{}", secure_id("vita")?);
+        let pending_action = WorkspaceReadPendingAction {
+            pending_id: pending_id.clone(),
+            request_id: request.request_id,
+            host_turn_id: request.host_turn_id,
+            life_id: request.binding.life_id.clone(),
+            task_id: request.binding.task_id.clone(),
+            capability_id: request.binding.capability_id.clone(),
+            workspace_summary: request.workspace_summary,
+            expires_at_unix_ms,
+            binding: request.binding,
+        };
+        let h7_pending = session
+            .pending
+            .lock()
+            .map_err(|_| "Vita pending state lock was poisoned".to_string())?;
+        let mut pending = session
+            .workspace_read_pending
+            .lock()
+            .map_err(|_| "Vita workspace read pending state lock was poisoned".to_string())?;
+        if h7_pending.len() + pending.len() >= MAX_PENDING {
+            return Err("Vita pending confirmation capacity was exhausted".to_string());
+        }
+        let ticket = ExpiryTicket::for_workspace_pending(&session.session_id, &pending_action);
+        pending.insert(pending_id, pending_action);
+        drop(pending);
+        drop(h7_pending);
+        drop(authority);
+        session.expiry.schedule(ticket);
+        Ok(())
+    }
+
+    fn handle_workspace_read_issue_grant(
+        session: &Arc<HostSessionState>,
+        storage: &StorageService,
+        registry: &CapabilityRegistry,
+        request: WorkspaceReadIssueGrant,
+    ) -> Result<(), String> {
+        request
+            .validate()
+            .map_err(|_| "Vita workspace read grant request was malformed".to_string())?;
+        if request.session_id != session.session_id {
+            return Err("Vita workspace read grant session was not exact".to_string());
+        }
+        let result = issue_workspace_read_grant(storage, registry, session, &request);
+        match result {
+            Ok(grant) => session.send(&HostMessage::WorkspaceReadGrantIssued(
+                WorkspaceReadGrantIssued {
+                    request_id: request.request_id,
+                    session_id: session.session_id.clone(),
+                    allowed: true,
+                    grant: Some(grant),
+                    error_code: None,
+                },
+            )),
+            Err(error) => {
+                let terminal = workspace_read_protocol_error_is_terminal(&error);
+                let result = session.send(&HostMessage::WorkspaceReadGrantIssued(
+                    WorkspaceReadGrantIssued {
+                        request_id: request.request_id,
+                        session_id: session.session_id.clone(),
+                        allowed: false,
+                        grant: None,
+                        error_code: Some(error_code(&error)),
+                    },
+                ));
+                if terminal {
+                    result?;
+                    Err(error)
+                } else {
+                    result
+                }
+            }
+        }
+    }
+
+    fn handle_workspace_read_revalidate_grant(
+        session: &Arc<HostSessionState>,
+        storage: &StorageService,
+        registry: &CapabilityRegistry,
+        request: WorkspaceReadRevalidateGrant,
+    ) -> Result<(), String> {
+        request
+            .validate()
+            .map_err(|_| "Vita workspace read revalidation request was malformed".to_string())?;
+        if request.session_id != session.session_id {
+            return Err("Vita workspace read revalidation session was not exact".to_string());
+        }
+        let result = revalidate_workspace_read_grant(storage, registry, session, &request);
+        match result {
+            Ok(grant) => session.send(&HostMessage::WorkspaceReadGrantRevalidated(
+                WorkspaceReadGrantRevalidated {
+                    request_id: request.request_id,
+                    session_id: session.session_id.clone(),
+                    allowed: true,
+                    grant: Some(grant),
+                    error_code: None,
+                },
+            )),
+            Err(error) => {
+                let terminal = workspace_read_protocol_error_is_terminal(&error);
+                let result = session.send(&HostMessage::WorkspaceReadGrantRevalidated(
+                    WorkspaceReadGrantRevalidated {
+                        request_id: request.request_id,
+                        session_id: session.session_id.clone(),
+                        allowed: false,
+                        grant: None,
+                        error_code: Some(error_code(&error)),
+                    },
+                ));
+                if terminal {
+                    result?;
+                    Err(error)
+                } else {
+                    result
+                }
+            }
+        }
+    }
+
+    fn handle_workspace_read_release_check(
+        session: &Arc<HostSessionState>,
+        storage: &StorageService,
+        registry: &CapabilityRegistry,
+        request: WorkspaceReadReleaseCheck,
+    ) -> Result<(), String> {
+        request
+            .validate()
+            .map_err(|_| "Vita workspace read release evidence was malformed".to_string())?;
+        if request.session_id != session.session_id {
+            return Err("Vita workspace read release session was not exact".to_string());
+        }
+        let result =
+            authorize_workspace_read_release_evidence(storage, registry, session, &request);
+        match result {
+            Ok(()) => session.send(&HostMessage::WorkspaceReadReleaseChecked(
+                WorkspaceReadReleaseChecked {
+                    request_id: request.request_id,
+                    session_id: session.session_id.clone(),
+                    allowed: true,
+                    error_code: None,
+                },
+            )),
+            Err(error) => {
+                let terminal = workspace_read_protocol_error_is_terminal(&error);
+                let result = session.send(&HostMessage::WorkspaceReadReleaseChecked(
+                    WorkspaceReadReleaseChecked {
+                        request_id: request.request_id,
+                        session_id: session.session_id.clone(),
+                        allowed: false,
+                        error_code: Some(error_code(&error)),
+                    },
+                ));
+                if terminal {
+                    result?;
+                    Err(error)
+                } else {
+                    result
+                }
+            }
+        }
     }
 
     fn handle_confirmation_required(
@@ -2945,6 +3620,31 @@ mod windows {
         removed
     }
 
+    fn take_workspace_read_pending(
+        session: &HostSessionState,
+        pending_id: &str,
+    ) -> Option<WorkspaceReadPendingAction> {
+        let removed = session
+            .workspace_read_pending
+            .lock()
+            .ok()
+            .and_then(|mut pending| {
+                pending
+                    .iter()
+                    .find_map(|(key, value)| {
+                        (value.pending_id == pending_id).then_some(key.clone())
+                    })
+                    .and_then(|key| pending.remove(&key))
+            });
+        if let Some(ref pending) = removed {
+            session.expiry.clear(&ExpiryTicket::for_workspace_pending(
+                &session.session_id,
+                pending,
+            ));
+        }
+        removed
+    }
+
     fn take_any_pending(session: &HostSessionState) -> Option<PendingAction> {
         let removed = session.pending.lock().ok().and_then(|mut pending| {
             let key = pending.keys().next().cloned()?;
@@ -2954,6 +3654,26 @@ mod windows {
             session
                 .expiry
                 .clear(&ExpiryTicket::for_pending(&session.session_id, pending));
+        }
+        removed
+    }
+
+    fn take_any_workspace_read_pending(
+        session: &HostSessionState,
+    ) -> Option<WorkspaceReadPendingAction> {
+        let removed = session
+            .workspace_read_pending
+            .lock()
+            .ok()
+            .and_then(|mut pending| {
+                let key = pending.keys().next().cloned()?;
+                pending.remove(&key)
+            });
+        if let Some(ref pending) = removed {
+            session.expiry.clear(&ExpiryTicket::for_workspace_pending(
+                &session.session_id,
+                pending,
+            ));
         }
         removed
     }
@@ -2970,6 +3690,36 @@ mod windows {
             decision,
             authorization_revision,
         }))
+    }
+
+    fn send_workspace_read_confirmation_decision(
+        session: &HostSessionState,
+        pending: &WorkspaceReadPendingAction,
+        decision: ConfirmationDecision,
+        authorization_revision: Option<i64>,
+    ) -> Result<(), String> {
+        session.send(&HostMessage::WorkspaceReadConfirmationReply(
+            WorkspaceReadConfirmationReply {
+                request_id: pending.request_id.clone(),
+                session_id: session.session_id.clone(),
+                decision,
+                authorization_revision,
+            },
+        ))
+    }
+
+    fn workspace_read_protocol_error_is_terminal(error: &str) -> bool {
+        matches!(
+            error,
+            "WORKSPACE_READ_DISCLOSURE_TURN_NOT_ACTIVE"
+                | "WORKSPACE_READ_BINDING_MISMATCH"
+                | "WORKSPACE_READ_GRANT_NOT_FOUND"
+                | "WORKSPACE_READ_GRANT_PROVENANCE_MISMATCH"
+                | "WORKSPACE_READ_GRANT_REVALIDATION_DENIED"
+                | "WORKSPACE_READ_CONFIRMATION_NOT_APPROVED"
+                | "WORKSPACE_READ_CONFIRMATION_STALE"
+                | "WORKSPACE_READ_GRANT_ALREADY_REVALIDATED"
+        )
     }
 
     fn expire_pending(session: &HostSessionState) {
@@ -2993,6 +3743,32 @@ mod windows {
                 .expiry
                 .clear(&ExpiryTicket::for_pending(&session.session_id, &pending));
             let _ = send_confirmation_decision(session, &pending, ConfirmationDecision::Deny, None);
+        }
+        let expired = if let Ok(mut pending) = session.workspace_read_pending.lock() {
+            let mut expired = Vec::new();
+            pending.retain(|_, value| {
+                if value.expires_at_unix_ms <= now {
+                    expired.push(value.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            expired
+        } else {
+            Vec::new()
+        };
+        for pending in expired {
+            session.expiry.clear(&ExpiryTicket::for_workspace_pending(
+                &session.session_id,
+                &pending,
+            ));
+            let _ = send_workspace_read_confirmation_decision(
+                session,
+                &pending,
+                ConfirmationDecision::Deny,
+                None,
+            );
         }
     }
 
@@ -3606,7 +4382,7 @@ mod windows {
                 task_id: session.task_id.clone(),
                 capability_id: protocol::WORKSPACE_READ_CAPABILITY_ID.to_string(),
                 tool_name: protocol::WORKSPACE_READ_TOOL_NAME.to_string(),
-                workspace_root_identity: "workspace-root".to_string(),
+                workspace_root_identity: session.workspace_identity.clone(),
                 relative_path: "notes/today.txt".to_string(),
                 target_identity: "workspace-target".to_string(),
                 target_kind: protocol::WorkspaceReadTargetKind::File,
@@ -3633,6 +4409,11 @@ mod windows {
                 .expect("active Host turn");
             let revision = current_workspace_read_revision(storage, registry, session, &binding)
                 .expect("workspace read revision");
+            if let Ok(mut authority) = session.turn_authority.lock() {
+                if let HostTurnAuthority::Active(active) = &mut *authority {
+                    active.h7_codex_turn_id = Some(binding.codex_turn_id.clone());
+                }
+            }
             session.install_workspace_read_approval(
                 host_turn_id,
                 binding.clone(),
@@ -4227,6 +5008,164 @@ mod windows {
                 Some(WorkspaceReadGrantPhase::Released)
             );
             session.retire();
+            drop(root);
+        }
+
+        #[test]
+        fn d31_workspace_read_production_handlers_complete_typed_chain() {
+            let provider = test_provider();
+            let (session, receiver) = test_session_with_provider(provider.clone());
+            let (root, storage, registry) =
+                synthetic_multi_capability_fixture(&session, None, Some(true));
+            let storage = Arc::new(storage);
+            let host_turn_id = "d31-handler-host-turn";
+            let provider_binding =
+                protocol::ProviderBinding::derive(&session.session_id, host_turn_id, &provider)
+                    .expect("provider binding");
+            session
+                .begin_turn(host_turn_id.to_string(), provider, provider_binding.clone())
+                .expect("active Host turn");
+            let binding = workspace_read_binding(&session, &test_provider(), host_turn_id);
+            handle_workspace_read_authority_evaluate(
+                &session,
+                &storage,
+                &registry,
+                WorkspaceReadAuthorityEvaluate {
+                    request_id: "d31-handler-authority".to_string(),
+                    session_id: session.session_id.clone(),
+                    host_turn_id: host_turn_id.to_string(),
+                    binding: binding.clone(),
+                },
+            )
+            .expect("workspace read authority handler");
+            let revision = match receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("workspace authority reply")
+            {
+                HostMessage::WorkspaceReadAuthorityReply(reply) => {
+                    assert!(reply.allowed);
+                    reply.authorization_revision.expect("read revision")
+                }
+                other => panic!("unexpected workspace authority reply: {other:?}"),
+            };
+            handle_workspace_read_confirmation_required(
+                &session,
+                WorkspaceReadConfirmationRequired {
+                    request_id: "d31-handler-confirm".to_string(),
+                    session_id: session.session_id.clone(),
+                    host_turn_id: host_turn_id.to_string(),
+                    workspace_summary: "handler fixture".to_string(),
+                    expires_at_unix_ms: unix_millis().saturating_add(5_000),
+                    binding: binding.clone(),
+                },
+            )
+            .expect("workspace read confirmation handler");
+            let pending_id = session
+                .pending_summary()
+                .expect("workspace read pending summary")
+                .pending_id;
+            assert!(pending_id.starts_with("read-pending:"));
+            let coordinator = VitaSidecarCoordinator::new(Arc::clone(&storage), registry.clone());
+            coordinator.install_test_session(Arc::clone(&session));
+            coordinator
+                .confirm(pending_id)
+                .expect("workspace read confirmation decision");
+            assert!(matches!(
+                receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("workspace read confirmation reply"),
+                HostMessage::WorkspaceReadConfirmationReply(
+                    WorkspaceReadConfirmationReply {
+                        decision: ConfirmationDecision::Confirm,
+                        authorization_revision: Some(reply_revision),
+                        ..
+                    }
+                ) if reply_revision == revision
+            ));
+            handle_workspace_read_issue_grant(
+                &session,
+                &storage,
+                &registry,
+                WorkspaceReadIssueGrant {
+                    request_id: "d31-handler-issue".to_string(),
+                    session_id: session.session_id.clone(),
+                    host_turn_id: host_turn_id.to_string(),
+                    binding: binding.clone(),
+                    authorization_revision: revision,
+                },
+            )
+            .expect("workspace read grant handler");
+            let issued = match receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("workspace read grant reply")
+            {
+                HostMessage::WorkspaceReadGrantIssued(reply) => {
+                    assert!(reply.allowed);
+                    reply.grant.expect("issued workspace read grant")
+                }
+                other => panic!("unexpected workspace grant reply: {other:?}"),
+            };
+            handle_workspace_read_revalidate_grant(
+                &session,
+                &storage,
+                &registry,
+                WorkspaceReadRevalidateGrant {
+                    request_id: "d31-handler-revalidate".to_string(),
+                    session_id: session.session_id.clone(),
+                    host_turn_id: host_turn_id.to_string(),
+                    binding: binding.clone(),
+                    grant: issued,
+                },
+            )
+            .expect("workspace read revalidation handler");
+            let revalidated = match receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("workspace read revalidation reply")
+            {
+                HostMessage::WorkspaceReadGrantRevalidated(reply) => {
+                    assert!(reply.allowed);
+                    reply.grant.expect("revalidated workspace read grant")
+                }
+                other => panic!("unexpected workspace revalidation reply: {other:?}"),
+            };
+            let content = b"D31-B handler content";
+            handle_workspace_read_release_check(
+                &session,
+                &storage,
+                &registry,
+                WorkspaceReadReleaseCheck {
+                    request_id: "d31-handler-release".to_string(),
+                    session_id: session.session_id.clone(),
+                    host_turn_id: host_turn_id.to_string(),
+                    binding,
+                    grant: revalidated,
+                    bytes_read: content.len() as u64,
+                    content_sha256: format!("{:x}", Sha256::digest(content)),
+                },
+            )
+            .expect("workspace read release handler");
+            assert!(matches!(
+                receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("workspace read release reply"),
+                HostMessage::WorkspaceReadReleaseChecked(WorkspaceReadReleaseChecked {
+                    allowed: true,
+                    error_code: None,
+                    ..
+                })
+            ));
+            assert_eq!(
+                session
+                    .workspace_read_grants
+                    .lock()
+                    .expect("workspace read grant lock")
+                    .values()
+                    .next()
+                    .map(|state| state.phase),
+                Some(WorkspaceReadGrantPhase::Released)
+            );
+            session.retire();
+            drop(coordinator);
             drop(root);
         }
 
@@ -5722,6 +6661,7 @@ mod windows {
                 provider,
                 writer: Mutex::new(None),
                 pending: Mutex::new(HashMap::new()),
+                workspace_read_pending: Mutex::new(HashMap::new()),
                 approvals: Mutex::new(HashMap::new()),
                 grants: Mutex::new(HashMap::new()),
                 workspace_read_approvals: Mutex::new(HashMap::new()),
@@ -7146,6 +8086,341 @@ mod windows {
             ));
             drop(writer);
             process.shutdown().expect("canary process shutdown");
+        }
+
+        #[test]
+        fn d31_b_real_process_workspace_read_canary() {
+            let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../vita-agent/target/release/vita-agent.exe");
+            if !executable.is_file() {
+                eprintln!(
+                    "skipping D31-B process canary; release image is absent: {}",
+                    executable.display()
+                );
+                return;
+            }
+            let git_path = match resolve_git_path() {
+                Ok(path) => path,
+                Err(error) => {
+                    eprintln!("skipping D31-B process canary: {error}");
+                    return;
+                }
+            };
+            let workspace = tempfile::tempdir().expect("D31-B canary workspace");
+            let git_metadata = workspace.path().join(".git");
+            fs::create_dir(&git_metadata).expect("D31-B canary Git metadata directory");
+            fs::write(
+                git_metadata.join("config"),
+                b"[core]\n\trepositoryformatversion = 0\n\tbare = false\n",
+            )
+            .expect("D31-B canary Git config");
+            let canary_file = workspace.path().join("canary.txt");
+            let canary_content = b"D31-B bounded canary content\n";
+            fs::write(&canary_file, canary_content).expect("D31-B canary file");
+            let app_data = tempfile::tempdir().expect("D31-B canary app-data");
+            let process_root = tempfile::tempdir().expect("D31-B canary process root");
+            let canary_resource = tempfile::tempdir().expect("D31-B canary resource root");
+            let canary_executable = canary_resource.path().join(SIDECAR_RESOURCE_NAME);
+            fs::copy(&executable, &canary_executable).expect("copy D31-B canary sidecar image");
+            let image =
+                VitaSidecarProcess::prepare_image(&canary_executable, canary_resource.path())
+                    .expect("prepared D31-B sidecar image");
+            let mut process = VitaSidecarProcess::spawn_prepared(
+                image,
+                &[OsString::from("--serve-ipc-test-canary")],
+                process_root.path(),
+            )
+            .expect("D31-B process-isolated sidecar");
+            let stdout = process.take_stdout().expect("D31-B sidecar stdout");
+            let stdin = process.take_stdin().expect("D31-B sidecar stdin");
+            let mut stderr = process.take_stderr().expect("D31-B sidecar stderr");
+
+            let handshake_result = receive_vita_message_with_timeout(
+                BufReader::new(stdout),
+                HANDSHAKE_TIMEOUT,
+                "D31-B canary handshake",
+            );
+            let (message, reader) = match handshake_result {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ = process.shutdown();
+                    let mut diagnostics = String::new();
+                    let _ = std::io::Read::read_to_string(&mut stderr, &mut diagnostics);
+                    eprintln!(
+                        "skipping D31-B process canary; release image lacks the test helper: {error}; sidecar stderr: {diagnostics}"
+                    );
+                    return;
+                }
+            };
+            let handshake = match message {
+                VitaMessage::Handshake(value) => value,
+                other => panic!("unexpected D31-B canary first frame: {other:?}"),
+            };
+            validate_handshake(&handshake).expect("D31-B canary pinned handshake");
+
+            let session_id = "d31-b-process-session".to_string();
+            let life_id = "d31-b-process-life".to_string();
+            let task_id = "d31-b-process-task".to_string();
+            let host_turn_id = "d31-b-process-host-turn".to_string();
+            let provider = protocol::ProviderConfiguration {
+                profile_id: "d31-b-canary-profile".to_string(),
+                purpose: "chat".to_string(),
+                provider_kind: "openai_compatible".to_string(),
+                base_url: "http://127.0.0.1:9/v1".to_string(),
+                model: "d31-b-canary-model".to_string(),
+                credential_ref: "d31-b-canary-credential".to_string(),
+                credential_destination: "http://127.0.0.1:9/v1".to_string(),
+            };
+            let workspace_for_sidecar =
+                normalize_sidecar_local_path(workspace.path()).expect("D31-B workspace path");
+            let app_data_for_sidecar =
+                normalize_sidecar_local_path(app_data.path()).expect("D31-B app-data path");
+            let git_for_sidecar = normalize_sidecar_local_path(&git_path).expect("D31-B Git path");
+            let mut writer = BufWriter::new(stdin);
+            protocol::write_frame(
+                &mut writer,
+                &HostMessage::Initialize(InitializeSession {
+                    request_id: "d31-b-canary-initialize".to_string(),
+                    protocol_version: PROTOCOL_VERSION.to_string(),
+                    session_id: session_id.clone(),
+                    life_id: life_id.clone(),
+                    task_id: task_id.clone(),
+                    app_data_root: app_data_for_sidecar.to_string_lossy().into_owned(),
+                    workspace_path: workspace_for_sidecar.to_string_lossy().into_owned(),
+                    git_path: git_for_sidecar.to_string_lossy().into_owned(),
+                    provider: Some(provider.clone()),
+                }),
+            )
+            .expect("D31-B canary initialize");
+            let ready_result =
+                receive_vita_message_with_timeout(reader, READY_TIMEOUT, "D31-B canary ready");
+            let (message, mut reader) = match ready_result {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ = process.shutdown();
+                    let mut diagnostics = String::new();
+                    let _ = std::io::Read::read_to_string(&mut stderr, &mut diagnostics);
+                    eprintln!(
+                        "skipping D31-B process canary; sidecar image has no test helper: {error}; sidecar stderr: {diagnostics}"
+                    );
+                    return;
+                }
+            };
+            let ready = match message {
+                VitaMessage::Ready(value) => value,
+                other => panic!("unexpected D31-B canary ready frame: {other:?}"),
+            };
+            let request = VitaSidecarStartRequest {
+                life_id: life_id.clone(),
+                task_id: task_id.clone(),
+                workspace_path: workspace_for_sidecar.to_string_lossy().into_owned(),
+            };
+            validate_ready(&ready, &session_id, &request, &life_id)
+                .expect("D31-B canary ready identity");
+
+            let authority_root = tempfile::tempdir().expect("D31-B authority root");
+            let storage = Arc::new(
+                StorageService::initialize_with_roots(authority_root.path().to_path_buf(), None)
+                    .expect("D31-B authority storage"),
+            );
+            storage
+                .save_persona(PersonaTemplateRecord {
+                    id: "d31-b-canary-persona".to_string(),
+                    name: "D31-B canary persona".to_string(),
+                    version: 1,
+                    persona_json: "{}".to_string(),
+                })
+                .expect("D31-B canary persona");
+            storage
+                .save_life(LifeIdentityRecord {
+                    id: life_id.clone(),
+                    name: "D31-B canary life".to_string(),
+                    created_at: "2026-09-14T00:00:00.000Z".to_string(),
+                    version: 1,
+                    body_id: "d31-b-canary-body".to_string(),
+                    persona_id: "d31-b-canary-persona".to_string(),
+                    persona_version: 1,
+                })
+                .expect("D31-B canary life");
+            let registry = CapabilityRegistry::production().expect("D31-B production registry");
+            let read_capability = CapabilityId::try_from(PRODUCTION_WORKSPACE_READ_CAPABILITY_ID)
+                .expect("D31-B read capability");
+            assert!(matches!(
+                storage
+                    .create_capability_authorization(LifeCapabilityAuthorizationCreateRequest {
+                        life_id: life_id.clone(),
+                        capability_id: read_capability,
+                    })
+                    .expect("D31-B canary read root"),
+                CapabilityAuthorizationCreateOutcome::Applied(_)
+            ));
+            let enabled_revision = apply_transition_for_test(
+                &storage,
+                &registry,
+                PRODUCTION_WORKSPACE_READ_CAPABILITY_ID,
+                true,
+                1,
+                &life_id,
+            )
+            .expect("D31-B canary enable read root");
+            assert_eq!(enabled_revision.revision, 2);
+
+            let provider_binding =
+                protocol::ProviderBinding::derive(&session_id, &host_turn_id, &provider)
+                    .expect("D31-B provider binding");
+            let session = Arc::new(HostSessionState {
+                session_id: session_id.clone(),
+                life_id: life_id.clone(),
+                task_id: task_id.clone(),
+                workspace_identity: ready.workspace_identity,
+                provider: Some(provider.clone()),
+                writer: Mutex::new(Some(writer)),
+                pending: Mutex::new(HashMap::new()),
+                workspace_read_pending: Mutex::new(HashMap::new()),
+                approvals: Mutex::new(HashMap::new()),
+                grants: Mutex::new(HashMap::new()),
+                workspace_read_approvals: Mutex::new(HashMap::new()),
+                workspace_read_grants: Mutex::new(HashMap::new()),
+                replay: Mutex::new(RequestReplayWindow::default()),
+                expiry: Arc::new(ExpiryOwner::new()),
+                closed: AtomicBool::new(false),
+                turn_authority: Mutex::new(HostTurnAuthority::Idle),
+                active_turn_id: Mutex::new(None),
+                turn_phase: Mutex::new(None),
+                assistant_text: Mutex::new(None),
+                turn_error: Mutex::new(None),
+                test_outbound: Mutex::new(None),
+            });
+            session
+                .begin_turn(
+                    host_turn_id.clone(),
+                    provider.clone(),
+                    provider_binding.clone(),
+                )
+                .expect("D31-B canary Host turn");
+            let coordinator = VitaSidecarCoordinator::new(Arc::clone(&storage), registry.clone());
+            coordinator.install_test_session(Arc::clone(&session));
+            session
+                .send(&HostMessage::StartTurn(protocol::StartTurn {
+                    request_id: "d31-b-canary-start-turn".to_string(),
+                    session_id: session_id.clone(),
+                    turn_id: host_turn_id.clone(),
+                    prompt: "Read canary.txt through the governed workspace-read tool.".to_string(),
+                    binding: provider_binding,
+                }))
+                .expect("D31-B canary start turn");
+
+            let mut completed = false;
+            for _ in 0..32 {
+                let (message, next_reader) = receive_vita_message_with_timeout(
+                    reader,
+                    READY_TIMEOUT,
+                    "D31-B canary turn frame",
+                )
+                .expect("D31-B canary turn frame");
+                reader = next_reader;
+                match message {
+                    VitaMessage::TurnState(state) => {
+                        handle_turn_state(&session, state).expect("D31-B canary turn state");
+                    }
+                    VitaMessage::CredentialRequired(request) => {
+                        request.validate().expect("D31-B credential request");
+                        assert_eq!(request.session_id, session_id);
+                        assert_eq!(request.turn_id, host_turn_id);
+                        assert_eq!(request.binding.purpose, "chat");
+                        let credential = protocol::SensitiveCredential::new(
+                            "h9-canary-fake-credential".to_string(),
+                        )
+                        .expect("D31-B canary credential");
+                        session
+                            .send(&HostMessage::SensitiveCredentialReply(
+                                protocol::SensitiveCredentialReply {
+                                    request_id: request.request_id,
+                                    session_id: session_id.clone(),
+                                    turn_id: request.turn_id,
+                                    binding_hash: request.binding.binding_hash,
+                                    credential_ref: request.binding.credential_ref,
+                                    credential: Some(credential),
+                                    error_code: None,
+                                },
+                            ))
+                            .expect("D31-B credential reply");
+                    }
+                    VitaMessage::WorkspaceReadAuthorityEvaluate(request) => {
+                        handle_workspace_read_authority_evaluate(
+                            &session, &storage, &registry, request,
+                        )
+                        .expect("D31-B authority evaluation");
+                    }
+                    VitaMessage::WorkspaceReadConfirmationRequired(request) => {
+                        handle_workspace_read_confirmation_required(&session, request)
+                            .expect("D31-B confirmation request");
+                        let pending_id = session
+                            .pending_summary()
+                            .expect("D31-B pending confirmation")
+                            .pending_id;
+                        coordinator
+                            .confirm(pending_id)
+                            .expect("D31-B explicit confirmation");
+                    }
+                    VitaMessage::WorkspaceReadIssueGrant(request) => {
+                        handle_workspace_read_issue_grant(&session, &storage, &registry, request)
+                            .expect("D31-B grant issue");
+                    }
+                    VitaMessage::WorkspaceReadRevalidateGrant(request) => {
+                        handle_workspace_read_revalidate_grant(
+                            &session, &storage, &registry, request,
+                        )
+                        .expect("D31-B pre-read revalidation");
+                    }
+                    VitaMessage::WorkspaceReadReleaseCheck(request) => {
+                        assert!(request.bytes_read <= 64);
+                        handle_workspace_read_release_check(&session, &storage, &registry, request)
+                            .expect("D31-B disclosure release");
+                    }
+                    VitaMessage::TurnCompleted(message) => {
+                        assert_eq!(message.session_id, session_id);
+                        assert_eq!(message.turn_id, host_turn_id);
+                        assert!(!message.assistant_text.is_empty());
+                        completed = true;
+                        break;
+                    }
+                    VitaMessage::TurnFailed(message) => {
+                        let _ = process.shutdown();
+                        let mut diagnostics = String::new();
+                        let _ = std::io::Read::read_to_string(&mut stderr, &mut diagnostics);
+                        panic!(
+                            "D31-B canary turn failed: {} ({}) in {:?}; sidecar stderr: {}",
+                            message.error_code, message.message, message.phase, diagnostics
+                        );
+                    }
+                    other => panic!("unexpected D31-B canary turn frame: {other:?}"),
+                }
+            }
+            assert!(completed, "D31-B canary did not complete a real turn");
+            assert_eq!(
+                fs::read(&canary_file).expect("D31-B canary file remains readable"),
+                canary_content
+            );
+            session
+                .send(&HostMessage::Shutdown(protocol::Shutdown {
+                    request_id: "d31-b-canary-shutdown".to_string(),
+                    session_id: session_id.clone(),
+                }))
+                .expect("D31-B canary shutdown");
+            let (message, _reader) = receive_vita_message_with_timeout(
+                reader,
+                READY_TIMEOUT,
+                "D31-B canary shutdown ack",
+            )
+            .expect("D31-B canary shutdown ack");
+            assert!(matches!(
+                message,
+                VitaMessage::ShutdownAck(protocol::ShutdownAck { session_id: ack_session, .. })
+                    if ack_session == session_id
+            ));
+            session.retire();
+            process.shutdown().expect("D31-B canary process shutdown");
         }
     }
 }

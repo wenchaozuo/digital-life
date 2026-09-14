@@ -4,8 +4,9 @@
 //! pinned Codex composition. Authority decisions are RPCs to the Tauri Host;
 //! this process never reads the Host SQLite database and never mints a grant.
 
+use codex_extension_api::ToolContributor;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, BufWriter, Read, Stdin, Stdout, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -33,11 +34,16 @@ use crate::provider_gateway::{
     VitaMessageRole, VitaResponsesRequest, VitaResponsesRequestOptions, VitaToolOutput,
 };
 use crate::{
-    H7ProcessBinding, H7ProcessGrant, VitaAgentEntrypoint, VitaAgentRuntime,
-    VitaAgentRuntimeProfile, VitaExecutionContext, VitaGitStatusAuthority,
-    VitaGitStatusPendingConfirmation, VitaGitStatusProduction,
+    H3ApprovalFloor, H3AuthorityOperation, H3AuthorityRequest, H3CanonicalDecision,
+    H3CanonicalDecisionCode, H3CanonicalOutcome, H3DisclosureRequest, H3HostAuthorityResponse,
+    H3HostScopedGrantEvidence, H3ScopeRequirement, H7ProcessBinding, H7ProcessGrant,
+    VitaAgentEntrypoint, VitaAgentRuntime, VitaAgentRuntimeProfile, VitaExecutionContext,
+    VitaGitStatusAuthority, VitaGitStatusPendingConfirmation, VitaGitStatusProduction,
+    VitaGitStatusToolContributor, VitaH3AuthorityError, VitaH3AuthorityFuture, VitaH3AuthorityPort,
+    VitaH3DisclosureFuture, VitaWorkspaceReadBroker, VitaWorkspaceReadToolContributor,
     VITA_WORKSPACE_GIT_STATUS_CAPABILITY_ID, VITA_WORKSPACE_GIT_STATUS_PROFILE_ID,
-    VITA_WORKSPACE_GIT_STATUS_TOOL_NAME,
+    VITA_WORKSPACE_GIT_STATUS_TOOL_NAME, VITA_WORKSPACE_READ_CAPABILITY_ID,
+    VITA_WORKSPACE_READ_TOOL_NAME,
 };
 
 const LOCAL_GATEWAY_HEADER_LIMIT: usize = 64 * 1024;
@@ -273,14 +279,19 @@ impl crate::provider_gateway::ProviderRequestTransport for ActiveIdentityTranspo
 struct H9CanaryTransport {
     request_count: AtomicUsize,
     expected_workspace_path: String,
+    read_mode: bool,
 }
 
 #[cfg(feature = "d29-h9-test-helper")]
+const D31_B_CANARY_CONTENT: &str = "D31-B bounded canary content\n";
+
+#[cfg(feature = "d29-h9-test-helper")]
 impl H9CanaryTransport {
-    fn new(expected_workspace_path: impl Into<String>) -> Self {
+    fn new(expected_workspace_path: impl Into<String>, read_mode: bool) -> Self {
         Self {
             request_count: AtomicUsize::new(0),
             expected_workspace_path: expected_workspace_path.into(),
+            read_mode,
         }
     }
 }
@@ -329,14 +340,26 @@ impl crate::provider_gateway::ProviderRequestTransport for H9CanaryTransport {
                             "H9 canary first request omitted tools".to_string(),
                         )
                     })?;
-                if tools.len() != 1
-                    || tools[0]
-                        .get("function")
-                        .and_then(Value::as_object)
-                        .and_then(|function| function.get("name"))
-                        .and_then(Value::as_str)
-                        != Some(VITA_WORKSPACE_GIT_STATUS_TOOL_NAME)
-                {
+                let mut names = tools
+                    .iter()
+                    .filter_map(|tool| {
+                        tool.get("function")
+                            .and_then(Value::as_object)
+                            .and_then(|function| function.get("name"))
+                            .and_then(Value::as_str)
+                            .or_else(|| tool.get("name").and_then(Value::as_str))
+                    })
+                    .collect::<Vec<_>>();
+                names.sort_unstable();
+                let expected_names = if self.read_mode {
+                    vec![
+                        VITA_WORKSPACE_GIT_STATUS_TOOL_NAME,
+                        VITA_WORKSPACE_READ_TOOL_NAME,
+                    ]
+                } else {
+                    vec![VITA_WORKSPACE_GIT_STATUS_TOOL_NAME]
+                };
+                if names != expected_names {
                     return Err(crate::VitaAgentError::GatewayProtocol(
                         "H9 canary first request advertised an unexpected tool set".to_string(),
                     ));
@@ -359,35 +382,57 @@ impl crate::provider_gateway::ProviderRequestTransport for H9CanaryTransport {
                         "H9 canary native tool output was not JSON".to_string(),
                     )
                 })?;
-                let entries = result
-                    .get("entries")
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| {
-                        crate::VitaAgentError::GatewayProtocol(
-                            "H9 canary native tool output omitted entries".to_string(),
-                        )
-                    })?;
-                let canary_seen = entries
-                    .iter()
-                    .any(|entry| entry.get("path").and_then(Value::as_str) == Some("canary.txt"));
-                let absolute_path_seen = entries.iter().any(|entry| {
-                    let Some(path) = entry.get("path").and_then(Value::as_str) else {
-                        return true;
-                    };
-                    Path::new(path).is_absolute()
-                        || path.starts_with('/')
-                        || path.starts_with('\\')
-                        || path.contains(":\\")
-                        || path.contains(":/")
-                });
-                if result.get("status").and_then(Value::as_str) != Some("completed")
-                    || !canary_seen
-                    || absolute_path_seen
-                    || output.contains(&self.expected_workspace_path)
-                {
+                let valid = if self.read_mode {
+                    let content = result.get("content").and_then(Value::as_str);
+                    let relative_path = result.get("relative_path").and_then(Value::as_str);
+                    let bytes_read = result.get("bytes_read").and_then(Value::as_u64);
+                    let max_bytes = result.get("max_bytes").and_then(Value::as_u64);
+                    let expected_hash = crate::sha256_hex(D31_B_CANARY_CONTENT.as_bytes());
+                    result.get("status").and_then(Value::as_str) == Some("success")
+                        && relative_path == Some("canary.txt")
+                        && content == Some(D31_B_CANARY_CONTENT)
+                        && bytes_read == Some(D31_B_CANARY_CONTENT.len() as u64)
+                        && max_bytes.is_some_and(|max| max <= 64 * 1024)
+                        && result.get("content_sha256").and_then(Value::as_str)
+                            == Some(expected_hash.as_str())
+                        && result.get("execution_started").and_then(Value::as_bool) == Some(true)
+                        && result.get("grant_issued").and_then(Value::as_bool) == Some(true)
+                        && result.get("side_effect_count").and_then(Value::as_u64) == Some(0)
+                } else {
+                    let entries =
+                        result
+                            .get("entries")
+                            .and_then(Value::as_array)
+                            .ok_or_else(|| {
+                                crate::VitaAgentError::GatewayProtocol(
+                                    "H9 canary native tool output omitted entries".to_string(),
+                                )
+                            })?;
+                    let canary_seen = entries.iter().any(|entry| {
+                        entry.get("path").and_then(Value::as_str) == Some("canary.txt")
+                    });
+                    let absolute_path_seen = entries.iter().any(|entry| {
+                        let Some(path) = entry.get("path").and_then(Value::as_str) else {
+                            return true;
+                        };
+                        Path::new(path).is_absolute()
+                            || path.starts_with('/')
+                            || path.starts_with('\\')
+                            || path.contains(":\\")
+                            || path.contains(":/")
+                    });
+                    result.get("status").and_then(Value::as_str) == Some("completed")
+                        && canary_seen
+                        && !absolute_path_seen
+                };
+                if !valid || output.contains(&self.expected_workspace_path) {
                     return Err(crate::VitaAgentError::GatewayProtocol(
-                        "H9 canary second request did not contain a bounded relative Git result"
-                            .to_string(),
+                        if self.read_mode {
+                            "D31-B canary second request did not contain exact bounded read result"
+                        } else {
+                            "H9 canary second request did not contain a bounded relative Git result"
+                        }
+                        .to_string(),
                     ));
                 }
             }
@@ -400,7 +445,7 @@ impl crate::provider_gateway::ProviderRequestTransport for H9CanaryTransport {
         let response = if request_number == 1 {
             serde_json::json!({
                 "id": "h9-canary-tool-call",
-                "model": "h9-canary-model",
+                "model": if self.read_mode { "d31-b-canary-model" } else { "h9-canary-model" },
                 "choices": [{
                     "index": 0,
                     "message": {
@@ -410,8 +455,16 @@ impl crate::provider_gateway::ProviderRequestTransport for H9CanaryTransport {
                             "id": "h9-canary-call-1",
                             "type": "function",
                             "function": {
-                                "name": VITA_WORKSPACE_GIT_STATUS_TOOL_NAME,
-                                "arguments": "{\"operation\":\"status\"}"
+                                "name": if self.read_mode {
+                                    VITA_WORKSPACE_READ_TOOL_NAME
+                                } else {
+                                    VITA_WORKSPACE_GIT_STATUS_TOOL_NAME
+                                },
+                                "arguments": if self.read_mode {
+                                    "{\"relative_path\":\"canary.txt\",\"max_bytes\":64}"
+                                } else {
+                                    "{\"operation\":\"status\"}"
+                                }
                             }
                         }]
                     },
@@ -421,7 +474,7 @@ impl crate::provider_gateway::ProviderRequestTransport for H9CanaryTransport {
         } else if request_number == 2 {
             serde_json::json!({
                 "id": "h9-canary-final",
-                "model": "h9-canary-model",
+                "model": if self.read_mode { "d31-b-canary-model" } else { "h9-canary-model" },
                 "choices": [{
                     "index": 0,
                     "message": {
@@ -989,7 +1042,7 @@ fn parse_gateway_responses_request(
                     .get("name")
                     .and_then(Value::as_str)
                     .ok_or_else(|| "function call name missing".to_string())?;
-                if name != TOOL_NAME {
+                if name != TOOL_NAME && name != VITA_WORKSPACE_READ_TOOL_NAME {
                     return Err("unknown tool call".to_string());
                 }
                 let arguments = item
@@ -1025,7 +1078,7 @@ fn parse_gateway_responses_request(
         stream: true,
         ..Default::default()
     };
-    let mut advertised_tool = false;
+    let mut advertised_tools = HashSet::new();
     if let Some(tools) = object.get("tools") {
         for tool in tools
             .as_array()
@@ -1045,13 +1098,12 @@ fn parse_gateway_responses_request(
                         .and_then(Value::as_str)
                 })
                 .ok_or_else(|| "tool name missing".to_string())?;
-            if name != TOOL_NAME {
+            if name != TOOL_NAME && name != VITA_WORKSPACE_READ_TOOL_NAME {
                 return Err("unknown advertised tool".to_string());
             }
-            if advertised_tool {
+            if !advertised_tools.insert(name.to_string()) {
                 return Err("duplicate advertised tool".to_string());
             }
-            advertised_tool = true;
             let description = tool
                 .get("description")
                 .and_then(Value::as_str)
@@ -1072,6 +1124,13 @@ fn parse_gateway_responses_request(
                 parameters,
             });
         }
+    }
+    if !options.tools.is_empty()
+        && tool_calls
+            .iter()
+            .any(|call| !options.tools.iter().any(|tool| tool.name == call.name))
+    {
+        return Err("function call was not advertised in this request".to_string());
     }
     Ok(VitaResponsesRequest {
         model: model.to_string(),
@@ -1362,6 +1421,17 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
         session_id: init.session_id.clone(),
         active_identity: Arc::clone(&active_identity),
     });
+    let read_authority = Arc::new(SidecarWorkspaceReadAuthority::new(
+        router.clone(),
+        &init,
+        workspace_identity.clone(),
+        Arc::clone(&active_identity),
+    ));
+    let read_broker = Arc::new(VitaWorkspaceReadBroker::new(
+        context.clone(),
+        workspace.clone(),
+        Arc::clone(&read_authority) as Arc<dyn VitaH3AuthorityPort>,
+    ));
     let production = Arc::new(
         VitaGitStatusProduction::new(
             context,
@@ -1371,7 +1441,10 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
         )
         .map_err(|error| format!("Vita H7-C production setup failed: {error}"))?,
     );
-    let contributor = production.contributor();
+    let contributor = VitaProductionContributors {
+        git: production.contributor(),
+        read: VitaWorkspaceReadToolContributor::new(Arc::clone(&read_broker)),
+    };
     let (entrypoint, mut gateway_server) = if let Some(provider_config) = init.provider.as_ref() {
         provider_config.validate().map_err(protocol_error)?;
         #[cfg(not(feature = "d29-h9-test-helper"))]
@@ -1461,6 +1534,7 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
                 {
                     SidecarGatewayTransport::H9Canary(Arc::new(H9CanaryTransport::new(
                         &init.workspace_path,
+                        provider_config.model == "d31-b-canary-model",
                     )))
                 }
                 #[cfg(not(feature = "d29-h9-test-helper"))]
@@ -1517,6 +1591,7 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
         .map_err(|_| "Vita sidecar command reader task failed".to_string())??;
         let Some(command) = command else {
             production.cancel();
+            read_broker.cancel();
             runtime.shutdown().await;
             if let Some(gateway_server) = gateway_server.take() {
                 gateway_server.stop();
@@ -1529,6 +1604,7 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
                 // start a later turn after the exact Cancelled acknowledgement;
                 // session-terminal teardown uses `production.cancel()` below.
                 production.cancel_turn();
+                read_broker.cancel_turn();
                 router.send(&VitaMessage::ActionCancelled(protocol::ActionCancelled {
                     request_id: message.request_id,
                     session_id: init.session_id.clone(),
@@ -1541,6 +1617,8 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
                     init.provider.as_ref(),
                     Arc::clone(&runtime),
                     Arc::clone(&production),
+                    Arc::clone(&read_broker),
+                    Arc::clone(&read_authority),
                     router.clone(),
                     Arc::clone(&active_identity),
                     Arc::clone(&gateway_authority),
@@ -1553,6 +1631,7 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
                     &init,
                     Arc::clone(&runtime),
                     Arc::clone(&production),
+                    Arc::clone(&read_broker),
                     router.clone(),
                     Arc::clone(&active_identity),
                     Arc::clone(&gateway_authority),
@@ -1562,6 +1641,7 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
             }
             HostMessage::Shutdown(message) if message.session_id == init.session_id => {
                 production.cancel();
+                read_broker.cancel();
                 runtime.shutdown().await;
                 if let Some(gateway_server) = gateway_server.take() {
                     gateway_server.stop();
@@ -1574,6 +1654,7 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
             }
             _ => {
                 production.cancel();
+                read_broker.cancel();
                 runtime.shutdown().await;
                 let _ = router.send(&VitaMessage::Fatal(protocol::FatalMessage {
                     request_id: next_request_id("vita-fatal"),
@@ -1592,6 +1673,8 @@ fn handle_start_turn(
     provider_config: Option<&ProviderConfiguration>,
     runtime: Arc<VitaAgentRuntime>,
     production: Arc<VitaGitStatusProduction>,
+    read_broker: Arc<VitaWorkspaceReadBroker>,
+    read_authority: Arc<SidecarWorkspaceReadAuthority>,
     router: SidecarRouter,
     active_identity: Arc<Mutex<Option<ProviderRequestIdentity>>>,
     gateway_authority: Arc<GatewayAuthority>,
@@ -1656,6 +1739,8 @@ fn handle_start_turn(
         }
     };
     production.begin_turn();
+    read_authority.begin_turn();
+    read_broker.begin_turn();
     let _ = router.send(&VitaMessage::TurnState(TurnState {
         request_id: next_request_id("vita-turn-starting"),
         session_id: init.session_id.clone(),
@@ -1771,6 +1856,7 @@ async fn handle_cancel_turn(
     init: &InitializeSession,
     runtime: Arc<VitaAgentRuntime>,
     production: Arc<VitaGitStatusProduction>,
+    read_broker: Arc<VitaWorkspaceReadBroker>,
     router: SidecarRouter,
     active_identity: Arc<Mutex<Option<ProviderRequestIdentity>>>,
     gateway_authority: Arc<GatewayAuthority>,
@@ -1792,6 +1878,7 @@ async fn handle_cancel_turn(
         active.take();
     }
     production.cancel_turn();
+    read_broker.cancel_turn();
     let Some(task) = turn_owner.take(&identity) else {
         gateway_authority.deactivate(&identity);
         return Err("Vita turn owner disappeared before cancellation proof".to_string());
@@ -1999,6 +2086,469 @@ impl VitaGitStatusAuthority for SidecarHostAuthority {
         let _ = h7_grant_from_wire(&returned, &expected_binding, &self.session_id, true)?;
         grant.mark_used_by_host();
         Ok(())
+    }
+}
+
+/// The process-isolated adapter for the production D31-B read lane.  The
+/// adapter is deliberately the only object that knows the D31 workspace-read
+/// wire messages; the H2/H3 broker receives only typed Host evidence and the
+/// retained workspace handle.
+#[derive(Clone)]
+struct SidecarWorkspaceReadAuthority {
+    router: SidecarRouter,
+    session_id: String,
+    life_id: String,
+    task_id: String,
+    workspace_identity: String,
+    workspace_summary: String,
+    active_identity: Arc<Mutex<Option<ProviderRequestIdentity>>>,
+    grants: Arc<Mutex<HashMap<String, protocol::WorkspaceReadGrant>>>,
+}
+
+impl SidecarWorkspaceReadAuthority {
+    fn new(
+        router: SidecarRouter,
+        init: &InitializeSession,
+        workspace_identity: String,
+        active_identity: Arc<Mutex<Option<ProviderRequestIdentity>>>,
+    ) -> Self {
+        Self {
+            router,
+            session_id: init.session_id.clone(),
+            life_id: init.life_id.clone(),
+            task_id: init.task_id.clone(),
+            workspace_identity,
+            workspace_summary: workspace_summary(&init.workspace_path),
+            active_identity,
+            grants: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn begin_turn(&self) {
+        if let Ok(mut grants) = self.grants.lock() {
+            grants.clear();
+        }
+    }
+
+    fn binding_for(
+        &self,
+        request: &H3AuthorityRequest,
+    ) -> Result<(protocol::WorkspaceReadBinding, String), VitaH3AuthorityError> {
+        if request.context.life_id() != self.life_id
+            || request.context.task_id() != self.task_id
+            || request.capability_id != VITA_WORKSPACE_READ_CAPABILITY_ID
+            || request.target_kind != crate::PreparedWorkspaceTargetKind::ExistingFile
+            || request.max_bytes == 0
+            || request.max_bytes > protocol::MAX_WORKSPACE_READ_BYTES as usize
+        {
+            return Err(VitaH3AuthorityError::InvalidVerdict);
+        }
+        let active = active_identity_snapshot(&self.active_identity)
+            .ok_or(VitaH3AuthorityError::Unavailable)?;
+        let relative_path = request
+            .relative_path
+            .as_path()
+            .to_str()
+            .ok_or(VitaH3AuthorityError::InvalidVerdict)?
+            .to_string();
+        // The wire contract uses canonical forward-slash components.  A
+        // backslash is rejected rather than normalized so the model cannot
+        // obtain a second spelling for the same target.
+        if relative_path.contains('\\') {
+            return Err(VitaH3AuthorityError::InvalidVerdict);
+        }
+        let target_identity = request.target_identity.wire();
+        let binding = protocol::WorkspaceReadBinding {
+            session_id: self.session_id.clone(),
+            life_id: self.life_id.clone(),
+            task_id: self.task_id.clone(),
+            capability_id: VITA_WORKSPACE_READ_CAPABILITY_ID.to_string(),
+            tool_name: VITA_WORKSPACE_READ_TOOL_NAME.to_string(),
+            workspace_root_identity: self.workspace_identity.clone(),
+            relative_path,
+            target_identity,
+            target_kind: protocol::WorkspaceReadTargetKind::File,
+            max_bytes: request.max_bytes as u64,
+            tool_call_id: request.tool_call_id.clone(),
+            codex_turn_id: request.turn_id.clone(),
+            provider_binding_hash: active.binding_hash,
+        };
+        binding
+            .validate()
+            .map_err(|_| VitaH3AuthorityError::InvalidVerdict)?;
+        Ok((binding, active.turn_id))
+    }
+
+    fn authority_reply(
+        &self,
+        request: &H3AuthorityRequest,
+        binding: &protocol::WorkspaceReadBinding,
+        host_turn_id: &str,
+    ) -> Result<(i64, protocol::WorkspaceReadGrant), VitaH3AuthorityError> {
+        let authority = self
+            .router
+            .request(VitaMessage::WorkspaceReadAuthorityEvaluate(
+                protocol::WorkspaceReadAuthorityEvaluate {
+                    request_id: next_request_id("vita-read-authority"),
+                    session_id: self.session_id.clone(),
+                    host_turn_id: host_turn_id.to_string(),
+                    binding: binding.clone(),
+                },
+            ))
+            .map_err(|_| VitaH3AuthorityError::Unavailable)?;
+        let protocol::WorkspaceReadAuthorityReply {
+            session_id,
+            allowed,
+            authorization_revision,
+            error_code,
+            ..
+        } = match authority {
+            HostMessage::WorkspaceReadAuthorityReply(reply) => reply,
+            _ => return Err(VitaH3AuthorityError::InvalidVerdict),
+        };
+        if session_id != self.session_id || !allowed {
+            let _ = error_code;
+            return Err(VitaH3AuthorityError::Unavailable);
+        }
+        let revision = authorization_revision.ok_or(VitaH3AuthorityError::InvalidVerdict)?;
+
+        let confirmation = self
+            .router
+            .request(VitaMessage::WorkspaceReadConfirmationRequired(
+                protocol::WorkspaceReadConfirmationRequired {
+                    request_id: next_request_id("vita-read-confirm"),
+                    session_id: self.session_id.clone(),
+                    host_turn_id: host_turn_id.to_string(),
+                    workspace_summary: self.workspace_summary.clone(),
+                    expires_at_unix_ms: unix_millis().saturating_add(30_000),
+                    binding: binding.clone(),
+                },
+            ))
+            .map_err(|_| VitaH3AuthorityError::Unavailable)?;
+        let protocol::WorkspaceReadConfirmationReply {
+            session_id,
+            decision,
+            authorization_revision,
+            ..
+        } = match confirmation {
+            HostMessage::WorkspaceReadConfirmationReply(reply) => reply,
+            _ => return Err(VitaH3AuthorityError::InvalidVerdict),
+        };
+        if session_id != self.session_id
+            || decision != ConfirmationDecision::Confirm
+            || authorization_revision != Some(revision)
+        {
+            return Err(VitaH3AuthorityError::Unavailable);
+        }
+
+        let issued = self
+            .router
+            .request(VitaMessage::WorkspaceReadIssueGrant(
+                protocol::WorkspaceReadIssueGrant {
+                    request_id: next_request_id("vita-read-issue"),
+                    session_id: self.session_id.clone(),
+                    host_turn_id: host_turn_id.to_string(),
+                    binding: binding.clone(),
+                    authorization_revision: revision,
+                },
+            ))
+            .map_err(|_| VitaH3AuthorityError::Unavailable)?;
+        let protocol::WorkspaceReadGrantIssued {
+            session_id,
+            allowed,
+            grant,
+            error_code,
+            ..
+        } = match issued {
+            HostMessage::WorkspaceReadGrantIssued(reply) => reply,
+            _ => return Err(VitaH3AuthorityError::InvalidVerdict),
+        };
+        if session_id != self.session_id || !allowed {
+            let _ = error_code;
+            return Err(VitaH3AuthorityError::Unavailable);
+        }
+        let grant = grant.ok_or(VitaH3AuthorityError::InvalidVerdict)?;
+        grant
+            .validate()
+            .map_err(|_| VitaH3AuthorityError::InvalidVerdict)?;
+        if grant.session_id != self.session_id
+            || grant.binding != *binding
+            || grant.authorization_revision != revision
+            || grant.used
+            || !grant.single_use
+        {
+            return Err(VitaH3AuthorityError::InvalidVerdict);
+        }
+        self.grants
+            .lock()
+            .map_err(|_| VitaH3AuthorityError::Unavailable)?
+            .insert(grant.grant_id.clone(), grant.clone());
+        let _ = request;
+        Ok((revision, grant))
+    }
+
+    fn revalidate(
+        &self,
+        request: &H3AuthorityRequest,
+        binding: &protocol::WorkspaceReadBinding,
+        host_turn_id: &str,
+        grant_id: &str,
+        revision: i64,
+    ) -> Result<protocol::WorkspaceReadGrant, VitaH3AuthorityError> {
+        let grant = self
+            .grants
+            .lock()
+            .map_err(|_| VitaH3AuthorityError::Unavailable)?
+            .get(grant_id)
+            .cloned()
+            .ok_or(VitaH3AuthorityError::Unavailable)?;
+        if grant.binding != *binding
+            || grant.authorization_revision != revision
+            || grant.used
+            || request.capability_id != VITA_WORKSPACE_READ_CAPABILITY_ID
+        {
+            return Err(VitaH3AuthorityError::InvalidVerdict);
+        }
+        let response = self
+            .router
+            .request(VitaMessage::WorkspaceReadRevalidateGrant(
+                protocol::WorkspaceReadRevalidateGrant {
+                    request_id: next_request_id("vita-read-revalidate"),
+                    session_id: self.session_id.clone(),
+                    host_turn_id: host_turn_id.to_string(),
+                    binding: binding.clone(),
+                    grant: grant.clone(),
+                },
+            ));
+        if response.is_err() {
+            if let Ok(mut grants) = self.grants.lock() {
+                grants.remove(grant_id);
+            }
+            return Err(VitaH3AuthorityError::Unavailable);
+        }
+        let response = response.expect("checked workspace read revalidation response");
+        let protocol::WorkspaceReadGrantRevalidated {
+            session_id,
+            allowed,
+            grant: returned,
+            error_code,
+            ..
+        } = match response {
+            HostMessage::WorkspaceReadGrantRevalidated(reply) => reply,
+            _ => return Err(VitaH3AuthorityError::InvalidVerdict),
+        };
+        if session_id != self.session_id || !allowed {
+            let _ = error_code;
+            if let Ok(mut grants) = self.grants.lock() {
+                grants.remove(grant_id);
+            }
+            return Err(VitaH3AuthorityError::Unavailable);
+        }
+        let returned = returned.ok_or(VitaH3AuthorityError::InvalidVerdict)?;
+        returned
+            .validate()
+            .map_err(|_| VitaH3AuthorityError::InvalidVerdict)?;
+        if returned.binding != *binding
+            || returned.grant_id != grant_id
+            || returned.authorization_revision != revision
+            || !returned.used
+        {
+            return Err(VitaH3AuthorityError::InvalidVerdict);
+        }
+        self.grants
+            .lock()
+            .map_err(|_| VitaH3AuthorityError::Unavailable)?
+            .insert(returned.grant_id.clone(), returned.clone());
+        Ok(returned)
+    }
+
+    fn evidence(
+        &self,
+        request: &H3AuthorityRequest,
+        binding: &protocol::WorkspaceReadBinding,
+        grant: &protocol::WorkspaceReadGrant,
+    ) -> H3HostScopedGrantEvidence {
+        H3HostScopedGrantEvidence {
+            grant_id: grant.grant_id.clone(),
+            life_id: request.context.life_id().to_string(),
+            task_id: request.context.task_id().to_string(),
+            capability_id: VITA_WORKSPACE_READ_CAPABILITY_ID.to_string(),
+            authorization_revision: grant.authorization_revision,
+            scope: crate::VitaRequestedScope::Workspace,
+            workspace_root_identity: request.workspace_root_identity,
+            relative_path: request.relative_path.clone(),
+            target_identity: request.target_identity,
+            target_kind: request.target_kind,
+            max_bytes: request.max_bytes,
+            tool_call_id: binding.tool_call_id.clone(),
+            turn_id: binding.codex_turn_id.clone(),
+            issued_at_unix_ms: grant.issued_at_unix_ms,
+            expires_at_unix_ms: grant.expires_at_unix_ms,
+        }
+    }
+
+    fn canonical(&self, request: &H3AuthorityRequest, revision: i64) -> H3CanonicalDecision {
+        H3CanonicalDecision {
+            life_id: request.context.life_id().to_string(),
+            capability_id: VITA_WORKSPACE_READ_CAPABILITY_ID.to_string(),
+            outcome: H3CanonicalOutcome::ScopeRequired,
+            decision_code: H3CanonicalDecisionCode::ScopeNotAvailable,
+            scope_requirement: H3ScopeRequirement::WorkspaceRequired,
+            // H3's scope-completion contract represents the canonical root
+            // floor separately from the per-action confirmation that the
+            // D31 adapter has just completed.
+            approval_floor: H3ApprovalFloor::RootEnabled,
+            authorization_revision: Some(revision),
+        }
+    }
+}
+
+impl VitaH3AuthorityPort for SidecarWorkspaceReadAuthority {
+    fn evaluate(&self, request: H3AuthorityRequest) -> VitaH3AuthorityFuture {
+        let authority = self.clone();
+        Box::pin(async move {
+            let (binding, host_turn_id) = authority.binding_for(&request)?;
+            match request.operation.clone() {
+                H3AuthorityOperation::IssueScopeGrant => {
+                    let (revision, grant) =
+                        authority.authority_reply(&request, &binding, &host_turn_id)?;
+                    Ok(H3HostAuthorityResponse {
+                        canonical: authority.canonical(&request, revision),
+                        scope_grant: Some(authority.evidence(&request, &binding, &grant)),
+                    })
+                }
+                H3AuthorityOperation::Revalidate {
+                    grant_id,
+                    authorization_revision,
+                } => {
+                    let grant = authority.revalidate(
+                        &request,
+                        &binding,
+                        &host_turn_id,
+                        &grant_id,
+                        authorization_revision,
+                    )?;
+                    Ok(H3HostAuthorityResponse {
+                        canonical: authority.canonical(&request, authorization_revision),
+                        scope_grant: Some(authority.evidence(&request, &binding, &grant)),
+                    })
+                }
+            }
+        })
+    }
+
+    fn release(&self, request: H3DisclosureRequest) -> VitaH3DisclosureFuture {
+        let authority = self.clone();
+        Box::pin(async move {
+            if request.context.life_id() != authority.life_id
+                || request.context.task_id() != authority.task_id
+                || request.capability_id != VITA_WORKSPACE_READ_CAPABILITY_ID
+                || request.target_kind != crate::PreparedWorkspaceTargetKind::ExistingFile
+                || request.max_bytes == 0
+                || request.max_bytes > protocol::MAX_WORKSPACE_READ_BYTES as usize
+            {
+                return Err(VitaH3AuthorityError::InvalidVerdict);
+            }
+            let active = active_identity_snapshot(&authority.active_identity)
+                .ok_or(VitaH3AuthorityError::Unavailable)?;
+            let relative_path = request
+                .relative_path
+                .as_path()
+                .to_str()
+                .ok_or(VitaH3AuthorityError::InvalidVerdict)?
+                .to_string();
+            if relative_path.contains('\\') {
+                return Err(VitaH3AuthorityError::InvalidVerdict);
+            }
+            let binding = protocol::WorkspaceReadBinding {
+                session_id: authority.session_id.clone(),
+                life_id: authority.life_id.clone(),
+                task_id: authority.task_id.clone(),
+                capability_id: VITA_WORKSPACE_READ_CAPABILITY_ID.to_string(),
+                tool_name: VITA_WORKSPACE_READ_TOOL_NAME.to_string(),
+                workspace_root_identity: authority.workspace_identity.clone(),
+                relative_path,
+                target_identity: request.target_identity.wire(),
+                target_kind: protocol::WorkspaceReadTargetKind::File,
+                max_bytes: request.max_bytes as u64,
+                tool_call_id: request.tool_call_id.clone(),
+                codex_turn_id: request.turn_id.clone(),
+                provider_binding_hash: active.binding_hash,
+            };
+            binding
+                .validate()
+                .map_err(|_| VitaH3AuthorityError::InvalidVerdict)?;
+            let grant = authority
+                .grants
+                .lock()
+                .map_err(|_| VitaH3AuthorityError::Unavailable)?
+                .get(&request.grant_id)
+                .cloned()
+                .ok_or(VitaH3AuthorityError::Unavailable)?;
+            if grant.binding != binding
+                || grant.authorization_revision != request.authorization_revision
+                || !grant.used
+            {
+                return Err(VitaH3AuthorityError::InvalidVerdict);
+            }
+            let response = authority
+                .router
+                .request(VitaMessage::WorkspaceReadReleaseCheck(
+                    protocol::WorkspaceReadReleaseCheck {
+                        request_id: next_request_id("vita-read-release"),
+                        session_id: authority.session_id.clone(),
+                        host_turn_id: active.turn_id,
+                        binding,
+                        grant,
+                        bytes_read: request.bytes_read as u64,
+                        content_sha256: request.content_sha256.clone(),
+                    },
+                ));
+            // A transport timeout or malformed Host response is terminal for
+            // this local grant as well; retaining it would make a later
+            // release retry a replay surface after the Host has already
+            // linearized cancellation/revocation.
+            if let Ok(mut grants) = authority.grants.lock() {
+                grants.remove(&request.grant_id);
+            }
+            let response = response.map_err(|_| VitaH3AuthorityError::Unavailable)?;
+            let protocol::WorkspaceReadReleaseChecked {
+                session_id,
+                allowed,
+                error_code,
+                ..
+            } = match response {
+                HostMessage::WorkspaceReadReleaseChecked(reply) => reply,
+                _ => return Err(VitaH3AuthorityError::InvalidVerdict),
+            };
+            if session_id != authority.session_id || !allowed {
+                let _ = error_code;
+                return Err(VitaH3AuthorityError::Unavailable);
+            }
+            Ok(())
+        })
+    }
+}
+
+/// The production Codex extension registry is closed over these two exact
+/// contributors.  Keeping the composition in one concrete contributor means
+/// the pinned runtime never receives a generic plugin or filesystem surface.
+struct VitaProductionContributors {
+    git: VitaGitStatusToolContributor,
+    read: VitaWorkspaceReadToolContributor,
+}
+
+impl ToolContributor for VitaProductionContributors {
+    fn tools(
+        &self,
+        session_store: &codex_extension_api::ExtensionData,
+        thread_store: &codex_extension_api::ExtensionData,
+    ) -> Vec<
+        Arc<dyn for<'call> codex_extension_api::ToolExecutor<codex_extension_api::ToolCall<'call>>>,
+    > {
+        let mut tools = self.git.tools(session_store, thread_store);
+        tools.extend(self.read.tools(session_store, thread_store));
+        tools
     }
 }
 

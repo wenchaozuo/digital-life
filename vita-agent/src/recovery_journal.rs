@@ -192,6 +192,17 @@ impl RecoveryJournalIdentity {
     pub fn file_id(&self) -> [u8; 16] {
         self.file_id
     }
+
+    /// Stable bounded identity representation shared with the private
+    /// Host↔Vita recovery authority protocol.
+    pub fn wire(&self) -> String {
+        let file_id = self
+            .file_id
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        format!("v{:x}f{file_id}", self.volume_serial_number)
+    }
 }
 
 /// Runtime-generated, filename-safe transaction identity.
@@ -2727,14 +2738,13 @@ fn target_key(journal: &RecoveryJournalV1) -> RecoveryJournalTargetKey {
     }
 }
 
-fn mutation_target_key(journal: &RecoveryJournalV1) -> RecoveryMutationTargetKey {
+pub(crate) fn mutation_target_key(journal: &RecoveryJournalV1) -> RecoveryMutationTargetKey {
     RecoveryMutationTargetKey {
         workspace_root_identity: journal.workspace_root_identity,
         target_identity: journal.target_identity,
     }
 }
 
-#[cfg(test)]
 pub(crate) fn mutation_target_key_for_prepared_target(
     target: &PreparedWorkspaceTarget,
 ) -> Result<RecoveryMutationTargetKey, RecoveryJournalError> {
@@ -4663,7 +4673,7 @@ mod tests {
     }
 
     #[test]
-    fn production_registry_contains_only_read_only_h7c() {
+    fn production_registry_contains_d31c_routes_and_host_only_recovery() {
         let source = fs::read_to_string(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .parent()
@@ -4672,7 +4682,11 @@ mod tests {
         )
         .unwrap();
         assert!(source.contains("PRODUCTION_GIT_STATUS_CAPABILITY_ID"));
-        assert!(!source.contains("vita.workspace.recover_replace"));
+        assert!(source.contains("PRODUCTION_WORKSPACE_READ_CAPABILITY_ID"));
+        assert!(source.contains("PRODUCTION_WORKSPACE_REPLACE_CAPABILITY_ID"));
+        assert!(source.contains("PRODUCTION_WORKSPACE_REPLACE_TOOL_NAME"));
+        assert!(source.contains("PRODUCTION_WORKSPACE_RECOVER_CAPABILITY_ID"));
+        assert!(source.contains("with_host_only_mutating_route"));
     }
 
     #[test]

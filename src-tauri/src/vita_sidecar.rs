@@ -172,17 +172,27 @@ mod windows {
         CapabilityId, ScopeRequirement, PRODUCTION_GIT_STATUS_CAPABILITY_ID,
         PRODUCTION_GIT_STATUS_PROFILE_ID, PRODUCTION_GIT_STATUS_TOOL_NAME,
         PRODUCTION_WORKSPACE_READ_CAPABILITY_ID, PRODUCTION_WORKSPACE_READ_TOOL_NAME,
+        PRODUCTION_WORKSPACE_RECOVER_CAPABILITY_ID, PRODUCTION_WORKSPACE_RECOVER_PROFILE_ID,
+        PRODUCTION_WORKSPACE_REPLACE_CAPABILITY_ID, PRODUCTION_WORKSPACE_REPLACE_PROFILE_ID,
+        PRODUCTION_WORKSPACE_REPLACE_TOOL_NAME,
     };
     use crate::execution_enclave::{CodexRuntimeError, VitaSidecarProcess};
     use protocol::{
         AuthorityEvaluate, AuthorityScopeReply, ConfirmationDecision, ConfirmationReply,
         ConfirmationRequired, GrantIssued, GrantRevalidated, HostMessage, InitializeSession,
-        IssueGrant, ProcessBinding, ProcessGrant, RevalidateGrant, VitaMessage,
-        WorkspaceReadAuthorityEvaluate, WorkspaceReadAuthorityReply,
-        WorkspaceReadConfirmationReply, WorkspaceReadConfirmationRequired, WorkspaceReadGrant,
-        WorkspaceReadGrantIssued, WorkspaceReadGrantRevalidated, WorkspaceReadIssueGrant,
-        WorkspaceReadReleaseCheck, WorkspaceReadReleaseChecked, WorkspaceReadRevalidateGrant,
-        CODEX_PROTOCOL_SCHEMA_HASH, CODEX_UPSTREAM_COMMIT, PROTOCOL_VERSION, RUNTIME_ID,
+        IssueGrant, ProcessBinding, ProcessGrant, RecoveryAuthorityEvaluate,
+        RecoveryAuthorityReply, RecoveryConfirmationReply, RecoveryConfirmationRequired,
+        RecoveryGrant, RecoveryGrantIssued, RecoveryGrantRevalidated, RecoveryIssueGrant,
+        RecoveryRevalidateGrant, RevalidateGrant, VitaMessage, WorkspaceReadAuthorityEvaluate,
+        WorkspaceReadAuthorityReply, WorkspaceReadConfirmationReply,
+        WorkspaceReadConfirmationRequired, WorkspaceReadGrant, WorkspaceReadGrantIssued,
+        WorkspaceReadGrantRevalidated, WorkspaceReadIssueGrant, WorkspaceReadReleaseCheck,
+        WorkspaceReadReleaseChecked, WorkspaceReadRevalidateGrant,
+        WorkspaceReplaceAuthorityEvaluate, WorkspaceReplaceAuthorityReply,
+        WorkspaceReplaceConfirmationReply, WorkspaceReplaceConfirmationRequired,
+        WorkspaceReplaceGrant, WorkspaceReplaceGrantIssued, WorkspaceReplaceGrantRevalidated,
+        WorkspaceReplaceIssueGrant, WorkspaceReplaceRevalidateGrant, CODEX_PROTOCOL_SCHEMA_HASH,
+        CODEX_UPSTREAM_COMMIT, PROTOCOL_VERSION, RUNTIME_ID,
     };
     use sha2::{Digest, Sha256};
     use std::collections::{HashMap, HashSet, VecDeque};
@@ -532,7 +542,212 @@ mod windows {
         Ok(())
     }
 
-    /// Host-owned grant issue helper for the production D31-B reader loop.  A
+    fn active_workspace_replace_turn_matches(
+        authority: &HostTurnAuthority,
+        host_turn_id: &str,
+        binding: &protocol::WorkspaceReplaceBinding,
+    ) -> bool {
+        matches!(
+            authority,
+            HostTurnAuthority::Active(active)
+                if active.turn_id == host_turn_id
+                    && active.binding.binding_hash == binding.provider_binding_hash
+                    && active.h7_codex_turn_id.as_deref()
+                        == Some(binding.codex_turn_id.as_str())
+        )
+    }
+
+    fn validate_workspace_replace_binding(
+        session: &HostSessionState,
+        binding: &protocol::WorkspaceReplaceBinding,
+    ) -> Result<(), String> {
+        binding
+            .validate()
+            .map_err(|_| "WORKSPACE_REPLACE_BINDING_MISMATCH".to_string())?;
+        if binding.session_id != session.session_id
+            || binding.life_id != session.life_id
+            || binding.task_id != session.task_id
+            || binding.capability_id != PRODUCTION_WORKSPACE_REPLACE_CAPABILITY_ID
+            || binding.tool_name != PRODUCTION_WORKSPACE_REPLACE_TOOL_NAME
+            || binding.workspace_root_identity != session.workspace_identity
+            || !matches!(
+                binding.target_kind,
+                protocol::WorkspaceReplaceTargetKind::File
+            )
+            || binding.replacement_bytes > protocol::MAX_WORKSPACE_READ_BYTES
+            || binding.provider_binding_hash.len() != 64
+            || !binding
+                .provider_binding_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err("WORKSPACE_REPLACE_BINDING_MISMATCH".to_string());
+        }
+        Ok(())
+    }
+
+    fn current_workspace_replace_revision(
+        storage: &StorageService,
+        registry: &CapabilityRegistry,
+        session: &HostSessionState,
+        binding: &protocol::WorkspaceReplaceBinding,
+    ) -> Result<i64, String> {
+        let authority_scope = storage
+            .capability_authorization_scope()
+            .map_err(capability_authorization_gate_error)?;
+        current_workspace_replace_revision_in_scope(&authority_scope, registry, session, binding)
+    }
+
+    fn current_workspace_replace_revision_in_scope(
+        authority: &crate::storage::CapabilityAuthorizationScope<'_>,
+        registry: &CapabilityRegistry,
+        session: &HostSessionState,
+        binding: &protocol::WorkspaceReplaceBinding,
+    ) -> Result<i64, String> {
+        validate_workspace_replace_binding(session, binding)?;
+        let capability_id = CapabilityId::try_from(binding.capability_id.as_str())
+            .map_err(|_| "CAPABILITY_AUTHORIZATION_UNAVAILABLE".to_string())?;
+        let descriptor = registry
+            .descriptor(&capability_id)
+            .ok_or_else(|| "CAPABILITY_AUTHORIZATION_REQUIRED".to_string())?;
+        if descriptor.execution_profile() != Some(PRODUCTION_WORKSPACE_REPLACE_PROFILE_ID)
+            || descriptor.tool_name() != Some(PRODUCTION_WORKSPACE_REPLACE_TOOL_NAME)
+            || descriptor.is_read_only()
+            || descriptor.approval_floor()
+                != crate::capability::descriptor::ApprovalFloor::ExplicitPerAction
+            || descriptor.scope_requirement() != ScopeRequirement::WorkspaceRequired
+        {
+            return Err("CAPABILITY_AUTHORIZATION_UNAVAILABLE".to_string());
+        }
+        let decision = evaluate_capability_authorization_in_scope(
+            authority,
+            registry,
+            &session.life_id,
+            &capability_id,
+            RequestedCapabilityScope::Workspace,
+        )
+        .map_err(|error| {
+            if matches!(
+                error.code,
+                CapabilityEvaluationErrorCode::AuthorityRestartRequired
+            ) {
+                CAPABILITY_AUTHORITY_RESTART_REQUIRED.to_string()
+            } else {
+                "CAPABILITY_AUTHORIZATION_UNAVAILABLE".to_string()
+            }
+        })?;
+        if decision.outcome() == CapabilityAuthorizationDecisionKind::RootDisabled {
+            return Err("CAPABILITY_ROOT_DISABLED".to_string());
+        }
+        if !root_is_usable(&decision) {
+            return Err("CAPABILITY_AUTHORIZATION_UNAVAILABLE".to_string());
+        }
+        decision
+            .authorization_revision()
+            .ok_or_else(|| "CAPABILITY_AUTHORIZATION_UNAVAILABLE".to_string())
+    }
+
+    fn active_recovery_turn_matches(
+        authority: &HostTurnAuthority,
+        host_turn_id: &str,
+        binding: &protocol::RecoveryBinding,
+    ) -> bool {
+        matches!(
+            authority,
+            HostTurnAuthority::Active(active)
+                if active.turn_id == host_turn_id
+                    && active.binding.binding_hash == binding.provider_binding_hash
+                    && active.h7_codex_turn_id.as_deref()
+                        == Some(binding.codex_turn_id.as_str())
+        )
+    }
+
+    fn validate_recovery_binding(
+        session: &HostSessionState,
+        binding: &protocol::RecoveryBinding,
+    ) -> Result<(), String> {
+        binding
+            .validate()
+            .map_err(|_| "RECOVERY_BINDING_MISMATCH".to_string())?;
+        if binding.session_id != session.session_id
+            || binding.life_id != session.life_id
+            || binding.task_id != session.task_id
+            || binding.capability_id != PRODUCTION_WORKSPACE_RECOVER_CAPABILITY_ID
+            || binding.workspace_root_identity != session.workspace_identity
+            || binding.provider_binding_hash.len() != 64
+            || !binding
+                .provider_binding_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err("RECOVERY_BINDING_MISMATCH".to_string());
+        }
+        Ok(())
+    }
+
+    fn current_recovery_revision(
+        storage: &StorageService,
+        registry: &CapabilityRegistry,
+        session: &HostSessionState,
+        binding: &protocol::RecoveryBinding,
+    ) -> Result<i64, String> {
+        let authority_scope = storage
+            .capability_authorization_scope()
+            .map_err(capability_authorization_gate_error)?;
+        validate_recovery_binding(session, binding)?;
+        current_recovery_revision_in_scope(&authority_scope, registry, session, binding)
+    }
+
+    fn current_recovery_revision_in_scope(
+        authority_scope: &crate::storage::CapabilityAuthorizationScope<'_>,
+        registry: &CapabilityRegistry,
+        session: &HostSessionState,
+        binding: &protocol::RecoveryBinding,
+    ) -> Result<i64, String> {
+        validate_recovery_binding(session, binding)?;
+        let capability_id = CapabilityId::try_from(binding.capability_id.as_str())
+            .map_err(|_| "CAPABILITY_AUTHORIZATION_UNAVAILABLE".to_string())?;
+        let descriptor = registry
+            .descriptor(&capability_id)
+            .ok_or_else(|| "CAPABILITY_AUTHORIZATION_REQUIRED".to_string())?;
+        if descriptor.execution_profile() != Some(PRODUCTION_WORKSPACE_RECOVER_PROFILE_ID)
+            || descriptor.tool_name().is_some()
+            || descriptor.is_read_only()
+            || descriptor.approval_floor()
+                != crate::capability::descriptor::ApprovalFloor::ExplicitPerAction
+            || descriptor.scope_requirement() != ScopeRequirement::WorkspaceRequired
+        {
+            return Err("CAPABILITY_AUTHORIZATION_UNAVAILABLE".to_string());
+        }
+        let decision = evaluate_capability_authorization_in_scope(
+            authority_scope,
+            registry,
+            &session.life_id,
+            &capability_id,
+            RequestedCapabilityScope::Workspace,
+        )
+        .map_err(|error| {
+            if matches!(
+                error.code,
+                CapabilityEvaluationErrorCode::AuthorityRestartRequired
+            ) {
+                CAPABILITY_AUTHORITY_RESTART_REQUIRED.to_string()
+            } else {
+                "CAPABILITY_AUTHORIZATION_UNAVAILABLE".to_string()
+            }
+        })?;
+        if decision.outcome() == CapabilityAuthorizationDecisionKind::RootDisabled {
+            return Err("CAPABILITY_ROOT_DISABLED".to_string());
+        }
+        if !root_is_usable(&decision) {
+            return Err("CAPABILITY_AUTHORIZATION_UNAVAILABLE".to_string());
+        }
+        decision
+            .authorization_revision()
+            .ok_or_else(|| "CAPABILITY_AUTHORIZATION_UNAVAILABLE".to_string())
+    }
+
+    /// Host-owned grant issue helper for the production workspace-read loop.  A
     /// confirmation ID can enter this function only through the Host-owned
     /// approved-action ledger.
     #[allow(dead_code)]
@@ -1041,10 +1256,17 @@ mod windows {
         writer: Mutex<Option<BufWriter<File>>>,
         pending: Mutex<HashMap<String, PendingAction>>,
         workspace_read_pending: Mutex<HashMap<String, WorkspaceReadPendingAction>>,
+        workspace_replace_pending: Mutex<HashMap<String, WorkspaceReplacePendingAction>>,
         approvals: Mutex<HashMap<String, ApprovedAction>>,
         grants: Mutex<HashMap<String, HostStoredGrant>>,
         workspace_read_approvals: Mutex<HashMap<String, WorkspaceReadApprovedAction>>,
         workspace_read_grants: Mutex<HashMap<String, WorkspaceReadGrantState>>,
+        workspace_replace_approvals: Mutex<HashMap<String, WorkspaceReplaceApprovedAction>>,
+        workspace_replace_grants: Mutex<HashMap<String, WorkspaceReplaceGrantState>>,
+        recovery_pending: Mutex<HashMap<String, RecoveryPendingAction>>,
+        recovery_scan_pending: Mutex<HashMap<String, protocol::RecoveryPending>>,
+        recovery_approvals: Mutex<HashMap<String, RecoveryApprovedAction>>,
+        recovery_grants: Mutex<HashMap<String, RecoveryGrantState>>,
         replay: Mutex<RequestReplayWindow>,
         expiry: Arc<ExpiryOwner>,
         closed: AtomicBool,
@@ -1081,6 +1303,32 @@ mod windows {
         workspace_summary: String,
         expires_at_unix_ms: u64,
         binding: protocol::WorkspaceReadBinding,
+    }
+
+    #[derive(Clone)]
+    struct WorkspaceReplacePendingAction {
+        pending_id: String,
+        request_id: String,
+        host_turn_id: String,
+        life_id: String,
+        task_id: String,
+        capability_id: String,
+        workspace_summary: String,
+        expires_at_unix_ms: u64,
+        binding: protocol::WorkspaceReplaceBinding,
+    }
+
+    #[derive(Clone)]
+    struct RecoveryPendingAction {
+        pending_id: String,
+        request_id: String,
+        host_turn_id: String,
+        life_id: String,
+        task_id: String,
+        capability_id: String,
+        workspace_summary: String,
+        expires_at_unix_ms: u64,
+        binding: protocol::RecoveryBinding,
     }
 
     struct ApprovedAction {
@@ -1129,9 +1377,55 @@ mod windows {
         phase: WorkspaceReadGrantPhase,
     }
 
+    #[derive(Clone)]
+    struct WorkspaceReplaceApprovedAction {
+        host_turn_id: String,
+        binding: protocol::WorkspaceReplaceBinding,
+        authorization_revision: i64,
+        confirmation_id: String,
+        expires_at_unix_ms: u64,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum WorkspaceReplaceGrantPhase {
+        Issued,
+        Revalidated,
+    }
+
+    #[derive(Clone)]
+    struct WorkspaceReplaceGrantState {
+        host_turn_id: String,
+        grant: WorkspaceReplaceGrant,
+        phase: WorkspaceReplaceGrantPhase,
+    }
+
+    #[derive(Clone)]
+    struct RecoveryApprovedAction {
+        host_turn_id: String,
+        binding: protocol::RecoveryBinding,
+        authorization_revision: i64,
+        confirmation_id: String,
+        expires_at_unix_ms: u64,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum RecoveryGrantPhase {
+        Issued,
+        Revalidated,
+    }
+
+    #[derive(Clone)]
+    struct RecoveryGrantState {
+        host_turn_id: String,
+        grant: RecoveryGrant,
+        phase: RecoveryGrantPhase,
+    }
+
     enum PendingCancellation {
         Git(PendingAction),
         WorkspaceRead(WorkspaceReadPendingAction),
+        WorkspaceReplace(WorkspaceReplacePendingAction),
+        Recovery(RecoveryPendingAction),
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1141,6 +1435,8 @@ mod windows {
         request_id: String,
         binding: Option<ProcessBinding>,
         workspace_binding: Option<protocol::WorkspaceReadBinding>,
+        workspace_replace_binding: Option<protocol::WorkspaceReplaceBinding>,
+        recovery_binding: Option<protocol::RecoveryBinding>,
         expires_at_unix_ms: u64,
     }
 
@@ -1152,6 +1448,8 @@ mod windows {
                 request_id: pending.request_id.clone(),
                 binding: Some(pending.binding.clone()),
                 workspace_binding: None,
+                workspace_replace_binding: None,
+                recovery_binding: None,
                 expires_at_unix_ms: pending.expires_at_unix_ms,
             }
         }
@@ -1163,6 +1461,37 @@ mod windows {
                 request_id: pending.request_id.clone(),
                 binding: None,
                 workspace_binding: Some(pending.binding.clone()),
+                workspace_replace_binding: None,
+                recovery_binding: None,
+                expires_at_unix_ms: pending.expires_at_unix_ms,
+            }
+        }
+
+        fn for_workspace_replace_pending(
+            session_id: &str,
+            pending: &WorkspaceReplacePendingAction,
+        ) -> Self {
+            Self {
+                session_id: session_id.to_string(),
+                pending_id: pending.pending_id.clone(),
+                request_id: pending.request_id.clone(),
+                binding: None,
+                workspace_binding: None,
+                workspace_replace_binding: Some(pending.binding.clone()),
+                recovery_binding: None,
+                expires_at_unix_ms: pending.expires_at_unix_ms,
+            }
+        }
+
+        fn for_recovery_pending(session_id: &str, pending: &RecoveryPendingAction) -> Self {
+            Self {
+                session_id: session_id.to_string(),
+                pending_id: pending.pending_id.clone(),
+                request_id: pending.request_id.clone(),
+                binding: None,
+                workspace_binding: None,
+                workspace_replace_binding: None,
+                recovery_binding: Some(pending.binding.clone()),
                 expires_at_unix_ms: pending.expires_at_unix_ms,
             }
         }
@@ -1329,6 +1658,24 @@ mod windows {
             }
             if let Ok(mut grants) = self.workspace_read_grants.lock() {
                 grants.clear();
+            }
+            if let Ok(mut approvals) = self.workspace_replace_approvals.lock() {
+                approvals.clear();
+            }
+            if let Ok(mut grants) = self.workspace_replace_grants.lock() {
+                grants.clear();
+            }
+            if let Ok(mut pending) = self.workspace_replace_pending.lock() {
+                pending.clear();
+            }
+            if let Ok(mut approvals) = self.recovery_approvals.lock() {
+                approvals.clear();
+            }
+            if let Ok(mut grants) = self.recovery_grants.lock() {
+                grants.clear();
+            }
+            if let Ok(mut pending) = self.recovery_pending.lock() {
+                pending.clear();
             }
             if let Ok(mut active) = self.active_turn_id.lock() {
                 *active = Some(turn_id);
@@ -1593,6 +1940,31 @@ mod windows {
             } else {
                 Vec::new()
             };
+            let workspace_replace_pending =
+                if let Ok(mut pending) = self.workspace_replace_pending.lock() {
+                    let keys = pending
+                        .iter()
+                        .filter(|(_, value)| value.host_turn_id == turn_id)
+                        .map(|(key, _)| key.clone())
+                        .collect::<Vec<_>>();
+                    keys.into_iter()
+                        .filter_map(|key| pending.remove(&key))
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+            let recovery_pending = if let Ok(mut pending) = self.recovery_pending.lock() {
+                let keys = pending
+                    .iter()
+                    .filter(|(_, value)| value.host_turn_id == turn_id)
+                    .map(|(key, _)| key.clone())
+                    .collect::<Vec<_>>();
+                keys.into_iter()
+                    .filter_map(|key| pending.remove(&key))
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
             for value in &pending {
                 if let PendingCancellation::Git(value) = value {
                     self.expiry
@@ -1604,6 +1976,17 @@ mod windows {
                     &self.session_id,
                     value,
                 ));
+            }
+            for value in &workspace_replace_pending {
+                self.expiry
+                    .clear(&ExpiryTicket::for_workspace_replace_pending(
+                        &self.session_id,
+                        value,
+                    ));
+            }
+            for value in &recovery_pending {
+                self.expiry
+                    .clear(&ExpiryTicket::for_recovery_pending(&self.session_id, value));
             }
             if let Ok(mut approvals) = self.approvals.lock() {
                 approvals.retain(|_, approval| approval.host_turn_id != turn_id);
@@ -1623,12 +2006,34 @@ mod windows {
                         || grant.phase == WorkspaceReadGrantPhase::Released
                 });
             }
+            if let Ok(mut approvals) = self.workspace_replace_approvals.lock() {
+                approvals.retain(|_, approval| approval.host_turn_id != turn_id);
+            }
+            if let Ok(mut grants) = self.workspace_replace_grants.lock() {
+                grants.retain(|_, grant| grant.host_turn_id != turn_id);
+            }
+            if let Ok(mut approvals) = self.recovery_approvals.lock() {
+                approvals.retain(|_, approval| approval.host_turn_id != turn_id);
+            }
+            if let Ok(mut grants) = self.recovery_grants.lock() {
+                grants.retain(|_, grant| grant.host_turn_id != turn_id);
+            }
             pending
                 .into_iter()
                 .chain(
                     workspace_pending
                         .into_iter()
                         .map(PendingCancellation::WorkspaceRead),
+                )
+                .chain(
+                    workspace_replace_pending
+                        .into_iter()
+                        .map(PendingCancellation::WorkspaceReplace),
+                )
+                .chain(
+                    recovery_pending
+                        .into_iter()
+                        .map(PendingCancellation::Recovery),
                 )
                 .collect()
         }
@@ -1652,6 +2057,22 @@ mod windows {
                             None,
                         );
                     }
+                    PendingCancellation::WorkspaceReplace(pending) => {
+                        let _ = send_workspace_replace_confirmation_decision(
+                            self,
+                            &pending,
+                            ConfirmationDecision::Cancel,
+                            None,
+                        );
+                    }
+                    PendingCancellation::Recovery(pending) => {
+                        let _ = send_recovery_confirmation_decision(
+                            self,
+                            &pending,
+                            ConfirmationDecision::Cancel,
+                            None,
+                        );
+                    }
                 }
             }
         }
@@ -1667,13 +2088,41 @@ mod windows {
                     expires_at_unix_ms: pending.expires_at_unix_ms,
                 });
             }
-            let pending = self
+            if let Some(pending) = self
                 .workspace_read_pending
                 .lock()
                 .ok()?
                 .values()
-                .next()?
-                .clone();
+                .next()
+                .cloned()
+            {
+                return Some(VitaSidecarPendingSummary {
+                    pending_id: pending.pending_id,
+                    life_id: pending.life_id,
+                    task_id: pending.task_id,
+                    capability_id: pending.capability_id,
+                    workspace_summary: pending.workspace_summary,
+                    expires_at_unix_ms: pending.expires_at_unix_ms,
+                });
+            }
+            if let Some(pending) = self
+                .workspace_replace_pending
+                .lock()
+                .ok()?
+                .values()
+                .next()
+                .cloned()
+            {
+                return Some(VitaSidecarPendingSummary {
+                    pending_id: pending.pending_id,
+                    life_id: pending.life_id,
+                    task_id: pending.task_id,
+                    capability_id: pending.capability_id,
+                    workspace_summary: pending.workspace_summary,
+                    expires_at_unix_ms: pending.expires_at_unix_ms,
+                });
+            }
+            let pending = self.recovery_pending.lock().ok()?.values().next()?.clone();
             Some(VitaSidecarPendingSummary {
                 pending_id: pending.pending_id,
                 life_id: pending.life_id,
@@ -1745,6 +2194,37 @@ mod windows {
                     },
                 ));
             }
+            let workspace_replace_pending =
+                if let Ok(mut pending) = self.workspace_replace_pending.lock() {
+                    pending.drain().map(|(_, value)| value).collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+            for pending in workspace_replace_pending {
+                let _ = self.send(&HostMessage::WorkspaceReplaceConfirmationReply(
+                    WorkspaceReplaceConfirmationReply {
+                        request_id: pending.request_id,
+                        session_id: self.session_id.clone(),
+                        decision: ConfirmationDecision::Deny,
+                        authorization_revision: None,
+                    },
+                ));
+            }
+            let recovery_pending = if let Ok(mut pending) = self.recovery_pending.lock() {
+                pending.drain().map(|(_, value)| value).collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            for pending in recovery_pending {
+                let _ = self.send(&HostMessage::RecoveryConfirmationReply(
+                    RecoveryConfirmationReply {
+                        request_id: pending.request_id,
+                        session_id: self.session_id.clone(),
+                        decision: ConfirmationDecision::Deny,
+                        authorization_revision: None,
+                    },
+                ));
+            }
             if let Ok(mut approvals) = self.approvals.lock() {
                 approvals.clear();
             }
@@ -1755,6 +2235,18 @@ mod windows {
                 approvals.clear();
             }
             if let Ok(mut grants) = self.workspace_read_grants.lock() {
+                grants.clear();
+            }
+            if let Ok(mut approvals) = self.workspace_replace_approvals.lock() {
+                approvals.clear();
+            }
+            if let Ok(mut grants) = self.workspace_replace_grants.lock() {
+                grants.clear();
+            }
+            if let Ok(mut approvals) = self.recovery_approvals.lock() {
+                approvals.clear();
+            }
+            if let Ok(mut grants) = self.recovery_grants.lock() {
                 grants.clear();
             }
             if let Ok(mut replay) = self.replay.lock() {
@@ -1841,10 +2333,58 @@ mod windows {
                 }
                 return;
             }
-            let Some(expected_binding) = ticket.workspace_binding.as_ref() else {
+            if let Some(expected_binding) = ticket.workspace_binding.as_ref() {
+                let expired = if let Ok(mut pending) = self.workspace_read_pending.lock() {
+                    let key = pending.iter().find_map(|(key, value)| {
+                        (value.pending_id == ticket.pending_id
+                            && value.request_id == ticket.request_id
+                            && value.binding == *expected_binding
+                            && value.expires_at_unix_ms == ticket.expires_at_unix_ms
+                            && value.expires_at_unix_ms <= unix_millis())
+                        .then_some(key.clone())
+                    });
+                    key.and_then(|key| pending.remove(&key))
+                } else {
+                    None
+                };
+                if let Some(pending) = expired {
+                    let _ = send_workspace_read_confirmation_decision(
+                        self,
+                        &pending,
+                        ConfirmationDecision::Deny,
+                        None,
+                    );
+                }
+                return;
+            }
+            if let Some(expected_binding) = ticket.workspace_replace_binding.as_ref() {
+                let expired = if let Ok(mut pending) = self.workspace_replace_pending.lock() {
+                    let key = pending.iter().find_map(|(key, value)| {
+                        (value.pending_id == ticket.pending_id
+                            && value.request_id == ticket.request_id
+                            && value.binding == *expected_binding
+                            && value.expires_at_unix_ms == ticket.expires_at_unix_ms
+                            && value.expires_at_unix_ms <= unix_millis())
+                        .then_some(key.clone())
+                    });
+                    key.and_then(|key| pending.remove(&key))
+                } else {
+                    None
+                };
+                if let Some(pending) = expired {
+                    let _ = send_workspace_replace_confirmation_decision(
+                        self,
+                        &pending,
+                        ConfirmationDecision::Deny,
+                        None,
+                    );
+                }
+                return;
+            }
+            let Some(expected_binding) = ticket.recovery_binding.as_ref() else {
                 return;
             };
-            let expired = if let Ok(mut pending) = self.workspace_read_pending.lock() {
+            let expired = if let Ok(mut pending) = self.recovery_pending.lock() {
                 let key = pending.iter().find_map(|(key, value)| {
                     (value.pending_id == ticket.pending_id
                         && value.request_id == ticket.request_id
@@ -1858,7 +2398,7 @@ mod windows {
                 None
             };
             if let Some(pending) = expired {
-                let _ = send_workspace_read_confirmation_decision(
+                let _ = send_recovery_confirmation_decision(
                     self,
                     &pending,
                     ConfirmationDecision::Deny,
@@ -2039,10 +2579,17 @@ mod windows {
                 writer: Mutex::new(Some(writer)),
                 pending: Mutex::new(HashMap::new()),
                 workspace_read_pending: Mutex::new(HashMap::new()),
+                workspace_replace_pending: Mutex::new(HashMap::new()),
                 approvals: Mutex::new(HashMap::new()),
                 grants: Mutex::new(HashMap::new()),
                 workspace_read_approvals: Mutex::new(HashMap::new()),
                 workspace_read_grants: Mutex::new(HashMap::new()),
+                workspace_replace_approvals: Mutex::new(HashMap::new()),
+                workspace_replace_grants: Mutex::new(HashMap::new()),
+                recovery_pending: Mutex::new(HashMap::new()),
+                recovery_scan_pending: Mutex::new(HashMap::new()),
+                recovery_approvals: Mutex::new(HashMap::new()),
+                recovery_grants: Mutex::new(HashMap::new()),
                 replay: Mutex::new(RequestReplayWindow::default()),
                 expiry: Arc::new(ExpiryOwner::new()),
                 closed: AtomicBool::new(false),
@@ -2198,6 +2745,13 @@ mod windows {
             expire_pending(session);
             if let Some(pending) = take_workspace_read_pending(session, &pending_id) {
                 return self.decide_workspace_read_pending_for_session(session, pending, decision);
+            }
+            if let Some(pending) = take_workspace_replace_pending(session, &pending_id) {
+                return self
+                    .decide_workspace_replace_pending_for_session(session, pending, decision);
+            }
+            if let Some(pending) = take_recovery_pending(session, &pending_id) {
+                return self.decide_recovery_pending_for_session(session, pending, decision);
             }
             let pending = take_pending(session, &pending_id)
                 .ok_or_else(|| "Vita pending confirmation was not found".to_string())?;
@@ -2384,6 +2938,163 @@ mod windows {
             Ok(VitaSidecarActionResponse { accepted: true })
         }
 
+        fn decide_workspace_replace_pending_for_session(
+            &self,
+            session: &Arc<HostSessionState>,
+            pending: WorkspaceReplacePendingAction,
+            decision: ConfirmationDecision,
+        ) -> Result<VitaSidecarActionResponse, String> {
+            let authority = session
+                .turn_authority
+                .lock()
+                .map_err(|_| "Vita turn authority lock was poisoned".to_string())?;
+            let active = matches!(
+                &*authority,
+                HostTurnAuthority::Active(active)
+                    if active.turn_id == pending.host_turn_id
+                        && active.binding.binding_hash == pending.binding.provider_binding_hash
+                        && active.h7_codex_turn_id.as_deref()
+                            == Some(pending.binding.codex_turn_id.as_str())
+            );
+            if !active {
+                let _ = send_workspace_replace_confirmation_decision(
+                    session,
+                    &pending,
+                    ConfirmationDecision::Cancel,
+                    None,
+                );
+                return Err("Vita pending workspace replace belongs to a retired turn".to_string());
+            }
+            if pending.expires_at_unix_ms <= unix_millis() {
+                let _ = send_workspace_replace_confirmation_decision(
+                    session,
+                    &pending,
+                    ConfirmationDecision::Deny,
+                    None,
+                );
+                return Err("Vita pending workspace replace confirmation expired".to_string());
+            }
+            let mut revision = None;
+            if decision == ConfirmationDecision::Confirm {
+                require_current_session_life(&self.authority_storage, session)?;
+                revision = Some(current_workspace_replace_revision(
+                    &self.authority_storage,
+                    &self.registry,
+                    session,
+                    &pending.binding,
+                )?);
+                let confirmation_id = secure_id("vita-replace-confirmation")?;
+                session
+                    .workspace_replace_approvals
+                    .lock()
+                    .map_err(|_| {
+                        "Vita workspace replace approval state lock was poisoned".to_string()
+                    })?
+                    .insert(
+                        workspace_replace_approval_key(&pending.host_turn_id, &pending.binding),
+                        WorkspaceReplaceApprovedAction {
+                            host_turn_id: pending.host_turn_id.clone(),
+                            binding: pending.binding.clone(),
+                            authorization_revision: revision.unwrap_or_default(),
+                            confirmation_id,
+                            expires_at_unix_ms: pending.expires_at_unix_ms,
+                        },
+                    );
+            }
+            if let Err(error) =
+                send_workspace_replace_confirmation_decision(session, &pending, decision, revision)
+            {
+                if decision == ConfirmationDecision::Confirm {
+                    if let Ok(mut approvals) = session.workspace_replace_approvals.lock() {
+                        approvals.remove(&workspace_replace_approval_key(
+                            &pending.host_turn_id,
+                            &pending.binding,
+                        ));
+                    }
+                }
+                return Err(error);
+            }
+            drop(authority);
+            Ok(VitaSidecarActionResponse { accepted: true })
+        }
+
+        fn decide_recovery_pending_for_session(
+            &self,
+            session: &Arc<HostSessionState>,
+            pending: RecoveryPendingAction,
+            decision: ConfirmationDecision,
+        ) -> Result<VitaSidecarActionResponse, String> {
+            let authority = session
+                .turn_authority
+                .lock()
+                .map_err(|_| "Vita turn authority lock was poisoned".to_string())?;
+            let active = matches!(
+                &*authority,
+                HostTurnAuthority::Active(active) if active.turn_id == pending.host_turn_id
+                    && active.binding.binding_hash == pending.binding.provider_binding_hash
+                    && active.h7_codex_turn_id.as_deref()
+                        == Some(pending.binding.codex_turn_id.as_str())
+            );
+            if !active {
+                let _ = send_recovery_confirmation_decision(
+                    session,
+                    &pending,
+                    ConfirmationDecision::Cancel,
+                    None,
+                );
+                return Err("Vita pending recovery belongs to a retired turn".to_string());
+            }
+            if pending.expires_at_unix_ms <= unix_millis() {
+                let _ = send_recovery_confirmation_decision(
+                    session,
+                    &pending,
+                    ConfirmationDecision::Deny,
+                    None,
+                );
+                return Err("Vita pending recovery confirmation expired".to_string());
+            }
+            let mut revision = None;
+            if decision == ConfirmationDecision::Confirm {
+                require_current_session_life(&self.authority_storage, session)?;
+                revision = Some(current_recovery_revision(
+                    &self.authority_storage,
+                    &self.registry,
+                    session,
+                    &pending.binding,
+                )?);
+                let confirmation_id = secure_id("vita-recovery-confirmation")?;
+                session
+                    .recovery_approvals
+                    .lock()
+                    .map_err(|_| "Vita recovery approval state lock was poisoned".to_string())?
+                    .insert(
+                        recovery_approval_key(&pending.host_turn_id, &pending.binding),
+                        RecoveryApprovedAction {
+                            host_turn_id: pending.host_turn_id.clone(),
+                            binding: pending.binding.clone(),
+                            authorization_revision: revision.unwrap_or_default(),
+                            confirmation_id,
+                            expires_at_unix_ms: pending.expires_at_unix_ms,
+                        },
+                    );
+            }
+            if let Err(error) =
+                send_recovery_confirmation_decision(session, &pending, decision, revision)
+            {
+                if decision == ConfirmationDecision::Confirm {
+                    if let Ok(mut approvals) = session.recovery_approvals.lock() {
+                        approvals.remove(&recovery_approval_key(
+                            &pending.host_turn_id,
+                            &pending.binding,
+                        ));
+                    }
+                }
+                return Err(error);
+            }
+            drop(authority);
+            Ok(VitaSidecarActionResponse { accepted: true })
+        }
+
         fn cancel(&self) -> Result<VitaSidecarActionResponse, String> {
             let guard = self
                 .inner
@@ -2414,6 +3125,26 @@ mod windows {
                     decision,
                     None,
                 );
+            } else if let Some(pending) = take_any_workspace_replace_pending(&running.session) {
+                let decision = if pending.expires_at_unix_ms <= unix_millis() {
+                    ConfirmationDecision::Deny
+                } else {
+                    ConfirmationDecision::Cancel
+                };
+                let _ = send_workspace_replace_confirmation_decision(
+                    &running.session,
+                    &pending,
+                    decision,
+                    None,
+                );
+            } else if let Some(pending) = take_any_recovery_pending(&running.session) {
+                let decision = if pending.expires_at_unix_ms <= unix_millis() {
+                    ConfirmationDecision::Deny
+                } else {
+                    ConfirmationDecision::Cancel
+                };
+                let _ =
+                    send_recovery_confirmation_decision(&running.session, &pending, decision, None);
             }
             running
                 .session
@@ -2571,6 +3302,26 @@ mod windows {
                     decision,
                     None,
                 );
+            } else if let Some(pending) = take_any_workspace_replace_pending(&running.session) {
+                let decision = if pending.expires_at_unix_ms <= unix_millis() {
+                    ConfirmationDecision::Deny
+                } else {
+                    ConfirmationDecision::Cancel
+                };
+                let _ = send_workspace_replace_confirmation_decision(
+                    &running.session,
+                    &pending,
+                    decision,
+                    None,
+                );
+            } else if let Some(pending) = take_any_recovery_pending(&running.session) {
+                let decision = if pending.expires_at_unix_ms <= unix_millis() {
+                    ConfirmationDecision::Deny
+                } else {
+                    ConfirmationDecision::Cancel
+                };
+                let _ =
+                    send_recovery_confirmation_decision(&running.session, &pending, decision, None);
             }
             // Cancel the governed H7 action and any pending H8 confirmation
             // before interrupting the Codex turn.  A turn-only interrupt is
@@ -2667,6 +3418,35 @@ mod windows {
                 VitaMessage::WorkspaceReadReleaseCheck(request) => {
                     handle_workspace_read_release_check(&session, &storage, &registry, request)
                 }
+                VitaMessage::WorkspaceReplaceAuthorityEvaluate(request) => {
+                    handle_workspace_replace_authority_evaluate(
+                        &session, &storage, &registry, request,
+                    )
+                }
+                VitaMessage::WorkspaceReplaceConfirmationRequired(request) => {
+                    handle_workspace_replace_confirmation_required(&session, request)
+                }
+                VitaMessage::WorkspaceReplaceIssueGrant(request) => {
+                    handle_workspace_replace_issue_grant(&session, &storage, &registry, request)
+                }
+                VitaMessage::WorkspaceReplaceRevalidateGrant(request) => {
+                    handle_workspace_replace_revalidate_grant(
+                        &session, &storage, &registry, request,
+                    )
+                }
+                VitaMessage::RecoveryAuthorityEvaluate(request) => {
+                    handle_recovery_authority_evaluate(&session, &storage, &registry, request)
+                }
+                VitaMessage::RecoveryConfirmationRequired(request) => {
+                    handle_recovery_confirmation_required(&session, request)
+                }
+                VitaMessage::RecoveryIssueGrant(request) => {
+                    handle_recovery_issue_grant(&session, &storage, &registry, request)
+                }
+                VitaMessage::RecoveryRevalidateGrant(request) => {
+                    handle_recovery_revalidate_grant(&session, &storage, &registry, request)
+                }
+                VitaMessage::RecoveryPending(request) => handle_recovery_pending(&session, request),
                 VitaMessage::CredentialRequired(request) => {
                     handle_credential_required(&session, &storage, &secrets, request)
                 }
@@ -2694,6 +3474,27 @@ mod windows {
         }
         session.retire();
         session.close_writer();
+    }
+
+    fn handle_recovery_pending(
+        session: &Arc<HostSessionState>,
+        request: protocol::RecoveryPending,
+    ) -> Result<(), String> {
+        request
+            .validate()
+            .map_err(|_| "Vita recovery pending evidence was malformed".to_string())?;
+        if request.session_id != session.session_id
+            || request.life_id != session.life_id
+            || request.task_id != session.task_id
+        {
+            return Err("RECOVERY_PENDING_BINDING_MISMATCH".to_string());
+        }
+        session
+            .recovery_scan_pending
+            .lock()
+            .map_err(|_| "Vita recovery scan state lock was poisoned".to_string())?
+            .insert(request.transaction_id.clone(), request);
+        Ok(())
     }
 
     fn handle_turn_state(
@@ -3645,6 +4446,54 @@ mod windows {
         removed
     }
 
+    fn take_workspace_replace_pending(
+        session: &HostSessionState,
+        pending_id: &str,
+    ) -> Option<WorkspaceReplacePendingAction> {
+        let removed = session
+            .workspace_replace_pending
+            .lock()
+            .ok()
+            .and_then(|mut pending| {
+                let key = pending.iter().find_map(|(key, value)| {
+                    (value.pending_id == pending_id).then_some(key.clone())
+                });
+                key.and_then(|key| pending.remove(&key))
+            });
+        if let Some(ref pending) = removed {
+            session
+                .expiry
+                .clear(&ExpiryTicket::for_workspace_replace_pending(
+                    &session.session_id,
+                    pending,
+                ));
+        }
+        removed
+    }
+
+    fn take_recovery_pending(
+        session: &HostSessionState,
+        pending_id: &str,
+    ) -> Option<RecoveryPendingAction> {
+        let removed = session
+            .recovery_pending
+            .lock()
+            .ok()
+            .and_then(|mut pending| {
+                let key = pending.iter().find_map(|(key, value)| {
+                    (value.pending_id == pending_id).then_some(key.clone())
+                });
+                key.and_then(|key| pending.remove(&key))
+            });
+        if let Some(ref pending) = removed {
+            session.expiry.clear(&ExpiryTicket::for_recovery_pending(
+                &session.session_id,
+                pending,
+            ));
+        }
+        removed
+    }
+
     fn take_any_pending(session: &HostSessionState) -> Option<PendingAction> {
         let removed = session.pending.lock().ok().and_then(|mut pending| {
             let key = pending.keys().next().cloned()?;
@@ -3678,6 +4527,46 @@ mod windows {
         removed
     }
 
+    fn take_any_workspace_replace_pending(
+        session: &HostSessionState,
+    ) -> Option<WorkspaceReplacePendingAction> {
+        let removed = session
+            .workspace_replace_pending
+            .lock()
+            .ok()
+            .and_then(|mut pending| {
+                let key = pending.keys().next().cloned()?;
+                pending.remove(&key)
+            });
+        if let Some(ref pending) = removed {
+            session
+                .expiry
+                .clear(&ExpiryTicket::for_workspace_replace_pending(
+                    &session.session_id,
+                    pending,
+                ));
+        }
+        removed
+    }
+
+    fn take_any_recovery_pending(session: &HostSessionState) -> Option<RecoveryPendingAction> {
+        let removed = session
+            .recovery_pending
+            .lock()
+            .ok()
+            .and_then(|mut pending| {
+                let key = pending.keys().next().cloned()?;
+                pending.remove(&key)
+            });
+        if let Some(ref pending) = removed {
+            session.expiry.clear(&ExpiryTicket::for_recovery_pending(
+                &session.session_id,
+                pending,
+            ));
+        }
+        removed
+    }
+
     fn send_confirmation_decision(
         session: &HostSessionState,
         pending: &PendingAction,
@@ -3700,6 +4589,38 @@ mod windows {
     ) -> Result<(), String> {
         session.send(&HostMessage::WorkspaceReadConfirmationReply(
             WorkspaceReadConfirmationReply {
+                request_id: pending.request_id.clone(),
+                session_id: session.session_id.clone(),
+                decision,
+                authorization_revision,
+            },
+        ))
+    }
+
+    fn send_workspace_replace_confirmation_decision(
+        session: &HostSessionState,
+        pending: &WorkspaceReplacePendingAction,
+        decision: ConfirmationDecision,
+        authorization_revision: Option<i64>,
+    ) -> Result<(), String> {
+        session.send(&HostMessage::WorkspaceReplaceConfirmationReply(
+            WorkspaceReplaceConfirmationReply {
+                request_id: pending.request_id.clone(),
+                session_id: session.session_id.clone(),
+                decision,
+                authorization_revision,
+            },
+        ))
+    }
+
+    fn send_recovery_confirmation_decision(
+        session: &HostSessionState,
+        pending: &RecoveryPendingAction,
+        decision: ConfirmationDecision,
+        authorization_revision: Option<i64>,
+    ) -> Result<(), String> {
+        session.send(&HostMessage::RecoveryConfirmationReply(
+            RecoveryConfirmationReply {
                 request_id: pending.request_id.clone(),
                 session_id: session.session_id.clone(),
                 decision,
@@ -3770,6 +4691,745 @@ mod windows {
                 None,
             );
         }
+        let expired = if let Ok(mut pending) = session.workspace_replace_pending.lock() {
+            let mut expired = Vec::new();
+            pending.retain(|_, value| {
+                if value.expires_at_unix_ms <= now {
+                    expired.push(value.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            expired
+        } else {
+            Vec::new()
+        };
+        for pending in expired {
+            session
+                .expiry
+                .clear(&ExpiryTicket::for_workspace_replace_pending(
+                    &session.session_id,
+                    &pending,
+                ));
+            let _ = send_workspace_replace_confirmation_decision(
+                session,
+                &pending,
+                ConfirmationDecision::Deny,
+                None,
+            );
+        }
+        let expired = if let Ok(mut pending) = session.recovery_pending.lock() {
+            let mut expired = Vec::new();
+            pending.retain(|_, value| {
+                if value.expires_at_unix_ms <= now {
+                    expired.push(value.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            expired
+        } else {
+            Vec::new()
+        };
+        for pending in expired {
+            session.expiry.clear(&ExpiryTicket::for_recovery_pending(
+                &session.session_id,
+                &pending,
+            ));
+            let _ = send_recovery_confirmation_decision(
+                session,
+                &pending,
+                ConfirmationDecision::Deny,
+                None,
+            );
+        }
+    }
+
+    fn handle_workspace_replace_authority_evaluate(
+        session: &Arc<HostSessionState>,
+        storage: &StorageService,
+        registry: &CapabilityRegistry,
+        request: WorkspaceReplaceAuthorityEvaluate,
+    ) -> Result<(), String> {
+        request
+            .validate()
+            .map_err(|_| "Vita workspace replace authority request was malformed".to_string())?;
+        if session.closed.load(Ordering::Acquire) || request.session_id != session.session_id {
+            return Err("WORKSPACE_REPLACE_BINDING_MISMATCH".to_string());
+        }
+        validate_workspace_replace_binding(session, &request.binding)?;
+        let mut authority = session
+            .turn_authority
+            .lock()
+            .map_err(|_| "Vita turn authority lock was poisoned".to_string())?;
+        let active = match &mut *authority {
+            HostTurnAuthority::Active(active) if active.turn_id == request.host_turn_id => active,
+            _ => {
+                return session.send(&HostMessage::WorkspaceReplaceAuthorityReply(
+                    WorkspaceReplaceAuthorityReply {
+                        request_id: request.request_id,
+                        session_id: session.session_id.clone(),
+                        allowed: false,
+                        authorization_revision: None,
+                        error_code: Some("TURN_NOT_ACTIVE".to_string()),
+                    },
+                ));
+            }
+        };
+        if active.binding.binding_hash != request.binding.provider_binding_hash
+            || active
+                .h7_codex_turn_id
+                .as_deref()
+                .is_some_and(|turn| turn != request.binding.codex_turn_id)
+        {
+            let result = session.send(&HostMessage::WorkspaceReplaceAuthorityReply(
+                WorkspaceReplaceAuthorityReply {
+                    request_id: request.request_id,
+                    session_id: session.session_id.clone(),
+                    allowed: false,
+                    authorization_revision: None,
+                    error_code: Some("PROVIDER_BINDING_MISMATCH".to_string()),
+                },
+            ));
+            drop(authority);
+            result?;
+            return Err("WORKSPACE_REPLACE_BINDING_MISMATCH".to_string());
+        }
+        let result = match storage.capability_authorization_scope() {
+            Ok(scope) => require_current_session_life(storage, session).and_then(|_| {
+                current_workspace_replace_revision_in_scope(
+                    &scope,
+                    registry,
+                    session,
+                    &request.binding,
+                )
+            }),
+            Err(error) => Err(capability_authorization_gate_error(error)),
+        };
+        let response = match result {
+            Ok(revision) => {
+                active.h7_codex_turn_id = Some(request.binding.codex_turn_id.clone());
+                WorkspaceReplaceAuthorityReply {
+                    request_id: request.request_id,
+                    session_id: session.session_id.clone(),
+                    allowed: true,
+                    authorization_revision: Some(revision),
+                    error_code: None,
+                }
+            }
+            Err(error) => WorkspaceReplaceAuthorityReply {
+                request_id: request.request_id,
+                session_id: session.session_id.clone(),
+                allowed: false,
+                authorization_revision: None,
+                error_code: Some(error_code(&error)),
+            },
+        };
+        let send_result = session.send(&HostMessage::WorkspaceReplaceAuthorityReply(response));
+        drop(authority);
+        send_result
+    }
+
+    fn handle_workspace_replace_confirmation_required(
+        session: &Arc<HostSessionState>,
+        request: WorkspaceReplaceConfirmationRequired,
+    ) -> Result<(), String> {
+        request
+            .validate()
+            .map_err(|_| "Vita workspace replace confirmation request was malformed".to_string())?;
+        if session.closed.load(Ordering::Acquire) || request.session_id != session.session_id {
+            return Err("WORKSPACE_REPLACE_BINDING_MISMATCH".to_string());
+        }
+        validate_workspace_replace_binding(session, &request.binding)?;
+        let now = unix_millis();
+        let Some(expires_at_unix_ms) =
+            effective_confirmation_expiry(now, request.expires_at_unix_ms)
+        else {
+            session.send(&HostMessage::WorkspaceReplaceConfirmationReply(
+                WorkspaceReplaceConfirmationReply {
+                    request_id: request.request_id,
+                    session_id: session.session_id.clone(),
+                    decision: ConfirmationDecision::Deny,
+                    authorization_revision: None,
+                },
+            ))?;
+            return Ok(());
+        };
+        expire_pending(session);
+        let authority = session
+            .turn_authority
+            .lock()
+            .map_err(|_| "Vita turn authority lock was poisoned".to_string())?;
+        if !active_workspace_replace_turn_matches(
+            &authority,
+            &request.host_turn_id,
+            &request.binding,
+        ) {
+            let result = session.send(&HostMessage::WorkspaceReplaceConfirmationReply(
+                WorkspaceReplaceConfirmationReply {
+                    request_id: request.request_id,
+                    session_id: session.session_id.clone(),
+                    decision: ConfirmationDecision::Cancel,
+                    authorization_revision: None,
+                },
+            ));
+            drop(authority);
+            result?;
+            return Err("WORKSPACE_REPLACE_TURN_NOT_ACTIVE".to_string());
+        }
+        let pending_id = format!("replace-pending:{}", secure_id("vita")?);
+        let pending_action = WorkspaceReplacePendingAction {
+            pending_id: pending_id.clone(),
+            request_id: request.request_id,
+            host_turn_id: request.host_turn_id,
+            life_id: request.binding.life_id.clone(),
+            task_id: request.binding.task_id.clone(),
+            capability_id: request.binding.capability_id.clone(),
+            workspace_summary: request.workspace_summary,
+            expires_at_unix_ms,
+            binding: request.binding,
+        };
+        let h7_pending = session
+            .pending
+            .lock()
+            .map_err(|_| "Vita pending state lock was poisoned".to_string())?;
+        let read_pending = session
+            .workspace_read_pending
+            .lock()
+            .map_err(|_| "Vita workspace read pending state lock was poisoned".to_string())?;
+        let mut pending = session
+            .workspace_replace_pending
+            .lock()
+            .map_err(|_| "Vita workspace replace pending state lock was poisoned".to_string())?;
+        let recovery_pending = session
+            .recovery_pending
+            .lock()
+            .map_err(|_| "Vita recovery pending state lock was poisoned".to_string())?;
+        if h7_pending.len() + read_pending.len() + pending.len() + recovery_pending.len()
+            >= MAX_PENDING
+        {
+            return Err("Vita pending confirmation capacity was exhausted".to_string());
+        }
+        let ticket =
+            ExpiryTicket::for_workspace_replace_pending(&session.session_id, &pending_action);
+        pending.insert(pending_id, pending_action);
+        drop(recovery_pending);
+        drop(pending);
+        drop(read_pending);
+        drop(h7_pending);
+        drop(authority);
+        session.expiry.schedule(ticket);
+        Ok(())
+    }
+
+    fn issue_workspace_replace_grant(
+        storage: &StorageService,
+        registry: &CapabilityRegistry,
+        session: &HostSessionState,
+        request: &WorkspaceReplaceIssueGrant,
+    ) -> Result<WorkspaceReplaceGrant, String> {
+        request
+            .validate()
+            .map_err(|_| "WORKSPACE_REPLACE_ISSUE_INVALID".to_string())?;
+        validate_workspace_replace_binding(session, &request.binding)?;
+        let authority = session
+            .turn_authority
+            .lock()
+            .map_err(|_| "Vita turn authority lock was poisoned".to_string())?;
+        if !active_workspace_replace_turn_matches(
+            &authority,
+            &request.host_turn_id,
+            &request.binding,
+        ) {
+            return Err("WORKSPACE_REPLACE_TURN_NOT_ACTIVE".to_string());
+        }
+        require_current_session_life(storage, session)?;
+        let current_revision =
+            current_workspace_replace_revision(storage, registry, session, &request.binding)?;
+        if current_revision != request.authorization_revision {
+            return Err("CAPABILITY_AUTHORIZATION_REVISION_MISMATCH".to_string());
+        }
+        let key = workspace_replace_approval_key(&request.host_turn_id, &request.binding);
+        let mut approvals = session
+            .workspace_replace_approvals
+            .lock()
+            .map_err(|_| "Vita workspace replace approval state lock was poisoned".to_string())?;
+        let approval = approvals
+            .remove(&key)
+            .ok_or_else(|| "WORKSPACE_REPLACE_CONFIRMATION_NOT_APPROVED".to_string())?;
+        if approval.host_turn_id != request.host_turn_id
+            || approval.binding != request.binding
+            || approval.authorization_revision != request.authorization_revision
+            || approval.expires_at_unix_ms <= unix_millis()
+        {
+            return Err("WORKSPACE_REPLACE_CONFIRMATION_STALE".to_string());
+        }
+        let now = unix_millis();
+        let expires_at_unix_ms = approval
+            .expires_at_unix_ms
+            .min(now.saturating_add(GRANT_LIFETIME_MS));
+        if expires_at_unix_ms <= now {
+            return Err("WORKSPACE_REPLACE_GRANT_EXPIRED".to_string());
+        }
+        let grant = WorkspaceReplaceGrant {
+            session_id: session.session_id.clone(),
+            grant_id: secure_id("vita-replace-grant")?,
+            confirmation_id: approval.confirmation_id,
+            binding: request.binding.clone(),
+            authorization_revision: request.authorization_revision,
+            issued_at_unix_ms: now,
+            expires_at_unix_ms,
+            single_use: true,
+            used: false,
+        };
+        grant
+            .validate()
+            .map_err(|_| "WORKSPACE_REPLACE_GRANT_INVALID".to_string())?;
+        let mut grants = session
+            .workspace_replace_grants
+            .lock()
+            .map_err(|_| "Vita workspace replace grant state lock was poisoned".to_string())?;
+        reap_expired_workspace_replace_grants(&mut grants);
+        if grants.len() >= MAX_GRANTS {
+            return Err("WORKSPACE_REPLACE_GRANT_CAPACITY_EXHAUSTED".to_string());
+        }
+        grants.insert(
+            grant.grant_id.clone(),
+            WorkspaceReplaceGrantState {
+                host_turn_id: request.host_turn_id.clone(),
+                grant: grant.clone(),
+                phase: WorkspaceReplaceGrantPhase::Issued,
+            },
+        );
+        drop(authority);
+        Ok(grant)
+    }
+
+    fn revalidate_workspace_replace_grant(
+        storage: &StorageService,
+        registry: &CapabilityRegistry,
+        session: &HostSessionState,
+        request: &WorkspaceReplaceRevalidateGrant,
+    ) -> Result<WorkspaceReplaceGrant, String> {
+        request
+            .validate()
+            .map_err(|_| "WORKSPACE_REPLACE_REVALIDATION_INVALID".to_string())?;
+        validate_workspace_replace_binding(session, &request.binding)?;
+        let authority = session
+            .turn_authority
+            .lock()
+            .map_err(|_| "Vita turn authority lock was poisoned".to_string())?;
+        if !active_workspace_replace_turn_matches(
+            &authority,
+            &request.host_turn_id,
+            &request.binding,
+        ) {
+            return Err("WORKSPACE_REPLACE_TURN_NOT_ACTIVE".to_string());
+        }
+        require_current_session_life(storage, session)?;
+        let current_revision =
+            current_workspace_replace_revision(storage, registry, session, &request.binding)?;
+        let mut grants = session
+            .workspace_replace_grants
+            .lock()
+            .map_err(|_| "Vita workspace replace grant state lock was poisoned".to_string())?;
+        let state = grants
+            .get_mut(&request.grant.grant_id)
+            .ok_or_else(|| "WORKSPACE_REPLACE_GRANT_NOT_FOUND".to_string())?;
+        if state.host_turn_id != request.host_turn_id
+            || state.phase != WorkspaceReplaceGrantPhase::Issued
+            || state.grant != request.grant
+            || state.grant.binding != request.binding
+            || state.grant.authorization_revision != current_revision
+            || state.grant.expires_at_unix_ms <= unix_millis()
+        {
+            return Err("WORKSPACE_REPLACE_GRANT_REVALIDATION_DENIED".to_string());
+        }
+        state.grant.used = true;
+        state.phase = WorkspaceReplaceGrantPhase::Revalidated;
+        let result = state.grant.clone();
+        drop(grants);
+        drop(authority);
+        Ok(result)
+    }
+
+    fn handle_workspace_replace_issue_grant(
+        session: &Arc<HostSessionState>,
+        storage: &StorageService,
+        registry: &CapabilityRegistry,
+        request: WorkspaceReplaceIssueGrant,
+    ) -> Result<(), String> {
+        let result = issue_workspace_replace_grant(storage, registry, session, &request);
+        match result {
+            Ok(grant) => session.send(&HostMessage::WorkspaceReplaceGrantIssued(
+                WorkspaceReplaceGrantIssued {
+                    request_id: request.request_id,
+                    session_id: session.session_id.clone(),
+                    allowed: true,
+                    grant: Some(grant),
+                    error_code: None,
+                },
+            )),
+            Err(error) => session.send(&HostMessage::WorkspaceReplaceGrantIssued(
+                WorkspaceReplaceGrantIssued {
+                    request_id: request.request_id,
+                    session_id: session.session_id.clone(),
+                    allowed: false,
+                    grant: None,
+                    error_code: Some(error_code(&error)),
+                },
+            )),
+        }
+    }
+
+    fn handle_workspace_replace_revalidate_grant(
+        session: &Arc<HostSessionState>,
+        storage: &StorageService,
+        registry: &CapabilityRegistry,
+        request: WorkspaceReplaceRevalidateGrant,
+    ) -> Result<(), String> {
+        let result = revalidate_workspace_replace_grant(storage, registry, session, &request);
+        match result {
+            Ok(grant) => session.send(&HostMessage::WorkspaceReplaceGrantRevalidated(
+                WorkspaceReplaceGrantRevalidated {
+                    request_id: request.request_id,
+                    session_id: session.session_id.clone(),
+                    allowed: true,
+                    grant: Some(grant),
+                    error_code: None,
+                },
+            )),
+            Err(error) => session.send(&HostMessage::WorkspaceReplaceGrantRevalidated(
+                WorkspaceReplaceGrantRevalidated {
+                    request_id: request.request_id,
+                    session_id: session.session_id.clone(),
+                    allowed: false,
+                    grant: None,
+                    error_code: Some(error_code(&error)),
+                },
+            )),
+        }
+    }
+
+    fn handle_recovery_authority_evaluate(
+        session: &Arc<HostSessionState>,
+        storage: &StorageService,
+        registry: &CapabilityRegistry,
+        request: RecoveryAuthorityEvaluate,
+    ) -> Result<(), String> {
+        request
+            .validate()
+            .map_err(|_| "Vita recovery authority request was malformed".to_string())?;
+        if session.closed.load(Ordering::Acquire) || request.session_id != session.session_id {
+            return Err("RECOVERY_BINDING_MISMATCH".to_string());
+        }
+        validate_recovery_binding(session, &request.binding)?;
+        let mut authority = session
+            .turn_authority
+            .lock()
+            .map_err(|_| "Vita turn authority lock was poisoned".to_string())?;
+        if !active_recovery_turn_matches(&authority, &request.host_turn_id, &request.binding) {
+            return session.send(&HostMessage::RecoveryAuthorityReply(
+                RecoveryAuthorityReply {
+                    request_id: request.request_id,
+                    session_id: session.session_id.clone(),
+                    allowed: false,
+                    authorization_revision: None,
+                    error_code: Some("TURN_NOT_ACTIVE".to_string()),
+                },
+            ));
+        }
+        let result = match storage.capability_authorization_scope() {
+            Ok(scope) => require_current_session_life(storage, session).and_then(|_| {
+                current_recovery_revision_in_scope(&scope, registry, session, &request.binding)
+            }),
+            Err(error) => Err(capability_authorization_gate_error(error)),
+        };
+        let response = match result {
+            Ok(revision) => RecoveryAuthorityReply {
+                request_id: request.request_id,
+                session_id: session.session_id.clone(),
+                allowed: true,
+                authorization_revision: Some(revision),
+                error_code: None,
+            },
+            Err(error) => RecoveryAuthorityReply {
+                request_id: request.request_id,
+                session_id: session.session_id.clone(),
+                allowed: false,
+                authorization_revision: None,
+                error_code: Some(error_code(&error)),
+            },
+        };
+        let send_result = session.send(&HostMessage::RecoveryAuthorityReply(response));
+        drop(authority);
+        send_result
+    }
+
+    fn handle_recovery_confirmation_required(
+        session: &Arc<HostSessionState>,
+        request: RecoveryConfirmationRequired,
+    ) -> Result<(), String> {
+        request
+            .validate()
+            .map_err(|_| "Vita recovery confirmation request was malformed".to_string())?;
+        if session.closed.load(Ordering::Acquire) || request.session_id != session.session_id {
+            return Err("RECOVERY_BINDING_MISMATCH".to_string());
+        }
+        validate_recovery_binding(session, &request.binding)?;
+        let now = unix_millis();
+        let Some(expires_at_unix_ms) =
+            effective_confirmation_expiry(now, request.expires_at_unix_ms)
+        else {
+            session.send(&HostMessage::RecoveryConfirmationReply(
+                RecoveryConfirmationReply {
+                    request_id: request.request_id,
+                    session_id: session.session_id.clone(),
+                    decision: ConfirmationDecision::Deny,
+                    authorization_revision: None,
+                },
+            ))?;
+            return Ok(());
+        };
+        expire_pending(session);
+        let authority = session
+            .turn_authority
+            .lock()
+            .map_err(|_| "Vita turn authority lock was poisoned".to_string())?;
+        if !active_recovery_turn_matches(&authority, &request.host_turn_id, &request.binding) {
+            let result = session.send(&HostMessage::RecoveryConfirmationReply(
+                RecoveryConfirmationReply {
+                    request_id: request.request_id,
+                    session_id: session.session_id.clone(),
+                    decision: ConfirmationDecision::Cancel,
+                    authorization_revision: None,
+                },
+            ));
+            drop(authority);
+            result?;
+            return Err("RECOVERY_TURN_NOT_ACTIVE".to_string());
+        }
+        let pending_id = format!("recovery-pending:{}", secure_id("vita")?);
+        let pending_action = RecoveryPendingAction {
+            pending_id: pending_id.clone(),
+            request_id: request.request_id,
+            host_turn_id: request.host_turn_id,
+            life_id: request.binding.life_id.clone(),
+            task_id: request.binding.task_id.clone(),
+            capability_id: request.binding.capability_id.clone(),
+            workspace_summary: request.workspace_summary,
+            expires_at_unix_ms,
+            binding: request.binding,
+        };
+        let h7_pending = session
+            .pending
+            .lock()
+            .map_err(|_| "Vita pending state lock was poisoned".to_string())?;
+        let read_pending = session
+            .workspace_read_pending
+            .lock()
+            .map_err(|_| "Vita workspace read pending state lock was poisoned".to_string())?;
+        let replace_pending = session
+            .workspace_replace_pending
+            .lock()
+            .map_err(|_| "Vita workspace replace pending state lock was poisoned".to_string())?;
+        let mut pending = session
+            .recovery_pending
+            .lock()
+            .map_err(|_| "Vita recovery pending state lock was poisoned".to_string())?;
+        if h7_pending.len() + read_pending.len() + replace_pending.len() + pending.len()
+            >= MAX_PENDING
+        {
+            return Err("Vita pending confirmation capacity was exhausted".to_string());
+        }
+        let ticket = ExpiryTicket::for_recovery_pending(&session.session_id, &pending_action);
+        pending.insert(pending_id, pending_action);
+        drop(pending);
+        drop(replace_pending);
+        drop(read_pending);
+        drop(h7_pending);
+        drop(authority);
+        session.expiry.schedule(ticket);
+        Ok(())
+    }
+
+    fn issue_recovery_grant(
+        storage: &StorageService,
+        registry: &CapabilityRegistry,
+        session: &HostSessionState,
+        request: &RecoveryIssueGrant,
+    ) -> Result<RecoveryGrant, String> {
+        request
+            .validate()
+            .map_err(|_| "RECOVERY_ISSUE_INVALID".to_string())?;
+        validate_recovery_binding(session, &request.binding)?;
+        let authority = session
+            .turn_authority
+            .lock()
+            .map_err(|_| "Vita turn authority lock was poisoned".to_string())?;
+        if !active_recovery_turn_matches(&authority, &request.host_turn_id, &request.binding) {
+            return Err("RECOVERY_TURN_NOT_ACTIVE".to_string());
+        }
+        require_current_session_life(storage, session)?;
+        let current_revision =
+            current_recovery_revision(storage, registry, session, &request.binding)?;
+        if current_revision != request.authorization_revision {
+            return Err("CAPABILITY_AUTHORIZATION_REVISION_MISMATCH".to_string());
+        }
+        let key = recovery_approval_key(&request.host_turn_id, &request.binding);
+        let mut approvals = session
+            .recovery_approvals
+            .lock()
+            .map_err(|_| "Vita recovery approval state lock was poisoned".to_string())?;
+        let approval = approvals
+            .remove(&key)
+            .ok_or_else(|| "RECOVERY_CONFIRMATION_NOT_APPROVED".to_string())?;
+        if approval.host_turn_id != request.host_turn_id
+            || approval.binding != request.binding
+            || approval.authorization_revision != request.authorization_revision
+            || approval.expires_at_unix_ms <= unix_millis()
+        {
+            return Err("RECOVERY_CONFIRMATION_STALE".to_string());
+        }
+        let now = unix_millis();
+        let expires_at_unix_ms = approval
+            .expires_at_unix_ms
+            .min(now.saturating_add(GRANT_LIFETIME_MS));
+        if expires_at_unix_ms <= now {
+            return Err("RECOVERY_GRANT_EXPIRED".to_string());
+        }
+        let grant = RecoveryGrant {
+            session_id: session.session_id.clone(),
+            grant_id: secure_id("vita-recovery-grant")?,
+            confirmation_id: approval.confirmation_id,
+            binding: request.binding.clone(),
+            authorization_revision: request.authorization_revision,
+            issued_at_unix_ms: now,
+            expires_at_unix_ms,
+            single_use: true,
+            used: false,
+        };
+        grant
+            .validate()
+            .map_err(|_| "RECOVERY_GRANT_INVALID".to_string())?;
+        let mut grants = session
+            .recovery_grants
+            .lock()
+            .map_err(|_| "Vita recovery grant state lock was poisoned".to_string())?;
+        reap_expired_recovery_grants(&mut grants);
+        if grants.len() >= MAX_GRANTS {
+            return Err("RECOVERY_GRANT_CAPACITY_EXHAUSTED".to_string());
+        }
+        grants.insert(
+            grant.grant_id.clone(),
+            RecoveryGrantState {
+                host_turn_id: request.host_turn_id.clone(),
+                grant: grant.clone(),
+                phase: RecoveryGrantPhase::Issued,
+            },
+        );
+        drop(authority);
+        Ok(grant)
+    }
+
+    fn revalidate_recovery_grant(
+        storage: &StorageService,
+        registry: &CapabilityRegistry,
+        session: &HostSessionState,
+        request: &RecoveryRevalidateGrant,
+    ) -> Result<RecoveryGrant, String> {
+        request
+            .validate()
+            .map_err(|_| "RECOVERY_REVALIDATION_INVALID".to_string())?;
+        validate_recovery_binding(session, &request.binding)?;
+        let authority = session
+            .turn_authority
+            .lock()
+            .map_err(|_| "Vita turn authority lock was poisoned".to_string())?;
+        if !active_recovery_turn_matches(&authority, &request.host_turn_id, &request.binding) {
+            return Err("RECOVERY_TURN_NOT_ACTIVE".to_string());
+        }
+        require_current_session_life(storage, session)?;
+        let current_revision =
+            current_recovery_revision(storage, registry, session, &request.binding)?;
+        let mut grants = session
+            .recovery_grants
+            .lock()
+            .map_err(|_| "Vita recovery grant state lock was poisoned".to_string())?;
+        let state = grants
+            .get_mut(&request.grant.grant_id)
+            .ok_or_else(|| "RECOVERY_GRANT_NOT_FOUND".to_string())?;
+        if state.host_turn_id != request.host_turn_id
+            || state.phase != RecoveryGrantPhase::Issued
+            || state.grant != request.grant
+            || state.grant.binding != request.binding
+            || state.grant.authorization_revision != current_revision
+            || state.grant.expires_at_unix_ms <= unix_millis()
+        {
+            return Err("RECOVERY_GRANT_REVALIDATION_DENIED".to_string());
+        }
+        state.grant.used = true;
+        state.phase = RecoveryGrantPhase::Revalidated;
+        let result = state.grant.clone();
+        drop(grants);
+        drop(authority);
+        Ok(result)
+    }
+
+    fn handle_recovery_issue_grant(
+        session: &Arc<HostSessionState>,
+        storage: &StorageService,
+        registry: &CapabilityRegistry,
+        request: RecoveryIssueGrant,
+    ) -> Result<(), String> {
+        let result = issue_recovery_grant(storage, registry, session, &request);
+        match result {
+            Ok(grant) => session.send(&HostMessage::RecoveryGrantIssued(RecoveryGrantIssued {
+                request_id: request.request_id,
+                session_id: session.session_id.clone(),
+                allowed: true,
+                grant: Some(grant),
+                error_code: None,
+            })),
+            Err(error) => session.send(&HostMessage::RecoveryGrantIssued(RecoveryGrantIssued {
+                request_id: request.request_id,
+                session_id: session.session_id.clone(),
+                allowed: false,
+                grant: None,
+                error_code: Some(error_code(&error)),
+            })),
+        }
+    }
+
+    fn handle_recovery_revalidate_grant(
+        session: &Arc<HostSessionState>,
+        storage: &StorageService,
+        registry: &CapabilityRegistry,
+        request: RecoveryRevalidateGrant,
+    ) -> Result<(), String> {
+        let result = revalidate_recovery_grant(storage, registry, session, &request);
+        match result {
+            Ok(grant) => session.send(&HostMessage::RecoveryGrantRevalidated(
+                RecoveryGrantRevalidated {
+                    request_id: request.request_id,
+                    session_id: session.session_id.clone(),
+                    allowed: true,
+                    grant: Some(grant),
+                    error_code: None,
+                },
+            )),
+            Err(error) => session.send(&HostMessage::RecoveryGrantRevalidated(
+                RecoveryGrantRevalidated {
+                    request_id: request.request_id,
+                    session_id: session.session_id.clone(),
+                    allowed: false,
+                    grant: None,
+                    error_code: Some(error_code(&error)),
+                },
+            )),
+        }
     }
 
     fn reap_expired_grants(grants: &mut HashMap<String, HostStoredGrant>) {
@@ -3782,6 +5442,18 @@ mod windows {
         grants.retain(|_, state| {
             state.phase == WorkspaceReadGrantPhase::Released || state.grant.expires_at_unix_ms > now
         });
+    }
+
+    fn reap_expired_workspace_replace_grants(
+        grants: &mut HashMap<String, WorkspaceReplaceGrantState>,
+    ) {
+        let now = unix_millis();
+        grants.retain(|_, state| state.grant.expires_at_unix_ms > now);
+    }
+
+    fn reap_expired_recovery_grants(grants: &mut HashMap<String, RecoveryGrantState>) {
+        let now = unix_millis();
+        grants.retain(|_, state| state.grant.expires_at_unix_ms > now);
     }
 
     fn consume_active_grant(
@@ -3836,6 +5508,23 @@ mod windows {
         )
     }
 
+    fn workspace_replace_approval_key(
+        host_turn_id: &str,
+        binding: &protocol::WorkspaceReplaceBinding,
+    ) -> String {
+        format!(
+            "{host_turn_id}:{}:{}",
+            binding.tool_call_id, binding.codex_turn_id
+        )
+    }
+
+    fn recovery_approval_key(host_turn_id: &str, binding: &protocol::RecoveryBinding) -> String {
+        format!(
+            "{host_turn_id}:{}:{}",
+            binding.transaction_id, binding.codex_turn_id
+        )
+    }
+
     fn vita_request_id(message: &VitaMessage) -> &str {
         match message {
             VitaMessage::Handshake(message) => &message.request_id,
@@ -3849,6 +5538,15 @@ mod windows {
             VitaMessage::WorkspaceReadIssueGrant(message) => &message.request_id,
             VitaMessage::WorkspaceReadRevalidateGrant(message) => &message.request_id,
             VitaMessage::WorkspaceReadReleaseCheck(message) => &message.request_id,
+            VitaMessage::WorkspaceReplaceAuthorityEvaluate(message) => &message.request_id,
+            VitaMessage::WorkspaceReplaceConfirmationRequired(message) => &message.request_id,
+            VitaMessage::WorkspaceReplaceIssueGrant(message) => &message.request_id,
+            VitaMessage::WorkspaceReplaceRevalidateGrant(message) => &message.request_id,
+            VitaMessage::RecoveryAuthorityEvaluate(message) => &message.request_id,
+            VitaMessage::RecoveryConfirmationRequired(message) => &message.request_id,
+            VitaMessage::RecoveryIssueGrant(message) => &message.request_id,
+            VitaMessage::RecoveryRevalidateGrant(message) => &message.request_id,
+            VitaMessage::RecoveryPending(message) => &message.request_id,
             VitaMessage::ActionCancelled(message) => &message.request_id,
             VitaMessage::CredentialRequired(message) => &message.request_id,
             VitaMessage::TurnState(message) => &message.request_id,
@@ -6829,10 +8527,17 @@ mod windows {
                 writer: Mutex::new(None),
                 pending: Mutex::new(HashMap::new()),
                 workspace_read_pending: Mutex::new(HashMap::new()),
+                workspace_replace_pending: Mutex::new(HashMap::new()),
                 approvals: Mutex::new(HashMap::new()),
                 grants: Mutex::new(HashMap::new()),
                 workspace_read_approvals: Mutex::new(HashMap::new()),
                 workspace_read_grants: Mutex::new(HashMap::new()),
+                workspace_replace_approvals: Mutex::new(HashMap::new()),
+                workspace_replace_grants: Mutex::new(HashMap::new()),
+                recovery_pending: Mutex::new(HashMap::new()),
+                recovery_scan_pending: Mutex::new(HashMap::new()),
+                recovery_approvals: Mutex::new(HashMap::new()),
+                recovery_grants: Mutex::new(HashMap::new()),
                 replay: Mutex::new(RequestReplayWindow::default()),
                 expiry: Arc::new(ExpiryOwner::new()),
                 closed: AtomicBool::new(false),
@@ -8158,6 +9863,12 @@ mod windows {
                 }
             };
             let app_data = tempfile::tempdir().expect("sidecar app-data root");
+            fs::create_dir(app_data.path().join("agent")).expect("Vita app-data root");
+            fs::write(
+                app_data.path().join("agent/.vita-agent-runtime"),
+                b"runtime_id=vita-agent\nlayout=v1\n",
+            )
+            .expect("Vita ownership marker");
             let process_root = tempfile::tempdir().expect("sidecar process root");
             let workspace = fs::canonicalize(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".."))
                 .expect("repository workspace");
@@ -8256,6 +9967,437 @@ mod windows {
         }
 
         #[test]
+        fn d31_c_real_process_workspace_replace_canary() {
+            run_d31_c_real_process_workspace_replace_canary(false, d31_c_require_real_canary());
+        }
+
+        #[test]
+        fn d31_c_real_process_workspace_replace_revocation_canary() {
+            if !d31_c_require_real_canary() {
+                eprintln!(
+                    "skipping D31-C negative process canary; set D31_C_REQUIRE_REAL_CANARY=1 for the freeze gate"
+                );
+                return;
+            }
+            run_d31_c_real_process_workspace_replace_canary(true, true);
+        }
+
+        fn d31_c_require_real_canary() -> bool {
+            std::env::var("D31_C_REQUIRE_REAL_CANARY").as_deref() == Ok("1")
+        }
+
+        fn run_d31_c_real_process_workspace_replace_canary(
+            revoke_before_revalidation: bool,
+            require_real_canary: bool,
+        ) {
+            let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../vita-agent/target/release/vita-agent.exe");
+            if !executable.is_file() {
+                if require_real_canary {
+                    panic!(
+                        "D31-C process freeze canary requires the release image: {}",
+                        executable.display()
+                    );
+                }
+                eprintln!(
+                    "skipping D31-C process canary; release image is absent: {}",
+                    executable.display()
+                );
+                return;
+            }
+            let git_path = match resolve_git_path() {
+                Ok(path) => path,
+                Err(error) => {
+                    if require_real_canary {
+                        panic!("D31-C process freeze canary requires trusted Git: {error}");
+                    }
+                    eprintln!("skipping D31-C process canary: {error}");
+                    return;
+                }
+            };
+            let workspace = tempfile::tempdir().expect("D31-C canary workspace");
+            let git_metadata = workspace.path().join(".git");
+            fs::create_dir(&git_metadata).expect("D31-C canary Git metadata directory");
+            fs::write(
+                git_metadata.join("config"),
+                b"[core]\n\trepositoryformatversion = 0\n\tbare = false\n",
+            )
+            .expect("D31-C canary Git config");
+            let canary_file = workspace.path().join("canary.txt");
+            let unrelated_file = workspace.path().join("unrelated.txt");
+            let canary_content = b"D31-C original canary content\n";
+            let replacement_content = b"D31-C replacement canary content\n";
+            fs::write(&canary_file, canary_content).expect("D31-C canary file");
+            fs::write(&unrelated_file, b"unrelated fixture\n").expect("D31-C unrelated file");
+            let unrelated_before = fs::read(&unrelated_file).expect("D31-C unrelated before");
+            let app_data = tempfile::tempdir().expect("D31-C canary app-data");
+            fs::create_dir(app_data.path().join("agent")).expect("D31-C Vita app-data root");
+            fs::write(
+                app_data.path().join("agent/.vita-agent-runtime"),
+                b"runtime_id=vita-agent\nlayout=v1\n",
+            )
+            .expect("D31-C Vita ownership marker");
+            let process_root = tempfile::tempdir().expect("D31-C canary process root");
+            let canary_resource = tempfile::tempdir().expect("D31-C canary resource root");
+            let canary_executable = canary_resource.path().join(SIDECAR_RESOURCE_NAME);
+            fs::copy(&executable, &canary_executable).expect("copy D31-C canary sidecar image");
+            let image =
+                VitaSidecarProcess::prepare_image(&canary_executable, canary_resource.path())
+                    .expect("prepared D31-C sidecar image");
+            let mut process = VitaSidecarProcess::spawn_prepared(
+                image,
+                &[OsString::from("--serve-ipc-test-canary")],
+                process_root.path(),
+            )
+            .expect("D31-C process-isolated sidecar");
+            let stdout = process.take_stdout().expect("D31-C sidecar stdout");
+            let stdin = process.take_stdin().expect("D31-C sidecar stdin");
+            let mut stderr = process.take_stderr().expect("D31-C sidecar stderr");
+
+            let handshake_result = receive_vita_message_with_timeout(
+                BufReader::new(stdout),
+                HANDSHAKE_TIMEOUT,
+                "D31-C canary handshake",
+            );
+            let (message, reader) = match handshake_result {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ = process.shutdown();
+                    let mut diagnostics = String::new();
+                    let _ = std::io::Read::read_to_string(&mut stderr, &mut diagnostics);
+                    if require_real_canary {
+                        panic!(
+                            "D31-C process freeze canary handshake failed: {error}; sidecar stderr: {diagnostics}"
+                        );
+                    }
+                    eprintln!(
+                        "skipping D31-C process canary; release image lacks the test helper: {error}; sidecar stderr: {diagnostics}"
+                    );
+                    return;
+                }
+            };
+            let handshake = match message {
+                VitaMessage::Handshake(value) => value,
+                other => panic!("unexpected D31-C canary first frame: {other:?}"),
+            };
+            validate_handshake(&handshake).expect("D31-C canary pinned handshake");
+
+            let session_id = "d31-c-process-session".to_string();
+            let life_id = "d31-c-process-life".to_string();
+            let task_id = "d31-c-process-task".to_string();
+            let host_turn_id = "d31-c-process-host-turn".to_string();
+            let provider = protocol::ProviderConfiguration {
+                profile_id: "d31-c-canary-profile".to_string(),
+                purpose: "chat".to_string(),
+                provider_kind: "openai_compatible".to_string(),
+                base_url: "http://127.0.0.1:9/v1".to_string(),
+                model: if revoke_before_revalidation {
+                    "d31-c-negative-canary-model".to_string()
+                } else {
+                    "d31-c-canary-model".to_string()
+                },
+                credential_ref: "d31-c-canary-credential".to_string(),
+                credential_destination: "http://127.0.0.1:9/v1".to_string(),
+            };
+            let workspace_for_sidecar =
+                normalize_sidecar_local_path(workspace.path()).expect("D31-C workspace path");
+            let app_data_for_sidecar =
+                normalize_sidecar_local_path(app_data.path()).expect("D31-C app-data path");
+            let git_for_sidecar = normalize_sidecar_local_path(&git_path).expect("D31-C Git path");
+            let mut writer = BufWriter::new(stdin);
+            protocol::write_frame(
+                &mut writer,
+                &HostMessage::Initialize(InitializeSession {
+                    request_id: "d31-c-canary-initialize".to_string(),
+                    protocol_version: PROTOCOL_VERSION.to_string(),
+                    session_id: session_id.clone(),
+                    life_id: life_id.clone(),
+                    task_id: task_id.clone(),
+                    app_data_root: app_data_for_sidecar.to_string_lossy().into_owned(),
+                    workspace_path: workspace_for_sidecar.to_string_lossy().into_owned(),
+                    git_path: git_for_sidecar.to_string_lossy().into_owned(),
+                    provider: Some(provider.clone()),
+                }),
+            )
+            .expect("D31-C canary initialize");
+            let ready_result =
+                receive_vita_message_with_timeout(reader, READY_TIMEOUT, "D31-C canary ready");
+            let (message, mut reader) = match ready_result {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ = process.shutdown();
+                    let mut diagnostics = String::new();
+                    let _ = std::io::Read::read_to_string(&mut stderr, &mut diagnostics);
+                    if require_real_canary {
+                        panic!(
+                            "D31-C process freeze canary ready failed: {error}; sidecar stderr: {diagnostics}"
+                        );
+                    }
+                    eprintln!(
+                        "skipping D31-C process canary; sidecar image has no test helper: {error}; sidecar stderr: {diagnostics}"
+                    );
+                    return;
+                }
+            };
+            let ready = match message {
+                VitaMessage::Ready(value) => value,
+                other => panic!("unexpected D31-C canary ready frame: {other:?}"),
+            };
+            let request = VitaSidecarStartRequest {
+                life_id: life_id.clone(),
+                task_id: task_id.clone(),
+                workspace_path: workspace_for_sidecar.to_string_lossy().into_owned(),
+            };
+            validate_ready(&ready, &session_id, &request, &life_id)
+                .expect("D31-C canary ready identity");
+
+            let authority_root = tempfile::tempdir().expect("D31-C authority root");
+            let storage = Arc::new(
+                StorageService::initialize_with_roots(authority_root.path().to_path_buf(), None)
+                    .expect("D31-C authority storage"),
+            );
+            storage
+                .save_persona(PersonaTemplateRecord {
+                    id: "d31-c-canary-persona".to_string(),
+                    name: "D31-C canary persona".to_string(),
+                    version: 1,
+                    persona_json: "{}".to_string(),
+                })
+                .expect("D31-C canary persona");
+            storage
+                .save_life(LifeIdentityRecord {
+                    id: life_id.clone(),
+                    name: "D31-C canary life".to_string(),
+                    created_at: "2026-09-14T00:00:00.000Z".to_string(),
+                    version: 1,
+                    body_id: "d31-c-canary-body".to_string(),
+                    persona_id: "d31-c-canary-persona".to_string(),
+                    persona_version: 1,
+                })
+                .expect("D31-C canary life");
+            let registry = CapabilityRegistry::production().expect("D31-C production registry");
+            let replace_capability =
+                CapabilityId::try_from(PRODUCTION_WORKSPACE_REPLACE_CAPABILITY_ID)
+                    .expect("D31-C replace capability");
+            assert!(matches!(
+                storage
+                    .create_capability_authorization(LifeCapabilityAuthorizationCreateRequest {
+                        life_id: life_id.clone(),
+                        capability_id: replace_capability,
+                    })
+                    .expect("D31-C canary replace root"),
+                CapabilityAuthorizationCreateOutcome::Applied(_)
+            ));
+            let enabled_revision = apply_transition_for_test(
+                &storage,
+                &registry,
+                PRODUCTION_WORKSPACE_REPLACE_CAPABILITY_ID,
+                true,
+                1,
+                &life_id,
+            )
+            .expect("D31-C canary enable replace root");
+            assert_eq!(enabled_revision.revision, 2);
+
+            let provider_binding =
+                protocol::ProviderBinding::derive(&session_id, &host_turn_id, &provider)
+                    .expect("D31-C provider binding");
+            let session = Arc::new(HostSessionState {
+                session_id: session_id.clone(),
+                life_id: life_id.clone(),
+                task_id: task_id.clone(),
+                workspace_identity: ready.workspace_identity,
+                provider: Some(provider.clone()),
+                writer: Mutex::new(Some(writer)),
+                pending: Mutex::new(HashMap::new()),
+                workspace_read_pending: Mutex::new(HashMap::new()),
+                workspace_replace_pending: Mutex::new(HashMap::new()),
+                approvals: Mutex::new(HashMap::new()),
+                grants: Mutex::new(HashMap::new()),
+                workspace_read_approvals: Mutex::new(HashMap::new()),
+                workspace_read_grants: Mutex::new(HashMap::new()),
+                workspace_replace_approvals: Mutex::new(HashMap::new()),
+                workspace_replace_grants: Mutex::new(HashMap::new()),
+                recovery_pending: Mutex::new(HashMap::new()),
+                recovery_scan_pending: Mutex::new(HashMap::new()),
+                recovery_approvals: Mutex::new(HashMap::new()),
+                recovery_grants: Mutex::new(HashMap::new()),
+                replay: Mutex::new(RequestReplayWindow::default()),
+                expiry: Arc::new(ExpiryOwner::new()),
+                closed: AtomicBool::new(false),
+                turn_authority: Mutex::new(HostTurnAuthority::Idle),
+                active_turn_id: Mutex::new(None),
+                turn_phase: Mutex::new(None),
+                assistant_text: Mutex::new(None),
+                turn_error: Mutex::new(None),
+                test_outbound: Mutex::new(None),
+            });
+            session
+                .begin_turn(
+                    host_turn_id.clone(),
+                    provider.clone(),
+                    provider_binding.clone(),
+                )
+                .expect("D31-C canary Host turn");
+            let coordinator = VitaSidecarCoordinator::new(Arc::clone(&storage), registry.clone());
+            coordinator.install_test_session(Arc::clone(&session));
+            session
+                .send(&HostMessage::StartTurn(protocol::StartTurn {
+                    request_id: "d31-c-canary-start-turn".to_string(),
+                    session_id: session_id.clone(),
+                    turn_id: host_turn_id.clone(),
+                    prompt: "Replace canary.txt through the governed workspace-replace tool."
+                        .to_string(),
+                    binding: provider_binding,
+                }))
+                .expect("D31-C canary start turn");
+
+            let mut completed = false;
+            let mut authority_evaluate_seen = false;
+            let mut confirmation_seen = false;
+            let mut grant_issue_seen = false;
+            let mut revalidation_seen = false;
+            for _ in 0..32 {
+                let (message, next_reader) = receive_vita_message_with_timeout(
+                    reader,
+                    READY_TIMEOUT,
+                    "D31-C canary turn frame",
+                )
+                .expect("D31-C canary turn frame");
+                reader = next_reader;
+                match message {
+                    VitaMessage::TurnState(state) => {
+                        handle_turn_state(&session, state).expect("D31-C canary turn state");
+                    }
+                    VitaMessage::CredentialRequired(request) => {
+                        request.validate().expect("D31-C credential request");
+                        assert_eq!(request.session_id, session_id);
+                        assert_eq!(request.turn_id, host_turn_id);
+                        let credential = protocol::SensitiveCredential::new(
+                            "h9-canary-fake-credential".to_string(),
+                        )
+                        .expect("D31-C canary credential");
+                        session
+                            .send(&HostMessage::SensitiveCredentialReply(
+                                protocol::SensitiveCredentialReply {
+                                    request_id: request.request_id,
+                                    session_id: session_id.clone(),
+                                    turn_id: request.turn_id,
+                                    binding_hash: request.binding.binding_hash,
+                                    credential_ref: request.binding.credential_ref,
+                                    credential: Some(credential),
+                                    error_code: None,
+                                },
+                            ))
+                            .expect("D31-C credential reply");
+                    }
+                    VitaMessage::WorkspaceReplaceAuthorityEvaluate(request) => {
+                        authority_evaluate_seen = true;
+                        handle_workspace_replace_authority_evaluate(
+                            &session, &storage, &registry, request,
+                        )
+                        .expect("D31-C authority evaluation");
+                    }
+                    VitaMessage::WorkspaceReplaceConfirmationRequired(request) => {
+                        confirmation_seen = true;
+                        handle_workspace_replace_confirmation_required(&session, request)
+                            .expect("D31-C confirmation request");
+                        let pending_id = session
+                            .pending_summary()
+                            .expect("D31-C pending confirmation")
+                            .pending_id;
+                        coordinator
+                            .confirm(pending_id)
+                            .expect("D31-C explicit confirmation");
+                    }
+                    VitaMessage::WorkspaceReplaceIssueGrant(request) => {
+                        grant_issue_seen = true;
+                        handle_workspace_replace_issue_grant(
+                            &session, &storage, &registry, request,
+                        )
+                        .expect("D31-C grant issue");
+                    }
+                    VitaMessage::WorkspaceReplaceRevalidateGrant(request) => {
+                        revalidation_seen = true;
+                        if revoke_before_revalidation {
+                            let revoked = apply_transition_for_test(
+                                &storage,
+                                &registry,
+                                PRODUCTION_WORKSPACE_REPLACE_CAPABILITY_ID,
+                                false,
+                                2,
+                                &life_id,
+                            )
+                            .expect("D31-C negative canary revocation");
+                            assert_eq!(revoked.revision, 3);
+                        }
+                        handle_workspace_replace_revalidate_grant(
+                            &session, &storage, &registry, request,
+                        )
+                        .expect("D31-C revalidation");
+                    }
+                    VitaMessage::TurnCompleted(message) => {
+                        assert_eq!(message.session_id, session_id);
+                        assert_eq!(message.turn_id, host_turn_id);
+                        assert!(!message.assistant_text.is_empty());
+                        completed = true;
+                        break;
+                    }
+                    VitaMessage::TurnFailed(message) => {
+                        let _ = process.shutdown();
+                        let mut diagnostics = String::new();
+                        let _ = std::io::Read::read_to_string(&mut stderr, &mut diagnostics);
+                        panic!(
+                            "D31-C canary turn failed: {} ({}) in {:?}; sidecar stderr: {}",
+                            message.error_code, message.message, message.phase, diagnostics
+                        );
+                    }
+                    other => panic!("unexpected D31-C canary turn frame: {other:?}"),
+                }
+            }
+            assert!(completed, "D31-C canary did not complete a real turn");
+            assert!(
+                authority_evaluate_seen,
+                "D31-C canary missed authority evaluation"
+            );
+            assert!(
+                confirmation_seen,
+                "D31-C canary missed explicit confirmation"
+            );
+            assert!(grant_issue_seen, "D31-C canary missed Host grant issue");
+            assert!(revalidation_seen, "D31-C canary missed Host revalidation");
+            let final_content = fs::read(&canary_file).expect("D31-C canary final file");
+            if revoke_before_revalidation {
+                assert_eq!(final_content, canary_content);
+            } else {
+                assert_eq!(final_content, replacement_content);
+            }
+            assert_eq!(
+                fs::read(&unrelated_file).expect("D31-C unrelated final"),
+                unrelated_before
+            );
+            session
+                .send(&HostMessage::Shutdown(protocol::Shutdown {
+                    request_id: "d31-c-canary-shutdown".to_string(),
+                    session_id: session_id.clone(),
+                }))
+                .expect("D31-C canary shutdown");
+            let (message, _reader) = receive_vita_message_with_timeout(
+                reader,
+                READY_TIMEOUT,
+                "D31-C canary shutdown ack",
+            )
+            .expect("D31-C canary shutdown ack");
+            assert!(matches!(
+                message,
+                VitaMessage::ShutdownAck(protocol::ShutdownAck { session_id: ack_session, .. })
+                    if ack_session == session_id
+            ));
+            session.retire();
+            process.shutdown().expect("D31-C canary process shutdown");
+        }
+
+        #[test]
         fn d31_b_real_process_workspace_read_canary() {
             run_d31_b_real_process_workspace_read_canary(false, d31_b_require_real_canary());
         }
@@ -8316,6 +10458,12 @@ mod windows {
             let canary_content = b"D31-B bounded canary content\n";
             fs::write(&canary_file, canary_content).expect("D31-B canary file");
             let app_data = tempfile::tempdir().expect("D31-B canary app-data");
+            fs::create_dir(app_data.path().join("agent")).expect("D31-B Vita app-data root");
+            fs::write(
+                app_data.path().join("agent/.vita-agent-runtime"),
+                b"runtime_id=vita-agent\nlayout=v1\n",
+            )
+            .expect("D31-B Vita ownership marker");
             let process_root = tempfile::tempdir().expect("D31-B canary process root");
             let canary_resource = tempfile::tempdir().expect("D31-B canary resource root");
             let canary_executable = canary_resource.path().join(SIDECAR_RESOURCE_NAME);
@@ -8489,10 +10637,17 @@ mod windows {
                 writer: Mutex::new(Some(writer)),
                 pending: Mutex::new(HashMap::new()),
                 workspace_read_pending: Mutex::new(HashMap::new()),
+                workspace_replace_pending: Mutex::new(HashMap::new()),
                 approvals: Mutex::new(HashMap::new()),
                 grants: Mutex::new(HashMap::new()),
                 workspace_read_approvals: Mutex::new(HashMap::new()),
                 workspace_read_grants: Mutex::new(HashMap::new()),
+                workspace_replace_approvals: Mutex::new(HashMap::new()),
+                workspace_replace_grants: Mutex::new(HashMap::new()),
+                recovery_pending: Mutex::new(HashMap::new()),
+                recovery_scan_pending: Mutex::new(HashMap::new()),
+                recovery_approvals: Mutex::new(HashMap::new()),
+                recovery_grants: Mutex::new(HashMap::new()),
                 replay: Mutex::new(RequestReplayWindow::default()),
                 expiry: Arc::new(ExpiryOwner::new()),
                 closed: AtomicBool::new(false),

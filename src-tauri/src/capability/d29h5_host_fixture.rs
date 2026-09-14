@@ -237,6 +237,7 @@ impl HostSession {
             .map_err(|_| "D29-H5 Host could not construct its test registry".to_string())?;
         let production_registry = CapabilityRegistry::production()
             .map_err(|_| "D29-H5 Host could not construct production registry".to_string())?;
+        let production_registry_size = production_registry.len();
         match storage
             .create_capability_authorization(LifeCapabilityAuthorizationCreateRequest {
                 life_id: life_id.clone(),
@@ -282,7 +283,7 @@ impl HostSession {
             json!({
                 "operation": "initialize",
                 "status": "ok",
-                "production_registry_size": 0,
+                "production_registry_size": production_registry_size,
                 "test_registry_size": 1,
                 "authorization_revision": 2,
                 "same_sqlite_row": true,

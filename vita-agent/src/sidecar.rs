@@ -21,10 +21,10 @@ use zeroize::Zeroizing;
 use protocol::{
     AuthorityEvaluate, ConfirmationDecision, ConfirmationRequired, CredentialRequired, GrantIssued,
     Handshake, HostMessage, InitializeSession, IssueGrant, ProcessBinding, ProcessGrant,
-    ProviderBinding, ProviderConfiguration, RevalidateGrant, StartTurn, TurnCompleted, TurnFailed,
-    TurnPhase, TurnState, VitaMessage, CODEX_PROTOCOL_SCHEMA_HASH, CODEX_UPSTREAM_COMMIT,
-    MAX_FRAME_BYTES, MAX_PROMPT_BYTES, MAX_TURN_OUTPUT_BYTES, PROTOCOL_VERSION, RUNTIME_ID,
-    TOOL_NAME,
+    ProviderBinding, ProviderConfiguration, RecoveryIssueGrant, RevalidateGrant, StartTurn,
+    TurnCompleted, TurnFailed, TurnPhase, TurnState, VitaMessage, CODEX_PROTOCOL_SCHEMA_HASH,
+    CODEX_UPSTREAM_COMMIT, MAX_FRAME_BYTES, MAX_PROMPT_BYTES, MAX_TURN_OUTPUT_BYTES,
+    PROTOCOL_VERSION, RUNTIME_ID, TOOL_NAME,
 };
 use vita_agent_protocol as protocol;
 
@@ -33,17 +33,26 @@ use crate::provider_gateway::{
     ProviderRequestIdentity, ResolvedCredential, VitaFunctionCall, VitaMessage as GatewayMessage,
     VitaMessageRole, VitaResponsesRequest, VitaResponsesRequestOptions, VitaToolOutput,
 };
+use crate::recovery_journal::{RecoveryJournalStore, RECOVERY_JOURNAL_MAX_PREIMAGE_BYTES};
 use crate::{
     H3ApprovalFloor, H3AuthorityOperation, H3AuthorityRequest, H3CanonicalDecision,
     H3CanonicalDecisionCode, H3CanonicalOutcome, H3DisclosureRequest, H3HostAuthorityResponse,
-    H3HostScopedGrantEvidence, H3ScopeRequirement, H7ProcessBinding, H7ProcessGrant,
-    VitaAgentEntrypoint, VitaAgentRuntime, VitaAgentRuntimeProfile, VitaExecutionContext,
-    VitaGitStatusAuthority, VitaGitStatusPendingConfirmation, VitaGitStatusProduction,
-    VitaGitStatusToolContributor, VitaH3AuthorityError, VitaH3AuthorityFuture, VitaH3AuthorityPort,
-    VitaH3DisclosureFuture, VitaWorkspaceReadBroker, VitaWorkspaceReadToolContributor,
+    H3HostScopedGrantEvidence, H3ScopeRequirement, H4ApprovalFloor, H4AuthorityOperation,
+    H4AuthorityRequest, H4CanonicalDecision, H4CanonicalDecisionCode, H4CanonicalOutcome,
+    H4ConfirmationEvidenceSource, H4HostAuthorityResponse, H4HostReplaceGrantEvidence,
+    H4ReplaceOperation, H4ScopeRequirement, H5RecoveryExecutor, H7ProcessBinding, H7ProcessGrant,
+    HostExplicitActionConfirmationEvidence, PreparedWorkspaceTargetKind, RecoveryActionRequest,
+    RecoveryAuthorityPort, RecoveryDenyReason, RecoveryGrantEvidence, VitaAgentEntrypoint,
+    VitaAgentRuntime, VitaAgentRuntimeProfile, VitaExecutionContext, VitaGitStatusAuthority,
+    VitaGitStatusPendingConfirmation, VitaGitStatusProduction, VitaGitStatusToolContributor,
+    VitaH3AuthorityError, VitaH3AuthorityFuture, VitaH3AuthorityPort, VitaH3DisclosureFuture,
+    VitaH4AuthorityError, VitaH4AuthorityFuture, VitaH4AuthorityPort, VitaWorkspaceReadBroker,
+    VitaWorkspaceReadToolContributor, VitaWorkspaceReplaceBroker,
+    VitaWorkspaceReplaceH5ToolContributor, H5_RECOVER_REPLACE_CAPABILITY_ID,
     VITA_WORKSPACE_GIT_STATUS_CAPABILITY_ID, VITA_WORKSPACE_GIT_STATUS_PROFILE_ID,
     VITA_WORKSPACE_GIT_STATUS_TOOL_NAME, VITA_WORKSPACE_READ_CAPABILITY_ID,
-    VITA_WORKSPACE_READ_TOOL_NAME,
+    VITA_WORKSPACE_READ_TOOL_NAME, VITA_WORKSPACE_REPLACE_CAPABILITY_ID,
+    VITA_WORKSPACE_REPLACE_TOOL_NAME,
 };
 
 const LOCAL_GATEWAY_HEADER_LIMIT: usize = 64 * 1024;
@@ -281,6 +290,8 @@ struct H9CanaryTransport {
     expected_workspace_path: String,
     read_mode: bool,
     negative_read_mode: bool,
+    replace_mode: bool,
+    negative_replace_mode: bool,
     response_model: String,
 }
 
@@ -288,11 +299,19 @@ struct H9CanaryTransport {
 const D31_B_CANARY_CONTENT: &str = "D31-B bounded canary content\n";
 
 #[cfg(feature = "d29-h9-test-helper")]
+const D31_C_CANARY_CONTENT: &str = "D31-C original canary content\n";
+
+#[cfg(feature = "d29-h9-test-helper")]
+const D31_C_REPLACEMENT_CONTENT: &str = "D31-C replacement canary content\n";
+
+#[cfg(feature = "d29-h9-test-helper")]
 impl H9CanaryTransport {
     fn new(
         expected_workspace_path: impl Into<String>,
         read_mode: bool,
         negative_read_mode: bool,
+        replace_mode: bool,
+        negative_replace_mode: bool,
         response_model: impl Into<String>,
     ) -> Self {
         Self {
@@ -300,6 +319,8 @@ impl H9CanaryTransport {
             expected_workspace_path: expected_workspace_path.into(),
             read_mode,
             negative_read_mode,
+            replace_mode,
+            negative_replace_mode,
             response_model: response_model.into(),
         }
     }
@@ -364,9 +385,14 @@ impl crate::provider_gateway::ProviderRequestTransport for H9CanaryTransport {
                     vec![
                         VITA_WORKSPACE_GIT_STATUS_TOOL_NAME,
                         VITA_WORKSPACE_READ_TOOL_NAME,
+                        VITA_WORKSPACE_REPLACE_TOOL_NAME,
                     ]
                 } else {
-                    vec![VITA_WORKSPACE_GIT_STATUS_TOOL_NAME]
+                    vec![
+                        VITA_WORKSPACE_GIT_STATUS_TOOL_NAME,
+                        VITA_WORKSPACE_READ_TOOL_NAME,
+                        VITA_WORKSPACE_REPLACE_TOOL_NAME,
+                    ]
                 };
                 if names != expected_names {
                     return Err(crate::VitaAgentError::GatewayProtocol(
@@ -391,7 +417,36 @@ impl crate::provider_gateway::ProviderRequestTransport for H9CanaryTransport {
                         "H9 canary native tool output was not JSON".to_string(),
                     )
                 })?;
-                let valid = if self.read_mode {
+                let valid = if self.replace_mode {
+                    let relative_path = result.get("relative_path").and_then(Value::as_str);
+                    let replacement_hash = crate::sha256_hex(D31_C_REPLACEMENT_CONTENT.as_bytes());
+                    let original_hash = crate::sha256_hex(D31_C_CANARY_CONTENT.as_bytes());
+                    if self.negative_replace_mode {
+                        result.get("status").and_then(Value::as_str) == Some("denied")
+                            && relative_path == Some("canary.txt")
+                            && result.get("mutation_performed").and_then(Value::as_bool)
+                                == Some(false)
+                            && result.get("side_effect_count").and_then(Value::as_u64) == Some(0)
+                            && result.get("automatic_retry").and_then(Value::as_bool) == Some(false)
+                            && result.get("recovery_required").and_then(Value::as_bool)
+                                == Some(false)
+                    } else {
+                        result.get("status").and_then(Value::as_str) == Some("committed")
+                            && relative_path == Some("canary.txt")
+                            && result.get("before_sha256").and_then(Value::as_str)
+                                == Some(original_hash.as_str())
+                            && result.get("after_sha256").and_then(Value::as_str)
+                                == Some(replacement_hash.as_str())
+                            && result.get("bytes_written").and_then(Value::as_u64)
+                                == Some(D31_C_REPLACEMENT_CONTENT.len() as u64)
+                            && result.get("mutation_performed").and_then(Value::as_bool)
+                                == Some(true)
+                            && result.get("side_effect_count").and_then(Value::as_u64) == Some(1)
+                            && result.get("automatic_retry").and_then(Value::as_bool) == Some(false)
+                            && result.get("recovery_required").and_then(Value::as_bool)
+                                == Some(false)
+                    }
+                } else if self.read_mode {
                     let content = result.get("content").and_then(Value::as_str);
                     let relative_path = result.get("relative_path").and_then(Value::as_str);
                     let bytes_read = result.get("bytes_read").and_then(Value::as_u64);
@@ -452,6 +507,8 @@ impl crate::provider_gateway::ProviderRequestTransport for H9CanaryTransport {
                     return Err(crate::VitaAgentError::GatewayProtocol(
                         if self.read_mode {
                             "D31-B canary second request did not contain exact bounded read result"
+                        } else if self.replace_mode {
+                            "D31-C canary second request did not contain exact governed replace result"
                         } else {
                             "H9 canary second request did not contain a bounded relative Git result"
                         }
@@ -478,15 +535,23 @@ impl crate::provider_gateway::ProviderRequestTransport for H9CanaryTransport {
                             "id": "h9-canary-call-1",
                             "type": "function",
                             "function": {
-                                "name": if self.read_mode {
+                                "name": if self.replace_mode {
+                                    VITA_WORKSPACE_REPLACE_TOOL_NAME
+                                } else if self.read_mode {
                                     VITA_WORKSPACE_READ_TOOL_NAME
                                 } else {
                                     VITA_WORKSPACE_GIT_STATUS_TOOL_NAME
                                 },
-                                "arguments": if self.read_mode {
-                                    "{\"relative_path\":\"canary.txt\",\"max_bytes\":64}"
+                                "arguments": if self.replace_mode {
+                                    serde_json::to_string(&serde_json::json!({
+                                        "relative_path": "canary.txt",
+                                        "expected_sha256": crate::sha256_hex(D31_C_CANARY_CONTENT.as_bytes()),
+                                        "replacement_content": D31_C_REPLACEMENT_CONTENT,
+                                    })).expect("D31-C canary replacement arguments")
+                                } else if self.read_mode {
+                                    "{\"relative_path\":\"canary.txt\",\"max_bytes\":64}".to_string()
                                 } else {
-                                    "{\"operation\":\"status\"}"
+                                    "{\"operation\":\"status\"}".to_string()
                                 }
                             }
                         }]
@@ -1065,7 +1130,10 @@ fn parse_gateway_responses_request(
                     .get("name")
                     .and_then(Value::as_str)
                     .ok_or_else(|| "function call name missing".to_string())?;
-                if name != TOOL_NAME && name != VITA_WORKSPACE_READ_TOOL_NAME {
+                if name != TOOL_NAME
+                    && name != VITA_WORKSPACE_READ_TOOL_NAME
+                    && name != VITA_WORKSPACE_REPLACE_TOOL_NAME
+                {
                     return Err("unknown tool call".to_string());
                 }
                 let arguments = item
@@ -1121,7 +1189,10 @@ fn parse_gateway_responses_request(
                         .and_then(Value::as_str)
                 })
                 .ok_or_else(|| "tool name missing".to_string())?;
-            if name != TOOL_NAME && name != VITA_WORKSPACE_READ_TOOL_NAME {
+            if name != TOOL_NAME
+                && name != VITA_WORKSPACE_READ_TOOL_NAME
+                && name != VITA_WORKSPACE_REPLACE_TOOL_NAME
+            {
                 return Err("unknown advertised tool".to_string());
             }
             if !advertised_tools.insert(name.to_string()) {
@@ -1365,6 +1436,14 @@ fn host_request_id(message: &HostMessage) -> &str {
         HostMessage::WorkspaceReadGrantIssued(message) => &message.request_id,
         HostMessage::WorkspaceReadGrantRevalidated(message) => &message.request_id,
         HostMessage::WorkspaceReadReleaseChecked(message) => &message.request_id,
+        HostMessage::WorkspaceReplaceAuthorityReply(message) => &message.request_id,
+        HostMessage::WorkspaceReplaceConfirmationReply(message) => &message.request_id,
+        HostMessage::WorkspaceReplaceGrantIssued(message) => &message.request_id,
+        HostMessage::WorkspaceReplaceGrantRevalidated(message) => &message.request_id,
+        HostMessage::RecoveryAuthorityReply(message) => &message.request_id,
+        HostMessage::RecoveryConfirmationReply(message) => &message.request_id,
+        HostMessage::RecoveryGrantIssued(message) => &message.request_id,
+        HostMessage::RecoveryGrantRevalidated(message) => &message.request_id,
         HostMessage::CancelAction(message) => &message.request_id,
         HostMessage::StartTurn(message) => &message.request_id,
         HostMessage::CancelTurn(message) => &message.request_id,
@@ -1386,6 +1465,15 @@ fn vita_request_id(message: &VitaMessage) -> &str {
         VitaMessage::WorkspaceReadIssueGrant(message) => &message.request_id,
         VitaMessage::WorkspaceReadRevalidateGrant(message) => &message.request_id,
         VitaMessage::WorkspaceReadReleaseCheck(message) => &message.request_id,
+        VitaMessage::WorkspaceReplaceAuthorityEvaluate(message) => &message.request_id,
+        VitaMessage::WorkspaceReplaceConfirmationRequired(message) => &message.request_id,
+        VitaMessage::WorkspaceReplaceIssueGrant(message) => &message.request_id,
+        VitaMessage::WorkspaceReplaceRevalidateGrant(message) => &message.request_id,
+        VitaMessage::RecoveryAuthorityEvaluate(message) => &message.request_id,
+        VitaMessage::RecoveryConfirmationRequired(message) => &message.request_id,
+        VitaMessage::RecoveryIssueGrant(message) => &message.request_id,
+        VitaMessage::RecoveryRevalidateGrant(message) => &message.request_id,
+        VitaMessage::RecoveryPending(message) => &message.request_id,
         VitaMessage::ActionCancelled(message) => &message.request_id,
         VitaMessage::CredentialRequired(message) => &message.request_id,
         VitaMessage::TurnState(message) => &message.request_id,
@@ -1434,6 +1522,8 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
         .ok_or_else(|| "Vita workspace authority is unavailable".to_string())?
         .clone();
     let workspace_identity = workspace.identity().wire();
+    let recovery_store = RecoveryJournalStore::from_runtime_profile(&profile)
+        .map_err(|error| format!("Vita recovery journal store setup failed: {error}"))?;
     let context = VitaExecutionContext::try_new(init.life_id.clone(), init.task_id.clone())
         .map_err(|error| format!("Vita execution identity was invalid: {error:?}"))?;
     let active_identity = Arc::new(Mutex::new(None::<ProviderRequestIdentity>));
@@ -1455,6 +1545,69 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
         workspace.clone(),
         Arc::clone(&read_authority) as Arc<dyn VitaH3AuthorityPort>,
     ));
+    let replace_authority = Arc::new(SidecarWorkspaceReplaceAuthority::new(
+        router.clone(),
+        &init,
+        workspace_identity.clone(),
+        Arc::clone(&active_identity),
+    ));
+    let replace_broker = Arc::new(VitaWorkspaceReplaceBroker::new(
+        context.clone(),
+        workspace.clone(),
+        Arc::clone(&replace_authority) as Arc<dyn VitaH4AuthorityPort>,
+    ));
+    let recovery_authority = Arc::new(SidecarRecoveryAuthority::new(
+        router.clone(),
+        &init,
+        workspace_identity.clone(),
+        Arc::clone(&active_identity),
+    ));
+    let recovery_executor = Arc::new(H5RecoveryExecutor::new(
+        recovery_store.clone(),
+        workspace.clone(),
+        Arc::clone(&recovery_authority) as Arc<dyn RecoveryAuthorityPort>,
+    ));
+    // Restart inspection is deliberately read-only.  Recovery actions are
+    // only initiated by an explicit Host/user flow and are never automatic.
+    let recovery_scan = recovery_executor
+        .scan()
+        .map_err(|error| format!("Vita recovery scan failed: {error}"))?;
+    let recovery_pending = recovery_scan
+        .actionable_recovery_transactions()
+        .filter_map(|snapshot| {
+            let journal = snapshot.journal();
+            let target = workspace
+                .prepare_target(journal.relative_path().as_path())
+                .ok()?;
+            if target.kind() != PreparedWorkspaceTargetKind::ExistingFile {
+                return None;
+            }
+            let current = target
+                .read_existing_file_raw_bounded(RECOVERY_JOURNAL_MAX_PREIMAGE_BYTES)
+                .ok()?;
+            Some(protocol::RecoveryPending {
+                request_id: next_request_id("vita-recovery-pending"),
+                session_id: init.session_id.clone(),
+                transaction_id: journal.transaction_id().as_str().to_string(),
+                life_id: journal.life_id().to_string(),
+                task_id: journal.task_id().to_string(),
+                capability_id: H5_RECOVER_REPLACE_CAPABILITY_ID.to_string(),
+                workspace_root_identity: journal.workspace_root_identity().wire(),
+                relative_path: journal
+                    .relative_path()
+                    .as_path()
+                    .to_string_lossy()
+                    .into_owned(),
+                target_identity: journal.target_identity().wire(),
+                journal_integrity_hash: journal.integrity_hash(),
+                current_sha256: crate::sha256_hex(&current),
+                current_bytes: current.len() as u64,
+                restore_sha256: journal.before_sha256(),
+                restore_bytes: journal.before_bytes() as u64,
+                original_replacement_sha256: journal.replacement_sha256(),
+            })
+        })
+        .collect::<Vec<_>>();
     let production = Arc::new(
         VitaGitStatusProduction::new(
             context,
@@ -1467,6 +1620,10 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
     let contributor = VitaProductionContributors {
         git: production.contributor(),
         read: VitaWorkspaceReadToolContributor::new(Arc::clone(&read_broker)),
+        replace: VitaWorkspaceReplaceH5ToolContributor::new(
+            Arc::clone(&replace_broker),
+            recovery_store.clone(),
+        ),
     };
     let (entrypoint, mut gateway_server) = if let Some(provider_config) = init.provider.as_ref() {
         provider_config.validate().map_err(protocol_error)?;
@@ -1556,10 +1713,14 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
                 #[cfg(feature = "d29-h9-test-helper")]
                 {
                     let negative_read_mode = provider_config.model == "d31-b-negative-canary-model";
+                    let negative_replace_mode =
+                        provider_config.model == "d31-c-negative-canary-model";
                     SidecarGatewayTransport::H9Canary(Arc::new(H9CanaryTransport::new(
                         &init.workspace_path,
                         provider_config.model == "d31-b-canary-model" || negative_read_mode,
                         negative_read_mode,
+                        provider_config.model == "d31-c-canary-model" || negative_replace_mode,
+                        negative_replace_mode,
                         provider_config.model.clone(),
                     )))
                 }
@@ -1601,6 +1762,9 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
         profile_id: VITA_WORKSPACE_GIT_STATUS_PROFILE_ID.to_string(),
         tool_name: VITA_WORKSPACE_GIT_STATUS_TOOL_NAME.to_string(),
     }))?;
+    for pending in recovery_pending {
+        router.send(&VitaMessage::RecoveryPending(pending))?;
+    }
     spawn_confirmation_loop(
         router.clone(),
         init.clone(),
@@ -1618,6 +1782,8 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
         let Some(command) = command else {
             production.cancel();
             read_broker.cancel();
+            replace_broker.cancel();
+            recovery_executor.cancel();
             runtime.shutdown().await;
             if let Some(gateway_server) = gateway_server.take() {
                 gateway_server.stop();
@@ -1631,6 +1797,8 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
                 // session-terminal teardown uses `production.cancel()` below.
                 production.cancel_turn();
                 read_broker.cancel_turn();
+                replace_broker.cancel_turn();
+                recovery_executor.cancel();
                 router.send(&VitaMessage::ActionCancelled(protocol::ActionCancelled {
                     request_id: message.request_id,
                     session_id: init.session_id.clone(),
@@ -1645,6 +1813,10 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
                     Arc::clone(&production),
                     Arc::clone(&read_broker),
                     Arc::clone(&read_authority),
+                    Arc::clone(&replace_broker),
+                    Arc::clone(&replace_authority),
+                    Arc::clone(&recovery_authority),
+                    Arc::clone(&recovery_executor),
                     router.clone(),
                     Arc::clone(&active_identity),
                     Arc::clone(&gateway_authority),
@@ -1658,6 +1830,8 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
                     Arc::clone(&runtime),
                     Arc::clone(&production),
                     Arc::clone(&read_broker),
+                    Arc::clone(&replace_broker),
+                    Arc::clone(&recovery_executor),
                     router.clone(),
                     Arc::clone(&active_identity),
                     Arc::clone(&gateway_authority),
@@ -1668,6 +1842,8 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
             HostMessage::Shutdown(message) if message.session_id == init.session_id => {
                 production.cancel();
                 read_broker.cancel();
+                replace_broker.cancel();
+                recovery_executor.cancel();
                 runtime.shutdown().await;
                 if let Some(gateway_server) = gateway_server.take() {
                     gateway_server.stop();
@@ -1681,6 +1857,8 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
             _ => {
                 production.cancel();
                 read_broker.cancel();
+                replace_broker.cancel();
+                recovery_executor.cancel();
                 runtime.shutdown().await;
                 let _ = router.send(&VitaMessage::Fatal(protocol::FatalMessage {
                     request_id: next_request_id("vita-fatal"),
@@ -1701,6 +1879,10 @@ fn handle_start_turn(
     production: Arc<VitaGitStatusProduction>,
     read_broker: Arc<VitaWorkspaceReadBroker>,
     read_authority: Arc<SidecarWorkspaceReadAuthority>,
+    replace_broker: Arc<VitaWorkspaceReplaceBroker>,
+    replace_authority: Arc<SidecarWorkspaceReplaceAuthority>,
+    recovery_authority: Arc<SidecarRecoveryAuthority>,
+    recovery_executor: Arc<H5RecoveryExecutor>,
     router: SidecarRouter,
     active_identity: Arc<Mutex<Option<ProviderRequestIdentity>>>,
     gateway_authority: Arc<GatewayAuthority>,
@@ -1767,6 +1949,10 @@ fn handle_start_turn(
     production.begin_turn();
     read_authority.begin_turn();
     read_broker.begin_turn();
+    replace_authority.begin_turn();
+    replace_broker.begin_turn();
+    recovery_authority.begin_turn();
+    recovery_executor.begin_turn();
     let _ = router.send(&VitaMessage::TurnState(TurnState {
         request_id: next_request_id("vita-turn-starting"),
         session_id: init.session_id.clone(),
@@ -1883,6 +2069,8 @@ async fn handle_cancel_turn(
     runtime: Arc<VitaAgentRuntime>,
     production: Arc<VitaGitStatusProduction>,
     read_broker: Arc<VitaWorkspaceReadBroker>,
+    replace_broker: Arc<VitaWorkspaceReplaceBroker>,
+    recovery_executor: Arc<H5RecoveryExecutor>,
     router: SidecarRouter,
     active_identity: Arc<Mutex<Option<ProviderRequestIdentity>>>,
     gateway_authority: Arc<GatewayAuthority>,
@@ -1905,6 +2093,8 @@ async fn handle_cancel_turn(
     }
     production.cancel_turn();
     read_broker.cancel_turn();
+    replace_broker.cancel_turn();
+    recovery_executor.cancel();
     let Some(task) = turn_owner.take(&identity) else {
         gateway_authority.deactivate(&identity);
         return Err("Vita turn owner disappeared before cancellation proof".to_string());
@@ -2556,12 +2746,609 @@ impl VitaH3AuthorityPort for SidecarWorkspaceReadAuthority {
     }
 }
 
-/// The production Codex extension registry is closed over these two exact
+/// Process-isolated adapter for the production H4/H5 replacement lane.  All
+/// authority facts in the returned H4 response are reconstructed from the
+/// immutable request plus the Host-issued wire grant; the sidecar never
+/// mints confirmation or grant identifiers.
+#[derive(Clone)]
+struct SidecarWorkspaceReplaceAuthority {
+    router: SidecarRouter,
+    session_id: String,
+    life_id: String,
+    task_id: String,
+    workspace_identity: String,
+    workspace_summary: String,
+    active_identity: Arc<Mutex<Option<ProviderRequestIdentity>>>,
+    grants: Arc<Mutex<HashMap<String, protocol::WorkspaceReplaceGrant>>>,
+}
+
+impl SidecarWorkspaceReplaceAuthority {
+    fn new(
+        router: SidecarRouter,
+        init: &InitializeSession,
+        workspace_identity: String,
+        active_identity: Arc<Mutex<Option<ProviderRequestIdentity>>>,
+    ) -> Self {
+        Self {
+            router,
+            session_id: init.session_id.clone(),
+            life_id: init.life_id.clone(),
+            task_id: init.task_id.clone(),
+            workspace_identity,
+            workspace_summary: workspace_summary(&init.workspace_path),
+            active_identity,
+            grants: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn begin_turn(&self) {
+        if let Ok(mut grants) = self.grants.lock() {
+            grants.clear();
+        }
+    }
+
+    fn binding_for(
+        &self,
+        request: &H4AuthorityRequest,
+    ) -> Result<(protocol::WorkspaceReplaceBinding, String), VitaH4AuthorityError> {
+        if request.context.life_id() != self.life_id
+            || request.context.task_id() != self.task_id
+            || request.capability_id != VITA_WORKSPACE_REPLACE_CAPABILITY_ID
+            || request.target_kind != crate::PreparedWorkspaceTargetKind::ExistingFile
+            || request.replacement_bytes > protocol::MAX_WORKSPACE_READ_BYTES as usize
+        {
+            return Err(VitaH4AuthorityError::InvalidVerdict);
+        }
+        let active = active_identity_snapshot(&self.active_identity)
+            .ok_or(VitaH4AuthorityError::Unavailable)?;
+        // The Host turn generation and Codex's independently-issued turn id
+        // are intentionally distinct.  The Host binds the first Codex id to
+        // this active generation during authority evaluation; subsequent
+        // confirmation/grant messages must carry that same id.
+        let relative_path = request
+            .relative_path
+            .as_path()
+            .to_str()
+            .ok_or(VitaH4AuthorityError::InvalidVerdict)?
+            .to_string();
+        if relative_path.contains('\\') {
+            return Err(VitaH4AuthorityError::InvalidVerdict);
+        }
+        let binding = protocol::WorkspaceReplaceBinding {
+            session_id: self.session_id.clone(),
+            life_id: self.life_id.clone(),
+            task_id: self.task_id.clone(),
+            capability_id: VITA_WORKSPACE_REPLACE_CAPABILITY_ID.to_string(),
+            tool_name: VITA_WORKSPACE_REPLACE_TOOL_NAME.to_string(),
+            workspace_root_identity: self.workspace_identity.clone(),
+            relative_path,
+            target_identity: request.target_identity.wire(),
+            target_kind: protocol::WorkspaceReplaceTargetKind::File,
+            expected_sha256: request.expected_sha256.clone(),
+            replacement_sha256: request.replacement_sha256.clone(),
+            replacement_bytes: request.replacement_bytes as u64,
+            tool_call_id: request.tool_call_id.clone(),
+            codex_turn_id: request.turn_id.clone(),
+            provider_binding_hash: active.binding_hash,
+        };
+        binding
+            .validate()
+            .map_err(|_| VitaH4AuthorityError::InvalidVerdict)?;
+        Ok((binding, active.turn_id))
+    }
+
+    fn canonical(&self, request: &H4AuthorityRequest, revision: i64) -> H4CanonicalDecision {
+        H4CanonicalDecision {
+            life_id: request.context.life_id().to_string(),
+            capability_id: VITA_WORKSPACE_REPLACE_CAPABILITY_ID.to_string(),
+            outcome: H4CanonicalOutcome::ScopeRequired,
+            decision_code: H4CanonicalDecisionCode::ScopeNotAvailable,
+            scope_requirement: H4ScopeRequirement::WorkspaceRequired,
+            approval_floor: H4ApprovalFloor::ExplicitPerAction,
+            authorization_revision: Some(revision),
+            workspace_scope_matches: true,
+        }
+    }
+
+    fn evidence(
+        &self,
+        request: &H4AuthorityRequest,
+        binding: &protocol::WorkspaceReplaceBinding,
+        grant: &protocol::WorkspaceReplaceGrant,
+    ) -> H4HostReplaceGrantEvidence {
+        H4HostReplaceGrantEvidence {
+            grant_id: grant.grant_id.clone(),
+            life_id: request.context.life_id().to_string(),
+            task_id: request.context.task_id().to_string(),
+            capability_id: VITA_WORKSPACE_REPLACE_CAPABILITY_ID.to_string(),
+            authorization_revision: grant.authorization_revision,
+            scope: crate::VitaRequestedScope::Workspace,
+            workspace_root_identity: request.workspace_root_identity,
+            relative_path: request.relative_path.clone(),
+            target_identity: request.target_identity,
+            target_kind: request.target_kind,
+            operation: H4ReplaceOperation::ReplaceExistingUtf8File,
+            expected_sha256: request.expected_sha256.clone(),
+            replacement_sha256: request.replacement_sha256.clone(),
+            replacement_bytes: request.replacement_bytes,
+            tool_call_id: binding.tool_call_id.clone(),
+            turn_id: binding.codex_turn_id.clone(),
+            confirmation_id: grant.confirmation_id.clone(),
+            issued_at_unix_ms: grant.issued_at_unix_ms,
+            expires_at_unix_ms: grant.expires_at_unix_ms,
+            single_use: grant.single_use,
+        }
+    }
+
+    fn confirmation(
+        &self,
+        request: &H4AuthorityRequest,
+        binding: &protocol::WorkspaceReplaceBinding,
+        grant: &protocol::WorkspaceReplaceGrant,
+    ) -> HostExplicitActionConfirmationEvidence {
+        HostExplicitActionConfirmationEvidence {
+            source: H4ConfirmationEvidenceSource::TrustedHost,
+            confirmation_id: grant.confirmation_id.clone(),
+            life_id: request.context.life_id().to_string(),
+            task_id: request.context.task_id().to_string(),
+            capability_id: VITA_WORKSPACE_REPLACE_CAPABILITY_ID.to_string(),
+            authorization_revision: grant.authorization_revision,
+            workspace_root_identity: request.workspace_root_identity,
+            relative_path: request.relative_path.clone(),
+            target_identity: request.target_identity,
+            expected_sha256: request.expected_sha256.clone(),
+            replacement_sha256: request.replacement_sha256.clone(),
+            replacement_bytes: request.replacement_bytes,
+            tool_call_id: binding.tool_call_id.clone(),
+            turn_id: binding.codex_turn_id.clone(),
+            issued_at_unix_ms: grant.issued_at_unix_ms,
+            expires_at_unix_ms: grant.expires_at_unix_ms,
+        }
+    }
+
+    fn issue(
+        &self,
+        request: &H4AuthorityRequest,
+        binding: &protocol::WorkspaceReplaceBinding,
+        host_turn_id: &str,
+    ) -> Result<H4HostAuthorityResponse, VitaH4AuthorityError> {
+        let authority = self
+            .router
+            .request(VitaMessage::WorkspaceReplaceAuthorityEvaluate(
+                protocol::WorkspaceReplaceAuthorityEvaluate {
+                    request_id: next_request_id("vita-replace-authority"),
+                    session_id: self.session_id.clone(),
+                    host_turn_id: host_turn_id.to_string(),
+                    binding: binding.clone(),
+                },
+            ))
+            .map_err(|_| VitaH4AuthorityError::Unavailable)?;
+        let reply = match authority {
+            HostMessage::WorkspaceReplaceAuthorityReply(reply) => reply,
+            _ => return Err(VitaH4AuthorityError::InvalidVerdict),
+        };
+        reply
+            .validate()
+            .map_err(|_| VitaH4AuthorityError::InvalidVerdict)?;
+        if reply.session_id != self.session_id || !reply.allowed {
+            return Err(VitaH4AuthorityError::Unavailable);
+        }
+        let revision = reply
+            .authorization_revision
+            .ok_or(VitaH4AuthorityError::InvalidVerdict)?;
+        let confirmation = self
+            .router
+            .request(VitaMessage::WorkspaceReplaceConfirmationRequired(
+                protocol::WorkspaceReplaceConfirmationRequired {
+                    request_id: next_request_id("vita-replace-confirm"),
+                    session_id: self.session_id.clone(),
+                    host_turn_id: host_turn_id.to_string(),
+                    workspace_summary: self.workspace_summary.clone(),
+                    expires_at_unix_ms: unix_millis().saturating_add(30_000),
+                    binding: binding.clone(),
+                },
+            ))
+            .map_err(|_| VitaH4AuthorityError::Unavailable)?;
+        let confirmation = match confirmation {
+            HostMessage::WorkspaceReplaceConfirmationReply(reply) => reply,
+            _ => return Err(VitaH4AuthorityError::InvalidVerdict),
+        };
+        confirmation
+            .validate()
+            .map_err(|_| VitaH4AuthorityError::InvalidVerdict)?;
+        if confirmation.session_id != self.session_id
+            || confirmation.decision != protocol::ConfirmationDecision::Confirm
+            || confirmation.authorization_revision != Some(revision)
+        {
+            return Err(VitaH4AuthorityError::Unavailable);
+        }
+        let issued = self
+            .router
+            .request(VitaMessage::WorkspaceReplaceIssueGrant(
+                protocol::WorkspaceReplaceIssueGrant {
+                    request_id: next_request_id("vita-replace-issue"),
+                    session_id: self.session_id.clone(),
+                    host_turn_id: host_turn_id.to_string(),
+                    binding: binding.clone(),
+                    authorization_revision: revision,
+                },
+            ))
+            .map_err(|_| VitaH4AuthorityError::Unavailable)?;
+        let issued = match issued {
+            HostMessage::WorkspaceReplaceGrantIssued(reply) => reply,
+            _ => return Err(VitaH4AuthorityError::InvalidVerdict),
+        };
+        issued
+            .validate()
+            .map_err(|_| VitaH4AuthorityError::InvalidVerdict)?;
+        if issued.session_id != self.session_id || !issued.allowed {
+            return Err(VitaH4AuthorityError::Unavailable);
+        }
+        let grant = issued.grant.ok_or(VitaH4AuthorityError::InvalidVerdict)?;
+        if grant.binding != *binding
+            || grant.authorization_revision != revision
+            || grant.used
+            || !grant.single_use
+        {
+            return Err(VitaH4AuthorityError::InvalidVerdict);
+        }
+        self.grants
+            .lock()
+            .map_err(|_| VitaH4AuthorityError::Unavailable)?
+            .insert(grant.grant_id.clone(), grant.clone());
+        Ok(H4HostAuthorityResponse {
+            status: crate::H4AuthorityResponseStatus::Ok,
+            canonical: self.canonical(request, revision),
+            confirmation: Some(self.confirmation(request, binding, &grant)),
+            grant: Some(self.evidence(request, binding, &grant)),
+            denial: None,
+            confirmation_consumed: true,
+        })
+    }
+
+    fn revalidate(
+        &self,
+        request: &H4AuthorityRequest,
+        binding: &protocol::WorkspaceReplaceBinding,
+        host_turn_id: &str,
+        grant_id: &str,
+        revision: i64,
+    ) -> Result<H4HostAuthorityResponse, VitaH4AuthorityError> {
+        let grant = self
+            .grants
+            .lock()
+            .map_err(|_| VitaH4AuthorityError::Unavailable)?
+            .get(grant_id)
+            .cloned()
+            .ok_or(VitaH4AuthorityError::Unavailable)?;
+        if grant.binding != *binding || grant.authorization_revision != revision || grant.used {
+            return Err(VitaH4AuthorityError::InvalidVerdict);
+        }
+        let response = self
+            .router
+            .request(VitaMessage::WorkspaceReplaceRevalidateGrant(
+                protocol::WorkspaceReplaceRevalidateGrant {
+                    request_id: next_request_id("vita-replace-revalidate"),
+                    session_id: self.session_id.clone(),
+                    host_turn_id: host_turn_id.to_string(),
+                    binding: binding.clone(),
+                    grant: grant.clone(),
+                },
+            ))
+            .map_err(|_| VitaH4AuthorityError::Unavailable)?;
+        let response = match response {
+            HostMessage::WorkspaceReplaceGrantRevalidated(reply) => reply,
+            _ => return Err(VitaH4AuthorityError::InvalidVerdict),
+        };
+        response
+            .validate()
+            .map_err(|_| VitaH4AuthorityError::InvalidVerdict)?;
+        if response.session_id != self.session_id || !response.allowed {
+            return Err(VitaH4AuthorityError::Unavailable);
+        }
+        let returned = response.grant.ok_or(VitaH4AuthorityError::InvalidVerdict)?;
+        if returned.binding != *binding
+            || returned.grant_id != grant_id
+            || returned.authorization_revision != revision
+            || !returned.used
+        {
+            return Err(VitaH4AuthorityError::InvalidVerdict);
+        }
+        if let Ok(mut grants) = self.grants.lock() {
+            grants.remove(grant_id);
+        }
+        Ok(H4HostAuthorityResponse {
+            status: crate::H4AuthorityResponseStatus::Ok,
+            canonical: self.canonical(request, revision),
+            confirmation: None,
+            grant: Some(self.evidence(request, binding, &returned)),
+            denial: None,
+            confirmation_consumed: false,
+        })
+    }
+}
+
+impl VitaH4AuthorityPort for SidecarWorkspaceReplaceAuthority {
+    fn evaluate(&self, request: H4AuthorityRequest) -> VitaH4AuthorityFuture {
+        let authority = self.clone();
+        Box::pin(async move {
+            let (binding, host_turn_id) = match authority.binding_for(&request) {
+                Ok(value) => value,
+                Err(error) => {
+                    #[cfg(feature = "d29-h9-test-helper")]
+                    eprintln!("D31-C canary replace binding error: {error:?}");
+                    return Err(error);
+                }
+            };
+            match request.operation.clone() {
+                H4AuthorityOperation::IssueReplaceGrant => {
+                    authority.issue(&request, &binding, &host_turn_id)
+                }
+                H4AuthorityOperation::Revalidate {
+                    grant_id,
+                    authorization_revision,
+                } => authority.revalidate(
+                    &request,
+                    &binding,
+                    &host_turn_id,
+                    &grant_id,
+                    authorization_revision,
+                ),
+            }
+        })
+    }
+}
+
+/// Host-only recovery authority adapter.  It is intentionally not a
+/// `ToolContributor`; only the recovery coordinator may call this trait.
+#[derive(Clone)]
+pub(crate) struct SidecarRecoveryAuthority {
+    router: SidecarRouter,
+    session_id: String,
+    life_id: String,
+    task_id: String,
+    workspace_identity: String,
+    workspace_summary: String,
+    active_identity: Arc<Mutex<Option<ProviderRequestIdentity>>>,
+    grants: Arc<Mutex<HashMap<String, protocol::RecoveryGrant>>>,
+}
+
+impl SidecarRecoveryAuthority {
+    fn new(
+        router: SidecarRouter,
+        init: &InitializeSession,
+        workspace_identity: String,
+        active_identity: Arc<Mutex<Option<ProviderRequestIdentity>>>,
+    ) -> Self {
+        Self {
+            router,
+            session_id: init.session_id.clone(),
+            life_id: init.life_id.clone(),
+            task_id: init.task_id.clone(),
+            workspace_identity,
+            workspace_summary: workspace_summary(&init.workspace_path),
+            active_identity,
+            grants: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub(crate) fn begin_turn(&self) {
+        if let Ok(mut grants) = self.grants.lock() {
+            grants.clear();
+        }
+    }
+
+    fn binding_for(
+        &self,
+        request: &RecoveryActionRequest,
+    ) -> Result<(protocol::RecoveryBinding, String), RecoveryDenyReason> {
+        if request.life_id != self.life_id
+            || request.task_id != self.task_id
+            || request.capability_id != H5_RECOVER_REPLACE_CAPABILITY_ID
+        {
+            return Err(RecoveryDenyReason::ConfirmationMismatch);
+        }
+        let active = active_identity_snapshot(&self.active_identity)
+            .ok_or(RecoveryDenyReason::Cancellation)?;
+        if request.action_id.is_empty() {
+            return Err(RecoveryDenyReason::RecoveryStateInvalid);
+        }
+        let binding = protocol::RecoveryBinding {
+            session_id: self.session_id.clone(),
+            life_id: self.life_id.clone(),
+            task_id: self.task_id.clone(),
+            capability_id: H5_RECOVER_REPLACE_CAPABILITY_ID.to_string(),
+            workspace_root_identity: self.workspace_identity.clone(),
+            relative_path: request
+                .relative_path
+                .as_path()
+                .to_str()
+                .ok_or(RecoveryDenyReason::ConfirmationMismatch)?
+                .to_string(),
+            target_identity: request.target_identity.wire(),
+            transaction_id: request.transaction_id.as_str().to_string(),
+            journal_integrity_hash: request.journal_integrity_hash.clone(),
+            current_sha256: request.current_sha256.clone(),
+            current_bytes: request.current_bytes as u64,
+            restore_sha256: request.restore_sha256.clone(),
+            restore_bytes: request.restore_bytes as u64,
+            original_replacement_sha256: request.original_replacement_sha256.clone(),
+            provider_binding_hash: active.binding_hash,
+            codex_turn_id: active.turn_id.clone(),
+        };
+        binding
+            .validate()
+            .map_err(|_| RecoveryDenyReason::ConfirmationMismatch)?;
+        Ok((binding, active.turn_id))
+    }
+
+    fn issue(
+        &self,
+        request: &RecoveryActionRequest,
+    ) -> Result<RecoveryGrantEvidence, RecoveryDenyReason> {
+        let (binding, host_turn_id) = self.binding_for(request)?;
+        let authority = self
+            .router
+            .request(VitaMessage::RecoveryAuthorityEvaluate(
+                protocol::RecoveryAuthorityEvaluate {
+                    request_id: next_request_id("vita-recovery-authority"),
+                    session_id: self.session_id.clone(),
+                    host_turn_id: host_turn_id.clone(),
+                    binding: binding.clone(),
+                },
+            ))
+            .map_err(|_| RecoveryDenyReason::AuthorizationDisabled)?;
+        let reply = match authority {
+            HostMessage::RecoveryAuthorityReply(reply) => reply,
+            _ => return Err(RecoveryDenyReason::RecoveryStateInvalid),
+        };
+        reply
+            .validate()
+            .map_err(|_| RecoveryDenyReason::RecoveryStateInvalid)?;
+        if reply.session_id != self.session_id || !reply.allowed {
+            return Err(RecoveryDenyReason::AuthorizationDisabled);
+        }
+        let revision = reply
+            .authorization_revision
+            .ok_or(RecoveryDenyReason::StaleRevision)?;
+        let confirmation = self
+            .router
+            .request(VitaMessage::RecoveryConfirmationRequired(
+                protocol::RecoveryConfirmationRequired {
+                    request_id: next_request_id("vita-recovery-confirm"),
+                    session_id: self.session_id.clone(),
+                    host_turn_id: host_turn_id.clone(),
+                    workspace_summary: self.workspace_summary.clone(),
+                    expires_at_unix_ms: unix_millis().saturating_add(30_000),
+                    binding: binding.clone(),
+                },
+            ))
+            .map_err(|_| RecoveryDenyReason::AuthorizationDisabled)?;
+        let confirmation = match confirmation {
+            HostMessage::RecoveryConfirmationReply(reply) => reply,
+            _ => return Err(RecoveryDenyReason::RecoveryStateInvalid),
+        };
+        confirmation
+            .validate()
+            .map_err(|_| RecoveryDenyReason::RecoveryStateInvalid)?;
+        if confirmation.session_id != self.session_id
+            || confirmation.decision != protocol::ConfirmationDecision::Confirm
+            || confirmation.authorization_revision != Some(revision)
+        {
+            return Err(RecoveryDenyReason::ConfirmationMismatch);
+        }
+        let issued = self
+            .router
+            .request(VitaMessage::RecoveryIssueGrant(RecoveryIssueGrant {
+                request_id: next_request_id("vita-recovery-issue"),
+                session_id: self.session_id.clone(),
+                host_turn_id,
+                binding: binding.clone(),
+                authorization_revision: revision,
+            }))
+            .map_err(|_| RecoveryDenyReason::AuthorizationDisabled)?;
+        let issued = match issued {
+            HostMessage::RecoveryGrantIssued(reply) => reply,
+            _ => return Err(RecoveryDenyReason::RecoveryStateInvalid),
+        };
+        issued
+            .validate()
+            .map_err(|_| RecoveryDenyReason::RecoveryStateInvalid)?;
+        if issued.session_id != self.session_id || !issued.allowed {
+            return Err(RecoveryDenyReason::AuthorizationDisabled);
+        }
+        let grant = issued
+            .grant
+            .ok_or(RecoveryDenyReason::RecoveryStateInvalid)?;
+        if grant.binding != binding
+            || grant.authorization_revision != revision
+            || grant.used
+            || !grant.single_use
+        {
+            return Err(RecoveryDenyReason::RecoveryStateInvalid);
+        }
+        self.grants
+            .lock()
+            .map_err(|_| RecoveryDenyReason::AuthorizationDisabled)?
+            .insert(grant.grant_id.clone(), grant.clone());
+        Ok(RecoveryGrantEvidence {
+            grant_id: grant.grant_id,
+            confirmation_id: grant.confirmation_id,
+            action: request.clone(),
+            issued_at_unix_ms: grant.issued_at_unix_ms,
+            expires_at_unix_ms: grant.expires_at_unix_ms,
+            single_use: grant.single_use,
+            used: grant.used,
+        })
+    }
+}
+
+impl RecoveryAuthorityPort for SidecarRecoveryAuthority {
+    fn issue_recovery_grant(
+        &self,
+        request: &RecoveryActionRequest,
+    ) -> Result<RecoveryGrantEvidence, RecoveryDenyReason> {
+        self.issue(request)
+    }
+
+    fn revalidate_recovery_grant(
+        &self,
+        grant: &RecoveryGrantEvidence,
+        request: &RecoveryActionRequest,
+    ) -> Result<(), RecoveryDenyReason> {
+        let (binding, host_turn_id) = self.binding_for(request)?;
+        let wire_grant = self
+            .grants
+            .lock()
+            .map_err(|_| RecoveryDenyReason::AuthorizationDisabled)?
+            .get(&grant.grant_id)
+            .cloned()
+            .ok_or(RecoveryDenyReason::RecoveryGrantReplay)?;
+        if wire_grant.binding != binding || wire_grant.used || grant.used {
+            return Err(RecoveryDenyReason::RecoveryGrantReplay);
+        }
+        let response = self
+            .router
+            .request(VitaMessage::RecoveryRevalidateGrant(
+                protocol::RecoveryRevalidateGrant {
+                    request_id: next_request_id("vita-recovery-revalidate"),
+                    session_id: self.session_id.clone(),
+                    host_turn_id,
+                    binding,
+                    grant: wire_grant,
+                },
+            ))
+            .map_err(|_| RecoveryDenyReason::AuthorizationDisabled)?;
+        let response = match response {
+            HostMessage::RecoveryGrantRevalidated(reply) => reply,
+            _ => return Err(RecoveryDenyReason::RecoveryStateInvalid),
+        };
+        response
+            .validate()
+            .map_err(|_| RecoveryDenyReason::RecoveryStateInvalid)?;
+        if response.session_id != self.session_id || !response.allowed {
+            return Err(RecoveryDenyReason::AuthorizationDisabled);
+        }
+        let returned = response
+            .grant
+            .ok_or(RecoveryDenyReason::RecoveryStateInvalid)?;
+        if returned.grant_id != grant.grant_id || !returned.used {
+            return Err(RecoveryDenyReason::RecoveryGrantReplay);
+        }
+        if let Ok(mut grants) = self.grants.lock() {
+            grants.remove(&grant.grant_id);
+        }
+        Ok(())
+    }
+}
+
+/// The production Codex extension registry is closed over these three exact
 /// contributors.  Keeping the composition in one concrete contributor means
 /// the pinned runtime never receives a generic plugin or filesystem surface.
 struct VitaProductionContributors {
     git: VitaGitStatusToolContributor,
     read: VitaWorkspaceReadToolContributor,
+    replace: VitaWorkspaceReplaceH5ToolContributor,
 }
 
 impl ToolContributor for VitaProductionContributors {
@@ -2574,6 +3361,7 @@ impl ToolContributor for VitaProductionContributors {
     > {
         let mut tools = self.git.tools(session_store, thread_store);
         tools.extend(self.read.tools(session_store, thread_store));
+        tools.extend(self.replace.tools(session_store, thread_store));
         tools
     }
 }

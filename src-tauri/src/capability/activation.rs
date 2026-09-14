@@ -759,7 +759,7 @@ mod tests {
 
         let snapshot = build_snapshot(&fixture.storage, &fixture.registry).expect("snapshot");
         assert_eq!(snapshot.life_id, LIFE_ID);
-        assert_eq!(snapshot.capabilities.len(), 2);
+        assert_eq!(snapshot.capabilities.len(), 4);
 
         let entry = snapshot
             .capabilities
@@ -1604,16 +1604,16 @@ mod tests {
             );
         }
 
-        // D31-B adds exactly one explicitly approved bounded read capability
-        // beside the frozen Git-status route. D30-A still changes only
-        // authorization reachability; no generic side-effect surface is
-        // admitted.
+        // D31-C keeps the frozen Git-status/read routes and adds only the
+        // exact bounded replacement route plus its Host-only recovery
+        // descriptor. D30-A still changes only authorization reachability;
+        // no generic side-effect surface is admitted.
         let registry = CapabilityRegistry::production().expect("production registry");
         let entries: Vec<&CapabilityDescriptor> = registry.entries().collect();
         assert_eq!(
             entries.len(),
-            2,
-            "D31-B opens exactly one bounded read route"
+            4,
+            "D31-C keeps exactly four trusted capability descriptors"
         );
         let entry_ids = entries
             .iter()
@@ -1624,16 +1624,32 @@ mod tests {
             std::collections::HashSet::from([
                 "vita.process.workspace.git_status",
                 "vita.workspace.read_file",
+                "vita.workspace.replace_file",
+                "vita.workspace.recover_replace",
             ])
         );
         for entry in entries {
-            assert!(entry.is_read_only());
             assert_eq!(entry.risk_class(), RiskClass::Critical);
             assert_eq!(entry.approval_floor(), ApprovalFloor::ExplicitPerAction);
             assert_eq!(
                 entry.scope_requirement(),
                 ScopeRequirement::WorkspaceRequired
             );
+            match entry.capability_id().as_str() {
+                "vita.process.workspace.git_status" | "vita.workspace.read_file" => {
+                    assert!(entry.is_read_only());
+                    assert!(entry.tool_name().is_some());
+                }
+                "vita.workspace.replace_file" => {
+                    assert!(!entry.is_read_only());
+                    assert_eq!(entry.tool_name(), Some("vita_workspace_replace_file"));
+                }
+                "vita.workspace.recover_replace" => {
+                    assert!(!entry.is_read_only());
+                    assert!(entry.tool_name().is_none());
+                }
+                _ => unreachable!("registry ID set was checked above"),
+            }
         }
         for forbidden in [
             "vita.process.run",

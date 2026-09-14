@@ -14,10 +14,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-/// Digital Life's private Host↔Vita wire version.  D31-A adds new workspace
-/// read authority variants, so old and new sidecars must fail closed during
-/// the initialization handshake instead of relying on serde compatibility.
-pub const PROTOCOL_VERSION: &str = "d31-a.vita-sidecar.v3";
+/// Digital Life's private Host↔Vita wire version.  D31-C adds only the typed
+/// whole-file replace and host-controlled recovery authority messages. Old
+/// and new sidecars fail closed during the initialization handshake instead of
+/// relying on serde compatibility.
+pub const PROTOCOL_VERSION: &str = "d31-c.vita-sidecar.v4";
 pub const RUNTIME_ID: &str = "vita-agent";
 pub const CODEX_UPSTREAM_COMMIT: &str = "316795b3cf2a45e90d121d9f46499d4658b2645c";
 pub const CODEX_PROTOCOL_SCHEMA_HASH: &str =
@@ -43,6 +44,11 @@ pub const TOOL_NAME: &str = "vita_workspace_git_status";
 pub const WORKSPACE_READ_CAPABILITY_ID: &str = "vita.workspace.read_file";
 pub const WORKSPACE_READ_PROFILE_ID: &str = "d31.workspace.read_file.v1";
 pub const WORKSPACE_READ_TOOL_NAME: &str = "vita_workspace_read_file";
+pub const WORKSPACE_REPLACE_CAPABILITY_ID: &str = "vita.workspace.replace_file";
+pub const WORKSPACE_REPLACE_PROFILE_ID: &str = "d31.workspace.replace_file.v1";
+pub const WORKSPACE_REPLACE_TOOL_NAME: &str = "vita_workspace_replace_file";
+pub const WORKSPACE_RECOVER_CAPABILITY_ID: &str = "vita.workspace.recover_replace";
+pub const WORKSPACE_RECOVER_PROFILE_ID: &str = "d31.workspace.recover_replace.v1";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FrameError {
@@ -193,6 +199,14 @@ pub enum HostMessage {
     WorkspaceReadGrantIssued(WorkspaceReadGrantIssued),
     WorkspaceReadGrantRevalidated(WorkspaceReadGrantRevalidated),
     WorkspaceReadReleaseChecked(WorkspaceReadReleaseChecked),
+    WorkspaceReplaceAuthorityReply(WorkspaceReplaceAuthorityReply),
+    WorkspaceReplaceConfirmationReply(WorkspaceReplaceConfirmationReply),
+    WorkspaceReplaceGrantIssued(WorkspaceReplaceGrantIssued),
+    WorkspaceReplaceGrantRevalidated(WorkspaceReplaceGrantRevalidated),
+    RecoveryAuthorityReply(RecoveryAuthorityReply),
+    RecoveryConfirmationReply(RecoveryConfirmationReply),
+    RecoveryGrantIssued(RecoveryGrantIssued),
+    RecoveryGrantRevalidated(RecoveryGrantRevalidated),
     CancelAction(CancelAction),
     StartTurn(StartTurn),
     CancelTurn(CancelTurn),
@@ -214,6 +228,15 @@ pub enum VitaMessage {
     WorkspaceReadIssueGrant(WorkspaceReadIssueGrant),
     WorkspaceReadRevalidateGrant(WorkspaceReadRevalidateGrant),
     WorkspaceReadReleaseCheck(WorkspaceReadReleaseCheck),
+    WorkspaceReplaceAuthorityEvaluate(WorkspaceReplaceAuthorityEvaluate),
+    WorkspaceReplaceConfirmationRequired(WorkspaceReplaceConfirmationRequired),
+    WorkspaceReplaceIssueGrant(WorkspaceReplaceIssueGrant),
+    WorkspaceReplaceRevalidateGrant(WorkspaceReplaceRevalidateGrant),
+    RecoveryAuthorityEvaluate(RecoveryAuthorityEvaluate),
+    RecoveryConfirmationRequired(RecoveryConfirmationRequired),
+    RecoveryIssueGrant(RecoveryIssueGrant),
+    RecoveryRevalidateGrant(RecoveryRevalidateGrant),
+    RecoveryPending(RecoveryPending),
     ActionCancelled(ActionCancelled),
     CredentialRequired(CredentialRequired),
     TurnState(TurnState),
@@ -538,6 +561,266 @@ pub struct WorkspaceReadReleaseChecked {
     pub session_id: String,
     pub allowed: bool,
     pub error_code: Option<String>,
+}
+
+/// Typed evidence for one exact existing-file replacement.  The replacement
+/// bytes stay in Vita; Host receives only their digest and bounded byte count
+/// as authority evidence.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceReplaceTargetKind {
+    File,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceReplaceBinding {
+    pub session_id: String,
+    pub life_id: String,
+    pub task_id: String,
+    pub capability_id: String,
+    pub tool_name: String,
+    pub workspace_root_identity: String,
+    pub relative_path: String,
+    pub target_identity: String,
+    pub target_kind: WorkspaceReplaceTargetKind,
+    pub expected_sha256: String,
+    pub replacement_sha256: String,
+    pub replacement_bytes: u64,
+    pub tool_call_id: String,
+    pub codex_turn_id: String,
+    pub provider_binding_hash: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceReplaceGrant {
+    pub session_id: String,
+    pub grant_id: String,
+    pub confirmation_id: String,
+    pub binding: WorkspaceReplaceBinding,
+    pub authorization_revision: i64,
+    pub issued_at_unix_ms: u64,
+    pub expires_at_unix_ms: u64,
+    pub single_use: bool,
+    pub used: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceReplaceAuthorityEvaluate {
+    pub request_id: String,
+    pub session_id: String,
+    pub host_turn_id: String,
+    pub binding: WorkspaceReplaceBinding,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceReplaceAuthorityReply {
+    pub request_id: String,
+    pub session_id: String,
+    pub allowed: bool,
+    pub authorization_revision: Option<i64>,
+    pub error_code: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceReplaceConfirmationRequired {
+    pub request_id: String,
+    pub session_id: String,
+    pub host_turn_id: String,
+    pub workspace_summary: String,
+    pub expires_at_unix_ms: u64,
+    pub binding: WorkspaceReplaceBinding,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceReplaceConfirmationReply {
+    pub request_id: String,
+    pub session_id: String,
+    pub decision: ConfirmationDecision,
+    pub authorization_revision: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceReplaceIssueGrant {
+    pub request_id: String,
+    pub session_id: String,
+    pub host_turn_id: String,
+    pub binding: WorkspaceReplaceBinding,
+    pub authorization_revision: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceReplaceGrantIssued {
+    pub request_id: String,
+    pub session_id: String,
+    pub allowed: bool,
+    pub grant: Option<WorkspaceReplaceGrant>,
+    pub error_code: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceReplaceRevalidateGrant {
+    pub request_id: String,
+    pub session_id: String,
+    pub host_turn_id: String,
+    pub binding: WorkspaceReplaceBinding,
+    pub grant: WorkspaceReplaceGrant,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceReplaceGrantRevalidated {
+    pub request_id: String,
+    pub session_id: String,
+    pub allowed: bool,
+    pub grant: Option<WorkspaceReplaceGrant>,
+    pub error_code: Option<String>,
+}
+
+/// Recovery is Host/user controlled and never appears in the Codex tool
+/// catalog.  These DTOs carry only the immutable H5 transaction binding.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryBinding {
+    pub session_id: String,
+    pub life_id: String,
+    pub task_id: String,
+    pub capability_id: String,
+    pub workspace_root_identity: String,
+    pub relative_path: String,
+    pub target_identity: String,
+    pub transaction_id: String,
+    pub journal_integrity_hash: String,
+    pub current_sha256: String,
+    pub current_bytes: u64,
+    pub restore_sha256: String,
+    pub restore_bytes: u64,
+    pub original_replacement_sha256: String,
+    pub provider_binding_hash: String,
+    pub codex_turn_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryGrant {
+    pub session_id: String,
+    pub grant_id: String,
+    pub confirmation_id: String,
+    pub binding: RecoveryBinding,
+    pub authorization_revision: i64,
+    pub issued_at_unix_ms: u64,
+    pub expires_at_unix_ms: u64,
+    pub single_use: bool,
+    pub used: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryAuthorityEvaluate {
+    pub request_id: String,
+    pub session_id: String,
+    pub host_turn_id: String,
+    pub binding: RecoveryBinding,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryAuthorityReply {
+    pub request_id: String,
+    pub session_id: String,
+    pub allowed: bool,
+    pub authorization_revision: Option<i64>,
+    pub error_code: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryConfirmationRequired {
+    pub request_id: String,
+    pub session_id: String,
+    pub host_turn_id: String,
+    pub workspace_summary: String,
+    pub expires_at_unix_ms: u64,
+    pub binding: RecoveryBinding,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryConfirmationReply {
+    pub request_id: String,
+    pub session_id: String,
+    pub decision: ConfirmationDecision,
+    pub authorization_revision: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryIssueGrant {
+    pub request_id: String,
+    pub session_id: String,
+    pub host_turn_id: String,
+    pub binding: RecoveryBinding,
+    pub authorization_revision: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryGrantIssued {
+    pub request_id: String,
+    pub session_id: String,
+    pub allowed: bool,
+    pub grant: Option<RecoveryGrant>,
+    pub error_code: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryRevalidateGrant {
+    pub request_id: String,
+    pub session_id: String,
+    pub host_turn_id: String,
+    pub binding: RecoveryBinding,
+    pub grant: RecoveryGrant,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryGrantRevalidated {
+    pub request_id: String,
+    pub session_id: String,
+    pub allowed: bool,
+    pub grant: Option<RecoveryGrant>,
+    pub error_code: Option<String>,
+}
+
+/// Read-only restart evidence.  This is a Host notification only; it carries
+/// no confirmation, grant, or executable recovery authority.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryPending {
+    pub request_id: String,
+    pub session_id: String,
+    pub transaction_id: String,
+    pub life_id: String,
+    pub task_id: String,
+    pub capability_id: String,
+    pub workspace_root_identity: String,
+    pub relative_path: String,
+    pub target_identity: String,
+    pub journal_integrity_hash: String,
+    pub current_sha256: String,
+    pub current_bytes: u64,
+    pub restore_sha256: String,
+    pub restore_bytes: u64,
+    pub original_replacement_sha256: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -1126,6 +1409,346 @@ impl WorkspaceReadReleaseChecked {
     }
 }
 
+impl WorkspaceReplaceBinding {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        for value in [
+            &self.session_id,
+            &self.life_id,
+            &self.task_id,
+            &self.capability_id,
+            &self.tool_name,
+            &self.workspace_root_identity,
+            &self.target_identity,
+            &self.tool_call_id,
+            &self.codex_turn_id,
+        ] {
+            valid_id(value)?;
+        }
+        if self.capability_id != WORKSPACE_REPLACE_CAPABILITY_ID
+            || self.tool_name != WORKSPACE_REPLACE_TOOL_NAME
+            || !matches!(self.target_kind, WorkspaceReplaceTargetKind::File)
+            || self.replacement_bytes > MAX_WORKSPACE_READ_BYTES
+        {
+            return Err(FrameError::InvalidField);
+        }
+        valid_workspace_relative_path(&self.relative_path)?;
+        valid_sha256(&self.expected_sha256)?;
+        valid_sha256(&self.replacement_sha256)?;
+        valid_sha256(&self.provider_binding_hash)
+    }
+}
+
+impl WorkspaceReplaceGrant {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        valid_id(&self.session_id)?;
+        valid_id(&self.grant_id)?;
+        valid_id(&self.confirmation_id)?;
+        self.binding.validate()?;
+        if self.session_id != self.binding.session_id
+            || self.authorization_revision <= 0
+            || self.issued_at_unix_ms > self.expires_at_unix_ms
+            || !self.single_use
+        {
+            return Err(FrameError::InvalidField);
+        }
+        Ok(())
+    }
+}
+
+impl WorkspaceReplaceAuthorityEvaluate {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        valid_id(&self.request_id)?;
+        valid_id(&self.session_id)?;
+        valid_id(&self.host_turn_id)?;
+        self.binding.validate()?;
+        if self.session_id != self.binding.session_id {
+            return Err(FrameError::InvalidField);
+        }
+        Ok(())
+    }
+}
+
+impl WorkspaceReplaceAuthorityReply {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        valid_authority_reply(
+            &self.request_id,
+            &self.session_id,
+            self.allowed,
+            self.authorization_revision,
+            self.error_code.as_deref(),
+        )
+    }
+}
+
+impl WorkspaceReplaceConfirmationRequired {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        valid_id(&self.request_id)?;
+        valid_id(&self.session_id)?;
+        valid_id(&self.host_turn_id)?;
+        valid_bounded_text(&self.workspace_summary, MAX_SUMMARY_BYTES)?;
+        if self.expires_at_unix_ms == 0 {
+            return Err(FrameError::InvalidField);
+        }
+        self.binding.validate()?;
+        if self.session_id != self.binding.session_id {
+            return Err(FrameError::InvalidField);
+        }
+        Ok(())
+    }
+}
+
+impl WorkspaceReplaceConfirmationReply {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        valid_confirmation_reply(
+            &self.request_id,
+            &self.session_id,
+            self.decision,
+            self.authorization_revision,
+        )
+    }
+}
+
+impl WorkspaceReplaceIssueGrant {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        valid_id(&self.request_id)?;
+        valid_id(&self.session_id)?;
+        valid_id(&self.host_turn_id)?;
+        self.binding.validate()?;
+        if self.session_id != self.binding.session_id || self.authorization_revision <= 0 {
+            return Err(FrameError::InvalidField);
+        }
+        Ok(())
+    }
+}
+
+impl WorkspaceReplaceGrantIssued {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        valid_replace_grant_reply(
+            &self.request_id,
+            &self.session_id,
+            self.allowed,
+            self.grant.as_ref(),
+            self.error_code.as_deref(),
+            false,
+        )
+    }
+}
+
+impl WorkspaceReplaceRevalidateGrant {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        valid_id(&self.request_id)?;
+        valid_id(&self.session_id)?;
+        valid_id(&self.host_turn_id)?;
+        self.binding.validate()?;
+        self.grant.validate()?;
+        if self.session_id != self.binding.session_id
+            || self.binding != self.grant.binding
+            || self.session_id != self.grant.session_id
+            || self.grant.used
+        {
+            return Err(FrameError::InvalidField);
+        }
+        Ok(())
+    }
+}
+
+impl WorkspaceReplaceGrantRevalidated {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        valid_replace_grant_reply(
+            &self.request_id,
+            &self.session_id,
+            self.allowed,
+            self.grant.as_ref(),
+            self.error_code.as_deref(),
+            true,
+        )
+    }
+}
+
+impl RecoveryBinding {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        for value in [
+            &self.session_id,
+            &self.life_id,
+            &self.task_id,
+            &self.capability_id,
+            &self.workspace_root_identity,
+            &self.target_identity,
+            &self.transaction_id,
+            &self.codex_turn_id,
+        ] {
+            valid_id(value)?;
+        }
+        if self.capability_id != WORKSPACE_RECOVER_CAPABILITY_ID
+            || self.current_bytes > MAX_WORKSPACE_READ_BYTES
+            || self.restore_bytes > MAX_WORKSPACE_READ_BYTES
+        {
+            return Err(FrameError::InvalidField);
+        }
+        valid_workspace_relative_path(&self.relative_path)?;
+        valid_sha256(&self.journal_integrity_hash)?;
+        valid_sha256(&self.current_sha256)?;
+        valid_sha256(&self.restore_sha256)?;
+        valid_sha256(&self.original_replacement_sha256)?;
+        valid_sha256(&self.provider_binding_hash)
+    }
+}
+
+impl RecoveryGrant {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        valid_id(&self.session_id)?;
+        valid_id(&self.grant_id)?;
+        valid_id(&self.confirmation_id)?;
+        self.binding.validate()?;
+        if self.session_id != self.binding.session_id
+            || self.authorization_revision <= 0
+            || self.issued_at_unix_ms > self.expires_at_unix_ms
+            || !self.single_use
+        {
+            return Err(FrameError::InvalidField);
+        }
+        Ok(())
+    }
+}
+
+impl RecoveryAuthorityEvaluate {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        valid_id(&self.request_id)?;
+        valid_id(&self.session_id)?;
+        valid_id(&self.host_turn_id)?;
+        self.binding.validate()?;
+        if self.session_id != self.binding.session_id {
+            return Err(FrameError::InvalidField);
+        }
+        Ok(())
+    }
+}
+
+impl RecoveryAuthorityReply {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        valid_authority_reply(
+            &self.request_id,
+            &self.session_id,
+            self.allowed,
+            self.authorization_revision,
+            self.error_code.as_deref(),
+        )
+    }
+}
+
+impl RecoveryConfirmationRequired {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        valid_id(&self.request_id)?;
+        valid_id(&self.session_id)?;
+        valid_id(&self.host_turn_id)?;
+        valid_bounded_text(&self.workspace_summary, MAX_SUMMARY_BYTES)?;
+        if self.expires_at_unix_ms == 0 {
+            return Err(FrameError::InvalidField);
+        }
+        self.binding.validate()?;
+        if self.session_id != self.binding.session_id {
+            return Err(FrameError::InvalidField);
+        }
+        Ok(())
+    }
+}
+
+impl RecoveryConfirmationReply {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        valid_confirmation_reply(
+            &self.request_id,
+            &self.session_id,
+            self.decision,
+            self.authorization_revision,
+        )
+    }
+}
+
+impl RecoveryIssueGrant {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        valid_id(&self.request_id)?;
+        valid_id(&self.session_id)?;
+        valid_id(&self.host_turn_id)?;
+        self.binding.validate()?;
+        if self.session_id != self.binding.session_id || self.authorization_revision <= 0 {
+            return Err(FrameError::InvalidField);
+        }
+        Ok(())
+    }
+}
+
+impl RecoveryGrantIssued {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        valid_recovery_grant_reply(
+            &self.request_id,
+            &self.session_id,
+            self.allowed,
+            self.grant.as_ref(),
+            self.error_code.as_deref(),
+            false,
+        )
+    }
+}
+
+impl RecoveryRevalidateGrant {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        valid_id(&self.request_id)?;
+        valid_id(&self.session_id)?;
+        valid_id(&self.host_turn_id)?;
+        self.binding.validate()?;
+        self.grant.validate()?;
+        if self.session_id != self.binding.session_id
+            || self.binding != self.grant.binding
+            || self.session_id != self.grant.session_id
+            || self.grant.used
+        {
+            return Err(FrameError::InvalidField);
+        }
+        Ok(())
+    }
+}
+
+impl RecoveryGrantRevalidated {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        valid_recovery_grant_reply(
+            &self.request_id,
+            &self.session_id,
+            self.allowed,
+            self.grant.as_ref(),
+            self.error_code.as_deref(),
+            true,
+        )
+    }
+}
+
+impl RecoveryPending {
+    pub fn validate(&self) -> Result<(), FrameError> {
+        for value in [
+            &self.request_id,
+            &self.session_id,
+            &self.transaction_id,
+            &self.life_id,
+            &self.task_id,
+            &self.capability_id,
+            &self.workspace_root_identity,
+            &self.target_identity,
+        ] {
+            valid_id(value)?;
+        }
+        if self.capability_id != WORKSPACE_RECOVER_CAPABILITY_ID
+            || self.current_bytes > MAX_WORKSPACE_READ_BYTES
+            || self.restore_bytes > MAX_WORKSPACE_READ_BYTES
+        {
+            return Err(FrameError::InvalidField);
+        }
+        valid_workspace_relative_path(&self.relative_path)?;
+        valid_sha256(&self.journal_integrity_hash)?;
+        valid_sha256(&self.current_sha256)?;
+        valid_sha256(&self.restore_sha256)?;
+        valid_sha256(&self.original_replacement_sha256)
+    }
+}
+
 impl SensitiveCredentialReply {
     pub fn validate(&self) -> Result<(), FrameError> {
         valid_id(&self.request_id)?;
@@ -1290,6 +1913,48 @@ fn valid_workspace_grant_reply(
     }
 }
 
+fn valid_replace_grant_reply(
+    request_id: &str,
+    session_id: &str,
+    allowed: bool,
+    grant: Option<&WorkspaceReplaceGrant>,
+    error_code: Option<&str>,
+    expected_used: bool,
+) -> Result<(), FrameError> {
+    valid_id(request_id)?;
+    valid_id(session_id)?;
+    match (allowed, grant, error_code) {
+        (true, Some(grant), None)
+            if grant.session_id == session_id && grant.used == expected_used =>
+        {
+            grant.validate()
+        }
+        (false, None, Some(code)) => valid_id(code),
+        _ => Err(FrameError::InvalidField),
+    }
+}
+
+fn valid_recovery_grant_reply(
+    request_id: &str,
+    session_id: &str,
+    allowed: bool,
+    grant: Option<&RecoveryGrant>,
+    error_code: Option<&str>,
+    expected_used: bool,
+) -> Result<(), FrameError> {
+    valid_id(request_id)?;
+    valid_id(session_id)?;
+    match (allowed, grant, error_code) {
+        (true, Some(grant), None)
+            if grant.session_id == session_id && grant.used == expected_used =>
+        {
+            grant.validate()
+        }
+        (false, None, Some(code)) => valid_id(code),
+        _ => Err(FrameError::InvalidField),
+    }
+}
+
 fn valid_id(value: &str) -> Result<(), FrameError> {
     if value.is_empty()
         || value.len() > MAX_ID_BYTES
@@ -1383,6 +2048,75 @@ mod tests {
             session_id: binding.session_id.clone(),
             grant_id: "grant-1".to_string(),
             confirmation_id: "confirmation-1".to_string(),
+            binding,
+            authorization_revision: 2,
+            issued_at_unix_ms: 1,
+            expires_at_unix_ms: 2,
+            single_use: true,
+            used: false,
+        }
+    }
+
+    fn replace_binding() -> WorkspaceReplaceBinding {
+        WorkspaceReplaceBinding {
+            session_id: "session".to_string(),
+            life_id: "life".to_string(),
+            task_id: "task".to_string(),
+            capability_id: WORKSPACE_REPLACE_CAPABILITY_ID.to_string(),
+            tool_name: WORKSPACE_REPLACE_TOOL_NAME.to_string(),
+            workspace_root_identity: "root-identity".to_string(),
+            relative_path: "notes/today.txt".to_string(),
+            target_identity: "target-identity".to_string(),
+            target_kind: WorkspaceReplaceTargetKind::File,
+            expected_sha256: "a".repeat(64),
+            replacement_sha256: "b".repeat(64),
+            replacement_bytes: 1024,
+            tool_call_id: "call-1".to_string(),
+            codex_turn_id: "codex-turn".to_string(),
+            provider_binding_hash: "c".repeat(64),
+        }
+    }
+
+    fn replace_grant(binding: WorkspaceReplaceBinding) -> WorkspaceReplaceGrant {
+        WorkspaceReplaceGrant {
+            session_id: binding.session_id.clone(),
+            grant_id: "replace-grant-1".to_string(),
+            confirmation_id: "replace-confirmation-1".to_string(),
+            binding,
+            authorization_revision: 2,
+            issued_at_unix_ms: 1,
+            expires_at_unix_ms: 2,
+            single_use: true,
+            used: false,
+        }
+    }
+
+    fn recovery_binding() -> RecoveryBinding {
+        RecoveryBinding {
+            session_id: "session".to_string(),
+            life_id: "life".to_string(),
+            task_id: "task".to_string(),
+            capability_id: WORKSPACE_RECOVER_CAPABILITY_ID.to_string(),
+            workspace_root_identity: "root-identity".to_string(),
+            relative_path: "notes/today.txt".to_string(),
+            target_identity: "target-identity".to_string(),
+            transaction_id: "tx-1".to_string(),
+            journal_integrity_hash: "a".repeat(64),
+            current_sha256: "b".repeat(64),
+            current_bytes: 1024,
+            restore_sha256: "c".repeat(64),
+            restore_bytes: 1024,
+            original_replacement_sha256: "d".repeat(64),
+            provider_binding_hash: "e".repeat(64),
+            codex_turn_id: "codex-turn".to_string(),
+        }
+    }
+
+    fn recovery_grant(binding: RecoveryBinding) -> RecoveryGrant {
+        RecoveryGrant {
+            session_id: binding.session_id.clone(),
+            grant_id: "recovery-grant-1".to_string(),
+            confirmation_id: "recovery-confirmation-1".to_string(),
             binding,
             authorization_revision: 2,
             issued_at_unix_ms: 1,
@@ -1642,6 +2376,122 @@ mod tests {
         assert_eq!(init.validate(), Err(FrameError::InvalidField));
         init.protocol_version = PROTOCOL_VERSION.to_string();
         assert!(init.validate().is_ok());
+    }
+
+    #[test]
+    fn workspace_replace_binding_is_exactly_bounded_and_denies_unknown_fields() {
+        let binding = replace_binding();
+        assert!(binding.validate().is_ok());
+
+        let mut unknown = serde_json::to_value(&binding).expect("replace binding json");
+        unknown
+            .as_object_mut()
+            .expect("replace binding object")
+            .insert(
+                "confirmation_id".to_string(),
+                serde_json::json!("forbidden"),
+            );
+        assert!(serde_json::from_value::<WorkspaceReplaceBinding>(unknown).is_err());
+
+        let mut oversized = binding.clone();
+        oversized.replacement_bytes = MAX_WORKSPACE_READ_BYTES + 1;
+        assert_eq!(oversized.validate(), Err(FrameError::InvalidField));
+
+        let mut uppercase_hash = binding.clone();
+        uppercase_hash.expected_sha256 = "A".repeat(64);
+        assert_eq!(uppercase_hash.validate(), Err(FrameError::InvalidField));
+
+        let mut ambiguous_path = binding;
+        ambiguous_path.relative_path = "notes\\today.txt".to_string();
+        assert_eq!(ambiguous_path.validate(), Err(FrameError::InvalidField));
+
+        let mut too_large_content = replace_grant(replace_binding());
+        too_large_content.binding.replacement_bytes = MAX_WORKSPACE_READ_BYTES + 1;
+        assert_eq!(too_large_content.validate(), Err(FrameError::InvalidField));
+    }
+
+    #[test]
+    fn workspace_replace_grant_replies_enforce_single_use_stages() {
+        let binding = replace_binding();
+        let grant = replace_grant(binding.clone());
+        assert!(WorkspaceReplaceGrantIssued {
+            request_id: "issue-replace".to_string(),
+            session_id: binding.session_id.clone(),
+            allowed: true,
+            grant: Some(grant.clone()),
+            error_code: None,
+        }
+        .validate()
+        .is_ok());
+        let mut used_on_issue = grant.clone();
+        used_on_issue.used = true;
+        assert_eq!(
+            (WorkspaceReplaceGrantIssued {
+                request_id: "issue-replace".to_string(),
+                session_id: binding.session_id.clone(),
+                allowed: true,
+                grant: Some(used_on_issue),
+                error_code: None,
+            })
+            .validate(),
+            Err(FrameError::InvalidField)
+        );
+        let mut used = grant;
+        used.used = true;
+        assert!(WorkspaceReplaceGrantRevalidated {
+            request_id: "revalidate-replace".to_string(),
+            session_id: binding.session_id,
+            allowed: true,
+            grant: Some(used),
+            error_code: None,
+        }
+        .validate()
+        .is_ok());
+    }
+
+    #[test]
+    fn recovery_binding_and_grant_are_host_only_typed_and_bounded() {
+        let binding = recovery_binding();
+        assert!(binding.validate().is_ok());
+        let mut unknown = serde_json::to_value(&binding).expect("recovery binding json");
+        unknown
+            .as_object_mut()
+            .expect("recovery binding object")
+            .insert(
+                "recovery_decision".to_string(),
+                serde_json::json!("restore"),
+            );
+        assert!(serde_json::from_value::<RecoveryBinding>(unknown).is_err());
+
+        let mut oversized = binding.clone();
+        oversized.restore_bytes = MAX_WORKSPACE_READ_BYTES + 1;
+        assert_eq!(oversized.validate(), Err(FrameError::InvalidField));
+
+        let mut uppercase_hash = binding.clone();
+        uppercase_hash.current_sha256 = "F".repeat(64);
+        assert_eq!(uppercase_hash.validate(), Err(FrameError::InvalidField));
+
+        let grant = recovery_grant(binding.clone());
+        assert!(RecoveryGrantIssued {
+            request_id: "issue-recovery".to_string(),
+            session_id: binding.session_id.clone(),
+            allowed: true,
+            grant: Some(grant.clone()),
+            error_code: None,
+        }
+        .validate()
+        .is_ok());
+        let mut used = grant;
+        used.used = true;
+        assert!(RecoveryGrantRevalidated {
+            request_id: "revalidate-recovery".to_string(),
+            session_id: binding.session_id,
+            allowed: true,
+            grant: Some(used),
+            error_code: None,
+        }
+        .validate()
+        .is_ok());
     }
 
     #[test]

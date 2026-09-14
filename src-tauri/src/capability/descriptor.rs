@@ -8,6 +8,12 @@ pub(crate) const PRODUCTION_GIT_STATUS_TOOL_NAME: &str = "vita_workspace_git_sta
 pub(crate) const PRODUCTION_WORKSPACE_READ_CAPABILITY_ID: &str = "vita.workspace.read_file";
 pub(crate) const PRODUCTION_WORKSPACE_READ_PROFILE_ID: &str = "d31.workspace.read_file.v1";
 pub(crate) const PRODUCTION_WORKSPACE_READ_TOOL_NAME: &str = "vita_workspace_read_file";
+pub(crate) const PRODUCTION_WORKSPACE_REPLACE_CAPABILITY_ID: &str = "vita.workspace.replace_file";
+pub(crate) const PRODUCTION_WORKSPACE_REPLACE_PROFILE_ID: &str = "d31.workspace.replace_file.v1";
+pub(crate) const PRODUCTION_WORKSPACE_REPLACE_TOOL_NAME: &str = "vita_workspace_replace_file";
+pub(crate) const PRODUCTION_WORKSPACE_RECOVER_CAPABILITY_ID: &str =
+    "vita.workspace.recover_replace";
+pub(crate) const PRODUCTION_WORKSPACE_RECOVER_PROFILE_ID: &str = "d31.workspace.recover_replace.v1";
 
 /// A capability identity is an opaque, exact, lower-case ASCII identifier.
 /// No normalization, aliasing, or case folding is performed.
@@ -141,7 +147,7 @@ impl CapabilityDescriptor {
         })
     }
 
-    fn with_execution_route(
+    fn with_read_only_execution_route(
         mut self,
         profile_id: impl Into<String>,
         tool_name: impl Into<String>,
@@ -149,6 +155,24 @@ impl CapabilityDescriptor {
         self.execution_profile = Some(profile_id.into());
         self.tool_name = Some(tool_name.into());
         self.read_only = true;
+        self
+    }
+
+    fn with_mutating_execution_route(
+        mut self,
+        profile_id: impl Into<String>,
+        tool_name: impl Into<String>,
+    ) -> Self {
+        self.execution_profile = Some(profile_id.into());
+        self.tool_name = Some(tool_name.into());
+        self.read_only = false;
+        self
+    }
+
+    fn with_host_only_mutating_route(mut self, profile_id: impl Into<String>) -> Self {
+        self.execution_profile = Some(profile_id.into());
+        self.tool_name = None;
+        self.read_only = false;
         self
     }
 
@@ -250,10 +274,10 @@ impl CapabilityRegistry {
         })
     }
 
-    /// The production catalog is a closed, trusted static set.  D31-B adds
-    /// exactly one bounded read-only workspace-file capability beside the
-    /// frozen H7 Git-status route; no generic process, shell, write, or
-    /// network descriptor is registered here.
+    /// The production catalog is a closed, trusted static set.  D31-C adds
+    /// exactly one bounded existing-file replacement capability and its
+    /// Host-only recovery descriptor beside the frozen Git-status/read routes;
+    /// no generic process, shell, filesystem, or network descriptor is here.
     pub(crate) fn production() -> Result<Self, CapabilityRegistryError> {
         let git_capability_id = CapabilityId::try_from(PRODUCTION_GIT_STATUS_CAPABILITY_ID)
             .expect("the production Git status capability ID is a valid static identifier");
@@ -265,7 +289,7 @@ impl CapabilityRegistry {
             ScopeRequirement::WorkspaceRequired,
         )
         .expect("the production Git status descriptor is valid")
-        .with_execution_route(
+        .with_read_only_execution_route(
             PRODUCTION_GIT_STATUS_PROFILE_ID,
             PRODUCTION_GIT_STATUS_TOOL_NAME,
         );
@@ -279,11 +303,45 @@ impl CapabilityRegistry {
             ScopeRequirement::WorkspaceRequired,
         )
         .expect("the production workspace read descriptor is valid")
-        .with_execution_route(
+        .with_read_only_execution_route(
             PRODUCTION_WORKSPACE_READ_PROFILE_ID,
             PRODUCTION_WORKSPACE_READ_TOOL_NAME,
         );
-        Self::from_trusted_descriptors([git_descriptor, read_descriptor])
+        let replace_capability_id = CapabilityId::try_from(
+            PRODUCTION_WORKSPACE_REPLACE_CAPABILITY_ID,
+        )
+        .expect("the production workspace replace capability ID is a valid static identifier");
+        let replace_descriptor = CapabilityDescriptor::new(
+            replace_capability_id,
+            "Governed bounded workspace file replacement",
+            RiskClass::Critical,
+            ApprovalFloor::ExplicitPerAction,
+            ScopeRequirement::WorkspaceRequired,
+        )
+        .expect("the production workspace replace descriptor is valid")
+        .with_mutating_execution_route(
+            PRODUCTION_WORKSPACE_REPLACE_PROFILE_ID,
+            PRODUCTION_WORKSPACE_REPLACE_TOOL_NAME,
+        );
+        let recover_capability_id = CapabilityId::try_from(
+            PRODUCTION_WORKSPACE_RECOVER_CAPABILITY_ID,
+        )
+        .expect("the production workspace recovery capability ID is a valid static identifier");
+        let recover_descriptor = CapabilityDescriptor::new(
+            recover_capability_id,
+            "Host-controlled bounded workspace replacement recovery",
+            RiskClass::Critical,
+            ApprovalFloor::ExplicitPerAction,
+            ScopeRequirement::WorkspaceRequired,
+        )
+        .expect("the production workspace recovery descriptor is valid")
+        .with_host_only_mutating_route(PRODUCTION_WORKSPACE_RECOVER_PROFILE_ID);
+        Self::from_trusted_descriptors([
+            git_descriptor,
+            read_descriptor,
+            replace_descriptor,
+            recover_descriptor,
+        ])
     }
 
     #[cfg(any(
@@ -388,7 +446,7 @@ mod tests {
             CapabilityRegistryError::DuplicateCapabilityId(_)
         ));
         let registry = CapabilityRegistry::production().unwrap();
-        assert_eq!(registry.len(), 2);
+        assert_eq!(registry.len(), 4);
         let git_status = CapabilityId::try_from(PRODUCTION_GIT_STATUS_CAPABILITY_ID).unwrap();
         let descriptor = registry.descriptor(&git_status).unwrap();
         assert_eq!(descriptor.risk_class(), RiskClass::Critical);

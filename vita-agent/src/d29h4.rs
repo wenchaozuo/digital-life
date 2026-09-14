@@ -1,8 +1,8 @@
 //! D29-H4-A's replace-authority and precondition foundation.
 //!
-//! This module deliberately stops after Host-issued authority has been
-//! validated and narrowed.  It never opens a write handle and has no file
-//! mutation API.  The real replacement primitive belongs to D29-H4-B.
+//! This module owns the validated H4 replace grant and final authority fence.
+//! It never opens a write handle itself; the production H5 executor consumes
+//! the grant and enters the audited same-handle replacement primitive.
 #![allow(dead_code, private_interfaces)]
 
 use std::collections::HashSet;
@@ -11,7 +11,6 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-#[cfg(test)]
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -28,10 +27,10 @@ use super::workspace_capability::{
     PreparedWorkspaceTarget, PreparedWorkspaceTargetKind, WorkspaceReplaceError,
     WorkspaceReplaceEvidence,
 };
+use super::workspace_capability::{WorkspaceReplaceCommitOutcome, WorkspaceReplaceFenceError};
 #[cfg(test)]
 use super::workspace_capability::{
-    WorkspaceReplaceCommitOutcome, WorkspaceReplaceEvidenceEvent, WorkspaceReplaceFenceError,
-    WorkspaceReplaceMutationPhase, WorkspaceReplaceMutationTracker,
+    WorkspaceReplaceEvidenceEvent, WorkspaceReplaceMutationPhase, WorkspaceReplaceMutationTracker,
 };
 use super::{sha256_hex, VitaExecutionContext, VitaRequestedScope};
 
@@ -157,7 +156,7 @@ enum H4RequestBuildError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum H4CanonicalOutcome {
+pub(crate) enum H4CanonicalOutcome {
     Denied,
     RootDisabled,
     ExplicitConfirmationRequired,
@@ -169,7 +168,7 @@ enum H4CanonicalOutcome {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum H4CanonicalDecisionCode {
+pub(crate) enum H4CanonicalDecisionCode {
     Denied,
     RootDisabled,
     ExplicitConfirmationRequired,
@@ -181,37 +180,37 @@ enum H4CanonicalDecisionCode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum H4ScopeRequirement {
+pub(crate) enum H4ScopeRequirement {
     None,
     WorkspaceRequired,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum H4ApprovalFloor {
+pub(crate) enum H4ApprovalFloor {
     RootEnabled,
     ExplicitPerAction,
     Forbidden,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct H4CanonicalDecision {
-    life_id: String,
-    capability_id: String,
-    outcome: H4CanonicalOutcome,
-    decision_code: H4CanonicalDecisionCode,
-    scope_requirement: H4ScopeRequirement,
-    approval_floor: H4ApprovalFloor,
-    authorization_revision: Option<i64>,
-    workspace_scope_matches: bool,
+pub(crate) struct H4CanonicalDecision {
+    pub(crate) life_id: String,
+    pub(crate) capability_id: String,
+    pub(crate) outcome: H4CanonicalOutcome,
+    pub(crate) decision_code: H4CanonicalDecisionCode,
+    pub(crate) scope_requirement: H4ScopeRequirement,
+    pub(crate) approval_floor: H4ApprovalFloor,
+    pub(crate) authorization_revision: Option<i64>,
+    pub(crate) workspace_scope_matches: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum H4ReplaceOperation {
+pub(crate) enum H4ReplaceOperation {
     ReplaceExistingUtf8File,
 }
 
 impl H4ReplaceOperation {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::ReplaceExistingUtf8File => "replace_existing_utf8_file",
         }
@@ -224,73 +223,77 @@ impl H4ReplaceOperation {
 /// not part of the model-visible request schema and cannot be supplied by a
 /// tool caller.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum H4ConfirmationEvidenceSource {
+pub(crate) enum H4ConfirmationEvidenceSource {
+    /// Evidence created by the production Host authority bridge.  This
+    /// marker is never model supplied; it is attached only to typed Host
+    /// evidence.
+    TrustedHost,
     TrustedTestHarness,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct HostExplicitActionConfirmationEvidence {
-    source: H4ConfirmationEvidenceSource,
-    confirmation_id: String,
-    life_id: String,
-    task_id: String,
-    capability_id: String,
-    authorization_revision: i64,
-    workspace_root_identity: super::WorkspaceRootIdentity,
-    relative_path: super::WorkspaceRelativePath,
-    target_identity: super::WorkspaceRootIdentity,
-    expected_sha256: String,
-    replacement_sha256: String,
-    replacement_bytes: usize,
-    tool_call_id: String,
-    turn_id: String,
-    issued_at_unix_ms: u64,
-    expires_at_unix_ms: u64,
+    pub(crate) source: H4ConfirmationEvidenceSource,
+    pub(crate) confirmation_id: String,
+    pub(crate) life_id: String,
+    pub(crate) task_id: String,
+    pub(crate) capability_id: String,
+    pub(crate) authorization_revision: i64,
+    pub(crate) workspace_root_identity: super::WorkspaceRootIdentity,
+    pub(crate) relative_path: super::WorkspaceRelativePath,
+    pub(crate) target_identity: super::WorkspaceRootIdentity,
+    pub(crate) expected_sha256: String,
+    pub(crate) replacement_sha256: String,
+    pub(crate) replacement_bytes: usize,
+    pub(crate) tool_call_id: String,
+    pub(crate) turn_id: String,
+    pub(crate) issued_at_unix_ms: u64,
+    pub(crate) expires_at_unix_ms: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct H4HostReplaceGrantEvidence {
-    grant_id: String,
-    life_id: String,
-    task_id: String,
-    capability_id: String,
-    authorization_revision: i64,
-    scope: VitaRequestedScope,
-    workspace_root_identity: super::WorkspaceRootIdentity,
-    relative_path: super::WorkspaceRelativePath,
-    target_identity: super::WorkspaceRootIdentity,
-    target_kind: PreparedWorkspaceTargetKind,
-    operation: H4ReplaceOperation,
-    expected_sha256: String,
-    replacement_sha256: String,
-    replacement_bytes: usize,
-    tool_call_id: String,
-    turn_id: String,
-    confirmation_id: String,
-    issued_at_unix_ms: u64,
-    expires_at_unix_ms: u64,
-    single_use: bool,
+    pub(crate) grant_id: String,
+    pub(crate) life_id: String,
+    pub(crate) task_id: String,
+    pub(crate) capability_id: String,
+    pub(crate) authorization_revision: i64,
+    pub(crate) scope: VitaRequestedScope,
+    pub(crate) workspace_root_identity: super::WorkspaceRootIdentity,
+    pub(crate) relative_path: super::WorkspaceRelativePath,
+    pub(crate) target_identity: super::WorkspaceRootIdentity,
+    pub(crate) target_kind: PreparedWorkspaceTargetKind,
+    pub(crate) operation: H4ReplaceOperation,
+    pub(crate) expected_sha256: String,
+    pub(crate) replacement_sha256: String,
+    pub(crate) replacement_bytes: usize,
+    pub(crate) tool_call_id: String,
+    pub(crate) turn_id: String,
+    pub(crate) confirmation_id: String,
+    pub(crate) issued_at_unix_ms: u64,
+    pub(crate) expires_at_unix_ms: u64,
+    pub(crate) single_use: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
-enum H4AuthorityResponseStatus {
+pub(crate) enum H4AuthorityResponseStatus {
     Ok,
     Denied,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct H4HostAuthorityResponse {
-    status: H4AuthorityResponseStatus,
-    canonical: H4CanonicalDecision,
-    confirmation: Option<HostExplicitActionConfirmationEvidence>,
-    grant: Option<H4HostReplaceGrantEvidence>,
-    denial: Option<H4DenyClassification>,
-    confirmation_consumed: bool,
+    pub(crate) status: H4AuthorityResponseStatus,
+    pub(crate) canonical: H4CanonicalDecision,
+    pub(crate) confirmation: Option<HostExplicitActionConfirmationEvidence>,
+    pub(crate) grant: Option<H4HostReplaceGrantEvidence>,
+    pub(crate) denial: Option<H4DenyClassification>,
+    pub(crate) confirmation_consumed: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum H4AuthorityOperation {
+pub(crate) enum H4AuthorityOperation {
     IssueReplaceGrant,
     Revalidate {
         grant_id: String,
@@ -300,18 +303,18 @@ enum H4AuthorityOperation {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct H4AuthorityRequest {
-    context: VitaExecutionContext,
-    capability_id: String,
-    operation: H4AuthorityOperation,
-    tool_call_id: String,
-    turn_id: String,
-    relative_path: super::WorkspaceRelativePath,
-    expected_sha256: String,
-    replacement_sha256: String,
-    replacement_bytes: usize,
-    workspace_root_identity: super::WorkspaceRootIdentity,
-    target_identity: super::WorkspaceRootIdentity,
-    target_kind: PreparedWorkspaceTargetKind,
+    pub(crate) context: VitaExecutionContext,
+    pub(crate) capability_id: String,
+    pub(crate) operation: H4AuthorityOperation,
+    pub(crate) tool_call_id: String,
+    pub(crate) turn_id: String,
+    pub(crate) relative_path: super::WorkspaceRelativePath,
+    pub(crate) expected_sha256: String,
+    pub(crate) replacement_sha256: String,
+    pub(crate) replacement_bytes: usize,
+    pub(crate) workspace_root_identity: super::WorkspaceRootIdentity,
+    pub(crate) target_identity: super::WorkspaceRootIdentity,
+    pub(crate) target_kind: PreparedWorkspaceTargetKind,
 }
 
 #[cfg(all(test, windows))]
@@ -598,9 +601,9 @@ pub(crate) struct VitaWorkspaceReplaceSnapshot {
     pub automatic_mutation_retries: usize,
 }
 
-/// H4-A's Vita-side boundary is test/integration-only.  It can import an
-/// exact Host grant and prove that a future replacement is authorized, but it
-/// intentionally has no mutation method or write-capable operation handle.
+/// H4's Vita-side boundary imports an exact Host grant and proves that a
+/// replacement is authorized, but it intentionally has no mutation method or
+/// write-capable operation handle; H5 consumes the grant.
 pub(crate) struct VitaWorkspaceReplaceBroker {
     context: Option<VitaExecutionContext>,
     root: super::TrustedWorkspaceRoot,
@@ -640,7 +643,24 @@ impl VitaWorkspaceReplaceBroker {
         self.cancellation_notify.notify_one();
     }
 
-    #[cfg(test)]
+    /// Starts a fresh Host turn generation.  All single-use call/grant
+    /// admission is generation-scoped; no evidence from a previous turn is
+    /// retained when the cancellation fence is reopened.
+    pub(crate) fn begin_turn(&self) {
+        self.cancelled.store(false, Ordering::Release);
+        let mut state = lock_unpoisoned(&self.state);
+        state.seen_call_ids.clear();
+        state.consumed_grant_ids.clear();
+    }
+
+    /// Cancels only the current turn.  The next explicit `begin_turn` may
+    /// reopen the broker after the Host has completed the lifecycle fence.
+    pub(crate) fn cancel_turn(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        #[cfg(test)]
+        self.cancellation_notify.notify_one();
+    }
+
     pub(crate) fn cancellation_token(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.cancelled)
     }
@@ -713,7 +733,6 @@ impl VitaWorkspaceReplaceBroker {
         lock_unpoisoned(&self.native_evidence).clone()
     }
 
-    #[cfg(test)]
     pub(crate) async fn issue_h5_authorized_replace_action(
         &self,
         input: H4ReplaceAuthorizationInput,
@@ -1007,7 +1026,6 @@ impl VitaWorkspaceReplaceBroker {
     /// Parse and authorize one real Codex call through the certified H4
     /// parser/authority boundary, returning only the H4 grant and the
     /// already-bound replacement content needed by canonical H5.
-    #[cfg(test)]
     pub(crate) async fn issue_h5_authorized_replace_action_from_codex_call(
         &self,
         call: &ToolCall<'_>,
@@ -1287,7 +1305,6 @@ impl VitaWorkspaceReplaceBroker {
 }
 
 // D29-H4-C IMPLEMENTATION START
-#[cfg(test)]
 const H4C_NATIVE_FENCE_WAIT: Duration = Duration::from_secs(5);
 
 #[cfg(test)]
@@ -1351,14 +1368,12 @@ impl super::workspace_capability::WorkspaceReplaceCommitFence for H4CCommitFence
     }
 }
 
-#[cfg(test)]
 struct H4CGrantBinding {
     grant_id: String,
     authorization_revision: i64,
     confirmation_id: String,
 }
 
-#[cfg(test)]
 impl H4CGrantBinding {
     fn from_grant(grant: &VitaExecutableReplaceGrant) -> Self {
         Self {
@@ -1369,7 +1384,6 @@ impl H4CGrantBinding {
     }
 }
 
-#[cfg(test)]
 struct H4CRevalidationInput {
     context: VitaExecutionContext,
     capability_id: String,
@@ -1384,7 +1398,6 @@ struct H4CRevalidationInput {
     target_kind: PreparedWorkspaceTargetKind,
 }
 
-#[cfg(test)]
 impl H4CRevalidationInput {
     fn from_grant(grant: &VitaExecutableReplaceGrant) -> Self {
         Self {
@@ -1992,7 +2005,6 @@ fn validate_h4c_native_binding(
     Ok(())
 }
 
-#[cfg(test)]
 fn validate_h4c_revalidation(
     response: &H4HostAuthorityResponse,
     request: &H4AuthorityRequest,
@@ -2044,19 +2056,16 @@ fn validate_h4c_revalidation(
     validate_grant_evidence(evidence, request, revision, &binding.confirmation_id).map(|_| ())
 }
 
-#[cfg(test)]
 pub(crate) struct H4FinalFenceRequest {
     decision: std::sync::mpsc::SyncSender<Result<(), WorkspaceReplaceFenceError>>,
 }
 
-#[cfg(test)]
 pub(crate) struct H4GrantFinalFence {
     requests: tokio::sync::mpsc::Sender<H4FinalFenceRequest>,
     cancellation: Arc<AtomicBool>,
     sent: bool,
 }
 
-#[cfg(test)]
 impl H4GrantFinalFence {
     fn new(
         requests: tokio::sync::mpsc::Sender<H4FinalFenceRequest>,
@@ -2070,7 +2079,6 @@ impl H4GrantFinalFence {
     }
 }
 
-#[cfg(test)]
 impl super::workspace_capability::WorkspaceReplaceCommitFence for H4GrantFinalFence {
     fn check(&mut self) -> Result<(), WorkspaceReplaceFenceError> {
         if self.sent {
@@ -2094,14 +2102,12 @@ impl super::workspace_capability::WorkspaceReplaceCommitFence for H4GrantFinalFe
     }
 }
 
-#[cfg(test)]
 pub(crate) struct H4GrantFinalFenceService {
     authority: Arc<dyn VitaH4AuthorityPort>,
     grant: VitaExecutableReplaceGrant,
     cancellation: Arc<AtomicBool>,
 }
 
-#[cfg(test)]
 impl H4GrantFinalFenceService {
     pub(crate) async fn service(
         &self,
@@ -2143,7 +2149,6 @@ impl H4GrantFinalFenceService {
     }
 }
 
-#[cfg(test)]
 fn h4_final_fence_error(classification: H4DenyClassification) -> WorkspaceReplaceFenceError {
     match classification {
         H4DenyClassification::StaleRevision
@@ -2159,7 +2164,6 @@ fn h4_final_fence_error(classification: H4DenyClassification) -> WorkspaceReplac
     }
 }
 
-#[cfg(test)]
 impl VitaWorkspaceReplaceExecutionOutcome {
     fn from_native(outcome: WorkspaceReplaceCommitOutcome) -> Self {
         match outcome {
@@ -2175,7 +2179,6 @@ impl VitaWorkspaceReplaceExecutionOutcome {
     }
 }
 
-#[cfg(test)]
 impl WorkspaceReplaceCommitOutcome {
     fn error_classification(&self) -> Option<H4DenyClassification> {
         match self {
@@ -2187,7 +2190,6 @@ impl WorkspaceReplaceCommitOutcome {
     }
 }
 
-#[cfg(test)]
 fn native_error_classification(error: WorkspaceReplaceError) -> H4DenyClassification {
     match error {
         WorkspaceReplaceError::TargetMissing => H4DenyClassification::TargetMissing,
@@ -2330,8 +2332,11 @@ fn validate_confirmation(
     revision: i64,
 ) -> Result<(), H4DenyClassification> {
     validate_common_action_binding(request)?;
-    if confirmation.source != H4ConfirmationEvidenceSource::TrustedTestHarness
-        || bounded_text(&confirmation.confirmation_id, MAX_CALL_ID_CHARS).is_none()
+    if !matches!(
+        confirmation.source,
+        H4ConfirmationEvidenceSource::TrustedHost
+            | H4ConfirmationEvidenceSource::TrustedTestHarness
+    ) || bounded_text(&confirmation.confirmation_id, MAX_CALL_ID_CHARS).is_none()
         || confirmation.life_id != request.context.life_id()
         || confirmation.task_id != request.context.task_id()
         || confirmation.capability_id != VITA_WORKSPACE_REPLACE_CAPABILITY_ID
@@ -2546,7 +2551,6 @@ impl VitaExecutableReplaceGrant {
     }
 }
 
-#[cfg(test)]
 pub(crate) struct H4ReplaceAuthorizationInput {
     context: VitaExecutionContext,
     relative_path: super::WorkspaceRelativePath,
@@ -2556,7 +2560,6 @@ pub(crate) struct H4ReplaceAuthorizationInput {
     turn_id: String,
 }
 
-#[cfg(test)]
 impl H4ReplaceAuthorizationInput {
     pub(crate) fn new(
         context: VitaExecutionContext,
@@ -2602,14 +2605,12 @@ impl H4ReplaceAuthorizationInput {
     }
 }
 
-#[cfg(test)]
 pub(crate) struct H4AuthorizedReplaceGrant {
     grant: VitaExecutableReplaceGrant,
     root: super::TrustedWorkspaceRoot,
     authority: Arc<dyn VitaH4AuthorityPort>,
 }
 
-#[cfg(test)]
 impl H4AuthorizedReplaceGrant {
     pub(crate) fn root(&self) -> &super::TrustedWorkspaceRoot {
         &self.root
@@ -2773,9 +2774,9 @@ fn unix_millis() -> u64 {
         .as_millis() as u64
 }
 
-/// Test/integration-only contributor.  The normal Vita entrypoint never
-/// installs H4-A; the production registry contains only the read-only H7-C
-/// route and no H4 mutation capability.
+/// Narrow H4 contributor retained for the authorization-only test seam.  The
+/// production sidecar installs the H5 contributor, which is the sole route
+/// from the Codex tool call into the durable mutation transaction.
 pub(crate) struct VitaWorkspaceReplaceToolContributor {
     broker: Arc<VitaWorkspaceReplaceBroker>,
 }

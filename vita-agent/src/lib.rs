@@ -23,7 +23,6 @@ use toml::Value as TomlValue;
 
 mod d29h3;
 mod d29h4;
-#[cfg(test)]
 mod d29h5;
 #[cfg(all(test, windows))]
 mod d29h5c;
@@ -64,6 +63,22 @@ pub(crate) use d29h3::{
     VitaH3AuthorityPort, VitaH3DisclosureFuture, VitaWorkspaceReadBroker,
     VitaWorkspaceReadToolContributor, VITA_WORKSPACE_READ_CAPABILITY_ID,
     VITA_WORKSPACE_READ_TOOL_NAME,
+};
+
+#[cfg(windows)]
+pub(crate) use d29h4::{
+    H4ApprovalFloor, H4AuthorityOperation, H4AuthorityRequest, H4AuthorityResponseStatus,
+    H4CanonicalDecision, H4CanonicalDecisionCode, H4CanonicalOutcome, H4ConfirmationEvidenceSource,
+    H4HostAuthorityResponse, H4HostReplaceGrantEvidence, H4ReplaceOperation, H4ScopeRequirement,
+    HostExplicitActionConfirmationEvidence, VitaH4AuthorityError, VitaH4AuthorityFuture,
+    VitaH4AuthorityPort, VitaWorkspaceReplaceBroker, VITA_WORKSPACE_REPLACE_CAPABILITY_ID,
+    VITA_WORKSPACE_REPLACE_TOOL_NAME,
+};
+
+#[cfg(windows)]
+pub(crate) use d29h5::{
+    H5RecoveryExecutor, RecoveryActionRequest, RecoveryAuthorityPort, RecoveryDenyReason,
+    RecoveryGrantEvidence, VitaWorkspaceReplaceH5ToolContributor, H5_RECOVER_REPLACE_CAPABILITY_ID,
 };
 
 #[cfg(windows)]

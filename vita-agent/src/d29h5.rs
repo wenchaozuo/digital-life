@@ -1,17 +1,20 @@
 //! D29-H5-B process-crash recovery and restart-authority closure.
 //!
-//! This module is compiled only for the test/integration boundary.  The
-//! production registry is limited to the read-only H7-C route; no H5
-//! mutation capability is registered.  The durable pieces used here are nevertheless
-//! production-shaped: H5-A journals stay immutable, H5-B markers are
-//! create-new sidecars, and recovery always requires a fresh Host decision.
+//! The production registry exposes the narrowly-scoped D31-C replacement route;
+//! recovery remains Host-only and is never advertised as a model tool.  The
+//! durable pieces used here are production-shaped: H5-A journals stay
+//! immutable, H5-B markers are create-new sidecars, and recovery always
+//! requires a fresh Host decision.
 
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+#[cfg(test)]
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+#[cfg(test)]
+use std::sync::Condvar;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use codex_extension_api::{
     parse_tool_input_schema, JsonToolOutput, ResponsesApiTool, ToolCall, ToolContributor,
@@ -20,25 +23,29 @@ use codex_extension_api::{
 use serde_json::{json, Value};
 
 use crate::d29h4::{
-    H4AuthorizedReplaceGrant, VitaWorkspaceReplaceBroker, VITA_WORKSPACE_REPLACE_TOOL_NAME,
+    H4AuthorizedReplaceGrant, VitaWorkspaceReplaceBroker, H4_MAX_REPLACEMENT_BYTES,
+    VITA_WORKSPACE_REPLACE_TOOL_NAME,
 };
 use crate::recovery_journal::{
-    mutation_target_key_for_prepared_target, RecoveryJournalContext, RecoveryJournalError,
-    RecoveryJournalIdentity, RecoveryJournalStore, RecoveryJournalV1,
-    RecoveryMarkerPersistenceTestFault, RecoveryMarkerState, RecoveryMarkerV1,
-    RecoveryMutationTargetKey, RecoveryTargetLifecycle, RecoveryTransactionBlockReason,
-    RecoveryTransactionId, RecoveryTransactionScan, RecoveryTransactionScanItem,
+    mutation_target_key, mutation_target_key_for_prepared_target, RecoveryJournalContext,
+    RecoveryJournalError, RecoveryJournalIdentity, RecoveryJournalStore, RecoveryJournalV1,
+    RecoveryMarkerPersistenceTestFault, RecoveryMutationTargetKey, RecoveryTargetLifecycle,
+    RecoveryTransactionBlockReason, RecoveryTransactionId, RecoveryTransactionScan,
     RecoveryTransactionSnapshot, RecoveryTransactionState, RECOVERY_JOURNAL_MAX_PREIMAGE_BYTES,
 };
+#[cfg(test)]
+use crate::recovery_journal::{RecoveryMarkerState, RecoveryMarkerV1, RecoveryTransactionScanItem};
 use crate::workspace_capability::{
     PreparedWorkspaceTargetKind, WorkspaceReadError, WorkspaceRecoveryCommitOutcome,
     WorkspaceRecoveryTestFault, WorkspaceReplaceCancellation, WorkspaceReplaceCommitFence,
     WorkspaceReplaceCommitOutcome, WorkspaceReplaceError, WorkspaceReplaceFenceError,
     WorkspaceReplaceTestFault,
 };
+#[cfg(test)]
+use crate::VitaAgentRuntimeProfile;
 use crate::{
-    sha256_hex, PreparedWorkspaceTarget, TrustedWorkspaceRoot, VitaAgentRuntimeProfile,
-    WorkspaceRelativePath, WorkspaceRootIdentity,
+    sha256_hex, PreparedWorkspaceTarget, TrustedWorkspaceRoot, WorkspaceRelativePath,
+    WorkspaceRootIdentity,
 };
 
 pub(crate) const H5_RECOVER_REPLACE_CAPABILITY_ID: &str = "vita.workspace.recover_replace";
@@ -53,21 +60,21 @@ const H5_GRANT_LIFETIME_MS: u64 = 30_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RecoveryActionRequest {
-    action_id: String,
-    life_id: String,
-    task_id: String,
-    capability_id: String,
-    workspace_root_identity: RecoveryJournalIdentity,
-    relative_path: WorkspaceRelativePath,
-    target_identity: RecoveryJournalIdentity,
-    transaction_id: RecoveryTransactionId,
-    journal_integrity_hash: String,
-    current_sha256: String,
-    current_bytes: usize,
-    restore_sha256: String,
-    restore_bytes: usize,
-    original_replacement_sha256: String,
-    authorization_revision: i64,
+    pub(crate) action_id: String,
+    pub(crate) life_id: String,
+    pub(crate) task_id: String,
+    pub(crate) capability_id: String,
+    pub(crate) workspace_root_identity: RecoveryJournalIdentity,
+    pub(crate) relative_path: WorkspaceRelativePath,
+    pub(crate) target_identity: RecoveryJournalIdentity,
+    pub(crate) transaction_id: RecoveryTransactionId,
+    pub(crate) journal_integrity_hash: String,
+    pub(crate) current_sha256: String,
+    pub(crate) current_bytes: usize,
+    pub(crate) restore_sha256: String,
+    pub(crate) restore_bytes: usize,
+    pub(crate) original_replacement_sha256: String,
+    pub(crate) authorization_revision: i64,
 }
 
 impl RecoveryActionRequest {
@@ -268,6 +275,17 @@ impl H5ExecutionOptions {
     }
 }
 
+#[cfg(not(test))]
+#[derive(Default)]
+struct H5ExecutionOptions;
+
+#[cfg(not(test))]
+impl H5ExecutionOptions {
+    fn from_test_environment() -> Self {
+        Self
+    }
+}
+
 #[cfg(test)]
 struct H5ExecutionLifetime {
     cancellation: Arc<AtomicBool>,
@@ -387,7 +405,9 @@ struct H5StartedFence<'a> {
     journal: &'a RecoveryJournalV1,
     host_fence: &'a mut dyn WorkspaceReplaceCommitFence,
     started_persistence: StartedPersistenceState,
+    #[cfg(test)]
     started_marker_fault: Option<RecoveryMarkerPersistenceTestFault>,
+    #[cfg(test)]
     abort_after_started_before_mutation: bool,
 }
 
@@ -404,15 +424,19 @@ impl WorkspaceReplaceCommitFence for H5StartedFence<'_> {
             return Err(WorkspaceReplaceFenceError::Error);
         }
         self.host_fence.check()?;
+        #[cfg(test)]
         let persisted = match self.started_marker_fault.take() {
             Some(fault) => self
                 .store
                 .persist_started_with_test_fault(self.journal, fault),
             None => self.store.persist_started(self.journal),
         };
+        #[cfg(not(test))]
+        let persisted = self.store.persist_started(self.journal);
         match persisted {
             Ok(_) => {
                 self.started_persistence = StartedPersistenceState::VerifiedDurable;
+                #[cfg(test)]
                 if self.abort_after_started_before_mutation {
                     std::process::abort();
                 }
@@ -439,21 +463,21 @@ impl RecoveryExecutionResult {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RecoveryConfirmationEvidence {
-    confirmation_id: String,
-    action: RecoveryActionRequest,
-    issued_at_unix_ms: u64,
-    expires_at_unix_ms: u64,
+    pub(crate) confirmation_id: String,
+    pub(crate) action: RecoveryActionRequest,
+    pub(crate) issued_at_unix_ms: u64,
+    pub(crate) expires_at_unix_ms: u64,
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct RecoveryGrantEvidence {
-    grant_id: String,
-    confirmation_id: String,
-    action: RecoveryActionRequest,
-    issued_at_unix_ms: u64,
-    expires_at_unix_ms: u64,
-    single_use: bool,
-    used: bool,
+    pub(crate) grant_id: String,
+    pub(crate) confirmation_id: String,
+    pub(crate) action: RecoveryActionRequest,
+    pub(crate) issued_at_unix_ms: u64,
+    pub(crate) expires_at_unix_ms: u64,
+    pub(crate) single_use: bool,
+    pub(crate) used: bool,
 }
 
 pub(crate) trait RecoveryAuthorityPort: Send + Sync {
@@ -630,6 +654,10 @@ impl H5RecoveryExecutor {
         self.cancelled.store(true, Ordering::Release);
     }
 
+    pub(crate) fn begin_turn(&self) {
+        self.cancelled.store(false, Ordering::Release);
+    }
+
     pub(crate) fn scan(&self) -> Result<RecoveryTransactionScan, RecoveryJournalError> {
         self.store.scan_transactions()
     }
@@ -696,7 +724,9 @@ impl H5RecoveryExecutor {
             );
         }
         let journal = snapshot.journal();
-        if scan.target_lifecycle_for_journal(journal) != RecoveryTargetLifecycle::RecoveryRequired {
+        if scan.target_lifecycle(&mutation_target_key(journal))
+            != RecoveryTargetLifecycle::RecoveryRequired
+        {
             return RecoveryExecutionResult::denied(RecoveryDenyReason::RecoveryBlocked, false);
         }
         if !action_binds_journal(&action, journal, self.root.identity()) {
@@ -795,7 +825,7 @@ impl H5RecoveryExecutor {
             sent: false,
             denial_reason: None,
         };
-        #[cfg(windows)]
+        #[cfg(all(windows, test))]
         let outcome = match fault {
             Some(fault) => prepared.recover_existing_file_raw_bounded_with_test_fault(
                 &action.current_sha256,
@@ -812,6 +842,17 @@ impl H5RecoveryExecutor {
                 &mut fence,
                 self.cancelled.as_ref(),
             ),
+        };
+        #[cfg(all(windows, not(test)))]
+        let outcome = {
+            let _ = fault;
+            prepared.recover_existing_file_raw_bounded(
+                &action.current_sha256,
+                action.current_bytes,
+                journal.before_content().as_bytes(),
+                &mut fence,
+                self.cancelled.as_ref(),
+            )
         };
         #[cfg(not(windows))]
         let outcome = {
@@ -1006,7 +1047,7 @@ fn reconcile_started_persistence_failure(
         .valid_transactions()
         .find(|snapshot| snapshot.journal().transaction_id() == journal.transaction_id())
         .map(RecoveryTransactionSnapshot::state);
-    let target_lifecycle = scan.target_lifecycle_for_journal(journal);
+    let target_lifecycle = scan.target_lifecycle(&mutation_target_key(journal));
 
     match (state, target_lifecycle) {
         (Some(RecoveryTransactionState::PreparedOnly), RecoveryTargetLifecycle::Clear) => {
@@ -1061,16 +1102,14 @@ pub(crate) async fn execute_governed_h5_replace(
     .await
 }
 
-/// Test/integration-only bridge for the real pinned Codex kernel.  It keeps
-/// the model-facing tool identity from H4, imports only an H4 executable
-/// grant, and then enters the one canonical H5 replace function.
-#[cfg(test)]
+/// Production bridge for the pinned Codex kernel.  It keeps the model-facing
+/// tool identity from H4, imports only an H4 executable grant, and then enters
+/// the one canonical H5 replace function.
 pub(crate) struct VitaWorkspaceReplaceH5ToolContributor {
     broker: Arc<VitaWorkspaceReplaceBroker>,
     store: RecoveryJournalStore,
 }
 
-#[cfg(test)]
 impl VitaWorkspaceReplaceH5ToolContributor {
     pub(crate) fn new(
         broker: Arc<VitaWorkspaceReplaceBroker>,
@@ -1080,7 +1119,6 @@ impl VitaWorkspaceReplaceH5ToolContributor {
     }
 }
 
-#[cfg(test)]
 impl ToolContributor for VitaWorkspaceReplaceH5ToolContributor {
     fn tools(
         &self,
@@ -1094,13 +1132,11 @@ impl ToolContributor for VitaWorkspaceReplaceH5ToolContributor {
     }
 }
 
-#[cfg(test)]
 struct VitaWorkspaceReplaceH5Tool {
     broker: Arc<VitaWorkspaceReplaceBroker>,
     store: RecoveryJournalStore,
 }
 
-#[cfg(test)]
 impl<'call> ToolExecutor<ToolCall<'call>> for VitaWorkspaceReplaceH5Tool {
     fn tool_name(&self) -> ToolName {
         ToolName::plain(VITA_WORKSPACE_REPLACE_TOOL_NAME)
@@ -1151,11 +1187,19 @@ impl<'call> ToolExecutor<ToolCall<'call>> for VitaWorkspaceReplaceH5Tool {
                 Ok(value) => value,
                 Err(classification) => {
                     return Ok(Box::new(JsonToolOutput::with_success(
-                        h5_denied_model_value(classification.as_str()),
+                        h5_denied_model_value_for_call(&call, classification.as_str()),
                         Some(false),
                     )) as Box<dyn ToolOutput>);
                 }
             };
+            let relative_path = grant
+                .relative_path()
+                .as_path()
+                .to_string_lossy()
+                .into_owned();
+            let expected_sha256 = grant.expected_sha256().to_string();
+            let replacement_sha256 = grant.replacement_sha256().to_string();
+            let replacement_bytes = grant.replacement_bytes();
             let result = execute_governed_h5_replace(
                 H5AuthorizedReplaceAction::from_h4_grant(grant),
                 replacement_content,
@@ -1164,54 +1208,293 @@ impl<'call> ToolExecutor<ToolCall<'call>> for VitaWorkspaceReplaceH5Tool {
             )
             .await;
             let value = match result {
-                Ok(result) => h5_model_value(result.transaction_outcome),
-                Err(_) => h5_denied_model_value("denied"),
+                Ok(result) => h5_model_value(result),
+                Err(error) if matches!(error, RecoveryJournalError::PreimageConflict) => {
+                    h5_conflict_model_value(
+                        &relative_path,
+                        &expected_sha256,
+                        &replacement_sha256,
+                        replacement_bytes,
+                    )
+                }
+                Err(_) => h5_denied_model_value_with_binding(
+                    "denied",
+                    &relative_path,
+                    &expected_sha256,
+                    &replacement_sha256,
+                    replacement_bytes,
+                ),
             };
             Ok(Box::new(JsonToolOutput::with_success(value, Some(false))) as Box<dyn ToolOutput>)
         })
     }
 }
 
-#[cfg(test)]
 fn h5_denied_model_value(reason: &str) -> Value {
     json!({
         "status": "denied",
+        "tool": VITA_WORKSPACE_REPLACE_TOOL_NAME,
         "reason": reason,
         "mutation_performed": false,
-        "side_effect_count": 0
+        "side_effect_count": 0,
+        "automatic_retry": false,
+        "recovery_required": false
     })
 }
 
-#[cfg(test)]
-fn h5_model_value(outcome: H5ReplaceTransactionOutcome) -> Value {
-    match outcome {
+fn h5_denied_model_value_with_binding(
+    reason: &str,
+    relative_path: &str,
+    expected_sha256: &str,
+    replacement_sha256: &str,
+    replacement_bytes: usize,
+) -> Value {
+    let mut value = h5_denied_model_value(reason);
+    if let Some(result) = value.as_object_mut() {
+        result.insert(
+            "relative_path".to_string(),
+            Value::String(relative_path.to_string()),
+        );
+        result.insert(
+            "expected_sha256".to_string(),
+            Value::String(expected_sha256.to_string()),
+        );
+        result.insert(
+            "replacement_sha256".to_string(),
+            Value::String(replacement_sha256.to_string()),
+        );
+        result.insert(
+            "replacement_bytes".to_string(),
+            Value::from(replacement_bytes as u64),
+        );
+    }
+    value
+}
+
+fn h5_denied_model_value_for_call(call: &ToolCall<'_>, reason: &str) -> Value {
+    let mut value = h5_denied_model_value(reason);
+    let Ok(arguments) = call.function_arguments() else {
+        return value;
+    };
+    let Ok(arguments) = serde_json::from_str::<Value>(arguments) else {
+        return value;
+    };
+    let Some(object) = arguments.as_object() else {
+        return value;
+    };
+    let Some(result) = value.as_object_mut() else {
+        return value;
+    };
+    if let Some(relative_path) = object
+        .get("relative_path")
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty() && path.len() <= 256 && !path.chars().any(char::is_control))
+    {
+        result.insert(
+            "relative_path".to_string(),
+            Value::String(relative_path.to_string()),
+        );
+    }
+    if let Some(expected_sha256) = object
+        .get("expected_sha256")
+        .and_then(Value::as_str)
+        .filter(|hash| {
+            hash.len() == 64
+                && hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        })
+    {
+        result.insert(
+            "expected_sha256".to_string(),
+            Value::String(expected_sha256.to_string()),
+        );
+    }
+    if let Some(replacement_content) = object
+        .get("replacement_content")
+        .and_then(Value::as_str)
+        .filter(|content| content.as_bytes().len() <= H4_MAX_REPLACEMENT_BYTES)
+    {
+        result.insert(
+            "replacement_sha256".to_string(),
+            Value::String(crate::sha256_hex(replacement_content.as_bytes())),
+        );
+        result.insert(
+            "replacement_bytes".to_string(),
+            Value::from(replacement_content.as_bytes().len() as u64),
+        );
+    }
+    value
+}
+
+fn h5_model_value(result: H5ReplaceExecutionResult) -> Value {
+    let journal = result.journal;
+    let relative_path = journal
+        .relative_path()
+        .as_path()
+        .to_string_lossy()
+        .into_owned();
+    let before_sha256 = journal.before_sha256();
+    let after_sha256 = journal.replacement_sha256();
+    let bytes_written = journal.replacement_bytes() as u64;
+    match result.transaction_outcome {
         H5ReplaceTransactionOutcome::Committed => json!({
             "status": "committed",
+            "tool": VITA_WORKSPACE_REPLACE_TOOL_NAME,
+            "relative_path": relative_path,
+            "before_sha256": before_sha256,
+            "after_sha256": after_sha256,
+            "bytes_written": bytes_written,
             "commit_outcome": "committed",
             "mutation_performed": true,
-            "side_effect_count": 1
+            "side_effect_count": 1,
+            "automatic_retry": false,
+            "recovery_required": false
         }),
-        H5ReplaceTransactionOutcome::Denied { .. } => h5_denied_model_value("denied"),
-        H5ReplaceTransactionOutcome::Conflict { .. } => json!({
-            "status": "conflict",
-            "commit_outcome": "conflict",
-            "mutation_performed": false,
-            "side_effect_count": 0
-        }),
+        H5ReplaceTransactionOutcome::Denied { .. } => h5_denied_model_value_with_binding(
+            "denied",
+            &relative_path,
+            &before_sha256,
+            &after_sha256,
+            bytes_written as usize,
+        ),
+        H5ReplaceTransactionOutcome::Conflict { .. } => h5_conflict_model_value(
+            &relative_path,
+            &before_sha256,
+            &after_sha256,
+            bytes_written as usize,
+        ),
         H5ReplaceTransactionOutcome::CommitUnknown { .. } => json!({
             "status": "commit_outcome_unknown",
+            "tool": VITA_WORKSPACE_REPLACE_TOOL_NAME,
+            "relative_path": relative_path,
+            "before_sha256": before_sha256,
+            "after_sha256": after_sha256,
+            "bytes_written": bytes_written,
             "commit_outcome": "unknown",
             "mutation_performed": true,
-            "side_effect_count": 1
+            "side_effect_count": 1,
+            "automatic_retry": false,
+            "recovery_required": true
         }),
         H5ReplaceTransactionOutcome::LifecycleUnknown {
             workspace_mutation_started,
         } => json!({
             "status": if workspace_mutation_started { "recovery_required" } else { "denied" },
+            "tool": VITA_WORKSPACE_REPLACE_TOOL_NAME,
+            "relative_path": relative_path,
+            "before_sha256": before_sha256,
+            "after_sha256": after_sha256,
+            "bytes_written": if workspace_mutation_started { bytes_written } else { 0 },
             "mutation_performed": workspace_mutation_started,
-            "side_effect_count": if workspace_mutation_started { 1 } else { 0 }
+            "side_effect_count": if workspace_mutation_started { 1 } else { 0 },
+            "automatic_retry": false,
+            "recovery_required": workspace_mutation_started
         }),
     }
+}
+
+fn h5_conflict_model_value(
+    relative_path: &str,
+    expected_sha256: &str,
+    replacement_sha256: &str,
+    replacement_bytes: usize,
+) -> Value {
+    json!({
+        "status": "conflict",
+        "tool": VITA_WORKSPACE_REPLACE_TOOL_NAME,
+        "relative_path": relative_path,
+        "expected_sha256": expected_sha256,
+        "replacement_sha256": replacement_sha256,
+        "replacement_bytes": replacement_bytes,
+        "commit_outcome": "conflict",
+        "mutation_performed": false,
+        "side_effect_count": 0,
+        "automatic_retry": false,
+        "recovery_required": false
+    })
+}
+
+#[cfg(not(test))]
+async fn execute_governed_h5_replace_with_options(
+    authorized_action: H5AuthorizedReplaceAction,
+    replacement_content: String,
+    store: RecoveryJournalStore,
+    cancellation: Arc<AtomicBool>,
+    _options: H5ExecutionOptions,
+    _lifecycle: Option<()>,
+) -> Result<H5ReplaceExecutionResult, RecoveryJournalError> {
+    let H5AuthorizedReplaceAction { h4_grant } = authorized_action;
+    let root = h4_grant.root().clone();
+    let target = h4_grant
+        .prepare_bound_target()
+        .map_err(|_| RecoveryJournalError::TargetBindingMismatch("H4 target binding rejected"))?;
+    let target_key = mutation_target_key_for_prepared_target(&target)?;
+    let admission_guard = H5TargetAdmissionGuard::try_acquire(target_key.clone()).ok_or(
+        RecoveryJournalError::TransactionBlocked(
+            RecoveryTransactionBlockReason::ConcurrentAdmission,
+        ),
+    )?;
+    let scan = store.scan_transactions()?;
+    match scan.target_lifecycle(&target_key) {
+        RecoveryTargetLifecycle::Clear => {}
+        RecoveryTargetLifecycle::RecoveryRequired => {
+            return Err(RecoveryJournalError::TransactionBlocked(
+                RecoveryTransactionBlockReason::RecoveryRequired,
+            ))
+        }
+        RecoveryTargetLifecycle::Ambiguous => {
+            return Err(RecoveryJournalError::TransactionBlocked(
+                RecoveryTransactionBlockReason::AmbiguousTarget,
+            ))
+        }
+        RecoveryTargetLifecycle::Poisoned => {
+            return Err(RecoveryJournalError::TransactionBlocked(
+                RecoveryTransactionBlockReason::PoisonedTarget,
+            ))
+        }
+    }
+    let expected_sha256 = h4_grant.expected_sha256().to_string();
+    if sha256_hex(replacement_content.as_bytes()) != h4_grant.replacement_sha256()
+        || replacement_content.as_bytes().len() != h4_grant.replacement_bytes()
+    {
+        return Err(RecoveryJournalError::TargetBindingMismatch(
+            "replacement content does not match the H4 executable grant",
+        ));
+    }
+    let context = RecoveryJournalContext::new(
+        h4_grant.life_id(),
+        h4_grant.task_id(),
+        h4_grant.capability_id(),
+        h4_grant.replacement_sha256(),
+        h4_grant.replacement_bytes(),
+        h4_grant.tool_call_id(),
+        h4_grant.turn_id(),
+    )?;
+    let (requests, mut receiver) = tokio::sync::mpsc::channel(1);
+    let (mut final_fence, final_service) =
+        h4_grant.into_bounded_final_fence(requests, Arc::clone(&cancellation));
+    let native_cancellation = Arc::clone(&cancellation);
+    let native = tokio::task::spawn_blocking(move || {
+        let _admission_guard = admission_guard;
+        execute_h5b_replace_after_host_pass_internal(
+            &store,
+            &root,
+            target,
+            context,
+            &expected_sha256,
+            &replacement_content,
+            native_cancellation.as_ref(),
+            &mut final_fence,
+            false,
+            None,
+            None,
+        )
+    });
+    let _ = final_service.service(&mut receiver).await;
+    native.await.map_err(|_| {
+        RecoveryJournalError::TargetBindingMismatch("H5 native worker did not return")
+    })?
 }
 
 #[cfg(test)]
@@ -1446,10 +1729,12 @@ fn execute_h5b_replace_after_host_pass_internal(
         journal: &journal,
         host_fence: fence,
         started_persistence: StartedPersistenceState::NotAttempted,
+        #[cfg(test)]
         started_marker_fault,
+        #[cfg(test)]
         abort_after_started_before_mutation: false,
     };
-    #[cfg(windows)]
+    #[cfg(all(windows, test))]
     let outcome = match native_fault {
         Some(fault) => target.replace_existing_file_utf8_bounded_with_test_fault(
             expected_sha256,
@@ -1465,9 +1750,19 @@ fn execute_h5b_replace_after_host_pass_internal(
             cancellation,
         ),
     };
+    #[cfg(all(windows, not(test)))]
+    let outcome = {
+        let _ = (native_fault, started_marker_fault);
+        target.replace_existing_file_utf8_bounded_with_cancellation(
+            expected_sha256,
+            replacement,
+            &mut started_fence,
+            cancellation,
+        )
+    };
     #[cfg(not(windows))]
     let outcome = {
-        let _ = native_fault;
+        let _ = (native_fault, started_marker_fault);
         target.replace_existing_file_utf8_bounded_with_cancellation(
             expected_sha256,
             replacement,
@@ -2065,7 +2360,7 @@ pub(crate) mod tests {
             if response.operation != "initialize"
                 || response.status != "ok"
                 || response.authorization_revision != Some(2)
-                || response.production_registry_size != Some(1)
+                || response.production_registry_size != Some(4)
                 || response.test_registry_size != Some(1)
                 || response.same_sqlite_row != Some(true)
                 || response.trusted_confirmation.is_some()
@@ -2390,7 +2685,7 @@ pub(crate) mod tests {
             if response.operation != "issue_recovery_grant"
                 || response.status != "ok"
                 || response.authorization_revision != Some(request.authorization_revision())
-                || response.production_registry_size != Some(1)
+                || response.production_registry_size != Some(4)
                 || response.test_registry_size != Some(1)
                 || response.confirmation_consumed != Some(true)
                 || response.denial.is_some()
@@ -4827,8 +5122,25 @@ pub(crate) mod tests {
         }
     }
 
+    /// D31-C freeze-gate wrapper for the process-isolated H5 crash/recovery
+    /// path.  The harness is deliberately subprocess based: the child exits
+    /// at each durable crash point, the parent performs a read-only restart
+    /// scan, and recovery is attempted only after fresh explicit authority.
     #[test]
-    fn production_registry_and_h5_namespace_are_test_only() {
+    fn d31_c_real_process_crash_recovery_canary() {
+        if std::env::var("D31_C_REQUIRE_REAL_CANARY").as_deref() != Ok("1") {
+            eprintln!(
+                "skipping D31-C crash/recovery process canary; set D31_C_REQUIRE_REAL_CANARY=1 for the freeze gate"
+            );
+            return;
+        }
+        for scenario in [3_u8, 4, 5, 8] {
+            run_crash_case(scenario);
+        }
+    }
+
+    #[test]
+    fn production_registry_and_h5_namespace_are_d31c_scoped() {
         let source = fs::read_to_string(
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
@@ -4837,7 +5149,14 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert!(source.contains("PRODUCTION_GIT_STATUS_CAPABILITY_ID"));
-        assert!(!source.contains("vita.workspace.recover_replace"));
+        assert!(source.contains("PRODUCTION_WORKSPACE_REPLACE_CAPABILITY_ID"));
+        assert!(source.contains("PRODUCTION_WORKSPACE_RECOVER_CAPABILITY_ID"));
+        assert!(source.contains("with_host_only_mutating_route"));
+        assert!(source.contains("vita.workspace.recover_replace"));
+        assert_eq!(
+            crate::VITA_WORKSPACE_REPLACE_TOOL_NAME,
+            "vita_workspace_replace_file"
+        );
         assert_eq!(H5_DESCRIPTOR_RISK_CLASS, "High");
         assert_eq!(H5_DESCRIPTOR_APPROVAL_FLOOR, "ExplicitPerAction");
         assert_eq!(H5_DESCRIPTOR_SCOPE_REQUIREMENT, "WorkspaceRequired");

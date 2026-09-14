@@ -579,7 +579,6 @@ pub(crate) enum WorkspaceRecoveryCommitOutcome {
     },
 }
 
-#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WorkspaceReplaceTestFault {
     AfterFirstWrite,

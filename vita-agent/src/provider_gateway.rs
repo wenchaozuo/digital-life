@@ -17,6 +17,7 @@ use url::{Host, Url};
 use vita_agent_protocol::TOOL_NAME;
 
 use crate::d29h3::VITA_WORKSPACE_READ_TOOL_NAME;
+use crate::d29h4::VITA_WORKSPACE_REPLACE_TOOL_NAME;
 use zeroize::Zeroizing;
 
 use super::{VitaAgentError, VITA_AGENT_RUNTIME_ID, VITA_GATEWAY_PROVIDER_ID};
@@ -1683,7 +1684,9 @@ fn parse_chat_tool_calls_with_tools(
 }
 
 fn is_vita_tool_name(name: &str) -> bool {
-    name == TOOL_NAME || name == VITA_WORKSPACE_READ_TOOL_NAME
+    name == TOOL_NAME
+        || name == VITA_WORKSPACE_READ_TOOL_NAME
+        || name == VITA_WORKSPACE_REPLACE_TOOL_NAME
 }
 
 fn bounded_tool_string(

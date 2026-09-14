@@ -4580,11 +4580,10 @@ fn validate_h7_canonical(
     } else {
         "CAPABILITY_CONFIRMATION_REQUIRED"
     };
-    // D31-B's closed production catalog contains the frozen H7 Git-status
-    // route plus the bounded workspace-read route.  The fixture must validate
-    // that current catalog shape rather than the pre-D31-B singleton.
+    // D31-C's closed production catalog contains the frozen H7 Git-status and
+    // bounded workspace-read routes plus the exact replace/recovery entries.
     if canonical.canonical_evaluations != 1
-        || canonical.production_registry_size != 2
+        || canonical.production_registry_size != 4
         || canonical.test_registry_size != 1
         || canonical.authorization_row_reads != 1
         || canonical.life_id != binding.life_id

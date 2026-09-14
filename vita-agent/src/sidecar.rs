@@ -49,13 +49,15 @@ use crate::{
     VitaGitStatusAuthority, VitaGitStatusPendingConfirmation, VitaGitStatusProduction,
     VitaGitStatusToolContributor, VitaH3AuthorityError, VitaH3AuthorityFuture, VitaH3AuthorityPort,
     VitaH3DisclosureFuture, VitaH4AuthorityError, VitaH4AuthorityFuture, VitaH4AuthorityPort,
-    VitaWorkspaceReadBroker, VitaWorkspaceReadToolContributor, VitaWorkspaceReplaceBroker,
-    VitaWorkspaceReplaceH5ToolContributor, H5_RECOVER_REPLACE_CAPABILITY_ID,
-    VITA_WORKSPACE_GIT_STATUS_CAPABILITY_ID, VITA_WORKSPACE_GIT_STATUS_PROFILE_ID,
-    VITA_WORKSPACE_GIT_STATUS_TOOL_NAME, VITA_WORKSPACE_READ_CAPABILITY_ID,
-    VITA_WORKSPACE_READ_TOOL_NAME, VITA_WORKSPACE_REPLACE_CAPABILITY_ID,
-    VITA_WORKSPACE_REPLACE_TOOL_NAME,
+    VitaWorkspacePatchToolContributor, VitaWorkspaceReadBroker, VitaWorkspaceReadToolContributor,
+    VitaWorkspaceReplaceBroker, VitaWorkspaceReplaceH5ToolContributor,
+    H5_RECOVER_REPLACE_CAPABILITY_ID, VITA_WORKSPACE_GIT_STATUS_CAPABILITY_ID,
+    VITA_WORKSPACE_GIT_STATUS_PROFILE_ID, VITA_WORKSPACE_GIT_STATUS_TOOL_NAME,
+    VITA_WORKSPACE_READ_CAPABILITY_ID, VITA_WORKSPACE_READ_TOOL_NAME,
+    VITA_WORKSPACE_REPLACE_CAPABILITY_ID, VITA_WORKSPACE_REPLACE_TOOL_NAME,
 };
+
+use crate::VITA_WORKSPACE_PATCH_TOOL_NAME;
 
 const LOCAL_GATEWAY_HEADER_LIMIT: usize = 64 * 1024;
 const LOCAL_GATEWAY_BODY_LIMIT: usize = MAX_FRAME_BYTES;
@@ -299,6 +301,9 @@ struct H9CanaryTransport {
     negative_read_mode: bool,
     replace_mode: bool,
     negative_replace_mode: bool,
+    patch_mode: bool,
+    negative_patch_mode: bool,
+    patch_conflict_mode: bool,
     response_model: String,
 }
 
@@ -319,6 +324,9 @@ impl H9CanaryTransport {
         negative_read_mode: bool,
         replace_mode: bool,
         negative_replace_mode: bool,
+        patch_mode: bool,
+        negative_patch_mode: bool,
+        patch_conflict_mode: bool,
         response_model: impl Into<String>,
     ) -> Self {
         Self {
@@ -328,6 +336,9 @@ impl H9CanaryTransport {
             negative_read_mode,
             replace_mode,
             negative_replace_mode,
+            patch_mode,
+            negative_patch_mode,
+            patch_conflict_mode,
             response_model: response_model.into(),
         }
     }
@@ -388,19 +399,12 @@ impl crate::provider_gateway::ProviderRequestTransport for H9CanaryTransport {
                     })
                     .collect::<Vec<_>>();
                 names.sort_unstable();
-                let expected_names = if self.read_mode {
-                    vec![
-                        VITA_WORKSPACE_GIT_STATUS_TOOL_NAME,
-                        VITA_WORKSPACE_READ_TOOL_NAME,
-                        VITA_WORKSPACE_REPLACE_TOOL_NAME,
-                    ]
-                } else {
-                    vec![
-                        VITA_WORKSPACE_GIT_STATUS_TOOL_NAME,
-                        VITA_WORKSPACE_READ_TOOL_NAME,
-                        VITA_WORKSPACE_REPLACE_TOOL_NAME,
-                    ]
-                };
+                let expected_names = vec![
+                    VITA_WORKSPACE_GIT_STATUS_TOOL_NAME,
+                    VITA_WORKSPACE_PATCH_TOOL_NAME,
+                    VITA_WORKSPACE_READ_TOOL_NAME,
+                    VITA_WORKSPACE_REPLACE_TOOL_NAME,
+                ];
                 if names != expected_names {
                     return Err(crate::VitaAgentError::GatewayProtocol(
                         "H9 canary first request advertised an unexpected tool set".to_string(),
@@ -424,7 +428,24 @@ impl crate::provider_gateway::ProviderRequestTransport for H9CanaryTransport {
                         "H9 canary native tool output was not JSON".to_string(),
                     )
                 })?;
-                let valid = if self.replace_mode {
+                let valid = if self.patch_mode {
+                    let mutation = result.get("mutation_performed").and_then(Value::as_bool);
+                    let side_effects = result.get("side_effect_count").and_then(Value::as_u64);
+                    if self.patch_conflict_mode {
+                        result.get("status").and_then(Value::as_str) == Some("conflict")
+                            && result.get("reason").and_then(Value::as_str) == Some("base_changed")
+                            && mutation == Some(false)
+                            && side_effects == Some(0)
+                    } else if self.negative_patch_mode {
+                        result.get("status").and_then(Value::as_str) == Some("denied")
+                            && mutation == Some(false)
+                            && side_effects == Some(0)
+                    } else {
+                        result.get("status").and_then(Value::as_str) == Some("patch_applied")
+                            && mutation == Some(true)
+                            && side_effects == Some(1)
+                    }
+                } else if self.replace_mode {
                     let relative_path = result.get("relative_path").and_then(Value::as_str);
                     let replacement_hash = crate::sha256_hex(D31_C_REPLACEMENT_CONTENT.as_bytes());
                     let original_hash = crate::sha256_hex(D31_C_CANARY_CONTENT.as_bytes());
@@ -512,7 +533,9 @@ impl crate::provider_gateway::ProviderRequestTransport for H9CanaryTransport {
                 };
                 if !valid || output.contains(&self.expected_workspace_path) {
                     return Err(crate::VitaAgentError::GatewayProtocol(
-                        if self.read_mode {
+                        if self.patch_mode {
+                            "D31-D canary second request did not contain exact bounded patch result"
+                        } else if self.read_mode {
                             "D31-B canary second request did not contain exact bounded read result"
                         } else if self.replace_mode {
                             "D31-C canary second request did not contain exact governed replace result"
@@ -542,14 +565,30 @@ impl crate::provider_gateway::ProviderRequestTransport for H9CanaryTransport {
                             "id": "h9-canary-call-1",
                             "type": "function",
                             "function": {
-                                "name": if self.replace_mode {
+                                "name": if self.patch_mode {
+                                    VITA_WORKSPACE_PATCH_TOOL_NAME
+                                } else if self.replace_mode {
                                     VITA_WORKSPACE_REPLACE_TOOL_NAME
                                 } else if self.read_mode {
                                     VITA_WORKSPACE_READ_TOOL_NAME
                                 } else {
                                     VITA_WORKSPACE_GIT_STATUS_TOOL_NAME
                                 },
-                                "arguments": if self.replace_mode {
+                                "arguments": if self.patch_mode {
+                                    let expected_sha256 = if self.patch_conflict_mode {
+                                        crate::sha256_hex(b"D31-D wrong base\n")
+                                    } else {
+                                        crate::sha256_hex(D31_C_CANARY_CONTENT.as_bytes())
+                                    };
+                                    serde_json::to_string(&serde_json::json!({
+                                        "relative_path": "canary.txt",
+                                        "expected_sha256": expected_sha256,
+                                        "edits": [{
+                                            "search": D31_C_CANARY_CONTENT,
+                                            "replace": D31_C_REPLACEMENT_CONTENT,
+                                        }],
+                                    })).expect("D31-D canary patch arguments")
+                                } else if self.replace_mode {
                                     serde_json::to_string(&serde_json::json!({
                                         "relative_path": "canary.txt",
                                         "expected_sha256": crate::sha256_hex(D31_C_CANARY_CONTENT.as_bytes()),
@@ -1140,6 +1179,7 @@ fn parse_gateway_responses_request(
                 if name != TOOL_NAME
                     && name != VITA_WORKSPACE_READ_TOOL_NAME
                     && name != VITA_WORKSPACE_REPLACE_TOOL_NAME
+                    && name != VITA_WORKSPACE_PATCH_TOOL_NAME
                 {
                     return Err("unknown tool call".to_string());
                 }
@@ -1199,6 +1239,7 @@ fn parse_gateway_responses_request(
             if name != TOOL_NAME
                 && name != VITA_WORKSPACE_READ_TOOL_NAME
                 && name != VITA_WORKSPACE_REPLACE_TOOL_NAME
+                && name != VITA_WORKSPACE_PATCH_TOOL_NAME
             {
                 return Err("unknown advertised tool".to_string());
             }
@@ -1620,6 +1661,7 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
     // as H5, but is independently driven by a Host command and never by a
     // Codex turn.
     let recovery_root = workspace.clone();
+    let patch_context = context.clone();
     let production = Arc::new(
         VitaGitStatusProduction::new(
             context,
@@ -1634,6 +1676,12 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
         read: VitaWorkspaceReadToolContributor::new(Arc::clone(&read_broker)),
         replace: VitaWorkspaceReplaceH5ToolContributor::new(
             Arc::clone(&replace_broker),
+            recovery_store.clone(),
+        ),
+        patch: VitaWorkspacePatchToolContributor::new(
+            Arc::clone(&replace_broker),
+            recovery_root.clone(),
+            patch_context,
             recovery_store.clone(),
         ),
     };
@@ -1727,12 +1775,21 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
                     let negative_read_mode = provider_config.model == "d31-b-negative-canary-model";
                     let negative_replace_mode =
                         provider_config.model == "d31-c-negative-canary-model";
+                    let negative_patch_mode =
+                        provider_config.model == "d31-d-negative-canary-model";
+                    let patch_conflict_mode =
+                        provider_config.model == "d31-d-conflict-canary-model";
                     SidecarGatewayTransport::H9Canary(Arc::new(H9CanaryTransport::new(
                         &init.workspace_path,
                         provider_config.model == "d31-b-canary-model" || negative_read_mode,
                         negative_read_mode,
                         provider_config.model == "d31-c-canary-model" || negative_replace_mode,
                         negative_replace_mode,
+                        provider_config.model == "d31-d-canary-model"
+                            || negative_patch_mode
+                            || patch_conflict_mode,
+                        negative_patch_mode,
+                        patch_conflict_mode,
                         provider_config.model.clone(),
                     )))
                 }
@@ -3522,13 +3579,14 @@ impl RecoveryAuthorityPort for SidecarRecoveryAuthority {
     }
 }
 
-/// The production Codex extension registry is closed over these three exact
+/// The production Codex extension registry is closed over these four exact
 /// contributors.  Keeping the composition in one concrete contributor means
 /// the pinned runtime never receives a generic plugin or filesystem surface.
 struct VitaProductionContributors {
     git: VitaGitStatusToolContributor,
     read: VitaWorkspaceReadToolContributor,
     replace: VitaWorkspaceReplaceH5ToolContributor,
+    patch: VitaWorkspacePatchToolContributor,
 }
 
 impl ToolContributor for VitaProductionContributors {
@@ -3542,6 +3600,7 @@ impl ToolContributor for VitaProductionContributors {
         let mut tools = self.git.tools(session_store, thread_store);
         tools.extend(self.read.tools(session_store, thread_store));
         tools.extend(self.replace.tools(session_store, thread_store));
+        tools.extend(self.patch.tools(session_store, thread_store));
         tools
     }
 }

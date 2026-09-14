@@ -11121,7 +11121,11 @@ mod windows {
 
         #[test]
         fn d31_c_real_process_workspace_replace_canary() {
-            run_d31_c_real_process_workspace_replace_canary(false, d31_c_require_real_canary());
+            run_d31_c_real_process_workspace_replace_canary(
+                D31WorkspaceCanaryMode::Replace,
+                false,
+                d31_c_require_real_canary(),
+            );
         }
 
         #[test]
@@ -11132,17 +11136,71 @@ mod windows {
                 );
                 return;
             }
-            run_d31_c_real_process_workspace_replace_canary(true, true);
+            run_d31_c_real_process_workspace_replace_canary(
+                D31WorkspaceCanaryMode::Replace,
+                true,
+                true,
+            );
+        }
+
+        #[test]
+        fn d31_d_real_process_workspace_patch_canary() {
+            run_d31_c_real_process_workspace_replace_canary(
+                D31WorkspaceCanaryMode::Patch,
+                false,
+                d31_d_require_real_canary(),
+            );
+        }
+
+        #[test]
+        fn d31_d_real_process_workspace_patch_conflict_canary() {
+            run_d31_c_real_process_workspace_replace_canary(
+                D31WorkspaceCanaryMode::PatchConflict,
+                false,
+                d31_d_require_real_canary(),
+            );
+        }
+
+        #[test]
+        fn d31_d_real_process_workspace_patch_revocation_canary() {
+            if !d31_d_require_real_canary() {
+                eprintln!(
+                    "skipping D31-D patch revocation canary; set D31_D_REQUIRE_REAL_CANARY=1 for the freeze gate"
+                );
+                return;
+            }
+            run_d31_c_real_process_workspace_replace_canary(
+                D31WorkspaceCanaryMode::Patch,
+                true,
+                true,
+            );
         }
 
         fn d31_c_require_real_canary() -> bool {
             std::env::var("D31_C_REQUIRE_REAL_CANARY").as_deref() == Ok("1")
         }
 
+        fn d31_d_require_real_canary() -> bool {
+            std::env::var("D31_D_REQUIRE_REAL_CANARY").as_deref() == Ok("1")
+        }
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum D31WorkspaceCanaryMode {
+            Replace,
+            Patch,
+            PatchConflict,
+        }
+
         fn run_d31_c_real_process_workspace_replace_canary(
+            mode: D31WorkspaceCanaryMode,
             revoke_before_revalidation: bool,
             require_real_canary: bool,
         ) {
+            let is_patch = matches!(
+                mode,
+                D31WorkspaceCanaryMode::Patch | D31WorkspaceCanaryMode::PatchConflict
+            );
+            let is_patch_conflict = matches!(mode, D31WorkspaceCanaryMode::PatchConflict);
             let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../vita-agent/target/release/vita-agent.exe");
             if !executable.is_file() {
@@ -11244,7 +11302,15 @@ mod windows {
                 purpose: "chat".to_string(),
                 provider_kind: "openai_compatible".to_string(),
                 base_url: "http://127.0.0.1:9/v1".to_string(),
-                model: if revoke_before_revalidation {
+                model: if is_patch {
+                    if is_patch_conflict {
+                        "d31-d-conflict-canary-model".to_string()
+                    } else if revoke_before_revalidation {
+                        "d31-d-negative-canary-model".to_string()
+                    } else {
+                        "d31-d-canary-model".to_string()
+                    }
+                } else if revoke_before_revalidation {
                     "d31-c-negative-canary-model".to_string()
                 } else {
                     "d31-c-canary-model".to_string()
@@ -11401,8 +11467,12 @@ mod windows {
                     request_id: "d31-c-canary-start-turn".to_string(),
                     session_id: session_id.clone(),
                     turn_id: host_turn_id.clone(),
-                    prompt: "Replace canary.txt through the governed workspace-replace tool."
-                        .to_string(),
+                    prompt: if is_patch {
+                        "Patch canary.txt through the bounded exact-literal patch tool."
+                    } else {
+                        "Replace canary.txt through the governed workspace-replace tool."
+                    }
+                    .to_string(),
                     binding: provider_binding,
                 }))
                 .expect("D31-C canary start turn");
@@ -11511,18 +11581,22 @@ mod windows {
                 }
             }
             assert!(completed, "D31-C canary did not complete a real turn");
-            assert!(
-                authority_evaluate_seen,
-                "D31-C canary missed authority evaluation"
-            );
-            assert!(
-                confirmation_seen,
-                "D31-C canary missed explicit confirmation"
-            );
-            assert!(grant_issue_seen, "D31-C canary missed Host grant issue");
-            assert!(revalidation_seen, "D31-C canary missed Host revalidation");
+            if is_patch_conflict {
+                assert!(!authority_evaluate_seen, "D31-D conflict must not reach authority");
+                assert!(!confirmation_seen, "D31-D conflict must not request confirmation");
+                assert!(!grant_issue_seen, "D31-D conflict must not issue a grant");
+                assert!(!revalidation_seen, "D31-D conflict must not revalidate a grant");
+            } else {
+                assert!(
+                    authority_evaluate_seen,
+                    "D31 canary missed authority evaluation"
+                );
+                assert!(confirmation_seen, "D31 canary missed explicit confirmation");
+                assert!(grant_issue_seen, "D31 canary missed Host grant issue");
+                assert!(revalidation_seen, "D31 canary missed Host revalidation");
+            }
             let final_content = fs::read(&canary_file).expect("D31-C canary final file");
-            if revoke_before_revalidation {
+            if revoke_before_revalidation || is_patch_conflict {
                 assert_eq!(final_content, canary_content);
             } else {
                 assert_eq!(final_content, replacement_content);

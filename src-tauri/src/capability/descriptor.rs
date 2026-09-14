@@ -487,6 +487,11 @@ mod tests {
             Some(PRODUCTION_WORKSPACE_READ_TOOL_NAME)
         );
         assert!(read_descriptor.is_read_only());
+        let patch_facade = CapabilityId::try_from("vita.workspace.patch_file").unwrap();
+        assert!(
+            registry.descriptor(&patch_facade).is_none(),
+            "the exact-literal patch façade must reuse replace authority"
+        );
         for excluded in [
             "vita.process.run",
             "vita.process.workspace.run",

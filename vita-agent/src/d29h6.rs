@@ -1,23 +1,37 @@
-//! D29-H6's bounded exact-literal patch frontend.
+//! D31-D's bounded exact-literal patch compiler.
 //!
-//! This module is test/integration-only.  It compiles a model-facing patch
-//! request into one opaque replacement proof and then delegates the side
-//! effect to the already-frozen H4/H5 replace path.  It intentionally adds no
-//! production capability, registry entry, or native mutation primitive.
+//! The compiler is a model-facing façade over the frozen D31-C whole-file
+//! replacement path. It derives one opaque replacement proof from a bounded
+//! UTF-8 preimage, then delegates every authority and filesystem side effect
+//! to H4/H5. It adds no capability descriptor and no native mutation path.
 
 #![allow(dead_code, private_interfaces)]
 
+use std::path::Path;
+use std::sync::Arc;
+
+#[cfg(test)]
 use std::collections::BTreeSet;
+#[cfg(test)]
 use std::fs;
+#[cfg(test)]
 use std::io::{Read, Write};
+#[cfg(test)]
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::PathBuf;
+#[cfg(test)]
 use std::process::Command;
+#[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+#[cfg(test)]
+use std::sync::{Condvar, Mutex};
+#[cfg(test)]
 use std::thread::{self, JoinHandle};
+#[cfg(test)]
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
 use codex_core_api::{
     CodexAppsToolsCache, CodexAuth, EnvironmentManager, EventMsg, Op, SessionSource,
     StartThreadOptions, ThreadId, ThreadManager, TurnInputRequest, TurnInputSubmission, UserInput,
@@ -28,26 +42,36 @@ use codex_extension_api::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+#[cfg(test)]
 use tempfile::tempdir;
 
+#[cfg(test)]
 use crate::d29h4::tests::ProcessIsolatedH4Authority;
-use crate::d29h4::{
-    H4AuthorityRequest, H4DenyClassification, VitaH4AuthorityPort, VitaWorkspaceReplaceBroker,
-};
+use crate::d29h4::VitaWorkspaceReplaceBroker;
+#[cfg(test)]
+use crate::d29h4::{H4AuthorityRequest, H4DenyClassification, VitaH4AuthorityPort};
+#[cfg(test)]
 use crate::d29h5::tests::ProcessIsolatedH5RecoveryAuthority;
 use crate::d29h5::{
-    execute_governed_h5_replace, H5AuthorizedReplaceAction, H5RecoveryExecutor,
-    H5ReplaceTransactionOutcome, RecoveryActionRequest, RecoveryAuthorityPort,
-    RecoveryExecutionOutcome,
+    execute_governed_h5_replace, H5AuthorizedReplaceAction, H5ReplaceTransactionOutcome,
 };
+#[cfg(test)]
+use crate::d29h5::{
+    H5RecoveryExecutor, RecoveryActionRequest, RecoveryAuthorityPort, RecoveryExecutionOutcome,
+};
+#[cfg(test)]
 use crate::provider_gateway::{VitaGatewayBinding, VitaProviderAuthority};
-use crate::recovery_journal::{RecoveryJournalStore, RecoveryTransactionState};
+use crate::recovery_journal::RecoveryJournalStore;
+#[cfg(test)]
+use crate::recovery_journal::RecoveryTransactionState;
 use crate::workspace_capability::{
     PreparedWorkspaceTargetKind, WorkspaceReadError, WorkspaceRelativePath, WorkspaceRootIdentity,
 };
+use crate::{sha256_hex, TrustedWorkspaceRoot, VitaExecutionContext};
+#[cfg(test)]
 use crate::{
-    sha256_hex, ProviderCapabilities, ProviderProfile, ProviderProtocol, ProviderRetryPolicy,
-    TrustedWorkspaceRoot, VitaAgentEntrypoint, VitaAgentRuntimeProfile, VitaExecutionContext,
+    ProviderCapabilities, ProviderProfile, ProviderProtocol, ProviderRetryPolicy,
+    VitaAgentEntrypoint, VitaAgentRuntimeProfile,
 };
 
 pub(crate) const VITA_WORKSPACE_PATCH_TOOL_NAME: &str = "vita_workspace_patch_file";
@@ -56,25 +80,42 @@ const H6_MAX_EDITS: usize = 16;
 const H6_MAX_EDIT_TEXT_BYTES: usize = 64 * 1024;
 const H6_MAX_RESULT_BYTES: usize = 64 * 1024;
 const H6_MAX_ID_CHARS: usize = 128;
+#[cfg(test)]
 const H6_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(2);
 
 // The frozen process-isolated H4 harness owns this test identity pair.  H6
 // deliberately binds to it when composing the existing H4/H5 proof path.
+#[cfg(test)]
 const LIFE_ID: &str = "life-d29h4-a";
+#[cfg(test)]
 const TASK_ID: &str = "task-d29h4-a";
+#[cfg(test)]
 const MODEL: &str = "d29h6-local-responses-model";
+#[cfg(test)]
 const PROVIDER_ID: &str = "d29h6-loopback-responses";
+#[cfg(test)]
 const RELATIVE_PATH: &str = "patch-me.txt";
+#[cfg(test)]
 const CALL_ID: &str = "call-d29h6-patch";
+#[cfg(test)]
 const PROMPT: &str = "Apply the exact bounded workspace patch.";
+#[cfg(test)]
 const REPLY: &str = "D29-H6 patch applied";
+#[cfg(test)]
 const ORIGINAL: &str = "first=old-first\nsecond=old-second\n";
+#[cfg(test)]
 const CRASH_ORIGINAL: &str = "A界B";
+#[cfg(test)]
 const CRASH_REPLACEMENT: &str = "XY";
+#[cfg(test)]
 const TURN_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
 const HTTP_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(test)]
 const HTTP_MAX_BODY: usize = 2 * 1024 * 1024;
+#[cfg(test)]
 const TEST_STACK_SIZE: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -348,7 +389,16 @@ fn compile_patch(
     context: &VitaExecutionContext,
     root: &TrustedWorkspaceRoot,
 ) -> Result<H6CompileOutcome, H6PatchConflict> {
-    if request.edits.is_empty()
+    if request
+        .relative_path
+        .as_path()
+        .to_string_lossy()
+        .chars()
+        .count()
+        > H6_MAX_PATH_CHARS
+        || bounded_identifier(&request.tool_call_id, H6_MAX_ID_CHARS).is_none()
+        || bounded_identifier(&request.turn_id, H6_MAX_ID_CHARS).is_none()
+        || request.edits.is_empty()
         || request.edits.len() > H6_MAX_EDITS
         || !is_lower_sha256(&request.expected_sha256)
     {
@@ -446,12 +496,18 @@ fn is_lower_sha256(value: &str) -> bool {
 }
 
 fn bounded_identifier(value: &str, max_chars: usize) -> Option<String> {
-    (!value.is_empty() && value.chars().count() <= max_chars).then(|| value.to_string())
+    (!value.is_empty()
+        && value.chars().count() <= max_chars
+        && !value
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace()))
+    .then(|| value.to_string())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct H6ToolResult {
     status: &'static str,
+    reason: Option<&'static str>,
     mutation_performed: bool,
     side_effect_count: usize,
 }
@@ -460,15 +516,17 @@ impl H6ToolResult {
     fn value(self) -> Value {
         json!({
             "status": self.status,
+            "reason": self.reason,
             "mutation_performed": self.mutation_performed,
             "side_effect_count": self.side_effect_count,
         })
     }
 }
 
-fn h6_conflict_value(_conflict: H6PatchConflict) -> H6ToolResult {
+fn h6_conflict_value(conflict: H6PatchConflict) -> H6ToolResult {
     H6ToolResult {
         status: "conflict",
+        reason: Some(conflict.as_str()),
         mutation_performed: false,
         side_effect_count: 0,
     }
@@ -477,16 +535,19 @@ fn h6_conflict_value(_conflict: H6PatchConflict) -> H6ToolResult {
 fn h6_denied_value() -> H6ToolResult {
     H6ToolResult {
         status: "denied",
+        reason: None,
         mutation_performed: false,
         side_effect_count: 0,
     }
 }
 
+#[cfg(test)]
 struct H6PendingConfirmation {
     intent: H4AuthorityRequest,
     response: tokio::sync::oneshot::Sender<()>,
 }
 
+#[cfg(test)]
 #[derive(Clone)]
 struct H6PendingConfirmationBridge {
     sender: tokio::sync::mpsc::Sender<H6PendingConfirmation>,
@@ -494,6 +555,7 @@ struct H6PendingConfirmationBridge {
     cancelled_notify: Arc<tokio::sync::Notify>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum H6BridgeFailure {
     Cancelled,
@@ -501,6 +563,7 @@ enum H6BridgeFailure {
     Closed,
 }
 
+#[cfg(test)]
 impl H6PendingConfirmationBridge {
     fn new() -> (
         Arc<Self>,
@@ -552,6 +615,7 @@ impl H6PendingConfirmationBridge {
     }
 }
 
+#[cfg(test)]
 async fn execute_compiled_patch(
     broker: &VitaWorkspaceReplaceBroker,
     store: RecoveryJournalStore,
@@ -587,17 +651,20 @@ async fn execute_compiled_patch(
         Ok(result) => match result.transaction_outcome {
             H5ReplaceTransactionOutcome::Committed => H6ToolResult {
                 status: "patch_applied",
+                reason: None,
                 mutation_performed: true,
                 side_effect_count: 1,
             },
             H5ReplaceTransactionOutcome::Conflict { .. } => H6ToolResult {
                 status: "conflict",
+                reason: Some("base_changed"),
                 mutation_performed: false,
                 side_effect_count: 0,
             },
             H5ReplaceTransactionOutcome::Denied { .. } => h6_denied_value(),
             H5ReplaceTransactionOutcome::CommitUnknown { .. } => H6ToolResult {
                 status: "commit_outcome_unknown",
+                reason: None,
                 mutation_performed: true,
                 side_effect_count: 1,
             },
@@ -609,6 +676,63 @@ async fn execute_compiled_patch(
                 } else {
                     "denied"
                 },
+                reason: None,
+                mutation_performed: workspace_mutation_started,
+                side_effect_count: usize::from(workspace_mutation_started),
+            },
+        },
+        Err(_) => h6_denied_value(),
+    }
+}
+
+/// Production patch execution is deliberately just the canonical D31-C
+/// replace flow. H6 has no confirmation, grant, or writer of its own.
+async fn execute_compiled_patch_production(
+    broker: &VitaWorkspaceReplaceBroker,
+    store: RecoveryJournalStore,
+    patch: H6CompiledPatch,
+) -> H6ToolResult {
+    let (grant, replacement) = match broker
+        .issue_h5_authorized_replace_action_from_h6_patch(patch)
+        .await
+    {
+        Ok(value) => value,
+        Err(_) => return h6_denied_value(),
+    };
+    match execute_governed_h5_replace(
+        H5AuthorizedReplaceAction::from_h4_grant(grant),
+        replacement,
+        store,
+        broker.cancellation_token(),
+    )
+    .await
+    {
+        Ok(result) => match result.transaction_outcome {
+            H5ReplaceTransactionOutcome::Committed => H6ToolResult {
+                status: "patch_applied",
+                reason: None,
+                mutation_performed: true,
+                side_effect_count: 1,
+            },
+            H5ReplaceTransactionOutcome::Conflict { .. } => {
+                h6_conflict_value(H6PatchConflict::BaseChanged)
+            }
+            H5ReplaceTransactionOutcome::Denied { .. } => h6_denied_value(),
+            H5ReplaceTransactionOutcome::CommitUnknown { .. } => H6ToolResult {
+                status: "commit_outcome_unknown",
+                reason: None,
+                mutation_performed: true,
+                side_effect_count: 1,
+            },
+            H5ReplaceTransactionOutcome::LifecycleUnknown {
+                workspace_mutation_started,
+            } => H6ToolResult {
+                status: if workspace_mutation_started {
+                    "recovery_required"
+                } else {
+                    "denied"
+                },
+                reason: None,
                 mutation_performed: workspace_mutation_started,
                 side_effect_count: usize::from(workspace_mutation_started),
             },
@@ -622,13 +746,17 @@ pub(crate) struct VitaWorkspacePatchToolContributor {
     root: TrustedWorkspaceRoot,
     context: VitaExecutionContext,
     store: RecoveryJournalStore,
-    bridge: Arc<H6PendingConfirmationBridge>,
+    #[cfg(test)]
+    bridge: Option<Arc<H6PendingConfirmationBridge>>,
+    #[cfg(test)]
     tamper_replacement: bool,
+    #[cfg(test)]
     tool_call_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl VitaWorkspacePatchToolContributor {
-    fn new(
+    #[cfg(test)]
+    fn new_with_bridge(
         broker: Arc<VitaWorkspaceReplaceBroker>,
         root: TrustedWorkspaceRoot,
         context: VitaExecutionContext,
@@ -640,17 +768,42 @@ impl VitaWorkspacePatchToolContributor {
             root,
             context,
             store,
-            bridge,
+            bridge: Some(bridge),
             tamper_replacement: false,
             tool_call_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
+    /// Construct the production façade. No H6 confirmation bridge is
+    /// retained: the existing D31-C replace broker performs the one Host
+    /// confirmation and issues the one replace grant.
+    pub(crate) fn new(
+        broker: Arc<VitaWorkspaceReplaceBroker>,
+        root: TrustedWorkspaceRoot,
+        context: VitaExecutionContext,
+        store: RecoveryJournalStore,
+    ) -> Self {
+        Self {
+            broker,
+            root,
+            context,
+            store,
+            #[cfg(test)]
+            bridge: None,
+            #[cfg(test)]
+            tamper_replacement: false,
+            #[cfg(test)]
+            tool_call_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    #[cfg(test)]
     fn with_tamper_replacement(mut self) -> Self {
         self.tamper_replacement = true;
         self
     }
 
+    #[cfg(test)]
     fn with_tool_call_count(
         mut self,
         tool_call_count: Arc<std::sync::atomic::AtomicUsize>,
@@ -671,8 +824,11 @@ impl ToolContributor for VitaWorkspacePatchToolContributor {
             root: self.root.clone(),
             context: self.context.clone(),
             store: self.store.clone(),
-            bridge: Arc::clone(&self.bridge),
+            #[cfg(test)]
+            bridge: self.bridge.as_ref().map(Arc::clone),
+            #[cfg(test)]
             tamper_replacement: self.tamper_replacement,
+            #[cfg(test)]
             tool_call_count: Arc::clone(&self.tool_call_count),
         })]
     }
@@ -683,8 +839,11 @@ struct VitaWorkspacePatchTool {
     root: TrustedWorkspaceRoot,
     context: VitaExecutionContext,
     store: RecoveryJournalStore,
-    bridge: Arc<H6PendingConfirmationBridge>,
+    #[cfg(test)]
+    bridge: Option<Arc<H6PendingConfirmationBridge>>,
+    #[cfg(test)]
     tamper_replacement: bool,
+    #[cfg(test)]
     tool_call_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -717,8 +876,11 @@ impl<'call> ToolExecutor<ToolCall<'call>> for VitaWorkspacePatchTool {
         let root = self.root.clone();
         let context = self.context.clone();
         let store = self.store.clone();
-        let bridge = Arc::clone(&self.bridge);
+        #[cfg(test)]
+        let bridge = self.bridge.as_ref().map(Arc::clone);
+        #[cfg(test)]
         let tamper_replacement = self.tamper_replacement;
+        #[cfg(test)]
         self.tool_call_count.fetch_add(1, Ordering::AcqRel);
         Box::pin(async move {
             let value = match H6PatchRequest::from_codex_call(&call)
@@ -727,11 +889,30 @@ impl<'call> ToolExecutor<ToolCall<'call>> for VitaWorkspacePatchTool {
                 Err(conflict) => h6_conflict_value(conflict),
                 Ok(H6CompileOutcome::NoEffect) => H6ToolResult {
                     status: "no_effect",
+                    reason: Some("no_effect"),
                     mutation_performed: false,
                     side_effect_count: 0,
                 },
                 Ok(H6CompileOutcome::Compiled(patch)) => {
-                    execute_compiled_patch(&broker, store, &bridge, patch, tamper_replacement).await
+                    #[cfg(test)]
+                    {
+                        if let Some(bridge) = bridge {
+                            execute_compiled_patch(
+                                &broker,
+                                store,
+                                &bridge,
+                                patch,
+                                tamper_replacement,
+                            )
+                            .await
+                        } else {
+                            execute_compiled_patch_production(&broker, store, patch).await
+                        }
+                    }
+                    #[cfg(not(test))]
+                    {
+                        execute_compiled_patch_production(&broker, store, patch).await
+                    }
                 }
             };
             Ok(
@@ -746,7 +927,7 @@ fn h6_patch_schema_contract() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "relative_path": {"type": "string"},
+            "relative_path": {"type": "string", "maxLength": H6_MAX_PATH_CHARS},
             "expected_sha256": {
                 "type": "string",
                 "pattern": "^[a-f0-9]{64}$"
@@ -758,8 +939,8 @@ fn h6_patch_schema_contract() -> Value {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "search": {"type": "string", "minLength": 1},
-                        "replace": {"type": "string"}
+                        "search": {"type": "string", "minLength": 1, "maxLength": H6_MAX_EDIT_TEXT_BYTES},
+                        "replace": {"type": "string", "maxLength": H6_MAX_EDIT_TEXT_BYTES}
                     },
                     "required": ["search", "replace"],
                     "additionalProperties": false
@@ -934,6 +1115,33 @@ mod tests {
         assert_eq!(patch.derived_replacement_bytes(), expected.len());
         assert_eq!(patch.expected_sha256(), sha256_hex(ORIGINAL.as_bytes()));
         fixture.assert_no_side_effects(ORIGINAL.as_bytes());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn d31_d_production_patch_path_uses_one_existing_replace_confirmation() {
+        let fixture = H6TestFixture::new(ORIGINAL.as_bytes());
+        let patch = compiled_patch(&fixture, ORIGINAL.as_bytes(), &[("old-first", "new-first")]);
+        let intent = fixture
+            .broker
+            .h6_authority_request_for_compiled_patch(&patch)
+            .expect("production H6 proof adapter intent");
+        fixture.authority.provision_trusted_confirmation(&intent);
+        let result = execute_compiled_patch_production(
+            &fixture.broker,
+            fixture.workspace.store.clone(),
+            patch,
+        )
+        .await;
+        assert_eq!(result.status, "patch_applied");
+        assert_eq!(result.mutation_performed, true);
+        assert_eq!(result.side_effect_count, 1);
+        assert_eq!(
+            fs::read(fixture.workspace.file_path()).unwrap(),
+            b"first=new-first\nsecond=old-second\n"
+        );
+        let provenance = fixture.authority.provenance_snapshot();
+        assert_eq!(provenance.trusted_confirmations_provisioned, 1);
+        assert_eq!(provenance.request_derived_confirmations, 0);
     }
 
     #[test]
@@ -1978,7 +2186,7 @@ mod tests {
             .map_err(|error| format!("create D29-H6 context: {error:?}"))?;
         let broker = VitaWorkspaceReplaceBroker::new(context.clone(), root.clone(), authority);
         let patch_tool_call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let contributor = VitaWorkspacePatchToolContributor::new(
+        let contributor = VitaWorkspacePatchToolContributor::new_with_bridge(
             Arc::clone(&broker),
             root,
             context,

@@ -26,7 +26,7 @@ mod d29h4;
 mod d29h5;
 #[cfg(all(test, windows))]
 mod d29h5c;
-#[cfg(all(test, windows))]
+#[cfg(windows)]
 mod d29h6;
 #[cfg(windows)]
 mod d29h7;
@@ -80,6 +80,9 @@ pub(crate) use d29h5::{
     H5RecoveryExecutor, RecoveryActionRequest, RecoveryAuthorityPort, RecoveryDenyReason,
     RecoveryGrantEvidence, VitaWorkspaceReplaceH5ToolContributor, H5_RECOVER_REPLACE_CAPABILITY_ID,
 };
+
+#[cfg(windows)]
+pub(crate) use d29h6::{VitaWorkspacePatchToolContributor, VITA_WORKSPACE_PATCH_TOOL_NAME};
 
 #[cfg(windows)]
 pub use d29h7::{

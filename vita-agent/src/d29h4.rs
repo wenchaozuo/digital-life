@@ -940,9 +940,9 @@ impl VitaWorkspaceReplaceBroker {
     }
 
     /// Build the exact existing-replace intent from H6's opaque, compiler-
-    /// derived proof.  This adapter is test/integration-only: H6 cannot mint
-    /// a second capability and cannot supply a generic replace request.
-    #[cfg(all(test, windows))]
+    /// derived proof. H6 cannot mint a second capability or supply a generic
+    /// replace request; this enters the existing replace authority only.
+    #[cfg(windows)]
     pub(crate) fn h6_authority_request_for_compiled_patch(
         &self,
         patch: &crate::d29h6::H6CompiledPatch,
@@ -1002,7 +1002,7 @@ impl VitaWorkspaceReplaceBroker {
     /// Consume exactly one H6 compiler proof and enter the existing H4 grant
     /// path.  The returned replacement is only the compiler-derived payload
     /// needed by canonical H5; it is not caller-supplied authority material.
-    #[cfg(all(test, windows))]
+    #[cfg(windows)]
     pub(crate) async fn issue_h5_authorized_replace_action_from_h6_patch(
         &self,
         patch: crate::d29h6::H6CompiledPatch,

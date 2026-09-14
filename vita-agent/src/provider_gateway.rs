@@ -1684,9 +1684,20 @@ fn parse_chat_tool_calls_with_tools(
 }
 
 fn is_vita_tool_name(name: &str) -> bool {
+    let patch_tool = {
+        #[cfg(windows)]
+        {
+            name == crate::d29h6::VITA_WORKSPACE_PATCH_TOOL_NAME
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    };
     name == TOOL_NAME
         || name == VITA_WORKSPACE_READ_TOOL_NAME
         || name == VITA_WORKSPACE_REPLACE_TOOL_NAME
+        || patch_tool
 }
 
 fn bounded_tool_string(

@@ -51,6 +51,12 @@ use windows_sys::Win32::Foundation::{
     OBJ_DONT_REPARSE, STATUS_NO_SUCH_FILE, STATUS_OBJECT_NAME_NOT_FOUND,
     STATUS_OBJECT_PATH_NOT_FOUND, UNICODE_STRING, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
+use windows_sys::Win32::NetworkManagement::WindowsFirewall::NetworkIsolationGetAppContainerConfig;
+use windows_sys::Win32::Security::Authorization::{
+    GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
+    GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN,
+    TRUSTEE_W,
+};
 use windows_sys::Win32::Security::Cryptography::{
     BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
 };
@@ -58,17 +64,21 @@ use windows_sys::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+use windows_sys::Win32::Security::{
+    EqualSid, DACL_SECURITY_INFORMATION, SID_AND_ATTRIBUTES, SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+};
 use windows_sys::Win32::Security::{PSID, SECURITY_CAPABILITIES};
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, GetDriveTypeW, GetFileInformationByHandle, ReadFile, BY_HANDLE_FILE_INFORMATION,
-    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
+    DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
     FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OVERLAPPED,
-    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ, OPEN_EXISTING,
-    PIPE_ACCESS_INBOUND,
+    FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, OPEN_EXISTING, PIPE_ACCESS_INBOUND,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_WRITE, FILE_TRAVERSE, SYNCHRONIZE,
 };
+use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
     JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
@@ -742,7 +752,7 @@ fn hash_file(file: &File) -> Result<String, String> {
     Ok(sha256_hex(&bytes))
 }
 
-fn d32_trusted_toolchain_paths(cargo_path: &Path) -> Result<(PathBuf, PathBuf, PathBuf), String> {
+pub(crate) fn d32_trusted_toolchain_root(cargo_path: &Path) -> Result<PathBuf, String> {
     let user_profile = std::env::var_os("USERPROFILE")
         .map(PathBuf::from)
         .ok_or_else(|| "D32 toolchain root was unavailable".to_string())?;
@@ -766,10 +776,18 @@ fn d32_trusted_toolchain_paths(cargo_path: &Path) -> Result<(PathBuf, PathBuf, P
             if !cargo_parent.is_dir() {
                 return Err("D32 cargo image parent was not a directory".to_string());
             }
-            return Ok((rustc, rustdoc, bin));
+            return Ok(root);
         }
     }
     Err("D32 trusted Rust toolchain was unavailable".to_string())
+}
+
+fn d32_trusted_toolchain_paths(cargo_path: &Path) -> Result<(PathBuf, PathBuf, PathBuf), String> {
+    let root = d32_trusted_toolchain_root(cargo_path)?;
+    let bin = root.join("bin");
+    let rustc = bin.join("rustc.exe");
+    let rustdoc = bin.join("rustdoc.exe");
+    Ok((rustc, rustdoc, bin))
 }
 
 struct H7CatalogEntry {
@@ -786,6 +804,8 @@ struct H7CatalogEntry {
     stdout_bound: usize,
     stderr_bound: usize,
     _owned_scratch: Option<Arc<TempDir>>,
+    d32_execution_root: Option<PathBuf>,
+    d32_toolchain_manifest_hash: Option<String>,
 }
 
 pub(crate) struct H7ExecutableCatalog {
@@ -807,7 +827,10 @@ impl H7ExecutableCatalog {
             H7_ENV_ALLOWLIST_KEY.to_string(),
             H7_ENV_ALLOWLIST_VALUE.to_string(),
         )]);
-        let environment_policy_hash = D32_CARGO_ENVIRONMENT_POLICY_HASH.to_string();
+        // D29-H7 is a generic fixture/history lane.  Its binding identity is
+        // derived from the actual fixture environment, independently of the
+        // D32 static Cargo profile policy.
+        let environment_policy_hash = sha256_hex(&environment_policy_bytes(&environment));
         image
             .reverify(expected_image_identity, &expected_image_sha256)
             .map_err(|error| format!("H7 catalog image proof failed: {error}"))?;
@@ -826,6 +849,8 @@ impl H7ExecutableCatalog {
                 stdout_bound: H7_STDOUT_BOUND,
                 stderr_bound: H7_STDERR_BOUND,
                 _owned_scratch: None,
+                d32_execution_root: None,
+                d32_toolchain_manifest_hash: None,
             },
         })
     }
@@ -900,6 +925,104 @@ impl H7ExecutableCatalog {
                 stdout_bound: 64 * 1024,
                 stderr_bound: 64 * 1024,
                 _owned_scratch: Some(scratch),
+                d32_execution_root: None,
+                d32_toolchain_manifest_hash: None,
+            },
+        })
+    }
+
+    pub(crate) fn cargo_check_projected(
+        cargo_path: PathBuf,
+        source_path: PathBuf,
+        execution_root: PathBuf,
+        rustc_path: PathBuf,
+        rustdoc_path: PathBuf,
+    ) -> Result<Self, String> {
+        for path in [
+            &cargo_path,
+            &source_path,
+            &execution_root,
+            &rustc_path,
+            &rustdoc_path,
+        ] {
+            if !path.is_absolute() {
+                return Err("D32 projected profile paths must be absolute".to_string());
+            }
+        }
+        let execution_root = fs::canonicalize(&execution_root)
+            .map_err(|_| "D32 execution root could not be canonicalized".to_string())?;
+        let source_path = fs::canonicalize(&source_path)
+            .map_err(|_| "D32 projected source root could not be canonicalized".to_string())?;
+        let cargo_path = fs::canonicalize(&cargo_path)
+            .map_err(|_| "D32 projected cargo image could not be canonicalized".to_string())?;
+        let rustc_path = fs::canonicalize(&rustc_path)
+            .map_err(|_| "D32 projected rustc image could not be canonicalized".to_string())?;
+        let rustdoc_path = fs::canonicalize(&rustdoc_path)
+            .map_err(|_| "D32 projected rustdoc image could not be canonicalized".to_string())?;
+        let expected_source = execution_root.join("source");
+        let expected_toolchain = execution_root.join("toolchain");
+        let expected_cargo_home = execution_root.join("cargo-home");
+        let expected_target = execution_root.join("target");
+        if !h7_workspace_paths_equal(&source_path, &expected_source)
+            || !is_strict_descendant_path(&cargo_path, &expected_toolchain)
+            || !is_strict_descendant_path(&rustc_path, &expected_toolchain)
+            || !is_strict_descendant_path(&rustdoc_path, &expected_toolchain)
+            || !expected_cargo_home.is_dir()
+            || !expected_target.is_dir()
+        {
+            return Err("D32 projected profile layout was not app-owned and exact".to_string());
+        }
+        let working_directory = Arc::new(PreparedWorkingDirectory::prepare(&source_path)?);
+        let mut image = PreparedExecutableImage::prepare(&cargo_path)?;
+        let expected_image_identity = image.identity;
+        let expected_image_namespace = image.namespace.identity();
+        let expected_image_sha256 = image.sha256.clone();
+        let environment = BTreeMap::from([
+            (
+                "CARGO_HOME".to_string(),
+                expected_cargo_home.to_string_lossy().into_owned(),
+            ),
+            ("CARGO_NET_OFFLINE".to_string(), "true".to_string()),
+            (
+                "CARGO_TARGET_DIR".to_string(),
+                expected_target.to_string_lossy().into_owned(),
+            ),
+            ("CARGO_TERM_COLOR".to_string(), "never".to_string()),
+            (
+                "PATH".to_string(),
+                expected_toolchain
+                    .join("bin")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            (
+                "RUSTC".to_string(),
+                rustc_path.to_string_lossy().into_owned(),
+            ),
+            (
+                "RUSTDOC".to_string(),
+                rustdoc_path.to_string_lossy().into_owned(),
+            ),
+        ]);
+        image.reverify(expected_image_identity, &expected_image_sha256)?;
+        let manifest_hash = toolchain_manifest_hash_for_catalog(&expected_toolchain)?;
+        Ok(Self {
+            entry: H7CatalogEntry {
+                program_id: "cargo-check-v1".to_string(),
+                image_path: cargo_path,
+                expected_image_identity,
+                expected_image_namespace,
+                expected_image_sha256,
+                working_directory_identity: working_directory.0.identity().wire(),
+                working_directory,
+                environment,
+                environment_policy_hash: D32_CARGO_ENVIRONMENT_POLICY_HASH.to_string(),
+                timeout: Duration::from_secs(120),
+                stdout_bound: 64 * 1024,
+                stderr_bound: 64 * 1024,
+                _owned_scratch: None,
+                d32_execution_root: Some(execution_root),
+                d32_toolchain_manifest_hash: Some(manifest_hash),
             },
         })
     }
@@ -1037,6 +1160,8 @@ impl H7ExecutableCatalog {
             git_metadata_fence_hash: (capability_id == VITA_WORKSPACE_CARGO_CHECK_CAPABILITY_ID)
                 .then(|| D32_CARGO_NO_GIT_METADATA_FENCE.to_string()),
             sandbox,
+            d32_execution_root: self.entry.d32_execution_root.clone(),
+            d32_toolchain_manifest_hash: self.entry.d32_toolchain_manifest_hash.clone(),
         }))
     }
 }
@@ -1065,6 +1190,8 @@ pub(crate) struct PreparedProcessAction {
     git_metadata_fence: Option<Arc<H7CGitMetadataFence>>,
     git_metadata_fence_hash: Option<String>,
     sandbox: Option<Arc<H7SandboxProfile>>,
+    d32_execution_root: Option<PathBuf>,
+    d32_toolchain_manifest_hash: Option<String>,
 }
 
 impl PreparedProcessAction {
@@ -1118,18 +1245,99 @@ fn verify_workspace_root_binding(action: &PreparedProcessAction) -> Result<(), S
     if action.workspace_root_identity != Some(root_identity) {
         return Err("H7-B workspace root and cwd binding did not match".to_string());
     }
-    // D32 keeps the governed workspace as the fixed, read-only working
-    // directory and sends all Cargo output to the app-owned scratch paths in
-    // the static environment.  The AppContainer must be able to read this
-    // root; otherwise CreateProcess/child I/O fails closed rather than
-    // widening the user's ambient filesystem authority.
-    if action.capability_id != VITA_WORKSPACE_CARGO_CHECK_CAPABILITY_ID
-        && !h7_workspace_paths_equal(action.working_directory.path(), root.final_path())
-    {
+    // D32 executes only from the immutable app-owned source projection.  The
+    // original governed root remains bound as authority evidence, but is never
+    // exposed as the child cwd.
+    if action.capability_id == VITA_WORKSPACE_CARGO_CHECK_CAPABILITY_ID {
+        let execution_root = action
+            .d32_execution_root
+            .as_ref()
+            .ok_or_else(|| "D32 execution projection was not retained".to_string())?;
+        let expected_source = execution_root.join("source");
+        if !h7_workspace_paths_equal(action.working_directory.path(), &expected_source) {
+            return Err("D32 child cwd was not the app-owned source projection".to_string());
+        }
+    } else if !h7_workspace_paths_equal(action.working_directory.path(), root.final_path()) {
         return Err("H7 workspace root and cwd binding did not match".to_string());
     }
     root.verify_named_path_current()
         .map_err(|_| "H7-B workspace root named path changed".to_string())
+}
+
+fn verify_d32_environment_policy(action: &PreparedProcessAction) -> Result<(), String> {
+    if action.capability_id != VITA_WORKSPACE_CARGO_CHECK_CAPABILITY_ID {
+        return Ok(());
+    }
+    let root = action
+        .d32_execution_root
+        .as_ref()
+        .ok_or_else(|| "D32 execution projection was absent".to_string())?;
+    let source = root.join("source");
+    let toolchain = root.join("toolchain");
+    let cargo_home = root.join("cargo-home");
+    let target = root.join("target");
+    let expected_path = toolchain.join("bin").to_string_lossy().into_owned();
+    let expected = BTreeMap::from([
+        (
+            "CARGO_HOME".to_string(),
+            cargo_home.to_string_lossy().into_owned(),
+        ),
+        ("CARGO_NET_OFFLINE".to_string(), "true".to_string()),
+        (
+            "CARGO_TARGET_DIR".to_string(),
+            target.to_string_lossy().into_owned(),
+        ),
+        ("CARGO_TERM_COLOR".to_string(), "never".to_string()),
+        ("PATH".to_string(), expected_path),
+        (
+            "RUSTC".to_string(),
+            toolchain
+                .join("bin/rustc.exe")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        (
+            "RUSTDOC".to_string(),
+            toolchain
+                .join("bin/rustdoc.exe")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    ]);
+    if action.environment != expected
+        || action.environment_policy_hash != D32_CARGO_ENVIRONMENT_POLICY_HASH
+        || action.working_directory.path() != source
+        || !is_strict_descendant_path(&action.working_directory.path().to_path_buf(), root)
+        || action
+            .environment
+            .keys()
+            .any(|key| key.contains("PROXY") || key.contains("TOKEN") || key.contains("KEY"))
+    {
+        return Err("D32 Cargo environment policy was not exact".to_string());
+    }
+    if action.environment.values().any(|value| {
+        value.contains("USERPROFILE") || value.contains("HOME\\") || value.contains(".rustup")
+    }) {
+        return Err("D32 Cargo environment retained user-profile authority".to_string());
+    }
+    let expected_manifest = action
+        .d32_toolchain_manifest_hash
+        .as_deref()
+        .ok_or_else(|| "D32 toolchain manifest evidence was absent".to_string())?;
+    for path in [&*root, &source, &toolchain, &cargo_home, &target] {
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|_| "D32 app-owned execution path became unavailable".to_string())?;
+        if metadata.file_type().is_symlink()
+            || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || !metadata.is_dir()
+        {
+            return Err("D32 app-owned execution path was not a stable directory".to_string());
+        }
+    }
+    if toolchain_manifest_hash_for_catalog(&toolchain)? != expected_manifest {
+        return Err("D32 toolchain manifest changed during the launch fence".to_string());
+    }
+    Ok(())
 }
 
 fn h7c_revalidate_metadata_fence(action: &PreparedProcessAction) -> Result<(), String> {
@@ -1177,6 +1385,58 @@ fn environment_policy_bytes(environment: &BTreeMap<String, String>) -> Vec<u8> {
         .into_iter()
         .flat_map(u16::to_le_bytes)
         .collect()
+}
+
+fn is_strict_descendant_path(path: &Path, root: &Path) -> bool {
+    let path = path.components().collect::<Vec<_>>();
+    let root = root.components().collect::<Vec<_>>();
+    path.len() > root.len() && path.starts_with(&root)
+}
+
+fn toolchain_manifest_hash_for_catalog(root: &Path) -> Result<String, String> {
+    fn collect(
+        root: &Path,
+        current: &Path,
+        entries: &mut Vec<(String, String)>,
+    ) -> Result<(), String> {
+        for entry in fs::read_dir(current)
+            .map_err(|_| "D32 toolchain manifest enumeration failed".to_string())?
+        {
+            let entry =
+                entry.map_err(|_| "D32 toolchain manifest enumeration failed".to_string())?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|_| "D32 toolchain manifest metadata failed".to_string())?;
+            if metadata.file_type().is_symlink()
+                || (cfg!(windows) && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+            {
+                return Err("D32 toolchain manifest rejected reparse entry".to_string());
+            }
+            if metadata.is_dir() {
+                collect(root, &path, entries)?;
+            } else if metadata.is_file() {
+                let mut file = File::open(&path)
+                    .map_err(|_| "D32 toolchain manifest file open failed".to_string())?;
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes)
+                    .map_err(|_| "D32 toolchain manifest file read failed".to_string())?;
+                entries.push((
+                    path.strip_prefix(root)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                    sha256_hex(&bytes),
+                ));
+            }
+        }
+        Ok(())
+    }
+    let mut entries = Vec::new();
+    collect(root, root, &mut entries)?;
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let encoded = serde_json::to_vec(&entries)
+        .map_err(|_| "D32 toolchain manifest serialization failed".to_string())?;
+    Ok(sha256_hex(&encoded))
 }
 
 fn quote_windows_arg(argument: &str) -> String {
@@ -1463,6 +1723,167 @@ impl H7SandboxProfile {
     fn security_capabilities(&self) -> *const SECURITY_CAPABILITIES {
         self.capabilities.as_ref()
     }
+
+    /// The AppContainer capability list is intentionally empty.  Windows also
+    /// maintains a separate per-SID loopback-exemption list; an inherited
+    /// exemption would make a local TCP/UDP listener reachable despite the
+    /// zero-capability token, so both the setup and final launch fences read
+    /// that list and fail closed if this SID appears in it.
+    fn verify_no_loopback_exemption(&self) -> Result<(), String> {
+        let mut count = 0_u32;
+        let mut entries: *mut SID_AND_ATTRIBUTES = std::ptr::null_mut();
+        let result = unsafe { NetworkIsolationGetAppContainerConfig(&mut count, &mut entries) };
+        if result != 0 {
+            return Err(format!(
+                "D32 AppContainer loopback exemption query failed: {result:#x}"
+            ));
+        }
+        let mut malformed = count != 0 && entries.is_null();
+        let found = if count == 0 || malformed {
+            false
+        } else {
+            let values = unsafe { std::slice::from_raw_parts(entries, count as usize) };
+            let mut found = false;
+            for entry in values {
+                if entry.Sid.is_null() {
+                    malformed = true;
+                    break;
+                }
+                if unsafe { EqualSid(entry.Sid, self.sid) != 0 } {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if !entries.is_null() {
+            unsafe {
+                CoTaskMemFree(entries.cast());
+            }
+        }
+        if malformed {
+            return Err("D32 AppContainer loopback exemption list was malformed".to_string());
+        }
+        if found {
+            return Err("D32 AppContainer loopback exemption was present".to_string());
+        }
+        Ok(())
+    }
+
+    /// Grants the stable AppContainer SID only the app-owned projection root.
+    /// The projection is never user workspace/home, so this ACL operation does
+    /// not widen any user-owned namespace.  Individual source/toolchain/scratch
+    /// directories are created below the root and inherit the same bounded
+    /// package identity.
+    pub(crate) fn grant_execution_root(&self, root: &Path) -> Result<(), String> {
+        if !root.is_dir() {
+            return Err("D32 app-owned execution root was not a directory".to_string());
+        }
+        let metadata = fs::symlink_metadata(root)
+            .map_err(|_| "D32 app-owned execution root metadata was unavailable".to_string())?;
+        if metadata.file_type().is_symlink()
+            || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        {
+            return Err("D32 app-owned execution root was a reparse point".to_string());
+        }
+        self.verify_no_loopback_exemption()?;
+        // The projection root and immutable source/toolchain trees are read
+        // only.  Cargo's two scratch namespaces receive the minimum extra
+        // rights needed for incremental artifacts and registry/cache writes.
+        apply_appcontainer_acl(self.sid, root, FILE_GENERIC_READ)?;
+        apply_appcontainer_acl(self.sid, &root.join("source"), FILE_GENERIC_READ)?;
+        apply_appcontainer_acl(
+            self.sid,
+            &root.join("toolchain"),
+            FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+        )?;
+        for name in ["cargo-home", "target"] {
+            let path = root.join(name);
+            apply_appcontainer_acl(
+                self.sid,
+                &path,
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn apply_appcontainer_acl(sid: PSID, path: &Path, rights: u32) -> Result<(), String> {
+    let mut wide = wide_null(path.as_os_str());
+    let mut old_dacl = std::ptr::null_mut();
+    let mut security_descriptor = std::ptr::null_mut();
+    let result = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_mut_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut old_dacl,
+            std::ptr::null_mut(),
+            &mut security_descriptor,
+        )
+    };
+    if result != 0 {
+        return Err(format!(
+            "D32 AppContainer ACL read failed for {}: {result:#x}",
+            path.display()
+        ));
+    }
+
+    let trustee = TRUSTEE_W {
+        pMultipleTrustee: std::ptr::null_mut(),
+        MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+        TrusteeForm: TRUSTEE_IS_SID,
+        TrusteeType: TRUSTEE_IS_UNKNOWN,
+        // The SID is owned by H7SandboxProfile and remains alive while this
+        // function executes and while the process attribute list is retained.
+        ptstrName: sid.cast(),
+    };
+    let access = EXPLICIT_ACCESS_W {
+        grfAccessPermissions: rights,
+        grfAccessMode: GRANT_ACCESS,
+        grfInheritance: SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+        Trustee: trustee,
+    };
+    let mut new_dacl = std::ptr::null_mut();
+    let result = unsafe { SetEntriesInAclW(1, &access, old_dacl, &mut new_dacl) };
+    if result != 0 || new_dacl.is_null() {
+        unsafe {
+            if !security_descriptor.is_null() {
+                LocalFree(security_descriptor as HLOCAL);
+            }
+        }
+        return Err(format!(
+            "D32 AppContainer ACL merge failed for {}: {result:#x}",
+            path.display()
+        ));
+    }
+    let result = unsafe {
+        SetNamedSecurityInfoW(
+            wide.as_mut_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            new_dacl,
+            std::ptr::null_mut(),
+        )
+    };
+    unsafe {
+        LocalFree(new_dacl as HLOCAL);
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+    }
+    if result != 0 {
+        return Err(format!(
+            "D32 AppContainer ACL write failed for {}: {result:#x}",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 impl Drop for H7SandboxProfile {
@@ -3111,6 +3532,7 @@ impl H7LaunchPreparation {
             return Err("H7 working-directory binding was not host-owned".to_string());
         }
         verify_workspace_root_binding(action)?;
+        verify_d32_environment_policy(action)?;
         // The historical H7 fixture remains single-process.  D32's fixed
         // sandbox profile permits a small, bounded descendant set so the
         // adversarial fixture can prove grandchild containment without ever
@@ -3219,6 +3641,10 @@ impl H7LaunchPreparation {
             return Err("H7 cancellation won the final launch fence".to_string());
         }
         verify_workspace_root_binding(action)?;
+        verify_d32_environment_policy(action)?;
+        if let Some(sandbox) = self.attributes.sandbox.as_ref() {
+            sandbox.verify_no_loopback_exemption()?;
+        }
         let (image_identity, image_namespace_identity, probe) = {
             let image = action
                 .image
@@ -3404,6 +3830,15 @@ fn supervise_native_inner(
     let mut process_information: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     if let Some(gate) = options.pre_create_process_gate.as_ref() {
         gate.wait_if_armed_blocking();
+    }
+    // The loopback exemption list is mutable global state.  Re-read it after
+    // the last optional gate and immediately before the cancellation/Create-
+    // ProcessW edge so an exemption added during the retained fence fails
+    // closed instead of being mistaken for a capability-free launch.
+    if let Some(sandbox) = attributes.sandbox.as_ref() {
+        if sandbox.verify_no_loopback_exemption().is_err() {
+            return launch_failed(false, false, None).with_kind(H7NativeOutcomeKind::Denied);
+        }
     }
     // A Git-status action owns a retained local metadata fence.  Recheck it
     // after any final gate and immediately before the last cancellation load
@@ -5300,6 +5735,10 @@ impl H7ToolResult {
         };
         json!({
             "status": status,
+            "process_created": self.process_created,
+            "user_code_started": self.user_code_started,
+            "process_tree_remaining": self.process_tree_remaining,
+            "job_terminated": self.job_terminated,
             "exit_code": self.exit_code,
             "timed_out": self.timed_out,
             "stdout": self.stdout,
@@ -6539,6 +6978,8 @@ impl H7CGitStatusProfile {
             git_metadata_fence: Some(Arc::clone(&self.git_metadata_fence)),
             git_metadata_fence_hash: Some(self.git_metadata_fence_hash.clone()),
             sandbox: None,
+            d32_execution_root: None,
+            d32_toolchain_manifest_hash: None,
         }))
     }
 
@@ -7298,6 +7739,36 @@ mod tests {
             .get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn h7_fixture_binding_uses_its_actual_environment_hash() {
+        let environment = BTreeMap::from([(
+            H7_ENV_ALLOWLIST_KEY.to_string(),
+            H7_ENV_ALLOWLIST_VALUE.to_string(),
+        )]);
+        let expected = sha256_hex(&environment_policy_bytes(&environment));
+        assert_ne!(expected, D32_CARGO_ENVIRONMENT_POLICY_HASH);
+        // This assertion guards the generic fixture constructor directly: a
+        // future D32 policy change must not silently overwrite the history
+        // lane's own environment binding.
+        let working_directory = tempdir().expect("D29-H7 fixture workspace");
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("D29-H7 repository root")
+            .to_path_buf();
+        let image = h7_process_fixture_executable(&repo_root).expect("D29-H7 fixture executable");
+        let catalog = H7ExecutableCatalog::fixture(image, working_directory.path().to_path_buf())
+            .expect("D29-H7 fixture catalog");
+        let context =
+            VitaExecutionContext::try_new(H7_LIFE_ID, H7_TASK_ID).expect("D29-H7 fixture context");
+        let action = catalog
+            .prepare_action(
+                context,
+                H7ProcessRequest::synthetic("call-d29h7-policy", "turn-d29h7-policy", &[]),
+            )
+            .expect("D29-H7 fixture action");
+        assert_eq!(action.environment_policy_hash, expected);
     }
 
     // The production workspace capability deliberately rejects the host's

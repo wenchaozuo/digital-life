@@ -216,7 +216,9 @@ mod windows {
     use std::collections::{HashMap, HashSet, VecDeque};
     use std::ffi::OsString;
     use std::fs::{self, File};
-    use std::io::{BufReader, BufWriter};
+    use std::io::{BufReader, BufWriter, Read};
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::MetadataExt;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::mpsc::{self, RecvTimeoutError};
@@ -225,6 +227,13 @@ mod windows {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tauri::{AppHandle, Manager, State};
     use vita_agent_protocol as protocol;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
 
     // H7-C's fixed Git-status program identity is the profile identity.  The
     // generic H7 fixture program id is deliberately not accepted on this
@@ -236,6 +245,12 @@ mod windows {
         "f45206b70dabb5c144d0ba95b966e97da91a1f284b2449a8e4bc96fade55ba3a";
     const CARGO_ARGV_HASH: &str =
         "51f73634568f17211b3f8305649cfd9391a1dd52c05b2469add4317fbc8603c8";
+    const D32_EXECUTION_ROOT_NAME: &str = "d32-cargo-check-v1";
+    const D32_SOURCE_DIR_NAME: &str = "source";
+    const D32_TOOLCHAIN_DIR_NAME: &str = "toolchain";
+    const D32_CARGO_SELECTION_FILE_NAME: &str = ".d32-cargo-selection-v1.json";
+    const D32_TOOLCHAIN_MANIFEST_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+    const D32_IMAGE_HASH_MAX_BYTES: u64 = 256 * 1024 * 1024;
     const GRANT_LIFETIME_MS: u64 = 30_000;
     const HOST_CONFIRMATION_TTL_MS: u64 = 30_000;
     const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -251,6 +266,508 @@ mod windows {
     const LIFE_RESTART_REQUIRED: &str = "SIDECAR_LIFE_RESTART_REQUIRED";
     const LIFE_UNAVAILABLE: &str = "CAPABILITY_RUNTIME_LIFE_UNAVAILABLE";
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+    /// Host-owned evidence for the fixed D32 Cargo profile.  The process
+    /// binding is intentionally protocol-frozen and cannot carry another
+    /// toolchain field, so this evidence stays inside the Host session and is
+    /// compared against every Cargo binding before a grant can be consumed.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct HostCargoCheckProfileEvidence {
+        executable_identity: String,
+        executable_sha256: String,
+        toolchain_manifest_hash: String,
+        staged_working_directory_identity: String,
+        environment_policy_hash: String,
+        profile_id: String,
+    }
+
+    /// The executable image is selected by the Host before Vita starts.  The
+    /// marker is app-owned state, not user/provider input; Vita may only
+    /// consume the exact path and digest that the Host published here.
+    #[derive(Clone, Debug, Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct HostCargoSelection {
+        path: String,
+        sha256: String,
+        toolchain_path: String,
+        toolchain_manifest_sha256: String,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct HostFileIdentity {
+        volume_serial: u32,
+        file_index: u64,
+        file_size: u64,
+        directory: bool,
+        reparse: bool,
+    }
+
+    impl HostFileIdentity {
+        fn image_wire(self) -> String {
+            format!(
+                "{:08x}-{:016x}-{:016x}",
+                self.volume_serial, self.file_index, self.file_size
+            )
+        }
+
+        fn namespace_wire(self) -> String {
+            format!(
+                "{}-{:08x}-{:016x}",
+                if self.directory { "directory" } else { "file" },
+                self.volume_serial,
+                self.file_index
+            )
+        }
+    }
+
+    fn host_wide_path(path: &Path) -> Result<Vec<u16>, String> {
+        let mut value = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        if value.iter().any(|unit| *unit == 0) {
+            return Err("D32 Host path contained an embedded NUL".to_string());
+        }
+        value.push(0);
+        Ok(value)
+    }
+
+    fn host_file_identity(path: &Path, expect_directory: bool) -> Result<HostFileIdentity, String> {
+        let wide = host_wide_path(path)?;
+        let raw = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        };
+        if raw.is_null() || raw == INVALID_HANDLE_VALUE {
+            return Err(format!(
+                "D32 Host identity could not open {}: {}",
+                path.display(),
+                unsafe { windows_sys::Win32::Foundation::GetLastError() }
+            ));
+        }
+        let mut information = BY_HANDLE_FILE_INFORMATION::default();
+        let read = unsafe { GetFileInformationByHandle(raw, &mut information) != 0 };
+        unsafe {
+            CloseHandle(raw);
+        }
+        if !read {
+            return Err(format!(
+                "D32 Host identity could not read {}",
+                path.display()
+            ));
+        }
+        let directory = information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+        let reparse = information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+        if reparse || directory != expect_directory {
+            return Err(format!(
+                "D32 Host identity was not the expected non-reparse {}: {}",
+                if expect_directory {
+                    "directory"
+                } else {
+                    "file"
+                },
+                path.display()
+            ));
+        }
+        Ok(HostFileIdentity {
+            volume_serial: information.dwVolumeSerialNumber,
+            file_index: (u64::from(information.nFileIndexHigh) << 32)
+                | u64::from(information.nFileIndexLow),
+            file_size: (u64::from(information.nFileSizeHigh) << 32)
+                | u64::from(information.nFileSizeLow),
+            directory,
+            reparse,
+        })
+    }
+
+    fn host_hash_file(path: &Path, max_bytes: u64) -> Result<String, String> {
+        let mut file = File::open(path)
+            .map_err(|_| format!("D32 Host executable hash could not open {}", path.display()))?;
+        let mut digest = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        let mut total = 0_u64;
+        loop {
+            let read = file.read(&mut buffer).map_err(|_| {
+                format!("D32 Host executable hash could not read {}", path.display())
+            })?;
+            if read == 0 {
+                break;
+            }
+            total = total.saturating_add(read as u64);
+            if total > max_bytes {
+                return Err(format!(
+                    "D32 Host executable exceeded its bounded hash limit: {}",
+                    path.display()
+                ));
+            }
+            digest.update(&buffer[..read]);
+        }
+        Ok(format!("{:x}", digest.finalize()))
+    }
+
+    fn host_metadata_is_reparse(metadata: &fs::Metadata) -> bool {
+        metadata.file_type().is_symlink()
+            || (metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+    }
+
+    fn host_verify_no_reparse_path(root: &Path, path: &Path) -> Result<(), String> {
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| "D32 Host app-owned path escaped its root".to_string())?;
+        let mut current = root.to_path_buf();
+        let root_metadata = fs::symlink_metadata(root)
+            .map_err(|_| "D32 Host app-owned root metadata was unavailable".to_string())?;
+        if host_metadata_is_reparse(&root_metadata) {
+            return Err("D32 Host app-owned root was a reparse point".to_string());
+        }
+        for component in relative.components() {
+            current.push(component.as_os_str());
+            let metadata = fs::symlink_metadata(&current).map_err(|_| {
+                format!(
+                    "D32 Host app-owned path metadata was unavailable: {}",
+                    current.display()
+                )
+            })?;
+            if host_metadata_is_reparse(&metadata) {
+                return Err(format!(
+                    "D32 Host app-owned path contained a reparse point: {}",
+                    current.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn host_toolchain_manifest_hash(root: &Path) -> Result<String, String> {
+        fn collect(
+            root: &Path,
+            current: &Path,
+            entries: &mut Vec<(String, String)>,
+            total_bytes: &mut u64,
+        ) -> Result<(), String> {
+            for entry in fs::read_dir(current).map_err(|_| {
+                format!(
+                    "D32 Host toolchain enumeration failed: {}",
+                    current.display()
+                )
+            })? {
+                let entry =
+                    entry.map_err(|_| "D32 Host toolchain enumeration failed".to_string())?;
+                let path = entry.path();
+                let metadata = fs::symlink_metadata(&path)
+                    .map_err(|_| "D32 Host toolchain metadata failed".to_string())?;
+                if host_metadata_is_reparse(&metadata) {
+                    return Err(format!(
+                        "D32 Host toolchain manifest rejected reparse entry: {}",
+                        path.display()
+                    ));
+                }
+                if metadata.is_dir() {
+                    collect(root, &path, entries, total_bytes)?;
+                } else if metadata.is_file() {
+                    if metadata.len() > 64 * 1024 * 1024 {
+                        return Err("D32 Host toolchain file exceeded its bound".to_string());
+                    }
+                    *total_bytes = total_bytes.saturating_add(metadata.len());
+                    if *total_bytes > D32_TOOLCHAIN_MANIFEST_MAX_BYTES {
+                        return Err("D32 Host toolchain manifest exceeded its bound".to_string());
+                    }
+                    entries.push((
+                        path.strip_prefix(root)
+                            .map_err(|_| {
+                                "D32 Host toolchain manifest path escaped root".to_string()
+                            })?
+                            .to_string_lossy()
+                            .replace('\\', "/"),
+                        host_hash_file(&path, 64 * 1024 * 1024)?,
+                    ));
+                } else {
+                    return Err(
+                        "D32 Host toolchain manifest encountered an unsupported entry".to_string(),
+                    );
+                }
+            }
+            Ok(())
+        }
+
+        let mut entries = Vec::new();
+        let mut total_bytes = 0_u64;
+        collect(root, root, &mut entries, &mut total_bytes)?;
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        let encoded = serde_json::to_vec(&entries)
+            .map_err(|_| "D32 Host toolchain manifest serialization failed".to_string())?;
+        Ok(format!("{:x}", Sha256::digest(encoded)))
+    }
+
+    fn host_toolchain_manifest_hash_with_cargo(
+        root: &Path,
+        cargo_path: &Path,
+    ) -> Result<String, String> {
+        let mut entries = Vec::new();
+        let mut total_bytes = 0_u64;
+        // Reuse the same deterministic tree walk as the staged projection;
+        // the projection adds the Host-selected cargo.exe at toolchain/bin.
+        fn collect(
+            root: &Path,
+            current: &Path,
+            entries: &mut Vec<(String, String)>,
+            total_bytes: &mut u64,
+        ) -> Result<(), String> {
+            for entry in fs::read_dir(current)
+                .map_err(|_| "D32 Host toolchain enumeration failed".to_string())?
+            {
+                let entry =
+                    entry.map_err(|_| "D32 Host toolchain enumeration failed".to_string())?;
+                let path = entry.path();
+                let metadata = fs::symlink_metadata(&path)
+                    .map_err(|_| "D32 Host toolchain metadata failed".to_string())?;
+                if host_metadata_is_reparse(&metadata) {
+                    return Err("D32 Host toolchain manifest rejected reparse entry".to_string());
+                }
+                if metadata.is_dir() {
+                    collect(root, &path, entries, total_bytes)?;
+                } else if metadata.is_file() {
+                    *total_bytes = total_bytes.saturating_add(metadata.len());
+                    if metadata.len() > 64 * 1024 * 1024
+                        || *total_bytes > D32_TOOLCHAIN_MANIFEST_MAX_BYTES
+                    {
+                        return Err("D32 Host toolchain manifest exceeded its bound".to_string());
+                    }
+                    entries.push((
+                        path.strip_prefix(root)
+                            .map_err(|_| "D32 Host toolchain path escaped root".to_string())?
+                            .to_string_lossy()
+                            .replace('\\', "/"),
+                        host_hash_file(&path, 64 * 1024 * 1024)?,
+                    ));
+                }
+            }
+            Ok(())
+        }
+        collect(root, root, &mut entries, &mut total_bytes)?;
+        let cargo_relative = "bin/cargo.exe".to_string();
+        let cargo_hash = host_hash_file(cargo_path, D32_IMAGE_HASH_MAX_BYTES)?;
+        entries.retain(|entry| entry.0 != cargo_relative);
+        entries.push((cargo_relative, cargo_hash));
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        let encoded = serde_json::to_vec(&entries)
+            .map_err(|_| "D32 Host toolchain manifest serialization failed".to_string())?;
+        Ok(format!("{:x}", Sha256::digest(encoded)))
+    }
+
+    fn host_cargo_candidates() -> Vec<PathBuf> {
+        let mut candidates = vec![
+            PathBuf::from(r"C:\Program Files\Rust\bin\cargo.exe"),
+            PathBuf::from(r"C:\Program Files\Cargo\bin\cargo.exe"),
+            PathBuf::from(r"E:\Program Files\Rust\bin\cargo.exe"),
+        ];
+        if let Some(user_profile) = std::env::var_os("USERPROFILE") {
+            candidates.push(PathBuf::from(user_profile).join(r".cargo\bin\cargo.exe"));
+        }
+        candidates
+    }
+
+    fn host_select_cargo_image() -> Result<HostCargoSelection, String> {
+        let (path, sha256) = host_cargo_candidates()
+            .into_iter()
+            .filter_map(|candidate| fs::canonicalize(candidate).ok())
+            .find_map(|candidate| {
+                if !candidate.is_file() {
+                    return None;
+                }
+                host_file_identity(&candidate, false).ok()?;
+                let sha256 = host_hash_file(&candidate, D32_IMAGE_HASH_MAX_BYTES).ok()?;
+                Some((candidate, sha256))
+            })
+            .ok_or_else(|| "No trusted absolute Cargo image is installed".to_string())?;
+        let user_profile = std::env::var_os("USERPROFILE")
+            .map(PathBuf::from)
+            .ok_or_else(|| "D32 Host Rust toolchain root was unavailable".to_string())?;
+        let toolchains = user_profile.join(".rustup").join("toolchains");
+        let mut candidates = fs::read_dir(&toolchains)
+            .map_err(|_| "D32 Host Rust toolchain directory was unavailable".to_string())?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter_map(|path| fs::canonicalize(path).ok())
+            .filter(|path| {
+                path.is_dir()
+                    && path.join("bin/rustc.exe").is_file()
+                    && path.join("bin/rustdoc.exe").is_file()
+            })
+            .collect::<Vec<_>>();
+        candidates.sort();
+        candidates.reverse();
+        let toolchain_path = candidates
+            .into_iter()
+            .find(|path| {
+                fs::symlink_metadata(path)
+                    .map(|metadata| !host_metadata_is_reparse(&metadata))
+                    .unwrap_or(false)
+            })
+            .ok_or_else(|| "D32 Host Rust toolchain was unavailable".to_string())?;
+        let toolchain_manifest_sha256 =
+            host_toolchain_manifest_hash_with_cargo(&toolchain_path, &path)?;
+        Ok(HostCargoSelection {
+            path: path.to_string_lossy().into_owned(),
+            sha256,
+            toolchain_path: toolchain_path.to_string_lossy().into_owned(),
+            toolchain_manifest_sha256,
+        })
+    }
+
+    fn host_cargo_selection_path(app_data_root: &Path) -> PathBuf {
+        app_data_root.join(D32_CARGO_SELECTION_FILE_NAME)
+    }
+
+    fn host_publish_cargo_selection(app_data_root: &Path) -> Result<(), String> {
+        if !app_data_root.is_absolute() {
+            return Err("D32 Host app-data root was not absolute".to_string());
+        }
+        let app_data_root = fs::canonicalize(app_data_root)
+            .map_err(|_| "D32 Host app-data root could not be canonicalized".to_string())?;
+        validate_private_app_data_root(&app_data_root)?;
+        let selection = host_select_cargo_image()?;
+        let marker = host_cargo_selection_path(&app_data_root);
+        match fs::symlink_metadata(&marker) {
+            Ok(_) => host_verify_no_reparse_path(&app_data_root, &marker)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err("D32 Host Cargo selection metadata was unavailable".to_string()),
+        }
+        let payload = serde_json::to_vec(&selection)
+            .map_err(|_| "D32 Host Cargo selection serialization failed".to_string())?;
+        fs::write(&marker, payload)
+            .map_err(|_| "D32 Host Cargo selection could not be published".to_string())?;
+        host_verify_no_reparse_path(&app_data_root, &marker)?;
+        Ok(())
+    }
+
+    fn host_clear_cargo_selection(app_data_root: &Path) -> Result<(), String> {
+        let marker = host_cargo_selection_path(app_data_root);
+        match fs::symlink_metadata(&marker) {
+            Ok(_) => {
+                host_verify_no_reparse_path(app_data_root, &marker)?;
+                fs::remove_file(&marker)
+                    .map_err(|_| "D32 Host Cargo selection could not be cleared".to_string())?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err("D32 Host Cargo selection metadata was unavailable".to_string()),
+        }
+        Ok(())
+    }
+
+    fn host_read_cargo_selection(app_data_root: &Path) -> Result<HostCargoSelection, String> {
+        let marker = host_cargo_selection_path(app_data_root);
+        host_verify_no_reparse_path(app_data_root, &marker)?;
+        let bytes = fs::read(&marker)
+            .map_err(|_| "D32 Host Cargo selection could not be read".to_string())?;
+        if bytes.len() > 16 * 1024 {
+            return Err("D32 Host Cargo selection exceeded its bound".to_string());
+        }
+        let selection: HostCargoSelection = serde_json::from_slice(&bytes)
+            .map_err(|_| "D32 Host Cargo selection was malformed".to_string())?;
+        if selection.sha256.len() != 64
+            || selection
+                .sha256
+                .bytes()
+                .any(|byte| !byte.is_ascii_hexdigit())
+        {
+            return Err("D32 Host Cargo selection hash was malformed".to_string());
+        }
+        let path = PathBuf::from(&selection.path);
+        if !path.is_absolute() {
+            return Err("D32 Host Cargo selection path was not absolute".to_string());
+        }
+        let canonical = fs::canonicalize(&path)
+            .map_err(|_| "D32 Host Cargo selection path could not be canonicalized".to_string())?;
+        if canonical != path || !canonical.is_file() {
+            return Err("D32 Host Cargo selection path changed".to_string());
+        }
+        let actual = host_hash_file(&canonical, D32_IMAGE_HASH_MAX_BYTES)?;
+        if actual != selection.sha256 {
+            return Err("D32 Host Cargo selection hash changed".to_string());
+        }
+        host_file_identity(&canonical, false)?;
+        let toolchain = PathBuf::from(&selection.toolchain_path);
+        if !toolchain.is_absolute() {
+            return Err("D32 Host toolchain selection path was not absolute".to_string());
+        }
+        let toolchain = fs::canonicalize(&toolchain)
+            .map_err(|_| "D32 Host toolchain selection could not be canonicalized".to_string())?;
+        if !toolchain.is_dir()
+            || toolchain.join("bin/rustc.exe").is_file() == false
+            || toolchain.join("bin/rustdoc.exe").is_file() == false
+        {
+            return Err("D32 Host toolchain selection was incomplete".to_string());
+        }
+        if selection.toolchain_manifest_sha256.len() != 64
+            || selection
+                .toolchain_manifest_sha256
+                .bytes()
+                .any(|byte| !byte.is_ascii_hexdigit())
+        {
+            return Err("D32 Host toolchain selection hash was malformed".to_string());
+        }
+        if host_toolchain_manifest_hash_with_cargo(&toolchain, &canonical)?
+            != selection.toolchain_manifest_sha256
+        {
+            return Err("D32 Host toolchain selection hash changed".to_string());
+        }
+        Ok(selection)
+    }
+
+    fn host_cargo_profile_evidence(
+        app_data_root: &Path,
+    ) -> Result<HostCargoCheckProfileEvidence, String> {
+        if !app_data_root.is_absolute() {
+            return Err("D32 Host app-data root was not absolute".to_string());
+        }
+        let app_data_root = fs::canonicalize(app_data_root)
+            .map_err(|_| "D32 Host app-data root could not be canonicalized".to_string())?;
+        let root = app_data_root.join(D32_EXECUTION_ROOT_NAME);
+        let source = root.join(D32_SOURCE_DIR_NAME);
+        let toolchain = root.join(D32_TOOLCHAIN_DIR_NAME);
+        let cargo_home = root.join("cargo-home");
+        let target = root.join("target");
+        let cargo = toolchain.join("bin").join("cargo.exe");
+        let selection = host_read_cargo_selection(&app_data_root)?;
+        for path in [
+            &root,
+            &source,
+            &toolchain,
+            &cargo_home,
+            &target,
+            cargo.as_path(),
+        ] {
+            host_verify_no_reparse_path(&app_data_root, path)?;
+        }
+        let root_identity = host_file_identity(&root, true)?;
+        let source_identity = host_file_identity(&source, true)?;
+        let toolchain_identity = host_file_identity(&toolchain, true)?;
+        let cargo_identity = host_file_identity(&cargo, false)?;
+        if !root_identity.directory || !toolchain_identity.directory {
+            return Err("D32 Host projection directory identity was invalid".to_string());
+        }
+        let toolchain_manifest_hash = host_toolchain_manifest_hash(&toolchain)?;
+        if toolchain_manifest_hash != selection.toolchain_manifest_sha256 {
+            return Err("D32 Host staged toolchain selection did not match".to_string());
+        }
+        let staged_cargo_hash = host_hash_file(&cargo, D32_IMAGE_HASH_MAX_BYTES)?;
+        if staged_cargo_hash != selection.sha256 {
+            return Err("D32 Host staged Cargo did not match Host selection".to_string());
+        }
+        Ok(HostCargoCheckProfileEvidence {
+            executable_identity: cargo_identity.image_wire(),
+            executable_sha256: staged_cargo_hash,
+            toolchain_manifest_hash,
+            staged_working_directory_identity: source_identity.namespace_wire(),
+            environment_policy_hash: CARGO_ENVIRONMENT_POLICY_HASH.to_string(),
+            profile_id: PRODUCTION_CARGO_CHECK_PROFILE_ID.to_string(),
+        })
+    }
 
     /// The Host-side turn authority is the security decision point for
     /// provider credentials.  The UI-facing `active_turn_id` and
@@ -361,6 +878,20 @@ mod windows {
         session: &HostSessionState,
     ) -> Result<(), String> {
         let current_life_id = current_life_id(storage)?;
+        if current_life_id != session.life_id {
+            return Err(LIFE_RESTART_REQUIRED.to_string());
+        }
+        Ok(())
+    }
+
+    fn require_current_session_life_in_scope(
+        authority: &crate::storage::CapabilityAuthorizationScope<'_>,
+        session: &HostSessionState,
+    ) -> Result<(), String> {
+        let current_life_id = authority
+            .current_life_id()
+            .map_err(|_| LIFE_UNAVAILABLE.to_string())?
+            .ok_or_else(|| LIFE_UNAVAILABLE.to_string())?;
         if current_life_id != session.life_id {
             return Err(LIFE_RESTART_REQUIRED.to_string());
         }
@@ -1265,6 +1796,8 @@ mod windows {
         life_id: String,
         task_id: String,
         workspace_identity: String,
+        cargo_profile: Option<HostCargoCheckProfileEvidence>,
+        cargo_profile_app_data_root: Option<PathBuf>,
         provider: Option<protocol::ProviderConfiguration>,
         writer: Mutex<Option<BufWriter<File>>>,
         pending: Mutex<HashMap<String, PendingAction>>,
@@ -2531,6 +3064,13 @@ mod windows {
             let app_data_root = fs::canonicalize(&app_data_root)
                 .map_err(|_| "Vita app data root could not be canonicalized".to_string())?;
             validate_private_app_data_root(&app_data_root)?;
+            // Cargo image authority is published by the Host into its own
+            // private app-data namespace before Vita is started.  A missing
+            // or changed installation clears stale state, leaving D32
+            // unavailable rather than allowing Vita to choose an image.
+            if host_publish_cargo_selection(&app_data_root).is_err() {
+                let _ = host_clear_cargo_selection(&app_data_root);
+            }
             let sidecar_app_data_root = normalize_sidecar_local_path(&app_data_root)?;
 
             let sidecar_binding = app_owned_sidecar_path(app)?;
@@ -2606,11 +3146,20 @@ mod windows {
                 _ => return Err("Vita sidecar post-initialize frame was not Ready".to_string()),
             };
             validate_ready(&ready, &session_id, &request, &life.id)?;
+            // D32 Cargo is an optional fixed profile alongside the generic
+            // H7/H9 sidecar.  A normal sidecar session must remain usable when
+            // the app-owned Cargo projection is unavailable; the Cargo lane
+            // then stays fail-closed because validate_binding() requires this
+            // Host-owned evidence before it can issue or revalidate a grant.
+            let cargo_profile = host_cargo_profile_evidence(&app_data_root).ok();
+            let cargo_profile_app_data_root = cargo_profile.as_ref().map(|_| app_data_root.clone());
             let session = Arc::new(HostSessionState {
                 session_id: session_id.clone(),
                 life_id: life.id.clone(),
                 task_id: request.task_id.clone(),
                 workspace_identity: ready.workspace_identity,
+                cargo_profile,
+                cargo_profile_app_data_root,
                 provider,
                 writer: Mutex::new(Some(writer)),
                 pending: Mutex::new(HashMap::new()),
@@ -4470,25 +5019,27 @@ mod windows {
                 }));
             }
         };
-        let result = validate_binding(session, &request.binding).and_then(|_| {
-            let revision = current_workspace_revision_in_scope(
-                &authority_scope,
-                registry,
-                session,
-                &request.binding,
-            )?;
-            let mut grants = session
-                .grants
-                .lock()
-                .map_err(|_| "Vita grant state lock was poisoned".to_string())?;
-            consume_active_grant(
-                &mut grants,
-                &request.host_turn_id,
-                &request.grant,
-                &request.binding,
-                revision,
-            )
-        });
+        let result = require_current_session_life_in_scope(&authority_scope, session)
+            .and_then(|_| validate_binding(session, &request.binding))
+            .and_then(|_| {
+                let revision = current_workspace_revision_in_scope(
+                    &authority_scope,
+                    registry,
+                    session,
+                    &request.binding,
+                )?;
+                let mut grants = session
+                    .grants
+                    .lock()
+                    .map_err(|_| "Vita grant state lock was poisoned".to_string())?;
+                consume_active_grant(
+                    &mut grants,
+                    &request.host_turn_id,
+                    &request.grant,
+                    &request.binding,
+                    revision,
+                )
+            });
         let result = match result {
             Ok(grant) => session.send(&HostMessage::GrantRevalidated(GrantRevalidated {
                 request_id: request.request_id,
@@ -4581,6 +5132,26 @@ mod windows {
         binding
             .validate()
             .map_err(|_| "Vita process binding was malformed".to_string())?;
+        let cargo_profile_exact = if binding.capability_id == PRODUCTION_CARGO_CHECK_CAPABILITY_ID {
+            let Some(expected) = session.cargo_profile.as_ref() else {
+                return Err("D32 Host Cargo profile evidence was absent".to_string());
+            };
+            let current = match session.cargo_profile_app_data_root.as_deref() {
+                Some(root) => host_cargo_profile_evidence(root).map_err(|_| {
+                    "D32 Host Cargo profile evidence changed or became unavailable".to_string()
+                })?,
+                None => expected.clone(),
+            };
+            current == *expected
+                && !expected.toolchain_manifest_hash.is_empty()
+                && binding.executable_identity == expected.executable_identity
+                && binding.executable_sha256 == expected.executable_sha256
+                && binding.working_directory_identity == expected.staged_working_directory_identity
+                && binding.environment_policy_hash == expected.environment_policy_hash
+                && binding.profile_id == expected.profile_id
+        } else {
+            false
+        };
         if binding.session_id != session.session_id
             || binding.life_id != session.life_id
             || binding.task_id != session.task_id
@@ -4597,16 +5168,10 @@ mod windows {
                     && binding.profile_id == PRODUCTION_CARGO_CHECK_PROFILE_ID
                     && binding.argv_count == 2
                     && binding.argv_hash == CARGO_ARGV_HASH
-                    && binding.working_directory_identity == session.workspace_identity
                     && binding.stdout_bound == 65_536
                     && binding.stderr_bound == 65_536
                     && binding.timeout_ms == 120_000
-                    && binding.environment_policy_hash == CARGO_ENVIRONMENT_POLICY_HASH
-                    && binding.executable_sha256.len() == 64
-                    && binding
-                        .executable_sha256
-                        .bytes()
-                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                    && cargo_profile_exact
                     && binding.git_metadata_fence_hash == CARGO_NO_GIT_METADATA_FENCE))
             || binding.workspace_root_identity != session.workspace_identity
         {
@@ -6051,6 +6616,8 @@ mod windows {
     fn error_code(error: &str) -> String {
         if error == CAPABILITY_AUTHORITY_RESTART_REQUIRED {
             CAPABILITY_AUTHORITY_RESTART_REQUIRED.to_string()
+        } else if matches!(error, LIFE_RESTART_REQUIRED | LIFE_UNAVAILABLE) {
+            error.to_string()
         } else if error.starts_with("CAPABILITY_") {
             error.to_string()
         } else if error.contains("revision") {
@@ -6168,6 +6735,7 @@ mod windows {
         use std::process::Command;
         use std::sync::{mpsc, Arc, Barrier};
         use std::thread;
+        use tempfile::Builder;
 
         fn test_binding(session_id: &str) -> ProcessBinding {
             test_binding_for(session_id, "turn", "call")
@@ -6194,6 +6762,17 @@ mod windows {
                 workspace_root_identity: "workspace".to_string(),
                 profile_id: PRODUCTION_GIT_STATUS_PROFILE_ID.to_string(),
                 git_metadata_fence_hash: "3".repeat(64),
+            }
+        }
+
+        fn test_cargo_profile_evidence(workspace_identity: &str) -> HostCargoCheckProfileEvidence {
+            HostCargoCheckProfileEvidence {
+                executable_identity: "v1f1".to_string(),
+                executable_sha256: "0".repeat(64),
+                toolchain_manifest_hash: "4".repeat(64),
+                staged_working_directory_identity: workspace_identity.to_string(),
+                environment_policy_hash: CARGO_ENVIRONMENT_POLICY_HASH.to_string(),
+                profile_id: PRODUCTION_CARGO_CHECK_PROFILE_ID.to_string(),
             }
         }
 
@@ -9716,6 +10295,8 @@ mod windows {
                 life_id: life_id.to_string(),
                 task_id: "task".to_string(),
                 workspace_identity: "workspace".to_string(),
+                cargo_profile: Some(test_cargo_profile_evidence("workspace")),
+                cargo_profile_app_data_root: None,
                 provider,
                 writer: Mutex::new(None),
                 pending: Mutex::new(HashMap::new()),
@@ -9979,6 +10560,462 @@ mod windows {
             binding.argv_count = 2;
             binding.environment_policy_hash = "0".repeat(64);
             assert!(validate_binding(&session, &binding).is_err());
+            binding.environment_policy_hash = CARGO_ENVIRONMENT_POLICY_HASH.to_string();
+            binding.executable_identity = "tampered".to_string();
+            assert!(validate_binding(&session, &binding).is_err());
+            binding.executable_identity = "v1f1".to_string();
+            binding.executable_sha256 = "f".repeat(64);
+            assert!(validate_binding(&session, &binding).is_err());
+            binding.executable_sha256 = "0".repeat(64);
+            binding.working_directory_identity = "tampered".to_string();
+            assert!(validate_binding(&session, &binding).is_err());
+        }
+
+        #[test]
+        fn d32_revalidation_life_fence_is_read_inside_the_authority_scope() {
+            let (session, _receiver) = test_session();
+            let (_root, storage, _registry, _revision) = authority_fixture(&session);
+            let authority_scope = storage
+                .capability_authorization_scope()
+                .expect("D32 authority scope");
+            assert!(require_current_session_life_in_scope(&authority_scope, &session).is_ok());
+            switch_current_life_for_test_with_persona(&storage, "d29h9-r3-persona");
+            assert_eq!(
+                require_current_session_life_in_scope(&authority_scope, &session).unwrap_err(),
+                LIFE_RESTART_REQUIRED
+            );
+        }
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum D32CargoCanaryMode {
+            Positive,
+            RevokeBeforeRevalidation,
+            LifeBeforeRevalidation,
+        }
+
+        #[test]
+        fn d32_a_real_host_vita_codex_cargo_canary() {
+            if std::env::var("D32_A_REQUIRE_REAL_CANARY").as_deref() != Ok("1") {
+                eprintln!(
+                    "skipping D32-A positive canary; set D32_A_REQUIRE_REAL_CANARY=1 for the freeze gate"
+                );
+                return;
+            }
+            run_d32_a_real_process_cargo_canary(D32CargoCanaryMode::Positive);
+        }
+
+        #[test]
+        fn d32_a_real_host_vita_codex_revoke_canary() {
+            if std::env::var("D32_A_REQUIRE_REAL_CANARY").as_deref() != Ok("1") {
+                eprintln!(
+                    "skipping D32-A revoke canary; set D32_A_REQUIRE_REAL_CANARY=1 for the freeze gate"
+                );
+                return;
+            }
+            run_d32_a_real_process_cargo_canary(D32CargoCanaryMode::RevokeBeforeRevalidation);
+        }
+
+        #[test]
+        fn d32_a_real_host_vita_codex_life_canary() {
+            if std::env::var("D32_A_REQUIRE_REAL_CANARY").as_deref() != Ok("1") {
+                eprintln!(
+                    "skipping D32-A Life canary; set D32_A_REQUIRE_REAL_CANARY=1 for the freeze gate"
+                );
+                return;
+            }
+            run_d32_a_real_process_cargo_canary(D32CargoCanaryMode::LifeBeforeRevalidation);
+        }
+
+        fn run_d32_a_real_process_cargo_canary(mode: D32CargoCanaryMode) {
+            let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../vita-agent/target/release/vita-agent.exe");
+            assert!(
+                executable.is_file(),
+                "D32-A mandatory canary requires the release image: {}",
+                executable.display()
+            );
+            let git_path = resolve_git_path().expect("D32-A mandatory canary trusted Git");
+            let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .expect("D32-A canary repository root")
+                .to_path_buf();
+            let workspace = Builder::new()
+                .prefix("d32a-canary-workspace-")
+                .tempdir_in(&repository_root)
+                .expect("D32-A canary workspace");
+            fs::create_dir(workspace.path().join(".git")).expect("D32-A canary Git metadata");
+            fs::write(
+                workspace.path().join(".git/config"),
+                b"[core]\n\trepositoryformatversion = 0\n\tbare = false\n",
+            )
+            .expect("D32-A canary Git config");
+            fs::create_dir(workspace.path().join("src")).expect("D32-A canary source");
+            fs::write(
+                workspace.path().join("Cargo.toml"),
+                b"[package]\nname = \"d32_a_canary\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            )
+            .expect("D32-A canary manifest");
+            fs::write(
+                workspace.path().join("Cargo.lock"),
+                b"# This file is automatically @generated by Cargo.\nversion = 3\n\n[[package]]\nname = \"d32_a_canary\"\nversion = \"0.1.0\"\n",
+            )
+            .expect("D32-A canary lockfile");
+            fs::write(
+                workspace.path().join("src/lib.rs"),
+                b"pub fn d32_a_canary() -> u32 { 32 }\n",
+            )
+            .expect("D32-A canary Rust source");
+            let unrelated = workspace.path().join("unrelated.txt");
+            fs::write(&unrelated, b"must remain unchanged\n").expect("D32-A unrelated fixture");
+            let unrelated_before = fs::read(&unrelated).expect("D32-A unrelated before");
+
+            let app_data = tempfile::tempdir().expect("D32-A canary app-data");
+            fs::create_dir(app_data.path().join("agent")).expect("D32-A Vita app-data root");
+            fs::write(
+                app_data.path().join("agent/.vita-agent-runtime"),
+                b"runtime_id=vita-agent\nlayout=v1\n",
+            )
+            .expect("D32-A Vita ownership marker");
+            host_publish_cargo_selection(app_data.path())
+                .expect("D32-A Host Cargo selection authority");
+            let process_root = tempfile::tempdir().expect("D32-A canary process root");
+            let canary_resource = tempfile::tempdir().expect("D32-A canary resource root");
+            let canary_executable = canary_resource.path().join(SIDECAR_RESOURCE_NAME);
+            fs::copy(&executable, &canary_executable).expect("copy D32-A sidecar image");
+            let image =
+                VitaSidecarProcess::prepare_image(&canary_executable, canary_resource.path())
+                    .expect("prepare D32-A sidecar image");
+            let mut process = VitaSidecarProcess::spawn_prepared(
+                image,
+                &[OsString::from("--serve-ipc-test-canary")],
+                process_root.path(),
+            )
+            .expect("spawn D32-A process-isolated sidecar");
+            let stdout = process.take_stdout().expect("D32-A sidecar stdout");
+            let stdin = process.take_stdin().expect("D32-A sidecar stdin");
+            let mut stderr = process.take_stderr().expect("D32-A sidecar stderr");
+            let (message, reader) = receive_vita_message_with_timeout(
+                BufReader::new(stdout),
+                HANDSHAKE_TIMEOUT,
+                "D32-A canary handshake",
+            )
+            .expect("D32-A canary handshake");
+            let handshake = match message {
+                VitaMessage::Handshake(value) => value,
+                other => panic!("unexpected D32-A canary first frame: {other:?}"),
+            };
+            validate_handshake(&handshake).expect("D32-A pinned handshake");
+
+            let session_id = "d32-a-process-session".to_string();
+            let life_id = "d32-a-process-life".to_string();
+            let task_id = "d32-a-process-task".to_string();
+            let host_turn_id = "d32-a-process-host-turn".to_string();
+            let provider = protocol::ProviderConfiguration {
+                profile_id: "d32-a-canary-profile".to_string(),
+                purpose: "chat".to_string(),
+                provider_kind: "openai_compatible".to_string(),
+                base_url: "http://127.0.0.1:9/v1".to_string(),
+                model: if mode != D32CargoCanaryMode::Positive {
+                    "d32-a-negative-canary-model".to_string()
+                } else {
+                    "d32-a-canary-model".to_string()
+                },
+                credential_ref: "d32-a-canary-credential".to_string(),
+                credential_destination: "http://127.0.0.1:9/v1".to_string(),
+            };
+            let workspace_for_sidecar =
+                normalize_sidecar_local_path(workspace.path()).expect("D32-A workspace path");
+            let app_data_for_sidecar =
+                normalize_sidecar_local_path(app_data.path()).expect("D32-A app-data path");
+            let git_for_sidecar = normalize_sidecar_local_path(&git_path).expect("D32-A Git path");
+            let mut writer = BufWriter::new(stdin);
+            protocol::write_frame(
+                &mut writer,
+                &HostMessage::Initialize(InitializeSession {
+                    request_id: "d32-a-canary-initialize".to_string(),
+                    protocol_version: PROTOCOL_VERSION.to_string(),
+                    session_id: session_id.clone(),
+                    life_id: life_id.clone(),
+                    task_id: task_id.clone(),
+                    app_data_root: app_data_for_sidecar.to_string_lossy().into_owned(),
+                    workspace_path: workspace_for_sidecar.to_string_lossy().into_owned(),
+                    git_path: git_for_sidecar.to_string_lossy().into_owned(),
+                    provider: Some(provider.clone()),
+                }),
+            )
+            .expect("D32-A canary initialize");
+            let (message, mut reader) =
+                receive_vita_message_with_timeout(reader, READY_TIMEOUT, "D32-A canary ready")
+                    .unwrap_or_else(|error| {
+                        let _ = process.shutdown();
+                        let mut diagnostics = String::new();
+                        let _ = std::io::Read::read_to_string(&mut stderr, &mut diagnostics);
+                        panic!("D32-A canary ready failed: {error}; sidecar stderr: {diagnostics}");
+                    });
+            let ready = match message {
+                VitaMessage::Ready(value) => value,
+                other => panic!("unexpected D32-A canary ready frame: {other:?}"),
+            };
+            let request = VitaSidecarStartRequest {
+                life_id: life_id.clone(),
+                task_id: task_id.clone(),
+                workspace_path: workspace_for_sidecar.to_string_lossy().into_owned(),
+            };
+            validate_ready(&ready, &session_id, &request, &life_id)
+                .expect("D32-A canary ready identity");
+
+            let authority_root = tempfile::tempdir().expect("D32-A authority root");
+            let storage = Arc::new(
+                StorageService::initialize_with_roots(authority_root.path().to_path_buf(), None)
+                    .expect("D32-A authority storage"),
+            );
+            storage
+                .save_persona(PersonaTemplateRecord {
+                    id: "d32-a-canary-persona".to_string(),
+                    name: "D32-A canary persona".to_string(),
+                    version: 1,
+                    persona_json: "{}".to_string(),
+                })
+                .expect("D32-A canary persona");
+            storage
+                .save_life(LifeIdentityRecord {
+                    id: life_id.clone(),
+                    name: "D32-A canary life".to_string(),
+                    created_at: "2026-09-15T00:00:00.000Z".to_string(),
+                    version: 1,
+                    body_id: "d32-a-canary-body".to_string(),
+                    persona_id: "d32-a-canary-persona".to_string(),
+                    persona_version: 1,
+                })
+                .expect("D32-A canary life");
+            let registry = CapabilityRegistry::production().expect("D32-A production registry");
+            let cargo_capability = CapabilityId::try_from(PRODUCTION_CARGO_CHECK_CAPABILITY_ID)
+                .expect("D32-A Cargo capability");
+            assert!(matches!(
+                storage
+                    .create_capability_authorization(LifeCapabilityAuthorizationCreateRequest {
+                        life_id: life_id.clone(),
+                        capability_id: cargo_capability,
+                    })
+                    .expect("D32-A Cargo authorization root"),
+                CapabilityAuthorizationCreateOutcome::Applied(_)
+            ));
+            let enabled_revision = apply_transition_for_test(
+                &storage,
+                &registry,
+                PRODUCTION_CARGO_CHECK_CAPABILITY_ID,
+                true,
+                1,
+                &life_id,
+            )
+            .expect("D32-A enable Cargo capability");
+            assert_eq!(enabled_revision.revision, 2);
+
+            let cargo_profile =
+                host_cargo_profile_evidence(app_data.path()).expect("D32-A Host Cargo evidence");
+            let provider_binding =
+                protocol::ProviderBinding::derive(&session_id, &host_turn_id, &provider)
+                    .expect("D32-A provider binding");
+            let session = Arc::new(HostSessionState {
+                session_id: session_id.clone(),
+                life_id: life_id.clone(),
+                task_id: task_id.clone(),
+                workspace_identity: ready.workspace_identity,
+                cargo_profile: Some(cargo_profile),
+                cargo_profile_app_data_root: Some(app_data.path().to_path_buf()),
+                provider: Some(provider.clone()),
+                writer: Mutex::new(Some(writer)),
+                pending: Mutex::new(HashMap::new()),
+                workspace_read_pending: Mutex::new(HashMap::new()),
+                workspace_replace_pending: Mutex::new(HashMap::new()),
+                approvals: Mutex::new(HashMap::new()),
+                grants: Mutex::new(HashMap::new()),
+                workspace_read_approvals: Mutex::new(HashMap::new()),
+                workspace_read_grants: Mutex::new(HashMap::new()),
+                workspace_replace_approvals: Mutex::new(HashMap::new()),
+                workspace_replace_grants: Mutex::new(HashMap::new()),
+                recovery_pending: Mutex::new(HashMap::new()),
+                recovery_scan_pending: Mutex::new(HashMap::new()),
+                recovery_actions: Mutex::new(HashMap::new()),
+                recovery_approvals: Mutex::new(HashMap::new()),
+                recovery_grants: Mutex::new(HashMap::new()),
+                replay: Mutex::new(RequestReplayWindow::default()),
+                expiry: Arc::new(ExpiryOwner::new()),
+                closed: AtomicBool::new(false),
+                turn_authority: Mutex::new(HostTurnAuthority::Idle),
+                active_turn_id: Mutex::new(None),
+                turn_phase: Mutex::new(None),
+                assistant_text: Mutex::new(None),
+                turn_error: Mutex::new(None),
+                recovery_result: Mutex::new(None),
+                test_outbound: Mutex::new(None),
+            });
+            session
+                .begin_turn(
+                    host_turn_id.clone(),
+                    provider.clone(),
+                    provider_binding.clone(),
+                )
+                .expect("D32-A Host turn");
+            let coordinator = VitaSidecarCoordinator::new(Arc::clone(&storage), registry.clone());
+            coordinator.install_test_session(Arc::clone(&session));
+            session
+                .send(&HostMessage::StartTurn(protocol::StartTurn {
+                    request_id: "d32-a-canary-start-turn".to_string(),
+                    session_id: session_id.clone(),
+                    turn_id: host_turn_id.clone(),
+                    prompt: "Run the fixed sandboxed cargo check tool.".to_string(),
+                    binding: provider_binding,
+                }))
+                .expect("D32-A canary start turn");
+
+            let mut completed = false;
+            let mut authority_seen = false;
+            let mut confirmation_seen = false;
+            let mut grant_seen = false;
+            let mut revalidation_seen = false;
+            let mut resumed_seen = false;
+            for _ in 0..64 {
+                let (message, next_reader) = receive_vita_message_with_timeout(
+                    reader,
+                    READY_TIMEOUT,
+                    "D32-A canary turn frame",
+                )
+                .expect("D32-A canary turn frame");
+                reader = next_reader;
+                match message {
+                    VitaMessage::TurnState(state) => {
+                        if state.phase == protocol::TurnPhase::Running {
+                            resumed_seen = true;
+                        }
+                        handle_turn_state(&session, state).expect("D32-A turn state");
+                    }
+                    VitaMessage::CredentialRequired(request) => {
+                        let credential = protocol::SensitiveCredential::new(
+                            "h9-canary-fake-credential".to_string(),
+                        )
+                        .expect("D32-A canary credential");
+                        session
+                            .send(&HostMessage::SensitiveCredentialReply(
+                                protocol::SensitiveCredentialReply {
+                                    request_id: request.request_id,
+                                    session_id: session_id.clone(),
+                                    turn_id: request.turn_id,
+                                    binding_hash: request.binding.binding_hash,
+                                    credential_ref: request.binding.credential_ref,
+                                    credential: Some(credential),
+                                    error_code: None,
+                                },
+                            ))
+                            .expect("D32-A credential reply");
+                    }
+                    VitaMessage::AuthorityEvaluate(request) => {
+                        authority_seen = true;
+                        handle_authority_evaluate(&session, &storage, &registry, request)
+                            .expect("D32-A authority evaluation");
+                    }
+                    VitaMessage::ConfirmationRequired(request) => {
+                        confirmation_seen = true;
+                        handle_confirmation_required(&session, request)
+                            .expect("D32-A confirmation request");
+                        let pending_id = session
+                            .pending_summary()
+                            .expect("D32-A pending confirmation")
+                            .pending_id;
+                        coordinator
+                            .confirm(pending_id)
+                            .expect("D32-A explicit confirmation");
+                    }
+                    VitaMessage::IssueGrant(request) => {
+                        grant_seen = true;
+                        handle_issue_grant(&session, &storage, &registry, request)
+                            .expect("D32-A grant issue");
+                    }
+                    VitaMessage::RevalidateGrant(request) => {
+                        revalidation_seen = true;
+                        match mode {
+                            D32CargoCanaryMode::RevokeBeforeRevalidation => {
+                                let revoked = apply_transition_for_test(
+                                    &storage,
+                                    &registry,
+                                    PRODUCTION_CARGO_CHECK_CAPABILITY_ID,
+                                    false,
+                                    2,
+                                    &life_id,
+                                )
+                                .expect("D32-A revoke before revalidation");
+                                assert_eq!(revoked.revision, 3);
+                            }
+                            D32CargoCanaryMode::LifeBeforeRevalidation => {
+                                switch_current_life_for_test_with_persona(
+                                    &storage,
+                                    "d32-a-canary-persona",
+                                );
+                            }
+                            D32CargoCanaryMode::Positive => {}
+                        }
+                        handle_revalidate_grant(&session, &storage, &registry, request)
+                            .expect("D32-A grant revalidation");
+                    }
+                    VitaMessage::TurnCompleted(message) => {
+                        assert_eq!(message.session_id, session_id);
+                        assert_eq!(message.turn_id, host_turn_id);
+                        completed = true;
+                        break;
+                    }
+                    VitaMessage::TurnFailed(message) => {
+                        let _ = process.shutdown();
+                        let mut diagnostics = String::new();
+                        let _ = std::io::Read::read_to_string(&mut stderr, &mut diagnostics);
+                        panic!(
+                            "D32-A canary turn failed: {} ({}) in {:?}; sidecar stderr: {}",
+                            message.error_code, message.message, message.phase, diagnostics
+                        );
+                    }
+                    other => panic!("unexpected D32-A canary turn frame: {other:?}"),
+                }
+            }
+            assert!(completed, "D32-A canary did not complete a real turn");
+            assert!(authority_seen, "D32-A canary missed authority evaluation");
+            assert!(
+                confirmation_seen,
+                "D32-A canary missed explicit confirmation"
+            );
+            assert!(grant_seen, "D32-A canary missed Host grant issue");
+            assert!(revalidation_seen, "D32-A canary missed Host revalidation");
+            // A successful run must have created/resumed a real suspended
+            // process and observed its terminal result.  The revoke lane is
+            // deliberately denied before CreateProcessW.
+            if mode == D32CargoCanaryMode::Positive {
+                assert!(
+                    resumed_seen,
+                    "D32-A positive canary missed the running/resume state"
+                );
+            }
+            assert!(resumed_seen || mode != D32CargoCanaryMode::Positive);
+            assert_eq!(
+                fs::read(&unrelated).expect("D32-A unrelated final"),
+                unrelated_before
+            );
+            session
+                .send(&HostMessage::Shutdown(protocol::Shutdown {
+                    request_id: "d32-a-canary-shutdown".to_string(),
+                    session_id: session_id.clone(),
+                }))
+                .expect("D32-A canary shutdown");
+            let (message, _reader) = receive_vita_message_with_timeout(
+                reader,
+                READY_TIMEOUT,
+                "D32-A canary shutdown ack",
+            )
+            .expect("D32-A canary shutdown ack");
+            assert!(matches!(
+                message,
+                VitaMessage::ShutdownAck(protocol::ShutdownAck { session_id: ack_session, .. })
+                    if ack_session == session_id
+            ));
+            session.retire();
+            process.shutdown().expect("D32-A canary process shutdown");
         }
 
         #[test]
@@ -11497,6 +12534,8 @@ mod windows {
                 life_id: life_id.clone(),
                 task_id: task_id.clone(),
                 workspace_identity: ready.workspace_identity,
+                cargo_profile: None,
+                cargo_profile_app_data_root: None,
                 provider: Some(provider.clone()),
                 writer: Mutex::new(Some(writer)),
                 pending: Mutex::new(HashMap::new()),
@@ -11943,6 +12982,8 @@ mod windows {
                 life_id: life_id.clone(),
                 task_id: task_id.clone(),
                 workspace_identity: ready.workspace_identity,
+                cargo_profile: None,
+                cargo_profile_app_data_root: None,
                 provider: None,
                 writer: Mutex::new(Some(writer)),
                 pending: Mutex::new(HashMap::new()),
@@ -12338,6 +13379,8 @@ mod windows {
                 life_id: life_id.clone(),
                 task_id: task_id.clone(),
                 workspace_identity: ready.workspace_identity,
+                cargo_profile: None,
+                cargo_profile_app_data_root: None,
                 provider: Some(provider.clone()),
                 writer: Mutex::new(Some(writer)),
                 pending: Mutex::new(HashMap::new()),

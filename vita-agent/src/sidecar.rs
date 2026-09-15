@@ -5,7 +5,9 @@
 //! this process never reads the Host SQLite database and never mints a grant.
 
 use codex_extension_api::ToolContributor;
+use serde::Deserialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, BufWriter, Read, Stdin, Stdout, Write};
 use std::net::{TcpListener, TcpStream};
@@ -306,6 +308,8 @@ struct H9CanaryTransport {
     patch_mode: bool,
     negative_patch_mode: bool,
     patch_conflict_mode: bool,
+    cargo_mode: bool,
+    negative_cargo_mode: bool,
     response_model: String,
 }
 
@@ -329,6 +333,8 @@ impl H9CanaryTransport {
         patch_mode: bool,
         negative_patch_mode: bool,
         patch_conflict_mode: bool,
+        cargo_mode: bool,
+        negative_cargo_mode: bool,
         response_model: impl Into<String>,
     ) -> Self {
         Self {
@@ -341,6 +347,8 @@ impl H9CanaryTransport {
             patch_mode,
             negative_patch_mode,
             patch_conflict_mode,
+            cargo_mode,
+            negative_cargo_mode,
             response_model: response_model.into(),
         }
     }
@@ -480,6 +488,24 @@ impl crate::provider_gateway::ProviderRequestTransport for H9CanaryTransport {
                             && result.get("recovery_required").and_then(Value::as_bool)
                                 == Some(false)
                     }
+                } else if self.cargo_mode {
+                    let status = result.get("status").and_then(Value::as_str);
+                    let process_created = result.get("process_created").and_then(Value::as_bool);
+                    let user_code_started =
+                        result.get("user_code_started").and_then(Value::as_bool);
+                    let process_tree_remaining =
+                        result.get("process_tree_remaining").and_then(Value::as_u64);
+                    status
+                        == Some(if self.negative_cargo_mode {
+                            "denied"
+                        } else {
+                            "completed"
+                        })
+                        && result.get("exit_code").is_some()
+                        && result.get("timed_out").and_then(Value::as_bool) == Some(false)
+                        && process_created == Some(!self.negative_cargo_mode)
+                        && user_code_started == Some(!self.negative_cargo_mode)
+                        && process_tree_remaining == Some(0)
                 } else if self.read_mode {
                     let content = result.get("content").and_then(Value::as_str);
                     let relative_path = result.get("relative_path").and_then(Value::as_str);
@@ -539,7 +565,9 @@ impl crate::provider_gateway::ProviderRequestTransport for H9CanaryTransport {
                 };
                 if !valid || output.contains(&self.expected_workspace_path) {
                     return Err(crate::VitaAgentError::GatewayProtocol(
-                        if self.patch_mode {
+                        if self.cargo_mode {
+                            "D32-A canary second request did not contain exact bounded Cargo result"
+                        } else if self.patch_mode {
                             "D31-D canary second request did not contain exact bounded patch result"
                         } else if self.read_mode {
                             "D31-B canary second request did not contain exact bounded read result"
@@ -571,7 +599,9 @@ impl crate::provider_gateway::ProviderRequestTransport for H9CanaryTransport {
                             "id": "h9-canary-call-1",
                             "type": "function",
                             "function": {
-                                "name": if self.patch_mode {
+                                "name": if self.cargo_mode {
+                                    D32_CARGO_TOOL_NAME
+                                } else if self.patch_mode {
                                     VITA_WORKSPACE_PATCH_TOOL_NAME
                                 } else if self.replace_mode {
                                     VITA_WORKSPACE_REPLACE_TOOL_NAME
@@ -580,7 +610,9 @@ impl crate::provider_gateway::ProviderRequestTransport for H9CanaryTransport {
                                 } else {
                                     VITA_WORKSPACE_GIT_STATUS_TOOL_NAME
                                 },
-                                "arguments": if self.patch_mode {
+                                "arguments": if self.cargo_mode {
+                                    "{}".to_string()
+                                } else if self.patch_mode {
                                     let expected_sha256 = if self.patch_conflict_mode {
                                         crate::sha256_hex(b"D31-D wrong base\n")
                                     } else {
@@ -1543,6 +1575,14 @@ fn vita_request_id(message: &VitaMessage) -> &str {
 }
 
 pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
+    let require_real_canary =
+        std::env::var("D32_A_REQUIRE_REAL_CANARY").ok().as_deref() == Some("1");
+    if require_real_canary && !test_canary {
+        return Err(
+            "D32-A mandatory real canary requires the test-canary Host/Vita/Codex harness"
+                .to_string(),
+        );
+    }
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut reader = BufReader::new(stdin);
@@ -1568,6 +1608,9 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
         _ => return Err("Vita sidecar expected Initialize as its first Host message".to_string()),
     };
     init.validate().map_err(protocol_error)?;
+    if require_real_canary && init.provider.is_none() {
+        return Err("D32-A mandatory real canary requires a pinned provider fixture".to_string());
+    }
 
     let router = SidecarRouter::start(reader, writer);
     let profile = VitaAgentRuntimeProfile::from_explicit_app_data_root(
@@ -1672,7 +1715,16 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
     let patch_context = context.clone();
     let cargo_context = context.clone();
     let cargo_workspace = workspace.clone();
-    let cargo_path = resolve_cargo_path().ok();
+    let cargo_selection = resolve_cargo_selection(Path::new(&init.app_data_root)).ok();
+    let cargo_path = cargo_selection
+        .as_ref()
+        .map(|selection| selection.cargo_path.clone());
+    let cargo_toolchain_root = cargo_selection
+        .as_ref()
+        .map(|selection| selection.toolchain_root.clone());
+    let cargo_toolchain_manifest_hash = cargo_selection
+        .as_ref()
+        .map(|selection| selection.toolchain_manifest_sha256.clone());
     let production = Arc::new(
         VitaGitStatusProduction::new(
             context,
@@ -1685,12 +1737,13 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
     let cargo_production = Arc::new(VitaCargoCheckProduction::new(
         cargo_context,
         cargo_workspace,
+        PathBuf::from(&init.app_data_root),
         cargo_path.unwrap_or_else(|| PathBuf::from(r"C:\__digital_life_missing_cargo__.exe")),
+        cargo_toolchain_root,
+        cargo_toolchain_manifest_hash,
         Arc::clone(&authority) as Arc<dyn VitaGitStatusAuthority>,
     ));
-    if std::env::var("D32_A_REQUIRE_REAL_CANARY").ok().as_deref() == Some("1")
-        && !cargo_production.is_available()
-    {
+    if require_real_canary && !cargo_production.is_available() {
         return Err(format!(
             "D32-A mandatory real canary prerequisites unavailable: {}",
             cargo_production
@@ -1807,6 +1860,10 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
                         provider_config.model == "d31-d-negative-canary-model";
                     let patch_conflict_mode =
                         provider_config.model == "d31-d-conflict-canary-model";
+                    let negative_cargo_mode =
+                        provider_config.model == "d32-a-negative-canary-model";
+                    let cargo_mode =
+                        provider_config.model == "d32-a-canary-model" || negative_cargo_mode;
                     SidecarGatewayTransport::H9Canary(Arc::new(H9CanaryTransport::new(
                         &init.workspace_path,
                         provider_config.model == "d31-b-canary-model" || negative_read_mode,
@@ -1818,6 +1875,8 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
                             || patch_conflict_mode,
                         negative_patch_mode,
                         patch_conflict_mode,
+                        cargo_mode,
+                        negative_cargo_mode,
                         provider_config.model.clone(),
                     )))
                 }
@@ -3770,22 +3829,124 @@ fn workspace_summary(path: &str) -> String {
         .unwrap_or_else(|| "selected workspace".to_string())
 }
 
-fn resolve_cargo_path() -> Result<PathBuf, String> {
-    // Absolute, fixed install locations only.  This is intentionally not a
-    // PATH lookup and never accepts a model/provider supplied executable.
-    let mut candidates = vec![
-        PathBuf::from(r"C:\Program Files\Rust\bin\cargo.exe"),
-        PathBuf::from(r"C:\Program Files\Cargo\bin\cargo.exe"),
-        PathBuf::from(r"E:\Program Files\Rust\bin\cargo.exe"),
-    ];
-    if let Some(user_profile) = std::env::var_os("USERPROFILE") {
-        candidates.push(PathBuf::from(user_profile).join(r".cargo\bin\cargo.exe"));
+const D32_CARGO_SELECTION_FILE_NAME: &str = ".d32-cargo-selection-v1.json";
+const D32_CARGO_SELECTION_MAX_BYTES: usize = 16 * 1024;
+const D32_CARGO_IMAGE_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SidecarCargoSelection {
+    path: String,
+    sha256: String,
+    toolchain_path: String,
+    toolchain_manifest_sha256: String,
+}
+
+struct ResolvedCargoSelection {
+    cargo_path: PathBuf,
+    toolchain_root: PathBuf,
+    toolchain_manifest_sha256: String,
+}
+
+fn hash_cargo_image(path: &Path) -> Result<String, String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|_| "Host-selected Cargo image could not be opened".to_string())?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut total = 0_u64;
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| "Host-selected Cargo image could not be read".to_string())?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read as u64);
+        if total > D32_CARGO_IMAGE_MAX_BYTES {
+            return Err("Host-selected Cargo image exceeded its bound".to_string());
+        }
+        digest.update(&buffer[..read]);
     }
-    candidates
-        .into_iter()
-        .filter_map(|candidate| std::fs::canonicalize(candidate).ok())
-        .find(|candidate| candidate.is_file())
-        .ok_or_else(|| "No trusted absolute Cargo image is installed".to_string())
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn resolve_cargo_selection(app_data_root: &Path) -> Result<ResolvedCargoSelection, String> {
+    // The Host publishes this marker before starting Vita.  There is no PATH,
+    // USERPROFILE, or model/provider fallback here: Vita can only consume the
+    // exact image path and digest selected by the Host.
+    if !app_data_root.is_absolute() {
+        return Err("Host Cargo authority root was not absolute".to_string());
+    }
+    let root = std::fs::canonicalize(app_data_root)
+        .map_err(|_| "Host Cargo authority root could not be canonicalized".to_string())?;
+    let marker = root.join(D32_CARGO_SELECTION_FILE_NAME);
+    let marker_metadata = std::fs::symlink_metadata(&marker)
+        .map_err(|_| "Host Cargo authority marker was unavailable".to_string())?;
+    if marker_metadata.file_type().is_symlink() || !marker_metadata.is_file() {
+        return Err("Host Cargo authority marker was not a regular file".to_string());
+    }
+    let marker_canonical = std::fs::canonicalize(&marker)
+        .map_err(|_| "Host Cargo authority marker could not be canonicalized".to_string())?;
+    if marker_canonical != marker {
+        return Err("Host Cargo authority marker escaped app data".to_string());
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(&marker)
+        .map_err(|_| "Host Cargo authority marker could not be opened".to_string())?
+        .take((D32_CARGO_SELECTION_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "Host Cargo authority marker could not be read".to_string())?;
+    if bytes.len() > D32_CARGO_SELECTION_MAX_BYTES {
+        return Err("Host Cargo authority marker exceeded its bound".to_string());
+    }
+    let selection: SidecarCargoSelection = serde_json::from_slice(&bytes)
+        .map_err(|_| "Host Cargo authority marker was malformed".to_string())?;
+    if selection.sha256.len() != 64
+        || selection
+            .sha256
+            .bytes()
+            .any(|byte| !byte.is_ascii_hexdigit())
+    {
+        return Err("Host Cargo authority digest was malformed".to_string());
+    }
+    let selected = PathBuf::from(selection.path);
+    if !selected.is_absolute() {
+        return Err("Host Cargo authority image path was not absolute".to_string());
+    }
+    let canonical = std::fs::canonicalize(&selected)
+        .map_err(|_| "Host Cargo authority image could not be canonicalized".to_string())?;
+    if !canonical.is_file() {
+        return Err("Host Cargo authority image was not a regular file".to_string());
+    }
+    let actual = hash_cargo_image(&canonical)?;
+    if actual != selection.sha256 {
+        return Err("Host Cargo authority image digest changed".to_string());
+    }
+    let toolchain = PathBuf::from(selection.toolchain_path);
+    if !toolchain.is_absolute() {
+        return Err("Host Cargo authority toolchain path was not absolute".to_string());
+    }
+    let toolchain = std::fs::canonicalize(&toolchain)
+        .map_err(|_| "Host Cargo authority toolchain could not be canonicalized".to_string())?;
+    if !toolchain.is_dir()
+        || !toolchain.join("bin/rustc.exe").is_file()
+        || !toolchain.join("bin/rustdoc.exe").is_file()
+    {
+        return Err("Host Cargo authority toolchain was incomplete".to_string());
+    }
+    if selection.toolchain_manifest_sha256.len() != 64
+        || selection
+            .toolchain_manifest_sha256
+            .bytes()
+            .any(|byte| !byte.is_ascii_hexdigit())
+    {
+        return Err("Host Cargo authority toolchain digest was malformed".to_string());
+    }
+    Ok(ResolvedCargoSelection {
+        cargo_path: canonical,
+        toolchain_root: toolchain,
+        toolchain_manifest_sha256: selection.toolchain_manifest_sha256,
+    })
 }
 
 fn unix_millis() -> u64 {

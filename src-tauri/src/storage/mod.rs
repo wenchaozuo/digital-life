@@ -507,6 +507,16 @@ impl<'a> CapabilityAuthorizationScope<'a> {
     pub(crate) fn storage(&self) -> &'a StorageService {
         self.storage
     }
+
+    /// Reads the current Life while the same cross-process capability
+    /// linearizer used by D28/D30 is still held.  Release authority callers
+    /// must use this method instead of acquiring a second, unlocked
+    /// `get_current_life` read between revision evaluation and grant
+    /// consumption.
+    pub(crate) fn current_life_id(&self) -> Result<Option<String>, StorageError> {
+        let state = self.storage.state()?;
+        StorageService::current_life_id(&state.connection)
+    }
 }
 
 impl StorageService {

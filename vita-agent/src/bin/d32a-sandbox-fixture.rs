@@ -20,8 +20,8 @@ fn main() {}
 fn run() -> Result<(), String> {
     use serde_json::json;
     use std::fs::{self, OpenOptions};
-    use std::io::Write;
-    use std::net::{SocketAddr, TcpStream, UdpSocket};
+    use std::io::{ErrorKind, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
     use std::time::Duration;
@@ -53,6 +53,12 @@ fn run() -> Result<(), String> {
         .to_string_lossy()
         .parse::<SocketAddr>()
         .map_err(|_| "network target is invalid".to_string())?;
+    let forbidden_handle = arguments
+        .next()
+        .ok_or_else(|| "known inheritable sentinel handle is required".to_string())?
+        .to_string_lossy()
+        .parse::<usize>()
+        .map_err(|_| "known inheritable sentinel handle was invalid".to_string())?;
 
     let allowed_read = bounded_read(&allowed).is_ok();
     fs::create_dir_all(&scratch).map_err(|_| "sandbox scratch root unavailable".to_string())?;
@@ -65,51 +71,74 @@ fn run() -> Result<(), String> {
         .is_ok();
 
     let outside_read_denied = bounded_read(&outside).is_err();
-    let outside_write_denied = denied_create(&outside);
+    let outside_write_target = outside.join("d32a-outside-write-sentinel.txt");
+    let outside_write_denied = denied_create(&outside_write_target);
     let profile_read_denied = bounded_read(&user_profile).is_err();
     let authority_read_denied = bounded_read(&authority).is_err();
     let recovery_read_denied = bounded_read(&recovery).is_err();
 
-    let tcp_denied =
-        TcpStream::connect_timeout(&network_target, Duration::from_millis(250)).is_err();
-    let udp_denied = UdpSocket::bind("0.0.0.0:0")
-        .and_then(|socket| socket.send_to(b"d32a", network_target))
-        .is_err();
+    // The harness owns a live listener at network_target.  Connection refused
+    // is reported separately and is never folded into the sandbox-denied
+    // result; otherwise a dead fixture could create a false security PASS.
+    let tcp_probe = TcpStream::connect_timeout(&network_target, Duration::from_millis(250));
+    let tcp_refused = tcp_probe
+        .as_ref()
+        .err()
+        .is_some_and(|error| error.kind() == ErrorKind::ConnectionRefused);
+    let tcp_denied = tcp_probe.is_err() && !tcp_refused;
+    let udp_probe =
+        UdpSocket::bind("0.0.0.0:0").and_then(|socket| socket.send_to(b"d32a", network_target));
+    let udp_denied = udp_probe.is_err();
+    let tcp_listener_denied = TcpListener::bind("127.0.0.1:0").is_err();
+    let udp_listener_denied = UdpSocket::bind("127.0.0.1:0").is_err();
 
     let executable =
         std::env::current_exe().map_err(|_| "fixture executable unavailable".to_string())?;
-    let grandchild = Command::new(&executable)
+    let mut grandchild = Command::new(&executable)
         .arg("d32-grandchild")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
     let grandchild_spawned = grandchild.is_ok();
+    let grandchild_stopped_after_probe = match grandchild.as_mut() {
+        Ok(child) => {
+            std::thread::sleep(Duration::from_millis(25));
+            if child.try_wait().ok().flatten().is_none() {
+                child.kill().is_ok() && child.wait().is_ok()
+            } else {
+                true
+            }
+        }
+        Err(_) => true,
+    };
 
-    let breakaway = Command::new(&executable)
+    let mut breakaway = Command::new(&executable)
         .arg("d32-grandchild")
         .creation_flags(CREATE_BREAKAWAY_FROM_JOB)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
-    let breakaway_denied = breakaway.is_err();
+    let breakaway_denied = match breakaway.as_mut() {
+        Ok(child) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            false
+        }
+        Err(_) => true,
+    };
 
     let mut handle_count = 0_u32;
     let handle_count_ok =
         unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut handle_count) } != 0;
-    let forbidden_handle_probe_denied = std::env::var("D32_FIXTURE_FORBIDDEN_HANDLE")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .map(|raw| {
-            let handle = raw as HANDLE;
-            let file_type = unsafe { windows_sys::Win32::Storage::FileSystem::GetFileType(handle) };
-            let error = unsafe { GetLastError() };
-            handle.is_null()
-                || file_type == windows_sys::Win32::Storage::FileSystem::FILE_TYPE_UNKNOWN
-                    && error != 0
-        })
-        .unwrap_or(true);
+    let forbidden_handle_probe_denied = {
+        let handle = forbidden_handle as HANDLE;
+        let file_type = unsafe { windows_sys::Win32::Storage::FileSystem::GetFileType(handle) };
+        let error = unsafe { GetLastError() };
+        handle.is_null()
+            || file_type == windows_sys::Win32::Storage::FileSystem::FILE_TYPE_UNKNOWN && error != 0
+    };
 
     println!(
         "{}",
@@ -122,8 +151,12 @@ fn run() -> Result<(), String> {
             "host_authority_read_denied": authority_read_denied,
             "recovery_read_denied": recovery_read_denied,
             "tcp_denied": tcp_denied,
+            "tcp_refused": tcp_refused,
             "udp_denied": udp_denied,
+            "tcp_listener_denied": tcp_listener_denied,
+            "udp_listener_denied": udp_listener_denied,
             "grandchild_spawned": grandchild_spawned,
+            "grandchild_stopped_after_probe": grandchild_stopped_after_probe,
             "breakaway_denied": breakaway_denied,
             "handle_count_observed": handle_count_ok,
             "handle_count": handle_count,

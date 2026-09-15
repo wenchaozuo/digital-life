@@ -216,7 +216,7 @@ mod windows {
     use std::collections::{HashMap, HashSet, VecDeque};
     use std::ffi::OsString;
     use std::fs::{self, File};
-    use std::io::{BufReader, BufWriter, Read};
+    use std::io::{BufReader, BufWriter, Read, Write};
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::fs::MetadataExt;
     use std::path::{Path, PathBuf};
@@ -247,9 +247,12 @@ mod windows {
         "51f73634568f17211b3f8305649cfd9391a1dd52c05b2469add4317fbc8603c8";
     const D32_EXECUTION_ROOT_NAME: &str = "d32-cargo-check-v1";
     const D32_SOURCE_DIR_NAME: &str = "source";
-    const D32_TOOLCHAIN_DIR_NAME: &str = "toolchain";
+    const D32_TOOLCHAIN_MIRROR_ROOT_NAME: &str = "d32-toolchains";
+    const D32_RUNS_DIR_NAME: &str = "runs";
     const D32_CARGO_SELECTION_FILE_NAME: &str = ".d32-cargo-selection-v1.json";
-    const D32_TOOLCHAIN_MANIFEST_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+    const D32_TOOLCHAIN_FILE_MAX_BYTES: u64 = 512 * 1024 * 1024;
+    const D32_TOOLCHAIN_TOTAL_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+    const D32_TOOLCHAIN_MAX_FILES: usize = 131_072;
     const D32_IMAGE_HASH_MAX_BYTES: u64 = 256 * 1024 * 1024;
     const GRANT_LIFETIME_MS: u64 = 30_000;
     const HOST_CONFIRMATION_TTL_MS: u64 = 30_000;
@@ -275,6 +278,11 @@ mod windows {
     struct HostCargoCheckProfileEvidence {
         executable_identity: String,
         executable_sha256: String,
+        rustc_identity: String,
+        rustc_sha256: String,
+        rustdoc_identity: String,
+        rustdoc_sha256: String,
+        toolchain_root_identity: String,
         toolchain_manifest_hash: String,
         staged_working_directory_identity: String,
         environment_policy_hash: String,
@@ -447,6 +455,7 @@ mod windows {
             root: &Path,
             current: &Path,
             entries: &mut Vec<(String, String)>,
+            file_count: &mut usize,
             total_bytes: &mut u64,
         ) -> Result<(), String> {
             for entry in fs::read_dir(current).map_err(|_| {
@@ -467,13 +476,16 @@ mod windows {
                     ));
                 }
                 if metadata.is_dir() {
-                    collect(root, &path, entries, total_bytes)?;
+                    collect(root, &path, entries, file_count, total_bytes)?;
                 } else if metadata.is_file() {
-                    if metadata.len() > 64 * 1024 * 1024 {
+                    *file_count = file_count.saturating_add(1);
+                    if metadata.len() > D32_TOOLCHAIN_FILE_MAX_BYTES {
                         return Err("D32 Host toolchain file exceeded its bound".to_string());
                     }
                     *total_bytes = total_bytes.saturating_add(metadata.len());
-                    if *total_bytes > D32_TOOLCHAIN_MANIFEST_MAX_BYTES {
+                    if *file_count > D32_TOOLCHAIN_MAX_FILES
+                        || *total_bytes > D32_TOOLCHAIN_TOTAL_MAX_BYTES
+                    {
                         return Err("D32 Host toolchain manifest exceeded its bound".to_string());
                     }
                     entries.push((
@@ -483,7 +495,7 @@ mod windows {
                             })?
                             .to_string_lossy()
                             .replace('\\', "/"),
-                        host_hash_file(&path, 64 * 1024 * 1024)?,
+                        host_hash_file(&path, D32_TOOLCHAIN_FILE_MAX_BYTES)?,
                     ));
                 } else {
                     return Err(
@@ -495,8 +507,9 @@ mod windows {
         }
 
         let mut entries = Vec::new();
+        let mut file_count = 0usize;
         let mut total_bytes = 0_u64;
-        collect(root, root, &mut entries, &mut total_bytes)?;
+        collect(root, root, &mut entries, &mut file_count, &mut total_bytes)?;
         entries.sort_by(|left, right| left.0.cmp(&right.0));
         let encoded = serde_json::to_vec(&entries)
             .map_err(|_| "D32 Host toolchain manifest serialization failed".to_string())?;
@@ -508,6 +521,7 @@ mod windows {
         cargo_path: &Path,
     ) -> Result<String, String> {
         let mut entries = Vec::new();
+        let mut file_count = 0usize;
         let mut total_bytes = 0_u64;
         // Reuse the same deterministic tree walk as the staged projection;
         // the projection adds the Host-selected cargo.exe at toolchain/bin.
@@ -515,6 +529,7 @@ mod windows {
             root: &Path,
             current: &Path,
             entries: &mut Vec<(String, String)>,
+            file_count: &mut usize,
             total_bytes: &mut u64,
         ) -> Result<(), String> {
             for entry in fs::read_dir(current)
@@ -529,11 +544,13 @@ mod windows {
                     return Err("D32 Host toolchain manifest rejected reparse entry".to_string());
                 }
                 if metadata.is_dir() {
-                    collect(root, &path, entries, total_bytes)?;
+                    collect(root, &path, entries, file_count, total_bytes)?;
                 } else if metadata.is_file() {
+                    *file_count = file_count.saturating_add(1);
                     *total_bytes = total_bytes.saturating_add(metadata.len());
-                    if metadata.len() > 64 * 1024 * 1024
-                        || *total_bytes > D32_TOOLCHAIN_MANIFEST_MAX_BYTES
+                    if *file_count > D32_TOOLCHAIN_MAX_FILES
+                        || metadata.len() > D32_TOOLCHAIN_FILE_MAX_BYTES
+                        || *total_bytes > D32_TOOLCHAIN_TOTAL_MAX_BYTES
                     {
                         return Err("D32 Host toolchain manifest exceeded its bound".to_string());
                     }
@@ -542,13 +559,13 @@ mod windows {
                             .map_err(|_| "D32 Host toolchain path escaped root".to_string())?
                             .to_string_lossy()
                             .replace('\\', "/"),
-                        host_hash_file(&path, 64 * 1024 * 1024)?,
+                        host_hash_file(&path, D32_TOOLCHAIN_FILE_MAX_BYTES)?,
                     ));
                 }
             }
             Ok(())
         }
-        collect(root, root, &mut entries, &mut total_bytes)?;
+        collect(root, root, &mut entries, &mut file_count, &mut total_bytes)?;
         let cargo_relative = "bin/cargo.exe".to_string();
         let cargo_hash = host_hash_file(cargo_path, D32_IMAGE_HASH_MAX_BYTES)?;
         entries.retain(|entry| entry.0 != cargo_relative);
@@ -559,31 +576,148 @@ mod windows {
         Ok(format!("{:x}", Sha256::digest(encoded)))
     }
 
-    fn host_cargo_candidates() -> Vec<PathBuf> {
-        let mut candidates = vec![
-            PathBuf::from(r"C:\Program Files\Rust\bin\cargo.exe"),
-            PathBuf::from(r"C:\Program Files\Cargo\bin\cargo.exe"),
-            PathBuf::from(r"E:\Program Files\Rust\bin\cargo.exe"),
-        ];
-        if let Some(user_profile) = std::env::var_os("USERPROFILE") {
-            candidates.push(PathBuf::from(user_profile).join(r".cargo\bin\cargo.exe"));
+    fn host_stream_copy_bounded(
+        source: &Path,
+        destination: &Path,
+        max_bytes: u64,
+    ) -> Result<(), String> {
+        let mut input = File::open(source)
+            .map_err(|_| "D32 Host toolchain source could not be opened".to_string())?;
+        let mut output = File::create(destination).map_err(|_| {
+            "D32 Host toolchain mirror destination could not be created".to_string()
+        })?;
+        let mut total = 0_u64;
+        let mut buffer = [0_u8; 1024 * 1024];
+        loop {
+            let read = input
+                .read(&mut buffer)
+                .map_err(|_| "D32 Host toolchain source could not be read".to_string())?;
+            if read == 0 {
+                break;
+            }
+            total = total.saturating_add(read as u64);
+            if total > max_bytes {
+                return Err("D32 Host toolchain file exceeded its bound".to_string());
+            }
+            output.write_all(&buffer[..read]).map_err(|_| {
+                "D32 Host toolchain mirror destination could not be written".to_string()
+            })?;
         }
-        candidates
+        output.flush().map_err(|_| {
+            "D32 Host toolchain mirror destination could not be flushed".to_string()
+        })?;
+        Ok(())
+    }
+
+    fn host_copy_toolchain_tree(
+        source: &Path,
+        destination: &Path,
+        files: &mut usize,
+        bytes: &mut u64,
+    ) -> Result<(), String> {
+        for entry in
+            fs::read_dir(source).map_err(|_| "D32 Host toolchain enumeration failed".to_string())?
+        {
+            let entry = entry.map_err(|_| "D32 Host toolchain enumeration failed".to_string())?;
+            let source_path = entry.path();
+            let destination_path = destination.join(entry.file_name());
+            let metadata = fs::symlink_metadata(&source_path)
+                .map_err(|_| "D32 Host toolchain metadata failed".to_string())?;
+            if host_metadata_is_reparse(&metadata) {
+                return Err("D32 Host toolchain mirror rejected a reparse entry".to_string());
+            }
+            if metadata.is_dir() {
+                fs::create_dir_all(&destination_path)
+                    .map_err(|_| "D32 Host toolchain mirror directory failed".to_string())?;
+                host_copy_toolchain_tree(&source_path, &destination_path, files, bytes)?;
+            } else if metadata.is_file() {
+                *files = files.saturating_add(1);
+                *bytes = bytes.saturating_add(metadata.len());
+                if *files > D32_TOOLCHAIN_MAX_FILES
+                    || metadata.len() > D32_TOOLCHAIN_FILE_MAX_BYTES
+                    || *bytes > D32_TOOLCHAIN_TOTAL_MAX_BYTES
+                {
+                    return Err("D32 Host toolchain mirror exceeded its bound".to_string());
+                }
+                host_stream_copy_bounded(
+                    &source_path,
+                    &destination_path,
+                    D32_TOOLCHAIN_FILE_MAX_BYTES,
+                )?;
+            } else {
+                return Err(
+                    "D32 Host toolchain mirror encountered an unsupported entry".to_string()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn host_prepare_toolchain_mirror(
+        app_data_root: &Path,
+        selection: &HostCargoSelection,
+    ) -> Result<PathBuf, String> {
+        let selected_root = fs::canonicalize(&selection.toolchain_path)
+            .map_err(|_| "D32 Host toolchain root could not be canonicalized".to_string())?;
+        let selected_cargo = fs::canonicalize(&selection.path)
+            .map_err(|_| "D32 Host Cargo image could not be canonicalized".to_string())?;
+        let mirror_parent = app_data_root.join(D32_TOOLCHAIN_MIRROR_ROOT_NAME);
+        fs::create_dir_all(&mirror_parent)
+            .map_err(|_| "D32 Host toolchain mirror parent could not be created".to_string())?;
+        let mirror = mirror_parent.join(&selection.toolchain_manifest_sha256);
+        let valid = fs::symlink_metadata(&mirror)
+            .ok()
+            .is_some_and(|metadata| !host_metadata_is_reparse(&metadata))
+            && mirror.is_dir()
+            && host_verify_no_reparse_path(&mirror_parent, &mirror).is_ok()
+            && host_toolchain_manifest_hash(&mirror).ok().as_deref()
+                == Some(selection.toolchain_manifest_sha256.as_str())
+            && mirror.join("bin/cargo.exe").is_file()
+            && mirror.join("bin/rustc.exe").is_file()
+            && mirror.join("bin/rustdoc.exe").is_file();
+        if !valid {
+            if fs::symlink_metadata(&mirror).is_ok() {
+                host_verify_no_reparse_path(&mirror_parent, &mirror)?;
+                fs::remove_dir_all(&mirror).map_err(|_| {
+                    "D32 stale Host toolchain mirror could not be removed".to_string()
+                })?;
+            }
+            let staging =
+                mirror_parent.join(format!(".{}.staging", selection.toolchain_manifest_sha256));
+            if fs::symlink_metadata(&staging).is_ok() {
+                host_verify_no_reparse_path(&mirror_parent, &staging)?;
+                fs::remove_dir_all(&staging).map_err(|_| {
+                    "D32 stale Host toolchain staging could not be removed".to_string()
+                })?;
+            }
+            fs::create_dir_all(&staging)
+                .map_err(|_| "D32 Host toolchain staging root could not be created".to_string())?;
+            let mut files = 0usize;
+            let mut bytes = 0u64;
+            host_copy_toolchain_tree(&selected_root, &staging, &mut files, &mut bytes)?;
+            host_stream_copy_bounded(
+                &selected_cargo,
+                &staging.join("bin/cargo.exe"),
+                D32_IMAGE_HASH_MAX_BYTES,
+            )?;
+            let manifest = host_toolchain_manifest_hash(&staging)?;
+            if manifest != selection.toolchain_manifest_sha256 {
+                let _ = fs::remove_dir_all(&staging);
+                return Err(
+                    "D32 Host toolchain mirror manifest did not match selection".to_string()
+                );
+            }
+            fs::rename(&staging, &mirror)
+                .map_err(|_| "D32 Host toolchain mirror could not be finalized".to_string())?;
+        }
+        host_verify_no_reparse_path(&mirror_parent, &mirror)?;
+        if host_toolchain_manifest_hash(&mirror)? != selection.toolchain_manifest_sha256 {
+            return Err("D32 Host toolchain mirror changed after finalization".to_string());
+        }
+        Ok(mirror)
     }
 
     fn host_select_cargo_image() -> Result<HostCargoSelection, String> {
-        let (path, sha256) = host_cargo_candidates()
-            .into_iter()
-            .filter_map(|candidate| fs::canonicalize(candidate).ok())
-            .find_map(|candidate| {
-                if !candidate.is_file() {
-                    return None;
-                }
-                host_file_identity(&candidate, false).ok()?;
-                let sha256 = host_hash_file(&candidate, D32_IMAGE_HASH_MAX_BYTES).ok()?;
-                Some((candidate, sha256))
-            })
-            .ok_or_else(|| "No trusted absolute Cargo image is installed".to_string())?;
         let user_profile = std::env::var_os("USERPROFILE")
             .map(PathBuf::from)
             .ok_or_else(|| "D32 Host Rust toolchain root was unavailable".to_string())?;
@@ -595,6 +729,7 @@ mod windows {
             .filter_map(|path| fs::canonicalize(path).ok())
             .filter(|path| {
                 path.is_dir()
+                    && path.join("bin/cargo.exe").is_file()
                     && path.join("bin/rustc.exe").is_file()
                     && path.join("bin/rustdoc.exe").is_file()
             })
@@ -609,6 +744,10 @@ mod windows {
                     .unwrap_or(false)
             })
             .ok_or_else(|| "D32 Host Rust toolchain was unavailable".to_string())?;
+        let path = fs::canonicalize(toolchain_path.join("bin/cargo.exe"))
+            .map_err(|_| "D32 Host toolchain Cargo image was unavailable".to_string())?;
+        host_file_identity(&path, false)?;
+        let sha256 = host_hash_file(&path, D32_IMAGE_HASH_MAX_BYTES)?;
         let toolchain_manifest_sha256 =
             host_toolchain_manifest_hash_with_cargo(&toolchain_path, &path)?;
         Ok(HostCargoSelection {
@@ -630,6 +769,11 @@ mod windows {
         let app_data_root = fs::canonicalize(app_data_root)
             .map_err(|_| "D32 Host app-data root could not be canonicalized".to_string())?;
         validate_private_app_data_root(&app_data_root)?;
+        if let Ok(selection) = host_read_cargo_selection_marker(&app_data_root) {
+            if host_prepare_toolchain_mirror(&app_data_root, &selection).is_ok() {
+                return Ok(());
+            }
+        }
         let selection = host_select_cargo_image()?;
         let marker = host_cargo_selection_path(&app_data_root);
         match fs::symlink_metadata(&marker) {
@@ -642,6 +786,7 @@ mod windows {
         fs::write(&marker, payload)
             .map_err(|_| "D32 Host Cargo selection could not be published".to_string())?;
         host_verify_no_reparse_path(&app_data_root, &marker)?;
+        host_prepare_toolchain_mirror(&app_data_root, &selection)?;
         Ok(())
     }
 
@@ -659,7 +804,9 @@ mod windows {
         Ok(())
     }
 
-    fn host_read_cargo_selection(app_data_root: &Path) -> Result<HostCargoSelection, String> {
+    fn host_read_cargo_selection_marker(
+        app_data_root: &Path,
+    ) -> Result<HostCargoSelection, String> {
         let marker = host_cargo_selection_path(app_data_root);
         host_verify_no_reparse_path(app_data_root, &marker)?;
         let bytes = fs::read(&marker)
@@ -677,32 +824,6 @@ mod windows {
         {
             return Err("D32 Host Cargo selection hash was malformed".to_string());
         }
-        let path = PathBuf::from(&selection.path);
-        if !path.is_absolute() {
-            return Err("D32 Host Cargo selection path was not absolute".to_string());
-        }
-        let canonical = fs::canonicalize(&path)
-            .map_err(|_| "D32 Host Cargo selection path could not be canonicalized".to_string())?;
-        if canonical != path || !canonical.is_file() {
-            return Err("D32 Host Cargo selection path changed".to_string());
-        }
-        let actual = host_hash_file(&canonical, D32_IMAGE_HASH_MAX_BYTES)?;
-        if actual != selection.sha256 {
-            return Err("D32 Host Cargo selection hash changed".to_string());
-        }
-        host_file_identity(&canonical, false)?;
-        let toolchain = PathBuf::from(&selection.toolchain_path);
-        if !toolchain.is_absolute() {
-            return Err("D32 Host toolchain selection path was not absolute".to_string());
-        }
-        let toolchain = fs::canonicalize(&toolchain)
-            .map_err(|_| "D32 Host toolchain selection could not be canonicalized".to_string())?;
-        if !toolchain.is_dir()
-            || toolchain.join("bin/rustc.exe").is_file() == false
-            || toolchain.join("bin/rustdoc.exe").is_file() == false
-        {
-            return Err("D32 Host toolchain selection was incomplete".to_string());
-        }
         if selection.toolchain_manifest_sha256.len() != 64
             || selection
                 .toolchain_manifest_sha256
@@ -711,10 +832,10 @@ mod windows {
         {
             return Err("D32 Host toolchain selection hash was malformed".to_string());
         }
-        if host_toolchain_manifest_hash_with_cargo(&toolchain, &canonical)?
-            != selection.toolchain_manifest_sha256
+        if !PathBuf::from(&selection.path).is_absolute()
+            || !PathBuf::from(&selection.toolchain_path).is_absolute()
         {
-            return Err("D32 Host toolchain selection hash changed".to_string());
+            return Err("D32 Host Cargo selection path was not absolute".to_string());
         }
         Ok(selection)
     }
@@ -727,46 +848,78 @@ mod windows {
         }
         let app_data_root = fs::canonicalize(app_data_root)
             .map_err(|_| "D32 Host app-data root could not be canonicalized".to_string())?;
-        let root = app_data_root.join(D32_EXECUTION_ROOT_NAME);
-        let source = root.join(D32_SOURCE_DIR_NAME);
-        let toolchain = root.join(D32_TOOLCHAIN_DIR_NAME);
-        let cargo_home = root.join("cargo-home");
-        let target = root.join("target");
+        // Every action is bound to the immutable app-owned mirror.  Do not
+        // reread/hash the user-profile toolchain on the AuthorityEvaluate
+        // path; Host publication already established this source evidence.
+        let selection = host_read_cargo_selection_marker(&app_data_root)?;
+        let toolchain = app_data_root
+            .join(D32_TOOLCHAIN_MIRROR_ROOT_NAME)
+            .join(&selection.toolchain_manifest_sha256);
         let cargo = toolchain.join("bin").join("cargo.exe");
-        let selection = host_read_cargo_selection(&app_data_root)?;
+        let rustc = toolchain.join("bin").join("rustc.exe");
+        let rustdoc = toolchain.join("bin").join("rustdoc.exe");
         for path in [
-            &root,
-            &source,
             &toolchain,
-            &cargo_home,
-            &target,
             cargo.as_path(),
+            rustc.as_path(),
+            rustdoc.as_path(),
         ] {
             host_verify_no_reparse_path(&app_data_root, path)?;
         }
-        let root_identity = host_file_identity(&root, true)?;
-        let source_identity = host_file_identity(&source, true)?;
         let toolchain_identity = host_file_identity(&toolchain, true)?;
         let cargo_identity = host_file_identity(&cargo, false)?;
-        if !root_identity.directory || !toolchain_identity.directory {
-            return Err("D32 Host projection directory identity was invalid".to_string());
-        }
+        let rustc_identity = host_file_identity(&rustc, false)?;
+        let rustdoc_identity = host_file_identity(&rustdoc, false)?;
         let toolchain_manifest_hash = host_toolchain_manifest_hash(&toolchain)?;
-        if toolchain_manifest_hash != selection.toolchain_manifest_sha256 {
-            return Err("D32 Host staged toolchain selection did not match".to_string());
+        if toolchain_manifest_hash != selection.toolchain_manifest_sha256
+            || host_hash_file(&cargo, D32_IMAGE_HASH_MAX_BYTES)? != selection.sha256
+        {
+            return Err("D32 Host toolchain mirror did not match selection".to_string());
         }
         let staged_cargo_hash = host_hash_file(&cargo, D32_IMAGE_HASH_MAX_BYTES)?;
-        if staged_cargo_hash != selection.sha256 {
-            return Err("D32 Host staged Cargo did not match Host selection".to_string());
-        }
         Ok(HostCargoCheckProfileEvidence {
             executable_identity: cargo_identity.image_wire(),
             executable_sha256: staged_cargo_hash,
+            rustc_identity: rustc_identity.image_wire(),
+            rustc_sha256: host_hash_file(&rustc, D32_TOOLCHAIN_FILE_MAX_BYTES)?,
+            rustdoc_identity: rustdoc_identity.image_wire(),
+            rustdoc_sha256: host_hash_file(&rustdoc, D32_TOOLCHAIN_FILE_MAX_BYTES)?,
+            toolchain_root_identity: toolchain_identity.namespace_wire(),
             toolchain_manifest_hash,
-            staged_working_directory_identity: source_identity.namespace_wire(),
+            staged_working_directory_identity: "per-action-fresh-run-v1".to_string(),
             environment_policy_hash: CARGO_ENVIRONMENT_POLICY_HASH.to_string(),
             profile_id: PRODUCTION_CARGO_CHECK_PROFILE_ID.to_string(),
         })
+    }
+
+    fn d32_run_id(session_id: &str, turn_id: &str, tool_call_id: &str) -> String {
+        format!(
+            "{:x}",
+            Sha256::digest(
+                format!(
+                    "{session_id}\u{1f}{turn_id}\u{1f}{tool_call_id}\u{1f}{PRODUCTION_CARGO_CHECK_PROFILE_ID}"
+                )
+                .as_bytes(),
+            )
+        )
+    }
+
+    fn host_cargo_run_source_identity(
+        app_data_root: &Path,
+        binding: &ProcessBinding,
+    ) -> Result<String, String> {
+        let root = fs::canonicalize(app_data_root)
+            .map_err(|_| "D32 Host app-data root could not be canonicalized".to_string())?
+            .join(D32_EXECUTION_ROOT_NAME)
+            .join(D32_RUNS_DIR_NAME)
+            .join(d32_run_id(
+                &binding.session_id,
+                &binding.turn_id,
+                &binding.tool_call_id,
+            ));
+        let source = root.join(D32_SOURCE_DIR_NAME);
+        host_verify_no_reparse_path(app_data_root, &source)?;
+        Ok(host_file_identity(&source, true)?.namespace_wire())
     }
 
     /// The Host-side turn authority is the security decision point for
@@ -5142,11 +5295,18 @@ mod windows {
                 })?,
                 None => expected.clone(),
             };
+            let fresh_source_exact = match session.cargo_profile_app_data_root.as_deref() {
+                Some(root) => host_cargo_run_source_identity(root, binding)
+                    .is_ok_and(|identity| identity == binding.working_directory_identity),
+                None => {
+                    binding.working_directory_identity == expected.staged_working_directory_identity
+                }
+            };
             current == *expected
                 && !expected.toolchain_manifest_hash.is_empty()
                 && binding.executable_identity == expected.executable_identity
                 && binding.executable_sha256 == expected.executable_sha256
-                && binding.working_directory_identity == expected.staged_working_directory_identity
+                && fresh_source_exact
                 && binding.environment_policy_hash == expected.environment_policy_hash
                 && binding.profile_id == expected.profile_id
         } else {
@@ -6769,6 +6929,11 @@ mod windows {
             HostCargoCheckProfileEvidence {
                 executable_identity: "v1f1".to_string(),
                 executable_sha256: "0".repeat(64),
+                rustc_identity: "rustc-id".to_string(),
+                rustc_sha256: "5".repeat(64),
+                rustdoc_identity: "rustdoc-id".to_string(),
+                rustdoc_sha256: "6".repeat(64),
+                toolchain_root_identity: "toolchain-root".to_string(),
                 toolchain_manifest_hash: "4".repeat(64),
                 staged_working_directory_identity: workspace_identity.to_string(),
                 environment_policy_hash: CARGO_ENVIRONMENT_POLICY_HASH.to_string(),
@@ -10590,7 +10755,12 @@ mod windows {
         enum D32CargoCanaryMode {
             Positive,
             RevokeBeforeRevalidation,
+            CancelBeforeRevalidation,
             LifeBeforeRevalidation,
+            MigrationBeforeRevalidation,
+            GrantReplay,
+            ExecutableIdentityTamper,
+            EnvironmentProfileTamper,
         }
 
         #[test]
@@ -10624,6 +10794,41 @@ mod windows {
                 return;
             }
             run_d32_a_real_process_cargo_canary(D32CargoCanaryMode::LifeBeforeRevalidation);
+        }
+
+        #[test]
+        fn d32_a_real_host_vita_codex_cancel_canary() {
+            if std::env::var("D32_A_REQUIRE_REAL_CANARY").as_deref() != Ok("1") {
+                eprintln!(
+                    "skipping D32-A cancel canary; set D32_A_REQUIRE_REAL_CANARY=1 for the freeze gate"
+                );
+                return;
+            }
+            run_d32_a_real_process_cargo_canary(D32CargoCanaryMode::CancelBeforeRevalidation);
+        }
+
+        #[test]
+        fn d32_a_real_host_vita_codex_migration_canary() {
+            if std::env::var("D32_A_REQUIRE_REAL_CANARY").as_deref() != Ok("1") {
+                eprintln!(
+                    "skipping D32-A migration canary; set D32_A_REQUIRE_REAL_CANARY=1 for the freeze gate"
+                );
+                return;
+            }
+            run_d32_a_real_process_cargo_canary(D32CargoCanaryMode::MigrationBeforeRevalidation);
+        }
+
+        #[test]
+        fn d32_a_real_host_vita_codex_binding_tamper_canaries() {
+            if std::env::var("D32_A_REQUIRE_REAL_CANARY").as_deref() != Ok("1") {
+                eprintln!(
+                    "skipping D32-A binding tamper canaries; set D32_A_REQUIRE_REAL_CANARY=1 for the freeze gate"
+                );
+                return;
+            }
+            run_d32_a_real_process_cargo_canary(D32CargoCanaryMode::GrantReplay);
+            run_d32_a_real_process_cargo_canary(D32CargoCanaryMode::ExecutableIdentityTamper);
+            run_d32_a_real_process_cargo_canary(D32CargoCanaryMode::EnvironmentProfileTamper);
         }
 
         fn run_d32_a_real_process_cargo_canary(mode: D32CargoCanaryMode) {
@@ -10662,9 +10867,22 @@ mod windows {
             .expect("D32-A canary lockfile");
             fs::write(
                 workspace.path().join("src/lib.rs"),
-                b"pub fn d32_a_canary() -> u32 { 32 }\n",
+                b"compile_error!(\"D32-A stale session-start source must never be compiled\");\n",
             )
-            .expect("D32-A canary Rust source");
+            .expect("D32-A canary source version A");
+            let cargo_toml_before =
+                fs::read(workspace.path().join("Cargo.toml")).expect("D32-A Cargo.toml before");
+            let cargo_lock_before =
+                fs::read(workspace.path().join("Cargo.lock")).expect("D32-A Cargo.lock before");
+            let cargo_config_before = ["config", "config.toml"]
+                .into_iter()
+                .map(|name| {
+                    let path = workspace.path().join(".cargo").join(name);
+                    let before = fs::read(&path).ok();
+                    (path, before)
+                })
+                .collect::<Vec<_>>();
+            assert!(!workspace.path().join("target").exists());
             let unrelated = workspace.path().join("unrelated.txt");
             fs::write(&unrelated, b"must remain unchanged\n").expect("D32-A unrelated fixture");
             let unrelated_before = fs::read(&unrelated).expect("D32-A unrelated before");
@@ -10716,7 +10934,7 @@ mod windows {
                 provider_kind: "openai_compatible".to_string(),
                 base_url: "http://127.0.0.1:9/v1".to_string(),
                 model: if mode != D32CargoCanaryMode::Positive {
-                    "d32-a-negative-canary-model".to_string()
+                    format!("d32-a-negative-{mode:?}").to_lowercase()
                 } else {
                     "d32-a-canary-model".to_string()
                 },
@@ -10763,6 +10981,14 @@ mod windows {
             };
             validate_ready(&ready, &session_id, &request, &life_id)
                 .expect("D32-A canary ready identity");
+
+            // This is the D31 replace/patch boundary for the R2 regression:
+            // the source visible when the sidecar became Ready is an
+            // intentionally uncompilable A version.  Only the bounded,
+            // per-action projection may make the valid B version executable.
+            let source_path = workspace.path().join("src/lib.rs");
+            fs::write(&source_path, b"pub fn d32_a_canary() -> u32 { 32 }\n")
+                .expect("D32-A D31 source version B");
 
             let authority_root = tempfile::tempdir().expect("D32-A authority root");
             let storage = Arc::new(
@@ -10875,6 +11101,7 @@ mod windows {
             let mut grant_seen = false;
             let mut revalidation_seen = false;
             let mut resumed_seen = false;
+            let migration_target = tempfile::tempdir().expect("D32-A migration target");
             for _ in 0..64 {
                 let (message, next_reader) = receive_vita_message_with_timeout(
                     reader,
@@ -10931,7 +11158,7 @@ mod windows {
                         handle_issue_grant(&session, &storage, &registry, request)
                             .expect("D32-A grant issue");
                     }
-                    VitaMessage::RevalidateGrant(request) => {
+                    VitaMessage::RevalidateGrant(mut request) => {
                         revalidation_seen = true;
                         match mode {
                             D32CargoCanaryMode::RevokeBeforeRevalidation => {
@@ -10951,6 +11178,36 @@ mod windows {
                                     &storage,
                                     "d32-a-canary-persona",
                                 );
+                            }
+                            D32CargoCanaryMode::CancelBeforeRevalidation => {
+                                assert_eq!(
+                                    session
+                                        .begin_cancellation()
+                                        .expect("D32-A cancel before revalidation"),
+                                    Some(host_turn_id.clone())
+                                );
+                            }
+                            D32CargoCanaryMode::MigrationBeforeRevalidation => {
+                                let migration = storage.migrate_location(
+                                    migration_target
+                                        .path()
+                                        .to_str()
+                                        .expect("D32-A migration target path"),
+                                );
+                                assert!(
+                                    migration.success,
+                                    "D32-A authority migration failed: {migration:?}"
+                                );
+                                assert!(migration.restart_required);
+                            }
+                            D32CargoCanaryMode::GrantReplay => {
+                                request.grant.grant_id = "d32-a-replayed-grant".to_string();
+                            }
+                            D32CargoCanaryMode::ExecutableIdentityTamper => {
+                                request.binding.executable_identity = "tampered".to_string();
+                            }
+                            D32CargoCanaryMode::EnvironmentProfileTamper => {
+                                request.binding.environment_policy_hash = "0".repeat(64);
                             }
                             D32CargoCanaryMode::Positive => {}
                         }
@@ -10997,6 +11254,43 @@ mod windows {
                 fs::read(&unrelated).expect("D32-A unrelated final"),
                 unrelated_before
             );
+            assert_eq!(
+                fs::read(&source_path).expect("D32-A source final"),
+                b"pub fn d32_a_canary() -> u32 { 32 }\n"
+            );
+            assert_eq!(
+                fs::read(workspace.path().join("Cargo.toml")).expect("D32-A Cargo.toml final"),
+                cargo_toml_before
+            );
+            assert_eq!(
+                fs::read(workspace.path().join("Cargo.lock")).expect("D32-A Cargo.lock final"),
+                cargo_lock_before
+            );
+            for (path, before) in cargo_config_before {
+                assert_eq!(
+                    fs::read(&path).ok(),
+                    before,
+                    "D32-A .cargo changed: {}",
+                    path.display()
+                );
+            }
+            assert!(
+                !workspace.path().join("target").exists(),
+                "D32-A Cargo wrote into the governed workspace target"
+            );
+            let runs_root = app_data
+                .path()
+                .join(D32_EXECUTION_ROOT_NAME)
+                .join(D32_RUNS_DIR_NAME);
+            if runs_root.exists() {
+                assert_eq!(
+                    fs::read_dir(&runs_root)
+                        .expect("D32-A run root enumeration")
+                        .count(),
+                    0,
+                    "D32-A per-action run root was not cleaned"
+                );
+            }
             session
                 .send(&HostMessage::Shutdown(protocol::Shutdown {
                     request_id: "d32-a-canary-shutdown".to_string(),

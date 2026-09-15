@@ -12,6 +12,7 @@ use codex_extension_api::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::ffi::{c_void, OsStr, OsString};
 #[cfg(test)]
@@ -752,44 +753,6 @@ fn hash_file(file: &File) -> Result<String, String> {
     Ok(sha256_hex(&bytes))
 }
 
-pub(crate) fn d32_trusted_toolchain_root(cargo_path: &Path) -> Result<PathBuf, String> {
-    let user_profile = std::env::var_os("USERPROFILE")
-        .map(PathBuf::from)
-        .ok_or_else(|| "D32 toolchain root was unavailable".to_string())?;
-    let toolchains = user_profile.join(".rustup").join("toolchains");
-    let mut candidates = fs::read_dir(&toolchains)
-        .map_err(|_| "D32 Rust toolchain directory was unavailable".to_string())?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.is_dir())
-        .collect::<Vec<_>>();
-    candidates.sort();
-    candidates.reverse();
-    for root in candidates {
-        let bin = root.join("bin");
-        let rustc = bin.join("rustc.exe");
-        let rustdoc = bin.join("rustdoc.exe");
-        if rustc.is_file() && rustdoc.is_file() {
-            let cargo_parent = cargo_path
-                .parent()
-                .ok_or_else(|| "D32 cargo image had no parent directory".to_string())?;
-            if !cargo_parent.is_dir() {
-                return Err("D32 cargo image parent was not a directory".to_string());
-            }
-            return Ok(root);
-        }
-    }
-    Err("D32 trusted Rust toolchain was unavailable".to_string())
-}
-
-fn d32_trusted_toolchain_paths(cargo_path: &Path) -> Result<(PathBuf, PathBuf, PathBuf), String> {
-    let root = d32_trusted_toolchain_root(cargo_path)?;
-    let bin = root.join("bin");
-    let rustc = bin.join("rustc.exe");
-    let rustdoc = bin.join("rustdoc.exe");
-    Ok((rustc, rustdoc, bin))
-}
-
 struct H7CatalogEntry {
     program_id: String,
     image_path: PathBuf,
@@ -805,6 +768,7 @@ struct H7CatalogEntry {
     stderr_bound: usize,
     _owned_scratch: Option<Arc<TempDir>>,
     d32_execution_root: Option<PathBuf>,
+    d32_toolchain_root: Option<PathBuf>,
     d32_toolchain_manifest_hash: Option<String>,
 }
 
@@ -850,82 +814,7 @@ impl H7ExecutableCatalog {
                 stderr_bound: H7_STDERR_BOUND,
                 _owned_scratch: None,
                 d32_execution_root: None,
-                d32_toolchain_manifest_hash: None,
-            },
-        })
-    }
-
-    /// Builds the one static D32 production profile.  The caller supplies the
-    /// already Host-selected absolute cargo image; argv and all environment
-    /// values remain fixed here and cannot be selected by the model.
-    pub(crate) fn cargo_check(
-        cargo_path: PathBuf,
-        workspace_path: PathBuf,
-    ) -> Result<Self, String> {
-        if !cargo_path.is_absolute() || !workspace_path.is_absolute() {
-            return Err("D32 cargo profile paths must be absolute".to_string());
-        }
-        let working_directory = Arc::new(PreparedWorkingDirectory::prepare(&workspace_path)?);
-        let mut image = PreparedExecutableImage::prepare(&cargo_path)?;
-        let expected_image_identity = image.identity;
-        let expected_image_namespace = image.namespace.identity();
-        let expected_image_sha256 = image.sha256.clone();
-        let scratch = Arc::new(
-            tempfile::tempdir()
-                .map_err(|_| "D32 cargo scratch root could not be created".to_string())?,
-        );
-        let target = scratch.path().join("target");
-        let cargo_home = scratch.path().join("cargo-home");
-        fs::create_dir_all(&target)
-            .map_err(|_| "D32 cargo target scratch could not be created".to_string())?;
-        fs::create_dir_all(&cargo_home)
-            .map_err(|_| "D32 cargo home scratch could not be created".to_string())?;
-        let (rustc, rustdoc, toolchain_bin) = d32_trusted_toolchain_paths(&cargo_path)?;
-        let cargo_bin = cargo_path
-            .parent()
-            .ok_or_else(|| "D32 cargo image had no parent directory".to_string())?;
-        let path = format!(
-            "{};{}",
-            toolchain_bin.to_string_lossy(),
-            cargo_bin.to_string_lossy()
-        );
-        let environment = BTreeMap::from([
-            (
-                "CARGO_HOME".to_string(),
-                cargo_home.to_string_lossy().into_owned(),
-            ),
-            ("CARGO_NET_OFFLINE".to_string(), "true".to_string()),
-            (
-                "CARGO_TARGET_DIR".to_string(),
-                target.to_string_lossy().into_owned(),
-            ),
-            ("CARGO_TERM_COLOR".to_string(), "never".to_string()),
-            ("PATH".to_string(), path),
-            ("RUSTC".to_string(), rustc.to_string_lossy().into_owned()),
-            (
-                "RUSTDOC".to_string(),
-                rustdoc.to_string_lossy().into_owned(),
-            ),
-        ]);
-        let environment_policy_hash = sha256_hex(&environment_policy_bytes(&environment));
-        let working_directory_identity = working_directory.0.identity().wire();
-        image.reverify(expected_image_identity, &expected_image_sha256)?;
-        Ok(Self {
-            entry: H7CatalogEntry {
-                program_id: "cargo-check-v1".to_string(),
-                image_path: cargo_path,
-                expected_image_identity,
-                expected_image_namespace,
-                expected_image_sha256,
-                working_directory_identity,
-                working_directory,
-                environment,
-                environment_policy_hash,
-                timeout: Duration::from_secs(120),
-                stdout_bound: 64 * 1024,
-                stderr_bound: 64 * 1024,
-                _owned_scratch: Some(scratch),
-                d32_execution_root: None,
+                d32_toolchain_root: None,
                 d32_toolchain_manifest_hash: None,
             },
         })
@@ -935,6 +824,7 @@ impl H7ExecutableCatalog {
         cargo_path: PathBuf,
         source_path: PathBuf,
         execution_root: PathBuf,
+        toolchain_root: PathBuf,
         rustc_path: PathBuf,
         rustdoc_path: PathBuf,
     ) -> Result<Self, String> {
@@ -942,6 +832,7 @@ impl H7ExecutableCatalog {
             &cargo_path,
             &source_path,
             &execution_root,
+            &toolchain_root,
             &rustc_path,
             &rustdoc_path,
         ] {
@@ -960,7 +851,8 @@ impl H7ExecutableCatalog {
         let rustdoc_path = fs::canonicalize(&rustdoc_path)
             .map_err(|_| "D32 projected rustdoc image could not be canonicalized".to_string())?;
         let expected_source = execution_root.join("source");
-        let expected_toolchain = execution_root.join("toolchain");
+        let expected_toolchain = fs::canonicalize(&toolchain_root)
+            .map_err(|_| "D32 projected toolchain mirror could not be canonicalized".to_string())?;
         let expected_cargo_home = execution_root.join("cargo-home");
         let expected_target = execution_root.join("target");
         if !h7_workspace_paths_equal(&source_path, &expected_source)
@@ -1022,6 +914,7 @@ impl H7ExecutableCatalog {
                 stderr_bound: 64 * 1024,
                 _owned_scratch: None,
                 d32_execution_root: Some(execution_root),
+                d32_toolchain_root: Some(expected_toolchain),
                 d32_toolchain_manifest_hash: Some(manifest_hash),
             },
         })
@@ -1096,6 +989,20 @@ impl H7ExecutableCatalog {
         )
     }
 
+    #[cfg(test)]
+    fn prepare_sandbox_fixture_action(
+        &self,
+        context: VitaExecutionContext,
+        request: H7ProcessRequest,
+        sandbox: Arc<H7SandboxProfile>,
+    ) -> Result<Arc<PreparedProcessAction>, String> {
+        let mut action = self.prepare_action(context, request)?;
+        Arc::get_mut(&mut action)
+            .ok_or_else(|| "H7 fixture action was shared before sandbox attachment".to_string())?
+            .sandbox = Some(sandbox);
+        Ok(action)
+    }
+
     fn prepare_action_with_profile(
         &self,
         context: VitaExecutionContext,
@@ -1161,6 +1068,7 @@ impl H7ExecutableCatalog {
                 .then(|| D32_CARGO_NO_GIT_METADATA_FENCE.to_string()),
             sandbox,
             d32_execution_root: self.entry.d32_execution_root.clone(),
+            d32_toolchain_root: self.entry.d32_toolchain_root.clone(),
             d32_toolchain_manifest_hash: self.entry.d32_toolchain_manifest_hash.clone(),
         }))
     }
@@ -1191,6 +1099,7 @@ pub(crate) struct PreparedProcessAction {
     git_metadata_fence_hash: Option<String>,
     sandbox: Option<Arc<H7SandboxProfile>>,
     d32_execution_root: Option<PathBuf>,
+    d32_toolchain_root: Option<PathBuf>,
     d32_toolchain_manifest_hash: Option<String>,
 }
 
@@ -1260,8 +1169,11 @@ fn verify_workspace_root_binding(action: &PreparedProcessAction) -> Result<(), S
     } else if !h7_workspace_paths_equal(action.working_directory.path(), root.final_path()) {
         return Err("H7 workspace root and cwd binding did not match".to_string());
     }
-    root.verify_named_path_current()
-        .map_err(|_| "H7-B workspace root named path changed".to_string())
+    if action.capability_id != VITA_WORKSPACE_CARGO_CHECK_CAPABILITY_ID {
+        root.verify_named_path_current()
+            .map_err(|_| "H7-B workspace root named path changed".to_string())?;
+    }
+    Ok(())
 }
 
 fn verify_d32_environment_policy(action: &PreparedProcessAction) -> Result<(), String> {
@@ -1273,7 +1185,10 @@ fn verify_d32_environment_policy(action: &PreparedProcessAction) -> Result<(), S
         .as_ref()
         .ok_or_else(|| "D32 execution projection was absent".to_string())?;
     let source = root.join("source");
-    let toolchain = root.join("toolchain");
+    let toolchain = action
+        .d32_toolchain_root
+        .as_ref()
+        .ok_or_else(|| "D32 toolchain mirror evidence was absent".to_string())?;
     let cargo_home = root.join("cargo-home");
     let target = root.join("target");
     let expected_path = toolchain.join("bin").to_string_lossy().into_owned();
@@ -1324,7 +1239,7 @@ fn verify_d32_environment_policy(action: &PreparedProcessAction) -> Result<(), S
         .d32_toolchain_manifest_hash
         .as_deref()
         .ok_or_else(|| "D32 toolchain manifest evidence was absent".to_string())?;
-    for path in [&*root, &source, &toolchain, &cargo_home, &target] {
+    for path in [&*root, &source, &cargo_home, &target, toolchain] {
         let metadata = fs::symlink_metadata(path)
             .map_err(|_| "D32 app-owned execution path became unavailable".to_string())?;
         if metadata.file_type().is_symlink()
@@ -1334,7 +1249,7 @@ fn verify_d32_environment_policy(action: &PreparedProcessAction) -> Result<(), S
             return Err("D32 app-owned execution path was not a stable directory".to_string());
         }
     }
-    if toolchain_manifest_hash_for_catalog(&toolchain)? != expected_manifest {
+    if toolchain_manifest_hash_for_catalog(toolchain)? != expected_manifest {
         return Err("D32 toolchain manifest changed during the launch fence".to_string());
     }
     Ok(())
@@ -1415,17 +1330,13 @@ fn toolchain_manifest_hash_for_catalog(root: &Path) -> Result<String, String> {
             if metadata.is_dir() {
                 collect(root, &path, entries)?;
             } else if metadata.is_file() {
-                let mut file = File::open(&path)
-                    .map_err(|_| "D32 toolchain manifest file open failed".to_string())?;
-                let mut bytes = Vec::new();
-                file.read_to_end(&mut bytes)
-                    .map_err(|_| "D32 toolchain manifest file read failed".to_string())?;
+                let digest = hash_d32_toolchain_file(&path)?;
                 entries.push((
                     path.strip_prefix(root)
                         .unwrap_or(&path)
                         .to_string_lossy()
                         .replace('\\', "/"),
-                    sha256_hex(&bytes),
+                    digest,
                 ));
             }
         }
@@ -1437,6 +1348,29 @@ fn toolchain_manifest_hash_for_catalog(root: &Path) -> Result<String, String> {
     let encoded = serde_json::to_vec(&entries)
         .map_err(|_| "D32 toolchain manifest serialization failed".to_string())?;
     Ok(sha256_hex(&encoded))
+}
+
+fn hash_d32_toolchain_file(path: &Path) -> Result<String, String> {
+    const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
+    let mut file =
+        File::open(path).map_err(|_| "D32 toolchain manifest file open failed".to_string())?;
+    let mut digest = Sha256::new();
+    let mut total = 0_u64;
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| "D32 toolchain manifest file read failed".to_string())?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read as u64);
+        if total > MAX_FILE_BYTES {
+            return Err("D32 toolchain manifest file exceeded its bound".to_string());
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn quote_windows_arg(argument: &str) -> String {
@@ -1775,9 +1709,12 @@ impl H7SandboxProfile {
     /// not widen any user-owned namespace.  Individual source/toolchain/scratch
     /// directories are created below the root and inherit the same bounded
     /// package identity.
-    pub(crate) fn grant_execution_root(&self, root: &Path) -> Result<(), String> {
+    pub(crate) fn grant_execution_root(&self, root: &Path, toolchain: &Path) -> Result<(), String> {
         if !root.is_dir() {
             return Err("D32 app-owned execution root was not a directory".to_string());
+        }
+        if !toolchain.is_dir() {
+            return Err("D32 app-owned toolchain mirror was not a directory".to_string());
         }
         let metadata = fs::symlink_metadata(root)
             .map_err(|_| "D32 app-owned execution root metadata was unavailable".to_string())?;
@@ -1794,7 +1731,7 @@ impl H7SandboxProfile {
         apply_appcontainer_acl(self.sid, &root.join("source"), FILE_GENERIC_READ)?;
         apply_appcontainer_acl(
             self.sid,
-            &root.join("toolchain"),
+            toolchain,
             FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
         )?;
         for name in ["cargo-home", "target"] {
@@ -2044,6 +1981,7 @@ struct H7SupervisorMetrics {
     pending_output_reads: AtomicUsize,
     output_handles_active: AtomicUsize,
     created_notify: Notify,
+    process_exited_notify: Notify,
     native_worker_finished_notify: Notify,
 }
 
@@ -3411,6 +3349,7 @@ impl H7NativeResources {
             self.phase
                 .store(H7LaunchPhase::Exited as u8, Ordering::Release);
             self.metrics.process_exited.fetch_add(1, Ordering::AcqRel);
+            self.metrics.process_exited_notify.notify_waiters();
         }
         self.job_terminated = job_call_succeeded && process_closed && tree_closed;
         if self.job_terminated {
@@ -3464,6 +3403,7 @@ fn terminate_process_and_verify_exit(
     if !phase_at_least(phase, H7LaunchPhase::Exited) {
         phase.store(H7LaunchPhase::Exited as u8, Ordering::Release);
         metrics.process_exited.fetch_add(1, Ordering::AcqRel);
+        metrics.process_exited_notify.notify_waiters();
     }
     true
 }
@@ -4712,6 +4652,48 @@ fn h7_process_fixture_executable(repo_root: &Path) -> Result<PathBuf, String> {
     Ok(executable)
 }
 
+#[cfg(test)]
+fn d32_sandbox_fixture_executable(repo_root: &Path) -> Result<PathBuf, String> {
+    let executable = repo_root
+        .join("vita-agent")
+        .join("target")
+        .join("debug")
+        .join("d32a-sandbox-fixture.exe");
+    let source = repo_root
+        .join("vita-agent")
+        .join("src")
+        .join("bin")
+        .join("d32a-sandbox-fixture.rs");
+    let executable_is_fresh = executable
+        .metadata()
+        .and_then(|binary| binary.modified())
+        .and_then(|binary_time| {
+            source.metadata().and_then(|source| {
+                source
+                    .modified()
+                    .map(|source_time| (binary_time, source_time))
+            })
+        })
+        .is_ok_and(|(binary_time, source_time)| binary_time >= source_time);
+    if executable.is_file() && executable_is_fresh {
+        return Ok(executable);
+    }
+    let status = Command::new("cargo")
+        .current_dir(repo_root)
+        .args(["build", "--quiet", "--locked", "--manifest-path"])
+        .arg(repo_root.join("vita-agent").join("Cargo.toml"))
+        .args(["--bin", "d32a-sandbox-fixture"])
+        .env("CARGO_BUILD_JOBS", "1")
+        .env("CARGO_INCREMENTAL", "0")
+        .env("CARGO_TERM_COLOR", "never")
+        .status()
+        .map_err(|error| format!("build D32-A sandbox fixture: {error}"))?;
+    if !status.success() || !executable.is_file() {
+        return Err("D32-A sandbox fixture executable was not produced".to_string());
+    }
+    Ok(executable)
+}
+
 pub struct H7ProcessGrant {
     grant_id: String,
     confirmation_id: String,
@@ -5441,18 +5423,18 @@ impl H7PendingConfirmationBridge {
         )
     }
 
-    fn cancel(&self) {
+    pub(crate) fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
         self.generation.fetch_add(1, Ordering::AcqRel);
         self.cancelled_notify.notify_waiters();
     }
 
-    fn begin_turn(&self) {
+    pub(crate) fn begin_turn(&self) {
         self.cancelled.store(false, Ordering::Release);
         self.generation.fetch_add(1, Ordering::AcqRel);
     }
 
-    fn cancel_turn(&self) {
+    pub(crate) fn cancel_turn(&self) {
         self.cancelled.store(true, Ordering::Release);
         self.generation.fetch_add(1, Ordering::AcqRel);
         self.cancelled_notify.notify_waiters();
@@ -5735,16 +5717,25 @@ impl H7ToolResult {
         };
         json!({
             "status": status,
-            "process_created": self.process_created,
-            "user_code_started": self.user_code_started,
-            "process_tree_remaining": self.process_tree_remaining,
-            "job_terminated": self.job_terminated,
             "exit_code": self.exit_code,
             "timed_out": self.timed_out,
             "stdout": self.stdout,
             "stderr": self.stderr,
             "stdout_truncated": self.status == "started_and_output_limited",
             "stderr_truncated": self.status == "started_and_output_limited",
+        })
+    }
+
+    #[cfg(feature = "d32-a-test-helper")]
+    pub(crate) fn internal_process_evidence(&self) -> Value {
+        json!({
+            "process_created": self.process_created,
+            "user_code_started": self.user_code_started,
+            "process_tree_remaining": self.process_tree_remaining,
+            "job_terminated": self.job_terminated,
+            "process_tree_observed": self.process_tree_observed,
+            "process_exit_verified": self.process_exit_verified,
+            "thread_resumed": self.process_created && self.user_code_started,
         })
     }
 }
@@ -5924,6 +5915,14 @@ impl H7ProcessBroker {
     }
 
     #[cfg(test)]
+    fn with_unlisted_inheritable_handle(mut self: Arc<Self>, handle: usize) -> Arc<Self> {
+        Arc::get_mut(&mut self)
+            .expect("H7 unlisted inheritable handle must be installed before sharing broker")
+            .unlisted_inheritable_handle = Some(handle);
+        self
+    }
+
+    #[cfg(test)]
     fn with_output_terminality_gate(
         mut self: Arc<Self>,
         gate: Arc<H7TerminalityGate>,
@@ -6009,6 +6008,12 @@ impl H7ProcessBroker {
         cancellation_notify: Arc<Notify>,
         admission: H7ProcessAdmissionLease,
     ) -> H7ToolResult {
+        if action.capability_id == VITA_WORKSPACE_CARGO_CHECK_CAPABILITY_ID
+            && (action.workspace_root.is_none()
+                || self.authority.evaluate_workspace_scope(&action).is_err())
+        {
+            return H7ToolResult::denied();
+        }
         let authorization_revision = match self
             .bridge
             .await_confirmation(
@@ -6979,6 +6984,7 @@ impl H7CGitStatusProfile {
             git_metadata_fence_hash: Some(self.git_metadata_fence_hash.clone()),
             sandbox: None,
             d32_execution_root: None,
+            d32_toolchain_root: None,
             d32_toolchain_manifest_hash: None,
         }))
     }
@@ -7728,7 +7734,7 @@ mod tests {
     };
     use serde_json::json;
     use std::collections::BTreeSet;
-    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
     use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
     use tempfile::{Builder, TempDir};
 
@@ -10263,6 +10269,149 @@ mod tests {
         assert_completed(&result);
         assert_eq!(parse_stdout(&result)["valid"], false);
         assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn d32_a_real_sandbox_fixture_harness_uses_production_supervisor() {
+        if std::env::var("D32_A_REQUIRE_REAL_CANARY").as_deref() != Ok("1") {
+            eprintln!(
+                "skipping D32-A adversarial sandbox fixture; set D32_A_REQUIRE_REAL_CANARY=1 for the freeze gate"
+            );
+            return;
+        }
+        let _lock = lock_h7_tests();
+        let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("D32-A repository root")
+            .to_path_buf();
+        let fixture = d32_sandbox_fixture_executable(&repository_root)
+            .expect("D32-A sandbox fixture executable");
+        let execution_root = tempdir().expect("D32-A fixture execution root");
+        let toolchain = execution_root.path().join("toolchain");
+        fs::create_dir_all(&toolchain).expect("D32-A fixture toolchain root");
+        let staged_fixture = toolchain.join("d32a-sandbox-fixture.exe");
+        fs::copy(&fixture, &staged_fixture).expect("D32-A stage sandbox fixture image");
+        let allowed = execution_root.path().join("source");
+        let scratch = execution_root.path().join("target");
+        fs::create_dir_all(&allowed).expect("D32-A fixture source root");
+        fs::create_dir_all(&execution_root.path().join("cargo-home"))
+            .expect("D32-A fixture cargo home");
+        fs::create_dir_all(&scratch).expect("D32-A fixture scratch root");
+        fs::write(allowed.join("canary.txt"), b"allowed").expect("D32-A fixture source");
+        let outside = tempdir().expect("D32-A fixture outside root");
+        let user_profile = tempdir().expect("D32-A fixture user profile");
+        let authority = tempdir().expect("D32-A fixture authority root");
+        let recovery = tempdir().expect("D32-A fixture recovery root");
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").expect("D32-A TCP listener");
+        let network_target = tcp_listener.local_addr().expect("D32-A TCP address");
+        let udp_receiver = UdpSocket::bind(network_target).expect("D32-A UDP receiver");
+        let sentinel = File::create(execution_root.path().join("sentinel.txt"))
+            .expect("D32-A sentinel handle");
+        let sentinel_raw = sentinel.as_raw_handle() as usize;
+        assert_ne!(
+            unsafe {
+                SetHandleInformation(
+                    sentinel_raw as HANDLE,
+                    HANDLE_FLAG_INHERIT,
+                    HANDLE_FLAG_INHERIT,
+                )
+            },
+            0
+        );
+
+        let catalog = Arc::new(
+            H7ExecutableCatalog::fixture(staged_fixture, execution_root.path().to_path_buf())
+                .expect("D32-A fixture catalog"),
+        );
+        let sandbox = Arc::new(H7SandboxProfile::new().expect("D32-A AppContainer profile"));
+        sandbox
+            .grant_execution_root(execution_root.path(), &toolchain)
+            .expect("D32-A fixture ACL projection");
+        let authority_port = H7Authority::new().expect("D32-A fixture authority");
+        let (bridge, mut receiver) = H7PendingConfirmationBridge::new();
+        let context =
+            VitaExecutionContext::try_new(H7_LIFE_ID, H7_TASK_ID).expect("D32-A fixture context");
+        let broker = H7ProcessBroker::new(
+            context.clone(),
+            Arc::clone(&catalog),
+            authority_port.clone(),
+            Arc::clone(&bridge),
+        )
+        .with_unlisted_inheritable_handle(sentinel_raw);
+        let args = vec![
+            "d32-sandbox-canary".to_string(),
+            allowed.to_string_lossy().into_owned(),
+            scratch.to_string_lossy().into_owned(),
+            outside.path().to_string_lossy().into_owned(),
+            user_profile.path().to_string_lossy().into_owned(),
+            authority.path().to_string_lossy().into_owned(),
+            recovery.path().to_string_lossy().into_owned(),
+            network_target.to_string(),
+            sentinel_raw.to_string(),
+        ];
+        let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+        let action = catalog
+            .prepare_sandbox_fixture_action(
+                context,
+                H7ProcessRequest::synthetic("d32-a-fixture-call", "d32-a-fixture-turn", &arg_refs),
+                Arc::clone(&sandbox),
+            )
+            .expect("D32-A fixture action");
+        let metrics = broker.metrics();
+        let task = tokio::spawn({
+            let broker = Arc::clone(&broker);
+            async move { broker.execute(action).await }
+        });
+        let pending = tokio::time::timeout(H7_TURN_TIMEOUT, receiver.recv())
+            .await
+            .expect("D32-A fixture confirmation wait")
+            .expect("D32-A fixture confirmation");
+        let revision = authority_port
+            .provision_confirmation(&pending.action)
+            .expect("D32-A fixture confirmation revision");
+        pending
+            .response
+            .send(revision)
+            .expect("D32-A fixture confirmation response");
+        if metrics.process_created.load(Ordering::Acquire) == 0 {
+            tokio::time::timeout(H7_TURN_TIMEOUT, metrics.created_notify.notified())
+                .await
+                .expect("D32-A fixture process creation");
+        }
+        // The fixture's parent exits after emitting its bounded observations;
+        // the grandchild remains in the Job.  Wait for that process-terminal
+        // event, then exercise the same outer cancellation supervisor that
+        // production Cargo uses to close the complete tree.
+        if metrics.process_exited.load(Ordering::Acquire) == 0 {
+            tokio::time::timeout(H7_TURN_TIMEOUT, metrics.process_exited_notify.notified())
+                .await
+                .expect("D32-A fixture parent terminal event");
+        }
+        broker.cancel();
+        let result = tokio::time::timeout(H7_TURN_TIMEOUT, task)
+            .await
+            .expect("D32-A fixture outer cancellation")
+            .expect("D32-A fixture broker task");
+        let observation = serde_json::from_str::<Value>(&result.stdout)
+            .expect("D32-A fixture bounded JSON observation");
+        assert_eq!(observation["allowed_read"], true);
+        assert_eq!(observation["scratch_write"], true);
+        assert_eq!(observation["outside_read_denied"], true);
+        assert_eq!(observation["outside_write_denied"], true);
+        assert_eq!(observation["user_profile_read_denied"], true);
+        assert_eq!(observation["host_authority_read_denied"], true);
+        assert_eq!(observation["recovery_read_denied"], true);
+        assert_eq!(observation["tcp_refused"], false);
+        assert_eq!(observation["tcp_denied"], true);
+        assert_eq!(observation["udp_denied"], true);
+        assert_eq!(observation["breakaway_denied"], true);
+        assert_eq!(observation["forbidden_handle_probe_denied"], true);
+        assert_eq!(metrics.process_tree_remaining.load(Ordering::Acquire), 0);
+        assert!(metrics.jobs_terminated.load(Ordering::Acquire) >= 1);
+        assert!(authority_port.shutdown());
+        drop(udp_receiver);
+        drop(tcp_listener);
+        drop(sentinel);
     }
 
     #[tokio::test(flavor = "current_thread")]

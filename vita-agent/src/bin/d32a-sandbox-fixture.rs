@@ -101,16 +101,12 @@ fn run() -> Result<(), String> {
         .stderr(Stdio::null())
         .spawn();
     let grandchild_spawned = grandchild.is_ok();
-    let grandchild_stopped_after_probe = match grandchild.as_mut() {
-        Ok(child) => {
-            std::thread::sleep(Duration::from_millis(25));
-            if child.try_wait().ok().flatten().is_none() {
-                child.kill().is_ok() && child.wait().is_ok()
-            } else {
-                true
-            }
-        }
-        Err(_) => true,
+    // Do not terminate this process from inside the fixture.  The production
+    // Job/cancellation supervisor owns the tree and must prove that an outer
+    // cancellation closes both the fixture and this grandchild.
+    let grandchild_alive_after_probe = match grandchild.as_mut() {
+        Ok(child) => child.try_wait().ok().flatten().is_none(),
+        Err(_) => false,
     };
 
     let mut breakaway = Command::new(&executable)
@@ -156,7 +152,7 @@ fn run() -> Result<(), String> {
             "tcp_listener_denied": tcp_listener_denied,
             "udp_listener_denied": udp_listener_denied,
             "grandchild_spawned": grandchild_spawned,
-            "grandchild_stopped_after_probe": grandchild_stopped_after_probe,
+            "grandchild_alive_after_probe": grandchild_alive_after_probe,
             "breakaway_denied": breakaway_denied,
             "handle_count_observed": handle_count_ok,
             "handle_count": handle_count,

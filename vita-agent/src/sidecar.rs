@@ -490,22 +490,49 @@ impl crate::provider_gateway::ProviderRequestTransport for H9CanaryTransport {
                     }
                 } else if self.cargo_mode {
                     let status = result.get("status").and_then(Value::as_str);
-                    let process_created = result.get("process_created").and_then(Value::as_bool);
-                    let user_code_started =
-                        result.get("user_code_started").and_then(Value::as_bool);
-                    let process_tree_remaining =
-                        result.get("process_tree_remaining").and_then(Value::as_u64);
-                    status
+                    let exit_code_ok = if self.negative_cargo_mode {
+                        result.get("exit_code").is_some_and(Value::is_null)
+                    } else {
+                        result.get("exit_code").and_then(Value::as_i64) == Some(0)
+                    };
+                    let public_shape_ok = status
                         == Some(if self.negative_cargo_mode {
                             "denied"
                         } else {
                             "completed"
                         })
-                        && result.get("exit_code").is_some()
+                        && exit_code_ok
                         && result.get("timed_out").and_then(Value::as_bool) == Some(false)
-                        && process_created == Some(!self.negative_cargo_mode)
-                        && user_code_started == Some(!self.negative_cargo_mode)
-                        && process_tree_remaining == Some(0)
+                        && result.get("stdout").and_then(Value::as_str).is_some()
+                        && result.get("stderr").and_then(Value::as_str).is_some()
+                        && result
+                            .get("stdout_truncated")
+                            .and_then(Value::as_bool)
+                            .is_some()
+                        && result
+                            .get("stderr_truncated")
+                            .and_then(Value::as_bool)
+                            .is_some()
+                        && result.get("process_created").is_none()
+                        && result.get("user_code_started").is_none()
+                        && result.get("process_tree_remaining").is_none()
+                        && result.get("job_terminated").is_none();
+                    #[cfg(feature = "d32-a-test-helper")]
+                    let evidence_ok = crate::d32a::take_internal_evidence()
+                        .map(|evidence| {
+                            evidence.get("process_created").and_then(Value::as_bool)
+                                == Some(!self.negative_cargo_mode)
+                                && evidence.get("user_code_started").and_then(Value::as_bool)
+                                    == Some(!self.negative_cargo_mode)
+                                && evidence
+                                    .get("process_tree_remaining")
+                                    .and_then(Value::as_u64)
+                                    == Some(0)
+                        })
+                        .unwrap_or(false);
+                    #[cfg(not(feature = "d32-a-test-helper"))]
+                    let evidence_ok = true;
+                    public_shape_ok && evidence_ok
                 } else if self.read_mode {
                     let content = result.get("content").and_then(Value::as_str);
                     let relative_path = result.get("relative_path").and_then(Value::as_str);
@@ -1742,6 +1769,7 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
         cargo_toolchain_root,
         cargo_toolchain_manifest_hash,
         Arc::clone(&authority) as Arc<dyn VitaGitStatusAuthority>,
+        init.session_id.clone(),
     ));
     if require_real_canary && !cargo_production.is_available() {
         return Err(format!(
@@ -1860,8 +1888,7 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
                         provider_config.model == "d31-d-negative-canary-model";
                     let patch_conflict_mode =
                         provider_config.model == "d31-d-conflict-canary-model";
-                    let negative_cargo_mode =
-                        provider_config.model == "d32-a-negative-canary-model";
+                    let negative_cargo_mode = provider_config.model.starts_with("d32-a-negative-");
                     let cargo_mode =
                         provider_config.model == "d32-a-canary-model" || negative_cargo_mode;
                     SidecarGatewayTransport::H9Canary(Arc::new(H9CanaryTransport::new(
@@ -3928,7 +3955,10 @@ fn resolve_cargo_selection(app_data_root: &Path) -> Result<ResolvedCargoSelectio
     }
     let toolchain = std::fs::canonicalize(&toolchain)
         .map_err(|_| "Host Cargo authority toolchain could not be canonicalized".to_string())?;
+    let expected_cargo = std::fs::canonicalize(toolchain.join("bin/cargo.exe"))
+        .map_err(|_| "Host Cargo authority toolchain Cargo image was unavailable".to_string())?;
     if !toolchain.is_dir()
+        || expected_cargo != canonical
         || !toolchain.join("bin/rustc.exe").is_file()
         || !toolchain.join("bin/rustdoc.exe").is_file()
     {

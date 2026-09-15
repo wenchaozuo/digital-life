@@ -13,18 +13,19 @@ use codex_extension_api::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::Digest;
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
 
 use crate::d29h7::{
-    H7ExecutableCatalog, H7PendingConfirmationBridge, H7PendingProcessAction, H7ProcessBroker,
-    H7ProcessRequest, H7SandboxProfile, VitaGitStatusAuthorityAdapter,
+    H7AuthorityPort, H7ExecutableCatalog, H7PendingConfirmationBridge, H7PendingProcessAction,
+    H7ProcessBroker, H7ProcessRequest, H7SandboxProfile, VitaGitStatusAuthorityAdapter,
     VITA_WORKSPACE_CARGO_CHECK_CAPABILITY_ID, VITA_WORKSPACE_CARGO_CHECK_PROFILE_ID,
     VITA_WORKSPACE_CARGO_CHECK_TOOL_NAME,
 };
@@ -38,15 +39,142 @@ pub(crate) use crate::d29h7::D32_CARGO_NO_GIT_METADATA_FENCE;
 
 pub(crate) const D32_EXECUTION_ROOT_NAME: &str = "d32-cargo-check-v1";
 pub(crate) const D32_SOURCE_DIR_NAME: &str = "source";
-pub(crate) const D32_TOOLCHAIN_DIR_NAME: &str = "toolchain";
 pub(crate) const D32_CARGO_HOME_DIR_NAME: &str = "cargo-home";
 pub(crate) const D32_TARGET_DIR_NAME: &str = "target";
 
 const D32_MAX_SOURCE_FILES: usize = 16_384;
 const D32_MAX_SOURCE_BYTES: u64 = 128 * 1024 * 1024;
 const D32_MAX_TOOLCHAIN_FILES: usize = 131_072;
-const D32_MAX_TOOLCHAIN_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-const D32_MAX_FILE_BYTES: usize = 64 * 1024 * 1024;
+const D32_MAX_TOOLCHAIN_FILE_BYTES: usize = 512 * 1024 * 1024;
+const D32_MAX_TOOLCHAIN_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const D32_MAX_SOURCE_FILE_BYTES: usize = 64 * 1024 * 1024;
+const D32_MAX_IMAGE_BYTES: usize = 256 * 1024 * 1024;
+
+pub(crate) const D32_TOOLCHAIN_MIRROR_ROOT_NAME: &str = "d32-toolchains";
+pub(crate) const D32_RUNS_DIR_NAME: &str = "runs";
+
+#[cfg(feature = "d32-a-test-helper")]
+static D32_TEST_EVIDENCE: OnceLock<Mutex<Option<Value>>> = OnceLock::new();
+
+#[cfg(feature = "d32-a-test-helper")]
+fn record_internal_evidence(value: Value) {
+    let slot = D32_TEST_EVIDENCE.get_or_init(|| Mutex::new(None));
+    if let Ok(mut evidence) = slot.lock() {
+        *evidence = Some(value);
+    }
+}
+
+#[cfg(feature = "d32-a-test-helper")]
+pub(crate) fn take_internal_evidence() -> Option<Value> {
+    D32_TEST_EVIDENCE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|mut evidence| evidence.take())
+}
+
+/// A Host-selected Rust toolchain mirrored below private app data.  The
+/// selected user-profile root is consulted only while this immutable mirror
+/// is built; production children receive only these app-owned paths.
+#[derive(Clone, Debug)]
+pub(crate) struct D32ToolchainMirror {
+    pub(crate) root: PathBuf,
+    pub(crate) cargo_path: PathBuf,
+    pub(crate) rustc_path: PathBuf,
+    pub(crate) rustdoc_path: PathBuf,
+    pub(crate) manifest_hash: String,
+}
+
+impl D32ToolchainMirror {
+    pub(crate) fn prepare(
+        app_data_root: &std::path::Path,
+        selected_cargo_path: &std::path::Path,
+        selected_root: &std::path::Path,
+        expected_manifest_hash: &str,
+    ) -> Result<Arc<Self>, String> {
+        if !app_data_root.is_absolute()
+            || !selected_cargo_path.is_absolute()
+            || !selected_root.is_absolute()
+            || expected_manifest_hash.len() != 64
+            || expected_manifest_hash
+                .bytes()
+                .any(|byte| !byte.is_ascii_hexdigit())
+        {
+            return Err("D32 Host toolchain mirror evidence was not exact".to_string());
+        }
+        let app_data_root = fs::canonicalize(app_data_root)
+            .map_err(|_| "D32 app-data root could not be canonicalized".to_string())?;
+        let selected_root = fs::canonicalize(selected_root)
+            .map_err(|_| "D32 selected toolchain root could not be canonicalized".to_string())?;
+        let selected_cargo = fs::canonicalize(selected_cargo_path).ok();
+        let root_cargo = fs::canonicalize(selected_root.join("bin/cargo.exe")).ok();
+        if !selected_root.is_dir()
+            || !selected_root.join("bin/rustc.exe").is_file()
+            || !selected_root.join("bin/rustdoc.exe").is_file()
+            || selected_cargo.is_none()
+            || selected_cargo != root_cargo
+        {
+            return Err("D32 Host-selected Rust toolchain was incomplete".to_string());
+        }
+
+        let mirror_parent = app_data_root.join(D32_TOOLCHAIN_MIRROR_ROOT_NAME);
+        fs::create_dir_all(&mirror_parent)
+            .map_err(|_| "D32 toolchain mirror parent could not be created".to_string())?;
+        let mirror_root = mirror_parent.join(expected_manifest_hash);
+        let valid_existing = fs::symlink_metadata(&mirror_root)
+            .ok()
+            .is_some_and(|metadata| !is_reparse(&metadata))
+            && mirror_root.is_dir()
+            && validate_existing_tree_without_reparse(&mirror_root).is_ok()
+            && toolchain_manifest_hash(&mirror_root).ok().as_deref()
+                == Some(expected_manifest_hash)
+            && mirror_root.join("bin/cargo.exe").is_file()
+            && mirror_root.join("bin/rustc.exe").is_file()
+            && mirror_root.join("bin/rustdoc.exe").is_file();
+
+        if !valid_existing {
+            if fs::symlink_metadata(&mirror_root).is_ok() {
+                validate_existing_tree_without_reparse(&mirror_root)?;
+                fs::remove_dir_all(&mirror_root)
+                    .map_err(|_| "D32 stale toolchain mirror could not be removed".to_string())?;
+            }
+            let staging = mirror_parent.join(format!(".{expected_manifest_hash}.staging"));
+            if fs::symlink_metadata(&staging).is_ok() {
+                validate_existing_tree_without_reparse(&staging)?;
+                fs::remove_dir_all(&staging)
+                    .map_err(|_| "D32 stale toolchain staging could not be removed".to_string())?;
+            }
+            fs::create_dir_all(&staging)
+                .map_err(|_| "D32 toolchain staging root could not be created".to_string())?;
+            let mut limits = CopyLimits::new(D32_MAX_TOOLCHAIN_FILES, D32_MAX_TOOLCHAIN_BYTES);
+            copy_tree_without_reparse(&selected_root, &staging, &mut limits)?;
+            copy_regular_file_without_reparse(
+                selected_cargo_path,
+                &staging.join("bin/cargo.exe"),
+                D32_MAX_IMAGE_BYTES,
+            )?;
+            let staged_manifest = toolchain_manifest_hash(&staging)?;
+            if staged_manifest != expected_manifest_hash {
+                let _ = fs::remove_dir_all(&staging);
+                return Err("D32 staged toolchain mirror did not match Host evidence".to_string());
+            }
+            fs::rename(&staging, &mirror_root)
+                .map_err(|_| "D32 toolchain mirror could not be finalized".to_string())?;
+        }
+
+        let manifest_hash = toolchain_manifest_hash(&mirror_root)?;
+        if manifest_hash != expected_manifest_hash {
+            return Err("D32 toolchain mirror manifest changed".to_string());
+        }
+        Ok(Arc::new(Self {
+            cargo_path: mirror_root.join("bin/cargo.exe"),
+            rustc_path: mirror_root.join("bin/rustc.exe"),
+            rustdoc_path: mirror_root.join("bin/rustdoc.exe"),
+            root: mirror_root,
+            manifest_hash,
+        }))
+    }
+}
 
 /// The app-owned execution projection consumed by the sandboxed child.  The
 /// live workspace and the user-profile toolchain never become the child cwd or
@@ -69,11 +197,16 @@ impl D32ExecutionProjection {
     pub(crate) fn prepare(
         app_data_root: PathBuf,
         workspace_root: &TrustedWorkspaceRoot,
-        cargo_path: PathBuf,
-        trusted_toolchain_root: Option<PathBuf>,
-        expected_toolchain_manifest_hash: Option<&str>,
+        toolchain: Arc<D32ToolchainMirror>,
+        session_id: &str,
+        turn_id: &str,
+        tool_call_id: &str,
     ) -> Result<Arc<Self>, String> {
-        if !app_data_root.is_absolute() || !cargo_path.is_absolute() {
+        if !app_data_root.is_absolute()
+            || session_id.is_empty()
+            || turn_id.is_empty()
+            || tool_call_id.is_empty()
+        {
             return Err("D32 app-owned projection paths must be absolute".to_string());
         }
         workspace_root
@@ -81,7 +214,10 @@ impl D32ExecutionProjection {
             .map_err(|_| "D32 governed workspace changed before staging".to_string())?;
         let app_data_root = fs::canonicalize(&app_data_root)
             .map_err(|_| "D32 app-data root could not be canonicalized".to_string())?;
-        let root = app_data_root.join(D32_EXECUTION_ROOT_NAME);
+        let root = app_data_root
+            .join(D32_EXECUTION_ROOT_NAME)
+            .join(D32_RUNS_DIR_NAME)
+            .join(d32_run_id(session_id, turn_id, tool_call_id));
         match fs::symlink_metadata(&root) {
             Ok(metadata) => {
                 if is_reparse(&metadata) {
@@ -98,10 +234,10 @@ impl D32ExecutionProjection {
             }
         }
         let source_root = root.join(D32_SOURCE_DIR_NAME);
-        let toolchain_root = root.join(D32_TOOLCHAIN_DIR_NAME);
+        let toolchain_root = toolchain.root.clone();
         let cargo_home = root.join(D32_CARGO_HOME_DIR_NAME);
         let target = root.join(D32_TARGET_DIR_NAME);
-        for path in [&source_root, &toolchain_root, &cargo_home, &target] {
+        for path in [&source_root, &cargo_home, &target] {
             fs::create_dir_all(path).map_err(|_| {
                 format!(
                     "D32 projection directory could not be created: {}",
@@ -119,55 +255,50 @@ impl D32ExecutionProjection {
             &mut source_limits,
         )?;
 
-        let toolchain_source = match trusted_toolchain_root {
-            Some(root) => root,
-            None => crate::d29h7::d32_trusted_toolchain_root(&cargo_path)?,
-        };
-        if !toolchain_source.is_absolute()
-            || !toolchain_source.is_dir()
-            || !toolchain_source.join("bin/rustc.exe").is_file()
-            || !toolchain_source.join("bin/rustdoc.exe").is_file()
+        if !toolchain_root.is_absolute()
+            || !toolchain_root.is_dir()
+            || !toolchain.cargo_path.is_file()
+            || !toolchain.rustc_path.is_file()
+            || !toolchain.rustdoc_path.is_file()
         {
-            return Err("D32 Host-selected Rust toolchain was incomplete".to_string());
+            return Err("D32 app-owned toolchain mirror was incomplete".to_string());
         }
-        let mut toolchain_limits =
-            CopyLimits::new(D32_MAX_TOOLCHAIN_FILES, D32_MAX_TOOLCHAIN_BYTES);
-        copy_tree_without_reparse(&toolchain_source, &toolchain_root, &mut toolchain_limits)?;
-
-        let staged_bin = toolchain_root.join("bin");
-        fs::create_dir_all(&staged_bin)
-            .map_err(|_| "D32 staged toolchain bin directory could not be created".to_string())?;
-        let staged_cargo = staged_bin.join("cargo.exe");
-        copy_regular_file_without_reparse(&cargo_path, &staged_cargo, D32_MAX_FILE_BYTES)?;
-        let rustc_source = toolchain_source.join("bin").join("rustc.exe");
-        let rustdoc_source = toolchain_source.join("bin").join("rustdoc.exe");
-        let staged_rustc = staged_bin.join("rustc.exe");
-        let staged_rustdoc = staged_bin.join("rustdoc.exe");
-        if !staged_rustc.is_file() || !staged_rustdoc.is_file() {
-            return Err("D32 staged Rust toolchain did not contain rustc/rustdoc".to_string());
-        }
-        let manifest_hash = toolchain_manifest_hash(&toolchain_root)?;
-        if expected_toolchain_manifest_hash.is_some_and(|expected| expected != manifest_hash) {
-            return Err("D32 projected toolchain did not match Host profile".to_string());
-        }
-        if !rustc_source.is_file() || !rustdoc_source.is_file() {
-            return Err("D32 trusted Rust toolchain was incomplete".to_string());
-        }
-        workspace_root
-            .verify_named_path_current()
-            .map_err(|_| "D32 governed workspace changed after staging".to_string())?;
+        let manifest_hash = toolchain.manifest_hash.clone();
         Ok(Arc::new(Self {
             root,
             source_root,
             toolchain_root,
             cargo_home,
             target,
-            cargo_path: staged_cargo,
-            rustc_path: staged_rustc,
-            rustdoc_path: staged_rustdoc,
+            cargo_path: toolchain.cargo_path.clone(),
+            rustc_path: toolchain.rustc_path.clone(),
+            rustdoc_path: toolchain.rustdoc_path.clone(),
             toolchain_manifest_hash: manifest_hash,
         }))
     }
+
+    pub(crate) fn cleanup(&self) -> Result<(), String> {
+        match fs::symlink_metadata(&self.root) {
+            Ok(metadata) => {
+                if is_reparse(&metadata) {
+                    return Err("D32 run root became a reparse point".to_string());
+                }
+                validate_existing_tree_without_reparse(&self.root)?;
+                fs::remove_dir_all(&self.root)
+                    .map_err(|_| "D32 run root could not be cleaned".to_string())?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err("D32 run root metadata was unavailable".to_string()),
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn d32_run_id(session_id: &str, turn_id: &str, tool_call_id: &str) -> String {
+    crate::sha256_hex(
+        format!("{session_id}\u{1f}{turn_id}\u{1f}{tool_call_id}\u{1f}{D32_CARGO_PROFILE_ID}")
+            .as_bytes(),
+    )
 }
 
 fn validate_existing_tree_without_reparse(root: &std::path::Path) -> Result<(), String> {
@@ -295,12 +426,12 @@ fn snapshot_workspace(
                 return Err("D32 workspace snapshot target classification changed".to_string());
             }
             let size = metadata.len();
-            if size > D32_MAX_FILE_BYTES as u64 {
+            if size > D32_MAX_SOURCE_FILE_BYTES as u64 {
                 return Err("D32 workspace snapshot file exceeded its bound".to_string());
             }
             limits.file(size)?;
             let bytes = prepared
-                .read_existing_file_raw_bounded(D32_MAX_FILE_BYTES)
+                .read_existing_file_raw_bounded(D32_MAX_SOURCE_FILE_BYTES)
                 .map_err(|_| "D32 workspace snapshot read failed".to_string())?;
             if bytes.len() as u64 != size {
                 return Err("D32 workspace snapshot changed during read".to_string());
@@ -360,8 +491,7 @@ fn copy_regular_file_without_reparse(
     if is_reparse(&metadata) || !metadata.is_file() || metadata.len() > max_bytes as u64 {
         return Err("D32 executable projection source was not a bounded regular file".to_string());
     }
-    fs::copy(source, destination)
-        .map_err(|_| "D32 executable projection copy failed".to_string())?;
+    stream_copy(source, destination, metadata.len())?;
     Ok(())
 }
 
@@ -372,18 +502,54 @@ fn copy_regular_file_without_reparse_with_limits(
 ) -> Result<(), String> {
     let metadata = fs::symlink_metadata(source)
         .map_err(|_| "D32 toolchain metadata read failed".to_string())?;
-    if is_reparse(&metadata) || !metadata.is_file() || metadata.len() > D32_MAX_FILE_BYTES as u64 {
+    if is_reparse(&metadata)
+        || !metadata.is_file()
+        || metadata.len() > D32_MAX_TOOLCHAIN_FILE_BYTES as u64
+    {
         return Err("D32 toolchain projection source was not a bounded regular file".to_string());
     }
     limits.file(metadata.len())?;
-    fs::copy(source, destination)
-        .map_err(|_| "D32 toolchain projection copy failed".to_string())?;
+    stream_copy(source, destination, metadata.len())?;
+    Ok(())
+}
+
+fn stream_copy(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+    expected_bytes: u64,
+) -> Result<(), String> {
+    let mut input =
+        File::open(source).map_err(|_| "D32 projection source could not be opened".to_string())?;
+    let mut output = File::create(destination)
+        .map_err(|_| "D32 projection destination could not be created".to_string())?;
+    let mut copied = 0_u64;
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let read = input
+            .read(&mut buffer)
+            .map_err(|_| "D32 projection source could not be read".to_string())?;
+        if read == 0 {
+            break;
+        }
+        output
+            .write_all(&buffer[..read])
+            .map_err(|_| "D32 projection destination could not be written".to_string())?;
+        copied = copied.saturating_add(read as u64);
+    }
+    if copied != expected_bytes {
+        return Err("D32 projection source changed during streaming copy".to_string());
+    }
+    output
+        .flush()
+        .map_err(|_| "D32 projection destination could not be flushed".to_string())?;
     Ok(())
 }
 
 fn toolchain_manifest_hash(root: &std::path::Path) -> Result<String, String> {
     let mut entries = Vec::new();
-    collect_manifest_entries(root, root, &mut entries)?;
+    let mut file_count = 0usize;
+    let mut total_bytes = 0u64;
+    collect_manifest_entries(root, root, &mut entries, &mut file_count, &mut total_bytes)?;
     entries.sort_by(|left, right| left.0.cmp(&right.0));
     let encoded = serde_json::to_vec(&entries)
         .map_err(|_| "D32 toolchain manifest serialization failed".to_string())?;
@@ -394,6 +560,8 @@ fn collect_manifest_entries(
     root: &std::path::Path,
     current: &std::path::Path,
     entries: &mut Vec<(String, String)>,
+    file_count: &mut usize,
+    total_bytes: &mut u64,
 ) -> Result<(), String> {
     for entry in fs::read_dir(current)
         .map_err(|_| "D32 toolchain manifest enumeration failed".to_string())?
@@ -406,34 +574,60 @@ fn collect_manifest_entries(
             return Err("D32 toolchain manifest rejected reparse entry".to_string());
         }
         if metadata.is_dir() {
-            collect_manifest_entries(root, &path, entries)?;
+            collect_manifest_entries(root, &path, entries, file_count, total_bytes)?;
         } else if metadata.is_file() {
-            let mut file = File::open(&path)
-                .map_err(|_| "D32 toolchain manifest file open failed".to_string())?;
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes)
-                .map_err(|_| "D32 toolchain manifest file read failed".to_string())?;
+            *file_count = file_count.saturating_add(1);
+            *total_bytes = total_bytes.saturating_add(metadata.len());
+            if *file_count > D32_MAX_TOOLCHAIN_FILES || *total_bytes > D32_MAX_TOOLCHAIN_BYTES {
+                return Err("D32 toolchain manifest exceeded its bounded total".to_string());
+            }
+            let digest = hash_bounded_file(&path, D32_MAX_TOOLCHAIN_FILE_BYTES as u64)?;
             entries.push((
                 path.strip_prefix(root)
                     .unwrap_or(&path)
                     .to_string_lossy()
                     .replace('\\', "/"),
-                crate::sha256_hex(&bytes),
+                digest,
             ));
         }
     }
     Ok(())
 }
 
+fn hash_bounded_file(path: &std::path::Path, max_bytes: u64) -> Result<String, String> {
+    let mut file =
+        File::open(path).map_err(|_| "D32 toolchain manifest file open failed".to_string())?;
+    let mut digest = sha2::Sha256::new();
+    let mut total = 0_u64;
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| "D32 toolchain manifest file read failed".to_string())?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read as u64);
+        if total > max_bytes {
+            return Err("D32 toolchain manifest file exceeded its bound".to_string());
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
 type CargoConfirmationReceiver = tokio::sync::mpsc::Receiver<H7PendingProcessAction>;
 
 struct CargoInner {
-    broker: Arc<H7ProcessBroker>,
-    catalog: Arc<H7ExecutableCatalog>,
     context: VitaExecutionContext,
     workspace_root: TrustedWorkspaceRoot,
+    app_data_root: PathBuf,
+    session_id: String,
+    toolchain: Arc<D32ToolchainMirror>,
     sandbox: Arc<H7SandboxProfile>,
-    projection: Arc<D32ExecutionProjection>,
+    authority: Arc<dyn H7AuthorityPort>,
+    confirmation: Arc<H7PendingConfirmationBridge>,
+    active_broker: Mutex<Option<Arc<H7ProcessBroker>>>,
 }
 
 /// Production D32 Cargo profile.  If a trusted toolchain or AppContainer
@@ -456,40 +650,35 @@ impl VitaCargoCheckProduction {
         trusted_toolchain_root: Option<PathBuf>,
         expected_toolchain_manifest_hash: Option<String>,
         authority: Arc<dyn VitaGitStatusAuthority>,
+        session_id: String,
     ) -> Self {
         let (confirmation, receiver) =
             H7PendingConfirmationBridge::new_with_timeout(std::time::Duration::from_secs(30));
         let attempted = (|| {
-            let projection = D32ExecutionProjection::prepare(
-                app_data_root,
-                &workspace_root,
-                cargo_path,
-                trusted_toolchain_root,
-                expected_toolchain_manifest_hash.as_deref(),
+            let selected_root = trusted_toolchain_root
+                .ok_or_else(|| "D32 Host-selected Rust toolchain was unavailable".to_string())?;
+            let expected_manifest_hash = expected_toolchain_manifest_hash.ok_or_else(|| {
+                "D32 Host toolchain manifest evidence was unavailable".to_string()
+            })?;
+            let toolchain = D32ToolchainMirror::prepare(
+                &app_data_root,
+                &cargo_path,
+                &selected_root,
+                &expected_manifest_hash,
             )?;
-            let catalog = Arc::new(H7ExecutableCatalog::cargo_check_projected(
-                projection.cargo_path.clone(),
-                projection.source_root.clone(),
-                projection.root.clone(),
-                projection.rustc_path.clone(),
-                projection.rustdoc_path.clone(),
-            )?);
             let sandbox = H7SandboxProfile::new()?;
-            sandbox.grant_execution_root(&projection.root)?;
-            let authority = Arc::new(VitaGitStatusAuthorityAdapter::new(authority));
-            let broker = H7ProcessBroker::new(
-                context.clone(),
-                Arc::clone(&catalog),
-                authority,
-                Arc::clone(&confirmation),
-            );
+            let authority: Arc<dyn H7AuthorityPort> =
+                Arc::new(VitaGitStatusAuthorityAdapter::new(authority));
             Ok::<_, String>(Arc::new(CargoInner {
-                broker,
-                catalog,
                 context,
                 workspace_root,
+                app_data_root,
+                session_id,
+                toolchain,
                 sandbox,
-                projection,
+                authority,
+                confirmation: Arc::clone(&confirmation),
+                active_broker: Mutex::new(None),
             }))
         })();
         let (inner, unavailable_reason) = match attempted {
@@ -528,20 +717,33 @@ impl VitaCargoCheckProduction {
 
     pub fn cancel(&self) {
         if let Some(inner) = &self.inner {
-            inner.broker.cancel();
+            if let Ok(broker) = inner.active_broker.lock() {
+                if let Some(broker) = broker.as_ref() {
+                    broker.cancel();
+                }
+            }
         }
         self.confirmation.cancel_pending();
     }
 
     pub fn begin_turn(&self) {
+        self.confirmation.begin_turn();
         if let Some(inner) = &self.inner {
-            inner.broker.begin_turn();
+            if let Ok(broker) = inner.active_broker.lock() {
+                if let Some(broker) = broker.as_ref() {
+                    broker.begin_turn();
+                }
+            }
         }
     }
 
     pub fn cancel_turn(&self) {
         if let Some(inner) = &self.inner {
-            inner.broker.cancel_turn();
+            if let Ok(broker) = inner.active_broker.lock() {
+                if let Some(broker) = broker.as_ref() {
+                    broker.cancel_turn();
+                }
+            }
         }
         self.confirmation.cancel_pending();
     }
@@ -651,13 +853,64 @@ impl<'call> ToolExecutor<ToolCall<'call>> for VitaCargoCheckTool {
                     .and_then(|raw| serde_json::from_str::<CargoCheckArguments>(raw).ok()),
             ) {
                 (Some(inner), true, Some(call_id), Some(turn_id), Some(_)) => {
+                    let projection = D32ExecutionProjection::prepare(
+                        inner.app_data_root.clone(),
+                        &inner.workspace_root,
+                        Arc::clone(&inner.toolchain),
+                        &inner.session_id,
+                        &turn_id,
+                        &call_id,
+                    );
+                    let projection = match projection {
+                        Ok(projection) => projection,
+                        Err(_) => {
+                            return Ok(Box::new(JsonToolOutput::with_success(
+                                denied_value(),
+                                Some(false),
+                            )) as Box<dyn ToolOutput>)
+                        }
+                    };
+                    let catalog = match H7ExecutableCatalog::cargo_check_projected(
+                        projection.cargo_path.clone(),
+                        projection.source_root.clone(),
+                        projection.root.clone(),
+                        projection.toolchain_root.clone(),
+                        projection.rustc_path.clone(),
+                        projection.rustdoc_path.clone(),
+                    ) {
+                        Ok(catalog) => Arc::new(catalog),
+                        Err(_) => {
+                            let _ = projection.cleanup();
+                            return Ok(Box::new(JsonToolOutput::with_success(
+                                denied_value(),
+                                Some(false),
+                            )) as Box<dyn ToolOutput>);
+                        }
+                    };
+                    if inner
+                        .sandbox
+                        .grant_execution_root(&projection.root, &projection.toolchain_root)
+                        .is_err()
+                    {
+                        let _ = projection.cleanup();
+                        return Ok(Box::new(JsonToolOutput::with_success(
+                            denied_value(),
+                            Some(false),
+                        )) as Box<dyn ToolOutput>);
+                    }
+                    let broker = H7ProcessBroker::new(
+                        inner.context.clone(),
+                        Arc::clone(&catalog),
+                        Arc::clone(&inner.authority),
+                        Arc::clone(&inner.confirmation),
+                    );
                     let request = H7ProcessRequest::synthetic_fixed(
                         &call_id,
                         &turn_id,
                         D32_CARGO_PROGRAM_ID,
                         &["check", "--locked"],
                     );
-                    match inner.catalog.prepare_fixed_workspace_action(
+                    let result = match catalog.prepare_fixed_workspace_action(
                         inner.context.clone(),
                         request,
                         D32_CARGO_CAPABILITY_ID,
@@ -665,8 +918,32 @@ impl<'call> ToolExecutor<ToolCall<'call>> for VitaCargoCheckTool {
                         inner.workspace_root.clone(),
                         Arc::clone(&inner.sandbox),
                     ) {
-                        Ok(action) => inner.broker.execute(action).await.cargo_value(),
+                        Ok(action) => {
+                            if let Ok(mut active) = inner.active_broker.lock() {
+                                *active = Some(Arc::clone(&broker));
+                            }
+                            let result = broker.execute(action).await;
+                            if let Ok(mut active) = inner.active_broker.lock() {
+                                if active
+                                    .as_ref()
+                                    .is_some_and(|current| Arc::ptr_eq(current, &broker))
+                                {
+                                    *active = None;
+                                }
+                            }
+                            #[cfg(feature = "d32-a-test-helper")]
+                            record_internal_evidence(result.internal_process_evidence());
+                            result.cargo_value()
+                        }
                         Err(_) => denied_value(),
+                    };
+                    if projection.cleanup().is_err() {
+                        // A terminal run must not be reported as a successful
+                        // Cargo result while its app-owned run root is still
+                        // present or has become unsafe to remove.
+                        denied_value()
+                    } else {
+                        result
                     }
                 }
                 _ => denied_value(),
@@ -705,5 +982,43 @@ mod tests {
             "vita.process.workspace.cargo_check"
         );
         assert_eq!(D32_CARGO_NO_GIT_METADATA_FENCE, "d32-no-git-fence-v1");
+    }
+
+    #[test]
+    fn each_call_has_a_distinct_profile_bound_run_identity() {
+        let first = d32_run_id("session", "turn", "call-a");
+        let second = d32_run_id("session", "turn", "call-b");
+        assert_eq!(first.len(), 64);
+        assert_ne!(first, second);
+        assert_eq!(first, d32_run_id("session", "turn", "call-a"));
+    }
+
+    #[test]
+    fn denied_cargo_output_is_the_frozen_public_shape() {
+        let value = denied_value();
+        let object = value.as_object().expect("D32 denied object");
+        assert_eq!(object.len(), 7);
+        for field in [
+            "status",
+            "exit_code",
+            "timed_out",
+            "stdout",
+            "stderr",
+            "stdout_truncated",
+            "stderr_truncated",
+        ] {
+            assert!(object.contains_key(field), "missing frozen field: {field}");
+        }
+        for forbidden in [
+            "process_created",
+            "user_code_started",
+            "process_tree_remaining",
+            "job_terminated",
+        ] {
+            assert!(
+                !object.contains_key(forbidden),
+                "telemetry leaked: {forbidden}"
+            );
+        }
     }
 }
